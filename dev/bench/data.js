@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780442932685,
+  "lastUpdate": 1780515067297,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -55406,6 +55406,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.27,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "53e48a781e96cd8cb0c1b6871cb71d078541c611",
+          "message": "perf(encode): size-gated dictionary match-finding for the Fast strategy (#328)\n\n* perf(encode): size-gated dict match-finding for Fast strategy\n\nMirror the donor ZSTD_shouldAttachDict heuristic: small or unknown-size\ninputs (<=8 KB for the Fast strategy) now attach a separate immutable\ndictionary hash table and run a 2-cursor dictMatchState search, while\nlarger inputs keep priming the dictionary into the live table for the\nexisting 4-cursor search.\n\nCloses ~25% of the small-payload dict compression-ratio gap\n(small-4k-log-lines 2.07x -> 1.55x vs C) without regressing large-corpus\ndict ratio (z000033 Fast still beats C) or any other corpus. 712 tests\npass; clippy + fmt clean.\n\n* perf(encode): direct seq-sink for Fast kernel emit path\n\nReplace the per-sequence `Sequence` enum + `FnMut` closure boundary on the\nFast strategy's hot emit path with a typed `SeqSink` the kernel pushes\n`(literals, offset, match_len)` into directly (donor `ZSTD_storeSeq` is\ninlined into the matcher loop the same way).\n\n- New `SeqSink` trait + `Matcher::start_matching_into<S>` (default bridges\n  to `start_matching` so non-Fast backends and the capture path are\n  unchanged).\n- Fast kernel cores `compress_block_fast_into` / `_dict_into` push straight\n  into the sink; thin `ClosureSink`-based wrappers keep the closure API for\n  unit tests and the sequence-capture tooling.\n- `MatchGeneratorDriver` overrides `start_matching_into` to route the Fast\n  owned path through the direct sink; everything else bridges via the\n  closure.\n- Production `collect_block_parts` feeds a `BlockPartsSink` over its flat\n  literal/sequence buffers.\n\nByte-identical output (712 tests + roundtrip + cross_validation pass);\nclippy + fmt clean. Targets the ~30% sequence-emit self-time in the Fast\nencoder profile.\n\n* Revert \"perf(encode): direct seq-sink for Fast kernel emit path\"\n\nThis reverts commit 2f16efb31f086a53dd1893c6fe48d518112c3e78.\n\n* perf(encode): hoist hash-table slice + hash_log in Fast kernel (#329)\n\nThe no-dict Fast kernel's hot loop did `hash_table.get` / `.put` /\n`.hash_ptr` per cursor through `&mut FastHashTable`. After each interior\nwrite the optimiser conservatively re-reads the `Vec` header (`ptr`,`len`)\nand the `hash_log` field on the next access — the \"chases the Vec\" reload.\n\nHoist the backing slice and `hash_log` into loop locals once via\n`FastHashTable::hot_state`, and compute hashes through the new free\n`hash_ptr_raw` (takes `hash_log` explicitly). The slice's `(ptr,len)` is\nloop-invariant (the table is fixed-size for the frame), so per-position\n`get_unchecked` / `get_unchecked_mut` no longer reload it.\n\nByte-identical output (712 tests + roundtrip + cross_validation pass);\nclippy + fmt clean. Targets the ~30% match-finding self-time in the Fast\nencoder profile. Only the no-dict kernel is converted in this commit.\n\n* test(encode): regression for dropped seam matches in chunked priming\n\nPriming the dict/main hash table in slice_size chunks hashes only\n[range_start ..= history_len - HASH_READ_SIZE] per chunk, so the\nHASH_READ_SIZE-1 positions straddling a chunk seam are indexed by\nneither chunk and every seam-spanning match is silently dropped.\n\nTwo unit tests prime two chunks and assert a seam-gap position is\npresent in the table; both fail on current code (the position resolves\nto the empty sentinel 0 instead of itself).\n\n* fix(encode): backfill seam positions when priming in chunks\n\nEach per-slice prime hashed only [range_start ..= history_len -\nHASH_READ_SIZE], so the HASH_READ_SIZE-1 positions whose 8-byte hash\nread straddles a chunk seam were indexed by neither the prior nor the\ncurrent slice. A dictionary (or history) fed in slice_size chunks\nsilently dropped every seam-spanning match.\n\nStart each prime at range_start - (HASH_READ_SIZE - 1) (saturating,\nfloored at the history base), re-hashing the prior slice's trailing\npositions. Re-inserting an already-indexed position is idempotent, and\nthe early-out now keys on the backfilled start so a sub-8-byte tail\nslice still indexes its seam. Applied to all three priming paths: main\ntable, dict table, and the borrowed-window analogue.\n\n* fix(encode): prefer recent match at the window floor in dict kernel\n\nThe dict-fallback gate used `main_idx <= prefix_start_index`, routing\nthe floor-aligned case `main_idx == prefix_start_index` to the dict\npath first. But `match_found` treats `match_idx >= prefix_start_index`\nas a valid in-window candidate, so that exact-floor index is a usable\nrecent-input match. With the two-`if` (dict, then main) structure the\n`<=` gate took the dict path before the recent match, inverting the\nintended \"recent input wins, dict is the fallback\" ordering.\n\nGate on `main_idx < prefix_start_index` so the floor-aligned index\nfalls through to the main-match probe, consistent with `match_found`'s\nwindow-validity floor.",
+          "timestamp": "2026-06-03T21:26:15+03:00",
+          "tree_id": "8560c452ebae35f4a3e4737a0df2678dbdc8c7e1",
+          "url": "https://github.com/structured-world/structured-zstd/commit/53e48a781e96cd8cb0c1b6871cb71d078541c611"
+        },
+        "date": 1780515055049,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.138,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.088,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 337.921,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 217.673,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.325,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.514,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.815,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.082,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.687,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 2.021,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.12,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.267,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.12,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.267,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.031,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 15.357,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.376,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.782,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.319,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.682,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.065,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.764,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.109,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.117,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.265,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.117,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.26,
             "unit": "ms"
           }
         ]
