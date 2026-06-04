@@ -78,13 +78,13 @@ Behind the `dict_builder` feature flag, the `dictionary` module can:
 
 | Level range | Strategy | Backend |
 |-------------|----------|---------|
-| 1-2         | `Fast`   | `Simple` matcher |
-| 3-4         | `Dfast`  | `Dfast` two-tier hash |
-| 5           | `Greedy` | `Row` matcher (`lazy_depth=0`) |
-| 6-15        | `Lazy` / `Lazy2` | `HashChain` with `lazy_depth=1` or `2` |
-| 16-17       | `btopt`-style price parser on top of hash-chain candidates |
-| 18-19       | `btultra`-style price parser profile |
-| 20-22       | `btultra2`-style dual-profile pass (choose lower-cost parse) |
+| 1-2         | `Fast`     | `Simple` matcher |
+| 3-4         | `Dfast`    | `Dfast` two-tier hash |
+| 5           | `Greedy`   | `Row` matcher (`lazy_depth=0`) |
+| 6-15        | `Lazy` / `Lazy2` | `HashChain` (`lazy_depth=1` or `2`) |
+| 16-17       | `BtOpt`    | `HashChain` candidates + `btopt` price parser |
+| 18          | `BtUltra`  | `HashChain` candidates + `btultra` price parser |
+| 19-22       | `BtUltra2` | `HashChain` candidates + `btultra2` dual-profile parse |
 
 The level → strategy column matches donor `ZSTD_defaultCParameters[0]` at `zstd/lib/compress/clevels.h:25-50` (srcSize > 256 KiB tier). Donor routes `greedy`/`lazy`/`lazy2` through its row-based matchfinder when `windowLog > 14`; we route `Greedy` through the row matcher (matches donor) but `Lazy`/`Lazy2` through the hash-chain matcher — an intentional architectural difference, not an oversight.
 
