@@ -406,16 +406,19 @@ fn split_block_from_borders(block: &[u8]) -> usize {
 }
 
 fn pre_split_level(level: CompressionLevel) -> Option<usize> {
+    // Mirror the donor `splitLevels[]` table (indexed by strategy) for the
+    // greedy and lazy bands and above, where the cheap fingerprint
+    // pre-splitter pays for itself on heterogeneous payloads:
+    //   greedy → 1, lazy/lazy2 → 2, btlazy2/btopt → 3, btultra/btultra2 → 4.
+    // Levels 1..=4 (fast/dfast) are deliberately left un-split: their
+    // match-finding is cheap, so the splitter's per-block fingerprint plus
+    // the extra per-sub-block entropy builds cost more throughput than the
+    // ratio they buy. The byChunks sampling rate / hashLog tighten with the
+    // split level (see `split_block_by_chunks`).
     match level {
-        // Donor `ZSTD_blockSplitter_level` table (`clevels.h`): cheap
-        // borders heuristic for lazy2 / btlazy2 strategies (levels
-        // 11..=15) — the splitter still pays for itself on
-        // heterogeneous payloads but the per-block cost stays bounded
-        // by two 512-byte histograms.
-        CompressionLevel::Level(11..=15) => Some(0),
-        // C zstd's default splitter level for btopt/btultra/btultra2 is 4
-        // (`ZSTD_splitBlock_byChunks` with internal level 3 — sampling
-        // rate 1, `hashLog` 10).
+        CompressionLevel::Level(5) => Some(1),
+        CompressionLevel::Level(6..=12) => Some(2),
+        CompressionLevel::Level(13..=15) => Some(3),
         CompressionLevel::Level(16..=22) => Some(4),
         _ => None,
     }
@@ -2892,19 +2895,23 @@ mod tests {
         );
     }
 
-    /// `pre_split_level` maps mid-range levels to the cheap
-    /// borders heuristic and high levels to the byChunks path. Levels
-    /// below 11 stay unsplit so the splitter never runs on fast /
-    /// default presets where its per-block cost would dominate.
+    /// `pre_split_level` mirrors the donor `splitLevels[]` table by
+    /// strategy band: greedy → 1, lazy/lazy2 → 2, btlazy2 → 3,
+    /// btopt/btultra/btultra2 → 4. Fast/dfast (levels 1..=4) and the named
+    /// presets stay unsplit so the splitter never runs where its per-block
+    /// cost would dominate the cheap match-finding.
     #[test]
     fn pre_split_level_dispatches_by_compression_level() {
         use crate::encoding::CompressionLevel;
         assert_eq!(super::pre_split_level(CompressionLevel::Fastest), None);
         assert_eq!(super::pre_split_level(CompressionLevel::Default), None);
-        assert_eq!(super::pre_split_level(CompressionLevel::Better), None);
-        assert_eq!(super::pre_split_level(CompressionLevel::Level(7)), None);
-        assert_eq!(super::pre_split_level(CompressionLevel::Level(11)), Some(0));
-        assert_eq!(super::pre_split_level(CompressionLevel::Level(15)), Some(0));
+        assert_eq!(super::pre_split_level(CompressionLevel::Level(1)), None);
+        assert_eq!(super::pre_split_level(CompressionLevel::Level(4)), None);
+        assert_eq!(super::pre_split_level(CompressionLevel::Level(5)), Some(1));
+        assert_eq!(super::pre_split_level(CompressionLevel::Level(7)), Some(2));
+        assert_eq!(super::pre_split_level(CompressionLevel::Level(12)), Some(2));
+        assert_eq!(super::pre_split_level(CompressionLevel::Level(13)), Some(3));
+        assert_eq!(super::pre_split_level(CompressionLevel::Level(15)), Some(3));
         assert_eq!(super::pre_split_level(CompressionLevel::Level(16)), Some(4));
         assert_eq!(super::pre_split_level(CompressionLevel::Level(22)), Some(4));
     }
