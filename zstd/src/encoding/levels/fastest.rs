@@ -93,8 +93,21 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         let mut compressed = Vec::new();
         let uncompressed_len = uncompressed_data.len();
         state.matcher.commit_space(uncompressed_data);
-        if matches!(compression_level, CompressionLevel::Level(16..=22))
-            && state.matcher.window_size() >= (1 << 17)
+        // Block splitting fits entropy tables to local statistics, the
+        // dominant literal-section win on mixed corpora (z000033 level 5:
+        // a single 128 KiB block spans varied literal distributions and
+        // carries one ill-fitting HUF table). Previously gated to btopt+
+        // (`Level(16..=22)`), which left greedy/lazy emitting un-split
+        // blocks. Extend to every search-based strategy (greedy and up);
+        // the Fast/Dfast speed tiers stay un-split because the splitter's
+        // per-partition entropy probes cost more than the ratio they buy
+        // when match-finding is already cheap.
+        if state.matcher.window_size() >= (1 << 17)
+            && !matches!(
+                state.strategy_tag,
+                crate::encoding::strategy::StrategyTag::Fast
+                    | crate::encoding::strategy::StrategyTag::Dfast
+            )
         {
             // This helper may emit multiple physical blocks (compressed or raw)
             // into `output`; checksums (if requested) are pushed per physical
