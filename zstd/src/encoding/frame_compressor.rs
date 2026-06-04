@@ -84,7 +84,11 @@ impl EncoderDictionary {
 /// // `compress` writes the compressed output into the provided buffer.
 /// compressor.compress();
 /// ```
-pub struct FrameCompressor<R: Read, W: Write, M: Matcher> {
+pub struct FrameCompressor<
+    R: Read = &'static [u8],
+    W: Write = Vec<u8>,
+    M: Matcher = MatchGeneratorDriver,
+> {
     uncompressed_data: Option<R>,
     compressed_data: Option<W>,
     compression_level: CompressionLevel,
@@ -575,64 +579,125 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         }
     }
 
-    /// One-shot compress of a contiguous `&[u8]` input. When the Fast
-    /// (Simple) backend is selected and no dictionary is active, the
-    /// matcher references the input in place as a borrowed window —
-    /// skipping the per-block copy into the owned `history` that the
-    /// streaming path performs (the dominant peak-allocation cost on Fast
-    /// one-shot compress). Over-window inputs are included: the borrowed
-    /// scan bounds matches with the same `window_low = block_end -
-    /// advertised_window` the owned (evicting) path uses, so it produces
-    /// byte-identical output without ever copying the input. Non-Fast /
-    /// dictionary / `Uncompressed` cases fall back to the owned loop.
+    /// Whether the borrowed (no per-block history copy) one-shot loop is
+    /// valid for an `input_len`-byte slice under the resolved `prep`.
     ///
-    /// Crate-internal: the only caller is [`crate::encoding::compress_slice_to_vec`],
-    /// which passes the SAME slice to both [`Self::set_source`] (for the
-    /// owned fallback) and this method. Not `pub` because the contract —
-    /// `input` must equal the configured source, and a source must be set
-    /// for the fallback — is a footgun for external callers who could pass
-    /// a mismatched slice and silently compress the wrong data.
-    pub(crate) fn compress_oneshot_borrowed(&mut self, input: &[u8]) {
+    /// `Uncompressed` resolves to `StrategyTag::Fast` but must emit stored
+    /// Raw blocks, which the borrowed loop's
+    /// `compress_block_encoded_borrowed` (RLE/raw-fast/compressed) does NOT
+    /// do, so exclude it; it then takes the owned path's dedicated
+    /// Uncompressed arm.
+    ///
+    /// No window-size gate: over-window inputs are handled too. The owned
+    /// path bounds matches to the last `advertised_window` bytes via
+    /// `window_low` and evicts/rehashes its history; the borrowed path
+    /// computes the identical `window_low = block_end - advertised_window`
+    /// and the kernel rejects any hash candidate below it, while the
+    /// per-position `put` during the scan keeps in-window slots current,
+    /// so it produces byte-identical output to the owned (evicting) path
+    /// without ever copying the input into `history`, even when the input
+    /// far exceeds the window.
+    ///
+    /// BUT gate on `input_len <= u32::MAX`: the Fast kernel stores ABSOLUTE
+    /// positions in a `u32` hash table, and the borrowed scan walks
+    /// absolute input offsets up to `block_end == input.len()`. Past 4 GiB
+    /// those offsets truncate / overflow the `u32` position math
+    /// (`base_off + ip0 as u32`, `window_low`), panicking or corrupting.
+    /// The owned/evicting path keeps the scanned window bounded (positions
+    /// stay small), so >4 GiB inputs fall back to it.
+    fn borrowed_eligible(&self, input_len: usize, prep: &FramePrep) -> bool {
         use crate::encoding::strategy::StrategyTag;
-        // Derive frame sizing from the actual payload, not whatever hint a
-        // previous call on a reused compressor left behind — a stale hint
-        // would change the resolved window/header and could even flip
-        // `borrowed_eligible` for this slice.
-        self.source_size_hint = Some(input.len() as u64);
-        let prep = self.prepare_frame();
-        // `Uncompressed` resolves to `StrategyTag::Fast` but must emit
-        // stored Raw blocks, which the borrowed loop's
-        // `compress_block_encoded_borrowed` (RLE/raw-fast/compressed)
-        // does NOT do — exclude it so it takes the owned path's dedicated
-        // Uncompressed arm.
-        //
-        // No window-size gate: over-window inputs are handled too. The
-        // owned path bounds matches to the last `advertised_window` bytes
-        // via `window_low` and evicts/rehashes its history; the borrowed
-        // path computes the identical `window_low = block_end -
-        // advertised_window` and the kernel rejects any hash candidate
-        // below it, while the per-position `put` during the scan keeps
-        // in-window slots current — so it produces byte-identical output
-        // to the owned (evicting) path without ever copying the input
-        // into `history`, even when the input far exceeds the window.
-        //
-        // BUT gate on `input.len() <= u32::MAX`: the Fast kernel stores
-        // ABSOLUTE positions in a `u32` hash table, and the borrowed scan
-        // walks absolute input offsets up to `block_end == input.len()`.
-        // Past 4 GiB those offsets truncate / overflow the `u32` position
-        // math (`base_off + ip0 as u32`, `window_low`), panicking or
-        // corrupting. The owned/evicting path keeps the scanned window
-        // bounded (positions stay small), so >4 GiB inputs fall back to it.
-        let borrowed_eligible = !prep.use_dictionary_state
+        !prep.use_dictionary_state
             && !matches!(self.compression_level, CompressionLevel::Uncompressed)
             && self.state.strategy_tag == StrategyTag::Fast
-            && input.len() <= u32::MAX as usize;
-        let (all_blocks, total_uncompressed) = if borrowed_eligible {
+            && input_len <= u32::MAX as usize
+    }
+
+    /// Compress `input` as one frame's worth of blocks: the borrowed
+    /// in-place loop when [`Self::borrowed_eligible`], else the owned
+    /// (history-copying) loop fed an in-place `&[u8]` cursor. Returns
+    /// `(all_blocks, total_uncompressed)`; the caller emits the frame tail
+    /// (`finish_frame` for a configured drain, `write_frame_to_vec` for a
+    /// returned buffer).
+    fn run_one_frame(&mut self, input: &[u8], prep: &FramePrep) -> (Vec<u8>, u64) {
+        if self.borrowed_eligible(input.len(), prep) {
             self.run_borrowed_block_loop(input, prep.initial_size_hint)
         } else {
-            self.run_owned_block_loop(prep.initial_size_hint)
-        };
-        self.finish_frame(all_blocks, total_uncompressed, &prep);
+            let mut cursor: &[u8] = input;
+            self.run_owned_block_loop(&mut cursor, prep.initial_size_hint)
+        }
+    }
+
+    /// Compress one contiguous `&[u8]` as a single independent Zstd frame,
+    /// writing the frame bytes into `out` (its previous contents are
+    /// replaced and its allocation reused), reusing this compressor's heavy
+    /// state across calls.
+    ///
+    /// This is the reusable-compression-context (CCtx-equivalent) entry
+    /// point, mirroring C `ZSTD_compress2` over a reused `ZSTD_CCtx`:
+    /// construct ONE `FrameCompressor` and call this in a loop to emit N
+    /// independent, self-describing frames (each carrying its own header,
+    /// blocks, and checksum, decodable in isolation, with no cross-frame
+    /// match history). Every call resets the per-frame state via
+    /// [`Self::prepare_frame`]: only the allocations are kept, so the
+    /// dominant per-frame setup cost (table allocation + dictionary prime)
+    /// is paid once instead of N times. Passing the same `out` buffer each
+    /// call additionally reuses the output allocation, matching C's
+    /// caller-owned `dst` buffer (no per-frame output allocation).
+    ///
+    /// Reusing the context + `out` across many small frames (the typical
+    /// per-block-frame workload) is far cheaper than a fresh
+    /// [`compress_slice_to_vec`](crate::encoding::compress_slice_to_vec)
+    /// per block, which allocates and primes from scratch each time.
+    ///
+    /// The input is read in place: no [`Self::set_source`] /
+    /// [`Self::set_drain`] setup is required, and the input lifetime is not
+    /// baked into the compressor type, so successive calls may pass slices
+    /// with unrelated lifetimes. When the Fast (Simple) backend is active
+    /// and no dictionary is set, the matcher references the input directly
+    /// (no per-block history copy); other backends / dictionary use copy
+    /// each block into history exactly as the streaming
+    /// [`compress`](Self::compress) path does. The source-size hint is
+    /// derived from the input length on every call, so per-frame table
+    /// sizing tracks each frame's actual size regardless of any earlier
+    /// hint.
+    ///
+    /// A sticky dictionary set via
+    /// [`set_dictionary`](Self::set_dictionary) (or its variants) is primed
+    /// into every frame, mirroring `ZSTD_CCtx_loadDictionary` /
+    /// `ZSTD_CCtx_refCDict`.
+    ///
+    /// # Panics
+    ///
+    /// Panics on encoder error, matching [`Self::compress`] and
+    /// [`compress_slice_to_vec`](crate::encoding::compress_slice_to_vec).
+    pub fn compress_independent_frame_into(&mut self, input: &[u8], out: &mut Vec<u8>) {
+        // Size the next frame from the actual payload, not a stale hint a
+        // previous call may have left behind (a wrong hint would change the
+        // resolved window/header and could flip borrowed eligibility).
+        self.source_size_hint = Some(input.len() as u64);
+        let prep = self.prepare_frame();
+        let (all_blocks, total_uncompressed) = self.run_one_frame(input, &prep);
+        self.write_frame_to_vec(out, all_blocks, total_uncompressed, &prep);
+    }
+
+    /// Convenience wrapper over [`Self::compress_independent_frame_into`]
+    /// that allocates and returns a fresh `Vec` per call. Prefer the
+    /// `_into` form in tight per-block-frame loops to reuse one output
+    /// buffer across frames (the CCtx-equivalent zero-per-call-alloc
+    /// output, matching C's caller-owned `dst`).
+    ///
+    /// ```rust
+    /// use structured_zstd::encoding::{FrameCompressor, CompressionLevel};
+    /// let mut cctx: FrameCompressor = FrameCompressor::new(CompressionLevel::Default);
+    /// let frame_a = cctx.compress_independent_frame(b"first block payload");
+    /// let frame_b = cctx.compress_independent_frame(b"second block payload");
+    /// assert!(!frame_a.is_empty() && !frame_b.is_empty());
+    /// ```
+    pub fn compress_independent_frame(&mut self, input: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.compress_independent_frame_into(input, &mut out);
+        out
     }
 
     /// Borrowed one-shot block loop: walks `input` in `MAX_BLOCK_SIZE`
@@ -799,7 +864,17 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// same reset / dict-prime / entropy-seed setup and frame tail.
     pub fn compress(&mut self) {
         let prep = self.prepare_frame();
-        let (all_blocks, total_uncompressed) = self.run_owned_block_loop(prep.initial_size_hint);
+        // Take the reader out so `run_owned_block_loop` can borrow it
+        // mutably alongside `&mut self` (the rest of the loop touches
+        // `self.state` / `self.hasher`, disjoint from the reader). Restored
+        // before the frame tail so a reused compressor keeps its source.
+        let mut source = self
+            .uncompressed_data
+            .take()
+            .expect("source must be set via set_source before compress()");
+        let (all_blocks, total_uncompressed) =
+            self.run_owned_block_loop(&mut source, prep.initial_size_hint);
+        self.uncompressed_data = Some(source);
         self.finish_frame(all_blocks, total_uncompressed, &prep);
     }
 
@@ -913,13 +988,21 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         }
     }
 
-    /// Owned streaming block loop: reads blocks from the source `Read`,
-    /// optionally pre-splits, hashes for the content checksum, and emits
-    /// each block via `compress_block_encoded`, accumulating the block
-    /// bytes. Returns `(all_blocks, total_uncompressed)`. Shared by
-    /// `compress` and the borrowed one-shot path's fallback.
-    fn run_owned_block_loop(&mut self, initial_size_hint: Option<u64>) -> (Vec<u8>, u64) {
-        let source = self.uncompressed_data.as_mut().unwrap();
+    /// Owned streaming block loop: reads blocks from the caller-provided
+    /// `source` reader, optionally pre-splits, hashes for the content
+    /// checksum, and emits each block via `compress_block_encoded`,
+    /// accumulating the block bytes. Returns `(all_blocks,
+    /// total_uncompressed)`. The source is passed in (rather than read
+    /// from `self.uncompressed_data`) so the streaming `compress` path can
+    /// feed the configured reader while the slice paths
+    /// (`compress_oneshot_borrowed`, `compress_independent_frame`) feed an
+    /// in-place `&[u8]` cursor without baking its lifetime into the
+    /// compressor type.
+    fn run_owned_block_loop<Rd: Read>(
+        &mut self,
+        source: &mut Rd,
+        initial_size_hint: Option<u64>,
+    ) -> (Vec<u8>, u64) {
         // Accumulate all compressed blocks; the frame header is written
         // after all input has been read so Frame_Content_Size is known.
         // Seed capacity by source-size hint — see `initial_all_blocks_cap`.
@@ -1071,27 +1154,22 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         (all_blocks, total_uncompressed)
     }
 
-    /// Write the frame header (with now-known FCS / single_segment), the
-    /// accumulated block bytes, and the optional trailing content
-    /// checksum; populate `frame_emit_info` (lsm). Shared by `compress`
-    /// and the borrowed one-shot path.
-    fn finish_frame(&mut self, all_blocks: Vec<u8>, total_uncompressed: u64, prep: &FramePrep) {
-        let window_size = prep.window_size;
-        let use_dictionary_state = prep.use_dictionary_state;
-        let source_size_hint_known = prep.source_size_hint_known;
-        let drain = self.compressed_data.as_mut().unwrap();
-        // Now that total_uncompressed is known, write the frame header with FCS.
+    /// Build the frame header bytes once the total payload size is known
+    /// (so `Frame_Content_Size` / `single_segment` can be set). Shared by
+    /// the drain (`finish_frame`) and returned-buffer
+    /// (`finish_frame_to_vec`) tails.
+    fn build_frame_header(&self, total_uncompressed: u64, prep: &FramePrep) -> Vec<u8> {
         // Match the donor framing policy for pledged one-shot inputs: use a
         // single-segment frame whenever the source fits the active window.
-        let single_segment = !use_dictionary_state
-            && source_size_hint_known
+        let single_segment = !prep.use_dictionary_state
+            && prep.source_size_hint_known
             && total_uncompressed >= 512
-            && total_uncompressed <= window_size;
+            && total_uncompressed <= prep.window_size;
         let header = FrameHeader {
             frame_content_size: Some(total_uncompressed),
             single_segment,
             content_checksum: cfg!(feature = "hash"),
-            dictionary_id: if use_dictionary_state {
+            dictionary_id: if prep.use_dictionary_state {
                 self.dictionary.as_ref().map(|dict| dict.inner.id as u64)
             } else {
                 None
@@ -1099,137 +1177,169 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             window_size: if single_segment {
                 None
             } else {
-                Some(window_size)
+                Some(prep.window_size)
             },
             magicless: self.magicless,
         };
-        // Write the frame header and compressed blocks separately to avoid
-        // shifting the entire `all_blocks` buffer to prepend the header.
         let mut header_buf: Vec<u8> = Vec::with_capacity(14);
         header.serialize(&mut header_buf);
+        header_buf
+    }
+
+    /// Write the frame header, accumulated block bytes, and optional
+    /// trailing content checksum to the configured drain; populate
+    /// `frame_emit_info` (lsm). Header and blocks are written separately to
+    /// avoid shifting `all_blocks` to prepend the header. Used by
+    /// `compress` and `compress_oneshot_borrowed`.
+    fn finish_frame(&mut self, all_blocks: Vec<u8>, total_uncompressed: u64, prep: &FramePrep) {
+        let header_buf = self.build_frame_header(total_uncompressed, prep);
+        // Snapshot the checksum before borrowing the drain field so the
+        // `self.hasher` read and the `self.compressed_data` write don't
+        // both need `&mut self` simultaneously.
+        #[cfg(feature = "hash")]
+        let checksum_bytes = (self.hasher.finish() as u32).to_le_bytes();
+        let drain = self.compressed_data.as_mut().unwrap();
         drain.write_all(&header_buf).unwrap();
         drain.write_all(&all_blocks).unwrap();
-
-        // If the `hash` feature is enabled, then `content_checksum` is set to true in the header
-        // and a 32 bit hash is written at the end of the data.
+        // If the `hash` feature is enabled, `content_checksum` is set in the
+        // header and the 32-bit digest is written at the end of the frame.
         #[cfg(feature = "hash")]
-        {
-            // Because we only have the data as a reader, we need to read all of it to calculate the checksum
-            // Possible TODO: create a wrapper around self.uncompressed data that hashes the data as it's read?
-            let content_checksum = self.hasher.finish();
-            drain
-                .write_all(&(content_checksum as u32).to_le_bytes())
-                .unwrap();
-        }
-
-        // FrameEmitInfo population (lsm feature): walk all_blocks to
-        // recover per-block layout. Each Block_Header is 3 bytes LE
-        // packing `(block_size << 3) | (block_type << 1) | last_block`.
-        // Physical body size differs by type: RLE bodies are always 1
-        // byte (the repeated byte), Raw/Compressed bodies span
-        // `block_size` bytes.
+        drain.write_all(&checksum_bytes).unwrap();
         #[cfg(feature = "lsm")]
-        {
-            use crate::blocks::block::BlockType as BT;
-            use crate::encoding::frame_emit_info::{FrameBlock, FrameEmitInfo};
-            // All frame-offset arithmetic below is bounded by u32 on
-            // the wire (Block_Size is a 21-bit field, frames bounded
-            // by MAX_BLOCK_SIZE * #blocks). A pathologically large
-            // frame whose total emitted size exceeds u32::MAX would
-            // overflow the cast — bail out by leaving
-            // `frame_emit_info` at `None` rather than handing the
-            // caller a silently-truncated layout. Checked once for
-            // header / all_blocks / cursor up front + once per push;
-            // the overflow path is statically unreachable on every
-            // realistic frame so the predictor amortises the branch
-            // to zero cost on the hot path.
-            let frame_header_len: u32 = match u32::try_from(header_buf.len()) {
+        self.populate_frame_emit_info(header_buf.len(), &all_blocks);
+    }
+
+    /// Assemble the frame (header + blocks + optional checksum) into the
+    /// caller-provided `out` buffer, replacing its contents, and populate
+    /// `frame_emit_info` (lsm). `out` is cleared first (its allocation is
+    /// reused, the CCtx-equivalent zero-per-call-alloc output path) then
+    /// grown once to the exact frame size. Used by
+    /// `compress_independent_frame_into`. The single `all_blocks` copy into
+    /// `out` is the same one copy `finish_frame` performs writing
+    /// `all_blocks` into a `Vec` drain, no extra buffering vs the drain
+    /// path.
+    fn write_frame_to_vec(
+        &mut self,
+        out: &mut Vec<u8>,
+        all_blocks: Vec<u8>,
+        total_uncompressed: u64,
+        prep: &FramePrep,
+    ) {
+        let header_buf = self.build_frame_header(total_uncompressed, prep);
+        let checksum_len = if cfg!(feature = "hash") { 4 } else { 0 };
+        out.clear();
+        out.reserve(header_buf.len() + all_blocks.len() + checksum_len);
+        out.extend_from_slice(&header_buf);
+        out.extend_from_slice(&all_blocks);
+        #[cfg(feature = "hash")]
+        out.extend_from_slice(&(self.hasher.finish() as u32).to_le_bytes());
+        #[cfg(feature = "lsm")]
+        self.populate_frame_emit_info(header_buf.len(), &all_blocks);
+    }
+
+    /// Walk `all_blocks` to recover per-block layout and store it in
+    /// `frame_emit_info`. Each Block_Header is 3 bytes LE packing
+    /// `(block_size << 3) | (block_type << 1) | last_block`. Physical body
+    /// size differs by type: RLE bodies are always 1 byte (the repeated
+    /// byte), Raw/Compressed bodies span `block_size`. `header_len` is the
+    /// serialized frame-header length (frame offset of the first block).
+    #[cfg(feature = "lsm")]
+    fn populate_frame_emit_info(&mut self, header_len: usize, all_blocks: &[u8]) {
+        use crate::blocks::block::BlockType as BT;
+        use crate::encoding::frame_emit_info::{FrameBlock, FrameEmitInfo};
+        // All frame-offset arithmetic below is bounded by u32 on the wire
+        // (Block_Size is a 21-bit field, frames bounded by MAX_BLOCK_SIZE *
+        // #blocks). A pathologically large frame whose total emitted size
+        // exceeds u32::MAX would overflow the cast; bail out by leaving
+        // `frame_emit_info` at `None` rather than handing the caller a
+        // silently-truncated layout. The overflow path is statically
+        // unreachable on every realistic frame so the predictor amortises
+        // the branch to zero cost.
+        let frame_header_len: u32 = match u32::try_from(header_len) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let all_blocks_len_u32: u32 = match u32::try_from(all_blocks.len()) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        let mut blocks: Vec<FrameBlock> = Vec::new();
+        let mut cursor: usize = 0;
+        while cursor + 3 <= all_blocks.len() {
+            let mut header_u32 = [0u8; 4];
+            header_u32[..3].copy_from_slice(&all_blocks[cursor..cursor + 3]);
+            let raw = u32::from_le_bytes(header_u32);
+            let last_block = (raw & 1) != 0;
+            let block_type = match (raw >> 1) & 0b11 {
+                0 => BT::Raw,
+                1 => BT::RLE,
+                2 => BT::Compressed,
+                _ => BT::Reserved,
+            };
+            let block_size_field = raw >> 3;
+            // RLE bodies are always 1 byte physical on the wire (the single
+            // repeated byte); the spec's Block_Size field carries the
+            // logical repeat count. Raw and Compressed bodies physically
+            // span block_size_field bytes. Store the physical length in
+            // body_size so the 'offset + header + body_size' arithmetic
+            // always lands on the next block boundary, and surface the raw
+            // spec field separately as block_size_field.
+            let physical_body: u32 = match block_type {
+                BT::RLE => 1,
+                _ => block_size_field,
+            };
+            let cursor_u32: u32 = match u32::try_from(cursor) {
                 Ok(v) => v,
                 Err(_) => return,
             };
-            let all_blocks_len_u32: u32 = match u32::try_from(all_blocks.len()) {
-                Ok(v) => v,
-                Err(_) => return,
-            };
-            let mut blocks: Vec<FrameBlock> = Vec::new();
-            let mut cursor: usize = 0;
-            while cursor + 3 <= all_blocks.len() {
-                let mut header_u32 = [0u8; 4];
-                header_u32[..3].copy_from_slice(&all_blocks[cursor..cursor + 3]);
-                let raw = u32::from_le_bytes(header_u32);
-                let last_block = (raw & 1) != 0;
-                let block_type = match (raw >> 1) & 0b11 {
-                    0 => BT::Raw,
-                    1 => BT::RLE,
-                    2 => BT::Compressed,
-                    _ => BT::Reserved,
-                };
-                let block_size_field = raw >> 3;
-                // RLE bodies are always 1 byte physical on the wire
-                // (the single repeated byte); the spec's Block_Size
-                // field carries the logical repeat count. Raw and
-                // Compressed bodies physically span block_size_field
-                // bytes. Store the physical length in body_size so the
-                // 'offset + header + body_size' arithmetic always
-                // lands on the next block boundary, and surface the
-                // raw spec field separately as block_size_field.
-                let physical_body: u32 = match block_type {
-                    BT::RLE => 1,
-                    _ => block_size_field,
-                };
-                let cursor_u32: u32 = match u32::try_from(cursor) {
-                    Ok(v) => v,
-                    Err(_) => return,
-                };
-                let offset_in_frame = match frame_header_len.checked_add(cursor_u32) {
-                    Some(v) => v,
-                    None => return,
-                };
-                blocks.push(FrameBlock {
-                    offset_in_frame,
-                    header_size: 3,
-                    body_size: physical_body,
-                    block_size_field,
-                    block_type,
-                    last_block,
-                });
-                cursor += 3 + physical_body as usize;
-                if last_block {
-                    break;
-                }
-            }
-            let checksum_range = if cfg!(feature = "hash") {
-                let cs_start = match frame_header_len.checked_add(all_blocks_len_u32) {
-                    Some(v) => v,
-                    None => return,
-                };
-                let cs_end = match cs_start.checked_add(4) {
-                    Some(v) => v,
-                    None => return,
-                };
-                Some(cs_start..cs_end)
-            } else {
-                None
-            };
-            let body_total = match frame_header_len.checked_add(all_blocks_len_u32) {
+            let offset_in_frame = match frame_header_len.checked_add(cursor_u32) {
                 Some(v) => v,
                 None => return,
             };
-            let total_size = if checksum_range.is_some() {
-                match body_total.checked_add(4) {
-                    Some(v) => v,
-                    None => return,
-                }
-            } else {
-                body_total
-            };
-            self.frame_emit_info = Some(FrameEmitInfo {
-                frame_header_range: 0..frame_header_len,
-                blocks,
-                checksum_range,
-                total_size,
+            blocks.push(FrameBlock {
+                offset_in_frame,
+                header_size: 3,
+                body_size: physical_body,
+                block_size_field,
+                block_type,
+                last_block,
             });
+            cursor += 3 + physical_body as usize;
+            if last_block {
+                break;
+            }
         }
+        let checksum_range = if cfg!(feature = "hash") {
+            let cs_start = match frame_header_len.checked_add(all_blocks_len_u32) {
+                Some(v) => v,
+                None => return,
+            };
+            let cs_end = match cs_start.checked_add(4) {
+                Some(v) => v,
+                None => return,
+            };
+            Some(cs_start..cs_end)
+        } else {
+            None
+        };
+        let body_total = match frame_header_len.checked_add(all_blocks_len_u32) {
+            Some(v) => v,
+            None => return,
+        };
+        let total_size = if checksum_range.is_some() {
+            match body_total.checked_add(4) {
+                Some(v) => v,
+                None => return,
+            }
+        } else {
+            body_total
+        };
+        self.frame_emit_info = Some(FrameEmitInfo {
+            frame_header_range: 0..frame_header_len,
+            blocks,
+            checksum_range,
+            total_size,
+        });
     }
 
     /// Layout of the most recently emitted frame.
@@ -3055,6 +3165,133 @@ mod tests {
                 "standard decoder must reject a magicless frame with \
                  ReadFrameHeaderError::BadMagicNumber or SkipFrame, got {other:?}",
             ),
+        }
+    }
+
+    /// A reused `FrameCompressor` must emit byte-identical frames to a
+    /// fresh compressor per input across both the borrowed (Fast) and
+    /// owned (Dfast/Lazy/Greedy/Uncompressed) backends. This proves
+    /// `prepare_frame` fully resets the per-frame state (matcher window,
+    /// content hasher, FSE/Huffman seeds) between independent frames; a
+    /// missed reset would corrupt frame N>=2's header checksum or matches.
+    /// Each emitted frame must also round-trip.
+    #[test]
+    fn compress_independent_frame_reuse_matches_fresh_and_roundtrips() {
+        use crate::encoding::{CompressionLevel, compress_slice_to_vec};
+        let levels = [
+            CompressionLevel::Uncompressed,
+            CompressionLevel::Fastest,
+            CompressionLevel::Default,
+            CompressionLevel::Better,
+            CompressionLevel::Best,
+            CompressionLevel::Level(5),
+        ];
+        let inputs: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            vec![0x00],
+            b"the quick brown fox jumps over the lazy dog\n".to_vec(),
+            vec![0x7Eu8; 50_000],          // highly compressible
+            generate_data(0xABCD, 70_000), // pseudo-random
+            generate_data(0x1234, 200_000),
+        ];
+        for level in levels {
+            let mut cctx: FrameCompressor = FrameCompressor::new(level);
+            for data in &inputs {
+                let reused = cctx.compress_independent_frame(data);
+                let fresh = compress_slice_to_vec(data, level);
+                assert_eq!(
+                    reused,
+                    fresh,
+                    "reused frame != fresh frame for len={} level={:?}",
+                    data.len(),
+                    level,
+                );
+                let mut decoder = FrameDecoder::new();
+                let mut decoded = Vec::with_capacity(data.len());
+                decoder.decode_all_to_vec(&reused, &mut decoded).unwrap();
+                assert_eq!(
+                    decoded,
+                    *data,
+                    "roundtrip failed for len={} level={:?}",
+                    data.len(),
+                    level,
+                );
+            }
+        }
+    }
+
+    /// `compress_independent_frame_into` must replace (not append to) the
+    /// caller's buffer each call, so a smaller frame after a larger one
+    /// yields exactly the smaller frame, and the reused buffer's content
+    /// matches a fresh compression of the same input.
+    #[test]
+    fn compress_independent_frame_into_replaces_buffer_contents() {
+        use crate::encoding::{CompressionLevel, compress_slice_to_vec};
+        let large = vec![0x11u8; 40_000];
+        let small = b"short payload".to_vec();
+        let mut cctx: FrameCompressor = FrameCompressor::new(CompressionLevel::Default);
+        let mut out = Vec::new();
+        cctx.compress_independent_frame_into(&large, &mut out);
+        let frame_large = out.clone();
+        // Reusing the same buffer for a smaller frame must clear it first.
+        cctx.compress_independent_frame_into(&small, &mut out);
+        assert_eq!(
+            out,
+            compress_slice_to_vec(&small, CompressionLevel::Default),
+            "reused buffer must hold exactly the second frame",
+        );
+        // The first frame, captured before reuse, still round-trips.
+        let mut decoder = FrameDecoder::new();
+        let mut decoded = Vec::with_capacity(large.len());
+        decoder
+            .decode_all_to_vec(&frame_large, &mut decoded)
+            .unwrap();
+        assert_eq!(decoded, large);
+    }
+
+    /// A sticky dictionary set once on a reused compressor must be primed
+    /// into every independent frame (mirroring `ZSTD_CCtx_loadDictionary`):
+    /// each frame decodes with the dictionary and is byte-identical to a
+    /// fresh compressor carrying the same dictionary. This proves
+    /// `prepare_frame` re-primes the dictionary (matcher content + offset
+    /// history + entropy seed) every call rather than only on the first.
+    #[test]
+    fn compress_independent_frame_reuses_sticky_dictionary() {
+        use crate::encoding::CompressionLevel;
+        let dict_raw = include_bytes!("../../dict_tests/dictionary");
+        let dict_content = crate::decoding::Dictionary::decode_dict(dict_raw).unwrap();
+        let mut payload_a = Vec::new();
+        for _ in 0..8 {
+            payload_a.extend_from_slice(&dict_content.dict_content[..2048]);
+        }
+        let payload_b = b"a different second frame payload, still dict-attached".to_vec();
+        let inputs = [payload_a, payload_b];
+
+        let mut cctx: FrameCompressor = FrameCompressor::new(CompressionLevel::Fastest);
+        cctx.set_dictionary_from_bytes(dict_raw)
+            .expect("dictionary bytes should parse");
+
+        for data in &inputs {
+            let reused = cctx.compress_independent_frame(data);
+            // Fresh compressor carrying the same sticky dictionary.
+            let mut fresh_enc: FrameCompressor = FrameCompressor::new(CompressionLevel::Fastest);
+            fresh_enc
+                .set_dictionary_from_bytes(dict_raw)
+                .expect("dictionary bytes should parse");
+            let fresh = fresh_enc.compress_independent_frame(data);
+            assert_eq!(
+                reused,
+                fresh,
+                "reused dict frame != fresh dict frame, len={}",
+                data.len(),
+            );
+            // Round-trip with the dictionary on the decode side.
+            let dict_for_decoder = crate::decoding::Dictionary::decode_dict(dict_raw).unwrap();
+            let mut decoder = FrameDecoder::new();
+            decoder.add_dict(dict_for_decoder).unwrap();
+            let mut decoded = Vec::with_capacity(data.len());
+            decoder.decode_all_to_vec(&reused, &mut decoded).unwrap();
+            assert_eq!(&decoded, data, "dict roundtrip failed, len={}", data.len());
         }
     }
 }
