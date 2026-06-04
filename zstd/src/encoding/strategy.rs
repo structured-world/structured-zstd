@@ -52,6 +52,78 @@ pub(crate) enum BackendTag {
     HashChain,
 }
 
+/// Parse strategy — what the outer match loop does with the candidates
+/// a search method produces. Orthogonal to [`SearchMethod`]: the same
+/// parse can run on top of any search backend (donor decouples these as
+/// `cParams.strategy`'s parse half vs the `useRowMatchFinder` switch).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ParseMode {
+    /// Commit the first acceptable match (donor `ZSTD_greedy`, depth 0).
+    Greedy,
+    /// One-position lazy lookahead (donor `ZSTD_lazy`, depth 1).
+    Lazy,
+    /// Two-position lazy lookahead (donor `ZSTD_lazy2`, depth 2).
+    Lazy2,
+    /// Optimal cost-model parse (donor `ZSTD_btopt`/`btultra`/`btultra2`).
+    Optimal,
+}
+
+impl ParseMode {
+    /// Lazy lookahead depth for the greedy/lazy band (0/1/2). `Optimal`
+    /// has no lazy depth and returns 0.
+    pub(crate) const fn lazy_depth(self) -> u8 {
+        match self {
+            Self::Greedy => 0,
+            Self::Lazy => 1,
+            Self::Lazy2 => 2,
+            Self::Optimal => 0,
+        }
+    }
+
+    /// Derive the greedy/lazy parse from a lazy-lookahead depth. Depth >= 2
+    /// saturates to `Lazy2`. Used to read the existing `LevelParams.lazy_depth`
+    /// into the decoupled parse axis.
+    pub(crate) const fn from_lazy_depth(depth: u8) -> Self {
+        match depth {
+            0 => Self::Greedy,
+            1 => Self::Lazy,
+            _ => Self::Lazy2,
+        }
+    }
+}
+
+/// Search method — how match candidates are produced for a position.
+/// Orthogonal to [`ParseMode`] (donor `cParams.strategy` search half plus
+/// the `useRowMatchFinder` cParam that swaps `HashChain` for `RowHash` in
+/// the greedy/lazy band).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SearchMethod {
+    /// Single-table fast finder (donor `ZSTD_fast`).
+    Fast,
+    /// Two parallel hash tables (donor `ZSTD_dfast`).
+    DoubleFast,
+    /// Row-hash SIMD-tag finder (donor row matchfinder).
+    RowHash,
+    /// Hash-chain finder (donor `ZSTD_HcFindBestMatch`).
+    HashChain,
+    /// Binary-tree finder for the optimal parser (donor `ZSTD_BtGetAllMatches`).
+    BinaryTree,
+}
+
+impl SearchMethod {
+    /// Storage backend (matcher variant) this search method runs in.
+    /// `BinaryTree` shares the `HashChain` storage (the BT scratch lives
+    /// inside the hash-chain matcher, gated by `uses_bt`).
+    pub(crate) const fn backend(self) -> BackendTag {
+        match self {
+            Self::Fast => BackendTag::Simple,
+            Self::DoubleFast => BackendTag::Dfast,
+            Self::RowHash => BackendTag::Row,
+            Self::HashChain | Self::BinaryTree => BackendTag::HashChain,
+        }
+    }
+}
+
 /// Compile-time encoder strategy. Each concrete implementor is a ZST
 /// whose associated `const`s tell the optimal parser / match finder
 /// which donor-equivalent path to execute. Hot entry points are
@@ -338,6 +410,31 @@ impl StrategyTag {
             Self::Dfast => BackendTag::Dfast,
             Self::Greedy => BackendTag::Row,
             Self::Lazy | Self::BtOpt | Self::BtUltra | Self::BtUltra2 => BackendTag::HashChain,
+        }
+    }
+
+    /// Default search method this tag historically ran on. Used to seed
+    /// the decoupled [`SearchMethod`] axis from the legacy tag during
+    /// migration; once `LEVEL_TABLE` carries explicit configs this is the
+    /// fallback for tag-only call sites.
+    pub(crate) const fn search(self) -> SearchMethod {
+        match self {
+            Self::Fast => SearchMethod::Fast,
+            Self::Dfast => SearchMethod::DoubleFast,
+            Self::Greedy => SearchMethod::RowHash,
+            Self::Lazy => SearchMethod::HashChain,
+            Self::BtOpt | Self::BtUltra | Self::BtUltra2 => SearchMethod::BinaryTree,
+        }
+    }
+
+    /// Default parse mode for this tag, ignoring per-level lazy depth (the
+    /// lazy band's real depth comes from `LevelParams.lazy_depth` via
+    /// [`ParseMode::from_lazy_depth`]). The opt tags map to `Optimal`.
+    pub(crate) const fn parse_mode(self) -> ParseMode {
+        match self {
+            Self::Fast | Self::Dfast | Self::Greedy => ParseMode::Greedy,
+            Self::Lazy => ParseMode::Lazy,
+            Self::BtOpt | Self::BtUltra | Self::BtUltra2 => ParseMode::Optimal,
         }
     }
 }
