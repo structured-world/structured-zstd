@@ -546,6 +546,7 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
             &ll_counts,
             total,
             9,
+            state.strategy_tag,
         );
         let ml_mode = choose_table_from_counts(
             state.fse_tables.ml_previous.as_ref(),
@@ -553,6 +554,7 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
             &ml_counts,
             total,
             9,
+            state.strategy_tag,
         );
         let of_mode = choose_table_from_counts(
             state.fse_tables.of_previous.as_ref(),
@@ -560,6 +562,7 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
             &of_counts,
             total,
             8,
+            state.strategy_tag,
         );
 
         writer.write_bits(encode_fse_table_modes(&ll_mode, &ml_mode, &of_mode), 8);
@@ -643,6 +646,7 @@ fn estimate_block_parts_size<M: Matcher>(
             &mut workspace.ll_counts,
             &mut workspace.ml_counts,
             &mut workspace.of_counts,
+            state.strategy_tag,
         )
     };
 
@@ -787,6 +791,7 @@ fn estimate_sequences_section_bytes(
     ll_counts: &mut [usize; 256],
     ml_counts: &mut [usize; 256],
     of_counts: &mut [usize; 256],
+    strategy: crate::encoding::strategy::StrategyTag,
 ) -> usize {
     ll_counts.fill(0);
     ml_counts.fill(0);
@@ -810,18 +815,21 @@ fn estimate_sequences_section_bytes(
         fse_tables.ll_default_ref(),
         sequences.iter().map(|seq| encode_literal_length(seq.ll).0),
         9,
+        strategy,
     );
     let ml_mode = choose_table(
         fse_tables.ml_previous.as_ref(),
         fse_tables.ml_default_ref(),
         sequences.iter().map(|seq| encode_match_len(seq.ml).0),
         9,
+        strategy,
     );
     let of_mode = choose_table(
         fse_tables.of_previous.as_ref(),
         fse_tables.of_default_ref(),
         sequences.iter().map(|seq| encode_offset(seq.of).0),
         8,
+        strategy,
     );
 
     let ll_bits_chosen =
@@ -1460,6 +1468,7 @@ fn choose_table<'a>(
     default_table: &'a FSETable,
     data: impl Iterator<Item = u8>,
     max_log: u8,
+    strategy: crate::encoding::strategy::StrategyTag,
 ) -> FseTableMode<'a> {
     // Collect symbol distribution
     let mut counts = [0usize; 256];
@@ -1468,7 +1477,7 @@ fn choose_table<'a>(
         counts[symbol as usize] += 1;
         total += 1;
     }
-    choose_table_from_counts(previous, default_table, &counts, total, max_log)
+    choose_table_from_counts(previous, default_table, &counts, total, max_log, strategy)
 }
 
 /// Same decision logic as [`choose_table`] but takes pre-computed
@@ -1484,6 +1493,7 @@ fn choose_table_from_counts<'a>(
     counts: &[usize; 256],
     total: usize,
     max_log: u8,
+    strategy: crate::encoding::strategy::StrategyTag,
 ) -> FseTableMode<'a> {
     if total == 0 {
         return FseTableMode::Predefined(default_table);
@@ -1506,6 +1516,27 @@ fn choose_table_from_counts<'a>(
             return FseTableMode::Predefined(default_table);
         }
         return FseTableMode::Rle(symbol);
+    }
+
+    // Fast-band preferRepeat (donor `ZSTD_selectEncodingType`,
+    // `zstd_compress_sequences.c:179-204`): for fast/dfast/greedy with a
+    // valid previous table and `< 1000` sequences, reuse it without building
+    // a new one. Trades a negligible ratio loss for skipping the per-block
+    // FSE table build + header descriptor — the dominant per-sub-block cost
+    // when these cheap-match strategies split a block. The validity probe
+    // (`fse_bit_cost` is finite) guarantees the previous table covers every
+    // symbol in this block, so the reuse can never produce an invalid stream.
+    if matches!(
+        strategy,
+        crate::encoding::strategy::StrategyTag::Fast
+            | crate::encoding::strategy::StrategyTag::Dfast
+            | crate::encoding::strategy::StrategyTag::Greedy
+    ) && total < 1000
+        && let Some(prev) = previous
+        && let Some(table) = prev.as_table(default_table)
+        && fse_bit_cost(counts, max_symbol, table).is_some()
+    {
+        return FseTableMode::RepeatLast(prev);
     }
 
     let use_low_prob_count = total >= 2048;
@@ -2616,28 +2647,70 @@ mod tests {
         ));
 
         let sample_codes = [0u8, 1u8];
+        // Lazy is a non-fast-band strategy, so this exercises the cost-based
+        // repeat decision (not the fast-band shortcut).
+        let strat = crate::encoding::strategy::StrategyTag::Lazy;
         let ll_repeat = choose_table(
             fse_tables.ll_previous.as_ref(),
             fse_tables.ll_default_ref(),
             sample_codes.iter().copied(),
             9,
+            strat,
         );
         let ml_repeat = choose_table(
             fse_tables.ml_previous.as_ref(),
             fse_tables.ml_default_ref(),
             sample_codes.iter().copied(),
             9,
+            strat,
         );
         let of_repeat = choose_table(
             fse_tables.of_previous.as_ref(),
             fse_tables.of_default_ref(),
             sample_codes.iter().copied(),
             8,
+            strat,
         );
 
         assert!(matches!(ll_repeat, FseTableMode::RepeatLast(_)));
         assert!(matches!(ml_repeat, FseTableMode::RepeatLast(_)));
         assert!(matches!(of_repeat, FseTableMode::RepeatLast(_)));
+    }
+
+    /// Fast-band strategies (fast/dfast/greedy) reuse a covering previous FSE
+    /// table without building a new one (donor `preferRepeat`), even on a
+    /// fresh distribution where the cost-based path could pick a new table.
+    /// A non-fast-band strategy on an identical distribution takes the
+    /// cost-based path instead.
+    #[test]
+    fn fast_band_strategies_prefer_repeat_fse_table() {
+        use crate::encoding::strategy::StrategyTag;
+        let prev = build_table_from_symbol_counts(&[8, 1], 9, false);
+        let previous = PreviousFseTable::Custom(Box::new(prev));
+        let fse_tables = FseTables::new();
+        // Distribution over symbols {0,1}, both covered by `previous`.
+        let mut counts = [0usize; 256];
+        counts[0] = 4;
+        counts[1] = 6;
+        let total = 10;
+
+        // All fast-band strategies (Fast, Dfast, Greedy) unconditionally
+        // reuse the covering previous table; cover every eligible arm so an
+        // enum-arm regression in the implementation branch is caught.
+        for strategy in [StrategyTag::Fast, StrategyTag::Dfast, StrategyTag::Greedy] {
+            let mode = super::choose_table_from_counts(
+                Some(&previous),
+                fse_tables.ll_default_ref(),
+                &counts,
+                total,
+                9,
+                strategy,
+            );
+            assert!(
+                matches!(mode, FseTableMode::RepeatLast(_)),
+                "fast-band {strategy:?} must reuse the covering previous table",
+            );
+        }
     }
 
     #[test]
@@ -2676,6 +2749,7 @@ mod tests {
             fse_tables.ll_default_ref(),
             core::iter::repeat_n(0u8, 32),
             9,
+            crate::encoding::strategy::StrategyTag::Lazy,
         );
         assert!(matches!(mode, FseTableMode::Rle(0)));
     }
@@ -2688,6 +2762,7 @@ mod tests {
             &only_zero_one_table,
             [1u8, 2].into_iter().cycle().take(32),
             5,
+            crate::encoding::strategy::StrategyTag::Lazy,
         );
         assert!(matches!(mode, FseTableMode::Encoded(_)));
     }

@@ -21,6 +21,75 @@ use core::convert::TryInto;
 
 use crate::common::MAXIMUM_ALLOWED_WINDOW_SIZE;
 
+/// Build the block-header decode error. With the `lsm` feature it captures
+/// the failing block's index and frame offset (block-precise recovery);
+/// without it, the legacy positionless variant — so the default build's
+/// error surface stays byte-identical to the donor.
+#[cfg(feature = "lsm")]
+fn block_header_decode_error(
+    source: crate::decoding::errors::BlockHeaderReadError,
+    block_index: u32,
+    frame_offset: u32,
+) -> FrameDecoderError {
+    FrameDecoderError::FailedToReadBlockHeaderAt {
+        source,
+        block_index,
+        frame_offset,
+    }
+}
+#[cfg(not(feature = "lsm"))]
+fn block_header_decode_error(
+    source: crate::decoding::errors::BlockHeaderReadError,
+    _block_index: u32,
+    _frame_offset: u32,
+) -> FrameDecoderError {
+    FrameDecoderError::FailedToReadBlockHeader(source)
+}
+
+/// Build the block-body decode error. With `lsm` it captures the block
+/// index, frame offset, and the failing block's structural metadata
+/// (reconstructed from its header); without it, the legacy variant.
+#[cfg(feature = "lsm")]
+fn block_body_decode_error(
+    source: DecodeBlockContentError,
+    block_index: u32,
+    frame_offset: u32,
+    header: &crate::blocks::block::BlockHeader,
+    header_size: u8,
+) -> FrameDecoderError {
+    use crate::blocks::block::BlockType;
+    // Physical wire body vs the raw `Block_Size` field: RLE writes a single
+    // body byte while `Block_Size` carries the repeat count; Raw/Compressed
+    // bodies match the field.
+    let (body_size, block_size_field) = match header.block_type {
+        BlockType::RLE => (1u32, header.decompressed_size),
+        _ => (header.content_size, header.content_size),
+    };
+    FrameDecoderError::FailedToReadBlockBodyAt {
+        source,
+        block_index,
+        frame_offset,
+        block: crate::encoding::frame_emit_info::FrameBlock {
+            offset_in_frame: frame_offset,
+            header_size,
+            body_size,
+            block_size_field,
+            block_type: header.block_type,
+            last_block: header.last_block,
+        },
+    }
+}
+#[cfg(not(feature = "lsm"))]
+fn block_body_decode_error(
+    source: DecodeBlockContentError,
+    _block_index: u32,
+    _frame_offset: u32,
+    _header: &crate::blocks::block::BlockHeader,
+    _header_size: u8,
+) -> FrameDecoderError {
+    FrameDecoderError::FailedToReadBlockBody(source)
+}
+
 /// Low level Zstandard decoder that can be used to decompress frames with fine control over when and how many bytes are decoded.
 ///
 /// This decoder is able to decode frames only partially and gives control
@@ -951,9 +1020,17 @@ impl FrameDecoder {
             vprintln!("################");
             vprintln!("Next Block: {}", state.block_counter);
             vprintln!("################");
-            let (block_header, block_header_size) = block_dec
-                .read_block_header(&mut source)
-                .map_err(err::FailedToReadBlockHeader)?;
+            // Capture the failing-block coordinates BEFORE the header read so
+            // the error carries where it happened: `bytes_read_counter` is the
+            // frame-absolute offset of this block's header (not yet advanced),
+            // `block_counter` its 0-based index. Used by both the header- and
+            // body-error builders below (block-precise recovery under `lsm`).
+            let block_index = state.block_counter as u32;
+            let block_frame_offset = state.bytes_read_counter as u32;
+            let (block_header, block_header_size) =
+                block_dec.read_block_header(&mut source).map_err(|source| {
+                    block_header_decode_error(source, block_index, block_frame_offset)
+                })?;
             state.bytes_read_counter += u64::from(block_header_size);
 
             vprintln!();
@@ -973,7 +1050,15 @@ impl FrameDecoder {
             let bytes_read_in_block_body = state
                 .decoder_scratch
                 .decode_block_content(&mut block_dec, &block_header, &mut source)
-                .map_err(err::FailedToReadBlockBody)?;
+                .map_err(|source| {
+                    block_body_decode_error(
+                        source,
+                        block_index,
+                        block_frame_offset,
+                        &block_header,
+                        block_header_size,
+                    )
+                })?;
             state.bytes_read_counter += bytes_read_in_block_body;
 
             // Per-block XXH64 (low 32 bits) of the just-decompressed
@@ -1130,9 +1215,13 @@ impl FrameDecoder {
                     if mt_source.len() < 3 {
                         break;
                     }
+                    let block_index = state.block_counter as u32;
+                    let block_frame_offset = state.bytes_read_counter as u32;
                     let (block_header, block_header_size) = block_dec
                         .read_block_header(&mut mt_source)
-                        .map_err(err::FailedToReadBlockHeader)?;
+                        .map_err(|source| {
+                            block_header_decode_error(source, block_index, block_frame_offset)
+                        })?;
 
                     // check the needed size for the block before updating counters.
                     // If not enough bytes are in the source, the header will have to be read again, so act like we never read it in the first place
@@ -1144,7 +1233,15 @@ impl FrameDecoder {
                     let bytes_read_in_block_body = state
                         .decoder_scratch
                         .decode_block_content(&mut block_dec, &block_header, &mut mt_source)
-                        .map_err(err::FailedToReadBlockBody)?;
+                        .map_err(|source| {
+                            block_body_decode_error(
+                                source,
+                                block_index,
+                                block_frame_offset,
+                                &block_header,
+                                block_header_size,
+                            )
+                        })?;
                     state.bytes_read_counter += bytes_read_in_block_body;
                     state.block_counter += 1;
 
@@ -1691,9 +1788,14 @@ impl FrameDecoder {
             } else {
                 None
             };
-            let (block_header, hsize) = block_dec
-                .read_block_header(&mut *input)
-                .map_err(err::FailedToReadBlockHeader)?;
+            // Failing-block coordinates captured before the header read (see
+            // the `decode_blocks` loop for the rationale).
+            let block_index = state.block_counter as u32;
+            let block_frame_offset = state.bytes_read_counter as u32;
+            let (block_header, hsize) =
+                block_dec.read_block_header(&mut *input).map_err(|source| {
+                    block_header_decode_error(source, block_index, block_frame_offset)
+                })?;
             state.bytes_read_counter += u64::from(hsize);
             // Pre-flight FCS check ONLY for Raw / RLE blocks where
             // `decompressed_size` is the actual block output size.
@@ -1737,7 +1839,15 @@ impl FrameDecoder {
                             .saturating_add(u64::from(block_header.decompressed_size)),
                     });
                 }
-                Err(e) => return Err(err::FailedToReadBlockBody(e)),
+                Err(e) => {
+                    return Err(block_body_decode_error(
+                        e,
+                        block_index,
+                        block_frame_offset,
+                        &block_header,
+                        hsize,
+                    ));
+                }
             };
             produced = direct.buffer.buffer_ref().tail() as u64;
             // Post-decode FCS overflow check.
@@ -2046,6 +2156,82 @@ mod tests {
             "expected FrameContentSizeMismatch, got {:?}",
             err
         );
+    }
+
+    /// Block-precise error positions (#174): a failing block header / body
+    /// reports its 0-based index and frame-absolute offset, consistent with
+    /// the encoder's `FrameEmitInfo.blocks[index].offset_in_frame`.
+    #[cfg(feature = "lsm")]
+    #[test]
+    fn block_precise_errors_carry_index_and_offset() {
+        use crate::encoding::{CompressionLevel, FrameCompressor};
+        // ~1.3 MiB of incompressible (xorshift) bytes → many 128 KiB raw
+        // blocks, so blocks 3 and 7 both exist and are not the last block.
+        let mut data = alloc::vec::Vec::with_capacity(1_300_000);
+        let mut s: u64 = 0x2545_F491_4F6C_DD1D;
+        while data.len() < 1_300_000 {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            data.push((s >> 33) as u8);
+        }
+
+        let mut frame = alloc::vec::Vec::new();
+        let blocks = {
+            let mut fc = FrameCompressor::new(CompressionLevel::Level(1));
+            fc.set_source(data.as_slice());
+            fc.set_drain(&mut frame);
+            fc.compress();
+            fc.last_frame_emit_info()
+                .expect("emit info present under lsm")
+                .blocks
+                .clone()
+        };
+        assert!(blocks.len() > 7, "need >7 blocks, got {}", blocks.len());
+
+        let mut out = alloc::vec![0u8; data.len() + 4096];
+
+        // (1) Corrupt block 7's header: force its Block_Type to Reserved (3)
+        // by setting both type bits — fails the header read at block 7.
+        let off7 = blocks[7].offset_in_frame as usize;
+        let mut corrupt = frame.clone();
+        corrupt[off7] |= 0b0000_0110;
+        let mut dec = FrameDecoder::new();
+        let err = dec
+            .decode_all(&corrupt, &mut out)
+            .expect_err("reserved block-7 header must fail");
+        match err {
+            super::FrameDecoderError::FailedToReadBlockHeaderAt {
+                block_index,
+                frame_offset,
+                ..
+            } => {
+                assert_eq!(block_index, 7);
+                assert_eq!(frame_offset, blocks[7].offset_in_frame);
+            }
+            other => panic!("expected FailedToReadBlockHeaderAt, got {other:?}"),
+        }
+
+        // (2) Truncate at block 3's body start: header intact, body missing
+        // → the body decode fails at block 3 with its FrameBlock metadata.
+        let body3 = blocks[3].offset_in_frame as usize + blocks[3].header_size as usize;
+        let mut dec = FrameDecoder::new();
+        let err = dec
+            .decode_all(&frame[..body3], &mut out)
+            .expect_err("truncated block-3 body must fail");
+        match err {
+            super::FrameDecoderError::FailedToReadBlockBodyAt {
+                block_index,
+                frame_offset,
+                block,
+                ..
+            } => {
+                assert_eq!(block_index, 3);
+                assert_eq!(frame_offset, blocks[3].offset_in_frame);
+                assert_eq!(block.offset_in_frame, blocks[3].offset_in_frame);
+            }
+            other => panic!("expected FailedToReadBlockBodyAt, got {other:?}"),
+        }
     }
 
     #[test]

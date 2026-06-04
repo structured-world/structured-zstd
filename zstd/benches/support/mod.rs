@@ -202,7 +202,7 @@ fn build_supported_levels() -> Vec<LevelConfig> {
     // `CompressionLevel::from_level(n)` — so the bench label
     // `level_<N>_<strategy>` matches the variant exercised by the
     // encoder. `from_level(11)` collapses to `Best`, and the named
-    // `Best` variant bypasses `donor_pre_split_level`'s
+    // `Best` variant bypasses `pre_split_level`'s
     // `Level(11..=15) -> Some(0)` arm (the borders pre-splitter
     // landed in #140), so the numbers would silently diverge from
     // what a user calling `compress_to_vec(input, Level(11))` sees.

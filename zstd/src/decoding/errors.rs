@@ -618,6 +618,33 @@ pub enum FrameDecoderError {
         expected: u8,
         found: Option<u8>,
     },
+    /// Block-precise variant of [`Self::FailedToReadBlockHeader`]: a block
+    /// header read failed and the decoder captured WHERE. `block_index` is
+    /// the 0-based index of the failing block in the frame; `frame_offset`
+    /// is the frame-absolute byte offset of that block's `Block_Header`
+    /// (matches `FrameEmitInfo.blocks[block_index].offset_in_frame` from the
+    /// encode side). Lets per-block recovery (ECC repair) target the one bad
+    /// block instead of re-fetching the whole frame.
+    #[cfg(feature = "lsm")]
+    FailedToReadBlockHeaderAt {
+        source: BlockHeaderReadError,
+        block_index: u32,
+        frame_offset: u32,
+    },
+    /// Block-precise variant of [`Self::FailedToReadBlockBody`]: a block
+    /// body decode failed. Carries the same `block_index` / `frame_offset`
+    /// coordinates plus the failing block's structural metadata
+    /// ([`FrameBlock`]) reconstructed from its header, so a consumer can
+    /// locate and repair exactly this block.
+    ///
+    /// [`FrameBlock`]: crate::encoding::frame_emit_info::FrameBlock
+    #[cfg(feature = "lsm")]
+    FailedToReadBlockBodyAt {
+        source: DecodeBlockContentError,
+        block_index: u32,
+        frame_offset: u32,
+        block: crate::encoding::frame_emit_info::FrameBlock,
+    },
 }
 
 #[cfg(feature = "std")]
@@ -629,6 +656,10 @@ impl StdError for FrameDecoderError {
             FrameDecoderError::DictionaryDecodeError(source) => Some(source),
             FrameDecoderError::FailedToReadBlockHeader(source) => Some(source),
             FrameDecoderError::FailedToReadBlockBody(source) => Some(source),
+            #[cfg(feature = "lsm")]
+            FrameDecoderError::FailedToReadBlockHeaderAt { source, .. } => Some(source),
+            #[cfg(feature = "lsm")]
+            FrameDecoderError::FailedToReadBlockBodyAt { source, .. } => Some(source),
             FrameDecoderError::FailedToReadChecksum(source) => Some(source),
             FrameDecoderError::FailedToInitialize(source) => Some(source),
             FrameDecoderError::FailedToDrainDecodebuffer(source) => Some(source),
@@ -662,6 +693,29 @@ impl core::fmt::Display for FrameDecoderError {
             }
             FrameDecoderError::FailedToReadBlockBody(e) => {
                 write!(f, "Failed to parse block header: {e}")
+            }
+            #[cfg(feature = "lsm")]
+            FrameDecoderError::FailedToReadBlockHeaderAt {
+                source,
+                block_index,
+                frame_offset,
+            } => {
+                write!(
+                    f,
+                    "Failed to read block header at block {block_index} (frame offset {frame_offset}): {source}"
+                )
+            }
+            #[cfg(feature = "lsm")]
+            FrameDecoderError::FailedToReadBlockBodyAt {
+                source,
+                block_index,
+                frame_offset,
+                ..
+            } => {
+                write!(
+                    f,
+                    "Failed to decode block body at block {block_index} (frame offset {frame_offset}): {source}"
+                )
             }
             FrameDecoderError::FailedToReadChecksum(e) => {
                 write!(f, "Failed to read checksum: {e}")

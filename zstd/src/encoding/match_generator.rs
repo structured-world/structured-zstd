@@ -298,6 +298,34 @@ impl LevelParams {
             _ => super::strategy::ParseMode::from_lazy_depth(self.lazy_depth),
         }
     }
+
+    /// Cheap fingerprint pre-splitter level (donor `splitLevels[]` by
+    /// strategy), or `None` to keep the whole 128 KiB block. `Fast`/`Dfast`
+    /// stay un-split: their match-finding is cheap, so the splitter's
+    /// per-block fingerprint plus extra per-sub-block entropy builds cost
+    /// more throughput than the ratio they buy. The btopt/btultra/btultra2
+    /// band keeps level 4 (matching the pre-existing high-level splitter).
+    /// This is the C-like `blockSplitterLevel` knob, regulated per level
+    /// here rather than scattered across the frame loop.
+    fn pre_split(&self) -> Option<u8> {
+        match self.strategy_tag {
+            // Fast/Dfast: cheap match-finding, the splitter costs more than
+            // it buys. Lazy: its ratio already tracks the reference, and
+            // splitting it regresses on highly-compressible frames until the
+            // per-block entropy path reuses tables as aggressively as the
+            // reference (tracked separately); keep whole blocks for now.
+            super::strategy::StrategyTag::Fast
+            | super::strategy::StrategyTag::Dfast
+            | super::strategy::StrategyTag::Lazy => None,
+            // Greedy is the band whose single-block literal section loses to
+            // the reference; the cheap fingerprint pre-split fits per-sub-
+            // block entropy and recovers it.
+            super::strategy::StrategyTag::Greedy => Some(1),
+            super::strategy::StrategyTag::BtOpt
+            | super::strategy::StrategyTag::BtUltra
+            | super::strategy::StrategyTag::BtUltra2 => Some(4),
+        }
+    }
 }
 
 fn dfast_hash_bits_for_window(max_window_size: usize) -> usize {
@@ -538,6 +566,21 @@ fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> Le
     } else {
         params
     }
+}
+
+/// The cheap fingerprint pre-splitter level for a compression level (the
+/// C-like `blockSplitterLevel`), resolved through the same per-level
+/// `LevelParams` table as every other tuning knob. `None` keeps the whole
+/// 128 KiB block. The frame loop reads this instead of hardcoding the
+/// level→split mapping at the call site.
+pub(crate) fn level_pre_split(level: CompressionLevel) -> Option<usize> {
+    // Named presets are pure aliases: resolve to their numeric level and
+    // read the split knob from the same `LevelParams` table as everything
+    // else. `Uncompressed` (raw blocks) has no numeric equivalent.
+    let numeric = level.numeric_level()?;
+    resolve_level_params(CompressionLevel::Level(numeric), None)
+        .pre_split()
+        .map(usize::from)
 }
 
 /// Backend storage for [`MatchGeneratorDriver`]. Exactly one match-finder
@@ -7180,7 +7223,7 @@ fn level22_donor_block_ranges(data: &[u8]) -> Vec<(usize, usize)> {
     while cursor < data.len() {
         let remaining = data.len() - cursor;
         let candidate_len = remaining.min(HC_BLOCKSIZE_MAX);
-        let block_len = crate::encoding::frame_compressor::donor_optimal_block_size(
+        let block_len = crate::encoding::frame_compressor::optimal_block_size(
             CompressionLevel::Level(22),
             &data[cursor..cursor + candidate_len],
             remaining,
