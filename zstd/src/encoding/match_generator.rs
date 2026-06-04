@@ -244,6 +244,12 @@ const ROW_L5: RowConfig = RowConfig {
 #[derive(Copy, Clone)]
 struct LevelParams {
     strategy_tag: super::strategy::StrategyTag,
+    /// Decoupled search-method axis. Independent of `strategy_tag`'s
+    /// parse half: a level can pair any parse (greedy / lazy depth via
+    /// `lazy_depth`) with any search backend here. Defaults to the
+    /// historical pairing (`strategy_tag.search()`) but is overridable
+    /// per level so the parse×search matrix can be swept and tuned.
+    search: super::strategy::SearchMethod,
     window_log: u8,
     /// Donor `cParams.hashLog` — only consumed by the Fast strategy
     /// backend (`FastKernelMatcher`). Other backends ignore.
@@ -264,11 +270,23 @@ struct LevelParams {
 }
 
 impl LevelParams {
-    /// Backend family for the driver dispatcher. Always derived from
-    /// `strategy_tag` so there is no second authoritative mapping
-    /// for the `(level → backend)` decision.
+    /// Backend family (storage variant) for the driver dispatcher.
+    /// Derived from the decoupled `search` axis so a level can route to
+    /// a different search backend than its `strategy_tag` historically
+    /// implied.
     fn backend(&self) -> super::strategy::BackendTag {
-        self.strategy_tag.backend()
+        self.search.backend()
+    }
+
+    /// Parse mode for the greedy/lazy band, read off `lazy_depth`. The
+    /// opt tags carry `ParseMode::Optimal` regardless of `lazy_depth`.
+    fn parse(&self) -> super::strategy::ParseMode {
+        match self.strategy_tag {
+            super::strategy::StrategyTag::BtOpt
+            | super::strategy::StrategyTag::BtUltra
+            | super::strategy::StrategyTag::BtUltra2 => super::strategy::ParseMode::Optimal,
+            _ => super::strategy::ParseMode::from_lazy_depth(self.lazy_depth),
+        }
     }
 }
 
@@ -294,10 +312,10 @@ fn row_hash_bits_for_window(max_window_size: usize) -> usize {
 const LEVEL_TABLE: [LevelParams; 22] = [
     // Lvl  Strategy       wlog  fast_hlog  fast_mls  fast_step  lazy  HC config                                   row config
     // ---  -------------- ----  ---------  --------  ---------  ----  ------------------------------------------  ----------
-    /* 1 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Fast, window_log: 19, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 0, hc: HC_CONFIG, row: ROW_CONFIG },
-    /* 2 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Fast, window_log: 20, fast_hash_log: 16, fast_mls: 6, fast_step_size: 2, lazy_depth: 0, hc: HC_CONFIG, row: ROW_CONFIG },
-    /* 3 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Dfast, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 1, hc: HC_CONFIG, row: ROW_CONFIG },
-    /* 4 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Dfast, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 1, hc: HC_CONFIG, row: ROW_CONFIG },
+    /* 1 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Fast, search: super::strategy::SearchMethod::Fast, window_log: 19, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 0, hc: HC_CONFIG, row: ROW_CONFIG },
+    /* 2 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Fast, search: super::strategy::SearchMethod::Fast, window_log: 20, fast_hash_log: 16, fast_mls: 6, fast_step_size: 2, lazy_depth: 0, hc: HC_CONFIG, row: ROW_CONFIG },
+    /* 3 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Dfast, search: super::strategy::SearchMethod::DoubleFast, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 1, hc: HC_CONFIG, row: ROW_CONFIG },
+    /* 4 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Dfast, search: super::strategy::SearchMethod::DoubleFast, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 1, hc: HC_CONFIG, row: ROW_CONFIG },
     // target_len column for L5..=L15 matches donor cParams.targetLength
     // from clevels.h table[0] (default — srcSize > 256 KB). Donor uses
     // it as the lazy outer loop's `sufficient_len` (nice-match) threshold.
@@ -305,14 +323,14 @@ const LEVEL_TABLE: [LevelParams; 22] = [
     // search_depth iterations instead of breaking on the first
     // long-enough match — the dominant cost in the L5..=L15 speed
     // regression vs FFI (see lazy_band_target_len_matches_donor_default_table).
-    /* 5 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Greedy, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 0, hc: HcConfig { hash_log: 18, chain_log: 17, search_depth: 4,  target_len: 2 }, row: ROW_L5 },
-    /* 6 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: BETTER_WINDOW_LOG, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 1, hc: HcConfig { hash_log: 19, chain_log: 18, search_depth: 8,  target_len: 4 }, row: ROW_CONFIG },
-    /* 7 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: BETTER_WINDOW_LOG, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 1, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 16, target_len: 8 }, row: ROW_CONFIG },
-    /* 8 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: BETTER_WINDOW_LOG, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 24, target_len: 16 }, row: ROW_CONFIG },
-    /* 9 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: BETTER_WINDOW_LOG, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 24, target_len: 16 }, row: ROW_CONFIG },
-    /*10 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 24, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 28, target_len: 16 }, row: ROW_CONFIG },
-    /*11 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 24, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 32, target_len: 16 }, row: ROW_CONFIG },
-    /*12 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 25, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 32 }, row: ROW_CONFIG },
+    /* 5 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Greedy, search: super::strategy::SearchMethod::RowHash, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 0, hc: HcConfig { hash_log: 18, chain_log: 17, search_depth: 4,  target_len: 2 }, row: ROW_L5 },
+    /* 6 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: BETTER_WINDOW_LOG, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 1, hc: HcConfig { hash_log: 19, chain_log: 18, search_depth: 8,  target_len: 4 }, row: ROW_CONFIG },
+    /* 7 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: BETTER_WINDOW_LOG, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 1, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 16, target_len: 8 }, row: ROW_CONFIG },
+    /* 8 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: BETTER_WINDOW_LOG, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 24, target_len: 16 }, row: ROW_CONFIG },
+    /* 9 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: BETTER_WINDOW_LOG, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 24, target_len: 16 }, row: ROW_CONFIG },
+    /*10 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 24, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 28, target_len: 16 }, row: ROW_CONFIG },
+    /*11 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 24, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 32, target_len: 16 }, row: ROW_CONFIG },
+    /*12 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 25, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 32 }, row: ROW_CONFIG },
     // L13-15: reference uses btlazy2 (binary-tree finder) with searchLog 4/5/6
     // (search_depth 16/32/64) and targetLength 32. We run the hash-chain Lazy
     // parser here, so we mirror the reference search budget rather than inflate
@@ -321,16 +339,16 @@ const LEVEL_TABLE: [LevelParams; 22] = [
     // smaller searchLog find longer matches (and re-establish a strict ratio
     // ladder above L12) is tracked separately; until it lands these levels sit
     // close to L12 on hash-chain inputs by design.
-    /*13 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 22, search_depth: 16, target_len: 32 }, row: ROW_CONFIG },
-    /*14 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 22, search_depth: 32, target_len: 32 }, row: ROW_CONFIG },
-    /*15 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 23, search_depth: 64, target_len: 32 }, row: ROW_CONFIG },
-    /*16 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtOpt, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 22, search_depth: 32, target_len: 48 }, row: ROW_CONFIG },
-    /*17 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtOpt, window_log: 23, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 23, search_depth: 32, target_len: 64 }, row: ROW_CONFIG },
-    /*18 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra, window_log: 23, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 23, search_depth: 64, target_len: 64 }, row: ROW_CONFIG },
-    /*19 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, window_log: 23, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 24, search_depth: 128, target_len: 256 }, row: ROW_CONFIG },
-    /*20 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, window_log: 25, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 25, search_depth: 128, target_len: 256 }, row: ROW_CONFIG },
-    /*21 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTULTRA2_HC_CONFIG, row: ROW_CONFIG },
-    /*22 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, window_log: 27, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTULTRA2_HC_CONFIG_L22, row: ROW_CONFIG },
+    /*13 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 22, search_depth: 16, target_len: 32 }, row: ROW_CONFIG },
+    /*14 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 22, search_depth: 32, target_len: 32 }, row: ROW_CONFIG },
+    /*15 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 23, search_depth: 64, target_len: 32 }, row: ROW_CONFIG },
+    /*16 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtOpt, search: super::strategy::SearchMethod::BinaryTree, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 22, search_depth: 32, target_len: 48 }, row: ROW_CONFIG },
+    /*17 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtOpt, search: super::strategy::SearchMethod::BinaryTree, window_log: 23, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 23, search_depth: 32, target_len: 64 }, row: ROW_CONFIG },
+    /*18 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra, search: super::strategy::SearchMethod::BinaryTree, window_log: 23, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 23, search_depth: 64, target_len: 64 }, row: ROW_CONFIG },
+    /*19 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, search: super::strategy::SearchMethod::BinaryTree, window_log: 23, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 24, search_depth: 128, target_len: 256 }, row: ROW_CONFIG },
+    /*20 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, search: super::strategy::SearchMethod::BinaryTree, window_log: 25, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 25, search_depth: 128, target_len: 256 }, row: ROW_CONFIG },
+    /*21 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, search: super::strategy::SearchMethod::BinaryTree, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTULTRA2_HC_CONFIG, row: ROW_CONFIG },
+    /*22 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, search: super::strategy::SearchMethod::BinaryTree, window_log: 27, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: BTULTRA2_HC_CONFIG_L22, row: ROW_CONFIG },
 ];
 
 /// Smallest window_log the encoder will use regardless of source size.
@@ -411,6 +429,7 @@ fn level22_btultra2_params_for_source_size(source_size: Option<u64>) -> LevelPar
     }
     LevelParams {
         strategy_tag: super::strategy::StrategyTag::BtUltra2,
+        search: super::strategy::SearchMethod::BinaryTree,
         window_log,
         fast_hash_log: 14,
         fast_mls: 7,
@@ -430,6 +449,7 @@ fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> Le
     let params = match level {
         CompressionLevel::Uncompressed => LevelParams {
             strategy_tag: super::strategy::StrategyTag::Fast,
+            search: super::strategy::SearchMethod::Fast,
             // Uncompressed frames emit raw blocks and never reference
             // history; advertising a larger window only inflates
             // decoder-side buffer reservation. Stay at 17 (128 KiB).
@@ -491,6 +511,7 @@ fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> Le
                 // ladder on both ratio and throughput.
                 LevelParams {
                     strategy_tag: super::strategy::StrategyTag::Fast,
+                    search: super::strategy::SearchMethod::Fast,
                     window_log: 19,
                     fast_hash_log: 13,
                     fast_mls: 7,
@@ -586,6 +607,23 @@ pub struct MatchGeneratorDriver {
     // this tag to enter the corresponding `Strategy`
     // monomorphisation (`compress_block::<S>`).
     strategy_tag: super::strategy::StrategyTag,
+    // Decoupled search-method axis resolved at `reset()` from
+    // `LevelParams.search`. The per-block dispatcher routes on this
+    // (not on `strategy_tag`) so a level's parse and search backend can
+    // be chosen independently. The `BinaryTree` arm still consults
+    // `strategy_tag` to pick the opt `Strategy` ZST.
+    search: super::strategy::SearchMethod,
+    // Decoupled parse-mode axis resolved at `reset()` from
+    // `LevelParams::parse()`. Independent of `search`: greedy / lazy /
+    // lazy2 can run on any non-opt search backend. The backends still
+    // read their own `lazy_depth` (kept in sync at `reset()`); this is
+    // the authoritative parse selector for the dispatcher.
+    parse: super::strategy::ParseMode,
+    /// Test-only per-level recipe override applied in `reset()` before
+    /// backend selection. Lets the parse×search matrix be exercised
+    /// without editing `LEVEL_TABLE`; never compiled into production.
+    #[cfg(test)]
+    config_override: Option<(super::strategy::SearchMethod, super::strategy::ParseMode)>,
     slice_size: usize,
     base_slice_size: usize,
     // Frame header window size must stay at the configured live-window budget.
@@ -673,6 +711,10 @@ impl MatchGeneratorDriver {
                 2, // donor default step_size (targetLength=0 → step=2)
             )),
             strategy_tag: super::strategy::StrategyTag::Fast,
+            search: super::strategy::SearchMethod::Fast,
+            parse: super::strategy::ParseMode::Greedy,
+            #[cfg(test)]
+            config_override: None,
             slice_size,
             base_slice_size: slice_size,
             // Report the ROUNDED-UP window size that the matcher
@@ -993,7 +1035,18 @@ impl Matcher for MatchGeneratorDriver {
         // hint is consumed here, but priming happens just after reset).
         self.reset_source_size = hint;
         let hinted = hint.is_some();
-        let params = Self::level_params(level, hint);
+        #[cfg_attr(not(test), allow(unused_mut))]
+        let mut params = Self::level_params(level, hint);
+        // Test-only: apply a parse×search override so the matrix can be
+        // exercised without editing `LEVEL_TABLE`. Mutating `params` here
+        // (before `next_backend`) flows the override through storage
+        // selection, `configure`, and the `self.search`/`self.parse`
+        // writes uniformly. Opt strategies keep their `Optimal` parse.
+        #[cfg(test)]
+        if let Some((search, parse)) = self.config_override {
+            params.search = search;
+            params.lazy_depth = parse.lazy_depth();
+        }
         let next_backend = params.backend();
         let max_window_size = 1usize << params.window_log;
         self.dictionary_retained_budget = 0;
@@ -1094,6 +1147,8 @@ impl Matcher for MatchGeneratorDriver {
         // so there is no separate runtime tag that could drift against
         // `LEVEL_TABLE`.
         self.strategy_tag = params.strategy_tag;
+        self.search = params.search;
+        self.parse = params.parse();
         self.slice_size = self.base_slice_size.min(max_window_size);
         self.reported_window_size = max_window_size;
         let strategy_tag = self.strategy_tag;
@@ -1482,24 +1537,54 @@ impl Matcher for MatchGeneratorDriver {
                 .start_matching_borrowed(block_start, block_end, &mut handle_sequence);
             return;
         }
-        // 7-arm match over the compile-time strategy tag fires once
-        // per block and hands off to a monomorphised
-        // `compress_block::<S>` that the optimiser specialises per
-        // strategy. Strategy-shaped predicates (`S::USE_BT`,
-        // `S::USE_HASH3`, `S::OPTIMAL_PASS_COUNT`) compile to constants
-        // inside each monomorphisation, so the dead arms drop out at
-        // codegen time — there is no remaining runtime parse-mode
-        // dispatch on the per-block hot path.
-        match self.strategy_tag {
-            StrategyTag::Fast => self.compress_block::<strategy::Fast>(&mut handle_sequence),
-            StrategyTag::Dfast => self.compress_block::<strategy::Dfast>(&mut handle_sequence),
-            StrategyTag::Greedy => self.compress_block::<strategy::Greedy>(&mut handle_sequence),
-            StrategyTag::Lazy => self.compress_block::<strategy::Lazy>(&mut handle_sequence),
-            StrategyTag::BtOpt => self.compress_block::<strategy::BtOpt>(&mut handle_sequence),
-            StrategyTag::BtUltra => self.compress_block::<strategy::BtUltra>(&mut handle_sequence),
-            StrategyTag::BtUltra2 => {
-                self.compress_block::<strategy::BtUltra2>(&mut handle_sequence)
+        // Decoupled parse×search dispatch (fires once per block). The
+        // search axis (`self.search`) picks the candidate-finding backend;
+        // the parse axis (greedy vs lazy depth) is carried by the
+        // backend's runtime `lazy_depth`, set per level at `reset()`.
+        // The two are independent, so any parse can run on any search
+        // backend. The `BinaryTree` arm still selects the opt `Strategy`
+        // ZST off `strategy_tag` so `compress_block::<S>` keeps its
+        // const-folded optimal-parser monomorphisation.
+        use super::strategy::SearchMethod;
+        match self.search {
+            SearchMethod::Fast => {
+                self.simple_mut().start_matching(&mut handle_sequence);
+                self.recycle_simple_space();
             }
+            SearchMethod::DoubleFast => {
+                self.dfast_matcher_mut()
+                    .start_matching(&mut handle_sequence);
+            }
+            SearchMethod::RowHash => {
+                // Greedy parse (depth 0) = donor-greedy entry (default
+                // `ip + 1` start, greedy repcode commit); lazy / lazy2 use
+                // the `pick_lazy_match` lookahead entry (reads `lazy_depth`).
+                let greedy = self.parse == super::strategy::ParseMode::Greedy;
+                let row = self.row_matcher_mut();
+                if greedy {
+                    row.start_matching_greedy(&mut handle_sequence);
+                } else {
+                    row.start_matching(&mut handle_sequence);
+                }
+            }
+            SearchMethod::HashChain => {
+                // Greedy/lazy/lazy2 all flow through the lazy parser; it
+                // reads `hc.lazy_depth` (0 = greedy commit).
+                self.hc_matcher_mut()
+                    .start_matching_lazy(&mut handle_sequence);
+            }
+            SearchMethod::BinaryTree => match self.strategy_tag {
+                StrategyTag::BtOpt => self.compress_block::<strategy::BtOpt>(&mut handle_sequence),
+                StrategyTag::BtUltra => {
+                    self.compress_block::<strategy::BtUltra>(&mut handle_sequence)
+                }
+                StrategyTag::BtUltra2 => {
+                    self.compress_block::<strategy::BtUltra2>(&mut handle_sequence)
+                }
+                _ => unreachable!(
+                    "SearchMethod::BinaryTree requires an opt strategy tag (BtOpt/BtUltra/BtUltra2)"
+                ),
+            },
         }
     }
 
@@ -3320,7 +3405,10 @@ impl HcMatchGenerator {
         }
     }
 
-    fn start_matching_lazy(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
+    pub(crate) fn start_matching_lazy(
+        &mut self,
+        mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+    ) {
         self.table.ensure_tables();
 
         let current_len = *self.table.chunk_lens.back().unwrap();
@@ -4495,6 +4583,105 @@ fn driver_level4_greedy_round_trip_cross_slice() {
 /// Helper: round-trip `data` through the L4 greedy parse and assert
 /// the reconstructed bytes match. Returns `(triple_count, max_offset)`
 /// so callers can probe parse shape (matches emitted, max-offset).
+#[cfg(test)]
+impl MatchGeneratorDriver {
+    /// Test-only: stage a parse×search recipe override applied on the
+    /// next `reset()`. Routes a level through a non-default (parse,
+    /// search) pair so the decoupling can be exercised end-to-end.
+    pub(crate) fn set_config_override(
+        &mut self,
+        search: super::strategy::SearchMethod,
+        parse: super::strategy::ParseMode,
+    ) {
+        self.config_override = Some((search, parse));
+    }
+}
+
+/// Drive a full compress parse for `data` at `level` (optionally with a
+/// parse×search override) and reconstruct the bytes from the emitted
+/// sequences. The returned buffer must equal `data` for a correct parse.
+#[cfg(test)]
+fn drive_roundtrip_with_override(
+    level: CompressionLevel,
+    over: Option<(super::strategy::SearchMethod, super::strategy::ParseMode)>,
+    data: &[u8],
+) -> Vec<u8> {
+    let mut driver = MatchGeneratorDriver::new(1 << 17, 8);
+    if let Some((s, p)) = over {
+        driver.set_config_override(s, p);
+    }
+    driver.reset(level);
+
+    let mut out: Vec<u8> = Vec::with_capacity(data.len());
+    let mut offset_in_data = 0usize;
+    while offset_in_data < data.len() {
+        let mut space = driver.get_next_space();
+        let take = (data.len() - offset_in_data).min(space.len());
+        space[..take].copy_from_slice(&data[offset_in_data..offset_in_data + take]);
+        space.truncate(take);
+        driver.commit_space(space);
+        offset_in_data += take;
+
+        driver.start_matching(|seq| match seq {
+            Sequence::Literals { literals } => out.extend_from_slice(literals),
+            Sequence::Triple {
+                literals,
+                offset,
+                match_len,
+            } => {
+                out.extend_from_slice(literals);
+                let start = out.len() - offset;
+                for i in 0..match_len {
+                    let byte = out[start + i];
+                    out.push(byte);
+                }
+            }
+        });
+    }
+    out
+}
+
+/// Phase 1 capability proof: parse and search are decoupled, so a level
+/// can run any parse mode on any non-opt search backend. Greedy-on-
+/// HashChain and Lazy2-on-RowHash are pairings the legacy `strategy_tag`
+/// could not express; both must reconstruct the input exactly.
+#[test]
+fn parse_search_matrix_decoupled_roundtrips() {
+    use super::strategy::{ParseMode, SearchMethod};
+    // Mixed repetitive + literal payload that exercises matches and reps.
+    let mut data = Vec::new();
+    for i in 0..4000u32 {
+        data.extend_from_slice(b"the quick brown fox ");
+        data.extend_from_slice(&i.to_le_bytes());
+    }
+
+    // Greedy parse on the HashChain search backend (legacy: Greedy was
+    // welded to RowHash).
+    let got = drive_roundtrip_with_override(
+        CompressionLevel::Level(5),
+        Some((SearchMethod::HashChain, ParseMode::Greedy)),
+        &data,
+    );
+    assert_eq!(got, data, "greedy-on-hashchain diverged");
+
+    // Lazy2 parse on the RowHash search backend (legacy: Lazy was welded
+    // to HashChain).
+    let got = drive_roundtrip_with_override(
+        CompressionLevel::Level(8),
+        Some((SearchMethod::RowHash, ParseMode::Lazy2)),
+        &data,
+    );
+    assert_eq!(got, data, "lazy2-on-rowhash diverged");
+
+    // Lazy on RowHash too (depth 1).
+    let got = drive_roundtrip_with_override(
+        CompressionLevel::Level(6),
+        Some((SearchMethod::RowHash, ParseMode::Lazy)),
+        &data,
+    );
+    assert_eq!(got, data, "lazy-on-rowhash diverged");
+}
+
 #[cfg(test)]
 fn l4_greedy_round_trip(slice_size: usize, max_slices: usize, data: &[u8]) -> (usize, usize) {
     let mut driver = MatchGeneratorDriver::new(slice_size, max_slices);
