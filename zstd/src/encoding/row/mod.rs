@@ -371,14 +371,18 @@ impl RowMatchGenerator {
         }
     }
 
-    pub(crate) fn skip_matching_with_hint(&mut self, incompressible_hint: Option<bool>) {
+    pub(crate) fn skip_matching_with_hint_rl<const ROW_LOG: usize>(
+        &mut self,
+        incompressible_hint: Option<bool>,
+    ) {
+        debug_assert_eq!(ROW_LOG, self.row_log);
         self.ensure_tables();
         let current_len = self.window.back().unwrap().len();
         let current_abs_start = self.history_abs_start + self.window_size - current_len;
         let current_abs_end = current_abs_start + current_len;
         let backfill_start = self.backfill_start(current_abs_start);
         if backfill_start < current_abs_start {
-            self.insert_positions(backfill_start, current_abs_start);
+            self.insert_positions::<ROW_LOG>(backfill_start, current_abs_start);
         }
         match incompressible_hint {
             Some(true) => {
@@ -386,7 +390,7 @@ impl RowMatchGenerator {
                 // unlikely to compress, so we seed only every
                 // `INCOMPRESSIBLE_SKIP_STEP` position plus a small tail to
                 // keep cross-block continuity at the boundary.
-                self.insert_positions_with_step(
+                self.insert_positions_with_step::<ROW_LOG>(
                     current_abs_start,
                     current_abs_end,
                     INCOMPRESSIBLE_SKIP_STEP,
@@ -397,7 +401,7 @@ impl RowMatchGenerator {
                     .max(current_abs_start);
                 for pos in tail_start..current_abs_end {
                     if !(pos - current_abs_start).is_multiple_of(INCOMPRESSIBLE_SKIP_STEP) {
-                        self.insert_position(pos);
+                        self.insert_position::<ROW_LOG>(pos);
                     }
                 }
             }
@@ -412,7 +416,7 @@ impl RowMatchGenerator {
                 // future fast-paths (e.g. an RLE / raw-block emitter
                 // that still wants cross-block matches into the skipped
                 // bytes) can reuse it without rewording the contract.
-                self.insert_positions(current_abs_start, current_abs_end);
+                self.insert_positions::<ROW_LOG>(current_abs_start, current_abs_end);
             }
             None => {
                 // Donor parity: a plain `skip_matching` (no hint) leaves
@@ -460,8 +464,11 @@ impl RowMatchGenerator {
     /// row-hash machinery, which is wasteful. The `dead_code` allow is
     /// scoped to this method and its private helpers so any new
     /// caller will pick them up unmodified.
-    #[allow(dead_code)]
-    pub(crate) fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
+    pub(crate) fn start_matching_rl<const ROW_LOG: usize>(
+        &mut self,
+        mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        debug_assert_eq!(ROW_LOG, self.row_log);
         self.ensure_tables();
 
         let current_len = self.window.back().unwrap().len();
@@ -471,7 +478,7 @@ impl RowMatchGenerator {
         let current_abs_start = self.history_abs_start + self.window_size - current_len;
         let backfill_start = self.backfill_start(current_abs_start);
         if backfill_start < current_abs_start {
-            self.insert_positions(backfill_start, current_abs_start);
+            self.insert_positions::<ROW_LOG>(backfill_start, current_abs_start);
         }
 
         let mut pos = 0usize;
@@ -480,9 +487,9 @@ impl RowMatchGenerator {
             let abs_pos = current_abs_start + pos;
             let lit_len = pos - literals_start;
 
-            let best = self.best_match(abs_pos, lit_len);
-            if let Some(candidate) = self.pick_lazy_match(abs_pos, lit_len, best) {
-                self.insert_match_span(abs_pos, candidate.start + candidate.match_len);
+            let best = self.best_match_rl::<ROW_LOG>(abs_pos, lit_len);
+            if let Some(candidate) = self.pick_lazy_match_rl::<ROW_LOG>(abs_pos, lit_len, best) {
+                self.insert_match_span::<ROW_LOG>(abs_pos, candidate.start + candidate.match_len);
                 let current = self.window.back().unwrap().as_slice();
                 let start = candidate.start - current_abs_start;
                 let literals = &current[literals_start..start];
@@ -499,13 +506,13 @@ impl RowMatchGenerator {
                 pos = start + candidate.match_len;
                 literals_start = pos;
             } else {
-                self.insert_position(abs_pos);
+                self.insert_position::<ROW_LOG>(abs_pos);
                 pos += 1;
             }
         }
 
         while pos + ROW_HASH_KEY_LEN <= current_len {
-            self.insert_position(current_abs_start + pos);
+            self.insert_position::<ROW_LOG>(current_abs_start + pos);
             pos += 1;
         }
 
@@ -578,10 +585,11 @@ impl RowMatchGenerator {
     ///
     /// `pick_lazy_match` is intentionally not called here — depth == 0
     /// means "no lookahead", emit the first viable hit.
-    pub(crate) fn start_matching_greedy(
+    pub(crate) fn start_matching_greedy_rl<const ROW_LOG: usize>(
         &mut self,
         mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
     ) {
+        debug_assert_eq!(ROW_LOG, self.row_log);
         self.ensure_tables();
 
         let current_len = self.window.back().unwrap().len();
@@ -591,7 +599,7 @@ impl RowMatchGenerator {
         let current_abs_start = self.history_abs_start + self.window_size - current_len;
         let backfill_start = self.backfill_start(current_abs_start);
         if backfill_start < current_abs_start {
-            self.insert_positions(backfill_start, current_abs_start);
+            self.insert_positions::<ROW_LOG>(backfill_start, current_abs_start);
         }
 
         // Donor mls for repcode probes is 4 (`MEM_read32` compare on
@@ -666,7 +674,7 @@ impl RowMatchGenerator {
             // indexes the committed span.
             let chosen = match rep_match {
                 Some(rep) => Some(rep),
-                None => self.row_candidate(abs_pos, lit_len),
+                None => self.row_candidate_rl::<ROW_LOG>(abs_pos, lit_len),
             };
 
             let Some(candidate) = chosen else {
@@ -683,7 +691,7 @@ impl RowMatchGenerator {
                 // drain.
                 const SKIP_STRENGTH: u32 = 10;
                 let step = ((lit_len as u32) >> SKIP_STRENGTH) as usize + 1;
-                self.insert_position(abs_pos);
+                self.insert_position::<ROW_LOG>(abs_pos);
                 pos += step;
                 continue;
             };
@@ -703,7 +711,7 @@ impl RowMatchGenerator {
             // `candidate.start` lower bound regresses `rust_bytes` by
             // ~+447 over `abs_pos` (537897 -> 538344), so the
             // narrower range is intentional.
-            self.insert_match_span(abs_pos, candidate.start + candidate.match_len);
+            self.insert_match_span::<ROW_LOG>(abs_pos, candidate.start + candidate.match_len);
             let current = self.window.back().unwrap().as_slice();
             let literals = &current[literals_start..start];
             handle_sequence(Sequence::Triple {
@@ -736,7 +744,7 @@ impl RowMatchGenerator {
         }
 
         while pos + ROW_HASH_KEY_LEN <= current_len {
-            self.insert_position(current_abs_start + pos);
+            self.insert_position::<ROW_LOG>(current_abs_start + pos);
             pos += 1;
         }
 
@@ -805,15 +813,17 @@ impl RowMatchGenerator {
     /// Used only by the dead-code [`Self::start_matching`] (lazy-style
     /// row parse). Kept paired with that method so reviving the lazy
     /// path doesn't have to re-derive the rep+row best-of-two pick.
-    #[allow(dead_code)]
-    pub(crate) fn best_match(&self, abs_pos: usize, lit_len: usize) -> Option<MatchCandidate> {
+    pub(crate) fn best_match_rl<const ROW_LOG: usize>(
+        &self,
+        abs_pos: usize,
+        lit_len: usize,
+    ) -> Option<MatchCandidate> {
         let rep = self.repcode_candidate(abs_pos, lit_len);
-        let row = self.row_candidate(abs_pos, lit_len);
+        let row = self.row_candidate_rl::<ROW_LOG>(abs_pos, lit_len);
         best_len_offset_candidate(rep, row)
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn pick_lazy_match(
+    pub(crate) fn pick_lazy_match_rl<const ROW_LOG: usize>(
         &self,
         abs_pos: usize,
         lit_len: usize,
@@ -829,7 +839,7 @@ impl RowMatchGenerator {
                 lazy_depth: self.lazy_depth,
                 history_abs_end: self.history_abs_end(),
             },
-            |next_pos, next_lit_len| self.best_match(next_pos, next_lit_len),
+            |next_pos, next_lit_len| self.best_match_rl::<ROW_LOG>(next_pos, next_lit_len),
         )
     }
 
@@ -849,7 +859,84 @@ impl RowMatchGenerator {
         )
     }
 
+    // Bounded `row_log` dispatchers. Each reads the runtime `row_log`
+    // (clamped to 4..=6 in `configure`) once and routes into the
+    // const-`ROW_LOG` monomorphisation, mirroring the donor's per-rowLog
+    // matchfinder variant table. The per-block / per-call dispatch cost is
+    // amortised over the whole block's hot loop. Callers (the driver and
+    // tests) use these bare names; the hot loops call the `_rl` siblings
+    // directly with the const already bound.
+    pub(crate) fn start_matching(&mut self, handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
+        match self.row_log {
+            4 => self.start_matching_rl::<4>(handle_sequence),
+            5 => self.start_matching_rl::<5>(handle_sequence),
+            6 => self.start_matching_rl::<6>(handle_sequence),
+            _ => unreachable!("row_log is clamped to 4..=6 in configure()"),
+        }
+    }
+
+    pub(crate) fn start_matching_greedy(
+        &mut self,
+        handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        match self.row_log {
+            4 => self.start_matching_greedy_rl::<4>(handle_sequence),
+            5 => self.start_matching_greedy_rl::<5>(handle_sequence),
+            6 => self.start_matching_greedy_rl::<6>(handle_sequence),
+            _ => unreachable!("row_log is clamped to 4..=6 in configure()"),
+        }
+    }
+
+    pub(crate) fn skip_matching_with_hint(&mut self, incompressible_hint: Option<bool>) {
+        match self.row_log {
+            4 => self.skip_matching_with_hint_rl::<4>(incompressible_hint),
+            5 => self.skip_matching_with_hint_rl::<5>(incompressible_hint),
+            6 => self.skip_matching_with_hint_rl::<6>(incompressible_hint),
+            _ => unreachable!("row_log is clamped to 4..=6 in configure()"),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn best_match(&self, abs_pos: usize, lit_len: usize) -> Option<MatchCandidate> {
+        match self.row_log {
+            4 => self.best_match_rl::<4>(abs_pos, lit_len),
+            5 => self.best_match_rl::<5>(abs_pos, lit_len),
+            6 => self.best_match_rl::<6>(abs_pos, lit_len),
+            _ => unreachable!("row_log is clamped to 4..=6 in configure()"),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn pick_lazy_match(
+        &self,
+        abs_pos: usize,
+        lit_len: usize,
+        best: Option<MatchCandidate>,
+    ) -> Option<MatchCandidate> {
+        match self.row_log {
+            4 => self.pick_lazy_match_rl::<4>(abs_pos, lit_len, best),
+            5 => self.pick_lazy_match_rl::<5>(abs_pos, lit_len, best),
+            6 => self.pick_lazy_match_rl::<6>(abs_pos, lit_len, best),
+            _ => unreachable!("row_log is clamped to 4..=6 in configure()"),
+        }
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn row_candidate(&self, abs_pos: usize, lit_len: usize) -> Option<MatchCandidate> {
+        match self.row_log {
+            4 => self.row_candidate_rl::<4>(abs_pos, lit_len),
+            5 => self.row_candidate_rl::<5>(abs_pos, lit_len),
+            6 => self.row_candidate_rl::<6>(abs_pos, lit_len),
+            _ => unreachable!("row_log is clamped to 4..=6 in configure()"),
+        }
+    }
+
+    pub(crate) fn row_candidate_rl<const ROW_LOG: usize>(
+        &self,
+        abs_pos: usize,
+        lit_len: usize,
+    ) -> Option<MatchCandidate> {
+        debug_assert_eq!(ROW_LOG, self.row_log);
         let concat = self.live_history();
         let current_idx = abs_pos - self.history_abs_start;
         if current_idx + ROW_MIN_MATCH_LEN > concat.len() {
@@ -857,9 +944,9 @@ impl RowMatchGenerator {
         }
 
         let (row, tag) = self.hash_and_row(abs_pos)?;
-        let row_entries = 1usize << self.row_log;
+        let row_entries = 1usize << ROW_LOG;
         let row_mask = row_entries - 1;
-        let row_base = row << self.row_log;
+        let row_base = row << ROW_LOG;
         let head = self.row_heads[row] as usize;
         let max_walk = self.search_depth.min(row_entries);
 
@@ -935,9 +1022,9 @@ impl RowMatchGenerator {
         )
     }
 
-    fn insert_positions(&mut self, start: usize, end: usize) {
+    fn insert_positions<const ROW_LOG: usize>(&mut self, start: usize, end: usize) {
         for pos in start..end {
-            self.insert_position(pos);
+            self.insert_position::<ROW_LOG>(pos);
         }
     }
 
@@ -951,26 +1038,31 @@ impl RowMatchGenerator {
     /// entire block: that O(matchlen) fill, not the search, is what left
     /// the row backend ~11x slower than FFI on those streams. The donor
     /// caps the fill at 96 + 32 positions regardless of match length.
-    fn insert_match_span(&mut self, start: usize, end: usize) {
+    fn insert_match_span<const ROW_LOG: usize>(&mut self, start: usize, end: usize) {
         const SKIP_THRESHOLD: usize = 384;
         const MAX_START: usize = 96;
         const MAX_END: usize = 32;
         if end.saturating_sub(start) > SKIP_THRESHOLD {
-            self.insert_positions(start, start + MAX_START);
-            self.insert_positions(end - MAX_END, end);
+            self.insert_positions::<ROW_LOG>(start, start + MAX_START);
+            self.insert_positions::<ROW_LOG>(end - MAX_END, end);
         } else {
-            self.insert_positions(start, end);
+            self.insert_positions::<ROW_LOG>(start, end);
         }
     }
 
-    fn insert_positions_with_step(&mut self, start: usize, end: usize, step: usize) {
+    fn insert_positions_with_step<const ROW_LOG: usize>(
+        &mut self,
+        start: usize,
+        end: usize,
+        step: usize,
+    ) {
         if step <= 1 {
-            self.insert_positions(start, end);
+            self.insert_positions::<ROW_LOG>(start, end);
             return;
         }
         let mut pos = start;
         while pos < end {
-            self.insert_position(pos);
+            self.insert_position::<ROW_LOG>(pos);
             let next = pos.saturating_add(step);
             if next <= pos {
                 break;
@@ -980,13 +1072,17 @@ impl RowMatchGenerator {
     }
 
     #[inline]
-    fn insert_position(&mut self, abs_pos: usize) {
+    fn insert_position<const ROW_LOG: usize>(&mut self, abs_pos: usize) {
         let Some((row, tag)) = self.hash_and_row(abs_pos) else {
             return;
         };
-        let row_entries = 1usize << self.row_log;
+        // `ROW_LOG` is the compile-time row width for this monomorphisation;
+        // the dispatcher guarantees `ROW_LOG == self.row_log` so the table
+        // bounds (`ensure_tables` sized by `self.row_log`) hold.
+        debug_assert_eq!(ROW_LOG, self.row_log);
+        let row_entries = 1usize << ROW_LOG;
         let row_mask = row_entries - 1;
-        let row_base = row << self.row_log;
+        let row_base = row << ROW_LOG;
         // SAFETY: `hash_and_row` masks `row` to `row_hash_log` bits and
         // `row_heads.len() == 1 << row_hash_log` by `ensure_tables`.
         // `row_base = row << row_log = row * row_entries` and

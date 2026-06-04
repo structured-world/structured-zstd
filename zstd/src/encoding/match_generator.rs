@@ -1559,6 +1559,8 @@ impl Matcher for MatchGeneratorDriver {
                 // Greedy parse (depth 0) = donor-greedy entry (default
                 // `ip + 1` start, greedy repcode commit); lazy / lazy2 use
                 // the `pick_lazy_match` lookahead entry (reads `lazy_depth`).
+                // Both bare entries dispatch on `row_log` internally into the
+                // const-`ROW_LOG` hot loop (donor per-rowLog variant table).
                 let greedy = self.parse == super::strategy::ParseMode::Greedy;
                 let row = self.row_matcher_mut();
                 if greedy {
@@ -1622,65 +1624,26 @@ impl Matcher for MatchGeneratorDriver {
 }
 
 impl MatchGeneratorDriver {
-    /// Monomorphised per-block encoder entry point. Each call from
-    /// [`Matcher::start_matching`] picks one concrete `S: Strategy` via
-    /// the [`super::strategy::StrategyTag`] resolved at `reset()`, so
-    /// the optimiser compiles a separate copy of this body per
-    /// strategy with `S::USE_BT` / `S::USE_HASH3` / `S::ACCURATE_PRICE`
-    /// inlined as compile-time constants. The backend dispatch below
-    /// is a `match S::BACKEND` over an associated `const`, so the
-    /// compiler keeps exactly one arm per monomorphisation.
+    /// Monomorphised optimal-parser entry point. Only the `BinaryTree`
+    /// search arm of [`Matcher::start_matching`] routes here, selecting
+    /// the concrete opt `S: Strategy` (BtOpt / BtUltra / BtUltra2) off
+    /// `strategy_tag`, so the optimiser keeps the cost-model predicates
+    /// (`S::USE_BT` / `S::USE_HASH3` / `S::ACCURATE_PRICE` /
+    /// `S::TWO_PASS_SEED`) const-folded per strategy. The non-opt search
+    /// backends (Fast / DoubleFast / RowHash / HashChain) are dispatched
+    /// directly off the search axis and never reach this method, so all
+    /// strategies arriving here are HashChain-backed.
     fn compress_block<S: super::strategy::Strategy>(
         &mut self,
         handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
     ) {
-        use super::strategy::BackendTag;
-        match S::BACKEND {
-            BackendTag::Simple => {
-                // FastKernelMatcher's `start_matching` is a SINGLE
-                // call per block — the donor-shape kernel walks the
-                // entire block internally and emits every
-                // `Sequence::Triple` through the handler. Replaces
-                // the legacy MatchGenerator's
-                // `while matcher.next_sequence(...) {}` loop where
-                // each iteration produced at most one sequence and
-                // re-paid the dispatch cost. The terminal
-                // `Sequence::Literals` (from `tail_literals_len`)
-                // also flows through this same handler invocation.
-                self.simple_mut().start_matching(&mut *handle_sequence);
-                self.recycle_simple_space();
-            }
-            BackendTag::Dfast => self.dfast_matcher_mut().start_matching(handle_sequence),
-            BackendTag::Row => {
-                // The Row backend is currently selected only by
-                // `StrategyTag::Greedy` (level 4) — see
-                // `StrategyTag::backend` in `strategy.rs`. Donor
-                // `ZSTD_compressBlock_lazy_generic` with `depth == 0`
-                // is a structurally different parse (default
-                // `start = ip + 1`, greedy repcode commit,
-                // immediate-rep loop after store) versus the lazy /
-                // lazy2 parse the plain `start_matching` runs, so L4
-                // dispatches directly to `start_matching_greedy`.
-                //
-                // The `debug_assert!` documents the invariant: any
-                // future routing of L5+ through the Row backend must
-                // first decide whether `start_matching_greedy` (depth
-                // == 0) or `start_matching` (depth >= 1, with
-                // `pick_lazy_match`) is the right entry point and
-                // adjust this dispatch accordingly. Today only
-                // `lazy_depth == 0` ever lands here.
-                let matcher = self.row_matcher_mut();
-                debug_assert_eq!(
-                    matcher.lazy_depth, 0,
-                    "Row backend currently expects lazy_depth == 0 (donor-greedy); \
-                     wire a depth-aware dispatch before routing lazy levels here",
-                );
-                matcher.start_matching_greedy(handle_sequence);
-            }
-            BackendTag::HashChain => self
-                .hc_matcher_mut()
-                .start_matching_strategy::<S>(handle_sequence),
-        }
+        debug_assert_eq!(S::BACKEND, super::strategy::BackendTag::HashChain);
+        debug_assert!(
+            S::USE_BT,
+            "compress_block only handles the optimal (BT) path"
+        );
+        self.hc_matcher_mut()
+            .start_matching_strategy::<S>(handle_sequence);
     }
 }
 
