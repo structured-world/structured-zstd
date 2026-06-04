@@ -3011,29 +3011,52 @@ mod tests {
         assert_eq!(level_pre_split(CompressionLevel::Level(22)), Some(4));
     }
 
-    /// End-to-end: a 256 KB heterogeneous payload compressed at Level(5)
+    /// End-to-end: a 256 KB payload whose SECOND 128 KB donor block carries
+    /// an intra-block fingerprint transition, compressed at Level(5)
     /// (greedy, the pre-split path this revision routes through the cheap
-    /// chunk splitter) round-trips through the crate's own decoder. The
-    /// pre-split path runs over the first 128 KB block and may emit two
-    /// consecutive sub-blocks; the second 128 KB block goes through the
-    /// splitter on its own. The test proves the split decisions do not
-    /// corrupt the frame bitstream. Level 13 (lazy) no longer pre-splits,
-    /// so the fixture uses Level 5 to keep the
-    /// `compress() -> optimal_block_size() -> split_block_by_chunks()`
-    /// wiring covered.
+    /// chunk splitter), round-trips through the crate's own decoder.
+    ///
+    /// The transition lives in the second block on purpose: the donor
+    /// `savings < 3` gate skips splitting the first block (savings start at
+    /// 0), so the first block is a homogeneous compressible run that banks
+    /// savings, and the second block is the one whose intra-block transition
+    /// `split_block_by_chunks()` resolves into a sub-block boundary (the
+    /// `pending_input.split_off(...)` path). The test asserts that split
+    /// decision directly so it cannot silently stop exercising the path if
+    /// the fixture or params drift, then proves the emitted split frame
+    /// round-trips. Level 13 (lazy) no longer pre-splits, hence Level 5.
     #[test]
     fn greedy_chunk_split_roundtrips_through_own_decoder() {
         use crate::encoding::CompressionLevel;
         let mut data = vec![0u8; 256 * 1024];
-        // First 128 KB: low-entropy repeating run; second 128 KB:
-        // counter sequence, clearly distinct sub-block fingerprints.
+        // First 128 KB: homogeneous low-entropy run (compressible, banks
+        // the savings the donor gate needs). Second 128 KB: low-entropy run
+        // for its first half, then a counter sequence: a clear intra-block
+        // fingerprint transition at the 192 KB midpoint for the chunk
+        // splitter to find.
         for (i, byte) in data.iter_mut().enumerate() {
-            *byte = if i < 128 * 1024 {
+            *byte = if i < 192 * 1024 {
                 (i & 0x07) as u8
             } else {
                 (i % 251 + 1) as u8
             };
         }
+
+        // Directly assert the chunk splitter resolves the second block's
+        // intra-block transition into a sub-block boundary once savings have
+        // accrued (the compressible first block banks well over the gate).
+        let second_block = &data[128 * 1024..];
+        let split = super::optimal_block_size(
+            CompressionLevel::Level(5),
+            second_block,
+            second_block.len(),
+            MAX_BLOCK_SIZE as usize,
+            100,
+        );
+        assert!(
+            split < MAX_BLOCK_SIZE as usize,
+            "second donor block must chunk-split at its intra-block transition, got {split}",
+        );
 
         let mut compressed = Vec::new();
         let mut compressor = FrameCompressor::new(CompressionLevel::Level(5));
