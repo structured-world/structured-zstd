@@ -482,7 +482,7 @@ impl RowMatchGenerator {
 
             let best = self.best_match(abs_pos, lit_len);
             if let Some(candidate) = self.pick_lazy_match(abs_pos, lit_len, best) {
-                self.insert_positions(abs_pos, candidate.start + candidate.match_len);
+                self.insert_match_span(abs_pos, candidate.start + candidate.match_len);
                 let current = self.window.back().unwrap().as_slice();
                 let start = candidate.start - current_abs_start;
                 let literals = &current[literals_start..start];
@@ -653,24 +653,20 @@ impl RowMatchGenerator {
             //     ties / near-ties the rep wins by being cheaper to
             //     encode (single-digit-bit offset code vs 9-13 bits for
             //     a regular offset).
-            let regular_match = self.row_candidate(abs_pos, lit_len);
-            let chosen = match (rep_match, regular_match) {
-                (Some(rep), Some(reg)) => {
-                    // Prefer the longer; tie-break to rep for cheaper
-                    // encoding. `best_len_offset_candidate` ties on
-                    // shorter offset which is the wrong direction for
-                    // rep-vs-regular (regular offsets are always bigger
-                    // than the corresponding rep, so it would always
-                    // pick rep on ties — that's the right choice here
-                    // but we want strict length preference too).
-                    if reg.match_len > rep.match_len {
-                        Some(reg)
-                    } else {
-                        Some(rep)
-                    }
-                }
-                (Some(rep), None) => Some(rep),
-                (None, reg) => reg,
+            // Donor greedy (depth 0): a repcode hit commits immediately and
+            // SKIPS the regular row search (`zstd_lazy.c:2039`,
+            // `if (depth==0) goto _storeSequence`). The regular
+            // `row_candidate` (SIMD row scan + match extension) is the
+            // dominant per-position cost; running it on every rep hit made
+            // rep-dense inputs (repetitive logs) up to ~11x slower than the
+            // donor, which short-circuits. So only run the regular search
+            // when there is no rep to take. `row_candidate` is `&self` (a
+            // pure search, no table mutation), so skipping it drops no hash
+            // insert — the post-emit `insert_positions(abs_pos, ..)` still
+            // indexes the committed span.
+            let chosen = match rep_match {
+                Some(rep) => Some(rep),
+                None => self.row_candidate(abs_pos, lit_len),
             };
 
             let Some(candidate) = chosen else {
@@ -707,7 +703,7 @@ impl RowMatchGenerator {
             // `candidate.start` lower bound regresses `rust_bytes` by
             // ~+447 over `abs_pos` (537897 -> 538344), so the
             // narrower range is intentional.
-            self.insert_positions(abs_pos, candidate.start + candidate.match_len);
+            self.insert_match_span(abs_pos, candidate.start + candidate.match_len);
             let current = self.window.back().unwrap().as_slice();
             let literals = &current[literals_start..start];
             handle_sequence(Sequence::Triple {
@@ -906,7 +902,15 @@ impl RowMatchGenerator {
             if match_len >= ROW_MIN_MATCH_LEN {
                 let candidate = self.extend_backwards(candidate_pos, abs_pos, match_len, lit_len);
                 best = best_len_offset_candidate(best, Some(candidate));
-                if best.is_some_and(|best| best.match_len >= self.target_len) {
+                // Donor `ZSTD_RowFindBestMatch` walks every probed slot and
+                // keeps the longest; its only early break is "best possible"
+                // (the match already reaches the block end, so no later slot
+                // can beat it). cParams.targetLength is the LAZY outer loop's
+                // nice-match threshold, NOT a row-search cutoff — gating the
+                // row walk on it (target_len=2 at level 5) returned the first
+                // most-recent slot instead of the longest, inflating sequence
+                // count and losing ratio. Keep only the best-possible break.
+                if best.is_some_and(|b| current_idx + b.match_len >= concat.len()) {
                     return best;
                 }
             }
@@ -934,6 +938,28 @@ impl RowMatchGenerator {
     fn insert_positions(&mut self, start: usize, end: usize) {
         for pos in start..end {
             self.insert_position(pos);
+        }
+    }
+
+    /// Index a just-emitted match span, mirroring the donor
+    /// `ZSTD_row_update_internal` skip-threshold (`zstd_lazy.c:922-940`):
+    /// when the span exceeds `SKIP_THRESHOLD` positions, only the first
+    /// `MAX_START` and last `MAX_END` are indexed and the interior is
+    /// skipped. Indexing every interior byte of a long match is
+    /// O(matchlen) and dominates encode time on periodic inputs (e.g.
+    /// repeated log lines), where a single greedy/lazy match can span an
+    /// entire block: that O(matchlen) fill, not the search, is what left
+    /// the row backend ~11x slower than FFI on those streams. The donor
+    /// caps the fill at 96 + 32 positions regardless of match length.
+    fn insert_match_span(&mut self, start: usize, end: usize) {
+        const SKIP_THRESHOLD: usize = 384;
+        const MAX_START: usize = 96;
+        const MAX_END: usize = 32;
+        if end.saturating_sub(start) > SKIP_THRESHOLD {
+            self.insert_positions(start, start + MAX_START);
+            self.insert_positions(end - MAX_END, end);
+        } else {
+            self.insert_positions(start, end);
         }
     }
 
