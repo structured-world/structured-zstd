@@ -7180,7 +7180,7 @@ fn level22_donor_block_ranges(data: &[u8]) -> Vec<(usize, usize)> {
     while cursor < data.len() {
         let remaining = data.len() - cursor;
         let candidate_len = remaining.min(HC_BLOCKSIZE_MAX);
-        let block_len = crate::encoding::frame_compressor::donor_optimal_block_size(
+        let block_len = crate::encoding::frame_compressor::optimal_block_size(
             CompressionLevel::Level(22),
             &data[cursor..cursor + candidate_len],
             remaining,

@@ -315,7 +315,7 @@ fn presplit_merge_events(acc: &mut PreSplitFingerprint, new_fp: &PreSplitFingerp
     acc.nb_events = acc.nb_events.saturating_add(new_fp.nb_events);
 }
 
-fn donor_split_block_by_chunks(block: &[u8], level: usize) -> usize {
+fn split_block_by_chunks(block: &[u8], level: usize) -> usize {
     debug_assert_eq!(block.len(), MAX_BLOCK_SIZE as usize);
     debug_assert!((1..=4).contains(&level));
     let (sampling_rate, hash_log) = match level - 1 {
@@ -361,7 +361,7 @@ fn donor_split_block_by_chunks(block: &[u8], level: usize) -> usize {
 /// size when the two ends look indistinguishable. Cheaper than the
 /// chunk-based path because it touches at most 1.5 KB of input
 /// regardless of block size.
-fn donor_split_block_from_borders(block: &[u8]) -> usize {
+fn split_block_from_borders(block: &[u8]) -> usize {
     debug_assert_eq!(block.len(), MAX_BLOCK_SIZE as usize);
     let block_size = block.len();
     let mut past = PreSplitFingerprint::default();
@@ -405,7 +405,7 @@ fn donor_split_block_from_borders(block: &[u8]) -> usize {
     }
 }
 
-fn donor_pre_split_level(level: CompressionLevel) -> Option<usize> {
+fn pre_split_level(level: CompressionLevel) -> Option<usize> {
     match level {
         // Donor `ZSTD_blockSplitter_level` table (`clevels.h`): cheap
         // borders heuristic for lazy2 / btlazy2 strategies (levels
@@ -438,7 +438,7 @@ pub(crate) fn xxh64_block_low32(data: &[u8]) -> u32 {
 /// Bench-only entry point for the donor-parity comparator test in
 /// `tests/block_splitter_donor_parity.rs`. Dispatches to the same
 /// `_from_borders` (split_level == 0) / `_by_chunks` (split_level ∈
-/// 1..=4) ports that `donor_optimal_block_size` itself routes
+/// 1..=4) ports that `optimal_block_size` itself routes
 /// through. Caller is responsible for passing exactly
 /// `MAX_BLOCK_SIZE` bytes (per donor `ZSTD_splitBlock` contract —
 /// "@blockSize must be == 128 KB" in `zstd_preSplit.h`).
@@ -454,20 +454,20 @@ pub(crate) fn block_splitter_decision_for_bench(block: &[u8], split_level: usize
         "block_splitter_decision_for_bench: split_level must be in 0..=4, got {split_level}"
     );
     if split_level == 0 {
-        donor_split_block_from_borders(block)
+        split_block_from_borders(block)
     } else {
-        donor_split_block_by_chunks(block, split_level)
+        split_block_by_chunks(block, split_level)
     }
 }
 
-pub(crate) fn donor_optimal_block_size(
+pub(crate) fn optimal_block_size(
     level: CompressionLevel,
     block: &[u8],
     remaining_src_size: usize,
     block_size_max: usize,
     savings: i64,
 ) -> usize {
-    let Some(split_level) = donor_pre_split_level(level) else {
+    let Some(split_level) = pre_split_level(level) else {
         return remaining_src_size.min(block_size_max);
     };
     if remaining_src_size < MAX_BLOCK_SIZE as usize || block_size_max < MAX_BLOCK_SIZE as usize {
@@ -484,9 +484,9 @@ pub(crate) fn donor_optimal_block_size(
     // `split_level == 1..=4` → byChunks with internal sampling level
     // `split_level - 1`.
     let raw_split = if split_level == 0 {
-        donor_split_block_from_borders(&block[..MAX_BLOCK_SIZE as usize])
+        split_block_from_borders(&block[..MAX_BLOCK_SIZE as usize])
     } else {
-        donor_split_block_by_chunks(&block[..MAX_BLOCK_SIZE as usize], split_level)
+        split_block_by_chunks(&block[..MAX_BLOCK_SIZE as usize], split_level)
     };
     raw_split
         .max(PRESPLIT_BLOCK_MIN)
@@ -988,7 +988,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             if !matches!(self.compression_level, CompressionLevel::Uncompressed)
                 && uncompressed_data.len() == block_capacity
             {
-                let block_len = donor_optimal_block_size(
+                let block_len = optimal_block_size(
                     self.compression_level,
                     &uncompressed_data,
                     remaining_for_split,
@@ -2854,9 +2854,9 @@ mod tests {
     /// function takes the early-return path at
     /// `zstd_preSplit.c:214` returning `blockSize`.
     #[test]
-    fn donor_split_block_from_borders_keeps_homogeneous_block() {
+    fn split_block_from_borders_keeps_homogeneous_block() {
         let block = vec![0xAAu8; MAX_BLOCK_SIZE as usize];
-        let split = super::donor_split_block_from_borders(&block);
+        let split = super::split_block_from_borders(&block);
         assert_eq!(split, MAX_BLOCK_SIZE as usize);
     }
 
@@ -2874,7 +2874,7 @@ mod tests {
     /// rather than just "one of {32K, 64K, 96K}" so a regression
     /// to a different quantised arm cannot silently slip through.
     #[test]
-    fn donor_split_block_from_borders_returns_midpoint_for_centred_transition() {
+    fn split_block_from_borders_returns_midpoint_for_centred_transition() {
         let mut block = vec![0u8; MAX_BLOCK_SIZE as usize];
         for (i, byte) in block
             .iter_mut()
@@ -2883,7 +2883,7 @@ mod tests {
         {
             *byte = (i % 251 + 1) as u8;
         }
-        let split = super::donor_split_block_from_borders(&block);
+        let split = super::split_block_from_borders(&block);
         assert_eq!(
             split,
             64 * 1024,
@@ -2892,42 +2892,21 @@ mod tests {
         );
     }
 
-    /// `donor_pre_split_level` maps mid-range levels to the cheap
+    /// `pre_split_level` maps mid-range levels to the cheap
     /// borders heuristic and high levels to the byChunks path. Levels
     /// below 11 stay unsplit so the splitter never runs on fast /
     /// default presets where its per-block cost would dominate.
     #[test]
-    fn donor_pre_split_level_dispatches_by_compression_level() {
+    fn pre_split_level_dispatches_by_compression_level() {
         use crate::encoding::CompressionLevel;
-        assert_eq!(
-            super::donor_pre_split_level(CompressionLevel::Fastest),
-            None
-        );
-        assert_eq!(
-            super::donor_pre_split_level(CompressionLevel::Default),
-            None
-        );
-        assert_eq!(super::donor_pre_split_level(CompressionLevel::Better), None);
-        assert_eq!(
-            super::donor_pre_split_level(CompressionLevel::Level(7)),
-            None
-        );
-        assert_eq!(
-            super::donor_pre_split_level(CompressionLevel::Level(11)),
-            Some(0)
-        );
-        assert_eq!(
-            super::donor_pre_split_level(CompressionLevel::Level(15)),
-            Some(0)
-        );
-        assert_eq!(
-            super::donor_pre_split_level(CompressionLevel::Level(16)),
-            Some(4)
-        );
-        assert_eq!(
-            super::donor_pre_split_level(CompressionLevel::Level(22)),
-            Some(4)
-        );
+        assert_eq!(super::pre_split_level(CompressionLevel::Fastest), None);
+        assert_eq!(super::pre_split_level(CompressionLevel::Default), None);
+        assert_eq!(super::pre_split_level(CompressionLevel::Better), None);
+        assert_eq!(super::pre_split_level(CompressionLevel::Level(7)), None);
+        assert_eq!(super::pre_split_level(CompressionLevel::Level(11)), Some(0));
+        assert_eq!(super::pre_split_level(CompressionLevel::Level(15)), Some(0));
+        assert_eq!(super::pre_split_level(CompressionLevel::Level(16)), Some(4));
+        assert_eq!(super::pre_split_level(CompressionLevel::Level(22)), Some(4));
     }
 
     /// End-to-end: a 256 KB heterogeneous payload compressed at

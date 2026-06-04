@@ -318,7 +318,7 @@ fn compress_and_collect_sequences_impl(
     // counter. Two distinct splitter mechanisms exist in
     // `frame_compressor.rs`:
     //
-    // * Pre-split (`Level(11..=15)` borders + `donor_optimal_block_size`,
+    // * Pre-split (`Level(11..=15)` borders + `optimal_block_size`,
     //   borders-only): the splitter chooses a shrunken `block_len`
     //   BEFORE the matcher runs; the suffix is parked in
     //   `pending_input` and the next compress-loop iteration calls
@@ -783,7 +783,7 @@ mod tests {
     /// physical on-wire blocks per single matcher call — the
     /// per-matcher-call counter cannot track that shape.
     /// `Level(11..=15)` is intentionally NOT rejected: those levels
-    /// pre-split via `donor_optimal_block_size` (borders), so each
+    /// pre-split via `optimal_block_size` (borders), so each
     /// shrunken block is processed by its own matcher call and the
     /// counter stays correct.
     #[test]
@@ -796,7 +796,7 @@ mod tests {
     }
 
     /// `Best` is documented as "roughly equivalent to Level 11" but
-    /// `donor_pre_split_level` matches the EXACT enum variants
+    /// `pre_split_level` matches the EXACT enum variants
     /// (`Level(11..=15)` / `Level(16..=22)`) — the `Best` arm
     /// falls through to `None`, so the named preset does NOT
     /// trigger the donor block-splitter. The guard above

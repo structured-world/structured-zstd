@@ -1,6 +1,6 @@
 //! Donor-parity verification for the block splitter port.
 //!
-//! Our `donor_split_block_from_borders` and `donor_split_block_by_chunks`
+//! Our `split_block_from_borders` and `split_block_by_chunks`
 //! ports must produce byte-identical decisions to upstream donor
 //! `ZSTD_splitBlock` for every (block, split_level) input in the
 //! decode corpus. This test invokes both implementations on the same
@@ -16,8 +16,8 @@
 //! issue acceptance criteria, divergences correlating with ratio
 //! losses would justify porting more donor split logic; divergences
 //! that are size-neutral represent algorithmic freedom. Today we
-//! assert STRICT equality because `donor_split_block_from_borders`
-//! and `donor_split_block_by_chunks` are direct ports — any
+//! assert STRICT equality because `split_block_from_borders`
+//! and `split_block_by_chunks` are direct ports; any
 //! divergence is a porting bug, not algorithmic freedom.
 
 use std::ffi::c_void;
