@@ -287,13 +287,14 @@ impl LevelParams {
         self.search.backend()
     }
 
-    /// Parse mode for the greedy/lazy band, read off `lazy_depth`. The
-    /// opt tags carry `ParseMode::Optimal` regardless of `lazy_depth`.
+    /// Parse mode derived from the decoupled `search` axis: the binary-tree
+    /// search path carries `ParseMode::Optimal`; every other search backend
+    /// derives greedy/lazy/lazy2 from `lazy_depth`. Reading `search` (not the
+    /// strategy tag) keeps the parse×search decoupling complete even when a
+    /// level whose tag is `Bt*` is overridden to a non-BT search backend.
     fn parse(&self) -> super::strategy::ParseMode {
-        match self.strategy_tag {
-            super::strategy::StrategyTag::BtOpt
-            | super::strategy::StrategyTag::BtUltra
-            | super::strategy::StrategyTag::BtUltra2 => super::strategy::ParseMode::Optimal,
+        match self.search {
+            super::strategy::SearchMethod::BinaryTree => super::strategy::ParseMode::Optimal,
             _ => super::strategy::ParseMode::from_lazy_depth(self.lazy_depth),
         }
     }
@@ -1050,9 +1051,11 @@ impl Matcher for MatchGeneratorDriver {
         // exercised without editing `LEVEL_TABLE`. Mutating `params` here
         // (before `next_backend`) flows the override through storage
         // selection, `configure`, and the `self.search`/`self.parse`
-        // writes uniformly. Opt strategies keep their `Optimal` parse.
+        // writes uniformly. Consumed with `take()` so it is one-shot: the
+        // synthetic pairing applies to exactly this `reset()`, and a later
+        // reset on the same driver falls back to the level's real config.
         #[cfg(test)]
-        if let Some((search, parse)) = self.config_override {
+        if let Some((search, parse)) = self.config_override.take() {
             params.search = search;
             params.lazy_depth = parse.lazy_depth();
         }
@@ -4702,6 +4705,43 @@ fn row_mls_knob_gates_matches_and_roundtrips() {
             );
         }
     }
+}
+
+/// `LevelParams::parse()` derives the parse mode from the `search` axis, not
+/// the strategy tag, so the decoupling holds even for a `Bt*`-tagged level
+/// overridden to a non-BT search backend. Pre-fix the method matched on
+/// `strategy_tag` and returned `Optimal` for any `Bt*` tag regardless of
+/// `search`/`lazy_depth`.
+#[test]
+fn parse_mode_follows_search_axis_not_strategy_tag() {
+    use super::strategy::{ParseMode, SearchMethod};
+    // LEVEL_TABLE[15] is level 16: BtOpt tag, BinaryTree search.
+    let mut p = LEVEL_TABLE[15];
+    assert_eq!(p.parse(), ParseMode::Optimal, "BinaryTree search → Optimal");
+    // Override the Bt-tagged level's search to a non-BT backend: parse must
+    // follow the search axis (derive from lazy_depth), not stay Optimal.
+    p.search = SearchMethod::RowHash;
+    p.lazy_depth = 0;
+    assert_eq!(p.parse(), ParseMode::Greedy, "RowHash + depth 0 → Greedy");
+    p.lazy_depth = 2;
+    assert_eq!(p.parse(), ParseMode::Lazy2, "RowHash + depth 2 → Lazy2");
+}
+
+/// The test-only `config_override` is consumed by the first `reset()` (one
+/// shot), so a reused driver does not silently keep the synthetic pairing
+/// armed across later resets. Pre-fix `reset()` copied the override and left
+/// it set.
+#[test]
+fn config_override_is_consumed_by_reset() {
+    use super::strategy::{ParseMode, SearchMethod};
+    let mut driver = MatchGeneratorDriver::new(1 << 17, 8);
+    driver.set_config_override(SearchMethod::RowHash, ParseMode::Lazy2);
+    assert!(driver.config_override.is_some());
+    driver.reset(CompressionLevel::Level(5));
+    assert!(
+        driver.config_override.is_none(),
+        "override must be consumed after one reset",
+    );
 }
 
 #[cfg(test)]
