@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780582721005,
+  "lastUpdate": 1780606002747,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -56426,6 +56426,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.272,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "3c62136663ce68a769a9941f300bc53e2a0959bf",
+          "message": "perf(encode): donor-correct block-split + block-precise decode errors (#336)\n\n* refactor(encode): rename block-splitter fns to describe behaviour\n\nDrop the reference-impl prefix from the pre-split identifiers, naming them\nfor what they do: split_block_by_chunks, split_block_from_borders,\npre_split_level, optimal_block_size. Reference attribution stays in the\ndoc comments (prose), not in the identifiers.\n\nPure rename across the splitter, its callers, tests, and comment\nreferences. Byte-identical, 683 tests pass.\n\n* perf(encode): pre-split greedy/lazy blocks via donor splitLevels\n\nExtend the cheap fingerprint pre-splitter to the greedy and lazy bands,\nmirroring the donor `splitLevels[]` table by strategy: greedy → 1,\nlazy/lazy2 → 2, btlazy2 → 3, btopt/btultra/btultra2 → 4. Previously only\nlevels 11..=22 pre-split (and 11..=15 used the weaker borders heuristic).\n\nThis gives greedy/lazy per-sub-block entropy tables on heterogeneous\ninput (the dominant literal-section ratio loss vs the C reference)\nthrough the cheap raw-input fingerprint, not the expensive post-parse\nsuper-block splitter. Fast/dfast (1..=4) stay un-split: their\nmatch-finding is cheap enough that the splitter would cost more\nthroughput than the ratio it buys.\n\n683 tests pass; behaviour change is bench-gated (ratio gain vs the added\nper-sub-block cost validated on the bench host).\n\n* refactor(encode): move block-split level into LevelParams\n\nSurface the cheap pre-splitter level as a `LevelParams::pre_split()` knob\n(the C-like `blockSplitterLevel`), derived per strategy like `backend()`\nand `parse()`, and expose it via `level_pre_split()`. The frame loop reads\nit there instead of hardcoding the level-to-split mapping at the call\nsite, so the split config sits next to search/parse/mls in the per-level\ntable.\n\nNamed presets (Fastest/Default/Better/Best) keep whole blocks: splitting\nthem regressed ratio on tiny highly-compressible frames where the\nper-sub-block header + entropy-table overhead outweighs the fit gain.\nOnly explicit numeric levels carry the split. 683 tests pass.\n\n* refactor(encode): named levels are pure aliases; scope pre-split to greedy\n\nResolve named presets to their numeric level via `numeric_level()` so the\nsplit knob (and the rest of the per-level config) is read uniformly from\nthe `LevelParams` table; named presets are aliases, never a separate path.\nRemoves the earlier named-preset special-case in `level_pre_split`.\n\nScope the cheap pre-splitter to the greedy band (the one whose\nsingle-block literal section actually loses to the reference). Lazy stays\nunsplit: its ratio already tracks the reference, and splitting it regresses\non highly-compressible frames until the per-block entropy path reuses\ntables as aggressively as the reference (tracked separately). Fast/dfast\nstay unsplit (cheap match-finding). btopt+ keep their existing level-4\nsplit.\n\n683 tests pass, clippy + fmt clean.\n\n* perf(encode): fast-band FSE repeat-mode to make splitting cheap\n\nAdd the donor `preferRepeat` shortcut to the FSE table selector: for\nfast/dfast/greedy with a valid (symbol-covering) previous table and fewer\nthan 1000 sequences, reuse it without building a new table or emitting a\ndescriptor. This mirrors `ZSTD_selectEncodingType`\n(zstd_compress_sequences.c:179-204) and is the per-block cost that made\ngreedy block-splitting expensive: each sub-block was rebuilding and\nre-emitting all three FSE tables instead of reusing the previous block's.\n\nThread the strategy through both the real encode path and the splitter's\nsize estimator so split decisions match the emitted bytes. 684 tests pass\n(roundtrip + cross-validation unchanged), clippy + fmt clean.\n\n* feat(decoding): block-precise error positions (lsm)\n\nAdd feature-gated `FailedToReadBlockHeaderAt` / `FailedToReadBlockBodyAt`\nvariants to `FrameDecoderError` carrying the failing block's 0-based index\nand frame-absolute offset (and, for the body, the block's `FrameBlock`\nmetadata reconstructed from its header). Lets consumers doing per-block ECC\nrepair locate and repair exactly the bad block instead of re-fetching the\nwhole frame.\n\nNew variants are `#[cfg(feature = \"lsm\")]`; without the feature the legacy\npositionless variants are unchanged, so the default build's error surface\n(and the cdylib C-FFI drop-in) stays byte-identical. Coordinates are\ncaptured before each block read across all three decode loops (decode_blocks,\nthe streaming loop, and the direct decode_all path); the offset matches the\nencoder's `FrameEmitInfo.blocks[index].offset_in_frame`.\n\nCloses #174. 684 tests (default) + 713 (lsm) pass, clippy + fmt clean both.\n\n* feat(encode): add reusable compression context (CCtx-equivalent)\n\nAdd `FrameCompressor::compress_independent_frame{,_into}` for emitting N\nindependent, self-describing frames from one reused compressor, mirroring\nC `ZSTD_CCtx` + `ZSTD_compress2`:\n\n- one independent frame per call (own header/FCS/checksum, no cross-frame\n  match history), reusing the matcher tables, scratch, FSE/Huffman seeds,\n  and any sticky dictionary so per-frame setup is paid once, not N times\n- the `_into` form also reuses the caller's output buffer, matching C's\n  caller-owned `dst` (no per-frame output allocation)\n- input is read in place; its lifetime is not baked into the compressor\n  type, so successive calls may pass slices with unrelated lifetimes\n\nRefactor to share one frame pipeline:\n\n- `run_owned_block_loop` reads from a caller-supplied source so the\n  streaming and slice paths share it without a lifetime-bound reader field\n- extract `run_one_frame` (borrowed/owned dispatch), `build_frame_header`,\n  `write_frame_to_vec`, and `populate_frame_emit_info` from `finish_frame`\n- `compress_slice_to_vec` now wraps `compress_independent_frame`, dropping\n  the internal `compress_oneshot_borrowed` and `compress_bound` helpers\n- `FrameCompressor` gains default type params so the bare type names the\n  reusable shape\n\nTests: reuse emits byte-identical frames to a fresh compressor across Fast\n(borrowed) and owned backends, the `_into` buffer is replaced not appended,\nand a sticky dictionary is re-primed into every frame.\n\nPart of #316\n\n* test(bench): add clean dict/small-input encode-loop profiling example\n\nStandalone perf-record harness for the encoder hot path on small inputs\nwith/without a dictionary. The compare_ffi dictionary bench cannot be\nflamegraphed for the timed compress: its per-scenario setup trains\ndictionaries and runs a validation decode for every scenario before the\nfiltered group, polluting a compress-filtered flamegraph with training /\ndecoder frames that never run in the timed loop.\n\nThis binary parses the dictionary once, then loops\ncompress_independent_frame_into over a contiguous slice, reusing the\ncompressor and output buffer (the reusable-context shape) so the profile\nisolates the per-frame cost (dictionary prime + optimal parse + entropy)\nwith no training, decode, or FFI symbols mixed in. `logs<N>` input\nreproduces the *-log-lines bench fixtures byte for byte.\n\nPart of #316\n\n* test(encode): broaden fast-band + pre-split coverage, borrow in decode assert\n\n- fast_band_strategies_prefer_repeat_fse_table: assert all three eligible\n  strategies (Fast, Dfast, Greedy), not just Greedy, so an enum-arm\n  regression in the reuse branch is caught.\n- retarget the end-to-end pre-split roundtrip from Level 13 (lazy, no longer\n  pre-splits) to Level 5 (greedy), the chunk-split path this revision\n  introduces, so compress -> optimal_block_size -> split_block_by_chunks\n  stays covered. Renamed accordingly.\n- borrow `result` in the truncated-frame match so the value stays usable in\n  the trailing assert format string.\n\n* test(encode): force second-block transition so chunk split is exercised\n\nThe greedy chunk-split roundtrip changed entropy only between the two donor\nblocks, leaving each block internally homogeneous. The donor savings<3 gate\nskips splitting the first block anyway, so split_block_by_chunks could return\nMAX_BLOCK_SIZE for both blocks and the pending_input.split_off path was never\nhit. Move the fingerprint transition into the second donor block (after the\ncompressible first block banks savings) and assert optimal_block_size returns\na sub-block boundary, so the test provably exercises chunk splitting before\nthe roundtrip rather than passing vacuously.",
+          "timestamp": "2026-06-04T22:54:26+03:00",
+          "tree_id": "cfe1869915384a3a6f89e2efbff978bfb42c6a6f",
+          "url": "https://github.com/structured-world/structured-zstd/commit/3c62136663ce68a769a9941f300bc53e2a0959bf"
+        },
+        "date": 1780605994382,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.106,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.068,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 236.402,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 158.672,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.219,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.19,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.961,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.61,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.859,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.566,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.092,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.207,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.092,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.207,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.03,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 13.028,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.353,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.786,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.316,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.674,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.062,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.754,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.098,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.119,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.265,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.119,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.26,
             "unit": "ms"
           }
         ]
