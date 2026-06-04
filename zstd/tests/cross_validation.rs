@@ -52,6 +52,53 @@ fn cross_rust_compress_ffi_decompress_1000() {
     }
 }
 
+/// Regression for the rebase-style `reset`: a reused compressor advances
+/// the absolute-position floor across independent frames instead of zeroing
+/// the matcher tables. Every frame must still decode through C zstd, proving
+/// the previous frame's stale table entries never leak into the next frame's
+/// match decisions. Level 22 (optimal parser, binary-tree backend) is the
+/// most sensitive path; the frames are sized into one source-size tier so the
+/// matcher reuses the same tables and the floor-advance path (not a realloc)
+/// is the one exercised.
+#[test]
+fn cross_rust_reused_compressor_level22_ffi_decompress() {
+    let mut enc: FrameCompressor = FrameCompressor::new(CompressionLevel::from_level(22));
+    for i in 0..64u64 {
+        // ~4 KiB, same tier each iteration; distinct, compressible content.
+        let data = generate_huffman_friendly(i.wrapping_add(1), 4096, 24);
+        let compressed = enc.compress_independent_frame(&data);
+        let result = zstd::decode_all(compressed.as_slice()).unwrap_or_else(|e| {
+            panic!("reused-compressor rust→ffi decode failed at frame {i}: {e}");
+        });
+        assert_eq!(
+            data, result,
+            "reused-compressor rust→ffi roundtrip failed at frame {i}"
+        );
+    }
+}
+
+/// Companion to the level-22 reuse test that also varies the frame size so
+/// the source-size tier (and therefore the table dimensions) changes between
+/// frames. This exercises the path where `reset` advances the floor but a
+/// later `ensure_tables` reallocates the tables clean, alongside the pure
+/// floor-advance path.
+#[test]
+fn cross_rust_reused_compressor_varied_sizes_ffi_decompress() {
+    let mut enc: FrameCompressor = FrameCompressor::new(CompressionLevel::from_level(19));
+    for i in 0..64u64 {
+        let len = (1024 + (i * 1531) % 96_000) as usize;
+        let data = generate_huffman_friendly(i.wrapping_add(7), len, 40);
+        let compressed = enc.compress_independent_frame(&data);
+        let result = zstd::decode_all(compressed.as_slice()).unwrap_or_else(|e| {
+            panic!("varied-size reuse rust→ffi decode failed at frame {i}, len={len}: {e}");
+        });
+        assert_eq!(
+            data, result,
+            "varied-size reuse rust→ffi roundtrip failed at frame {i}, len={len}"
+        );
+    }
+}
+
 #[test]
 fn cross_rust_fastest_with_source_hint_ffi_decompress_iteration_23() {
     let i = 23u64;

@@ -7178,17 +7178,55 @@ fn hc_chain_candidates_returns_sentinels_for_short_suffix() {
 }
 
 #[test]
-fn hc_reset_refills_existing_tables_with_empty_sentinel() {
+fn hc_reset_advances_floor_past_prior_frame_entries() {
+    use super::match_table::storage::MatchTable;
     let mut hc = HcMatchGenerator::new(32);
     hc.table.add_data(b"abcdeabcde".to_vec(), |_| {});
     hc.table.ensure_tables();
-    assert!(!hc.table.hash_table.is_empty());
-    assert!(!hc.table.chain_table.is_empty());
-    hc.table.hash_table.fill(123);
-    hc.table.chain_table.fill(456);
+    // Populate real hash / chain entries for the first frame's positions.
+    hc.table.insert_positions(0, 6);
+    let prev_end = hc.table.history_abs_end();
+    assert_eq!(prev_end, 10);
+    assert!(hc.table.hash_table.iter().any(|&v| v != HC_EMPTY));
 
     hc.reset(|_| {});
 
+    // Behavioural contract: the previous frame's entries are no longer
+    // matchable. `reset` advances the floor past every prior position
+    // instead of zeroing the tables, so each populated slot now decodes
+    // to an absolute position strictly below `history_abs_start` and is
+    // rejected by the `window_low` guard before any byte is read.
+    assert_eq!(hc.table.history_abs_start, prev_end);
+    for &slot in hc.table.hash_table.iter() {
+        if let Some(candidate_abs) =
+            MatchTable::stored_abs_position_fast(slot, hc.table.position_base, hc.table.index_shift)
+        {
+            assert!(
+                candidate_abs < hc.table.history_abs_start,
+                "a prior-frame entry must resolve below the advanced floor"
+            );
+        }
+    }
+}
+
+#[test]
+fn hc_reset_full_zeroes_when_floor_would_cross_ceiling() {
+    use super::match_table::storage::REBASE_RESET_FLOOR_CEILING;
+    let mut hc = HcMatchGenerator::new(32);
+    hc.table.add_data(b"abcdeabcde".to_vec(), |_| {});
+    hc.table.ensure_tables();
+    hc.table.hash_table.fill(123);
+    hc.table.chain_table.fill(456);
+    // Push the would-be floor (`history_abs_end`) past the ceiling so
+    // `reset` takes the bounded fallback: rewind to the origin and zero
+    // the tables, keeping the absolute cursor from climbing toward
+    // `usize::MAX` on 32-bit targets.
+    hc.table.history_abs_start = REBASE_RESET_FLOOR_CEILING;
+
+    hc.reset(|_| {});
+
+    assert_eq!(hc.table.history_abs_start, 0);
+    assert_eq!(hc.table.position_base, 0);
     assert!(hc.table.hash_table.iter().all(|&v| v == HC_EMPTY));
     assert!(hc.table.chain_table.iter().all(|&v| v == HC_EMPTY));
 }

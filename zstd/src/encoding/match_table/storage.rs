@@ -34,6 +34,23 @@ use super::helpers::INCOMPRESSIBLE_SKIP_STEP;
 /// 32-bit targets without per-call saturating guards.
 pub(crate) const STREAM_ABS_HEADROOM: usize = HC_OPT_NUM + 16;
 
+/// Ceiling on the absolute-position floor (`history_abs_start`) that the
+/// rebase-style `reset` is allowed to advance to before it falls back to a
+/// full table zeroing.
+///
+/// `reset` invalidates the previous frame's table entries by advancing
+/// `history_abs_start` past the previous frame's end (a per-position
+/// `window_low` reject then drops every stale candidate before it is ever
+/// dereferenced), instead of memset-ing the hash / chain / hash3 tables.
+/// That keeps the absolute cursor monotonic across independent frames in a
+/// reused compressor, so the floor grows by one frame per `reset`. Once it
+/// crosses this ceiling, `reset` does the original full zeroing and rewinds
+/// the floor to `0`, which bounds `history_abs_start` so
+/// [`check_stream_abs_headroom`] stays satisfiable on 32-bit targets (where
+/// `usize::MAX` is ~4.29e9): the fallback fires roughly once per 2 GiB of
+/// cumulative input on a 32-bit build and is astronomically far on 64-bit.
+pub(crate) const REBASE_RESET_FLOOR_CEILING: usize = usize::MAX >> 1;
+
 /// Frame-level overflow gate shared by `MatchTable`,
 /// `DfastMatchGenerator`, and `RowMatchGenerator`.
 ///
@@ -640,36 +657,69 @@ impl MatchTable {
         Some(shifted - index_shift)
     }
 
-    /// Reset the per-frame portion of the storage. The hash / chain /
-    /// hash3 tables themselves are zeroed in place (via
-    /// `Vec::fill(HC_EMPTY)`) if they're already sized; otherwise
-    /// they're left empty so the next `ensure_tables()` call resizes
-    /// them. The window is now just `chunk_lens` (the bytes live in
-    /// `history`, which this method clears below), so there are no
-    /// per-block buffers to drain; `_reuse_space` is retained only for
-    /// caller signature compatibility and is intentionally unused.
+    /// Reset the per-frame portion of the storage for the next
+    /// independent frame.
+    ///
+    /// Rather than memset-ing the hash / chain / hash3 tables (the cost
+    /// of which is proportional to table size, paid once per frame in a
+    /// reused compressor), this advances the absolute-position floor
+    /// `history_abs_start` past the previous frame's end. Every table
+    /// walker rejects a candidate whose absolute position is below the
+    /// floor (`window_low >= history_abs_start`) before it dereferences
+    /// any history byte or trusts a binary-tree seed length, so the
+    /// previous frame's stale entries become unreachable without being
+    /// cleared. `position_base` / `index_shift` are left untouched so the
+    /// stale entries still decode to their (now sub-floor) absolute
+    /// positions; the per-position rebase guard
+    /// ([`Self::maybe_rebase_positions`]) handles the rare `u32`
+    /// representability rollover as the cursor keeps climbing.
+    ///
+    /// When advancing the floor would push it past
+    /// [`REBASE_RESET_FLOOR_CEILING`], the original full zeroing runs and
+    /// the floor rewinds to `0`, bounding the absolute cursor so
+    /// [`check_stream_abs_headroom`] stays satisfiable on 32-bit targets.
+    /// The window is just `chunk_lens` (the bytes live in `history`,
+    /// cleared below), so there are no per-block buffers to drain;
+    /// `_reuse_space` is retained only for caller signature compatibility
+    /// and is intentionally unused.
     pub(crate) fn reset(&mut self, _reuse_space: impl FnMut(Vec<u8>)) {
+        // Snapshot the previous frame's one-past-the-end absolute
+        // position before clearing the history that `history_abs_end`
+        // reads. Every stale table entry points strictly below this.
+        let next_floor = self.history_abs_end();
         self.window_size = 0;
         self.chunk_lens.clear();
         self.history.clear();
         self.history_start = 0;
-        self.history_abs_start = 0;
-        self.position_base = 0;
-        self.index_shift = 0;
         self.offset_hist = [1, 4, 8];
-        self.next_to_update3 = 0;
         self.skip_insert_until_abs = 0;
         self.dictionary_limit_abs = None;
         self.dictionary_primed_for_frame = false;
         self.allow_zero_relative_position = false;
-        // Clear each table independently — `Vec::fill` on an empty Vec
-        // is a no-op, so unconditional fills are safe even when a table
-        // hasn't been allocated yet (HC mode keeps hash3_table empty,
-        // and the backend-switch path swaps every table for Vec::new()
-        // to release oversized allocations).
-        self.hash_table.fill(HC_EMPTY);
-        self.hash3_table.fill(HC_EMPTY);
-        self.chain_table.fill(HC_EMPTY);
+        if next_floor <= REBASE_RESET_FLOOR_CEILING {
+            // Fast path: advance the floor so the previous frame's
+            // entries fall below `window_low` and are rejected on read.
+            // The tables keep their contents (and their sizing — a later
+            // `ensure_tables` call still reallocates them clean if the
+            // next level's config changed their dimensions).
+            self.history_abs_start = next_floor;
+            self.next_to_update3 = next_floor;
+        } else {
+            // Bounded fallback: rewind the cursor to the origin and zero
+            // the tables so `history_abs_start` cannot climb toward
+            // `usize::MAX`. Clear each table independently — `Vec::fill`
+            // on an empty Vec is a no-op, so unconditional fills are safe
+            // even when a table hasn't been allocated yet (HC mode keeps
+            // hash3_table empty, and the backend-switch path swaps every
+            // table for Vec::new() to release oversized allocations).
+            self.history_abs_start = 0;
+            self.position_base = 0;
+            self.index_shift = 0;
+            self.next_to_update3 = 0;
+            self.hash_table.fill(HC_EMPTY);
+            self.hash3_table.fill(HC_EMPTY);
+            self.chain_table.fill(HC_EMPTY);
+        }
     }
 
     /// Donor parity: `ZSTD_compressBlock_btopt_generic` starts its main
