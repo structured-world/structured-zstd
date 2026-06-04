@@ -165,6 +165,13 @@ pub(crate) struct RowConfig {
     pub(crate) row_log: usize,
     pub(crate) search_depth: usize,
     pub(crate) target_len: usize,
+    /// Donor `cParams.minMatch` for the row matcher: the regular-search
+    /// acceptance floor (a row candidate must extend to >= `mls` bytes).
+    /// The C-like advanced API surfaces this as the row min-match knob.
+    /// `ROW_MIN_MATCH_LEN` (5) is the default; the row hash key width stays
+    /// 4 bytes (an internal detail), so this only tunes the acceptance
+    /// floor, not the candidate hash distribution.
+    pub(crate) mls: usize,
 }
 
 const HC_CONFIG: HcConfig = HcConfig {
@@ -214,6 +221,7 @@ const ROW_CONFIG: RowConfig = RowConfig {
     row_log: ROW_LOG,
     search_depth: ROW_SEARCH_DEPTH,
     target_len: ROW_TARGET_LEN,
+    mls: ROW_MIN_MATCH_LEN,
 };
 
 // Level-5 greedy is the ONLY strategy routed to the Row backend
@@ -234,6 +242,7 @@ const ROW_L5: RowConfig = RowConfig {
     row_log: 4,
     search_depth: 8,
     target_len: 2,
+    mls: ROW_MIN_MATCH_LEN,
 };
 
 /// Resolved tuning parameters for a compression level. The
@@ -4643,6 +4652,56 @@ fn parse_search_matrix_decoupled_roundtrips() {
         &data,
     );
     assert_eq!(got, data, "lazy-on-rowhash diverged");
+}
+
+/// The row `mls` knob (C-like `minMatch`) is respected: every accepted
+/// match (regular row + repcode, on the lazy parse) is at least `mls`
+/// bytes, and the stream still round-trips for the whole 4..=7 range. The
+/// default (5) reproduces the historical `ROW_MIN_MATCH_LEN` behaviour.
+#[test]
+fn row_mls_knob_gates_matches_and_roundtrips() {
+    let data: Vec<u8> = (0..4000u32)
+        .flat_map(|i| {
+            let mut v = b"abcdefgh".to_vec();
+            v.extend_from_slice(&i.to_le_bytes());
+            v
+        })
+        .collect();
+
+    for mls in [4usize, 5, 6, 7] {
+        let mut matcher = RowMatchGenerator::new(1 << 22);
+        let mut cfg = ROW_CONFIG;
+        cfg.mls = mls;
+        matcher.configure(cfg);
+        matcher.add_data(data.clone(), |_| {});
+
+        let mut out: Vec<u8> = Vec::with_capacity(data.len());
+        let mut shortest_match = usize::MAX;
+        matcher.start_matching(|seq| match seq {
+            Sequence::Literals { literals } => out.extend_from_slice(literals),
+            Sequence::Triple {
+                literals,
+                offset,
+                match_len,
+            } => {
+                out.extend_from_slice(literals);
+                shortest_match = shortest_match.min(match_len);
+                let start = out.len() - offset;
+                for i in 0..match_len {
+                    let byte = out[start + i];
+                    out.push(byte);
+                }
+            }
+        });
+
+        assert_eq!(out, data, "mls={mls} round-trip diverged");
+        if shortest_match != usize::MAX {
+            assert!(
+                shortest_match >= mls,
+                "mls={mls}: emitted a {shortest_match}-byte match below the floor",
+            );
+        }
+    }
 }
 
 #[cfg(test)]

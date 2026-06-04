@@ -347,6 +347,11 @@ pub(crate) struct RowMatchGenerator {
     pub(crate) row_log: usize,
     pub(crate) search_depth: usize,
     pub(crate) target_len: usize,
+    /// Regular-search min-match floor (donor `cParams.minMatch`). A row
+    /// candidate must extend to >= `mls` bytes to be accepted. Hoisted to
+    /// a local in the parse loops so the per-position compare reads a
+    /// register, not this field. Default `ROW_MIN_MATCH_LEN` (5).
+    pub(crate) mls: usize,
     pub(crate) lazy_depth: u8,
     /// Cached fastpath kernel for `hash_mix_u64`; see Dfast for rationale.
     pub(crate) hash_kernel: crate::encoding::fastpath::FastpathKernel,
@@ -372,6 +377,7 @@ impl RowMatchGenerator {
             row_log: ROW_LOG,
             search_depth: ROW_SEARCH_DEPTH,
             target_len: ROW_TARGET_LEN,
+            mls: ROW_MIN_MATCH_LEN,
             lazy_depth: 1,
             hash_kernel: crate::encoding::fastpath::select_kernel(),
             row_heads: Vec::new(),
@@ -396,6 +402,10 @@ impl RowMatchGenerator {
         self.row_log = config.row_log.clamp(4, 6);
         self.search_depth = config.search_depth;
         self.target_len = config.target_len;
+        // Clamp the min-match floor to >= the hash key width (a shorter
+        // floor can't be satisfied: the hash only surfaces candidates
+        // sharing the 4-byte key) and a sane upper bound.
+        self.mls = config.mls.clamp(ROW_HASH_KEY_LEN, 7);
         self.set_hash_bits(config.hash_bits.max(self.row_log + 1));
     }
 
@@ -558,9 +568,10 @@ impl RowMatchGenerator {
             self.insert_positions::<ROW_LOG>(backfill_start, current_abs_start);
         }
 
+        let mls = self.mls;
         let mut pos = 0usize;
         let mut literals_start = 0usize;
-        while pos + ROW_MIN_MATCH_LEN <= current_len {
+        while pos + mls <= current_len {
             let abs_pos = current_abs_start + pos;
             let lit_len = pos - literals_start;
 
@@ -912,7 +923,7 @@ impl RowMatchGenerator {
             best,
             LazyMatchConfig {
                 target_len: self.target_len,
-                min_match_len: ROW_MIN_MATCH_LEN,
+                min_match_len: self.mls,
                 lazy_depth: self.lazy_depth,
                 history_abs_end: self.history_abs_end(),
             },
@@ -932,7 +943,7 @@ impl RowMatchGenerator {
             self.offset_hist,
             abs_pos,
             lit_len,
-            ROW_MIN_MATCH_LEN,
+            self.mls,
         )
     }
 
@@ -1016,9 +1027,10 @@ impl RowMatchGenerator {
         lit_len: usize,
     ) -> Option<MatchCandidate> {
         debug_assert_eq!(ROW_LOG, self.row_log);
+        let mls = self.mls;
         let concat = self.live_history();
         let current_idx = abs_pos - self.history_abs_start;
-        if current_idx + ROW_MIN_MATCH_LEN > concat.len() {
+        if current_idx + mls > concat.len() {
             return None;
         }
 
@@ -1062,7 +1074,7 @@ impl RowMatchGenerator {
             }
             let candidate_idx = candidate_pos - self.history_abs_start;
             let match_len = common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
-            if match_len >= ROW_MIN_MATCH_LEN {
+            if match_len >= mls {
                 let candidate = self.extend_backwards(candidate_pos, abs_pos, match_len, lit_len);
                 best = best_len_offset_candidate(best, Some(candidate));
                 // Donor `ZSTD_RowFindBestMatch` walks every probed slot and
