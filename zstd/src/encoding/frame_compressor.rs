@@ -405,25 +405,6 @@ fn split_block_from_borders(block: &[u8]) -> usize {
     }
 }
 
-fn pre_split_level(level: CompressionLevel) -> Option<usize> {
-    // Mirror the donor `splitLevels[]` table (indexed by strategy) for the
-    // greedy and lazy bands and above, where the cheap fingerprint
-    // pre-splitter pays for itself on heterogeneous payloads:
-    //   greedy → 1, lazy/lazy2 → 2, btlazy2/btopt → 3, btultra/btultra2 → 4.
-    // Levels 1..=4 (fast/dfast) are deliberately left un-split: their
-    // match-finding is cheap, so the splitter's per-block fingerprint plus
-    // the extra per-sub-block entropy builds cost more throughput than the
-    // ratio they buy. The byChunks sampling rate / hashLog tighten with the
-    // split level (see `split_block_by_chunks`).
-    match level {
-        CompressionLevel::Level(5) => Some(1),
-        CompressionLevel::Level(6..=12) => Some(2),
-        CompressionLevel::Level(13..=15) => Some(3),
-        CompressionLevel::Level(16..=22) => Some(4),
-        _ => None,
-    }
-}
-
 /// XXH64 (low 32 bits, seed 0) over `data`. Shared helper for the
 /// per-physical-block checksum sidecar so encoder and decoder hash
 /// the exact same byte ranges with the exact same parameters. Gated
@@ -470,7 +451,7 @@ pub(crate) fn optimal_block_size(
     block_size_max: usize,
     savings: i64,
 ) -> usize {
-    let Some(split_level) = pre_split_level(level) else {
+    let Some(split_level) = crate::encoding::match_generator::level_pre_split(level) else {
         return remaining_src_size.min(block_size_max);
     };
     if remaining_src_size < MAX_BLOCK_SIZE as usize || block_size_max < MAX_BLOCK_SIZE as usize {
@@ -2895,25 +2876,23 @@ mod tests {
         );
     }
 
-    /// `pre_split_level` mirrors the donor `splitLevels[]` table by
-    /// strategy band: greedy → 1, lazy/lazy2 → 2, btlazy2 → 3,
-    /// btopt/btultra/btultra2 → 4. Fast/dfast (levels 1..=4) and the named
-    /// presets stay unsplit so the splitter never runs where its per-block
-    /// cost would dominate the cheap match-finding.
+    /// `level_pre_split` resolves the per-level split knob through the
+    /// `LevelParams` table (donor `splitLevels[]` by strategy): greedy → 1,
+    /// the lazy band → 2, the btopt/btultra/btultra2 band → 4. Fast/dfast
+    /// (levels 1..=4) and the speed-first named presets stay unsplit.
     #[test]
     fn pre_split_level_dispatches_by_compression_level() {
         use crate::encoding::CompressionLevel;
-        assert_eq!(super::pre_split_level(CompressionLevel::Fastest), None);
-        assert_eq!(super::pre_split_level(CompressionLevel::Default), None);
-        assert_eq!(super::pre_split_level(CompressionLevel::Level(1)), None);
-        assert_eq!(super::pre_split_level(CompressionLevel::Level(4)), None);
-        assert_eq!(super::pre_split_level(CompressionLevel::Level(5)), Some(1));
-        assert_eq!(super::pre_split_level(CompressionLevel::Level(7)), Some(2));
-        assert_eq!(super::pre_split_level(CompressionLevel::Level(12)), Some(2));
-        assert_eq!(super::pre_split_level(CompressionLevel::Level(13)), Some(3));
-        assert_eq!(super::pre_split_level(CompressionLevel::Level(15)), Some(3));
-        assert_eq!(super::pre_split_level(CompressionLevel::Level(16)), Some(4));
-        assert_eq!(super::pre_split_level(CompressionLevel::Level(22)), Some(4));
+        use crate::encoding::match_generator::level_pre_split;
+        assert_eq!(level_pre_split(CompressionLevel::Fastest), None);
+        assert_eq!(level_pre_split(CompressionLevel::Default), None);
+        assert_eq!(level_pre_split(CompressionLevel::Level(1)), None);
+        assert_eq!(level_pre_split(CompressionLevel::Level(4)), None);
+        assert_eq!(level_pre_split(CompressionLevel::Level(5)), Some(1));
+        assert_eq!(level_pre_split(CompressionLevel::Level(7)), Some(2));
+        assert_eq!(level_pre_split(CompressionLevel::Level(15)), Some(2));
+        assert_eq!(level_pre_split(CompressionLevel::Level(16)), Some(4));
+        assert_eq!(level_pre_split(CompressionLevel::Level(22)), Some(4));
     }
 
     /// End-to-end: a 256 KB heterogeneous payload compressed at

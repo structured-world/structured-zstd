@@ -298,6 +298,25 @@ impl LevelParams {
             _ => super::strategy::ParseMode::from_lazy_depth(self.lazy_depth),
         }
     }
+
+    /// Cheap fingerprint pre-splitter level (donor `splitLevels[]` by
+    /// strategy), or `None` to keep the whole 128 KiB block. `Fast`/`Dfast`
+    /// stay un-split: their match-finding is cheap, so the splitter's
+    /// per-block fingerprint plus extra per-sub-block entropy builds cost
+    /// more throughput than the ratio they buy. The btopt/btultra/btultra2
+    /// band keeps level 4 (matching the pre-existing high-level splitter).
+    /// This is the C-like `blockSplitterLevel` knob, regulated per level
+    /// here rather than scattered across the frame loop.
+    fn pre_split(&self) -> Option<u8> {
+        match self.strategy_tag {
+            super::strategy::StrategyTag::Fast | super::strategy::StrategyTag::Dfast => None,
+            super::strategy::StrategyTag::Greedy => Some(1),
+            super::strategy::StrategyTag::Lazy => Some(2),
+            super::strategy::StrategyTag::BtOpt
+            | super::strategy::StrategyTag::BtUltra
+            | super::strategy::StrategyTag::BtUltra2 => Some(4),
+        }
+    }
 }
 
 fn dfast_hash_bits_for_window(max_window_size: usize) -> usize {
@@ -538,6 +557,25 @@ fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> Le
     } else {
         params
     }
+}
+
+/// The cheap fingerprint pre-splitter level for a compression level (the
+/// C-like `blockSplitterLevel`), resolved through the same per-level
+/// `LevelParams` table as every other tuning knob. `None` keeps the whole
+/// 128 KiB block. The frame loop reads this instead of hardcoding the
+/// level→split mapping at the call site.
+pub(crate) fn level_pre_split(level: CompressionLevel) -> Option<usize> {
+    // Only the explicit numeric levels carry the split knob; the named
+    // presets (Fastest/Default/Better/Best/Uncompressed) keep whole blocks.
+    // Splitting the named presets regressed ratio on highly-compressible
+    // inputs (the per-sub-block header + entropy-table overhead outweighs
+    // the fit gain when the whole frame is already a few hundred bytes).
+    if !matches!(level, CompressionLevel::Level(_)) {
+        return None;
+    }
+    resolve_level_params(level, None)
+        .pre_split()
+        .map(usize::from)
 }
 
 /// Backend storage for [`MatchGeneratorDriver`]. Exactly one match-finder
