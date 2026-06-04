@@ -1350,28 +1350,37 @@ impl MatchTable {
         let chain_ptr = self.chain_table.as_mut_ptr();
         debug_assert!(self.hash_table.len() == 1usize << hash_log);
         debug_assert!(self.chain_table.len() == 1usize << self.chain_log);
-        for pos in start..end {
-            let idx = pos - history_abs_start;
-            // The last `< 4` bytes of the live window can't be hashed; once
-            // one position is too close to the end every later one is too,
-            // so break rather than continue.
-            if idx + 4 > concat_len {
-                break;
-            }
-            // SAFETY: `hist_start + idx + 4 <= self.history.len()` (from the
-            // bound above), so the 4-byte read is in range. `hash` is masked
-            // to `hash_log` bits and `chain_idx` to `chain_log` bits, both
-            // within the table lengths asserted above. `rel` is `< u32::MAX`
-            // because the caller proved `!needs_rebase(end - 1)`.
+        // The last `< 4` bytes of the live window can't be hashed. Compute
+        // the hashable upper bound once instead of branching per position: a
+        // position `pos` is hashable iff `pos - history_abs_start + 4 <=
+        // concat_len`, i.e. `pos < history_abs_start + (concat_len - 3)`.
+        let hashable_end = end.min(history_abs_start + concat_len.saturating_sub(3));
+        if start >= hashable_end {
+            return;
+        }
+        // Hoist the source pointer and relative index out of the loop and
+        // advance both by one per iteration, mirroring the donor's
+        // `ip++ / idx++` fill rather than recomputing them from `pos`.
+        let mut src = unsafe { concat_ptr.add(hist_start + (start - history_abs_start)) };
+        // `rel` cannot reach `u32::MAX` because the caller proved
+        // `!needs_rebase(end - 1)`; `wrapping_add` keeps the overflow branch
+        // off this per-byte hot loop.
+        let mut rel = (start + index_shift - position_base) as u32;
+        for _ in start..hashable_end {
+            // SAFETY: every `src` in `[start, hashable_end)` is at least 4
+            // bytes from the end of `history`, so the unaligned 4-byte read is
+            // in range. `hash` is masked to `hash_log` bits and `chain_idx` to
+            // `chain_log` bits, both within the table lengths asserted above.
             unsafe {
-                let value = Self::read_le_u32_ptr(concat_ptr.add(hist_start + idx));
+                let value = Self::read_le_u32_ptr(src);
                 let hash = Self::hash_value_with_mls(value, hash_log, 4);
-                let rel = (pos + index_shift - position_base) as u32;
                 let chain_idx = (rel as usize) & chain_mask;
                 let prev = *hash_ptr.add(hash);
                 *chain_ptr.add(chain_idx) = prev;
                 *hash_ptr.add(hash) = rel + 1;
+                src = src.add(1);
             }
+            rel = rel.wrapping_add(1);
         }
     }
 
