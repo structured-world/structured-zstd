@@ -532,14 +532,17 @@ fn test_decode_all() {
     assert_eq!(result, original.len());
     assert_eq!(&output[..result], original);
 
-    // decode_all with truncated regular frame.
+    // decode_all with truncated regular frame. Under `lsm` the decoder
+    // raises the block-precise variant; without it, the legacy one.
     let mut output = vec![0; original.len()];
     let result = decoder.decode_all(&input[..input.len() - 600], &mut output);
-    assert!(
-        matches!(result, Err(FrameDecoderError::FailedToReadBlockBody(_))),
-        "{:?}",
-        result
-    );
+    let is_block_body_err = match result {
+        Err(FrameDecoderError::FailedToReadBlockBody(_)) => true,
+        #[cfg(feature = "lsm")]
+        Err(FrameDecoderError::FailedToReadBlockBodyAt { .. }) => true,
+        _ => false,
+    };
+    assert!(is_block_body_err, "{result:?}");
 
     // decode_all with truncated skip frame.
     let mut output = vec![0; original.len()];
