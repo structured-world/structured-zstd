@@ -2694,19 +2694,23 @@ mod tests {
         counts[1] = 6;
         let total = 10;
 
-        // Greedy is fast-band → unconditional reuse of the covering table.
-        let mode = super::choose_table_from_counts(
-            Some(&previous),
-            fse_tables.ll_default_ref(),
-            &counts,
-            total,
-            9,
-            StrategyTag::Greedy,
-        );
-        assert!(
-            matches!(mode, FseTableMode::RepeatLast(_)),
-            "fast-band greedy must reuse the covering previous table",
-        );
+        // All fast-band strategies (Fast, Dfast, Greedy) unconditionally
+        // reuse the covering previous table; cover every eligible arm so an
+        // enum-arm regression in the implementation branch is caught.
+        for strategy in [StrategyTag::Fast, StrategyTag::Dfast, StrategyTag::Greedy] {
+            let mode = super::choose_table_from_counts(
+                Some(&previous),
+                fse_tables.ll_default_ref(),
+                &counts,
+                total,
+                9,
+                strategy,
+            );
+            assert!(
+                matches!(mode, FseTableMode::RepeatLast(_)),
+                "fast-band {strategy:?} must reuse the covering previous table",
+            );
+        }
     }
 
     #[test]

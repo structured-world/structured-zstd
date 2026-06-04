@@ -3011,18 +3011,22 @@ mod tests {
         assert_eq!(level_pre_split(CompressionLevel::Level(22)), Some(4));
     }
 
-    /// End-to-end: a 256 KB heterogeneous payload compressed at
-    /// Level(13) (borders heuristic active) round-trips through the
-    /// crate's own decoder. The pre-split path runs over the first
-    /// 128 KB block and emits two consecutive sub-blocks; the second
-    /// 128 KB block goes through the splitter on its own. The test
-    /// proves the split decisions do not corrupt the frame bitstream.
+    /// End-to-end: a 256 KB heterogeneous payload compressed at Level(5)
+    /// (greedy, the pre-split path this revision routes through the cheap
+    /// chunk splitter) round-trips through the crate's own decoder. The
+    /// pre-split path runs over the first 128 KB block and may emit two
+    /// consecutive sub-blocks; the second 128 KB block goes through the
+    /// splitter on its own. The test proves the split decisions do not
+    /// corrupt the frame bitstream. Level 13 (lazy) no longer pre-splits,
+    /// so the fixture uses Level 5 to keep the
+    /// `compress() -> optimal_block_size() -> split_block_by_chunks()`
+    /// wiring covered.
     #[test]
-    fn level_13_borders_split_roundtrips_through_own_decoder() {
+    fn greedy_chunk_split_roundtrips_through_own_decoder() {
         use crate::encoding::CompressionLevel;
         let mut data = vec![0u8; 256 * 1024];
         // First 128 KB: low-entropy repeating run; second 128 KB:
-        // counter sequence — clearly distinct border histograms.
+        // counter sequence, clearly distinct sub-block fingerprints.
         for (i, byte) in data.iter_mut().enumerate() {
             *byte = if i < 128 * 1024 {
                 (i & 0x07) as u8
@@ -3032,7 +3036,7 @@ mod tests {
         }
 
         let mut compressed = Vec::new();
-        let mut compressor = FrameCompressor::new(CompressionLevel::Level(13));
+        let mut compressor = FrameCompressor::new(CompressionLevel::Level(5));
         compressor.set_source(data.as_slice());
         compressor.set_drain(&mut compressed);
         compressor.compress();

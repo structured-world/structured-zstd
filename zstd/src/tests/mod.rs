@@ -536,7 +536,7 @@ fn test_decode_all() {
     // raises the block-precise variant; without it, the legacy one.
     let mut output = vec![0; original.len()];
     let result = decoder.decode_all(&input[..input.len() - 600], &mut output);
-    let is_block_body_err = match result {
+    let is_block_body_err = match &result {
         Err(FrameDecoderError::FailedToReadBlockBody(_)) => true,
         #[cfg(feature = "lsm")]
         Err(FrameDecoderError::FailedToReadBlockBodyAt { .. }) => true,
