@@ -377,6 +377,22 @@ impl CompressionLevel {
             _ => Self::Level(level),
         }
     }
+
+    /// Numeric level a named preset is a shortcut for, so per-level config
+    /// (the `LevelParams` table) is resolved uniformly: named presets are
+    /// pure aliases, never a separate config path. `Uncompressed` is the
+    /// one genuine mode (raw blocks) with no numeric equivalent and returns
+    /// `None`.
+    pub(crate) const fn numeric_level(self) -> Option<i32> {
+        match self {
+            Self::Uncompressed => None,
+            Self::Fastest => Some(1),
+            Self::Default => Some(Self::DEFAULT_LEVEL),
+            Self::Better => Some(7),
+            Self::Best => Some(11),
+            Self::Level(n) => Some(n),
+        }
+    }
 }
 
 /// Trait used by the encoder that users can use to extend the matching facilities with their own algorithm

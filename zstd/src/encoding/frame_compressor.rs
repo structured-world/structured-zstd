@@ -2877,20 +2877,26 @@ mod tests {
     }
 
     /// `level_pre_split` resolves the per-level split knob through the
-    /// `LevelParams` table (donor `splitLevels[]` by strategy): greedy → 1,
-    /// the lazy band → 2, the btopt/btultra/btultra2 band → 4. Fast/dfast
-    /// (levels 1..=4) and the speed-first named presets stay unsplit.
+    /// `LevelParams` table, with named presets as pure numeric aliases:
+    /// greedy (level 5) → 1, btopt/btultra/btultra2 (16..=22) → 4. Fast,
+    /// dfast and the lazy band stay unsplit (lazy split is deferred until
+    /// the per-block entropy path reuses tables like the reference).
     #[test]
     fn pre_split_level_dispatches_by_compression_level() {
         use crate::encoding::CompressionLevel;
         use crate::encoding::match_generator::level_pre_split;
+        assert_eq!(level_pre_split(CompressionLevel::Uncompressed), None);
         assert_eq!(level_pre_split(CompressionLevel::Fastest), None);
         assert_eq!(level_pre_split(CompressionLevel::Default), None);
-        assert_eq!(level_pre_split(CompressionLevel::Level(1)), None);
+        // Better is a pure alias for level 7 (lazy): unsplit, same as Level(7).
+        assert_eq!(
+            level_pre_split(CompressionLevel::Better),
+            level_pre_split(CompressionLevel::Level(7)),
+        );
         assert_eq!(level_pre_split(CompressionLevel::Level(4)), None);
         assert_eq!(level_pre_split(CompressionLevel::Level(5)), Some(1));
-        assert_eq!(level_pre_split(CompressionLevel::Level(7)), Some(2));
-        assert_eq!(level_pre_split(CompressionLevel::Level(15)), Some(2));
+        assert_eq!(level_pre_split(CompressionLevel::Level(7)), None);
+        assert_eq!(level_pre_split(CompressionLevel::Level(15)), None);
         assert_eq!(level_pre_split(CompressionLevel::Level(16)), Some(4));
         assert_eq!(level_pre_split(CompressionLevel::Level(22)), Some(4));
     }

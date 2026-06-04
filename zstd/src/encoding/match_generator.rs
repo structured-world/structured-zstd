@@ -309,9 +309,18 @@ impl LevelParams {
     /// here rather than scattered across the frame loop.
     fn pre_split(&self) -> Option<u8> {
         match self.strategy_tag {
-            super::strategy::StrategyTag::Fast | super::strategy::StrategyTag::Dfast => None,
+            // Fast/Dfast: cheap match-finding, the splitter costs more than
+            // it buys. Lazy: its ratio already tracks the reference, and
+            // splitting it regresses on highly-compressible frames until the
+            // per-block entropy path reuses tables as aggressively as the
+            // reference (tracked separately); keep whole blocks for now.
+            super::strategy::StrategyTag::Fast
+            | super::strategy::StrategyTag::Dfast
+            | super::strategy::StrategyTag::Lazy => None,
+            // Greedy is the band whose single-block literal section loses to
+            // the reference; the cheap fingerprint pre-split fits per-sub-
+            // block entropy and recovers it.
             super::strategy::StrategyTag::Greedy => Some(1),
-            super::strategy::StrategyTag::Lazy => Some(2),
             super::strategy::StrategyTag::BtOpt
             | super::strategy::StrategyTag::BtUltra
             | super::strategy::StrategyTag::BtUltra2 => Some(4),
@@ -565,15 +574,11 @@ fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> Le
 /// 128 KiB block. The frame loop reads this instead of hardcoding the
 /// level→split mapping at the call site.
 pub(crate) fn level_pre_split(level: CompressionLevel) -> Option<usize> {
-    // Only the explicit numeric levels carry the split knob; the named
-    // presets (Fastest/Default/Better/Best/Uncompressed) keep whole blocks.
-    // Splitting the named presets regressed ratio on highly-compressible
-    // inputs (the per-sub-block header + entropy-table overhead outweighs
-    // the fit gain when the whole frame is already a few hundred bytes).
-    if !matches!(level, CompressionLevel::Level(_)) {
-        return None;
-    }
-    resolve_level_params(level, None)
+    // Named presets are pure aliases: resolve to their numeric level and
+    // read the split knob from the same `LevelParams` table as everything
+    // else. `Uncompressed` (raw blocks) has no numeric equivalent.
+    let numeric = level.numeric_level()?;
+    resolve_level_params(CompressionLevel::Level(numeric), None)
         .pre_split()
         .map(usize::from)
 }
