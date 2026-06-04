@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780566385313,
+  "lastUpdate": 1780582721005,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -56222,6 +56222,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.2,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "83724fd7a385d90dc639ef31fbb1c5b4e1c5f08b",
+          "message": "perf(encode): decouple and monomorphize the row matcher (#335)\n\n* perf(encode): decouple parse from search axis\n\nSplit the welded parse-to-backend mapping into two independent axes: a\nparse mode (greedy/lazy/lazy2/optimal) and a search method\n(fast/double-fast/row-hash/hash-chain/binary-tree). The per-block\ndispatcher routes on the search axis with the parse carried separately,\nso any non-opt parse can run on any search backend (greedy-on-hash-chain,\nlazy2-on-row-hash) - pairings the old strategy tag could not express.\n\n- add ParseMode / SearchMethod enums + derivations in strategy.rs\n- LEVEL_TABLE carries an explicit per-level search column\n- driver stores search + parse and dispatches on them; the binary-tree\n  arm still selects the opt strategy ZST off the tag\n- test-only per-level config override exercises the matrix end-to-end\n\nBehaviour-preserving: every level keeps its historical (parse, search)\npairing. 680 tests pass. Foundation for per-level match-finder tuning.\n\n* perf(encode): monomorphize row matcher over row_log\n\nThread a compile-time `const ROW_LOG` through the row matcher hot path\n(row_candidate, insert_position/span, the greedy and lazy parse loops,\nthe skip path). The row width `1 << ROW_LOG`, tag mask, row-base shift\nand SIMD tag-compare width are now compile-time constants, so the\noptimiser unrolls the per-slot walk and fixes the tag-mask vector width\nper variant instead of reloading `self.row_log` each iteration.\n\n`row_log` (clamped 4..=6) is read once per block by a bare dispatcher\nthat routes into the const-`ROW_LOG` `_rl` monomorphisation, mirroring\nthe donor's per-rowLog matchfinder variant table. The bare names stay\nthe public entry points, so the driver and tests are unchanged.\n\nByte-identical: the dispatched const equals the runtime `row_log`, so\noutput is unchanged. 680 tests pass. Sets up the bounded-dispatch\ninfrastructure for the depth and min-match axes.\n\n* perf(encode): monomorphize row tag kernel, drop per-position enum\n\nThe row search tested `match self.tag_kernel` (Scalar/SSE2/AVX2/NEON) on\nevery probed position. Even inlined, that left every tier's SIMD body in\nthe loop plus a branch per call.\n\nReplace the runtime enum on the hot path with a `RowTags` trait + one ZST\nper tier (ScalarTags/Sse2Tags/Avx2Tags/NeonTags). The search loop is now\ngeneric over `K: RowTags`; the tag compare and the `USE_MASK` scalar-vs-\nSIMD choice const-fold per tier, so each monomorphisation carries only its\nown kernel and no branch.\n\n`tag_kernel` is still detected at construction and now selects the tier\nonce per block via a two-level bounded dispatch (kernel then row_log) into\nthe `_rl::<K, ROW_LOG>` hot loop. The dispatch is cold; an impl is only\ninstantiated/used on a CPU that supports its ISA, the same contract the\nold enum upheld for its unsafe SIMD calls.\n\nByte-identical: each tier computes the identical mask it did through the\nenum. 680 tests pass, clippy + fmt clean.\n\n* perf(encode): make row min-match (mls) a configurable floor\n\nThe row matcher hardcoded the regular-search acceptance floor at\n`ROW_MIN_MATCH_LEN` (5). Surface it as a `RowConfig.mls` knob (the\nC-like advanced API's row `minMatch`) carried on `RowMatchGenerator` and\napplied in `configure`.\n\nThe floor is read once and hoisted to a local in the parse loops, so the\nper-position compare hits a register, not a field. The row hash key width\nstays 4 bytes (an internal detail), so this tunes only the acceptance\nfloor, not the candidate hash distribution.\n\nDefault `mls = 5` reproduces the historical behaviour byte-for-byte; a new\ntest pins that the knob both gates emitted matches (>= mls) and\nround-trips across the 4..=7 range. 681 tests pass, clippy + fmt clean.\n\n* fix(encode): derive row parse mode from the search axis\n\n`LevelParams::parse()` matched on the strategy tag and forced\n`ParseMode::Optimal` for every `Bt*` level, so a `Bt*`-tagged level\noverridden to a non-BT search backend kept `Optimal` and the row\ndispatcher could never pick the greedy entry — the parse×search\ndecoupling was incomplete for those levels. Derive the parse mode from\n`search` instead (`BinaryTree` → `Optimal`, else from `lazy_depth`).\n\nAlso consume the test-only `config_override` with `take()` so it is\none-shot: a reused driver no longer keeps a synthetic pairing armed\nacross later resets.\n\nAdds two regression tests (parse follows search; override consumed by\none reset). 683 tests pass.",
+          "timestamp": "2026-06-04T16:15:25+03:00",
+          "tree_id": "3348160e77d6d1aab7953b66336b6d59b4c66630",
+          "url": "https://github.com/structured-world/structured-zstd/commit/83724fd7a385d90dc639ef31fbb1c5b4e1c5f08b"
+        },
+        "date": 1780582714324,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.147,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.111,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 272.248,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 225.234,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.592,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.486,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.629,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.031,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.521,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.965,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.11,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.109,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.032,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 15.032,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.698,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.628,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.333,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.675,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.093,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.761,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.128,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.107,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.237,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.107,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.272,
             "unit": "ms"
           }
         ]
