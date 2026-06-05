@@ -1,7 +1,9 @@
 //! Standalone decode-loop binary for clean perf-record profiles.
-//! Generates a 1MB deterministic corpus, FFI-encodes once at the given
-//! level, then loops `decode_all` for N iters. No criterion overhead,
-//! no per-iter encode — pure decoder hot path.
+//! Decodes the in-tree z000033 corpus (or a user-provided file) in a tight
+//! loop after one-time FFI encoding at the given level. N iters of
+//! `decode_all`, no criterion overhead, no per-iter encode: pure decoder
+//! hot path. The random LCG synthetic source is opt-in via the `synthetic`
+//! arg only.
 //!
 //! Build: cargo build --profile flamegraph -p structured-zstd \
 //!          --example decode_loop_z000033 --features dict_builder
@@ -25,20 +27,67 @@ fn main() {
     // isolate the checksum cost (flag-on vs flag-off) in one harness.
     let checksum: bool = args.get(5).map(|s| s == "checksum").unwrap_or(false);
 
-    // Source: either a file from disk, or a deterministic 1MB LCG synthetic.
-    let src: Vec<u8> = if let Some(path) = corpus_path {
-        std::fs::read(path).expect("read corpus file")
-    } else {
-        let n = 1_048_576usize;
-        let mut src = Vec::with_capacity(n);
-        let mut state: u64 = 0x517cc1b727220a95;
-        while src.len() < n {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            src.push((state >> 56) as u8);
+    // Source resolution. This example is named after the `z000033` corpus,
+    // so an explicit path or the in-tree corpus is the contract. The LCG
+    // synthetic is RANDOM (≈incompressible → mostly RAW blocks → a trivial,
+    // unrepresentative decode workload), so it is NEVER substituted silently:
+    // a missing corpus fails loudly, and synthetic is opt-in via the
+    // `synthetic` arg (case-insensitive). (A silent fallback here previously
+    // masked a missing corpus and produced ~30 GB/s "decode" numbers that hid
+    // the real gap.)
+    let src: Vec<u8> = match corpus_path {
+        // Case-insensitive so `Synthetic` / `SYNTHETIC` hit the opt-in source
+        // rather than being treated as a (missing) file path.
+        Some(arg) if arg.eq_ignore_ascii_case("synthetic") => {
+            eprintln!(
+                "decode_loop_z000033: WARNING — using the random LCG synthetic \
+                 source; decode timings are NOT representative of z000033 \
+                 (random data decodes as RAW blocks)."
+            );
+            let n = 1_048_576usize;
+            let mut src = Vec::with_capacity(n);
+            let mut state: u64 = 0x517cc1b727220a95;
+            while src.len() < n {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                src.push((state >> 56) as u8);
+            }
+            src
         }
-        src
+        Some(path) => std::fs::read(path).expect("read corpus file"),
+        None => {
+            // Default to the in-tree z000033 this example is named after.
+            // Follow the same resolution order as the benchmarks (see
+            // `zstd/benches/support/mod.rs`): explicit env var first, then
+            // the cargo-driven manifest dir, then cwd-relative locations
+            // (repo root / `zstd/`). Fail loudly if absent — never silently
+            // synthesize.
+            let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+            if let Ok(explicit) = std::env::var("STRUCTURED_ZSTD_BENCH_CORPUS_PATH") {
+                let trimmed = explicit.trim();
+                if !trimmed.is_empty() {
+                    candidates.push(std::path::PathBuf::from(trimmed));
+                }
+            }
+            if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
+                candidates.push(
+                    std::path::PathBuf::from(manifest_dir).join("decodecorpus_files/z000033"),
+                );
+            }
+            candidates.push(std::path::PathBuf::from("zstd/decodecorpus_files/z000033"));
+            candidates.push(std::path::PathBuf::from("decodecorpus_files/z000033"));
+            candidates
+                .iter()
+                .find_map(|p| std::fs::read(p).ok())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "decode_loop_z000033: corpus z000033 not found via env vars or in \
+                         {candidates:?}; pass an explicit path as arg 4, or `synthetic` to \
+                         opt into the random LCG fallback"
+                    )
+                })
+        }
     };
     let n = src.len();
 

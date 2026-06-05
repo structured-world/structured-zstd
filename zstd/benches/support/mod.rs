@@ -229,6 +229,34 @@ fn leak_owned(name: String) -> &'static str {
     Box::leak(name.into_boxed_str())
 }
 
+/// The `REPORT_KERNEL` line for this run: the CPU kernel tier actually
+/// selected (the entropy / sequence dispatch is shared by encode and decode,
+/// see #247), plus arch / libc. Lets the dashboard attribute every measurement
+/// to the kernel that produced it. Shared verbatim by both bench binaries so
+/// the format stays in lockstep; each caller decides when to print it.
+pub(crate) fn kernel_report_line() -> String {
+    let arch = if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "other"
+    };
+    let target_env = if cfg!(target_env = "musl") {
+        "musl"
+    } else if cfg!(target_env = "gnu") {
+        "gnu"
+    } else {
+        "other"
+    };
+    format!(
+        "REPORT_KERNEL kernel={} arch={} target_env={}",
+        structured_zstd::active_cpu_kernel_name(),
+        arch,
+        target_env
+    )
+}
+
 impl Scenario {
     fn new(
         id: impl Into<String>,

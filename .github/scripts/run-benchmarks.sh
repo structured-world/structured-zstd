@@ -97,6 +97,12 @@ DICT_RE = re.compile(
 DICT_TRAIN_RE = re.compile(
     r'^REPORT_DICT_TRAIN scenario=(\S+) label="((?:[^"\\]|\\.)+)" training_bytes=(\d+) dict_bytes_requested=(\d+) rust_train_ms=([0-9.]+) ffi_train_ms=([0-9.]+) rust_dict_bytes=(\d+) ffi_dict_bytes=(\d+) rust_fastcover_score=(\d+)$'
 )
+# Process-global CPU kernel tier the run actually selected (shared
+# encode/decode entropy dispatch). One line per run; attributes every
+# measurement to the kernel + arch + libc that produced it.
+KERNEL_RE = re.compile(
+    r'^REPORT_KERNEL kernel=(\S+) arch=(\S+) target_env=(\S+)$'
+)
 
 def unescape_report_label(value):
     output = []
@@ -131,6 +137,7 @@ ratios = []
 memory_rows = []
 dictionary_rows = []
 dictionary_training_rows = []
+kernel_info = None
 timing_rows = []
 scenario_input_bytes = {}
 scenario_training_bytes = {}
@@ -298,6 +305,12 @@ with open(raw_path) as f:
                 "target": bench_target_id,
                 "ms_per_iter": ms,
             })
+            continue
+
+        kernel_match = KERNEL_RE.match(line)
+        if kernel_match:
+            k_name, k_arch, k_env = kernel_match.groups()
+            kernel_info = {"kernel": k_name, "arch": k_arch, "target_env": k_env}
             continue
 
         report_match = REPORT_RE.match(line)
@@ -811,12 +824,25 @@ for row in dictionary_rows:
         }
     )
 
+# Stamp the run's CPU kernel tier onto every relative record. The deployed
+# dashboard payload concatenates records from per-target runs, so the
+# per-run `target.kernel` below would be overwritten on merge — carrying it
+# per-record lets the dashboard map each target to the kernel that produced
+# its numbers regardless of how the per-target files are merged.
+for _r in relative_rows:
+    _r["kernel"] = kernel_info
+
 relative_payload = {
     "version": 1,
     "target": {
         "id": bench_target_id,
         "label": bench_target_label,
         "triple": bench_target_triple or None,
+        # CPU kernel tier (entropy/sequence dispatch, shared encode/decode)
+        # this run actually selected, plus arch / libc — so a dashboard
+        # reading this can attribute every record to the kernel that
+        # produced it. `None` if the bench binary predates REPORT_KERNEL.
+        "kernel": kernel_info,
     },
     "reference_band": {
         "delta_low": DELTA_LOW,

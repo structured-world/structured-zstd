@@ -32,7 +32,8 @@ use structured_zstd::dictionary::{
 };
 use structured_zstd::encoding::FrameCompressor;
 use support::{
-    LevelConfig, Scenario, ScenarioClass, benchmark_scenarios, supported_levels_filtered,
+    LevelConfig, Scenario, ScenarioClass, benchmark_scenarios, kernel_report_line,
+    supported_levels_filtered,
 };
 
 static BENCHMARK_SCENARIOS: OnceLock<Vec<Scenario>> = OnceLock::new();
@@ -209,8 +210,22 @@ fn emit_reports_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Emit the shared `REPORT_KERNEL` line exactly once per process. The kernel
+/// tier is process-global, so a single line covers every bench in the run even
+/// though both `bench_compress` and `bench_decompress` call this.
+fn emit_kernel_report_once() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        println!("{}", kernel_report_line());
+    });
+}
+
 fn bench_compress(c: &mut Criterion) {
     let emit_reports = emit_reports_enabled();
+    if emit_reports {
+        emit_kernel_report_once();
+    }
     for scenario in benchmark_scenarios_cached().iter() {
         for level in supported_levels_filtered() {
             if emit_reports {
@@ -249,6 +264,9 @@ fn bench_compress(c: &mut Criterion) {
 
 fn bench_decompress(c: &mut Criterion) {
     let emit_reports = emit_reports_enabled();
+    if emit_reports {
+        emit_kernel_report_once();
+    }
     for scenario in benchmark_scenarios_cached().iter() {
         for level in supported_levels_filtered() {
             let expected_len = scenario.len();
