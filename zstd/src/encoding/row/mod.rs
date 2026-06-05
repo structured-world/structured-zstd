@@ -365,10 +365,13 @@ pub(crate) struct RowMatchGenerator {
     pub(crate) row_heads: Vec<u8>,
     // Absolute match positions, one per row slot. Stored as `u32` (not
     // `usize`): this is the largest match-finder array, and `u32` halves its
-    // footprint vs the donor-parity `U32` layout. The encoder caps a single
-    // Row frame below `u32::MAX` in `add_data` (so every stored position is
-    // representable and `ROW_EMPTY_SLOT == u32::MAX` stays an unambiguous
-    // sentinel); the absolute cursor resets to 0 per frame.
+    // footprint vs the donor-parity `U32` layout. `ROW_EMPTY_SLOT == u32::MAX`
+    // is the empty sentinel, so every stored position must stay strictly below
+    // it. On a long stream the cumulative absolute cursor would cross `u32::MAX`
+    // even while the live window is bounded; `add_data` rebases the coordinate
+    // origin down to the oldest live byte before that happens (see
+    // [`Self::rebase_positions`]), keeping positions representable without
+    // capping frame length.
     pub(crate) row_positions: Vec<u32>,
     pub(crate) row_tags: Vec<u8>,
     /// Cached tag-match SIMD kernel; CPU features are fixed per process, so
