@@ -1,6 +1,6 @@
 //! Utilities and interfaces for encoding an entire frame. Allows reusing resources
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::vec::Vec;
 use core::convert::TryInto;
 #[cfg(feature = "hash")]
 use twox_hash::XxHash64;
@@ -132,12 +132,28 @@ struct CachedDictionaryEntropy {
     of_previous: Option<PreviousFseTable>,
 }
 
+/// Shared owner for a custom "previous" FSE encoder table. `Arc` on
+/// atomic-pointer targets, `Rc` otherwise (keeps `no_std` no-atomics
+/// builds compiling, single-thread there anyway), mirroring
+/// `decoding::dictionary::SharedDictionary`. Cloning the cached
+/// dictionary entropy into the per-frame state is then a refcount bump,
+/// not a full `FSETable` copy — the donor references `cdict->cBlockState`
+/// instead of rebuilding it per frame.
+#[cfg(target_has_atomic = "ptr")]
+pub(crate) type SharedFseTable = alloc::sync::Arc<FSETable>;
+#[cfg(not(target_has_atomic = "ptr"))]
+pub(crate) type SharedFseTable = alloc::rc::Rc<FSETable>;
+
 #[derive(Clone)]
 pub(crate) enum PreviousFseTable {
     // Default tables are immutable and already stored alongside the state, so
     // repeating them only needs a lightweight marker instead of cloning FSETable.
     Default,
-    Custom(Box<FSETable>),
+    // Shared handle: cloning (per-frame dictionary entropy seed) is a refcount
+    // bump. The table is only ever read or REPLACED wholesale (a block that
+    // builds a new table swaps in a fresh `SharedFseTable`), never mutated in
+    // place, so sharing is sound.
+    Custom(SharedFseTable),
     Rle(u8),
 }
 
@@ -1590,17 +1606,17 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 .fse
                 .literal_lengths
                 .to_encoder_table()
-                .map(|table| PreviousFseTable::Custom(Box::new(table))),
+                .map(|table| PreviousFseTable::Custom(SharedFseTable::new(table))),
             ml_previous: dictionary
                 .fse
                 .match_lengths
                 .to_encoder_table()
-                .map(|table| PreviousFseTable::Custom(Box::new(table))),
+                .map(|table| PreviousFseTable::Custom(SharedFseTable::new(table))),
             of_previous: dictionary
                 .fse
                 .offsets
                 .to_encoder_table()
-                .map(|table| PreviousFseTable::Custom(Box::new(table))),
+                .map(|table| PreviousFseTable::Custom(SharedFseTable::new(table))),
         });
         // A previously-captured CDict prime snapshot belongs to the OLD
         // dictionary; drop it so the first frame with the new dictionary

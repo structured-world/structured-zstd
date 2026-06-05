@@ -4,7 +4,7 @@ use crate::{
     bit_io::BitWriter,
     blocks::block::BlockType,
     encoding::block_header::BlockHeader,
-    encoding::frame_compressor::{CompressState, FseTables, PreviousFseTable},
+    encoding::frame_compressor::{CompressState, FseTables, PreviousFseTable, SharedFseTable},
     encoding::{Matcher, Sequence},
     fse::fse_encoder::{FSETable, build_table_from_symbol_counts, fse_header_bits_for_counts},
     huff0::huff0_encoder,
@@ -1668,7 +1668,7 @@ fn remember_last_used_table(slot: &mut Option<PreviousFseTable>, next: Option<Pr
 
 fn into_last_used_table(mode: FseTableMode<'_>) -> Option<PreviousFseTable> {
     match mode {
-        FseTableMode::Encoded(table) => Some(PreviousFseTable::Custom(Box::new(table))),
+        FseTableMode::Encoded(table) => Some(PreviousFseTable::Custom(SharedFseTable::new(table))),
         FseTableMode::Predefined(_) => Some(PreviousFseTable::Default),
         FseTableMode::Rle(symbol) => Some(PreviousFseTable::Rle(symbol)),
         FseTableMode::RepeatLast(_) => None,
@@ -2200,7 +2200,6 @@ fn compress_literals(
 
 #[cfg(test)]
 mod tests {
-    use alloc::boxed::Box;
 
     use super::{
         FseTableMode, RawSequence, choose_table, emit_single_sequence_block, encode_match_len,
@@ -2693,7 +2692,8 @@ mod tests {
     fn fast_band_strategies_prefer_repeat_fse_table() {
         use crate::encoding::strategy::StrategyTag;
         let prev = build_table_from_symbol_counts(&[8, 1], 9, false);
-        let previous = PreviousFseTable::Custom(Box::new(prev));
+        let previous =
+            PreviousFseTable::Custom(crate::encoding::frame_compressor::SharedFseTable::new(prev));
         let fse_tables = FseTables::new();
         // Distribution over symbols {0,1}, both covered by `previous`.
         let mut counts = [0usize; 256];
@@ -2724,7 +2724,9 @@ mod tests {
     fn remember_last_used_tables_reuses_existing_custom_slot_for_repeat() {
         let mut fse_tables = FseTables::new();
         let custom = build_table_from_symbol_counts(&[1, 1], 5, false);
-        fse_tables.ll_previous = Some(PreviousFseTable::Custom(Box::new(custom)));
+        fse_tables.ll_previous = Some(PreviousFseTable::Custom(
+            crate::encoding::frame_compressor::SharedFseTable::new(custom),
+        ));
 
         let before = core::ptr::from_ref(
             previous_table(fse_tables.ll_previous.as_ref(), fse_tables.ll_default_ref()).unwrap(),
