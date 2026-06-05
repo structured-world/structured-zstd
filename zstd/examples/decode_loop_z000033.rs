@@ -31,11 +31,14 @@ fn main() {
     // so an explicit path or the in-tree corpus is the contract. The LCG
     // synthetic is RANDOM (≈incompressible → mostly RAW blocks → a trivial,
     // unrepresentative decode workload), so it is NEVER substituted silently:
-    // a missing corpus fails loudly, and synthetic is opt-in via the literal
-    // `synthetic` arg. (A silent fallback here previously masked a missing
-    // corpus and produced ~30 GB/s "decode" numbers that hid the real gap.)
+    // a missing corpus fails loudly, and synthetic is opt-in via the
+    // `synthetic` arg (case-insensitive). (A silent fallback here previously
+    // masked a missing corpus and produced ~30 GB/s "decode" numbers that hid
+    // the real gap.)
     let src: Vec<u8> = match corpus_path {
-        Some("synthetic") => {
+        // Case-insensitive so `Synthetic` / `SYNTHETIC` hit the opt-in source
+        // rather than being treated as a (missing) file path.
+        Some(arg) if arg.eq_ignore_ascii_case("synthetic") => {
             eprintln!(
                 "decode_loop_z000033: WARNING — using the random LCG synthetic \
                  source; decode timings are NOT representative of z000033 \
