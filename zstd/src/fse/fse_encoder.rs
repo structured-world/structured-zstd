@@ -260,48 +260,12 @@ impl FSETable {
     /// The result assumes the header starts at a byte boundary, which matches
     /// all current encoder call sites.
     pub(crate) fn table_header_bits(&self) -> usize {
-        let mut bits = 4; // acc_log - 5
-        let mut probability_counter = 0usize;
-        let probability_sum = 1 << self.acc_log();
-
-        let mut prob_idx = 0;
-        while probability_counter < probability_sum {
-            let max_remaining_value = probability_sum - probability_counter + 1;
-            let bits_to_write = max_remaining_value.ilog2() + 1;
-            let low_threshold = ((1 << bits_to_write) - 1) - max_remaining_value;
-
-            let prob = self.states[prob_idx].probability;
-            prob_idx += 1;
-            let value = (prob + 1) as u32;
-            if value < low_threshold as u32 {
-                bits += bits_to_write as usize - 1;
-            } else {
-                bits += bits_to_write as usize;
-            }
-
-            if prob == -1 {
-                probability_counter += 1;
-            } else if prob > 0 {
-                probability_counter += prob as usize;
-            } else {
-                let mut zeros = 0u8;
-                while prob_idx < self.states.len() && self.states[prob_idx].probability == 0 {
-                    zeros += 1;
-                    prob_idx += 1;
-                    if zeros == 3 {
-                        bits += 2;
-                        zeros = 0;
-                    }
-                }
-                bits += 2;
-            }
-        }
-        // Byte-alignment padding
-        let misaligned = bits % 8;
-        if misaligned != 0 {
-            bits += 8 - misaligned;
-        }
-        bits
+        // Delegate to the free `ncount_header_bits` so the header sizing has a
+        // single source of truth shared with the pre-build cost estimate in
+        // `fse_header_bits_for_counts` (the table-mode selector prices a
+        // candidate table from its normalized counts without building it).
+        let probs: [i32; 256] = core::array::from_fn(|i| self.states[i].probability);
+        ncount_header_bits(&probs, self.acc_log())
     }
 
     pub(crate) fn write_table<V: AsMut<Vec<u8>>>(&self, writer: &mut BitWriter<V>) {
@@ -465,6 +429,99 @@ fn build_table_from_counts(counts: &[usize], max_log: u8, avoid_0_numbit: bool) 
         avoid_0_numbit,
     );
     build_table_from_probabilities(&probs[..counts.len()], table_log)
+}
+
+/// Bit size of the serialized FSE NCount table header for the normalized
+/// distribution `probs` at `acc_log`. This is exactly what
+/// [`FSETable::table_header_bits`] returns (they share this implementation),
+/// but computed from the normalized counts alone — no spread / state-table /
+/// `symbolTT` construction. The table-mode selector uses it to price a
+/// candidate custom table without building its (otherwise discarded) state
+/// tables.
+fn ncount_header_bits(probs: &[i32], acc_log: u8) -> usize {
+    let mut bits = 4; // acc_log - 5
+    let mut probability_counter = 0usize;
+    let probability_sum = 1usize << acc_log;
+
+    let mut prob_idx = 0;
+    while probability_counter < probability_sum {
+        let max_remaining_value = probability_sum - probability_counter + 1;
+        let bits_to_write = max_remaining_value.ilog2() + 1;
+        let low_threshold = ((1 << bits_to_write) - 1) - max_remaining_value;
+
+        let prob = probs[prob_idx];
+        prob_idx += 1;
+        let value = (prob + 1) as u32;
+        if value < low_threshold as u32 {
+            bits += bits_to_write as usize - 1;
+        } else {
+            bits += bits_to_write as usize;
+        }
+
+        if prob == -1 {
+            probability_counter += 1;
+        } else if prob > 0 {
+            probability_counter += prob as usize;
+        } else {
+            let mut zeros = 0u8;
+            while prob_idx < probs.len() && probs[prob_idx] == 0 {
+                zeros += 1;
+                prob_idx += 1;
+                if zeros == 3 {
+                    bits += 2;
+                    zeros = 0;
+                }
+            }
+            bits += 2;
+        }
+    }
+    // Byte-alignment padding
+    let misaligned = bits % 8;
+    if misaligned != 0 {
+        bits += 8 - misaligned;
+    }
+    bits
+}
+
+/// Header bit cost of the custom FSE table that
+/// [`build_table_from_symbol_counts`] would produce for `counts`, without
+/// building it. Mirrors the front of `build_table_from_counts` (table-log
+/// selection + count normalization) and then sizes the header via
+/// [`ncount_header_bits`]. Returns the exact value the built table's
+/// `table_header_bits()` would, so the table-mode selection stays
+/// byte-identical while skipping the state-table build for candidates that
+/// lose to the predefined / repeated table.
+pub(crate) fn fse_header_bits_for_counts(
+    counts: &[usize],
+    max_log: u8,
+    avoid_0_numbit: bool,
+) -> usize {
+    let total = counts.iter().sum::<usize>();
+    // Mirror `build_table_from_counts`'s contract: pricing must reject the
+    // same inputs the builder rejects. A histogram with fewer than two
+    // samples cannot form a valid FSE table, and the table-log selection
+    // below takes an integer logarithm of `total` that underflows on
+    // `total <= 1`. Trip the guard up front so the failure mode matches
+    // the builder instead of an opaque arithmetic panic.
+    assert!(
+        total > 1,
+        "FSE table requires at least 2 samples in the histogram (got {total})"
+    );
+    let max_symbol = counts
+        .iter()
+        .rposition(|&count| count > 0)
+        .unwrap_or_default();
+    let table_log = donor_optimal_table_log(max_log, total, max_symbol);
+    let mut probs = [0i32; 256];
+    donor_normalize_counts(
+        &mut probs[..counts.len()],
+        table_log,
+        counts,
+        total,
+        max_symbol,
+        avoid_0_numbit,
+    );
+    ncount_header_bits(&probs[..counts.len()], table_log)
 }
 
 fn donor_min_table_log(total: usize, max_symbol: usize) -> u8 {

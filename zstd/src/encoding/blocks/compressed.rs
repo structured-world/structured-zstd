@@ -6,7 +6,7 @@ use crate::{
     encoding::block_header::BlockHeader,
     encoding::frame_compressor::{CompressState, FseTables, PreviousFseTable},
     encoding::{Matcher, Sequence},
-    fse::fse_encoder::{FSETable, build_table_from_symbol_counts},
+    fse::fse_encoder::{FSETable, build_table_from_symbol_counts, fse_header_bits_for_counts},
     huff0::huff0_encoder,
 };
 
@@ -1540,16 +1540,17 @@ fn choose_table_from_counts<'a>(
     }
 
     let use_low_prob_count = total >= 2048;
-    let new_table = (distinct_symbols > 1).then(|| {
-        build_table_from_symbol_counts(&counts[..=max_symbol], max_log, use_low_prob_count)
-    });
 
-    // Mirror donor `ZSTD_selectEncodingType()` for optimal strategies:
-    // compare default cross-entropy, repeat-table FSE bit cost, and
-    // compressed table header plus entropy-bound payload cost.
-    let new_total_cost = new_table.as_ref().map(|table| {
-        table
-            .table_header_bits()
+    // Mirror donor `ZSTD_selectEncodingType()`: compare default
+    // cross-entropy, repeat-table FSE bit cost, and the custom compressed
+    // table (header + entropy-bound payload). The custom table's header is
+    // priced from its normalized counts via `fse_header_bits_for_counts`
+    // WITHOUT building the (often-discarded) state tables — the build only
+    // runs in the `Choice::New` arm below, when the custom table actually
+    // wins. The estimate equals the built table's `table_header_bits()`
+    // exactly, so the selection is byte-identical.
+    let new_total_cost = (distinct_symbols > 1).then(|| {
+        fse_header_bits_for_counts(&counts[..=max_symbol], max_log, use_low_prob_count)
             .saturating_add(entropy_cost(counts, max_symbol, total))
     });
 
@@ -1592,9 +1593,15 @@ fn choose_table_from_counts<'a>(
             .map(FseTableMode::RepeatLast)
             .unwrap_or(FseTableMode::Predefined(default_table)),
         Some(Choice::Predefined) => FseTableMode::Predefined(default_table),
-        Some(Choice::New) => new_table
-            .map(FseTableMode::Encoded)
-            .unwrap_or(FseTableMode::Predefined(default_table)),
+        // The custom table won the cost comparison — build it now (the only
+        // place the state tables are constructed). `distinct_symbols > 1`
+        // held when `new_total_cost` was computed, so the histogram has the
+        // two-sample minimum `build_table_from_symbol_counts` requires.
+        Some(Choice::New) => FseTableMode::Encoded(build_table_from_symbol_counts(
+            &counts[..=max_symbol],
+            max_log,
+            use_low_prob_count,
+        )),
         None => {
             let fallback_counts = [counts[0], 0];
             let fallback = if max_symbol == 0 {

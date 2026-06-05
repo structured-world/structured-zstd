@@ -272,3 +272,39 @@ pub fn round_trip(data: &[u8]) {
 
     assert_eq!(br.bits_remaining(), 0);
 }
+
+#[test]
+#[should_panic(expected = "FSE table requires at least 2 samples")]
+fn fse_header_pricing_rejects_single_sample_histogram() {
+    // A histogram with fewer than two samples cannot form a valid FSE
+    // table. Header pricing must trip the same `total > 1` guard as the
+    // builder it mirrors, rather than fall through into table-log /
+    // normalization arithmetic that underflows on `total <= 1`.
+    let _ = fse_encoder::fse_header_bits_for_counts(&[1], 9, false);
+}
+
+#[test]
+fn fse_header_pricing_matches_built_table_header_bits() {
+    // The custom-table mode selector trusts that pricing a header from
+    // counts returns exactly what the eventually built table's
+    // `table_header_bits()` reports. Lock that invariant across a few
+    // representative histograms and both `avoid_0_numbit` modes.
+    let histograms: [&[usize]; 4] = [
+        &[50, 50],
+        &[4, 4, 4, 4],
+        &[100, 5, 1, 1],
+        &[200, 100, 50, 25, 12, 6, 3, 1],
+    ];
+    for counts in histograms {
+        for avoid_0_numbit in [false, true] {
+            let priced = fse_encoder::fse_header_bits_for_counts(counts, 9, avoid_0_numbit);
+            let built = fse_encoder::build_table_from_symbol_counts(counts, 9, avoid_0_numbit)
+                .table_header_bits();
+            assert_eq!(
+                priced, built,
+                "header pricing diverged from built table for counts={counts:?} \
+                 avoid_0_numbit={avoid_0_numbit}"
+            );
+        }
+    }
+}
