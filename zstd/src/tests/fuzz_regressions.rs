@@ -171,12 +171,15 @@ fn over_producing_block_does_not_oom_via_unbounded_reserve() {
         0x0a, 0x0a, 0x0a, 0x0a, 0xb5, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0xe5, 0x0a, 0xb5,
     ];
 
-    // Frame headers are well-formed, so streaming construction succeeds; the
-    // over-producing block must surface a decode Err (not OOM, not panic).
-    if let Ok(mut decoder) = crate::decoding::StreamingDecoder::new(data) {
-        let mut output = alloc::vec::Vec::new();
-        let _: Result<_, _> = decoder.read_to_end(&mut output);
-    }
+    // Frame headers are well-formed, so streaming construction must
+    // succeed — make it mandatory so the test can't vacuously pass by
+    // skipping the OOM path if construction ever regresses. The decode
+    // result is ignored: the regression is "no OOM / no panic", not a
+    // specific Ok/Err.
+    let mut decoder = crate::decoding::StreamingDecoder::new(data)
+        .expect("regression artifact must pass frame-header construction");
+    let mut output = alloc::vec::Vec::new();
+    let _: Result<_, _> = decoder.read_to_end(&mut output);
 }
 
 #[test]
