@@ -6072,6 +6072,29 @@ fn driver_small_source_hint_shrinks_dfast_hash_tables() {
 }
 
 #[test]
+fn driver_huge_source_hint_does_not_overflow_table_window_shift() {
+    // Regression: the Dfast / Row table-window sizing in `reset` derives a
+    // shift from `ceil_log2(hint)`. A hint >= 2^63 + 1 makes that shift 64,
+    // and `1usize << 64` panics in debug / wraps to 0 in release before the
+    // `.min(max_window_size)` cap can apply. A `u64::MAX` pledged source size
+    // must size the table to the real window, never panic or wrap to zero.
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+    driver.set_source_size_hint(u64::MAX);
+    driver.reset(CompressionLevel::Level(3));
+
+    let mut space = driver.get_next_space();
+    space[..12].copy_from_slice(b"abcabcabcabc");
+    space.truncate(12);
+    driver.commit_space(space);
+    driver.skip_matching_with_hint(None);
+
+    assert!(
+        driver.dfast_matcher().long_hash.len() >= 1 << MIN_WINDOW_LOG,
+        "huge hint must size the dfast table from the real window, not wrap to zero"
+    );
+}
+
+#[test]
 fn driver_small_source_hint_shrinks_row_hash_tables() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
 
