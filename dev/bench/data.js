@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780679493654,
+  "lastUpdate": 1780696200181,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -57650,6 +57650,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.26,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "681ebdbbd143fa73241e0edad45982299b432d5b",
+          "message": "fix(decode): bound per-block output (decompression-bomb OOM) + L19 decode gap (#350)\n\n* fix(decode): bound per-block output to reject decompression-bomb OOM\n\nA crafted frame whose sequences over-produce within one block drove\nDecodeBuffer::repeat -> RingBuffer::reserve_amortized to 0.5-2 GiB inside\nthe block-decode loop, before the post-block validity check ran and\nupstream of any consumer Read::take cap (the OOM is in the decoder, not\nthe output). Reproduced from the libFuzzer decode artifact oom-66db61d9.\n\nA single zstd block decompresses to at most MAX_BLOCK_SIZE. Arm a\nper-block output ceiling (len_at_block_start + MAX_BLOCK_SIZE) on the\nDecodeBuffer before the sequence loop and reject in repeat() any match\nthat would cross it, returning BlockOutputExceedsMax instead of growing\nthe buffer unbounded. The default usize::MAX ceiling leaves\nnon-block-decode callers unaffected; the inline executor path (fixed /\nFCS-capped backends) is unchanged.\n\nCloses #349 (OOM part)\n\n* fix(decode): arm per-block output ceiling on all CPU-tier paths\n\nThe decompression-bomb ceiling was armed only in the generic\ndecode_and_execute_sequences_impl (the aarch64 NEON/SVE path). The\nx86_64 per-tier sequence decoders (scalar, bmi2, avx2, vbmi2) are\nseparate functions that each reserve MAX_BLOCK_SIZE but never called\nset_block_output_ceiling, so block_output_limit stayed usize::MAX and\nan over-producing block grew the RingBuffer unbounded.\n\nOn 64-bit this only wasted memory (the ringbuffer capacity assertion\nshort-circuits true via usize::BITS >= 64); on i686 it tripped\nnew_cap < isize::MAX, surfacing as the over_producing_block fuzz\nregression panic. Arm the ceiling after every per-tier reserve so the\nguard fires on all targets, not just aarch64.\n\n* refactor(decode): hoist shared sequence-stream preamble into one helper\n\nThe per-CPU-tier sequence decoders (scalar/bmi2/avx2/vbmi2) and the\nK-generic impl each carried a byte-identical cold preamble: consume\nddict flag, rebuild FSE tables, skip stream padding, init the LL/OF/ML\ndecoder states, reserve output, arm the per-block output ceiling, and\ncompute the long-pipeline gate. Five copies meant five places to keep\nin sync, and the decompression-bomb ceiling drift this fixes was a\ndirect consequence (the ceiling was armed in only one copy).\n\nExtract it into a single generic init_sequence_stream<B, K> returning\nthe bit reader, the three FSE decoder states, and the scalar gate\nvalues. Only the hot decode+execute loop still diverges per tier (that\ndivergence is deliberate: each tier's loop body inlines its own\ntarget_feature intrinsics). The cold preamble is not perf-sensitive,\nso centralising it costs nothing and makes the ceiling (and every\nother per-block invariant) impossible to drift between tiers.\n\n* test(decode): assert BlockOutputExceedsMax Display + ExtraPadding reject\n\n- BlockOutputExceedsMax Display arm (errors.rs): the ceiling test only\n  matched the variant; now also assert the rendered string carries the\n  produced byte count.\n- init_sequence_stream ExtraPadding return: a sequences block whose\n  bitstream is all-zero has no start-of-stream sentinel bit, so more\n  than 8 padding bits are skipped. New unit test drives that branch via\n  predefined-mode tables and an all-zero source.\n\n* test(decode): exercise per-tier sequence-decoder preambles directly\n\nThe per-CPU-tier monoliths (scalar, bmi2, avx2, vbmi2) and the\nK-generic impl share one preamble, but the runtime kernel selector\npicks a single tier per CPU, so x86_64 CI only ever runs the avx2 path\nthrough normal decode. Call the other tiers' entry points directly with\na one-sequence Predefined header and a well-formed bitstream so their\nshared preamble executes:\n\n- scalar tier + K-generic impl (ScalarKernel): always runnable.\n- bmi2 / avx2 tiers: guarded on runtime feature detection.\n- vbmi2 tier: guarded on avx512vbmi2; self-skips where absent.\n\n* perf(decode): outline cold block-output-ceiling error path\n\nThe per-block decompression-bomb ceiling check runs on every match\nrepeat in the sequence hot loop. Keep the hot path to a single compare\nby moving the produced-byte error arithmetic into a #[cold]\n#[inline(never)] builder, so the rejection-only computation no longer\nbloats the inlined repeat path.\n\n* test(decode): require frame construction in over-producing OOM test\n\nMake StreamingDecoder::new mandatory (expect) instead of if-let, so the\nregression can't vacuously pass by skipping the OOM decode path if frame\nconstruction ever regresses. Only the decode result stays ignored.\n\n* test(decode): gate vbmi2 preamble test on full kernel set\n\nThe bare avx512vbmi2 probe could SIGILL on a CPU that reports VBMI2 but\nlacks a companion feature required by the unsafe monolith's\ntarget_feature(bmi2,avx2,avx512vbmi2,avx512f,avx512vl,avx512bw). Mirror\nthe production dispatch gate via detect_cpu_kernel() == Vbmi2, which\nverifies the complete set.\n\n* test(decode): assert over-producing block surfaces decode Err\n\nThe OOM fix converts the unbounded-reserve path into a normal decode\nErr via the per-block output ceiling. Assert is_err() so the regression\nalso locks in that the decoder never silently accepts the malformed\nframe, instead of only checking for absence of OOM.",
+          "timestamp": "2026-06-05T23:55:07+03:00",
+          "tree_id": "285b5712697cc4e010ba5ed1fcc450ee4e435513",
+          "url": "https://github.com/structured-world/structured-zstd/commit/681ebdbbd143fa73241e0edad45982299b432d5b"
+        },
+        "date": 1780696189074,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.13,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.088,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 304.567,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 229.647,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.508,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.512,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.624,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.098,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.496,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 2.031,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.119,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.267,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.119,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.267,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.021,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 12.86,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.667,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.563,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.3,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.545,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.093,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.597,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.125,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.107,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.237,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.108,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.27,
             "unit": "ms"
           }
         ]
