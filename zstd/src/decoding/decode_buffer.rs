@@ -6,7 +6,6 @@ use core::hash::Hasher;
 use super::buffer_backend::BufferBackend;
 use super::prefetch;
 use super::ringbuffer::RingBuffer;
-use crate::common::MAX_BLOCK_SIZE;
 use crate::decoding::errors::DecodeBufferError;
 
 /// Generic decode-side output buffer parameterised over the storage
@@ -37,14 +36,6 @@ pub struct DecodeBuffer<B: BufferBackend = RingBuffer> {
 
     pub window_size: usize,
     total_output_counter: u64,
-    /// Upper bound on `buffer.len()` for the block currently being decoded.
-    /// Set per block to `len_at_block_start + MAX_BLOCK_SIZE` so a single
-    /// block cannot decompress to more than `MAX_BLOCK_SIZE` of output; a
-    /// `repeat` that would cross it is rejected before its `try_reserve`,
-    /// bounding the growable `RingBuffer` against decompression-bomb OOMs.
-    /// `usize::MAX` (the default) disables the check for non-block-decode
-    /// callers of `repeat`.
-    block_output_limit: usize,
     #[cfg(feature = "hash")]
     pub hash: twox_hash::XxHash64,
 }
@@ -93,7 +84,6 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             dict: None,
             window_size,
             total_output_counter: 0,
-            block_output_limit: usize::MAX,
             #[cfg(feature = "hash")]
             hash: twox_hash::XxHash64::with_seed(0),
         }
@@ -118,40 +108,24 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             dict: None,
             window_size,
             total_output_counter: 0,
-            block_output_limit: usize::MAX,
             #[cfg(feature = "hash")]
             hash: twox_hash::XxHash64::with_seed(0),
         }
     }
 
     /// Arm the per-block decompressed-output ceiling for the block about to
-    /// be decoded: a `repeat` whose match would push `buffer.len()` past
-    /// `current_len + MAX_BLOCK_SIZE` is rejected (see `block_output_limit`),
-    /// bounding the growable backend against decompression-bomb OOMs. Called
-    /// once per block by the sequence decoder, before the sequence loop.
+    /// be decoded: the growable backend is told it may grow only up to
+    /// `current_len + max_block_output`, so a match that would push this
+    /// block's output past `MAX_BLOCK_SIZE` fails its `try_reserve` on the
+    /// cold growth path instead of growing the ring to gigabytes (a
+    /// decompression-bomb OOM) before the post-block validity check runs.
+    /// Called once per block by the sequence decoder, before the sequence
+    /// loop. Backends that cannot grow unbounded (fixed-capacity, or the
+    /// inline-exec FCS-capped path) take the trait's no-op default.
     #[inline]
     pub(crate) fn set_block_output_ceiling(&mut self, max_block_output: usize) {
-        self.block_output_limit = self.buffer.len().saturating_add(max_block_output);
-    }
-
-    /// Cold-path error builder for the per-block output ceiling. Outlined
-    /// from `repeat_inner` so the hot per-match check stays a single
-    /// compare; the produced-byte arithmetic only runs on the
-    /// malformed-input rejection path.
-    #[cold]
-    #[inline(never)]
-    fn block_output_exceeded(&self, match_length: usize) -> DecodeBufferError {
-        let block_start = self
-            .block_output_limit
-            .saturating_sub(MAX_BLOCK_SIZE as usize);
-        DecodeBufferError::BlockOutputExceedsMax {
-            produced: self
-                .buffer
-                .len()
-                .saturating_add(match_length)
-                .saturating_sub(block_start),
-            max: MAX_BLOCK_SIZE as usize,
-        }
+        let ceiling = self.buffer.len().saturating_add(max_block_output);
+        self.buffer.set_max_capacity(ceiling);
     }
 
     pub fn reset(&mut self, window_size: usize) {
@@ -168,8 +142,9 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         // the frame will actually hit this buffer.
         self.dict = None;
         self.total_output_counter = 0;
-        // Cleared per frame; re-armed per block by the sequence decoder.
-        self.block_output_limit = usize::MAX;
+        // Lift the per-block growth ceiling between frames; the sequence
+        // decoder re-arms it per block. Non-block callers stay unbounded.
+        self.buffer.set_max_capacity(usize::MAX);
         #[cfg(feature = "hash")]
         {
             self.hash = twox_hash::XxHash64::with_seed(0);
@@ -408,22 +383,14 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             return Ok(());
         }
 
-        // Bound the block's cumulative decompressed output. A single zstd
-        // block decompresses to at most MAX_BLOCK_SIZE; reject a match that
-        // would push this block's output past the per-block ceiling
-        // (`block_output_limit`, set per block by the sequence decoder)
-        // before its `try_reserve`. On the growable `RingBuffer` an
-        // over-producing malformed / adversarial block would otherwise grow
-        // the buffer to gigabytes inside the decode loop — a
-        // decompression-bomb OOM — before the post-block validity check can
-        // reject the frame. The default `usize::MAX` ceiling leaves
-        // non-block-decode callers of `repeat` unaffected.
-        if self.buffer.len().saturating_add(match_length) > self.block_output_limit {
-            // Cold path outlined so the per-match hot check is just the
-            // compare above (the error-byte arithmetic must not bloat the
-            // sequence loop's inlined repeat path).
-            return Err(self.block_output_exceeded(match_length));
-        }
+        // The per-block decompression-bomb ceiling is NOT checked here on
+        // every match (that compare bloated the inlined hot loop). It is
+        // enforced once on the cold growth path: `set_block_output_ceiling`
+        // lowers the backend's `max_capacity` per block, so the
+        // `try_reserve` below rejects an over-producing match exactly when
+        // it would have to grow the buffer past the ceiling — bounding the
+        // OOM on every target while a well-formed block (covered by the
+        // upfront `reserve(MAX_BLOCK_SIZE)`) never reaches the check.
 
         if offset > self.buffer.len() {
             self.repeat_from_dict(offset, match_length)
@@ -436,12 +403,13 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             // assumes the required free capacity exists; skipping it
             // would turn a malformed block (match_length past the
             // upfront `reserve(MAX_BLOCK_SIZE)`) into release-build
-            // UB. Use the fallible variant so fixed-capacity backends
-            // (`UserSliceBackend`) surface a structured error instead
-            // of panicking via the per-call `assert!` inside
-            // `extend_from_within_unchecked`. Growable backends'
-            // default impl never fails (allocation succeeds or
-            // aborts), so the conversion is a cheap no-op there.
+            // UB. The fallible variant surfaces a structured error for
+            // both fixed-capacity backends (`UserSliceBackend`: write
+            // past the user's slice) and the growable `RingBuffer` (a
+            // grow past the per-block `max_capacity` ceiling — the
+            // decompression-bomb guard). On the common path the upfront
+            // `reserve(MAX_BLOCK_SIZE)` already covers the write, so this
+            // is a cheap capacity check, not an allocation.
             self.buffer.try_reserve(match_length).map_err(|o| {
                 DecodeBufferError::OutputBufferOverflow {
                     tail: o.tail,
@@ -1330,29 +1298,41 @@ mod tests {
 
     #[test]
     fn repeat_rejects_output_past_block_ceiling() {
-        // A single zstd block decompresses to at most MAX_BLOCK_SIZE. With
-        // the per-block ceiling armed, a `repeat` whose match would push the
-        // block's output past it must be rejected before its `try_reserve`.
-        // Without this guard the over-long match drives `try_reserve`
-        // unbounded on the growable `RingBuffer` — the artifact `oom-66db61d9…`
-        // grew the ring to ~0.5–2 GiB across many over-producing sequences
-        // before any post-block check ran (a decompression-bomb OOM,
-        // reproduced via the fuzz `decode` target). Pre-guard this `repeat`
-        // returned `Ok` (reserved + copied); it must now reject.
+        // A single zstd block decompresses to at most MAX_BLOCK_SIZE. The
+        // per-block ceiling is enforced on the growable `RingBuffer`'s cold
+        // growth path: `set_block_output_ceiling` lowers `max_capacity`, so a
+        // `repeat` whose match would have to grow the buffer past the ceiling
+        // fails its `try_reserve` instead of growing the ring unbounded.
+        // Without this guard the over-long match drove `try_reserve` to
+        // ~0.5–2 GiB across many over-producing sequences (artifact
+        // `oom-66db61d9…`, fuzz `decode` target) before any post-block check
+        // ran — a decompression-bomb OOM. The match needing growth surfaces
+        // as `OutputBufferOverflow` (the backend's structured reject).
         let mut decode_buf = DecodeBuffer::<RingBuffer>::new(4 * 1024);
         decode_buf.push(b"abcdef"); // len = 6
-        decode_buf.set_block_output_ceiling(8); // ceiling = 6 + 8 = 14
+        decode_buf.set_block_output_ceiling(8); // max_capacity = 6 + 8 = 14
         let err = decode_buf.repeat(4, 16).unwrap_err(); // 6 + 16 = 22 > 14
-        assert!(matches!(
-            err,
-            crate::decoding::errors::DecodeBufferError::BlockOutputExceedsMax { .. }
-        ));
-        // Display carries the produced bytes for diagnostics. `produced`
-        // is `(len + match_length) - block_start` = `22 - 0 = 22` (the
-        // ceiling of 14 sits below MAX_BLOCK_SIZE so `block_start`
-        // saturates to 0); `max` is always MAX_BLOCK_SIZE.
-        let rendered = alloc::format!("{err}");
-        assert!(rendered.contains("22"), "unexpected Display: {rendered}");
+        assert!(
+            matches!(
+                err,
+                crate::decoding::errors::DecodeBufferError::OutputBufferOverflow { .. }
+            ),
+            "over-producing match must be rejected, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn repeat_within_block_ceiling_still_succeeds() {
+        // A match that keeps the block's output at/below the armed ceiling
+        // must NOT be rejected — the guard fires only on growth past the
+        // ceiling, never on legitimate in-bounds output.
+        let mut decode_buf = DecodeBuffer::<RingBuffer>::new(4 * 1024);
+        decode_buf.push(b"abcdef"); // len = 6
+        decode_buf.set_block_output_ceiling(8); // max_capacity = 14
+        decode_buf
+            .repeat(4, 8)
+            .expect("6 + 8 = 14 == ceiling is allowed");
+        assert_eq!(decode_buf.len(), 14);
     }
 
     #[test]

@@ -226,6 +226,15 @@ pub(crate) trait BufferBackend: Sized {
         Ok(())
     }
 
+    /// Lower the per-block growth ceiling on backends whose `try_reserve`
+    /// may grow without bound (the streaming `RingBuffer`). The block
+    /// sequence decoder sets it to `len + MAX_BLOCK_SIZE` per block so an
+    /// over-producing match is rejected on the cold growth path,
+    /// bounding decompression-bomb OOMs. Default no-op: fixed-capacity
+    /// backends are already bounded, and the inline-exec (FCS-capped)
+    /// path never grows through `try_reserve`.
+    fn set_max_capacity(&mut self, _max_capacity: usize) {}
+
     /// Live byte count: bytes between the logical head and tail.
     fn len(&self) -> usize;
 

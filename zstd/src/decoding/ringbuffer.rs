@@ -29,6 +29,17 @@ pub struct RingBuffer {
     cap: usize,
     head: usize,
     tail: usize,
+    /// Upper bound on the live byte count (`len()`) that a *growing*
+    /// reserve may target. `usize::MAX` (the default) leaves growth
+    /// unbounded. The block sequence decoder lowers it to
+    /// `len_at_block_start + MAX_BLOCK_SIZE` before each block so a
+    /// match that would push output past the per-block ceiling fails its
+    /// `try_reserve` (cold growth path) instead of growing the ring to
+    /// gigabytes — a decompression-bomb OOM — before the post-block
+    /// validity check runs. Enforced only when a reserve actually has to
+    /// grow, so well-formed blocks (covered by the upfront
+    /// `reserve(MAX_BLOCK_SIZE)`) never pay for the check.
+    max_capacity: usize,
 }
 
 // SAFETY: RingBuffer does not hold any thread specific values -> it can be sent to another thread -> RingBuffer is Send
@@ -46,6 +57,7 @@ impl RingBuffer {
             // SAFETY: Upholds invariant 2-4
             head: 0,
             tail: 0,
+            max_capacity: usize::MAX,
         }
     }
 
@@ -171,6 +183,51 @@ impl RingBuffer {
         }
 
         self.reserve_amortized(amount - free);
+    }
+
+    /// Lower the growth ceiling (see [`Self::max_capacity`]). `usize::MAX`
+    /// restores unbounded growth.
+    #[inline]
+    pub fn set_max_capacity(&mut self, max_capacity: usize) {
+        self.max_capacity = max_capacity;
+    }
+
+    /// Fallible [`Self::reserve`]: identical fast path, but when the
+    /// reserve would have to *grow* the ring it first rejects any target
+    /// `len() + amount` past [`Self::max_capacity`]. This is where the
+    /// per-block decompression-bomb ceiling is enforced — on the cold
+    /// growth path only, so well-formed blocks never pay for it.
+    #[inline]
+    pub fn try_reserve(
+        &mut self,
+        amount: usize,
+    ) -> Result<(), super::buffer_backend::BackendOverflow> {
+        // Flat fast path (mirrors `reserve`): no wrap and the write fits
+        // below `cap` — capacity already present, no growth, no ceiling
+        // check.
+        if self.head <= self.tail && amount < self.cap.saturating_sub(self.tail) {
+            return Ok(());
+        }
+        let free = self.free();
+        if free >= amount {
+            return Ok(());
+        }
+        // Growth is required. Reject if it would cross the per-block
+        // ceiling before allocating (bounds the bomb on every target,
+        // unlike a 32-bit-only assert).
+        if self
+            .len()
+            .checked_add(amount)
+            .is_none_or(|needed| needed > self.max_capacity)
+        {
+            return Err(super::buffer_backend::BackendOverflow {
+                tail: self.tail,
+                requested: amount,
+                capacity: self.max_capacity,
+            });
+        }
+        self.reserve_amortized(amount - free);
+        Ok(())
     }
 
     #[inline(never)]
@@ -860,6 +917,14 @@ impl super::buffer_backend::BufferBackend for RingBuffer {
     #[inline]
     fn reserve(&mut self, n: usize) {
         Self::reserve(self, n);
+    }
+    #[inline]
+    fn try_reserve(&mut self, n: usize) -> Result<(), super::buffer_backend::BackendOverflow> {
+        Self::try_reserve(self, n)
+    }
+    #[inline]
+    fn set_max_capacity(&mut self, max_capacity: usize) {
+        Self::set_max_capacity(self, max_capacity);
     }
     #[inline]
     fn len(&self) -> usize {
