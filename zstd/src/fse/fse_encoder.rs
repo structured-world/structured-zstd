@@ -497,6 +497,16 @@ pub(crate) fn fse_header_bits_for_counts(
     avoid_0_numbit: bool,
 ) -> usize {
     let total = counts.iter().sum::<usize>();
+    // Mirror `build_table_from_counts`'s contract: pricing must reject the
+    // same inputs the builder rejects. A histogram with fewer than two
+    // samples cannot form a valid FSE table, and the table-log selection
+    // below takes an integer logarithm of `total` that underflows on
+    // `total <= 1`. Trip the guard up front so the failure mode matches
+    // the builder instead of an opaque arithmetic panic.
+    assert!(
+        total > 1,
+        "FSE table requires at least 2 samples in the histogram (got {total})"
+    );
     let max_symbol = counts
         .iter()
         .rposition(|&count| count > 0)
