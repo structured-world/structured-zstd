@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780696200181,
+  "lastUpdate": 1780699859685,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -57854,6 +57854,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.27,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "47694c6e2cd882f9fd349bcfc4870d6e741ad7e3",
+          "message": "feat(bench): report active CPU kernel tier + fix decode_loop corpus masking (#351)\n\n* feat(bench): report active CPU kernel tier; fix decode_loop corpus masking\n\nEmit a REPORT_KERNEL line (kernel + arch + target_env) once per bench run\nfrom compare_ffi and compare_ffi_memory, expose the tier via the new public\n`active_cpu_kernel_name()`, and capture it into benchmark-relative.json's\n`target.kernel` so the dashboard can attribute every measurement to the\nkernel that actually ran (entropy/sequence dispatch is shared encode/decode,\n#247) and tell apart e.g. x86_64-gnu vs x86_64-musl.\n\nAlso stop decode_loop_z000033 from silently substituting a random LCG\nsynthetic source when no corpus path is given: random data is ~incompressible\n(decodes as RAW blocks → trivial, unrepresentative ~30 GB/s timings that mask\nthe real workload). It now defaults to the in-tree z000033, fails loudly if\nabsent, and only uses the synthetic source via an explicit `synthetic` arg\n(with a warning).\n\nPart of #349\n\n* feat(bench-dashboard): show CPU kernel tier per target\n\nCarry the run's CPU kernel onto every relative record and annotate each\ntarget chip in the dashboard with its kernel tier (`target · avx2`), with\narch / libc in the tooltip. Per-record so it survives merging the per-target\npayloads. Lets a reader see which kernel produced each target's numbers.\n\nPart of #349\n\n* fix(dashboard): pick latest-snapshot kernel tier per target\n\nThe kernel chip took the first record per target, which is\norder-dependent and can show a stale tier when the payload merges\nseveral snapshots. Select the kernel from the record with the max\ngenerated_at (commit_sha fallback) per target instead.\n\n* test(example): resolve z000033 corpus via env + manifest dir\n\nAlign decode_loop_z000033 corpus lookup with the benchmark resolution\norder: STRUCTURED_ZSTD_BENCH_CORPUS_PATH, then\nCARGO_MANIFEST_DIR/decodecorpus_files/z000033, then the cwd-relative\npaths, before the loud not-found panic.\n\n* docs(example): correct decode_loop header for corpus-first default\n\nThe header said it generates a 1 MB synthetic corpus, but the example\nnow defaults to the in-tree z000033 file; synthetic is opt-in via the\n`synthetic` arg.\n\n* test(cpu_kernel): cover active_cpu_kernel_name diagnostic\n\nAssert the public tier name is a recognised lowercase string and is\nstable across calls. Brings the new diagnostic API under coverage.\n\n* refactor(bench): share REPORT_KERNEL line builder across benches\n\nExtract the duplicated arch/target_env cfg block + REPORT_KERNEL format\ninto support::kernel_report_line(), used by both compare_ffi (once-guarded)\nand compare_ffi_memory (unconditional). Keeps the emitted format in lockstep.\n\n* fix(example): accept synthetic arg case-insensitively\n\ndecode_loop_z000033 matched the literal \"synthetic\" only, so Synthetic /\nSYNTHETIC fell through to the file-path arm and panicked with a confusing\n\"read corpus file\" error. Match via eq_ignore_ascii_case instead.\n\n* fix(dashboard): order kernel-by-target via compareSnapshotIdentity\n\nThe latest-snapshot-per-target kernel pick compared generated_at || commit_sha\nas raw strings, which can misorder a SHA-fallback record against a timestamped\none. Reuse compareSnapshotIdentity (the comparator the latest-profile selection\nalready uses) and keep the full row, matching the dashboard's ordering\nsemantics. No JS test harness in-tree; verified against the existing usage\npattern and absence of stale references.\n\n* test(cpu_kernel): cover every kernel-tag name arm\n\nExtract the tag-to-name mapping into CpuKernelTag::name() so it is a pure\nfunction over the tag, and add a test that maps each constructible variant\ndirectly. active_cpu_kernel_name only hits whichever arm the running CPU\nresolves to, leaving the other tier arms uncovered on a single-CPU CI runner;\nthe per-variant test exercises all of them on this build's feature set.",
+          "timestamp": "2026-06-06T00:50:56+03:00",
+          "tree_id": "e9c9038141cb1f7d4f6a01ca3178ed45790e8e92",
+          "url": "https://github.com/structured-world/structured-zstd/commit/47694c6e2cd882f9fd349bcfc4870d6e741ad7e3"
+        },
+        "date": 1780699850794,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.102,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.068,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 230.384,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 158.454,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.172,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.167,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.8,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.835,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.701,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.782,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.094,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.207,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.094,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.206,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.02,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.008,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 11.62,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 4.628,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.052,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.317,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.56,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.039,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.804,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.071,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.097,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.201,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.097,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.199,
             "unit": "ms"
           }
         ]
