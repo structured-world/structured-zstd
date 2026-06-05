@@ -174,12 +174,16 @@ fn over_producing_block_does_not_oom_via_unbounded_reserve() {
     // Frame headers are well-formed, so streaming construction must
     // succeed — make it mandatory so the test can't vacuously pass by
     // skipping the OOM path if construction ever regresses. The decode
-    // result is ignored: the regression is "no OOM / no panic", not a
-    // specific Ok/Err.
+    // must surface a normal Err (the per-block ceiling rejecting the
+    // over-producing match), not just "no OOM": asserting Err also locks
+    // in that the decoder never silently accepts this malformed frame.
     let mut decoder = crate::decoding::StreamingDecoder::new(data)
         .expect("regression artifact must pass frame-header construction");
     let mut output = alloc::vec::Vec::new();
-    let _: Result<_, _> = decoder.read_to_end(&mut output);
+    assert!(
+        decoder.read_to_end(&mut output).is_err(),
+        "over-producing block must surface a decode Err, not decode successfully"
+    );
 }
 
 #[test]
