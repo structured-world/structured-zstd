@@ -412,12 +412,17 @@ fn adjust_params_for_source_size(mut params: LevelParams, src_size: u64) -> Leve
     // clamp first to MIN_WINDOW_LOG (baseline encoder minimum) and then to
     // MIN_HINTED_WINDOW_LOG (16 KiB hinted floor). For tiny or zero hints we
     // therefore keep a 16 KiB effective minimum window in hinted mode.
-    let src_log = if src_size == 0 {
+    // Raw ceil(log2(src_size)) drives the internal table sizes. The
+    // advertised `window_log` is separately floored at MIN_HINTED_WINDOW_LOG
+    // (a decoder-interop requirement on the wire format), but the hash /
+    // chain table widths are internal and never appear in the frame, so they
+    // can track the actual source size below that floor.
+    let raw_src_log = if src_size == 0 {
         MIN_WINDOW_LOG
     } else {
         (64 - (src_size - 1).leading_zeros()) as u8 // ceil_log2
     };
-    let src_log = src_log.max(MIN_WINDOW_LOG).max(MIN_HINTED_WINDOW_LOG);
+    let src_log = raw_src_log.max(MIN_WINDOW_LOG).max(MIN_HINTED_WINDOW_LOG);
     if src_log < params.window_log {
         params.window_log = src_log;
     }
@@ -435,6 +440,18 @@ fn adjust_params_for_source_size(mut params: LevelParams, src_size: u64) -> Leve
     } else if backend == super::strategy::BackendTag::Row {
         let max_window_size = 1usize << params.window_log;
         params.row.hash_bits = row_hash_bits_for_window(max_window_size);
+    } else if backend == super::strategy::BackendTag::Simple {
+        // Right-size the flat fast hash table for small inputs so the
+        // per-frame zeroing scales with the source instead of always
+        // clearing the full `1 << fast_hash_log` table. The cap uses the
+        // RAW source log (not the window floor) plus one bit of headroom,
+        // keeping the load factor low so match quality is unaffected; large
+        // inputs keep the level's table width. A `MIN_WINDOW_LOG` floor
+        // avoids a degenerately small table for sub-kilobyte blocks.
+        let fast_cap = (raw_src_log + 1).max(MIN_WINDOW_LOG) as u32;
+        if fast_cap < params.fast_hash_log {
+            params.fast_hash_log = fast_cap;
+        }
     }
     params
 }
