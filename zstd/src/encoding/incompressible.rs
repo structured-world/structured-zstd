@@ -292,6 +292,32 @@ mod tests {
     }
 
     #[test]
+    fn scan_sample_region_early_exits_on_repetitive_input() {
+        // 32 identical 4-byte quads: the repeat count climbs past any small
+        // guard, exercising the early-exit `true` path directly.
+        let sample = [0xAB_u8; 128];
+        let mut counts = [0u16; 256];
+        let mut repeat_table = [u32::MAX; INCOMPRESSIBLE_REPEAT_TABLE_LEN];
+        let mut repeat_occupied = [0_u64; INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS];
+        let mut repeats = 0usize;
+
+        // Guard of 1: the first quad seeds the table, the second is the first
+        // counted repeat (repeats == 1), the third pushes repeats past the
+        // guard and returns `true`.
+        let bailed = scan_sample_region(
+            &sample,
+            &mut counts,
+            &mut repeat_table,
+            &mut repeat_occupied,
+            &mut repeats,
+            1,
+        );
+
+        assert!(bailed, "repetitive input must trigger the early exit");
+        assert!(repeats > 1, "repeat count must have exceeded the guard");
+    }
+
+    #[test]
     fn best_raw_fast_path_requires_better_sized_window() {
         assert!(compression_level_allows_raw_fast_path(
             CompressionLevel::Best,
