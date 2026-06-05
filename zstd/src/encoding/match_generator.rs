@@ -7914,6 +7914,38 @@ fn hc_rebases_positions_after_u32_boundary() {
 }
 
 #[test]
+fn row_rebases_positions_after_u32_boundary() {
+    // Row stores absolute match positions as u32. On a long stream the
+    // cumulative absolute cursor crosses the u32 range even while the live
+    // window stays bounded; `add_data` must rebase the coordinate origin
+    // down to the oldest live byte instead of asserting. Before the rebase
+    // landed this panicked on the `< u32::MAX` assertion, dropping valid
+    // long Row-backed frames.
+    let mut m = RowMatchGenerator::new(64);
+    m.add_data(b"abcdeabcdeabcde".to_vec(), |_| {});
+
+    // Simulate ~4 GiB of stream behind a bounded window: the live bytes now
+    // sit just under the u32 absolute ceiling.
+    let near_ceiling = (u32::MAX as usize) - 16;
+    m.history_abs_start = near_ceiling;
+
+    // The next commit would push a u32 position past the ceiling; add_data
+    // must rebase the origin rather than panic.
+    m.add_data(b"fghij".to_vec(), |_| {});
+
+    assert!(
+        m.history_abs_start < near_ceiling,
+        "add_data must rebase the absolute origin down when the cursor nears \
+         u32::MAX (got {})",
+        m.history_abs_start
+    );
+    assert!(
+        (m.history_abs_start + m.window_size) < u32::MAX as usize,
+        "after rebase the live window must fit below the u32 position ceiling"
+    );
+}
+
+#[test]
 fn hc_rebase_rebuilds_only_inserted_prefix() {
     let mut matcher = HcMatchGenerator::new(64);
     matcher.table.add_data(b"abcdeabcdeabcde".to_vec(), |_| {});
