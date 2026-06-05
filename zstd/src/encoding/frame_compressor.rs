@@ -1017,17 +1017,19 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             // suffix, top it back up before compressing the next block, matching
             // ZSTD_compress_frameChunk() over a contiguous input buffer.
             let block_capacity = MAX_BLOCK_SIZE as usize;
-            let had_pending = !pending_input.is_empty();
-            let mut uncompressed_data = if had_pending {
-                core::mem::take(&mut pending_input)
-            } else {
-                self.state.matcher.get_next_space()
-            };
-            let mut filled = if had_pending {
-                uncompressed_data.len()
-            } else {
-                0
-            };
+            // Always draw the block buffer from the matcher's recycled pool
+            // (its capacity already covers the block size, so the resize below
+            // stays in-place). Any carried pre-split suffix is copied in, and
+            // `pending_input` is retained as a reusable carry buffer. The prior
+            // approach `split_off`'d a fresh suffix Vec per pre-split and
+            // `reserve_exact`-grew it to `block_capacity` every block; on a
+            // heavily pre-split frame that churned one block-sized allocation
+            // per split (~12 MB over ~90 splits on a 1 MiB corpus input).
+            let mut uncompressed_data = self.state.matcher.get_next_space();
+            uncompressed_data.clear();
+            uncompressed_data.extend_from_slice(&pending_input);
+            let mut filled = pending_input.len();
+            pending_input.clear();
             if uncompressed_data.len() < block_capacity {
                 uncompressed_data.resize(block_capacity, 0);
             }
@@ -1063,16 +1065,14 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                     savings,
                 );
                 if block_len < uncompressed_data.len() {
-                    pending_input = uncompressed_data.split_off(block_len);
-                    // `split_off` returns a Vec whose capacity is typically
-                    // close to its length. Next iteration's `had_pending`
-                    // branch moves `pending_input` into `uncompressed_data`
-                    // and resizes to `block_capacity`, which would reallocate
-                    // from scratch on every pre-split. Pre-reserve here so
-                    // the resize stays in-place.
-                    if pending_input.capacity() < block_capacity {
-                        pending_input.reserve_exact(block_capacity - pending_input.len());
-                    }
+                    // Carry the kept suffix into the reusable `pending_input`
+                    // buffer (cleared, capacity retained) instead of allocating
+                    // a fresh Vec via `split_off`. Next iteration copies it back
+                    // into a pooled block buffer. The block currently being
+                    // compressed is truncated to the chosen split length.
+                    pending_input.clear();
+                    pending_input.extend_from_slice(&uncompressed_data[block_len..]);
+                    uncompressed_data.truncate(block_len);
                     last_block = false;
                 }
             }
