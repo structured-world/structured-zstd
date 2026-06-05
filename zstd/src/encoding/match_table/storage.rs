@@ -1291,11 +1291,97 @@ impl MatchTable {
 
     /// Insert every position in `[start, end)` into the hash / chain
     /// tables and advance the hash3 fill cursor past `end`.
+    ///
+    /// The rebase guard is hoisted out of the per-position loop: a single
+    /// `(rel + 1)`-representability check on both ends of the range decides
+    /// whether the whole span fits without a rebase. The check is monotone
+    /// in `pos` (rebase only fires as the relative position approaches
+    /// `u32::MAX`, or at the reserved stream-origin `rel == 0`), so when
+    /// neither end needs a rebase no interior position can either, and the
+    /// fill runs as a tight loop with raw `(pos - position_base)` index
+    /// arithmetic and hoisted base pointers. This mirrors the donor's
+    /// once-per-block `ZSTD_window_correctOverflow` followed by an
+    /// unchecked fill, and matters on highly repetitive inputs where a
+    /// single long match makes this loop fill the entire block. When a
+    /// rebase is required the cold per-position path runs unchanged.
     pub(crate) fn insert_positions(&mut self, start: usize, end: usize) {
-        for pos in start..end {
-            self.insert_position(pos);
+        if start < end {
+            let is_btultra2 = self.is_btultra2;
+            if self.needs_rebase(start, is_btultra2) || self.needs_rebase(end - 1, is_btultra2) {
+                // Cold path: at least one position in the range needs a
+                // rebase. Defer to the guarded per-position insert, which
+                // rebases exactly when each position requires it (including
+                // the reserved `rel == 0` stream-origin skip).
+                for pos in start..end {
+                    self.insert_position(pos);
+                }
+            } else {
+                self.fill_hash_chain_positions(start, end);
+            }
         }
         self.next_to_update3 = self.next_to_update3.max(end);
+    }
+
+    /// Tight hash/chain fill for `[start, end)` when the caller has already
+    /// proven every position is `(rel + 1)`-representable (so no rebase and
+    /// no `rel == 0` skip can occur). Equivalent to looping
+    /// [`Self::insert_position_no_rebase`], but with the table base pointers
+    /// and config hoisted out of the loop and the relative position derived
+    /// by a raw subtraction instead of the checked `relative_position`
+    /// arithmetic. Donor parity: the unchecked `ZSTD_insertAndFindFirstIndex`
+    /// fill body.
+    #[inline]
+    fn fill_hash_chain_positions(&mut self, start: usize, end: usize) {
+        let history_abs_start = self.history_abs_start;
+        let position_base = self.position_base;
+        let index_shift = self.index_shift;
+        let hash_log = self.hash_log;
+        let chain_mask = (1usize << self.chain_log) - 1;
+        let hist_start = self.history_start;
+        let concat_len = self.history.len() - hist_start;
+        // Raw base pointers hoisted once: the loop reads `history` and
+        // writes `hash_table` / `chain_table`, which are disjoint fields, so
+        // raw pointers let the writes proceed without re-borrowing `self`
+        // each iteration. `ensure_tables` (run before any matching pass)
+        // guarantees `hash_table.len() == 1 << hash_log` and
+        // `chain_table.len() == 1 << chain_log`.
+        let concat_ptr = self.history.as_ptr();
+        let hash_ptr = self.hash_table.as_mut_ptr();
+        let chain_ptr = self.chain_table.as_mut_ptr();
+        debug_assert!(self.hash_table.len() == 1usize << hash_log);
+        debug_assert!(self.chain_table.len() == 1usize << self.chain_log);
+        // The last `< 4` bytes of the live window can't be hashed. Compute
+        // the hashable upper bound once instead of branching per position: a
+        // position `pos` is hashable iff `pos - history_abs_start + 4 <=
+        // concat_len`, i.e. `pos < history_abs_start + (concat_len - 3)`.
+        let hashable_end = end.min(history_abs_start + concat_len.saturating_sub(3));
+        if start >= hashable_end {
+            return;
+        }
+        // Hoist the source pointer and relative index out of the loop and
+        // advance both by one per iteration, mirroring the donor's
+        // `ip++ / idx++` fill rather than recomputing them from `pos`.
+        let mut src = unsafe { concat_ptr.add(hist_start + (start - history_abs_start)) };
+        // `rel` cannot reach `u32::MAX` because the caller proved
+        // `!needs_rebase(end - 1)`; `wrapping_add` keeps the overflow branch
+        // off this per-byte hot loop.
+        let mut rel = (start + index_shift - position_base) as u32;
+        for _ in start..hashable_end {
+            // SAFETY: every `src` in `[start, hashable_end)` is at least 4
+            // bytes from the end of `history`, so the unaligned 4-byte read is
+            // in range. `hash` is masked to `hash_log` bits and `chain_idx` to
+            // `chain_log` bits, both within the table lengths asserted above.
+            unsafe {
+                let value = Self::read_le_u32_ptr(src);
+                let hash = Self::hash_value_with_mls(value, hash_log, 4);
+                let chain_idx = (rel as usize) & chain_mask;
+                let prev = *hash_ptr.add(hash);
+                *chain_ptr.add(chain_idx) = prev;
+                *hash_ptr.add(hash) = rel + 1;
+                src = src.add(1);
+            }
+            rel = rel.wrapping_add(1);
+        }
     }
 
     /// Insert every `step`-th position in `[start, end)` — the sparse
