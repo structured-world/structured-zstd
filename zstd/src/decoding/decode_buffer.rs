@@ -1296,6 +1296,12 @@ mod tests {
             err,
             crate::decoding::errors::DecodeBufferError::BlockOutputExceedsMax { .. }
         ));
+        // Display carries the produced bytes for diagnostics. `produced`
+        // is `(len + match_length) - block_start` = `22 - 0 = 22` (the
+        // ceiling of 14 sits below MAX_BLOCK_SIZE so `block_start`
+        // saturates to 0); `max` is always MAX_BLOCK_SIZE.
+        let rendered = alloc::format!("{err}");
+        assert!(rendered.contains("22"), "unexpected Display: {rendered}");
     }
 
     #[test]

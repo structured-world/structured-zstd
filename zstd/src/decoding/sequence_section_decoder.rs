@@ -1954,3 +1954,51 @@ mod compute_use_long_pipeline_tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod init_sequence_stream_tests {
+    use super::super::scratch::FSEScratch;
+    use super::init_sequence_stream;
+    use crate::blocks::sequence_section::SequencesHeader;
+    use crate::cpu_kernel::ScalarKernel;
+    use crate::decoding::decode_buffer::DecodeBuffer;
+    use crate::decoding::errors::{DecodeSequenceError, DecompressBlockError};
+    use crate::decoding::ringbuffer::RingBuffer;
+
+    /// The sequence bitstream must end with a single `1` sentinel bit in
+    /// the final byte; the decoder skips trailing `0` padding looking for
+    /// it. A final byte (read first, MSB-down) that is all zeros has no
+    /// sentinel, so more than 8 padding bits are skipped — that must be
+    /// rejected as `ExtraPadding`, not decoded.
+    #[test]
+    fn rejects_bitstream_with_excess_padding() {
+        let mut header = SequencesHeader::new();
+        // `0x01` = one sequence; `0x00` modes byte = all axes Predefined,
+        // so `maybe_update_fse_tables` reads zero table bytes and the
+        // whole source is the (malformed) bitstream.
+        header.parse_from_header(&[0x01, 0x00]).unwrap();
+
+        let mut fse = FSEScratch::new();
+        let mut buffer = DecodeBuffer::<RingBuffer>::new(4 * 1024);
+        // All-zero bitstream: no sentinel `1` bit anywhere.
+        let source = [0u8; 2];
+
+        // `SeqStreamSetup` is not `Debug`, so assert on the `Result`
+        // directly via `matches!` rather than unwrapping the Ok side.
+        let result = init_sequence_stream::<RingBuffer, ScalarKernel>(
+            &header,
+            &source,
+            &mut fse,
+            &mut buffer,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(DecompressBlockError::DecodeSequenceError(
+                    DecodeSequenceError::ExtraPadding { .. }
+                ))
+            ),
+            "all-zero padding must be rejected as ExtraPadding"
+        );
+    }
+}
