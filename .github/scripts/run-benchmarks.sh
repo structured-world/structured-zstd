@@ -824,6 +824,14 @@ for row in dictionary_rows:
         }
     )
 
+# Stamp the run's CPU kernel tier onto every relative record. The deployed
+# dashboard payload concatenates records from per-target runs, so the
+# per-run `target.kernel` below would be overwritten on merge — carrying it
+# per-record lets the dashboard map each target to the kernel that produced
+# its numbers regardless of how the per-target files are merged.
+for _r in relative_rows:
+    _r["kernel"] = kernel_info
+
 relative_payload = {
     "version": 1,
     "target": {
