@@ -924,24 +924,45 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             // This state drives sequence encoding, while matcher priming below updates
             // the match generator's internal repeat-offset history for match finding.
             self.state.offset_hist = dict.inner.offset_hist;
-            // CDict fast path (donor `ZSTD_compressBegin_usingCDict`): restore
-            // the precomputed primed matcher state (a table copy) instead of
-            // re-hashing every dictionary position into the match tables. The
-            // snapshot is captured on the first prime and reused while the
-            // dictionary + level stay the same; `restore` returns false when
-            // it must be (re)built.
-            if !self
-                .state
-                .matcher
-                .restore_primed_dictionary(self.compression_level)
-            {
+            // Donor `ZSTD_shouldAttachDict` (`zstd_compress.c`): a
+            // precomputed-dictionary table is COPIED into the working context
+            // only when the source is larger than a per-strategy cutoff; at or
+            // below it (and for unknown size) the donor ATTACHES the dictionary
+            // tables by reference (no per-frame table touch at all). We don't
+            // have an attach-by-reference path yet, so:
+            //   - large source (> cutoff): reuse the captured prime snapshot
+            //     (a table copy) instead of re-hashing the dictionary — the
+            //     donor COPY regime, where the copy is cheaper than re-priming;
+            //   - small / unknown source: re-prime (the snapshot copy of the
+            //     whole table would cost MORE than the sparse re-prime here,
+            //     which is exactly why the donor attaches by reference instead).
+            // `attachDictSizeCutoffs` per strategy: fast 8K, dfast 16K,
+            // greedy/lazy/btopt 32K, btultra/btultra2 8K.
+            let cutoff = match self.state.strategy_tag {
+                crate::encoding::strategy::StrategyTag::Fast
+                | crate::encoding::strategy::StrategyTag::BtUltra
+                | crate::encoding::strategy::StrategyTag::BtUltra2 => 8 * 1024,
+                crate::encoding::strategy::StrategyTag::Dfast => 16 * 1024,
+                crate::encoding::strategy::StrategyTag::Greedy
+                | crate::encoding::strategy::StrategyTag::Lazy
+                | crate::encoding::strategy::StrategyTag::BtOpt => 32 * 1024,
+            };
+            let prefer_copy_snapshot = initial_size_hint.is_some_and(|s| s as usize > cutoff);
+            let restored = prefer_copy_snapshot
+                && self
+                    .state
+                    .matcher
+                    .restore_primed_dictionary(self.compression_level);
+            if !restored {
                 self.state.matcher.prime_with_dictionary(
                     dict.inner.dict_content.as_slice(),
                     dict.inner.offset_hist,
                 );
-                self.state
-                    .matcher
-                    .capture_primed_dictionary(self.compression_level);
+                if prefer_copy_snapshot {
+                    self.state
+                        .matcher
+                        .capture_primed_dictionary(self.compression_level);
+                }
             }
         }
         if let Some(cache) = cached_entropy {
@@ -2395,8 +2416,16 @@ mod tests {
         // byte-for-byte, and every frame must round-trip through a
         // dict-primed decoder.
         let dict_raw = include_bytes!("../../dict_tests/dictionary");
-        let payload = b"tenant=demo table=orders op=put key=1 value=aaaaabbbbbcccccdddddeeeee\n\
-              tenant=demo table=orders op=put key=2 value=aaaaabbbbbcccccdddddeeeee\n";
+        // Source must exceed the Fast strategy's 8 KiB attach cutoff so the
+        // copy-snapshot (restore) path is taken on frame 2 — at or below the
+        // cutoff the donor attaches by reference and we fall back to re-prime,
+        // which would not exercise restore.
+        let mut payload = Vec::new();
+        while payload.len() < 16 * 1024 {
+            payload.extend_from_slice(
+                b"tenant=demo table=orders op=put key=1 value=aaaaabbbbbcccccdddddeeeee\n",
+            );
+        }
 
         let prepared =
             super::EncoderDictionary::from_bytes(dict_raw).expect("dict bytes should parse");
