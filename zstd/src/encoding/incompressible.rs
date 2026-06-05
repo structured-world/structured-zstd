@@ -83,41 +83,68 @@ pub(crate) fn compression_level_allows_raw_fast_path(
     }
 }
 
+/// Accumulate byte counts and 4-byte repeat hits for one sample region in a
+/// single pass.
+///
+/// Returns `true` as soon as the running repeat count passes `repeat_guard`.
+/// That guard is the FINAL threshold (fixed before any region is scanned)
+/// and the repeat count only grows, so an early `true` is exactly the
+/// verdict (`false` = compressible) that a full scan would have produced —
+/// the `repeats <= repeat_guard` term of the final verdict is already
+/// settled. On repetitive data (structured text, a single long match) the
+/// quad repeats pass the guard within the first few hundred bytes; on random
+/// data the guard is never reached and the whole region is counted, with no
+/// per-byte branch in the hot path (the byte counts and the quad hashing
+/// share one pass instead of the previous two).
 #[inline]
-fn update_sample_metrics(
+fn scan_sample_region(
     sample: &[u8],
     counts: &mut [u16; 256],
     repeat_table: &mut [u32; INCOMPRESSIBLE_REPEAT_TABLE_LEN],
     repeat_occupied: &mut [u64; INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS],
     repeats: &mut usize,
-    sampled_quads: &mut usize,
-) {
-    for &byte in sample {
-        counts[byte as usize] += 1;
-    }
+    repeat_guard: usize,
+) -> bool {
     let mut idx = 0usize;
-    while idx + 4 <= sample.len() {
+    let len = sample.len();
+    while idx + 4 <= len {
+        counts[sample[idx] as usize] += 1;
+        counts[sample[idx + 1] as usize] += 1;
+        counts[sample[idx + 2] as usize] += 1;
+        counts[sample[idx + 3] as usize] += 1;
         let quad = u32::from_le_bytes([
             sample[idx],
             sample[idx + 1],
             sample[idx + 2],
             sample[idx + 3],
         ]);
-        let slot = ((quad.wrapping_mul(INCOMPRESSIBLE_REPEAT_HASH_MULT) as usize)
-            >> (32 - INCOMPRESSIBLE_REPEAT_TABLE_BITS))
-            & (INCOMPRESSIBLE_REPEAT_TABLE_LEN - 1);
+        // Top `INCOMPRESSIBLE_REPEAT_TABLE_BITS` bits of the 32-bit hash give
+        // the slot directly: the `as usize` value is `< 2^32`, so the shift
+        // by `32 - BITS` already yields an index in `0..TABLE_LEN`. No mask
+        // needed (donor `ZSTD_hashPtr` shape).
+        let slot = (quad.wrapping_mul(INCOMPRESSIBLE_REPEAT_HASH_MULT) as usize)
+            >> (32 - INCOMPRESSIBLE_REPEAT_TABLE_BITS);
         let word = slot / 64;
         let bit = 1_u64 << (slot % 64);
         let occupied = (repeat_occupied[word] & bit) != 0;
-        *sampled_quads += 1;
         if occupied && repeat_table[slot] == quad {
             *repeats += 1;
+            if *repeats > repeat_guard {
+                return true;
+            }
         } else {
             repeat_table[slot] = quad;
             repeat_occupied[word] |= bit;
         }
         idx += 4;
     }
+    // Tail bytes that don't form a full quad still count toward the symbol
+    // histogram used by the final distinct / max-frequency verdict.
+    while idx < len {
+        counts[sample[idx] as usize] += 1;
+        idx += 1;
+    }
+    false
 }
 
 #[inline]
@@ -167,63 +194,57 @@ fn sample_looks_incompressible(block: &[u8]) -> bool {
         return false;
     }
 
+    // Select the sampled regions: the whole block when it fits the cap, or
+    // head / middle / tail probes so capped samples still reject
+    // mixed-entropy blocks whose center is compressible.
+    let mut regions: [&[u8]; 3] = [&[], &[], &[]];
+    let region_count;
+    if sample_len == block.len() {
+        regions[0] = block;
+        region_count = 1;
+    } else {
+        let head_len = sample_len / 3;
+        let mid_len = sample_len / 3;
+        let tail_len = sample_len - head_len - mid_len;
+        let mid_start = (block.len() - mid_len) / 2;
+        regions[0] = &block[..head_len];
+        regions[1] = &block[mid_start..mid_start + mid_len];
+        regions[2] = &block[block.len() - tail_len..];
+        region_count = 3;
+    }
+
+    // `repeat_guard` is the FINAL verdict threshold, fixed before scanning.
+    // It needs the total 4-byte-quad count up front (one quad per 4 bytes of
+    // each region) so `scan_sample_region` can bail the moment the running
+    // repeat count passes it.
+    let max_symbol_guard = sample_len / INCOMPRESSIBLE_MAX_SYMBOL_DIVISOR;
+    let total_quads: usize = regions[..region_count].iter().map(|r| r.len() / 4).sum();
+    let repeat_guard = total_quads / INCOMPRESSIBLE_REPEAT_DIVISOR + 1;
+
     let mut counts = [0u16; 256];
     let mut repeat_table = [u32::MAX; INCOMPRESSIBLE_REPEAT_TABLE_LEN];
     // Bitset occupancy keeps this path no_std-friendly while avoiding the
     // larger per-slot bool map (and extra matcher-level scratch state).
     let mut repeat_occupied = [0_u64; INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS];
     let mut repeats = 0usize;
-    let mut sampled_quads = 0usize;
 
-    if sample_len == block.len() {
-        update_sample_metrics(
-            block,
+    for region in &regions[..region_count] {
+        if scan_sample_region(
+            region,
             &mut counts,
             &mut repeat_table,
             &mut repeat_occupied,
             &mut repeats,
-            &mut sampled_quads,
-        );
-    } else {
-        // Probe head, middle, and tail so capped samples can still reject
-        // mixed-entropy blocks whose center is compressible.
-        let head_len = sample_len / 3;
-        let mid_len = sample_len / 3;
-        let tail_len = sample_len - head_len - mid_len;
-        let head = &block[..head_len];
-        let mid_start = (block.len() - mid_len) / 2;
-        let mid = &block[mid_start..mid_start + mid_len];
-        let tail = &block[block.len() - tail_len..];
-        update_sample_metrics(
-            head,
-            &mut counts,
-            &mut repeat_table,
-            &mut repeat_occupied,
-            &mut repeats,
-            &mut sampled_quads,
-        );
-        update_sample_metrics(
-            mid,
-            &mut counts,
-            &mut repeat_table,
-            &mut repeat_occupied,
-            &mut repeats,
-            &mut sampled_quads,
-        );
-        update_sample_metrics(
-            tail,
-            &mut counts,
-            &mut repeat_table,
-            &mut repeat_occupied,
-            &mut repeats,
-            &mut sampled_quads,
-        );
+            repeat_guard,
+        ) {
+            // The repeat guard was passed — the block is compressible. This
+            // is exactly the verdict a full scan would have produced.
+            return false;
+        }
     }
 
     let distinct = counts.iter().filter(|&&count| count != 0).count();
     let max_freq = counts.iter().copied().max().unwrap_or(0) as usize;
-    let max_symbol_guard = sample_len / INCOMPRESSIBLE_MAX_SYMBOL_DIVISOR;
-    let repeat_guard = sampled_quads / INCOMPRESSIBLE_REPEAT_DIVISOR + 1;
     distinct >= INCOMPRESSIBLE_MIN_DISTINCT_BYTES
         && max_freq <= max_symbol_guard
         && repeats <= repeat_guard
@@ -255,19 +276,48 @@ mod tests {
         let mut repeat_table = [u32::MAX; INCOMPRESSIBLE_REPEAT_TABLE_LEN];
         let mut repeat_occupied = [0_u64; INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS];
         let mut repeats = 0usize;
-        let mut sampled_quads = 0usize;
 
-        update_sample_metrics(
+        // Guard set high so the early-exit never fires: this exercises the
+        // repeat-table init, where `0xFFFFFFFF` matches the `u32::MAX`
+        // sentinel but the occupancy bit is still clear, so the first quad
+        // must NOT be counted as a repeat.
+        let bailed = scan_sample_region(
             &sample,
             &mut counts,
             &mut repeat_table,
             &mut repeat_occupied,
             &mut repeats,
-            &mut sampled_quads,
+            usize::MAX,
         );
 
-        assert_eq!(sampled_quads, 1);
+        assert!(!bailed, "high guards must not trigger an early exit");
         assert_eq!(repeats, 0, "first quad must not be miscounted as a repeat");
+    }
+
+    #[test]
+    fn scan_sample_region_early_exits_on_repetitive_input() {
+        // 32 identical 4-byte quads: the repeat count climbs past any small
+        // guard, exercising the early-exit `true` path directly.
+        let sample = [0xAB_u8; 128];
+        let mut counts = [0u16; 256];
+        let mut repeat_table = [u32::MAX; INCOMPRESSIBLE_REPEAT_TABLE_LEN];
+        let mut repeat_occupied = [0_u64; INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS];
+        let mut repeats = 0usize;
+
+        // Guard of 1: the first quad seeds the table, the second is the first
+        // counted repeat (repeats == 1), the third pushes repeats past the
+        // guard and returns `true`.
+        let bailed = scan_sample_region(
+            &sample,
+            &mut counts,
+            &mut repeat_table,
+            &mut repeat_occupied,
+            &mut repeats,
+            1,
+        );
+
+        assert!(bailed, "repetitive input must trigger the early exit");
+        assert!(repeats > 1, "repeat count must have exceeded the guard");
     }
 
     #[test]
