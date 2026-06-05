@@ -2114,7 +2114,15 @@ mod init_sequence_stream_tests {
     #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel_vbmi2"))]
     #[test]
     fn vbmi2_tier_runs_preamble() {
-        if !std::is_x86_feature_detected!("avx512vbmi2") {
+        // Mirror the production dispatch gate: the unsafe monolith is annotated
+        // `target_feature(bmi2,avx2,avx512vbmi2,avx512f,avx512vl,avx512bw)`, so a
+        // bare `avx512vbmi2` probe could SIGILL on a CPU that reports VBMI2 but
+        // lacks a companion feature. `detect_cpu_kernel() == Vbmi2` verifies the
+        // full set before we call it.
+        if !matches!(
+            crate::cpu_kernel::detect_cpu_kernel(),
+            crate::cpu_kernel::CpuKernelTag::Vbmi2
+        ) {
             return;
         }
         let header = predefined_one_sequence_header();
