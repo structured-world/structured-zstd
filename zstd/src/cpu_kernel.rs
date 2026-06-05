@@ -516,4 +516,29 @@ mod tests {
             "cached detect must return same tag on repeated calls"
         );
     }
+
+    #[test]
+    fn active_kernel_name_is_known_lowercase_tier() {
+        // The diagnostic name must be one of the stable lowercase tier
+        // strings the dashboard parses, and must match whatever tier
+        // detection resolves to on this host (no `unknown` / empty leak).
+        const KNOWN: &[&str] = &["scalar", "sse2", "bmi2", "avx2", "vbmi2", "neon", "sve"];
+        let name = active_cpu_kernel_name();
+        assert!(
+            KNOWN.contains(&name),
+            "active kernel name {name:?} is not a recognised tier"
+        );
+        assert_eq!(
+            name,
+            name.to_ascii_lowercase(),
+            "tier name must be lowercase for stable dashboard parsing"
+        );
+    }
+
+    #[test]
+    fn active_kernel_name_is_stable_across_calls() {
+        // Backed by the cached `detect_cpu_kernel`, so repeated calls must
+        // return the identical static string.
+        assert_eq!(active_cpu_kernel_name(), active_cpu_kernel_name());
+    }
 }
