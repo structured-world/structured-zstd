@@ -7829,6 +7829,41 @@ fn hc_commit_without_eviction_retires_no_dictionary_budget() {
 }
 
 #[test]
+fn row_commit_without_eviction_retires_no_dictionary_budget() {
+    // Regression for the Row arm of commit_space after the window ->
+    // chunk_lens migration: RowMatchGenerator::add_data now invokes its
+    // reuse_space callback for the *input* buffer (per-commit recycle),
+    // not for evicted chunks. The Row arm must derive eviction bytes from
+    // the window_size delta like the Dfast / HashChain arms — counting the
+    // callback argument as evicted charges the whole committed block as
+    // "evicted" and prematurely retires dictionary budget even when the
+    // window is nowhere near full.
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    driver.reset(CompressionLevel::Level(5));
+    assert!(matches!(driver.storage, MatcherStorage::Row(_)));
+    // A large live window so a small committed block evicts nothing.
+    driver.row_matcher_mut().max_window_size = 1 << 20;
+    driver.reported_window_size = 1 << 20;
+    driver.prime_with_dictionary(b"abcdefghABCDEFGHijklmnop", [1, 4, 8]);
+    let budget_after_prime = driver.dictionary_retained_budget;
+    assert!(
+        budget_after_prime > 0,
+        "priming must retain a non-zero dictionary budget"
+    );
+
+    let mut space = driver.get_next_space();
+    space.clear();
+    space.extend_from_slice(b"AAAAAAAA");
+    driver.commit_space(space);
+    driver.skip_matching_with_hint(None);
+
+    assert_eq!(
+        driver.dictionary_retained_budget, budget_after_prime,
+        "a Row commit that evicts nothing must retire no dictionary budget"
+    );
+}
+
+#[test]
 fn hc_rebases_positions_after_u32_boundary() {
     let mut matcher = HcMatchGenerator::new(64);
     matcher.table.add_data(b"abcdeabcdeabcde".to_vec(), |_| {});
