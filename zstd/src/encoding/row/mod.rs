@@ -448,17 +448,17 @@ impl RowMatchGenerator {
             self.window_size,
             data.len(),
         );
-        // Row stores absolute match positions as `u32` with `u32::MAX`
-        // reserved as the empty sentinel, so a single frame's absolute cursor
-        // must stay below `u32::MAX`. The cursor resets to 0 per frame, so
-        // this only bounds a single >= ~4 GiB frame — far beyond the
-        // decoder's window cap. `check_stream_abs_headroom` above already
-        // guaranteed this sum does not overflow `usize`.
-        assert!(
-            self.history_abs_start + self.window_size + data.len() < u32::MAX as usize,
-            "structured-zstd: a Row-strategy frame exceeded the u32 match-position \
-             limit; split the input into smaller frames or use a higher level"
-        );
+        // Row stores absolute match positions as `u32` (with `u32::MAX` the
+        // empty sentinel). On a long stream the cumulative absolute cursor
+        // crosses the u32 range even while the live window stays bounded, so
+        // rebase the coordinate origin down to the oldest live byte before the
+        // upcoming block's positions would overflow. Cold path — fires at most
+        // once per ~4 GiB of stream, and one rebase always suffices because the
+        // live window is far smaller than u32::MAX. `check_stream_abs_headroom`
+        // above already guards the 32-bit-target `usize` overflow separately.
+        if self.history_abs_start + self.window_size + data.len() >= u32::MAX as usize - 1 {
+            self.rebase_positions();
+        }
         while self.window_size + data.len() > self.max_window_size {
             let removed_len = self.chunk_lens.pop_front().unwrap();
             self.window_size -= removed_len;
@@ -482,6 +482,35 @@ impl RowMatchGenerator {
             self.history_start += removed_len;
             self.history_abs_start += removed_len;
         }
+    }
+
+    /// Rebase the absolute coordinate origin down to the oldest live byte so
+    /// stored `u32` match positions stay representable on long (multi-GiB)
+    /// streams. Cold path, driven from [`Self::add_data`] when the cursor
+    /// nears `u32::MAX`. Subtracts the current `history_abs_start` from every
+    /// live `row_positions` entry; entries older than the new origin (already
+    /// unreachable through the `candidate_pos < history_abs_start` read guard)
+    /// collapse to `ROW_EMPTY_SLOT`. The shift is uniform across the origin and
+    /// every stored position, so every match offset is preserved and matching
+    /// is unaffected. `row_heads` (slot cursors) and `row_tags` (hash tags)
+    /// hold no absolute positions and are left untouched.
+    fn rebase_positions(&mut self) {
+        let delta = self.history_abs_start;
+        if delta == 0 {
+            return;
+        }
+        for slot in self.row_positions.iter_mut() {
+            if *slot == ROW_EMPTY_SLOT {
+                continue;
+            }
+            let abs = *slot as usize;
+            *slot = if abs < delta {
+                ROW_EMPTY_SLOT
+            } else {
+                (abs - delta) as u32
+            };
+        }
+        self.history_abs_start -= delta;
     }
 
     pub(crate) fn skip_matching_with_hint_rl<const ROW_LOG: usize>(
