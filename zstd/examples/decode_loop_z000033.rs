@@ -1,7 +1,9 @@
 //! Standalone decode-loop binary for clean perf-record profiles.
-//! Generates a 1MB deterministic corpus, FFI-encodes once at the given
-//! level, then loops `decode_all` for N iters. No criterion overhead,
-//! no per-iter encode — pure decoder hot path.
+//! Decodes the in-tree z000033 corpus (or a user-provided file) in a tight
+//! loop after one-time FFI encoding at the given level. N iters of
+//! `decode_all`, no criterion overhead, no per-iter encode: pure decoder
+//! hot path. The random LCG synthetic source is opt-in via the `synthetic`
+//! arg only.
 //!
 //! Build: cargo build --profile flamegraph -p structured-zstd \
 //!          --example decode_loop_z000033 --features dict_builder
