@@ -53,20 +53,33 @@ fn main() {
         Some(path) => std::fs::read(path).expect("read corpus file"),
         None => {
             // Default to the in-tree z000033 this example is named after.
-            // Try the usual cwd-relative locations (repo root / `zstd/`).
-            // Fail loudly if absent — never silently synthesize.
-            const CANDIDATES: [&str; 2] = [
-                "zstd/decodecorpus_files/z000033",
-                "decodecorpus_files/z000033",
-            ];
-            CANDIDATES
+            // Follow the same resolution order as the benchmarks (see
+            // `zstd/benches/support/mod.rs`): explicit env var first, then
+            // the cargo-driven manifest dir, then cwd-relative locations
+            // (repo root / `zstd/`). Fail loudly if absent — never silently
+            // synthesize.
+            let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+            if let Ok(explicit) = std::env::var("STRUCTURED_ZSTD_BENCH_CORPUS_PATH") {
+                let trimmed = explicit.trim();
+                if !trimmed.is_empty() {
+                    candidates.push(std::path::PathBuf::from(trimmed));
+                }
+            }
+            if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
+                candidates.push(
+                    std::path::PathBuf::from(manifest_dir).join("decodecorpus_files/z000033"),
+                );
+            }
+            candidates.push(std::path::PathBuf::from("zstd/decodecorpus_files/z000033"));
+            candidates.push(std::path::PathBuf::from("decodecorpus_files/z000033"));
+            candidates
                 .iter()
                 .find_map(|p| std::fs::read(p).ok())
                 .unwrap_or_else(|| {
                     panic!(
-                        "decode_loop_z000033: corpus z000033 not found in {CANDIDATES:?}; \
-                         pass an explicit path as arg 4, or `synthetic` to opt into the \
-                         random LCG fallback"
+                        "decode_loop_z000033: corpus z000033 not found via env vars or in \
+                         {candidates:?}; pass an explicit path as arg 4, or `synthetic` to \
+                         opt into the random LCG fallback"
                     )
                 })
         }
