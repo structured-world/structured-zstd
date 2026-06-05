@@ -32,7 +32,8 @@ use structured_zstd::dictionary::{
 };
 use structured_zstd::encoding::FrameCompressor;
 use support::{
-    LevelConfig, Scenario, ScenarioClass, benchmark_scenarios, supported_levels_filtered,
+    LevelConfig, Scenario, ScenarioClass, benchmark_scenarios, kernel_report_line,
+    supported_levels_filtered,
 };
 
 static BENCHMARK_SCENARIOS: OnceLock<Vec<Scenario>> = OnceLock::new();
@@ -209,35 +210,14 @@ fn emit_reports_enabled() -> bool {
         .unwrap_or(false)
 }
 
-/// Emit (once per process) the CPU kernel tier this run actually selected,
-/// plus arch / libc, so the dashboard can attribute every measurement in the
-/// run to the kernel that produced it (the entropy / sequence dispatch tier is
-/// shared by encode and decode — see #247). The kernel is process-global, so a
-/// single line covers all benches in the run.
+/// Emit the shared `REPORT_KERNEL` line exactly once per process. The kernel
+/// tier is process-global, so a single line covers every bench in the run even
+/// though both `bench_compress` and `bench_decompress` call this.
 fn emit_kernel_report_once() {
     use std::sync::Once;
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        let arch = if cfg!(target_arch = "x86_64") {
-            "x86_64"
-        } else if cfg!(target_arch = "aarch64") {
-            "aarch64"
-        } else {
-            "other"
-        };
-        let target_env = if cfg!(target_env = "musl") {
-            "musl"
-        } else if cfg!(target_env = "gnu") {
-            "gnu"
-        } else {
-            "other"
-        };
-        println!(
-            "REPORT_KERNEL kernel={} arch={} target_env={}",
-            structured_zstd::active_cpu_kernel_name(),
-            arch,
-            target_env
-        );
+        println!("{}", kernel_report_line());
     });
 }
 

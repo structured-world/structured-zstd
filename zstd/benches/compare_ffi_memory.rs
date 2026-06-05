@@ -36,7 +36,9 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use structured_zstd::decoding::FrameDecoder;
-use support::{LevelConfig, Scenario, benchmark_scenarios, supported_levels_filtered};
+use support::{
+    LevelConfig, Scenario, benchmark_scenarios, kernel_report_line, supported_levels_filtered,
+};
 
 /// Process-wide byte tracker. Two allocation paths feed the SAME
 /// pair of atomic counters (`ALLOC_CURRENT` / `ALLOC_PEAK`) once
@@ -416,29 +418,12 @@ fn emit_report(
 }
 
 fn main() {
-    // Report the CPU kernel tier this run selected (shared encode/decode
-    // entropy dispatch — see #247), plus arch / libc, so the dashboard can
-    // attribute every REPORT_MEM line to the kernel that produced it.
-    let arch = if cfg!(target_arch = "x86_64") {
-        "x86_64"
-    } else if cfg!(target_arch = "aarch64") {
-        "aarch64"
-    } else {
-        "other"
-    };
-    let target_env = if cfg!(target_env = "musl") {
-        "musl"
-    } else if cfg!(target_env = "gnu") {
-        "gnu"
-    } else {
-        "other"
-    };
-    println!(
-        "REPORT_KERNEL kernel={} arch={} target_env={}",
-        structured_zstd::active_cpu_kernel_name(),
-        arch,
-        target_env
-    );
+    // Report the CPU kernel tier this run selected, so the dashboard can
+    // attribute every REPORT_MEM line to the kernel that produced it. Printed
+    // unconditionally (no STRUCTURED_ZSTD_EMIT_REPORT gate like compare_ffi):
+    // this binary is purpose-built for report generation and its only output
+    // is REPORT_* lines, so the header is always wanted.
+    println!("{}", kernel_report_line());
 
     let scenarios = benchmark_scenarios();
     for scenario in &scenarios {
