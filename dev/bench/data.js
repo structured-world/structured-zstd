@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780648217315,
+  "lastUpdate": 1780655560986,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -57033,6 +57033,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
             "value": 0.117,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.26,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "839dba7c50d8659e6fa485750c10c335cd8350bf",
+          "message": "perf(encode): cut small-input fixed cost on the fast levels (#342)\n\n* perf(encode): early-exit the incompressible pre-scan on compressible data\n\nThe raw-fast-path classifier read up to a 4 KiB sample of every block\nbefore deciding, so on small compressible inputs the pre-scan dominated the\nencode: 21% of self-time on a level-1 4 KiB log-line block whose actual\nmatch loop was under 4%.\n\nThe verdict is `distinct >= 200 && max_freq <= sample/24 && repeats <=\nquads/64`. Both upper-bound guards are the final thresholds, fixed before\nscanning, and `max_freq` / `repeats` only grow, so the scan can stop the\nmoment either guard is passed: that is exactly the `false` (compressible)\nverdict a full scan would have produced. On compressible data (structured\ntext, a single long match) it now bails within the first few hundred bytes;\non genuinely random data neither guard fires and the full sample is scanned\nas before, preserving the incompressible-block win.\n\nThe classification is unchanged (the early exit is verdict-preserving), so\nratio and all existing raw-fast-path tests are unaffected.\n\nPart of #341\n\n* perf(encode): single-pass incompressible scan, repeat-only early-exit\n\nThe first cut early-exited on both the per-byte max-frequency guard and the\nrepeat guard, but the per-byte guard added a branch to the byte-count loop\nthat slowed the non-bailing (random) case, and the byte counts and quad\nhashing still ran as two passes.\n\nFold both into one pass: count the four bytes of each quad and hash the quad\ntogether, and early-exit only on the repeat guard (the max-frequency term\nstays in the final verdict). On random data the repeat guard is never\nreached, so the region is counted in a single pass with no per-byte branch\n(faster than the previous two-pass scan); on repetitive data the quad\nrepeats pass the guard within a few hundred bytes, so it bails even earlier\nthan the per-byte guard did. Still verdict-preserving, so ratio and the\nraw-fast-path tests are unaffected.\n\nPart of #341\n\n* perf(encode): right-size the fast hash table for small inputs\n\nThe fast (level 1/2 and negative) backend always cleared a full\n`1 << fast_hash_log` hash table per frame (64 KiB at level 1), which on a\n4 KiB block was ~14% of the encode. The source-size adjustment already\nshrinks the hash-chain and row tables but left the flat fast table at its\nlevel width.\n\n`adjust_params_for_source_size` now also caps `fast_hash_log` for the fast\nbackend, using the raw `ceil(log2(src))` (not the wire `window_log` floor,\nwhich is a decoder-interop requirement and unrelated to the internal table\nwidth) plus one bit of headroom. The load factor stays low so match quality\nis unchanged; large inputs keep the level's table width. A `MIN_WINDOW_LOG`\nfloor avoids a degenerate table for sub-kilobyte blocks.\n\nPart of #341\n\n* test(encode): cover the scan_sample_region early-exit path directly\n\nAdd a unit test that drives scan_sample_region with repetitive input and a\nsmall guard so the repeat count passes the guard and the function returns\ntrue. The early-exit path was previously only exercised indirectly through\nthe block-level classifier tests.\n\n* perf(encode): build the huffman table once per block, not per table_log (#343)\n\n* perf(encode): drop redundant re-sort in the huffman weight builder\n\n`build_donor_limited_weights` sorted the leaves by (count desc, symbol asc),\nbuilt the tree, then re-sorted the same leaves by the same comparator before\nheight-limiting. The tree build only writes `parent` / `nb_bits` and never\nreorders the leaves or changes their `count` / `symbol`, so the second sort\nwas a no-op on already-ordered data. Drop it; `enforce_max_height` already\nrequires (and now directly receives) the count-descending order. Output is\nbyte-identical.\n\nPart of #341\n\n* perf(encode): build the huffman tree once across table_log candidates\n\n`build_from_counts` searches `table_log` from `min_table_log..=11`, and each\niteration rebuilt the whole Huffman tree via `build_donor_limited_weights`\n(filter, sort, two-queue merge, depth walk) before height-limiting it. The\ntree shape and the natural per-leaf depths do not depend on `table_log` —\nonly the height limiting does.\n\nSplit the builder into `build_huffman_leaf_depths` (the table_log-independent\ntree, built once) and `limited_weights_from_leaves` (the per-candidate\nlimiting), and hoist the tree build out of the search loop. For a small\ntext block this turned ~5 tree builds (and ~5 leaf sorts) per block into\none. `build_donor_limited_weights` keeps its signature for the other call\nsites. Output is byte-identical.\n\nPart of #341\n\n* refactor(encode): drop redundant mask in the incompressible hash slot\n\nThe repeat-table slot is the top `INCOMPRESSIBLE_REPEAT_TABLE_BITS` bits of\nthe 32-bit hash: shifting a `< 2^32` value right by `32 - BITS` already\nyields an index in `0..TABLE_LEN`, so the trailing `& (TABLE_LEN - 1)` was a\nno-op. Drop it to match the donor `ZSTD_hashPtr` shape; behaviour is\nunchanged.",
+          "timestamp": "2026-06-05T12:41:06+03:00",
+          "tree_id": "d217f49c3298ec0024e310e9d8b0709cac60294c",
+          "url": "https://github.com/structured-world/structured-zstd/commit/839dba7c50d8659e6fa485750c10c335cd8350bf"
+        },
+        "date": 1780655552144,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.139,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.111,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 291.453,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 241.627,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.473,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.335,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.631,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.045,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.519,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.984,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.108,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.107,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.024,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 12.145,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 4.801,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.747,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.316,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.677,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.064,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.756,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.095,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.118,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.265,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.118,
             "unit": "ms"
           },
           {
