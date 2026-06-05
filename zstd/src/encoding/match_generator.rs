@@ -971,18 +971,32 @@ impl MatchGeneratorDriver {
         match self.active_backend() {
             super::strategy::BackendTag::Simple => {
                 let matcher = self.simple_mut();
+                // `reclaimed` can exceed the CURRENT `max_window_size`: the
+                // retained dict budget is tracked independently and the
+                // window may already have been shrunk by a prior eviction,
+                // so the floor at 0 is the correct clamp, not a masked bug.
                 matcher.max_window_size = matcher.max_window_size.saturating_sub(reclaimed);
             }
             super::strategy::BackendTag::Dfast => {
                 let matcher = self.dfast_matcher_mut();
+                // `reclaimed` can exceed the CURRENT `max_window_size`: the
+                // retained dict budget is tracked independently and the
+                // window may already have been shrunk by a prior eviction,
+                // so the floor at 0 is the correct clamp, not a masked bug.
                 matcher.max_window_size = matcher.max_window_size.saturating_sub(reclaimed);
             }
             super::strategy::BackendTag::Row => {
                 let matcher = self.row_matcher_mut();
+                // `reclaimed` can exceed the CURRENT `max_window_size`: the
+                // retained dict budget is tracked independently and the
+                // window may already have been shrunk by a prior eviction,
+                // so the floor at 0 is the correct clamp, not a masked bug.
                 matcher.max_window_size = matcher.max_window_size.saturating_sub(reclaimed);
             }
             super::strategy::BackendTag::HashChain => {
                 let matcher = self.hc_matcher_mut();
+                // See the Simple arm: `reclaimed` may exceed the current
+                // window, so saturating to 0 is the correct clamp.
                 matcher.table.max_window_size =
                     matcher.table.max_window_size.saturating_sub(reclaimed);
             }
