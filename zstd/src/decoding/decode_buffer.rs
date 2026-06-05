@@ -127,6 +127,26 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         self.block_output_limit = self.buffer.len().saturating_add(max_block_output);
     }
 
+    /// Cold-path error builder for the per-block output ceiling. Outlined
+    /// from `repeat_inner` so the hot per-match check stays a single
+    /// compare; the produced-byte arithmetic only runs on the
+    /// malformed-input rejection path.
+    #[cold]
+    #[inline(never)]
+    fn block_output_exceeded(&self, match_length: usize) -> DecodeBufferError {
+        let block_start = self
+            .block_output_limit
+            .saturating_sub(MAX_BLOCK_SIZE as usize);
+        DecodeBufferError::BlockOutputExceedsMax {
+            produced: self
+                .buffer
+                .len()
+                .saturating_add(match_length)
+                .saturating_sub(block_start),
+            max: MAX_BLOCK_SIZE as usize,
+        }
+    }
+
     pub fn reset(&mut self, window_size: usize) {
         self.window_size = window_size;
         self.buffer.clear();
@@ -373,17 +393,10 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         // reject the frame. The default `usize::MAX` ceiling leaves
         // non-block-decode callers of `repeat` unaffected.
         if self.buffer.len().saturating_add(match_length) > self.block_output_limit {
-            let block_start = self
-                .block_output_limit
-                .saturating_sub(MAX_BLOCK_SIZE as usize);
-            return Err(DecodeBufferError::BlockOutputExceedsMax {
-                produced: self
-                    .buffer
-                    .len()
-                    .saturating_add(match_length)
-                    .saturating_sub(block_start),
-                max: MAX_BLOCK_SIZE as usize,
-            });
+            // Cold path outlined so the per-match hot check is just the
+            // compare above (the error-byte arithmetic must not bloat the
+            // sequence loop's inlined repeat path).
+            return Err(self.block_output_exceeded(match_length));
         }
 
         if offset > self.buffer.len() {
