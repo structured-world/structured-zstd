@@ -449,6 +449,19 @@ pub enum DecodeBufferError {
         requested: usize,
         capacity: usize,
     },
+    /// A block's cumulative decompressed output would exceed `MAX_BLOCK_SIZE`,
+    /// the most a single zstd block can produce. Surfaced by
+    /// [`super::decode_buffer::DecodeBuffer::repeat`] before the match copy
+    /// when the running block output plus this match would cross the
+    /// per-block ceiling. Without it a malformed / adversarial frame whose
+    /// sequences over-produce drives an unbounded `try_reserve` on a growable
+    /// backend (`RingBuffer`), which grows to gigabytes inside the
+    /// block-decode loop (a decompression-bomb OOM) before the post-block
+    /// validity check can reject the frame.
+    BlockOutputExceedsMax {
+        produced: usize,
+        max: usize,
+    },
 }
 
 #[cfg(feature = "std")]
@@ -483,6 +496,12 @@ impl core::fmt::Display for DecodeBufferError {
                 write!(
                     f,
                     "Match repeat would write past fixed-capacity buffer: tail={tail}, requested={requested}, capacity={capacity}"
+                )
+            }
+            DecodeBufferError::BlockOutputExceedsMax { produced, max } => {
+                write!(
+                    f,
+                    "Block decompressed output {produced} exceeds the per-block maximum {max}"
                 )
             }
         }

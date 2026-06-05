@@ -6,6 +6,7 @@ use core::hash::Hasher;
 use super::buffer_backend::BufferBackend;
 use super::prefetch;
 use super::ringbuffer::RingBuffer;
+use crate::common::MAX_BLOCK_SIZE;
 use crate::decoding::errors::DecodeBufferError;
 
 /// Generic decode-side output buffer parameterised over the storage
@@ -29,6 +30,14 @@ pub struct DecodeBuffer<B: BufferBackend = RingBuffer> {
 
     pub window_size: usize,
     total_output_counter: u64,
+    /// Upper bound on `buffer.len()` for the block currently being decoded.
+    /// Set per block to `len_at_block_start + MAX_BLOCK_SIZE` so a single
+    /// block cannot decompress to more than `MAX_BLOCK_SIZE` of output; a
+    /// `repeat` that would cross it is rejected before its `try_reserve`,
+    /// bounding the growable `RingBuffer` against decompression-bomb OOMs.
+    /// `usize::MAX` (the default) disables the check for non-block-decode
+    /// callers of `repeat`.
+    block_output_limit: usize,
     #[cfg(feature = "hash")]
     pub hash: twox_hash::XxHash64,
 }
@@ -77,6 +86,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             dict_content: Vec::new(),
             window_size,
             total_output_counter: 0,
+            block_output_limit: usize::MAX,
             #[cfg(feature = "hash")]
             hash: twox_hash::XxHash64::with_seed(0),
         }
@@ -101,9 +111,20 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             dict_content: Vec::new(),
             window_size,
             total_output_counter: 0,
+            block_output_limit: usize::MAX,
             #[cfg(feature = "hash")]
             hash: twox_hash::XxHash64::with_seed(0),
         }
+    }
+
+    /// Arm the per-block decompressed-output ceiling for the block about to
+    /// be decoded: a `repeat` whose match would push `buffer.len()` past
+    /// `current_len + MAX_BLOCK_SIZE` is rejected (see `block_output_limit`),
+    /// bounding the growable backend against decompression-bomb OOMs. Called
+    /// once per block by the sequence decoder, before the sequence loop.
+    #[inline]
+    pub(crate) fn set_block_output_ceiling(&mut self, max_block_output: usize) {
+        self.block_output_limit = self.buffer.len().saturating_add(max_block_output);
     }
 
     pub fn reset(&mut self, window_size: usize) {
@@ -120,6 +141,8 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         // the frame will actually hit this buffer.
         self.dict_content.clear();
         self.total_output_counter = 0;
+        // Cleared per frame; re-armed per block by the sequence decoder.
+        self.block_output_limit = usize::MAX;
         #[cfg(feature = "hash")]
         {
             self.hash = twox_hash::XxHash64::with_seed(0);
@@ -337,6 +360,30 @@ impl<B: BufferBackend> DecodeBuffer<B> {
 
         if match_length == 0 {
             return Ok(());
+        }
+
+        // Bound the block's cumulative decompressed output. A single zstd
+        // block decompresses to at most MAX_BLOCK_SIZE; reject a match that
+        // would push this block's output past the per-block ceiling
+        // (`block_output_limit`, set per block by the sequence decoder)
+        // before its `try_reserve`. On the growable `RingBuffer` an
+        // over-producing malformed / adversarial block would otherwise grow
+        // the buffer to gigabytes inside the decode loop — a
+        // decompression-bomb OOM — before the post-block validity check can
+        // reject the frame. The default `usize::MAX` ceiling leaves
+        // non-block-decode callers of `repeat` unaffected.
+        if self.buffer.len().saturating_add(match_length) > self.block_output_limit {
+            let block_start = self
+                .block_output_limit
+                .saturating_sub(MAX_BLOCK_SIZE as usize);
+            return Err(DecodeBufferError::BlockOutputExceedsMax {
+                produced: self
+                    .buffer
+                    .len()
+                    .saturating_add(match_length)
+                    .saturating_sub(block_start),
+                max: MAX_BLOCK_SIZE as usize,
+            });
         }
 
         if offset > self.buffer.len() {
@@ -1227,6 +1274,27 @@ mod tests {
         assert!(matches!(
             err,
             crate::decoding::errors::DecodeBufferError::ZeroOffset
+        ));
+    }
+
+    #[test]
+    fn repeat_rejects_output_past_block_ceiling() {
+        // A single zstd block decompresses to at most MAX_BLOCK_SIZE. With
+        // the per-block ceiling armed, a `repeat` whose match would push the
+        // block's output past it must be rejected before its `try_reserve`.
+        // Without this guard the over-long match drives `try_reserve`
+        // unbounded on the growable `RingBuffer` — the artifact `oom-66db61d9…`
+        // grew the ring to ~0.5–2 GiB across many over-producing sequences
+        // before any post-block check ran (a decompression-bomb OOM,
+        // reproduced via the fuzz `decode` target). Pre-guard this `repeat`
+        // returned `Ok` (reserved + copied); it must now reject.
+        let mut decode_buf = DecodeBuffer::<RingBuffer>::new(4 * 1024);
+        decode_buf.push(b"abcdef"); // len = 6
+        decode_buf.set_block_output_ceiling(8); // ceiling = 6 + 8 = 14
+        let err = decode_buf.repeat(4, 16).unwrap_err(); // 6 + 16 = 22 > 14
+        assert!(matches!(
+            err,
+            crate::decoding::errors::DecodeBufferError::BlockOutputExceedsMax { .. }
         ));
     }
 
