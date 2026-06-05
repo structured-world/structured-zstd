@@ -1923,10 +1923,19 @@
         targetsContainer.replaceChildren();
         // Map each target to the CPU kernel tier that produced its numbers.
         // Carried per-record (see run-benchmarks.sh) so it survives merging
-        // per-target payloads; first non-null record wins per target.
+        // per-target payloads. Pick the kernel from the LATEST snapshot per
+        // target (max `generated_at`, falling back to `commit_sha`) so a
+        // payload that merges several snapshots can't show stale kernel info;
+        // ISO-8601 `generated_at` sorts lexicographically = chronologically,
+        // matching the snapshot ordering used elsewhere.
         const kernelByTarget = {};
+        const kernelSnapByTarget = {};
         for (const r of state.records) {
-          if (r.kernel && r.kernel.kernel && !kernelByTarget[r.target]) {
+          if (!(r.kernel && r.kernel.kernel && r.target)) continue;
+          const snap = r.generated_at || r.commit_sha || "";
+          const prev = kernelSnapByTarget[r.target];
+          if (prev === undefined || snap >= prev) {
+            kernelSnapByTarget[r.target] = snap;
             kernelByTarget[r.target] = r.kernel;
           }
         }
