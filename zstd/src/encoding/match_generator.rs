@@ -7913,6 +7913,12 @@ fn hc_rebases_positions_after_u32_boundary() {
     );
 }
 
+// 64-bit only: the >4 GiB absolute cursor this test fabricates cannot exist on
+// a 32-bit target (usize == u32 can't address that much), and setting
+// `history_abs_start` near `u32::MAX` there overflows `usize` in the
+// `check_stream_abs_headroom` guard before the rebase path is reached. Mirrors
+// the `try_into()` early-return guard on `hc_rebases_positions_after_u32_boundary`.
+#[cfg(target_pointer_width = "64")]
 #[test]
 fn row_rebases_positions_after_u32_boundary() {
     // Row stores absolute match positions as u32. On a long stream the
