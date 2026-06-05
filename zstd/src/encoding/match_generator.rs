@@ -1234,7 +1234,14 @@ impl Matcher for MatchGeneratorDriver {
                 } else {
                     (64 - (h - 1).leading_zeros()) as u8
                 };
-                (1usize << raw_log.max(MIN_WINDOW_LOG)).min(max_window_size)
+                // Clamp the shift below the pointer width before `1usize <<`:
+                // an oversized hint (>= 2^63 + 1, and on 32-bit usize any hint
+                // >= 2^32) drives `raw_log` to 64 / >= 32, and the shift would
+                // overflow (panic in debug, wrap to 0 in release) before the
+                // `.min(max_window_size)` cap below could bound it. The min cap
+                // still provides the real semantic window bound.
+                let shift = raw_log.max(MIN_WINDOW_LOG).min(usize::BITS as u8 - 1);
+                (1usize << shift).min(max_window_size)
             }
             None => max_window_size,
         };
