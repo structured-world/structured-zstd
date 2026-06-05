@@ -53,6 +53,7 @@ const PRIME_8_BYTES: u64 = 0xCF1BBCDCB7A56463;
 /// initial prefix (where the `+= (ip0 == prefixStart)` adjustment at
 /// loop entry skips it) or is below `prefixStartIndex` and filtered by
 /// the in-range check.
+#[derive(Clone)]
 pub(crate) struct FastHashTable {
     table: Vec<u32>,
     /// Donor `hash_log` — number of bits the hash output is reduced to.
