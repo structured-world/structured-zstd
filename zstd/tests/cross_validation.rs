@@ -99,6 +99,31 @@ fn cross_rust_reused_compressor_varied_sizes_ffi_decompress() {
     }
 }
 
+/// Regression for the hoisted hash/chain fill: a single long match over a
+/// highly repetitive input drives `insert_positions` to fill an entire
+/// block in one tight loop (the path that skips the per-position rebase
+/// guard). Compress the repeated pattern at a lazy level and decode through
+/// C zstd to prove the fast fill produces a valid, correct frame.
+#[test]
+fn cross_rust_repetitive_pattern_lazy_ffi_decompress() {
+    let pattern = b"coordinode:segment:0001|tenant=demo|label=orders|";
+    let mut data = Vec::with_capacity(1 << 20);
+    while data.len() < (1 << 20) {
+        let remaining = (1 << 20) - data.len();
+        data.extend_from_slice(&pattern[..pattern.len().min(remaining)]);
+    }
+    for level in [6i32, 9, 12] {
+        let compressed = compress_to_vec(&data[..], CompressionLevel::from_level(level));
+        let result = zstd::decode_all(compressed.as_slice()).unwrap_or_else(|e| {
+            panic!("repetitive lazy L{level} rust->ffi decode failed: {e}");
+        });
+        assert_eq!(
+            data, result,
+            "repetitive lazy L{level} rust->ffi roundtrip failed"
+        );
+    }
+}
+
 #[test]
 fn cross_rust_fastest_with_source_hint_ffi_decompress_iteration_23() {
     let i = 23u64;
