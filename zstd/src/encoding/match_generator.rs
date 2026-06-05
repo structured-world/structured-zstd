@@ -426,29 +426,27 @@ fn adjust_params_for_source_size(mut params: LevelParams, src_size: u64) -> Leve
     if src_log < params.window_log {
         params.window_log = src_log;
     }
-    // For HC backend: also cap hash_log and chain_log so tables are
-    // proportional to the source, avoiding multi-MB allocations for
-    // tiny inputs.
+    // Internal match-finder tables are sized from `table_log` — the RAW
+    // source log (floored only at the baseline `MIN_WINDOW_LOG`), NOT the
+    // wire `window_log` floor. The table widths never appear in the frame, so
+    // for small inputs they can track the actual source size and avoid
+    // zeroing a window-sized table per frame; large inputs keep the level's
+    // widths. The cap is applied with the same per-backend headroom the
+    // level table uses, so the load factor (and match quality) is unchanged.
+    // The Row / Dfast backends derive their table widths from the source in
+    // `reset` (their `set_hash_bits` recomputes there), so they are not
+    // adjusted here.
+    let table_log = raw_src_log.max(MIN_WINDOW_LOG);
     let backend = params.backend();
     if backend == super::strategy::BackendTag::HashChain {
-        if (src_log + 2) < params.hc.hash_log as u8 {
-            params.hc.hash_log = (src_log + 2) as usize;
+        if (table_log + 2) < params.hc.hash_log as u8 {
+            params.hc.hash_log = (table_log + 2) as usize;
         }
-        if (src_log + 1) < params.hc.chain_log as u8 {
-            params.hc.chain_log = (src_log + 1) as usize;
+        if (table_log + 1) < params.hc.chain_log as u8 {
+            params.hc.chain_log = (table_log + 1) as usize;
         }
-    } else if backend == super::strategy::BackendTag::Row {
-        let max_window_size = 1usize << params.window_log;
-        params.row.hash_bits = row_hash_bits_for_window(max_window_size);
     } else if backend == super::strategy::BackendTag::Simple {
-        // Right-size the flat fast hash table for small inputs so the
-        // per-frame zeroing scales with the source instead of always
-        // clearing the full `1 << fast_hash_log` table. The cap uses the
-        // RAW source log (not the window floor) plus one bit of headroom,
-        // keeping the load factor low so match quality is unaffected; large
-        // inputs keep the level's table width. A `MIN_WINDOW_LOG` floor
-        // avoids a degenerately small table for sub-kilobyte blocks.
-        let fast_cap = (raw_src_log + 1).max(MIN_WINDOW_LOG) as u32;
+        let fast_cap = (table_log + 1) as u32;
         if fast_cap < params.fast_hash_log {
             params.fast_hash_log = fast_cap;
         }
@@ -1224,6 +1222,29 @@ impl Matcher for MatchGeneratorDriver {
         self.slice_size = self.base_slice_size.min(max_window_size);
         self.reported_window_size = max_window_size;
         let strategy_tag = self.strategy_tag;
+        // Source-proportional table window for the backends whose hash-table
+        // widths are recomputed here (Dfast / Row). Like the HC / Fast caps
+        // in `adjust_params_for_source_size`, this sizes the internal tables
+        // from the RAW source log (not the wire `window_log` floor) so a
+        // small frame zeroes a small table; it never exceeds the real window.
+        let table_window_size = match hint {
+            Some(h) => {
+                let raw_log = if h == 0 {
+                    MIN_WINDOW_LOG
+                } else {
+                    (64 - (h - 1).leading_zeros()) as u8
+                };
+                // Clamp the shift below the pointer width before `1usize <<`:
+                // an oversized hint (>= 2^63 + 1, and on 32-bit usize any hint
+                // >= 2^32) drives `raw_log` to 64 / >= 32, and the shift would
+                // overflow (panic in debug, wrap to 0 in release) before the
+                // `.min(max_window_size)` cap below could bound it. The min cap
+                // still provides the real semantic window bound.
+                let shift = raw_log.max(MIN_WINDOW_LOG).min(usize::BITS as u8 - 1);
+                (1usize << shift).min(max_window_size)
+            }
+            None => max_window_size,
+        };
         match &mut self.storage {
             MatcherStorage::Simple(m) => {
                 // Per-level Fast cParams threaded from
@@ -1246,7 +1267,7 @@ impl Matcher for MatchGeneratorDriver {
                         | CompressionLevel::Level(3)
                 );
                 dfast.set_hash_bits(if hinted {
-                    dfast_hash_bits_for_window(max_window_size)
+                    dfast_hash_bits_for_window(table_window_size)
                 } else {
                     DFAST_HASH_BITS
                 });
@@ -1260,7 +1281,7 @@ impl Matcher for MatchGeneratorDriver {
                 row.lazy_depth = params.lazy_depth;
                 row.configure(params.row);
                 if hinted {
-                    row.set_hash_bits(row_hash_bits_for_window(max_window_size));
+                    row.set_hash_bits(row_hash_bits_for_window(table_window_size));
                 }
                 let vec_pool = &mut self.vec_pool;
                 row.reset(|mut data| {
@@ -6041,27 +6062,42 @@ fn driver_small_source_hint_shrinks_dfast_hash_tables() {
     let hinted_long = driver.dfast_matcher().long_hash.len();
     let hinted_short = driver.dfast_matcher().short_hash.len();
 
+    // The wire `window_log` stays at its floor (decoder-interop), but the
+    // internal dfast tables are sized from the RAW 1 KiB source, not the
+    // floored window: `table_window = 1 << ceil_log2(1024) = 1 << 10`, so
+    // both tables land at the `MIN_WINDOW_LOG` floor (the long table at
+    // `dfast_hash_bits_for_window(1 << 10) = 10`, the short table one
+    // `DFAST_SHORT_HASH_BITS_DELTA` step below but clamped back up to
+    // `MIN_WINDOW_LOG`).
     assert_eq!(driver.window_size(), 1 << MIN_HINTED_WINDOW_LOG);
-    // At the hinted floor `MIN_HINTED_WINDOW_LOG`, the long table
-    // matches the hinted size; the short table sits one
-    // `DFAST_SHORT_HASH_BITS_DELTA` step below it, clamped at its own
-    // `MIN_WINDOW_LOG` floor. The one-bit split between the two tables
-    // is preserved — the short table is NOT pulled up to equal the
-    // long table at this floor.
-    assert_eq!(hinted_long, 1 << MIN_HINTED_WINDOW_LOG);
-    let expected_hinted_short_bits = (MIN_HINTED_WINDOW_LOG as usize)
-        .saturating_sub(DFAST_SHORT_HASH_BITS_DELTA)
-        .max(MIN_WINDOW_LOG as usize);
-    assert_eq!(
-        hinted_short,
-        1 << expected_hinted_short_bits,
-        "short table must sit one DFAST_SHORT_HASH_BITS_DELTA below the long table \
-         (clamped at MIN_WINDOW_LOG) — a regression that pulls it up to the long-table \
-         floor would still satisfy the `< full_short` bound below and slip through"
-    );
+    assert_eq!(hinted_long, 1 << MIN_WINDOW_LOG);
+    assert_eq!(hinted_short, 1 << MIN_WINDOW_LOG);
     assert!(
         hinted_long < full_long && hinted_short < full_short,
         "tiny source hint should reduce both dfast tables"
+    );
+}
+
+#[test]
+fn driver_huge_source_hint_does_not_overflow_table_window_shift() {
+    // Regression: the Dfast / Row table-window sizing in `reset` derives a
+    // shift from `ceil_log2(hint)`. A hint >= 2^63 + 1 makes that shift 64,
+    // and `1usize << 64` panics in debug / wraps to 0 in release before the
+    // `.min(max_window_size)` cap can apply. A `u64::MAX` pledged source size
+    // must size the table to the real window, never panic or wrap to zero.
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+    driver.set_source_size_hint(u64::MAX);
+    driver.reset(CompressionLevel::Level(3));
+
+    let mut space = driver.get_next_space();
+    space[..12].copy_from_slice(b"abcabcabcabc");
+    space.truncate(12);
+    driver.commit_space(space);
+    driver.skip_matching_with_hint(None);
+
+    assert!(
+        driver.dfast_matcher().long_hash.len() >= 1 << MIN_WINDOW_LOG,
+        "huge hint must size the dfast table from the real window, not wrap to zero"
     );
 }
 
@@ -6089,10 +6125,14 @@ fn driver_small_source_hint_shrinks_row_hash_tables() {
     driver.skip_matching_with_hint(None);
     let hinted_rows = driver.row_matcher().row_heads.len();
 
+    // Wire `window_log` stays floored, but the row hash table is sized from
+    // the RAW 1 KiB source: `table_window = 1 << 10`, so
+    // `row_hash_bits_for_window(1 << 10) = MIN_WINDOW_LOG` and the row count
+    // is `1 << (MIN_WINDOW_LOG - ROW_L5.row_log)`.
     assert_eq!(driver.window_size(), 1 << MIN_HINTED_WINDOW_LOG);
     assert_eq!(
         hinted_rows,
-        1 << ((MIN_HINTED_WINDOW_LOG as usize) - ROW_L5.row_log)
+        1 << ((MIN_WINDOW_LOG as usize) - ROW_L5.row_log)
     );
     assert!(
         hinted_rows < full_rows,
