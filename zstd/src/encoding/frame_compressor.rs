@@ -1073,16 +1073,24 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             // just to read a few KiB (the zero-fill past `filled` is then
             // truncated away). Bound the initial fill by the source-size hint
             // (exact for the slice entry points), and grow toward
-            // `block_capacity` only if the hint under-counted, so an inexact /
-            // unknown (`None` → full `block_capacity`) hint stays correct.
-            let initial_target = initial_size_hint
-                .map(|h| {
-                    let remaining = (h as usize).saturating_sub(total_uncompressed as usize);
-                    filled
-                        .saturating_add(remaining)
-                        .clamp(filled.max(1), block_capacity)
-                })
-                .unwrap_or(block_capacity);
+            // `block_capacity` only if the hint under-counted.
+            //
+            // Overflow-free by construction (no `saturating_*` masking):
+            // `filled <= block_capacity` always (the read only ever targets
+            // `[filled..len]` with `len <= block_capacity`, and a carried-over
+            // `pending_input` is a `split_off` below `block_capacity`), so
+            // `block_capacity - filled` never underflows; pinning `remaining`
+            // to `block_capacity` before the `usize` cast keeps the cast and
+            // the final add within `usize` on every target.
+            let initial_target = match initial_size_hint {
+                Some(hint) if hint > total_uncompressed => {
+                    let remaining = (hint - total_uncompressed).min(block_capacity as u64) as usize;
+                    filled + remaining.min(block_capacity - filled)
+                }
+                // Unknown hint, or an inexact hint already met by prior blocks:
+                // read against the full block window.
+                _ => block_capacity,
+            };
             if uncompressed_data.len() < initial_target {
                 uncompressed_data.resize(initial_target, 0);
             }
@@ -1093,11 +1101,11 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 if filled == uncompressed_data.len() {
                     // Hint under-counted the block; grow toward block_capacity
                     // (doubling, capped) so reading continues without paying a
-                    // full-buffer zero up front.
-                    let grow_to = uncompressed_data
-                        .len()
-                        .saturating_mul(2)
-                        .clamp(filled + 1, block_capacity);
+                    // full-buffer zero up front. `len <= block_capacity` so the
+                    // double stays well within `usize`; `filled < block_capacity`
+                    // here (the `== block_capacity` break fired otherwise), so
+                    // `filled + 1 <= block_capacity`.
+                    let grow_to = (uncompressed_data.len() * 2).clamp(filled + 1, block_capacity);
                     uncompressed_data.resize(grow_to, 0);
                 }
                 let read_end = uncompressed_data.len();
