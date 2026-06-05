@@ -2001,4 +2001,138 @@ mod init_sequence_stream_tests {
             "all-zero padding must be rejected as ExtraPadding"
         );
     }
+
+    /// One-sequence, all-Predefined header. Pairs with an ample non-zero
+    /// bitstream so `init_sequence_stream` returns `Ok` (the sequence loop
+    /// may still error afterwards). Used to drive the per-tier monolith
+    /// preambles directly: on x86_64 CI only the avx2 tier is selected at
+    /// runtime, so scalar / bmi2 / vbmi2 and the K-generic impl would
+    /// otherwise never execute their (shared) preamble.
+    fn predefined_one_sequence_header() -> SequencesHeader {
+        let mut header = SequencesHeader::new();
+        header.parse_from_header(&[0x01, 0x00]).unwrap();
+        header
+    }
+
+    /// Drives the always-available decoders (the portable scalar tier and
+    /// the K-generic impl that backs the aarch64 NEON/SVE path) through a
+    /// well-formed preamble. The result is intentionally ignored: a
+    /// crafted bitstream need not yield a valid sequence, only reach and
+    /// pass the preamble.
+    #[test]
+    fn scalar_tier_and_generic_impl_run_preamble() {
+        let header = predefined_one_sequence_header();
+        let source = [0xFFu8; 8];
+        let lits = [0u8; 32];
+
+        let mut fse = FSEScratch::new();
+        let mut buf = DecodeBuffer::<RingBuffer>::new(4 * 1024);
+        let mut offset_hist = [1u32, 4, 8];
+        let _ = crate::decoding::seq_decoder_scalar::decode_and_execute_sequences_scalar(
+            &header,
+            &source,
+            &mut fse,
+            &mut buf,
+            &mut offset_hist,
+            &lits,
+        );
+
+        let mut fse = FSEScratch::new();
+        let mut buf = DecodeBuffer::<RingBuffer>::new(4 * 1024);
+        let mut offset_hist = [1u32, 4, 8];
+        let _ = super::decode_and_execute_sequences_impl::<RingBuffer, ScalarKernel>(
+            &header,
+            &source,
+            &mut fse,
+            &mut buf,
+            &mut offset_hist,
+            &lits,
+        );
+    }
+
+    /// Drive the BMI2 monolith preamble directly. The runtime kernel
+    /// selector prefers the avx2 tier on any CPU that has BMI2, so this
+    /// tier never runs through the normal dispatch on CI hardware; call it
+    /// directly (guarded on the same feature it requires).
+    #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel_bmi2"))]
+    #[test]
+    fn bmi2_tier_runs_preamble() {
+        if !std::is_x86_feature_detected!("bmi2") {
+            return;
+        }
+        let header = predefined_one_sequence_header();
+        let source = [0xFFu8; 8];
+        let lits = [0u8; 32];
+        let mut fse = FSEScratch::new();
+        let mut buf = DecodeBuffer::<RingBuffer>::new(4 * 1024);
+        let mut offset_hist = [1u32, 4, 8];
+        // SAFETY: BMI2 confirmed available by the runtime check above.
+        let _ = unsafe {
+            crate::decoding::seq_decoder_bmi2::decode_and_execute_sequences_bmi2::<RingBuffer>(
+                &header,
+                &source,
+                &mut fse,
+                &mut buf,
+                &mut offset_hist,
+                &lits,
+            )
+        };
+    }
+
+    /// Drive the AVX2 monolith preamble directly. The avx2 tier is the
+    /// production path on AVX2 hardware, so this is usually also covered by
+    /// the normal decode tests; the explicit call keeps the preamble
+    /// covered even on a runner that lacks AVX2.
+    #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel_avx2"))]
+    #[test]
+    fn avx2_tier_runs_preamble() {
+        if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi2")) {
+            return;
+        }
+        let header = predefined_one_sequence_header();
+        let source = [0xFFu8; 8];
+        let lits = [0u8; 32];
+        let mut fse = FSEScratch::new();
+        let mut buf = DecodeBuffer::<RingBuffer>::new(4 * 1024);
+        let mut offset_hist = [1u32, 4, 8];
+        // SAFETY: AVX2 + BMI2 confirmed available by the runtime check.
+        let _ = unsafe {
+            crate::decoding::seq_decoder_avx2::decode_and_execute_sequences_avx2::<RingBuffer>(
+                &header,
+                &source,
+                &mut fse,
+                &mut buf,
+                &mut offset_hist,
+                &lits,
+            )
+        };
+    }
+
+    /// Drive the VBMI2 monolith preamble directly. Requires AVX-512 VBMI2,
+    /// which most CI runners lack; the test self-skips there, so this tier
+    /// is only covered on AVX-512 hardware.
+    #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel_vbmi2"))]
+    #[test]
+    fn vbmi2_tier_runs_preamble() {
+        if !std::is_x86_feature_detected!("avx512vbmi2") {
+            return;
+        }
+        let header = predefined_one_sequence_header();
+        let source = [0xFFu8; 8];
+        let lits = [0u8; 32];
+        let mut fse = FSEScratch::new();
+        let mut buf = DecodeBuffer::<RingBuffer>::new(4 * 1024);
+        let mut offset_hist = [1u32, 4, 8];
+        // SAFETY: AVX-512 VBMI2 confirmed available by the runtime check.
+        let _ = unsafe {
+            crate::decoding::seq_decoder_vbmi2::decode_and_execute_sequences_vbmi2::<RingBuffer>(
+                &header,
+                &source,
+                &mut fse,
+                &mut buf,
+                &mut offset_hist,
+                &lits,
+            )
+        };
+    }
 }
