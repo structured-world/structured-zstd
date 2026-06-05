@@ -148,6 +148,45 @@ fn malformed_block_does_not_panic_via_restore_checkpoint() {
 }
 
 #[test]
+fn over_producing_block_does_not_oom_via_unbounded_reserve() {
+    // Regression for libFuzzer artifact oom-66db61d9… (decode target). A
+    // crafted frame's sequences over-produce inside one block: every match
+    // is small, but cumulatively they drove `RingBuffer::reserve_amortized`
+    // to ~0.5–2 GiB *inside* the block-decode loop, before the post-block
+    // validity check ran and before the consumer's output cap could
+    // intervene (the OOM is upstream of any `Read::take`). A single block
+    // decompresses to at most MAX_BLOCK_SIZE, so the per-block output
+    // ceiling now rejects the over-producing match with a normal decode
+    // Err instead of growing the buffer unbounded.
+    extern crate std;
+    use std::io::Read;
+
+    let data: &[u8] = &[
+        0x28, 0xb5, 0x2f, 0xfd, 0x00, 0x30, 0xb5, 0x00, 0x00, 0x2d, 0x28, 0xb5, 0x2f, 0xfd, 0x00,
+        0x26, 0x02, 0x00, 0x04, 0x28, 0xb5, 0x2f, 0xfd, 0x34, 0x0e, 0x02, 0x00, 0x0a, 0x0a, 0x0a,
+        0x0a, 0x0a, 0x0a, 0x00, 0x0b, 0x0b, 0x19, 0x00, 0x02, 0xfc, 0xe9, 0x98, 0x0a, 0x0a, 0x0a,
+        0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a,
+        0x0a, 0x0a, 0xd7, 0x0a, 0x0a, 0x0a, 0x0a, 0xd3, 0x4a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a,
+        0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a,
+        0x0a, 0x0a, 0x0a, 0x0a, 0xb5, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0xe5, 0x0a, 0xb5,
+    ];
+
+    // Frame headers are well-formed, so streaming construction must
+    // succeed — make it mandatory so the test can't vacuously pass by
+    // skipping the OOM path if construction ever regresses. The decode
+    // must surface a normal Err (the per-block ceiling rejecting the
+    // over-producing match), not just "no OOM": asserting Err also locks
+    // in that the decoder never silently accepts this malformed frame.
+    let mut decoder = crate::decoding::StreamingDecoder::new(data)
+        .expect("regression artifact must pass frame-header construction");
+    let mut output = alloc::vec::Vec::new();
+    assert!(
+        decoder.read_to_end(&mut output).is_err(),
+        "over-producing block must surface a decode Err, not decode successfully"
+    );
+}
+
+#[test]
 fn multi_frame_flat_buf_path_does_not_panic() {
     // Regression for libFuzzer artifact crash-e33ba082... — a
     // multi-frame stream that hits the flat-buffer wiring landed in

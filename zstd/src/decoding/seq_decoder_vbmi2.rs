@@ -11,15 +11,12 @@ use super::buffer_backend::BufferBackend;
 use super::decode_buffer::DecodeBuffer;
 use super::scratch::FSEScratch;
 use super::sequence_section_decoder::{
-    ADVANCE, ADVANCE_MASK, ExecSeq, compute_use_long_pipeline, maybe_update_fse_tables,
+    ADVANCE, ADVANCE_MASK, ExecSeq, SeqStreamSetup, init_sequence_stream,
 };
-use crate::bit_io::BitReaderReversed;
 use crate::blocks::sequence_section::{MAX_OFFSET_CODE, Sequence, SequencesHeader};
-use crate::common::MAX_BLOCK_SIZE;
 use crate::cpu_kernel::Vbmi2Kernel;
 use crate::decoding::errors::{DecodeSequenceError, DecompressBlockError, ExecuteSequencesError};
 use crate::decoding::sequence_execution::do_offset_history;
-use crate::fse::SeqFSEDecoder;
 
 macro_rules! decode_one_body {
     ($ll_dec:expr, $ml_dec:expr, $of_dec:expr, $br:expr) => {{
@@ -161,67 +158,22 @@ pub(crate) unsafe fn decode_and_execute_sequences_vbmi2<B: BufferBackend>(
     offset_hist: &mut [u32; 3],
     literals_buffer: &[u8],
 ) -> Result<(), DecompressBlockError> {
-    let ddict_is_cold = fse.ddict_is_cold;
-    fse.ddict_is_cold = false;
-
-    let bytes_read = maybe_update_fse_tables(section, source, fse)?;
-    let bit_stream = &source[bytes_read..];
-    let mut br = BitReaderReversed::<Vbmi2Kernel>::new(bit_stream);
-
-    let mut skipped_bits = 0;
-    loop {
-        let val = br.get_bits(1);
-        skipped_bits += 1;
-        if val == 1 || skipped_bits > 8 {
-            break;
-        }
-    }
-    if skipped_bits > 8 {
-        return Err(DecodeSequenceError::ExtraPadding { skipped_bits }.into());
-    }
-
-    let mut ll_dec = SeqFSEDecoder::new(&fse.literal_lengths);
-    let mut ml_dec = SeqFSEDecoder::new(&fse.match_lengths);
-    let mut of_dec = SeqFSEDecoder::new(&fse.offsets);
-
-    ll_dec
-        .init_state(&mut br)
-        .map_err(DecodeSequenceError::from)?;
-    of_dec
-        .init_state(&mut br)
-        .map_err(DecodeSequenceError::from)?;
-    ml_dec
-        .init_state(&mut br)
-        .map_err(DecodeSequenceError::from)?;
-
-    let max_update_bits = fse.literal_lengths.accuracy_log
-        + fse.match_lengths.accuracy_log
-        + fse.offsets.accuracy_log;
-    debug_assert!(
-        max_update_bits <= 56,
-        "sequence section update bits exceed 56-bit budget"
-    );
-
-    buffer.reserve(MAX_BLOCK_SIZE as usize);
-    let old_buffer_size = buffer.len();
+    let SeqStreamSetup {
+        mut br,
+        mut ll_dec,
+        mut ml_dec,
+        mut of_dec,
+        max_update_bits,
+        old_buffer_size,
+        num_sequences,
+        use_long_pipeline,
+    } = init_sequence_stream::<B, Vbmi2Kernel>(section, source, fse, buffer)?;
     let literals_buffer_len = literals_buffer.len();
     let mut lit_cur: usize = 0;
     let mut seq_sum: u32 = 0;
 
     let buffer_checkpoint = buffer.checkpoint();
     let saved_offset_hist = *offset_hist;
-    let num_sequences = section.num_sequences as usize;
-
-    // `saturating_add` defuses 32-bit `usize` wrap (see
-    // `sequence_section_decoder::compute_use_long_pipeline` for the
-    // gate semantics this feeds into).
-    let total_history = buffer.window_size.saturating_add(buffer.dict_content.len());
-    let use_long_pipeline = compute_use_long_pipeline(
-        num_sequences,
-        ddict_is_cold,
-        total_history,
-        fse.offsets_long_share,
-    );
 
     if use_long_pipeline {
         let mut prefetch_pos: usize = old_buffer_size;
