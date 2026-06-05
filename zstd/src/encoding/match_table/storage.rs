@@ -214,7 +214,6 @@ pub(crate) const HC3_HASH_LOG: usize = 17;
 /// tables. Methods on this struct contain only logic that's identical
 /// between HC and BT modes — backend-specific table interpretation
 /// lives in the matcher modules.
-#[derive(Clone)]
 pub(crate) struct MatchTable {
     pub(crate) max_window_size: usize,
     /// Per-chunk lengths of the live window, in add order. The bytes

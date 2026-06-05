@@ -51,7 +51,6 @@ const HASH_READ_SIZE: usize = 8;
 /// rep emissions that upstream produces.
 const DFAST_REP_MIN_MATCH_LEN: usize = 4;
 
-#[derive(Clone)]
 pub(crate) struct DfastMatchGenerator {
     pub(crate) max_window_size: usize,
     /// Per-block length queue. Previously held the raw input

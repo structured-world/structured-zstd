@@ -36,7 +36,6 @@ pub(crate) const HC3_MAX_OFFSET: usize = 1 << 18;
 /// `BtUltra2` parse modes. Owns the cost model and the per-frame
 /// scratch arenas; the actual BT pointer-pair table lives on the
 /// shared [`super::match_table::storage::MatchTable`].
-#[derive(Clone)]
 pub(crate) struct BtMatcher {
     /// Donor `optStatePtr_t` — Huffman / FSE-derived literal and
     /// sequence-symbol cost tables that drive the optimal parser.

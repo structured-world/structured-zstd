@@ -197,7 +197,7 @@ pub fn compress_slice_to_vec(source: &[u8], level: CompressionLevel) -> Vec<u8> 
 /// The compression mode used impacts the speed of compression,
 /// and resulting compression ratios. Faster compression will result
 /// in worse compression ratios, and vice versa.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug)]
 pub enum CompressionLevel {
     /// This level does not compress the data at all, and simply wraps
     /// it in a Zstandard frame.
@@ -344,21 +344,6 @@ pub trait Matcher {
     /// Prime matcher state with dictionary history before compressing the next frame.
     /// Default implementation is a no-op for custom matchers that do not support this.
     fn prime_with_dictionary(&mut self, _dict_content: &[u8], _offset_hist: [u32; 3]) {}
-    /// CDict-equivalent fast path for repeated frames sharing one dictionary.
-    /// Restore the matcher state captured by [`Self::capture_primed_dictionary`]
-    /// at the SAME level (a table copy) instead of re-running
-    /// [`Self::prime_with_dictionary`] (which re-hashes every dictionary
-    /// position). Returns `true` when a matching snapshot was restored;
-    /// `false` (the default) means the caller must prime then capture.
-    fn restore_primed_dictionary(&mut self, _level: CompressionLevel) -> bool {
-        false
-    }
-    /// Snapshot the post-prime matcher state for the given level so later
-    /// frames can [`Self::restore_primed_dictionary`] it. Default no-op.
-    fn capture_primed_dictionary(&mut self, _level: CompressionLevel) {}
-    /// Drop any captured prime snapshot (dictionary or level changed).
-    /// Default no-op.
-    fn invalidate_primed_dictionary(&mut self) {}
     /// Seed matcher cost model with dictionary entropy tables before the next frame.
     /// Default implementation is a no-op for custom matchers.
     fn seed_dictionary_entropy(

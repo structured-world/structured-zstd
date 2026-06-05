@@ -95,7 +95,6 @@ const LDM_XXH64_SEED: u64 = 0;
 /// [`Self::clear`] only when starting a new frame (so the
 /// long-range history accumulated across blocks is preserved
 /// within a frame, mirroring donor's `ldmState_t` lifecycle).
-#[derive(Clone)]
 pub(crate) struct LdmProducer {
     /// Parameter set this producer was built with. Used by the
     /// split walker (next commit) to honour `min_match_length` /
