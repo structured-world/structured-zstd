@@ -112,7 +112,7 @@ pub(crate) const ROW_LOG: usize = 5;
 pub(crate) const ROW_SEARCH_DEPTH: usize = 16;
 pub(crate) const ROW_TARGET_LEN: usize = 48;
 pub(crate) const ROW_TAG_BITS: usize = 8;
-pub(crate) const ROW_EMPTY_SLOT: usize = usize::MAX;
+pub(crate) const ROW_EMPTY_SLOT: u32 = u32::MAX;
 pub(crate) const ROW_HASH_KEY_LEN: usize = 4;
 // HASH_MIX_PRIME now lives in `crate::encoding::fastpath::scalar`; the four
 // per-CPU `hash_mix_u64` variants share it via that module.

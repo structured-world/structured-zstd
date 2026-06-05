@@ -356,7 +356,13 @@ pub(crate) struct RowMatchGenerator {
     /// Cached fastpath kernel for `hash_mix_u64`; see Dfast for rationale.
     pub(crate) hash_kernel: crate::encoding::fastpath::FastpathKernel,
     pub(crate) row_heads: Vec<u8>,
-    pub(crate) row_positions: Vec<usize>,
+    // Absolute match positions, one per row slot. Stored as `u32` (not
+    // `usize`): this is the largest match-finder array, and `u32` halves its
+    // footprint vs the donor-parity `U32` layout. The encoder caps a single
+    // Row frame below `u32::MAX` in `add_data` (so every stored position is
+    // representable and `ROW_EMPTY_SLOT == u32::MAX` stays an unambiguous
+    // sentinel); the absolute cursor resets to 0 per frame.
+    pub(crate) row_positions: Vec<u32>,
     pub(crate) row_tags: Vec<u8>,
     /// Cached tag-match SIMD kernel; CPU features are fixed per process, so
     /// resolve once instead of querying per `row_candidate` call.
@@ -434,6 +440,17 @@ impl RowMatchGenerator {
             self.history_abs_start,
             self.window_size,
             data.len(),
+        );
+        // Row stores absolute match positions as `u32` with `u32::MAX`
+        // reserved as the empty sentinel, so a single frame's absolute cursor
+        // must stay below `u32::MAX`. The cursor resets to 0 per frame, so
+        // this only bounds a single >= ~4 GiB frame — far beyond the
+        // decoder's window cap. `check_stream_abs_headroom` above already
+        // guaranteed this sum does not overflow `usize`.
+        assert!(
+            self.history_abs_start + self.window_size + data.len() < u32::MAX as usize,
+            "structured-zstd: a Row-strategy frame exceeded the u32 match-position \
+             limit; split the input into smaller frames or use a higher level"
         );
         while self.window_size + data.len() > self.max_window_size {
             let removed = self.window.pop_front().unwrap();
@@ -1065,11 +1082,14 @@ impl RowMatchGenerator {
             if !matched {
                 continue;
             }
-            let candidate_pos = self.row_positions[idx];
-            if candidate_pos == ROW_EMPTY_SLOT
-                || candidate_pos < self.history_abs_start
-                || candidate_pos >= abs_pos
-            {
+            let raw_pos = self.row_positions[idx];
+            if raw_pos == ROW_EMPTY_SLOT {
+                continue;
+            }
+            // Stored positions are absolute (`< u32::MAX`, capped per frame in
+            // `add_data`); widen to `usize` for the window-bound checks.
+            let candidate_pos = raw_pos as usize;
+            if candidate_pos < self.history_abs_start || candidate_pos >= abs_pos {
                 continue;
             }
             let candidate_idx = candidate_pos - self.history_abs_start;
@@ -1185,7 +1205,10 @@ impl RowMatchGenerator {
             let next = head.wrapping_sub(1) & row_mask;
             *self.row_heads.get_unchecked_mut(row) = next as u8;
             *self.row_tags.get_unchecked_mut(row_base + next) = tag;
-            *self.row_positions.get_unchecked_mut(row_base + next) = abs_pos;
+            // `abs_pos < u32::MAX` holds: `add_data` caps a Row frame's
+            // absolute cursor below `u32::MAX`, so the cast is lossless and
+            // never collides with the `ROW_EMPTY_SLOT == u32::MAX` sentinel.
+            *self.row_positions.get_unchecked_mut(row_base + next) = abs_pos as u32;
         }
     }
 }
