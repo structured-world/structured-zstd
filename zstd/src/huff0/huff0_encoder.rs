@@ -511,8 +511,14 @@ impl HuffmanTable {
         // table-log search loop stay allocation-free past the
         // mandatory `build_donor_limited_weights` Vec.
         let mut weights_u8 = [0u8; 256];
+        // The Huffman tree shape (and thus the per-leaf natural depths) does
+        // not depend on `table_log`; only the height limiting does. Build the
+        // leaves once and reuse them across every candidate `table_log`
+        // instead of rebuilding the whole tree per iteration.
+        let leaves = build_huffman_leaf_depths(counts);
         for table_log in min_table_log..=11 {
-            let weights = build_donor_limited_weights(counts, table_log);
+            let weights = limited_weights_from_leaves(&leaves, counts.len(), table_log)
+                .unwrap_or_else(|| legacy_distributed_weights(counts));
             if !huffman_weight_sum_is_power_of_two(&weights) {
                 continue;
             }
@@ -862,7 +868,14 @@ struct HuffNode {
     nb_bits: usize,
 }
 
-fn build_donor_limited_weights(counts: &[usize], max_nb_bits: usize) -> Vec<usize> {
+/// Build the count-sorted Huffman leaves with their natural (unlimited) code
+/// lengths in `nb_bits`. The tree shape is independent of any maximum-length
+/// limit, so this is computed once per block and shared across every
+/// candidate `table_log` instead of being rebuilt per candidate. The
+/// returned leaves are sorted by (count desc, symbol asc); for <= 1 distinct
+/// symbol the (0 or 1) leaves are returned with `nb_bits == 0` and the caller
+/// assigns the trivial weight.
+fn build_huffman_leaf_depths(counts: &[usize]) -> Vec<HuffNode> {
     let mut leaves = counts
         .iter()
         .copied()
@@ -877,11 +890,7 @@ fn build_donor_limited_weights(counts: &[usize], max_nb_bits: usize) -> Vec<usiz
         .collect::<Vec<_>>();
 
     if leaves.len() <= 1 {
-        let mut weights = alloc::vec![0; counts.len()];
-        if let Some(leaf) = leaves.first() {
-            weights[leaf.symbol] = 1;
-        }
-        return weights;
+        return leaves;
     }
 
     leaves.sort_by(|left, right| match right.count.cmp(&left.count) {
@@ -890,7 +899,7 @@ fn build_donor_limited_weights(counts: &[usize], max_nb_bits: usize) -> Vec<usiz
     });
 
     let leaf_count = leaves.len();
-    let mut nodes = leaves.clone();
+    let mut nodes = leaves;
     nodes.resize(
         2 * leaf_count - 1,
         HuffNode {
@@ -969,25 +978,50 @@ fn build_donor_limited_weights(counts: &[usize], max_nb_bits: usize) -> Vec<usiz
         nodes[leaf_idx].nb_bits = depth;
     }
 
-    // `nodes[..leaf_count]` are the leaves in their original `leaves` order,
-    // already sorted by (count desc, symbol asc) above; the tree build only
-    // writes `parent` / `nb_bits` on them and never reorders or changes their
-    // `count` / `symbol`, so they are still in that order. Re-sorting by the
-    // same comparator would be a no-op, and `enforce_max_height` already
-    // requires exactly this count-descending order. Copy the leaves out
-    // without the redundant sort.
-    let mut sorted_leaves = nodes[..leaf_count].to_vec();
+    // The leaves keep their (count desc, symbol asc) order: the tree build
+    // only writes `parent` / `nb_bits` on them and never reorders them or
+    // changes their `count` / `symbol`. Return just the leaves (with depths).
+    nodes.truncate(leaf_count);
+    nodes
+}
+
+/// Limit the natural Huffman depths in `leaves` (from
+/// [`build_huffman_leaf_depths`]) to `max_nb_bits` and project them onto a
+/// per-symbol weight table of length `counts_len`. Returns `None` when the
+/// height limiting cannot reach `max_nb_bits` (the caller then falls back to
+/// the distributed-weight construction). `leaves` must be sorted by count
+/// descending, which `enforce_max_height` relies on.
+fn limited_weights_from_leaves(
+    leaves: &[HuffNode],
+    counts_len: usize,
+    max_nb_bits: usize,
+) -> Option<Vec<usize>> {
+    if leaves.len() <= 1 {
+        let mut weights = alloc::vec![0; counts_len];
+        if let Some(leaf) = leaves.first() {
+            weights[leaf.symbol] = 1;
+        }
+        return Some(weights);
+    }
+
+    let mut sorted_leaves = leaves.to_vec();
     enforce_max_height(&mut sorted_leaves, max_nb_bits);
     repair_limited_lengths(&mut sorted_leaves, max_nb_bits);
     if sorted_leaves.iter().any(|leaf| leaf.nb_bits > max_nb_bits) {
-        return legacy_distributed_weights(counts);
+        return None;
     }
 
-    let mut weights = alloc::vec![0; counts.len()];
+    let mut weights = alloc::vec![0; counts_len];
     for leaf in sorted_leaves {
         weights[leaf.symbol] = max_nb_bits - leaf.nb_bits + 1;
     }
-    weights
+    Some(weights)
+}
+
+fn build_donor_limited_weights(counts: &[usize], max_nb_bits: usize) -> Vec<usize> {
+    let leaves = build_huffman_leaf_depths(counts);
+    limited_weights_from_leaves(&leaves, counts.len(), max_nb_bits)
+        .unwrap_or_else(|| legacy_distributed_weights(counts))
 }
 
 fn repair_limited_lengths(nodes: &mut [HuffNode], target_nb_bits: usize) {
