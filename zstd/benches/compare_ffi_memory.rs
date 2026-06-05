@@ -36,7 +36,9 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use structured_zstd::decoding::FrameDecoder;
-use support::{LevelConfig, Scenario, benchmark_scenarios, supported_levels_filtered};
+use support::{
+    LevelConfig, Scenario, benchmark_scenarios, kernel_report_line, supported_levels_filtered,
+};
 
 /// Process-wide byte tracker. Two allocation paths feed the SAME
 /// pair of atomic counters (`ALLOC_CURRENT` / `ALLOC_PEAK`) once
@@ -416,6 +418,13 @@ fn emit_report(
 }
 
 fn main() {
+    // Report the CPU kernel tier this run selected, so the dashboard can
+    // attribute every REPORT_MEM line to the kernel that produced it. Printed
+    // unconditionally (no STRUCTURED_ZSTD_EMIT_REPORT gate like compare_ffi):
+    // this binary is purpose-built for report generation and its only output
+    // is REPORT_* lines, so the header is always wanted.
+    println!("{}", kernel_report_line());
+
     let scenarios = benchmark_scenarios();
     for scenario in &scenarios {
         for level in supported_levels_filtered() {

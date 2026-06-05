@@ -92,6 +92,11 @@ pub mod huff0;
 #[cfg(feature = "fuzz_exports")]
 pub use crate::cpu_kernel::{CpuKernel, ScalarKernel};
 
+/// Name of the active CPU kernel tier (entropy / sequence hot paths) for this
+/// process — for diagnostics and benchmark/dashboard reporting. See
+/// [`cpu_kernel::active_cpu_kernel_name`].
+pub use crate::cpu_kernel::active_cpu_kernel_name;
+
 #[cfg(not(feature = "fuzz_exports"))]
 pub(crate) mod fse;
 #[cfg(not(feature = "fuzz_exports"))]

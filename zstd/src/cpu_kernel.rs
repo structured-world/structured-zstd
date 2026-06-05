@@ -372,6 +372,45 @@ pub(crate) fn detect_cpu_kernel() -> CpuKernelTag {
     CpuKernelTag::Scalar
 }
 
+impl CpuKernelTag {
+    /// Stable lowercase diagnostic name for this tier (used by
+    /// [`active_cpu_kernel_name`] and the bench/dashboard reporting). Pure
+    /// mapping over the tag, so every arm is exercisable in tests regardless
+    /// of which tier the running CPU actually resolves to.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            CpuKernelTag::Scalar => "scalar",
+            #[cfg(all(target_arch = "x86_64", feature = "kernel_sse2"))]
+            CpuKernelTag::Sse2 => "sse2",
+            #[cfg(all(target_arch = "x86_64", feature = "kernel_bmi2"))]
+            CpuKernelTag::Bmi2 => "bmi2",
+            #[cfg(all(target_arch = "x86_64", feature = "kernel_avx2"))]
+            CpuKernelTag::Avx2 => "avx2",
+            #[cfg(all(target_arch = "x86_64", feature = "kernel_vbmi2"))]
+            CpuKernelTag::Vbmi2 => "vbmi2",
+            #[cfg(all(target_arch = "aarch64", feature = "kernel_neon"))]
+            CpuKernelTag::Neon => "neon",
+            #[cfg(all(
+                target_arch = "aarch64",
+                feature = "kernel_sve",
+                any(feature = "std", target_feature = "sve"),
+            ))]
+            CpuKernelTag::Sve => "sve",
+        }
+    }
+}
+
+/// Name of the CPU kernel tier this process selected for the entropy /
+/// sequence hot paths: decode (literals + FSE sequence decode) and encode
+/// (entropy) share this dispatch (see #247). Returned as a stable lowercase
+/// string for diagnostics and benchmark/dashboard reporting; the value is
+/// what the runtime CPU-feature detection (or compile-time `target_feature`
+/// on `no_std`) actually resolves to on this machine, so a dashboard can
+/// attribute a measurement to the kernel that produced it.
+pub fn active_cpu_kernel_name() -> &'static str {
+    detect_cpu_kernel().name()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,5 +525,54 @@ mod tests {
             first, second,
             "cached detect must return same tag on repeated calls"
         );
+    }
+
+    #[test]
+    fn active_kernel_name_is_known_lowercase_tier() {
+        // The diagnostic name must be one of the stable lowercase tier
+        // strings the dashboard parses, and must match whatever tier
+        // detection resolves to on this host (no `unknown` / empty leak).
+        const KNOWN: &[&str] = &["scalar", "sse2", "bmi2", "avx2", "vbmi2", "neon", "sve"];
+        let name = active_cpu_kernel_name();
+        assert!(
+            KNOWN.contains(&name),
+            "active kernel name {name:?} is not a recognised tier"
+        );
+        assert_eq!(
+            name,
+            name.to_ascii_lowercase(),
+            "tier name must be lowercase for stable dashboard parsing"
+        );
+    }
+
+    #[test]
+    fn every_kernel_tag_maps_to_its_lowercase_name() {
+        // `active_cpu_kernel_name` only exercises whichever arm the running
+        // CPU resolves to, so map each constructible tag directly to cover
+        // every branch on this build's feature set.
+        assert_eq!(CpuKernelTag::Scalar.name(), "scalar");
+        #[cfg(all(target_arch = "x86_64", feature = "kernel_sse2"))]
+        assert_eq!(CpuKernelTag::Sse2.name(), "sse2");
+        #[cfg(all(target_arch = "x86_64", feature = "kernel_bmi2"))]
+        assert_eq!(CpuKernelTag::Bmi2.name(), "bmi2");
+        #[cfg(all(target_arch = "x86_64", feature = "kernel_avx2"))]
+        assert_eq!(CpuKernelTag::Avx2.name(), "avx2");
+        #[cfg(all(target_arch = "x86_64", feature = "kernel_vbmi2"))]
+        assert_eq!(CpuKernelTag::Vbmi2.name(), "vbmi2");
+        #[cfg(all(target_arch = "aarch64", feature = "kernel_neon"))]
+        assert_eq!(CpuKernelTag::Neon.name(), "neon");
+        #[cfg(all(
+            target_arch = "aarch64",
+            feature = "kernel_sve",
+            any(feature = "std", target_feature = "sve"),
+        ))]
+        assert_eq!(CpuKernelTag::Sve.name(), "sve");
+    }
+
+    #[test]
+    fn active_kernel_name_is_stable_across_calls() {
+        // Backed by the cached `detect_cpu_kernel`, so repeated calls must
+        // return the identical static string.
+        assert_eq!(active_cpu_kernel_name(), active_cpu_kernel_name());
     }
 }

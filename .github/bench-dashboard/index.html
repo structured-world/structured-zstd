@@ -1921,10 +1921,32 @@
         el("stat-records").textContent = String(state.records.length);
         const targetsContainer = el("stat-targets");
         targetsContainer.replaceChildren();
+        // Map each target to the CPU kernel tier that produced its numbers.
+        // Carried per-record (see run-benchmarks.sh) so it survives merging
+        // per-target payloads. Pick the kernel from the LATEST snapshot per
+        // target so a payload that merges several snapshots can't show stale
+        // kernel info. Order via `compareSnapshotIdentity` (the same comparator
+        // the latest-profile selection uses) rather than a raw string compare,
+        // so a record with only a `commit_sha` fallback never misorders against
+        // one carrying a `generated_at` timestamp.
+        const kernelByTarget = {};
+        const kernelRowByTarget = {};
+        for (const r of state.records) {
+          if (!(r.kernel && r.kernel.kernel && r.target)) continue;
+          const prev = kernelRowByTarget[r.target];
+          if (!prev || compareSnapshotIdentity(r, prev) > 0) {
+            kernelRowByTarget[r.target] = r;
+            kernelByTarget[r.target] = r.kernel;
+          }
+        }
         for (const target of targets) {
           const chip = document.createElement("span");
           chip.className = "chip";
-          chip.textContent = target;
+          const k = kernelByTarget[target];
+          chip.textContent = k ? `${target} · ${k.kernel}` : target;
+          if (k) {
+            chip.title = `CPU kernel: ${k.kernel} · arch ${k.arch} · libc ${k.target_env}`;
+          }
           targetsContainer.appendChild(chip);
         }
         const latestSha = (latest.commit_sha || "local-run").slice(0, 12);
