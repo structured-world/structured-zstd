@@ -615,6 +615,7 @@ pub(crate) fn level_pre_split(level: CompressionLevel) -> Option<usize> {
 /// number of arms, but `storage.backend()` is now the canonical source
 /// of truth and dead variants are dropped when the active backend
 /// changes.
+#[derive(Clone)]
 enum MatcherStorage {
     /// Donor `ZSTD_fast` family. Constructed by
     /// [`MatchGeneratorDriver::new`] as the initial variant and
@@ -716,6 +717,16 @@ pub struct MatchGeneratorDriver {
     // committed-block path; consumed (reset to `None`) by the routed
     // call. Always `None` on the owned streaming path.
     borrowed_pending: Option<(usize, usize)>,
+    /// CDict-equivalent: snapshot of the post-prime matcher state taken
+    /// once after the first dictionary prime — the backend `storage`
+    /// (hash tables + dictionary history + offset history + window) plus
+    /// the driver-level `dictionary_retained_budget`, the only two pieces
+    /// `prime_with_dictionary` writes. Subsequent frames restore this
+    /// (a table memcpy) instead of re-hashing every dictionary position,
+    /// mirroring donor `ZSTD_compressBegin_usingCDict` copying the
+    /// precomputed `cdict->matchState`. Invalidated when the dictionary or
+    /// level changes (keyed by the captured `CompressionLevel`).
+    primed: Option<(MatcherStorage, usize, super::CompressionLevel)>,
 }
 
 impl MatchGeneratorDriver {
@@ -798,6 +809,7 @@ impl MatchGeneratorDriver {
             dictionary_retained_budget: 0,
             source_size_hint: None,
             borrowed_pending: None,
+            primed: None,
         }
     }
 
@@ -1453,6 +1465,31 @@ impl Matcher for MatchGeneratorDriver {
         }
     }
 
+    fn restore_primed_dictionary(&mut self, level: super::CompressionLevel) -> bool {
+        // Only the (storage, dictionary_retained_budget) pair is what
+        // `prime_with_dictionary` writes; restoring them reproduces the
+        // post-prime state exactly. Gated on the captured level so a driver
+        // reused at a different level (different backend / params) re-primes
+        // instead of restoring a mismatched table.
+        let (storage, budget) = match &self.primed {
+            Some((storage, budget, captured_level)) if *captured_level == level => {
+                (storage.clone(), *budget)
+            }
+            _ => return false,
+        };
+        self.storage = storage;
+        self.dictionary_retained_budget = budget;
+        true
+    }
+
+    fn capture_primed_dictionary(&mut self, level: super::CompressionLevel) {
+        self.primed = Some((self.storage.clone(), self.dictionary_retained_budget, level));
+    }
+
+    fn invalidate_primed_dictionary(&mut self) {
+        self.primed = None;
+    }
+
     fn seed_dictionary_entropy(
         &mut self,
         huff: Option<&crate::huff0::huff0_encoder::HuffmanTable>,
@@ -1757,6 +1794,7 @@ impl MatchGeneratorDriver {
 /// The discriminator lives next to `parse_mode` so `configure()` can
 /// promote between the two on a level change without touching the
 /// `MatchTable` storage.
+#[derive(Clone)]
 pub(crate) enum HcBackend {
     /// Lazy / lazy2 modes — no per-frame backend state.
     Hc,
@@ -1782,6 +1820,7 @@ impl HcBackend {
     }
 }
 
+#[derive(Clone)]
 struct HcMatchGenerator {
     /// Shared match-finder storage (window, history, hash / chain /
     /// hash3 tables, dictionary-priming flags). Used identically by HC

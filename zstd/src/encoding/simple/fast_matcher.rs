@@ -137,6 +137,7 @@ const INITIAL_PREFIX_START_INDEX: u32 = 1;
 ///   across blocks (cleared only on full `reset`).
 /// - `pending` holds the most recently `commit_space`'d block before
 ///   `start_matching` appends it onto `history` and runs the kernel.
+#[derive(Clone)]
 pub(crate) struct FastKernelMatcher {
     /// Concatenated input history: prior-block bytes followed by the
     /// most-recently-committed (still pending-matching) tail.

@@ -91,6 +91,7 @@ const REBASE_GUARD_BAND: u32 = 1u32 << 30;
 /// [`LdmHashTable::insert_absolute`] / [`LdmHashTable::resolve`]
 /// helpers so absolute-position support extends past `u32::MAX`
 /// transparently — same pattern as `MatchTable`'s chain rebase.
+#[derive(Clone)]
 pub(crate) struct LdmHashTable {
     entries: Vec<LdmEntry>,
     bucket_offsets: Vec<u8>,

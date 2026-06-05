@@ -924,9 +924,25 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             // This state drives sequence encoding, while matcher priming below updates
             // the match generator's internal repeat-offset history for match finding.
             self.state.offset_hist = dict.inner.offset_hist;
-            self.state
+            // CDict fast path (donor `ZSTD_compressBegin_usingCDict`): restore
+            // the precomputed primed matcher state (a table copy) instead of
+            // re-hashing every dictionary position into the match tables. The
+            // snapshot is captured on the first prime and reused while the
+            // dictionary + level stay the same; `restore` returns false when
+            // it must be (re)built.
+            if !self
+                .state
                 .matcher
-                .prime_with_dictionary(dict.inner.dict_content.as_slice(), dict.inner.offset_hist);
+                .restore_primed_dictionary(self.compression_level)
+            {
+                self.state.matcher.prime_with_dictionary(
+                    dict.inner.dict_content.as_slice(),
+                    dict.inner.offset_hist,
+                );
+                self.state
+                    .matcher
+                    .capture_primed_dictionary(self.compression_level);
+            }
         }
         if let Some(cache) = cached_entropy {
             self.state.last_huff_table.clone_from(&cache.huff);
@@ -1486,6 +1502,10 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// Remove the attached dictionary, returning it as an [`EncoderDictionary`].
     pub fn clear_dictionary(&mut self) -> Option<EncoderDictionary> {
         self.dictionary_entropy_cache = None;
+        // Drop the CDict prime snapshot — it is keyed to the dictionary
+        // being removed and must not be restored against a different (or no)
+        // dictionary on the next frame.
+        self.state.matcher.invalidate_primed_dictionary();
         self.dictionary.take()
     }
 
@@ -1526,6 +1546,10 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 .to_encoder_table()
                 .map(|table| PreviousFseTable::Custom(Box::new(table))),
         });
+        // A previously-captured CDict prime snapshot belongs to the OLD
+        // dictionary; drop it so the first frame with the new dictionary
+        // re-primes (and re-captures) instead of restoring stale tables.
+        self.state.matcher.invalidate_primed_dictionary();
         Ok(self.dictionary.replace(enc))
     }
 }
@@ -2360,6 +2384,51 @@ mod tests {
             with_dict2, with_dict,
             "reattached prepared dict must produce an identical frame"
         );
+    }
+
+    #[test]
+    fn dict_primed_matcher_snapshot_reused_across_frames_is_byte_identical() {
+        // CDict-equivalent: a compressor reused across frames with the same
+        // dictionary restores the primed matcher snapshot on frames 2..N
+        // (a table copy) instead of re-hashing the dictionary. The restored
+        // state must reproduce the first-frame (freshly-primed) output
+        // byte-for-byte, and every frame must round-trip through a
+        // dict-primed decoder.
+        let dict_raw = include_bytes!("../../dict_tests/dictionary");
+        let payload = b"tenant=demo table=orders op=put key=1 value=aaaaabbbbbcccccdddddeeeee\n\
+              tenant=demo table=orders op=put key=2 value=aaaaabbbbbcccccdddddeeeee\n";
+
+        let prepared =
+            super::EncoderDictionary::from_bytes(dict_raw).expect("dict bytes should parse");
+        let dict_id = prepared.id();
+        let mut compressor: FrameCompressor =
+            FrameCompressor::new(super::CompressionLevel::Fastest);
+        compressor
+            .set_encoder_dictionary(prepared)
+            .expect("prepared dictionary should attach");
+
+        // Frame 1 primes + captures the snapshot; frame 2 restores it.
+        let frame1 = compressor.compress_independent_frame(payload.as_slice());
+        let frame2 = compressor.compress_independent_frame(payload.as_slice());
+        assert_eq!(
+            frame1, frame2,
+            "restored prime snapshot must reproduce the freshly-primed frame byte-for-byte"
+        );
+
+        // Both frames advertise the dict id and round-trip through a
+        // dict-primed decoder.
+        for frame in [&frame1, &frame2] {
+            let (hdr, _) =
+                crate::decoding::frame::read_frame_header(frame.as_slice()).expect("frame header");
+            assert_eq!(hdr.dictionary_id(), Some(dict_id));
+            let mut decoder = FrameDecoder::new();
+            decoder
+                .add_dict(crate::decoding::Dictionary::decode_dict(dict_raw).unwrap())
+                .unwrap();
+            let mut decoded = Vec::with_capacity(payload.len());
+            decoder.decode_all_to_vec(frame, &mut decoded).unwrap();
+            assert_eq!(decoded.as_slice(), payload.as_slice());
+        }
     }
 
     #[test]

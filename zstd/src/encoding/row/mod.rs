@@ -335,6 +335,7 @@ unsafe fn row_tag_match_mask_neon(tags: &[u8], tag: u8) -> u64 {
     mask
 }
 
+#[derive(Clone)]
 pub(crate) struct RowMatchGenerator {
     pub(crate) max_window_size: usize,
     /// Per-committed-block lengths of the live window, mirroring the
