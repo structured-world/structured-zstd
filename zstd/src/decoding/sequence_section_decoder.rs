@@ -62,6 +62,129 @@ pub(crate) fn compute_use_long_pipeline(
                 && offsets_long_share >= MIN_LONG_OFFSET_SHARE))
 }
 
+/// Cold per-block sequence-stream setup, returned by [`init_sequence_stream`].
+/// Carries the bit reader, the three FSE decoder states (with their
+/// initial states already read), and the scalar gate values the hot
+/// decode+execute loop needs. Only that loop diverges per CPU tier; this
+/// preamble is identical across tiers and lives in one place.
+pub(crate) struct SeqStreamSetup<'src, 'fse, K: crate::cpu_kernel::CpuKernel> {
+    pub(crate) br: BitReaderReversed<'src, K>,
+    pub(crate) ll_dec: SeqFSEDecoder<'fse>,
+    pub(crate) ml_dec: SeqFSEDecoder<'fse>,
+    pub(crate) of_dec: SeqFSEDecoder<'fse>,
+    pub(crate) max_update_bits: u8,
+    pub(crate) old_buffer_size: usize,
+    pub(crate) num_sequences: usize,
+    pub(crate) use_long_pipeline: bool,
+}
+
+/// Shared cold preamble for every CPU-tier sequence decoder (the
+/// `K`-generic [`decode_and_execute_sequences_impl`] and the per-tier
+/// x86 monoliths in `seq_decoder_{scalar,bmi2,avx2,vbmi2}`).
+///
+/// Consumes the one-shot `ddict_is_cold` flag, rebuilds the FSE tables
+/// if the block's mode bytes call for it, skips the start-of-stream
+/// padding, initialises the LL/OF/ML decoder states, reserves the
+/// block's output capacity AND arms the per-block output ceiling (the
+/// decompression-bomb guard that bounds growth at `len + MAX_BLOCK_SIZE`),
+/// and computes the long-pipeline gate.
+///
+/// Centralising this is what keeps the ceiling (and every other
+/// per-block invariant) from drifting between tiers — the per-tier
+/// copies previously each had to remember to arm it.
+pub(crate) fn init_sequence_stream<'src, 'fse, B, K>(
+    section: &SequencesHeader,
+    source: &'src [u8],
+    fse: &'fse mut FSEScratch,
+    buffer: &mut super::decode_buffer::DecodeBuffer<B>,
+) -> Result<SeqStreamSetup<'src, 'fse, K>, DecompressBlockError>
+where
+    B: super::buffer_backend::BufferBackend,
+    K: crate::cpu_kernel::CpuKernel,
+{
+    // Consume the one-shot `ddict_is_cold` flag BEFORE any early return
+    // (padding validation) so a later block's gate can't mis-apply a
+    // cold-dict signal that no longer holds. Donor
+    // `ZSTD_decompressBlock_internal` clears `dctx->ddictIsCold = 0`
+    // unconditionally after the sequence-section dispatch decision.
+    let ddict_is_cold = fse.ddict_is_cold;
+    fse.ddict_is_cold = false;
+
+    let bytes_read = maybe_update_fse_tables(section, source, fse)?;
+    vprintln!("Updating tables used {} bytes", bytes_read);
+
+    let bit_stream = &source[bytes_read..];
+    let mut br = BitReaderReversed::<K>::new(bit_stream);
+
+    // Skip the 0-padding at the end of the last byte and consume the
+    // start-of-stream `1` bit.
+    let mut skipped_bits = 0;
+    loop {
+        let val = br.get_bits(1);
+        skipped_bits += 1;
+        if val == 1 || skipped_bits > 8 {
+            break;
+        }
+    }
+    if skipped_bits > 8 {
+        return Err(DecodeSequenceError::ExtraPadding { skipped_bits }.into());
+    }
+
+    // RLE-mode axes are handled uniformly: `maybe_update_fse_tables`
+    // builds a degenerate single-state table for them, so the fused
+    // decode reads every axis the same way (no separate fallback).
+    let mut ll_dec = SeqFSEDecoder::new(&fse.literal_lengths);
+    let mut ml_dec = SeqFSEDecoder::new(&fse.match_lengths);
+    let mut of_dec = SeqFSEDecoder::new(&fse.offsets);
+
+    ll_dec
+        .init_state(&mut br)
+        .map_err(DecodeSequenceError::from)?;
+    of_dec
+        .init_state(&mut br)
+        .map_err(DecodeSequenceError::from)?;
+    ml_dec
+        .init_state(&mut br)
+        .map_err(DecodeSequenceError::from)?;
+
+    let max_update_bits = fse.literal_lengths.accuracy_log
+        + fse.match_lengths.accuracy_log
+        + fse.offsets.accuracy_log;
+    debug_assert!(
+        max_update_bits <= 56,
+        "sequence section update bits exceed 56-bit budget"
+    );
+
+    buffer.reserve(MAX_BLOCK_SIZE as usize);
+    // Arm the per-block output ceiling so a malformed / adversarial block
+    // whose sequences over-produce cannot grow the buffer past
+    // `len + MAX_BLOCK_SIZE` (a decompression-bomb OOM on the growable
+    // RingBuffer); `DecodeBuffer::repeat` rejects the crossing match.
+    buffer.set_block_output_ceiling(MAX_BLOCK_SIZE as usize);
+    let old_buffer_size = buffer.len();
+    let num_sequences = section.num_sequences as usize;
+
+    // `saturating_add` defuses 32-bit `usize` wrap.
+    let total_history = buffer.window_size.saturating_add(buffer.dict_content.len());
+    let use_long_pipeline = compute_use_long_pipeline(
+        num_sequences,
+        ddict_is_cold,
+        total_history,
+        fse.offsets_long_share,
+    );
+
+    Ok(SeqStreamSetup {
+        br,
+        ll_dec,
+        ml_dec,
+        of_dec,
+        max_update_bits,
+        old_buffer_size,
+        num_sequences,
+        use_long_pipeline,
+    })
+}
+
 /// Fused decode + execute pipeline: decodes each sequence from the FSE
 /// bitstream and immediately executes it (literal copy + match copy)
 /// without materialising the intermediate `Vec<Sequence>` round-trip.
@@ -248,56 +371,16 @@ pub(crate) fn decode_and_execute_sequences_impl<
     // cold-dict signal that no longer holds (FSE/HUF tables are now
     // warm regardless of how the previous block decoded its sequences,
     // including RLE-mode axes handled in-line via the fused table).
-    let ddict_is_cold = fse.ddict_is_cold;
-    fse.ddict_is_cold = false;
-
-    let bytes_read = maybe_update_fse_tables(section, source, fse)?;
-    vprintln!("Updating tables used {} bytes", bytes_read);
-
-    let bit_stream = &source[bytes_read..];
-    let mut br = BitReaderReversed::<K>::new(bit_stream);
-
-    // Skip the 0-padding at the end of the last byte and consume the
-    // start-of-stream `1` bit.
-    let mut skipped_bits = 0;
-    loop {
-        let val = br.get_bits(1);
-        skipped_bits += 1;
-        if val == 1 || skipped_bits > 8 {
-            break;
-        }
-    }
-    if skipped_bits > 8 {
-        return Err(DecodeSequenceError::ExtraPadding { skipped_bits }.into());
-    }
-
-    // RLE-mode axes are handled uniformly: `maybe_update_fse_tables`
-    // builds a degenerate single-state table for them, so the fused
-    // decode below reads every axis the same way (no separate fallback).
-    let mut ll_dec = SeqFSEDecoder::new(&fse.literal_lengths);
-    let mut ml_dec = SeqFSEDecoder::new(&fse.match_lengths);
-    let mut of_dec = SeqFSEDecoder::new(&fse.offsets);
-
-    ll_dec
-        .init_state(&mut br)
-        .map_err(DecodeSequenceError::from)?;
-    of_dec
-        .init_state(&mut br)
-        .map_err(DecodeSequenceError::from)?;
-    ml_dec
-        .init_state(&mut br)
-        .map_err(DecodeSequenceError::from)?;
-
-    let max_update_bits = fse.literal_lengths.accuracy_log
-        + fse.match_lengths.accuracy_log
-        + fse.offsets.accuracy_log;
-    debug_assert!(
-        max_update_bits <= 56,
-        "sequence section update bits exceed 56-bit budget"
-    );
-
-    buffer.reserve(MAX_BLOCK_SIZE as usize);
-    let old_buffer_size = buffer.len();
+    let SeqStreamSetup {
+        mut br,
+        mut ll_dec,
+        mut ml_dec,
+        mut of_dec,
+        max_update_bits,
+        old_buffer_size,
+        num_sequences,
+        use_long_pipeline,
+    } = init_sequence_stream::<B, K>(section, source, fse, buffer)?;
     let literals_buffer_len = literals_buffer.len();
     let mut lit_cur: usize = 0;
     let mut seq_sum: u32 = 0;
@@ -328,8 +411,6 @@ pub(crate) fn decode_and_execute_sequences_impl<
     // bitstream-tail validation fails, covering the edge case where
     // every sequence succeeds but the bitstream has leftover bits.
 
-    let num_sequences = section.num_sequences as usize;
-
     // 8-slot software pipeline mirroring donor
     // `ZSTD_decompressSequencesLong_body`. Pre-decode `ADVANCE`
     // sequences ahead, prefetch each match source as we go, then
@@ -351,34 +432,6 @@ pub(crate) fn decode_and_execute_sequences_impl<
     // ADVANCE / ADVANCE_MASK hoisted to module scope so the extracted
     // `run_pipelined_sequence_loop` can reach them.
 
-    // Donor `ZSTD_getOffsetInfo` parity. The share of FSE offset
-    // codes > LONG_OFFSET_CODE_THRESHOLD (scaled to donor's
-    // OffFSELog = 8 reference) is computed once per table refresh
-    // and cached in `fse.offsets_long_share` — see
-    // `compute_offsets_long_share` and the `maybe_update_fse_tables`
-    // call sites. Repeat-mode blocks (the table didn't change)
-    // re-use the cached value without re-walking 32–256 table
-    // entries per block. Gate stays sequence-count-first so short /
-    // no-sequence blocks don't even read the cache.
-    //
-    // Donor `minShare = MEM_64bits() ? 7 : 20`: the 32-bit
-    // threshold is higher because the prefetch pipeline needs a
-    // stronger long-offset signal to outpace the narrower load
-    // window on those targets.
-    // `saturating_add` to defuse the 32-bit `usize` overflow path: a
-    // pathological frame header could combine a 4 GiB-class window_size
-    // with a non-trivial dict to wrap on i686, silently flipping the
-    // long-pipeline gate around `HISTORY_THRESHOLD_FOR_PREFETCH`. The
-    // saturating variant pins the wrap result at `usize::MAX`, which
-    // crosses the 16 MiB threshold cleanly — gate decision matches the
-    // real (non-wrapped) value's intent.
-    let total_history = buffer.window_size.saturating_add(buffer.dict_content.len());
-    let use_long_pipeline = compute_use_long_pipeline(
-        num_sequences,
-        ddict_is_cold,
-        total_history,
-        fse.offsets_long_share,
-    );
     // The format-level `isLongOffset` shortcut from donor is
     // irrelevant on our u32-indexed decoder, so on top of the
     // long-offset share the cold-dict signal is the only other gate.
@@ -1899,5 +1952,195 @@ mod compute_use_long_pipeline_tests {
             usize::MAX,
             MIN_SHARE,
         ));
+    }
+}
+
+#[cfg(test)]
+mod init_sequence_stream_tests {
+    use super::super::scratch::FSEScratch;
+    use super::init_sequence_stream;
+    use crate::blocks::sequence_section::SequencesHeader;
+    use crate::cpu_kernel::ScalarKernel;
+    use crate::decoding::decode_buffer::DecodeBuffer;
+    use crate::decoding::errors::{DecodeSequenceError, DecompressBlockError};
+    use crate::decoding::ringbuffer::RingBuffer;
+
+    /// The sequence bitstream must end with a single `1` sentinel bit in
+    /// the final byte; the decoder skips trailing `0` padding looking for
+    /// it. A final byte (read first, MSB-down) that is all zeros has no
+    /// sentinel, so more than 8 padding bits are skipped — that must be
+    /// rejected as `ExtraPadding`, not decoded.
+    #[test]
+    fn rejects_bitstream_with_excess_padding() {
+        let mut header = SequencesHeader::new();
+        // `0x01` = one sequence; `0x00` modes byte = all axes Predefined,
+        // so `maybe_update_fse_tables` reads zero table bytes and the
+        // whole source is the (malformed) bitstream.
+        header.parse_from_header(&[0x01, 0x00]).unwrap();
+
+        let mut fse = FSEScratch::new();
+        let mut buffer = DecodeBuffer::<RingBuffer>::new(4 * 1024);
+        // All-zero bitstream: no sentinel `1` bit anywhere.
+        let source = [0u8; 2];
+
+        // `SeqStreamSetup` is not `Debug`, so assert on the `Result`
+        // directly via `matches!` rather than unwrapping the Ok side.
+        let result = init_sequence_stream::<RingBuffer, ScalarKernel>(
+            &header,
+            &source,
+            &mut fse,
+            &mut buffer,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(DecompressBlockError::DecodeSequenceError(
+                    DecodeSequenceError::ExtraPadding { .. }
+                ))
+            ),
+            "all-zero padding must be rejected as ExtraPadding"
+        );
+    }
+
+    /// One-sequence, all-Predefined header. Pairs with an ample non-zero
+    /// bitstream so `init_sequence_stream` returns `Ok` (the sequence loop
+    /// may still error afterwards). Used to drive the per-tier monolith
+    /// preambles directly: on x86_64 CI only the avx2 tier is selected at
+    /// runtime, so scalar / bmi2 / vbmi2 and the K-generic impl would
+    /// otherwise never execute their (shared) preamble.
+    fn predefined_one_sequence_header() -> SequencesHeader {
+        let mut header = SequencesHeader::new();
+        header.parse_from_header(&[0x01, 0x00]).unwrap();
+        header
+    }
+
+    /// Drives the always-available decoders (the portable scalar tier and
+    /// the K-generic impl that backs the aarch64 NEON/SVE path) through a
+    /// well-formed preamble. The result is intentionally ignored: a
+    /// crafted bitstream need not yield a valid sequence, only reach and
+    /// pass the preamble.
+    #[test]
+    fn scalar_tier_and_generic_impl_run_preamble() {
+        let header = predefined_one_sequence_header();
+        let source = [0xFFu8; 8];
+        let lits = [0u8; 32];
+
+        let mut fse = FSEScratch::new();
+        let mut buf = DecodeBuffer::<RingBuffer>::new(4 * 1024);
+        let mut offset_hist = [1u32, 4, 8];
+        let _ = crate::decoding::seq_decoder_scalar::decode_and_execute_sequences_scalar(
+            &header,
+            &source,
+            &mut fse,
+            &mut buf,
+            &mut offset_hist,
+            &lits,
+        );
+
+        let mut fse = FSEScratch::new();
+        let mut buf = DecodeBuffer::<RingBuffer>::new(4 * 1024);
+        let mut offset_hist = [1u32, 4, 8];
+        let _ = super::decode_and_execute_sequences_impl::<RingBuffer, ScalarKernel>(
+            &header,
+            &source,
+            &mut fse,
+            &mut buf,
+            &mut offset_hist,
+            &lits,
+        );
+    }
+
+    /// Drive the BMI2 monolith preamble directly. The runtime kernel
+    /// selector prefers the avx2 tier on any CPU that has BMI2, so this
+    /// tier never runs through the normal dispatch on CI hardware; call it
+    /// directly (guarded on the same feature it requires).
+    #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel_bmi2"))]
+    #[test]
+    fn bmi2_tier_runs_preamble() {
+        if !std::is_x86_feature_detected!("bmi2") {
+            return;
+        }
+        let header = predefined_one_sequence_header();
+        let source = [0xFFu8; 8];
+        let lits = [0u8; 32];
+        let mut fse = FSEScratch::new();
+        let mut buf = DecodeBuffer::<RingBuffer>::new(4 * 1024);
+        let mut offset_hist = [1u32, 4, 8];
+        // SAFETY: BMI2 confirmed available by the runtime check above.
+        let _ = unsafe {
+            crate::decoding::seq_decoder_bmi2::decode_and_execute_sequences_bmi2::<RingBuffer>(
+                &header,
+                &source,
+                &mut fse,
+                &mut buf,
+                &mut offset_hist,
+                &lits,
+            )
+        };
+    }
+
+    /// Drive the AVX2 monolith preamble directly. The avx2 tier is the
+    /// production path on AVX2 hardware, so this is usually also covered by
+    /// the normal decode tests; the explicit call keeps the preamble
+    /// covered even on a runner that lacks AVX2.
+    #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel_avx2"))]
+    #[test]
+    fn avx2_tier_runs_preamble() {
+        if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi2")) {
+            return;
+        }
+        let header = predefined_one_sequence_header();
+        let source = [0xFFu8; 8];
+        let lits = [0u8; 32];
+        let mut fse = FSEScratch::new();
+        let mut buf = DecodeBuffer::<RingBuffer>::new(4 * 1024);
+        let mut offset_hist = [1u32, 4, 8];
+        // SAFETY: AVX2 + BMI2 confirmed available by the runtime check.
+        let _ = unsafe {
+            crate::decoding::seq_decoder_avx2::decode_and_execute_sequences_avx2::<RingBuffer>(
+                &header,
+                &source,
+                &mut fse,
+                &mut buf,
+                &mut offset_hist,
+                &lits,
+            )
+        };
+    }
+
+    /// Drive the VBMI2 monolith preamble directly. Requires AVX-512 VBMI2,
+    /// which most CI runners lack; the test self-skips there, so this tier
+    /// is only covered on AVX-512 hardware.
+    #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel_vbmi2"))]
+    #[test]
+    fn vbmi2_tier_runs_preamble() {
+        // Mirror the production dispatch gate: the unsafe monolith is annotated
+        // `target_feature(bmi2,avx2,avx512vbmi2,avx512f,avx512vl,avx512bw)`, so a
+        // bare `avx512vbmi2` probe could SIGILL on a CPU that reports VBMI2 but
+        // lacks a companion feature. `detect_cpu_kernel() == Vbmi2` verifies the
+        // full set before we call it.
+        if !matches!(
+            crate::cpu_kernel::detect_cpu_kernel(),
+            crate::cpu_kernel::CpuKernelTag::Vbmi2
+        ) {
+            return;
+        }
+        let header = predefined_one_sequence_header();
+        let source = [0xFFu8; 8];
+        let lits = [0u8; 32];
+        let mut fse = FSEScratch::new();
+        let mut buf = DecodeBuffer::<RingBuffer>::new(4 * 1024);
+        let mut offset_hist = [1u32, 4, 8];
+        // SAFETY: AVX-512 VBMI2 confirmed available by the runtime check.
+        let _ = unsafe {
+            crate::decoding::seq_decoder_vbmi2::decode_and_execute_sequences_vbmi2::<RingBuffer>(
+                &header,
+                &source,
+                &mut fse,
+                &mut buf,
+                &mut offset_hist,
+                &lits,
+            )
+        };
     }
 }
