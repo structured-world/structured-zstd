@@ -969,11 +969,14 @@ fn build_donor_limited_weights(counts: &[usize], max_nb_bits: usize) -> Vec<usiz
         nodes[leaf_idx].nb_bits = depth;
     }
 
+    // `nodes[..leaf_count]` are the leaves in their original `leaves` order,
+    // already sorted by (count desc, symbol asc) above; the tree build only
+    // writes `parent` / `nb_bits` on them and never reorders or changes their
+    // `count` / `symbol`, so they are still in that order. Re-sorting by the
+    // same comparator would be a no-op, and `enforce_max_height` already
+    // requires exactly this count-descending order. Copy the leaves out
+    // without the redundant sort.
     let mut sorted_leaves = nodes[..leaf_count].to_vec();
-    sorted_leaves.sort_by(|left, right| match right.count.cmp(&left.count) {
-        Ordering::Equal => left.symbol.cmp(&right.symbol),
-        other => other,
-    });
     enforce_max_height(&mut sorted_leaves, max_nb_bits);
     repair_limited_lengths(&mut sorted_leaves, max_nb_bits);
     if sorted_leaves.iter().any(|leaf| leaf.nb_bits > max_nb_bits) {
