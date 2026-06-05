@@ -1542,11 +1542,24 @@ impl Matcher for MatchGeneratorDriver {
                 evicted_bytes += pre.saturating_add(space_len).saturating_sub(m.window_size);
             }
             MatcherStorage::Row(m) => {
-                m.add_data(space, |mut data| {
-                    evicted_bytes += data.len();
-                    data.resize(data.capacity(), 0);
+                // RowMatchGenerator::add_data recycles the *input* buffer
+                // through this callback every commit (its bytes are mirrored
+                // into `history`), not the evicted chunks. Derive the eviction
+                // delta from `window_size` before/after — `evicted = pre +
+                // space_len - post` — exactly like the Simple / HashChain arms.
+                // Counting the callback argument as evicted would charge the
+                // whole committed block as evicted and prematurely retire
+                // dictionary budget on a window that evicts nothing.
+                let pre = m.window_size;
+                let space_len = space.len();
+                m.add_data(space, |data| {
+                    // Recycle the spent buffer as-is; `add_data` runs this for
+                    // every committed block, so zero-filling to capacity here
+                    // would be hot-path waste (`get_next_space` zeroes at most
+                    // `slice_size` on reuse).
                     vec_pool.push(data);
                 });
+                evicted_bytes += pre.saturating_add(space_len).saturating_sub(m.window_size);
             }
             MatcherStorage::HashChain(m) => {
                 // MatchTable::add_data now recycles the *incoming* buffer
