@@ -1013,15 +1013,14 @@ impl MatchGeneratorDriver {
                     evicted_bytes += pre - dfast.window_size;
                 }
                 super::strategy::BackendTag::Row => {
-                    let mut retired = Vec::new();
-                    self.row_matcher_mut().trim_to_window(|data| {
-                        evicted_bytes += data.len();
-                        retired.push(data);
-                    });
-                    for mut data in retired {
-                        data.resize(data.capacity(), 0);
-                        self.vec_pool.push(data);
-                    }
+                    // Row keeps bytes only in the contiguous `history` mirror
+                    // (block buffers are returned to the pool per block in
+                    // `add_data`), so derive the eviction count from the
+                    // `window_size` delta, mirroring the Dfast / HashChain arms.
+                    let row = self.row_matcher_mut();
+                    let pre = row.window_size;
+                    row.trim_to_window();
+                    evicted_bytes += pre - row.window_size;
                 }
                 super::strategy::BackendTag::HashChain => {
                     // HC keeps bytes only in the contiguous `history` mirror
@@ -1161,11 +1160,7 @@ impl Matcher for MatchGeneratorDriver {
                     m.row_heads = Vec::new();
                     m.row_positions = Vec::new();
                     m.row_tags = Vec::new();
-                    let vec_pool = &mut self.vec_pool;
-                    m.reset(|mut data| {
-                        data.resize(data.capacity(), 0);
-                        vec_pool.push(data);
-                    });
+                    m.reset();
                 }
                 MatcherStorage::HashChain(m) => {
                     // Release oversized tables when switching away from
@@ -1262,11 +1257,7 @@ impl Matcher for MatchGeneratorDriver {
                 if hinted {
                     row.set_hash_bits(row_hash_bits_for_window(max_window_size));
                 }
-                let vec_pool = &mut self.vec_pool;
-                row.reset(|mut data| {
-                    data.resize(data.capacity(), 0);
-                    vec_pool.push(data);
-                });
+                row.reset();
             }
             MatcherStorage::HashChain(hc) => {
                 hc.table.max_window_size = max_window_size;
@@ -6816,8 +6807,8 @@ fn prime_with_dictionary_budget_shrinks_after_row_eviction() {
 /// the swap, so there is nothing to inspect by accessor; the "window
 /// cleared" invariant is replaced by "variant dropped", and a
 /// subsequent `row_matcher()` call would panic by design. The
-/// pool-recycling side of the same transition is covered by
-/// [`driver_reset_from_row_backend_recycles_row_buffers_into_pool`].
+/// pool-recycling side of the row backend is covered by
+/// [`driver_row_commit_recycles_block_buffer_into_pool`].
 #[test]
 fn row_get_last_space_then_reset_to_fastest_drops_row_variant() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
@@ -6835,41 +6826,38 @@ fn row_get_last_space_then_reset_to_fastest_drops_row_variant() {
     assert_eq!(driver.active_backend(), super::strategy::BackendTag::Simple);
 }
 
-/// Switching from Row to Simple drains row-side buffers into `vec_pool`
-/// before swapping the storage variant. With the [`MatcherStorage`] enum
-/// the old [`RowMatchGenerator`] is dropped on swap, so this test
-/// guards only the pool-recycling side of the transition. The
-/// pre-enum tests (`…reclaims_row_buffer_pool` /
-/// `…tolerates_missing_row_matcher`) checked that the row matcher
-/// stayed allocated across the switch with its internals cleared —
-/// the new invariant is "dead variants are dropped", and the
-/// `row_match_generator: Option<_>` field whose lazy-init recovery
-/// they exercised no longer exists.
+/// Committing a Row block must return the input buffer to `vec_pool`
+/// immediately (the bytes are mirrored into the contiguous `history`,
+/// so there is no reason to retain a second copy in the window). This
+/// guards the chunk-length window: the previous `VecDeque<Vec<u8>>`
+/// window retained a full `block_capacity` buffer per committed block,
+/// which on a heavily pre-split frame ballooned peak memory to many
+/// times the live byte count. With the buffer recycled at commit time
+/// the pool grows by exactly one Vec per committed block.
 #[test]
-fn driver_reset_from_row_backend_recycles_row_buffers_into_pool() {
+fn driver_row_commit_recycles_block_buffer_into_pool() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
     driver.reset(CompressionLevel::Level(5));
     assert_eq!(driver.active_backend(), super::strategy::BackendTag::Row);
 
+    let before_pool = driver.vec_pool.len();
     let mut space = driver.get_next_space();
+    space.clear();
     space.extend_from_slice(b"row-data-to-recycle");
     driver.commit_space(space);
 
-    let before_pool = driver.vec_pool.len();
-    driver.reset(CompressionLevel::Fastest);
-
-    assert_eq!(driver.active_backend(), super::strategy::BackendTag::Simple);
     // `>` not `>=`: a fresh driver starts with `before_pool == 0`, so the
-    // weaker bound passes even if the Row→Simple transition failed to
-    // drain the committed buffer back into `vec_pool`. Strict growth
-    // proves the drain ran. Single fixture buffer → exactly one Vec
-    // returned to the pool.
+    // weaker bound passes even if the commit failed to recycle. Strict
+    // growth proves the buffer was returned to the pool at commit time
+    // rather than retained in the window (the pre-`chunk_lens` bug).
     assert!(
         driver.vec_pool.len() > before_pool,
-        "row reset must recycle the committed row history buffer into vec_pool \
+        "row commit must recycle the committed block buffer into vec_pool \
          (before_pool = {before_pool}, after = {})",
         driver.vec_pool.len()
     );
+    // The bytes still resolve through the contiguous history mirror.
+    assert_eq!(driver.get_last_space(), b"row-data-to-recycle");
 }
 
 #[test]

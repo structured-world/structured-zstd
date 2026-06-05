@@ -337,7 +337,14 @@ unsafe fn row_tag_match_mask_neon(tags: &[u8], tag: u8) -> u64 {
 
 pub(crate) struct RowMatchGenerator {
     pub(crate) max_window_size: usize,
-    pub(crate) window: VecDeque<Vec<u8>>,
+    /// Per-committed-block lengths of the live window, mirroring the
+    /// `HashChain` backend's `chunk_lens`. The block bytes themselves live
+    /// only in the contiguous `history` mirror; the input buffers are handed
+    /// straight back to the caller's pool in `add_data` rather than retained
+    /// here. Retaining them (the old `VecDeque<Vec<u8>>`) held a full
+    /// `block_capacity`-sized buffer per committed block, which on a heavily
+    /// pre-split frame ballooned the window to many times the live byte count.
+    pub(crate) chunk_lens: VecDeque<usize>,
     pub(crate) window_size: usize,
     pub(crate) history: Vec<u8>,
     pub(crate) history_start: usize,
@@ -373,7 +380,7 @@ impl RowMatchGenerator {
     pub(crate) fn new(max_window_size: usize) -> Self {
         Self {
             max_window_size,
-            window: VecDeque::new(),
+            chunk_lens: VecDeque::new(),
             window_size: 0,
             history: Vec::new(),
             history_start: 0,
@@ -415,7 +422,7 @@ impl RowMatchGenerator {
         self.set_hash_bits(config.hash_bits.max(self.row_log + 1));
     }
 
-    pub(crate) fn reset(&mut self, mut reuse_space: impl FnMut(Vec<u8>)) {
+    pub(crate) fn reset(&mut self) {
         self.window_size = 0;
         self.history.clear();
         self.history_start = 0;
@@ -424,14 +431,14 @@ impl RowMatchGenerator {
         self.row_heads.fill(0);
         self.row_positions.fill(ROW_EMPTY_SLOT);
         self.row_tags.fill(0);
-        for mut data in self.window.drain(..) {
-            data.resize(data.capacity(), 0);
-            reuse_space(data);
-        }
+        // Block buffers are returned to the caller's pool per block in
+        // `add_data`, so there is nothing window-side to recycle here.
+        self.chunk_lens.clear();
     }
 
     pub(crate) fn get_last_space(&self) -> &[u8] {
-        self.window.back().unwrap().as_slice()
+        let last = *self.chunk_lens.back().unwrap();
+        &self.history[self.history.len() - last..]
     }
 
     pub(crate) fn add_data(&mut self, data: Vec<u8>, mut reuse_space: impl FnMut(Vec<u8>)) {
@@ -453,25 +460,27 @@ impl RowMatchGenerator {
              limit; split the input into smaller frames or use a higher level"
         );
         while self.window_size + data.len() > self.max_window_size {
-            let removed = self.window.pop_front().unwrap();
-            self.window_size -= removed.len();
-            self.history_start += removed.len();
-            self.history_abs_start += removed.len();
-            reuse_space(removed);
+            let removed_len = self.chunk_lens.pop_front().unwrap();
+            self.window_size -= removed_len;
+            self.history_start += removed_len;
+            self.history_abs_start += removed_len;
         }
         self.compact_history();
+        let added = data.len();
         self.history.extend_from_slice(&data);
-        self.window_size += data.len();
-        self.window.push_back(data);
+        self.window_size += added;
+        self.chunk_lens.push_back(added);
+        // The bytes now live in `history`; return the input buffer to the
+        // caller's pool instead of holding a second copy in the window.
+        reuse_space(data);
     }
 
-    pub(crate) fn trim_to_window(&mut self, mut reuse_space: impl FnMut(Vec<u8>)) {
+    pub(crate) fn trim_to_window(&mut self) {
         while self.window_size > self.max_window_size {
-            let removed = self.window.pop_front().unwrap();
-            self.window_size -= removed.len();
-            self.history_start += removed.len();
-            self.history_abs_start += removed.len();
-            reuse_space(removed);
+            let removed_len = self.chunk_lens.pop_front().unwrap();
+            self.window_size -= removed_len;
+            self.history_start += removed_len;
+            self.history_abs_start += removed_len;
         }
     }
 
@@ -481,7 +490,7 @@ impl RowMatchGenerator {
     ) {
         debug_assert_eq!(ROW_LOG, self.row_log);
         self.ensure_tables();
-        let current_len = self.window.back().unwrap().len();
+        let current_len = *self.chunk_lens.back().unwrap();
         let current_abs_start = self.history_abs_start + self.window_size - current_len;
         let current_abs_end = current_abs_start + current_len;
         let backfill_start = self.backfill_start(current_abs_start);
@@ -575,7 +584,7 @@ impl RowMatchGenerator {
         debug_assert_eq!(ROW_LOG, self.row_log);
         self.ensure_tables();
 
-        let current_len = self.window.back().unwrap().len();
+        let current_len = *self.chunk_lens.back().unwrap();
         if current_len == 0 {
             return;
         }
@@ -595,7 +604,7 @@ impl RowMatchGenerator {
             let best = self.best_match_rl::<K, ROW_LOG>(abs_pos, lit_len);
             if let Some(candidate) = self.pick_lazy_match_rl::<K, ROW_LOG>(abs_pos, lit_len, best) {
                 self.insert_match_span::<ROW_LOG>(abs_pos, candidate.start + candidate.match_len);
-                let current = self.window.back().unwrap().as_slice();
+                let current = &self.history[self.history.len() - current_len..];
                 let start = candidate.start - current_abs_start;
                 let literals = &current[literals_start..start];
                 handle_sequence(Sequence::Triple {
@@ -622,7 +631,7 @@ impl RowMatchGenerator {
         }
 
         if literals_start < current_len {
-            let current = self.window.back().unwrap().as_slice();
+            let current = &self.history[self.history.len() - current_len..];
             handle_sequence(Sequence::Literals {
                 literals: &current[literals_start..],
             });
@@ -697,7 +706,7 @@ impl RowMatchGenerator {
         debug_assert_eq!(ROW_LOG, self.row_log);
         self.ensure_tables();
 
-        let current_len = self.window.back().unwrap().len();
+        let current_len = *self.chunk_lens.back().unwrap();
         if current_len == 0 {
             return;
         }
@@ -817,7 +826,7 @@ impl RowMatchGenerator {
             // ~+447 over `abs_pos` (537897 -> 538344), so the
             // narrower range is intentional.
             self.insert_match_span::<ROW_LOG>(abs_pos, candidate.start + candidate.match_len);
-            let current = self.window.back().unwrap().as_slice();
+            let current = &self.history[self.history.len() - current_len..];
             let literals = &current[literals_start..start];
             handle_sequence(Sequence::Triple {
                 literals,
@@ -854,7 +863,7 @@ impl RowMatchGenerator {
         }
 
         if literals_start < current_len {
-            let current = self.window.back().unwrap().as_slice();
+            let current = &self.history[self.history.len() - current_len..];
             handle_sequence(Sequence::Literals {
                 literals: &current[literals_start..],
             });
