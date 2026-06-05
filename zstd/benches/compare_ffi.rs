@@ -209,8 +209,43 @@ fn emit_reports_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Emit (once per process) the CPU kernel tier this run actually selected,
+/// plus arch / libc, so the dashboard can attribute every measurement in the
+/// run to the kernel that produced it (the entropy / sequence dispatch tier is
+/// shared by encode and decode — see #247). The kernel is process-global, so a
+/// single line covers all benches in the run.
+fn emit_kernel_report_once() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let arch = if cfg!(target_arch = "x86_64") {
+            "x86_64"
+        } else if cfg!(target_arch = "aarch64") {
+            "aarch64"
+        } else {
+            "other"
+        };
+        let target_env = if cfg!(target_env = "musl") {
+            "musl"
+        } else if cfg!(target_env = "gnu") {
+            "gnu"
+        } else {
+            "other"
+        };
+        println!(
+            "REPORT_KERNEL kernel={} arch={} target_env={}",
+            structured_zstd::active_cpu_kernel_name(),
+            arch,
+            target_env
+        );
+    });
+}
+
 fn bench_compress(c: &mut Criterion) {
     let emit_reports = emit_reports_enabled();
+    if emit_reports {
+        emit_kernel_report_once();
+    }
     for scenario in benchmark_scenarios_cached().iter() {
         for level in supported_levels_filtered() {
             if emit_reports {
@@ -249,6 +284,9 @@ fn bench_compress(c: &mut Criterion) {
 
 fn bench_decompress(c: &mut Criterion) {
     let emit_reports = emit_reports_enabled();
+    if emit_reports {
+        emit_kernel_report_once();
+    }
     for scenario in benchmark_scenarios_cached().iter() {
         for level in supported_levels_filtered() {
             let expected_len = scenario.len();

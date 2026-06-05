@@ -25,20 +25,51 @@ fn main() {
     // isolate the checksum cost (flag-on vs flag-off) in one harness.
     let checksum: bool = args.get(5).map(|s| s == "checksum").unwrap_or(false);
 
-    // Source: either a file from disk, or a deterministic 1MB LCG synthetic.
-    let src: Vec<u8> = if let Some(path) = corpus_path {
-        std::fs::read(path).expect("read corpus file")
-    } else {
-        let n = 1_048_576usize;
-        let mut src = Vec::with_capacity(n);
-        let mut state: u64 = 0x517cc1b727220a95;
-        while src.len() < n {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            src.push((state >> 56) as u8);
+    // Source resolution. This example is named after the `z000033` corpus,
+    // so an explicit path or the in-tree corpus is the contract. The LCG
+    // synthetic is RANDOM (≈incompressible → mostly RAW blocks → a trivial,
+    // unrepresentative decode workload), so it is NEVER substituted silently:
+    // a missing corpus fails loudly, and synthetic is opt-in via the literal
+    // `synthetic` arg. (A silent fallback here previously masked a missing
+    // corpus and produced ~30 GB/s "decode" numbers that hid the real gap.)
+    let src: Vec<u8> = match corpus_path {
+        Some("synthetic") => {
+            eprintln!(
+                "decode_loop_z000033: WARNING — using the random LCG synthetic \
+                 source; decode timings are NOT representative of z000033 \
+                 (random data decodes as RAW blocks)."
+            );
+            let n = 1_048_576usize;
+            let mut src = Vec::with_capacity(n);
+            let mut state: u64 = 0x517cc1b727220a95;
+            while src.len() < n {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                src.push((state >> 56) as u8);
+            }
+            src
         }
-        src
+        Some(path) => std::fs::read(path).expect("read corpus file"),
+        None => {
+            // Default to the in-tree z000033 this example is named after.
+            // Try the usual cwd-relative locations (repo root / `zstd/`).
+            // Fail loudly if absent — never silently synthesize.
+            const CANDIDATES: [&str; 2] = [
+                "zstd/decodecorpus_files/z000033",
+                "decodecorpus_files/z000033",
+            ];
+            CANDIDATES
+                .iter()
+                .find_map(|p| std::fs::read(p).ok())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "decode_loop_z000033: corpus z000033 not found in {CANDIDATES:?}; \
+                         pass an explicit path as arg 4, or `synthetic` to opt into the \
+                         random LCG fallback"
+                    )
+                })
+        }
     };
     let n = src.len();
 

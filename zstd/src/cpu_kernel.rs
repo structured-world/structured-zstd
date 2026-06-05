@@ -372,6 +372,35 @@ pub(crate) fn detect_cpu_kernel() -> CpuKernelTag {
     CpuKernelTag::Scalar
 }
 
+/// Name of the CPU kernel tier this process selected for the entropy /
+/// sequence hot paths — decode (literals + FSE sequence decode) and encode
+/// (entropy) share this dispatch (see #247). Returned as a stable lowercase
+/// string for diagnostics and benchmark/dashboard reporting; the value is
+/// what the runtime CPU-feature detection (or compile-time `target_feature`
+/// on `no_std`) actually resolves to on this machine, so a dashboard can
+/// attribute a measurement to the kernel that produced it.
+pub fn active_cpu_kernel_name() -> &'static str {
+    match detect_cpu_kernel() {
+        CpuKernelTag::Scalar => "scalar",
+        #[cfg(all(target_arch = "x86_64", feature = "kernel_sse2"))]
+        CpuKernelTag::Sse2 => "sse2",
+        #[cfg(all(target_arch = "x86_64", feature = "kernel_bmi2"))]
+        CpuKernelTag::Bmi2 => "bmi2",
+        #[cfg(all(target_arch = "x86_64", feature = "kernel_avx2"))]
+        CpuKernelTag::Avx2 => "avx2",
+        #[cfg(all(target_arch = "x86_64", feature = "kernel_vbmi2"))]
+        CpuKernelTag::Vbmi2 => "vbmi2",
+        #[cfg(all(target_arch = "aarch64", feature = "kernel_neon"))]
+        CpuKernelTag::Neon => "neon",
+        #[cfg(all(
+            target_arch = "aarch64",
+            feature = "kernel_sve",
+            any(feature = "std", target_feature = "sve"),
+        ))]
+        CpuKernelTag::Sve => "sve",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

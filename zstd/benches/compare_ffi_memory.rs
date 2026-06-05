@@ -416,6 +416,30 @@ fn emit_report(
 }
 
 fn main() {
+    // Report the CPU kernel tier this run selected (shared encode/decode
+    // entropy dispatch — see #247), plus arch / libc, so the dashboard can
+    // attribute every REPORT_MEM line to the kernel that produced it.
+    let arch = if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "other"
+    };
+    let target_env = if cfg!(target_env = "musl") {
+        "musl"
+    } else if cfg!(target_env = "gnu") {
+        "gnu"
+    } else {
+        "other"
+    };
+    println!(
+        "REPORT_KERNEL kernel={} arch={} target_env={}",
+        structured_zstd::active_cpu_kernel_name(),
+        arch,
+        target_env
+    );
+
     let scenarios = benchmark_scenarios();
     for scenario in &scenarios {
         for level in supported_levels_filtered() {
