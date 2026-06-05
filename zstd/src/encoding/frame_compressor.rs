@@ -2512,6 +2512,68 @@ mod tests {
     }
 
     #[test]
+    fn dict_primed_matcher_cache_reused_across_small_attach_frames_is_byte_identical() {
+        // CDict-equivalent ATTACH path (small source, at/below the Fast 8 KiB
+        // attach cutoff): frames 2..N re-prime — re-committing the dict bytes
+        // to history — but reuse the already-built dict table instead of
+        // re-hashing it. The cached-table frame must reproduce the
+        // freshly-primed first frame byte-for-byte, and a fresh single-frame
+        // compressor (no prior dict cache) must produce the identical bytes
+        // too, proving the cache changes timing, not output.
+        let dict_raw = include_bytes!("../../dict_tests/dictionary");
+        // Stay under the 8 KiB cutoff so the attach (re-prime) path is taken
+        // every frame rather than the copy-snapshot restore.
+        let mut payload = Vec::new();
+        while payload.len() < 2 * 1024 {
+            payload.extend_from_slice(b"tenant=demo op=put key=1 value=aaaaabbbbbcccccddddd\n");
+        }
+
+        let prepared =
+            super::EncoderDictionary::from_bytes(dict_raw).expect("dict bytes should parse");
+        let dict_id = prepared.id();
+        let mut compressor: FrameCompressor =
+            FrameCompressor::new(super::CompressionLevel::Fastest);
+        compressor
+            .set_encoder_dictionary(prepared)
+            .expect("prepared dictionary should attach");
+
+        // Frame 1 builds + marks the dict table; frame 2 reuses it.
+        let frame1 = compressor.compress_independent_frame(payload.as_slice());
+        let frame2 = compressor.compress_independent_frame(payload.as_slice());
+        assert_eq!(
+            frame1, frame2,
+            "reused dict table (attach path) must reproduce the freshly-built frame byte-for-byte"
+        );
+
+        // A fresh compressor (cold dict cache) must emit the same bytes — the
+        // cache is a timing optimization, never a content change.
+        let fresh_prepared =
+            super::EncoderDictionary::from_bytes(dict_raw).expect("dict bytes should parse");
+        let mut fresh: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Fastest);
+        fresh
+            .set_encoder_dictionary(fresh_prepared)
+            .expect("prepared dictionary should attach");
+        let fresh_frame = fresh.compress_independent_frame(payload.as_slice());
+        assert_eq!(
+            fresh_frame, frame1,
+            "cold-cache compressor must match the warm-cache frame byte-for-byte"
+        );
+
+        for frame in [&frame1, &frame2] {
+            let (hdr, _) =
+                crate::decoding::frame::read_frame_header(frame.as_slice()).expect("frame header");
+            assert_eq!(hdr.dictionary_id(), Some(dict_id));
+            let mut decoder = FrameDecoder::new();
+            decoder
+                .add_dict(crate::decoding::Dictionary::decode_dict(dict_raw).unwrap())
+                .unwrap();
+            let mut decoded = Vec::with_capacity(payload.len());
+            decoder.decode_all_to_vec(frame, &mut decoded).unwrap();
+            assert_eq!(decoded.as_slice(), payload.as_slice());
+        }
+    }
+
+    #[test]
     fn set_dictionary_from_bytes_matches_full_decode_byte_for_byte() {
         // The encoder-only dict parse (`decode_dict_for_encoding`, used by
         // `set_dictionary_from_bytes`) skips the FSE/HUF decoder-table build and

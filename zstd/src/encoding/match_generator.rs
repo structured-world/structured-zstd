@@ -1463,6 +1463,14 @@ impl Matcher for MatchGeneratorDriver {
                 .table
                 .set_dictionary_limit_from_primed_bytes(committed_dict_budget);
         }
+        // CDict-equivalent: now that every dict chunk is indexed, mark the
+        // Fast-backend dict table primed so the next frame's re-prime reuses
+        // it (skips the re-hash) while still re-committing the dict bytes to
+        // history. No-op when the attach path built no table (copy mode or a
+        // sub-8-byte dict) — `mark_dict_primed` self-guards on table presence.
+        if self.active_backend() == super::strategy::BackendTag::Simple {
+            self.simple_mut().mark_dict_primed();
+        }
     }
 
     fn restore_primed_dictionary(&mut self, level: super::CompressionLevel) -> bool {
@@ -1488,6 +1496,13 @@ impl Matcher for MatchGeneratorDriver {
 
     fn invalidate_primed_dictionary(&mut self) {
         self.primed = None;
+        // Drop the Fast-backend CDict-equivalent table cache too: it is keyed
+        // to the dictionary being removed / replaced. Left in place, the next
+        // same-params `reset` would retain it and the kernel would probe a
+        // dict region whose bytes are no longer re-committed to history.
+        if self.active_backend() == super::strategy::BackendTag::Simple {
+            self.simple_mut().invalidate_dict_cache();
+        }
     }
 
     fn seed_dictionary_entropy(
