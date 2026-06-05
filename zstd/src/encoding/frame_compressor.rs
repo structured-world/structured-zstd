@@ -1067,15 +1067,42 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             uncompressed_data.extend_from_slice(&pending_input);
             let mut filled = pending_input.len();
             pending_input.clear();
-            if uncompressed_data.len() < block_capacity {
-                uncompressed_data.resize(block_capacity, 0);
+            // Size the read buffer to the bytes this block actually expects
+            // rather than always zero-filling a full MAX_BLOCK_SIZE: a small
+            // frame otherwise pays a 128 KiB `resize(_, 0)` memset per block
+            // just to read a few KiB (the zero-fill past `filled` is then
+            // truncated away). Bound the initial fill by the source-size hint
+            // (exact for the slice entry points), and grow toward
+            // `block_capacity` only if the hint under-counted, so an inexact /
+            // unknown (`None` → full `block_capacity`) hint stays correct.
+            let initial_target = initial_size_hint
+                .map(|h| {
+                    let remaining = (h as usize).saturating_sub(total_uncompressed as usize);
+                    filled
+                        .saturating_add(remaining)
+                        .clamp(filled.max(1), block_capacity)
+                })
+                .unwrap_or(block_capacity);
+            if uncompressed_data.len() < initial_target {
+                uncompressed_data.resize(initial_target, 0);
             }
             'read_loop: loop {
                 if reached_eof || filled == block_capacity {
                     break 'read_loop;
                 }
+                if filled == uncompressed_data.len() {
+                    // Hint under-counted the block; grow toward block_capacity
+                    // (doubling, capped) so reading continues without paying a
+                    // full-buffer zero up front.
+                    let grow_to = uncompressed_data
+                        .len()
+                        .saturating_mul(2)
+                        .clamp(filled + 1, block_capacity);
+                    uncompressed_data.resize(grow_to, 0);
+                }
+                let read_end = uncompressed_data.len();
                 let new_bytes = source
-                    .read(&mut uncompressed_data[filled..block_capacity])
+                    .read(&mut uncompressed_data[filled..read_end])
                     .unwrap();
                 if new_bytes == 0 {
                     reached_eof = true;
