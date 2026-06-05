@@ -207,6 +207,11 @@ pub(crate) unsafe fn decode_and_execute_sequences_bmi2<B: BufferBackend>(
     );
 
     buffer.reserve(MAX_BLOCK_SIZE as usize);
+    // Arm the per-block output ceiling so a malformed / adversarial block
+    // whose sequences over-produce cannot grow the buffer past
+    // `len + MAX_BLOCK_SIZE` (a decompression-bomb OOM on the growable
+    // RingBuffer); `DecodeBuffer::repeat` rejects the crossing match.
+    buffer.set_block_output_ceiling(MAX_BLOCK_SIZE as usize);
     let old_buffer_size = buffer.len();
     let literals_buffer_len = literals_buffer.len();
     let mut lit_cur: usize = 0;
