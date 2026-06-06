@@ -141,15 +141,21 @@ fn analyze(frame: &[u8]) -> Split {
                 s.rle_blocks += 1;
                 pos += 1; // physical RLE body is one byte
             }
-            _ => {
+            2 => {
                 s.comp_blocks += 1;
                 let body = &frame[pos..pos + bsize];
                 let (lit_total, lit_type) = lit_section_len(body);
+                assert!(
+                    lit_total <= bsize,
+                    "invalid block split: literals exceed block size \
+                     (lit_total={lit_total}, bsize={bsize})"
+                );
                 s.lit_type_counts[lit_type as usize] += 1;
                 s.lit_bytes += lit_total;
                 s.seq_bytes += bsize - lit_total;
                 pos += bsize;
             }
+            _ => panic!("unexpected block type {btype}"),
         }
         if last == 1 {
             break;

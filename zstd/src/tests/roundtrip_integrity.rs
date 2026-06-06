@@ -468,12 +468,15 @@ fn better_level_compresses_close_to_default() {
 /// 4 MiB window so only Better (8 MiB) can match it.
 #[test]
 fn roundtrip_better_level_large_window() {
-    // Two identical 256 KiB regions separated by a 4.5 MiB compressible gap.
-    // The gap uses a different seed so it doesn't share patterns with the
-    // regions, but being compressible means hash chains aren't fully
-    // destroyed by random noise. Better's 8 MiB window can still reach the
-    // first region; Default's 4 MiB window cannot.
-    let region = generate_compressible(42, 256 * 1024);
+    // Two identical 256 KiB INCOMPRESSIBLE regions separated by a 4.5 MiB
+    // compressible gap. The region is random (not pattern-repeating), so the
+    // only way to compress the second copy is a back-reference to the first,
+    // which sits ~4.8 MiB earlier. Better's 8 MiB window reaches it (one
+    // cross-gap match, the second region collapses to a few bytes); Default's
+    // 4 MiB window cannot, so the second region stays raw. This makes the
+    // window behaviour the SOLE differentiator: entropy/splitting cannot
+    // rescue Default on random bytes.
+    let region = generate_data(42, 256 * 1024);
     let gap = generate_compressible(9999, 4 * 1024 * 1024 + 512 * 1024);
     let mut data = Vec::with_capacity(region.len() + gap.len() + region.len());
     data.extend_from_slice(&region);
@@ -482,22 +485,20 @@ fn roundtrip_better_level_large_window() {
 
     assert_eq!(roundtrip_better(&data), data);
 
-    // Both levels must compress this 5 MiB fixture to a tiny frame: the two
-    // identical 256 KiB regions and the patterned gap are all independently
-    // highly compressible, so the large window only has to round-trip
-    // correctly (asserted above) — it need not beat the smaller window on
-    // total size. The former `better < default` size assertion was a stale
-    // proxy: with donor-faithful block-splitting enabled, the C reference
-    // itself produces `better(L7) > default(L3)` on this fixture
-    // (829 vs 525 bytes; ours 795 vs 495), because Default's split + entropy
-    // fit compresses the duplicated regions without needing the cross-gap
-    // match. Assert strong compression on both instead of their ordering.
+    // Window-load-bearing assertion: Better (8 MiB window) must beat Default
+    // (4 MiB window) because only Better can match the second random region
+    // across the 4.8 MiB gap. With an incompressible region the size delta is
+    // ~256 KiB (the whole second region), so a real large-window regression
+    // — Better losing the cross-gap match — flips this ordering and fails the
+    // test. (The earlier `< input/1000` floor was not window-specific: it
+    // passed even if Better lost the match, since the patterned fixture
+    // compressed tiny regardless of window.)
     let compressed_better = compress_to_vec(&data[..], CompressionLevel::Better);
     let compressed_default = compress_to_vec(&data[..], CompressionLevel::Default);
     assert!(
-        compressed_better.len() < data.len() / 1000 && compressed_default.len() < data.len() / 1000,
-        "both levels should compress this highly-redundant 5 MiB fixture to <0.1% \
-         (better={}, default={}, input={})",
+        compressed_better.len() < compressed_default.len(),
+        "Better (8 MiB window) should beat Default (4 MiB window) across the \
+         4.5 MiB gap via a cross-gap match (better={}, default={}, input={})",
         compressed_better.len(),
         compressed_default.len(),
         data.len(),

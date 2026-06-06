@@ -57,7 +57,8 @@ fn main() {
             )
         };
         assert_eq!(unsafe { zstd_sys::ZSTD_isError(w) }, 0, "decompress failed");
-        total = total.wrapping_add(out[0] as u64);
+        assert_eq!(w, n, "decompress produced unexpected output size");
+        total = total.wrapping_add(out.first().copied().unwrap_or(0) as u64);
     }
     unsafe { zstd_sys::ZSTD_freeDCtx(dctx) };
     eprintln!(

@@ -3241,6 +3241,12 @@ mod tests {
             level_pre_split(CompressionLevel::Better),
             level_pre_split(CompressionLevel::Level(7)),
         );
+        // Best is a pure alias for level 11 (lazy): pin it to the numeric
+        // route so the named path can't drift from the pre-split table.
+        assert_eq!(
+            level_pre_split(CompressionLevel::Best),
+            level_pre_split(CompressionLevel::Level(11)),
+        );
         assert_eq!(level_pre_split(CompressionLevel::Level(2)), Some(0)); // fast
         assert_eq!(level_pre_split(CompressionLevel::Level(4)), Some(1)); // dfast
         assert_eq!(level_pre_split(CompressionLevel::Level(5)), Some(2)); // greedy
