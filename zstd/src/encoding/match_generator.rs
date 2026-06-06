@@ -724,9 +724,27 @@ pub struct MatchGeneratorDriver {
     /// `prime_with_dictionary` writes. Subsequent frames restore this
     /// (a table memcpy) instead of re-hashing every dictionary position,
     /// mirroring donor `ZSTD_compressBegin_usingCDict` copying the
-    /// precomputed `cdict->matchState`. Invalidated when the dictionary or
-    /// level changes (keyed by the captured `CompressionLevel`).
-    primed: Option<(MatcherStorage, usize, super::CompressionLevel)>,
+    /// precomputed `cdict->matchState`. Invalidated when the dictionary
+    /// changes; keyed by [`PrimedKey`] (level AND the resolved reset
+    /// parameters) so a snapshot is only restored into a reset that produces
+    /// the same matcher shape — see `restore_primed_dictionary`.
+    primed: Option<(MatcherStorage, usize, PrimedKey)>,
+}
+
+/// Identity of the matcher configuration a primed snapshot was captured
+/// under. `reset()` resolves the matcher shape from BOTH the compression
+/// level and the source-size hint (the hint caps `window_log`, which sizes
+/// `reported_window_size`, the Fast attach-vs-copy mode, and the
+/// Dfast/Row/HC table widths). Restoring a snapshot whose key differs would
+/// reinstate the old `storage` (and its `max_window_size`) while the driver
+/// advertises a different window — the encoder could then search past the
+/// frame header's window and emit an undecodable match. Both fields must
+/// match before a restore is allowed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PrimedKey {
+    level: super::CompressionLevel,
+    reset_source_size: Option<u64>,
+    reported_window_size: usize,
 }
 
 impl MatchGeneratorDriver {
@@ -1490,11 +1508,20 @@ impl Matcher for MatchGeneratorDriver {
     fn restore_primed_dictionary(&mut self, level: super::CompressionLevel) -> bool {
         // Only the (storage, dictionary_retained_budget) pair is what
         // `prime_with_dictionary` writes; restoring them reproduces the
-        // post-prime state exactly. Gated on the captured level so a driver
-        // reused at a different level (different backend / params) re-primes
-        // instead of restoring a mismatched table.
+        // post-prime state exactly. Gated on the FULL resolved key (level +
+        // source-size hint + reported window), not just the level: `reset`
+        // caps `window_log` by the hint, so a same-level snapshot taken at a
+        // different hint carries a `storage.max_window_size` that no longer
+        // matches the advertised window. Restoring it would let the encoder
+        // search past the frame header's window (an undecodable match), so on
+        // a key mismatch we refuse and the caller re-primes.
+        let key = PrimedKey {
+            level,
+            reset_source_size: self.reset_source_size,
+            reported_window_size: self.reported_window_size,
+        };
         let (storage, budget) = match &self.primed {
-            Some((storage, budget, captured_level)) if *captured_level == level => {
+            Some((storage, budget, captured_key)) if *captured_key == key => {
                 (storage.clone(), *budget)
             }
             _ => return false,
@@ -1505,7 +1532,12 @@ impl Matcher for MatchGeneratorDriver {
     }
 
     fn capture_primed_dictionary(&mut self, level: super::CompressionLevel) {
-        self.primed = Some((self.storage.clone(), self.dictionary_retained_budget, level));
+        let key = PrimedKey {
+            level,
+            reset_source_size: self.reset_source_size,
+            reported_window_size: self.reported_window_size,
+        };
+        self.primed = Some((self.storage.clone(), self.dictionary_retained_budget, key));
     }
 
     fn invalidate_primed_dictionary(&mut self) {
