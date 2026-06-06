@@ -1636,8 +1636,7 @@ mod tests {
         let m = FastKernelMatcher::with_params(16, 12, 5, 2);
         assert_eq!(m.window_size(), 1u64 << 16);
         // Larger window_log → larger reported window. window_log = 22
-        // (4 MiB, donor's BETTER_WINDOW_LOG) confirms the shift width
-        // (`u64` head room).
+        // (4 MiB) confirms the shift width (`u64` head room).
         let m = FastKernelMatcher::with_params(22, 14, 7, 2);
         assert_eq!(m.window_size(), 1u64 << 22);
     }
