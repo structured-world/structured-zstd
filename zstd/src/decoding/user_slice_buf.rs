@@ -1273,7 +1273,9 @@ mod tests {
     /// - offset 64 (deep AVX2 path)
     ///
     /// against a byte-by-byte reference of the same repeat semantics.
-    #[cfg(target_arch = "x86_64")]
+    // `std` feature gates the test: `is_x86_feature_detected!` is `std`-only
+    // (runtime CPU detection), unavailable in the crate's `#![no_std]` build.
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
     #[test]
     fn exec_sequence_inline_avx2_offset_boundary_correctness() {
         if !std::arch::is_x86_feature_detected!("avx2") {
