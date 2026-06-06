@@ -431,6 +431,10 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                         // The streaming encoder has no dictionary state, so the
                         // raw-fast-path stays enabled (no dict to match against).
                         false,
+                        // No FrameEmitInfo on the streaming encoder path — it
+                        // does not surface per-block layout, so no sidecar.
+                        #[cfg(feature = "lsm")]
+                        None,
                         #[cfg(all(feature = "lsm", feature = "hash"))]
                         None,
                     );

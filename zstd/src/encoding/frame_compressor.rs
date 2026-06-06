@@ -122,6 +122,14 @@ pub struct FrameCompressor<
     /// Gated on `all(lsm, hash)` (see `per_block_checksums_enabled`).
     #[cfg(all(feature = "lsm", feature = "hash"))]
     block_checksums: Option<alloc::vec::Vec<u32>>,
+    /// Per-physical-block decompressed (regenerated) sizes captured
+    /// during `compress()`, in block-emit order (1:1 with
+    /// `frame_emit_info.blocks`). Always captured under `lsm` (no
+    /// opt-in, unlike `block_checksums`) because `FrameEmitInfo` is
+    /// always built under `lsm` and `decompressed_byte_range` needs
+    /// the per-block sizes. Cleared and refilled per frame.
+    #[cfg(feature = "lsm")]
+    block_decompressed_sizes: alloc::vec::Vec<u32>,
 }
 
 #[derive(Clone, Default)]
@@ -592,6 +600,8 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             per_block_checksums_enabled: false,
             #[cfg(all(feature = "lsm", feature = "hash"))]
             block_checksums: None,
+            #[cfg(feature = "lsm")]
+            block_decompressed_sizes: alloc::vec::Vec::new(),
         }
     }
 
@@ -740,6 +750,8 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 block_size: 0,
             };
             header.serialize(&mut all_blocks);
+            #[cfg(feature = "lsm")]
+            self.block_decompressed_sizes.push(0);
             #[cfg(all(feature = "lsm", feature = "hash"))]
             if let Some(checksums) = self.block_checksums.as_mut() {
                 checksums.push(xxh64_block_low32(&[]));
@@ -800,6 +812,8 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 start,
                 end,
                 &mut all_blocks,
+                #[cfg(feature = "lsm")]
+                Some(&mut self.block_decompressed_sizes),
                 #[cfg(all(feature = "lsm", feature = "hash"))]
                 self.block_checksums.as_mut(),
             );
@@ -839,6 +853,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             per_block_checksums_enabled: false,
             #[cfg(all(feature = "lsm", feature = "hash"))]
             block_checksums: None,
+            #[cfg(feature = "lsm")]
+            block_decompressed_sizes: alloc::vec::Vec::new(),
         }
     }
 
@@ -915,6 +931,9 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         #[cfg(feature = "lsm")]
         {
             self.frame_emit_info = None;
+            // Always captured under lsm (drives `decompressed_byte_range`);
+            // clear, keep the allocation for a reused compressor.
+            self.block_decompressed_sizes.clear();
         }
         #[cfg(all(feature = "lsm", feature = "hash"))]
         {
@@ -1207,6 +1226,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                     block_size: 0,
                 };
                 header.serialize(&mut all_blocks);
+                #[cfg(feature = "lsm")]
+                self.block_decompressed_sizes.push(0);
                 #[cfg(all(feature = "lsm", feature = "hash"))]
                 if let Some(checksums) = self.block_checksums.as_mut() {
                     checksums.push(xxh64_block_low32(&[]));
@@ -1222,6 +1243,9 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                         block_size: uncompressed_data.len().try_into().unwrap(),
                     };
                     header.serialize(&mut all_blocks);
+                    #[cfg(feature = "lsm")]
+                    self.block_decompressed_sizes
+                        .push(uncompressed_data.len() as u32);
                     #[cfg(all(feature = "lsm", feature = "hash"))]
                     if let Some(checksums) = self.block_checksums.as_mut() {
                         checksums.push(xxh64_block_low32(&uncompressed_data));
@@ -1254,6 +1278,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                         uncompressed_data,
                         &mut all_blocks,
                         dict_active,
+                        #[cfg(feature = "lsm")]
+                        Some(&mut self.block_decompressed_sizes),
                         #[cfg(all(feature = "lsm", feature = "hash"))]
                         self.block_checksums.as_mut(),
                     );
@@ -1409,6 +1435,19 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 Some(v) => v,
                 None => return,
             };
+            // Decompressed (regenerated) size, captured per physical block
+            // during emit (1:1 with the wire blocks scanned here). Raw/RLE
+            // are also wire-derivable (`block_size_field`); fall back to that
+            // if the sidecar is somehow short, and to 0 for a Compressed
+            // block whose size is not on the wire.
+            let decompressed_size = self
+                .block_decompressed_sizes
+                .get(blocks.len())
+                .copied()
+                .unwrap_or(match block_type {
+                    BT::Raw | BT::RLE => block_size_field,
+                    _ => 0,
+                });
             blocks.push(FrameBlock {
                 offset_in_frame,
                 header_size: 3,
@@ -1416,6 +1455,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 block_size_field,
                 block_type,
                 last_block,
+                decompressed_size,
             });
             cursor += 3 + physical_body as usize;
             if last_block {
@@ -3080,6 +3120,109 @@ mod tests {
             chksum_from_data1, chksum_from_data2,
             "frame 1 and frame 2 should have the same checksum (same data, hash must reset per frame)"
         );
+    }
+
+    #[cfg(feature = "lsm")]
+    #[test]
+    fn frame_emit_info_decompressed_ranges_match_decoded_output() {
+        // Part A correctness: the per-block `decompressed_size` captured during
+        // encode (and the `decompressed_byte_range` prefix sum derived from it)
+        // must describe the real decoded output exactly — one entry per
+        // physical block, contiguous, summing to the full decompressed length.
+        // A multi-block compressible payload exercises the Compressed-block
+        // path (whose regenerated size is NOT on the wire, so it relies on the
+        // encode-side capture this test guards).
+        let mut data: Vec<u8> = Vec::with_capacity(400 * 1024);
+        let mut x = 0x9E37_79B9u32;
+        // Semi-repetitive: long runs interleaved with stride patterns so the
+        // encoder produces several Compressed blocks rather than one giant Raw.
+        while data.len() < 400 * 1024 {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            let run = 16 + (x as usize % 48);
+            let byte = (x >> 24) as u8;
+            for _ in 0..run {
+                data.push(byte);
+            }
+            data.extend_from_slice(b"the quick brown fox jumps over the lazy dog\n");
+        }
+
+        // Cover both the single-block-per-chunk path (Default) and the
+        // Level(16..=22) post-split path (multiple physical partitions per
+        // input chunk), since lsm-tree compresses at zstd:22 and post-split
+        // is the riskiest capture site (per-partition `src_size`).
+        for level in [
+            super::CompressionLevel::Default,
+            super::CompressionLevel::Level(22),
+        ] {
+            let mut compressed = Vec::new();
+            let mut compressor = FrameCompressor::new(level);
+            // Pledge the source size so the high-level (22) window shrinks to
+            // fit the payload — otherwise level 22's default 128 MiB window
+            // exceeds the decoder's MAXIMUM_ALLOWED_WINDOW_SIZE cap. Still
+            // >= 128 KiB, so post-split eligibility is preserved.
+            compressor.set_source_size_hint(data.len() as u64);
+            compressor.set_source(data.as_slice());
+            compressor.set_drain(&mut compressed);
+            compressor.compress();
+
+            let info = compressor
+                .last_frame_emit_info()
+                .expect("emit info populated after compress")
+                .clone();
+
+            // Reference: full decode of the same frame.
+            let mut decoder = FrameDecoder::new();
+            let mut source = compressed.as_slice();
+            decoder.reset(&mut source).unwrap();
+            while !decoder.is_finished() {
+                decoder
+                    .decode_blocks(&mut source, crate::decoding::BlockDecodingStrategy::All)
+                    .unwrap();
+            }
+            let mut decoded = Vec::new();
+            decoder.collect_to_writer(&mut decoded).unwrap();
+            assert_eq!(decoded, data, "sanity: frame must round-trip ({level:?})");
+
+            assert!(
+                info.blocks.len() >= 2,
+                "fixture must span multiple blocks to exercise the mapping ({level:?}, got {})",
+                info.blocks.len()
+            );
+            assert!(
+                info.blocks.last().unwrap().last_block,
+                "final block must carry last_block ({level:?})"
+            );
+
+            // Per-block ranges: contiguous, zero-based, summing to the full output.
+            let mut expected_start = 0u64;
+            for i in 0..info.blocks.len() {
+                let range = info
+                    .decompressed_byte_range(i)
+                    .expect("in-bounds block has a range");
+                assert_eq!(
+                    range.start, expected_start,
+                    "block {i} range must start where the previous ended ({level:?})"
+                );
+                assert_eq!(
+                    u64::from(info.blocks[i].decompressed_size),
+                    range.end - range.start,
+                    "block {i} decompressed_size must equal its range width ({level:?})"
+                );
+                expected_start = range.end;
+            }
+            assert_eq!(
+                expected_start,
+                decoded.len() as u64,
+                "block decompressed sizes must sum to the full decoded length ({level:?})"
+            );
+            assert_eq!(
+                info.decompressed_byte_range(info.blocks.len()),
+                None,
+                "out-of-range index yields None ({level:?})"
+            );
+        }
     }
 
     #[cfg(feature = "std")]

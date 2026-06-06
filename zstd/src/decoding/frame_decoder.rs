@@ -76,6 +76,10 @@ fn block_body_decode_error(
             block_size_field,
             block_type: header.block_type,
             last_block: header.last_block,
+            // Raw/RLE carry their regenerated size in the header;
+            // a Compressed block's is unknown until decoded, so
+            // `read_block_header` leaves `decompressed_size` 0 here.
+            decompressed_size: header.decompressed_size,
         },
     }
 }
@@ -363,6 +367,30 @@ impl DecoderScratchKind {
         }
     }
 
+    /// Drop visible output beyond `window_size` without producing it,
+    /// keeping the most recent `window_size` bytes available to back
+    /// future match copies. Used by `decode_blocks_partial` to bound
+    /// memory while decoding the leading (skipped) blocks into the window.
+    #[cfg(feature = "lsm")]
+    fn buffer_drop_to_window_size(&mut self) -> usize {
+        match self {
+            Self::Ring(s) => s.buffer.drop_to_window_size(),
+            Self::Flat(s) => s.buffer.drop_to_window_size(),
+        }
+    }
+
+    /// Drop exactly `n` bytes from the front of the visible output without
+    /// producing them. Used by `decode_blocks_partial` to discard the
+    /// leading blocks' window-context bytes once the in-range blocks are
+    /// decoded (match resolution complete), leaving only the in-range output.
+    #[cfg(feature = "lsm")]
+    fn buffer_discard_front(&mut self, n: usize) {
+        match self {
+            Self::Ring(s) => s.buffer.discard_front(n),
+            Self::Flat(s) => s.buffer.discard_front(n),
+        }
+    }
+
     fn decode_block_content<R: Read>(
         &mut self,
         decoder: &mut BlockDecoder,
@@ -399,6 +427,38 @@ pub enum BlockDecodingStrategy {
     All,
     UptoBlocks(usize),
     UptoBytes(usize),
+}
+
+/// Outcome of [`FrameDecoder::decode_blocks_partial`]: the decompressed
+/// bytes of the requested inner-block range plus where (if anywhere)
+/// decoding stopped early.
+///
+/// Behind the `lsm` Cargo feature.
+#[cfg(feature = "lsm")]
+#[derive(Debug)]
+pub struct PartialDecode {
+    /// Decompressed bytes of the in-range blocks actually decoded, in
+    /// frame order, as one contiguous buffer. `data.len()` equals the sum
+    /// of the decompressed sizes of blocks `start_block .. start_block +
+    /// blocks_decoded`.
+    pub data: alloc::vec::Vec<u8>,
+    /// First block whose output is in [`data`](Self::data) (equals the
+    /// requested `start_block`).
+    pub start_block: u32,
+    /// Number of in-range blocks successfully decoded into
+    /// [`data`](Self::data).
+    pub blocks_decoded: u32,
+    /// `Some((block_index, error))` if decoding stopped on a failing block
+    /// before reaching `end_block` (a corrupt block inside the range, or a
+    /// leading block needed for window context). `None` if the requested
+    /// range decoded cleanly or the frame's last block was reached first.
+    ///
+    /// When the failing block is a leading context block
+    /// (`block_index < start_block`), the in-range window could not be
+    /// built so [`data`](Self::data) is empty and `blocks_decoded` is 0.
+    pub stopped_at: Option<(u32, FrameDecoderError)>,
+    /// `true` if the frame's last block was reached during this decode.
+    pub frame_finished: bool,
 }
 
 impl FrameDecoderState {
@@ -1114,6 +1174,183 @@ impl FrameDecoder {
         }
 
         Ok(state.frame_finished)
+    }
+
+    /// Decode the inner blocks `[start_block, end_block)` of the current
+    /// frame and return their decompressed bytes as one contiguous buffer.
+    ///
+    /// Serves two consumer needs with one call:
+    ///
+    /// - **Range-query performance:** decode only the inner zstd blocks that
+    ///   cover a key range instead of the whole frame. Blocks before
+    ///   `start_block` are decoded into the window (zstd blocks share one
+    ///   window, so a leading block's bytes may be the match source for an
+    ///   in-range block and cannot simply be skipped) but their output is not
+    ///   returned; blocks at or after `end_block` are not decoded at all,
+    ///   which is the trailing-block work saving. Map a decompressed byte
+    ///   offset to a block index with
+    ///   [`FrameEmitInfo::decompressed_byte_range`].
+    /// - **Best-effort recovery:** if a block decode fails, decoding stops,
+    ///   the clean prefix of in-range output is preserved in
+    ///   [`PartialDecode::data`], and the failure is reported via
+    ///   [`PartialDecode::stopped_at`]. Passing `(0, u32::MAX)` decodes the
+    ///   whole frame, stopping at the first corrupt block (pure recovery).
+    ///
+    /// `end_block` is exclusive; pass `u32::MAX` to decode to the end of the
+    /// frame. Call on a freshly [`reset`](Self::reset) decoder (it decodes
+    /// from the frame's first block).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrameDecoderError::NotYetInitialized`] if the decoder has not
+    /// been reset, and [`FrameDecoderError::InvalidBlockRange`] if
+    /// `start_block > end_block`. A corrupt block is NOT an `Err` here: it is
+    /// reported via [`PartialDecode::stopped_at`] so the clean prefix survives.
+    ///
+    /// [`FrameEmitInfo::decompressed_byte_range`]: crate::encoding::frame_emit_info::FrameEmitInfo::decompressed_byte_range
+    #[cfg(feature = "lsm")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "lsm")))]
+    pub fn decode_blocks_partial(
+        &mut self,
+        mut source: impl Read,
+        start_block: u32,
+        end_block: u32,
+    ) -> Result<PartialDecode, FrameDecoderError> {
+        use FrameDecoderError as err;
+        if start_block > end_block {
+            return Err(err::InvalidBlockRange {
+                start_block,
+                end_block,
+            });
+        }
+        let state = self.state.as_mut().ok_or(err::NotYetInitialized)?;
+
+        // Mirror `decode_blocks`: pre-reserve the backing buffer to
+        // `window_size` so multi-block frames don't pay repeated grow steps.
+        let window_size = state.frame_header.window_size().unwrap_or(0) as usize;
+        state.decoder_scratch.reserve_buffer(window_size);
+
+        let mut block_dec = decoding::block_decoder::new();
+
+        // Bytes of prefix-window output that physically precede the first
+        // in-range block in the buffer. Captured at the prefix → in-range
+        // transition (after leading blocks were dropped to the window) so we
+        // can discard exactly those bytes once decoding is done. `None` until
+        // the first in-range block is reached.
+        let mut prefix_window_len: Option<usize> = None;
+        // Exact count of clean in-range decompressed bytes (sum of per-block
+        // length deltas of the in-range blocks that succeeded). Any partial
+        // bytes of a failing in-range block are excluded — the fused executor
+        // rolls the buffer back to the pre-block checkpoint on a sequence
+        // error, and anything left over is never counted here, so it is not
+        // drained into `data`.
+        let mut subset_bytes: u64 = 0;
+        let mut blocks_decoded: u32 = 0;
+        let mut stopped_at: Option<(u32, FrameDecoderError)> = None;
+
+        loop {
+            let block_index = state.block_counter as u32;
+            // Stop before decoding `end_block`: the trailing blocks are never
+            // touched (the perf win), and the frame's tail is left unread.
+            if block_index >= end_block || state.frame_finished {
+                break;
+            }
+            let in_range = block_index >= start_block;
+            // Snapshot the window length at the prefix → in-range boundary.
+            if in_range && prefix_window_len.is_none() {
+                prefix_window_len = Some(state.decoder_scratch.buffer_len());
+            }
+
+            let block_frame_offset = state.bytes_read_counter as u32;
+            let (block_header, block_header_size) = match block_dec.read_block_header(&mut source) {
+                Ok(v) => v,
+                Err(e) => {
+                    stopped_at = Some((
+                        block_index,
+                        block_header_decode_error(e, block_index, block_frame_offset),
+                    ));
+                    break;
+                }
+            };
+            state.bytes_read_counter += u64::from(block_header_size);
+
+            let len_before = state.decoder_scratch.buffer_len();
+            match state.decoder_scratch.decode_block_content(
+                &mut block_dec,
+                &block_header,
+                &mut source,
+            ) {
+                Ok(body_read) => state.bytes_read_counter += body_read,
+                Err(e) => {
+                    stopped_at = Some((
+                        block_index,
+                        block_body_decode_error(
+                            e,
+                            block_index,
+                            block_frame_offset,
+                            &block_header,
+                            block_header_size,
+                        ),
+                    ));
+                    break;
+                }
+            }
+            let produced = state.decoder_scratch.buffer_len() - len_before;
+            state.block_counter += 1;
+            if in_range {
+                subset_bytes += produced as u64;
+                blocks_decoded += 1;
+            }
+
+            if block_header.last_block {
+                state.frame_finished = true;
+                if state.frame_header.descriptor.content_checksum_flag() {
+                    let mut chksum = [0u8; 4];
+                    match source.read_exact(&mut chksum) {
+                        Ok(()) => {
+                            state.bytes_read_counter += 4;
+                            state.check_sum = Some(u32::from_le_bytes(chksum));
+                        }
+                        // A trailing-checksum read failure does not invalidate
+                        // the decoded bytes; surface it so the caller knows the
+                        // frame tail was truncated, but keep `data`.
+                        Err(e) => {
+                            stopped_at = Some((block_index, err::FailedToReadChecksum(e)));
+                        }
+                    }
+                }
+                break;
+            }
+
+            // Leading (out-of-range) block: bound memory to the window. We
+            // must NOT drop once in-range, or the in-range output we are about
+            // to return would be discarded.
+            if !in_range {
+                state.decoder_scratch.buffer_drop_to_window_size();
+            }
+        }
+
+        // The visible buffer is now `[prefix window][in-range clean][maybe
+        // trailing garbage from a failed in-range block]`. Drop the prefix
+        // window from the front (match resolution is complete, so it is no
+        // longer needed), then drain exactly the clean in-range byte count —
+        // any trailing garbage is left undrained and cleared on the next
+        // `reset`.
+        let w = prefix_window_len.unwrap_or(0);
+        state.decoder_scratch.buffer_discard_front(w);
+        let mut data = alloc::vec![0u8; subset_bytes as usize];
+        state
+            .decoder_scratch
+            .buffer_read_all(&mut data)
+            .map_err(err::FailedToDrainDecodebuffer)?;
+
+        Ok(PartialDecode {
+            data,
+            start_block,
+            blocks_decoded,
+            stopped_at,
+            frame_finished: state.frame_finished,
+        })
     }
 
     /// Collect bytes and retain window_size bytes while decoding is still going on.
@@ -2897,5 +3134,225 @@ mod tests {
 
         let decoder_checksums = decoder.computed_block_checksums();
         assert_eq!(decoder_checksums, encoder_checksums.as_slice());
+    }
+
+    // ── decode_blocks_partial (block-subset partial decode, lsm) ──
+
+    /// Build a multi-block compressible frame and return
+    /// `(compressed, full_decode, emit_info)`. The emit info's
+    /// `decompressed_byte_range` maps decompressed offsets to block indices.
+    #[cfg(feature = "lsm")]
+    fn multi_block_fixture() -> (
+        Vec<u8>,
+        Vec<u8>,
+        crate::encoding::frame_emit_info::FrameEmitInfo,
+    ) {
+        let mut data: Vec<u8> = Vec::with_capacity(400 * 1024);
+        let mut x = 0x9E37_79B9u32;
+        while data.len() < 400 * 1024 {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            let run = 16 + (x as usize % 48);
+            let byte = (x >> 24) as u8;
+            for _ in 0..run {
+                data.push(byte);
+            }
+            data.extend_from_slice(b"the quick brown fox jumps over the lazy dog\n");
+        }
+
+        let mut compressed = Vec::new();
+        let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        compressor.set_source(data.as_slice());
+        compressor.set_drain(&mut compressed);
+        compressor.compress();
+        let info = compressor
+            .last_frame_emit_info()
+            .expect("emit info populated")
+            .clone();
+        drop(compressor);
+
+        let mut dec = FrameDecoder::new();
+        let mut full = alloc::vec![0u8; data.len()];
+        let n = dec
+            .decode_all(compressed.as_slice(), &mut full)
+            .expect("full decode");
+        full.truncate(n);
+        assert_eq!(full, data, "fixture must round-trip");
+        (compressed, full, info)
+    }
+
+    #[cfg(feature = "lsm")]
+    #[test]
+    fn decode_blocks_partial_subset_matches_full_decode() {
+        let (compressed, full, info) = multi_block_fixture();
+        let nblocks = info.blocks.len() as u32;
+        assert!(
+            nblocks >= 4,
+            "fixture must have several blocks, got {nblocks}"
+        );
+        let half = nblocks / 2;
+        // Boundaries: 1 block, 2 blocks, half, all, and a non-zero start.
+        for &(s, e) in &[
+            (0u32, 1u32),
+            (0, 2),
+            (0, half),
+            (0, nblocks),
+            (1, 2),
+            (half, nblocks),
+        ] {
+            let mut source = compressed.as_slice();
+            let mut dec = FrameDecoder::new();
+            dec.reset(&mut source).unwrap();
+            let pd = dec
+                .decode_blocks_partial(&mut source, s, e)
+                .unwrap_or_else(|err| panic!("range [{s},{e}) errored: {err:?}"));
+
+            let start = info.decompressed_byte_range(s as usize).unwrap().start as usize;
+            let end = info.decompressed_byte_range((e - 1) as usize).unwrap().end as usize;
+            assert_eq!(
+                pd.data.as_slice(),
+                &full[start..end],
+                "subset bytes must equal the full-decode slice for [{s},{e})"
+            );
+            assert_eq!(pd.start_block, s);
+            assert_eq!(pd.blocks_decoded, e - s);
+            assert!(pd.stopped_at.is_none(), "clean range [{s},{e})");
+        }
+    }
+
+    #[cfg(feature = "lsm")]
+    #[test]
+    fn decode_blocks_partial_recovers_clean_prefix_on_truncated_block() {
+        let (compressed, full, info) = multi_block_fixture();
+        let nblocks = info.blocks.len();
+        let k = nblocks / 2;
+        assert!(k >= 1, "need a clean prefix before the failing block");
+
+        // Truncate the source right after block k's 3-byte header, so its body
+        // read fails regardless of block type (0 body bytes available).
+        let cut = info.blocks[k].offset_in_frame as usize + info.blocks[k].header_size as usize;
+        let truncated = &compressed[..cut];
+
+        let mut source = truncated;
+        let mut dec = FrameDecoder::new();
+        dec.reset(&mut source).unwrap();
+        let pd = dec.decode_blocks_partial(&mut source, 0, u32::MAX).unwrap();
+
+        let (idx, _err) = pd.stopped_at.expect("must stop on the truncated block");
+        assert_eq!(idx, k as u32, "stopped at the truncated block index");
+        assert_eq!(pd.blocks_decoded, k as u32, "blocks 0..k decoded cleanly");
+        assert!(!pd.frame_finished);
+        let clean_end = info.decompressed_byte_range(k).unwrap().start as usize;
+        assert_eq!(
+            pd.data.as_slice(),
+            &full[..clean_end],
+            "clean prefix preserved through the failure"
+        );
+    }
+
+    #[cfg(feature = "lsm")]
+    #[test]
+    fn decode_blocks_partial_invalid_range_errors() {
+        let (compressed, _full, _info) = multi_block_fixture();
+        let mut source = compressed.as_slice();
+        let mut dec = FrameDecoder::new();
+        dec.reset(&mut source).unwrap();
+        let err = dec
+            .decode_blocks_partial(&mut source, 5, 2)
+            .expect_err("start > end must error");
+        assert!(matches!(
+            err,
+            crate::decoding::errors::FrameDecoderError::InvalidBlockRange {
+                start_block: 5,
+                end_block: 2,
+            }
+        ));
+    }
+
+    #[cfg(feature = "lsm")]
+    #[test]
+    fn decode_blocks_partial_skips_trailing_blocks() {
+        let (compressed, full, info) = multi_block_fixture();
+        assert!(info.blocks.len() >= 3);
+        let mut source = compressed.as_slice();
+        let mut dec = FrameDecoder::new();
+        dec.reset(&mut source).unwrap();
+        let pd = dec.decode_blocks_partial(&mut source, 0, 1).unwrap();
+
+        assert_eq!(pd.blocks_decoded, 1);
+        assert!(pd.stopped_at.is_none());
+        assert!(!pd.frame_finished, "block 0 is not the last block");
+        let end = info.decompressed_byte_range(0).unwrap().end as usize;
+        assert_eq!(pd.data.as_slice(), &full[..end]);
+        // The trailing blocks + checksum were never consumed from the source.
+        assert!(
+            dec.bytes_read_from_source() < u64::from(info.total_size),
+            "only block 0's region should be consumed, read {} of {}",
+            dec.bytes_read_from_source(),
+            info.total_size
+        );
+    }
+
+    #[cfg(feature = "lsm")]
+    #[test]
+    fn lsm_style_range_query_partial_recovery() {
+        // Simulates lsm-tree's range-query path: a key range resolves to a
+        // decompressed byte window, which maps to inner zstd block indices via
+        // `decompressed_byte_range`; decode only the covering blocks and check
+        // the wanted window is recovered exactly (no key outside, all inside).
+        let (compressed, full, info) = multi_block_fixture();
+        let total = full.len() as u64;
+        let want_start = total / 3;
+        let want_end = (total * 2) / 3;
+
+        // Map [want_start, want_end) to covering block indices.
+        let nblocks = info.blocks.len();
+        let mut start_block = 0u32;
+        let mut end_block = nblocks as u32;
+        for i in 0..nblocks {
+            let r = info.decompressed_byte_range(i).unwrap();
+            if r.start <= want_start && want_start < r.end {
+                start_block = i as u32;
+            }
+            if r.start < want_end && want_end <= r.end {
+                end_block = i as u32 + 1;
+                break;
+            }
+        }
+
+        let mut source = compressed.as_slice();
+        let mut dec = FrameDecoder::new();
+        dec.reset(&mut source).unwrap();
+        let pd = dec
+            .decode_blocks_partial(&mut source, start_block, end_block)
+            .unwrap();
+        assert!(pd.stopped_at.is_none());
+
+        let covered_start = info
+            .decompressed_byte_range(start_block as usize)
+            .unwrap()
+            .start;
+        let covered_end = info
+            .decompressed_byte_range((end_block - 1) as usize)
+            .unwrap()
+            .end;
+        assert!(
+            covered_start <= want_start && want_end <= covered_end,
+            "covering blocks must contain the wanted window"
+        );
+        assert_eq!(
+            pd.data.as_slice(),
+            &full[covered_start as usize..covered_end as usize],
+            "covered subset must equal the full-decode slice"
+        );
+        // Slice the exact key range out of the covered subset.
+        let off = (want_start - covered_start) as usize;
+        let len = (want_end - want_start) as usize;
+        assert_eq!(
+            &pd.data[off..off + len],
+            &full[want_start as usize..want_end as usize],
+            "exact key range recovered from the partial decode"
+        );
     }
 }

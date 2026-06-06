@@ -912,6 +912,24 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         }
     }
 
+    /// Drop the first `n` visible bytes from the front without producing
+    /// them to any sink (advances the head, like the beyond-window drop in
+    /// [`Self::drop_to_window_size`] but for an exact count). Used by the
+    /// subset partial-decode path to discard the window-context bytes of the
+    /// skipped leading blocks once every in-range block is decoded and match
+    /// resolution is complete: they were retained only to back the in-range
+    /// blocks' match copies, never to be emitted. Does NOT mutate
+    /// `total_output_counter` (same rationale as `drop_to_window_size`).
+    ///
+    /// `n` must be `<= self.len()`.
+    #[cfg(feature = "lsm")]
+    pub(crate) fn discard_front(&mut self, n: usize) {
+        debug_assert!(n <= self.buffer.len());
+        if n != 0 {
+            self.buffer.drop_first_n(n);
+        }
+    }
+
     /// drain the buffer completely
     pub fn drain(&mut self) -> Vec<u8> {
         let (slice1, slice2) = self.buffer.as_slices();
