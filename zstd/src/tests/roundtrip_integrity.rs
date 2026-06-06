@@ -80,16 +80,8 @@ fn roundtrip_default(data: &[u8]) -> Vec<u8> {
     roundtrip_at_level(data, CompressionLevel::Default)
 }
 
-fn roundtrip_better(data: &[u8]) -> Vec<u8> {
-    roundtrip_at_level(data, CompressionLevel::Better)
-}
-
 fn roundtrip_better_streaming(data: &[u8]) -> Vec<u8> {
     roundtrip_streaming_at_level(data, CompressionLevel::Better)
-}
-
-fn roundtrip_best(data: &[u8]) -> Vec<u8> {
-    roundtrip_at_level(data, CompressionLevel::Best)
 }
 
 fn roundtrip_best_streaming(data: &[u8]) -> Vec<u8> {
@@ -464,47 +456,6 @@ fn better_level_compresses_close_to_default() {
     );
 }
 
-/// Exercise the 8 MiB window: place a repeated pattern beyond Default's
-/// 4 MiB window so only Better (8 MiB) can match it.
-#[test]
-fn roundtrip_better_level_large_window() {
-    // Two identical 256 KiB INCOMPRESSIBLE regions separated by a 4.5 MiB
-    // compressible gap. The region is random (not pattern-repeating), so the
-    // only way to compress the second copy is a back-reference to the first,
-    // which sits ~4.8 MiB earlier. Better's 8 MiB window reaches it (one
-    // cross-gap match, the second region collapses to a few bytes); Default's
-    // 4 MiB window cannot, so the second region stays raw. This makes the
-    // window behaviour the SOLE differentiator: entropy/splitting cannot
-    // rescue Default on random bytes.
-    let region = generate_data(42, 256 * 1024);
-    let gap = generate_compressible(9999, 4 * 1024 * 1024 + 512 * 1024);
-    let mut data = Vec::with_capacity(region.len() + gap.len() + region.len());
-    data.extend_from_slice(&region);
-    data.extend_from_slice(&gap);
-    data.extend_from_slice(&region);
-
-    assert_eq!(roundtrip_better(&data), data);
-
-    // Window-load-bearing assertion: Better (8 MiB window) must beat Default
-    // (4 MiB window) because only Better can match the second random region
-    // across the 4.8 MiB gap. With an incompressible region the size delta is
-    // ~256 KiB (the whole second region), so a real large-window regression
-    // — Better losing the cross-gap match — flips this ordering and fails the
-    // test. (The earlier `< input/1000` floor was not window-specific: it
-    // passed even if Better lost the match, since the patterned fixture
-    // compressed tiny regardless of window.)
-    let compressed_better = compress_to_vec(&data[..], CompressionLevel::Better);
-    let compressed_default = compress_to_vec(&data[..], CompressionLevel::Default);
-    assert!(
-        compressed_better.len() < compressed_default.len(),
-        "Better (8 MiB window) should beat Default (4 MiB window) across the \
-         4.5 MiB gap via a cross-gap match (better={}, default={}, input={})",
-        compressed_better.len(),
-        compressed_default.len(),
-        data.len(),
-    );
-}
-
 /// Best must not regress vs Better on this repetitive fixture. Equal
 /// output is expected here (HC finds identical matches at any depth);
 /// the strict Best < Better check lives in cross_validation.rs on the
@@ -517,36 +468,6 @@ fn best_level_does_not_regress_vs_better() {
     assert!(
         compressed_best.len() <= compressed_better.len(),
         "Best must not regress vs Better. best={} bytes, better={} bytes",
-        compressed_best.len(),
-        compressed_better.len(),
-    );
-}
-
-/// Exercise the 16 MiB window: place a repeated pattern beyond Better's
-/// 8 MiB window so only Best (16 MiB) can match it.
-#[test]
-fn roundtrip_best_level_large_window() {
-    // Two identical 256 KiB high-entropy regions separated by a 9 MiB
-    // compressible gap. The region is random so the only way to compress
-    // the second copy is via long-distance matching (window reach).
-    // Best's 16 MiB window can still reach the first region;
-    // Better's 8 MiB window cannot.
-    let region = generate_data(42, 256 * 1024);
-    let gap = generate_compressible(7777, 9 * 1024 * 1024);
-    let mut data = Vec::with_capacity(region.len() + gap.len() + region.len());
-    data.extend_from_slice(&region);
-    data.extend_from_slice(&gap);
-    data.extend_from_slice(&region);
-
-    assert_eq!(roundtrip_best(&data), data);
-
-    // Best should compress the duplicated region; Better cannot reach it.
-    let compressed_best = compress_to_vec(&data[..], CompressionLevel::Best);
-    let compressed_better = compress_to_vec(&data[..], CompressionLevel::Better);
-    assert!(
-        compressed_best.len() < compressed_better.len(),
-        "Best (16 MiB window) should beat Better (8 MiB) across 9 MiB gap. \
-         best={} better={}",
         compressed_best.len(),
         compressed_better.len(),
     );

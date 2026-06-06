@@ -9,7 +9,6 @@ use alloc::vec::Vec;
 // SIMD/CRC intrinsics now live in `crate::encoding::fastpath::*` where they
 // sit under per-CPU `#[target_feature]` umbrellas; no architecture-specific
 // intrinsic imports remain in this file.
-use super::BETTER_WINDOW_LOG;
 use super::CompressionLevel;
 use super::Matcher;
 use super::Sequence;
@@ -391,13 +390,13 @@ const LEVEL_TABLE: [LevelParams; 22] = [
     // long-enough match — the dominant cost in the L5..=L15 speed
     // regression vs FFI (see lazy_band_target_len_matches_donor_default_table).
     /* 5 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Greedy, search: super::strategy::SearchMethod::RowHash, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 0, hc: HcConfig { hash_log: 18, chain_log: 17, search_depth: 4,  target_len: 2 }, row: ROW_L5 },
-    /* 6 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: BETTER_WINDOW_LOG, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 1, hc: HcConfig { hash_log: 19, chain_log: 18, search_depth: 8,  target_len: 4 }, row: ROW_CONFIG },
-    /* 7 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: BETTER_WINDOW_LOG, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 1, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 16, target_len: 8 }, row: ROW_CONFIG },
-    /* 8 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: BETTER_WINDOW_LOG, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 24, target_len: 16 }, row: ROW_CONFIG },
-    /* 9 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: BETTER_WINDOW_LOG, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 24, target_len: 16 }, row: ROW_CONFIG },
-    /*10 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 24, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 28, target_len: 16 }, row: ROW_CONFIG },
-    /*11 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 24, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 32, target_len: 16 }, row: ROW_CONFIG },
-    /*12 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 25, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 32 }, row: ROW_CONFIG },
+    /* 6 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 21, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 1, hc: HcConfig { hash_log: 19, chain_log: 18, search_depth: 8,  target_len: 4 }, row: ROW_CONFIG },
+    /* 7 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 21, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 1, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 16, target_len: 8 }, row: ROW_CONFIG },
+    /* 8 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 21, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 16, target_len: 16 }, row: ROW_CONFIG },
+    /* 9 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 16, target_len: 16 }, row: ROW_CONFIG },
+    /*10 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 16 }, row: ROW_CONFIG },
+    /*11 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 22, chain_log: 21, search_depth: 64, target_len: 16 }, row: ROW_CONFIG },
+    /*12 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, hc: HcConfig { hash_log: 23, chain_log: 22, search_depth: 64, target_len: 32 }, row: ROW_CONFIG },
     // L13-15: reference uses btlazy2 (binary-tree finder) with searchLog 4/5/6
     // (search_depth 16/32/64) and targetLength 32. We run the hash-chain Lazy
     // parser here, so we mirror the reference search budget rather than inflate
@@ -6674,9 +6673,9 @@ fn pooled_space_keeps_capacity_when_slice_size_shrinks() {
 fn driver_best_to_fastest_releases_oversized_hc_tables() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
 
-    // Initialize at Best — allocates large HC tables (2M hash, 1M chain).
+    // Initialize at Best — allocates large HC tables (4M hash, 2M chain).
     driver.reset(CompressionLevel::Best);
-    assert_eq!(driver.window_size(), (1u64 << 24));
+    assert_eq!(driver.window_size(), (1u64 << 22));
 
     // Feed data so tables are actually allocated via ensure_tables().
     let mut space = driver.get_next_space();
@@ -6710,7 +6709,7 @@ fn driver_better_to_best_resizes_hc_tables() {
 
     // Initialize at Better — allocates small HC tables (1M hash, 512K chain).
     driver.reset(CompressionLevel::Better);
-    assert_eq!(driver.window_size(), (1u64 << 23));
+    assert_eq!(driver.window_size(), (1u64 << 21));
 
     let mut space = driver.get_next_space();
     space[..12].copy_from_slice(b"abcabcabcabc");
@@ -6724,7 +6723,7 @@ fn driver_better_to_best_resizes_hc_tables() {
 
     // Switch to Best — must resize to larger tables.
     driver.reset(CompressionLevel::Best);
-    assert_eq!(driver.window_size(), (1u64 << 24));
+    assert_eq!(driver.window_size(), (1u64 << 22));
 
     // Feed data to trigger ensure_tables with new sizes.
     let mut space = driver.get_next_space();
