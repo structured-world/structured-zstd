@@ -425,31 +425,23 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // this overshoot for well-formed frames.
         const MAX_WILDCOPY_OVERSHOOT: usize = 31;
         let cap = self.slice.len();
-        let total = match lit_length.checked_add(match_length) {
-            Some(v) => v,
-            None => {
-                return Err(ExecuteSequencesError::OutputBufferOverflow {
-                    tail: self.tail,
-                    requested: usize::MAX,
-                    capacity: cap,
-                });
-            }
-        };
-        let cap_required = self
-            .tail
-            .checked_add(total)
-            .and_then(|new_tail| new_tail.checked_add(MAX_WILDCOPY_OVERSHOOT));
-        let cap_required = match cap_required {
-            Some(v) if v <= cap => v,
-            _ => {
-                return Err(ExecuteSequencesError::OutputBufferOverflow {
-                    tail: self.tail,
-                    requested: total,
-                    capacity: cap,
-                });
-            }
-        };
-        let _ = cap_required;
+        // `lit_length` and `match_length` are each bounded by the maximum
+        // FSE LL/ML code expansion (~131 KB), so `total` and
+        // `total + MAX_WILDCOPY_OVERSHOOT` cannot overflow `usize` (even on
+        // 32-bit). `self.tail <= cap` holds on entry: `from_slice` starts at
+        // 0 and every prior sequence only advanced `tail` after passing the
+        // same check below (`total + overshoot <= cap - tail` ⇒
+        // `new_tail < cap`), so `cap - self.tail` cannot underflow. This
+        // single subtraction + compare replaces a per-sequence `checked_add`
+        // chain (runs on every sequence on the decode hot path).
+        let total = lit_length + match_length;
+        if total + MAX_WILDCOPY_OVERSHOOT > cap - self.tail {
+            return Err(ExecuteSequencesError::OutputBufferOverflow {
+                tail: self.tail,
+                requested: total,
+                capacity: cap,
+            });
+        }
         let new_tail = self.tail + total;
         debug_assert!(offset >= 1);
         debug_assert!(match_length >= 1);
