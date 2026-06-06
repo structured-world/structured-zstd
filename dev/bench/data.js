@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780708267415,
+  "lastUpdate": 1780741053669,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -58262,6 +58262,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.26,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b8ba38ee124955d5704284ffb565478e51e78952",
+          "message": "perf(codec): warm dictionary reuse (decode + encode) + relocate decompression-bomb guard (#352)\n\n* perf(decode): share dictionary by handle instead of per-frame copy\n\nThe decoder copied the whole dictionary content into a per-frame\n`DecodeBuffer::dict_content` Vec on every `init_from_dict` (memmove\n~27% of a small dict-frame decode). Hold the dictionary by shared\nhandle (`DictionaryHandle` = `Arc`/`Rc` on the no-std fallback) and read\nmatch bytes straight out of it in `repeat_from_dict` — donor\n`ZSTD_refDDict` semantics.\n\nOne dictionary content copy is now shared across every frame AND across\ndecoder instances on other threads (`Arc<Dictionary>` is Send + Sync);\nattaching a dictionary is a refcount bump, never a content memcpy.\nRegistered dicts (`owned_dicts`) also move to handles so all attach\npaths are uniform. no-std stays intact via the existing SharedDictionary\nalias (Arc with atomics, Rc without).\n\n* perf(decode): copy only decode-essential entropy on dict reinit\n\nPer-frame dict attach (`init_from_dict`) ran `reinit_from` on the FSE and\nHUF tables, which copied the full build-time workspace into the decoder\nscratch every frame: FSE `symbol_probabilities` + spread buffer, and HUF\n`weights` / `bits` / `rank_indexes` plus the recursive weight-decoding\n`fse_table`. The decode hot path (and Repeat-mode reuse) reads only the\n`decode` table (FSE) and `packed_decode` + `max_num_bits` + `state_mask`\n(HUF); the rest is scratch any rebuilding block repopulates itself.\n\nCopy only the decode-essential state, mirroring the donor copying just\nthe entropy decode tables per frame rather than the whole build\nworkspace. Cuts the per-frame dict-setup memmove on small dict frames.\n\n* test(bench): measure compress-dict steady-state with reused context\n\nThe compress-dict arms built a fresh compressor + parsed the dictionary\ninside b.iter every iteration, measuring one-time setup cost rather than\nsteady-state throughput and unfairly penalising the side with heavier\nper-attach setup. Build the compressor + attach the dictionary ONCE\nbefore b.iter on both sides (C CDict created once + compress per frame;\nRust prepared EncoderDictionary + compress_independent_frame per frame),\nthe real prepared-dictionary lifecycle. compress_independent_frame_into\nreads input in place and takes the output per call, so it needs no\nset_source/set_drain (sidesteps the lifetime issue that forced the old\nper-iter shape).\n\n* perf(encode): cache primed dict matcher state (CDict-equivalent)\n\nReusing a dictionary across frames re-hashed every dictionary position\ninto the match tables on EVERY frame (prepare_frame -> reset + full\nprime_with_dictionary), the dominant cost of small dict-compress\n(steady-state ~10x slower than C, which copies a precomputed\ncdict->matchState).\n\nSnapshot the post-prime matcher state once (the backend storage hash\ntables + dictionary history + offset history + window, plus the\ndriver's dictionary_retained_budget — the only state prime writes),\nkeyed by compression level, and restore it (a table copy) on later\nframes instead of re-priming. Mirrors donor ZSTD_compressBegin_usingCDict.\nThe snapshot is invalidated on dictionary attach/clear and ignored on a\nlevel mismatch, so it can never be restored against the wrong dict/level.\n\nMatcher backends gain Clone for the storage snapshot; CompressionLevel\ngains PartialEq for the level key. New regression test asserts frame 2\n(restored) is byte-identical to frame 1 (freshly primed) and both\nround-trip through a dict-primed decoder.\n\n* Revert \"perf(encode): cache primed dict matcher state (CDict-equivalent)\"\n\nThis reverts commit 5895680f7650eee5b786f95941beb0aa77318cb2.\n\n* Reapply \"perf(encode): cache primed dict matcher state (CDict-equivalent)\"\n\nThis reverts commit a0943b2d588400041ccb9ae4cec5677203d92cf7.\n\n* perf(encode): gate dict prime-snapshot copy to large sources\n\nDonor ZSTD_shouldAttachDict only COPIES a precomputed dictionary table\ninto the working context when the source exceeds a per-strategy cutoff\n(fast 8K, dfast 16K, greedy/lazy/btopt 32K, btultra/btultra2 8K); at or\nbelow it the donor ATTACHES the dictionary tables by reference with no\nper-frame table touch.\n\nThe prime snapshot is a whole-table copy, so applying it unconditionally\nregressed small-source dict frames (the copy costs more than the sparse\nre-prime — which is exactly why the donor attaches by reference there).\nGate restore/capture to sources above the cutoff so the snapshot is used\nonly in the donor COPY regime; small/unknown sources keep re-priming\nuntil an attach-by-reference path lands.\n\n* perf(encode): size block-read buffer to source hint, not always 128 KiB\n\nrun_owned_block_loop zero-filled a full MAX_BLOCK_SIZE (128 KiB) buffer\nvia resize(_, 0) every block just to read the input into it and truncate\nback down — a small frame paid a 128 KiB memset per block to read a few\nKiB (37% of steady-state small dict-compress was memset, the largest\nsingle cost). Bound the initial fill by the source-size hint (exact for\nthe slice entry points) and grow toward block_capacity only if the hint\nunder-counts, so inexact / unknown (None -> full capacity) hints stay\ncorrect. Helps every small-frame compress, dict or not.\n\n* refactor(encode): bound block-read sizing without saturating arithmetic\n\nReplace the saturating_sub/add/mul in the block-read buffer sizing with\nplain checked-by-construction arithmetic: filled <= block_capacity holds\non every path (the read only targets [filled..len] with len <=\nblock_capacity, and a carried pending_input is a sub-block split_off), so\nblock_capacity - filled never underflows; remaining is pinned to\nblock_capacity before the usize cast and the doubling stays within usize.\nBehaviour identical; no saturating masking.\n\n* perf(encode): share dictionary entropy tables by handle, not per-frame clone\n\nprepare_frame deep-cloned the cached dictionary FSE encoder tables into\nthe per-frame state every frame (PreviousFseTable::clone was ~16% of\nsteady-state small dict-compress). The previous-table is only ever read\nor REPLACED wholesale, never mutated in place, so back PreviousFseTable::\nCustom with a shared handle (SharedFseTable = Arc on atomic targets, Rc\notherwise — keeps no_std no-atomics building) instead of Box. The\nper-frame entropy seed is now a refcount bump, mirroring the donor\nreferencing cdict->cBlockState rather than rebuilding it per frame.\n\n* perf(encode): cache Fast dict table across attach-path frames\n\nSmall-source dictionary frames (at/below the Fast 8 KiB attach cutoff)\nre-prime every frame instead of restoring a copy snapshot. Re-priming\nre-committed the dict bytes to history AND re-hashed every position into\nthe immutable dict table each frame.\n\nKeep the built dict table across a same-parameter reset and skip the\nre-hash: the dictionary lands at identical absolute history positions\nevery frame (history is cleared then the dict is committed first), so\nthe cached hashes stay valid. The dict bytes are still re-committed\n(needed for match extension); only the hashing is elided.\n\nThe cache is dropped on parameter change, history eviction, and\ndictionary attach/clear, so the kernel never probes a dict region whose\nbytes are no longer re-committed. Output is byte-identical: cold-cache\nand warm-cache frames match.\n\nPart of #316. Closes #349\n\n* perf(decode): move decompression-bomb ceiling off the per-match hot path\n\nThe per-block output ceiling added to guard against decompression-bomb\nOOMs was checked in repeat_inner on EVERY match copy\n(buffer.len() + match_length > block_output_limit). That compare plus a\nfield load and a cold branch bloated the #[inline(always)] repeat path\ninlined into the pipelined sequence loop, regressing lazy-level decode\non small frames (~-31% on small-4k-log-lines, level_7/8/10 lazy, stream\ndecode through the growable RingBuffer) where matches are dense.\n\nEnforce the ceiling on the cold growth path instead: RingBuffer gains a\nmax_capacity lowered per block via set_max_capacity, and its try_reserve\nrejects a reserve that would have to GROW past it. A well-formed block\nis fully covered by the upfront reserve(MAX_BLOCK_SIZE), so its matches\nnever reach the check; only an over-producing match (the bomb) forces a\ngrow and is rejected with OutputBufferOverflow. The guard now bounds the\nOOM on every target (not just the i686 assert path) at zero hot-path\ncost, replacing the per-match BlockOutputExceedsMax check (variant\nremoved).\n\n742 tests pass; i686 builds (the reserve_amortized debug_assert panic\npath is no longer reached for over-production).\n\n* docs(encode): note retire_dictionary_budget saturating_sub is a real clamp\n\nThe dict-budget retire shrinks max_window_size by the reclaimed bytes.\nreclaimed (capped at dictionary_retained_budget) can exceed the CURRENT\nmax_window_size when a prior eviction already shrank the window, so the\nsaturating_sub floor at 0 is the correct clamp, not a masked underflow\nbug. Documented at all four backend arms so the next reader (or audit)\ndoes not mistake it for overflow-masking and convert it to checked_sub,\nwhich panics on the legitimate reclaim>window case\n(dfast_commit_space_eviction_uses_window_size_delta exercises it).\n\n* fix(encode): key dict prime snapshot on resolved matcher shape\n\nCache the post-prime matcher snapshot (CDict-equivalent) keyed on the fully\nresolved matcher shape so repeated dictionary frames restore it (a table copy)\ninstead of re-hashing every dictionary position.\n\nThe key is the resolved LevelParams (window-log cap, HC/Fast table and search\ngeometry, parse depth/target-length baked into the restored storage), the active\nbackend's applied Dfast/Row hash-table width, the compression level, and the\nFast attach-vs-copy mode. Keying on the raw source-size hint, or its ceil-log\nbucket, over-keys: the hint-to-shape mapping is many-to-one (the source-size\nadjustment is monotone in ceil_log2(hint), and Level 22 collapses several\nbuckets onto one donor tier via its 16/128/256 KiB thresholds), so two hints\nthat resolve to the identical matcher would each force a full re-prime.\ntable_window_size is excluded from the key (it varies spuriously for HC levels\nthat ignore it). level stays in the key because some stored state is derived\nfrom the level directly, not through params (Dfast use_fast_loop is true for L3\n/ false for L4 at identical params). fast_attach stays because the 8 KiB\nattach/copy cutoff falls inside a single resolved shape (an 8192 vs 8193 byte\nLevel 1 hint resolves to identical params/table_bits but a different dict-table\nshape), keeping the snapshot identity self-sufficient rather than relying on the\nframe compressor's copy-path gating.\n\nThe fast-attach/copy cutoff is unified on the same ceil-log bucket in the driver\nand the frame compressor's prefer_copy_snapshot gate, comparing\nsource_size_ceil_log(hint) on the full u64 rather than an as-usize cast that\ncould diverge on 32-bit targets. LevelParams/HcConfig/RowConfig gain\nPartialEq/Eq for the comparison. Regression tests cover same-bucket reuse,\nLevel 22 cross-bucket donor-tier reuse, the attach/copy boundary refusal, and\nthe window-mismatch refusal.\n\n* perf(decode): single-compare sequence bounds check + per-block bomb ceiling\n\nExtract the per-sequence output-capacity guard into sequence_output_fits in\nbuffer_backend, used by all six inline exec_sequence variants (FlatBuf and\nUserSliceBackend, each SSE2 / portable / AVX2). Replaces the per-variant\nchecked_add chain with one subtraction and one compare on plain arithmetic:\nlit_length and match_length are each bounded by the maximum FSE LL/ML code\nexpansion (~131 KB) so the sums cannot overflow usize even on 32-bit, and\ntail <= cap holds on entry (Vec len <= capacity for the flat buffer; the\nuser-slice tail only advances past this same check) so cap - tail cannot\nunderflow.\n\nComplete the decompression-bomb ceiling on the growable backends:\n\n- FlatBuf gains a max_capacity field and overrides set_max_capacity +\n  try_reserve so its fallback push/repeat path (taken when the inline slack gate\n  fails) is bounded, mirroring RingBuffer.\n- Both FlatBuf and RingBuffer check the ceiling BEFORE the no-growth fast path,\n  so a write that fits existing capacity (a large pre-reserved FCS buffer, or an\n  over-allocated ring) but exceeds the per-block ceiling is rejected rather than\n  silently admitted.\n- repeat_from_dict now try_reserves before appending dictionary bytes, so a\n  match satisfied from the dictionary is bounded too instead of bypassing the\n  guard via a direct extend.\n\nLength sums in these growth paths use checked/plain arithmetic, not\nsaturating_add, so a broken bound fails at its cause. Adds regression tests for\nthe AVX2 FlatBuf overflow, FlatBuf reserve past the ceiling both with and\nwithout growth, and dict-backed (full and mixed) matches past the ceiling; the\noverflow tests size their literal buffer to lit_length.next_multiple_of(16).\n\n* fix(encode): scope fast_attach to Simple backend in prime snapshot key\n\nThe attach-vs-copy split is a Simple/Fast-backend concept (the 8 KiB dict-table\ncutoff). Recording it in PrimedKey for HashChain/Dfast/Row over-keyed those\nsnapshots: an unhinted capture (fast_attach = true) and a hinted reset that\nresolved to the identical LevelParams keyed differently and forced a needless\nre-prime. Gate the bit on the Simple backend so non-Simple snapshots ignore it.\n\nRegression test captures a HashChain (Best) snapshot with no hint and restores\nit under a large hint that resolves to the same matcher, asserting the restore\nsucceeds.",
+          "timestamp": "2026-06-06T12:23:58+03:00",
+          "tree_id": "5c034342c440dc2a1dd35222c32c4f1cf014bb88",
+          "url": "https://github.com/structured-world/structured-zstd/commit/b8ba38ee124955d5704284ffb565478e51e78952"
+        },
+        "date": 1780741043150,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.128,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.087,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 287.634,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 202.128,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.496,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.51,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.571,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.087,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.436,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 2.023,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.12,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.12,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.02,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 12.827,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.787,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.578,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.299,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.531,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.094,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.607,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.13,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.107,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.237,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.109,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.27,
             "unit": "ms"
           }
         ]
