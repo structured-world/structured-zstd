@@ -1,9 +1,14 @@
-use super::{BETTER_WINDOW_LOG, CompressionLevel};
+use super::CompressionLevel;
 
 pub(crate) const RAW_FAST_PATH_MIN_BLOCK_LEN: usize = 512;
 pub(crate) const RAW_FAST_PATH_MAX_SAMPLE_LEN: usize = 4096;
 pub(crate) const RAW_FAST_PATH_MIN_SAMPLE_LEN: usize = 32;
-const BETTER_WINDOW_SIZE_BYTES: u64 = 1u64 << BETTER_WINDOW_LOG;
+/// Window-size ceiling (8 MiB) above which the incompressible raw-fast-path is
+/// disabled for `Best` / numeric levels: the largest-window levels (L20-22)
+/// do full match-finding even on apparently-incompressible blocks rather than
+/// risk emitting raw blocks where a far back-reference might still pay off.
+const RAW_FAST_PATH_MAX_WINDOW_LOG: u8 = 23;
+const RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES: u64 = 1u64 << RAW_FAST_PATH_MAX_WINDOW_LOG;
 
 // Keep classifier scratch modest for no_std/small-stack targets: 1024 slots
 // cuts per-call stack for repeat tracking from ~8 KiB to ~4 KiB.
@@ -77,8 +82,8 @@ pub(crate) fn compression_level_allows_raw_fast_path(
 ) -> bool {
     match level {
         CompressionLevel::Fastest | CompressionLevel::Default | CompressionLevel::Better => true,
-        CompressionLevel::Best => window_size <= BETTER_WINDOW_SIZE_BYTES,
-        CompressionLevel::Level(_) => window_size <= BETTER_WINDOW_SIZE_BYTES,
+        CompressionLevel::Best => window_size <= RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES,
+        CompressionLevel::Level(_) => window_size <= RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES,
         CompressionLevel::Uncompressed => false,
     }
 }
@@ -324,11 +329,11 @@ mod tests {
     fn best_raw_fast_path_requires_better_sized_window() {
         assert!(compression_level_allows_raw_fast_path(
             CompressionLevel::Best,
-            BETTER_WINDOW_SIZE_BYTES
+            RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES
         ));
         assert!(!compression_level_allows_raw_fast_path(
             CompressionLevel::Best,
-            BETTER_WINDOW_SIZE_BYTES + 1
+            RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES + 1
         ));
     }
 
@@ -336,7 +341,13 @@ mod tests {
     fn level4_row_raw_fast_path_allowed_with_better_window_reach() {
         assert!(compression_level_allows_raw_fast_path(
             CompressionLevel::Level(4),
-            BETTER_WINDOW_SIZE_BYTES
+            RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES
+        ));
+        // Over-cap numeric level is rejected, same boundary as `Best`, so the
+        // two branches can't drift apart.
+        assert!(!compression_level_allows_raw_fast_path(
+            CompressionLevel::Level(4),
+            RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES + 1
         ));
     }
 

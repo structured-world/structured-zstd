@@ -772,7 +772,22 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         let block_capacity = MAX_BLOCK_SIZE as usize;
         let mut start = 0usize;
         while start < input.len() {
-            let end = (start + block_capacity).min(input.len());
+            // Donor `ZSTD_compress_frameChunk`: size each block via the cheap
+            // fingerprint pre-splitter so a full 128 KiB block is cut at a
+            // statistical boundary when it pays. `savings = consumed -
+            // produced` mirrors the donor gate (the first block and
+            // incompressible input keep the full 128 KiB). The borrowed window
+            // already spans the whole input, so a smaller block is just a
+            // narrower `(block_start, block_end)` range into it.
+            let savings = start as i64 - all_blocks.len() as i64;
+            let block_len = optimal_block_size(
+                self.compression_level,
+                &input[start..],
+                input.len() - start,
+                block_capacity,
+                savings,
+            );
+            let end = (start + block_len).min(input.len());
             let block = &input[start..end];
             let last_block = end == input.len();
             #[cfg(feature = "hash")]
@@ -3208,28 +3223,42 @@ mod tests {
     }
 
     /// `level_pre_split` resolves the per-level split knob through the
-    /// `LevelParams` table, with named presets as pure numeric aliases:
-    /// greedy (level 5) → 1, btopt/btultra/btultra2 (16..=22) → 4. Fast,
-    /// dfast and the lazy band stay unsplit (lazy split is deferred until
-    /// the per-block entropy path reuses tables like the reference).
+    /// `LevelParams` table, mirroring the donor `splitLevels[]` by strategy
+    /// (`ZSTD_optimalBlockSize`): fast → 0 (from-borders), dfast → 1,
+    /// greedy/lazy → 2, lazy2/btlazy2 (Lazy tag at depth 2) → 3,
+    /// btopt/btultra/btultra2 → 4. `Uncompressed` has no numeric level so it
+    /// stays `None`.
     #[test]
     fn pre_split_level_dispatches_by_compression_level() {
         use crate::encoding::CompressionLevel;
         use crate::encoding::match_generator::level_pre_split;
         assert_eq!(level_pre_split(CompressionLevel::Uncompressed), None);
-        assert_eq!(level_pre_split(CompressionLevel::Fastest), None);
-        assert_eq!(level_pre_split(CompressionLevel::Default), None);
-        // Better is a pure alias for level 7 (lazy): unsplit, same as Level(7).
+        // Fastest = level 1 (fast) → 0 (from-borders).
+        assert_eq!(level_pre_split(CompressionLevel::Fastest), Some(0));
+        // Default = level 3 (dfast) → 1.
+        assert_eq!(level_pre_split(CompressionLevel::Default), Some(1));
+        // Better is a pure alias for level 7 (lazy): same as Level(7).
         assert_eq!(
             level_pre_split(CompressionLevel::Better),
             level_pre_split(CompressionLevel::Level(7)),
         );
-        assert_eq!(level_pre_split(CompressionLevel::Level(4)), None);
-        assert_eq!(level_pre_split(CompressionLevel::Level(5)), Some(1));
-        assert_eq!(level_pre_split(CompressionLevel::Level(7)), None);
-        assert_eq!(level_pre_split(CompressionLevel::Level(15)), None);
-        assert_eq!(level_pre_split(CompressionLevel::Level(16)), Some(4));
-        assert_eq!(level_pre_split(CompressionLevel::Level(22)), Some(4));
+        // Best is a pure alias for level 11 (lazy): pin it to the numeric
+        // route so the named path can't drift from the pre-split table.
+        assert_eq!(
+            level_pre_split(CompressionLevel::Best),
+            level_pre_split(CompressionLevel::Level(11)),
+        );
+        assert_eq!(level_pre_split(CompressionLevel::Level(2)), Some(0)); // fast
+        assert_eq!(level_pre_split(CompressionLevel::Level(4)), Some(1)); // dfast
+        assert_eq!(level_pre_split(CompressionLevel::Level(5)), Some(2)); // greedy
+        assert_eq!(level_pre_split(CompressionLevel::Level(7)), Some(2)); // lazy (depth 1)
+        assert_eq!(level_pre_split(CompressionLevel::Level(8)), Some(3)); // lazy2 lower bound
+        assert_eq!(level_pre_split(CompressionLevel::Level(11)), Some(3)); // lazy2 (depth 2)
+        assert_eq!(level_pre_split(CompressionLevel::Level(12)), Some(3)); // lazy2 upper bound
+        assert_eq!(level_pre_split(CompressionLevel::Level(13)), Some(3)); // btlazy2 lower bound
+        assert_eq!(level_pre_split(CompressionLevel::Level(15)), Some(3)); // btlazy2 (depth 2)
+        assert_eq!(level_pre_split(CompressionLevel::Level(16)), Some(4)); // btopt
+        assert_eq!(level_pre_split(CompressionLevel::Level(22)), Some(4)); // btultra2
     }
 
     /// End-to-end: a 256 KB payload whose SECOND 128 KB donor block carries
@@ -3298,6 +3327,69 @@ mod tests {
         let mut decoded = Vec::with_capacity(data.len());
         decoder.collect_to_writer(&mut decoded).unwrap();
         assert_eq!(decoded, data, "roundtrip must reproduce the input verbatim");
+    }
+
+    /// Outside-diff coverage for the FAST one-shot path.
+    /// `compress_slice_to_vec` / `compress_independent_frame` on a Fast level
+    /// routes through `run_borrowed_block_loop` (not the owned loop the test
+    /// above covers), which must honour `optimal_block_size` and emit a
+    /// sub-`MAX_BLOCK_SIZE` boundary rather than fixed 128 KiB blocks. A
+    /// 256 KiB input is two 128 KiB blocks when unsplit; a chunk boundary in
+    /// the second block yields >= 3 decoded blocks, asserted on the round-trip.
+    #[test]
+    fn fast_oneshot_borrowed_split_emits_subblock() {
+        use crate::encoding::CompressionLevel;
+        // First 192 KiB: homogeneous zero run (banks the savings the split
+        // gate needs). The second 128 KiB block flips to a counter sequence
+        // at its 64 KiB midpoint (the 192 KiB mark) — a fingerprint
+        // transition the Fast from-borders splitter (split level 0) resolves
+        // into a sub-block boundary.
+        let mut data = vec![0u8; 256 * 1024];
+        for (i, byte) in data.iter_mut().enumerate() {
+            if i >= 192 * 1024 {
+                *byte = (i % 251 + 1) as u8;
+            }
+        }
+
+        // Pin the splitter decision for the Fast path directly (mirrors the
+        // greedy test): the second donor block must resolve to a sub-block
+        // boundary, so the >= 3 block count below cannot pass vacuously.
+        let second_block = &data[128 * 1024..];
+        assert!(
+            super::optimal_block_size(
+                CompressionLevel::Fastest,
+                second_block,
+                second_block.len(),
+                MAX_BLOCK_SIZE as usize,
+                100,
+            ) < MAX_BLOCK_SIZE as usize,
+            "fixture must resolve to a sub-block split in the second donor block",
+        );
+
+        // Drive the borrowed one-shot route explicitly (Fast level ->
+        // run_borrowed_block_loop via compress_independent_frame).
+        let mut compressor: FrameCompressor = FrameCompressor::new(CompressionLevel::Fastest);
+        let frame = compressor.compress_independent_frame(&data);
+
+        let mut decoder = FrameDecoder::new();
+        let mut source = frame.as_slice();
+        decoder
+            .reset(&mut source)
+            .expect("frame header should parse");
+        while !decoder.is_finished() {
+            decoder
+                .decode_blocks(&mut source, crate::decoding::BlockDecodingStrategy::All)
+                .expect("decode should succeed");
+        }
+        let mut decoded = Vec::with_capacity(data.len());
+        decoder.collect_to_writer(&mut decoded).unwrap();
+        assert_eq!(decoded, data, "roundtrip must reproduce the input verbatim");
+        assert!(
+            decoder.blocks_decoded() >= 3,
+            "fast one-shot borrowed path must split the second donor block \
+             (256 KiB unsplit = 2 blocks), got {} blocks",
+            decoder.blocks_decoded(),
+        );
     }
 
     /// Regression: `set_compression_level` followed by `compress()` must

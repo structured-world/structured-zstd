@@ -312,6 +312,21 @@ impl BufferBackend for FlatBuf {
         Ok(())
     }
 
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn inline_exec_base_ptr(&mut self) -> *mut u8 {
+        self.buf.as_mut_ptr()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn inline_exec_commit(&mut self, new_tail: usize) {
+        // The macro wrote `[buf.len(), new_tail)`; grow the Vec to expose it.
+        // SAFETY: new_tail <= capacity (sequence_output_fits validated it) and
+        // `[0, new_tail)` is now initialised.
+        unsafe { self.buf.set_len(new_tail) };
+    }
+
     fn new() -> Self {
         Self {
             buf: Vec::new(),
@@ -662,8 +677,10 @@ mod tests {
     /// offsets across the SSE2/AVX2 threshold boundary
     /// (offset 20 routes to SSE2 16-byte path, offset 32 to AVX2
     /// 32-byte ymm path, offset 64 to deep AVX2 path).
-    // AVX2 override is x86_64-only; this test calls it directly.
-    #[cfg(target_arch = "x86_64")]
+    // AVX2 override is x86_64-only; this test calls it directly. The `std`
+    // feature gate is required: `is_x86_feature_detected!` is `std`-only,
+    // unavailable in the crate's `#![no_std]` build.
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
     #[test]
     fn exec_sequence_inline_avx2_offset_boundary_correctness() {
         if !std::arch::is_x86_feature_detected!("avx2") {
@@ -735,7 +752,8 @@ mod tests {
     /// when the requested write plus the 31-byte overshoot exceeds the
     /// remaining headroom. Guards the single-compare bounds check on the AVX2
     /// hot path.
-    #[cfg(target_arch = "x86_64")]
+    // `std` feature gate required: `is_x86_feature_detected!` is `std`-only.
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
     #[test]
     fn exec_sequence_inline_avx2_capacity_overflow_returns_err() {
         if !std::arch::is_x86_feature_detected!("avx2") {

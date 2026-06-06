@@ -472,6 +472,18 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         Ok(())
     }
 
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn inline_exec_base_ptr(&mut self) -> *mut u8 {
+        self.slice.as_mut_ptr()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn inline_exec_commit(&mut self, new_tail: usize) {
+        self.tail = new_tail;
+    }
+
     /// `new()` exists for trait conformance but is not used on the
     /// direct-decode path — the slice is always provided up-front via
     /// [`Self::from_slice`]. Returns an empty backend wrapping an
@@ -1261,7 +1273,9 @@ mod tests {
     /// - offset 64 (deep AVX2 path)
     ///
     /// against a byte-by-byte reference of the same repeat semantics.
-    #[cfg(target_arch = "x86_64")]
+    // `std` feature gates the test: `is_x86_feature_detected!` is `std`-only
+    // (runtime CPU detection), unavailable in the crate's `#![no_std]` build.
+    #[cfg(all(target_arch = "x86_64", feature = "std"))]
     #[test]
     fn exec_sequence_inline_avx2_offset_boundary_correctness() {
         if !std::arch::is_x86_feature_detected!("avx2") {

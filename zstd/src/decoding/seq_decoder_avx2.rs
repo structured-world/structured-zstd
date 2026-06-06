@@ -18,6 +18,7 @@
 
 use super::buffer_backend::BufferBackend;
 use super::decode_buffer::DecodeBuffer;
+use super::exec_sequence_inline::exec_sequence_avx2_inline;
 use super::scratch::FSEScratch;
 use super::sequence_section_decoder::{
     ADVANCE, ADVANCE_MASK, ExecSeq, SeqStreamSetup, init_sequence_stream,
@@ -78,8 +79,8 @@ macro_rules! decode_one_body {
     }};
 }
 
-/// Textual expansion of per-sequence execute. Fast path:
-/// `exec_sequence_inline_avx2` (32-byte ymm wildcopy). Cold path: legacy
+/// Textual expansion of per-sequence execute. Fast path: the inlined AVX2
+/// match-copy macro [`exec_sequence_avx2_inline`]. Cold path: legacy
 /// try_push + repeat_lookahead_prefetched. Expands as a statement-block
 /// returning `Result<(), DecompressBlockError>` so the caller can `?`
 /// or branch on it as needed.
@@ -143,15 +144,15 @@ macro_rules! execute_one_body {
                 if prefix_end_ok {
                     // SAFETY: parent-slice provenance; offset prefix-resident.
                     let lit_src = unsafe { $literals_buffer.as_ptr().add(lit_cur_before) };
-                    // SAFETY: enclosing fn carries target_feature(bmi2,avx2).
-                    let r = unsafe {
-                        $buffer.buffer_mut().exec_sequence_inline_avx2(
-                            lit_src,
-                            seq_ll_v as usize,
-                            offset,
-                            seq_ml_v as usize,
-                        )
-                    };
+                    // Inline the AVX2 exec body at the call site (no trait-method
+                    // call boundary; see `exec_sequence_avx2_inline`).
+                    let r = exec_sequence_avx2_inline!(
+                        $buffer,
+                        lit_src,
+                        seq_ll_v as usize,
+                        offset,
+                        seq_ml_v as usize
+                    );
                     break 'exec_inner r.map_err(DecompressBlockError::ExecuteSequencesError);
                 }
             }
