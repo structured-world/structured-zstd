@@ -202,19 +202,13 @@ impl RingBuffer {
         &mut self,
         amount: usize,
     ) -> Result<(), super::buffer_backend::BackendOverflow> {
-        // Flat fast path (mirrors `reserve`): no wrap and the write fits
-        // below `cap` — capacity already present, no growth, no ceiling
-        // check.
-        if self.head <= self.tail && amount < self.cap.saturating_sub(self.tail) {
-            return Ok(());
-        }
-        let free = self.free();
-        if free >= amount {
-            return Ok(());
-        }
-        // Growth is required. Reject if it would cross the per-block
-        // ceiling before allocating (bounds the bomb on every target,
-        // unlike a 32-bit-only assert).
+        // Enforce the per-block ceiling FIRST, before the no-growth fast
+        // paths: the ceiling bounds this block's OUTPUT, not just allocation,
+        // so a write past it must be rejected even when it fits the ring's
+        // current capacity (a large window or an over-allocated ring can have
+        // more than `MAX_BLOCK_SIZE` of slack). Bounds the bomb on every target
+        // unlike a 32-bit-only assert; `max_capacity = usize::MAX` between
+        // blocks makes this a no-op for unbounded callers.
         if self
             .len()
             .checked_add(amount)
@@ -225,6 +219,16 @@ impl RingBuffer {
                 requested: amount,
                 capacity: self.max_capacity,
             });
+        }
+        // Within the ceiling: fast paths when capacity is already present.
+        // Flat fast path (mirrors `reserve`): no wrap and the write fits below
+        // `cap` — capacity already present, no growth.
+        if self.head <= self.tail && amount < self.cap.saturating_sub(self.tail) {
+            return Ok(());
+        }
+        let free = self.free();
+        if free >= amount {
+            return Ok(());
         }
         self.reserve_amortized(amount - free);
         Ok(())

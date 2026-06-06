@@ -120,11 +120,18 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     /// cold growth path instead of growing the ring to gigabytes (a
     /// decompression-bomb OOM) before the post-block validity check runs.
     /// Called once per block by the sequence decoder, before the sequence
-    /// loop. Backends that cannot grow unbounded (fixed-capacity, or the
-    /// inline-exec FCS-capped path) take the trait's no-op default.
+    /// loop. The growable backends (`RingBuffer`, `FlatBuf`) enforce it in
+    /// `try_reserve`; fixed-capacity backends (`UserSliceBackend`) are already
+    /// bounded and take the trait's no-op default.
     #[inline]
     pub(crate) fn set_block_output_ceiling(&mut self, max_block_output: usize) {
-        let ceiling = self.buffer.len().saturating_add(max_block_output);
+        // Plain add (not saturating): `len()` is the bytes decoded so far and
+        // `max_block_output` is one block's `MAX_BLOCK_SIZE` (128 KiB), so the
+        // sum is nowhere near `usize::MAX` — overflow is unreachable. Saturating
+        // would silently turn the ceiling into `usize::MAX` (no guard at all)
+        // if that invariant were ever broken, masking the bug instead of
+        // tripping the debug overflow check at its cause.
+        let ceiling = self.buffer.len() + max_block_output;
         self.buffer.set_max_capacity(ceiling);
     }
 
@@ -788,6 +795,21 @@ impl<B: BufferBackend> DecodeBuffer<B> {
                 });
             }
 
+            // Enforce the per-block bomb ceiling on the dictionary-backed
+            // output too: the `extend` below appends `dict_slice` directly
+            // (the inline `push`/`repeat` guard never runs for it), so without
+            // this an over-producing match satisfied from the dictionary could
+            // grow past the armed ceiling. Reserving the full `match_length`
+            // covers both the dict portion here and the buffer-history
+            // remainder the recursive `repeat` appends.
+            self.buffer.try_reserve(match_length).map_err(|o| {
+                DecodeBufferError::OutputBufferOverflow {
+                    tail: o.tail,
+                    requested: o.requested,
+                    capacity: o.capacity,
+                }
+            })?;
+
             if bytes_from_dict < match_length {
                 let dict_slice = &dict_content[dict_len - bytes_from_dict..];
                 prefetch::prefetch_slice(dict_slice);
@@ -1333,6 +1355,51 @@ mod tests {
             .repeat(4, 8)
             .expect("6 + 8 = 14 == ceiling is allowed");
         assert_eq!(decode_buf.len(), 14);
+    }
+
+    #[test]
+    fn repeat_from_dict_rejects_output_past_block_ceiling() {
+        // A match satisfied (fully or partially) from the dictionary appends
+        // `dict_slice` directly via `buffer.extend`, bypassing the inline
+        // push/repeat guard. The per-block bomb ceiling must still bound it, so
+        // a dict-backed over-producing match returns `OutputBufferOverflow`
+        // instead of growing the buffer toward OOM.
+        let dict = || {
+            crate::decoding::dictionary::DictionaryHandle::from_dictionary(
+                crate::decoding::dictionary::Dictionary::from_raw_content(
+                    1,
+                    alloc::vec![0xABu8; 256],
+                )
+                .unwrap(),
+            )
+        };
+
+        // Fully-dictionary match: empty buffer, offset reaches into the dict.
+        let mut full = DecodeBuffer::<RingBuffer>::new(4 * 1024);
+        full.set_dict(dict());
+        full.set_block_output_ceiling(8); // max_capacity = 0 + 8 = 8
+        let err = full.repeat(200, 100).unwrap_err(); // 0 + 100 > 8, all from dict
+        assert!(
+            matches!(
+                err,
+                crate::decoding::errors::DecodeBufferError::OutputBufferOverflow { .. }
+            ),
+            "fully-dictionary over-producing match must be rejected, got {err:?}"
+        );
+
+        // Mixed match: part from dict, remainder from buffer history.
+        let mut mixed = DecodeBuffer::<RingBuffer>::new(4 * 1024);
+        mixed.set_dict(dict());
+        mixed.push(b"abcd"); // len = 4
+        mixed.set_block_output_ceiling(8); // max_capacity = 4 + 8 = 12
+        let err = mixed.repeat(10, 100).unwrap_err(); // 6 from dict + rest, 4 + 100 > 12
+        assert!(
+            matches!(
+                err,
+                crate::decoding::errors::DecodeBufferError::OutputBufferOverflow { .. }
+            ),
+            "mixed dict+buffer over-producing match must be rejected, got {err:?}"
+        );
     }
 
     #[test]

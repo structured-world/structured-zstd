@@ -39,6 +39,44 @@ use crate::io::{Error, Read};
 /// slack contract cannot drift between backends.
 pub(crate) const WILDCOPY_OVERLENGTH: usize = 32;
 
+/// Single-compare output-capacity guard for the inline sequence-exec hot
+/// path, shared by every [`BufferBackend::exec_sequence_inline`] /
+/// `exec_sequence_inline_avx2` override so the per-sequence bounds check has
+/// one implementation instead of a duplicated `checked_add` chain.
+///
+/// Returns `lit_length + match_length` when the literal+match write plus
+/// `overshoot` bytes of SIMD wildcopy slack fits within `cap - tail`;
+/// otherwise [`ExecuteSequencesError::OutputBufferOverflow`](super::errors::ExecuteSequencesError::OutputBufferOverflow).
+///
+/// # Preconditions
+/// - `tail <= cap`, so `cap - tail` cannot underflow. Holds for every
+///   backend: `Vec::len() <= Vec::capacity()` on the flat / growable buffers,
+///   and the user-slice tail only ever advances past this same check.
+/// - `lit_length` and `match_length` are each bounded by the maximum FSE
+///   LL/ML code expansion (~131 KB), so `total` and `total + overshoot`
+///   cannot overflow `usize` even on 32-bit.
+///
+/// Each caller documents why the first precondition holds at its site; the
+/// arithmetic safety of the second is the same FSE bound everywhere.
+#[inline(always)]
+pub(crate) fn sequence_output_fits(
+    lit_length: usize,
+    match_length: usize,
+    tail: usize,
+    cap: usize,
+    overshoot: usize,
+) -> Result<usize, super::errors::ExecuteSequencesError> {
+    let total = lit_length + match_length;
+    if total + overshoot > cap - tail {
+        return Err(super::errors::ExecuteSequencesError::OutputBufferOverflow {
+            tail,
+            requested: total,
+            capacity: cap,
+        });
+    }
+    Ok(total)
+}
+
 /// Storage operations the decoder needs from its output buffer.
 ///
 /// The trait surface mirrors the historical `RingBuffer` API the
@@ -227,12 +265,12 @@ pub(crate) trait BufferBackend: Sized {
     }
 
     /// Lower the per-block growth ceiling on backends whose `try_reserve`
-    /// may grow without bound (the streaming `RingBuffer`). The block
-    /// sequence decoder sets it to `len + MAX_BLOCK_SIZE` per block so an
-    /// over-producing match is rejected on the cold growth path,
-    /// bounding decompression-bomb OOMs. Default no-op: fixed-capacity
-    /// backends are already bounded, and the inline-exec (FCS-capped)
-    /// path never grows through `try_reserve`.
+    /// may grow without bound. The block sequence decoder sets it to
+    /// `len + MAX_BLOCK_SIZE` per block so an over-producing match is rejected
+    /// on the cold growth path, bounding decompression-bomb OOMs. Overridden by
+    /// the streaming `RingBuffer` and the growable `FlatBuf` (whose fallback
+    /// `push`/`repeat` path grows through `try_reserve`). Default no-op for
+    /// fixed-capacity backends (`UserSliceBackend`), which are already bounded.
     fn set_max_capacity(&mut self, _max_capacity: usize) {}
 
     /// Live byte count: bytes between the logical head and tail.
