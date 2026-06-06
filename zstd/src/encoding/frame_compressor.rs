@@ -1436,18 +1436,27 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 None => return,
             };
             // Decompressed (regenerated) size, captured per physical block
-            // during emit (1:1 with the wire blocks scanned here). Raw/RLE
-            // are also wire-derivable (`block_size_field`); fall back to that
-            // if the sidecar is somehow short, and to 0 for a Compressed
-            // block whose size is not on the wire.
-            let decompressed_size = self
-                .block_decompressed_sizes
-                .get(blocks.len())
-                .copied()
-                .unwrap_or(match block_type {
-                    BT::Raw | BT::RLE => block_size_field,
-                    _ => 0,
-                });
+            // during emit (1:1 with the wire blocks scanned here). Raw/RLE are
+            // wire-derivable (`block_size_field`), so a short sidecar still
+            // yields the correct value for them. A Compressed block's size is
+            // NOT on the wire: if the sidecar is missing its entry, fabricating
+            // 0 would publish a silently-wrong `decompressed_byte_range`. Since
+            // this metadata is the authoritative mapping for a successful
+            // encode, bail out (leave `frame_emit_info` at `None`) rather than
+            // hand back a corrupt layout; the 1:1 push invariant makes this
+            // unreachable in practice (debug_assert catches a regression).
+            let decompressed_size = match self.block_decompressed_sizes.get(blocks.len()).copied() {
+                Some(size) => size,
+                None if matches!(block_type, BT::Raw | BT::RLE) => block_size_field,
+                None => {
+                    debug_assert!(
+                        false,
+                        "missing decompressed-size sidecar entry for compressed block {}",
+                        blocks.len()
+                    );
+                    return;
+                }
+            };
             blocks.push(FrameBlock {
                 offset_in_frame,
                 header_size: 3,
@@ -3209,6 +3218,26 @@ mod tests {
                     u64::from(info.blocks[i].decompressed_size),
                     range.end - range.start,
                     "block {i} decompressed_size must equal its range width ({level:?})"
+                );
+                // Validate the mapping against REAL per-block bytes, not just
+                // prefix-sum consistency: decode block `i` alone and require it
+                // to equal the corresponding slice of the full decode. A
+                // sidecar that swapped sizes between adjacent blocks (same sum,
+                // same contiguity) would fail here.
+                let mut psrc = compressed.as_slice();
+                let mut pdec = FrameDecoder::new();
+                pdec.reset(&mut psrc).unwrap();
+                let pd = pdec
+                    .decode_blocks_partial(&mut psrc, i as u32, i as u32 + 1)
+                    .unwrap();
+                assert!(
+                    pd.stopped_at.is_none(),
+                    "block {i} must decode cleanly ({level:?})"
+                );
+                assert_eq!(
+                    pd.data.as_slice(),
+                    &decoded[range.start as usize..range.end as usize],
+                    "block {i} partial-decode bytes must equal the full-decode slice ({level:?})"
                 );
                 expected_start = range.end;
             }
