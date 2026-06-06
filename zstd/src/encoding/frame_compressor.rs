@@ -953,17 +953,27 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             //     whole table would cost MORE than the sparse re-prime here,
             //     which is exactly why the donor attaches by reference instead).
             // `attachDictSizeCutoffs` per strategy: fast 8K, dfast 16K,
-            // greedy/lazy/btopt 32K, btultra/btultra2 8K.
-            let cutoff = match self.state.strategy_tag {
+            // greedy/lazy/btopt 32K, btultra/btultra2 8K. Expressed as the
+            // ceil-log bucket (8K = 2^13, 16K = 2^14, 32K = 2^15) so the
+            // decision uses the SAME bucketed representation as the driver's
+            // attach/copy gate (`reset_size_log`) — comparing
+            // `source_size_ceil_log(hint)` on the full u64 avoids the `as usize`
+            // truncation that could diverge from the driver on 32-bit targets.
+            // For a power-of-two cutoff `2^k`, `ceil_log2(hint) > k` is exactly
+            // `hint > 2^k`, so this is identical to the raw `hint > cutoff` on
+            // 64-bit.
+            let cutoff_log = match self.state.strategy_tag {
                 crate::encoding::strategy::StrategyTag::Fast
                 | crate::encoding::strategy::StrategyTag::BtUltra
-                | crate::encoding::strategy::StrategyTag::BtUltra2 => 8 * 1024,
-                crate::encoding::strategy::StrategyTag::Dfast => 16 * 1024,
+                | crate::encoding::strategy::StrategyTag::BtUltra2 => 13,
+                crate::encoding::strategy::StrategyTag::Dfast => 14,
                 crate::encoding::strategy::StrategyTag::Greedy
                 | crate::encoding::strategy::StrategyTag::Lazy
-                | crate::encoding::strategy::StrategyTag::BtOpt => 32 * 1024,
+                | crate::encoding::strategy::StrategyTag::BtOpt => 15,
             };
-            let prefer_copy_snapshot = initial_size_hint.is_some_and(|s| s as usize > cutoff);
+            let prefer_copy_snapshot = initial_size_hint.is_some_and(|s| {
+                crate::encoding::match_generator::source_size_ceil_log(s) > cutoff_log
+            });
             let restored = prefer_copy_snapshot
                 && self
                     .state
