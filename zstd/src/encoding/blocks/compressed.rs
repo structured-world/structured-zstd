@@ -365,59 +365,66 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
     state.block_scratch = scratch;
 }
 
-/// Append `lits` to `dst` using inline byte / u64 ops for short
-/// slices, avoiding the libc memmove call overhead that
-/// `Vec::extend_from_slice` lowers to for runtime-sized
-/// `ptr::copy_nonoverlapping`. Fast L1 emits literal runs of 1-10
-/// bytes typically — at thousands of sequences per block, the per-
-/// emit libc call dominated the hot path (flamegraph: 60 % of CPU
-/// in `__memmove_avx_unaligned_erms` chain).
+/// Literal-run length at or above which `append_literals` hands off to
+/// `Vec::extend_from_slice` (libc `memcpy` → ERMS `rep movsb` on x86).
+/// Below it the inline exact-copy loop wins (no libc call + ERMS startup
+/// cost); at/above it the copy is bandwidth-bound and ERMS is faster.
+/// Mirrors `simd_copy::BULK_MEMCPY_THRESHOLD` (the match-copy crossover).
+const LITERAL_INLINE_COPY_MAX: usize = 2048;
+
+/// Append `lits` to `dst` using inline copy ops, avoiding the libc
+/// memcpy call overhead that `Vec::extend_from_slice` lowers to for
+/// runtime-sized `ptr::copy_nonoverlapping`. Fast L1 emits literal runs
+/// of 1-10 bytes typically — at thousands of sequences per block, the
+/// per-emit libc call dominated the hot path (flamegraph:
+/// `__memmove_avx_unaligned_erms` chain ≈ 16 % of L1 encode CPU).
 ///
-/// Route through `simd_copy::copy_bytes_overshooting` with src.1 ==
-/// dst.1 == lit_len (no overshoot READ; we don't know how much
-/// readable slack the caller's slice has). For lit_len ≤ 32 that
-/// drops into the byte-by-byte / overlapping-u64 path, fully
-/// inlineable. Larger runs fall through `extend_from_slice` —
-/// they're rare and libc memmove amortises across the longer copy.
+/// - `len ≤ 32`: `simd_copy::copy_bytes_overshooting` with
+///   `src.1 == dst.1 == lit_len` (no overshoot READ — the caller's slice
+///   readable slack is unknown), which drops into the byte / overlapping-
+///   u64 path, fully inlineable.
+/// - `32 < len < 2048`: `simd_copy::copy_exact_medium` — the widest
+///   available SIMD tier (AVX2 32B / SSE2 16B / NEON / scalar) doing an
+///   EXACT copy (floor bulk + overlapping tier-width tail), the safe
+///   donor-wildcopy analog: matches glibc's store width but drops the
+///   libc call, and never overshoots reads (borrowed-input safe).
+/// - `len ≥ 2048`: `extend_from_slice` — bandwidth-bound, ERMS wins.
 #[inline]
 fn append_literals(dst: &mut Vec<u8>, lits: &[u8]) {
     let lit_len = lits.len();
     if lit_len == 0 {
         return;
     }
-    if lit_len <= 32 {
-        // Production callers (`collect_block_parts`) pre-reserve
-        // `src_len` of spare capacity, so the sum of all literal
-        // runs across a block fits without grow. But this is a SAFE
-        // fn (module-private; callers in this same file are the
-        // only ones today, but the safety net still must hold), so
-        // we enforce the precondition in release too — otherwise a
-        // future caller skipping the pre-reserve would get an
-        // immediate 32-byte OOB write into whatever follows the
-        // `Vec`'s allocation. The branch is cold on the production
-        // hot path (debug_assert in tests confirms it stays
-        // untaken).
-        let cur_len = dst.len();
-        if dst.capacity() - cur_len < lit_len {
-            dst.reserve(lit_len);
-        }
-        let dst_ptr = unsafe { dst.as_mut_ptr().add(cur_len) };
-        // SAFETY: `lits` is a valid slice (so reading `lit_len`
-        // bytes from `lits.as_ptr()` is in-bounds); the
-        // `dst.reserve(lit_len)` above guarantees `dst_ptr` has
-        // `lit_len` bytes of spare capacity. copy_bytes_overshooting
-        // writes EXACTLY `lit_len` bytes when
-        // `min(src.1, dst.1) == lit_len`.
-        unsafe {
+    if lit_len >= LITERAL_INLINE_COPY_MAX {
+        dst.extend_from_slice(lits);
+        return;
+    }
+    // Production callers (`collect_block_parts`) pre-reserve `src_len` of
+    // spare capacity, so the sum of all literal runs across a block fits
+    // without grow. This is a SAFE fn, so enforce the precondition in
+    // release too — a future caller skipping the pre-reserve would
+    // otherwise get an OOB write past the `Vec`'s allocation. The branch
+    // is cold on the production hot path.
+    let cur_len = dst.len();
+    if dst.capacity() - cur_len < lit_len {
+        dst.reserve(lit_len);
+    }
+    let dst_ptr = unsafe { dst.as_mut_ptr().add(cur_len) };
+    // SAFETY: `lits` is a valid slice (reading `lit_len` bytes from
+    // `lits.as_ptr()` is in-bounds); the `dst.reserve(lit_len)` above
+    // guarantees `dst_ptr` has `lit_len` bytes of spare capacity. Both
+    // paths write EXACTLY `lit_len` bytes (no overshoot).
+    unsafe {
+        if lit_len <= 32 {
             crate::decoding::simd_copy::copy_bytes_overshooting(
                 (lits.as_ptr(), lit_len),
                 (dst_ptr, lit_len),
                 lit_len,
             );
-            dst.set_len(cur_len + lit_len);
+        } else {
+            crate::decoding::simd_copy::copy_exact_medium(lits.as_ptr(), dst_ptr, lit_len);
         }
-    } else {
-        dst.extend_from_slice(lits);
+        dst.set_len(cur_len + lit_len);
     }
 }
 

@@ -885,10 +885,331 @@ unsafe fn copy_neon(mut src: *const u8, mut dst: *mut u8, len: usize) {
     }
 }
 
+/// AVX2 (32-byte) inline exact copy: 32-byte unaligned stores for the
+/// floor-aligned bulk plus one **overlapping** 32-byte store ending exactly
+/// at `len`. Reads and writes strictly `[0, len)` (no read-overshoot), so it
+/// is safe for sources without WILDCOPY slack (encoder literal slices into
+/// possibly-borrowed input). No `#[target_feature]` attribute: this is only
+/// compiled when the whole crate is built with AVX2 enabled
+/// (`cfg(target_feature = "avx2")`, e.g. `-C target-cpu=x86-64-v3`), so the
+/// intrinsics are legal and the body **inlines into the caller** with no ABI
+/// boundary and no runtime detect. Requires `len >= 33` (the `append_literals`
+/// `> 32` gate), so the overlapping 32-byte tail never underflows.
+///
+/// **Unrolled 2×32B (64 B/iter)** to match `copy_avx2`'s kernel shape: a
+/// single-store-per-iter loop is throughput-bound by the loop branch on long
+/// runs (measured: it degraded vs libc for `len > 128`); two independent
+/// load/store pairs per iteration expose ILP and amortise the branch.
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    target_feature = "avx2",
+    feature = "kernel_avx2"
+))]
+#[inline]
+unsafe fn copy_exact_inline_avx2(src: *const u8, dst: *mut u8, len: usize) {
+    debug_assert!(len >= 33, "copy_exact_inline_avx2 requires len >= 33");
+    unsafe {
+        if len <= 64 {
+            // 33..=64: two overlapping 32B blocks, BRANCHLESS. glibc's tiny
+            // path beats a per-block loop here purely on the loop's branch
+            // overhead (measured: a loop lost +23% to glibc at len=40, the
+            // dominant medium bucket); the straight-line 2-store form ties /
+            // beats it. Load both before storing — regions don't overlap in
+            // src, and the dst overlap is store-after-store (last wins).
+            let a = _mm256_loadu_si256(src.cast::<__m256i>());
+            let b = _mm256_loadu_si256(src.add(len - 32).cast::<__m256i>());
+            _mm256_storeu_si256(dst.cast::<__m256i>(), a);
+            _mm256_storeu_si256(dst.add(len - 32).cast::<__m256i>(), b);
+        } else if len <= 128 {
+            // 65..=128: head 64 + tail 64 (overlapping), branchless 4 stores.
+            let a = _mm256_loadu_si256(src.cast::<__m256i>());
+            let b = _mm256_loadu_si256(src.add(32).cast::<__m256i>());
+            let c = _mm256_loadu_si256(src.add(len - 64).cast::<__m256i>());
+            let d = _mm256_loadu_si256(src.add(len - 32).cast::<__m256i>());
+            _mm256_storeu_si256(dst.cast::<__m256i>(), a);
+            _mm256_storeu_si256(dst.add(32).cast::<__m256i>(), b);
+            _mm256_storeu_si256(dst.add(len - 64).cast::<__m256i>(), c);
+            _mm256_storeu_si256(dst.add(len - 32).cast::<__m256i>(), d);
+        } else {
+            // >128: 2×32B-unrolled 64 B/iter loop, then an EXACT 32B cleanup
+            // loop, then at most one overlapping 32B tail. The tail overlaps
+            // the preceding block by <=31 bytes and fires AT MOST ONCE — unlike
+            // a 2×32B tail whose first store overlaps the block the 64B loop
+            // JUST wrote, which on Skylake hits a store-buffer partial-overlap
+            // penalty every iteration (measured +69% at len=800 vs this form).
+            let mut o = 0usize;
+            while o + 64 <= len {
+                let v0 = _mm256_loadu_si256(src.add(o).cast::<__m256i>());
+                let v1 = _mm256_loadu_si256(src.add(o + 32).cast::<__m256i>());
+                _mm256_storeu_si256(dst.add(o).cast::<__m256i>(), v0);
+                _mm256_storeu_si256(dst.add(o + 32).cast::<__m256i>(), v1);
+                o += 64;
+            }
+            while o + 32 <= len {
+                let v = _mm256_loadu_si256(src.add(o).cast::<__m256i>());
+                _mm256_storeu_si256(dst.add(o).cast::<__m256i>(), v);
+                o += 32;
+            }
+            if o < len {
+                let t = len - 32;
+                let v = _mm256_loadu_si256(src.add(t).cast::<__m256i>());
+                _mm256_storeu_si256(dst.add(t).cast::<__m256i>(), v);
+            }
+        }
+    }
+}
+
+/// SSE2 inline exact copy for **i686** (`target_arch = "x86"`, SSE2 baseline)
+/// — 16-byte-width analog of [`copy_exact_inline_avx2`] (branchless size-class
+/// for `len <= 64`, then 2×16B-unrolled loop + exact cleanup + one overlapping
+/// 16B tail). On 32-bit x86 the libc-memcpy call is relatively MORE expensive
+/// (cdecl stack args, few registers), so inlining wins even vs glibc's tuned
+/// SSE2 memcpy; on musl/no_std (scalar memcpy) it wins outright. Compiled only
+/// when SSE2 is in the build (default on `i686-unknown-linux-*`) and NOT AVX2
+/// (the AVX2 arm handles that). Gated to `target_arch = "x86"` so x86_64 — where
+/// glibc's IFUNC AVX memcpy beats a 16-byte inline — keeps the AVX2-or-memcpy
+/// arms. Requires `len >= 33`.
+#[cfg(all(
+    target_arch = "x86",
+    target_feature = "sse2",
+    not(target_feature = "avx2"),
+    feature = "kernel_sse2"
+))]
+#[inline]
+unsafe fn copy_exact_inline_sse2(src: *const u8, dst: *mut u8, len: usize) {
+    debug_assert!(len >= 33, "copy_exact_inline_sse2 requires len >= 33");
+    unsafe {
+        if len <= 64 {
+            let a = _mm_loadu_si128(src.cast::<__m128i>());
+            let b = _mm_loadu_si128(src.add(16).cast::<__m128i>());
+            let c = _mm_loadu_si128(src.add(len - 32).cast::<__m128i>());
+            let d = _mm_loadu_si128(src.add(len - 16).cast::<__m128i>());
+            _mm_storeu_si128(dst.cast::<__m128i>(), a);
+            _mm_storeu_si128(dst.add(16).cast::<__m128i>(), b);
+            _mm_storeu_si128(dst.add(len - 32).cast::<__m128i>(), c);
+            _mm_storeu_si128(dst.add(len - 16).cast::<__m128i>(), d);
+        } else {
+            let mut o = 0usize;
+            while o + 32 <= len {
+                let v0 = _mm_loadu_si128(src.add(o).cast::<__m128i>());
+                let v1 = _mm_loadu_si128(src.add(o + 16).cast::<__m128i>());
+                _mm_storeu_si128(dst.add(o).cast::<__m128i>(), v0);
+                _mm_storeu_si128(dst.add(o + 16).cast::<__m128i>(), v1);
+                o += 32;
+            }
+            while o + 16 <= len {
+                _mm_storeu_si128(
+                    dst.add(o).cast::<__m128i>(),
+                    _mm_loadu_si128(src.add(o).cast::<__m128i>()),
+                );
+                o += 16;
+            }
+            if o < len {
+                let t = len - 16;
+                _mm_storeu_si128(
+                    dst.add(t).cast::<__m128i>(),
+                    _mm_loadu_si128(src.add(t).cast::<__m128i>()),
+                );
+            }
+        }
+    }
+}
+
+/// NEON inline exact copy — aarch64 analog of [`copy_exact_inline_avx2`],
+/// **unrolled 2×16B (32 B/iter)**. NEON is the aarch64 baseline
+/// (`cfg(target_feature = "neon")`), so the body inlines with no boundary.
+/// Requires `len >= 33`.
+#[cfg(all(
+    target_arch = "aarch64",
+    target_feature = "neon",
+    feature = "kernel_neon"
+))]
+#[inline]
+unsafe fn copy_exact_inline_neon(src: *const u8, dst: *mut u8, len: usize) {
+    debug_assert!(len >= 33, "copy_exact_inline_neon requires len >= 33");
+    let mut o = 0usize;
+    unsafe {
+        while o + 32 <= len {
+            let v0 = vld1q_u8(src.add(o));
+            let v1 = vld1q_u8(src.add(o + 16));
+            vst1q_u8(dst.add(o), v0);
+            vst1q_u8(dst.add(o + 16), v1);
+            o += 32;
+        }
+        while o + 16 <= len {
+            vst1q_u8(dst.add(o), vld1q_u8(src.add(o)));
+            o += 16;
+        }
+        if o < len {
+            let t = len - 16;
+            vst1q_u8(dst.add(t), vld1q_u8(src.add(t)));
+        }
+    }
+}
+
+/// Exact medium-size copy (`16 < len < `[`BULK_MEMCPY_THRESHOLD`]) for encoder
+/// literal runs — the safe analog of donor `ZSTD_wildcopy`. The kernel is
+/// fixed at **compile time** (the build's `target_feature`), so the chosen
+/// SIMD body inlines directly into the caller with NO runtime detect and NO
+/// `#[target_feature]` ABI boundary:
+/// - AVX2 build (`-C target-cpu=x86-64-v3`): inline 32-byte exact copy.
+/// - aarch64 (NEON baseline): inline 16-byte exact copy.
+/// - any other build: libc `memcpy` (`ptr::copy_nonoverlapping`), whose
+///   per-CPU IFUNC routine is already optimal for medium runs — a narrow
+///   inline loop or a runtime-dispatched `#[target_feature]` call both
+///   measured slower than it (i9, 2026-06-06). Default multi-kernel builds
+///   that select AVX2 at runtime fall here: a leaf copy cannot inline AVX2
+///   without the crate-wide feature, and a dispatched call ties glibc, so
+///   glibc is the right choice until the whole emit path is under the
+///   `fastpath` umbrella (then this collapses into the per-tier monolith).
+///
+/// # Safety
+/// `src` readable and `dst` writable for `len` bytes; regions non-overlapping.
+#[inline]
+pub(crate) unsafe fn copy_exact_medium(src: *const u8, dst: *mut u8, len: usize) {
+    // Exactly one of the three cfg arms compiles per build, so each is a
+    // tail statement with no `return` (avoids `clippy::needless_return`).
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        target_feature = "avx2",
+        feature = "kernel_avx2"
+    ))]
+    unsafe {
+        copy_exact_inline_avx2(src, dst, len)
+    };
+
+    #[cfg(all(
+        target_arch = "x86",
+        target_feature = "sse2",
+        not(target_feature = "avx2"),
+        feature = "kernel_sse2"
+    ))]
+    unsafe {
+        copy_exact_inline_sse2(src, dst, len)
+    };
+
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        feature = "kernel_neon"
+    ))]
+    unsafe {
+        copy_exact_inline_neon(src, dst, len)
+    };
+
+    #[cfg(not(any(
+        all(
+            any(target_arch = "x86", target_arch = "x86_64"),
+            target_feature = "avx2",
+            feature = "kernel_avx2"
+        ),
+        all(
+            target_arch = "x86",
+            target_feature = "sse2",
+            not(target_feature = "avx2"),
+            feature = "kernel_sse2"
+        ),
+        all(
+            target_arch = "aarch64",
+            target_feature = "neon",
+            feature = "kernel_neon"
+        )
+    )))]
+    unsafe {
+        core::ptr::copy_nonoverlapping(src, dst, len)
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloc::vec;
+
+    #[test]
+    fn copy_exact_medium_matches_memcpy_all_sizes() {
+        // Exact byte-for-byte equivalence across the medium range, incl.
+        // non-multiples of every tier width (16/32) so the overlapping
+        // tail is exercised.
+        let src: vec::Vec<u8> = (0..4096u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+            .collect();
+        for len in 33..2048usize {
+            let mut got = vec![0u8; len];
+            unsafe { copy_exact_medium(src.as_ptr(), got.as_mut_ptr(), len) };
+            assert_eq!(
+                &got[..],
+                &src[..len],
+                "copy_exact_medium mismatch at len={len}"
+            );
+        }
+    }
+
+    /// Scalar word-at-a-time copy — proxy for a libc WITHOUT a tuned SIMD
+    /// `memcpy` (musl, most no_std platforms). Mirrors musl's portable
+    /// `memcpy` shape (8-byte words + byte tail).
+    #[cfg(test)]
+    unsafe fn scalar_word_copy(src: *const u8, dst: *mut u8, len: usize) {
+        let mut o = 0usize;
+        unsafe {
+            while o + 8 <= len {
+                dst.add(o)
+                    .cast::<u64>()
+                    .write_unaligned(src.add(o).cast::<u64>().read_unaligned());
+                o += 8;
+            }
+            while o < len {
+                dst.add(o).write(src.add(o).read());
+                o += 1;
+            }
+        }
+    }
+
+    /// Short relative microbench (run with `--no-capture`): inline tier copy
+    /// (`copy_exact_medium` — NEON on aarch64 / AVX2 on x86-v3) vs the libc
+    /// `memcpy` (`ptr::copy_nonoverlapping`) vs a scalar word-copy
+    /// (musl / no_std proxy). Relative ratios are meaningful even on M1; the
+    /// point is whether inline-SIMD beats the scalar proxy (→ musl/no_std win)
+    /// while ~tying the tuned platform memcpy (→ std neutral). Ignored by
+    /// default so it never gates CI on timing.
+    #[test]
+    #[ignore = "timing microbench; run explicitly with --no-capture"]
+    fn microbench_literal_copy_medium() {
+        use std::time::Instant;
+        let src: vec::Vec<u8> = (0..8192u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+            .collect();
+        let mut dst = vec![0u8; 8192];
+        let iters: u64 = 4_000_000;
+        std::eprintln!("medium literal copy (ns/op, lower=better):");
+        for &len in &[40usize, 64, 100, 200, 400, 800] {
+            // inline tier (NEON/AVX2 per build)
+            let t = Instant::now();
+            for _ in 0..iters {
+                unsafe { copy_exact_medium(src.as_ptr(), dst.as_mut_ptr(), len) };
+                core::hint::black_box(dst.as_ptr());
+            }
+            let inl = t.elapsed().as_nanos() as f64 / iters as f64;
+            // libc memcpy (tuned platform routine)
+            let t = Instant::now();
+            for _ in 0..iters {
+                unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr(), len) };
+                core::hint::black_box(dst.as_ptr());
+            }
+            let lc = t.elapsed().as_nanos() as f64 / iters as f64;
+            // scalar word copy (musl / no_std memcpy proxy)
+            let t = Instant::now();
+            for _ in 0..iters {
+                unsafe { scalar_word_copy(src.as_ptr(), dst.as_mut_ptr(), len) };
+                core::hint::black_box(dst.as_ptr());
+            }
+            let sc = t.elapsed().as_nanos() as f64 / iters as f64;
+            std::eprintln!(
+                "  len={len:4}: inline={inl:6.2}  libc={lc:6.2}  scalar={sc:6.2}  (inline vs libc {:+.1}%, vs scalar {:+.1}%)",
+                100.0 * (inl - lc) / lc,
+                100.0 * (inl - sc) / sc,
+            );
+        }
+    }
 
     #[test]
     fn copy_bytes_overshooting_zero_len_is_noop() {
