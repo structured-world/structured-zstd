@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780741053669,
+  "lastUpdate": 1780758536136,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -58466,6 +58466,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.27,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "4dc83327b4c08b49472fe55eb6931884747f6282",
+          "message": "perf(codec): per-strategy block-split levels + per-tier exec-macro seq monolith (#354)\n\n* perf(decode): share dictionary by handle instead of per-frame copy\n\nThe decoder copied the whole dictionary content into a per-frame\n`DecodeBuffer::dict_content` Vec on every `init_from_dict` (memmove\n~27% of a small dict-frame decode). Hold the dictionary by shared\nhandle (`DictionaryHandle` = `Arc`/`Rc` on the no-std fallback) and read\nmatch bytes straight out of it in `repeat_from_dict` — donor\n`ZSTD_refDDict` semantics.\n\nOne dictionary content copy is now shared across every frame AND across\ndecoder instances on other threads (`Arc<Dictionary>` is Send + Sync);\nattaching a dictionary is a refcount bump, never a content memcpy.\nRegistered dicts (`owned_dicts`) also move to handles so all attach\npaths are uniform. no-std stays intact via the existing SharedDictionary\nalias (Arc with atomics, Rc without).\n\n* perf(decode): copy only decode-essential entropy on dict reinit\n\nPer-frame dict attach (`init_from_dict`) ran `reinit_from` on the FSE and\nHUF tables, which copied the full build-time workspace into the decoder\nscratch every frame: FSE `symbol_probabilities` + spread buffer, and HUF\n`weights` / `bits` / `rank_indexes` plus the recursive weight-decoding\n`fse_table`. The decode hot path (and Repeat-mode reuse) reads only the\n`decode` table (FSE) and `packed_decode` + `max_num_bits` + `state_mask`\n(HUF); the rest is scratch any rebuilding block repopulates itself.\n\nCopy only the decode-essential state, mirroring the donor copying just\nthe entropy decode tables per frame rather than the whole build\nworkspace. Cuts the per-frame dict-setup memmove on small dict frames.\n\n* test(bench): measure compress-dict steady-state with reused context\n\nThe compress-dict arms built a fresh compressor + parsed the dictionary\ninside b.iter every iteration, measuring one-time setup cost rather than\nsteady-state throughput and unfairly penalising the side with heavier\nper-attach setup. Build the compressor + attach the dictionary ONCE\nbefore b.iter on both sides (C CDict created once + compress per frame;\nRust prepared EncoderDictionary + compress_independent_frame per frame),\nthe real prepared-dictionary lifecycle. compress_independent_frame_into\nreads input in place and takes the output per call, so it needs no\nset_source/set_drain (sidesteps the lifetime issue that forced the old\nper-iter shape).\n\n* perf(encode): cache primed dict matcher state (CDict-equivalent)\n\nReusing a dictionary across frames re-hashed every dictionary position\ninto the match tables on EVERY frame (prepare_frame -> reset + full\nprime_with_dictionary), the dominant cost of small dict-compress\n(steady-state ~10x slower than C, which copies a precomputed\ncdict->matchState).\n\nSnapshot the post-prime matcher state once (the backend storage hash\ntables + dictionary history + offset history + window, plus the\ndriver's dictionary_retained_budget — the only state prime writes),\nkeyed by compression level, and restore it (a table copy) on later\nframes instead of re-priming. Mirrors donor ZSTD_compressBegin_usingCDict.\nThe snapshot is invalidated on dictionary attach/clear and ignored on a\nlevel mismatch, so it can never be restored against the wrong dict/level.\n\nMatcher backends gain Clone for the storage snapshot; CompressionLevel\ngains PartialEq for the level key. New regression test asserts frame 2\n(restored) is byte-identical to frame 1 (freshly primed) and both\nround-trip through a dict-primed decoder.\n\n* Revert \"perf(encode): cache primed dict matcher state (CDict-equivalent)\"\n\nThis reverts commit 5895680f7650eee5b786f95941beb0aa77318cb2.\n\n* Reapply \"perf(encode): cache primed dict matcher state (CDict-equivalent)\"\n\nThis reverts commit a0943b2d588400041ccb9ae4cec5677203d92cf7.\n\n* perf(encode): gate dict prime-snapshot copy to large sources\n\nDonor ZSTD_shouldAttachDict only COPIES a precomputed dictionary table\ninto the working context when the source exceeds a per-strategy cutoff\n(fast 8K, dfast 16K, greedy/lazy/btopt 32K, btultra/btultra2 8K); at or\nbelow it the donor ATTACHES the dictionary tables by reference with no\nper-frame table touch.\n\nThe prime snapshot is a whole-table copy, so applying it unconditionally\nregressed small-source dict frames (the copy costs more than the sparse\nre-prime — which is exactly why the donor attaches by reference there).\nGate restore/capture to sources above the cutoff so the snapshot is used\nonly in the donor COPY regime; small/unknown sources keep re-priming\nuntil an attach-by-reference path lands.\n\n* perf(encode): size block-read buffer to source hint, not always 128 KiB\n\nrun_owned_block_loop zero-filled a full MAX_BLOCK_SIZE (128 KiB) buffer\nvia resize(_, 0) every block just to read the input into it and truncate\nback down — a small frame paid a 128 KiB memset per block to read a few\nKiB (37% of steady-state small dict-compress was memset, the largest\nsingle cost). Bound the initial fill by the source-size hint (exact for\nthe slice entry points) and grow toward block_capacity only if the hint\nunder-counts, so inexact / unknown (None -> full capacity) hints stay\ncorrect. Helps every small-frame compress, dict or not.\n\n* refactor(encode): bound block-read sizing without saturating arithmetic\n\nReplace the saturating_sub/add/mul in the block-read buffer sizing with\nplain checked-by-construction arithmetic: filled <= block_capacity holds\non every path (the read only targets [filled..len] with len <=\nblock_capacity, and a carried pending_input is a sub-block split_off), so\nblock_capacity - filled never underflows; remaining is pinned to\nblock_capacity before the usize cast and the doubling stays within usize.\nBehaviour identical; no saturating masking.\n\n* perf(encode): share dictionary entropy tables by handle, not per-frame clone\n\nprepare_frame deep-cloned the cached dictionary FSE encoder tables into\nthe per-frame state every frame (PreviousFseTable::clone was ~16% of\nsteady-state small dict-compress). The previous-table is only ever read\nor REPLACED wholesale, never mutated in place, so back PreviousFseTable::\nCustom with a shared handle (SharedFseTable = Arc on atomic targets, Rc\notherwise — keeps no_std no-atomics building) instead of Box. The\nper-frame entropy seed is now a refcount bump, mirroring the donor\nreferencing cdict->cBlockState rather than rebuilding it per frame.\n\n* perf(encode): cache Fast dict table across attach-path frames\n\nSmall-source dictionary frames (at/below the Fast 8 KiB attach cutoff)\nre-prime every frame instead of restoring a copy snapshot. Re-priming\nre-committed the dict bytes to history AND re-hashed every position into\nthe immutable dict table each frame.\n\nKeep the built dict table across a same-parameter reset and skip the\nre-hash: the dictionary lands at identical absolute history positions\nevery frame (history is cleared then the dict is committed first), so\nthe cached hashes stay valid. The dict bytes are still re-committed\n(needed for match extension); only the hashing is elided.\n\nThe cache is dropped on parameter change, history eviction, and\ndictionary attach/clear, so the kernel never probes a dict region whose\nbytes are no longer re-committed. Output is byte-identical: cold-cache\nand warm-cache frames match.\n\nPart of #316. Closes #349\n\n* perf(decode): move decompression-bomb ceiling off the per-match hot path\n\nThe per-block output ceiling added to guard against decompression-bomb\nOOMs was checked in repeat_inner on EVERY match copy\n(buffer.len() + match_length > block_output_limit). That compare plus a\nfield load and a cold branch bloated the #[inline(always)] repeat path\ninlined into the pipelined sequence loop, regressing lazy-level decode\non small frames (~-31% on small-4k-log-lines, level_7/8/10 lazy, stream\ndecode through the growable RingBuffer) where matches are dense.\n\nEnforce the ceiling on the cold growth path instead: RingBuffer gains a\nmax_capacity lowered per block via set_max_capacity, and its try_reserve\nrejects a reserve that would have to GROW past it. A well-formed block\nis fully covered by the upfront reserve(MAX_BLOCK_SIZE), so its matches\nnever reach the check; only an over-producing match (the bomb) forces a\ngrow and is rejected with OutputBufferOverflow. The guard now bounds the\nOOM on every target (not just the i686 assert path) at zero hot-path\ncost, replacing the per-match BlockOutputExceedsMax check (variant\nremoved).\n\n742 tests pass; i686 builds (the reserve_amortized debug_assert panic\npath is no longer reached for over-production).\n\n* docs(encode): note retire_dictionary_budget saturating_sub is a real clamp\n\nThe dict-budget retire shrinks max_window_size by the reclaimed bytes.\nreclaimed (capped at dictionary_retained_budget) can exceed the CURRENT\nmax_window_size when a prior eviction already shrank the window, so the\nsaturating_sub floor at 0 is the correct clamp, not a masked underflow\nbug. Documented at all four backend arms so the next reader (or audit)\ndoes not mistake it for overflow-masking and convert it to checked_sub,\nwhich panics on the legitimate reclaim>window case\n(dfast_commit_space_eviction_uses_window_size_delta exercises it).\n\n* fix(encode): key dict prime snapshot on resolved matcher shape\n\nCache the post-prime matcher snapshot (CDict-equivalent) keyed on the fully\nresolved matcher shape so repeated dictionary frames restore it (a table copy)\ninstead of re-hashing every dictionary position.\n\nThe key is the resolved LevelParams (window-log cap, HC/Fast table and search\ngeometry, parse depth/target-length baked into the restored storage), the active\nbackend's applied Dfast/Row hash-table width, the compression level, and the\nFast attach-vs-copy mode. Keying on the raw source-size hint, or its ceil-log\nbucket, over-keys: the hint-to-shape mapping is many-to-one (the source-size\nadjustment is monotone in ceil_log2(hint), and Level 22 collapses several\nbuckets onto one donor tier via its 16/128/256 KiB thresholds), so two hints\nthat resolve to the identical matcher would each force a full re-prime.\ntable_window_size is excluded from the key (it varies spuriously for HC levels\nthat ignore it). level stays in the key because some stored state is derived\nfrom the level directly, not through params (Dfast use_fast_loop is true for L3\n/ false for L4 at identical params). fast_attach stays because the 8 KiB\nattach/copy cutoff falls inside a single resolved shape (an 8192 vs 8193 byte\nLevel 1 hint resolves to identical params/table_bits but a different dict-table\nshape), keeping the snapshot identity self-sufficient rather than relying on the\nframe compressor's copy-path gating.\n\nThe fast-attach/copy cutoff is unified on the same ceil-log bucket in the driver\nand the frame compressor's prefer_copy_snapshot gate, comparing\nsource_size_ceil_log(hint) on the full u64 rather than an as-usize cast that\ncould diverge on 32-bit targets. LevelParams/HcConfig/RowConfig gain\nPartialEq/Eq for the comparison. Regression tests cover same-bucket reuse,\nLevel 22 cross-bucket donor-tier reuse, the attach/copy boundary refusal, and\nthe window-mismatch refusal.\n\n* perf(decode): single-compare sequence bounds check + per-block bomb ceiling\n\nExtract the per-sequence output-capacity guard into sequence_output_fits in\nbuffer_backend, used by all six inline exec_sequence variants (FlatBuf and\nUserSliceBackend, each SSE2 / portable / AVX2). Replaces the per-variant\nchecked_add chain with one subtraction and one compare on plain arithmetic:\nlit_length and match_length are each bounded by the maximum FSE LL/ML code\nexpansion (~131 KB) so the sums cannot overflow usize even on 32-bit, and\ntail <= cap holds on entry (Vec len <= capacity for the flat buffer; the\nuser-slice tail only advances past this same check) so cap - tail cannot\nunderflow.\n\nComplete the decompression-bomb ceiling on the growable backends:\n\n- FlatBuf gains a max_capacity field and overrides set_max_capacity +\n  try_reserve so its fallback push/repeat path (taken when the inline slack gate\n  fails) is bounded, mirroring RingBuffer.\n- Both FlatBuf and RingBuffer check the ceiling BEFORE the no-growth fast path,\n  so a write that fits existing capacity (a large pre-reserved FCS buffer, or an\n  over-allocated ring) but exceeds the per-block ceiling is rejected rather than\n  silently admitted.\n- repeat_from_dict now try_reserves before appending dictionary bytes, so a\n  match satisfied from the dictionary is bounded too instead of bypassing the\n  guard via a direct extend.\n\nLength sums in these growth paths use checked/plain arithmetic, not\nsaturating_add, so a broken bound fails at its cause. Adds regression tests for\nthe AVX2 FlatBuf overflow, FlatBuf reserve past the ceiling both with and\nwithout growth, and dict-backed (full and mixed) matches past the ceiling; the\noverflow tests size their literal buffer to lit_length.next_multiple_of(16).\n\n* perf(encode): donor block-split levels for fast/dfast/greedy/lazy\n\nThe cheap fingerprint pre-splitter was wired only for greedy (1) and\nbtopt+ (4); fast/dfast/lazy kept whole 128 KiB blocks. The C reference\nsplits all of them (splitLevels[] = fast 0, dfast 1, greedy/lazy 2,\nbtopt+ 4 in ZSTD_optimalBlockSize), cutting each full block at a\nstatistical boundary so the per-block Huffman tree fits local literal\nstatistics. On decodecorpus-z000033 that block-count gap (we emitted the\nminimum 8 blocks, the reference 14) cost ~1.6% on the literals section at\nthe fast levels.\n\n- pre_split() now returns the donor splitLevels[] by strategy.\n- run_borrowed_block_loop (the Fast one-shot path) calls optimal_block_size\n  per block instead of always emitting fixed 128 KiB blocks, so fast levels\n  split too. savings = consumed - produced mirrors the donor gate (first\n  block and incompressible input stay whole).\n\nResult (i9, z000033 compress, rust vs ffi bytes): L1 571077 vs 571525,\nL2 550576 vs 550910, L3 489251 vs 498911, L4 488705 vs 498591 — we now\nbeat the reference at every level (was +1.6%/+1.3% behind at L1/L2).\n\nThe pre-splitter, FSE table-mode selection, and HUF reuse decision are all\nalready byte-faithful to the reference, so split sub-blocks reuse entropy\ntables via the same cost comparison. A stale unit assertion\n(better < default on a redundant 5 MiB fixture) was corrected: with\nblock-splitting the reference itself produces better(L7) > default(L3)\nthere (829 vs 525; ours 795 vs 495), so the size-ordering proxy was\ninvalid; the test now asserts both levels reach <0.1% plus the round-trip.\n\nAdds examples/section_split.rs: splits a frame into literals/sequences\nsection bytes per block for rust vs ffi, the diagnostic that localized\nthe gap.\n\nPart of #316\n\n* test(bench): add C-decoder loop for reference decode profiling\n\n* perf(decode): inline AVX2 exec body into seq monolith via macro\n\nThe AVX2 sequence loop called BufferBackend::exec_sequence_inline_avx2 as\na trait method on every sequence (14% decode self-time, a real call\nboundary). A #[target_feature] fn cannot be #[inline(always)]\n(rust#145574), so the call could not be collapsed the way the reference\nfuses ZSTD_decodeSequence + ZSTD_execSequence into one inlined bmi2\nmonolith.\n\nExpand the exec body at the call site via macro_rules!\n(exec_sequence_avx2_inline!) instead. Backend access goes through the\ninlinable trait accessors cap/tail + two new ones (inline_exec_base_ptr,\ninline_exec_commit), so the macro stays generic over B while only the\nlinear inline backends (UserSliceBackend, FlatBuf) reach it (gated on\nSUPPORTS_INLINE_SEQUENCE_EXEC). AVX2 tier only for now; other tiers keep\nthe trait method.\n\nPart of #316\n\n* fix(decode): silence dead_code on inline-exec trait accessors for non-x86_64\n\ninline_exec_base_ptr / inline_exec_commit are only reached from the\nx86_64 AVX2 exec macro; on i686/aarch64 (scalar/NEON exec paths) the\ndefaults are dead, matching the existing exec_sequence_inline_avx2\n#[allow(dead_code)].\n\n* perf(decode): switch-on-length HUF DTable fill (donor HUF_fillDTableX1)\n\nbuild_table_from_weights filled each symbol's run with slice::fill on a\nRUNTIME length, lowering to a runtime-length memset call per symbol. The\nshort lengths dominate the symbol count (high-nbBits symbols span 1/2/4\ntable entries). Specialise those into compile-time-fixed stores via\nmatch dst.len(), matching the reference's switch-on-length fill, and keep\nslice::fill only for the longer runs. One sub-slice keeps a single bounds\ncheck. Table output unchanged (212 huf/decode/roundtrip/cross tests pass).\n\nPart of #316\n\n* Revert \"perf(decode): switch-on-length HUF DTable fill (donor HUF_fillDTableX1)\"\n\nThis reverts commit 9064d3a9f90ae9eacf2fb3e7cc3bb623105b9958.\n\n* fix(encode): scope fast_attach to Simple backend in prime snapshot key\n\nThe attach-vs-copy split is a Simple/Fast-backend concept (the 8 KiB dict-table\ncutoff). Recording it in PrimedKey for HashChain/Dfast/Row over-keyed those\nsnapshots: an unhinted capture (fast_attach = true) and a hinted reset that\nresolved to the identical LevelParams keyed differently and forced a needless\nre-prime. Gate the bit on the Simple backend so non-Simple snapshots ignore it.\n\nRegression test captures a HashChain (Best) snapshot with no hint and restores\nit under a large hint that resolves to the same matcher, asserting the restore\nsucceeds.\n\n* perf(decode): fuse match-copy into VBMI2 + BMI2 seq monoliths\n\nThe AVX2-tier exec fuse (call-boundary removal via macro) only covered the\nAVX2 kernel; VBMI2 and BMI2 tiers still called the exec trait method per\nsequence. Share the exec body as two macros in exec_sequence_inline:\n\n- exec_sequence_avx2_inline (32-byte ymm, offset>=32 path) — AVX2 + VBMI2\n  (VBMI2 always implies AVX2+BMI2)\n- exec_sequence_sse2_inline (16-byte xmm, overshoot 15) — BMI2 (no AVX2)\n\nBoth expand textually at the sequence-loop call site so the match-copy\nfuses into each per-tier monolith (target_feature fns can't be\ninline(always), rust#145574). The exec_sequence_inline / _avx2 trait\nmethods remain as the unit-tested reference spec the macros mirror.\n\nVBMI2/BMI2 paths are not reachable on the available test hardware\n(i9-9900K = AVX2 tier, no AVX-512; M1 = aarch64; i686 = scalar): the\nVBMI2 macro is identical to the i9-verified AVX2 expansion, and the BMI2\nSSE2 macro mirrors the directly unit-tested exec_sequence_inline body.\n\n* test(codec): harden window test + diagnostic examples\n\n- roundtrip_better_level_large_window: switch the repeated region to\n  incompressible random bytes so the cross-gap match is the SOLE way to\n  compress the second copy, then assert Better (8 MiB window) beats Default\n  (4 MiB window). The prior <0.1% size floor passed even if Better lost the\n  cross-gap match (patterned fixture compressed tiny regardless of window).\n- pre_split_level_dispatches: pin Best == Level(11) so the named alias can't\n  drift from the numeric pre-split route.\n- section_split example: match block type 2 explicitly, panic on unknown\n  type, assert literals do not exceed block size.\n- c_decode_loop example: assert decode size == expected and guard the sink\n  read against empty output.\n\n* fix(decode): gate shared exec macros on their kernel features\n\nThe exec_sequence_avx2_inline / _sse2_inline macros were gated only on\ntarget_arch=x86_64, but their consumers (seq_decoder_avx2/vbmi2 behind\nkernel_avx2, seq_decoder_bmi2 behind kernel_bmi2) are feature-gated. On an\nx86_64 host with --no-default-features the macros were defined but unused,\ntripping the no-std clippy -D warnings gate. Gate each macro + its\npub(crate) use on the matching kernel feature (kernel_avx2 covers vbmi2 via\nthe feature implication; kernel_bmi2 for the sse2 variant).\n\n* fix(decode): gate AVX2 boundary tests on std feature\n\nThe exec_sequence_inline_avx2 tests call std::arch::is_x86_feature_detected!,\nwhich is std-only (runtime CPU detection). The crate is #![no_std] by\ndefault, so under --no-default-features the macro fails to resolve. Gate the\nthree AVX2 tests (user_slice_buf + flat_buf) on\ncfg(all(target_arch=x86_64, feature=std)).\n\n* fix(encode): donor-correct pre-split level for lazy2/btlazy2\n\npre_split matched only the coarse StrategyTag, returning split level 2 for\nthe whole Lazy band. The donor splitLevels[] table (ZSTD_optimalBlockSize,\nindexed by ZSTD_strategy: {0,0,1,2,2,3,3,4,4,4}) assigns lazy=2 but\nlazy2=3 and btlazy2=3. Our level table runs both lazy2 (L8-12) and btlazy2\n(L13-15) on the hash-chain Lazy tag at lazy_depth 2, so they were\nunder-split by one level versus the donor.\n\nDistinguish them by lazy_depth: Lazy at depth >= 2 now returns split level\n3. optimal_block_size already supports level 3 (byChunks sampling index 2).\n\nRatio gate (arch-independent, compare_ffi REPORT) on the 1 MB z000033\nfixture at level 11 (lazy2): rust_bytes=465531 vs ffi_bytes=509326 — 8.6%\nsmaller than the C reference. Test pre_split_level_dispatches updated:\nLevel(11)/Level(15) now Some(3).\n\n* test(codec): cover fast borrowed split path + harden header parse\n\n- Add fast_oneshot_borrowed_split_emits_subblock: compress_slice_to_vec on\n  a Fast level routes through run_borrowed_block_loop, which the existing\n  greedy test (owned loop) did not exercise. Asserts >= 3 decoded blocks on\n  a 256 KiB fixture (two 128 KiB blocks unsplit) so the borrowed split path\n  cannot silently regress to fixed 128 KiB blocks.\n- Pin the lazy2/btlazy2 split range: add Level(8)/Level(12)/Level(13) ->\n  Some(3) boundary assertions.\n- section_split example: pack the compressed/treeless literals header with\n  u64 arithmetic; the 5-byte (sf 3) header reaches bit 35 (body[4] << 28),\n  which truncates in a 32-bit usize.\n\n* perf(encode): align lazy band to donor clevels.h, drop oversized preset windows\n\nSet L6-L12 lazy params to the donor default-row clevels.h values: window_log\n21/22 (was 23/24/25), hash/chain/search_depth per donor (search_depth =\n1<<searchLog). L13-L15 already matched. This removes the larger-than-donor\npreset windows (Better/Best no longer carry an 8/16 MiB window; they resolve\nto donor L7/L11 with donor windows), so BETTER_WINDOW_LOG is no longer read\nhere. Ratio on z000033 unchanged (L11 465120 vs C 509326, still -8.7%) since\na 4 MiB window already covers the 1 MB fixture.\n\nRemove the two large-window roundtrip tests and their now-unused helpers:\nthey validated the >donor preset-window reach that no longer exists.\n\n* perf(encode): config-drive dfast hash sizing from donor clevels.h\n\nAdd DfastConfig { long_hash_log, short_hash_log } carried per level as\nLevelParams.dfast (Some only on Dfast rows, None elsewhere so the table\nself-documents which levels the Dfast backend configures). L3 = {17,16},\nL4 = {18,18} per the donor default-row clevels.h columns; window_log 21.\n\nThe Dfast backend now sets its long/short hash table bits from this config\ninstead of deriving the long hash from the window clamped to a hardcoded\nDFAST_HASH_BITS=17 ceiling, which previously capped L4 below its donor\nhashLog of 18. set_hash_bits takes (long, short) explicitly; the hinted\nsmall-input path caps each by the source-size window. minMatch stays the\ndonor-fixed 5 (used in const contexts).\n\nz000033 ratio still beats C (L3 489251 vs 527148, L4 489092 vs 526163).\n\n* refactor(encode): per-strategy Option configs in LevelParams + L5 donor window\n\nGroup the Fast knobs into FastConfig and make every per-strategy config an\nOption on LevelParams: fast / dfast / hc / row. Exactly one is Some per level\nrow, matching the strategy backend; the rest are None — so the table\nself-documents which knobs each level consumes instead of carrying dead\nplaceholder values (the old fast_hash_log:14 / fast_mls:7 on lazy/bt rows).\n\nBackend configure/reset arms read their config via expect() (the native\nbackend's config is always Some). The test-only parse×search override\nsynthesizes a default config for a cross-backend pairing via get_or_insert.\nHC_CONFIG / ROW_CONFIG (and the HC_HASH_LOG/HC_CHAIN_LOG imports) are now\ntest-only and cfg(test)-gated.\n\nL5 greedy window_log 22 -> 21 (donor clevels.h). Behaviour-neutral refactor:\n749 tests pass incl. the FFI donor-parity checks.\n\n* refactor(encode): name raw-fast-path window cutoff for its purpose\n\nThe incompressible raw-fast-path window ceiling reused BETTER_WINDOW_LOG,\nwhich no longer matches the Better preset window after the donor alignment.\nGive it a self-describing name (RAW_FAST_PATH_MAX_WINDOW_LOG = 23, 8 MiB) in\nincompressible.rs and drop the now-unused BETTER_WINDOW_LOG constant. Value\nunchanged. Also corrects a stale fast-matcher test doc reference.\n\n* test(encode): pin fast borrowed split decision + raw-fast-path over-cap\n\n- fast_oneshot_borrowed_split_emits_subblock: assert optimal_block_size for\n  Fastest resolves the second donor block below MAX_BLOCK_SIZE before encoding,\n  and drive the borrowed route explicitly via compress_independent_frame, so\n  the block-count check cannot pass through the owned loop.\n- level4 raw-fast-path test: add the over-cap reject case\n  (RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES + 1) so numeric levels and Best stay\n  locked to the same window boundary.",
+          "timestamp": "2026-06-06T17:12:46+03:00",
+          "tree_id": "2d8277dba6a6cce2f2428f7b1e2cc50efc322412",
+          "url": "https://github.com/structured-world/structured-zstd/commit/4dc83327b4c08b49472fe55eb6931884747f6282"
+        },
+        "date": 1780758527589,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.127,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.089,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 306.307,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 217.904,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.455,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.622,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.528,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.083,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.402,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 2.019,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.119,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.119,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.02,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 16.711,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.732,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.653,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.286,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.887,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.279,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.586,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.129,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.105,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.237,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.106,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.273,
             "unit": "ms"
           }
         ]
