@@ -337,7 +337,14 @@ unsafe fn row_tag_match_mask_neon(tags: &[u8], tag: u8) -> u64 {
 
 pub(crate) struct RowMatchGenerator {
     pub(crate) max_window_size: usize,
-    pub(crate) window: VecDeque<Vec<u8>>,
+    /// Per-committed-block lengths of the live window, mirroring the
+    /// `HashChain` backend's `chunk_lens`. The block bytes themselves live
+    /// only in the contiguous `history` mirror; the input buffers are handed
+    /// straight back to the caller's pool in `add_data` rather than retained
+    /// here. Retaining them (the old `VecDeque<Vec<u8>>`) held a full
+    /// `block_capacity`-sized buffer per committed block, which on a heavily
+    /// pre-split frame ballooned the window to many times the live byte count.
+    pub(crate) chunk_lens: VecDeque<usize>,
     pub(crate) window_size: usize,
     pub(crate) history: Vec<u8>,
     pub(crate) history_start: usize,
@@ -356,7 +363,16 @@ pub(crate) struct RowMatchGenerator {
     /// Cached fastpath kernel for `hash_mix_u64`; see Dfast for rationale.
     pub(crate) hash_kernel: crate::encoding::fastpath::FastpathKernel,
     pub(crate) row_heads: Vec<u8>,
-    pub(crate) row_positions: Vec<usize>,
+    // Absolute match positions, one per row slot. Stored as `u32` (not
+    // `usize`): this is the largest match-finder array, and `u32` halves its
+    // footprint vs the donor-parity `U32` layout. `ROW_EMPTY_SLOT == u32::MAX`
+    // is the empty sentinel, so every stored position must stay strictly below
+    // it. On a long stream the cumulative absolute cursor would cross `u32::MAX`
+    // even while the live window is bounded; `add_data` rebases the coordinate
+    // origin down to the oldest live byte before that happens (see
+    // [`Self::rebase_positions`]), keeping positions representable without
+    // capping frame length.
+    pub(crate) row_positions: Vec<u32>,
     pub(crate) row_tags: Vec<u8>,
     /// Cached tag-match SIMD kernel; CPU features are fixed per process, so
     /// resolve once instead of querying per `row_candidate` call.
@@ -367,7 +383,7 @@ impl RowMatchGenerator {
     pub(crate) fn new(max_window_size: usize) -> Self {
         Self {
             max_window_size,
-            window: VecDeque::new(),
+            chunk_lens: VecDeque::new(),
             window_size: 0,
             history: Vec::new(),
             history_start: 0,
@@ -409,7 +425,7 @@ impl RowMatchGenerator {
         self.set_hash_bits(config.hash_bits.max(self.row_log + 1));
     }
 
-    pub(crate) fn reset(&mut self, mut reuse_space: impl FnMut(Vec<u8>)) {
+    pub(crate) fn reset(&mut self) {
         self.window_size = 0;
         self.history.clear();
         self.history_start = 0;
@@ -418,14 +434,14 @@ impl RowMatchGenerator {
         self.row_heads.fill(0);
         self.row_positions.fill(ROW_EMPTY_SLOT);
         self.row_tags.fill(0);
-        for mut data in self.window.drain(..) {
-            data.resize(data.capacity(), 0);
-            reuse_space(data);
-        }
+        // Block buffers are returned to the caller's pool per block in
+        // `add_data`, so there is nothing window-side to recycle here.
+        self.chunk_lens.clear();
     }
 
     pub(crate) fn get_last_space(&self) -> &[u8] {
-        self.window.back().unwrap().as_slice()
+        let last = *self.chunk_lens.back().unwrap();
+        &self.history[self.history.len() - last..]
     }
 
     pub(crate) fn add_data(&mut self, data: Vec<u8>, mut reuse_space: impl FnMut(Vec<u8>)) {
@@ -435,27 +451,69 @@ impl RowMatchGenerator {
             self.window_size,
             data.len(),
         );
+        // Row stores absolute match positions as `u32` (with `u32::MAX` the
+        // empty sentinel). On a long stream the cumulative absolute cursor
+        // crosses the u32 range even while the live window stays bounded, so
+        // rebase the coordinate origin down to the oldest live byte before the
+        // upcoming block's positions would overflow. Cold path — fires at most
+        // once per ~4 GiB of stream, and one rebase always suffices because the
+        // live window is far smaller than u32::MAX. `check_stream_abs_headroom`
+        // above already guards the 32-bit-target `usize` overflow separately.
+        if self.history_abs_start + self.window_size + data.len() >= u32::MAX as usize - 1 {
+            self.rebase_positions();
+        }
         while self.window_size + data.len() > self.max_window_size {
-            let removed = self.window.pop_front().unwrap();
-            self.window_size -= removed.len();
-            self.history_start += removed.len();
-            self.history_abs_start += removed.len();
-            reuse_space(removed);
+            let removed_len = self.chunk_lens.pop_front().unwrap();
+            self.window_size -= removed_len;
+            self.history_start += removed_len;
+            self.history_abs_start += removed_len;
         }
         self.compact_history();
+        let added = data.len();
         self.history.extend_from_slice(&data);
-        self.window_size += data.len();
-        self.window.push_back(data);
+        self.window_size += added;
+        self.chunk_lens.push_back(added);
+        // The bytes now live in `history`; return the input buffer to the
+        // caller's pool instead of holding a second copy in the window.
+        reuse_space(data);
     }
 
-    pub(crate) fn trim_to_window(&mut self, mut reuse_space: impl FnMut(Vec<u8>)) {
+    pub(crate) fn trim_to_window(&mut self) {
         while self.window_size > self.max_window_size {
-            let removed = self.window.pop_front().unwrap();
-            self.window_size -= removed.len();
-            self.history_start += removed.len();
-            self.history_abs_start += removed.len();
-            reuse_space(removed);
+            let removed_len = self.chunk_lens.pop_front().unwrap();
+            self.window_size -= removed_len;
+            self.history_start += removed_len;
+            self.history_abs_start += removed_len;
         }
+    }
+
+    /// Rebase the absolute coordinate origin down to the oldest live byte so
+    /// stored `u32` match positions stay representable on long (multi-GiB)
+    /// streams. Cold path, driven from [`Self::add_data`] when the cursor
+    /// nears `u32::MAX`. Subtracts the current `history_abs_start` from every
+    /// live `row_positions` entry; entries older than the new origin (already
+    /// unreachable through the `candidate_pos < history_abs_start` read guard)
+    /// collapse to `ROW_EMPTY_SLOT`. The shift is uniform across the origin and
+    /// every stored position, so every match offset is preserved and matching
+    /// is unaffected. `row_heads` (slot cursors) and `row_tags` (hash tags)
+    /// hold no absolute positions and are left untouched.
+    fn rebase_positions(&mut self) {
+        let delta = self.history_abs_start;
+        if delta == 0 {
+            return;
+        }
+        for slot in self.row_positions.iter_mut() {
+            if *slot == ROW_EMPTY_SLOT {
+                continue;
+            }
+            let abs = *slot as usize;
+            *slot = if abs < delta {
+                ROW_EMPTY_SLOT
+            } else {
+                (abs - delta) as u32
+            };
+        }
+        self.history_abs_start -= delta;
     }
 
     pub(crate) fn skip_matching_with_hint_rl<const ROW_LOG: usize>(
@@ -464,7 +522,7 @@ impl RowMatchGenerator {
     ) {
         debug_assert_eq!(ROW_LOG, self.row_log);
         self.ensure_tables();
-        let current_len = self.window.back().unwrap().len();
+        let current_len = *self.chunk_lens.back().unwrap();
         let current_abs_start = self.history_abs_start + self.window_size - current_len;
         let current_abs_end = current_abs_start + current_len;
         let backfill_start = self.backfill_start(current_abs_start);
@@ -558,7 +616,7 @@ impl RowMatchGenerator {
         debug_assert_eq!(ROW_LOG, self.row_log);
         self.ensure_tables();
 
-        let current_len = self.window.back().unwrap().len();
+        let current_len = *self.chunk_lens.back().unwrap();
         if current_len == 0 {
             return;
         }
@@ -578,7 +636,7 @@ impl RowMatchGenerator {
             let best = self.best_match_rl::<K, ROW_LOG>(abs_pos, lit_len);
             if let Some(candidate) = self.pick_lazy_match_rl::<K, ROW_LOG>(abs_pos, lit_len, best) {
                 self.insert_match_span::<ROW_LOG>(abs_pos, candidate.start + candidate.match_len);
-                let current = self.window.back().unwrap().as_slice();
+                let current = &self.history[self.history.len() - current_len..];
                 let start = candidate.start - current_abs_start;
                 let literals = &current[literals_start..start];
                 handle_sequence(Sequence::Triple {
@@ -605,7 +663,7 @@ impl RowMatchGenerator {
         }
 
         if literals_start < current_len {
-            let current = self.window.back().unwrap().as_slice();
+            let current = &self.history[self.history.len() - current_len..];
             handle_sequence(Sequence::Literals {
                 literals: &current[literals_start..],
             });
@@ -680,7 +738,7 @@ impl RowMatchGenerator {
         debug_assert_eq!(ROW_LOG, self.row_log);
         self.ensure_tables();
 
-        let current_len = self.window.back().unwrap().len();
+        let current_len = *self.chunk_lens.back().unwrap();
         if current_len == 0 {
             return;
         }
@@ -800,7 +858,7 @@ impl RowMatchGenerator {
             // ~+447 over `abs_pos` (537897 -> 538344), so the
             // narrower range is intentional.
             self.insert_match_span::<ROW_LOG>(abs_pos, candidate.start + candidate.match_len);
-            let current = self.window.back().unwrap().as_slice();
+            let current = &self.history[self.history.len() - current_len..];
             let literals = &current[literals_start..start];
             handle_sequence(Sequence::Triple {
                 literals,
@@ -837,7 +895,7 @@ impl RowMatchGenerator {
         }
 
         if literals_start < current_len {
-            let current = self.window.back().unwrap().as_slice();
+            let current = &self.history[self.history.len() - current_len..];
             handle_sequence(Sequence::Literals {
                 literals: &current[literals_start..],
             });
@@ -1065,11 +1123,14 @@ impl RowMatchGenerator {
             if !matched {
                 continue;
             }
-            let candidate_pos = self.row_positions[idx];
-            if candidate_pos == ROW_EMPTY_SLOT
-                || candidate_pos < self.history_abs_start
-                || candidate_pos >= abs_pos
-            {
+            let raw_pos = self.row_positions[idx];
+            if raw_pos == ROW_EMPTY_SLOT {
+                continue;
+            }
+            // Stored positions are absolute (`< u32::MAX`, capped per frame in
+            // `add_data`); widen to `usize` for the window-bound checks.
+            let candidate_pos = raw_pos as usize;
+            if candidate_pos < self.history_abs_start || candidate_pos >= abs_pos {
                 continue;
             }
             let candidate_idx = candidate_pos - self.history_abs_start;
@@ -1185,7 +1246,10 @@ impl RowMatchGenerator {
             let next = head.wrapping_sub(1) & row_mask;
             *self.row_heads.get_unchecked_mut(row) = next as u8;
             *self.row_tags.get_unchecked_mut(row_base + next) = tag;
-            *self.row_positions.get_unchecked_mut(row_base + next) = abs_pos;
+            // `abs_pos < u32::MAX` holds: `add_data` caps a Row frame's
+            // absolute cursor below `u32::MAX`, so the cast is lossless and
+            // never collides with the `ROW_EMPTY_SLOT == u32::MAX` sentinel.
+            *self.row_positions.get_unchecked_mut(row_base + next) = abs_pos as u32;
         }
     }
 }

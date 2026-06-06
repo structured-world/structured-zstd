@@ -112,7 +112,7 @@ pub(crate) const ROW_LOG: usize = 5;
 pub(crate) const ROW_SEARCH_DEPTH: usize = 16;
 pub(crate) const ROW_TARGET_LEN: usize = 48;
 pub(crate) const ROW_TAG_BITS: usize = 8;
-pub(crate) const ROW_EMPTY_SLOT: usize = usize::MAX;
+pub(crate) const ROW_EMPTY_SLOT: u32 = u32::MAX;
 pub(crate) const ROW_HASH_KEY_LEN: usize = 4;
 // HASH_MIX_PRIME now lives in `crate::encoding::fastpath::scalar`; the four
 // per-CPU `hash_mix_u64` variants share it via that module.
@@ -1011,15 +1011,14 @@ impl MatchGeneratorDriver {
                     evicted_bytes += pre - dfast.window_size;
                 }
                 super::strategy::BackendTag::Row => {
-                    let mut retired = Vec::new();
-                    self.row_matcher_mut().trim_to_window(|data| {
-                        evicted_bytes += data.len();
-                        retired.push(data);
-                    });
-                    for mut data in retired {
-                        data.resize(data.capacity(), 0);
-                        self.vec_pool.push(data);
-                    }
+                    // Row keeps bytes only in the contiguous `history` mirror
+                    // (block buffers are returned to the pool per block in
+                    // `add_data`), so derive the eviction count from the
+                    // `window_size` delta, mirroring the Dfast / HashChain arms.
+                    let row = self.row_matcher_mut();
+                    let pre = row.window_size;
+                    row.trim_to_window();
+                    evicted_bytes += pre - row.window_size;
                 }
                 super::strategy::BackendTag::HashChain => {
                     // HC keeps bytes only in the contiguous `history` mirror
@@ -1159,11 +1158,7 @@ impl Matcher for MatchGeneratorDriver {
                     m.row_heads = Vec::new();
                     m.row_positions = Vec::new();
                     m.row_tags = Vec::new();
-                    let vec_pool = &mut self.vec_pool;
-                    m.reset(|mut data| {
-                        data.resize(data.capacity(), 0);
-                        vec_pool.push(data);
-                    });
+                    m.reset();
                 }
                 MatcherStorage::HashChain(m) => {
                     // Release oversized tables when switching away from
@@ -1283,11 +1278,7 @@ impl Matcher for MatchGeneratorDriver {
                 if hinted {
                     row.set_hash_bits(row_hash_bits_for_window(table_window_size));
                 }
-                let vec_pool = &mut self.vec_pool;
-                row.reset(|mut data| {
-                    data.resize(data.capacity(), 0);
-                    vec_pool.push(data);
-                });
+                row.reset();
             }
             MatcherStorage::HashChain(hc) => {
                 hc.table.max_window_size = max_window_size;
@@ -1572,11 +1563,24 @@ impl Matcher for MatchGeneratorDriver {
                 evicted_bytes += pre.saturating_add(space_len).saturating_sub(m.window_size);
             }
             MatcherStorage::Row(m) => {
-                m.add_data(space, |mut data| {
-                    evicted_bytes += data.len();
-                    data.resize(data.capacity(), 0);
+                // RowMatchGenerator::add_data recycles the *input* buffer
+                // through this callback every commit (its bytes are mirrored
+                // into `history`), not the evicted chunks. Derive the eviction
+                // delta from `window_size` before/after — `evicted = pre +
+                // space_len - post` — exactly like the Simple / HashChain arms.
+                // Counting the callback argument as evicted would charge the
+                // whole committed block as evicted and prematurely retire
+                // dictionary budget on a window that evicts nothing.
+                let pre = m.window_size;
+                let space_len = space.len();
+                m.add_data(space, |data| {
+                    // Recycle the spent buffer as-is; `add_data` runs this for
+                    // every committed block, so zero-filling to capacity here
+                    // would be hot-path waste (`get_next_space` zeroes at most
+                    // `slice_size` on reuse).
                     vec_pool.push(data);
                 });
+                evicted_bytes += pre.saturating_add(space_len).saturating_sub(m.window_size);
             }
             MatcherStorage::HashChain(m) => {
                 // MatchTable::add_data now recycles the *incoming* buffer
@@ -6856,8 +6860,8 @@ fn prime_with_dictionary_budget_shrinks_after_row_eviction() {
 /// the swap, so there is nothing to inspect by accessor; the "window
 /// cleared" invariant is replaced by "variant dropped", and a
 /// subsequent `row_matcher()` call would panic by design. The
-/// pool-recycling side of the same transition is covered by
-/// [`driver_reset_from_row_backend_recycles_row_buffers_into_pool`].
+/// pool-recycling side of the row backend is covered by
+/// [`driver_row_commit_recycles_block_buffer_into_pool`].
 #[test]
 fn row_get_last_space_then_reset_to_fastest_drops_row_variant() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
@@ -6875,41 +6879,38 @@ fn row_get_last_space_then_reset_to_fastest_drops_row_variant() {
     assert_eq!(driver.active_backend(), super::strategy::BackendTag::Simple);
 }
 
-/// Switching from Row to Simple drains row-side buffers into `vec_pool`
-/// before swapping the storage variant. With the [`MatcherStorage`] enum
-/// the old [`RowMatchGenerator`] is dropped on swap, so this test
-/// guards only the pool-recycling side of the transition. The
-/// pre-enum tests (`…reclaims_row_buffer_pool` /
-/// `…tolerates_missing_row_matcher`) checked that the row matcher
-/// stayed allocated across the switch with its internals cleared —
-/// the new invariant is "dead variants are dropped", and the
-/// `row_match_generator: Option<_>` field whose lazy-init recovery
-/// they exercised no longer exists.
+/// Committing a Row block must return the input buffer to `vec_pool`
+/// immediately (the bytes are mirrored into the contiguous `history`,
+/// so there is no reason to retain a second copy in the window). This
+/// guards the chunk-length window: the previous `VecDeque<Vec<u8>>`
+/// window retained a full `block_capacity` buffer per committed block,
+/// which on a heavily pre-split frame ballooned peak memory to many
+/// times the live byte count. With the buffer recycled at commit time
+/// the pool grows by exactly one Vec per committed block.
 #[test]
-fn driver_reset_from_row_backend_recycles_row_buffers_into_pool() {
+fn driver_row_commit_recycles_block_buffer_into_pool() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
     driver.reset(CompressionLevel::Level(5));
     assert_eq!(driver.active_backend(), super::strategy::BackendTag::Row);
 
+    let before_pool = driver.vec_pool.len();
     let mut space = driver.get_next_space();
+    space.clear();
     space.extend_from_slice(b"row-data-to-recycle");
     driver.commit_space(space);
 
-    let before_pool = driver.vec_pool.len();
-    driver.reset(CompressionLevel::Fastest);
-
-    assert_eq!(driver.active_backend(), super::strategy::BackendTag::Simple);
     // `>` not `>=`: a fresh driver starts with `before_pool == 0`, so the
-    // weaker bound passes even if the Row→Simple transition failed to
-    // drain the committed buffer back into `vec_pool`. Strict growth
-    // proves the drain ran. Single fixture buffer → exactly one Vec
-    // returned to the pool.
+    // weaker bound passes even if the commit failed to recycle. Strict
+    // growth proves the buffer was returned to the pool at commit time
+    // rather than retained in the window (the pre-`chunk_lens` bug).
     assert!(
         driver.vec_pool.len() > before_pool,
-        "row reset must recycle the committed row history buffer into vec_pool \
+        "row commit must recycle the committed block buffer into vec_pool \
          (before_pool = {before_pool}, after = {})",
         driver.vec_pool.len()
     );
+    // The bytes still resolve through the contiguous history mirror.
+    assert_eq!(driver.get_last_space(), b"row-data-to-recycle");
 }
 
 #[test]
@@ -7881,6 +7882,41 @@ fn hc_commit_without_eviction_retires_no_dictionary_budget() {
 }
 
 #[test]
+fn row_commit_without_eviction_retires_no_dictionary_budget() {
+    // Regression for the Row arm of commit_space after the window ->
+    // chunk_lens migration: RowMatchGenerator::add_data now invokes its
+    // reuse_space callback for the *input* buffer (per-commit recycle),
+    // not for evicted chunks. The Row arm must derive eviction bytes from
+    // the window_size delta like the Dfast / HashChain arms — counting the
+    // callback argument as evicted charges the whole committed block as
+    // "evicted" and prematurely retires dictionary budget even when the
+    // window is nowhere near full.
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    driver.reset(CompressionLevel::Level(5));
+    assert!(matches!(driver.storage, MatcherStorage::Row(_)));
+    // A large live window so a small committed block evicts nothing.
+    driver.row_matcher_mut().max_window_size = 1 << 20;
+    driver.reported_window_size = 1 << 20;
+    driver.prime_with_dictionary(b"abcdefghABCDEFGHijklmnop", [1, 4, 8]);
+    let budget_after_prime = driver.dictionary_retained_budget;
+    assert!(
+        budget_after_prime > 0,
+        "priming must retain a non-zero dictionary budget"
+    );
+
+    let mut space = driver.get_next_space();
+    space.clear();
+    space.extend_from_slice(b"AAAAAAAA");
+    driver.commit_space(space);
+    driver.skip_matching_with_hint(None);
+
+    assert_eq!(
+        driver.dictionary_retained_budget, budget_after_prime,
+        "a Row commit that evicts nothing must retire no dictionary budget"
+    );
+}
+
+#[test]
 fn hc_rebases_positions_after_u32_boundary() {
     let mut matcher = HcMatchGenerator::new(64);
     matcher.table.add_data(b"abcdeabcdeabcde".to_vec(), |_| {});
@@ -7914,6 +7950,44 @@ fn hc_rebases_positions_after_u32_boundary() {
     assert!(
         candidates.iter().any(|candidate| *candidate != usize::MAX),
         "chain_candidates should return valid matches after rebase"
+    );
+}
+
+// 64-bit only: the >4 GiB absolute cursor this test fabricates cannot exist on
+// a 32-bit target (usize == u32 can't address that much), and setting
+// `history_abs_start` near `u32::MAX` there overflows `usize` in the
+// `check_stream_abs_headroom` guard before the rebase path is reached. Mirrors
+// the `try_into()` early-return guard on `hc_rebases_positions_after_u32_boundary`.
+#[cfg(target_pointer_width = "64")]
+#[test]
+fn row_rebases_positions_after_u32_boundary() {
+    // Row stores absolute match positions as u32. On a long stream the
+    // cumulative absolute cursor crosses the u32 range even while the live
+    // window stays bounded; `add_data` must rebase the coordinate origin
+    // down to the oldest live byte instead of asserting. Before the rebase
+    // landed this panicked on the `< u32::MAX` assertion, dropping valid
+    // long Row-backed frames.
+    let mut m = RowMatchGenerator::new(64);
+    m.add_data(b"abcdeabcdeabcde".to_vec(), |_| {});
+
+    // Simulate ~4 GiB of stream behind a bounded window: the live bytes now
+    // sit just under the u32 absolute ceiling.
+    let near_ceiling = (u32::MAX as usize) - 16;
+    m.history_abs_start = near_ceiling;
+
+    // The next commit would push a u32 position past the ceiling; add_data
+    // must rebase the origin rather than panic.
+    m.add_data(b"fghij".to_vec(), |_| {});
+
+    assert!(
+        m.history_abs_start < near_ceiling,
+        "add_data must rebase the absolute origin down when the cursor nears \
+         u32::MAX (got {})",
+        m.history_abs_start
+    );
+    assert!(
+        (m.history_abs_start + m.window_size) < u32::MAX as usize,
+        "after rebase the live window must fit below the u32 position ceiling"
     );
 }
 
