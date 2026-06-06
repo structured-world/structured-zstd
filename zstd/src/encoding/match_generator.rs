@@ -6915,6 +6915,43 @@ fn primed_snapshot_restored_for_hints_in_same_window_bucket() {
     );
 }
 
+#[test]
+fn primed_snapshot_restored_across_level22_donor_tier_hints() {
+    // Level 22 collapses several ceil-log buckets onto one donor source-size
+    // tier: `resolve_level_params(Level(22), ..)` selects the HC config and
+    // window_log by raw `<= 16 KiB / 128 KiB / 256 KiB` thresholds, so a 20 KiB
+    // and a 100 KiB hint (ceil-log buckets 15 and 17) both land in the
+    // `<= 128 KiB` tier and resolve to the IDENTICAL matcher (same window_log,
+    // same HC hash/chain/search geometry). Keying on the raw ceil-log bucket
+    // would still reject the restore here because the buckets differ; the key
+    // must compare the resolved matcher shape so these share one snapshot.
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    let level = CompressionLevel::Level(22);
+
+    driver.set_source_size_hint(20 * 1024);
+    driver.reset(level);
+    let window_a = driver.window_size();
+    driver.prime_with_dictionary(b"abcdefghABCDEFGHijklmnop", [1, 4, 8]);
+    driver.capture_primed_dictionary(level);
+
+    driver.set_source_size_hint(100 * 1024);
+    driver.reset(level);
+    let window_b = driver.window_size();
+    assert_eq!(
+        window_a, window_b,
+        "precondition: both hints must land in the same Level 22 donor tier \
+         (a={window_a}, b={window_b})"
+    );
+
+    let restored = driver.restore_primed_dictionary(level);
+    assert!(
+        restored,
+        "Level 22 snapshot captured at a 20 KiB hint must be restored into a \
+         100 KiB hint that resolves to the same donor tier (different ceil-log \
+         buckets, identical matcher shape)"
+    );
+}
+
 #[cfg(any())] // disabled: tested SuffixStore-per-block tail-handling specific to legacy MatchGenerator
 #[test]
 fn prime_with_dictionary_does_not_reuse_tiny_suffix_store() {
