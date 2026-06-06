@@ -26,6 +26,142 @@
 //! See the [`portable`] module doc for how the inline path is reached
 //! per target.
 
+/// Textual expansion of the AVX2 `ZSTD_execSequence` body at the call
+/// site, fusing the match-copy into a per-tier sequence monolith. A
+/// `#[target_feature(avx2)]` function cannot be `#[inline(always)]`
+/// (rust#145574), so the [`BufferBackend::exec_sequence_inline_avx2`]
+/// trait method stays a real CALL on the hot path; expanding the body via
+/// a macro removes that boundary (the reference `decompressSequences_bmi2`
+/// is one inlined monolith). Backend access goes through the inlinable
+/// accessors `cap` / `tail` / `inline_exec_base_ptr` / `inline_exec_commit`,
+/// so the macro stays generic over `B` while only the linear inline
+/// backends (`UserSliceBackend`, `FlatBuf`) ever reach it (gated on
+/// `SUPPORTS_INLINE_SEQUENCE_EXEC`). 32-byte ymm match-copy for
+/// `offset >= 32`; usable from any tier whose enclosing fn carries
+/// `target_feature(avx2,bmi2)` (AVX2 and VBMI2). The trait method
+/// `exec_sequence_inline_avx2` remains the unit-tested reference spec for
+/// this body. Returns `Result<(), ExecuteSequencesError>`.
+#[cfg(target_arch = "x86_64")]
+macro_rules! exec_sequence_avx2_inline {
+    ($buffer:expr, $lit_src:expr, $lit_length:expr, $offset:expr, $match_length:expr) => {{
+        use crate::decoding::buffer_backend::sequence_output_fits;
+        use crate::decoding::exec_sequence_inline::x86::{
+            copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_no_overlap_avx2,
+            wildcopy_overlap_8byte_stride,
+        };
+        const MAX_WILDCOPY_OVERSHOOT: usize = 31;
+        let lit_length_v: usize = $lit_length;
+        let offset_v: usize = $offset;
+        let match_length_v: usize = $match_length;
+        let lit_src_v: *const u8 = $lit_src;
+        let backend = $buffer.buffer_mut();
+        let cap = backend.cap();
+        let tail = backend.tail();
+        match sequence_output_fits(
+            lit_length_v,
+            match_length_v,
+            tail,
+            cap,
+            MAX_WILDCOPY_OVERSHOOT,
+        ) {
+            Err(e) => Err(e),
+            Ok(total) => {
+                // SAFETY: the enclosing fn carries
+                // `#[target_feature(enable = "...,bmi2,avx2")]`; the inline
+                // path is gated on `B::SUPPORTS_INLINE_SEQUENCE_EXEC`, so the
+                // backend is linear and overrides `inline_exec_base_ptr` /
+                // `inline_exec_commit`. `sequence_output_fits` validated
+                // `tail + total + overshoot <= cap`.
+                unsafe {
+                    let base = backend.inline_exec_base_ptr();
+                    let op_lit = base.add(tail);
+                    copy16(op_lit, lit_src_v);
+                    if lit_length_v > 16 {
+                        wildcopy_no_overlap(op_lit.add(16), lit_src_v.add(16), lit_length_v - 16);
+                    }
+                    let op_match = base.add(tail + lit_length_v);
+                    let match_src = base.cast_const().add(tail + lit_length_v - offset_v);
+                    if offset_v >= 32 {
+                        wildcopy_no_overlap_avx2(op_match, match_src, match_length_v);
+                    } else if offset_v >= 16 {
+                        wildcopy_no_overlap(op_match, match_src, match_length_v);
+                    } else {
+                        let (op2, ip2) = overlap_copy8(op_match, match_src, offset_v);
+                        if match_length_v > 8 {
+                            wildcopy_overlap_8byte_stride(op2, ip2, match_length_v - 8);
+                        }
+                    }
+                    backend.inline_exec_commit(tail + total);
+                }
+                Ok(())
+            }
+        }
+    }};
+}
+#[cfg(target_arch = "x86_64")]
+pub(crate) use exec_sequence_avx2_inline;
+
+/// SSE2 twin of [`exec_sequence_avx2_inline`] for the BMI2 tier (which has
+/// no AVX2): 16-byte xmm match-copy only (`offset >= 16`), so the WILDCOPY
+/// destination overshoot stays 15 bytes (vs 31 for the ymm path). Mirrors
+/// the [`BufferBackend::exec_sequence_inline`] trait method body, which
+/// remains the unit-tested reference spec. Usable from any fn carrying
+/// `target_feature(bmi2)`; baseline SSE2 needs no feature gate on x86_64.
+#[cfg(target_arch = "x86_64")]
+macro_rules! exec_sequence_sse2_inline {
+    ($buffer:expr, $lit_src:expr, $lit_length:expr, $offset:expr, $match_length:expr) => {{
+        use crate::decoding::buffer_backend::sequence_output_fits;
+        use crate::decoding::exec_sequence_inline::x86::{
+            copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_overlap_8byte_stride,
+        };
+        const MAX_WILDCOPY_OVERSHOOT: usize = 15;
+        let lit_length_v: usize = $lit_length;
+        let offset_v: usize = $offset;
+        let match_length_v: usize = $match_length;
+        let lit_src_v: *const u8 = $lit_src;
+        let backend = $buffer.buffer_mut();
+        let cap = backend.cap();
+        let tail = backend.tail();
+        match sequence_output_fits(
+            lit_length_v,
+            match_length_v,
+            tail,
+            cap,
+            MAX_WILDCOPY_OVERSHOOT,
+        ) {
+            Err(e) => Err(e),
+            Ok(total) => {
+                // SAFETY: inline path gated on `B::SUPPORTS_INLINE_SEQUENCE_EXEC`
+                // (linear backend, overrides the accessors);
+                // `sequence_output_fits` validated `tail + total + 15 <= cap`.
+                // All copy primitives are SSE2 baseline (no target_feature).
+                unsafe {
+                    let base = backend.inline_exec_base_ptr();
+                    let op_lit = base.add(tail);
+                    copy16(op_lit, lit_src_v);
+                    if lit_length_v > 16 {
+                        wildcopy_no_overlap(op_lit.add(16), lit_src_v.add(16), lit_length_v - 16);
+                    }
+                    let op_match = base.add(tail + lit_length_v);
+                    let match_src = base.cast_const().add(tail + lit_length_v - offset_v);
+                    if offset_v >= 16 {
+                        wildcopy_no_overlap(op_match, match_src, match_length_v);
+                    } else {
+                        let (op2, ip2) = overlap_copy8(op_match, match_src, offset_v);
+                        if match_length_v > 8 {
+                            wildcopy_overlap_8byte_stride(op2, ip2, match_length_v - 8);
+                        }
+                    }
+                    backend.inline_exec_commit(tail + total);
+                }
+                Ok(())
+            }
+        }
+    }};
+}
+#[cfg(target_arch = "x86_64")]
+pub(crate) use exec_sequence_sse2_inline;
+
 // x86_64 only: SSE2 is the architectural baseline there (every x86_64
 // CPU has SSE2 by definition). 32-bit `x86` is excluded because the
 // SSE2 intrinsics here are emitted without a `#[target_feature]`

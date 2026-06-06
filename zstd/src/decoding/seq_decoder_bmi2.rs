@@ -9,6 +9,7 @@
 
 use super::buffer_backend::BufferBackend;
 use super::decode_buffer::DecodeBuffer;
+use super::exec_sequence_inline::exec_sequence_sse2_inline;
 use super::scratch::FSEScratch;
 use super::sequence_section_decoder::{
     ADVANCE, ADVANCE_MASK, ExecSeq, SeqStreamSetup, init_sequence_stream,
@@ -122,15 +123,16 @@ macro_rules! execute_one_body {
                 if prefix_end_ok {
                     // SAFETY: parent-slice provenance; offset prefix-resident.
                     let lit_src = unsafe { $literals_buffer.as_ptr().add(lit_cur_before) };
-                    // SAFETY: enclosing fn carries target_feature(bmi2).
-                    let r = unsafe {
-                        $buffer.buffer_mut().exec_sequence_inline(
-                            lit_src,
-                            seq_ll_v as usize,
-                            offset,
-                            seq_ml_v as usize,
-                        )
-                    };
+                    // Inline the SSE2 exec body at the call site (no trait-method
+                    // call boundary; BMI2 tier has no AVX2, so the 16-byte xmm
+                    // wildcopy variant is used — see `exec_sequence_sse2_inline`).
+                    let r = exec_sequence_sse2_inline!(
+                        $buffer,
+                        lit_src,
+                        seq_ll_v as usize,
+                        offset,
+                        seq_ml_v as usize
+                    );
                     break 'exec_inner r.map_err(DecompressBlockError::ExecuteSequencesError);
                 }
             }
