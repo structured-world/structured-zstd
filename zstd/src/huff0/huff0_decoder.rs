@@ -682,28 +682,7 @@ impl HuffmanTable {
                 let len = 1 << (max_bits - bits_for_symbol);
                 self.rank_indexes[bits_for_symbol as usize] += len;
                 let packed = u16::from(symbol as u8) | (u16::from(bits_for_symbol) << 8);
-                // Donor `HUF_fillDTableX1` switch-on-length: `len` here is a
-                // RUNTIME value (per symbol), so `slice::fill` lowers to a
-                // runtime-length memset call every symbol. The short lengths
-                // dominate the symbol count (high-`nbBits` symbols span 1/2/4
-                // table entries), so specialise them into compile-time-fixed
-                // stores — the reference hoists the same switch out of its
-                // per-weight loop. A single sub-slice keeps one bounds check.
-                let dst = &mut self.packed_decode[base_idx..base_idx + len];
-                match dst.len() {
-                    1 => dst[0] = packed,
-                    2 => {
-                        dst[0] = packed;
-                        dst[1] = packed;
-                    }
-                    4 => {
-                        dst[0] = packed;
-                        dst[1] = packed;
-                        dst[2] = packed;
-                        dst[3] = packed;
-                    }
-                    _ => dst.fill(packed),
-                }
+                self.packed_decode[base_idx..base_idx + len].fill(packed);
             }
         }
 
