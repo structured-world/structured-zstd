@@ -343,6 +343,12 @@ mod tests {
             CompressionLevel::Level(4),
             RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES
         ));
+        // Over-cap numeric level is rejected, same boundary as `Best`, so the
+        // two branches can't drift apart.
+        assert!(!compression_level_allows_raw_fast_path(
+            CompressionLevel::Level(4),
+            RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES + 1
+        ));
     }
 
     #[test]

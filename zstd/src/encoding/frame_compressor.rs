@@ -3338,7 +3338,7 @@ mod tests {
     /// the second block yields >= 3 decoded blocks, asserted on the round-trip.
     #[test]
     fn fast_oneshot_borrowed_split_emits_subblock() {
-        use crate::encoding::{CompressionLevel, compress_slice_to_vec};
+        use crate::encoding::CompressionLevel;
         // First 192 KiB: homogeneous zero run (banks the savings the split
         // gate needs). The second 128 KiB block flips to a counter sequence
         // at its 64 KiB midpoint (the 192 KiB mark) — a fingerprint
@@ -3351,7 +3351,25 @@ mod tests {
             }
         }
 
-        let frame = compress_slice_to_vec(&data, CompressionLevel::Fastest);
+        // Pin the splitter decision for the Fast path directly (mirrors the
+        // greedy test): the second donor block must resolve to a sub-block
+        // boundary, so the >= 3 block count below cannot pass vacuously.
+        let second_block = &data[128 * 1024..];
+        assert!(
+            super::optimal_block_size(
+                CompressionLevel::Fastest,
+                second_block,
+                second_block.len(),
+                MAX_BLOCK_SIZE as usize,
+                100,
+            ) < MAX_BLOCK_SIZE as usize,
+            "fixture must resolve to a sub-block split in the second donor block",
+        );
+
+        // Drive the borrowed one-shot route explicitly (Fast level ->
+        // run_borrowed_block_loop via compress_independent_frame).
+        let mut compressor: FrameCompressor = FrameCompressor::new(CompressionLevel::Fastest);
+        let frame = compressor.compress_independent_frame(&data);
 
         let mut decoder = FrameDecoder::new();
         let mut source = frame.as_slice();
