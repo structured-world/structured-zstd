@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780699859685,
+  "lastUpdate": 1780708267415,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -58058,6 +58058,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.199,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d0fa7ddcee169b6ecf03aa12bc271b3d7891e3ea",
+          "message": "perf(encode): store row match positions as u32 to cut peak memory (#346)\n\n* perf(encode): store row match positions as u32 to cut peak memory\n\nThe Row backend (greedy / row-hash levels) stored absolute match positions\nin `row_positions: Vec<usize>` — 8 bytes per slot, the largest match-finder\nallocation. On a 1 MiB input at level 5 the compress peak was 24.3 MB vs\n5.1 MB for the C reference (4.76x), with this table the dominant term.\n\nStore positions as `u32` (the donor `U32` layout), halving that table. The\nabsolute cursor resets to 0 per frame and a single Row frame is capped below\n`u32::MAX` in `add_data` (a loud assert, mirroring `check_stream_abs_headroom`;\nthe cursor reset means this only bounds a single ~4 GiB+ frame, far beyond\nthe decoder's window cap). `ROW_EMPTY_SLOT` becomes `u32::MAX` and every\nstored position stays strictly below it, so the sentinel is unambiguous.\nOutput is byte-identical (same positions, narrower storage).\n\nPart of #341\n\n* perf(encode): reuse pre-split carry buffer to cut block-loop alloc churn\n\nThe owned block loop split the kept suffix into a fresh Vec via split_off\nand reserve_exact-grew it to block_capacity on every pre-split. On a\nheavily pre-split frame that churned one block-sized allocation per split\n(~12 MB over ~90 splits on a 1 MiB corpus input). Draw the block buffer\nfrom the matcher's recycled pool (capacity already covers the block size)\nand carry the suffix in a retained, reused pending_input buffer instead.\n\nPart of #341\n\n* perf(encode): store Row window as chunk lengths, not retained buffers\n\nThe Row backend kept every committed block in a VecDeque<Vec<u8>> window\nwhile also mirroring the bytes into the contiguous history buffer. Each\nretained Vec carried its full block_capacity, so on a heavily pre-split\nframe the window held many block-sized buffers for far fewer live bytes\n(e.g. ~12 MB of window for a 1 MiB input split into ~90 sub-blocks).\n\nMirror the HashChain backend: keep only per-block lengths in a\nVecDeque<usize> and return the input buffer to the caller's pool at commit\ntime. Match bytes already live in the contiguous history mirror, and the\ncurrent block resolves as its tail slice. Output is byte-identical.\n\nPart of #341\n\n* test(encode): Row commit must not retire dict budget without eviction\n\nAfter the Row window -> chunk_lens migration, RowMatchGenerator::add_data\nrecycles the input buffer through reuse_space every commit. The Row arm of\ncommit_space still adds that callback argument's length to evicted_bytes,\ncharging the whole committed block as evicted and retiring dictionary\nbudget even when the window evicts nothing. The regression test primes a\ndictionary, commits a small block into a large window, and asserts the\nretained budget is unchanged. It fails until the Row arm is fixed.\n\nPart of #341\n\n* fix(encode): derive Row commit eviction from window_size delta\n\nThe Row arm of commit_space counted the per-commit recycle callback's\nbuffer length as evicted bytes, so every commit retired dictionary budget\nas if it had evicted a full block — dropping dictionary-primed Row history\nprematurely. Mirror the Simple / HashChain arms: compute evicted = pre +\nspace_len - post from the window_size delta, and recycle the spent buffer\nwithout zero-filling to capacity on the hot path.\n\nPart of #341\n\n* test(encode): Row must rebase u32 positions past the 4 GiB boundary\n\nThe Row backend stores absolute match positions as u32 and asserted the\ncumulative cursor stays below u32::MAX, so a long streaming frame at a\nRow-backed level panicked once the absolute cursor crossed 4 GiB even\nthough the live window was still bounded. The regression test drives the\ncursor to just under the ceiling and commits another block; it panics on\nthe assertion until add_data rebases the coordinate origin.\n\nPart of #341\n\n* fix(encode): rebase Row u32 positions instead of capping frames at 4 GiB\n\nThe u32 position store hard-asserted the cumulative absolute cursor stayed\nbelow u32::MAX, so a valid long streaming frame at a Row-backed level\npanicked once it crossed 4 GiB even though the live window was bounded\n(the pre-u32 usize store handled such streams). Add a cold rebase in\nadd_data, mirroring the donor index-reduction: when the cursor nears the\nceiling, subtract history_abs_start from the origin and every live\nrow_positions entry (stale entries collapse to the empty sentinel). The\nuniform shift preserves all match offsets, keeping the u32 footprint win\nwhile restoring multi-GiB streaming.\n\nPart of #341\n\n* docs(encode): note Row position rebase in row_positions field doc\n\nThe field comment still claimed add_data caps frame length below u32::MAX;\nit now rebases the coordinate origin instead. Update the doc to match.\n\nPart of #341\n\n* test(encode): gate Row u32-boundary rebase test to 64-bit targets\n\nThe test fabricates a >4 GiB absolute cursor to force the rebase path.\nThat cursor is impossible on a 32-bit target (usize == u32 cannot address\nit), and setting history_abs_start near u32::MAX there overflows usize in\nthe check_stream_abs_headroom guard before the rebase runs, panicking the\ncross-i686 job. Gate the test on target_pointer_width = \"64\", mirroring\nthe try_into() early-return guard already on the HashChain equivalent.\n\nPart of #341",
+          "timestamp": "2026-06-06T03:16:33+03:00",
+          "tree_id": "03d5386d5020ae52a7eafe9901e8daa5f1e25fde",
+          "url": "https://github.com/structured-world/structured-zstd/commit/d0fa7ddcee169b6ecf03aa12bc271b3d7891e3ea"
+        },
+        "date": 1780708256962,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.133,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.112,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 260.658,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 228.369,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.378,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.274,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.338,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.028,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.223,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.974,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.108,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.108,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.022,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 12.247,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 4.941,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.748,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.316,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.679,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.07,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.769,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.11,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.117,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.265,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.117,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.26,
             "unit": "ms"
           }
         ]
