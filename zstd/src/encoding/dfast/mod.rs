@@ -139,17 +139,15 @@ impl DfastMatchGenerator {
         }
     }
 
-    /// Set both hash table sizes. `bits` is the long-hash bit count
-    /// (donor `cParams.hashLog`); the short hash is derived as
-    /// `bits - DFAST_SHORT_HASH_BITS_DELTA`, donor-correct for dfast
-    /// levels. Both clamps stay above `MIN_WINDOW_LOG` so very small
-    /// windows don't underflow.
-    pub(crate) fn set_hash_bits(&mut self, bits: usize) {
+    /// Set both hash table sizes from the per-level [`DfastConfig`]:
+    /// `long_bits` = donor `cParams.hashLog`, `short_bits` = donor
+    /// `cParams.chainLog`. Both clamps stay above `MIN_WINDOW_LOG` so very
+    /// small windows don't underflow. The caller already caps `long_bits` by
+    /// the source-size window when hinted, so no upper clamp is applied here.
+    pub(crate) fn set_hash_bits(&mut self, long_bits: usize, short_bits: usize) {
         let min_bits = MIN_WINDOW_LOG as usize;
-        let long_clamped = bits.clamp(min_bits, DFAST_HASH_BITS);
-        let short_clamped = long_clamped
-            .saturating_sub(DFAST_SHORT_HASH_BITS_DELTA)
-            .max(min_bits);
+        let long_clamped = long_bits.max(min_bits);
+        let short_clamped = short_bits.max(min_bits);
         if self.long_hash_bits != long_clamped {
             self.long_hash_bits = long_clamped;
             self.long_hash = Vec::new();
