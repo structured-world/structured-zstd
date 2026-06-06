@@ -6787,6 +6787,45 @@ fn prime_with_dictionary_does_not_inflate_reported_window_size() {
     );
 }
 
+#[test]
+fn primed_snapshot_not_restored_when_window_hint_differs() {
+    // The copy-snapshot must be keyed on the resolved reset parameters, not
+    // just the CompressionLevel. `reset()` caps window_log by the source-size
+    // hint, so two same-level frames with different hints resolve to different
+    // windows. Restoring a snapshot captured at the larger hint into a reset
+    // for the smaller hint would advertise the smaller window in the frame
+    // header while the matcher's `max_window_size` (from the restored storage)
+    // still spans the larger window — the encoder could then emit a match
+    // (e.g. into the dictionary) past the advertised window, producing an
+    // undecodable frame. Restore must REFUSE when the resolved window differs.
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    let level = CompressionLevel::Best;
+
+    // Frame A: large hint → larger resolved window. Prime + capture.
+    driver.set_source_size_hint(256 * 1024);
+    driver.reset(level);
+    let big_window = driver.window_size();
+    driver.prime_with_dictionary(b"abcdefghABCDEFGHijklmnop", [1, 4, 8]);
+    driver.capture_primed_dictionary(level);
+
+    // Frame B: smaller hint, SAME level → smaller resolved window.
+    driver.set_source_size_hint(48 * 1024);
+    driver.reset(level);
+    let small_window = driver.window_size();
+    assert!(
+        small_window < big_window,
+        "precondition: the two hints must resolve to different windows \
+         (small={small_window}, big={big_window})"
+    );
+
+    let restored = driver.restore_primed_dictionary(level);
+    assert!(
+        !restored,
+        "snapshot captured at window {big_window} must NOT be restored into a \
+         reset advertising window {small_window} (level alone is an insufficient key)"
+    );
+}
+
 #[cfg(any())] // disabled: tested SuffixStore-per-block tail-handling specific to legacy MatchGenerator
 #[test]
 fn prime_with_dictionary_does_not_reuse_tiny_suffix_store() {
