@@ -472,6 +472,18 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         Ok(())
     }
 
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn inline_exec_base_ptr(&mut self) -> *mut u8 {
+        self.slice.as_mut_ptr()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn inline_exec_commit(&mut self, new_tail: usize) {
+        self.tail = new_tail;
+    }
+
     /// `new()` exists for trait conformance but is not used on the
     /// direct-decode path — the slice is always provided up-front via
     /// [`Self::from_slice`]. Returns an empty backend wrapping an

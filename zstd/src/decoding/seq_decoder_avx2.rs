@@ -78,8 +78,77 @@ macro_rules! decode_one_body {
     }};
 }
 
-/// Textual expansion of per-sequence execute. Fast path:
-/// `exec_sequence_inline_avx2` (32-byte ymm wildcopy). Cold path: legacy
+/// Textual expansion of the AVX2 `ZSTD_execSequence` body at the call
+/// site, fusing the match-copy into the per-tier sequence monolith. A
+/// `#[target_feature(avx2)]` function cannot be `#[inline(always)]`
+/// (rust#145574), so the trait method `exec_sequence_inline_avx2` stays a
+/// real CALL on the hot path; expanding the body via a macro removes that
+/// boundary (the donor `ZSTD_decompressSequences_bmi2` is one inlined
+/// monolith). Backend access goes through the inlinable trait accessors
+/// `cap` / `tail` / `inline_exec_base_ptr` / `inline_exec_commit`, so the
+/// macro stays generic over `B` while only the linear inline backends
+/// (`UserSliceBackend`, `FlatBuf`) ever reach it (gated on
+/// `SUPPORTS_INLINE_SEQUENCE_EXEC`). Returns `Result<(),
+/// ExecuteSequencesError>`.
+macro_rules! exec_sequence_avx2_inline {
+    ($buffer:expr, $lit_src:expr, $lit_length:expr, $offset:expr, $match_length:expr) => {{
+        use crate::decoding::buffer_backend::sequence_output_fits;
+        use crate::decoding::exec_sequence_inline::x86::{
+            copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_no_overlap_avx2,
+            wildcopy_overlap_8byte_stride,
+        };
+        const MAX_WILDCOPY_OVERSHOOT: usize = 31;
+        let lit_length_v: usize = $lit_length;
+        let offset_v: usize = $offset;
+        let match_length_v: usize = $match_length;
+        let lit_src_v: *const u8 = $lit_src;
+        let backend = $buffer.buffer_mut();
+        let cap = backend.cap();
+        let tail = backend.tail();
+        match sequence_output_fits(
+            lit_length_v,
+            match_length_v,
+            tail,
+            cap,
+            MAX_WILDCOPY_OVERSHOOT,
+        ) {
+            Err(e) => Err(e),
+            Ok(total) => {
+                // SAFETY: the enclosing fn carries
+                // `#[target_feature(enable = "bmi2,avx2")]`; the inline path
+                // is gated on `B::SUPPORTS_INLINE_SEQUENCE_EXEC`, so the
+                // backend is linear and overrides `inline_exec_base_ptr` /
+                // `inline_exec_commit`. `sequence_output_fits` validated
+                // `tail + total + overshoot <= cap`.
+                unsafe {
+                    let base = backend.inline_exec_base_ptr();
+                    let op_lit = base.add(tail);
+                    copy16(op_lit, lit_src_v);
+                    if lit_length_v > 16 {
+                        wildcopy_no_overlap(op_lit.add(16), lit_src_v.add(16), lit_length_v - 16);
+                    }
+                    let op_match = base.add(tail + lit_length_v);
+                    let match_src = base.cast_const().add(tail + lit_length_v - offset_v);
+                    if offset_v >= 32 {
+                        wildcopy_no_overlap_avx2(op_match, match_src, match_length_v);
+                    } else if offset_v >= 16 {
+                        wildcopy_no_overlap(op_match, match_src, match_length_v);
+                    } else {
+                        let (op2, ip2) = overlap_copy8(op_match, match_src, offset_v);
+                        if match_length_v > 8 {
+                            wildcopy_overlap_8byte_stride(op2, ip2, match_length_v - 8);
+                        }
+                    }
+                    backend.inline_exec_commit(tail + total);
+                }
+                Ok(())
+            }
+        }
+    }};
+}
+
+/// Textual expansion of per-sequence execute. Fast path: the inlined AVX2
+/// match-copy macro [`exec_sequence_avx2_inline`]. Cold path: legacy
 /// try_push + repeat_lookahead_prefetched. Expands as a statement-block
 /// returning `Result<(), DecompressBlockError>` so the caller can `?`
 /// or branch on it as needed.
@@ -143,15 +212,15 @@ macro_rules! execute_one_body {
                 if prefix_end_ok {
                     // SAFETY: parent-slice provenance; offset prefix-resident.
                     let lit_src = unsafe { $literals_buffer.as_ptr().add(lit_cur_before) };
-                    // SAFETY: enclosing fn carries target_feature(bmi2,avx2).
-                    let r = unsafe {
-                        $buffer.buffer_mut().exec_sequence_inline_avx2(
-                            lit_src,
-                            seq_ll_v as usize,
-                            offset,
-                            seq_ml_v as usize,
-                        )
-                    };
+                    // Inline the AVX2 exec body at the call site (no trait-method
+                    // call boundary; see `exec_sequence_avx2_inline`).
+                    let r = exec_sequence_avx2_inline!(
+                        $buffer,
+                        lit_src,
+                        seq_ll_v as usize,
+                        offset,
+                        seq_ml_v as usize
+                    );
                     break 'exec_inner r.map_err(DecompressBlockError::ExecuteSequencesError);
                 }
             }

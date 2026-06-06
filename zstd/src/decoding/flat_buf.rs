@@ -312,6 +312,21 @@ impl BufferBackend for FlatBuf {
         Ok(())
     }
 
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn inline_exec_base_ptr(&mut self) -> *mut u8 {
+        self.buf.as_mut_ptr()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn inline_exec_commit(&mut self, new_tail: usize) {
+        // The macro wrote `[buf.len(), new_tail)`; grow the Vec to expose it.
+        // SAFETY: new_tail <= capacity (sequence_output_fits validated it) and
+        // `[0, new_tail)` is now initialised.
+        unsafe { self.buf.set_len(new_tail) };
+    }
+
     fn new() -> Self {
         Self {
             buf: Vec::new(),
