@@ -3213,14 +3213,20 @@ mod tests {
         );
         let half = nblocks / 2;
         // Boundaries: 1 block, 2 blocks, half, all, and a non-zero start.
+        // `(0, u32::MAX)` exercises the "decode to end of frame" sentinel,
+        // a distinct public contract from an explicit upper bound.
         for &(s, e) in &[
-            (0u32, 1u32),
+            (0u32, u32::MAX),
+            (0, 1),
             (0, 2),
             (0, half),
             (0, nblocks),
             (1, 2),
             (half, nblocks),
         ] {
+            // The sentinel decodes through the last block; map it to nblocks
+            // for the expected-slice / block-count arithmetic below.
+            let effective_end = if e == u32::MAX { nblocks } else { e };
             let mut source = compressed.as_slice();
             let mut dec = FrameDecoder::new();
             dec.reset(&mut source).unwrap();
@@ -3229,14 +3235,17 @@ mod tests {
                 .unwrap_or_else(|err| panic!("range [{s},{e}) errored: {err:?}"));
 
             let start = info.decompressed_byte_range(s as usize).unwrap().start as usize;
-            let end = info.decompressed_byte_range((e - 1) as usize).unwrap().end as usize;
+            let end = info
+                .decompressed_byte_range((effective_end - 1) as usize)
+                .unwrap()
+                .end as usize;
             assert_eq!(
                 pd.data.as_slice(),
                 &full[start..end],
                 "subset bytes must equal the full-decode slice for [{s},{e})"
             );
             assert_eq!(pd.start_block, s);
-            assert_eq!(pd.blocks_decoded, e - s);
+            assert_eq!(pd.blocks_decoded, effective_end - s);
             assert!(pd.stopped_at.is_none(), "clean range [{s},{e})");
         }
     }
@@ -3402,6 +3411,35 @@ mod tests {
             dec.can_collect(),
             0,
             "context bytes must not leak via collect()/read() when data is empty"
+        );
+    }
+
+    #[cfg(feature = "lsm")]
+    #[test]
+    fn decode_blocks_partial_empty_range_leaves_no_residual() {
+        // Companion to the start-past-EOF case: an in-frame empty range `[k, k)`
+        // (k < EOF) takes the same `prefix_window_len == None` path but with
+        // `frame_finished == false` and up to `window_size` context bytes still
+        // physically present. Assert the buffer is fully cleared directly (a
+        // `can_collect()` check alone would pass even with <= window_size bytes
+        // retained, because it holds the window back).
+        let (compressed, _full, info) = multi_block_fixture();
+        let k = ((info.blocks.len() as u32) / 2).max(1);
+        let mut source = compressed.as_slice();
+        let mut dec = FrameDecoder::new();
+        dec.reset(&mut source).unwrap();
+        let pd = dec.decode_blocks_partial(&mut source, k, k).unwrap();
+
+        assert!(pd.data.is_empty(), "empty range must yield empty data");
+        assert_eq!(pd.blocks_decoded, 0);
+        assert!(
+            !pd.frame_finished,
+            "frame should still have trailing blocks"
+        );
+        assert_eq!(
+            dec.state.as_ref().unwrap().decoder_scratch.buffer_len(),
+            0,
+            "empty-range partial decode must not retain context bytes"
         );
     }
 

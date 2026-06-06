@@ -3141,21 +3141,7 @@ mod tests {
         // A multi-block compressible payload exercises the Compressed-block
         // path (whose regenerated size is NOT on the wire, so it relies on the
         // encode-side capture this test guards).
-        let mut data: Vec<u8> = Vec::with_capacity(400 * 1024);
-        let mut x = 0x9E37_79B9u32;
-        // Semi-repetitive: long runs interleaved with stride patterns so the
-        // encoder produces several Compressed blocks rather than one giant Raw.
-        while data.len() < 400 * 1024 {
-            x ^= x << 13;
-            x ^= x >> 17;
-            x ^= x << 5;
-            let run = 16 + (x as usize % 48);
-            let byte = (x >> 24) as u8;
-            for _ in 0..run {
-                data.push(byte);
-            }
-            data.extend_from_slice(b"the quick brown fox jumps over the lazy dog\n");
-        }
+        let data = emit_info_fixture_data();
 
         // Cover both the single-block-per-chunk path (Default) and the
         // Level(16..=22) post-split path (multiple physical partitions per
@@ -3203,6 +3189,22 @@ mod tests {
                 info.blocks.last().unwrap().last_block,
                 "final block must carry last_block ({level:?})"
             );
+
+            // Pin the Level(22) post-split path: the owned loop feeds the
+            // encoder MAX_BLOCK_SIZE input chunks, so without post-split the
+            // block count cannot exceed the chunk count. More blocks than
+            // chunks proves at least one chunk was split into multiple physical
+            // partitions (the per-partition `src_size` capture under test).
+            if matches!(level, super::CompressionLevel::Level(22)) {
+                let max_block = crate::common::MAX_BLOCK_SIZE as usize;
+                let n_chunks = data.len().div_ceil(max_block);
+                assert!(
+                    info.blocks.len() > n_chunks,
+                    "Level(22) must exercise post-split: {} blocks for {} input chunks",
+                    info.blocks.len(),
+                    n_chunks
+                );
+            }
 
             // Per-block ranges: contiguous, zero-based, summing to the full output.
             let mut expected_start = 0u64;
@@ -3252,6 +3254,90 @@ mod tests {
                 "out-of-range index yields None ({level:?})"
             );
         }
+    }
+
+    /// ~400 KiB semi-repetitive payload (long runs interleaved with a stride
+    /// phrase) that compresses into several multi-block frames across levels.
+    #[cfg(feature = "lsm")]
+    fn emit_info_fixture_data() -> Vec<u8> {
+        let mut data: Vec<u8> = Vec::with_capacity(400 * 1024);
+        let mut x = 0x9E37_79B9u32;
+        while data.len() < 400 * 1024 {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            let run = 16 + (x as usize % 48);
+            let byte = (x >> 24) as u8;
+            for _ in 0..run {
+                data.push(byte);
+            }
+            data.extend_from_slice(b"the quick brown fox jumps over the lazy dog\n");
+        }
+        data
+    }
+
+    #[cfg(feature = "lsm")]
+    #[test]
+    fn frame_emit_info_decompressed_ranges_match_on_borrowed_oneshot_path() {
+        // The borrowed one-shot path (`compress_independent_frame` ->
+        // `run_borrowed_block_loop` -> `compress_block_encoded_borrowed`)
+        // threads the decompressed-size sidecar through a DIFFERENT emit site
+        // than the owned/streaming loop, so it needs its own per-block mapping
+        // check. A Fast level keeps the encoder on the borrowed-eligible
+        // (Simple matcher) path.
+        let data = emit_info_fixture_data();
+
+        let mut compressor: FrameCompressor =
+            FrameCompressor::new(super::CompressionLevel::Fastest);
+        let compressed = compressor.compress_independent_frame(data.as_slice());
+        let info = compressor
+            .last_frame_emit_info()
+            .expect("emit info populated after compress_independent_frame")
+            .clone();
+        assert!(
+            info.blocks.len() >= 2,
+            "borrowed fixture must span multiple blocks (got {})",
+            info.blocks.len()
+        );
+        assert!(info.blocks.last().unwrap().last_block);
+
+        // Full decode reference.
+        let mut decoder = FrameDecoder::new();
+        let mut source = compressed.as_slice();
+        decoder.reset(&mut source).unwrap();
+        while !decoder.is_finished() {
+            decoder
+                .decode_blocks(&mut source, crate::decoding::BlockDecodingStrategy::All)
+                .unwrap();
+        }
+        let mut decoded = Vec::new();
+        decoder.collect_to_writer(&mut decoded).unwrap();
+        assert_eq!(decoded, data, "borrowed one-shot frame must round-trip");
+
+        // Each block's mapping must match real per-block bytes.
+        let mut expected_start = 0u64;
+        for i in 0..info.blocks.len() {
+            let range = info.decompressed_byte_range(i).unwrap();
+            assert_eq!(range.start, expected_start, "block {i} range contiguity");
+            let mut psrc = compressed.as_slice();
+            let mut pdec = FrameDecoder::new();
+            pdec.reset(&mut psrc).unwrap();
+            let pd = pdec
+                .decode_blocks_partial(&mut psrc, i as u32, i as u32 + 1)
+                .unwrap();
+            assert!(pd.stopped_at.is_none(), "block {i} must decode cleanly");
+            assert_eq!(
+                pd.data.as_slice(),
+                &decoded[range.start as usize..range.end as usize],
+                "borrowed block {i} partial-decode bytes must equal the full-decode slice"
+            );
+            expected_start = range.end;
+        }
+        assert_eq!(
+            expected_start,
+            decoded.len() as u64,
+            "ranges sum to full length"
+        );
     }
 
     #[cfg(feature = "std")]
