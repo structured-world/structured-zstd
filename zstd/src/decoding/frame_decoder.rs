@@ -1296,6 +1296,20 @@ impl FrameDecoder {
                 }
             }
             let produced = state.decoder_scratch.buffer_len() - len_before;
+            // Per-block XXH64 capture, mirroring `decode_blocks`: hash this
+            // block's just-decoded bytes BEFORE any window drop so the digest
+            // count stays 1:1 with the blocks decoded on this path too. Covers
+            // context (out-of-range) blocks as well, matching `decode_blocks`
+            // which hashes every block it decodes.
+            #[cfg(all(feature = "lsm", feature = "hash"))]
+            if self.per_block_checksums_enabled {
+                use core::hash::Hasher;
+                let (s1, s2) = state.decoder_scratch.last_n_as_slices(produced);
+                let mut h = twox_hash::XxHash64::with_seed(0);
+                h.write(s1);
+                h.write(s2);
+                self.computed_block_checksums.push(h.finish() as u32);
+            }
             state.block_counter += 1;
             if in_range {
                 subset_bytes += produced as u64;
@@ -1333,9 +1347,7 @@ impl FrameDecoder {
         // The visible buffer is now `[prefix window][in-range clean][maybe
         // trailing garbage from a failed in-range block]`. Drop the prefix
         // window from the front (match resolution is complete, so it is no
-        // longer needed), then drain exactly the clean in-range byte count —
-        // any trailing garbage is left undrained and cleared on the next
-        // `reset`.
+        // longer needed), then drain exactly the clean in-range byte count.
         let w = prefix_window_len.unwrap_or(0);
         state.decoder_scratch.buffer_discard_front(w);
         let mut data = alloc::vec![0u8; subset_bytes as usize];
@@ -1343,6 +1355,14 @@ impl FrameDecoder {
             .decoder_scratch
             .buffer_read_all(&mut data)
             .map_err(err::FailedToDrainDecodebuffer)?;
+
+        // Clear anything still buffered so a later `read()`/`collect()` on this
+        // decoder cannot surface out-of-range bytes: the leading-block window
+        // when no in-range block was reached (`prefix_window_len` stayed
+        // `None`, so `w` was 0), or trailing garbage from a failed in-range
+        // block. Only the returned `data` is the partial decode's output.
+        let residual = state.decoder_scratch.buffer_len();
+        state.decoder_scratch.buffer_discard_front(residual);
 
         Ok(PartialDecode {
             data,
