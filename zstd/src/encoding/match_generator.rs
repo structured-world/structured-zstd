@@ -151,7 +151,7 @@ use super::hc::MAX_HC_SEARCH_DEPTH;
 
 /// Bundled tuning knobs for the hash-chain matcher. Using a typed config
 /// instead of positional `usize` args eliminates parameter-order hazards.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq)]
 struct HcConfig {
     hash_log: usize,
     chain_log: usize,
@@ -159,7 +159,7 @@ struct HcConfig {
     target_len: usize,
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq)]
 pub(crate) struct RowConfig {
     pub(crate) hash_bits: usize,
     pub(crate) row_log: usize,
@@ -250,7 +250,7 @@ const ROW_L5: RowConfig = RowConfig {
 /// family and the compile-time strategy consts; the runtime
 /// [`BackendTag`] used by the driver dispatcher is derived via
 /// [`StrategyTag::backend`] so the two cannot drift.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq)]
 struct LevelParams {
     strategy_tag: super::strategy::StrategyTag,
     /// Decoupled search-method axis. Independent of `strategy_tag`'s
@@ -325,6 +325,21 @@ impl LevelParams {
             | super::strategy::StrategyTag::BtUltra
             | super::strategy::StrategyTag::BtUltra2 => Some(4),
         }
+    }
+}
+
+/// `ceil(log2(size))` of a source-size hint, with a zero hint floored to
+/// [`MIN_WINDOW_LOG`]. This is the single quantization every hint-dependent
+/// matcher parameter is derived from: the window-log cap, the HC / Fast hash
+/// and chain widths, the Dfast / Row table widths, the L22 config buckets, and
+/// the Fast attach-vs-copy cutoff. Two hints sharing this value resolve to the
+/// identical matcher shape, which is why it (not the raw byte count) keys the
+/// primed-dictionary snapshot — see [`PrimedKey`].
+fn source_size_ceil_log(size: u64) -> u8 {
+    if size == 0 {
+        MIN_WINDOW_LOG
+    } else {
+        (64 - (size - 1).leading_zeros()) as u8
     }
 }
 
@@ -417,11 +432,7 @@ fn adjust_params_for_source_size(mut params: LevelParams, src_size: u64) -> Leve
     // (a decoder-interop requirement on the wire format), but the hash /
     // chain table widths are internal and never appear in the frame, so they
     // can track the actual source size below that floor.
-    let raw_src_log = if src_size == 0 {
-        MIN_WINDOW_LOG
-    } else {
-        (64 - (src_size - 1).leading_zeros()) as u8 // ceil_log2
-    };
+    let raw_src_log = source_size_ceil_log(src_size);
     let src_log = raw_src_log.max(MIN_WINDOW_LOG).max(MIN_HINTED_WINDOW_LOG);
     if src_log < params.window_log {
         params.window_log = src_log;
@@ -470,11 +481,7 @@ fn level22_btultra2_params_for_source_size(source_size: Option<u64>) -> LevelPar
     if let Some(size) = source_size
         && size > 256 * 1024
     {
-        let src_log = if size == 0 {
-            MIN_WINDOW_LOG
-        } else {
-            (64 - (size - 1).leading_zeros()) as u8
-        };
+        let src_log = source_size_ceil_log(size);
         window_log = window_log.min(src_log.max(MIN_WINDOW_LOG));
         let adjusted_table_log = window_log as usize + 1;
         hc.hash_log = hc.hash_log.min(adjusted_table_log);
@@ -703,13 +710,21 @@ pub struct MatchGeneratorDriver {
     dictionary_retained_budget: usize,
     // Source size hint for next frame (set via set_source_size_hint, cleared on reset).
     source_size_hint: Option<u64>,
-    // Snapshot of the frame's source-size hint captured at `reset` (where
-    // `source_size_hint` is consumed). Read by `prime_with_dictionary` to pick
-    // the donor `ZSTD_shouldAttachDict` dict mode for the Simple/Fast backend:
-    // `None` (unknown) or `<= FAST_ATTACH_DICT_CUTOFF` → attach (separate dict
-    // table, 2-cursor `compress_block_fast_dict`); larger → copy (dictionary
-    // primed into the live table, 4-cursor `compress_block_fast`).
-    reset_source_size: Option<u64>,
+    // Normalized `ceil_log2` bucket of the frame's source-size hint, captured at
+    // `reset` (where `source_size_hint` is consumed) via [`source_size_ceil_log`].
+    // `None` means the frame was unhinted. Drives `prime_with_dictionary`'s donor
+    // `ZSTD_shouldAttachDict` mode for the Simple/Fast backend: `None` (unknown)
+    // or `<= FAST_ATTACH_DICT_CUTOFF_LOG` → attach (separate dict table, 2-cursor
+    // `compress_block_fast_dict`); larger → copy (dictionary primed into the live
+    // table, 4-cursor `compress_block_fast`). The primed-snapshot key is the
+    // resolved shape ([`reset_shape`](Self::reset_shape)), not this bucket.
+    reset_size_log: Option<u8>,
+    // Hint-resolved matcher shape from the last `reset`: the [`LevelParams`] and
+    // the active backend's applied Dfast/Row hash-table width (`0` for HC/Fast).
+    // Combined with the frame's level into the [`PrimedKey`] that keys the primed
+    // snapshot, so it is only restored into a reset that resolved the identical
+    // matcher. `None` before the first `reset`.
+    reset_shape: Option<(LevelParams, usize)>,
     // One-shot borrowed block range `[start, end)` staged by the borrowed
     // Fast frame path (`set_borrowed_block`) for the NEXT
     // `start_matching` / `skip_matching_with_hint`. `Some` routes that
@@ -725,26 +740,48 @@ pub struct MatchGeneratorDriver {
     /// (a table memcpy) instead of re-hashing every dictionary position,
     /// mirroring donor `ZSTD_compressBegin_usingCDict` copying the
     /// precomputed `cdict->matchState`. Invalidated when the dictionary
-    /// changes; keyed by [`PrimedKey`] (level AND the resolved reset
-    /// parameters) so a snapshot is only restored into a reset that produces
-    /// the same matcher shape — see `restore_primed_dictionary`.
+    /// changes; keyed by the [`PrimedKey`] resolved matcher shape so a snapshot
+    /// is only restored into a reset that produces the same matcher — see
+    /// `restore_primed_dictionary`.
     primed: Option<(MatcherStorage, usize, PrimedKey)>,
 }
 
-/// Identity of the matcher configuration a primed snapshot was captured
-/// under. `reset()` resolves the matcher shape from BOTH the compression
-/// level and the source-size hint (the hint caps `window_log`, which sizes
-/// `reported_window_size`, the Fast attach-vs-copy mode, and the
-/// Dfast/Row/HC table widths). Restoring a snapshot whose key differs would
-/// reinstate the old `storage` (and its `max_window_size`) while the driver
-/// advertises a different window — the encoder could then search past the
-/// frame header's window and emit an undecodable match. Both fields must
-/// match before a restore is allowed.
+/// Identity of the matcher configuration a primed snapshot was captured under:
+/// the FULLY RESOLVED matcher shape, not the raw source-size hint.
+///
+/// `reset()` resolves the hint into a [`LevelParams`] (window_log cap, the
+/// HC/Fast table and search geometry, the parse depth/target-length that get
+/// baked into the restored `storage`) plus, for the Dfast/Row backends, a
+/// table-width derived from the hint's ceil-log bucket. The mapping from hint
+/// to resolved shape is many-to-one: the source-size adjustment is monotone in
+/// `ceil_log2(hint)`, and Level 22 additionally collapses several buckets onto
+/// one donor tier (its `<= 16/128/256 KiB` thresholds). Keying on the raw hint
+/// (or even its ceil-log bucket) therefore over-keys — two hints that resolve
+/// to the identical matcher would each force a full re-prime. Keying on the
+/// resolved (`params`, `table_bits`) pair restores across them.
+///
+/// `table_bits` is the hint-dependent hash-table width the ACTIVE backend
+/// applied (`set_hash_bits` value for Dfast/Row; `0` for HC/Fast, whose widths
+/// already live in `params`). The snapshot is only ever captured on the COPY
+/// path (a hinted, above-cutoff frame), so `table_bits` is always the resolved
+/// Dfast/Row value there, never the unhinted default.
+///
+/// `level` is kept alongside the resolved `params` because some stored matcher
+/// state is derived from the level DIRECTLY, not through `params`: e.g. Dfast's
+/// `use_fast_loop` is true for L3 but false for L4, yet L3 and L4 resolve to
+/// byte-identical `params`. Without `level` a snapshot captured at L3 could be
+/// restored into an L4 reset, installing the wrong `use_fast_loop`.
+///
+/// Restoring a snapshot whose key differs would reinstate the old `storage`
+/// (and its `max_window_size` / table dimensions / parse params) under a reset
+/// that resolved a different shape — the encoder could then search past the
+/// frame header's window and emit an undecodable match. All fields must match
+/// before a restore is allowed.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct PrimedKey {
     level: super::CompressionLevel,
-    reset_source_size: Option<u64>,
-    reported_window_size: usize,
+    params: LevelParams,
+    table_bits: usize,
 }
 
 impl MatchGeneratorDriver {
@@ -823,7 +860,8 @@ impl MatchGeneratorDriver {
             // the first `reset()` overwrites both sides from the
             // resolved LevelParams.
             reported_window_size: next_pow2,
-            reset_source_size: None,
+            reset_size_log: None,
+            reset_shape: None,
             dictionary_retained_budget: 0,
             source_size_hint: None,
             borrowed_pending: None,
@@ -1109,10 +1147,13 @@ impl MatchGeneratorDriver {
                 // matches/beats the donor on large corpora). The dispatch in
                 // `start_matching` keys off `dict_table.is_some()`, which only
                 // the attach path populates.
-                const FAST_ATTACH_DICT_CUTOFF: u64 = 8 * 1024;
+                // Donor cutoff is 8 KiB; `ceil_log2(8192) == 13`, and because the
+                // bucket is monotonic in the hint, `bucket <= 13` is exactly
+                // `hint <= 8192`.
+                const FAST_ATTACH_DICT_CUTOFF_LOG: u8 = 13;
                 let attach = self
-                    .reset_source_size
-                    .is_none_or(|n| n <= FAST_ATTACH_DICT_CUTOFF);
+                    .reset_size_log
+                    .is_none_or(|log| log <= FAST_ATTACH_DICT_CUTOFF_LOG);
                 if attach {
                     self.simple_mut().skip_matching_for_dict_prime();
                 } else {
@@ -1142,9 +1183,12 @@ impl Matcher for MatchGeneratorDriver {
 
     fn reset(&mut self, level: CompressionLevel) {
         let hint = self.source_size_hint.take();
-        // Snapshot for prime_with_dictionary's attach/copy mode decision (the
-        // hint is consumed here, but priming happens just after reset).
-        self.reset_source_size = hint;
+        // Snapshot the hint's normalized ceil-log bucket for the primed-snapshot
+        // key and prime_with_dictionary's attach/copy mode decision (the hint is
+        // consumed here, but priming happens just after reset). Storing the
+        // bucket rather than the raw bytes means two hints that resolve to the
+        // same matcher shape share one snapshot instead of each re-priming.
+        self.reset_size_log = hint.map(source_size_ceil_log);
         let hinted = hint.is_some();
         #[cfg_attr(not(test), allow(unused_mut))]
         let mut params = Self::level_params(level, hint);
@@ -1268,11 +1312,7 @@ impl Matcher for MatchGeneratorDriver {
         // small frame zeroes a small table; it never exceeds the real window.
         let table_window_size = match hint {
             Some(h) => {
-                let raw_log = if h == 0 {
-                    MIN_WINDOW_LOG
-                } else {
-                    (64 - (h - 1).leading_zeros()) as u8
-                };
+                let raw_log = source_size_ceil_log(h);
                 // Clamp the shift below the pointer width before `1usize <<`:
                 // an oversized hint (>= 2^63 + 1, and on 32-bit usize any hint
                 // >= 2^32) drives `raw_log` to 64 / >= 32, and the shift would
@@ -1284,6 +1324,11 @@ impl Matcher for MatchGeneratorDriver {
             }
             None => max_window_size,
         };
+        // The hint-dependent hash-table width the active backend applies, for
+        // the primed-snapshot key. Dfast/Row compute it from `table_window_size`
+        // below; HC/Fast leave it `0` because their widths live in `params`
+        // (`hc.{hash,chain}_log` / `fast_hash_log`) — already part of the key.
+        let mut resolved_table_bits: usize = 0;
         match &mut self.storage {
             MatcherStorage::Simple(m) => {
                 // Per-level Fast cParams threaded from
@@ -1305,11 +1350,12 @@ impl Matcher for MatchGeneratorDriver {
                         | CompressionLevel::Level(0)
                         | CompressionLevel::Level(3)
                 );
-                dfast.set_hash_bits(if hinted {
+                resolved_table_bits = if hinted {
                     dfast_hash_bits_for_window(table_window_size)
                 } else {
                     DFAST_HASH_BITS
-                });
+                };
+                dfast.set_hash_bits(resolved_table_bits);
                 // Dfast holds no per-block input Vecs (history owns the
                 // bytes and `add_data` returns each Vec eagerly), so
                 // `reset` takes no `reuse_space` callback.
@@ -1320,7 +1366,8 @@ impl Matcher for MatchGeneratorDriver {
                 row.lazy_depth = params.lazy_depth;
                 row.configure(params.row);
                 if hinted {
-                    row.set_hash_bits(row_hash_bits_for_window(table_window_size));
+                    resolved_table_bits = row_hash_bits_for_window(table_window_size);
+                    row.set_hash_bits(resolved_table_bits);
                 }
                 row.reset();
             }
@@ -1335,6 +1382,10 @@ impl Matcher for MatchGeneratorDriver {
                 });
             }
         }
+        // Record the resolved matcher shape for the primed-snapshot key. Captured
+        // here (post-resolution, after the test-only param override) so the key
+        // reflects exactly the geometry the restored `storage` must match.
+        self.reset_shape = Some((params, resolved_table_bits));
     }
 
     fn prime_with_dictionary(&mut self, dict_content: &[u8], offset_hist: [u32; 3]) {
@@ -1508,17 +1559,21 @@ impl Matcher for MatchGeneratorDriver {
     fn restore_primed_dictionary(&mut self, level: super::CompressionLevel) -> bool {
         // Only the (storage, dictionary_retained_budget) pair is what
         // `prime_with_dictionary` writes; restoring them reproduces the
-        // post-prime state exactly. Gated on the FULL resolved key (level +
-        // source-size hint + reported window), not just the level: `reset`
-        // caps `window_log` by the hint, so a same-level snapshot taken at a
-        // different hint carries a `storage.max_window_size` that no longer
-        // matches the advertised window. Restoring it would let the encoder
-        // search past the frame header's window (an undecodable match), so on
-        // a key mismatch we refuse and the caller re-primes.
+        // post-prime state exactly. Gated on the FULL resolved key (level + the
+        // resolved `LevelParams` + the active backend's table width), not just
+        // the level: `reset` resolves the hint into a window/table geometry, so a
+        // same-level snapshot taken at a hint that resolved to a different shape
+        // carries a `storage.max_window_size` / table dimensions that no longer
+        // match this reset. Restoring it would let the encoder search past the
+        // frame header's window (an undecodable match), so on a key mismatch we
+        // refuse and the caller re-primes.
+        let Some((params, table_bits)) = self.reset_shape else {
+            return false;
+        };
         let key = PrimedKey {
             level,
-            reset_source_size: self.reset_source_size,
-            reported_window_size: self.reported_window_size,
+            params,
+            table_bits,
         };
         let (storage, budget) = match &self.primed {
             Some((storage, budget, captured_key)) if *captured_key == key => {
@@ -1532,10 +1587,15 @@ impl Matcher for MatchGeneratorDriver {
     }
 
     fn capture_primed_dictionary(&mut self, level: super::CompressionLevel) {
+        // No resolved shape means `reset` has not run for this frame — nothing
+        // valid to key a snapshot on, so skip the capture.
+        let Some((params, table_bits)) = self.reset_shape else {
+            return;
+        };
         let key = PrimedKey {
             level,
-            reset_source_size: self.reset_source_size,
-            reported_window_size: self.reported_window_size,
+            params,
+            table_bits,
         };
         self.primed = Some((self.storage.clone(), self.dictionary_retained_budget, key));
     }
@@ -6855,6 +6915,81 @@ fn primed_snapshot_not_restored_when_window_hint_differs() {
         !restored,
         "snapshot captured at window {big_window} must NOT be restored into a \
          reset advertising window {small_window} (level alone is an insufficient key)"
+    );
+}
+
+#[test]
+fn primed_snapshot_restored_for_hints_in_same_window_bucket() {
+    // The snapshot key must normalize the source-size hint to the resolved
+    // matcher geometry, not the raw hinted byte count. `reset()` derives every
+    // hint-dependent parameter (window_log cap, HC/Fast/Dfast/Row table widths,
+    // the Fast attach-vs-copy cutoff) from `ceil_log2(hint)`, so two distinct
+    // hints that share a ceil-log bucket resolve to the *identical* matcher
+    // shape. Keying on the raw bytes over-keys: it forces a full re-prime on the
+    // second frame even though the cached snapshot is a perfect fit. Restore
+    // must SUCCEED across same-bucket hints.
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    let level = CompressionLevel::Best;
+
+    // Both hints fall in ceil_log2 bucket 19 (2^18 < n <= 2^19): 300 KiB and
+    // 400 KiB resolve to the same window and table widths.
+    driver.set_source_size_hint(300 * 1024);
+    driver.reset(level);
+    let window_a = driver.window_size();
+    driver.prime_with_dictionary(b"abcdefghABCDEFGHijklmnop", [1, 4, 8]);
+    driver.capture_primed_dictionary(level);
+
+    driver.set_source_size_hint(400 * 1024);
+    driver.reset(level);
+    let window_b = driver.window_size();
+    assert_eq!(
+        window_a, window_b,
+        "precondition: same-bucket hints must resolve to the same window \
+         (a={window_a}, b={window_b})"
+    );
+
+    let restored = driver.restore_primed_dictionary(level);
+    assert!(
+        restored,
+        "snapshot captured at a 300 KiB hint must be restored into a 400 KiB \
+         hint that resolves to the identical matcher shape (raw bytes over-key)"
+    );
+}
+
+#[test]
+fn primed_snapshot_restored_across_level22_donor_tier_hints() {
+    // Level 22 collapses several ceil-log buckets onto one donor source-size
+    // tier: `resolve_level_params(Level(22), ..)` selects the HC config and
+    // window_log by raw `<= 16 KiB / 128 KiB / 256 KiB` thresholds, so a 20 KiB
+    // and a 100 KiB hint (ceil-log buckets 15 and 17) both land in the
+    // `<= 128 KiB` tier and resolve to the IDENTICAL matcher (same window_log,
+    // same HC hash/chain/search geometry). Keying on the raw ceil-log bucket
+    // would still reject the restore here because the buckets differ; the key
+    // must compare the resolved matcher shape so these share one snapshot.
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    let level = CompressionLevel::Level(22);
+
+    driver.set_source_size_hint(20 * 1024);
+    driver.reset(level);
+    let window_a = driver.window_size();
+    driver.prime_with_dictionary(b"abcdefghABCDEFGHijklmnop", [1, 4, 8]);
+    driver.capture_primed_dictionary(level);
+
+    driver.set_source_size_hint(100 * 1024);
+    driver.reset(level);
+    let window_b = driver.window_size();
+    assert_eq!(
+        window_a, window_b,
+        "precondition: both hints must land in the same Level 22 donor tier \
+         (a={window_a}, b={window_b})"
+    );
+
+    let restored = driver.restore_primed_dictionary(level);
+    assert!(
+        restored,
+        "Level 22 snapshot captured at a 20 KiB hint must be restored into a \
+         100 KiB hint that resolves to the same donor tier (different ceil-log \
+         buckets, identical matcher shape)"
     );
 }
 
