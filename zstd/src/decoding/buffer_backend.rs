@@ -250,6 +250,10 @@ pub(crate) trait BufferBackend: Sized {
     /// Caller must hold the macro's preconditions (inline path gated on
     /// `SUPPORTS_INLINE_SEQUENCE_EXEC` + capacity validated by
     /// `sequence_output_fits`).
+    // Only reached from the x86_64 AVX2 macro; dead on other targets
+    // (i686/aarch64 use the scalar/NEON exec paths), same as
+    // `exec_sequence_inline_avx2` above.
+    #[allow(dead_code)]
     #[inline(always)]
     unsafe fn inline_exec_base_ptr(&mut self) -> *mut u8 {
         unreachable!("inline_exec_base_ptr on a backend without inline-sequence support")
@@ -264,6 +268,7 @@ pub(crate) trait BufferBackend: Sized {
     /// # Safety
     /// `new_tail` bytes `[0, new_tail)` must be initialised (the macro just
     /// wrote `[tail, new_tail)`); `new_tail <= capacity`.
+    #[allow(dead_code)]
     #[inline(always)]
     unsafe fn inline_exec_commit(&mut self, _new_tail: usize) {
         unreachable!("inline_exec_commit on a backend without inline-sequence support")
