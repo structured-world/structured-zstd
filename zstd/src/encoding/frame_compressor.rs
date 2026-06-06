@@ -772,7 +772,22 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         let block_capacity = MAX_BLOCK_SIZE as usize;
         let mut start = 0usize;
         while start < input.len() {
-            let end = (start + block_capacity).min(input.len());
+            // Donor `ZSTD_compress_frameChunk`: size each block via the cheap
+            // fingerprint pre-splitter so a full 128 KiB block is cut at a
+            // statistical boundary when it pays. `savings = consumed -
+            // produced` mirrors the donor gate (the first block and
+            // incompressible input keep the full 128 KiB). The borrowed window
+            // already spans the whole input, so a smaller block is just a
+            // narrower `(block_start, block_end)` range into it.
+            let savings = start as i64 - all_blocks.len() as i64;
+            let block_len = optimal_block_size(
+                self.compression_level,
+                &input[start..],
+                input.len() - start,
+                block_capacity,
+                savings,
+            );
+            let end = (start + block_len).min(input.len());
             let block = &input[start..end];
             let last_block = end == input.len();
             #[cfg(feature = "hash")]
@@ -3208,28 +3223,31 @@ mod tests {
     }
 
     /// `level_pre_split` resolves the per-level split knob through the
-    /// `LevelParams` table, with named presets as pure numeric aliases:
-    /// greedy (level 5) → 1, btopt/btultra/btultra2 (16..=22) → 4. Fast,
-    /// dfast and the lazy band stay unsplit (lazy split is deferred until
-    /// the per-block entropy path reuses tables like the reference).
+    /// `LevelParams` table, mirroring the donor `splitLevels[]` by strategy
+    /// (`ZSTD_optimalBlockSize`): fast → 0 (from-borders), dfast → 1,
+    /// greedy/lazy → 2, btopt/btultra/btultra2 → 4. `Uncompressed` has no
+    /// numeric level so it stays `None`.
     #[test]
     fn pre_split_level_dispatches_by_compression_level() {
         use crate::encoding::CompressionLevel;
         use crate::encoding::match_generator::level_pre_split;
         assert_eq!(level_pre_split(CompressionLevel::Uncompressed), None);
-        assert_eq!(level_pre_split(CompressionLevel::Fastest), None);
-        assert_eq!(level_pre_split(CompressionLevel::Default), None);
-        // Better is a pure alias for level 7 (lazy): unsplit, same as Level(7).
+        // Fastest = level 1 (fast) → 0 (from-borders).
+        assert_eq!(level_pre_split(CompressionLevel::Fastest), Some(0));
+        // Default = level 3 (dfast) → 1.
+        assert_eq!(level_pre_split(CompressionLevel::Default), Some(1));
+        // Better is a pure alias for level 7 (lazy): same as Level(7).
         assert_eq!(
             level_pre_split(CompressionLevel::Better),
             level_pre_split(CompressionLevel::Level(7)),
         );
-        assert_eq!(level_pre_split(CompressionLevel::Level(4)), None);
-        assert_eq!(level_pre_split(CompressionLevel::Level(5)), Some(1));
-        assert_eq!(level_pre_split(CompressionLevel::Level(7)), None);
-        assert_eq!(level_pre_split(CompressionLevel::Level(15)), None);
-        assert_eq!(level_pre_split(CompressionLevel::Level(16)), Some(4));
-        assert_eq!(level_pre_split(CompressionLevel::Level(22)), Some(4));
+        assert_eq!(level_pre_split(CompressionLevel::Level(2)), Some(0)); // fast
+        assert_eq!(level_pre_split(CompressionLevel::Level(4)), Some(1)); // dfast
+        assert_eq!(level_pre_split(CompressionLevel::Level(5)), Some(2)); // greedy
+        assert_eq!(level_pre_split(CompressionLevel::Level(7)), Some(2)); // lazy
+        assert_eq!(level_pre_split(CompressionLevel::Level(15)), Some(2)); // lazy
+        assert_eq!(level_pre_split(CompressionLevel::Level(16)), Some(4)); // btopt
+        assert_eq!(level_pre_split(CompressionLevel::Level(22)), Some(4)); // btultra2
     }
 
     /// End-to-end: a 256 KB payload whose SECOND 128 KB donor block carries

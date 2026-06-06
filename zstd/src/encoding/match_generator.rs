@@ -299,28 +299,19 @@ impl LevelParams {
         }
     }
 
-    /// Cheap fingerprint pre-splitter level (donor `splitLevels[]` by
-    /// strategy), or `None` to keep the whole 128 KiB block. `Fast`/`Dfast`
-    /// stay un-split: their match-finding is cheap, so the splitter's
-    /// per-block fingerprint plus extra per-sub-block entropy builds cost
-    /// more throughput than the ratio they buy. The btopt/btultra/btultra2
-    /// band keeps level 4 (matching the pre-existing high-level splitter).
-    /// This is the C-like `blockSplitterLevel` knob, regulated per level
-    /// here rather than scattered across the frame loop.
+    /// Cheap fingerprint pre-splitter level, the C-like `blockSplitterLevel`
+    /// knob (donor `splitLevels[]` by strategy in `ZSTD_optimalBlockSize`):
+    /// fast=0, dfast=1, greedy=2, lazy=2, lazy2/btlazy2=3,
+    /// btopt/btultra/btultra2=4. `split_level == 0` routes to the cheap
+    /// from-borders heuristic; `1..=4` to byChunks with internal sampling
+    /// level `split_level - 1`. The `savings >= 3` gate in
+    /// `optimal_block_size` keeps incompressible data and the first full
+    /// block whole, so homogeneous frames are not over-split.
     fn pre_split(&self) -> Option<u8> {
         match self.strategy_tag {
-            // Fast/Dfast: cheap match-finding, the splitter costs more than
-            // it buys. Lazy: its ratio already tracks the reference, and
-            // splitting it regresses on highly-compressible frames until the
-            // per-block entropy path reuses tables as aggressively as the
-            // reference (tracked separately); keep whole blocks for now.
-            super::strategy::StrategyTag::Fast
-            | super::strategy::StrategyTag::Dfast
-            | super::strategy::StrategyTag::Lazy => None,
-            // Greedy is the band whose single-block literal section loses to
-            // the reference; the cheap fingerprint pre-split fits per-sub-
-            // block entropy and recovers it.
-            super::strategy::StrategyTag::Greedy => Some(1),
+            super::strategy::StrategyTag::Fast => Some(0),
+            super::strategy::StrategyTag::Dfast => Some(1),
+            super::strategy::StrategyTag::Greedy | super::strategy::StrategyTag::Lazy => Some(2),
             super::strategy::StrategyTag::BtOpt
             | super::strategy::StrategyTag::BtUltra
             | super::strategy::StrategyTag::BtUltra2 => Some(4),
