@@ -128,7 +128,10 @@ use super::match_table::storage::{HC_PRIME3BYTES, HC_PRIME4BYTES};
 // macros / configs / tests keep their unqualified names.
 #[cfg(test)]
 use super::match_table::storage::HC_EMPTY;
-use super::match_table::storage::{HC_CHAIN_LOG, HC_HASH_LOG, HC3_HASH_LOG};
+use super::match_table::storage::HC3_HASH_LOG;
+// HC_HASH_LOG / HC_CHAIN_LOG feed the test-only `HC_CONFIG` default.
+#[cfg(test)]
+use super::match_table::storage::{HC_CHAIN_LOG, HC_HASH_LOG};
 // HC3_MAX_OFFSET moved to encoding::bt alongside the hash3 candidate
 // probe macro that consumes it; the macro references it via the
 // fully-qualified `$crate::encoding::bt::HC3_MAX_OFFSET` path so this
@@ -173,6 +176,9 @@ pub(crate) struct RowConfig {
     pub(crate) mls: usize,
 }
 
+// Only used as the default HashChain config when the test-only parse×search
+// override pairs a level with a backend its native row doesn't populate.
+#[cfg(test)]
 const HC_CONFIG: HcConfig = HcConfig {
     hash_log: HC_HASH_LOG,
     chain_log: HC_CHAIN_LOG,
@@ -215,6 +221,9 @@ const BTULTRA2_HC_CONFIG_L22_16K: HcConfig = HcConfig {
     target_len: 999,
 };
 
+// Default Row config: only used by tests and the test-only parse×search
+// override (production greedy L5 carries its own `ROW_L5`).
+#[cfg(test)]
 const ROW_CONFIG: RowConfig = RowConfig {
     hash_bits: ROW_HASH_BITS,
     row_log: ROW_LOG,
@@ -268,6 +277,28 @@ const DFAST_L4: DfastConfig = DfastConfig {
     short_hash_log: 18,
 };
 
+/// Per-level Fast-strategy tuning, only consumed by the `FastKernelMatcher`
+/// (Simple backend): `hash_log` = donor `cParams.hashLog`, `mls` = donor
+/// `cParams.minMatch` (4..=8), `step_size` = donor `stepSize`. Carried as
+/// `LevelParams.fast` (`Some` only on Fast level rows; `None` elsewhere).
+#[derive(Copy, Clone, PartialEq, Eq)]
+struct FastConfig {
+    hash_log: u32,
+    mls: u32,
+    step_size: usize,
+}
+
+const FAST_L1: FastConfig = FastConfig {
+    hash_log: 14,
+    mls: 7,
+    step_size: 2,
+};
+const FAST_L2: FastConfig = FastConfig {
+    hash_log: 16,
+    mls: 6,
+    step_size: 2,
+};
+
 /// Resolved tuning parameters for a compression level. The
 /// [`StrategyTag`] is the single source of truth for the backend
 /// family and the compile-time strategy consts; the runtime
@@ -283,26 +314,17 @@ struct LevelParams {
     /// per level so the parse×search matrix can be swept and tuned.
     search: super::strategy::SearchMethod,
     window_log: u8,
-    /// Donor `cParams.hashLog` — only consumed by the Fast strategy
-    /// backend (`FastKernelMatcher`). Other backends ignore.
-    fast_hash_log: u32,
-    /// Donor `cParams.minMatch` (mls) — only consumed by the Fast
-    /// strategy backend. Range 4..=8 per donor's mml dispatch.
-    fast_mls: u32,
-    /// Donor's `stepSize = targetLength + !(targetLength) + 1`
-    /// (min 2). For Fast strategy, negative levels use
-    /// `targetLength = -level` (1..7), giving step_size 2..8.
-    /// L1 / L2 / Uncompressed use targetLength=0 → step_size=2.
-    /// Drives the kernel's initial `step` for the 4-cursor body's
-    /// skip schedule.
-    fast_step_size: usize,
     lazy_depth: u8,
-    /// Donor dfast tuning (`clevels.h` columns). `Some` only on Dfast level
-    /// rows; `None` elsewhere so the table self-documents which levels the
-    /// Dfast backend configures.
+    /// Per-strategy tuning. Exactly one is `Some` on each level row, matching
+    /// `strategy_tag`'s backend, so the table self-documents which knobs a
+    /// level actually consumes (the others are `None`, not dead placeholders):
+    /// `fast` for the Fast/Simple backend, `dfast` for Double-Fast, `hc` for
+    /// the HashChain (lazy / btopt / btultra*) backend, `row` for the Row
+    /// (greedy L5) backend.
+    fast: Option<FastConfig>,
     dfast: Option<DfastConfig>,
-    hc: HcConfig,
-    row: RowConfig,
+    hc: Option<HcConfig>,
+    row: Option<RowConfig>,
 }
 
 impl LevelParams {
@@ -407,12 +429,14 @@ fn row_hash_bits_for_window(max_window_size: usize) -> usize {
 /// Index 0 = level 1, index 21 = level 22.
 #[rustfmt::skip]
 const LEVEL_TABLE: [LevelParams; 22] = [
-    // Lvl  Strategy       wlog  fast_hlog  fast_mls  fast_step  lazy  HC config                                   row config
-    // ---  -------------- ----  ---------  --------  ---------  ----  ------------------------------------------  ----------
-    /* 1 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Fast, search: super::strategy::SearchMethod::Fast, window_log: 19, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 0, dfast: None, hc: HC_CONFIG, row: ROW_CONFIG },
-    /* 2 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Fast, search: super::strategy::SearchMethod::Fast, window_log: 20, fast_hash_log: 16, fast_mls: 6, fast_step_size: 2, lazy_depth: 0, dfast: None, hc: HC_CONFIG, row: ROW_CONFIG },
-    /* 3 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Dfast, search: super::strategy::SearchMethod::DoubleFast, window_log: 21, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 1, dfast: Some(DFAST_L3), hc: HC_CONFIG, row: ROW_CONFIG },
-    /* 4 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Dfast, search: super::strategy::SearchMethod::DoubleFast, window_log: 21, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 1, dfast: Some(DFAST_L4), hc: HC_CONFIG, row: ROW_CONFIG },
+    // Exactly one of fast/dfast/hc/row is Some per row, matching the strategy
+    // backend; the rest are None (not dead placeholders).
+    // Lvl  Strategy       wlog  lazy  per-strategy config
+    // ---  -------------- ----  ----  -------------------
+    /* 1 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Fast, search: super::strategy::SearchMethod::Fast, window_log: 19, lazy_depth: 0, fast: Some(FAST_L1), dfast: None, hc: None, row: None },
+    /* 2 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Fast, search: super::strategy::SearchMethod::Fast, window_log: 20, lazy_depth: 0, fast: Some(FAST_L2), dfast: None, hc: None, row: None },
+    /* 3 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Dfast, search: super::strategy::SearchMethod::DoubleFast, window_log: 21, lazy_depth: 1, fast: None, dfast: Some(DFAST_L3), hc: None, row: None },
+    /* 4 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Dfast, search: super::strategy::SearchMethod::DoubleFast, window_log: 21, lazy_depth: 1, fast: None, dfast: Some(DFAST_L4), hc: None, row: None },
     // target_len column for L5..=L15 matches donor cParams.targetLength
     // from clevels.h table[0] (default — srcSize > 256 KB). Donor uses
     // it as the lazy outer loop's `sufficient_len` (nice-match) threshold.
@@ -420,14 +444,14 @@ const LEVEL_TABLE: [LevelParams; 22] = [
     // search_depth iterations instead of breaking on the first
     // long-enough match — the dominant cost in the L5..=L15 speed
     // regression vs FFI (see lazy_band_target_len_matches_donor_default_table).
-    /* 5 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Greedy, search: super::strategy::SearchMethod::RowHash, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 0, dfast: None, hc: HcConfig { hash_log: 18, chain_log: 17, search_depth: 4,  target_len: 2 }, row: ROW_L5 },
-    /* 6 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 21, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 1, dfast: None, hc: HcConfig { hash_log: 19, chain_log: 18, search_depth: 8,  target_len: 4 }, row: ROW_CONFIG },
-    /* 7 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 21, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 1, dfast: None, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 16, target_len: 8 }, row: ROW_CONFIG },
-    /* 8 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 21, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, dfast: None, hc: HcConfig { hash_log: 20, chain_log: 19, search_depth: 16, target_len: 16 }, row: ROW_CONFIG },
-    /* 9 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, dfast: None, hc: HcConfig { hash_log: 21, chain_log: 20, search_depth: 16, target_len: 16 }, row: ROW_CONFIG },
-    /*10 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, dfast: None, hc: HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 16 }, row: ROW_CONFIG },
-    /*11 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, dfast: None, hc: HcConfig { hash_log: 22, chain_log: 21, search_depth: 64, target_len: 16 }, row: ROW_CONFIG },
-    /*12 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, dfast: None, hc: HcConfig { hash_log: 23, chain_log: 22, search_depth: 64, target_len: 32 }, row: ROW_CONFIG },
+    /* 5 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Greedy, search: super::strategy::SearchMethod::RowHash, window_log: 21, lazy_depth: 0, fast: None, dfast: None, hc: None, row: Some(ROW_L5) },
+    /* 6 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 21, lazy_depth: 1, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 19, chain_log: 18, search_depth: 8,  target_len: 4 }), row: None },
+    /* 7 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 21, lazy_depth: 1, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 20, chain_log: 19, search_depth: 16, target_len: 8 }), row: None },
+    /* 8 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 21, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 20, chain_log: 19, search_depth: 16, target_len: 16 }), row: None },
+    /* 9 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 21, chain_log: 20, search_depth: 16, target_len: 16 }), row: None },
+    /*10 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 16 }), row: None },
+    /*11 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 21, search_depth: 64, target_len: 16 }), row: None },
+    /*12 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 23, chain_log: 22, search_depth: 64, target_len: 32 }), row: None },
     // L13-15: reference uses btlazy2 (binary-tree finder) with searchLog 4/5/6
     // (search_depth 16/32/64) and targetLength 32. We run the hash-chain Lazy
     // parser here, so we mirror the reference search budget rather than inflate
@@ -436,16 +460,16 @@ const LEVEL_TABLE: [LevelParams; 22] = [
     // smaller searchLog find longer matches (and re-establish a strict ratio
     // ladder above L12) is tracked separately; until it lands these levels sit
     // close to L12 on hash-chain inputs by design.
-    /*13 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, dfast: None, hc: HcConfig { hash_log: 22, chain_log: 22, search_depth: 16, target_len: 32 }, row: ROW_CONFIG },
-    /*14 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, dfast: None, hc: HcConfig { hash_log: 23, chain_log: 22, search_depth: 32, target_len: 32 }, row: ROW_CONFIG },
-    /*15 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, dfast: None, hc: HcConfig { hash_log: 23, chain_log: 23, search_depth: 64, target_len: 32 }, row: ROW_CONFIG },
-    /*16 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtOpt, search: super::strategy::SearchMethod::BinaryTree, window_log: 22, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, dfast: None, hc: HcConfig { hash_log: 22, chain_log: 22, search_depth: 32, target_len: 48 }, row: ROW_CONFIG },
-    /*17 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtOpt, search: super::strategy::SearchMethod::BinaryTree, window_log: 23, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, dfast: None, hc: HcConfig { hash_log: 22, chain_log: 23, search_depth: 32, target_len: 64 }, row: ROW_CONFIG },
-    /*18 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra, search: super::strategy::SearchMethod::BinaryTree, window_log: 23, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, dfast: None, hc: HcConfig { hash_log: 22, chain_log: 23, search_depth: 64, target_len: 64 }, row: ROW_CONFIG },
-    /*19 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, search: super::strategy::SearchMethod::BinaryTree, window_log: 23, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, dfast: None, hc: HcConfig { hash_log: 22, chain_log: 24, search_depth: 128, target_len: 256 }, row: ROW_CONFIG },
-    /*20 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, search: super::strategy::SearchMethod::BinaryTree, window_log: 25, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, dfast: None, hc: HcConfig { hash_log: 23, chain_log: 25, search_depth: 128, target_len: 256 }, row: ROW_CONFIG },
-    /*21 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, search: super::strategy::SearchMethod::BinaryTree, window_log: 26, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, dfast: None, hc: BTULTRA2_HC_CONFIG, row: ROW_CONFIG },
-    /*22 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, search: super::strategy::SearchMethod::BinaryTree, window_log: 27, fast_hash_log: 14, fast_mls: 7, fast_step_size: 2, lazy_depth: 2, dfast: None, hc: BTULTRA2_HC_CONFIG_L22, row: ROW_CONFIG },
+    /*13 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 22, search_depth: 16, target_len: 32 }), row: None },
+    /*14 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 23, chain_log: 22, search_depth: 32, target_len: 32 }), row: None },
+    /*15 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 23, chain_log: 23, search_depth: 64, target_len: 32 }), row: None },
+    /*16 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtOpt, search: super::strategy::SearchMethod::BinaryTree, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 22, search_depth: 32, target_len: 48 }), row: None },
+    /*17 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtOpt, search: super::strategy::SearchMethod::BinaryTree, window_log: 23, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 23, search_depth: 32, target_len: 64 }), row: None },
+    /*18 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra, search: super::strategy::SearchMethod::BinaryTree, window_log: 23, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 23, search_depth: 64, target_len: 64 }), row: None },
+    /*19 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, search: super::strategy::SearchMethod::BinaryTree, window_log: 23, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 24, search_depth: 128, target_len: 256 }), row: None },
+    /*20 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, search: super::strategy::SearchMethod::BinaryTree, window_log: 25, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 23, chain_log: 25, search_depth: 128, target_len: 256 }), row: None },
+    /*21 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, search: super::strategy::SearchMethod::BinaryTree, window_log: 26, lazy_depth: 2, fast: None, dfast: None, hc: Some(BTULTRA2_HC_CONFIG), row: None },
+    /*22 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, search: super::strategy::SearchMethod::BinaryTree, window_log: 27, lazy_depth: 2, fast: None, dfast: None, hc: Some(BTULTRA2_HC_CONFIG_L22), row: None },
 ];
 
 /// Smallest window_log the encoder will use regardless of source size.
@@ -494,16 +518,24 @@ fn adjust_params_for_source_size(mut params: LevelParams, src_size: u64) -> Leve
     let table_log = raw_src_log.max(MIN_WINDOW_LOG);
     let backend = params.backend();
     if backend == super::strategy::BackendTag::HashChain {
-        if (table_log + 2) < params.hc.hash_log as u8 {
-            params.hc.hash_log = (table_log + 2) as usize;
+        let hc = params
+            .hc
+            .as_mut()
+            .expect("HashChain level row carries an HcConfig");
+        if (table_log + 2) < hc.hash_log as u8 {
+            hc.hash_log = (table_log + 2) as usize;
         }
-        if (table_log + 1) < params.hc.chain_log as u8 {
-            params.hc.chain_log = (table_log + 1) as usize;
+        if (table_log + 1) < hc.chain_log as u8 {
+            hc.chain_log = (table_log + 1) as usize;
         }
     } else if backend == super::strategy::BackendTag::Simple {
+        let fast = params
+            .fast
+            .as_mut()
+            .expect("Fast level row carries a FastConfig");
         let fast_cap = (table_log + 1) as u32;
-        if fast_cap < params.fast_hash_log {
-            params.fast_hash_log = fast_cap;
+        if fast_cap < fast.hash_log {
+            fast.hash_log = fast_cap;
         }
     }
     params
@@ -535,13 +567,11 @@ fn level22_btultra2_params_for_source_size(source_size: Option<u64>) -> LevelPar
         strategy_tag: super::strategy::StrategyTag::BtUltra2,
         search: super::strategy::SearchMethod::BinaryTree,
         window_log,
-        fast_hash_log: 14,
-        fast_mls: 7,
-        fast_step_size: 2,
         lazy_depth: 2,
+        fast: None,
         dfast: None,
-        hc,
-        row: ROW_CONFIG,
+        hc: Some(hc),
+        row: None,
     }
 }
 
@@ -559,17 +589,18 @@ fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> Le
             // history; advertising a larger window only inflates
             // decoder-side buffer reservation. Stay at 17 (128 KiB).
             window_log: 17,
-            // Beyond-donor: hash_log=14 (vs donor's 13) for 2× fewer
-            // collisions on structured corpora.
-            fast_hash_log: 14,
-            fast_mls: 6,
-            // Donor's "base for negative" row has targetLength=1,
-            // which gives step_size = 1 + 0 + 1 = 2.
-            fast_step_size: 2,
             lazy_depth: 0,
+            // Beyond-donor: hash_log=14 (vs donor's 13) for 2× fewer
+            // collisions on structured corpora. Donor's "base for negative"
+            // row has targetLength=1 → step_size = 1 + 0 + 1 = 2.
+            fast: Some(FastConfig {
+                hash_log: 14,
+                mls: 6,
+                step_size: 2,
+            }),
             dfast: None,
-            hc: HC_CONFIG,
-            row: ROW_CONFIG,
+            hc: None,
+            row: None,
         },
         CompressionLevel::Fastest => {
             // Only the Fast-specific cParams
@@ -579,9 +610,11 @@ fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> Le
             // does real compression on a full window, unlike
             // Uncompressed which clamps to 17.
             let mut p = LEVEL_TABLE[0];
-            p.fast_hash_log = 14;
-            p.fast_mls = 6;
-            p.fast_step_size = 2;
+            p.fast = Some(FastConfig {
+                hash_log: 14,
+                mls: 6,
+                step_size: 2,
+            });
             p
         }
         CompressionLevel::Default => LEVEL_TABLE[2],
@@ -619,13 +652,15 @@ fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> Le
                     strategy_tag: super::strategy::StrategyTag::Fast,
                     search: super::strategy::SearchMethod::Fast,
                     window_log: 19,
-                    fast_hash_log: 13,
-                    fast_mls: 7,
-                    fast_step_size: step_size,
                     lazy_depth: 0,
+                    fast: Some(FastConfig {
+                        hash_log: 13,
+                        mls: 7,
+                        step_size,
+                    }),
                     dfast: None,
-                    hc: HC_CONFIG,
-                    row: ROW_CONFIG,
+                    hc: None,
+                    row: None,
                 }
             }
         }
@@ -1256,6 +1291,25 @@ impl Matcher for MatchGeneratorDriver {
         if let Some((search, parse)) = self.config_override.take() {
             params.search = search;
             params.lazy_depth = parse.lazy_depth();
+            // The matrix sweep can pair a level with a backend its native
+            // row doesn't populate (e.g. greedy L5, which carries only `row`,
+            // run on HashChain). Synthesize a default config for the
+            // overridden backend so its `configure` arm has something to read.
+            use super::strategy::SearchMethod;
+            match search {
+                SearchMethod::Fast => {
+                    params.fast.get_or_insert(FAST_L1);
+                }
+                SearchMethod::DoubleFast => {
+                    params.dfast.get_or_insert(DFAST_L3);
+                }
+                SearchMethod::RowHash => {
+                    params.row.get_or_insert(ROW_CONFIG);
+                }
+                SearchMethod::HashChain | SearchMethod::BinaryTree => {
+                    params.hc.get_or_insert(HC_CONFIG);
+                }
+            }
         }
         let next_backend = params.backend();
         let max_window_size = 1usize << params.window_log;
@@ -1328,11 +1382,12 @@ impl Matcher for MatchGeneratorDriver {
                     // get donor row-0 (hash_log=13, mls=7); Fastest /
                     // Uncompressed keep (hash_log=14, mls=6). See
                     // resolve_level_params for rationale.
+                    let fast = params.fast.expect("Fast level row carries a FastConfig");
                     MatcherStorage::Simple(FastKernelMatcher::with_params(
                         params.window_log,
-                        params.fast_hash_log,
-                        params.fast_mls,
-                        params.fast_step_size,
+                        fast.hash_log,
+                        fast.mls,
+                        fast.step_size,
                     ))
                 }
                 super::strategy::BackendTag::Dfast => {
@@ -1387,12 +1442,8 @@ impl Matcher for MatchGeneratorDriver {
                 // Per-level Fast cParams threaded from
                 // resolve_level_params (see Simple-backend swap
                 // arm above for the (level → params) mapping).
-                m.reset(
-                    params.window_log,
-                    params.fast_hash_log,
-                    params.fast_mls,
-                    params.fast_step_size,
-                );
+                let fast = params.fast.expect("Fast level row carries a FastConfig");
+                m.reset(params.window_log, fast.hash_log, fast.mls, fast.step_size);
             }
             MatcherStorage::Dfast(dfast) => {
                 dfast.max_window_size = max_window_size;
@@ -1429,7 +1480,7 @@ impl Matcher for MatchGeneratorDriver {
             MatcherStorage::Row(row) => {
                 row.max_window_size = max_window_size;
                 row.lazy_depth = params.lazy_depth;
-                row.configure(params.row);
+                row.configure(params.row.expect("Row level row carries a RowConfig"));
                 if hinted {
                     resolved_table_bits = row_hash_bits_for_window(table_window_size);
                     row.set_hash_bits(resolved_table_bits);
@@ -1439,7 +1490,11 @@ impl Matcher for MatchGeneratorDriver {
             MatcherStorage::HashChain(hc) => {
                 hc.table.max_window_size = max_window_size;
                 hc.hc.lazy_depth = params.lazy_depth;
-                hc.configure(params.hc, strategy_tag, params.window_log);
+                hc.configure(
+                    params.hc.expect("HashChain level row carries an HcConfig"),
+                    strategy_tag,
+                    params.window_log,
+                );
                 let vec_pool = &mut self.vec_pool;
                 hc.reset(|mut data| {
                     data.resize(data.capacity(), 0);
@@ -5375,10 +5430,11 @@ fn level_20_22_map_to_btultra2_strategy() {
 fn level22_uses_donor_target_length_and_large_input_tables() {
     let params = resolve_level_params(CompressionLevel::Level(22), None);
     assert_eq!(params.window_log, 27);
-    assert_eq!(params.hc.hash_log, 25);
-    assert_eq!(params.hc.chain_log, 27);
-    assert_eq!(params.hc.search_depth, 1 << 9);
-    assert_eq!(params.hc.target_len, 999);
+    let hc = params.hc.unwrap();
+    assert_eq!(hc.hash_log, 25);
+    assert_eq!(hc.chain_log, 27);
+    assert_eq!(hc.search_depth, 1 << 9);
+    assert_eq!(hc.target_len, 999);
 }
 
 #[test]
@@ -5401,10 +5457,11 @@ fn bt_levels_16_to_21_pin_clevels_params() {
     for (level, wlog, hlog, clog, sd, tl) in expected {
         let p = resolve_level_params(CompressionLevel::Level(level as i32), None);
         assert_eq!(p.window_log, wlog, "level {level} window_log");
-        assert_eq!(p.hc.hash_log, hlog, "level {level} hash_log");
-        assert_eq!(p.hc.chain_log, clog, "level {level} chain_log");
-        assert_eq!(p.hc.search_depth, sd, "level {level} search_depth");
-        assert_eq!(p.hc.target_len, tl, "level {level} target_len");
+        let hc = p.hc.unwrap();
+        assert_eq!(hc.hash_log, hlog, "level {level} hash_log");
+        assert_eq!(hc.chain_log, clog, "level {level} chain_log");
+        assert_eq!(hc.search_depth, sd, "level {level} search_depth");
+        assert_eq!(hc.target_len, tl, "level {level} target_len");
     }
 }
 
@@ -5412,24 +5469,27 @@ fn bt_levels_16_to_21_pin_clevels_params() {
 fn level22_source_size_hint_uses_donor_btultra2_tiers() {
     let p16k = resolve_level_params(CompressionLevel::Level(22), Some(16 * 1024));
     assert_eq!(p16k.window_log, 14);
-    assert_eq!(p16k.hc.hash_log, 15);
-    assert_eq!(p16k.hc.chain_log, 15);
-    assert_eq!(p16k.hc.search_depth, 1 << 10);
-    assert_eq!(p16k.hc.target_len, 999);
+    let hc16k = p16k.hc.unwrap();
+    assert_eq!(hc16k.hash_log, 15);
+    assert_eq!(hc16k.chain_log, 15);
+    assert_eq!(hc16k.search_depth, 1 << 10);
+    assert_eq!(hc16k.target_len, 999);
 
     let p128k = resolve_level_params(CompressionLevel::Level(22), Some(128 * 1024));
     assert_eq!(p128k.window_log, 17);
-    assert_eq!(p128k.hc.hash_log, 17);
-    assert_eq!(p128k.hc.chain_log, 18);
-    assert_eq!(p128k.hc.search_depth, 1 << 11);
-    assert_eq!(p128k.hc.target_len, 999);
+    let hc128k = p128k.hc.unwrap();
+    assert_eq!(hc128k.hash_log, 17);
+    assert_eq!(hc128k.chain_log, 18);
+    assert_eq!(hc128k.search_depth, 1 << 11);
+    assert_eq!(hc128k.target_len, 999);
 
     let p256k = resolve_level_params(CompressionLevel::Level(22), Some(256 * 1024));
     assert_eq!(p256k.window_log, 18);
-    assert_eq!(p256k.hc.hash_log, 19);
-    assert_eq!(p256k.hc.chain_log, 19);
-    assert_eq!(p256k.hc.search_depth, 1 << 13);
-    assert_eq!(p256k.hc.target_len, 999);
+    let hc256k = p256k.hc.unwrap();
+    assert_eq!(hc256k.hash_log, 19);
+    assert_eq!(hc256k.chain_log, 19);
+    assert_eq!(hc256k.search_depth, 1 << 13);
+    assert_eq!(hc256k.target_len, 999);
 }
 
 #[test]
@@ -5440,12 +5500,13 @@ fn level22_small_source_size_hint_matches_donor_cparams() {
     let donor = unsafe { zstd_sys::ZSTD_getCParams(22, source_size, 0) };
     let params = resolve_level_params(CompressionLevel::Level(22), Some(source_size));
 
+    let hc = params.hc.unwrap();
     assert_eq!(params.window_log as u32, donor.windowLog);
-    assert_eq!(params.hc.chain_log as u32, donor.chainLog);
-    assert_eq!(params.hc.hash_log as u32, donor.hashLog);
-    assert_eq!(params.hc.search_depth as u32, 1u32 << donor.searchLog);
+    assert_eq!(hc.chain_log as u32, donor.chainLog);
+    assert_eq!(hc.hash_log as u32, donor.hashLog);
+    assert_eq!(hc.search_depth as u32, 1u32 << donor.searchLog);
     assert_eq!(HC_OPT_MIN_MATCH_LEN as u32, donor.minMatch);
-    assert_eq!(params.hc.target_len as u32, donor.targetLength);
+    assert_eq!(hc.target_len as u32, donor.targetLength);
 }
 
 #[test]
@@ -9460,10 +9521,12 @@ fn fastest_hint_iteration_23_sequences_reconstruct_source() {
 fn fast_levels_dispatch_per_level_hash_log_and_mls() {
     // Level 1 — donor `{ 19, 13, 14, 1, 7, 0, ZSTD_fast }` row:
     // window_log=19, hash_log=14, mls=7.
-    let p1 = resolve_level_params(CompressionLevel::Level(1), None);
-    assert_eq!(p1.fast_hash_log, 14);
-    assert_eq!(p1.fast_mls, 7);
-    assert_eq!(p1.fast_step_size, 2);
+    let f1 = resolve_level_params(CompressionLevel::Level(1), None)
+        .fast
+        .unwrap();
+    assert_eq!(f1.hash_log, 14);
+    assert_eq!(f1.mls, 7);
+    assert_eq!(f1.step_size, 2);
 
     // Negative levels — donor row-0 ("base for negative"):
     // hash_log=13, mls=7. The 32 KiB table is L1d-resident (every
@@ -9473,35 +9536,29 @@ fn fast_levels_dispatch_per_level_hash_log_and_mls() {
     // step_size follows donor's formula: targetLength = -level,
     // step_size = (-level) + 1, giving 2..8 for L-1..L-7.
     for n in -7..=-1 {
-        let p = resolve_level_params(CompressionLevel::Level(n), None);
-        assert_eq!(p.fast_hash_log, 13, "Level({n}) fast_hash_log");
-        assert_eq!(p.fast_mls, 7, "Level({n}) fast_mls");
+        let f = resolve_level_params(CompressionLevel::Level(n), None)
+            .fast
+            .unwrap();
+        assert_eq!(f.hash_log, 13, "Level({n}) fast_hash_log");
+        assert_eq!(f.mls, 7, "Level({n}) fast_mls");
         let expected_step = ((-n) as usize) + 1;
-        assert_eq!(p.fast_step_size, expected_step, "Level({n}) fast_step_size");
+        assert_eq!(f.step_size, expected_step, "Level({n}) fast_step_size");
     }
 
     // Fastest + Uncompressed keep hash_log=14 / mls=6 (their own
     // tuning; not part of the negative-level donor ladder).
     let pf = resolve_level_params(CompressionLevel::Fastest, None);
+    let ff = pf.fast.unwrap();
     assert_eq!(
-        (
-            pf.window_log,
-            pf.fast_hash_log,
-            pf.fast_mls,
-            pf.fast_step_size
-        ),
+        (pf.window_log, ff.hash_log, ff.mls, ff.step_size),
         (19, 14, 6, 2),
     );
     // Uncompressed keeps window_log=17 (no history references, smaller
     // decoder reservation); fast cParams same as negative-base row.
     let pu = resolve_level_params(CompressionLevel::Uncompressed, None);
+    let fu = pu.fast.unwrap();
     assert_eq!(
-        (
-            pu.window_log,
-            pu.fast_hash_log,
-            pu.fast_mls,
-            pu.fast_step_size
-        ),
+        (pu.window_log, fu.hash_log, fu.mls, fu.step_size),
         (17, 14, 6, 2),
     );
 }
@@ -9556,20 +9613,21 @@ fn fast_levels_driver_wiring_threads_cparams_into_inner_matcher() {
         // by FrameCompressor / StreamingEncoder).
         crate::encoding::Matcher::reset(&mut driver, level);
 
+        let f = p.fast.unwrap();
         let m = driver.simple_mut();
         assert_eq!(
             m.hash_log(),
-            p.fast_hash_log,
+            f.hash_log,
             "{level:?}: inner matcher hash_log mismatch — argument swap?",
         );
         assert_eq!(
             m.mls(),
-            p.fast_mls,
+            f.mls,
             "{level:?}: inner matcher mls mismatch — argument swap?",
         );
         assert_eq!(
             m.step_size(),
-            p.fast_step_size,
+            f.step_size,
             "{level:?}: inner matcher step_size mismatch — stale value carried from prior reset?",
         );
     }
@@ -9596,10 +9654,17 @@ fn lazy_band_target_len_matches_donor_default_table() {
         // call with any (level, srcSize, dictSize) combination.
         let reference = unsafe { zstd_sys::ZSTD_getCParams(level, 0, 0) };
         let params = resolve_level_params(CompressionLevel::Level(level), None);
+        // L5 = greedy (Row backend → `row`); L6-15 = lazy (HashChain → `hc`).
+        // Both surface the donor `targetLength` as their nice-match threshold.
+        let target_len = params
+            .hc
+            .map(|hc| hc.target_len)
+            .or_else(|| params.row.map(|row| row.target_len))
+            .expect("lazy/greedy level carries hc or row config");
         assert_eq!(
-            params.hc.target_len as u32, reference.targetLength,
-            "L{level}: hc.target_len ({}) must match reference cParams.targetLength ({})",
-            params.hc.target_len, reference.targetLength
+            target_len as u32, reference.targetLength,
+            "L{level}: target_len ({target_len}) must match reference cParams.targetLength ({})",
+            reference.targetLength
         );
     }
 }
@@ -9621,11 +9686,12 @@ fn upper_lazy_band_params_match_donor_default_table() {
         // call with any (level, srcSize, dictSize) combination.
         let reference = unsafe { zstd_sys::ZSTD_getCParams(level, 0, 0) };
         let params = resolve_level_params(CompressionLevel::Level(level), None);
+        let hc = params.hc.unwrap();
         assert_eq!(
-            params.hc.search_depth as u32,
+            hc.search_depth as u32,
             1u32 << reference.searchLog,
             "L{level}: hc.search_depth ({}) must equal 1<<cParams.searchLog ({})",
-            params.hc.search_depth,
+            hc.search_depth,
             1u32 << reference.searchLog
         );
         assert_eq!(
@@ -9634,14 +9700,14 @@ fn upper_lazy_band_params_match_donor_default_table() {
             params.window_log, reference.windowLog
         );
         assert_eq!(
-            params.hc.hash_log as u32, reference.hashLog,
+            hc.hash_log as u32, reference.hashLog,
             "L{level}: hc.hash_log ({}) must equal cParams.hashLog ({})",
-            params.hc.hash_log, reference.hashLog
+            hc.hash_log, reference.hashLog
         );
         assert_eq!(
-            params.hc.chain_log as u32, reference.chainLog,
+            hc.chain_log as u32, reference.chainLog,
             "L{level}: hc.chain_log ({}) must equal cParams.chainLog ({})",
-            params.hc.chain_log, reference.chainLog
+            hc.chain_log, reference.chainLog
         );
     }
 }
