@@ -3252,7 +3252,10 @@ mod tests {
         assert_eq!(level_pre_split(CompressionLevel::Level(4)), Some(1)); // dfast
         assert_eq!(level_pre_split(CompressionLevel::Level(5)), Some(2)); // greedy
         assert_eq!(level_pre_split(CompressionLevel::Level(7)), Some(2)); // lazy (depth 1)
+        assert_eq!(level_pre_split(CompressionLevel::Level(8)), Some(3)); // lazy2 lower bound
         assert_eq!(level_pre_split(CompressionLevel::Level(11)), Some(3)); // lazy2 (depth 2)
+        assert_eq!(level_pre_split(CompressionLevel::Level(12)), Some(3)); // lazy2 upper bound
+        assert_eq!(level_pre_split(CompressionLevel::Level(13)), Some(3)); // btlazy2 lower bound
         assert_eq!(level_pre_split(CompressionLevel::Level(15)), Some(3)); // btlazy2 (depth 2)
         assert_eq!(level_pre_split(CompressionLevel::Level(16)), Some(4)); // btopt
         assert_eq!(level_pre_split(CompressionLevel::Level(22)), Some(4)); // btultra2
@@ -3324,6 +3327,51 @@ mod tests {
         let mut decoded = Vec::with_capacity(data.len());
         decoder.collect_to_writer(&mut decoded).unwrap();
         assert_eq!(decoded, data, "roundtrip must reproduce the input verbatim");
+    }
+
+    /// Outside-diff coverage for the FAST one-shot path.
+    /// `compress_slice_to_vec` / `compress_independent_frame` on a Fast level
+    /// routes through `run_borrowed_block_loop` (not the owned loop the test
+    /// above covers), which must honour `optimal_block_size` and emit a
+    /// sub-`MAX_BLOCK_SIZE` boundary rather than fixed 128 KiB blocks. A
+    /// 256 KiB input is two 128 KiB blocks when unsplit; a chunk boundary in
+    /// the second block yields >= 3 decoded blocks, asserted on the round-trip.
+    #[test]
+    fn fast_oneshot_borrowed_split_emits_subblock() {
+        use crate::encoding::{CompressionLevel, compress_slice_to_vec};
+        // First 192 KiB: homogeneous zero run (banks the savings the split
+        // gate needs). The second 128 KiB block flips to a counter sequence
+        // at its 64 KiB midpoint (the 192 KiB mark) — a fingerprint
+        // transition the Fast from-borders splitter (split level 0) resolves
+        // into a sub-block boundary.
+        let mut data = vec![0u8; 256 * 1024];
+        for (i, byte) in data.iter_mut().enumerate() {
+            if i >= 192 * 1024 {
+                *byte = (i % 251 + 1) as u8;
+            }
+        }
+
+        let frame = compress_slice_to_vec(&data, CompressionLevel::Fastest);
+
+        let mut decoder = FrameDecoder::new();
+        let mut source = frame.as_slice();
+        decoder
+            .reset(&mut source)
+            .expect("frame header should parse");
+        while !decoder.is_finished() {
+            decoder
+                .decode_blocks(&mut source, crate::decoding::BlockDecodingStrategy::All)
+                .expect("decode should succeed");
+        }
+        let mut decoded = Vec::with_capacity(data.len());
+        decoder.collect_to_writer(&mut decoded).unwrap();
+        assert_eq!(decoded, data, "roundtrip must reproduce the input verbatim");
+        assert!(
+            decoder.blocks_decoded() >= 3,
+            "fast one-shot borrowed path must split the second donor block \
+             (256 KiB unsplit = 2 blocks), got {} blocks",
+            decoder.blocks_decoded(),
+        );
     }
 
     /// Regression: `set_compression_level` followed by `compress()` must

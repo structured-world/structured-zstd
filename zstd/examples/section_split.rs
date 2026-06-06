@@ -39,25 +39,27 @@ fn lit_section_len(body: &[u8]) -> (usize, u8) {
         }
         _ => {
             // Compressed / Treeless: size fields start at bit 4.
+            // Fixed-width u64: the 5-byte (sf 3) header packs up to bit 35
+            // (`body[4] << 28`), which truncates in a 32-bit `usize`.
             let (hdr, compressed) = match sf {
                 0 | 1 => {
-                    let v = (b0 >> 4) | ((body[1] as usize) << 4) | ((body[2] as usize) << 12);
-                    (3, (v >> 10) & 0x3FF)
+                    let v = ((b0 as u64) >> 4) | ((body[1] as u64) << 4) | ((body[2] as u64) << 12);
+                    (3, ((v >> 10) & 0x3FF) as usize)
                 }
                 2 => {
-                    let v = (b0 >> 4)
-                        | ((body[1] as usize) << 4)
-                        | ((body[2] as usize) << 12)
-                        | ((body[3] as usize) << 20);
-                    (4, (v >> 14) & 0x3FFF)
+                    let v = ((b0 as u64) >> 4)
+                        | ((body[1] as u64) << 4)
+                        | ((body[2] as u64) << 12)
+                        | ((body[3] as u64) << 20);
+                    (4, ((v >> 14) & 0x3FFF) as usize)
                 }
                 _ => {
-                    let v = (b0 >> 4)
-                        | ((body[1] as usize) << 4)
-                        | ((body[2] as usize) << 12)
-                        | ((body[3] as usize) << 20)
-                        | ((body[4] as usize) << 28);
-                    (5, (v >> 18) & 0x3FFFF)
+                    let v = ((b0 as u64) >> 4)
+                        | ((body[1] as u64) << 4)
+                        | ((body[2] as u64) << 12)
+                        | ((body[3] as u64) << 20)
+                        | ((body[4] as u64) << 28);
+                    (5, ((v >> 18) & 0x3FFFF) as usize)
                 }
             };
             (hdr + compressed, lit_type)
