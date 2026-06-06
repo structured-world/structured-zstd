@@ -1047,12 +1047,13 @@ unsafe fn copy_exact_inline_neon(src: *const u8, dst: *mut u8, len: usize) {
     }
 }
 
-/// Exact medium-size copy (`16 < len < `[`BULK_MEMCPY_THRESHOLD`]) for encoder
+/// Exact medium-size copy (`33 <= len < `[`BULK_MEMCPY_THRESHOLD`]) for encoder
 /// literal runs — the safe analog of donor `ZSTD_wildcopy`. The kernel is
 /// fixed at **compile time** (the build's `target_feature`), so the chosen
 /// SIMD body inlines directly into the caller with NO runtime detect and NO
 /// `#[target_feature]` ABI boundary:
 /// - AVX2 build (`-C target-cpu=x86-64-v3`): inline 32-byte exact copy.
+/// - i686 (SSE2 baseline, no AVX2): inline 16-byte exact copy.
 /// - aarch64 (NEON baseline): inline 16-byte exact copy.
 /// - any other build: libc `memcpy` (`ptr::copy_nonoverlapping`), whose
 ///   per-CPU IFUNC routine is already optimal for medium runs — a narrow
@@ -1065,8 +1066,16 @@ unsafe fn copy_exact_inline_neon(src: *const u8, dst: *mut u8, len: usize) {
 ///
 /// # Safety
 /// `src` readable and `dst` writable for `len` bytes; regions non-overlapping.
+/// `len` MUST be `>= 33`: every SIMD kernel reads/writes an overlapping tail at
+/// `len - 32` (AVX2) or `len - 16` (SSE2/NEON), which underflows for smaller
+/// `len`. Callers route `<= 32` through a separate exact path, so the dispatcher
+/// only ever sees `>= 33`; the `debug_assert!` below guards future misuse.
 #[inline]
 pub(crate) unsafe fn copy_exact_medium(src: *const u8, dst: *mut u8, len: usize) {
+    debug_assert!(
+        len >= 33,
+        "copy_exact_medium requires len >= 33 (overlapping SIMD tail underflows below that)",
+    );
     // Exactly one of the three cfg arms compiles per build, so each is a
     // tail statement with no `return` (avoids `clippy::needless_return`).
     #[cfg(all(
@@ -1140,73 +1149,6 @@ mod tests {
                 &got[..],
                 &src[..len],
                 "copy_exact_medium mismatch at len={len}"
-            );
-        }
-    }
-
-    /// Scalar word-at-a-time copy — proxy for a libc WITHOUT a tuned SIMD
-    /// `memcpy` (musl, most no_std platforms). Mirrors musl's portable
-    /// `memcpy` shape (8-byte words + byte tail).
-    #[cfg(test)]
-    unsafe fn scalar_word_copy(src: *const u8, dst: *mut u8, len: usize) {
-        let mut o = 0usize;
-        unsafe {
-            while o + 8 <= len {
-                dst.add(o)
-                    .cast::<u64>()
-                    .write_unaligned(src.add(o).cast::<u64>().read_unaligned());
-                o += 8;
-            }
-            while o < len {
-                dst.add(o).write(src.add(o).read());
-                o += 1;
-            }
-        }
-    }
-
-    /// Short relative microbench (run with `--no-capture`): inline tier copy
-    /// (`copy_exact_medium` — NEON on aarch64 / AVX2 on x86-v3) vs the libc
-    /// `memcpy` (`ptr::copy_nonoverlapping`) vs a scalar word-copy
-    /// (musl / no_std proxy). Relative ratios are meaningful even on M1; the
-    /// point is whether inline-SIMD beats the scalar proxy (→ musl/no_std win)
-    /// while ~tying the tuned platform memcpy (→ std neutral). Ignored by
-    /// default so it never gates CI on timing.
-    #[test]
-    #[ignore = "timing microbench; run explicitly with --no-capture"]
-    fn microbench_literal_copy_medium() {
-        use std::time::Instant;
-        let src: vec::Vec<u8> = (0..8192u32)
-            .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
-            .collect();
-        let mut dst = vec![0u8; 8192];
-        let iters: u64 = 4_000_000;
-        std::eprintln!("medium literal copy (ns/op, lower=better):");
-        for &len in &[40usize, 64, 100, 200, 400, 800] {
-            // inline tier (NEON/AVX2 per build)
-            let t = Instant::now();
-            for _ in 0..iters {
-                unsafe { copy_exact_medium(src.as_ptr(), dst.as_mut_ptr(), len) };
-                core::hint::black_box(dst.as_ptr());
-            }
-            let inl = t.elapsed().as_nanos() as f64 / iters as f64;
-            // libc memcpy (tuned platform routine)
-            let t = Instant::now();
-            for _ in 0..iters {
-                unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr(), len) };
-                core::hint::black_box(dst.as_ptr());
-            }
-            let lc = t.elapsed().as_nanos() as f64 / iters as f64;
-            // scalar word copy (musl / no_std memcpy proxy)
-            let t = Instant::now();
-            for _ in 0..iters {
-                unsafe { scalar_word_copy(src.as_ptr(), dst.as_mut_ptr(), len) };
-                core::hint::black_box(dst.as_ptr());
-            }
-            let sc = t.elapsed().as_nanos() as f64 / iters as f64;
-            std::eprintln!(
-                "  len={len:4}: inline={inl:6.2}  libc={lc:6.2}  scalar={sc:6.2}  (inline vs libc {:+.1}%, vs scalar {:+.1}%)",
-                100.0 * (inl - lc) / lc,
-                100.0 * (inl - sc) / sc,
             );
         }
     }
