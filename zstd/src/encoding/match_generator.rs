@@ -6858,6 +6858,44 @@ fn primed_snapshot_not_restored_when_window_hint_differs() {
     );
 }
 
+#[test]
+fn primed_snapshot_restored_for_hints_in_same_window_bucket() {
+    // The snapshot key must normalize the source-size hint to the resolved
+    // matcher geometry, not the raw hinted byte count. `reset()` derives every
+    // hint-dependent parameter (window_log cap, HC/Fast/Dfast/Row table widths,
+    // the Fast attach-vs-copy cutoff) from `ceil_log2(hint)`, so two distinct
+    // hints that share a ceil-log bucket resolve to the *identical* matcher
+    // shape. Keying on the raw bytes over-keys: it forces a full re-prime on the
+    // second frame even though the cached snapshot is a perfect fit. Restore
+    // must SUCCEED across same-bucket hints.
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    let level = CompressionLevel::Best;
+
+    // Both hints fall in ceil_log2 bucket 19 (2^18 < n <= 2^19): 300 KiB and
+    // 400 KiB resolve to the same window and table widths.
+    driver.set_source_size_hint(300 * 1024);
+    driver.reset(level);
+    let window_a = driver.window_size();
+    driver.prime_with_dictionary(b"abcdefghABCDEFGHijklmnop", [1, 4, 8]);
+    driver.capture_primed_dictionary(level);
+
+    driver.set_source_size_hint(400 * 1024);
+    driver.reset(level);
+    let window_b = driver.window_size();
+    assert_eq!(
+        window_a, window_b,
+        "precondition: same-bucket hints must resolve to the same window \
+         (a={window_a}, b={window_b})"
+    );
+
+    let restored = driver.restore_primed_dictionary(level);
+    assert!(
+        restored,
+        "snapshot captured at a 300 KiB hint must be restored into a 400 KiB \
+         hint that resolves to the identical matcher shape (raw bytes over-key)"
+    );
+}
+
 #[cfg(any())] // disabled: tested SuffixStore-per-block tail-handling specific to legacy MatchGenerator
 #[test]
 fn prime_with_dictionary_does_not_reuse_tiny_suffix_store() {
