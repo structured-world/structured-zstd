@@ -300,18 +300,31 @@ impl LevelParams {
     }
 
     /// Cheap fingerprint pre-splitter level, the C-like `blockSplitterLevel`
-    /// knob (donor `splitLevels[]` by strategy in `ZSTD_optimalBlockSize`):
-    /// fast=0, dfast=1, greedy=2, lazy=2, lazy2/btlazy2=3,
-    /// btopt/btultra/btultra2=4. `split_level == 0` routes to the cheap
-    /// from-borders heuristic; `1..=4` to byChunks with internal sampling
-    /// level `split_level - 1`. The `savings >= 3` gate in
-    /// `optimal_block_size` keeps incompressible data and the first full
-    /// block whole, so homogeneous frames are not over-split.
+    /// knob. Mirrors the donor `splitLevels[]` table indexed by strategy in
+    /// `ZSTD_optimalBlockSize` (`{0,0,1,2,2,3,3,4,4,4}` over fast..btultra2):
+    /// fast=0, dfast=1, greedy=2, lazy=2, lazy2=3, btlazy2=3,
+    /// btopt/btultra/btultra2=4. We collapse the donor `lazy2` and `btlazy2`
+    /// strategies into the hash-chain `Lazy` tag, distinguished here by
+    /// `lazy_depth` (the level table runs both at depth 2), so depth 2 routes
+    /// to split level 3 to match the donor. `split_level == 0` routes to the
+    /// cheap from-borders heuristic; `1..=4` to byChunks with internal
+    /// sampling level `split_level - 1`. The `savings >= 3` gate in
+    /// `optimal_block_size` keeps incompressible data and the first full block
+    /// whole, so homogeneous frames are not over-split.
     fn pre_split(&self) -> Option<u8> {
         match self.strategy_tag {
             super::strategy::StrategyTag::Fast => Some(0),
             super::strategy::StrategyTag::Dfast => Some(1),
-            super::strategy::StrategyTag::Greedy | super::strategy::StrategyTag::Lazy => Some(2),
+            super::strategy::StrategyTag::Greedy => Some(2),
+            // lazy=2, lazy2/btlazy2=3; both lazy2 and btlazy2 ride the Lazy
+            // tag at lazy_depth 2 in the level table.
+            super::strategy::StrategyTag::Lazy => {
+                if self.lazy_depth >= 2 {
+                    Some(3)
+                } else {
+                    Some(2)
+                }
+            }
             super::strategy::StrategyTag::BtOpt
             | super::strategy::StrategyTag::BtUltra
             | super::strategy::StrategyTag::BtUltra2 => Some(4),

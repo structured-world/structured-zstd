@@ -3225,8 +3225,9 @@ mod tests {
     /// `level_pre_split` resolves the per-level split knob through the
     /// `LevelParams` table, mirroring the donor `splitLevels[]` by strategy
     /// (`ZSTD_optimalBlockSize`): fast → 0 (from-borders), dfast → 1,
-    /// greedy/lazy → 2, btopt/btultra/btultra2 → 4. `Uncompressed` has no
-    /// numeric level so it stays `None`.
+    /// greedy/lazy → 2, lazy2/btlazy2 (Lazy tag at depth 2) → 3,
+    /// btopt/btultra/btultra2 → 4. `Uncompressed` has no numeric level so it
+    /// stays `None`.
     #[test]
     fn pre_split_level_dispatches_by_compression_level() {
         use crate::encoding::CompressionLevel;
@@ -3250,8 +3251,9 @@ mod tests {
         assert_eq!(level_pre_split(CompressionLevel::Level(2)), Some(0)); // fast
         assert_eq!(level_pre_split(CompressionLevel::Level(4)), Some(1)); // dfast
         assert_eq!(level_pre_split(CompressionLevel::Level(5)), Some(2)); // greedy
-        assert_eq!(level_pre_split(CompressionLevel::Level(7)), Some(2)); // lazy
-        assert_eq!(level_pre_split(CompressionLevel::Level(15)), Some(2)); // lazy
+        assert_eq!(level_pre_split(CompressionLevel::Level(7)), Some(2)); // lazy (depth 1)
+        assert_eq!(level_pre_split(CompressionLevel::Level(11)), Some(3)); // lazy2 (depth 2)
+        assert_eq!(level_pre_split(CompressionLevel::Level(15)), Some(3)); // btlazy2 (depth 2)
         assert_eq!(level_pre_split(CompressionLevel::Level(16)), Some(4)); // btopt
         assert_eq!(level_pre_split(CompressionLevel::Level(22)), Some(4)); // btultra2
     }
