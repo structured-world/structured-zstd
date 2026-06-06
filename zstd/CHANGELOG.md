@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.29](https://github.com/structured-world/structured-zstd/compare/v0.0.28...v0.0.29) - 2026-06-06
+
+### Added
+
+- *(bench)* report active CPU kernel tier + fix decode_loop corpus masking ([#351](https://github.com/structured-world/structured-zstd/pull/351))
+
+### Documentation
+
+- *(readme)* fix btultra/btultra2 level boundary in strategy table ([#334](https://github.com/structured-world/structured-zstd/pull/334))
+
+### Fixed
+
+- *(decode)* bound per-block output (decompression-bomb OOM) + L19 decode gap ([#350](https://github.com/structured-world/structured-zstd/pull/350))
+
+### Performance
+
+- *(codec)* per-strategy block-split levels + per-tier exec-macro seq monolith ([#354](https://github.com/structured-world/structured-zstd/pull/354))
+- *(codec)* warm dictionary reuse (decode + encode) + relocate decompression-bomb guard ([#352](https://github.com/structured-world/structured-zstd/pull/352))
+- *(encode)* store row match positions as u32 to cut peak memory ([#346](https://github.com/structured-world/structured-zstd/pull/346))
+- *(encode)* right-size dfast/row/hash-chain tables for small inputs ([#345](https://github.com/structured-world/structured-zstd/pull/345))
+- *(encode)* price the custom FSE table without building it ([#344](https://github.com/structured-world/structured-zstd/pull/344))
+- *(encode)* cut small-input fixed cost on the fast levels ([#342](https://github.com/structured-world/structured-zstd/pull/342))
+- *(encode)* hoist hash/chain fill rebase guard out of insert loop ([#340](https://github.com/structured-world/structured-zstd/pull/340))
+- *(encode)* rebase matcher floor on reset instead of zeroing tables ([#338](https://github.com/structured-world/structured-zstd/pull/338))
+- *(encode)* donor-correct block-split + block-precise decode errors ([#336](https://github.com/structured-world/structured-zstd/pull/336))
+- *(encode)* decouple and monomorphize the row matcher ([#335](https://github.com/structured-world/structured-zstd/pull/335))
+- *(encode)* close level-5 greedy speed gap (row match-span cap) ([#331](https://github.com/structured-world/structured-zstd/pull/331))
+- *(encode)* donor row-0 params for Fast negative levels ([#330](https://github.com/structured-world/structured-zstd/pull/330))
+- *(encode)* size-gated dictionary match-finding for the Fast strategy ([#328](https://github.com/structured-world/structured-zstd/pull/328))
+- *(dict)* greedy set-cover segment selection in fastcover trainer ([#324](https://github.com/structured-world/structured-zstd/pull/324))
+
 ## [0.0.28](https://github.com/structured-world/structured-zstd/compare/v0.0.27...v0.0.28) - 2026-06-02
 
 ### Added
