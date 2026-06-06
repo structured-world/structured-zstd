@@ -169,7 +169,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         offset: usize,
         match_length: usize,
     ) -> Result<(), super::errors::ExecuteSequencesError> {
-        use super::errors::ExecuteSequencesError;
+        use super::buffer_backend::sequence_output_fits;
         use super::exec_sequence_inline::x86::{
             copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_overlap_8byte_stride,
         };
@@ -190,39 +190,16 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // unsafe pointer math go out of bounds.
         const MAX_WILDCOPY_OVERSHOOT: usize = 15;
         let cap = self.slice.len();
-        // `requested` reports the LOGICAL write length
-        // (`lit_length + match_length`) to stay consistent with
-        // `BackendOverflow.requested` on the `try_*` paths. The
-        // capacity check itself uses `tail + total + overshoot`
-        // because the unconditional 16-byte `copy16` over-reaches
-        // `tail + total` by up to 15 bytes — but that overshoot is
-        // an artefact of the SIMD copy shape, NOT a value the
-        // caller can act on, so it doesn't belong in the diagnostic.
-        let total = match lit_length.checked_add(match_length) {
-            Some(v) => v,
-            None => {
-                return Err(ExecuteSequencesError::OutputBufferOverflow {
-                    tail: self.tail,
-                    requested: usize::MAX,
-                    capacity: cap,
-                });
-            }
-        };
-        let cap_required = self
-            .tail
-            .checked_add(total)
-            .and_then(|new_tail| new_tail.checked_add(MAX_WILDCOPY_OVERSHOOT));
-        let cap_required = match cap_required {
-            Some(v) if v <= cap => v,
-            _ => {
-                return Err(ExecuteSequencesError::OutputBufferOverflow {
-                    tail: self.tail,
-                    requested: total,
-                    capacity: cap,
-                });
-            }
-        };
-        let _ = cap_required;
+        // `self.tail <= cap` holds on entry (`from_slice` starts at 0 and
+        // every prior sequence advanced `tail` only after this same check),
+        // satisfying the `tail <= cap` precondition; see `sequence_output_fits`.
+        let total = sequence_output_fits(
+            lit_length,
+            match_length,
+            self.tail,
+            cap,
+            MAX_WILDCOPY_OVERSHOOT,
+        )?;
         let new_tail = self.tail + total;
         debug_assert!(offset >= 1);
         debug_assert!(match_length >= 1);
@@ -303,36 +280,21 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         offset: usize,
         match_length: usize,
     ) -> Result<(), super::errors::ExecuteSequencesError> {
-        use super::errors::ExecuteSequencesError;
+        use super::buffer_backend::sequence_output_fits;
         use super::exec_sequence_inline::portable::{
             copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_overlap_8byte_stride,
         };
         const MAX_WILDCOPY_OVERSHOOT: usize = 15;
         let cap = self.slice.len();
-        let total = match lit_length.checked_add(match_length) {
-            Some(v) => v,
-            None => {
-                return Err(ExecuteSequencesError::OutputBufferOverflow {
-                    tail: self.tail,
-                    requested: usize::MAX,
-                    capacity: cap,
-                });
-            }
-        };
-        let cap_required = self
-            .tail
-            .checked_add(total)
-            .and_then(|new_tail| new_tail.checked_add(MAX_WILDCOPY_OVERSHOOT));
-        match cap_required {
-            Some(v) if v <= cap => {}
-            _ => {
-                return Err(ExecuteSequencesError::OutputBufferOverflow {
-                    tail: self.tail,
-                    requested: total,
-                    capacity: cap,
-                });
-            }
-        }
+        // `self.tail <= cap` precondition holds as in the SSE2 arm; see
+        // `sequence_output_fits`.
+        let total = sequence_output_fits(
+            lit_length,
+            match_length,
+            self.tail,
+            cap,
+            MAX_WILDCOPY_OVERSHOOT,
+        )?;
         let new_tail = self.tail + total;
         debug_assert!(offset >= 1);
         debug_assert!(match_length >= 1);
@@ -413,7 +375,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         offset: usize,
         match_length: usize,
     ) -> Result<(), super::errors::ExecuteSequencesError> {
-        use super::errors::ExecuteSequencesError;
+        use super::buffer_backend::sequence_output_fits;
         use super::exec_sequence_inline::x86::{
             copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_no_overlap_avx2,
             wildcopy_overlap_8byte_stride,
@@ -425,31 +387,16 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // this overshoot for well-formed frames.
         const MAX_WILDCOPY_OVERSHOOT: usize = 31;
         let cap = self.slice.len();
-        let total = match lit_length.checked_add(match_length) {
-            Some(v) => v,
-            None => {
-                return Err(ExecuteSequencesError::OutputBufferOverflow {
-                    tail: self.tail,
-                    requested: usize::MAX,
-                    capacity: cap,
-                });
-            }
-        };
-        let cap_required = self
-            .tail
-            .checked_add(total)
-            .and_then(|new_tail| new_tail.checked_add(MAX_WILDCOPY_OVERSHOOT));
-        let cap_required = match cap_required {
-            Some(v) if v <= cap => v,
-            _ => {
-                return Err(ExecuteSequencesError::OutputBufferOverflow {
-                    tail: self.tail,
-                    requested: total,
-                    capacity: cap,
-                });
-            }
-        };
-        let _ = cap_required;
+        // `self.tail <= cap` holds on entry (`from_slice` starts at 0 and every
+        // prior sequence advanced `tail` only after this same check), satisfying
+        // the `tail <= cap` precondition; see `sequence_output_fits`.
+        let total = sequence_output_fits(
+            lit_length,
+            match_length,
+            self.tail,
+            cap,
+            MAX_WILDCOPY_OVERSHOOT,
+        )?;
         let new_tail = self.tail + total;
         debug_assert!(offset >= 1);
         debug_assert!(match_length >= 1);

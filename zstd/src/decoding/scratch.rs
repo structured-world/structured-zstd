@@ -3,7 +3,7 @@
 use super::buffer_backend::BufferBackend;
 use super::decode_buffer::DecodeBuffer;
 use super::ringbuffer::RingBuffer;
-use crate::decoding::dictionary::Dictionary;
+use crate::decoding::dictionary::DictionaryHandle;
 use crate::fse::SeqFSETable;
 use crate::huff0::HuffmanTable;
 use alloc::vec::Vec;
@@ -222,14 +222,15 @@ impl<B: BufferBackend> DecoderScratch<B> {
         self.huf.table.reset();
     }
 
-    pub fn init_from_dict(&mut self, dict: &Dictionary) {
-        self.fse.reinit_from(&dict.fse);
-        self.huf.table.reinit_from(&dict.huf.table);
-        self.offset_hist = dict.offset_hist;
-        self.buffer.dict_content.clear();
-        self.buffer
-            .dict_content
-            .extend_from_slice(&dict.dict_content);
+    pub fn init_from_dict(&mut self, dict: &DictionaryHandle) {
+        let d = dict.as_dict();
+        self.fse.reinit_from(&d.fse);
+        self.huf.table.reinit_from(&d.huf.table);
+        self.offset_hist = d.offset_hist;
+        // Share the dictionary content by handle (Arc/Rc clone = refcount
+        // bump) instead of copying it into a per-frame buffer; the decoder
+        // reads match bytes straight out of the shared content.
+        self.buffer.set_dict(dict.clone());
         // Donor parity: `ZSTD_decompressBegin_usingDDict` sets
         // `dctx->ddictIsCold = 1` so the first block of the frame
         // engages the prefetch decoder regardless of long-offset
@@ -365,7 +366,9 @@ mod tests {
         extern crate std;
         let dict_raw =
             std::fs::read("./dict_tests/dictionary").expect("dictionary fixture should load");
-        let dict = Dictionary::decode_dict(&dict_raw).expect("dictionary should parse");
+        let dict = DictionaryHandle::from_dictionary(
+            Dictionary::decode_dict(&dict_raw).expect("dictionary should parse"),
+        );
         let mut scratch: DecoderScratch = DecoderScratch::new(1024);
         assert!(
             !scratch.fse.ddict_is_cold,

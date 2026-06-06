@@ -30,7 +30,7 @@ use structured_zstd::decoding::FrameDecoder;
 use structured_zstd::dictionary::{
     FastCoverOptions, FinalizeOptions, finalize_raw_dict, train_fastcover_raw_from_slice,
 };
-use structured_zstd::encoding::FrameCompressor;
+use structured_zstd::encoding::{EncoderDictionary, FrameCompressor};
 use support::{
     LevelConfig, Scenario, ScenarioClass, benchmark_scenarios, kernel_report_line,
     supported_levels_filtered,
@@ -651,60 +651,59 @@ fn bench_dictionary(c: &mut Criterion) {
                 })
             });
 
-            // c_ffi_with_dict + pure_rust_with_dict: both construct
-            // their compressor + attach dict INSIDE `b.iter` so the
-            // measurement covers the same shape on both sides.
-            // Asymmetric setup-vs-iter placement was flagged in
-            // PR #277 review (Copilot threads #2/#3/#4): the Rust
-            // FrameCompressor API stores `set_drain`'s `&mut Vec<u8>`
-            // inside the compressor for its full lifetime, so a
-            // "compressor outside b.iter, fresh Vec inside" pattern
-            // doesn't type-check. Rather than gymnast around that,
-            // match the per-iter shape on both arms — the FFI per-
-            // iter construction cost is small (`Compressor::with_
-            // dictionary` is a single CDict reference attach into a
-            // freshly-allocated CCtx) and stays comparable to the
-            // Rust per-iter `FrameCompressor::new +
-            // set_dictionary_from_bytes`.
+            // c_ffi_with_dict + pure_rust_with_dict: STEADY-STATE measurement.
+            // Both build the compressor + attach the dictionary ONCE before
+            // `b.iter`, then compress in the loop reusing that context — the
+            // real prepared-dictionary lifecycle (C `CDict` created once +
+            // `ZSTD_compress_usingCDict` per frame; Rust prepared
+            // `EncoderDictionary` + `compress_independent_frame` per frame).
+            // The earlier per-iter shape (fresh compressor + dict parse every
+            // iteration) measured one-time setup cost, not steady-state
+            // throughput, and unfairly penalised the side with heavier
+            // per-attach setup. `compress_independent_frame_into` reads the
+            // input in place and takes the output buffer per call, so it needs
+            // no `set_drain`/`set_source` — sidestepping the lifetime issue
+            // (PR #277) that forced the old per-iter shape.
             group.bench_function("c_ffi_with_dict", |b| {
-                b.iter(|| {
-                    let mut compressor =
-                        zstd::bulk::Compressor::with_dictionary(level.ffi_level, &ffi_dictionary)
-                            .unwrap();
-                    black_box(compressor.compress(&scenario.bytes).unwrap())
-                })
+                let mut compressor =
+                    zstd::bulk::Compressor::with_dictionary(level.ffi_level, &ffi_dictionary)
+                        .unwrap();
+                b.iter(|| black_box(compressor.compress(&scenario.bytes).unwrap()))
             });
 
             // Gate pure_rust_with_dict registration on the same
-            // `rust_dict_handle.is_some()` signal that
-            // decompress-dict uses below — if DictionaryHandle::
-            // decode_dict failed earlier (the per-scenario parse
-            // above), FrameCompressor::set_dictionary_from_bytes
-            // routes through the same Dictionary::decode_dict and
-            // would fail identically. An `.expect()` panic inside
-            // b.iter would abort the whole bench suite.
-            if let Some(preallocated_capacity) = rust_with_dict_len {
-                // `rust_with_dict_len` above already did the one-time
-                // pre-compress that learns the Rust encoder's actual output
-                // size at this (scenario, level, dict) — reuse it as the
-                // timing-loop preallocation hint. Using `with_dict_bytes.len()`
-                // (the FFI-side size) would under-allocate when Rust emits a
-                // slightly larger frame, forcing `Vec` reallocations inside the
-                // timing loop and skewing the measurement vs FFI (which always
-                // allocates exact output size internally).
+            // `rust_dict_handle.is_some()` signal that decompress-dict uses
+            // below — if the per-scenario dictionary parse failed earlier,
+            // `EncoderDictionary::from_bytes` routes through the same parse and
+            // would fail identically; an `.expect()` panic before `b.iter`
+            // would abort the whole bench suite.
+            if let Some(preallocated_capacity) = rust_with_dict_len
+                && EncoderDictionary::from_bytes(&ffi_dictionary).is_ok()
+            {
                 group.bench_function("pure_rust_with_dict", |b| {
+                    // `compress_independent_frame_into` reads input in
+                    // place + takes the output buffer per call, so neither
+                    // the source `R` nor drain `W` generic is ever bound by
+                    // a `set_source`/`set_drain` call — pin them to the
+                    // defaults so inference has a concrete type.
+                    let mut compressor: FrameCompressor = FrameCompressor::new(level.rust_level);
+                    compressor
+                        .set_encoder_dictionary(
+                            EncoderDictionary::from_bytes(&ffi_dictionary)
+                                .expect("dictionary parse checked above"),
+                        )
+                        .expect("prepared dictionary should attach");
+                    // Reuse one output buffer across iterations (the
+                    // CCtx-equivalent caller-owned `dst`). `rust_with_dict_len`
+                    // pre-sizes it so no realloc happens inside the loop.
+                    let mut compressed = Vec::with_capacity(preallocated_capacity);
                     b.iter(|| {
-                        let mut compressor = FrameCompressor::new(level.rust_level);
-                        compressor
-                            .set_dictionary_from_bytes(&ffi_dictionary)
-                            .expect("dictionary should attach");
-                        compressor.set_source_size_hint(scenario.bytes.len() as u64);
-                        compressor.set_source(scenario.bytes.as_slice());
-                        let mut compressed = Vec::with_capacity(preallocated_capacity);
-                        compressor.set_drain(&mut compressed);
-                        compressor.compress();
-                        black_box(compressed)
-                    })
+                        compressor.compress_independent_frame_into(
+                            scenario.bytes.as_slice(),
+                            &mut compressed,
+                        );
+                        black_box(&compressed);
+                    });
                 });
             }
 

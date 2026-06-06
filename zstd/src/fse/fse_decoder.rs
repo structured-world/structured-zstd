@@ -288,10 +288,13 @@ impl<E: FseEntry> FSETableImpl<E> {
     /// but skip the bytes copy.
     pub fn reinit_from(&mut self, other: &Self) {
         self.reset();
-        self.symbol_probabilities
-            .extend_from_slice(&other.symbol_probabilities);
-        self.symbol_spread_buffer
-            .reserve(other.symbol_spread_buffer.len());
+        // Copy ONLY the decode-time state. `symbol_probabilities` and
+        // `symbol_spread_buffer` are build-time scratch ("used while building
+        // the decode Vector"): the decode hot path and Repeat-mode reuse read
+        // only `decode` + `accuracy_log`, and any block that rebuilds the
+        // table (`build_decoder`) repopulates the scratch itself. Skipping
+        // them mirrors the donor copying just the FSE decode table per frame
+        // instead of the full build workspace.
         self.decode.extend_from_slice(&other.decode);
         self.accuracy_log = other.accuracy_log;
     }

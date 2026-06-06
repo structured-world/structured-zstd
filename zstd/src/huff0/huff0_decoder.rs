@@ -356,13 +356,15 @@ impl HuffmanTable {
     /// of `other`.
     pub fn reinit_from(&mut self, other: &Self) {
         self.reset();
+        // Copy ONLY the decode-time state. `weights` / `bits` /
+        // `rank_indexes` and the weight-decoding `fse_table` are build-time
+        // scratch (repopulated when a block carries a new HUF table); the
+        // literal-decode hot path reads only `packed_decode` + `max_num_bits`
+        // + `state_mask`. Skipping the rest mirrors the donor copying just the
+        // HUF decode table per frame, not the full build workspace.
         self.packed_decode.extend_from_slice(&other.packed_decode);
-        self.weights.extend_from_slice(&other.weights);
         self.max_num_bits = other.max_num_bits;
         self.state_mask = other.state_mask;
-        self.bits.extend_from_slice(&other.bits);
-        self.rank_indexes.extend_from_slice(&other.rank_indexes);
-        self.fse_table.reinit_from(&other.fse_table);
     }
 
     /// Completely empty the table of all data.

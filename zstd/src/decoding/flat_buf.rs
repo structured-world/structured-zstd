@@ -17,7 +17,7 @@
 use crate::io::{Error, Read};
 use alloc::vec::Vec;
 
-use super::buffer_backend::{BufferBackend, WILDCOPY_OVERLENGTH};
+use super::buffer_backend::{BackendOverflow, BufferBackend, WILDCOPY_OVERLENGTH};
 
 pub(crate) struct FlatBuf {
     buf: Vec<u8>,
@@ -42,6 +42,14 @@ pub(crate) struct FlatBuf {
     /// path can't observe a streaming-drain scenario where the
     /// distinction would matter.
     head: usize,
+    /// Per-block decompression-bomb growth ceiling, mirroring
+    /// [`super::ringbuffer::RingBuffer`]. `usize::MAX` is unbounded; the
+    /// sequence decoder lowers it to `len + MAX_BLOCK_SIZE` per block via
+    /// [`BufferBackend::set_max_capacity`]. `FlatBuf` is growable (the inline
+    /// exec path is capacity-bounded, but the fallback `push`/`repeat` route
+    /// grows through `try_reserve`), so it must honour this ceiling to bound a
+    /// malformed single-segment block's output instead of growing toward OOM.
+    max_capacity: usize,
 }
 
 impl FlatBuf {
@@ -59,6 +67,7 @@ impl FlatBuf {
         Self {
             buf: Vec::with_capacity(cap + WILDCOPY_OVERLENGTH),
             head: 0,
+            max_capacity: usize::MAX,
         }
     }
 }
@@ -86,7 +95,7 @@ impl BufferBackend for FlatBuf {
         offset: usize,
         match_length: usize,
     ) -> Result<(), super::errors::ExecuteSequencesError> {
-        use super::errors::ExecuteSequencesError;
+        use super::buffer_backend::sequence_output_fits;
         use super::exec_sequence_inline::x86::{
             copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_overlap_8byte_stride,
         };
@@ -98,35 +107,19 @@ impl BufferBackend for FlatBuf {
         // headroom. Surface that as `OutputBufferOverflow` (mirrors
         // `UserSliceBackend::exec_sequence_inline`) so the safe
         // public decode APIs see a structured error instead of UB
-        // from writing past `Vec::capacity()`. All sums use
-        // `checked_*` against adversarial input that could wrap
-        // `usize`.
+        // from writing past `Vec::capacity()`.
         const MAX_WILDCOPY_OVERSHOOT: usize = 15;
         let cap = self.buf.capacity();
         let buf_len = self.buf.len();
-        let total = match lit_length.checked_add(match_length) {
-            Some(v) => v,
-            None => {
-                return Err(ExecuteSequencesError::OutputBufferOverflow {
-                    tail: buf_len,
-                    requested: usize::MAX,
-                    capacity: cap,
-                });
-            }
-        };
-        let cap_required = buf_len
-            .checked_add(total)
-            .and_then(|new_tail| new_tail.checked_add(MAX_WILDCOPY_OVERSHOOT));
-        match cap_required {
-            Some(v) if v <= cap => {}
-            _ => {
-                return Err(ExecuteSequencesError::OutputBufferOverflow {
-                    tail: buf_len,
-                    requested: total,
-                    capacity: cap,
-                });
-            }
-        }
+        // `buf.len() <= buf.capacity()` (a `Vec` invariant) satisfies the
+        // `tail <= cap` precondition; see `sequence_output_fits`.
+        let total = sequence_output_fits(
+            lit_length,
+            match_length,
+            buf_len,
+            cap,
+            MAX_WILDCOPY_OVERSHOOT,
+        )?;
         debug_assert!(offset >= 1);
         debug_assert!(match_length >= 1);
         let live_len = buf_len - self.head;
@@ -181,7 +174,7 @@ impl BufferBackend for FlatBuf {
         offset: usize,
         match_length: usize,
     ) -> Result<(), super::errors::ExecuteSequencesError> {
-        use super::errors::ExecuteSequencesError;
+        use super::buffer_backend::sequence_output_fits;
         use super::exec_sequence_inline::portable::{
             copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_overlap_8byte_stride,
         };
@@ -193,29 +186,15 @@ impl BufferBackend for FlatBuf {
         const MAX_WILDCOPY_OVERSHOOT: usize = 15;
         let cap = self.buf.capacity();
         let buf_len = self.buf.len();
-        let total = match lit_length.checked_add(match_length) {
-            Some(v) => v,
-            None => {
-                return Err(ExecuteSequencesError::OutputBufferOverflow {
-                    tail: buf_len,
-                    requested: usize::MAX,
-                    capacity: cap,
-                });
-            }
-        };
-        let cap_required = buf_len
-            .checked_add(total)
-            .and_then(|new_tail| new_tail.checked_add(MAX_WILDCOPY_OVERSHOOT));
-        match cap_required {
-            Some(v) if v <= cap => {}
-            _ => {
-                return Err(ExecuteSequencesError::OutputBufferOverflow {
-                    tail: buf_len,
-                    requested: total,
-                    capacity: cap,
-                });
-            }
-        }
+        // `buf.len() <= buf.capacity()` (a `Vec` invariant) satisfies the
+        // `tail <= cap` precondition; see `sequence_output_fits`.
+        let total = sequence_output_fits(
+            lit_length,
+            match_length,
+            buf_len,
+            cap,
+            MAX_WILDCOPY_OVERSHOOT,
+        )?;
         debug_assert!(offset >= 1);
         debug_assert!(match_length >= 1);
         let live_len = buf_len - self.head;
@@ -271,7 +250,7 @@ impl BufferBackend for FlatBuf {
         offset: usize,
         match_length: usize,
     ) -> Result<(), super::errors::ExecuteSequencesError> {
-        use super::errors::ExecuteSequencesError;
+        use super::buffer_backend::sequence_output_fits;
         use super::exec_sequence_inline::x86::{
             copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_no_overlap_avx2,
             wildcopy_overlap_8byte_stride,
@@ -285,29 +264,15 @@ impl BufferBackend for FlatBuf {
         const MAX_WILDCOPY_OVERSHOOT: usize = 31;
         let cap = self.buf.capacity();
         let buf_len = self.buf.len();
-        let total = match lit_length.checked_add(match_length) {
-            Some(v) => v,
-            None => {
-                return Err(ExecuteSequencesError::OutputBufferOverflow {
-                    tail: buf_len,
-                    requested: usize::MAX,
-                    capacity: cap,
-                });
-            }
-        };
-        let cap_required = buf_len
-            .checked_add(total)
-            .and_then(|new_tail| new_tail.checked_add(MAX_WILDCOPY_OVERSHOOT));
-        match cap_required {
-            Some(v) if v <= cap => {}
-            _ => {
-                return Err(ExecuteSequencesError::OutputBufferOverflow {
-                    tail: buf_len,
-                    requested: total,
-                    capacity: cap,
-                });
-            }
-        }
+        // `buf.len() <= buf.capacity()` (a `Vec` invariant) satisfies the
+        // `tail <= cap` precondition; see `sequence_output_fits`.
+        let total = sequence_output_fits(
+            lit_length,
+            match_length,
+            buf_len,
+            cap,
+            MAX_WILDCOPY_OVERSHOOT,
+        )?;
         debug_assert!(offset >= 1);
         debug_assert!(match_length >= 1);
         let live_len = buf_len - self.head;
@@ -351,6 +316,7 @@ impl BufferBackend for FlatBuf {
         Self {
             buf: Vec::new(),
             head: 0,
+            max_capacity: usize::MAX,
         }
     }
 
@@ -380,7 +346,58 @@ impl BufferBackend for FlatBuf {
         // `dst_off + len <= capacity` debug assert.
         // libFuzzer artifact crash-e33ba082… exercises exactly that
         // shape.
-        self.buf.reserve(n.saturating_add(WILDCOPY_OVERLENGTH));
+        //
+        // `checked_add` (not `saturating_add`): callers reserve a bounded
+        // amount (a block's `MAX_BLOCK_SIZE`, or a `try_reserve` amount already
+        // gated by the per-block ceiling), so `n + WILDCOPY_OVERLENGTH` cannot
+        // overflow in practice. If it ever did, saturating to `usize::MAX`
+        // would silently mask the bad input before `Vec::reserve` panicked on
+        // it anyway — fail loudly at the cause instead.
+        let additional = n
+            .checked_add(WILDCOPY_OVERLENGTH)
+            .expect("FlatBuf::reserve amount + wildcopy slack overflows usize");
+        self.buf.reserve(additional);
+    }
+
+    #[inline]
+    fn set_max_capacity(&mut self, max_capacity: usize) {
+        self.max_capacity = max_capacity;
+    }
+
+    #[inline]
+    fn try_reserve(&mut self, n: usize) -> Result<(), BackendOverflow> {
+        // Enforce the per-block ceiling FIRST, before the no-growth fast path:
+        // the ceiling bounds this block's OUTPUT, not just allocation, so a
+        // write that would push live output past it must be rejected even when
+        // it fits the current capacity (e.g. a large pre-reserved FCS buffer
+        // whose spare exceeds `MAX_BLOCK_SIZE`). This is where the
+        // decompression bomb is bounded on FlatBuf's fallback push/repeat path
+        // (the inline exec path is already capacity-bounded by
+        // `sequence_output_fits`). `max_capacity = usize::MAX` between blocks
+        // makes this a no-op for unbounded callers.
+        if self
+            .len()
+            .checked_add(n)
+            .is_none_or(|needed| needed > self.max_capacity)
+        {
+            return Err(BackendOverflow {
+                tail: self.buf.len(),
+                requested: n,
+                capacity: self.max_capacity,
+            });
+        }
+        // Within the ceiling: if the live region plus this write (and the
+        // wildcopy slack `reserve` adds) already fits the current allocation,
+        // no growth is needed. `capacity >= len` is a `Vec` invariant, so the
+        // subtraction cannot underflow.
+        let free = self.buf.capacity() - self.buf.len();
+        if n.checked_add(WILDCOPY_OVERLENGTH)
+            .is_some_and(|need| free >= need)
+        {
+            return Ok(());
+        }
+        self.reserve(n);
+        Ok(())
     }
 
     #[inline]
@@ -697,8 +714,11 @@ mod tests {
         let mut f = FlatBuf::with_capacity(32);
         f.extend(&[0u8; 16]);
         // Request `lit_length + match_length + 15 = 17 + 100 + 15 = 132`
-        // bytes past tail; well over the 64-byte allocation.
-        let lits = [0xAAu8; 16];
+        // bytes past tail; well over the 64-byte allocation. The literal
+        // buffer is `lit_length.next_multiple_of(16) = 32` bytes so the call
+        // satisfies the inline read-slack precondition even if the capacity
+        // guard later moves past the first literal read.
+        let lits = [0xAAu8; 32];
         // SAFETY: error-returning path; no writes performed.
         let result = unsafe { f.exec_sequence_inline(lits.as_ptr(), 17, 8, 100) };
         assert!(
@@ -707,6 +727,81 @@ mod tests {
                 Err(super::super::errors::ExecuteSequencesError::OutputBufferOverflow { .. })
             ),
             "expected OutputBufferOverflow, got {result:?}"
+        );
+    }
+
+    /// AVX2 analogue of the capacity guard: the 32-byte-stride variant MUST
+    /// also return `OutputBufferOverflow` (not write past `Vec::capacity()`)
+    /// when the requested write plus the 31-byte overshoot exceeds the
+    /// remaining headroom. Guards the single-compare bounds check on the AVX2
+    /// hot path.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn exec_sequence_inline_avx2_capacity_overflow_returns_err() {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let mut f = FlatBuf::with_capacity(32);
+        f.extend(&[0u8; 16]);
+        // 32-byte literal buffer = `lit_length.next_multiple_of(16)`, so the
+        // call satisfies the inline read-slack precondition even if the guard
+        // later moves past the first literal read.
+        let lits = [0xAAu8; 32];
+        // SAFETY: AVX2 detected above; error-returning path performs no writes.
+        let result = unsafe { f.exec_sequence_inline_avx2(lits.as_ptr(), 17, 8, 100) };
+        assert!(
+            matches!(
+                result,
+                Err(super::super::errors::ExecuteSequencesError::OutputBufferOverflow { .. })
+            ),
+            "expected OutputBufferOverflow, got {result:?}"
+        );
+    }
+
+    /// `FlatBuf` is growable, so the per-block decompression-bomb ceiling
+    /// (`set_max_capacity`) MUST be honoured on its `try_reserve` growth path —
+    /// the fallback `push`/`repeat` route a malformed single-segment block can
+    /// take when the inline slack gate fails. A reserve that would grow live
+    /// output past the ceiling must return `BackendOverflow` instead of growing
+    /// the `Vec` toward a decompression-bomb OOM.
+    #[test]
+    fn try_reserve_rejects_growth_past_block_ceiling() {
+        let mut f = FlatBuf::with_capacity(64);
+        f.extend(&[0u8; 32]);
+        let ceiling = f.len() + 100; // 132
+        f.set_max_capacity(ceiling);
+        // Within the ceiling: succeeds (32 + 50 = 82 <= 132).
+        assert!(f.try_reserve(50).is_ok());
+        // Past the ceiling (32 + 200 = 232 > 132): rejected, no growth.
+        assert!(
+            matches!(
+                f.try_reserve(200),
+                Err(super::super::buffer_backend::BackendOverflow { .. })
+            ),
+            "reserve past the per-block ceiling must be rejected, not grown"
+        );
+    }
+
+    /// The ceiling bounds this block's OUTPUT, so a reserve past it must be
+    /// rejected even when it FITS the existing allocation (no growth needed).
+    /// A large pre-reserved buffer (e.g. a known-FCS single-segment frame) has
+    /// spare capacity beyond `MAX_BLOCK_SIZE`; without checking the ceiling
+    /// ahead of the no-growth fast path, an over-producing block could write
+    /// into that spare and bypass the decompression-bomb guard.
+    #[test]
+    fn try_reserve_rejects_within_capacity_but_past_ceiling() {
+        let mut f = FlatBuf::with_capacity(4096);
+        f.extend(&[0u8; 32]);
+        let ceiling = f.len() + 100; // 132, far below the 4 KiB allocation
+        f.set_max_capacity(ceiling);
+        // 32 + 500 = 532 <= 4096 capacity (no growth) but > 132 ceiling.
+        assert!(
+            matches!(
+                f.try_reserve(500),
+                Err(super::super::buffer_backend::BackendOverflow { .. })
+            ),
+            "a reserve past the ceiling must be rejected even when it fits the \
+             current capacity without growth"
         );
     }
 }

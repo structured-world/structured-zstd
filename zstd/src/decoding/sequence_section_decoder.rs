@@ -164,8 +164,14 @@ where
     let old_buffer_size = buffer.len();
     let num_sequences = section.num_sequences as usize;
 
-    // `saturating_add` defuses 32-bit `usize` wrap.
-    let total_history = buffer.window_size.saturating_add(buffer.dict_content.len());
+    // Overflow is only reachable on 32-bit `usize` (a 4 GiB-class
+    // window_size plus a dict). The gate below asks "does history exceed
+    // the prefetch threshold", so on the overflow path the clamped maximum
+    // is the correct answer, not a wrapped small value.
+    let total_history = match buffer.window_size.checked_add(buffer.dict_content().len()) {
+        Some(sum) => sum,
+        None => usize::MAX,
+    };
     let use_long_pipeline = compute_use_long_pipeline(
         num_sequences,
         ddict_is_cold,

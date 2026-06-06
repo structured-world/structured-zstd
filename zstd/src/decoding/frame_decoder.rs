@@ -145,7 +145,11 @@ fn block_body_decode_error(
 /// ```
 pub struct FrameDecoder {
     state: Option<FrameDecoderState>,
-    owned_dicts: BTreeMap<u32, Dictionary>,
+    // Registered dictionaries are stored by shared handle (Arc/Rc) so a
+    // single content copy is referenced by every frame the decoder decodes
+    // (donor `ZSTD_refDDict`), rather than re-copied into the decode buffer
+    // per frame. `add_dict` wraps an owned `Dictionary` into a handle.
+    owned_dicts: BTreeMap<u32, DictionaryHandle>,
     #[cfg(target_has_atomic = "ptr")]
     shared_dicts: BTreeMap<u32, DictionaryHandle>,
     #[cfg(not(target_has_atomic = "ptr"))]
@@ -257,7 +261,7 @@ impl DecoderScratchKind {
         }
     }
 
-    fn init_from_dict(&mut self, dict: &Dictionary) {
+    fn init_from_dict(&mut self, dict: &DictionaryHandle) {
         match self {
             Self::Ring(s) => s.init_from_dict(dict),
             Self::Flat(s) => s.init_from_dict(dict),
@@ -774,7 +778,7 @@ impl FrameDecoder {
                 .or_else(|| {
                     #[cfg(target_has_atomic = "ptr")]
                     {
-                        shared_dicts.get(&dict_id).map(DictionaryHandle::as_dict)
+                        shared_dicts.get(&dict_id)
                     }
                     #[cfg(not(target_has_atomic = "ptr"))]
                     {
@@ -855,7 +859,7 @@ impl FrameDecoder {
                 provided: dict.id(),
             });
         }
-        state.decoder_scratch.init_from_dict(dict.as_dict());
+        state.decoder_scratch.init_from_dict(dict);
         state.using_dict = Some(dict.id());
         Ok(())
     }
@@ -870,7 +874,8 @@ impl FrameDecoder {
         if self.owned_dicts.contains_key(&dict_id) || self.shared_dict_exists(dict_id) {
             return Err(FrameDecoderError::DictAlreadyRegistered { dict_id });
         }
-        self.owned_dicts.insert(dict_id, dict);
+        self.owned_dicts
+            .insert(dict_id, DictionaryHandle::from_dictionary(dict));
         Ok(())
     }
 
@@ -910,7 +915,7 @@ impl FrameDecoder {
             .or_else(|| {
                 #[cfg(target_has_atomic = "ptr")]
                 {
-                    shared_dicts.get(&dict_id).map(DictionaryHandle::as_dict)
+                    shared_dicts.get(&dict_id)
                 }
                 #[cfg(not(target_has_atomic = "ptr"))]
                 {

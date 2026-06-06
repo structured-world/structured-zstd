@@ -35,6 +35,7 @@ pub(crate) const MAX_HC_SEARCH_DEPTH: usize = 512;
 /// tables live on the shared
 /// [`super::match_table::storage::MatchTable`] that this matcher
 /// borrows when it runs.
+#[derive(Clone)]
 pub(crate) struct HcMatcher {
     /// Lookahead depth (1 = lazy, 2 = lazy2). Donor parity:
     /// `params->cParams.strategy >= ZSTD_lazy2`.

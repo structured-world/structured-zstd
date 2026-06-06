@@ -1,6 +1,6 @@
 //! Utilities and interfaces for encoding an entire frame. Allows reusing resources
 
-use alloc::{boxed::Box, vec::Vec};
+use alloc::vec::Vec;
 use core::convert::TryInto;
 #[cfg(feature = "hash")]
 use twox_hash::XxHash64;
@@ -132,12 +132,28 @@ struct CachedDictionaryEntropy {
     of_previous: Option<PreviousFseTable>,
 }
 
+/// Shared owner for a custom "previous" FSE encoder table. `Arc` on
+/// atomic-pointer targets, `Rc` otherwise (keeps `no_std` no-atomics
+/// builds compiling, single-thread there anyway), mirroring
+/// `decoding::dictionary::SharedDictionary`. Cloning the cached
+/// dictionary entropy into the per-frame state is then a refcount bump,
+/// not a full `FSETable` copy — the donor references `cdict->cBlockState`
+/// instead of rebuilding it per frame.
+#[cfg(target_has_atomic = "ptr")]
+pub(crate) type SharedFseTable = alloc::sync::Arc<FSETable>;
+#[cfg(not(target_has_atomic = "ptr"))]
+pub(crate) type SharedFseTable = alloc::rc::Rc<FSETable>;
+
 #[derive(Clone)]
 pub(crate) enum PreviousFseTable {
     // Default tables are immutable and already stored alongside the state, so
     // repeating them only needs a lightweight marker instead of cloning FSETable.
     Default,
-    Custom(Box<FSETable>),
+    // Shared handle: cloning (per-frame dictionary entropy seed) is a refcount
+    // bump. The table is only ever read or REPLACED wholesale (a block that
+    // builds a new table swaps in a fresh `SharedFseTable`), never mutated in
+    // place, so sharing is sound.
+    Custom(SharedFseTable),
     Rle(u8),
 }
 
@@ -924,9 +940,56 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             // This state drives sequence encoding, while matcher priming below updates
             // the match generator's internal repeat-offset history for match finding.
             self.state.offset_hist = dict.inner.offset_hist;
-            self.state
-                .matcher
-                .prime_with_dictionary(dict.inner.dict_content.as_slice(), dict.inner.offset_hist);
+            // Donor `ZSTD_shouldAttachDict` (`zstd_compress.c`): a
+            // precomputed-dictionary table is COPIED into the working context
+            // only when the source is larger than a per-strategy cutoff; at or
+            // below it (and for unknown size) the donor ATTACHES the dictionary
+            // tables by reference (no per-frame table touch at all). We don't
+            // have an attach-by-reference path yet, so:
+            //   - large source (> cutoff): reuse the captured prime snapshot
+            //     (a table copy) instead of re-hashing the dictionary — the
+            //     donor COPY regime, where the copy is cheaper than re-priming;
+            //   - small / unknown source: re-prime (the snapshot copy of the
+            //     whole table would cost MORE than the sparse re-prime here,
+            //     which is exactly why the donor attaches by reference instead).
+            // `attachDictSizeCutoffs` per strategy: fast 8K, dfast 16K,
+            // greedy/lazy/btopt 32K, btultra/btultra2 8K. Expressed as the
+            // ceil-log bucket (8K = 2^13, 16K = 2^14, 32K = 2^15) so the
+            // decision uses the SAME bucketed representation as the driver's
+            // attach/copy gate (`reset_size_log`) — comparing
+            // `source_size_ceil_log(hint)` on the full u64 avoids the `as usize`
+            // truncation that could diverge from the driver on 32-bit targets.
+            // For a power-of-two cutoff `2^k`, `ceil_log2(hint) > k` is exactly
+            // `hint > 2^k`, so this is identical to the raw `hint > cutoff` on
+            // 64-bit.
+            let cutoff_log = match self.state.strategy_tag {
+                crate::encoding::strategy::StrategyTag::Fast
+                | crate::encoding::strategy::StrategyTag::BtUltra
+                | crate::encoding::strategy::StrategyTag::BtUltra2 => 13,
+                crate::encoding::strategy::StrategyTag::Dfast => 14,
+                crate::encoding::strategy::StrategyTag::Greedy
+                | crate::encoding::strategy::StrategyTag::Lazy
+                | crate::encoding::strategy::StrategyTag::BtOpt => 15,
+            };
+            let prefer_copy_snapshot = initial_size_hint.is_some_and(|s| {
+                crate::encoding::match_generator::source_size_ceil_log(s) > cutoff_log
+            });
+            let restored = prefer_copy_snapshot
+                && self
+                    .state
+                    .matcher
+                    .restore_primed_dictionary(self.compression_level);
+            if !restored {
+                self.state.matcher.prime_with_dictionary(
+                    dict.inner.dict_content.as_slice(),
+                    dict.inner.offset_hist,
+                );
+                if prefer_copy_snapshot {
+                    self.state
+                        .matcher
+                        .capture_primed_dictionary(self.compression_level);
+                }
+            }
         }
         if let Some(cache) = cached_entropy {
             self.state.last_huff_table.clone_from(&cache.huff);
@@ -1030,15 +1093,50 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             uncompressed_data.extend_from_slice(&pending_input);
             let mut filled = pending_input.len();
             pending_input.clear();
-            if uncompressed_data.len() < block_capacity {
-                uncompressed_data.resize(block_capacity, 0);
+            // Size the read buffer to the bytes this block actually expects
+            // rather than always zero-filling a full MAX_BLOCK_SIZE: a small
+            // frame otherwise pays a 128 KiB `resize(_, 0)` memset per block
+            // just to read a few KiB (the zero-fill past `filled` is then
+            // truncated away). Bound the initial fill by the source-size hint
+            // (exact for the slice entry points), and grow toward
+            // `block_capacity` only if the hint under-counted.
+            //
+            // Overflow-free by construction (no `saturating_*` masking):
+            // `filled <= block_capacity` always (the read only ever targets
+            // `[filled..len]` with `len <= block_capacity`, and a carried-over
+            // `pending_input` is a `split_off` below `block_capacity`), so
+            // `block_capacity - filled` never underflows; pinning `remaining`
+            // to `block_capacity` before the `usize` cast keeps the cast and
+            // the final add within `usize` on every target.
+            let initial_target = match initial_size_hint {
+                Some(hint) if hint > total_uncompressed => {
+                    let remaining = (hint - total_uncompressed).min(block_capacity as u64) as usize;
+                    filled + remaining.min(block_capacity - filled)
+                }
+                // Unknown hint, or an inexact hint already met by prior blocks:
+                // read against the full block window.
+                _ => block_capacity,
+            };
+            if uncompressed_data.len() < initial_target {
+                uncompressed_data.resize(initial_target, 0);
             }
             'read_loop: loop {
                 if reached_eof || filled == block_capacity {
                     break 'read_loop;
                 }
+                if filled == uncompressed_data.len() {
+                    // Hint under-counted the block; grow toward block_capacity
+                    // (doubling, capped) so reading continues without paying a
+                    // full-buffer zero up front. `len <= block_capacity` so the
+                    // double stays well within `usize`; `filled < block_capacity`
+                    // here (the `== block_capacity` break fired otherwise), so
+                    // `filled + 1 <= block_capacity`.
+                    let grow_to = (uncompressed_data.len() * 2).clamp(filled + 1, block_capacity);
+                    uncompressed_data.resize(grow_to, 0);
+                }
+                let read_end = uncompressed_data.len();
                 let new_bytes = source
-                    .read(&mut uncompressed_data[filled..block_capacity])
+                    .read(&mut uncompressed_data[filled..read_end])
                     .unwrap();
                 if new_bytes == 0 {
                     reached_eof = true;
@@ -1486,6 +1584,10 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// Remove the attached dictionary, returning it as an [`EncoderDictionary`].
     pub fn clear_dictionary(&mut self) -> Option<EncoderDictionary> {
         self.dictionary_entropy_cache = None;
+        // Drop the CDict prime snapshot — it is keyed to the dictionary
+        // being removed and must not be restored against a different (or no)
+        // dictionary on the next frame.
+        self.state.matcher.invalidate_primed_dictionary();
         self.dictionary.take()
     }
 
@@ -1514,18 +1616,22 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 .fse
                 .literal_lengths
                 .to_encoder_table()
-                .map(|table| PreviousFseTable::Custom(Box::new(table))),
+                .map(|table| PreviousFseTable::Custom(SharedFseTable::new(table))),
             ml_previous: dictionary
                 .fse
                 .match_lengths
                 .to_encoder_table()
-                .map(|table| PreviousFseTable::Custom(Box::new(table))),
+                .map(|table| PreviousFseTable::Custom(SharedFseTable::new(table))),
             of_previous: dictionary
                 .fse
                 .offsets
                 .to_encoder_table()
-                .map(|table| PreviousFseTable::Custom(Box::new(table))),
+                .map(|table| PreviousFseTable::Custom(SharedFseTable::new(table))),
         });
+        // A previously-captured CDict prime snapshot belongs to the OLD
+        // dictionary; drop it so the first frame with the new dictionary
+        // re-primes (and re-captures) instead of restoring stale tables.
+        self.state.matcher.invalidate_primed_dictionary();
         Ok(self.dictionary.replace(enc))
     }
 }
@@ -2360,6 +2466,121 @@ mod tests {
             with_dict2, with_dict,
             "reattached prepared dict must produce an identical frame"
         );
+    }
+
+    #[test]
+    fn dict_primed_matcher_snapshot_reused_across_frames_is_byte_identical() {
+        // CDict-equivalent: a compressor reused across frames with the same
+        // dictionary restores the primed matcher snapshot on frames 2..N
+        // (a table copy) instead of re-hashing the dictionary. The restored
+        // state must reproduce the first-frame (freshly-primed) output
+        // byte-for-byte, and every frame must round-trip through a
+        // dict-primed decoder.
+        let dict_raw = include_bytes!("../../dict_tests/dictionary");
+        // Source must exceed the Fast strategy's 8 KiB attach cutoff so the
+        // copy-snapshot (restore) path is taken on frame 2 — at or below the
+        // cutoff the donor attaches by reference and we fall back to re-prime,
+        // which would not exercise restore.
+        let mut payload = Vec::new();
+        while payload.len() < 16 * 1024 {
+            payload.extend_from_slice(
+                b"tenant=demo table=orders op=put key=1 value=aaaaabbbbbcccccdddddeeeee\n",
+            );
+        }
+
+        let prepared =
+            super::EncoderDictionary::from_bytes(dict_raw).expect("dict bytes should parse");
+        let dict_id = prepared.id();
+        let mut compressor: FrameCompressor =
+            FrameCompressor::new(super::CompressionLevel::Fastest);
+        compressor
+            .set_encoder_dictionary(prepared)
+            .expect("prepared dictionary should attach");
+
+        // Frame 1 primes + captures the snapshot; frame 2 restores it.
+        let frame1 = compressor.compress_independent_frame(payload.as_slice());
+        let frame2 = compressor.compress_independent_frame(payload.as_slice());
+        assert_eq!(
+            frame1, frame2,
+            "restored prime snapshot must reproduce the freshly-primed frame byte-for-byte"
+        );
+
+        // Both frames advertise the dict id and round-trip through a
+        // dict-primed decoder.
+        for frame in [&frame1, &frame2] {
+            let (hdr, _) =
+                crate::decoding::frame::read_frame_header(frame.as_slice()).expect("frame header");
+            assert_eq!(hdr.dictionary_id(), Some(dict_id));
+            let mut decoder = FrameDecoder::new();
+            decoder
+                .add_dict(crate::decoding::Dictionary::decode_dict(dict_raw).unwrap())
+                .unwrap();
+            let mut decoded = Vec::with_capacity(payload.len());
+            decoder.decode_all_to_vec(frame, &mut decoded).unwrap();
+            assert_eq!(decoded.as_slice(), payload.as_slice());
+        }
+    }
+
+    #[test]
+    fn dict_primed_matcher_cache_reused_across_small_attach_frames_is_byte_identical() {
+        // CDict-equivalent ATTACH path (small source, at/below the Fast 8 KiB
+        // attach cutoff): frames 2..N re-prime — re-committing the dict bytes
+        // to history — but reuse the already-built dict table instead of
+        // re-hashing it. The cached-table frame must reproduce the
+        // freshly-primed first frame byte-for-byte, and a fresh single-frame
+        // compressor (no prior dict cache) must produce the identical bytes
+        // too, proving the cache changes timing, not output.
+        let dict_raw = include_bytes!("../../dict_tests/dictionary");
+        // Stay under the 8 KiB cutoff so the attach (re-prime) path is taken
+        // every frame rather than the copy-snapshot restore.
+        let mut payload = Vec::new();
+        while payload.len() < 2 * 1024 {
+            payload.extend_from_slice(b"tenant=demo op=put key=1 value=aaaaabbbbbcccccddddd\n");
+        }
+
+        let prepared =
+            super::EncoderDictionary::from_bytes(dict_raw).expect("dict bytes should parse");
+        let dict_id = prepared.id();
+        let mut compressor: FrameCompressor =
+            FrameCompressor::new(super::CompressionLevel::Fastest);
+        compressor
+            .set_encoder_dictionary(prepared)
+            .expect("prepared dictionary should attach");
+
+        // Frame 1 builds + marks the dict table; frame 2 reuses it.
+        let frame1 = compressor.compress_independent_frame(payload.as_slice());
+        let frame2 = compressor.compress_independent_frame(payload.as_slice());
+        assert_eq!(
+            frame1, frame2,
+            "reused dict table (attach path) must reproduce the freshly-built frame byte-for-byte"
+        );
+
+        // A fresh compressor (cold dict cache) must emit the same bytes — the
+        // cache is a timing optimization, never a content change.
+        let fresh_prepared =
+            super::EncoderDictionary::from_bytes(dict_raw).expect("dict bytes should parse");
+        let mut fresh: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Fastest);
+        fresh
+            .set_encoder_dictionary(fresh_prepared)
+            .expect("prepared dictionary should attach");
+        let fresh_frame = fresh.compress_independent_frame(payload.as_slice());
+        assert_eq!(
+            fresh_frame, frame1,
+            "cold-cache compressor must match the warm-cache frame byte-for-byte"
+        );
+
+        for frame in [&frame1, &frame2] {
+            let (hdr, _) =
+                crate::decoding::frame::read_frame_header(frame.as_slice()).expect("frame header");
+            assert_eq!(hdr.dictionary_id(), Some(dict_id));
+            let mut decoder = FrameDecoder::new();
+            decoder
+                .add_dict(crate::decoding::Dictionary::decode_dict(dict_raw).unwrap())
+                .unwrap();
+            let mut decoded = Vec::with_capacity(payload.len());
+            decoder.decode_all_to_vec(frame, &mut decoded).unwrap();
+            assert_eq!(decoded.as_slice(), payload.as_slice());
+        }
     }
 
     #[test]

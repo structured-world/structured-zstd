@@ -137,6 +137,7 @@ const INITIAL_PREFIX_START_INDEX: u32 = 1;
 ///   across blocks (cleared only on full `reset`).
 /// - `pending` holds the most recently `commit_space`'d block before
 ///   `start_matching` appends it onto `history` and runs the kernel.
+#[derive(Clone)]
 pub(crate) struct FastKernelMatcher {
     /// Concatenated input history: prior-block bytes followed by the
     /// most-recently-committed (still pending-matching) tail.
@@ -248,6 +249,15 @@ pub(crate) struct FastKernelMatcher {
     /// dict kernel uses to separate main-table (input) from dict-table
     /// matches. `0` when no dictionary is primed.
     dict_region_len: usize,
+    /// CDict-equivalent cache flag: `true` once [`Self::dict_table`] has been
+    /// fully built for the attached dictionary. A reused compressor keeps the
+    /// built `dict_table` across the per-frame `reset` (the dictionary
+    /// re-commits to the same absolute history positions, so the hashed
+    /// positions stay valid) and skips re-hashing it — the donor copies /
+    /// references the precomputed `cdict->matchState` rather than rebuilding
+    /// it per frame. Cleared on parameter change, history eviction, or
+    /// dictionary attach/clear (see `invalidate_dict_cache`).
+    dict_primed: bool,
 }
 
 impl FastKernelMatcher {
@@ -337,6 +347,7 @@ impl FastKernelMatcher {
             last_borrowed_block: None,
             dict_table: None,
             dict_region_len: 0,
+            dict_primed: false,
         }
     }
 
@@ -359,12 +370,20 @@ impl FastKernelMatcher {
         );
         if self.hash_table.hash_log() != hash_log || self.hash_table.mls() != mls {
             // Parameters changed — rebuild the table at the new size.
-            // Cannot reuse the old allocation because the donor-shape
-            // hash table dimensions are baked in at construction.
+            // Cannot reuse the old allocation because the hash table
+            // dimensions are baked in at construction. A reshape also
+            // invalidates the cached dict table: its absolute positions
+            // index a table whose shape no longer matches.
             self.hash_table = FastHashTable::new(hash_log, mls);
+            self.dict_table = None;
+            self.dict_region_len = 0;
+            self.dict_primed = false;
         } else {
             // Same shape — keep the allocation, zero the entries via
-            // `memset` (donor's `ZSTD_window_clear` cadence).
+            // `memset` (ZSTD_window_clear cadence). A primed dict table
+            // is retained: the dictionary lands at the same absolute
+            // history positions every frame, so its hashes stay valid
+            // and the per-frame re-hash is skipped (CDict-equivalent).
             self.hash_table.clear();
         }
         // M8: history starts empty (HISTORY_DRAIN_BASE = 0).
@@ -386,11 +405,6 @@ impl FastKernelMatcher {
         // different allocation, so a stale (ptr, len) would dangle.
         self.borrowed = None;
         self.last_borrowed_block = None;
-        // Drop any primed dictionary state: the next frame re-primes (or
-        // not) from scratch, and stale absolute dict positions must not
-        // leak across frames.
-        self.dict_table = None;
-        self.dict_region_len = 0;
     }
 
     /// Reported decoder-side window size (bytes) — test-only.
@@ -629,6 +643,7 @@ impl FastKernelMatcher {
         // reachable anyway.
         self.dict_table = None;
         self.dict_region_len = 0;
+        self.dict_primed = false;
         self.hash_table.clear();
         self.last_block_start = self.last_block_start.saturating_sub(drop_n);
         // Skip position 0 — `prefix_start_index = 1` means the kernel
@@ -1155,6 +1170,27 @@ impl FastKernelMatcher {
         self.prime_dict_table_for_range(block_start);
     }
 
+    /// Mark the dict table as fully built (CDict-equivalent). Called by the
+    /// driver after the final dictionary chunk has been primed, so the next
+    /// frame's [`Self::prime_dict_table_for_range`] skips the re-hash while
+    /// the dict bytes are still re-committed to history. Only marks when a
+    /// table actually exists — a sub-8-byte dict builds no table and must
+    /// re-run the (cheap, no-op) prime path each frame.
+    pub(crate) fn mark_dict_primed(&mut self) {
+        if self.dict_table.is_some() {
+            self.dict_primed = true;
+        }
+    }
+
+    /// Drop the cached dict table and its primed flag. Called by the driver
+    /// when the next frame carries no dictionary, so the kernel never probes
+    /// a stale dict region whose bytes are no longer re-committed.
+    pub(crate) fn invalidate_dict_cache(&mut self) {
+        self.dict_table = None;
+        self.dict_region_len = 0;
+        self.dict_primed = false;
+    }
+
     /// Build (or extend) [`Self::dict_table`] over `history[range_start..]`,
     /// the freshly-appended dictionary bytes. Lazily allocates the dict table
     /// at the same `(hash_log, mls)` as the main table so one hash keys both.
@@ -1164,6 +1200,13 @@ impl FastKernelMatcher {
         // Record the dict/input boundary regardless of whether any position
         // is hashable (a sub-8-byte dict still bounds the input floor).
         self.dict_region_len = history_len;
+        if self.dict_primed {
+            // CDict-equivalent fast path: `dict_table` was built over the
+            // identical dictionary bytes on a prior frame, and those bytes
+            // sit at the same absolute history positions now (the dict is
+            // re-committed before this call). Skip the re-hash entirely.
+            return;
+        }
         if history_len < HASH_READ_SIZE {
             return;
         }
