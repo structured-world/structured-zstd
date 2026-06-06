@@ -1401,12 +1401,16 @@ impl Matcher for MatchGeneratorDriver {
         // Record the resolved matcher shape for the primed-snapshot key. Captured
         // here (post-resolution, after the test-only param override) so the key
         // reflects exactly the geometry the restored `storage` must match. The
-        // Fast attach-vs-copy mode is part of the shape (it decides whether a
-        // dict table is built), and matches the decision `prime_with_dictionary`
-        // makes from the same `reset_size_log`.
-        let fast_attach = self
-            .reset_size_log
-            .is_none_or(|log| log <= FAST_ATTACH_DICT_CUTOFF_LOG);
+        // Fast attach-vs-copy mode is part of the shape ONLY for the Simple
+        // backend (it decides whether a separate dict table is built); the other
+        // backends prime the dictionary the same way regardless, so including
+        // the bit there would over-key identical resolved shapes. When it
+        // applies it matches the decision `prime_with_dictionary` makes from the
+        // same `reset_size_log`.
+        let fast_attach = matches!(next_backend, super::strategy::BackendTag::Simple)
+            && self
+                .reset_size_log
+                .is_none_or(|log| log <= FAST_ATTACH_DICT_CUTOFF_LOG);
         self.reset_shape = Some((params, resolved_table_bits, fast_attach));
     }
 
@@ -7046,6 +7050,43 @@ fn primed_snapshot_not_restored_across_fast_attach_copy_boundary() {
         "a copy-mode snapshot (8193 B hint) must NOT be restored into an \
          attach-mode reset (8192 B hint) that resolves to the same params but a \
          different dict-table shape"
+    );
+}
+
+#[test]
+fn primed_snapshot_fast_attach_does_not_over_key_non_simple_backends() {
+    // `fast_attach` is a Simple/Fast-backend concept (the 8 KiB attach-vs-copy
+    // table split). On the HashChain/Dfast/Row backends the dictionary is
+    // always primed the same way, so the bit must NOT enter their snapshot key
+    // — otherwise an unhinted capture (which would record `fast_attach = true`)
+    // and a hinted reset that resolves to the IDENTICAL `LevelParams` would key
+    // differently and force a needless re-prime. `Best` is a HashChain level.
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    let level = CompressionLevel::Best;
+
+    // Capture with no hint.
+    driver.reset(level);
+    let window_a = driver.window_size();
+    driver.prime_with_dictionary(b"abcdefghABCDEFGHijklmnop", [1, 4, 8]);
+    driver.capture_primed_dictionary(level);
+
+    // Reset with a hint large enough to resolve to the same window/params as
+    // the unhinted level (>= 2^window_log, so the source-size cap is a no-op).
+    driver.set_source_size_hint(64 * 1024 * 1024);
+    driver.reset(level);
+    let window_b = driver.window_size();
+    assert_eq!(
+        window_a, window_b,
+        "precondition: the large hint must resolve to the same window as the \
+         unhinted level (a={window_a}, b={window_b})"
+    );
+
+    let restored = driver.restore_primed_dictionary(level);
+    assert!(
+        restored,
+        "a HashChain snapshot must restore across an unhinted vs large-hinted \
+         reset that resolves to the identical matcher — `fast_attach` is a Fast \
+         backend concept and must not over-key non-Simple shapes"
     );
 }
 
