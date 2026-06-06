@@ -3355,4 +3355,69 @@ mod tests {
             "exact key range recovered from the partial decode"
         );
     }
+
+    #[cfg(feature = "lsm")]
+    #[test]
+    fn decode_blocks_partial_leaves_no_residual_when_no_in_range_block() {
+        // Regression: when the requested range reaches no in-range block (here
+        // start_block is past EOF, so every block is decoded only as window
+        // context), `PartialDecode::data` is empty — but the context bytes must
+        // NOT linger in the decoder buffer, or a later collect()/read() on the
+        // same decoder returns out-of-range data.
+        let (compressed, _full, info) = multi_block_fixture();
+        let nblocks = info.blocks.len() as u32;
+        let mut source = compressed.as_slice();
+        let mut dec = FrameDecoder::new();
+        dec.reset(&mut source).unwrap();
+        let pd = dec
+            .decode_blocks_partial(&mut source, nblocks + 5, u32::MAX)
+            .unwrap();
+        assert!(pd.data.is_empty(), "no in-range block → empty data");
+        assert_eq!(pd.blocks_decoded, 0);
+        assert!(
+            pd.frame_finished,
+            "frame's last block was reached as context"
+        );
+        assert_eq!(
+            dec.can_collect(),
+            0,
+            "context bytes must not leak via collect()/read() when data is empty"
+        );
+    }
+
+    #[cfg(all(feature = "lsm", feature = "hash"))]
+    #[test]
+    fn decode_blocks_partial_captures_per_block_checksums() {
+        // Regression: with per-block checksums enabled, decode_blocks_partial
+        // must populate computed_block_checksums just like decode_blocks /
+        // decode_all — otherwise callers verifying per-block digests silently
+        // lose them on the partial path.
+        let (compressed, full, _info) = multi_block_fixture();
+
+        // Reference digests via decode_blocks (the path that captures them).
+        let mut ref_dec = FrameDecoder::new();
+        ref_dec.enable_per_block_checksums();
+        let mut rsrc = compressed.as_slice();
+        ref_dec.reset(&mut rsrc).unwrap();
+        while !ref_dec.is_finished() {
+            ref_dec
+                .decode_blocks(&mut rsrc, crate::decoding::BlockDecodingStrategy::All)
+                .unwrap();
+        }
+        let expected = ref_dec.computed_block_checksums().to_vec();
+        assert!(!expected.is_empty(), "fixture must have multiple blocks");
+        let _ = full;
+
+        // Partial decode of the whole frame must capture the same digests.
+        let mut source = compressed.as_slice();
+        let mut dec = FrameDecoder::new();
+        dec.enable_per_block_checksums();
+        dec.reset(&mut source).unwrap();
+        let _ = dec.decode_blocks_partial(&mut source, 0, u32::MAX).unwrap();
+        assert_eq!(
+            dec.computed_block_checksums(),
+            expected.as_slice(),
+            "partial decode must capture the same per-block checksums as full decode"
+        );
+    }
 }
