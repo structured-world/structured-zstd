@@ -155,3 +155,32 @@ calibration/pre-test coefficients):
 - **speed status**: `rust_faster` when `> 1.05`, `near_parity` when `0.99..=1.05`, `rust_slower` when `< 0.99`
 
 Criterion also writes its usual detailed estimates under `target/criterion/`.
+
+## WebAssembly Comparison (vs @bokuweb/zstd-wasm)
+
+The native matrix above compares pure-Rust against C FFI. The WebAssembly
+build is tracked separately against the most popular npm wasm zstd,
+[`@bokuweb/zstd-wasm`](https://www.npmjs.com/package/@bokuweb/zstd-wasm) (an
+emscripten build of the C reference).
+
+- **Harness:** `node zstd-wasm/bench/bench.mjs` — loads both of our payloads
+  (`simd128` + `scalar`) plus bokuweb, runs the shared fixtures, and emits
+  `REPORT` / `REPORT_DICT` lines (engine triplet: `ours-simd128`,
+  `ours-scalar`, `bokuweb`).
+- **CI shard:** `bench-wasm` in `ci.yml`. Push-to-main only (like the rest of
+  the bench pipeline) and gated on `wasm_core` path changes; independent of the
+  native `rust_core`-gated matrix so a wasm-only change still updates the
+  dashboard. It builds the npm payloads, runs the harness, parses the
+  `REPORT*` lines (`.github/scripts/parse-wasm-bench.py`), and merges the
+  result into the persisted `gh-pages/dev/bench/benchmark-wasm.json` timeseries
+  (`.github/scripts/merge-wasm-bench.py`, 180-day retention).
+- **Dashboard:** the `dev/bench` page renders a dedicated *WebAssembly* section
+  plotting compress speed, decompress speed, and output ratio per engine over
+  time, with our throughput shown as a multiple of bokuweb (`>1` = faster).
+- **Local run:** `cd zstd-wasm/npm && npm ci && npm run build` then
+  `cd ../bench && npm ci && node bench.mjs` (also the pre-publish gate before
+  shipping the npm package).
+
+`benchmark-wasm.json` record dimensions: `kind` (`plain` / `dict`),
+`scenario`, `level`, `engine`; metrics: `ratio`, `compress_bytes_per_sec`,
+`decompress_bytes_per_sec`.

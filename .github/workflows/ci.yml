@@ -47,6 +47,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       rust_core: ${{ steps.filter.outputs.rust_core }}
+      wasm_core: ${{ steps.filter.outputs.wasm_core }}
     steps:
       - uses: actions/checkout@v6
       - uses: dorny/paths-filter@v3
@@ -55,6 +56,19 @@ jobs:
           filters: |
             rust_core:
               - 'zstd/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+            # The wasm-vs-bokuweb dashboard shard (`bench-wasm`) only needs
+            # to re-run when something that can move the wasm payloads'
+            # speed/ratio changed: the core crate (compiled into the wasm
+            # module), the wasm crate / npm glue itself, the bench harness,
+            # or the dep/toolchain pins. A push touching only the native
+            # bench scripts, docs, or unrelated CI leaves the wasm numbers
+            # untouched, so the wasm shard stays green-skipped on it.
+            wasm_core:
+              - 'zstd/**'
+              - 'zstd-wasm/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'rust-toolchain.toml'
@@ -292,6 +306,121 @@ jobs:
               exit 1
             fi
           done
+
+  bench-wasm:
+    # #366: continuous wasm dashboard shard. The native bench matrix runs
+    # a prebuilt criterion binary (Rust vs C FFI); this shard instead
+    # builds the npm payloads and runs `node zstd-wasm/bench/bench.mjs`,
+    # which measures our two wasm tiers (simd128 + scalar) against the
+    # most popular npm competitor (@bokuweb/zstd-wasm). Its REPORT* lines
+    # feed a dedicated wasm section on the gh-pages dashboard so the
+    # wasm speed/ratio vs bokuweb is tracked over time, not just checked
+    # locally before an npm publish.
+    #
+    # Push-to-main only (consistent with the rest of the bench pipeline
+    # being push-only — #362) and gated on `wasm_core` so it skips pushes
+    # that can't move the wasm numbers. It is INDEPENDENT of the native
+    # `bench-matrix` cascade (which is `rust_core`-gated): a wasm-only
+    # change must still update the dashboard. It publishes only
+    # `benchmark-wasm.json` to gh-pages — `index.html` stays owned by
+    # `benchmark-pages` / `pages-only.yml` — so the two publishers write
+    # disjoint files and never race for the same blob.
+    name: Bench wasm vs bokuweb (dashboard shard)
+    needs: [lint, changes]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.wasm_core == 'true'
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: wasm-bench
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Build npm payloads (simd128 + scalar)
+        working-directory: zstd-wasm/npm
+        run: |
+          npm ci || npm install
+          npm run build
+
+      - name: Run wasm bench (capture REPORT* lines)
+        working-directory: zstd-wasm/bench
+        # `pipefail` + `tee`: bench.mjs exits non-zero on any round-trip
+        # failure, which must fail the shard. `tee` keeps the captured
+        # stdout for the parser regardless of pass/fail.
+        run: |
+          npm ci || npm install
+          set -o pipefail
+          node bench.mjs | tee "$GITHUB_WORKSPACE/wasm-bench-raw.txt"
+
+      - name: Parse REPORT* lines into dashboard records
+        env:
+          WASM_BENCH_RAW_FILE: ${{ github.workspace }}/wasm-bench-raw.txt
+          STRUCTURED_ZSTD_BENCH_GENERATED_AT: ${{ github.event.head_commit.timestamp || github.event.repository.updated_at }}
+        run: python3 .github/scripts/parse-wasm-bench.py
+
+      - name: Upload wasm bench artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: benchmark-wasm-run
+          path: benchmark-wasm-run.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Generate bot token
+        id: bot-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.RELEASER_APP_ID }}
+          private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
+
+      - name: Checkout gh-pages with push token
+        uses: actions/checkout@v6
+        with:
+          ref: gh-pages
+          token: ${{ steps.bot-token.outputs.token }}
+          path: gh-pages
+
+      - name: Merge into persisted wasm timeseries and publish
+        env:
+          WASM_RUN_FILE: ${{ github.workspace }}/benchmark-wasm-run.json
+          WASM_EXISTING_FILE: ${{ github.workspace }}/gh-pages/dev/bench/benchmark-wasm.json
+          WASM_OUTPUT_FILE: ${{ github.workspace }}/gh-pages/dev/bench/benchmark-wasm.json
+        run: |
+          mkdir -p gh-pages/dev/bench
+          python3 .github/scripts/merge-wasm-bench.py
+          cd gh-pages
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add dev/bench/benchmark-wasm.json
+          if git diff --cached --quiet; then
+            echo "No wasm timeseries change to publish."
+            exit 0
+          fi
+          git commit -m "chore(bench): publish wasm vs bokuweb dashboard data"
+          # Disjoint-file publishers can still collide on a concurrent
+          # gh-pages push; rebase onto the latest remote tip and retry a
+          # few times before giving up.
+          for attempt in 1 2 3; do
+            if git push origin gh-pages; then
+              echo "Published on attempt $attempt."
+              exit 0
+            fi
+            echo "Push rejected (attempt $attempt); rebasing on remote gh-pages."
+            git pull --rebase origin gh-pages
+          done
+          echo "::error::failed to publish wasm timeseries after 3 attempts"
+          exit 1
 
   codecov:
     needs: lint

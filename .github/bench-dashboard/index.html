@@ -332,6 +332,45 @@
         <div id="aggregate-status" style="margin-top: 8px; font-size: 0.88rem"></div>
       </section>
 
+      <section class="card" id="wasm-section" style="margin-top: 14px">
+        <h2 style="margin: 0 0 8px; font-size: 1.2rem">WebAssembly: structured-zstd vs @bokuweb/zstd-wasm</h2>
+        <p style="font-size: 0.9rem">
+          Tracks our two wasm payloads (<strong>simd128</strong> +
+          <strong>scalar</strong>) against the most popular npm wasm zstd,
+          <code>@bokuweb/zstd-wasm</code> (an emscripten build of the C
+          reference), over time. Source: <code>node
+          zstd-wasm/bench/bench.mjs</code>, run as a push-to-main shard
+          (<code>bench-wasm</code> in <code>ci.yml</code>). Pick a
+          <strong>Metric</strong> (compress speed, decompress speed, or
+          output ratio), a payload <strong>Kind</strong> (plain or
+          dictionary), a <strong>Scenario</strong> and a
+          <strong>Level</strong>; each line is one engine plotted across
+          snapshots. For the speed metrics the secondary axis also shows
+          our throughput as a multiple of bokuweb (<code>&gt;1 =
+          faster</code>); for the ratio metric lower is better
+          (<code>compressed/input</code>).
+        </p>
+        <div class="filters">
+          <label>Metric
+            <select id="wf-metric"></select>
+          </label>
+          <label>Kind
+            <select id="wf-kind"></select>
+          </label>
+          <label>Scenario
+            <select id="wf-scenario"></select>
+          </label>
+          <label>Level
+            <select id="wf-level"></select>
+          </label>
+        </div>
+        <div class="chart-wrap">
+          <canvas id="chart-wasm"></canvas>
+        </div>
+        <div id="legend-wasm" class="html-legend"></div>
+        <div id="wasm-status" style="margin-top: 8px; font-size: 0.88rem"></div>
+      </section>
+
       <details class="card">
         <summary><strong>Raw timings (secondary view)</strong></summary>
         <p style="margin-top: 8px">
@@ -1976,8 +2015,293 @@
         renderRawSummary();
       }
 
+      // ---- WebAssembly section (structured-zstd vs @bokuweb/zstd-wasm) ----
+      // Self-contained: reads its own `benchmark-wasm.json` timeseries
+      // (produced by the push-only `bench-wasm` CI shard) and renders one
+      // chart of our two wasm tiers vs the bokuweb competitor over time.
+      // Kept fully independent of the Rust↔FFI relative payload above —
+      // it's an engine triplet, not a two-sided delta — and degrades
+      // gracefully when the payload is missing (no wasm run published
+      // yet) so the rest of the dashboard is unaffected.
+      const WASM_REF_ENGINE = "bokuweb";
+      const WASM_ENGINE_STYLE = {
+        "ours-simd128": { label: "ours simd128", color: "hsl(150 65% 38%)" },
+        "ours-scalar": { label: "ours scalar", color: "hsl(190 60% 40%)" },
+        bokuweb: { label: "bokuweb (C ref)", color: "hsl(20 75% 50%)" },
+      };
+      // Logical metric → how to pull a comparable value out of a record.
+      // Speed metrics carry bytes/sec (converted to MiB/s for the axis);
+      // ratio is the output fraction (compressed/input, lower=better).
+      const WASM_METRICS = {
+        compress_speed: {
+          label: "Compress speed (MiB/s)",
+          axisTitle: "Throughput (MiB/s)",
+          value: (r) => (typeof r.compress_bytes_per_sec === "number" ? r.compress_bytes_per_sec / (1024 * 1024) : null),
+          higherIsBetter: true,
+        },
+        decompress_speed: {
+          label: "Decompress speed (MiB/s)",
+          axisTitle: "Throughput (MiB/s)",
+          value: (r) => (typeof r.decompress_bytes_per_sec === "number" ? r.decompress_bytes_per_sec / (1024 * 1024) : null),
+          higherIsBetter: true,
+        },
+        ratio: {
+          label: "Output ratio (compressed/input, lower=better)",
+          axisTitle: "Output ratio (lower=better)",
+          value: (r) => (typeof r.ratio === "number" ? r.ratio : null),
+          higherIsBetter: false,
+        },
+      };
+
+      const wasmState = {
+        records: [],
+        chart: null,
+        selectors: {
+          metric: el("wf-metric"),
+          kind: el("wf-kind"),
+          scenario: el("wf-scenario"),
+          level: el("wf-level"),
+        },
+      };
+
+      function wasmRenderMetricOptions(select) {
+        const fragment = document.createDocumentFragment();
+        for (const [value, def] of Object.entries(WASM_METRICS)) {
+          const option = document.createElement("option");
+          option.value = value;
+          option.textContent = def.label;
+          fragment.appendChild(option);
+        }
+        select.replaceChildren(fragment);
+      }
+
+      function wasmRenderPlainOptions(select, values, allLabel) {
+        const fragment = document.createDocumentFragment();
+        if (allLabel) {
+          const allOption = document.createElement("option");
+          allOption.value = ALWAYS;
+          allOption.textContent = allLabel;
+          fragment.appendChild(allOption);
+        }
+        for (const value of values) {
+          const option = document.createElement("option");
+          option.value = String(value);
+          option.textContent = String(value);
+          fragment.appendChild(option);
+        }
+        select.replaceChildren(fragment);
+      }
+
+      function wasmCurrentFilter() {
+        return {
+          metric: wasmState.selectors.metric.value || "compress_speed",
+          kind: wasmState.selectors.kind.value || "plain",
+          scenario: wasmState.selectors.scenario.value,
+          level: wasmState.selectors.level.value,
+        };
+      }
+
+      // Build chart data for the current filter: one absolute-value line per
+      // engine across snapshots, plus (for speed metrics) one dashed
+      // "ours/bokuweb" multiple per ours-* engine on the secondary axis so
+      // the competitive position is legible without mental arithmetic.
+      function buildWasmChart(filter) {
+        const metricDef = WASM_METRICS[filter.metric] || WASM_METRICS.compress_speed;
+        const rows = wasmState.records.filter((r) =>
+          r.kind === filter.kind &&
+          (filter.scenario === ALWAYS || r.scenario === filter.scenario) &&
+          String(r.level) === String(filter.level),
+        );
+
+        const snapshots = uniq(rows.map((r) => r.generated_at || r.commit_sha || "local-run"));
+        // engine → snapshot → mean value (a scenario=all filter averages
+        // across scenarios for the snapshot, matching the native charts'
+        // cumulative-mean behaviour).
+        const perEngine = new Map();
+        for (const r of rows) {
+          const v = metricDef.value(r);
+          if (v === null) continue;
+          const snap = r.generated_at || r.commit_sha || "local-run";
+          let byEngine = perEngine.get(r.engine);
+          if (!byEngine) { byEngine = new Map(); perEngine.set(r.engine, byEngine); }
+          let cell = byEngine.get(snap);
+          if (!cell) { cell = { sum: 0, count: 0 }; byEngine.set(snap, cell); }
+          cell.sum += v;
+          cell.count += 1;
+        }
+        const meanAt = (engine, snap) => {
+          const cell = perEngine.get(engine)?.get(snap);
+          return cell && cell.count ? cell.sum / cell.count : null;
+        };
+
+        const engines = Array.from(perEngine.keys());
+        // Stable engine order: ours first, reference last.
+        engines.sort((a, b) => {
+          if (a === WASM_REF_ENGINE) return 1;
+          if (b === WASM_REF_ENGINE) return -1;
+          return a.localeCompare(b);
+        });
+
+        const datasets = [];
+        for (const engine of engines) {
+          const style = WASM_ENGINE_STYLE[engine] || { label: engine, color: "hsl(260 50% 50%)" };
+          datasets.push({
+            label: style.label,
+            data: snapshots.map((s) => meanAt(engine, s)),
+            yAxisID: "y",
+            borderColor: style.color,
+            backgroundColor: style.color.replace(")", " / 0.2)").replace("hsl(", "hsla("),
+            borderWidth: 2,
+            pointRadius: 3,
+            spanGaps: true,
+            tension: 0.25,
+          });
+        }
+
+        // Secondary axis: ours/bokuweb speed multiple (>1 = we're faster).
+        // Skipped for the ratio metric, where a per-engine ratio multiple
+        // is less intuitive than the absolute lower-is-better lines.
+        let showSecondary = false;
+        if (metricDef.higherIsBetter) {
+          for (const engine of engines) {
+            if (engine === WASM_REF_ENGINE) continue;
+            const style = WASM_ENGINE_STYLE[engine] || { label: engine, color: "hsl(260 50% 50%)" };
+            const data = snapshots.map((s) => {
+              const ours = meanAt(engine, s);
+              const ref = meanAt(WASM_REF_ENGINE, s);
+              return ours !== null && ref !== null && ref > 0 ? ours / ref : null;
+            });
+            if (data.some((v) => v !== null)) showSecondary = true;
+            datasets.push({
+              label: `${style.label} ÷ bokuweb (×)`,
+              data,
+              yAxisID: "y1",
+              borderColor: style.color,
+              backgroundColor: "transparent",
+              borderWidth: 2,
+              borderDash: [5, 4],
+              pointRadius: 2,
+              spanGaps: true,
+              tension: 0.25,
+            });
+          }
+        }
+
+        return { snapshots, datasets, metricDef, showSecondary };
+      }
+
+      function renderWasmChart() {
+        const statusEl = el("wasm-status");
+        if (!wasmState.records.length) {
+          statusEl.textContent = "No wasm benchmark data published yet — the bench-wasm shard runs on the next push that touches the wasm payloads.";
+          return;
+        }
+        const filter = wasmCurrentFilter();
+        const { snapshots, datasets, metricDef, showSecondary } = buildWasmChart(filter);
+        if (!snapshots.length || !datasets.length) {
+          if (wasmState.chart) {
+            wasmState.chart.data.labels = [];
+            wasmState.chart.data.datasets = [];
+            wasmState.chart.update("none");
+          }
+          el("legend-wasm").replaceChildren();
+          const scen = filter.scenario === ALWAYS ? "all" : filter.scenario;
+          statusEl.textContent = `No wasm points for kind=${filter.kind}, scenario=${scen}, level=${filter.level}.`;
+          return;
+        }
+        const scenDesc = filter.scenario === ALWAYS ? "scenario=all" : `scenario=${filter.scenario}`;
+        statusEl.textContent =
+          `Showing ${snapshots.length} snapshot(s) — ${metricDef.label}, kind=${filter.kind}, ${scenDesc}, level=${filter.level}.`;
+
+        const scales = {
+          x: {
+            title: { display: true, text: "Snapshot (generated_at / commit)" },
+            ticks: { autoSkip: true, maxTicksLimit: 12, maxRotation: 60, minRotation: 30 },
+          },
+          y: {
+            type: "linear",
+            position: "left",
+            title: { display: true, text: metricDef.axisTitle },
+            beginAtZero: !metricDef.higherIsBetter ? false : true,
+          },
+        };
+        if (showSecondary) {
+          scales.y1 = {
+            type: "linear",
+            position: "right",
+            title: { display: true, text: "ours ÷ bokuweb (×, >1 = faster)" },
+            grid: { drawOnChartArea: false },
+          };
+        }
+
+        if (wasmState.chart) {
+          wasmState.chart.options.scales = scales;
+          wasmState.chart.data.labels = snapshots;
+          wasmState.chart.data.datasets = datasets;
+          wasmState.chart.update("none");
+        } else {
+          wasmState.chart = new Chart(el("chart-wasm"), {
+            type: "line",
+            data: { labels: snapshots, datasets },
+            options: {
+              responsive: true,
+              maintainAspectRatio: false,
+              interaction: { mode: "index", intersect: false },
+              scales,
+              plugins: {
+                legend: { display: false },
+                tooltip: { mode: "index", intersect: false },
+              },
+            },
+          });
+        }
+        renderHtmlLegend(wasmState.chart, el("legend-wasm"));
+      }
+
+      function bindWasmControls() {
+        for (const control of Object.values(wasmState.selectors)) {
+          control.addEventListener("change", renderWasmChart);
+        }
+      }
+
+      async function initWasmSection() {
+        wasmRenderMetricOptions(wasmState.selectors.metric);
+        const response = await fetch("./benchmark-wasm.json", { cache: "no-store" });
+        if (!response.ok) {
+          // 404 = no wasm run has published yet. Leave the section with its
+          // empty-state message rather than treating it as a hard error.
+          renderWasmChart();
+          bindWasmControls();
+          return;
+        }
+        const payload = await response.json();
+        wasmState.records = payload.records || [];
+
+        const kinds = uniq(wasmState.records.map((r) => r.kind));
+        const scenarios = uniq(wasmState.records.map((r) => r.scenario));
+        const levels = uniq(wasmState.records.map((r) => r.level)).sort((a, b) => Number(a) - Number(b));
+        wasmRenderPlainOptions(wasmState.selectors.kind, kinds, null);
+        wasmRenderPlainOptions(wasmState.selectors.scenario, scenarios, "all");
+        wasmRenderPlainOptions(wasmState.selectors.level, levels, null);
+
+        // Default to a meaningful starting view: plain kind, all scenarios,
+        // the donor default level (3) if present.
+        if (kinds.includes("plain")) wasmState.selectors.kind.value = "plain";
+        wasmState.selectors.scenario.value = ALWAYS;
+        if (levels.map(String).includes("3")) wasmState.selectors.level.value = "3";
+
+        bindWasmControls();
+        renderWasmChart();
+      }
+
       main().catch((err) => {
         setStatusText(String(err), "outside-band");
+      });
+
+      // Independent of main(): a wasm-payload fetch failure must not blank
+      // the Rust↔FFI dashboard, and vice versa.
+      initWasmSection().catch((err) => {
+        el("wasm-status").textContent = `wasm section error: ${err}`;
       });
     </script>
   </body>
