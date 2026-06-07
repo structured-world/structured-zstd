@@ -95,7 +95,7 @@ The level → strategy column matches donor `ZSTD_defaultCParameters[0]` at `zst
 
 Per-merge benchmarks publish to GitHub Pages: **[structured-world.github.io/structured-zstd/dev/bench](https://structured-world.github.io/structured-zstd/dev/bench/)**.
 
-The CI matrix covers `x86_64-linux-gnu`, `i686-linux-gnu`, and `x86_64-musl`; the dashboard exposes per-target / stage / scenario / level filtering. The encoder architecture rewrite ([#111](https://github.com/structured-world/structured-zstd/issues/111)) is the active surface for compression-side work; the public benchmark report tracks the delta vs upstream C zstd over time.
+The CI matrix covers `x86_64-linux-gnu`, `i686-linux-gnu`, and `x86_64-musl`; the dashboard exposes per-target / stage / scenario / level filtering. The encoder architecture rewrite ([#111](https://github.com/structured-world/structured-zstd/issues/111)) is the active surface for compression-side work; the public benchmark report tracks the delta vs upstream C zstd over time. A dedicated dashboard section also tracks the WebAssembly build (`simd128` + `scalar`) against the most popular npm wasm zstd, [`@bokuweb/zstd-wasm`](https://www.npmjs.com/package/@bokuweb/zstd-wasm), over time.
 
 See [BENCHMARKS.md](https://github.com/structured-world/structured-zstd/blob/main/BENCHMARKS.md) for the methodology — small payloads, entropy extremes, a `100 MiB` large-stream scenario, repository corpus fixtures, and optional local Silesia corpora.
 
