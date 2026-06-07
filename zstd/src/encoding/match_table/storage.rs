@@ -224,9 +224,12 @@ pub(crate) const HC3_HASH_LOG: usize = 17;
 /// `dict_rel + 1` (dictionary-relative concat index); `0` is empty.
 #[derive(Clone, Default)]
 pub(crate) struct DmsDictTables {
-    /// Head-of-chain per hash bucket (`1 << hash_log` entries).
+    /// Per-hash-bucket binary-tree root (`1 << hash_log` entries), packed
+    /// `dict_rel + 1` (`0` = empty).
     pub(crate) hash_table: Vec<u32>,
-    /// Per-dictionary-position next link (`region_len` entries).
+    /// Binary-tree children, 2 per dict position (`2 * region_len` entries):
+    /// `[2*p] = smaller child, [2*p+1] = larger child` of dict position `p`,
+    /// packed `dict_rel + 1` (`0` = empty). An unsorted-DUBT (donor dms-BT).
     pub(crate) chain_table: Vec<u32>,
     /// Hash width (bits) the dict chain was built at, so probe hashing
     /// reproduces the same buckets.
@@ -563,13 +566,21 @@ impl MatchTable {
         };
     }
 
-    /// Build the immutable dictionary match chain (donor `ZSTD_dictMatchState`)
-    /// over the first `region_len` bytes of the live history (the dictionary
-    /// content at the front). Hashed at the BT `search_mls` width into a
-    /// dict-sized hash log, so the BT/optimal collect can dual-probe it with
-    /// its own compare budget. `dict_rel + 1` packing, `0` sentinel. Called on
-    /// BT levels (`uses_bt`); cached across frames via `DictAttach::is_primed`.
-    pub(crate) fn prime_dms_chain(&mut self, region_len: usize) {
+    /// Build the immutable dictionary match **binary tree** (donor
+    /// `ZSTD_dictMatchState`, the dms-BT walked in `ZSTD_insertBtAndGetAllMatches`
+    /// `zstd_opt.c:777-813`) over the first `region_len` bytes of the live
+    /// history (the dictionary content at the front). A hash-chain dms surfaces
+    /// only the few candidates that share a hash bucket; a DUBT descends to the
+    /// LONGEST dict match efficiently, which is where the donor extracts the
+    /// bulk of its dict-match value at btlazy2 / btopt (a chain there left
+    /// 80-90% of the dict savings on the table). Hashed at the BT `search_mls`
+    /// width into a dict-sized hash log; `chain_table` holds 2 entries per dict
+    /// position (`[smaller_child, larger_child]`), `hash_table` the per-bucket
+    /// tree roots. `dict_rel + 1` packing, `0` sentinel. Dict positions are
+    /// concat indices at the front of the shared buffer, so the walk's offset is
+    /// `idx - dict_idx` directly (no donor `dmsIndexDelta`). Called on BT levels
+    /// (`uses_bt`); cached across frames via `DictAttach::is_primed`.
+    pub(crate) fn prime_dms_bt(&mut self, region_len: usize) {
         // Donor `ZSTD_dictMatchState` searches the dict at the live cParams
         // `minMatch` (= our `search_mls`), NOT a fixed 3 — a fixed 3 surfaces
         // huge-offset ml=3 dict matches that the greedy btlazy2 parser commits
@@ -586,14 +597,61 @@ impl MatchTable {
         // Dict-sized hash log: ceil-log2(region) clamped to [10, hash_log].
         let dms_hash_log =
             (usize::BITS - (region - 1).leading_zeros()).clamp(10, self.hash_log as u32) as usize;
+        // Build-pass compare budget: the dict is bounded (<= window), so a
+        // generous fixed depth keeps the tree well-ordered without the live
+        // searchLog cap. Mirrors donor `ZSTD_insertBt1` nbCompares.
+        const DMS_BUILD_DEPTH: usize = 1 << 9;
         let mut hash_table = alloc::vec![0u32; 1usize << dms_hash_log];
-        let mut chain_table = alloc::vec![0u32; region];
-        let mut p = 0usize;
-        while p + read <= region {
-            let h = Self::hash_position_at(concat, p, dms_hash_log, mls);
-            chain_table[p] = hash_table[h];
-            hash_table[h] = (p + 1) as u32;
-            p += 1;
+        // 2 children per dict position: [smaller, larger].
+        let mut chain_table = alloc::vec![0u32; 2 * region];
+        let mut current = 0usize;
+        while current + read <= region {
+            let h = Self::hash_position_at(concat, current, dms_hash_log, mls);
+            // Insert `current` as the new root; splay the old tree into
+            // `current`'s smaller/larger subtrees (donor `ZSTD_insertBt1`).
+            let mut match_packed = hash_table[h];
+            hash_table[h] = (current + 1) as u32;
+            let mut smaller_slot = 2 * current;
+            let mut larger_slot = 2 * current + 1;
+            let mut common_smaller = 0usize;
+            let mut common_larger = 0usize;
+            let mut compares = DMS_BUILD_DEPTH;
+            while compares > 0 && match_packed != 0 {
+                let cand = (match_packed - 1) as usize;
+                // Tree holds only earlier positions; `cand < current` always.
+                if cand >= current {
+                    break;
+                }
+                compares -= 1;
+                let next_pair = 2 * cand;
+                let mut ml = common_smaller.min(common_larger);
+                // Common prefix bounded by the dict tail from `current`
+                // (`cand < current`, so `current` is the binding limit).
+                let limit = region - current;
+                while ml < limit && concat[cand + ml] == concat[current + ml] {
+                    ml += 1;
+                }
+                if current + ml >= region {
+                    // Reached the dict end: can't order this pair, stop (donor
+                    // `ip+matchLength == iend` break).
+                    break;
+                }
+                if concat[cand + ml] < concat[current + ml] {
+                    // `cand` (and its smaller subtree) sorts below `current`.
+                    chain_table[smaller_slot] = match_packed;
+                    common_smaller = ml;
+                    smaller_slot = next_pair + 1;
+                    match_packed = chain_table[next_pair + 1];
+                } else {
+                    chain_table[larger_slot] = match_packed;
+                    common_larger = ml;
+                    larger_slot = next_pair;
+                    match_packed = chain_table[next_pair];
+                }
+            }
+            chain_table[smaller_slot] = 0;
+            chain_table[larger_slot] = 0;
+            current += 1;
         }
         // `concat`'s borrow of `self` ends above; now mutate `self.dms`.
         let tables = self.dms.table_mut_or_init(DmsDictTables::default);

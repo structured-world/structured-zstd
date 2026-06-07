@@ -2060,7 +2060,7 @@ impl Matcher for MatchGeneratorDriver {
             // collect dual-probes the dictionary with its own compare budget
             // (the dict bytes were just committed to the front of history).
             if table.uses_bt {
-                table.prime_dms_chain(committed_dict_budget);
+                table.prime_dms_bt(committed_dict_budget);
             }
         }
         // CDict-equivalent: now that every dict chunk is indexed, mark the
@@ -4080,14 +4080,18 @@ macro_rules! bt_insert_and_collect_matches_body {
             $table.chain_table[larger_slot] = $crate::encoding::match_table::storage::HC_EMPTY;
         }
 
-        // Dict dual-probe (donor `ZSTD_dictMatchState`, zstd_opt.c:776-812):
-        // after the live tree, walk the immutable dictionary chain with its
-        // OWN compare budget and push any dict match longer than the live best
-        // into the ladder. Dict positions are dictionary-relative concat
-        // indices in `[0, region)`, pinned at the front of history, so a dict
-        // candidate at `dict_idx` sits at offset `idx - dict_idx`. The optimal
-        // parser prices these (its DP lookahead values the repcode chain a dict
-        // match seeds), unlike the greedy/lazy parsers.
+        // Dict dual-probe (donor `ZSTD_dictMatchState`, zstd_opt.c:777-813):
+        // after the live tree, descend the immutable dictionary BINARY TREE
+        // (built in `prime_dms_bt`) with its OWN compare budget and push any
+        // dict match longer than the live best into the ladder. The DUBT
+        // descent reaches the longest dict match efficiently (a hash-chain
+        // surfaced only the few same-bucket candidates and left most of the
+        // dict savings unrealised at btlazy2 / btopt). Dict positions are
+        // dictionary-relative concat indices in `[0, region)`, pinned at the
+        // front of history, so a dict candidate at `dict_idx` sits at offset
+        // `idx - dict_idx` (no donor `dmsIndexDelta`). The optimal parser
+        // prices these (its DP lookahead values the repcode chain a dict match
+        // seeds); the greedy/lazy parser commits the longest.
         if let Some(dms) = $table.dms.table() {
             let region = $table.dms.region_len();
             let dh = $crate::encoding::match_table::storage::MatchTable::hash_position_at(
@@ -4097,50 +4101,62 @@ macro_rules! bt_insert_and_collect_matches_body {
                 dms.mls,
             );
             let mut dcur = dms.hash_table[dh];
+            // DUBT seed lengths: bytes already known common on each side, so
+            // `$cmf` resumes from there (donor commonLengthSmaller/Larger).
+            let mut common_smaller = 0usize;
+            let mut common_larger = 0usize;
             let mut dms_compares = $profile.max_chain_depth.min($search_depth);
-            while dms_compares > 0 {
-                if dcur == $crate::encoding::match_table::storage::HC_EMPTY {
+            while dms_compares > 0 && dcur != $crate::encoding::match_table::storage::HC_EMPTY {
+                let dict_idx = (dcur - 1) as usize;
+                // The dict tree holds only dict positions (`< region <= idx`).
+                if dict_idx >= region || dict_idx >= idx {
                     break;
                 }
-                let dict_idx = (dcur - 1) as usize;
                 dms_compares -= 1;
-                let dnext = dms.chain_table[dict_idx];
-                let dms_self_loop = dnext == dcur;
-                if dict_idx < region && dict_idx < idx {
-                    // SAFETY: `dict_idx < idx` and `idx + tail_limit <=
-                    // concat.len()` (checked at entry); same umbrella as the
-                    // live walk's `$cmf`.
-                    let match_len = unsafe { $cmf(concat, idx, dict_idx, tail_limit, 0) };
-                    if match_len > best_len {
-                        let offset = idx - dict_idx;
-                        let accepted = $crate::encoding::bt::BtMatcher::push_candidate_ladder(
-                            $out,
-                            $best_len_for_skip,
-                            $crate::encoding::opt::types::MatchCandidate {
-                                start: $abs_pos,
-                                offset,
-                                match_len,
-                            },
-                            $min_match_len,
-                        );
-                        if accepted {
-                            best_len = match_len;
-                            let candidate_end = $abs_pos + match_len;
-                            if candidate_end > match_end_abs {
-                                match_end_abs = candidate_end;
-                            }
-                            if match_len >= tail_limit
-                                || match_len > $crate::encoding::cost_model::HC_OPT_NUM
-                            {
-                                break;
-                            }
+                let pair = 2 * dict_idx;
+                let seed = common_smaller.min(common_larger);
+                // SAFETY: `dict_idx < idx` and `idx + tail_limit <=
+                // concat.len()` (checked at entry); same umbrella as the live
+                // walk's `$cmf`. `seed <= prior match_len <= tail_limit`.
+                let match_len = unsafe { $cmf(concat, idx, dict_idx, tail_limit, seed) };
+                if match_len > best_len {
+                    let offset = idx - dict_idx;
+                    let accepted = $crate::encoding::bt::BtMatcher::push_candidate_ladder(
+                        $out,
+                        $best_len_for_skip,
+                        $crate::encoding::opt::types::MatchCandidate {
+                            start: $abs_pos,
+                            offset,
+                            match_len,
+                        },
+                        $min_match_len,
+                    );
+                    if accepted {
+                        best_len = match_len;
+                        let candidate_end = $abs_pos + match_len;
+                        if candidate_end > match_end_abs {
+                            match_end_abs = candidate_end;
+                        }
+                        if match_len > $crate::encoding::cost_model::HC_OPT_NUM {
+                            break;
                         }
                     }
                 }
-                if dms_self_loop {
+                // Match reached the block tail: can't order the pair (donor
+                // `ip+matchLength == iLimit`), and indexing `concat[idx +
+                // match_len]` below would step past the searchable region.
+                if match_len >= tail_limit {
                     break;
                 }
-                dcur = dnext;
+                // Descend the DUBT (donor zstd_opt.c:806-811): dict candidate
+                // smaller than input → its larger child is closer to `idx`.
+                if concat[dict_idx + match_len] < concat[idx + match_len] {
+                    common_smaller = match_len;
+                    dcur = dms.chain_table[pair + 1];
+                } else {
+                    common_larger = match_len;
+                    dcur = dms.chain_table[pair];
+                }
             }
         }
 
