@@ -707,12 +707,19 @@ pub struct PartialDecode {
     pub stopped_at: Option<(u32, FrameDecoderError)>,
     /// `true` if the frame's last block was reached during this decode.
     pub frame_finished: bool,
-    /// Cross-block carry-over state for resuming the next extent, present
-    /// only when the call was made with `emit_resume = true`. Feed it back
+    /// Cross-block carry-over state for resuming the next extent. Feed it back
     /// (with the matching `window_prime`) via the `resume` argument of a
     /// later [`FrameDecoder::decode_blocks_partial`] to continue from
     /// [`ResumeState::block_index`] without re-decompressing the prefix.
-    /// `None` when emission was not requested.
+    ///
+    /// `None` in two cases: emission was not requested (`emit_resume = false`),
+    /// OR this decode reached the frame's last block ([`frame_finished`] is
+    /// `true`) — there is no following block to resume from, so no snapshot is
+    /// emitted even with `emit_resume = true`. Callers walking a frame
+    /// incrementally should therefore stop when `frame_finished` is set rather
+    /// than treat a `None` here as "emission disabled".
+    ///
+    /// [`frame_finished`]: Self::frame_finished
     pub resume_state: Option<ResumeState>,
 }
 
@@ -1466,7 +1473,10 @@ impl FrameDecoder {
     /// - `emit_resume = true` captures the cross-block carry-over state (entropy
     ///   tables + repcode history + the next block index / output offset) into
     ///   [`PartialDecode::resume_state`]. The entropy-table snapshot clone is
-    ///   only paid when this is set.
+    ///   only paid when this is set. The snapshot is `None` when the decode
+    ///   reaches the frame's last block ([`PartialDecode::frame_finished`]):
+    ///   there is no following block to resume from, so an incremental walk
+    ///   stops on `frame_finished` rather than on a `None` snapshot.
     /// - `resume = Some(`[`ResumeInput`]`)` continues from a previously emitted
     ///   [`ResumeState`] WITHOUT re-decompressing the preceding blocks: the
     ///   match window is primed from [`ResumeInput::window_prime`] and the
