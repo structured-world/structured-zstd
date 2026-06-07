@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780844934645,
+  "lastUpdate": 1780852187749,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -59894,6 +59894,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.27,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "b4a14629709a278ab10bbe42be3f84ddc80ff488",
+          "message": "feat(wasm): simd128 kernel tier + npm package; LDM bench matrix variants (#364)\n\n* test(bench): add LDM and LDM+dict matrix variants at levels 1 & 22\n\n- Add `ldm`/`dict` flags to LevelConfig (false for every numeric level, so\n  existing matrix output is byte-for-byte unchanged)\n- Append level_1_fast_ldm, level_22_btultra2_ldm, level_1_fast_ldm_dict,\n  level_22_btultra2_ldm_dict to the bench inventory (literal names that\n  round-trip through STRUCTURED_ZSTD_BENCH_LEVEL_FILTER)\n- Wire LDM on both encoders (compress_with_parameters /\n  ZSTD_c_enableLongDistanceMatching) in compare_ffi and compare_ffi_memory\n- Route dict variants through the dictionary groups; share dict-training\n  and LDM helpers via benches/support to keep both binaries in lockstep\n- Add a real dictionary compress/decode peak-memory path to\n  compare_ffi_memory (CCtx/DCtx loadDictionary + DictionaryHandle)\n- Run the four variants in the push-event btopt CI shard\n\nCloses #362\n\n* perf(bench): split compress/decompress measurement_time budgets\n\ncriterion's Flat sampling fills `measurement_time` with iterations at a\nfixed `sample_size`, so any op faster than `measurement_time / sample_size`\nis over-iterated. Decompress is fast and extremely low-variance (100 MiB\ndecode ~11 ms/iter, 1 KiB ~147 ns, CI ±0.1-0.5%) yet shared the compress\nbudget — Large decode burnt the full 20 s on an 11 ms op (~1300 iters per\nsample, pure overbench).\n\nGive `configure_group` a `BenchOp` and budget decode separately:\n- Small:          compress 0.5 s / decode 0.3 s\n- Corpus/Entropy: compress 3 s   / decode 1.5 s\n- Large/Silesia:  compress 20 s  / decode 3 s\n\nCompress budgets are unchanged (z000033 L22 sits at the 3 s Corpus floor;\n100 MiB L22 compress on i686 needs the 20 s budget to avoid criterion's\n\"increase target time\" warning). `sample_size` (10/30) and warm-up are\nunchanged — the statistical floor and ns-scale timer amortisation stay\nintact. Cuts the slowest shards' decode wall by ~8x with no precision loss\nagainst the dashboard regression thresholds.\n\n* docs(bench): note z000033 L22 compress warning is CI-runner-bound\n\nThe \"increase target time\" notice on decodecorpus-z000033 L22 compress is a\nbenign, pre-existing CI-only artifact: ~0.3 s/iter on a dev box but ~20 s for\n10 samples on a GitHub free runner (~6-8x slower), so no budget below ~22 s\nsilences it. Raising the budget would only inflate the faster corpus-compress\nlevels without helping, so Corpus compress stays in the 3 s tier.\n\n* ci(bench): gate bench pipeline to push-to-main, drop PR regression gate\n\nThe pre-merge `benchmark-regression-check` job forced the full pr-canonical\nbench matrix on every PR (3 targets, ~20 min per L22 shard on free runners)\nfor little signal. Gate the whole bench pipeline on push-to-main via the\nsingle `bench-matrix` `if:` (cascades through `needs:` to bench-build,\nbenchmark, benchmark-aggregate, benchmark-pages) and delete the regression\ngate. PRs now run zero benches; perf is measured and published to the\n`dev/bench` dashboard post-merge on main — matching the \"main is the\nhistorical record\" design.\n\n* feat(kernel): wasm simd128 row tag-scan tier (#347)\n\nAdd a `kernel_simd128` feature and a `RowTagKernel::Simd128` tier for the\nencoder row match-find on wasm32. `row_tag_match_mask_simd128` mirrors the\nSSE2 kernel (`i8x16_splat` + `i8x16_eq` + `i8x16_bitmask` over each 16-byte\nrow chunk). wasm has no runtime CPUID, so `detect()` resolves the tier at\ncompile time from `target_feature = \"simd128\"`; everything is cfg-gated to\n`wasm32 + simd128` and inert elsewhere. Verified: wasm32 builds with and\nwithout `+simd128`, native clippy clean.\n\nPart of #347.\n\n* feat(wasm): npm package @structured-world/structured-zstd (#348)\n\nAdd the `structured-zstd-wasm` workspace crate: a thin `#![cfg(wasm32)]`\nwasm-bindgen wrapper exposing one-shot `compress(data, level)` /\n`decompress(data)` over the core codec (errors surface as JS exceptions).\nThe core crate stays no_std + bindgen-free; std + wasm-bindgen live only in\nthis leaf.\n\nPlus the npm package at `zstd-wasm/npm` (`@structured-world/structured-zstd`):\nstrict-TypeScript, pure-ESM loader that feature-detects wasm SIMD\n(`wasm-feature-detect`) and loads the simd128 or scalar payload, handling\nNode (read bytes) vs browser/Deno (fetch) init. package.json is ESM-only\n(`type: module`, `exports`, `files` allowlist, types), Apache-2.0.\n\nVerified: wasm-pack builds both payloads (web/ESM); strict tsc clean; Node\nroundtrip passes across 3 data shapes × 5 levels on the simd payload.\ndecompress uses StreamingDecoder so the output grows to fit any frame.\n\nPart of #348. Build outputs (simd/, scalar/, index.js, node_modules) are\ngitignored — regenerated by `npm run build` / the publish job.\n\n* test(wasm): Node bench harness vs @bokuweb/zstd-wasm (#348)\n\nPre-publish gate: load our simd128 + scalar payloads explicitly (bypassing\nthe autodetect loader so both tiers are measured) alongside the most popular\nnpm wasm zstd (@bokuweb/zstd-wasm, an emscripten build of the C reference),\nrun shared fixtures (log lines, random, low/high entropy, z000033, 8 MiB\nstream) × levels {1,3,19,22}, and emit REPORT lines + a ratio/speed table.\nVerifies round-trip correctness on every cell before timing.\n\n* feat(kernel): wasm simd128 match-copy decode kernel (#347)\n\nAdd a `simd128` arm to the decoder wildcopy: `copy_simd128` (16-byte\n`v128_load`/`v128_store` chunk loop, mirroring `copy_neon`) wired into\n`copy_bytes_overshooting`'s chunk dispatch, plus a `v128` stamp in\n`single_op_copy_16`. Gated `wasm32 + simd128 + kernel_simd128`; the scalar\ntwo-u64 fallback stays for wasm builds without simd128. Reachability matrix\nupdated. Verified: wasm32 builds (+simd128 and scalar), native clippy clean,\nand the Node bench round-trips correctly on every fixture × level on the\nsimd128 payload (SIMD output == scalar output).\n\nCompletes the #347 kernel surface (row tag-scan + match-copy).\n\n* test(wasm): cross-payload byte-identity + C-interop gate (#347, #348)\n\nAdd `zstd-wasm/bench/test.mjs` (fast, no timing): asserts the simd128 payload\nis byte-identical to the scalar payload (the scalar-vs-SIMD bit-identity rule),\nround-trips on both, and interoperates with the C reference @bokuweb/zstd-wasm\n(our frames decode there; its frames decode here) across fixtures × levels\n{-3,1,3,9,19,22}. Exits non-zero on the first mismatch — CI correctness gate.\n\n* test(wasm): make format cross-check the gate, byte-identity informational\n\nPer the drop-in contract (wire-format validity, not byte parity): the\nmandatory gate is round-trip + format cross-check against the C reference\n(@bokuweb/zstd-wasm) in both directions — our frames decode there, its frames\ndecode here. A broken simd128 kernel corrupts the frame and is caught by\ninterop. simd128-vs-scalar byte divergence is now logged, never fails.\n\n* ci(wasm): build both payloads + format cross-check on every PR (#347, #348)\n\nAdd a `wasm` CI job: wasm32 clippy for both crates (simd128 and scalar),\nbuild both wasm-pack payloads + the strict-TS types, then run the Node format\ncross-check against the C reference (@bokuweb/zstd-wasm). A wasm size-budget\nstep fails if either `.wasm` exceeds ~768 KiB (≈550 KiB baseline). Scope\n`+simd128` to the wasm32 target via `--config` so host build-scripts don't\nwarn (also applied to the package's `build:wasm:simd` script). Runs on PRs —\ncheap (wasm build + node), unlike the push-only bench pipeline.\n\n* ci(release): npm OIDC publish job for the wasm package (#348)\n\nAdd a `publish-npm` job to release.yml (on release: created, alongside the\ncrates.io publish): build both wasm payloads + types, stamp the version from\nthe release tag (mirrors how cargo publish reads the release-plz-bumped\nmanifest — Proposal A), and `npm publish --provenance --access public` via\nnpm OIDC trusted publishing (environment: release + id-token: write, no\nstatic token, no registry-url). Idempotent version-check guard.\n\nMark structured-zstd-wasm `release = false` in .release-plz.toml (npm-only,\nno crates.io release, no git release of its own).\n\nFirst publish is manual (the package must exist before a Trusted Publisher\ncan be attached at npmjs.com: org structured-world, repo structured-zstd,\nworkflow release.yml, environment release).\n\n* docs: add WebAssembly / npm package section to README (#348)\n\nDocument @structured-world/structured-zstd: install, one-shot usage, the\ndual simd128/scalar payload with runtime engine-capability selection, ESM +\nstrict TypeScript, native-zstd interop, and a pointer to zstd-wasm/.\n\n* feat(wasm): dictionary compress/decompress API + dict benches (#348)\n\nMatch (and simplify) the C reference's dictionary surface: add one-shot\n`compressUsingDict(data, dict, level?)` / `decompressUsingDict(data, dict)` to\nthe wasm-bindgen wrapper (mirroring ZSTD_compress/decompress_usingDict) and\nthe strict-TS ESM loader — no manual context handles, unlike @bokuweb's\ncreateCCtx/createDCtx. The JS/TS API is now a superset of bokuweb's\n(simple + dict, cleaner ergonomics).\n\nExtend the bench harness: dict compress/decompress timing vs bokuweb's dict\nAPI, and a dict format cross-check in test.mjs (our dict frames decode in the\nC reference and vice versa). Self-contained fixtures: a 16 KiB dictionary\ntrained from systemd .service samples + two sample payloads.\n\nVerified: wasm clippy clean, dict round-trip + C-reference dict interop pass.\n\n* feat(wasm): incremental streaming decompressor (#348)\n\nAdd `ZstdDecompressStream` (exposed as `createDecompressStream()`): push\ncompressed chunks, read decompressed output as it arrives, `finish()` at end\nof input. The decoder window is retained wasm-side across chunks, so a large\nframe need never be fully buffered — a surface the common npm wasm zstd\npackages (incl. @bokuweb/zstd-wasm) don't offer.\n\nCorrectness: the wrapper parses RFC 8878 frame/block headers to hand\n`decode_blocks` only complete blocks (it errors on a mid-block EOF) and drains\nvia `collect()` (retains the window mid-frame). Tested: chunked decode at\n1/3/7/64/full-byte granularities equals one-shot output across fixtures ×\nlevels on both payloads.\n\n* fix(wasm): address CodeRabbit review on PR #364\n\n- row/mod.rs: gate the wasm simd128 row kernel on `kernel_simd128` too (all 6\n  cfg sites), matching simd_copy's feature contract — a kernel_scalar trim now\n  uses the scalar row path even with target_feature=simd128.\n- bench.mjs: round-trip checks compare bytes, not just length (catch\n  same-length corruption); both main and dict loops.\n- test.mjs: format cross-check now covers the scalar payload both ways\n  (scalar→C and C→scalar), not just simd↔C.\n- README: absolute GitHub links for the wasm docs refs (relative links break\n  in crate-embedded / docs.rs views).\n- package.json: prepublishOnly runs the full build (+ LICENSE copy), not just\n  tsc, so a local publish can't ship without the wasm payloads.\n- ci.yml / release.yml: persist-credentials: false on the wasm + publish-npm\n  checkouts (neither pushes via the checkout token).",
+          "timestamp": "2026-06-07T19:20:47+03:00",
+          "tree_id": "be8506ecd25f9386582662198357ec8c6d49efdf",
+          "url": "https://github.com/structured-world/structured-zstd/commit/b4a14629709a278ab10bbe42be3f84ddc80ff488"
+        },
+        "date": 1780852178715,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.128,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.088,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 323.09,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 232.823,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.693,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.688,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.593,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.078,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.462,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 2.01,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.119,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.119,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.02,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 16.274,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 4.786,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.825,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.36,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.975,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.239,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.63,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.095,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.117,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.265,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.117,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.26,
             "unit": "ms"
           }
         ]
