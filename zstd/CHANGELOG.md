@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.30](https://github.com/structured-world/structured-zstd/compare/v0.0.29...v0.0.30) - 2026-06-07
+
+### Added
+
+- *(decoding)* block-subset partial decode + per-block decompressed byte ranges ([#357](https://github.com/structured-world/structured-zstd/pull/357))
+
+### Performance
+
+- *(encode)* inline SIMD literal copy for medium runs ([#355](https://github.com/structured-world/structured-zstd/pull/355))
+
 ## [0.0.29](https://github.com/structured-world/structured-zstd/compare/v0.0.28...v0.0.29) - 2026-06-06
 
 ### Added
