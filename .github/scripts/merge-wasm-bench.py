@@ -51,7 +51,15 @@ def load_records(path):
     p = Path(path)
     if not p.is_file():
         return []
-    payload = json.loads(p.read_text())
+    try:
+        payload = json.loads(p.read_text())
+    except (json.JSONDecodeError, ValueError) as exc:
+        # A corrupted persisted file (partial write, manual tamper) must not
+        # block every future wasm publish. Warn loudly (visible in CI logs)
+        # and rebuild from this run's records — history re-accumulates over
+        # subsequent pushes rather than wedging the shard permanently.
+        print(f"WARN: corrupted existing file {path}, starting fresh: {exc}", file=sys.stderr)
+        return []
     return payload.get("records", [])
 
 

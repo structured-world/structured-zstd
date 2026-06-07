@@ -78,7 +78,7 @@
         margin-top: 14px;
         min-height: 460px;
       }
-      #chart, #chart-profile, #chart-aggregate {
+      #chart, #chart-profile, #chart-aggregate, #chart-wasm {
         width: 100% !important;
         height: 440px !important;
       }
@@ -2267,12 +2267,18 @@
       async function initWasmSection() {
         wasmRenderMetricOptions(wasmState.selectors.metric);
         const response = await fetch("./benchmark-wasm.json", { cache: "no-store" });
-        if (!response.ok) {
+        if (response.status === 404) {
           // 404 = no wasm run has published yet. Leave the section with its
           // empty-state message rather than treating it as a hard error.
           renderWasmChart();
           bindWasmControls();
           return;
+        }
+        if (!response.ok) {
+          // Any other non-2xx (500, 403, broken publish) is a real failure,
+          // not a "no data yet" state — surface it via the section's .catch
+          // instead of masking it as the empty state.
+          throw new Error(`Unable to load benchmark-wasm.json (${response.status})`);
         }
         const payload = await response.json();
         wasmState.records = payload.records || [];
