@@ -387,9 +387,10 @@ impl StrategyTag {
     /// * 1-2 → `Fast`
     /// * 3-4 → `Dfast`
     /// * 5 → `Greedy`
-    /// * 6-15 → `Lazy` (donor splits 6/7=lazy, 8-12=lazy2,
-    ///   13-15=btlazy2; we collapse all three onto our `Lazy` tag and
-    ///   carry the lazy_depth variance via `LevelParams.lazy_depth`)
+    /// * 6-12 → `Lazy` (donor 6/7=lazy, 8-12=lazy2; we collapse lazy and
+    ///   lazy2 onto our `Lazy` tag and carry the lazy/lazy2 split via
+    ///   `LevelParams.lazy_depth` — 1 for lazy, 2 for lazy2)
+    /// * 13-15 → `Btlazy2` (donor btlazy2: BinaryTree finder + lazy parse)
     /// * 16-17 → `BtOpt`
     /// * 18 → `BtUltra`
     /// * 19-22 → `BtUltra2`

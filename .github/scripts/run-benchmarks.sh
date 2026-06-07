@@ -552,34 +552,6 @@ for row in ratios:
         "status": classify_ratio_delta(ratio_delta),
     }
 
-# Dictionary-path ratio (`REPORT_DICT`) → `compress-dict` stage so the
-# `*_dict` / `*_ldm_dict` levels carry a rust-vs-ffi ratio on the relative
-# dashboard. The plain `compress/` group skips dict levels (they emit only
-# `REPORT_DICT`, never a plain `REPORT`), so without this they'd appear with
-# speed only — or, for dict-only levels like `level_22_btultra2_ldm_dict`,
-# not at all. The Rust side is comparable only when the Rust dict path
-# produced a frame (`rust_with_dict_bytes > 0` → ratio > 0); when it's
-# unavailable the bench logs `0` and we skip the row rather than plot a
-# bogus delta. Keyed on the same `(compress-dict, scenario, level, None)`
-# tuple the `compress-dict` timing rows use, so ratio + speed join.
-for row in dictionary_rows:
-    if row["rust_with_dict_ratio"] <= 0.0 or row["ffi_with_dict_ratio"] <= 0.0:
-        continue
-    key = canonical_key("compress-dict", row["scenario"], row["level"], None)
-    ratio_delta = row["rust_with_dict_ratio"] / row["ffi_with_dict_ratio"]
-    ratio_index[key] = {
-        "meta": {
-            "stage": "compress-dict",
-            "scenario": row["scenario"],
-            "level": row["level"],
-            "source": None,
-        },
-        "rust_ratio": row["rust_with_dict_ratio"],
-        "ffi_ratio": row["ffi_with_dict_ratio"],
-        "delta": ratio_delta,
-        "status": classify_ratio_delta(ratio_delta),
-    }
-
 speed_index = defaultdict(dict)
 key_meta = {}
 for row in timing_rows:

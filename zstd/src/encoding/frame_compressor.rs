@@ -2723,6 +2723,81 @@ mod tests {
     }
 
     #[test]
+    fn dict_primed_btlazy2_reused_across_attach_and_copy_boundary_is_byte_identical() {
+        // Btlazy2 (Level 15) uses the 32 KiB dict attach/copy cutoff in
+        // prepare_frame. Exercise BOTH sides of that boundary on a reused
+        // compressor: a sub-cutoff payload (re-prime/attach path) and an
+        // over-cutoff payload (copy-snapshot restore path). In each case the
+        // warm-cache second frame must reproduce the cold-cache first frame
+        // byte-for-byte (the dict cache is a timing optimization, never a
+        // content change), and every frame must round-trip.
+        let dict_raw = include_bytes!("../../dict_tests/dictionary");
+        let dict_id = super::EncoderDictionary::from_bytes(dict_raw)
+            .expect("dict bytes should parse")
+            .id();
+        // Distinct lines so the payload does not trivially self-compress; the
+        // BT finder + dict dual-probe both get exercised.
+        let make_payload = |target: usize| {
+            let mut p = Vec::with_capacity(target);
+            let mut i = 0u64;
+            while p.len() < target {
+                p.extend_from_slice(
+                    format!(
+                        "tenant=demo op=put key={i} value=aaaaabbbbbcccccddddd-{}\n",
+                        i % 97
+                    )
+                    .as_bytes(),
+                );
+                i += 1;
+            }
+            p
+        };
+        // Below the 32 KiB cutoff (attach/re-prime) and above it (copy-snapshot).
+        for target in [16 * 1024usize, 64 * 1024usize] {
+            let payload = make_payload(target);
+            let mut warm: FrameCompressor =
+                FrameCompressor::new(super::CompressionLevel::Level(15));
+            warm.set_encoder_dictionary(
+                super::EncoderDictionary::from_bytes(dict_raw).expect("dict parse"),
+            )
+            .expect("dict attach");
+            // Frame 1 builds + marks the dict tables; frame 2 reuses them.
+            let frame1 = warm.compress_independent_frame(payload.as_slice());
+            let frame2 = warm.compress_independent_frame(payload.as_slice());
+            assert_eq!(
+                frame1, frame2,
+                "reused dict cache must reproduce the freshly-primed frame byte-for-byte \
+                 (Level 15, target={target})"
+            );
+            // Cold-cache compressor: must match the warm-cache bytes.
+            let mut cold: FrameCompressor =
+                FrameCompressor::new(super::CompressionLevel::Level(15));
+            cold.set_encoder_dictionary(
+                super::EncoderDictionary::from_bytes(dict_raw).expect("dict parse"),
+            )
+            .expect("dict attach");
+            let cold_frame = cold.compress_independent_frame(payload.as_slice());
+            assert_eq!(
+                cold_frame, frame1,
+                "cold-cache compressor must match warm-cache frame (Level 15, target={target})"
+            );
+            // Round-trip through a decoder primed with the same dict.
+            for frame in [&frame1, &frame2] {
+                let (hdr, _) = crate::decoding::frame::read_frame_header(frame.as_slice())
+                    .expect("frame header");
+                assert_eq!(hdr.dictionary_id(), Some(dict_id));
+                let mut decoder = FrameDecoder::new();
+                decoder
+                    .add_dict(crate::decoding::Dictionary::decode_dict(dict_raw).unwrap())
+                    .unwrap();
+                let mut decoded = Vec::with_capacity(payload.len());
+                decoder.decode_all_to_vec(frame, &mut decoded).unwrap();
+                assert_eq!(decoded.as_slice(), payload.as_slice());
+            }
+        }
+    }
+
+    #[test]
     fn set_dictionary_from_bytes_matches_full_decode_byte_for_byte() {
         // The encoder-only dict parse (`decode_dict_for_encoding`, used by
         // `set_dictionary_from_bytes`) skips the FSE/HUF decoder-table build and
