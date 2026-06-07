@@ -214,7 +214,14 @@ pub struct FrameDecoder {
 struct FrameKey {
     window_size: u64,
     frame_content_size: u64,
+    /// `Dictionary_ID` declared in the frame header (`None` when omitted).
     dictionary_id: Option<u32>,
+    /// Dictionary actually applied to the decoder (`state.using_dict`). This is
+    /// distinct from `dictionary_id`: a frame with a dictless header can still
+    /// be decoded with an explicit dictionary via `reset_with_dict_handle` /
+    /// `force_dict`, and two such decodes with different dictionaries must NOT
+    /// compare equal — keying only on the header field would miss that.
+    active_dictionary_id: Option<u32>,
     single_segment: bool,
     content_checksum: bool,
     magicless: bool,
@@ -222,16 +229,30 @@ struct FrameKey {
 
 #[cfg(feature = "lsm")]
 impl FrameKey {
-    fn from_header(header: &frame::FrameHeader, magicless: bool) -> FrameKey {
+    fn from_state(state: &FrameDecoderState, magicless: bool) -> FrameKey {
+        let header = &state.frame_header;
         FrameKey {
             window_size: header.window_size().unwrap_or(0),
             frame_content_size: header.frame_content_size(),
             dictionary_id: header.dictionary_id(),
+            active_dictionary_id: state.using_dict,
             single_segment: header.descriptor.single_segment_flag(),
             content_checksum: header.descriptor.content_checksum_flag(),
             magicless,
         }
     }
+}
+
+/// XXH64 of a contiguous byte slice — the resume-side counterpart to
+/// [`DecoderScratchKind::window_tail_hash`]. Streaming XXH64 is chunk-boundary
+/// independent, so this single-slice hash equals the emit-side two-slice hash
+/// over the same bytes.
+#[cfg(all(feature = "lsm", feature = "hash"))]
+fn xxh64_of(bytes: &[u8]) -> u64 {
+    use core::hash::Hasher;
+    let mut h = twox_hash::XxHash64::with_seed(0);
+    h.write(bytes);
+    h.finish()
 }
 
 /// Cross-block decode state needed to resume a cold partial decode at an inner
@@ -250,7 +271,11 @@ impl FrameKey {
 /// byte-identical to a contiguous decode even across a dropped decoder. The
 /// window itself is NOT stored here — the caller supplies it back through
 /// [`ResumeInput::window_prime`] from the decompressed output it already
-/// persists.
+/// persists. Neither is the dictionary: for a dictionary frame the caller
+/// re-attaches it to the resuming decoder via [`FrameDecoder::reset`] /
+/// [`FrameDecoder::reset_with_dict_handle`] (it already holds the dictionary
+/// from encode time), and the snapshot records only the dictionary's identity
+/// so a resume under a different dictionary is rejected.
 ///
 /// Behind the `lsm` Cargo feature.
 #[cfg(feature = "lsm")]
@@ -275,6 +300,16 @@ pub struct ResumeState {
     /// Running repeat-offset history (`offset_hist`) as of the last decoded
     /// block.
     offset_hist: [u32; 3],
+    /// XXH64 of the exact window-prime bytes (the last `min(window_size,
+    /// output_offset)` decompressed bytes) captured at emit. Verified at resume
+    /// against the caller-supplied [`ResumeInput::window_prime`]: a content
+    /// mismatch (wrong frame, wrong or corrupted prime) is a near-unique
+    /// (≈2⁻⁶⁴) signal and is rejected with
+    /// [`FrameDecoderError::ResumeFrameMismatch`]. This is the content-exact
+    /// guard; [`FrameKey`] is the cheap shape pre-check that works without the
+    /// `hash` feature. Behind `all(lsm, hash)`.
+    #[cfg(feature = "hash")]
+    window_hash: u64,
 }
 
 #[cfg(feature = "lsm")]
@@ -585,6 +620,22 @@ impl DecoderScratchKind {
                 s.offset_hist = state.offset_hist;
             }
         }
+    }
+
+    /// XXH64 of the window-prime bytes for a [`ResumeState`]: the last
+    /// `min(window_size, buffer_len)` bytes of the current buffer, which at emit
+    /// time are exactly the match-window context the resume block will see.
+    /// Wrap-aware via `last_n_as_slices` — streaming XXH64 over the two slices
+    /// equals a single hash over the contiguous `window_prime` at resume.
+    #[cfg(all(feature = "lsm", feature = "hash"))]
+    fn window_tail_hash(&self, window_size: usize) -> u64 {
+        use core::hash::Hasher;
+        let n = core::cmp::min(window_size, self.buffer_len());
+        let (s1, s2) = self.last_n_as_slices(n);
+        let mut h = twox_hash::XxHash64::with_seed(0);
+        h.write(s1);
+        h.write(s2);
+        h.finish()
     }
 
     fn decode_block_content<R: Read>(
@@ -1430,16 +1481,31 @@ impl FrameDecoder {
     /// resumed call, [`bytes_read_from_source`](Self::bytes_read_from_source)
     /// and any `stopped_at` offsets are relative to the repositioned `source`.
     ///
+    /// **Dictionaries:** [`ResumeState`] does NOT carry the dictionary content.
+    /// For a dictionary frame, attach the dictionary to the resuming decoder the
+    /// same way as for a fresh decode — [`reset`](Self::reset) with the
+    /// dictionary registered (or
+    /// [`reset_with_dict_handle`](Self::reset_with_dict_handle)) BEFORE this
+    /// call — so dict-sourced matches near the frame start resolve. The caller
+    /// already holds the dictionary (it supplied it at encode time), so
+    /// re-supplying it on resume is free; storing it in the snapshot would only
+    /// duplicate it. The resume guard records the applied dictionary's identity
+    /// and rejects ([`FrameDecoderError::ResumeFrameMismatch`]) a resume whose
+    /// active dictionary differs from the one the snapshot was captured under.
+    ///
     /// # Errors
     ///
     /// Returns [`FrameDecoderError::NotYetInitialized`] if the decoder has not
-    /// been reset, [`FrameDecoderError::InvalidBlockRange`] if
-    /// `start_block > end_block`, and [`FrameDecoderError::ResumeWindowTooShort`]
+    /// been reset, [`FrameDecoderError::InvalidBlockRange`] if the effective
+    /// start exceeds `end_block`, [`FrameDecoderError::ResumeWindowTooShort`]
     /// if `resume`'s `window_prime` is shorter than the match window the resume
-    /// block can reach back into (`min(window_size, output_offset)`) — rejected
-    /// up front rather than silently mis-resolving matches. A corrupt block is
-    /// NOT an `Err` here: it is reported via [`PartialDecode::stopped_at`] so the
-    /// clean prefix survives.
+    /// block can reach back into (`min(window_size, output_offset)`), and
+    /// [`FrameDecoderError::ResumeFrameMismatch`] if the snapshot was captured
+    /// from a frame with a different decode shape / dictionary, or (with the
+    /// `hash` feature) a `window_prime` whose content does not match what was
+    /// captured — all rejected up front rather than silently mis-resolving
+    /// matches. A corrupt block is NOT an `Err` here: it is reported via
+    /// [`PartialDecode::stopped_at`] so the clean prefix survives.
     ///
     /// [`FrameEmitInfo::decompressed_byte_range`]: crate::encoding::frame_emit_info::FrameEmitInfo::decompressed_byte_range
     /// [`FrameEmitInfo::blocks`]: crate::encoding::frame_emit_info::FrameEmitInfo::blocks
@@ -1472,7 +1538,7 @@ impl FrameDecoder {
             // Reject a snapshot captured from a different frame shape BEFORE
             // touching any decoder state: restoring entropy/repcode tables that
             // belong to another frame would silently produce byte-wrong output.
-            let current_key = FrameKey::from_header(&state.frame_header, magicless);
+            let current_key = FrameKey::from_state(state, magicless);
             if current_key != r.state.frame_key {
                 return Err(err::ResumeFrameMismatch);
             }
@@ -1495,6 +1561,15 @@ impl FrameDecoder {
             } else {
                 r.window_prime
             };
+            // Content-exact identity: the primed window must hash to what was
+            // captured at emit. Catches a same-shape-but-different-frame
+            // snapshot and a wrong/corrupted window_prime (which FrameKey alone
+            // cannot), before any state is restored. O(window) one-time per
+            // resume — negligible next to the decode it guards.
+            #[cfg(feature = "hash")]
+            if xxh64_of(prime) != r.state.window_hash {
+                return Err(err::ResumeFrameMismatch);
+            }
             state.decoder_scratch.restore_entropy(r.state);
             state.decoder_scratch.prime_window(prime, output_offset);
             state.block_counter = r.state.block_index as usize;
@@ -1642,12 +1717,14 @@ impl FrameDecoder {
         let resume_state = if emit_resume {
             let (fse, huf, offset_hist) = state.decoder_scratch.export_entropy();
             Some(ResumeState {
-                frame_key: FrameKey::from_header(&state.frame_header, magicless),
+                frame_key: FrameKey::from_state(state, magicless),
                 block_index: state.block_counter as u32,
                 output_offset: state.decoder_scratch.total_output(),
                 fse,
                 huf,
                 offset_hist,
+                #[cfg(feature = "hash")]
+                window_hash: state.decoder_scratch.window_tail_hash(window_size),
             })
         } else {
             None
@@ -4212,6 +4289,100 @@ mod tests {
                 false,
             )
             .expect_err("resume state from a different frame must be rejected");
+        assert!(
+            matches!(
+                err,
+                crate::decoding::errors::FrameDecoderError::ResumeFrameMismatch
+            ),
+            "expected ResumeFrameMismatch, got {err:?}"
+        );
+    }
+
+    #[cfg(all(feature = "lsm", feature = "hash"))]
+    #[test]
+    fn resume_rejects_wrong_window_prime_content() {
+        // Same frame (FrameKey matches) but the caller supplies a window_prime
+        // with one byte flipped. The shape key cannot catch this; the
+        // content-exact XXH64 of the window must, rejecting before any restore
+        // rather than mis-resolving matches against corrupted history.
+        let (compressed, full, info) = multi_block_fixture();
+        let nblocks = info.blocks.len() as u32;
+        let n = (nblocks / 2).max(1);
+        let st = emit_resume_state_at(&compressed, n);
+        let output_offset = info.decompressed_byte_range(n as usize).unwrap().start as usize;
+        assert!(output_offset > 0);
+
+        // Correct prefix with the last byte corrupted (this byte is inside the
+        // window the resume block reaches back into).
+        let mut corrupted = full[..output_offset].to_vec();
+        let last = corrupted.len() - 1;
+        corrupted[last] ^= 0xFF;
+
+        let mut header_src = compressed.as_slice();
+        let mut dec = FrameDecoder::new();
+        dec.reset(&mut header_src).unwrap();
+        let off = info.blocks[n as usize].offset_in_frame as usize;
+        let mut block_src = &compressed[off..];
+        let err = dec
+            .decode_blocks_partial(
+                &mut block_src,
+                n,
+                u32::MAX,
+                Some(super::ResumeInput {
+                    window_prime: &corrupted,
+                    state: &st,
+                }),
+                false,
+            )
+            .expect_err("corrupted window_prime must be rejected by content hash");
+        assert!(
+            matches!(
+                err,
+                crate::decoding::errors::FrameDecoderError::ResumeFrameMismatch
+            ),
+            "expected ResumeFrameMismatch, got {err:?}"
+        );
+    }
+
+    #[cfg(feature = "lsm")]
+    #[test]
+    fn resume_rejects_state_with_different_active_dictionary() {
+        // A dictless-header frame can be decoded with an explicit dictionary
+        // applied at runtime (force_dict / reset_with_dict_handle). Two such
+        // decodes differ in entropy/repcode/dict context even though the header
+        // dictionary_id is identically absent, so the resume guard must key on
+        // the ACTIVE dictionary, not just the header field. Here the snapshot is
+        // captured with no active dictionary; resuming with one applied must be
+        // rejected before any state is restored.
+        let (compressed, full, info) = multi_block_fixture();
+        let nblocks = info.blocks.len() as u32;
+        let n = (nblocks / 2).max(1);
+        let st = emit_resume_state_at(&compressed, n); // active_dictionary_id = None
+        let output_offset = info.decompressed_byte_range(n as usize).unwrap().start as usize;
+
+        let raw = std::fs::read("./dict_tests/dictionary").expect("dictionary fixture");
+        let dict = crate::decoding::dictionary::Dictionary::decode_dict(&raw).expect("parse dict");
+        let dict_id = dict.id;
+
+        let mut header_src = compressed.as_slice();
+        let mut dec = FrameDecoder::new();
+        dec.add_dict(dict).unwrap();
+        dec.reset(&mut header_src).unwrap();
+        dec.force_dict(dict_id).unwrap(); // active_dictionary_id = Some(dict_id)
+        let off = info.blocks[n as usize].offset_in_frame as usize;
+        let mut block_src = &compressed[off..];
+        let err = dec
+            .decode_blocks_partial(
+                &mut block_src,
+                n,
+                u32::MAX,
+                Some(super::ResumeInput {
+                    window_prime: &full[..output_offset],
+                    state: &st,
+                }),
+                false,
+            )
+            .expect_err("resume with a different active dictionary must be rejected");
         assert!(
             matches!(
                 err,
