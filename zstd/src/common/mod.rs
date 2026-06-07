@@ -20,7 +20,14 @@ pub const MAX_WINDOW_SIZE: u64 = (1 << 41) + 7 * (1 << 38);
 /// <https://github.com/facebook/zstd/blob/eca205fc7849a61ab287492931a04960ac58e031/doc/educational_decoder/zstd_decompress.c#L28-L29>
 pub const MAX_BLOCK_SIZE: u32 = 128 * 1024;
 
-/// Implementation limit for window size (100 MiB) to protect against
-/// malformed frames. The zstd spec allows much larger windows, but this
-/// cap prevents excessive memory allocation on untrusted input.
-pub const MAXIMUM_ALLOWED_WINDOW_SIZE: u64 = 1024 * 1024 * 100;
+/// Decoder window-size limit (128 MiB = `1 << 27`), matching upstream zstd's
+/// default `ZSTD_d_windowLogMax` (`ZSTD_WINDOWLOG_LIMIT_DEFAULT = 27`). Frames
+/// advertising a larger window are rejected to bound allocation on untrusted
+/// input. The spec permits larger windows, but no standard zstd encoder emits
+/// them by default, so matching the upstream limit keeps the drop-in contract:
+/// every frame a stock zstd decoder accepts, we accept too — and crucially,
+/// every frame OUR encoder emits (up to `window_log 27` at level 22) round-trips
+/// through our own decoder. A non-power-of-two cap below `1 << 27` would reject
+/// our own level-22 / streaming output (whose window header carries the full
+/// 128 MiB). Decompression-bomb protection lives on the OUTPUT path, not here.
+pub const MAXIMUM_ALLOWED_WINDOW_SIZE: u64 = 1 << 27;

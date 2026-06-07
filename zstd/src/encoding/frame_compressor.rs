@@ -3228,9 +3228,9 @@ mod tests {
             let mut compressed = Vec::new();
             let mut compressor = FrameCompressor::new(level);
             // Pledge the source size so the high-level (22) window shrinks to
-            // fit the payload — otherwise level 22's default 128 MiB window
-            // exceeds the decoder's MAXIMUM_ALLOWED_WINDOW_SIZE cap. Still
-            // >= 128 KiB, so post-split eligibility is preserved.
+            // fit the payload, keeping the frame compact (no oversized window
+            // descriptor for a small input). Still >= 128 KiB, so post-split
+            // eligibility is preserved.
             compressor.set_source_size_hint(data.len() as u64);
             compressor.set_source(data.as_slice());
             compressor.set_drain(&mut compressed);
