@@ -19,9 +19,20 @@ release = false
 # its own. release-plz may still bump its version on dependency updates; that
 # version is non-authoritative — the npm publish stamps the package version
 # from the release tag (Proposal A, single source of truth = Cargo.toml).
+#
+# Private tag namespace (`structured-zstd-wasm-v*`, never actually created
+# because `release = false`). This crate was added after the workspace's last
+# shared `v*` tag (v0.0.30), so resolving its "last release" against the shared
+# `v{{ version }}` pattern pointed release-plz at the v0.0.30 worktree — where
+# this package does not yet exist — and crashed `release-pr` with
+# "Failed to find package". A namespace with no matching tag makes release-plz
+# treat it as unreleased and skip that broken baseline diff. The main crate
+# keeps the shared `v*` tag, so the npm version flow (tag → npm version) is
+# unaffected.
 [[package]]
 name = "structured-zstd-wasm"
 release = false
+git_tag_name = "structured-zstd-wasm-v{{ version }}"
 
 [changelog]
 commit_parsers = [
