@@ -277,3 +277,37 @@ fn ldm_large_window_multi_segment_round_trips() {
         );
     }
 }
+
+/// Reverting to a plain level via `set_compression_level` after a
+/// customized frame must drop the parameter overrides. Otherwise the
+/// strategy/LDM/log overrides stay sticky and the "plain" frame is still
+/// encoded with the previous tuning. The second frame must be
+/// byte-identical to a fresh plain-level compression of the same input.
+#[test]
+fn set_compression_level_clears_parameter_overrides() {
+    // Compressible fixture so the strategy choice actually changes the
+    // output (incompressible data raw-stores regardless of strategy).
+    let data = long_range_repetitive(64 * 1024);
+
+    let mut compressor: FrameCompressor = FrameCompressor::new(CompressionLevel::Default);
+    // First frame: a custom strategy override (greedy) far from the
+    // level-19 default (btultra2).
+    let params = CompressionParameters::builder(CompressionLevel::Level(19))
+        .strategy(Strategy::Greedy)
+        .build()
+        .unwrap();
+    compressor.set_parameters(&params);
+    let _first = compressor.compress_independent_frame(&data);
+
+    // Revert to a plain level and compress again.
+    compressor.set_compression_level(CompressionLevel::Level(19));
+    let reverted = compressor.compress_independent_frame(&data);
+
+    // Must match a brand-new compressor at plain level 19 (no overrides).
+    let expected = compress_slice_to_vec(&data, CompressionLevel::Level(19));
+    assert_eq!(
+        reverted, expected,
+        "set_compression_level did not clear sticky parameter overrides",
+    );
+    assert_eq!(decode(&reverted), data);
+}
