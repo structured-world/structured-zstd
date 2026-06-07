@@ -138,6 +138,14 @@ pub(crate) struct CompressedBlockScratch {
     compressed: Vec<u8>,
     estimator_sequences: Vec<crate::blocks::sequence_section::Sequence>,
     estimator_workspace: EstimatorWorkspace,
+    /// Reusable scratch for the block-split estimator's inner
+    /// `CompressState` — kept across frames so the estimator does not
+    /// re-allocate a whole `CompressedBlockScratch` (4×`Box<[u32;256]>`
+    /// count tables + Vecs) every frame in a reused compressor. `Box`
+    /// breaks the type recursion; `None` by default (lazily filled on
+    /// first block-split). The estimator uses `EntropyOnlyMatcher` and
+    /// never re-splits, so this nesting is one level deep.
+    estimator_inner: Option<Box<CompressedBlockScratch>>,
 }
 
 impl CompressedBlockScratch {
@@ -296,6 +304,14 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
     scratch.partitions.clear();
     scratch.prefix_sums.rebuild(&scratch.parts.sequences);
     let mut workspace = core::mem::take(&mut scratch.estimator_workspace);
+    // Reuse the estimator's inner scratch across frames instead of
+    // allocating a fresh `CompressedBlockScratch` (count tables + Vecs)
+    // every block-split. Lazily created on the first split.
+    let inner_scratch = scratch
+        .estimator_inner
+        .take()
+        .map(|b| *b)
+        .unwrap_or_else(super::CompressedBlockScratch::new);
     let mut estimator = SplitEstimator {
         parts: &scratch.parts,
         prefix_sums: &scratch.prefix_sums,
@@ -310,7 +326,7 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
             matcher: EntropyOnlyMatcher,
             last_huff_table: state.last_huff_table.clone(),
             fse_tables: clone_fse_tables(&state.fse_tables),
-            block_scratch: super::CompressedBlockScratch::new(),
+            block_scratch: inner_scratch,
             offset_hist: state.offset_hist,
             strategy_tag: state.strategy_tag,
         },
@@ -320,6 +336,9 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
     scratch.partitions.push(scratch.parts.sequences.len());
     workspace = estimator.workspace;
     scratch.estimator_workspace = workspace;
+    // Stash the inner scratch back for the next frame (its buffers stay
+    // allocated; the estimator clears them per use).
+    scratch.estimator_inner = Some(Box::new(estimator.scratch_state.block_scratch));
 
     scratch.compressed.clear();
     let mut seq_start = 0usize;
