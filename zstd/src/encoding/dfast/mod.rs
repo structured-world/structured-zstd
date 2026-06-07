@@ -612,7 +612,19 @@ impl DfastMatchGenerator {
         // has at most `bits` bits set, in-bounds for the `1 << bits` tables.
         // `pos + 1` fits u32: concat indices are bounded by the u32 history
         // gate upstream (`check_stream_abs_headroom`).
-        let mut pos = start_concat;
+        //
+        // Backfill the previous chunk's last 7/3 bytes (the seam), which only
+        // became hashable now that this chunk extended history — mirrors the
+        // dense priming paths' backfill so multi-chunk dictionary priming
+        // doesn't drop seam-spanning candidates.
+        //
+        // `saturating_sub` is a deliberate FLOOR clamp to concat position 0
+        // (the dict start), NOT overflow-masking: `start_concat` is a valid
+        // concat index, and the seam window `[start_concat - tail, start_concat)`
+        // is clamped at 0 because there are no dict bytes before the front.
+        // The first chunk (`start_concat == 0`) clamps to 0 → no seam, no-op.
+        let backfill_floor = start_concat.saturating_sub(Self::BOUNDARY_DENSE_TAIL_LEN);
+        let mut pos = backfill_floor;
         while pos < long_safe_end {
             unsafe {
                 let load_ptr = base.add(history_start + pos);
@@ -1588,6 +1600,16 @@ impl DfastMatchGenerator {
         // strictly cheaper than a full inner-loop iter.
         let idxl0 = unsafe { *self.long_hash.as_ptr().add(hl0_idx) };
         let idxs0 = unsafe { *self.short_hash.as_ptr().add(hs0_idx) };
+
+        // Live tables only — no attached-dict probe here, by design. This
+        // helper runs for exactly ONE position per block (the last hashable
+        // `ip0` when `ip1` has fallen off the tail), so a missed dict match
+        // costs at most one sequence per ~128 KiB block (negligible ratio).
+        // `seed_remaining_hashable_starts` inserts this position so it is
+        // dict-searchable in the next block; replicating the full dict
+        // long+short dual-probe here would duplicate ~40 lines for that single
+        // boundary position and defeat the helper's "strictly cheaper than a
+        // full inner-loop iter" purpose.
 
         // Long-hash probe first (upstream priority: an 8-byte hit
         // beats a 4-byte hit even before extension).

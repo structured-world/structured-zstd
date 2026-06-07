@@ -1647,8 +1647,13 @@ impl RowMatchGenerator {
         // is u32-bounded upstream).
         for concat in start_concat..safe_end {
             unsafe {
+                // Little-endian load to match the live probe's
+                // `u32::from_le_bytes` hash (`hash_and_row`); a native-endian
+                // load would bucket dict rows differently on big-endian targets
+                // and lose every attached-dict match there.
                 let value =
-                    (base.add(history_start + concat) as *const u32).read_unaligned() as u64;
+                    u32::from_le((base.add(history_start + concat) as *const u32).read_unaligned())
+                        as u64;
                 let hash = crate::encoding::fastpath::hash_mix_u64_with_kernel(hash_kernel, value);
                 let combined = hash >> (u64::BITS as usize - total_bits);
                 let row = ((combined >> ROW_TAG_BITS) as usize) & row_count_mask;

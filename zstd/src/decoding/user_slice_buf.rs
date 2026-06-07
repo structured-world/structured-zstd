@@ -230,13 +230,12 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         use super::exec_sequence_inline::x86::{
             copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_overlap_8byte_stride,
         };
-        // Fallible capacity check — covers the literal+match copies
-        // INCLUDING the wildcopy overshoot tail (up to 15 bytes past
-        // `tail + total`). On a well-formed frame the caller-side
-        // `WILDCOPY_OVERLENGTH = 32` slack on the user slice absorbs
-        // it; on a malformed frame whose sequences overproduce past
-        // `frame_content_size`, the check returns
-        // `ExecuteSequencesError::OutputBufferOverflow` so the
+        // Fallible capacity check for the literal+match copies, with
+        // `overshoot = 0` — the SIMD wildcopy's up-to-15-byte tail overshoot
+        // is NOT absorbed by caller-side slice slack (the slice carries none);
+        // it is handled by the tight-tail bounded branch below. On a malformed
+        // frame whose sequences overproduce past `frame_content_size`, the
+        // check returns `ExecuteSequencesError::OutputBufferOverflow` so the
         // safe public decode APIs (`decode_all`, `decode_all_to_vec`)
         // surface a structured `FrameDecoderError` rather than
         // panic on the unsafe write surface.
@@ -432,10 +431,10 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
     /// short-offset (`offset < 16`) match path also stay on the
     /// SSE2 helpers — they're capped by the caller-side
     /// `inline_path_safe` gate at 16-byte slack and changing them
-    /// would require re-tightening that gate. Match copy slack is
-    /// bounded by `UserSliceBackend`'s `WILDCOPY_OVERLENGTH = 32`
-    /// byte padding at the slice tail, which accommodates the
-    /// 31-byte AVX2 stride overshoot.
+    /// would require re-tightening that gate. The 31-byte AVX2 stride
+    /// overshoot is contained by the per-sequence `overshoot = 0`
+    /// capacity guard plus the tight-tail bounded copy (the slice
+    /// carries no trailing slack), not by slice-tail padding.
     ///
     /// # Safety
     /// Same preconditions as [`Self::exec_sequence_inline`] plus
@@ -458,11 +457,11 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
             copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_no_overlap_avx2,
             wildcopy_overlap_8byte_stride,
         };
-        // 31-byte tail overshoot bound: the AVX2 no-overlap match
-        // wildcopy may write up to 31 bytes past `tail + total`.
-        // UserSliceBackend's slice carries `WILDCOPY_OVERLENGTH = 32`
-        // slack at construction (see `from_slice`), which accommodates
-        // this overshoot for well-formed frames.
+        // 31-byte tail overshoot bound: the AVX2 no-overlap match wildcopy may
+        // write up to 31 bytes past `tail + total`. The slice carries NO
+        // trailing slack (`from_slice` takes the caller's exact buffer), so
+        // this overshoot is handled by the tight-tail bounded branch below
+        // rather than absorbed by slice capacity.
         const MAX_WILDCOPY_OVERSHOOT: usize = 31;
         let cap = self.slice.len();
         // `self.tail <= cap` holds on entry (`from_slice` starts at 0 and every

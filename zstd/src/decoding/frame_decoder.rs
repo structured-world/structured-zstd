@@ -255,11 +255,13 @@ impl DecoderScratchKind {
             match self {
                 Self::Flat(s) => {
                     s.reset(window_size);
-                    // DecodeBuffer::reset clears + reserves
-                    // window_size; FlatBuf's reserve grows the
-                    // backing Vec if the new FCS is larger than
-                    // what's already allocated. No alloc when the
-                    // previous flat frame had >= this capacity.
+                    // `DecoderScratch::reset` clears the backing buffer and
+                    // updates `window_size` WITHOUT reserving it (it may still
+                    // resize the per-block scratch Vecs up to
+                    // `min(window_size, MAX_BLOCK_SIZE)`). Backing-buffer
+                    // capacity is decided one layer up: direct-eligible frames
+                    // never touch it, and the non-direct path pre-reserves once
+                    // via `reserve_buffer(window_size)` at frame entry.
                 }
                 Self::Ring(_) => *self = Self::new_flat(window_size),
             }
@@ -297,6 +299,14 @@ impl DecoderScratchKind {
     /// `new_flat` are each lazy (no pre-reserve), so a direct-eligible
     /// frame writes only through `UserSliceBackend` and leaves this
     /// buffer empty.
+    /// `window_size` is the ADDITIONAL-bytes argument the backend `reserve`
+    /// contract expects (Vec-style `reserve(additional)` → `capacity >= len +
+    /// additional`, plus the backend's wildcopy slack). This is always called at
+    /// frame entry on a freshly-reset buffer (`len == 0`), so the additional
+    /// request equals the desired total window capacity. Do NOT pass
+    /// `window_size - buffer.len()`: when `len == 0` it's identical, and the
+    /// backend `reserve` impls deliberately reject that form because it
+    /// under-reserves on reused buffers (see `FlatBuf::reserve`).
     #[inline]
     fn reserve_buffer(&mut self, window_size: usize) {
         match self {

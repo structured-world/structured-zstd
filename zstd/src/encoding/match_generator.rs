@@ -1752,9 +1752,17 @@ impl Matcher for MatchGeneratorDriver {
             MatcherStorage::Row(row) => {
                 row.max_window_size = max_window_size;
                 row.lazy_depth = params.lazy_depth;
-                row.configure(params.row.expect("Row level row carries a RowConfig"));
+                let row_cfg = params.row.expect("Row level row carries a RowConfig");
+                row.configure(row_cfg);
                 if hinted {
-                    resolved_table_bits = row_hash_bits_for_window(table_window_size);
+                    // Clamp the configured hash width by the hinted window
+                    // (donor `ZSTD_adjustCParams` caps hashLog by windowLog) —
+                    // `min`, not replace, so an explicit `hash_log` param
+                    // override (`row_cfg.hash_bits`) survives the hinted path
+                    // instead of being overwritten by the window value.
+                    resolved_table_bits = row_cfg
+                        .hash_bits
+                        .min(row_hash_bits_for_window(table_window_size));
                     row.set_hash_bits(resolved_table_bits);
                 }
                 row.reset();
