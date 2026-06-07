@@ -561,8 +561,20 @@ impl DfastMatchGenerator {
 
     /// Mark the dict tables fully built (CDict cache). The driver calls this
     /// after the final dictionary chunk so the next frame skips the re-hash.
+    ///
+    /// Only the fast-loop path builds the immutable dict tables; the
+    /// general-path levels (L1/L2/L4) prime the dict into the LIVE tables and
+    /// `invalidate()` the attach cache (see [`Self::skip_matching_for_dict_attach`]),
+    /// leaving `self.dict.table()` empty. Gate on `use_fast_loop` so a
+    /// general-path frame can never flip the primed flag, which would let a
+    /// later fast-loop frame short-circuit [`Self::prime_dict_tables_for_range`]
+    /// with no dict tables built. ([`DictAttach::mark_primed`] also self-guards
+    /// on `table.is_some()`, so this is belt-and-suspenders making the
+    /// precondition explicit at the call site.)
     pub(crate) fn mark_dict_primed(&mut self) {
-        self.dict.mark_primed();
+        if self.use_fast_loop {
+            self.dict.mark_primed();
+        }
     }
 
     /// Drop the cached dict tables (next frame carries no dict, or eviction /
@@ -759,7 +771,6 @@ impl DfastMatchGenerator {
         self.seed_remaining_hashable_starts(current_abs_start, current_len, pos);
         self.emit_trailing_literals(literals_start, handle_sequence);
     }
-
 
     /// Single-cursor probe at the last hashable position in the
     /// current block. Called from `start_matching_fast_loop` only when

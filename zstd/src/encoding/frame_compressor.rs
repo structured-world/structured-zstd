@@ -2873,6 +2873,17 @@ mod tests {
         compressor.compress();
         assert!(!output.is_empty(), "compression should produce a frame");
 
+        // The emitted frame must advertise the attached dictionary id, proving
+        // the tiny-dict path stayed active (the payload round-trips either way,
+        // so without this the test would also pass on a silent no-dict frame).
+        let (frame_header, _) = crate::decoding::frame::read_frame_header(output.as_slice())
+            .expect("encoded frame should have a readable header");
+        assert_eq!(
+            frame_header.dictionary_id(),
+            Some(dict_id),
+            "tiny raw dict frame should still advertise its dictionary id",
+        );
+
         // Full roundtrip: decode the dict-compressed frame with the SAME
         // dictionary attached and confirm byte-exact recovery — proves the
         // tiny-dict fast path produces a correct frame, not just a non-empty

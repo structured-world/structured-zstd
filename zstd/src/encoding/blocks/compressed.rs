@@ -27,12 +27,12 @@ const MAX_NB_BLOCK_SPLITS: usize = 196;
 /// strategy 1..6 → 64 bytes, strategy 7 (btopt) → 32, strategy 8 (btultra)
 /// → 16, strategy 9 (btultra2) → 8.
 ///
-/// Our `StrategyTag` enum has seven variants (no separate lazy2/btlazy2 —
-/// the `Lazy` variant covers donor strategies 4..6). Within the
-/// fast..lazy2 band donor's shift table is flat: strategies 1..6 all
-/// pin `shift = MIN(9 - strat, 3) = 3`, so `Lazy → 64-byte floor`
-/// regardless of which donor index (4, 5, or 6) we'd nominally use.
-/// No aggressiveness gradient within this band to preserve.
+/// Our `StrategyTag` enum has eight variants: `Lazy` covers donor strategies
+/// 4..5 (greedy/lazy/lazy2) and `Btlazy2` is the separate donor strategy 6.
+/// Within the fast..btlazy2 band donor's shift table is flat: strategies 1..6
+/// all pin `shift = MIN(9 - strat, 3) = 3`, so both `Lazy` and `Btlazy2` land
+/// on the 64-byte floor. No aggressiveness gradient within this band to
+/// preserve (the gradient only starts at btopt).
 #[inline]
 fn min_literals_to_compress(
     strategy: crate::encoding::strategy::StrategyTag,

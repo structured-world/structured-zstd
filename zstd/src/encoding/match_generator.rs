@@ -1795,7 +1795,8 @@ impl Matcher for MatchGeneratorDriver {
                     let wlog = hc_hash_bits_for_window(table_window_size);
                     let uses_bt = matches!(
                         strategy_tag,
-                        super::strategy::StrategyTag::BtOpt
+                        super::strategy::StrategyTag::Btlazy2
+                            | super::strategy::StrategyTag::BtOpt
                             | super::strategy::StrategyTag::BtUltra
                             | super::strategy::StrategyTag::BtUltra2
                     );
@@ -2672,7 +2673,7 @@ macro_rules! start_matching_btlazy2_body {
             .table
             .backfill_boundary_positions(current_abs_start, current_abs_end);
 
-        let profile = HcOptimalCostProfile::const_for_strategy::<super::strategy::BtOpt>();
+        let profile = HcOptimalCostProfile::const_for_strategy::<super::strategy::Btlazy2>();
         let mut candidates = core::mem::take(&mut $self.backend.bt_mut().opt_candidates_scratch);
 
         let mut pos = 0usize;
@@ -2684,13 +2685,16 @@ macro_rules! start_matching_btlazy2_body {
             let query = HcCandidateQuery {
                 reps: $self.table.offset_hist,
                 lit_len,
+                // No LDM seed: L13-15 run at windowLog 22, below donor's
+                // LDM auto-enable threshold (windowLog >= 27), so long-
+                // distance matching is off for this strategy by default.
                 ldm_candidate: None,
             };
             // SAFETY: called inside the wrapper's `#[target_feature]` umbrella
             // (the scalar wrapper's `$collect` is a safe fn — `unused_unsafe`
             // is allowed on the wrapper).
             unsafe {
-                $self.$collect::<super::strategy::BtOpt, true>(
+                $self.$collect::<super::strategy::Btlazy2, true>(
                     abs_pos,
                     current_abs_end,
                     profile,
