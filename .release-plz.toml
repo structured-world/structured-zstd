@@ -14,6 +14,15 @@ publish = false
 name = "structured-zstd-cli"
 release = false
 
+# npm-only crate: published to npm (@structured-world/structured-zstd) by the
+# release.yml `publish-npm` job, never to crates.io and with no git release of
+# its own. release-plz may still bump its version on dependency updates; that
+# version is non-authoritative — the npm publish stamps the package version
+# from the release tag (Proposal A, single source of truth = Cargo.toml).
+[[package]]
+name = "structured-zstd-wasm"
+release = false
+
 [changelog]
 commit_parsers = [
     { message = "^chore", skip = true },

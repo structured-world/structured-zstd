@@ -1,4 +1,4 @@
-name: Publish to crates.io
+name: Publish (crates.io + npm)
 
 on:
   release:
@@ -6,6 +6,7 @@ on:
 
 jobs:
   publish:
+    name: Publish crate to crates.io
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -18,3 +19,54 @@ jobs:
       - run: cargo publish -p structured-zstd
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+  publish-npm:
+    # Publish @structured-world/structured-zstd (wasm) via npm OIDC trusted
+    # publishing — NO static token (see ~/projects/sw/gitlab-mcp for the
+    # pattern). The version is NOT hand-maintained in package.json: it is
+    # stamped from the release tag (release-plz already bumped Cargo.toml),
+    # exactly mirroring how `cargo publish` reads the bumped manifest
+    # (Proposal A, single source of truth). The FIRST publish must be done
+    # manually so the package exists and a Trusted Publisher can be attached
+    # at npmjs.com (org: structured-world, repo: structured-zstd, workflow:
+    # release.yml, environment: release).
+    name: Publish wasm to npm (OIDC)
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      id-token: write # npm OIDC trusted publishing + provenance
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          # NO registry-url — it writes an .npmrc with a NODE_AUTH_TOKEN
+          # placeholder that overrides OIDC trusted publishing.
+      - name: Build npm package (both payloads + types)
+        working-directory: zstd-wasm/npm
+        run: |
+          npm ci || npm install
+          npm run build
+          cp ../../LICENSE LICENSE
+      - name: Stamp version from release tag
+        working-directory: zstd-wasm/npm
+        run: |
+          V="${GITHUB_REF_NAME#v}"
+          npm version "$V" --no-git-tag-version --allow-same-version
+      - name: Publish via npm OIDC (provenance)
+        working-directory: zstd-wasm/npm
+        run: |
+          V="$(jq -r .version package.json)"
+          if npm view "@structured-world/structured-zstd@${V}" version >/dev/null 2>&1; then
+            echo "@structured-world/structured-zstd@${V} already published; skipping."
+            exit 0
+          fi
+          npm publish --provenance --access public
