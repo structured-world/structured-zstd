@@ -570,6 +570,7 @@ mod tests {
         assert!(!Dfast::USE_BT);
         assert!(!Greedy::USE_BT);
         assert!(!Lazy::USE_BT);
+        assert!(Btlazy2::USE_BT);
         assert!(BtOpt::USE_BT);
         assert!(BtUltra::USE_BT);
         assert!(BtUltra2::USE_BT);
@@ -583,6 +584,8 @@ mod tests {
         assert!(!Dfast::USE_HASH3);
         assert!(!Greedy::USE_HASH3);
         assert!(!Lazy::USE_HASH3);
+        assert!(!Btlazy2::USE_HASH3);
+        assert!(!Btlazy2::TWO_PASS_SEED);
         assert!(!BtOpt::USE_HASH3);
         assert!(BtUltra::USE_HASH3);
         assert!(BtUltra2::USE_HASH3);
@@ -597,9 +600,14 @@ mod tests {
     // silently.
     const _COST_MODEL_LAYOUT: () = {
         assert!(!Lazy::ACCURATE_PRICE && Lazy::FAVOR_SMALL_OFFSETS);
+        assert!(!Btlazy2::ACCURATE_PRICE && Btlazy2::FAVOR_SMALL_OFFSETS);
         assert!(!BtOpt::ACCURATE_PRICE && BtOpt::FAVOR_SMALL_OFFSETS);
         assert!(BtUltra::ACCURATE_PRICE && !BtUltra::FAVOR_SMALL_OFFSETS);
         assert!(BtUltra2::ACCURATE_PRICE && !BtUltra2::FAVOR_SMALL_OFFSETS);
+        // btlazy2 runs the full BT find (no early bail) and a search depth
+        // that lets L15's configured search_depth=64 govern; see `Btlazy2`.
+        assert!(Btlazy2::MAX_CHAIN_DEPTH == 64);
+        assert!(Btlazy2::SUFFICIENT_MATCH_LEN == usize::MAX);
         assert!(BtOpt::MAX_CHAIN_DEPTH == 32);
         // 1 << searchLog for clevels.h level 18 (searchLog = 6).
         assert!(BtUltra::MAX_CHAIN_DEPTH == 64);

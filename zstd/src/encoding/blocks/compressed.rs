@@ -2294,6 +2294,7 @@ mod tests {
             StrategyTag::Dfast,
             StrategyTag::Greedy,
             StrategyTag::Lazy,
+            StrategyTag::Btlazy2,
         ] {
             assert_eq!(min_literals_to_compress(strat, false), 64);
             assert_eq!(min_literals_to_compress(strat, true), 6);
@@ -2314,6 +2315,7 @@ mod tests {
             StrategyTag::Dfast,
             StrategyTag::Greedy,
             StrategyTag::Lazy,
+            StrategyTag::Btlazy2,
             StrategyTag::BtOpt,
         ] {
             assert_eq!(min_gain(src, strat), (src >> 6) + 2);
@@ -2391,6 +2393,10 @@ mod tests {
                 "Lazy/{lit_len}"
             );
             assert!(
+                !prefer_repeat_eligible(StrategyTag::Btlazy2, lit_len),
+                "Btlazy2/{lit_len}"
+            );
+            assert!(
                 !prefer_repeat_eligible(StrategyTag::BtOpt, lit_len),
                 "BtOpt/{lit_len}"
             );
@@ -2410,6 +2416,7 @@ mod tests {
             assert!(!prefer_repeat_eligible(StrategyTag::Fast, lit_len));
             assert!(!prefer_repeat_eligible(StrategyTag::Dfast, lit_len));
             assert!(!prefer_repeat_eligible(StrategyTag::Greedy, lit_len));
+            assert!(!prefer_repeat_eligible(StrategyTag::Btlazy2, lit_len));
         }
     }
 

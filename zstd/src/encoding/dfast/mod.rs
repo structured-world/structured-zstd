@@ -1620,7 +1620,6 @@ impl DfastMatchGenerator {
     }
 }
 
-
 /// Per-kernel body of the dfast fast match loop. Mirrors the BT/opt
 /// `*_body!` macros: the wrapper carries the `#[target_feature]` umbrella and
 /// passes its tier `common_prefix_len_ptr` as `$cpl`, so the 7 match-extension

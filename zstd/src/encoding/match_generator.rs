@@ -4988,7 +4988,15 @@ impl HcMatchGenerator {
                     query,
                     out,
                 ),
-            StrategyTag::Btlazy2 | StrategyTag::BtOpt => self
+            StrategyTag::Btlazy2 => self
+                .collect_optimal_candidates_initialized::<strategy::Btlazy2, true>(
+                    abs_pos,
+                    current_abs_end,
+                    profile,
+                    query,
+                    out,
+                ),
+            StrategyTag::BtOpt => self
                 .collect_optimal_candidates_initialized::<strategy::BtOpt, true>(
                     abs_pos,
                     current_abs_end,
