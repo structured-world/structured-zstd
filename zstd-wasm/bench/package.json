@@ -1,0 +1,13 @@
+{
+  "name": "structured-zstd-wasm-bench",
+  "private": true,
+  "type": "module",
+  "description": "Node bench harness: structured-zstd wasm (simd128 + scalar) vs @bokuweb/zstd-wasm.",
+  "license": "Apache-2.0",
+  "scripts": {
+    "bench": "node bench.mjs"
+  },
+  "devDependencies": {
+    "@bokuweb/zstd-wasm": "^0.0.24"
+  }
+}
