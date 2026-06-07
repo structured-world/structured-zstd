@@ -45,6 +45,10 @@ enum RowTagKernel {
     // on little-endian. Big-endian aarch64 falls back to the scalar kernel.
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     Neon,
+    // WebAssembly fixed-128-bit SIMD. Compile-time only (wasm has no runtime
+    // CPUID): present only when the build enables `simd128`.
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    Simd128,
 }
 
 impl RowTagKernel {
@@ -95,6 +99,13 @@ impl RowTagKernel {
             if cfg!(target_feature = "neon") {
                 return RowTagKernel::Neon;
             }
+        }
+        // wasm32: no runtime CPUID. Resolve purely from the compile-time
+        // `simd128` target feature, baked into the build (the variant only
+        // exists under that cfg). Mirrors the no_std `cfg!` arms above.
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        {
+            return RowTagKernel::Simd128;
         }
         #[allow(unreachable_code)]
         RowTagKernel::Scalar
@@ -175,6 +186,18 @@ impl RowTags for NeonTags {
     }
 }
 
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[derive(Copy, Clone)]
+struct Simd128Tags;
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+impl RowTags for Simd128Tags {
+    const USE_MASK: bool = true;
+    #[inline]
+    fn mask(tags: &[u8], tag: u8) -> u64 {
+        row_tag_match_mask_simd128(tags, tag)
+    }
+}
+
 /// Resolve the runtime `tag_kernel` to a `RowTags` ZST once, then call a
 /// `*_k::<K>` method that binds the `row_log` const. The kernel branch
 /// runs once per block (cold), so the per-position hot loop is fully
@@ -188,6 +211,8 @@ macro_rules! dispatch_tag_kernel {
             RowTagKernel::Sse2 => $self.$k_method::<Sse2Tags>($($arg),*),
             #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
             RowTagKernel::Neon => $self.$k_method::<NeonTags>($($arg),*),
+            #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+            RowTagKernel::Simd128 => $self.$k_method::<Simd128Tags>($($arg),*),
             RowTagKernel::Scalar => $self.$k_method::<ScalarTags>($($arg),*),
         }
     };
@@ -329,6 +354,32 @@ unsafe fn row_tag_match_mask_neon(tags: &[u8], tag: u8) -> u64 {
         let paired32 = vreinterpretq_u64_u32(vsraq_n_u32(paired16, paired16, 14));
         let paired64 = vreinterpretq_u8_u64(vsraq_n_u64(paired32, paired32, 28));
         let bits = (vgetq_lane_u8(paired64, 0) as u64) | ((vgetq_lane_u8(paired64, 8) as u64) << 8);
+        mask |= bits << off;
+        off += 16;
+    }
+    mask
+}
+
+/// WebAssembly `simd128` tag-match mask: `i8x16_eq` against the broadcast
+/// tag, then `i8x16_bitmask` (the direct 16-lane-to-16-bit movemask wasm
+/// provides) over each 16-byte chunk. Shape mirrors the SSE2 kernel exactly.
+/// `tags.len()` is a multiple of 16, so no scalar tail is needed. Compiled
+/// only under `target_feature = "simd128"`, so the intrinsics are available
+/// without a separate `#[target_feature]` attribute (no runtime detection on
+/// wasm); only `v128_load` is `unsafe` (a raw pointer load).
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+fn row_tag_match_mask_simd128(tags: &[u8], tag: u8) -> u64 {
+    use core::arch::wasm32::{i8x16_bitmask, i8x16_eq, i8x16_splat, v128_load};
+
+    let needle = i8x16_splat(tag as i8);
+    let mut mask = 0u64;
+    let mut off = 0;
+    while off + 16 <= tags.len() {
+        // SAFETY: `off + 16 <= tags.len()`, so the 16-byte unaligned load is
+        // in bounds.
+        let v = unsafe { v128_load(tags.as_ptr().add(off) as *const _) };
+        let eq = i8x16_eq(v, needle);
+        let bits = i8x16_bitmask(eq) as u64;
         mask |= bits << off;
         off += 16;
     }

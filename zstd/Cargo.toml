@@ -70,6 +70,7 @@ default = [
     "kernel_vbmi2",
     "kernel_neon",
     "kernel_sve",
+    "kernel_simd128",
 ]
 # Per-CPU-tier decode kernel selection. The default build enables every
 # kernel; with `std`, `detect_cpu_kernel()` picks the best tier at runtime
@@ -94,6 +95,14 @@ kernel_avx2 = ["kernel_bmi2"]
 kernel_vbmi2 = ["kernel_avx2"]
 kernel_neon = []
 kernel_sve = ["kernel_neon"]
+# WebAssembly fixed-128-bit SIMD tier (`simd128`). Inert on non-wasm targets
+# the same way `kernel_neon` is inert on x86. wasm has no runtime CPU
+# detection, so the tier is chosen at compile time from `target_feature =
+# "simd128"`; consumers build with `-C target-feature=+simd128`. Covers the
+# two 128-bit-class kernels that port directly (row tag-scan, match-copy);
+# the 256-bit (AVX2/VBMI2) and scalar-bit-manip (BMI2) kernels have no
+# simd128 equivalent and stay scalar on wasm.
+kernel_simd128 = []
 dict_builder = ["std", "dep:fastrand"]
 hash = ["dep:twox-hash"]
 # Opt-in cache for FSE default tables on no-atomic targets. See
