@@ -196,6 +196,175 @@ pub struct FrameDecoder {
     computed_block_checksums: alloc::vec::Vec<u32>,
 }
 
+/// Decode-relevant identity of a frame, used to reject a [`ResumeState`]
+/// captured from one frame being applied to a frame of a different shape. Covers
+/// every header field that changes how blocks decode (buffer sizing, backend
+/// kind, entropy/dictionary context, trailing-checksum handling, declared
+/// content size, magicless framing).
+///
+/// This is a SHAPE guard, not a content-unique fingerprint: two distinct frames
+/// that happen to share all these header fields produce the same key (no cheap
+/// header field uniquely identifies frame content). It catches the realistic
+/// accidental misuse — applying a snapshot to a frame with a different
+/// window/dictionary/size — with a typed error instead of byte-wrong output.
+/// Pairing a `ResumeState` with the correct frame's compressed source and
+/// `window_prime` remains the caller's contract.
+#[cfg(feature = "lsm")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct FrameKey {
+    window_size: u64,
+    frame_content_size: u64,
+    /// `Dictionary_ID` declared in the frame header (`None` when omitted).
+    dictionary_id: Option<u32>,
+    /// Dictionary actually applied to the decoder (`state.using_dict`). This is
+    /// distinct from `dictionary_id`: a frame with a dictless header can still
+    /// be decoded with an explicit dictionary via `reset_with_dict_handle` /
+    /// `force_dict`, and two such decodes with different dictionaries must NOT
+    /// compare equal — keying only on the header field would miss that.
+    active_dictionary_id: Option<u32>,
+    single_segment: bool,
+    content_checksum: bool,
+    magicless: bool,
+}
+
+#[cfg(feature = "lsm")]
+impl FrameKey {
+    fn from_state(state: &FrameDecoderState, magicless: bool) -> FrameKey {
+        let header = &state.frame_header;
+        FrameKey {
+            window_size: header.window_size().unwrap_or(0),
+            frame_content_size: header.frame_content_size(),
+            dictionary_id: header.dictionary_id(),
+            active_dictionary_id: state.using_dict,
+            single_segment: header.descriptor.single_segment_flag(),
+            content_checksum: header.descriptor.content_checksum_flag(),
+            magicless,
+        }
+    }
+}
+
+/// XXH64 of a contiguous byte slice — the resume-side counterpart to
+/// [`DecoderScratchKind::window_tail_hash`]. Streaming XXH64 is chunk-boundary
+/// independent, so this single-slice hash equals the emit-side two-slice hash
+/// over the same bytes.
+#[cfg(all(feature = "lsm", feature = "hash"))]
+fn xxh64_of(bytes: &[u8]) -> u64 {
+    use core::hash::Hasher;
+    let mut h = twox_hash::XxHash64::with_seed(0);
+    h.write(bytes);
+    h.finish()
+}
+
+/// Cross-block decode state needed to resume a cold partial decode at an inner
+/// block boundary, emitted by [`FrameDecoder::decode_blocks_partial`] when its
+/// `emit_resume` argument is `true` (returned in
+/// [`PartialDecode::resume_state`]) and fed back via that same method's
+/// [`resume`](FrameDecoder::decode_blocks_partial) argument
+/// ([`ResumeInput`]).
+///
+/// A zstd block does not carry all the state required to decode it in
+/// isolation: besides the shared match window (the decompressed output history),
+/// a Compressed block may reuse the previous block's entropy tables via
+/// `Repeat_Mode` (literals Huffman + the LL/OF/ML FSE distributions) and always
+/// continues the running repeat-offset history. This snapshot carries exactly
+/// that carry-over state plus the resume coordinates, so resuming is
+/// byte-identical to a contiguous decode even across a dropped decoder. The
+/// window itself is NOT stored here — the caller supplies it back through
+/// [`ResumeInput::window_prime`] from the decompressed output it already
+/// persists. Neither is the dictionary: for a dictionary frame the caller
+/// re-attaches it to the resuming decoder via [`FrameDecoder::reset`] /
+/// [`FrameDecoder::reset_with_dict_handle`] (it already holds the dictionary
+/// from encode time), and the snapshot records only the dictionary's identity
+/// so a resume under a different dictionary is rejected.
+///
+/// Behind the `lsm` Cargo feature.
+#[cfg(feature = "lsm")]
+#[cfg_attr(docsrs, doc(cfg(feature = "lsm")))]
+pub struct ResumeState {
+    /// Identity of the frame this state was captured from. Compared against the
+    /// frame currently reset into the decoder before any state is restored, so a
+    /// snapshot from a different frame shape is rejected with
+    /// [`FrameDecoderError::ResumeFrameMismatch`] instead of silently producing
+    /// byte-wrong output.
+    frame_key: FrameKey,
+    /// Index of the block to resume AT (the first block NOT yet decoded).
+    block_index: u32,
+    /// Cumulative decompressed byte count produced before `block_index`.
+    output_offset: u64,
+    /// FSE tables (LL/OF/ML) as of the last decoded block — the source for a
+    /// `Repeat_Mode` resume block.
+    fse: crate::decoding::scratch::FSEScratch,
+    /// Huffman literals table as of the last decoded block — the source for a
+    /// treeless (repeat) literals resume block.
+    huf: crate::decoding::scratch::HuffmanScratch,
+    /// Running repeat-offset history (`offset_hist`) as of the last decoded
+    /// block.
+    offset_hist: [u32; 3],
+    /// XXH64 of the exact window-prime bytes (the last `min(window_size,
+    /// output_offset)` decompressed bytes) captured at emit. Verified at resume
+    /// against the caller-supplied [`ResumeInput::window_prime`]: a content
+    /// mismatch (wrong frame, wrong or corrupted prime) is a near-unique
+    /// (≈2⁻⁶⁴) signal and is rejected with
+    /// [`FrameDecoderError::ResumeFrameMismatch`]. This is the content-exact
+    /// guard; [`FrameKey`] is the cheap shape pre-check that works without the
+    /// `hash` feature. Behind `all(lsm, hash)`.
+    #[cfg(feature = "hash")]
+    window_hash: u64,
+}
+
+#[cfg(feature = "lsm")]
+impl ResumeState {
+    /// Inner block index this state resumes at (the first block not yet
+    /// decoded). Pass it as the `end_block` lower bound (and as `start_block`)
+    /// of the resuming
+    /// [`decode_blocks_partial`](FrameDecoder::decode_blocks_partial) call.
+    pub fn block_index(&self) -> u32 {
+        self.block_index
+    }
+
+    /// Cumulative decompressed byte count produced before
+    /// [`block_index`](Self::block_index) — i.e. the decompressed offset at
+    /// which the resumed output begins. Equals
+    /// `FrameEmitInfo::decompressed_byte_range(block_index).start`. Use it to
+    /// slice the `window_prime` tail the resumed call needs.
+    pub fn output_offset(&self) -> u64 {
+        self.output_offset
+    }
+}
+
+// Manual Debug: the entropy tables are large internal scratch with no useful
+// Debug surface; only the resume coordinates are worth printing (and this lets
+// `PartialDecode` keep its derived Debug).
+#[cfg(feature = "lsm")]
+impl core::fmt::Debug for ResumeState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ResumeState")
+            .field("block_index", &self.block_index)
+            .field("output_offset", &self.output_offset)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Resume input fed to [`FrameDecoder::decode_blocks_partial`]'s `resume`
+/// argument to continue a cold partial decode without re-decompressing the
+/// preceding blocks.
+///
+/// Behind the `lsm` Cargo feature.
+#[cfg(feature = "lsm")]
+#[cfg_attr(docsrs, doc(cfg(feature = "lsm")))]
+pub struct ResumeInput<'a> {
+    /// The caller's already-decompressed output ending just before
+    /// [`ResumeState::block_index`]. Must contain at least the last
+    /// `min(window_size, output_offset)` bytes (a full match window, or the
+    /// whole prefix when it is shorter than one window); anything beyond the
+    /// last `window_size` bytes is ignored, so passing the entire prefix is
+    /// also valid (capped internally, bounding resume memory to one window).
+    pub window_prime: &'a [u8],
+    /// Cross-block entropy/repcode state emitted by the prior
+    /// [`decode_blocks_partial`](FrameDecoder::decode_blocks_partial) call.
+    pub state: &'a ResumeState,
+}
+
 /// Backend-tagged decode scratch — chosen at frame-reset time based
 /// on the parsed `FrameHeader.descriptor.single_segment_flag()` and
 /// kept stable through the lifetime of the frame. The match in each
@@ -391,6 +560,84 @@ impl DecoderScratchKind {
         }
     }
 
+    /// Prime the match window with the caller's already-decompressed tail for
+    /// a resumed partial decode. Routes through whichever backend the current
+    /// scratch holds. See [`DecodeBuffer::prime_window`].
+    #[cfg(feature = "lsm")]
+    fn prime_window(&mut self, prefix: &[u8], total_output: u64) {
+        match self {
+            Self::Ring(s) => s.buffer.prime_window(prefix, total_output),
+            Self::Flat(s) => s.buffer.prime_window(prefix, total_output),
+        }
+    }
+
+    /// Total decompressed bytes produced so far (the buffer's running output
+    /// counter, unaffected by window drops / drains). Used to stamp a captured
+    /// [`ResumeState`]'s `output_offset`.
+    #[cfg(feature = "lsm")]
+    fn total_output(&self) -> u64 {
+        match self {
+            Self::Ring(s) => s.buffer.total_output(),
+            Self::Flat(s) => s.buffer.total_output(),
+        }
+    }
+
+    /// Clone the cross-block entropy/repcode state (FSE + Huffman tables +
+    /// `offset_hist`) out of the live scratch for a [`ResumeState`] snapshot.
+    #[cfg(feature = "lsm")]
+    fn export_entropy(
+        &self,
+    ) -> (
+        crate::decoding::scratch::FSEScratch,
+        crate::decoding::scratch::HuffmanScratch,
+        [u32; 3],
+    ) {
+        let (fse_src, huf_src, offset_hist) = match self {
+            Self::Ring(s) => (&s.fse, &s.huf, s.offset_hist),
+            Self::Flat(s) => (&s.fse, &s.huf, s.offset_hist),
+        };
+        let mut fse = crate::decoding::scratch::FSEScratch::new();
+        fse.reinit_from(fse_src);
+        let mut huf = crate::decoding::scratch::HuffmanScratch::new();
+        huf.table.reinit_from(&huf_src.table);
+        (fse, huf, offset_hist)
+    }
+
+    /// Install entropy/repcode state from a [`ResumeState`] into the live
+    /// scratch so a `Repeat_Mode` / treeless resume block resolves against the
+    /// same tables a contiguous decode would have carried over.
+    #[cfg(feature = "lsm")]
+    fn restore_entropy(&mut self, state: &ResumeState) {
+        match self {
+            Self::Ring(s) => {
+                s.fse.reinit_from(&state.fse);
+                s.huf.table.reinit_from(&state.huf.table);
+                s.offset_hist = state.offset_hist;
+            }
+            Self::Flat(s) => {
+                s.fse.reinit_from(&state.fse);
+                s.huf.table.reinit_from(&state.huf.table);
+                s.offset_hist = state.offset_hist;
+            }
+        }
+    }
+
+    /// XXH64 of the window-prime bytes for a [`ResumeState`]: the last
+    /// `min(window_size, buffer_len)` bytes of the current buffer, which at emit
+    /// time are exactly the match-window context the resume block will see.
+    /// Wrap-aware via `last_n_as_slices` — streaming XXH64 over the two slices
+    /// equals a single hash over the contiguous `window_prime` at resume.
+    #[cfg(all(feature = "lsm", feature = "hash"))]
+    fn window_tail_hash(&self, window_size: usize) -> u64 {
+        use core::hash::Hasher;
+        let n = core::cmp::min(window_size, self.buffer_len());
+        let (s1, s2) = self.last_n_as_slices(n);
+        let mut h = twox_hash::XxHash64::with_seed(0);
+        h.write(s1);
+        h.write(s2);
+        h.finish()
+    }
+
     fn decode_block_content<R: Read>(
         &mut self,
         decoder: &mut BlockDecoder,
@@ -442,8 +689,9 @@ pub struct PartialDecode {
     /// of the decompressed sizes of blocks `start_block .. start_block +
     /// blocks_decoded`.
     pub data: alloc::vec::Vec<u8>,
-    /// First block whose output is in [`data`](Self::data) (equals the
-    /// requested `start_block`).
+    /// First block whose output is in [`data`](Self::data): the requested
+    /// `start_block` on a fresh decode, or [`ResumeState::block_index`] when
+    /// resuming (the caller-supplied `start_block` is ignored in resume mode).
     pub start_block: u32,
     /// Number of in-range blocks successfully decoded into
     /// [`data`](Self::data).
@@ -459,6 +707,20 @@ pub struct PartialDecode {
     pub stopped_at: Option<(u32, FrameDecoderError)>,
     /// `true` if the frame's last block was reached during this decode.
     pub frame_finished: bool,
+    /// Cross-block carry-over state for resuming the next extent. Feed it back
+    /// (with the matching `window_prime`) via the `resume` argument of a
+    /// later [`FrameDecoder::decode_blocks_partial`] to continue from
+    /// [`ResumeState::block_index`] without re-decompressing the prefix.
+    ///
+    /// `None` in two cases: emission was not requested (`emit_resume = false`),
+    /// OR this decode reached the frame's last block ([`frame_finished`] is
+    /// `true`) — there is no following block to resume from, so no snapshot is
+    /// emitted even with `emit_resume = true`. Callers walking a frame
+    /// incrementally should therefore stop when `frame_finished` is set rather
+    /// than treat a `None` here as "emission disabled".
+    ///
+    /// [`frame_finished`]: Self::frame_finished
+    pub resume_state: Option<ResumeState>,
 }
 
 impl FrameDecoderState {
@@ -1200,14 +1462,64 @@ impl FrameDecoder {
     /// frame. Call on a freshly [`reset`](Self::reset) decoder (it decodes
     /// from the frame's first block).
     ///
+    /// # Resume (cold incremental / top-up)
+    ///
+    /// A plain call drains its in-range output from the match window on return,
+    /// so two consecutive calls cannot resume one another and growing a decoded
+    /// extent would mean re-decoding the covering prefix from block 0
+    /// (`O(extent)` per growth, `O(N²)` for a forward walk). The `resume` /
+    /// `emit_resume` arguments make a symmetric one-call grow-loop possible:
+    ///
+    /// - `emit_resume = true` captures the cross-block carry-over state (entropy
+    ///   tables + repcode history + the next block index / output offset) into
+    ///   [`PartialDecode::resume_state`]. The entropy-table snapshot clone is
+    ///   only paid when this is set. The snapshot is `None` when the decode
+    ///   reaches the frame's last block ([`PartialDecode::frame_finished`]):
+    ///   there is no following block to resume from, so an incremental walk
+    ///   stops on `frame_finished` rather than on a `None` snapshot.
+    /// - `resume = Some(`[`ResumeInput`]`)` continues from a previously emitted
+    ///   [`ResumeState`] WITHOUT re-decompressing the preceding blocks: the
+    ///   match window is primed from [`ResumeInput::window_prime`] and the
+    ///   entropy/repcode tables are restored from the state, so a `Repeat_Mode`
+    ///   resume block resolves byte-identically to a contiguous decode — even
+    ///   across a dropped (cold) decoder.
+    ///
+    /// When `resume` is `Some`, decoding resumes at
+    /// [`ResumeState::block_index`] and the `start_block` argument is ignored
+    /// (pass `resume.state.block_index()`); position `source` at that block's
+    /// compressed frame offset
+    /// ([`FrameEmitInfo::blocks`]`[block_index].offset_in_frame`). After a
+    /// resumed call, [`bytes_read_from_source`](Self::bytes_read_from_source)
+    /// and any `stopped_at` offsets are relative to the repositioned `source`.
+    ///
+    /// **Dictionaries:** [`ResumeState`] does NOT carry the dictionary content.
+    /// For a dictionary frame, attach the dictionary to the resuming decoder the
+    /// same way as for a fresh decode — [`reset`](Self::reset) with the
+    /// dictionary registered (or
+    /// [`reset_with_dict_handle`](Self::reset_with_dict_handle)) BEFORE this
+    /// call — so dict-sourced matches near the frame start resolve. The caller
+    /// already holds the dictionary (it supplied it at encode time), so
+    /// re-supplying it on resume is free; storing it in the snapshot would only
+    /// duplicate it. The resume guard records the applied dictionary's identity
+    /// and rejects ([`FrameDecoderError::ResumeFrameMismatch`]) a resume whose
+    /// active dictionary differs from the one the snapshot was captured under.
+    ///
     /// # Errors
     ///
     /// Returns [`FrameDecoderError::NotYetInitialized`] if the decoder has not
-    /// been reset, and [`FrameDecoderError::InvalidBlockRange`] if
-    /// `start_block > end_block`. A corrupt block is NOT an `Err` here: it is
-    /// reported via [`PartialDecode::stopped_at`] so the clean prefix survives.
+    /// been reset, [`FrameDecoderError::InvalidBlockRange`] if the effective
+    /// start exceeds `end_block`, [`FrameDecoderError::ResumeWindowTooShort`]
+    /// if `resume`'s `window_prime` is shorter than the match window the resume
+    /// block can reach back into (`min(window_size, output_offset)`), and
+    /// [`FrameDecoderError::ResumeFrameMismatch`] if the snapshot was captured
+    /// from a frame with a different decode shape / dictionary, or (with the
+    /// `hash` feature) a `window_prime` whose content does not match what was
+    /// captured — all rejected up front rather than silently mis-resolving
+    /// matches. A corrupt block is NOT an `Err` here: it is reported via
+    /// [`PartialDecode::stopped_at`] so the clean prefix survives.
     ///
     /// [`FrameEmitInfo::decompressed_byte_range`]: crate::encoding::frame_emit_info::FrameEmitInfo::decompressed_byte_range
+    /// [`FrameEmitInfo::blocks`]: crate::encoding::frame_emit_info::FrameEmitInfo::blocks
     #[cfg(feature = "lsm")]
     #[cfg_attr(docsrs, doc(cfg(feature = "lsm")))]
     pub fn decode_blocks_partial(
@@ -1215,20 +1527,90 @@ impl FrameDecoder {
         mut source: impl Read,
         start_block: u32,
         end_block: u32,
+        resume: Option<ResumeInput<'_>>,
+        emit_resume: bool,
     ) -> Result<PartialDecode, FrameDecoderError> {
         use FrameDecoderError as err;
-        if start_block > end_block {
-            return Err(err::InvalidBlockRange {
-                start_block,
-                end_block,
-            });
-        }
+        let magicless = self.magicless;
         let state = self.state.as_mut().ok_or(err::NotYetInitialized)?;
 
         // Mirror `decode_blocks`: pre-reserve the backing buffer to
         // `window_size` so multi-block frames don't pay repeated grow steps.
         let window_size = state.frame_header.window_size().unwrap_or(0) as usize;
         state.decoder_scratch.reserve_buffer(window_size);
+
+        // Cold resume: prime the match window + restore entropy/repcode state +
+        // advance the block cursor BEFORE the loop, so the first in-range block
+        // resolves its matches and `Repeat_Mode` tables against the caller's
+        // persisted state instead of re-decoded prefix blocks. The effective
+        // start is the resume state's block index (the passed `start_block` is
+        // ignored in resume mode, per the doc).
+        let effective_start = if let Some(r) = resume {
+            // Reject a snapshot captured from a different frame shape BEFORE
+            // touching any decoder state: restoring entropy/repcode tables that
+            // belong to another frame would silently produce byte-wrong output.
+            let current_key = FrameKey::from_state(state, magicless);
+            if current_key != r.state.frame_key {
+                return Err(err::ResumeFrameMismatch);
+            }
+            let output_offset = r.state.output_offset;
+            // The window the resume block can reach back into is bounded by the
+            // smaller of the frame's window_size and the bytes produced so far.
+            let required = core::cmp::min(window_size as u64, output_offset) as usize;
+            if r.window_prime.len() < required {
+                return Err(err::ResumeWindowTooShort {
+                    got: r.window_prime.len(),
+                    need: required,
+                });
+            }
+            // Only the most recent `window_size` bytes can ever back a match
+            // (offset <= window_size by the frame invariant); load just those
+            // even if the caller handed us a longer prefix, bounding resume
+            // memory to one window regardless of the skipped prefix's size.
+            let prime = if r.window_prime.len() > window_size {
+                &r.window_prime[r.window_prime.len() - window_size..]
+            } else {
+                r.window_prime
+            };
+            // Content-exact identity: the primed window must hash to what was
+            // captured at emit. Catches a same-shape-but-different-frame
+            // snapshot and a wrong/corrupted window_prime (which FrameKey alone
+            // cannot), before any state is restored. O(window) one-time per
+            // resume — negligible next to the decode it guards.
+            #[cfg(feature = "hash")]
+            if xxh64_of(prime) != r.state.window_hash {
+                return Err(err::ResumeFrameMismatch);
+            }
+            // Validate the effective range (resume mode begins at the resume
+            // block, ignoring the caller's `start_block`) BEFORE mutating the
+            // decoder: an inverted `end_block` must fail without priming the
+            // window / entropy or advancing the cursor, leaving the decoder
+            // re-resettable rather than in a half-resumed state.
+            let effective_start = r.state.block_index;
+            if effective_start > end_block {
+                return Err(err::InvalidBlockRange {
+                    start_block: effective_start,
+                    end_block,
+                });
+            }
+            state.decoder_scratch.restore_entropy(r.state);
+            state.decoder_scratch.prime_window(prime, output_offset);
+            state.block_counter = effective_start as usize;
+            // The caller repositions `source` to the resume block; report
+            // consumed bytes relative to that point (reset left this at the
+            // frame-header size).
+            state.bytes_read_counter = 0;
+            effective_start
+        } else {
+            // Fresh decode: validate the caller's range (no state to mutate).
+            if start_block > end_block {
+                return Err(err::InvalidBlockRange {
+                    start_block,
+                    end_block,
+                });
+            }
+            start_block
+        };
 
         let mut block_dec = decoding::block_decoder::new();
 
@@ -1255,7 +1637,7 @@ impl FrameDecoder {
             if block_index >= end_block || state.frame_finished {
                 break;
             }
-            let in_range = block_index >= start_block;
+            let in_range = block_index >= effective_start;
             // Snapshot the window length at the prefix → in-range boundary.
             if in_range && prefix_window_len.is_none() {
                 prefix_window_len = Some(state.decoder_scratch.buffer_len());
@@ -1344,6 +1726,32 @@ impl FrameDecoder {
             }
         }
 
+        // Emit cross-block carry-over state for a later resume, if requested.
+        // Captured AFTER the loop (entropy tables / repcode history are final)
+        // but BEFORE the drain — the drain only touches the visible output, not
+        // the entropy state or `total_output_counter`. `block_counter` /
+        // `total_output()` give the resume coordinates: the next block to decode
+        // and the cumulative decompressed offset before it (clean even after an
+        // early stop, since a failed block rolls both back to its checkpoint).
+        // Suppress the snapshot on the terminal block: `block_counter` is then
+        // one past the last block (EOF), for which there is no next-block source
+        // position to resume from. A resume needs a real following block.
+        let resume_state = if emit_resume && !state.frame_finished {
+            let (fse, huf, offset_hist) = state.decoder_scratch.export_entropy();
+            Some(ResumeState {
+                frame_key: FrameKey::from_state(state, magicless),
+                block_index: state.block_counter as u32,
+                output_offset: state.decoder_scratch.total_output(),
+                fse,
+                huf,
+                offset_hist,
+                #[cfg(feature = "hash")]
+                window_hash: state.decoder_scratch.window_tail_hash(window_size),
+            })
+        } else {
+            None
+        };
+
         // The visible buffer is now `[prefix window][in-range clean][maybe
         // trailing garbage from a failed in-range block]`. Drop the prefix
         // window from the front (match resolution is complete, so it is no
@@ -1366,10 +1774,11 @@ impl FrameDecoder {
 
         Ok(PartialDecode {
             data,
-            start_block,
+            start_block: effective_start,
             blocks_decoded,
             stopped_at,
             frame_finished: state.frame_finished,
+            resume_state,
         })
     }
 
@@ -3332,7 +3741,7 @@ mod tests {
             let mut dec = FrameDecoder::new();
             dec.reset(&mut source).unwrap();
             let pd = dec
-                .decode_blocks_partial(&mut source, s, e)
+                .decode_blocks_partial(&mut source, s, e, None, false)
                 .unwrap_or_else(|err| panic!("range [{s},{e}) errored: {err:?}"));
 
             let start = info.decompressed_byte_range(s as usize).unwrap().start as usize;
@@ -3367,7 +3776,9 @@ mod tests {
         let mut source = truncated;
         let mut dec = FrameDecoder::new();
         dec.reset(&mut source).unwrap();
-        let pd = dec.decode_blocks_partial(&mut source, 0, u32::MAX).unwrap();
+        let pd = dec
+            .decode_blocks_partial(&mut source, 0, u32::MAX, None, false)
+            .unwrap();
 
         let (idx, _err) = pd.stopped_at.expect("must stop on the truncated block");
         assert_eq!(idx, k as u32, "stopped at the truncated block index");
@@ -3389,7 +3800,7 @@ mod tests {
         let mut dec = FrameDecoder::new();
         dec.reset(&mut source).unwrap();
         let err = dec
-            .decode_blocks_partial(&mut source, 5, 2)
+            .decode_blocks_partial(&mut source, 5, 2, None, false)
             .expect_err("start > end must error");
         assert!(matches!(
             err,
@@ -3408,7 +3819,9 @@ mod tests {
         let mut source = compressed.as_slice();
         let mut dec = FrameDecoder::new();
         dec.reset(&mut source).unwrap();
-        let pd = dec.decode_blocks_partial(&mut source, 0, 1).unwrap();
+        let pd = dec
+            .decode_blocks_partial(&mut source, 0, 1, None, false)
+            .unwrap();
 
         assert_eq!(pd.blocks_decoded, 1);
         assert!(pd.stopped_at.is_none());
@@ -3455,7 +3868,7 @@ mod tests {
         let mut dec = FrameDecoder::new();
         dec.reset(&mut source).unwrap();
         let pd = dec
-            .decode_blocks_partial(&mut source, start_block, end_block)
+            .decode_blocks_partial(&mut source, start_block, end_block, None, false)
             .unwrap();
         assert!(pd.stopped_at.is_none());
 
@@ -3500,7 +3913,7 @@ mod tests {
         let mut dec = FrameDecoder::new();
         dec.reset(&mut source).unwrap();
         let pd = dec
-            .decode_blocks_partial(&mut source, nblocks + 5, u32::MAX)
+            .decode_blocks_partial(&mut source, nblocks + 5, u32::MAX, None, false)
             .unwrap();
         assert!(pd.data.is_empty(), "no in-range block → empty data");
         assert_eq!(pd.blocks_decoded, 0);
@@ -3529,7 +3942,9 @@ mod tests {
         let mut source = compressed.as_slice();
         let mut dec = FrameDecoder::new();
         dec.reset(&mut source).unwrap();
-        let pd = dec.decode_blocks_partial(&mut source, k, k).unwrap();
+        let pd = dec
+            .decode_blocks_partial(&mut source, k, k, None, false)
+            .unwrap();
 
         assert!(pd.data.is_empty(), "empty range must yield empty data");
         assert_eq!(pd.blocks_decoded, 0);
@@ -3572,11 +3987,612 @@ mod tests {
         let mut dec = FrameDecoder::new();
         dec.enable_per_block_checksums();
         dec.reset(&mut source).unwrap();
-        let _ = dec.decode_blocks_partial(&mut source, 0, u32::MAX).unwrap();
+        let _ = dec
+            .decode_blocks_partial(&mut source, 0, u32::MAX, None, false)
+            .unwrap();
         assert_eq!(
             dec.computed_block_checksums(),
             expected.as_slice(),
             "partial decode must capture the same per-block checksums as full decode"
+        );
+    }
+
+    // ── resume (window-priming + entropy cold resume, lsm) ───────────
+
+    /// Window size of `compressed`'s frame, read from a freshly-reset decoder.
+    #[cfg(feature = "lsm")]
+    fn frame_window_size(compressed: &[u8]) -> usize {
+        let mut src = compressed;
+        let mut dec = FrameDecoder::new();
+        dec.reset(&mut src).unwrap();
+        dec.state
+            .as_ref()
+            .unwrap()
+            .frame_header
+            .window_size()
+            .unwrap_or(0) as usize
+    }
+
+    /// Build a large compressible MULTI-SEGMENT frame (window_size < content,
+    /// so mid-frame blocks reach back only into a bounded window) and return
+    /// `(compressed, full_decode, emit_info)`.
+    #[cfg(feature = "lsm")]
+    fn multi_segment_block_fixture() -> (
+        Vec<u8>,
+        Vec<u8>,
+        crate::encoding::frame_emit_info::FrameEmitInfo,
+    ) {
+        // ~3 MiB of compressible (runs + repeated phrase) data — large enough
+        // that the encoder picks window_size < content_size (multi-segment).
+        let mut data: Vec<u8> = Vec::with_capacity(3 * 1024 * 1024);
+        let mut x = 0x9E37_79B9u32;
+        while data.len() < 3 * 1024 * 1024 {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            let run = 16 + (x as usize % 48);
+            let byte = (x >> 24) as u8;
+            for _ in 0..run {
+                data.push(byte);
+            }
+            data.extend_from_slice(b"the quick brown fox jumps over the lazy dog\n");
+        }
+
+        let mut compressed = Vec::new();
+        let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        compressor.set_source(data.as_slice());
+        compressor.set_drain(&mut compressed);
+        compressor.compress();
+        let info = compressor
+            .last_frame_emit_info()
+            .expect("emit info populated")
+            .clone();
+        drop(compressor);
+
+        // Confirm the precondition: the frame must be multi-segment.
+        let mut sanity = FrameDecoder::new();
+        sanity.init(&mut compressed.as_slice()).unwrap();
+        assert!(
+            !sanity
+                .state
+                .as_ref()
+                .unwrap()
+                .frame_header
+                .descriptor
+                .single_segment_flag(),
+            "fixture precondition: frame must be multi-segment (resize if encoder default changed)"
+        );
+
+        let mut dec = FrameDecoder::new();
+        let mut full = alloc::vec![0u8; data.len()];
+        let n = dec
+            .decode_all(compressed.as_slice(), &mut full)
+            .expect("full decode");
+        full.truncate(n);
+        assert_eq!(full, data, "fixture must round-trip");
+        (compressed, full, info)
+    }
+
+    /// Emit a [`ResumeState`] for resuming at block `n` by decoding `[0, n)` on
+    /// a throwaway decoder with `emit_resume = true`.
+    #[cfg(feature = "lsm")]
+    fn emit_resume_state_at(compressed: &[u8], n: u32) -> super::ResumeState {
+        let mut src = compressed;
+        let mut dec = FrameDecoder::new();
+        dec.reset(&mut src).unwrap();
+        let pd = dec
+            .decode_blocks_partial(&mut src, 0, n, None, true)
+            .expect("prefix decode for resume-state emission");
+        pd.resume_state
+            .expect("emit_resume should populate resume_state")
+    }
+
+    #[cfg(feature = "lsm")]
+    #[test]
+    fn resume_matches_full_decode_at_first_mid_last() {
+        // Acceptance criterion: after resuming at block N (cold decoder, primed
+        // window + restored entropy), decode_blocks_partial yields bytes
+        // byte-identical to a full decode's [ends[N-1]..ends[end-1]) slice, for
+        // N in {1, mid, last}. Repeat_Mode entropy blocks are covered because
+        // the emitted ResumeState carries the carry-over tables.
+        let (compressed, full, info) = multi_block_fixture();
+        let nblocks = info.blocks.len() as u32;
+        assert!(nblocks >= 4, "need several blocks, got {nblocks}");
+
+        for &n in &[1u32, nblocks / 2, nblocks - 1] {
+            // Producer: emit resume state for block n (separate decoder).
+            let st = emit_resume_state_at(&compressed, n);
+            assert_eq!(st.block_index(), n);
+            let output_offset = info.decompressed_byte_range(n as usize).unwrap().start;
+            assert_eq!(st.output_offset(), output_offset);
+
+            // Consumer: a FRESH (cold) decoder resumes at n. Pass the WHOLE
+            // decompressed prefix as window_prime; it is capped to one window
+            // internally, exercising the cap path.
+            let window_prime = &full[..output_offset as usize];
+            let mut header_src = compressed.as_slice();
+            let mut dec = FrameDecoder::new();
+            dec.reset(&mut header_src).unwrap();
+            // Caller positions the source at block n's compressed frame offset.
+            let off = info.blocks[n as usize].offset_in_frame as usize;
+            let mut block_src = &compressed[off..];
+            let pd = dec
+                .decode_blocks_partial(
+                    &mut block_src,
+                    n,
+                    u32::MAX,
+                    Some(super::ResumeInput {
+                        window_prime,
+                        state: &st,
+                    }),
+                    false,
+                )
+                .unwrap_or_else(|e| panic!("resume decode at N={n} errored: {e:?}"));
+
+            let start = output_offset as usize;
+            let end = info
+                .decompressed_byte_range((nblocks - 1) as usize)
+                .unwrap()
+                .end as usize;
+            assert_eq!(
+                pd.data.as_slice(),
+                &full[start..end],
+                "resumed bytes must equal the full-decode slice for N={n}"
+            );
+            assert_eq!(pd.start_block, n);
+            assert_eq!(pd.blocks_decoded, nblocks - n);
+            assert!(pd.stopped_at.is_none(), "clean resume at N={n}");
+            assert!(pd.frame_finished, "decoded through the last block");
+        }
+    }
+
+    #[cfg(feature = "lsm")]
+    #[test]
+    fn resume_with_exact_window_tail_matches_full_decode() {
+        // Realistic cold-resume shape on a MULTI-SEGMENT frame: caller supplies
+        // only the last `window_size` decompressed bytes (not the whole prefix),
+        // which is all that can ever back a match.
+        let (compressed, full, info) = multi_segment_block_fixture();
+        let nblocks = info.blocks.len() as u32;
+        let window_size = frame_window_size(&compressed);
+        // First block whose preceding output exceeds one window, so the tail
+        // genuinely truncates the prefix.
+        let n = (1..nblocks)
+            .find(|&i| {
+                info.decompressed_byte_range(i as usize).unwrap().start as usize > window_size
+            })
+            .expect("multi-segment frame must have a block past one window");
+        let st = emit_resume_state_at(&compressed, n);
+        let output_offset = info.decompressed_byte_range(n as usize).unwrap().start;
+        assert!(output_offset as usize > window_size);
+        let tail_start = output_offset as usize - window_size;
+        let window_prime = &full[tail_start..output_offset as usize];
+
+        let mut header_src = compressed.as_slice();
+        let mut dec = FrameDecoder::new();
+        dec.reset(&mut header_src).unwrap();
+        let off = info.blocks[n as usize].offset_in_frame as usize;
+        let mut block_src = &compressed[off..];
+        let pd = dec
+            .decode_blocks_partial(
+                &mut block_src,
+                n,
+                u32::MAX,
+                Some(super::ResumeInput {
+                    window_prime,
+                    state: &st,
+                }),
+                false,
+            )
+            .unwrap();
+
+        let end = info
+            .decompressed_byte_range((nblocks - 1) as usize)
+            .unwrap()
+            .end as usize;
+        assert_eq!(pd.data.as_slice(), &full[output_offset as usize..end]);
+        assert_eq!(pd.blocks_decoded, nblocks - n);
+    }
+
+    #[cfg(feature = "lsm")]
+    #[test]
+    fn resume_rejects_short_window_prime() {
+        // Acceptance criterion: a window_prime shorter than the required window
+        // is rejected with a typed error, not a silent mis-decode.
+        let (compressed, full, info) = multi_block_fixture();
+        let nblocks = info.blocks.len() as u32;
+        let window_size = frame_window_size(&compressed);
+        let n = nblocks / 2;
+        let st = emit_resume_state_at(&compressed, n);
+        let output_offset = info.decompressed_byte_range(n as usize).unwrap().start;
+        let required = core::cmp::min(window_size as u64, output_offset) as usize;
+        assert!(required > 0, "mid block must require a non-empty window");
+
+        // One byte short of the required window.
+        let prime = &full[output_offset as usize - (required - 1)..output_offset as usize];
+
+        let mut header_src = compressed.as_slice();
+        let mut dec = FrameDecoder::new();
+        dec.reset(&mut header_src).unwrap();
+        let off = info.blocks[n as usize].offset_in_frame as usize;
+        let mut block_src = &compressed[off..];
+        let err = dec
+            .decode_blocks_partial(
+                &mut block_src,
+                n,
+                u32::MAX,
+                Some(super::ResumeInput {
+                    window_prime: prime,
+                    state: &st,
+                }),
+                false,
+            )
+            .expect_err("short window_prime must be rejected");
+        match err {
+            crate::decoding::errors::FrameDecoderError::ResumeWindowTooShort { got, need } => {
+                assert_eq!(got, required - 1);
+                assert_eq!(need, required);
+            }
+            other => panic!("expected ResumeWindowTooShort, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "lsm")]
+    #[test]
+    fn resume_range_validates_against_effective_start_not_start_block() {
+        // In resume mode `start_block` is ignored and decoding begins at
+        // `state.block_index()`. The range guard must therefore validate the
+        // EFFECTIVE start against `end_block`: `end_block` below the resume
+        // block is an inverted range and must error, not silently return an
+        // empty decode. Caller passes the conventional ignored `start_block = 0`.
+        let (compressed, _full, info) = multi_block_fixture();
+        let nblocks = info.blocks.len() as u32;
+        let n = (nblocks / 2).max(2);
+        let st = emit_resume_state_at(&compressed, n);
+        let output_offset = info.decompressed_byte_range(n as usize).unwrap().start;
+
+        let mut header_src = compressed.as_slice();
+        let mut dec = FrameDecoder::new();
+        dec.reset(&mut header_src).unwrap();
+        let off = info.blocks[n as usize].offset_in_frame as usize;
+        let mut block_src = &compressed[off..];
+        // end_block = n - 1 is below the resume block n → inverted range.
+        let err = dec
+            .decode_blocks_partial(
+                &mut block_src,
+                0,
+                n - 1,
+                Some(super::ResumeInput {
+                    window_prime: &_full[..output_offset as usize],
+                    state: &st,
+                }),
+                false,
+            )
+            .expect_err("end_block below the resume block must be an inverted range");
+        match err {
+            crate::decoding::errors::FrameDecoderError::InvalidBlockRange {
+                start_block,
+                end_block,
+            } => {
+                assert_eq!(start_block, n, "error must report the effective start");
+                assert_eq!(end_block, n - 1);
+            }
+            other => panic!("expected InvalidBlockRange, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "lsm")]
+    #[test]
+    fn resume_rejects_state_from_a_different_frame() {
+        // A ResumeState captured from one frame must not be applied to a frame
+        // with a different decode shape (window size / single-segment / dict):
+        // restoring foreign entropy tables would yield byte-wrong output. The
+        // frame-identity guard must reject it up front with a typed error.
+        let (frame_a, _full_a, info_a) = multi_block_fixture();
+        let (frame_b, full_b, _info_b) = multi_segment_block_fixture();
+        // Sanity: the two fixtures must differ in decode shape for the guard to
+        // be exercised (single-segment vs multi-segment here).
+        let st = emit_resume_state_at(&frame_a, (info_a.blocks.len() as u32 / 2).max(1));
+
+        let mut header_src = frame_b.as_slice();
+        let mut dec = FrameDecoder::new();
+        dec.reset(&mut header_src).unwrap();
+        // The frame-key check runs before the window-length check, so even a
+        // valid-length window_prime for frame B is rejected on identity.
+        let err = dec
+            .decode_blocks_partial(
+                &mut frame_b.as_slice(),
+                st.block_index(),
+                u32::MAX,
+                Some(super::ResumeInput {
+                    window_prime: &full_b,
+                    state: &st,
+                }),
+                false,
+            )
+            .expect_err("resume state from a different frame must be rejected");
+        assert!(
+            matches!(
+                err,
+                crate::decoding::errors::FrameDecoderError::ResumeFrameMismatch
+            ),
+            "expected ResumeFrameMismatch, got {err:?}"
+        );
+    }
+
+    #[cfg(all(feature = "lsm", feature = "hash"))]
+    #[test]
+    fn resume_rejects_wrong_window_prime_content() {
+        // Same frame (FrameKey matches) but the caller supplies a window_prime
+        // with one byte flipped. The shape key cannot catch this; the
+        // content-exact XXH64 of the window must, rejecting before any restore
+        // rather than mis-resolving matches against corrupted history.
+        let (compressed, full, info) = multi_block_fixture();
+        let nblocks = info.blocks.len() as u32;
+        let n = (nblocks / 2).max(1);
+        let st = emit_resume_state_at(&compressed, n);
+        let output_offset = info.decompressed_byte_range(n as usize).unwrap().start as usize;
+        assert!(output_offset > 0);
+
+        // Correct prefix with the last byte corrupted (this byte is inside the
+        // window the resume block reaches back into).
+        let mut corrupted = full[..output_offset].to_vec();
+        let last = corrupted.len() - 1;
+        corrupted[last] ^= 0xFF;
+
+        let mut header_src = compressed.as_slice();
+        let mut dec = FrameDecoder::new();
+        dec.reset(&mut header_src).unwrap();
+        let off = info.blocks[n as usize].offset_in_frame as usize;
+        let mut block_src = &compressed[off..];
+        let err = dec
+            .decode_blocks_partial(
+                &mut block_src,
+                n,
+                u32::MAX,
+                Some(super::ResumeInput {
+                    window_prime: &corrupted,
+                    state: &st,
+                }),
+                false,
+            )
+            .expect_err("corrupted window_prime must be rejected by content hash");
+        assert!(
+            matches!(
+                err,
+                crate::decoding::errors::FrameDecoderError::ResumeFrameMismatch
+            ),
+            "expected ResumeFrameMismatch, got {err:?}"
+        );
+    }
+
+    #[cfg(feature = "lsm")]
+    #[test]
+    fn resume_rejects_state_with_different_active_dictionary() {
+        // A dictless-header frame can be decoded with an explicit dictionary
+        // applied at runtime (force_dict / reset_with_dict_handle). Two such
+        // decodes differ in entropy/repcode/dict context even though the header
+        // dictionary_id is identically absent, so the resume guard must key on
+        // the ACTIVE dictionary, not just the header field. Here the snapshot is
+        // captured with no active dictionary; resuming with one applied must be
+        // rejected before any state is restored.
+        let (compressed, full, info) = multi_block_fixture();
+        let nblocks = info.blocks.len() as u32;
+        let n = (nblocks / 2).max(1);
+        let st = emit_resume_state_at(&compressed, n); // active_dictionary_id = None
+        let output_offset = info.decompressed_byte_range(n as usize).unwrap().start as usize;
+
+        let raw = std::fs::read("./dict_tests/dictionary").expect("dictionary fixture");
+        let dict = crate::decoding::dictionary::Dictionary::decode_dict(&raw).expect("parse dict");
+        let dict_id = dict.id;
+
+        let mut header_src = compressed.as_slice();
+        let mut dec = FrameDecoder::new();
+        dec.add_dict(dict).unwrap();
+        dec.reset(&mut header_src).unwrap();
+        dec.force_dict(dict_id).unwrap(); // active_dictionary_id = Some(dict_id)
+        let off = info.blocks[n as usize].offset_in_frame as usize;
+        let mut block_src = &compressed[off..];
+        let err = dec
+            .decode_blocks_partial(
+                &mut block_src,
+                n,
+                u32::MAX,
+                Some(super::ResumeInput {
+                    window_prime: &full[..output_offset],
+                    state: &st,
+                }),
+                false,
+            )
+            .expect_err("resume with a different active dictionary must be rejected");
+        assert!(
+            matches!(
+                err,
+                crate::decoding::errors::FrameDecoderError::ResumeFrameMismatch
+            ),
+            "expected ResumeFrameMismatch, got {err:?}"
+        );
+    }
+
+    #[cfg(feature = "lsm")]
+    #[test]
+    fn resume_invalid_range_does_not_mutate_decoder_state() {
+        // An inverted effective range must be rejected WITHOUT priming the
+        // decoder: no entropy restore, no window prime, no cursor advance. As
+        // written before the fix, those mutations ran before the range check,
+        // leaving the decoder in a synthetic resumed state on the error path.
+        let (compressed, full, info) = multi_block_fixture();
+        let nblocks = info.blocks.len() as u32;
+        let n = (nblocks / 2).max(2);
+        let st = emit_resume_state_at(&compressed, n);
+        let output_offset = info.decompressed_byte_range(n as usize).unwrap().start as usize;
+
+        let mut header_src = compressed.as_slice();
+        let mut dec = FrameDecoder::new();
+        dec.reset(&mut header_src).unwrap();
+        // Freshly reset: cursor at block 0.
+        assert_eq!(dec.state.as_ref().unwrap().block_counter, 0);
+
+        let off = info.blocks[n as usize].offset_in_frame as usize;
+        let mut block_src = &compressed[off..];
+        let err = dec
+            .decode_blocks_partial(
+                &mut block_src,
+                0,
+                n - 1, // below the resume block → inverted range
+                Some(super::ResumeInput {
+                    window_prime: &full[..output_offset],
+                    state: &st,
+                }),
+                false,
+            )
+            .expect_err("inverted range must error");
+        assert!(matches!(
+            err,
+            crate::decoding::errors::FrameDecoderError::InvalidBlockRange { .. }
+        ));
+        assert_eq!(
+            dec.state.as_ref().unwrap().block_counter,
+            0,
+            "error path must not advance the cursor (validate before priming)"
+        );
+    }
+
+    #[cfg(feature = "lsm")]
+    #[test]
+    fn emit_resume_state_absent_on_terminal_block() {
+        // When a decode reaches the frame's last block there is no "next block"
+        // to resume at: the snapshot's block_index would be one past EOF and the
+        // caller has no offset_in_frame for it. emit_resume must therefore yield
+        // None on the terminal block, not a dangling snapshot.
+        let (compressed, _full, info) = multi_block_fixture();
+        let nblocks = info.blocks.len() as u32;
+        let mut src = compressed.as_slice();
+        let mut dec = FrameDecoder::new();
+        dec.reset(&mut src).unwrap();
+        let pd = dec
+            .decode_blocks_partial(&mut src, 0, nblocks, None, true)
+            .unwrap();
+        assert!(pd.frame_finished, "decode must reach the last block");
+        assert!(
+            pd.resume_state.is_none(),
+            "no resume state past the frame's last block"
+        );
+    }
+
+    #[cfg(feature = "lsm")]
+    #[test]
+    fn emit_resume_state_absent_when_not_requested() {
+        // Default partial decode (emit_resume = false) must NOT pay the entropy
+        // clone: resume_state stays None.
+        let (compressed, _full, info) = multi_block_fixture();
+        let nblocks = info.blocks.len() as u32;
+        let mut src = compressed.as_slice();
+        let mut dec = FrameDecoder::new();
+        dec.reset(&mut src).unwrap();
+        let pd = dec
+            .decode_blocks_partial(&mut src, 0, nblocks, None, false)
+            .unwrap();
+        assert!(
+            pd.resume_state.is_none(),
+            "resume_state must be None unless emit_resume is set"
+        );
+    }
+
+    #[cfg(feature = "lsm")]
+    #[test]
+    fn resume_grow_loop_reconstructs_full() {
+        // The motivating scenario: a symmetric one-call grow-loop. Each call
+        // takes the previous ResumeState and emits the next, decoding only the
+        // new extent — concatenated, the extents reconstruct the full output
+        // with no prefix ever re-decompressed.
+        let (compressed, full, info) = multi_block_fixture();
+        let nblocks = info.blocks.len() as u32;
+        assert!(nblocks >= 4);
+
+        // Walk the frame in extents of `step` blocks each.
+        let step = (nblocks / 3).max(1);
+        let mut combined: Vec<u8> = Vec::new();
+        let mut next: u32 = 0;
+        let mut carry: Option<super::ResumeState> = None;
+
+        while next < nblocks {
+            let end = (next + step).min(nblocks);
+            let mut dec = FrameDecoder::new();
+            let mut header_src = compressed.as_slice();
+            dec.reset(&mut header_src).unwrap();
+
+            let off = info.blocks[next as usize].offset_in_frame as usize;
+            let mut block_src = &compressed[off..];
+
+            let output_offset = info.decompressed_byte_range(next as usize).unwrap().start;
+            let pd = if let Some(st) = carry.as_ref() {
+                // Resume from the prior extent's state (cold: fresh decoder).
+                let window_prime = &full[..output_offset as usize];
+                dec.decode_blocks_partial(
+                    &mut block_src,
+                    next,
+                    end,
+                    Some(super::ResumeInput {
+                        window_prime,
+                        state: st,
+                    }),
+                    true,
+                )
+                .unwrap()
+            } else {
+                // First extent: no resume input, just emit for the next.
+                dec.decode_blocks_partial(&mut block_src, next, end, None, true)
+                    .unwrap()
+            };
+
+            combined.extend_from_slice(&pd.data);
+            carry = pd.resume_state;
+            next = end;
+        }
+
+        assert_eq!(
+            combined, full,
+            "grow-loop extents must reconstruct the full output"
+        );
+    }
+
+    #[cfg(all(feature = "lsm", feature = "hash"))]
+    #[test]
+    fn resume_does_not_redecode_prefix_blocks() {
+        // Instrumented confirmation that blocks < N are not re-decoded on
+        // resume. With per-block checksums enabled on the resuming decoder, the
+        // resumed decode must record exactly one digest per in-range block
+        // (end - N), never one per frame block.
+        let (compressed, full, info) = multi_block_fixture();
+        let nblocks = info.blocks.len() as u32;
+        let n = nblocks / 2;
+        let st = emit_resume_state_at(&compressed, n);
+        let output_offset = info.decompressed_byte_range(n as usize).unwrap().start;
+
+        let mut header_src = compressed.as_slice();
+        let mut dec = FrameDecoder::new();
+        dec.enable_per_block_checksums();
+        dec.reset(&mut header_src).unwrap();
+        let off = info.blocks[n as usize].offset_in_frame as usize;
+        let mut block_src = &compressed[off..];
+        let _ = dec
+            .decode_blocks_partial(
+                &mut block_src,
+                n,
+                u32::MAX,
+                Some(super::ResumeInput {
+                    window_prime: &full[..output_offset as usize],
+                    state: &st,
+                }),
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(
+            dec.computed_block_checksums().len() as u32,
+            nblocks - n,
+            "resume must decode only in-range blocks, not re-decode the prefix"
         );
     }
 }
