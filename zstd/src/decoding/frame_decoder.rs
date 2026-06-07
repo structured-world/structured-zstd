@@ -4394,6 +4394,28 @@ mod tests {
 
     #[cfg(feature = "lsm")]
     #[test]
+    fn emit_resume_state_absent_on_terminal_block() {
+        // When a decode reaches the frame's last block there is no "next block"
+        // to resume at: the snapshot's block_index would be one past EOF and the
+        // caller has no offset_in_frame for it. emit_resume must therefore yield
+        // None on the terminal block, not a dangling snapshot.
+        let (compressed, _full, info) = multi_block_fixture();
+        let nblocks = info.blocks.len() as u32;
+        let mut src = compressed.as_slice();
+        let mut dec = FrameDecoder::new();
+        dec.reset(&mut src).unwrap();
+        let pd = dec
+            .decode_blocks_partial(&mut src, 0, nblocks, None, true)
+            .unwrap();
+        assert!(pd.frame_finished, "decode must reach the last block");
+        assert!(
+            pd.resume_state.is_none(),
+            "no resume state past the frame's last block"
+        );
+    }
+
+    #[cfg(feature = "lsm")]
+    #[test]
     fn emit_resume_state_absent_when_not_requested() {
         // Default partial decode (emit_resume = false) must NOT pay the entropy
         // clone: resume_state stays None.
