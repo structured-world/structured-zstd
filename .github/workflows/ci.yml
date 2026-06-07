@@ -36,6 +36,29 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  changes:
+    # Cheap path probe (~10s) consumed by the bench pipeline gate below.
+    # Bench numbers (Rust vs C FFI) can only move when the core crate,
+    # the workspace manifests that pin deps / profiles, or the toolchain
+    # file change. A push touching ONLY wasm / npm / ts / js / CI / docs
+    # cannot move them, so `bench-matrix` (and its whole downstream
+    # cascade) is skipped on such pushes — see the gate on that job.
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    outputs:
+      rust_core: ${{ steps.filter.outputs.rust_core }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            rust_core:
+              - 'zstd/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+
   lint:
     timeout-minutes: 10
     runs-on: ubuntu-latest
@@ -386,9 +409,15 @@ jobs:
     # (`bench-build`, `benchmark`, `benchmark-aggregate`, `benchmark-pages`)
     # stays green-skipped on PRs without each needing its own filter.
     # See #164 (sharding) and #362 (push-only gate).
+    #
+    # Second gate: `needs.changes.outputs.rust_core`. A push to main that
+    # touched ONLY wasm / npm / ts / js / CI / docs cannot move the
+    # Rust-vs-FFI numbers, so the bench pipeline is skipped on it (the
+    # published dashboard snapshot stays the last Rust-core baseline).
+    # Same cascade — skipping `bench-matrix` skips every downstream bench job.
     name: Resolve bench target matrix
-    needs: lint
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [lint, changes]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.rust_core == 'true'
     runs-on: ubuntu-latest
     outputs:
       targets: ${{ steps.set.outputs.targets }}

@@ -21,6 +21,7 @@ async function loadOurPayload(dir) {
     decompress: glue.decompress,
     compressUsingDict: glue.compressUsingDict,
     decompressUsingDict: glue.decompressUsingDict,
+    CompressStreamCtor: glue.ZstdCompressStream,
   };
 }
 
@@ -192,6 +193,51 @@ for (const [scenario, data] of dictSamples) {
         ` | c: simd ${fmtNs(s.cNs)}(${x(s)}x) scalar ${fmtNs(sc.cNs)}(${x(sc)}x) boku ${fmtNs(b.cNs)}` +
         ` | d: simd ${fmtNs(s.dNs)}(${xd(s)}x) scalar ${fmtNs(sc.dNs)}(${xd(sc)}x) boku ${fmtNs(b.dNs)}`,
     );
+  }
+}
+
+// --- Streaming compress: incremental push/finish vs one-shot compress -------
+// Times our block-flush streaming encoder (O(window) peak) against the one-shot
+// compress for the same payload, so the streaming overhead is visible. Uses a
+// fixed 64 KiB push granularity (a realistic chunk for a network/file stream);
+// bokuweb has no symmetric streaming-compress surface, so this measures ours
+// only. Round-trip is verified before timing.
+const STREAM_CHUNK = 64 * 1024;
+function streamCompressOnce(ctor, data, level) {
+  const s = new ctor(level);
+  const parts = [];
+  for (let i = 0; i < data.length; i += STREAM_CHUNK) {
+    parts.push(s.push(data.subarray(i, Math.min(i + STREAM_CHUNK, data.length))));
+  }
+  parts.push(s.finish());
+  s.free();
+  const total = parts.reduce((n, p) => n + p.length, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) { out.set(p, off); off += p.length; }
+  return out;
+}
+console.log("\n=== streaming compress (push/finish, 64 KiB chunks) vs one-shot ===");
+console.log("(x = streaming/one-shot time; ratio = framed/input, our two payloads)");
+for (const [scenario, data] of fixtures) {
+  for (const level of LEVELS) {
+    const line = [`${scenario.padEnd(22)} L${String(level).padStart(2)}`];
+    for (const tier of ["ours-simd128", "ours-scalar"]) {
+      const eng = engines[tier];
+      const streamed = streamCompressOnce(eng.CompressStreamCtor, data, level);
+      const ok = eq(eng.decompress(streamed), data);
+      if (!ok) { rows.push({ scenario, level, name: `${tier}-stream`, ok: false }); }
+      const sNs = medianNsPerOp(() => streamCompressOnce(eng.CompressStreamCtor, data, level), BUDGET_MS);
+      const oNs = medianNsPerOp(() => eng.compress(data, level), BUDGET_MS);
+      const ratio = streamed.length / Math.max(1, data.length);
+      console.log(
+        `REPORT_STREAM scenario=${scenario} engine=${tier} level=${level} ` +
+          `input_bytes=${data.length} framed_bytes=${streamed.length} ratio=${ratio.toFixed(6)} ` +
+          `stream_ns=${sNs} oneshot_ns=${oNs} roundtrip=${ok ? "ok" : "FAIL"}`,
+      );
+      line.push(`${tier.replace("ours-", "")}: ${fmtNs(sNs)}(${(sNs / oNs).toFixed(2)}x) r=${ratio.toFixed(4)}`);
+    }
+    console.log("  " + line.join("  |  "));
   }
 }
 

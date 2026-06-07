@@ -1312,6 +1312,41 @@ mod tests {
         }
     }
 
+    /// Level 22 advertises the largest default window (`window_log 27` =
+    /// 128 MiB). Because streaming omits FCS, that window is written verbatim
+    /// into the frame header — so the encoder's max window MUST NOT exceed the
+    /// decoder's [`crate::common::MAXIMUM_ALLOWED_WINDOW_SIZE`], or our own
+    /// decoder rejects our own frame with `WindowSizeTooBig`. Regression for
+    /// the encoder↔decoder window-cap mismatch: streaming L22 must round-trip
+    /// through `StreamingDecoder` (and, implicitly, any stock zstd decoder,
+    /// which accepts up to the same 128 MiB default).
+    #[test]
+    fn level_22_streaming_window_roundtrips_in_our_decoder() {
+        let payload = b"level-22-streaming-window-cap-".repeat(512);
+        let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::from_level(22));
+        for chunk in payload.chunks(101) {
+            encoder.write_all(chunk).unwrap();
+        }
+        let compressed = encoder.finish().unwrap();
+
+        // The advertised window equals the L22 default (128 MiB) and must sit
+        // at or below the decoder cap — otherwise the round-trip below fails.
+        let header = crate::decoding::frame::read_frame_header(compressed.as_slice())
+            .unwrap()
+            .0;
+        let window = header.window_size().unwrap();
+        assert!(
+            window <= crate::common::MAXIMUM_ALLOWED_WINDOW_SIZE,
+            "L22 advertised window {window} exceeds decoder cap {}",
+            crate::common::MAXIMUM_ALLOWED_WINDOW_SIZE,
+        );
+
+        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, payload);
+    }
+
     #[test]
     fn no_pledged_size_omits_fcs_from_header() {
         let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Fastest);
