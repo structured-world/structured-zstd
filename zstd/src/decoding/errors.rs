@@ -656,6 +656,33 @@ pub enum FrameDecoderError {
         start_block: u32,
         end_block: u32,
     },
+    /// A resuming [`FrameDecoder::decode_blocks_partial`] was given a
+    /// `window_prime` (via [`ResumeInput`]) shorter than the match window the
+    /// resume block can reach back into. The resumed decode would read past the
+    /// primed history and silently mis-resolve matches, so it is rejected up
+    /// front. `got` is the supplied prime length; `need` is the required
+    /// minimum (`min(window_size, output_offset)`).
+    ///
+    /// [`FrameDecoder::decode_blocks_partial`]: crate::decoding::FrameDecoder::decode_blocks_partial
+    /// [`ResumeInput`]: crate::decoding::ResumeInput
+    #[cfg(feature = "lsm")]
+    ResumeWindowTooShort {
+        got: usize,
+        need: usize,
+    },
+    /// A resuming [`FrameDecoder::decode_blocks_partial`] was given a
+    /// [`ResumeInput`] whose [`ResumeState`] was captured from a frame with a
+    /// different decode-relevant shape (window size, dictionary id,
+    /// single-segment flag, content-checksum flag, or magicless mode) than the
+    /// frame currently [`reset`](crate::decoding::FrameDecoder::reset) into the
+    /// decoder. Applying entropy/repcode state across mismatched frames would
+    /// yield byte-wrong output, so it is rejected up front.
+    ///
+    /// [`FrameDecoder::decode_blocks_partial`]: crate::decoding::FrameDecoder::decode_blocks_partial
+    /// [`ResumeInput`]: crate::decoding::ResumeInput
+    /// [`ResumeState`]: crate::decoding::ResumeState
+    #[cfg(feature = "lsm")]
+    ResumeFrameMismatch,
 }
 
 #[cfg(feature = "std")]
@@ -811,6 +838,20 @@ impl core::fmt::Display for FrameDecoderError {
                 write!(
                     f,
                     "Invalid block range for partial decode: start_block {start_block} > end_block {end_block}"
+                )
+            }
+            #[cfg(feature = "lsm")]
+            FrameDecoderError::ResumeWindowTooShort { got, need } => {
+                write!(
+                    f,
+                    "resume window_prime too short: got {got} bytes, need at least {need}"
+                )
+            }
+            #[cfg(feature = "lsm")]
+            FrameDecoderError::ResumeFrameMismatch => {
+                write!(
+                    f,
+                    "resume state was captured from a frame with a different decode shape than the current frame"
                 )
             }
         }

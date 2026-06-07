@@ -3522,7 +3522,7 @@ mod tests {
                 let mut pdec = FrameDecoder::new();
                 pdec.reset(&mut psrc).unwrap();
                 let pd = pdec
-                    .decode_blocks_partial(&mut psrc, i as u32, i as u32 + 1)
+                    .decode_blocks_partial(&mut psrc, i as u32, i as u32 + 1, None, false)
                     .unwrap();
                 assert!(
                     pd.stopped_at.is_none(),
@@ -3625,7 +3625,7 @@ mod tests {
             let mut pdec = FrameDecoder::new();
             pdec.reset(&mut psrc).unwrap();
             let pd = pdec
-                .decode_blocks_partial(&mut psrc, i as u32, i as u32 + 1)
+                .decode_blocks_partial(&mut psrc, i as u32, i as u32 + 1, None, false)
                 .unwrap();
             assert!(pd.stopped_at.is_none(), "block {i} must decode cleanly");
             assert_eq!(

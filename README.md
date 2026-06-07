@@ -203,13 +203,18 @@ exposes a typed `SkippableFrame` API
 (`structured_zstd::skippable`) for storage-format authors who need
 to interleave application metadata with zstd data, plus a
 block-subset partial decoder: `FrameDecoder::decode_blocks_partial(src,
-start_block, end_block)` decodes only the inner blocks covering a
-requested range (skipping the trailing ones) and preserves the clean
-prefix on a corrupt block, while
+start_block, end_block, resume, emit_resume)` decodes only the inner
+blocks covering a requested range (skipping the trailing ones) and
+preserves the clean prefix on a corrupt block, while
 `FrameEmitInfo::decompressed_byte_range(block_index)` returns the
 decompressed byte range of a given block, so a range query can locate
-which inner blocks cover a target byte window. Enable on the command
-line:
+which inner blocks cover a target byte window. For incremental /
+resumable decoding, pass `emit_resume = true` to capture a `ResumeState`
+(cross-block entropy tables + repcode history + next-block coordinates)
+in `PartialDecode::resume_state`, then feed it back via the `resume`
+argument (`ResumeInput { window_prime, state }`) to continue from a later
+block WITHOUT re-decompressing the prefix — even across a dropped (cold)
+decoder. Enable on the command line:
 
 ```bash
 cargo add structured-zstd --features lsm

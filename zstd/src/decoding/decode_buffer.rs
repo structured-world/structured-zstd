@@ -930,6 +930,35 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         }
     }
 
+    /// Prime the match window for a resumed partial decode.
+    ///
+    /// Loads `prefix` (the caller's already-decompressed tail) as the buffer's
+    /// initial history so subsequent in-range blocks resolve their match copies
+    /// against it without re-decompressing the skipped prefix, and sets the
+    /// produced-byte counter to `total_output` (the true cumulative
+    /// decompressed length before the resume block). The counter governs the
+    /// `repeat_from_dict` reachability gate, so setting it to the real value —
+    /// not just `prefix.len()` — keeps a dictionary-backed frame's match
+    /// resolution byte-identical to a non-resumed decode, and closes the
+    /// dictionary off for mid-frame resumes where it is out of window.
+    ///
+    /// The caller must have already capped `prefix` to the last `window_size`
+    /// bytes (only those can ever back a match) and validated its length.
+    #[cfg(feature = "lsm")]
+    pub(crate) fn prime_window(&mut self, prefix: &[u8], total_output: u64) {
+        self.buffer.extend(prefix);
+        self.total_output_counter = total_output;
+    }
+
+    /// Total decompressed bytes produced so far. Incremented by
+    /// `push`/`repeat`/`extend_and_fill`; window drops and drains do NOT
+    /// decrement it, so it equals the cumulative decompressed length even after
+    /// the visible buffer has been bounded to `window_size`.
+    #[cfg(feature = "lsm")]
+    pub(crate) fn total_output(&self) -> u64 {
+        self.total_output_counter
+    }
+
     /// drain the buffer completely
     pub fn drain(&mut self) -> Vec<u8> {
         let (slice1, slice2) = self.buffer.as_slices();

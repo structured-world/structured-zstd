@@ -24,7 +24,17 @@ wasm-bindgen = "0.2"
 # Pull the core codec with no default features (no std) and the simd128 kernel
 # tier. The actual SIMD selection is compile-time via `-C target-feature`:
 # the +simd128 payload engages it, the scalar payload does not.
-structured-zstd = { path = "../zstd", default-features = false, features = ["kernel_simd128"] }
+#
+# Floating `version = "0"` (NOT an exact pin) so `cargo package`'s
+# "all deps must have a version requirement" check passes without ANY
+# per-release update: `^0` matches every `0.x.x` (0.0.31, 0.1.1, ...), so it
+# survives the 0.0 -> 0.1 transition too; only the eventual 1.0.0 boundary
+# would ever need a one-time bump. This crate is `release = false`, so
+# release-plz never rewrites the requirement for us, and an exact pin would
+# go stale on the next core bump and break packaging again. The requirement
+# is purely ceremonial: `path` always wins for local/workspace builds and
+# this crate is never published to crates.io.
+structured-zstd = { version = "0", path = "../zstd", default-features = false, features = ["kernel_simd128"] }
 
 # Size-tuned wasm-pack release profile: optimise for size + a wasm-opt -Oz
 # post-pass, since payload bytes are the budget for a published wasm module.
