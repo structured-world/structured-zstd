@@ -265,22 +265,6 @@ const ROW_L5: RowConfig = RowConfig {
     mls: ROW_MIN_MATCH_LEN,
 };
 
-// Level-8 lazy2 routed to the Row finder (donor `useRowMatchFinder`: the row
-// finder is enabled by default for greedy/lazy/lazy2 whenever windowLog > 14,
-// which holds for every lazy level here). Donor `clevels.h` L8 (srcSize > 256
-// KB) is searchLog=4, targetLength=16, minMatch=5, from which the row matcher
-// derives rowLog = clamp(searchLog, 4, 6) = 4, search_depth = 1 << min(searchLog,
-// rowLog) = 16, target_len = 16. Replaces the legacy HashChain config so the
-// bounded row dual-probe (and its dict attach) runs instead of the unbounded
-// hash-chain dict walk.
-const ROW_L8: RowConfig = RowConfig {
-    hash_bits: ROW_HASH_BITS,
-    row_log: 4,
-    search_depth: 16,
-    target_len: 16,
-    mls: ROW_MIN_MATCH_LEN,
-};
-
 /// Per-level Double-Fast hash sizing, mirroring the donor `clevels.h` columns
 /// (config-driven, not a hardcoded constant): `long_hash_log` =
 /// `cParams.hashLog` (the long 8-byte hash table), `short_hash_log` =
@@ -402,6 +386,8 @@ impl LevelParams {
                     Some(2)
                 }
             }
+            // btlazy2 rides the same lazy2 split code (3).
+            super::strategy::StrategyTag::Btlazy2 => Some(3),
             super::strategy::StrategyTag::BtOpt
             | super::strategy::StrategyTag::BtUltra
             | super::strategy::StrategyTag::BtUltra2 => Some(4),
@@ -536,6 +522,8 @@ fn ldm_strategy_ordinal(tag: super::strategy::StrategyTag, lazy_depth: u8) -> u3
                 4
             }
         }
+        // Donor `ZSTD_btlazy2` ordinal.
+        StrategyTag::Btlazy2 => 6,
         StrategyTag::BtOpt => 7,
         StrategyTag::BtUltra => 8,
         StrategyTag::BtUltra2 => 9,
@@ -633,7 +621,7 @@ const LEVEL_TABLE: [LevelParams; 22] = [
     /* 5 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Greedy, search: super::strategy::SearchMethod::RowHash, window_log: 21, lazy_depth: 0, fast: None, dfast: None, hc: None, row: Some(ROW_L5) },
     /* 6 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 21, lazy_depth: 1, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 19, chain_log: 18, search_depth: 8,  target_len: 4 }), row: None },
     /* 7 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 21, lazy_depth: 1, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 20, chain_log: 19, search_depth: 16, target_len: 8 }), row: None },
-    /* 8 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::RowHash, window_log: 21, lazy_depth: 2, fast: None, dfast: None, hc: None, row: Some(ROW_L8) },
+    /* 8 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 21, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 20, chain_log: 19, search_depth: 16, target_len: 16 }), row: None },
     /* 9 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 21, chain_log: 20, search_depth: 16, target_len: 16 }), row: None },
     /*10 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 16 }), row: None },
     /*11 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 21, search_depth: 64, target_len: 16 }), row: None },
@@ -646,9 +634,9 @@ const LEVEL_TABLE: [LevelParams; 22] = [
     // smaller searchLog find longer matches (and re-establish a strict ratio
     // ladder above L12) is tracked separately; until it lands these levels sit
     // close to L12 on hash-chain inputs by design.
-    /*13 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 22, search_depth: 16, target_len: 32 }), row: None },
-    /*14 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 23, chain_log: 22, search_depth: 32, target_len: 32 }), row: None },
-    /*15 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 23, chain_log: 23, search_depth: 64, target_len: 32 }), row: None },
+    /*13 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Btlazy2, search: super::strategy::SearchMethod::BinaryTree, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 22, search_depth: 16, target_len: 32 }), row: None },
+    /*14 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Btlazy2, search: super::strategy::SearchMethod::BinaryTree, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 23, chain_log: 22, search_depth: 32, target_len: 32 }), row: None },
+    /*15 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Btlazy2, search: super::strategy::SearchMethod::BinaryTree, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 23, chain_log: 23, search_depth: 64, target_len: 32 }), row: None },
     /*16 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtOpt, search: super::strategy::SearchMethod::BinaryTree, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 22, search_depth: 32, target_len: 48 }), row: None },
     /*17 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtOpt, search: super::strategy::SearchMethod::BinaryTree, window_log: 23, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 23, search_depth: 32, target_len: 64 }), row: None },
     /*18 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra, search: super::strategy::SearchMethod::BinaryTree, window_log: 23, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 23, search_depth: 64, target_len: 64 }), row: None },
@@ -2323,6 +2311,9 @@ impl Matcher for MatchGeneratorDriver {
                     .start_matching_lazy(&mut handle_sequence);
             }
             SearchMethod::BinaryTree => match self.strategy_tag {
+                StrategyTag::Btlazy2 => self
+                    .hc_matcher_mut()
+                    .start_matching_btlazy2(&mut handle_sequence),
                 StrategyTag::BtOpt => self.compress_block::<strategy::BtOpt>(&mut handle_sequence),
                 StrategyTag::BtUltra => {
                     self.compress_block::<strategy::BtUltra>(&mut handle_sequence)
@@ -2331,7 +2322,7 @@ impl Matcher for MatchGeneratorDriver {
                     self.compress_block::<strategy::BtUltra2>(&mut handle_sequence)
                 }
                 _ => unreachable!(
-                    "SearchMethod::BinaryTree requires an opt strategy tag (BtOpt/BtUltra/BtUltra2)"
+                    "SearchMethod::BinaryTree requires a BT strategy tag (Btlazy2/BtOpt/BtUltra/BtUltra2)"
                 ),
             },
         }
@@ -2631,6 +2622,94 @@ pub(crate) use bt_insert_step_no_rebase_body;
 /// (`ACCURATE_PRICE`, `FAVOR_SMALL_OFFSETS`) come from the wrapper's
 /// generic parameter list and are referenced as bare identifiers; macro
 /// hygiene resolves them at the expansion site.
+/// Per-kernel body of the `btlazy2` (levels 13-15) greedy/lazy parse over
+/// the binary-tree match finder. Mirrors `build_optimal_plan_impl_body!`'s
+/// kernel-dispatch discipline: the wrapper carries the `#[target_feature]`
+/// umbrella and passes its tier-specific `collect_optimal_candidates_initialized_<kernel>`
+/// as `$collect`, so the per-position BT collect (and its inlined cpl)
+/// stays under one umbrella — the runtime `select_kernel()` dispatch happens
+/// ONCE per block in the bare `start_matching_btlazy2`, never per position.
+macro_rules! start_matching_btlazy2_body {
+    ($self:ident, $handle_sequence:ident, $collect:ident $(,)?) => {{
+        $self.table.ensure_tables();
+        let current_len = *$self.table.chunk_lens.back().unwrap();
+        if current_len == 0 {
+            return;
+        }
+        let current_ptr = $self.table.get_last_space().as_ptr();
+        // Mutates tables but never reallocates `history`, so this tail slice
+        // stays valid for the routine's duration (same as the other parsers).
+        let current: &[u8] = unsafe { core::slice::from_raw_parts(current_ptr, current_len) };
+        let current_abs_start =
+            $self.table.history_abs_start + $self.table.window_size - current_len;
+        let current_abs_end = current_abs_start + current_len;
+        $self
+            .table
+            .apply_limited_update_after_long_match(current_abs_start);
+        $self
+            .table
+            .backfill_boundary_positions(current_abs_start, current_abs_end);
+
+        let profile = HcOptimalCostProfile::const_for_strategy::<super::strategy::BtOpt>();
+        let mut candidates = core::mem::take(&mut $self.backend.bt_mut().opt_candidates_scratch);
+
+        let mut pos = 0usize;
+        let mut literals_start = 0usize;
+        while pos + HC_OPT_MIN_MATCH_LEN <= current_len {
+            let abs_pos = current_abs_start + pos;
+            let lit_len = pos - literals_start;
+            candidates.clear();
+            let query = HcCandidateQuery {
+                reps: $self.table.offset_hist,
+                lit_len,
+                ldm_candidate: None,
+            };
+            // SAFETY: called inside the wrapper's `#[target_feature]` umbrella
+            // (the scalar wrapper's `$collect` is a safe fn — `unused_unsafe`
+            // is allowed on the wrapper).
+            unsafe {
+                $self.$collect::<super::strategy::BtOpt, true>(
+                    abs_pos,
+                    current_abs_end,
+                    profile,
+                    query,
+                    &mut candidates,
+                );
+            }
+            // Greedy commit: the ladder is increasing in length, so the last
+            // entry is the longest match found at this position (donor btlazy2
+            // commits the best/longest match).
+            if let Some(best) = candidates.last().copied() {
+                let match_len = best.match_len.min(current_len - pos);
+                if match_len >= HC_OPT_MIN_MATCH_LEN {
+                    let literals = &current[literals_start..pos];
+                    $handle_sequence(Sequence::Triple {
+                        literals,
+                        offset: best.offset,
+                        match_len,
+                    });
+                    let _ = encode_offset_with_history(
+                        best.offset as u32,
+                        lit_len as u32,
+                        &mut $self.table.offset_hist,
+                    );
+                    pos += match_len;
+                    literals_start = pos;
+                    continue;
+                }
+            }
+            pos += 1;
+        }
+
+        if literals_start < current_len {
+            $handle_sequence(Sequence::Literals {
+                literals: &current[literals_start..],
+            });
+        }
+        $self.backend.bt_mut().opt_candidates_scratch = candidates;
+    }};
+}
+
 macro_rules! build_optimal_plan_impl_body {
     (
         $self:expr,
@@ -4005,7 +4084,10 @@ impl HcMatchGenerator {
         let is_btultra2 = tag == StrategyTag::BtUltra2;
         let uses_bt = matches!(
             tag,
-            StrategyTag::BtOpt | StrategyTag::BtUltra | StrategyTag::BtUltra2
+            StrategyTag::Btlazy2
+                | StrategyTag::BtOpt
+                | StrategyTag::BtUltra
+                | StrategyTag::BtUltra2
         );
         // btultra and btultra2 both run the mls=3 hash3 short-match probe
         // (clevels.h minMatch 3). The `is_btultra2` flag below stays
@@ -4108,6 +4190,7 @@ impl HcMatchGenerator {
             StrategyTag::Fast | StrategyTag::Dfast | StrategyTag::Greedy | StrategyTag::Lazy => {
                 self.start_matching_lazy(&mut handle_sequence)
             }
+            StrategyTag::Btlazy2 => self.start_matching_btlazy2(&mut handle_sequence),
             StrategyTag::BtOpt => {
                 self.start_matching_optimal::<strategy::BtOpt>(&mut handle_sequence)
             }
@@ -4211,6 +4294,97 @@ impl HcMatchGenerator {
                 literals: &current[literals_start..],
             });
         }
+    }
+
+    /// Donor `ZSTD_btlazy2` (levels 13-15): binary-tree match finder with a
+    /// greedy/lazy parse. Bare dispatcher — resolves the runtime tier ONCE
+    /// per block via `select_kernel()` and calls the matching
+    /// `start_matching_btlazy2_<kernel>` wrapper, so the per-position BT
+    /// collect runs under a single `#[target_feature]` umbrella (mirrors
+    /// `build_optimal_plan_impl`). See `start_matching_btlazy2_body!` for the
+    /// shared loop.
+    fn start_matching_btlazy2(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        unsafe {
+            self.start_matching_btlazy2_neon(&mut handle_sequence)
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
+            match select_kernel() {
+                FastpathKernel::Avx2Bmi2 => unsafe {
+                    self.start_matching_btlazy2_avx2_bmi2(&mut handle_sequence)
+                },
+                FastpathKernel::Sse42 => unsafe {
+                    self.start_matching_btlazy2_sse42(&mut handle_sequence)
+                },
+                FastpathKernel::Scalar => self.start_matching_btlazy2_scalar(&mut handle_sequence),
+            }
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_endian = "little"),
+            target_arch = "x86",
+            target_arch = "x86_64"
+        )))]
+        {
+            self.start_matching_btlazy2_scalar(&mut handle_sequence)
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[target_feature(enable = "neon")]
+    unsafe fn start_matching_btlazy2_neon(
+        &mut self,
+        mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        start_matching_btlazy2_body!(
+            self,
+            handle_sequence,
+            collect_optimal_candidates_initialized_neon
+        )
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "sse4.2")]
+    unsafe fn start_matching_btlazy2_sse42(
+        &mut self,
+        mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        start_matching_btlazy2_body!(
+            self,
+            handle_sequence,
+            collect_optimal_candidates_initialized_sse42
+        )
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx2,bmi2")]
+    unsafe fn start_matching_btlazy2_avx2_bmi2(
+        &mut self,
+        mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        start_matching_btlazy2_body!(
+            self,
+            handle_sequence,
+            collect_optimal_candidates_initialized_avx2_bmi2
+        )
+    }
+
+    // Scalar wrapper: no `#[target_feature]`; `$collect` (the scalar collect)
+    // is a safe fn, so the body macro's `unsafe` block is inert here. Same cfg
+    // as `collect_optimal_candidates_initialized_scalar` (absent on
+    // aarch64-little, where NEON is the baseline tier).
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    #[allow(unused_unsafe)]
+    fn start_matching_btlazy2_scalar(
+        &mut self,
+        mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        start_matching_btlazy2_body!(
+            self,
+            handle_sequence,
+            collect_optimal_candidates_initialized_scalar
+        )
     }
 
     fn start_matching_optimal<S: super::strategy::Strategy>(
@@ -4687,7 +4861,7 @@ impl HcMatchGenerator {
                     query,
                     out,
                 ),
-            StrategyTag::BtOpt => self
+            StrategyTag::Btlazy2 | StrategyTag::BtOpt => self
                 .collect_optimal_candidates_initialized::<strategy::BtOpt, true>(
                     abs_pos,
                     current_abs_end,
@@ -5771,7 +5945,10 @@ fn driver_reset_keeps_strategy_tag_in_sync_with_active_backend() {
     check(CompressionLevel::Level(4), StrategyTag::Dfast);
     check(CompressionLevel::Level(5), StrategyTag::Greedy);
     check(CompressionLevel::Level(7), StrategyTag::Lazy);
-    check(CompressionLevel::Level(15), StrategyTag::Lazy);
+    check(CompressionLevel::Level(12), StrategyTag::Lazy);
+    check(CompressionLevel::Level(13), StrategyTag::Btlazy2);
+    check(CompressionLevel::Level(14), StrategyTag::Btlazy2);
+    check(CompressionLevel::Level(15), StrategyTag::Btlazy2);
     check(CompressionLevel::Level(16), StrategyTag::BtOpt);
     check(CompressionLevel::Level(18), StrategyTag::BtUltra);
     check(CompressionLevel::Level(22), StrategyTag::BtUltra2);

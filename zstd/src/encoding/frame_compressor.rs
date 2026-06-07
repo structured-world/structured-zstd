@@ -1051,6 +1051,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 crate::encoding::strategy::StrategyTag::Dfast => 14,
                 crate::encoding::strategy::StrategyTag::Greedy
                 | crate::encoding::strategy::StrategyTag::Lazy
+                | crate::encoding::strategy::StrategyTag::Btlazy2
                 | crate::encoding::strategy::StrategyTag::BtOpt => 15,
             };
             let prefer_copy_snapshot = initial_size_hint.is_some_and(|s| {

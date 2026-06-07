@@ -340,6 +340,10 @@ pub(crate) enum StrategyTag {
     Dfast,
     Greedy,
     Lazy,
+    /// Donor `ZSTD_btlazy2` (levels 13-15): binary-tree match finder with a
+    /// lazy parse (not the optimal DP). Shares the BT table layout / finder
+    /// with the opt strategies (`uses_bt`) but selects greedily/lazily.
+    Btlazy2,
     BtOpt,
     BtUltra,
     BtUltra2,
@@ -409,7 +413,9 @@ impl StrategyTag {
             Self::Fast => BackendTag::Simple,
             Self::Dfast => BackendTag::Dfast,
             Self::Greedy => BackendTag::Row,
-            Self::Lazy | Self::BtOpt | Self::BtUltra | Self::BtUltra2 => BackendTag::HashChain,
+            Self::Lazy | Self::Btlazy2 | Self::BtOpt | Self::BtUltra | Self::BtUltra2 => {
+                BackendTag::HashChain
+            }
         }
     }
 
@@ -423,7 +429,9 @@ impl StrategyTag {
             Self::Dfast => SearchMethod::DoubleFast,
             Self::Greedy => SearchMethod::RowHash,
             Self::Lazy => SearchMethod::HashChain,
-            Self::BtOpt | Self::BtUltra | Self::BtUltra2 => SearchMethod::BinaryTree,
+            Self::Btlazy2 | Self::BtOpt | Self::BtUltra | Self::BtUltra2 => {
+                SearchMethod::BinaryTree
+            }
         }
     }
 
@@ -433,7 +441,7 @@ impl StrategyTag {
     pub(crate) const fn parse_mode(self) -> ParseMode {
         match self {
             Self::Fast | Self::Dfast | Self::Greedy => ParseMode::Greedy,
-            Self::Lazy => ParseMode::Lazy,
+            Self::Lazy | Self::Btlazy2 => ParseMode::Lazy,
             Self::BtOpt | Self::BtUltra | Self::BtUltra2 => ParseMode::Optimal,
         }
     }
