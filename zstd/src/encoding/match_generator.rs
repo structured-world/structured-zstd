@@ -1749,9 +1749,19 @@ impl Matcher for MatchGeneratorDriver {
             && self
                 .reset_size_log
                 .is_none_or(|log| log <= FAST_ATTACH_DICT_CUTOFF_LOG);
-        // The LDM override (if any) is part of the snapshot identity: the
-        // restored `storage` carries the producer this override configured.
-        let active_ldm = self.param_overrides.and_then(|ov| ov.ldm);
+        // The LDM override is part of the snapshot identity ONLY on the
+        // optimal (BinaryTree) path: that is the only backend whose cloned
+        // `storage` carries a `BtMatcher::ldm_producer`. On Fast / Dfast /
+        // Row and lazy-HashChain resets the producer slot does not exist,
+        // so folding the override there would over-key the snapshot and
+        // force needless re-primes when LDM is toggled. Gated like
+        // `fast_attach` (a key bit only participates where it changes the
+        // cloned matcher shape).
+        let active_ldm = if matches!(params.search, super::strategy::SearchMethod::BinaryTree) {
+            self.param_overrides.and_then(|ov| ov.ldm)
+        } else {
+            None
+        };
         self.reset_shape = Some((params, resolved_table_bits, fast_attach, active_ldm));
     }
 
