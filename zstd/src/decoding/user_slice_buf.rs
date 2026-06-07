@@ -101,11 +101,14 @@ use super::buffer_backend::{BufferBackend, WILDCOPY_OVERLENGTH};
 /// `exec_sequence_inline` (which returns
 /// `Result<(), ExecuteSequencesError>`). A malformed Compressed
 /// block whose payload expands past the declared
-/// `frame_content_size` surfaces as
+/// `frame_content_size` is caught per-write as
 /// `ExecuteSequencesError::OutputBufferOverflow` (literal-push /
 /// donor-inline path) or `DecodeBufferError::OutputBufferOverflow`
-/// (match-repeat path), both of which propagate up the call stack
-/// as a structured `FrameDecoderError` instead of panicking.
+/// (match-repeat path); `FrameDecoder::run_direct_decode` folds both
+/// into a structured `FrameDecoderError::FrameContentSizeMismatch` —
+/// the SAME error a Raw / RLE overshoot produces — instead of
+/// panicking. The contract is uniform across all three block types:
+/// "the frame's content exceeded its declared size".
 ///
 /// The INFALLIBLE entry points (`extend`, `extend_and_fill`,
 /// `extend_from_within_unchecked`) remain on the type as defense in
@@ -1146,6 +1149,41 @@ mod tests {
     /// callee. Tests cover: short-literal + short-match, long
     /// literal (wildcopy tail), short-offset match (overlapCopy8 +
     /// 8-byte stride), long-offset match (wildcopy_no_overlap).
+    #[test]
+    fn exec_sequence_inline_overflow_returns_output_buffer_overflow() {
+        // #246: the donor-inline sequence executor must return
+        // `ExecuteSequencesError::OutputBufferOverflow` (NOT panic, NOT
+        // an out-of-bounds unsafe write) when a sequence's literal+match
+        // copy plus wildcopy overshoot would land past the fixed slice.
+        // This is the per-sequence guard that keeps the unsafe write
+        // surface inside the user slice on the way to the post-block FCS
+        // check; the higher-level acceptance test
+        // (`decode_all_compressed_block_fcs_overflow_returns_structured_error`)
+        // proves the whole chain folds into `FrameContentSizeMismatch`.
+        use super::super::errors::ExecuteSequencesError;
+        // Tiny slice: 16-byte capacity, tail already at 8. A sequence
+        // writing 8 literals + 8 match (16 bytes) plus the 15-byte
+        // wildcopy overshoot cannot fit in `16 - 8 = 8` remaining bytes.
+        let mut buf = vec![0u8; 16];
+        for (i, slot) in buf.iter_mut().take(8).enumerate() {
+            *slot = i as u8;
+        }
+        let mut b = UserSliceBackend::from_slice(&mut buf);
+        b.tail = 8;
+        let lits = [0xAAu8; 16];
+        // SAFETY: `lits` is a 16-byte parent buffer (donor 16-byte read
+        // slack satisfied); the call must return Err before any write
+        // past the slice end.
+        let err = unsafe { b.exec_sequence_inline(lits.as_ptr(), 8, 4, 8) }
+            .expect_err("overshoot must return OutputBufferOverflow");
+        assert!(
+            matches!(err, ExecuteSequencesError::OutputBufferOverflow { .. }),
+            "expected OutputBufferOverflow, got {err:?}"
+        );
+        // Backend left untouched on Err — tail not advanced.
+        assert_eq!(b.tail, 8, "tail must not advance on overflow");
+    }
+
     #[test]
     fn exec_sequence_inline_short_literal_plus_long_offset_match() {
         // Layout: pre-fill `tail = 8` with a "history" region so

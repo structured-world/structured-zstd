@@ -1020,6 +1020,32 @@ impl From<crate::decoding::buffer_backend::BackendOverflow> for ExecuteSequences
     }
 }
 
+impl ExecuteSequencesError {
+    /// `Some(requested)` when this error is a fixed-capacity output-buffer
+    /// overshoot from the Compressed-block sequence executor — either the
+    /// donor-inline path ([`Self::OutputBufferOverflow`]) or the
+    /// match-repeat fallback ([`DecodeBufferError::OutputBufferOverflow`]
+    /// wrapped in [`Self::DecodebufferError`]). `requested` is the byte
+    /// count the failing write tried to append past the slice end.
+    ///
+    /// `None` for every non-overflow variant. Used by
+    /// `FrameDecoder::run_direct_decode` to fold an in-block Compressed
+    /// overshoot into the same `FrameContentSizeMismatch` contract the
+    /// Raw/RLE [`DecodeBlockContentError::BackendOverflow`] arm already
+    /// produces — both mean "the frame's content expands past the
+    /// declared `frame_content_size`".
+    pub(crate) fn output_overflow_requested(&self) -> Option<usize> {
+        match self {
+            ExecuteSequencesError::OutputBufferOverflow { requested, .. } => Some(*requested),
+            ExecuteSequencesError::DecodebufferError(DecodeBufferError::OutputBufferOverflow {
+                requested,
+                ..
+            }) => Some(*requested),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum DecodeSequenceError {
@@ -1545,9 +1571,45 @@ mod tests {
     use alloc::{string::ToString, vec};
 
     use super::{
-        BlockTypeError, DecodeBlockContentError, DecodeSequenceError, DecompressBlockError,
-        DecompressLiteralsError, FSETableError, FrameDecoderError, HuffmanTableError,
+        BlockTypeError, DecodeBlockContentError, DecodeBufferError, DecodeSequenceError,
+        DecompressBlockError, DecompressLiteralsError, ExecuteSequencesError, FSETableError,
+        FrameDecoderError, HuffmanTableError,
     };
+
+    #[test]
+    fn execute_sequences_output_overflow_requested_covers_all_arms() {
+        // #246: `run_direct_decode` folds a Compressed-block overshoot into
+        // `FrameContentSizeMismatch` by reading `requested` from whichever
+        // overflow shape the executor produced. Cover all three arms:
+        //   1. donor-inline path -> `OutputBufferOverflow` directly,
+        //   2. match-repeat path -> `DecodebufferError(OutputBufferOverflow)`,
+        //   3. any other variant -> None (no fold).
+        let inline = ExecuteSequencesError::OutputBufferOverflow {
+            tail: 10,
+            requested: 7,
+            capacity: 12,
+        };
+        assert_eq!(inline.output_overflow_requested(), Some(7));
+
+        let repeat =
+            ExecuteSequencesError::DecodebufferError(DecodeBufferError::OutputBufferOverflow {
+                tail: 3,
+                requested: 99,
+                capacity: 4,
+            });
+        assert_eq!(repeat.output_overflow_requested(), Some(99));
+
+        // Non-overflow variants (and non-overflow DecodeBufferError) -> None.
+        assert_eq!(
+            ExecuteSequencesError::ZeroOffset.output_overflow_requested(),
+            None
+        );
+        assert_eq!(
+            ExecuteSequencesError::DecodebufferError(DecodeBufferError::ZeroOffset)
+                .output_overflow_requested(),
+            None
+        );
+    }
 
     #[test]
     fn block_and_sequence_display_messages_are_specific() {
