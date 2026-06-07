@@ -689,8 +689,9 @@ pub struct PartialDecode {
     /// of the decompressed sizes of blocks `start_block .. start_block +
     /// blocks_decoded`.
     pub data: alloc::vec::Vec<u8>,
-    /// First block whose output is in [`data`](Self::data) (equals the
-    /// requested `start_block`).
+    /// First block whose output is in [`data`](Self::data): the requested
+    /// `start_block` on a fresh decode, or [`ResumeState::block_index`] when
+    /// resuming (the caller-supplied `start_block` is ignored in resume mode).
     pub start_block: u32,
     /// Number of in-range blocks successfully decoded into
     /// [`data`](Self::data).
@@ -1714,7 +1715,10 @@ impl FrameDecoder {
         // `total_output()` give the resume coordinates: the next block to decode
         // and the cumulative decompressed offset before it (clean even after an
         // early stop, since a failed block rolls both back to its checkpoint).
-        let resume_state = if emit_resume {
+        // Suppress the snapshot on the terminal block: `block_counter` is then
+        // one past the last block (EOF), for which there is no next-block source
+        // position to resume from. A resume needs a real following block.
+        let resume_state = if emit_resume && !state.frame_finished {
             let (fse, huf, offset_hist) = state.decoder_scratch.export_entropy();
             Some(ResumeState {
                 frame_key: FrameKey::from_state(state, magicless),
