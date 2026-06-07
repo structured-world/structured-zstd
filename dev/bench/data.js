@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780800605307,
+  "lastUpdate": 1780839662256,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -59481,6 +59481,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
             "value": 0.117,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.26,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "4e76ae0bcc808e2902b26863845cd47e266b577b",
+          "message": "feat(encode): configurable compression parameters API (#360)\n\n* feat(encode): configurable compression parameters API\n\nAdd the drop-in equivalent of C zstd's ZSTD_CCtx_setParameter surface:\na CompressionParameters builder over a base level that overrides\nindividual match-finder knobs and activates long-distance matching.\n\n- CompressionParameters + builder (window/hash/chain/search logs,\n  minMatch, targetLength, strategy, LDM block) with per-knob bounds\n  validation; CParameter::bounds mirrors ZSTD_cParam_getBounds\n- Public Strategy enum (1..=9) incl. Greedy; FrameCompressor::\n  set_parameters + compress_with_parameters one-shot helper\n- Thread overrides through the matcher reset: strategy re-routes the\n  backend, per-knob values map into the Fast/Dfast/Row/Hc configs;\n  an empty override is byte-identical to plain level-based output\n- LDM activation: attach LdmProducer to the optimal BtMatcher when\n  enabled; custom LDM knobs derive over donor-consistent defaults.\n  LDM stays off at every level preset (libzstd parity)\n\nFix a pre-existing LDM <-> optimal-parser bug this activation surfaces:\nthe optimal parser runs per-segment with segment-relative positions\nwhile ldm_sequences are block-relative, so opt_ldm must fast-forward\nthe raw seq-store by each segment's block offset. Without it, segments\nafter the first emitted matches copying the wrong bytes (frames\nrejected by both this decoder and upstream zstd). Carried via a new\nHcOptimalPlanState.block_offset field.\n\nVerified: round-trip through this decoder and upstream zstd -d for\ncustom params, Greedy, and LDM up to window_log 26 (multi-segment).\n\nCloses #27\n\n* test(encode): add regression test for sticky parameter overrides\n\nset_compression_level only mutated compression_level, leaving the\nstrategy/LDM/log overrides installed by set_parameters in place. A\ncaller reverting to a plain level after one customized frame kept\nencoding with the stale tuning. This test compresses one frame with a\nGreedy strategy override, reverts to plain level 19, and asserts the\nsecond frame is byte-identical to a fresh plain-level-19 compression.\nFails on current code (overrides stay sticky).\n\n* fix(encode): clear parameter overrides on set_compression_level\n\nset_compression_level only updated the level, leaving the strategy\noverride flag and the matcher's per-knob overrides installed by\nset_parameters in place. A caller that reused the compressor and\nreverted to a bare level kept encoding with the stale tuning.\n\nAdd a Matcher::clear_param_overrides hook (default no-op, overridden by\nMatchGeneratorDriver to drop its overrides) and call it from\nset_compression_level alongside clearing strategy_override.\n\n* test(encode): regression test for primed snapshot across LDM change\n\nThe CDict-equivalent primed snapshot clones the matcher storage, which\non the BT backend carries the LDM producer. PrimedKey keyed only on\n(level, params, table_bits, fast_attach), so a snapshot captured with\nLDM on could be restored into a reset that resolved LDM off, reinstating\nthe stale producer. This test captures under LDM-on, resets under\nLDM-off at the same level, and asserts restore is refused. Fails on\ncurrent code (restore returns true).\n\n* fix(encode): key primed snapshot on LDM config + recap hinted overrides\n\nTwo issues in the public-parameter reset path:\n\n- The CDict-equivalent primed snapshot clones the matcher storage, which\n  on the BT backend carries the LDM producer. PrimedKey keyed only on\n  (level, params, table_bits, fast_attach), so a snapshot captured under\n  one LDM configuration could be restored into a reset that resolved a\n  different one, reinstating a stale producer. Fold the active LDM\n  override into reset_shape / PrimedKey so such restores are refused and\n  the caller re-primes.\n\n- A strategy override can move a hinted frame onto a backend whose\n  default config was synthesized after the source-size cap already ran,\n  so the new backend allocated full-size tables for a tiny input.\n  Re-apply the hint cap after the override (preserving an explicit\n  window_log override).\n\n* docs(encode): correct CompressionParameters rustdoc\n\nThe builder takes an explicit base level (no implicit default), and the\nldm_* knob setters also enable LDM, so enable_long_distance_matching is\nnot the sole activation surface. Clarify the enable flag is plain\nlast-write-wins.\n\n* fix(encode): gate LDM snapshot key bit to the optimal backend\n\nOnly the BinaryTree (optimal) reset clones a BtMatcher carrying the LDM\nproducer; Fast/Dfast/Row and lazy-HashChain resets have no producer\nslot. Folding the LDM override into the snapshot key for those backends\nover-keyed it and forced needless re-primes when LDM was toggled. Gate\nactive_ldm to the BinaryTree path, mirroring how fast_attach only\nparticipates where it changes the cloned matcher shape.",
+          "timestamp": "2026-06-07T15:45:19+03:00",
+          "tree_id": "69a92513348f274f8ed9376a10f47440268920ad",
+          "url": "https://github.com/structured-world/structured-zstd/commit/4e76ae0bcc808e2902b26863845cd47e266b577b"
+        },
+        "date": 1780839649960,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.133,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.113,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 260.682,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 232.059,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.36,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.282,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.277,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.034,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.141,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.976,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.108,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.108,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.02,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 16.801,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.252,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.821,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.315,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.973,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.243,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.616,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.098,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.119,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.265,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.119,
             "unit": "ms"
           },
           {
