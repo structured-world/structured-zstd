@@ -74,6 +74,13 @@ pub(crate) struct HcOptimalPlanState {
     pub(crate) reps: [u32; 3],
     pub(crate) litlen: usize,
     pub(crate) profile: HcOptimalCostProfile,
+    /// Block-relative byte offset of the SEGMENT this plan pass covers.
+    /// The optimal parser runs per-segment with segment-relative
+    /// positions, but the LDM `ldm_sequences` are block-relative, so the
+    /// raw LDM seq-store is fast-forwarded by this many bytes at the
+    /// start of each segment to land its windows at the right positions.
+    /// `0` for the first segment / when LDM is inactive.
+    pub(crate) block_offset: usize,
 }
 
 /// Bundle of scratch buffers the DP body owns for the duration of one

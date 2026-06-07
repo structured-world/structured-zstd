@@ -583,6 +583,8 @@ pub mod dict_test;
 pub mod encode_corpus;
 pub mod fuzz_regressions;
 #[cfg(feature = "std")]
+pub mod parameters_test;
+#[cfg(feature = "std")]
 #[allow(dead_code)]
 pub mod roundtrip_integrity;
 

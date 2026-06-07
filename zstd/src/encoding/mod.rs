@@ -84,6 +84,7 @@ pub(crate) mod frame_compressor;
 #[cfg(feature = "lsm")]
 pub mod frame_emit_info;
 mod levels;
+pub(crate) mod parameters;
 #[cfg(feature = "bench_internals")]
 pub mod sequence_capture;
 mod streaming_encoder;
@@ -91,6 +92,10 @@ pub use frame_compressor::{EncoderDictionary, FrameCompressor};
 #[cfg(feature = "lsm")]
 pub use frame_emit_info::{BlockType, FrameBlock, FrameEmitInfo};
 pub use match_generator::MatchGeneratorDriver;
+pub use parameters::{
+    Bounds, CParameter, CompressionParameters, CompressionParametersBuilder, ParameterError,
+    Strategy,
+};
 pub use streaming_encoder::StreamingEncoder;
 
 use crate::io::{Read, Write};
@@ -189,6 +194,32 @@ pub fn compress_slice_to_vec(source: &[u8], level: CompressionLevel) -> Vec<u8> 
     // neither the reader nor the drain is used by the in-place
     // `compress_independent_frame` path.
     let mut enc: FrameCompressor = FrameCompressor::new(level);
+    enc.compress_independent_frame(source)
+}
+
+/// Compress a byte slice into a fresh `Vec<u8>` using fine-grained
+/// [`CompressionParameters`] (#27) instead of a bare
+/// [`CompressionLevel`].
+///
+/// One-shot wrapper over [`FrameCompressor::set_parameters`] +
+/// [`FrameCompressor::compress_independent_frame`]. The produced frame is
+/// a valid RFC 8878 stream regardless of the knobs chosen.
+///
+/// ```rust
+/// use structured_zstd::encoding::{
+///     compress_with_parameters, CompressionLevel, CompressionParameters, Strategy,
+/// };
+/// let data: &[u8] = b"the quick brown fox jumps over the lazy dog";
+/// let params = CompressionParameters::builder(CompressionLevel::Level(5))
+///     .strategy(Strategy::Greedy)
+///     .build()
+///     .unwrap();
+/// let compressed = compress_with_parameters(data, &params);
+/// assert!(!compressed.is_empty());
+/// ```
+pub fn compress_with_parameters(source: &[u8], params: &CompressionParameters) -> Vec<u8> {
+    let mut enc: FrameCompressor = FrameCompressor::new(params.level());
+    enc.set_parameters(params);
     enc.compress_independent_frame(source)
 }
 

@@ -66,6 +66,24 @@ impl LdmParams {
     ///
     /// Returns a fully-initialised `LdmParams` with no zero fields.
     pub(crate) fn adjust_for(window_log: u32, strategy: u32) -> Self {
+        Self {
+            window_log,
+            ..Self::default()
+        }
+        .derive(strategy)
+    }
+
+    /// Donor `ZSTD_ldm_adjustParameters` derivation over a (possibly
+    /// caller-seeded) parameter set: fill every zero-valued knob from
+    /// `window_log` / `strategy`, leaving non-zero fields untouched.
+    ///
+    /// This is the path the public-parameter LDM overrides (#27) use:
+    /// the caller seeds the knobs it wants to pin (the rest stay zero),
+    /// and `derive` completes the set with donor cross-field
+    /// consistency (e.g. `hash_rate_log = window_log - hash_log` when a
+    /// caller pins `hash_log`). Calling `adjust_for` and then clobbering
+    /// fields afterwards would break that consistency.
+    pub(crate) fn derive(self, strategy: u32) -> Self {
         // Runtime `assert!` (not `debug_assert!`) — the body uses
         // raw `LDM_HASH_RLOG - (strategy / 3)`, which underflows
         // `u32` for `strategy >= 24` (`7 - 8 = u32::MAX`) and
@@ -81,10 +99,7 @@ impl LdmParams {
              zstd_ldm.c:149 + zstd_ldm.c:167)"
         );
 
-        let mut params = Self {
-            window_log,
-            ..Self::default()
-        };
+        let mut params = self;
 
         // hash_rate_log: donor `zstd_ldm.c:141-153`. With `hash_log`
         // still zero (the only path we expose), donor falls into the
