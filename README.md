@@ -233,6 +233,27 @@ upstream `main`, so the link target is correct for forks too —
 fork consumers should point readers at the upstream registry
 rather than maintain divergent copies. -->
 
+## WebAssembly / npm
+
+JavaScript / TypeScript consumers can use the codec from npm — no native
+addons, no build step:
+
+```sh
+npm install @structured-world/structured-zstd
+```
+
+```ts
+import { compress, decompress } from "@structured-world/structured-zstd";
+const framed = await compress(new TextEncoder().encode("hello"), 19);
+const plain = await decompress(framed);
+```
+
+The package ships two WebAssembly payloads — one built with the `simd128`
+SIMD tier, one scalar — and selects the fast one at runtime from the host
+engine's capabilities. Pure ESM, strict TypeScript types. Frames interoperate
+with native zstd. Source lives in [`zstd-wasm/`](zstd-wasm); see the
+[package README](zstd-wasm/npm/README.md).
+
 ## Project relationship
 
 Maintained fork of [KillingSpark/zstd-rs](https://github.com/KillingSpark/zstd-rs) (ruzstd) by the [Structured World Foundation](https://sw.foundation). We sync periodically with upstream but maintain an independent development trajectory focused on the [CoordiNode](https://github.com/structured-world/coordinode) database engine's per-label dictionary needs.
