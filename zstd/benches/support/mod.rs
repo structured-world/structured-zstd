@@ -2,7 +2,7 @@
 // Use RngExt::fill() instead of RngCore::fill_bytes(); RngCore removed from rand's public root in 0.10.
 use rand::{RngExt, SeedableRng, rngs::SmallRng};
 use std::{collections::HashSet, env, fs, path::Path};
-use structured_zstd::encoding::CompressionLevel;
+use structured_zstd::encoding::{CompressionLevel, CompressionParameters};
 
 pub(crate) struct Scenario {
     pub(crate) id: String,
@@ -25,6 +25,68 @@ pub(crate) struct LevelConfig {
     pub(crate) name: &'static str,
     pub(crate) rust_level: CompressionLevel,
     pub(crate) ffi_level: i32,
+    /// Enable long-distance matching (`ZSTD_c_enableLongDistanceMatching`)
+    /// on both the Rust encoder (via `FrameCompressor::set_parameters`) and
+    /// the FFI reference. `false` for every numeric-level entry — only the
+    /// dedicated `*_ldm` / `*_ldm_dict` variants set it. LDM only attaches to
+    /// the optimal parsers, so a Fast-level entry measures the "LDM requested
+    /// but strategy below btopt" path and a BtUltra2 entry measures LDM
+    /// actually engaged.
+    pub(crate) ldm: bool,
+    /// Apply a trained FastCOVER dictionary on both sides. `false` for every
+    /// numeric-level entry (those route through the plain compress/decompress
+    /// groups). Only the `*_ldm_dict` variants set it, routing through the
+    /// dictionary group (`bench_dictionary`) instead.
+    pub(crate) dict: bool,
+}
+
+/// Resolve the LDM-enabled [`CompressionParameters`] for a variant, or `None`
+/// for the plain numeric levels (`ldm = false`). Shared by both bench
+/// binaries (`compare_ffi` timing/ratio + `compare_ffi_memory`) so the Rust
+/// LDM encode path is wired identically in each. LDM-only parameters set no
+/// bounds-checked knobs, so `build()` cannot fail.
+pub(crate) fn ldm_parameters(level: &LevelConfig) -> Option<CompressionParameters> {
+    level.ldm.then(|| {
+        CompressionParameters::builder(level.rust_level)
+            .enable_long_distance_matching(true)
+            .build()
+            .expect("LDM-only parameters set no bounds-checked knobs, build cannot fail")
+    })
+}
+
+/// Build the byte-slice samples fed to FFI's `zstd::dict::from_samples` (and,
+/// in `compare_ffi`, mirrored by the Rust FastCOVER trainer). Shared by both
+/// bench binaries so the dictionary-training input is identical across the
+/// timing/ratio matrix and the peak-memory matrix. Primary path chunks by
+/// `sample_size`; a 2-sample midpoint split is the fallback for inputs too
+/// small to yield ≥2 chunks; a single-sample last resort keeps the slice
+/// non-empty for <64-byte inputs (FFI then rejects it, which is correct —
+/// tiny inputs can't train a meaningful dictionary). Returns `Vec<&[u8]>`
+/// borrowing from `source` for zero-copy.
+pub(crate) fn build_training_samples(source: &[u8]) -> Vec<&[u8]> {
+    let sample_size = source.len().div_ceil(16).clamp(256, 8192);
+    let samples: Vec<&[u8]> = source
+        .chunks(sample_size)
+        .take(64)
+        .filter(|chunk| chunk.len() >= 64)
+        .collect();
+    if samples.len() >= 2 {
+        return samples;
+    }
+    let midpoint = source.len() / 2;
+    let left = &source[..midpoint];
+    let right = &source[midpoint..];
+    if left.len() >= 64 && right.len() >= 64 {
+        return vec![left, right];
+    }
+    vec![source]
+}
+
+/// Requested dictionary size for a `source.len()`-byte training input: an
+/// eighth of the input clamped to `[256, 16 KiB]`. Shared by both benches so
+/// the trained dictionary geometry matches across matrices.
+pub(crate) fn dictionary_size_for(input_len: usize) -> usize {
+    input_len.div_ceil(8).clamp(256, 16 * 1024)
 }
 
 pub(crate) fn benchmark_scenarios() -> Vec<Scenario> {
@@ -177,10 +239,11 @@ fn strategy_suffix(level: i32) -> &'static str {
 /// that catches the drift in CI before any silent skips.
 ///
 /// The inventory is built once per process via [`LazyLock`] so the
-/// `Box::leak` that backs each `&'static str` `name` happens exactly
-/// 29 times total — the criterion bench loops call this helper many
-/// times per scenario, and a naive per-call rebuild would compound
-/// the leak proportionally.
+/// `Box::leak` that backs each formatted `&'static str` `name` happens
+/// exactly 29 times total — the criterion bench loops call this helper
+/// many times per scenario, and a naive per-call rebuild would compound
+/// the leak proportionally. The four LDM / LDM+dict variants (#362) use
+/// plain string literals, so they add no leak.
 pub(crate) fn supported_levels() -> Vec<LevelConfig> {
     static INVENTORY: std::sync::LazyLock<Vec<LevelConfig>> =
         std::sync::LazyLock::new(build_supported_levels);
@@ -188,13 +251,15 @@ pub(crate) fn supported_levels() -> Vec<LevelConfig> {
 }
 
 fn build_supported_levels() -> Vec<LevelConfig> {
-    let mut levels = Vec::with_capacity(29);
+    let mut levels = Vec::with_capacity(33);
     // Ultra-fast tier: `-7..=-1`. Donor strategy = Fast.
     for n in -7..=-1i32 {
         levels.push(LevelConfig {
             name: leak_owned(format!("level_{n}_{}", strategy_suffix(n))),
             rust_level: CompressionLevel::Level(n),
             ffi_level: n,
+            ldm: false,
+            dict: false,
         });
     }
     // Standard tier: `1..=22`. Strategy mirrors `clevels.h`. Use
@@ -213,8 +278,47 @@ fn build_supported_levels() -> Vec<LevelConfig> {
             name: leak_owned(format!("level_{n}_{}", strategy_suffix(n))),
             rust_level: CompressionLevel::Level(n),
             ffi_level: n,
+            ldm: false,
+            dict: false,
         });
     }
+    // LDM and LDM+dict matrix variants (#362). Anchored at the cheap-fast
+    // (level 1, Fast) and max-compression (level 22, BtUltra2) ends so the
+    // matrix gets a regression signal for both the "LDM requested but
+    // strategy below btopt" path (level 1) and the "LDM actually engaged"
+    // path (level 22). LDM is off at every level preset by default on both
+    // encoders, so these are the only entries that exercise it. Names are
+    // `&'static` literals (no `leak_owned`) and must round-trip through
+    // `STRUCTURED_ZSTD_BENCH_LEVEL_FILTER` — they are listed verbatim in the
+    // `btopt` push-event shard in `.github/workflows/ci.yml`.
+    levels.push(LevelConfig {
+        name: "level_1_fast_ldm",
+        rust_level: CompressionLevel::Level(1),
+        ffi_level: 1,
+        ldm: true,
+        dict: false,
+    });
+    levels.push(LevelConfig {
+        name: "level_22_btultra2_ldm",
+        rust_level: CompressionLevel::Level(22),
+        ffi_level: 22,
+        ldm: true,
+        dict: false,
+    });
+    levels.push(LevelConfig {
+        name: "level_1_fast_ldm_dict",
+        rust_level: CompressionLevel::Level(1),
+        ffi_level: 1,
+        ldm: true,
+        dict: true,
+    });
+    levels.push(LevelConfig {
+        name: "level_22_btultra2_ldm_dict",
+        rust_level: CompressionLevel::Level(22),
+        ffi_level: 22,
+        ldm: true,
+        dict: true,
+    });
     levels
 }
 

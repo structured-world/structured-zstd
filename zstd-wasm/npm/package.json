@@ -1,0 +1,74 @@
+{
+  "name": "@structured-world/structured-zstd",
+  "version": "0.0.0",
+  "description": "Pure-Rust Zstandard (zstd) codec compiled to WebAssembly — compress and decompress in the browser, Node.js and Deno, with automatic SIMD (simd128) acceleration and a scalar fallback. No native addons, no FFI.",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.js"
+    }
+  },
+  "types": "./index.d.ts",
+  "files": [
+    "index.js",
+    "index.js.map",
+    "index.d.ts",
+    "index.d.ts.map",
+    "index.ts",
+    "simd/structured_zstd_wasm.js",
+    "simd/structured_zstd_wasm.d.ts",
+    "simd/structured_zstd_wasm_bg.wasm",
+    "simd/structured_zstd_wasm_bg.wasm.d.ts",
+    "scalar/structured_zstd_wasm.js",
+    "scalar/structured_zstd_wasm.d.ts",
+    "scalar/structured_zstd_wasm_bg.wasm",
+    "scalar/structured_zstd_wasm_bg.wasm.d.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "zstd",
+    "zstandard",
+    "compression",
+    "decompression",
+    "wasm",
+    "webassembly",
+    "simd",
+    "simd128",
+    "browser",
+    "nodejs",
+    "deno",
+    "codec",
+    "pure-rust"
+  ],
+  "license": "Apache-2.0",
+  "author": "Structured World Foundation <foundation@sw.foundation>",
+  "homepage": "https://github.com/structured-world/structured-zstd#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/structured-world/structured-zstd.git",
+    "directory": "zstd-wasm/npm"
+  },
+  "bugs": {
+    "url": "https://github.com/structured-world/structured-zstd/issues"
+  },
+  "dependencies": {
+    "wasm-feature-detect": "^1.8.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  },
+  "scripts": {
+    "build:wasm:simd": "cd .. && wasm-pack build --release --target web --out-dir npm/simd --out-name structured_zstd_wasm -- --config 'target.wasm32-unknown-unknown.rustflags=[\"-C\",\"target-feature=+simd128\"]'",
+    "build:wasm:scalar": "cd .. && wasm-pack build --release --target web --out-dir npm/scalar --out-name structured_zstd_wasm",
+    "build:ts": "tsc",
+    "build": "npm run build:wasm:simd && npm run build:wasm:scalar && npm run build:ts",
+    "prepublishOnly": "npm run build && cp ../../LICENSE LICENSE"
+  }
+}

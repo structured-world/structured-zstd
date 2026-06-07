@@ -1,0 +1,32 @@
+[package]
+name = "structured-zstd-wasm"
+version = "0.0.30"
+rust-version = "1.92"
+authors = ["Structured World Foundation <foundation@sw.foundation>"]
+edition = "2024"
+license = "Apache-2.0"
+homepage = "https://github.com/structured-world/structured-zstd"
+repository = "https://github.com/structured-world/structured-zstd"
+description = "WebAssembly bindings for structured-zstd — pure-Rust zstd codec for browser, Node.js and Deno."
+# npm-only distribution (the npm package is @structured-world/structured-zstd);
+# this crate is never published to crates.io.
+publish = false
+
+[lib]
+# `cdylib` is what wasm-pack consumes; `rlib` lets the workspace `cargo check`
+# the crate on the host target (where the wasm-bindgen surface is cfg'd out).
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Leaf binding crate: std + wasm-bindgen are fine here. The CORE crate stays
+# no_std + bindgen-free; this wrapper is the only place wasm-bindgen appears.
+wasm-bindgen = "0.2"
+# Pull the core codec with no default features (no std) and the simd128 kernel
+# tier. The actual SIMD selection is compile-time via `-C target-feature`:
+# the +simd128 payload engages it, the scalar payload does not.
+structured-zstd = { path = "../zstd", default-features = false, features = ["kernel_simd128"] }
+
+# Size-tuned wasm-pack release profile: optimise for size + a wasm-opt -Oz
+# post-pass, since payload bytes are the budget for a published wasm module.
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = ['-Oz']

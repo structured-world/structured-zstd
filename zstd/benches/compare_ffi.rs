@@ -32,17 +32,43 @@ use structured_zstd::dictionary::{
 };
 use structured_zstd::encoding::{EncoderDictionary, FrameCompressor};
 use support::{
-    LevelConfig, Scenario, ScenarioClass, benchmark_scenarios, kernel_report_line,
-    supported_levels_filtered,
+    LevelConfig, Scenario, ScenarioClass, benchmark_scenarios, build_training_samples,
+    dictionary_size_for, kernel_report_line, ldm_parameters, supported_levels_filtered,
 };
 
 static BENCHMARK_SCENARIOS: OnceLock<Vec<Scenario>> = OnceLock::new();
 
+/// Enable `ZSTD_c_enableLongDistanceMatching` on an FFI bulk compressor for
+/// the LDM variants; a no-op for the plain numeric levels.
+fn apply_ffi_ldm(compressor: &mut zstd::bulk::Compressor<'_>, level: &LevelConfig) {
+    if level.ldm {
+        compressor
+            .set_parameter(zstd::zstd_safe::CParameter::EnableLongDistanceMatching(
+                true,
+            ))
+            .expect("FFI bulk compressor accepts EnableLongDistanceMatching");
+    }
+}
+
+/// Build the matching Rust-encoder bytes for a matrix variant. The plain
+/// numeric levels keep the historical `compress_slice_to_vec` path so their
+/// output stays byte-for-byte identical to pre-#362 runs; the LDM variants
+/// route through `compress_with_parameters` with
+/// `enable_long_distance_matching(true)` on the variant's base level.
+fn rust_encode_to_vec(input: &[u8], level: &LevelConfig) -> Vec<u8> {
+    match ldm_parameters(level) {
+        Some(params) => structured_zstd::encoding::compress_with_parameters(input, &params),
+        None => structured_zstd::encoding::compress_slice_to_vec(input, level.rust_level),
+    }
+}
+
 /// FFI encode helper used by criterion's timing loop. Uses
 /// `ZSTD_compressStream2` into a growing-output `Vec` — same shape as
 /// the pure-Rust `compress_to_vec` so output-buffer growth profiles
-/// match cross-side.
-fn ffi_encode_to_vec(input: &[u8], level: i32) -> Vec<u8> {
+/// match cross-side. When `ldm` is set, `ZSTD_c_enableLongDistanceMatching`
+/// is turned on alongside the level so the FFI reference mirrors the Rust
+/// LDM variant (#362).
+fn ffi_encode_to_vec(input: &[u8], level: i32, ldm: bool) -> Vec<u8> {
     use zstd::zstd_safe::zstd_sys;
     // SAFETY: `ZSTD_createCCtx` returns null on OOM, asserted below.
     // The CCtx is freed before returning.
@@ -80,6 +106,18 @@ fn ffi_encode_to_vec(input: &[u8], level: i32) -> Vec<u8> {
             zstd_sys::ZSTD_isError(rc) == 0,
             "set contentSizeFlag failed"
         );
+
+        if ldm {
+            let rc = zstd_sys::ZSTD_CCtx_setParameter(
+                cctx,
+                zstd_sys::ZSTD_cParameter::ZSTD_c_enableLongDistanceMatching,
+                1,
+            );
+            assert!(
+                zstd_sys::ZSTD_isError(rc) == 0,
+                "set enableLongDistanceMatching failed"
+            );
+        }
 
         // Tiny inputs use a 14-bit window so the FFI frame matches
         // the pure-Rust frame on small payloads. Without this the
@@ -228,12 +266,16 @@ fn bench_compress(c: &mut Criterion) {
     }
     for scenario in benchmark_scenarios_cached().iter() {
         for level in supported_levels_filtered() {
+            // Dictionary variants (`*_ldm_dict`) route through
+            // `bench_dictionary`; the plain compress group only covers the
+            // no-dictionary levels (numeric levels + the `*_ldm` variants).
+            if level.dict {
+                continue;
+            }
             if emit_reports {
-                let rust_compressed = structured_zstd::encoding::compress_slice_to_vec(
-                    &scenario.bytes[..],
-                    level.rust_level,
-                );
-                let ffi_compressed = ffi_encode_to_vec(&scenario.bytes[..], level.ffi_level);
+                let rust_compressed = rust_encode_to_vec(&scenario.bytes[..], &level);
+                let ffi_compressed =
+                    ffi_encode_to_vec(&scenario.bytes[..], level.ffi_level, level.ldm);
                 emit_report_line(scenario, level, &rust_compressed, &ffi_compressed);
                 emit_frame_header_report(scenario, level, "rust", &rust_compressed);
                 emit_frame_header_report(scenario, level, "ffi", &ffi_compressed);
@@ -241,20 +283,21 @@ fn bench_compress(c: &mut Criterion) {
 
             let benchmark_name = format!("compress/{}/{}/{}", level.name, scenario.id, "matrix");
             let mut group = c.benchmark_group(benchmark_name);
-            configure_group(&mut group, scenario);
+            configure_group(&mut group, scenario, BenchOp::Compress);
             group.throughput(Throughput::Bytes(scenario.throughput_bytes()));
 
             group.bench_function("pure_rust", |b| {
-                b.iter(|| {
-                    black_box(structured_zstd::encoding::compress_slice_to_vec(
-                        &scenario.bytes[..],
-                        level.rust_level,
-                    ))
-                })
+                b.iter(|| black_box(rust_encode_to_vec(&scenario.bytes[..], &level)))
             });
 
             group.bench_function("c_ffi", |b| {
-                b.iter(|| black_box(ffi_encode_to_vec(&scenario.bytes[..], level.ffi_level)))
+                b.iter(|| {
+                    black_box(ffi_encode_to_vec(
+                        &scenario.bytes[..],
+                        level.ffi_level,
+                        level.ldm,
+                    ))
+                })
             });
 
             group.finish();
@@ -269,6 +312,14 @@ fn bench_decompress(c: &mut Criterion) {
     }
     for scenario in benchmark_scenarios_cached().iter() {
         for level in supported_levels_filtered() {
+            // Dictionary variants decode via the dictionary-aware groups in
+            // `bench_dictionary` (`decompress-dict/...`); the plain decode
+            // group only covers the no-dictionary levels. The `*_ldm` frames
+            // decode through the same dictionary-free path as numeric levels
+            // (LDM is an encoder-only concern), just over LDM-encoded bytes.
+            if level.dict {
+                continue;
+            }
             let expected_len = scenario.len();
             bench_decompress_source(
                 c,
@@ -339,7 +390,7 @@ fn bench_decompress_source(
         level.name, scenario.id, source
     );
     let mut group = c.benchmark_group(benchmark_name);
-    configure_group(&mut group, scenario);
+    configure_group(&mut group, scenario, BenchOp::Decompress);
     group.throughput(Throughput::Bytes(scenario.throughput_bytes()));
 
     // Compression of the input stream is the setup step for this group's
@@ -354,11 +405,10 @@ fn bench_decompress_source(
         compressed
             .get_or_init(|| {
                 let bytes = match source {
-                    "rust_stream" => structured_zstd::encoding::compress_slice_to_vec(
-                        &scenario.bytes[..],
-                        level.rust_level,
-                    ),
-                    "c_stream" => ffi_encode_to_vec(&scenario.bytes[..], level.ffi_level),
+                    "rust_stream" => rust_encode_to_vec(&scenario.bytes[..], &level),
+                    "c_stream" => {
+                        ffi_encode_to_vec(&scenario.bytes[..], level.ffi_level, level.ldm)
+                    }
                     other => panic!("bench_decompress_source: unknown source {other}"),
                 };
                 assert_decompress_matches_reference(scenario, &bytes, expected_len);
@@ -534,7 +584,7 @@ fn bench_dictionary(c: &mut Criterion) {
 
         let benchmark_name = format!("dict-train/na/{}/{}", scenario.id, "matrix");
         let mut group = c.benchmark_group(benchmark_name);
-        configure_group(&mut group, scenario);
+        configure_group(&mut group, scenario, BenchOp::Compress);
         group.throughput(Throughput::Bytes(total_training_bytes as u64));
 
         group.bench_function("pure_rust", |b| {
@@ -591,9 +641,20 @@ fn bench_dictionary(c: &mut Criterion) {
         };
 
         for level in supported_levels_filtered() {
+            // The pure-LDM-no-dict variants (`*_ldm`, `dict = false`) belong to
+            // the plain compress/decompress groups, not the dictionary group.
+            // Everything else runs here: the numeric levels (unchanged
+            // behaviour) and the `*_ldm_dict` variants (`dict = true`), the
+            // latter with LDM enabled on both sides via `apply_ffi_ldm` /
+            // `ldm_parameters` below.
+            if level.ldm && !level.dict {
+                continue;
+            }
             let mut no_dict = zstd::bulk::Compressor::new(level.ffi_level).unwrap();
+            apply_ffi_ldm(&mut no_dict, &level);
             let mut with_dict =
                 zstd::bulk::Compressor::with_dictionary(level.ffi_level, &ffi_dictionary).unwrap();
+            apply_ffi_ldm(&mut with_dict, &level);
             let no_dict_bytes = no_dict.compress(&scenario.bytes).unwrap();
             let with_dict_bytes = with_dict.compress(&scenario.bytes).unwrap();
 
@@ -604,6 +665,12 @@ fn bench_dictionary(c: &mut Criterion) {
             // timing-loop preallocation hint so we compress once, not twice.
             let rust_with_dict_len: Option<usize> = if rust_dict_handle.is_some() {
                 let mut warmup_compressor = FrameCompressor::new(level.rust_level);
+                // Enable LDM before attaching the dictionary — `set_parameters`
+                // resets the base level + installs the LDM override; the dict
+                // attach below is independent and survives it.
+                if let Some(params) = ldm_parameters(&level) {
+                    warmup_compressor.set_parameters(&params);
+                }
                 warmup_compressor
                     .set_dictionary_from_bytes(&ffi_dictionary)
                     .expect("dictionary should attach");
@@ -634,7 +701,7 @@ fn bench_dictionary(c: &mut Criterion) {
             let benchmark_name =
                 format!("compress-dict/{}/{}/{}", level.name, scenario.id, "matrix");
             let mut group = c.benchmark_group(benchmark_name);
-            configure_group(&mut group, scenario);
+            configure_group(&mut group, scenario, BenchOp::Compress);
             group.throughput(Throughput::Bytes(scenario.throughput_bytes()));
 
             // Construct the FFI compressor INSIDE `b.iter` to match the
@@ -647,6 +714,7 @@ fn bench_dictionary(c: &mut Criterion) {
             group.bench_function("c_ffi_without_dict", |b| {
                 b.iter(|| {
                     let mut compressor = zstd::bulk::Compressor::new(level.ffi_level).unwrap();
+                    apply_ffi_ldm(&mut compressor, &level);
                     black_box(compressor.compress(&scenario.bytes).unwrap())
                 })
             });
@@ -668,6 +736,7 @@ fn bench_dictionary(c: &mut Criterion) {
                 let mut compressor =
                     zstd::bulk::Compressor::with_dictionary(level.ffi_level, &ffi_dictionary)
                         .unwrap();
+                apply_ffi_ldm(&mut compressor, &level);
                 b.iter(|| black_box(compressor.compress(&scenario.bytes).unwrap()))
             });
 
@@ -687,6 +756,11 @@ fn bench_dictionary(c: &mut Criterion) {
                     // a `set_source`/`set_drain` call — pin them to the
                     // defaults so inference has a concrete type.
                     let mut compressor: FrameCompressor = FrameCompressor::new(level.rust_level);
+                    // Enable LDM before attaching the dictionary (see the
+                    // warmup compressor above for why the order is safe).
+                    if let Some(params) = ldm_parameters(&level) {
+                        compressor.set_parameters(&params);
+                    }
                     compressor
                         .set_encoder_dictionary(
                             EncoderDictionary::from_bytes(&ffi_dictionary)
@@ -748,7 +822,7 @@ fn bench_dictionary(c: &mut Criterion) {
                 level.name, scenario.id, "matrix"
             );
             let mut group = c.benchmark_group(decompress_dict_name);
-            configure_group(&mut group, scenario);
+            configure_group(&mut group, scenario, BenchOp::Decompress);
             group.throughput(Throughput::Bytes(scenario.throughput_bytes()));
 
             // One-time byte-equality verification BEFORE the bench loops.
@@ -830,73 +904,82 @@ fn bench_dictionary(c: &mut Criterion) {
     }
 }
 
+/// Whether a bench group times compression or decompression. The two
+/// operations sit at opposite ends of the per-iter cost / variance curve, so
+/// they take different `measurement_time` budgets on the same scenario class.
+#[derive(Clone, Copy)]
+enum BenchOp {
+    Compress,
+    Decompress,
+}
+
 fn configure_group<M: criterion::measurement::Measurement>(
     group: &mut criterion::BenchmarkGroup<'_, M>,
     scenario: &Scenario,
+    op: BenchOp,
 ) {
-    // CI wall-time tuning (#164):
+    // CI wall-time tuning (#164, #362):
     //
     // criterion 0.8 hard-asserts `sample_size >= 10` (`benchmark_group.rs:97`
     // / `lib.rs:519`). The floor is set in source and cannot be lowered
-    // without forking criterion, so we tune `measurement_time` and
+    // without forking criterion, so we tune `measurement_time` /
     // `warm_up_time` to cut per-bench wall-clock instead.
     //
-    // Pre-tuning budget per `bench_function` (one side):
-    //   Small:    3s measurement + 3s default warm-up = 6s
-    //   Corpus/Entropy: 8s + 3s default warm-up      = 11s
-    //   Large/Silesia:  10s + 0.5s warm-up           = 10.5s
+    // criterion's `SamplingMode::Flat` FILLS `measurement_time` with
+    // iterations at a fixed `sample_size`: any op faster than
+    // `measurement_time / sample_size` is over-iterated. Cost per
+    // `bench_function` ≈ `max(measurement_time, sample_size × per_iter)`.
     //
-    // Each `pure_rust` / `c_ffi` pair doubles that. Across the 21
-    // strategy shards × ~7 scenarios × 3 bench groups (compress,
-    // decompress rust_stream, decompress c_stream) × 2 sides, the
-    // worst shard (`lazy`, 11 levels) reached the 120-min CI cap.
+    // Compress and decompress sit at opposite ends of that curve, so #362
+    // split the budget by `op` (the `bench_compress` / `bench_decompress`
+    // call sites already pass it):
+    //   - compress at high levels is SLOW and is the regression signal we
+    //     protect: z000033 L22 ≈ 294 ms/iter (10 samples ≈ 2.9 s, right at
+    //     the Corpus budget); 100 MiB L22 compress on i686 ≈ ~1 s/iter
+    //     (≈ 10 s+ wall) — the reason Large compress keeps the 20 s budget,
+    //     below which criterion's "increase target time" warning returns.
+    //   - decompress is FAST and extremely low-variance (CI ±0.1–0.5 %):
+    //     100 MiB decode ≈ ~11 ms/iter, 1 KiB ≈ 147 ns. Sharing the compress
+    //     budget made Large decode burn 20 s on an 11 ms op (~1300 iters per
+    //     sample — pure overbench). It now gets a much smaller budget: still
+    //     hundreds+ of iters, CI stays < 1 %, no precision loss against the
+    //     dashboard's regression thresholds.
     //
-    // Post-tuning (criterion still gets >= 10 samples; only the
-    // wall-clock budget shrinks where the measured per-iter is faster
-    // than the budget — slow-per-iter benches are bound by
-    // `samples × per_iter` regardless of budget):
-    //   Small:    1s + 0.2s = 1.2s per side (×2 = 2.4s) — 60% cut
-    //   Corpus/Entropy: 3s + 0.5s = 3.5s per side (×2 = 7s) — 68% cut
-    //   Large/Silesia:  20s + 0.5s — bumped UP from 10s. The slowest
-    //     combos on i686 (level_22_btultra2 / 100 MiB) need ~2 s per
-    //     iter × 10 samples ≈ 20 s wall; the old 10 s budget produced
-    //     persistent criterion "increase target time" warnings and
-    //     occasional flaky measurements. Budget is dwarfed by the
-    //     actual per-iter cost on slow combos, so this only widens the
-    //     warning-free envelope — fast combos still finish under
-    //     budget.
-    //
-    // For very small inputs (1-10 KiB) Small still keeps `sample_size(30)` to
-    // amortise the per-sample fixed cost across more measurements — those
-    // benches finish their 30 samples well inside 1 s thanks to tight
-    // per-iter timings.
-    match scenario.class {
-        ScenarioClass::Small => {
-            group.sample_size(30);
-            group.measurement_time(Duration::from_secs(1));
-            group.warm_up_time(Duration::from_millis(200));
-            group.sampling_mode(SamplingMode::Flat);
+    // `sample_size` (10 / 30) and `warm_up_time` are unchanged: the sample
+    // floor is criterion's statistical minimum, and the 30-sample Small count
+    // amortises timer resolution for ns-scale decode.
+    let measurement = match (scenario.class, op) {
+        (ScenarioClass::Small, BenchOp::Compress) => Duration::from_millis(500),
+        (ScenarioClass::Small, BenchOp::Decompress) => Duration::from_millis(300),
+        // z000033 L22 compress (~0.3 s/iter on i9-x86_64) takes ≈20 s for 10
+        // samples on a GitHub free runner (~6-8x slower), so it emits a benign
+        // "increase target time" notice under any budget below ~22 s — a
+        // pre-existing, CI-only cosmetic warning (it still collects all 10
+        // samples). Raising the budget to silence it would only inflate the
+        // faster corpus-compress levels (they would fill the larger budget)
+        // without helping the slow level, so Corpus compress stays at the 3 s
+        // tier alongside Entropy.
+        (ScenarioClass::Corpus | ScenarioClass::Entropy, BenchOp::Compress) => {
+            Duration::from_secs(3)
         }
-        ScenarioClass::Corpus | ScenarioClass::Entropy => {
-            group.sample_size(10);
-            group.measurement_time(Duration::from_secs(3));
-            group.warm_up_time(Duration::from_millis(500));
-            group.sampling_mode(SamplingMode::Flat);
+        (ScenarioClass::Corpus | ScenarioClass::Entropy, BenchOp::Decompress) => {
+            Duration::from_millis(1500)
         }
-        ScenarioClass::Large | ScenarioClass::Silesia => {
-            // Large/Silesia payloads (16-100 MiB) on slow targets
-            // (i686 + level_22_btultra2) need ~2 s per iter ×
-            // 10 samples ≈ 20 s wall. Old 10 s budget caused
-            // "increase target time" warnings + occasional flakies;
-            // widening to 20 s covers the slowest combo without
-            // affecting wall on faster targets (criterion exits the
-            // budget early when samples complete).
-            group.sample_size(10);
-            group.measurement_time(Duration::from_secs(20));
-            group.warm_up_time(Duration::from_millis(500));
-            group.sampling_mode(SamplingMode::Flat);
+        (ScenarioClass::Large | ScenarioClass::Silesia, BenchOp::Compress) => {
+            Duration::from_secs(20)
         }
-    }
+        (ScenarioClass::Large | ScenarioClass::Silesia, BenchOp::Decompress) => {
+            Duration::from_secs(3)
+        }
+    };
+    let (samples, warm_up) = match scenario.class {
+        ScenarioClass::Small => (30, Duration::from_millis(200)),
+        _ => (10, Duration::from_millis(500)),
+    };
+    group.sample_size(samples);
+    group.measurement_time(measurement);
+    group.warm_up_time(warm_up);
+    group.sampling_mode(SamplingMode::Flat);
 }
 
 fn emit_frame_header_report(
@@ -1083,43 +1166,6 @@ fn training_sample_count(source: &[u8]) -> usize {
     } else {
         samples
     }
-}
-
-/// Build the same byte-slice samples that `training_sample_count`
-/// counts, for passing into FFI's `zstd::dict::from_samples`. Keeps
-/// the two functions in lockstep: primary chunk-by-`sample_size`,
-/// 2-sample midpoint-split fallback for tiny inputs, single-sample
-/// last-resort fallback. Returning `Vec<&[u8]>` borrows from
-/// `source` for zero-copy.
-fn build_training_samples(source: &[u8]) -> Vec<&[u8]> {
-    let sample_size = source.len().div_ceil(16).clamp(256, 8192);
-    let samples: Vec<&[u8]> = source
-        .chunks(sample_size)
-        .take(64)
-        .filter(|chunk| chunk.len() >= 64)
-        .collect();
-    if samples.len() >= 2 {
-        return samples;
-    }
-    let midpoint = source.len() / 2;
-    let left = &source[..midpoint];
-    let right = &source[midpoint..];
-    if left.len() >= 64 && right.len() >= 64 {
-        return vec![left, right];
-    }
-    // Single-sample last resort — matches the BENCH_WARN path in
-    // `training_sample_count`. FFI rejects this and the caller hits
-    // BENCH_WARN, which is the correct behaviour: tiny inputs can't
-    // train a meaningful dictionary regardless of bench-shape
-    // gymnastics. Return the source even for <64-byte inputs so
-    // `samples.len() == training_sample_count(source)` invariant
-    // holds — the diagnostic value reported in the BENCH_WARN line
-    // stays in lockstep across both helpers.
-    vec![source]
-}
-
-fn dictionary_size_for(input_len: usize) -> usize {
-    input_len.div_ceil(8).clamp(256, 16 * 1024)
 }
 
 fn fastcover_fixed_options() -> FastCoverOptions {

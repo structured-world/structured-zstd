@@ -213,6 +213,63 @@ jobs:
         working-directory: zstd
         run: cargo clippy -p structured-zstd --no-default-features --features kernel_scalar,std,hash -- -D warnings
 
+  wasm:
+    # #347 / #348: the wasm32 simd128 kernel tier + the npm package
+    # (@structured-world/structured-zstd). Builds both payloads (simd128 +
+    # scalar), then runs the Node format cross-check against the C reference
+    # (@bokuweb/zstd-wasm): our frames decode there and vice versa. `+simd128`
+    # is scoped to the wasm32 target via `--config` so host build-scripts don't
+    # warn. Cheap (wasm build + node), so it runs on every PR.
+    needs: lint
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # This job builds + tests only (no push); don't leave the token in
+          # the checkout's git config.
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: wasm
+      - name: Clippy (wasm32 simd128)
+        run: cargo clippy -p structured-zstd -p structured-zstd-wasm --target wasm32-unknown-unknown --no-default-features --features kernel_simd128 --config 'target.wasm32-unknown-unknown.rustflags=["-C","target-feature=+simd128"]' -- -D warnings
+      - name: Clippy (wasm32 scalar)
+        run: cargo clippy -p structured-zstd -p structured-zstd-wasm --target wasm32-unknown-unknown --no-default-features --features kernel_simd128 -- -D warnings
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+      - name: Build npm package (both payloads + types)
+        working-directory: zstd-wasm/npm
+        run: |
+          npm ci || npm install
+          npm run build
+      - name: Format cross-check vs C reference (@bokuweb/zstd-wasm)
+        working-directory: zstd-wasm/bench
+        run: |
+          npm ci || npm install
+          npm test
+      - name: wasm size budget
+        run: |
+          for p in simd scalar; do
+            sz=$(stat -c %s "zstd-wasm/npm/$p/structured_zstd_wasm_bg.wasm")
+            echo "$p payload: $sz bytes"
+            # Generous ceiling (~768 KiB) over the ~550 KiB baseline; bump
+            # deliberately if a feature legitimately grows the module.
+            if [ "$sz" -gt 786432 ]; then
+              echo "::error::$p .wasm is $sz bytes, over the 768 KiB budget"
+              exit 1
+            fi
+          done
+
   codecov:
     needs: lint
     timeout-minutes: 15
@@ -319,17 +376,19 @@ jobs:
     # needs gcc-multilib's 32-bit loader at runtime, while `x86_64-musl`
     # only needs `musl-tools` for the build).
     #
-    # Release-plz PRs are version-bump-only (no source changes), so the
-    # entire bench pipeline (matrix → build → shards → aggregate →
-    # pages → regression) is gated out for them via this `if:` filter.
-    # The skip cascades through `needs:` so downstream bench jobs
-    # also stay green-skipped on those PRs. See #164.
+    # The bench pipeline runs ONLY on push-to-main, never on PRs (#362).
+    # Benchmarks on GitHub free runners (~6-8x slower than a dev box) cost
+    # ~20 min per (target, L22) shard, and the pre-merge regression gate it
+    # used to feed added runner load for little signal. `main` is the
+    # immutable historical record: the `dev/bench` dashboard surfaces perf
+    # post-merge, which is where it gets published. This single gate
+    # cascades through `needs:` so EVERY downstream bench job
+    # (`bench-build`, `benchmark`, `benchmark-aggregate`, `benchmark-pages`)
+    # stays green-skipped on PRs without each needing its own filter.
+    # See #164 (sharding) and #362 (push-only gate).
     name: Resolve bench target matrix
     needs: lint
-    if: |
-      github.event_name != 'pull_request' ||
-      (github.event.pull_request.user.login != 'release-plz[bot]' &&
-       !startsWith(github.head_ref, 'release-plz-'))
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     outputs:
       targets: ${{ steps.set.outputs.targets }}
@@ -426,7 +485,7 @@ jobs:
             },
             {
               "id": "btopt",
-              "levels": "level_16_btopt,level_17_btopt"
+              "levels": "level_16_btopt,level_17_btopt,level_1_fast_ldm,level_22_btultra2_ldm,level_1_fast_ldm_dict,level_22_btultra2_ldm_dict"
             },
             {
               "id": "btultra2",
@@ -666,12 +725,13 @@ jobs:
           retention-days: 7
 
       # Save baseline (main push only). Intentionally NO `fail-on-alert`
-      # and NO `comment-on-alert` here — regression alerts are handled
-      # exclusively by the `benchmark-regression-check` job below, which
-      # runs only on regular developer PRs. Mixing the alert/fail path
-      # with the save path here would re-create the stuck-baseline
-      # cascade from #158: a regression on main push would fail the step
-      # before `save-data-file` ran, freezing the baseline indefinitely.
+      # and NO `comment-on-alert` — this step only records the new baseline
+      # for the dashboard. The pre-merge PR regression gate was removed in
+      # #362 (it forced the full bench matrix on every PR for little signal);
+      # perf is now surfaced post-merge via the `dev/bench` dashboard. Adding
+      # an alert/fail path here would re-create the stuck-baseline cascade
+      # from #158: a regression on main push would fail the step before
+      # `save-data-file` ran, freezing the baseline indefinitely.
       - name: Save benchmark baseline (main push only)
         if: steps.bot-token.outputs.token != '' && github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: benchmark-action/github-action-benchmark@v1
@@ -690,7 +750,10 @@ jobs:
   benchmark-pages:
     name: Publish benchmark pages payloads
     needs: benchmark-aggregate
-    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    # Push-to-main only — the whole bench pipeline is gated there now (#362);
+    # the PR branch of this filter was dead once `bench-matrix` stopped
+    # running on PRs (cascade-skip), and PR runs never published anyway.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
@@ -743,60 +806,3 @@ jobs:
           git add dev/bench/index.html dev/bench/benchmark-report.md dev/bench/benchmark-delta.json dev/bench/benchmark-delta.md dev/bench/benchmark-relative.json dev/bench/benchmark-summary.md dev/bench/benchmark-delta-summary.md
           git diff --cached --quiet || git commit -m "chore(bench): publish benchmark reports"
           git push origin gh-pages
-
-  # Regression alert gate — runs ONLY on regular developer PRs from
-  # this repo. Intentionally NOT on:
-  #   * push events (main is the immutable historical record; the
-  #     dev/bench dashboard surfaces regressions visually, no need to
-  #     fail CI red and freeze the publish chain)
-  #   * release-plz PRs (version-bump only, no source changes → perf
-  #     deltas are noise)
-  #   * fork PRs (no access to gh-pages baseline anyway, would just
-  #     emit a confusing comparison-failed line)
-  #
-  # Decoupled from `benchmark-aggregate` / `benchmark-pages` so that a
-  # red alert here does NOT block publish or baseline save (see #158
-  # for the stuck-baseline cascade this avoids).
-  benchmark-regression-check:
-    name: Bench regression alert (developer PR only)
-    needs: benchmark-aggregate
-    if: |
-      github.event_name == 'pull_request' &&
-      github.event.pull_request.head.repo.full_name == github.repository &&
-      github.event.pull_request.user.login != 'release-plz[bot]' &&
-      !startsWith(github.head_ref, 'release-plz-')
-    timeout-minutes: 5
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      # The aggregated artifact carries `benchmark-results.<target>.json`
-      # at its root; download into workspace root so the action's
-      # `output-file-path` resolves without extra path plumbing.
-      - uses: actions/download-artifact@v8
-        with:
-          name: benchmark-aggregated
-
-      - name: Compare against baseline + alert (no save, no push)
-        uses: benchmark-action/github-action-benchmark@v1
-        with:
-          name: "structured-zstd vs C FFI (x86_64-gnu)"
-          tool: customSmallerIsBetter
-          output-file-path: benchmark-results.x86_64-gnu.json
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          # Read-only comparison: no baseline write, no gh-pages push.
-          # The save path lives in `benchmark-aggregate` and runs on
-          # main push only.
-          auto-push: false
-          save-data-file: false
-          # Surface regressions to the PR author + reviewer. Comment is
-          # posted on the head commit so it shows in the PR conversation.
-          comment-on-alert: true
-          alert-comment-cc-users: "@polaz"
-          alert-threshold: "130%"
-          fail-threshold: "160%"
-          # Red CI on >60% regression so a reviewer can't merge by
-          # accident without acknowledging the delta. Failing here does
-          # NOT block publish / baseline save (separate job).
-          fail-on-alert: true
-          benchmark-data-dir-path: dev/bench
