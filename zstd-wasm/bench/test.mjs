@@ -21,12 +21,26 @@ async function loadOurPayload(dir) {
   const glue = await import(`../npm/${dir}/structured_zstd_wasm.js`);
   const bytes = await readFile(here(`../npm/${dir}/structured_zstd_wasm_bg.wasm`));
   await glue.default({ module_or_path: bytes });
-  return { compress: glue.compress, decompress: glue.decompress };
+  return {
+    compress: glue.compress,
+    decompress: glue.decompress,
+    compressUsingDict: glue.compressUsingDict,
+    decompressUsingDict: glue.decompressUsingDict,
+  };
 }
 async function loadBokuweb() {
   const m = await import("@bokuweb/zstd-wasm");
   await m.init();
-  return { compress: m.compress, decompress: m.decompress };
+  return {
+    compress: m.compress,
+    decompress: m.decompress,
+    createCCtx: m.createCCtx,
+    freeCCtx: m.freeCCtx,
+    compressUsingDict: m.compressUsingDict,
+    createDCtx: m.createDCtx,
+    freeDCtx: m.freeDCtx,
+    decompressUsingDict: m.decompressUsingDict,
+  };
 }
 
 const eq = (a, b) => a.length === b.length && Buffer.from(a).equals(Buffer.from(b));
@@ -74,6 +88,29 @@ for (const [name, data] of fixtures()) {
       divergences++;
       console.log(`note: simd128 != scalar bytes for ${name} L${level} (${cs.length} vs ${cc.length}) — allowed`);
     }
+  }
+}
+
+// --- Dictionary API: round-trip + format cross-check with the C reference ---
+// bokuweb's dict API is low-level (createCCtx/freeCCtx); ours is one-shot.
+const dict = new Uint8Array(await readFile(here("fixtures/service.dict")));
+for (const sample of ["sample-1.service", "sample-2.service"]) {
+  const data = new Uint8Array(await readFile(here(`fixtures/${sample}`)));
+  for (const level of [3, 19]) {
+    const cs = simd.compressUsingDict(data, dict, level);
+    const cc = scalar.compressUsingDict(data, dict, level);
+    if (!eq(simd.decompressUsingDict(cs, dict), data)) fail(`dict ${sample} L${level}: simd round-trip`);
+    if (!eq(scalar.decompressUsingDict(cc, dict), data)) fail(`dict ${sample} L${level}: scalar round-trip`);
+    // FORMAT CROSS-CHECK: the C reference decodes our dict frame, and we
+    // decode its dict frame.
+    const dctx = boku.createDCtx();
+    if (!eq(boku.decompressUsingDict(dctx, cs, dict), data)) fail(`dict ${sample} L${level}: C ref cannot decode our dict frame`);
+    boku.freeDCtx(dctx);
+    const cctx = boku.createCCtx();
+    const cb = boku.compressUsingDict(cctx, data, dict, level);
+    boku.freeCCtx(cctx);
+    if (!eq(simd.decompressUsingDict(cb, dict), data)) fail(`dict ${sample} L${level}: we cannot decode C ref's dict frame`);
+    if (!eq(cs, cc)) { divergences++; console.log(`note: dict simd128 != scalar bytes for ${sample} L${level} — allowed`); }
   }
 }
 

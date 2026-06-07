@@ -26,6 +26,8 @@ interface Payload {
   default: (moduleOrPath?: unknown) => Promise<unknown>;
   compress: (data: Uint8Array, level: number) => Uint8Array;
   decompress: (data: Uint8Array) => Uint8Array;
+  compressUsingDict: (data: Uint8Array, dict: Uint8Array, level: number) => Uint8Array;
+  decompressUsingDict: (data: Uint8Array, dict: Uint8Array) => Uint8Array;
 }
 
 /** Default compression level when the caller does not pass one. */
@@ -98,4 +100,32 @@ export async function compress(
 export async function decompress(data: Uint8Array): Promise<Uint8Array> {
   loading ??= load();
   return (await loading).decompress(data);
+}
+
+/**
+ * Compress `data` against a raw Zstandard `dict` (e.g. from `zstd --train`) at
+ * `level` (defaults to {@link DEFAULT_LEVEL}). Mirrors C
+ * `ZSTD_compress_usingDict` — small, similar payloads compress far better.
+ * Rejects if the dictionary is invalid.
+ */
+export async function compressUsingDict(
+  data: Uint8Array,
+  dict: Uint8Array,
+  level: number = DEFAULT_LEVEL,
+): Promise<Uint8Array> {
+  loading ??= load();
+  return (await loading).compressUsingDict(data, dict, level);
+}
+
+/**
+ * Decompress a dictionary-encoded frame. `dict` must be the same raw
+ * dictionary used to compress it. Mirrors C `ZSTD_decompress_usingDict`.
+ * Rejects on a malformed frame or dictionary mismatch.
+ */
+export async function decompressUsingDict(
+  data: Uint8Array,
+  dict: Uint8Array,
+): Promise<Uint8Array> {
+  loading ??= load();
+  return (await loading).decompressUsingDict(data, dict);
 }

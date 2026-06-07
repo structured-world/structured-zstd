@@ -15,13 +15,27 @@ async function loadOurPayload(dir) {
   const glue = await import(`../npm/${dir}/structured_zstd_wasm.js`);
   const bytes = await readFile(here(`../npm/${dir}/structured_zstd_wasm_bg.wasm`));
   await glue.default({ module_or_path: bytes });
-  return { compress: glue.compress, decompress: glue.decompress };
+  return {
+    compress: glue.compress,
+    decompress: glue.decompress,
+    compressUsingDict: glue.compressUsingDict,
+    decompressUsingDict: glue.decompressUsingDict,
+  };
 }
 
 async function loadBokuweb() {
   const m = await import("@bokuweb/zstd-wasm");
   await m.init();
-  return { compress: m.compress, decompress: m.decompress };
+  // Wrap bokuweb's low-level cctx/dctx dict API in the same one-shot shape as
+  // ours so the bench compares like with like (one reused context each).
+  const cctx = m.createCCtx();
+  const dctx = m.createDCtx();
+  return {
+    compress: m.compress,
+    decompress: m.decompress,
+    compressUsingDict: (data, dict, level) => m.compressUsingDict(cctx, data, dict, level),
+    decompressUsingDict: (data, dict) => m.decompressUsingDict(dctx, data, dict),
+  };
 }
 
 // --- Fixtures (mirror zstd/benches/support/mod.rs shapes) -------------------
@@ -141,6 +155,45 @@ for (const [scenario, data] of fixtures) {
   }
 }
 
-const anyFail = rows.some((r) => !r.ok);
+// --- Dictionary benchmarks (dict-friendly small payloads) ------------------
+const dict = await readFile(here("fixtures/service.dict")).then((b) => new Uint8Array(b));
+const dictSamples = [];
+for (const s of ["sample-1.service", "sample-2.service"]) {
+  dictSamples.push([s, new Uint8Array(await readFile(here(`fixtures/${s}`)))]);
+}
+console.log("\n=== dictionary compress/decompress vs @bokuweb/zstd-wasm ===");
+const dictRows = [];
+for (const [scenario, data] of dictSamples) {
+  for (const level of [3, 19]) {
+    for (const [name, eng] of Object.entries(engines)) {
+      const framed = eng.compressUsingDict(data, dict, level);
+      const ok = eng.decompressUsingDict(framed, dict).length === data.length;
+      const cNs = medianNsPerOp(() => eng.compressUsingDict(data, dict, level), BUDGET_MS);
+      const dNs = medianNsPerOp(() => eng.decompressUsingDict(framed, dict), BUDGET_MS);
+      const ratio = framed.length / Math.max(1, data.length);
+      console.log(
+        `REPORT_DICT scenario=${scenario} engine=${name} level=${level} ` +
+          `input_bytes=${data.length} framed_bytes=${framed.length} ratio=${ratio.toFixed(6)} ` +
+          `compress_ns=${cNs} decompress_ns=${dNs} roundtrip=${ok ? "ok" : "FAIL"}`,
+      );
+      dictRows.push({ scenario, level, name, ratio, cNs, dNs, ok });
+    }
+  }
+}
+for (const [scenario, data] of dictSamples) {
+  console.log(`\n${scenario} + dict (${data.length} bytes, dict ${dict.length})`);
+  for (const level of [3, 19]) {
+    const at = (n) => dictRows.find((r) => r.scenario === scenario && r.level === level && r.name === n);
+    const b = at("bokuweb"), s = at("ours-simd128"), sc = at("ours-scalar");
+    const x = (o) => (o.cNs / b.cNs).toFixed(2), xd = (o) => (o.dNs / b.dNs).toFixed(2);
+    console.log(
+      `  L${String(level).padStart(2)}  ratio ours=${s.ratio.toFixed(4)} boku=${b.ratio.toFixed(4)}` +
+        ` | c: simd ${fmtNs(s.cNs)}(${x(s)}x) scalar ${fmtNs(sc.cNs)}(${x(sc)}x) boku ${fmtNs(b.cNs)}` +
+        ` | d: simd ${fmtNs(s.dNs)}(${xd(s)}x) scalar ${fmtNs(sc.dNs)}(${xd(sc)}x) boku ${fmtNs(b.dNs)}`,
+    );
+  }
+}
+
+const anyFail = rows.some((r) => !r.ok) || dictRows.some((r) => !r.ok);
 console.log(anyFail ? "\nROUNDTRIP FAILURES PRESENT" : "\nall roundtrips ok");
 process.exit(anyFail ? 1 : 0);

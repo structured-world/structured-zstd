@@ -15,7 +15,7 @@
 #![cfg(target_arch = "wasm32")]
 
 use structured_zstd::decoding::StreamingDecoder;
-use structured_zstd::encoding::{CompressionLevel, compress_slice_to_vec};
+use structured_zstd::encoding::{CompressionLevel, FrameCompressor, compress_slice_to_vec};
 use structured_zstd::io::Read;
 use wasm_bindgen::prelude::*;
 
@@ -43,5 +43,37 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>, JsError> {
     decoder
         .read_to_end(&mut out)
         .map_err(|err| JsError::new(&format!("structured-zstd: decompress failed: {err:?}")))?;
+    Ok(out)
+}
+
+/// Compress `data` against a raw Zstandard dictionary at compression `level`.
+///
+/// Mirrors C `ZSTD_compress_usingDict`: the dictionary primes the encoder so
+/// small, similar payloads compress far better. The dictionary is the raw
+/// zstd dictionary blob (e.g. from `zstd --train`). Throws if it is invalid.
+#[wasm_bindgen(js_name = compressUsingDict)]
+pub fn compress_using_dict(data: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8>, JsError> {
+    let mut enc: FrameCompressor = FrameCompressor::new(CompressionLevel::Level(level));
+    enc.set_dictionary_from_bytes(dict)
+        .map_err(|err| JsError::new(&format!("structured-zstd: invalid dictionary: {err:?}")))?;
+    Ok(enc.compress_independent_frame(data))
+}
+
+/// Decompress a dictionary-encoded Zstandard frame.
+///
+/// Mirrors C `ZSTD_decompress_usingDict`: `dict` must be the same raw
+/// dictionary the frame was compressed with. Throws on a malformed frame or a
+/// dictionary mismatch.
+#[wasm_bindgen(js_name = decompressUsingDict)]
+pub fn decompress_using_dict(data: &[u8], dict: &[u8]) -> Result<Vec<u8>, JsError> {
+    let mut decoder = StreamingDecoder::new_with_dictionary_bytes(data, dict).map_err(|err| {
+        JsError::new(&format!(
+            "structured-zstd: dict decode init failed: {err:?}"
+        ))
+    })?;
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out).map_err(|err| {
+        JsError::new(&format!("structured-zstd: dict decompress failed: {err:?}"))
+    })?;
     Ok(out)
 }

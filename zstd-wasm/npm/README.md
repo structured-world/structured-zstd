@@ -49,7 +49,15 @@ const out = await compress(payload);
 |--------|-----------|-------|
 | `compress` | `(data: Uint8Array, level?: number) => Promise<Uint8Array>` | `level` defaults to `3`. |
 | `decompress` | `(data: Uint8Array) => Promise<Uint8Array>` | Rejects on a malformed/incomplete frame. |
+| `compressUsingDict` | `(data: Uint8Array, dict: Uint8Array, level?: number) => Promise<Uint8Array>` | Dictionary compression (raw zstd dictionary, e.g. `zstd --train`). |
+| `decompressUsingDict` | `(data: Uint8Array, dict: Uint8Array) => Promise<Uint8Array>` | `dict` must match the one used to compress. |
 | `init` | `() => Promise<void>` | Optional pre-warm; idempotent. |
+
+```ts
+import { compressUsingDict, decompressUsingDict } from "@structured-world/structured-zstd";
+const framed = await compressUsingDict(record, dictionary, 19);
+const back = await decompressUsingDict(framed, dictionary);
+```
 
 ## How the payload is selected
 
