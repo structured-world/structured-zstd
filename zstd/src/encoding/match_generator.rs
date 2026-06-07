@@ -1497,7 +1497,16 @@ impl MatchGeneratorDriver {
                 }
             }
             super::strategy::BackendTag::HashChain => {
-                self.hc_matcher_mut().skip_matching(Some(false))
+                let table = &mut self.hc_matcher_mut().table;
+                if table.uses_bt {
+                    // BT / optimal levels: keep the dict in history for the dms
+                    // but do NOT insert it into the live tree (donor separate
+                    // dictMatchState). Lazy-HC levels still index the dict into
+                    // the live chain (they have no dms).
+                    table.skip_matching_dict_bt();
+                } else {
+                    self.hc_matcher_mut().skip_matching(Some(false));
+                }
             }
         }
     }
@@ -2016,9 +2025,14 @@ impl Matcher for MatchGeneratorDriver {
                 .saturating_add(granted_retained_budget);
         }
         if self.active_backend() == super::strategy::BackendTag::HashChain {
-            self.hc_matcher_mut()
-                .table
-                .set_dictionary_limit_from_primed_bytes(committed_dict_budget);
+            let table = &mut self.hc_matcher_mut().table;
+            table.set_dictionary_limit_from_primed_bytes(committed_dict_budget);
+            // Build the dictMatchState chain for BT/optimal levels so the
+            // collect dual-probes the dictionary with its own compare budget
+            // (the dict bytes were just committed to the front of history).
+            if table.uses_bt {
+                table.prime_dms_chain(committed_dict_budget);
+            }
         }
         // CDict-equivalent: now that every dict chunk is indexed, mark the
         // Fast-backend dict table primed so the next frame's re-prime reuses
@@ -4033,6 +4047,71 @@ macro_rules! bt_insert_and_collect_matches_body {
         if larger_slot != usize::MAX {
             $table.chain_table[larger_slot] = $crate::encoding::match_table::storage::HC_EMPTY;
         }
+
+        // Dict dual-probe (donor `ZSTD_dictMatchState`, zstd_opt.c:776-812):
+        // after the live tree, walk the immutable dictionary chain with its
+        // OWN compare budget and push any dict match longer than the live best
+        // into the ladder. Dict positions are dictionary-relative concat
+        // indices in `[0, region)`, pinned at the front of history, so a dict
+        // candidate at `dict_idx` sits at offset `idx - dict_idx`. The optimal
+        // parser prices these (its DP lookahead values the repcode chain a dict
+        // match seeds), unlike the greedy/lazy parsers.
+        if let Some(dms) = $table.dms.table() {
+            let region = $table.dms.region_len();
+            let dh = $crate::encoding::match_table::storage::MatchTable::hash_position_at(
+                concat,
+                idx,
+                dms.hash_log,
+                dms.mls,
+            );
+            let mut dcur = dms.hash_table[dh];
+            let mut dms_compares = $profile.max_chain_depth.min($search_depth);
+            while dms_compares > 0 {
+                if dcur == $crate::encoding::match_table::storage::HC_EMPTY {
+                    break;
+                }
+                let dict_idx = (dcur - 1) as usize;
+                dms_compares -= 1;
+                let dnext = dms.chain_table[dict_idx];
+                let dms_self_loop = dnext == dcur;
+                if dict_idx < region && dict_idx < idx {
+                    // SAFETY: `dict_idx < idx` and `idx + tail_limit <=
+                    // concat.len()` (checked at entry); same umbrella as the
+                    // live walk's `$cmf`.
+                    let match_len = unsafe { $cmf(concat, idx, dict_idx, tail_limit, 0) };
+                    if match_len > best_len {
+                        let offset = idx - dict_idx;
+                        let accepted = $crate::encoding::bt::BtMatcher::push_candidate_ladder(
+                            $out,
+                            $best_len_for_skip,
+                            $crate::encoding::opt::types::MatchCandidate {
+                                start: $abs_pos,
+                                offset,
+                                match_len,
+                            },
+                            $min_match_len,
+                        );
+                        if accepted {
+                            best_len = match_len;
+                            let candidate_end = $abs_pos + match_len;
+                            if candidate_end > match_end_abs {
+                                match_end_abs = candidate_end;
+                            }
+                            if match_len >= tail_limit
+                                || match_len > $crate::encoding::cost_model::HC_OPT_NUM
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+                if dms_self_loop {
+                    break;
+                }
+                dcur = dnext;
+            }
+        }
+
         // `match_end_abs >= abs_pos + 9 >= 9` (initialized and monotonic),
         // so `match_end_abs - 8 >= 1` cannot underflow.
         $table.skip_insert_until_abs = match_end_abs - 8;

@@ -21,6 +21,7 @@ use alloc::vec::Vec;
 use super::super::Sequence;
 use super::super::blocks::encode_offset_with_history;
 use super::super::cost_model::{HC_OPT_NUM, HcOptimalCostProfile};
+use super::super::dict_attach::DictAttach;
 use super::super::hc::HC_MIN_MATCH_LEN;
 use super::super::opt::types::{HcOptimalSequence, MatchCandidate};
 use super::helpers::INCOMPRESSIBLE_SKIP_STEP;
@@ -215,6 +216,27 @@ pub(crate) const HC_CHAIN_LOG: usize = 19;
 pub(crate) const HC3_HASH_LOG: usize = 17;
 
 /// Shared storage backing every match finder. Holds the contiguous
+/// Immutable dictionary match structure (donor `ZSTD_dictMatchState`) for
+/// the binary-tree / optimal path. A hash + single-link chain over the
+/// dictionary content concat range, searched in addition to the live BT
+/// with its OWN compare budget so dictionary candidates are reachable even
+/// when the live tree's budget is spent on recent positions. Slots store
+/// `dict_rel + 1` (dictionary-relative concat index); `0` is empty.
+#[derive(Clone, Default)]
+pub(crate) struct DmsDictTables {
+    /// Head-of-chain per hash bucket (`1 << hash_log` entries).
+    pub(crate) hash_table: Vec<u32>,
+    /// Per-dictionary-position next link (`region_len` entries).
+    pub(crate) chain_table: Vec<u32>,
+    /// Hash width (bits) the dict chain was built at, so probe hashing
+    /// reproduces the same buckets.
+    pub(crate) hash_log: usize,
+    /// Match-length search width (`mls`) the dict chain was built/probed at —
+    /// the live cParams `minMatch` (donor `ZSTD_dictMatchState` uses the same
+    /// `mls` as the live search), so probe hashing matches the build.
+    pub(crate) mls: usize,
+}
+
 /// history buffer, the rolling window, and the hash / chain / hash3
 /// tables. Methods on this struct contain only logic that's identical
 /// between HC and BT modes — backend-specific table interpretation
@@ -268,6 +290,10 @@ pub(crate) struct MatchTable {
     /// guarantee 8 readable bytes); the HC `hash_position` stays 4-byte.
     /// Defaults to `4`.
     pub(crate) search_mls: usize,
+    /// Immutable dictionary match chain (donor `ZSTD_dictMatchState`),
+    /// searched by the BT/optimal collect alongside the live tree. `Some`
+    /// once primed from a non-empty dictionary on a BT level.
+    pub(crate) dms: DictAttach<DmsDictTables>,
 }
 
 impl MatchTable {
@@ -297,6 +323,7 @@ impl MatchTable {
             is_btultra2: false,
             uses_bt: false,
             search_mls: 4,
+            dms: DictAttach::new(),
         }
     }
 
@@ -534,6 +561,48 @@ impl MatchTable {
         } else {
             Some(self.history_abs_start.saturating_add(primed_len))
         };
+    }
+
+    /// Build the immutable dictionary match chain (donor `ZSTD_dictMatchState`)
+    /// over the first `region_len` bytes of the live history (the dictionary
+    /// content at the front). Hashed at the BT `search_mls` width into a
+    /// dict-sized hash log, so the BT/optimal collect can dual-probe it with
+    /// its own compare budget. `dict_rel + 1` packing, `0` sentinel. Called on
+    /// BT levels (`uses_bt`); cached across frames via `DictAttach::is_primed`.
+    pub(crate) fn prime_dms_chain(&mut self, region_len: usize) {
+        // Donor `ZSTD_dictMatchState` searches the dict at the live cParams
+        // `minMatch` (= our `search_mls`), NOT a fixed 3 — a fixed 3 surfaces
+        // huge-offset ml=3 dict matches that the greedy btlazy2 parser commits
+        // at a loss. The dms's value is being a SEPARATE structure (the dict is
+        // not in the live tree), not a lower minMatch.
+        let mls = self.search_mls;
+        let read = if mls >= 5 { 8 } else { 4 };
+        let concat = self.live_history();
+        let region = region_len.min(concat.len());
+        if region < read {
+            self.dms.invalidate();
+            return;
+        }
+        // Dict-sized hash log: ceil-log2(region) clamped to [10, hash_log].
+        let dms_hash_log =
+            (usize::BITS - (region - 1).leading_zeros()).clamp(10, self.hash_log as u32) as usize;
+        let mut hash_table = alloc::vec![0u32; 1usize << dms_hash_log];
+        let mut chain_table = alloc::vec![0u32; region];
+        let mut p = 0usize;
+        while p + read <= region {
+            let h = Self::hash_position_at(concat, p, dms_hash_log, mls);
+            chain_table[p] = hash_table[h];
+            hash_table[h] = (p + 1) as u32;
+            p += 1;
+        }
+        // `concat`'s borrow of `self` ends above; now mutate `self.dms`.
+        let tables = self.dms.table_mut_or_init(DmsDictTables::default);
+        tables.hash_table = hash_table;
+        tables.chain_table = chain_table;
+        tables.hash_log = dms_hash_log;
+        tables.mls = mls;
+        self.dms.set_region_len(region);
+        self.dms.mark_primed();
     }
 
     /// Append a freshly committed buffer to the rolling window. Drops
@@ -1559,6 +1628,21 @@ impl MatchTable {
     /// `skip_matching` body — backfill the slice boundary and then walk
     /// the current slice in either dense or sparse mode (driven by the
     /// `incompressible_hint`). BT and HC modes branch via `uses_bt`.
+    /// Dict-priming for BT / optimal levels (donor `ZSTD_dictMatchState`):
+    /// the dictionary content stays in `history` (so the dms chain can read it
+    /// and offsets are computed across the dict→input boundary) but is NOT
+    /// inserted into the LIVE binary tree — the donor keeps the dictionary in a
+    /// SEPARATE matchState, so the live tree searches only the input. Advancing
+    /// the BT (`skip_insert_until_abs`) and hash3 cursors past the committed
+    /// dict block makes the first input block's tree update start after it,
+    /// leaving the live tree input-only (the dms is the sole dict source).
+    pub(crate) fn skip_matching_dict_bt(&mut self) {
+        self.ensure_tables();
+        let committed_end = self.history_abs_start + self.window_size;
+        self.skip_insert_until_abs = self.skip_insert_until_abs.max(committed_end);
+        self.next_to_update3 = self.next_to_update3.max(committed_end);
+    }
+
     pub(crate) fn skip_matching(&mut self, incompressible_hint: Option<bool>) {
         self.ensure_tables();
         let current_len = *self.chunk_lens.back().unwrap();
