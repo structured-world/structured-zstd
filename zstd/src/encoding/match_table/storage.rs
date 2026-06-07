@@ -179,6 +179,11 @@ mod stream_abs_headroom_tests {
 pub(crate) const HC_PRIME3BYTES: u32 = 506_832_829;
 /// Knuth-style 4-byte hash multiplier. Donor parity: `ZSTD_HASHPRIME`.
 pub(crate) const HC_PRIME4BYTES: u32 = 2_654_435_761;
+/// 5-byte hash multiplier. Donor parity: `prime5bytes` in
+/// `lib/compress/zstd_compress_internal.h`.
+pub(crate) const HC_PRIME5BYTES: u64 = 889_523_592_379;
+/// 6-byte hash multiplier. Donor parity: `prime6bytes`.
+pub(crate) const HC_PRIME6BYTES: u64 = 227_718_039_650_203;
 
 /// Hash / chain / hash3 sentinel marking an empty slot.
 ///
@@ -255,6 +260,14 @@ pub(crate) struct MatchTable {
     /// `btultra`, `btultra2`). Mirrored from the active strategy for
     /// the same reason as `is_btultra2`.
     pub(crate) uses_bt: bool,
+    /// Binary-tree finder hash width (`mls`), donor `ZSTD_hashPtr` mls =
+    /// `BOUNDED(4, cParams.minMatch, 6)`. clevels.h gives the btlazy2 / btopt
+    /// band (levels 13-16) `minMatch = 5` → a 5-byte (8-byte read) hash that
+    /// shortens the chains the BT walks (speed), so it is set per level in
+    /// `configure`. Only the BT body reads it (the BT hash sites already
+    /// guarantee 8 readable bytes); the HC `hash_position` stays 4-byte.
+    /// Defaults to `4`.
+    pub(crate) search_mls: usize,
 }
 
 impl MatchTable {
@@ -283,6 +296,7 @@ impl MatchTable {
             search_depth: 0,
             is_btultra2: false,
             uses_bt: false,
+            search_mls: 4,
         }
     }
 
@@ -428,6 +442,17 @@ impl MatchTable {
         unsafe { u32::from_le(core::ptr::read_unaligned(ptr as *const u32)) }
     }
 
+    /// 8-byte little-endian read for the `mls` 5/6 hash. Donor parity:
+    /// `MEM_readLE64`.
+    ///
+    /// # Safety
+    /// `ptr` must be valid for a `u64` read (caller guarantees 8 in-bounds
+    /// bytes — every `mls >= 5` hash site gates on `idx + 8 <= len`).
+    #[inline(always)]
+    pub(crate) unsafe fn read_le_u64_ptr(ptr: *const u8) -> u64 {
+        unsafe { u64::from_le(core::ptr::read_unaligned(ptr as *const u64)) }
+    }
+
     /// MLS-parameterised hash of a 32-bit value into a `hash_log`-bit
     /// index. Donor parity: the `mls`-switch in `ZSTD_hashPtr`.
     #[inline(always)]
@@ -438,9 +463,28 @@ impl MatchTable {
         }
     }
 
+    /// 8-byte (`mls` 5/6) hash of a 64-bit value into a `hash_log`-bit index.
+    /// Donor parity: `ZSTD_hash5` / `ZSTD_hash6` in
+    /// `lib/compress/zstd_compress_internal.h` (`(readLE64 << (64 - 8*mls)) *
+    /// primeNbytes >> (64 - hBits)`). Used by the `minMatch = 5` lazy / BT
+    /// band (clevels.h levels 6-16).
+    #[inline(always)]
+    pub(crate) fn hash_value8_with_mls(value: u64, hash_log: usize, mls: usize) -> usize {
+        match mls {
+            6 => (((value << 16).wrapping_mul(HC_PRIME6BYTES)) >> (64 - hash_log)) as usize,
+            // mls == 5 (and any other 8-byte caller defaults here).
+            _ => (((value << 24).wrapping_mul(HC_PRIME5BYTES)) >> (64 - hash_log)) as usize,
+        }
+    }
+
     /// Hash a 4-byte window at the head of `data`.
     #[inline(always)]
     pub(crate) fn hash_position_with_mls(data: &[u8], hash_log: usize, mls: usize) -> usize {
+        if mls >= 5 {
+            debug_assert!(data.len() >= 8);
+            let value = unsafe { Self::read_le_u64_ptr(data.as_ptr()) };
+            return Self::hash_value8_with_mls(value, hash_log, mls);
+        }
         let value = Self::read_le_u32(data);
         Self::hash_value_with_mls(value, hash_log, mls)
     }
@@ -450,6 +494,12 @@ impl MatchTable {
     /// path.
     #[inline(always)]
     pub(crate) fn hash_position_at(data: &[u8], idx: usize, hash_log: usize, mls: usize) -> usize {
+        if mls >= 5 {
+            // 8-byte (mls 5/6) hash. Caller guarantees `idx + 8 <= len`.
+            debug_assert!(idx + 8 <= data.len());
+            let value = unsafe { Self::read_le_u64_ptr(data.as_ptr().add(idx)) };
+            return Self::hash_value8_with_mls(value, hash_log, mls);
+        }
         debug_assert!(idx + 4 <= data.len());
         let value = unsafe { Self::read_le_u32_ptr(data.as_ptr().add(idx)) };
         Self::hash_value_with_mls(value, hash_log, mls)

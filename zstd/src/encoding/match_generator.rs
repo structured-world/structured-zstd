@@ -2485,7 +2485,7 @@ macro_rules! bt_insert_step_no_rebase_body {
             concat,
             idx,
             $table.hash_log,
-            $crate::encoding::bt::BtMatcher::HASH_MLS,
+            $table.search_mls,
         );
         let Some(relative_pos) = $table.relative_position($abs_pos) else {
             return 1;
@@ -3902,7 +3902,7 @@ macro_rules! bt_insert_and_collect_matches_body {
             concat,
             idx,
             $table.hash_log,
-            $crate::encoding::bt::BtMatcher::HASH_MLS,
+            $table.search_mls,
         );
         let Some(relative_pos) = $table.relative_position($abs_pos) else {
             return;
@@ -4117,6 +4117,19 @@ impl HcMatchGenerator {
         self.table.search_depth = self.hc.search_depth;
         self.table.is_btultra2 = is_btultra2;
         self.table.uses_bt = uses_bt;
+        // BT finder hash width, donor `mls = BOUNDED(4, cParams.minMatch, 6)`.
+        // clevels.h (srcSize > 256 KiB tier): btlazy2 L13-15 and btopt L16 are
+        // minMatch=5; btopt L17 is minMatch=4; btultra/btultra2 are minMatch=3
+        // (4-byte main hash + the hash3 short-match probe). The 5-byte hash
+        // shortens the BT walk vs our prior 4-byte everywhere (speed). Only the
+        // BT body reads `search_mls`. `window_log` here is source-clamped (so it
+        // can't tell L16 from L17 on a small source); `config.target_len` is the
+        // level's own value (L16=48, L17=64) and distinguishes them reliably.
+        self.table.search_mls = match tag {
+            StrategyTag::Btlazy2 => 5,
+            StrategyTag::BtOpt if config.target_len <= 48 => 5,
+            _ => 4,
+        };
         // Stage D: promote the backend discriminator. HC modes drop the
         // BT scratch buffers entirely; switching back into a BT mode
         // allocates a fresh `BtMatcher` on demand.
