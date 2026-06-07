@@ -26,6 +26,7 @@ async function loadOurPayload(dir) {
     decompress: glue.decompress,
     compressUsingDict: glue.compressUsingDict,
     decompressUsingDict: glue.decompressUsingDict,
+    StreamCtor: glue.ZstdDecompressStream,
   };
 }
 async function loadBokuweb() {
@@ -111,6 +112,39 @@ for (const sample of ["sample-1.service", "sample-2.service"]) {
     boku.freeCCtx(cctx);
     if (!eq(simd.decompressUsingDict(cb, dict), data)) fail(`dict ${sample} L${level}: we cannot decode C ref's dict frame`);
     if (!eq(cs, cc)) { divergences++; console.log(`note: dict simd128 != scalar bytes for ${sample} L${level} — allowed`); }
+  }
+}
+
+// --- Streaming decompressor: chunked input must equal one-shot output -------
+// Feed each frame to ZstdDecompressStream in several chunk granularities
+// (incl. 1-byte, which exercises the mid-block buffering / block-boundary
+// gate hardest) and assert the concatenated output matches one-shot decode.
+function streamDecode(ctor, framed, chunkSize) {
+  const s = new ctor();
+  const parts = [];
+  for (let i = 0; i < framed.length; i += chunkSize) {
+    parts.push(s.push(framed.subarray(i, Math.min(i + chunkSize, framed.length))));
+  }
+  parts.push(s.finish());
+  s.free();
+  const total = parts.reduce((n, p) => n + p.length, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) { out.set(p, off); off += p.length; }
+  return out;
+}
+for (const [name, data] of fixtures()) {
+  if (data.length === 0) continue; // empty frame: trivial, skip chunk sweep
+  for (const level of [1, 3, 19]) {
+    const framed = simd.compress(data, level);
+    for (const chunk of [1, 3, 7, 64, framed.length]) {
+      if (!eq(streamDecode(simd.StreamCtor, framed, chunk), data)) {
+        fail(`stream ${name} L${level} chunk=${chunk}: simd streaming != one-shot`);
+      }
+      if (!eq(streamDecode(scalar.StreamCtor, framed, chunk), data)) {
+        fail(`stream ${name} L${level} chunk=${chunk}: scalar streaming != one-shot`);
+      }
+    }
   }
 }
 

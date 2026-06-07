@@ -28,6 +28,23 @@ interface Payload {
   decompress: (data: Uint8Array) => Uint8Array;
   compressUsingDict: (data: Uint8Array, dict: Uint8Array, level: number) => Uint8Array;
   decompressUsingDict: (data: Uint8Array, dict: Uint8Array) => Uint8Array;
+  ZstdDecompressStream: new () => DecompressStream;
+}
+
+/**
+ * Incremental streaming decompressor handle. Feed compressed chunks with
+ * {@link DecompressStream.push} and read decompressed output as it becomes
+ * available; call {@link DecompressStream.finish} at end of input. The decoder
+ * window is held on the wasm side across chunks, so a large frame never needs
+ * to be fully buffered. Call {@link DecompressStream.free} when done.
+ */
+export interface DecompressStream {
+  /** Feed compressed bytes; returns decompressed output available so far. */
+  push(chunk: Uint8Array): Uint8Array;
+  /** Signal end of input; returns the final bytes. Throws if incomplete. */
+  finish(): Uint8Array;
+  /** Release the underlying wasm handle. */
+  free(): void;
 }
 
 /** Default compression level when the caller does not pass one. */
@@ -128,4 +145,15 @@ export async function decompressUsingDict(
 ): Promise<Uint8Array> {
   loading ??= load();
   return (await loading).decompressUsingDict(data, dict);
+}
+
+/**
+ * Create an incremental streaming decompressor. Push compressed chunks and
+ * read decompressed output as it arrives, then `finish()`; `free()` when done.
+ * Unlike the common npm wasm zstd packages, the frame need not be fully
+ * buffered — the decoder window lives on the wasm side across chunks.
+ */
+export async function createDecompressStream(): Promise<DecompressStream> {
+  loading ??= load();
+  return new (await loading).ZstdDecompressStream();
 }
