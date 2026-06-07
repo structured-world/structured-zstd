@@ -4082,6 +4082,50 @@ mod tests {
 
     #[cfg(feature = "lsm")]
     #[test]
+    fn resume_range_validates_against_effective_start_not_start_block() {
+        // In resume mode `start_block` is ignored and decoding begins at
+        // `state.block_index()`. The range guard must therefore validate the
+        // EFFECTIVE start against `end_block`: `end_block` below the resume
+        // block is an inverted range and must error, not silently return an
+        // empty decode. Caller passes the conventional ignored `start_block = 0`.
+        let (compressed, _full, info) = multi_block_fixture();
+        let nblocks = info.blocks.len() as u32;
+        let n = (nblocks / 2).max(2);
+        let st = emit_resume_state_at(&compressed, n);
+        let output_offset = info.decompressed_byte_range(n as usize).unwrap().start;
+
+        let mut header_src = compressed.as_slice();
+        let mut dec = FrameDecoder::new();
+        dec.reset(&mut header_src).unwrap();
+        let off = info.blocks[n as usize].offset_in_frame as usize;
+        let mut block_src = &compressed[off..];
+        // end_block = n - 1 is below the resume block n → inverted range.
+        let err = dec
+            .decode_blocks_partial(
+                &mut block_src,
+                0,
+                n - 1,
+                Some(super::ResumeInput {
+                    window_prime: &_full[..output_offset as usize],
+                    state: &st,
+                }),
+                false,
+            )
+            .expect_err("end_block below the resume block must be an inverted range");
+        match err {
+            crate::decoding::errors::FrameDecoderError::InvalidBlockRange {
+                start_block,
+                end_block,
+            } => {
+                assert_eq!(start_block, n, "error must report the effective start");
+                assert_eq!(end_block, n - 1);
+            }
+            other => panic!("expected InvalidBlockRange, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "lsm")]
+    #[test]
     fn emit_resume_state_absent_when_not_requested() {
         // Default partial decode (emit_resume = false) must NOT pay the entropy
         // clone: resume_state stays None.
