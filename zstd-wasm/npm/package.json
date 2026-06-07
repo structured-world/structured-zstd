@@ -65,7 +65,7 @@
     "typescript": "^5.7.0"
   },
   "scripts": {
-    "build:wasm:simd": "cd .. && RUSTFLAGS='-C target-feature=+simd128' wasm-pack build --release --target web --out-dir npm/simd --out-name structured_zstd_wasm",
+    "build:wasm:simd": "cd .. && wasm-pack build --release --target web --out-dir npm/simd --out-name structured_zstd_wasm -- --config 'target.wasm32-unknown-unknown.rustflags=[\"-C\",\"target-feature=+simd128\"]'",
     "build:wasm:scalar": "cd .. && wasm-pack build --release --target web --out-dir npm/scalar --out-name structured_zstd_wasm",
     "build:ts": "tsc",
     "build": "npm run build:wasm:simd && npm run build:wasm:scalar && npm run build:ts",

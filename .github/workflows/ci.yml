@@ -213,6 +213,59 @@ jobs:
         working-directory: zstd
         run: cargo clippy -p structured-zstd --no-default-features --features kernel_scalar,std,hash -- -D warnings
 
+  wasm:
+    # #347 / #348: the wasm32 simd128 kernel tier + the npm package
+    # (@structured-world/structured-zstd). Builds both payloads (simd128 +
+    # scalar), then runs the Node format cross-check against the C reference
+    # (@bokuweb/zstd-wasm): our frames decode there and vice versa. `+simd128`
+    # is scoped to the wasm32 target via `--config` so host build-scripts don't
+    # warn. Cheap (wasm build + node), so it runs on every PR.
+    needs: lint
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: wasm
+      - name: Clippy (wasm32 simd128)
+        run: cargo clippy -p structured-zstd -p structured-zstd-wasm --target wasm32-unknown-unknown --no-default-features --features kernel_simd128 --config 'target.wasm32-unknown-unknown.rustflags=["-C","target-feature=+simd128"]' -- -D warnings
+      - name: Clippy (wasm32 scalar)
+        run: cargo clippy -p structured-zstd -p structured-zstd-wasm --target wasm32-unknown-unknown --no-default-features --features kernel_simd128 -- -D warnings
+      - name: Install wasm-pack
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-pack
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+      - name: Build npm package (both payloads + types)
+        working-directory: zstd-wasm/npm
+        run: |
+          npm ci || npm install
+          npm run build
+      - name: Format cross-check vs C reference (@bokuweb/zstd-wasm)
+        working-directory: zstd-wasm/bench
+        run: |
+          npm ci || npm install
+          npm test
+      - name: wasm size budget
+        run: |
+          for p in simd scalar; do
+            sz=$(stat -c %s "zstd-wasm/npm/$p/structured_zstd_wasm_bg.wasm")
+            echo "$p payload: $sz bytes"
+            # Generous ceiling (~768 KiB) over the ~550 KiB baseline; bump
+            # deliberately if a feature legitimately grows the module.
+            if [ "$sz" -gt 786432 ]; then
+              echo "::error::$p .wasm is $sz bytes, over the 768 KiB budget"
+              exit 1
+            fi
+          done
+
   codecov:
     needs: lint
     timeout-minutes: 15
