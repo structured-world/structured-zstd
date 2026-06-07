@@ -3812,13 +3812,69 @@ mod tests {
         assert_eq!(level_pre_split(CompressionLevel::Level(4)), Some(1)); // dfast
         assert_eq!(level_pre_split(CompressionLevel::Level(5)), Some(2)); // greedy
         assert_eq!(level_pre_split(CompressionLevel::Level(7)), Some(2)); // lazy (depth 1)
-        assert_eq!(level_pre_split(CompressionLevel::Level(8)), Some(3)); // lazy2 lower bound
-        assert_eq!(level_pre_split(CompressionLevel::Level(11)), Some(3)); // lazy2 (depth 2)
-        assert_eq!(level_pre_split(CompressionLevel::Level(12)), Some(3)); // lazy2 upper bound
-        assert_eq!(level_pre_split(CompressionLevel::Level(13)), Some(3)); // btlazy2 lower bound
-        assert_eq!(level_pre_split(CompressionLevel::Level(15)), Some(3)); // btlazy2 (depth 2)
+        // lazy2 / btlazy2 use the rate-1 full-scan splitter (4), not the
+        // rate-5 sampler (3): the sampler phantom-splits homogeneous periodic
+        // input (see `pre_split` comment + `periodic_stream_not_oversplit`).
+        assert_eq!(level_pre_split(CompressionLevel::Level(8)), Some(4)); // lazy2 lower bound
+        assert_eq!(level_pre_split(CompressionLevel::Level(11)), Some(4)); // lazy2 (depth 2)
+        assert_eq!(level_pre_split(CompressionLevel::Level(12)), Some(4)); // lazy2 upper bound
+        assert_eq!(level_pre_split(CompressionLevel::Level(13)), Some(4)); // btlazy2 lower bound
+        assert_eq!(level_pre_split(CompressionLevel::Level(15)), Some(4)); // btlazy2 (depth 2)
         assert_eq!(level_pre_split(CompressionLevel::Level(16)), Some(4)); // btopt
         assert_eq!(level_pre_split(CompressionLevel::Level(22)), Some(4)); // btultra2
+    }
+
+    /// Regression: a homogeneous but periodic multi-block stream must not be
+    /// pre-split into tiny blocks at the lazy2 / btlazy2 levels. The rate-5
+    /// chunk sampler used to phantom-split such input at every 8 KB chunk,
+    /// cascading a large stream into hundreds of tiny blocks whose per-block
+    /// headers ballooned the output (~5x vs the lazy level next door). With
+    /// the rate-1 full-scan splitter the periodic stream is seen as uniform
+    /// and stays a few full blocks. We assert the lazy2 (L8) and btlazy2 (L15)
+    /// outputs stay within 2x of the lazy (L7) output on the same input, and
+    /// that every output round-trips.
+    #[test]
+    fn periodic_stream_not_oversplit() {
+        use crate::encoding::{CompressionLevel, compress_slice_to_vec};
+        const LINES: &[&str] = &[
+            "ts=2026-03-26T21:39:28Z level=INFO msg=\"flush memtable\" tenant=demo table=orders region=eu-west\n",
+            "ts=2026-03-26T21:39:29Z level=INFO msg=\"rotate segment\" tenant=demo table=orders region=eu-west\n",
+            "ts=2026-03-26T21:39:30Z level=INFO msg=\"compact level\" tenant=demo table=orders region=eu-west\n",
+            "ts=2026-03-26T21:39:31Z level=INFO msg=\"write block\" tenant=demo table=orders region=eu-west\n",
+        ];
+        // 512 KB = 4 donor blocks, enough for the cascade to manifest.
+        let target = 512 * 1024usize;
+        let mut data = Vec::with_capacity(target);
+        let mut i = 0;
+        while data.len() < target {
+            let line = LINES[i % LINES.len()].as_bytes();
+            let take = line.len().min(target - data.len());
+            data.extend_from_slice(&line[..take]);
+            i += 1;
+        }
+        let l7 = compress_slice_to_vec(&data, CompressionLevel::Level(7)); // lazy depth1
+        let l8 = compress_slice_to_vec(&data, CompressionLevel::Level(8)); // lazy2
+        let l15 = compress_slice_to_vec(&data, CompressionLevel::Level(15)); // btlazy2
+        assert!(
+            l8.len() < l7.len() * 2,
+            "lazy2 over-split periodic stream: l7={} l8={}",
+            l7.len(),
+            l8.len()
+        );
+        assert!(
+            l15.len() < l7.len() * 2,
+            "btlazy2 over-split periodic stream: l7={} l15={}",
+            l7.len(),
+            l15.len()
+        );
+        for out in [&l7, &l8, &l15] {
+            let mut decoder = FrameDecoder::new();
+            let mut round = Vec::with_capacity(data.len());
+            decoder
+                .decode_all_to_vec(out, &mut round)
+                .expect("decode periodic stream");
+            assert_eq!(round, data, "periodic stream roundtrip mismatch");
+        }
     }
 
     /// End-to-end: a 256 KB payload whose SECOND 128 KB donor block carries

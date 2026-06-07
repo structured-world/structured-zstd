@@ -377,17 +377,31 @@ impl LevelParams {
             super::strategy::StrategyTag::Fast => Some(0),
             super::strategy::StrategyTag::Dfast => Some(1),
             super::strategy::StrategyTag::Greedy => Some(2),
-            // lazy=2, lazy2/btlazy2=3; both lazy2 and btlazy2 ride the Lazy
-            // tag at lazy_depth 2 in the level table.
+            // The lazy2 / btlazy2 band (Lazy at lazy_depth >= 2, and Btlazy2)
+            // uses the rate-1 full-scan chunk splitter (4), NOT the rate-5
+            // sampler (3). The rate-5 sampler combined with the larger
+            // hash_log is sensitive enough to register a phantom statistical
+            // transition on perfectly homogeneous but periodic input (e.g. a
+            // repeating log-line stream whose period does not divide the 8 KB
+            // chunk size): the sampled bytes land on a different phase in each
+            // chunk, so two identical-distribution chunks look different and
+            // the block is split at 8 KB, then re-split on every window,
+            // cascading a large stream into hundreds of tiny blocks whose
+            // per-block headers dwarf the payload. The rate-1 scan reads every
+            // byte, so it sees periodic data as uniform and declines to split,
+            // while still finding genuine content boundaries (measured better
+            // ratio on the real decode corpus, and no longer expands a
+            // periodic stream vs a single full block). lazy/greedy keep the
+            // coarse samplers (lower hash_log => not sensitive enough to
+            // alias here).
             super::strategy::StrategyTag::Lazy => {
                 if self.lazy_depth >= 2 {
-                    Some(3)
+                    Some(4)
                 } else {
                     Some(2)
                 }
             }
-            // btlazy2 rides the same lazy2 split code (3).
-            super::strategy::StrategyTag::Btlazy2 => Some(3),
+            super::strategy::StrategyTag::Btlazy2 => Some(4),
             super::strategy::StrategyTag::BtOpt
             | super::strategy::StrategyTag::BtUltra
             | super::strategy::StrategyTag::BtUltra2 => Some(4),
