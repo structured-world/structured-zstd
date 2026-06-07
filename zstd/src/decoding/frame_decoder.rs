@@ -2101,6 +2101,32 @@ impl FrameDecoder {
                             .saturating_add(u64::from(block_header.decompressed_size)),
                     });
                 }
+                // Compressed-block in-block overshoot: the sequence
+                // executor (donor-inline path) or the match-repeat
+                // fallback tripped the fixed-capacity backend's per-write
+                // check. Unlike Raw/RLE, a Compressed block carries no
+                // header-declared output size, so `produced` is computed
+                // from the partial fill: `tail` bytes were written before
+                // the failing op, and `requested` is what overflowed —
+                // their sum is a strict lower bound on the frame's true
+                // expanded size and is always > `content_size` (the
+                // direct path is only entered when the slice is sized to
+                // `content_size + WILDCOPY_OVERLENGTH`, so any overflow
+                // means the frame exceeded the declared FCS, never a
+                // caller-undersized buffer). Folds into the same
+                // `FrameContentSizeMismatch` contract as Raw/RLE.
+                Err(crate::decoding::errors::DecodeBlockContentError::DecompressBlockError(
+                    crate::decoding::errors::DecompressBlockError::ExecuteSequencesError(ref e),
+                )) if e.output_overflow_requested().is_some() => {
+                    let requested = e
+                        .output_overflow_requested()
+                        .expect("guard guarantees Some") as u64;
+                    let tail = direct.buffer.buffer_ref().tail() as u64;
+                    return Err(err::FrameContentSizeMismatch {
+                        declared: content_size,
+                        produced: tail.saturating_add(requested),
+                    });
+                }
                 Err(e) => {
                     return Err(block_body_decode_error(
                         e,
@@ -2418,6 +2444,81 @@ mod tests {
             "expected FrameContentSizeMismatch, got {:?}",
             err
         );
+    }
+
+    #[test]
+    fn decode_all_compressed_block_fcs_overflow_returns_structured_error() {
+        // Acceptance test for #246: a malformed frame whose *Compressed*
+        // block expands past the declared `frame_content_size` must
+        // surface `FrameContentSizeMismatch` from the direct-decode path
+        // (UserSliceBackend sequence executor), NOT panic and NOT a
+        // generic FailedToReadBlockBody. The Raw-block sibling above
+        // covers the `BackendOverflow` arm; this covers the Compressed
+        // sequence-executor overflow arm (`ExecuteSequencesError::
+        // OutputBufferOverflow` folded into FrameContentSizeMismatch in
+        // `run_direct_decode`).
+        //
+        // Construction: compress a compressible payload to get a genuine
+        // Compressed block + a header-declared FCS, then surgically patch
+        // the FCS field down to a tiny value. The block body still
+        // decodes (literals/sequences are independent of FCS) and the
+        // sequence executor overflows the small output slice.
+        // Highly compressible payload (repeated phrase) → Compressed
+        // block whose sequence executor produces ~4 KiB of output.
+        let unit = b"The quick brown fox jumps over the lazy dog. ";
+        let mut payload = Vec::with_capacity(4 * 1024);
+        while payload.len() < 4 * 1024 {
+            payload.extend_from_slice(unit);
+        }
+        let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        compressor.set_source(payload.as_slice());
+        let mut frame = Vec::new();
+        compressor.set_drain(&mut frame);
+        compressor.compress();
+        // Sanity: the encoder actually compressed (=> a Compressed block,
+        // not a raw-stored fallback) so we exercise the sequence path.
+        assert!(frame.len() < payload.len());
+
+        // Locate the FCS field: it is the last `fcs_len` bytes of the
+        // frame header, whose total size `header_size` includes the magic.
+        // A ~4 KiB single-segment frame declares FCS = 4096, which lands in
+        // the 2-byte field range [256, 65791] (RFC 8878 §3.1.1.1.4) — assert
+        // that so the patch logic below stays a single deterministic branch.
+        let (header, header_size) =
+            super::super::frame::read_frame_header(frame.as_slice()).expect("valid header");
+        let fcs_len = header
+            .descriptor
+            .frame_content_size_bytes()
+            .expect("fcs present") as usize;
+        assert_eq!(
+            fcs_len, 2,
+            "4 KiB single-segment frame must use a 2-byte FCS"
+        );
+        let fcs_off = header_size as usize - fcs_len;
+
+        // Patch the 2-byte FCS to its floor: stored bytes 0 decode to 256
+        // (the field's `+256` bias), far below the 4 KiB the block actually
+        // produces, so the sequence executor overflows the output slice.
+        let patched_declared: u64 = 256;
+        frame[fcs_off] = 0;
+        frame[fcs_off + 1] = 0;
+
+        // Size the output to declared + WILDCOPY slack so the direct path
+        // is eligible (output.len() >= content_size + slack) — the
+        // overflow then comes from the frame, not an undersized buffer.
+        let slack = super::super::buffer_backend::WILDCOPY_OVERLENGTH;
+        let mut out = alloc::vec![0u8; patched_declared as usize + slack];
+        let mut dec = FrameDecoder::new();
+        let err = dec
+            .decode_all(frame.as_slice(), &mut out)
+            .expect_err("Compressed block exceeding FCS must fail decode");
+        match err {
+            super::FrameDecoderError::FrameContentSizeMismatch { declared, produced } => {
+                assert_eq!(declared, patched_declared, "declared echoes patched FCS");
+                assert!(produced > declared, "produced must exceed declared");
+            }
+            other => panic!("expected FrameContentSizeMismatch, got {other:?}"),
+        }
     }
 
     /// Block-precise error positions (#174): a failing block header / body
