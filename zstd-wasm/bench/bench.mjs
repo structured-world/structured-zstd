@@ -224,7 +224,6 @@ for (const [scenario, data] of fixtures) {
     const line = [`${scenario.padEnd(22)} L${String(level).padStart(2)}`];
     for (const tier of ["ours-simd128", "ours-scalar"]) {
       const eng = engines[tier];
-      const oneShot = eng.compress(data, level);
       const streamed = streamCompressOnce(eng.CompressStreamCtor, data, level);
       const ok = eq(eng.decompress(streamed), data);
       if (!ok) { rows.push({ scenario, level, name: `${tier}-stream`, ok: false }); }
