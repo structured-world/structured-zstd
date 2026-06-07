@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780862822917,
+  "lastUpdate": 1780869678761,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -60506,6 +60506,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.26,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "34c20c78a92cb05d441fedf54254b48be85b3c3f",
+          "message": "feat(decoding): resumable cold partial decode (resume_at via decode_blocks_partial) (#371)\n\n* feat(decoding): resumable cold partial decode for decode_blocks_partial\n\nAdd a symmetric one-call resume to the lsm partial decoder so a decoded\nextent can grow without re-decompressing the covering prefix (was O(N²)\nfor a forward block walk).\n\n- `decode_blocks_partial` gains `resume: Option<ResumeInput>` and\n  `emit_resume: bool`; `PartialDecode` gains `resume_state`.\n- `emit_resume` captures cross-block carry-over state (FSE/Huffman\n  tables + repcode history + next-block coordinates) into a new\n  `ResumeState`; the entropy-table clone is only paid when requested.\n- `resume` continues from a prior `ResumeState`: the match window is\n  primed from the caller's already-decompressed tail and the entropy\n  tables are restored, so a Repeat_Mode resume block resolves\n  byte-identically to a contiguous decode, even across a dropped\n  (cold) decoder. Window priming alone is insufficient because\n  Compressed blocks reuse the previous block's entropy tables.\n- A too-short `window_prime` is rejected up front with the typed\n  `ResumeWindowTooShort` instead of silently mis-resolving matches.\n\nAll new symbols are gated behind the `lsm` feature; the default build is\nunchanged. Covered by resume round-trip, grow-loop reconstruction,\nexact-window-tail (multi-segment), short-window rejection, no-emit, and\nan instrumented no-prefix-redecode test.\n\nCloses #368\n\n* test(decoding): add regression test for resume range guard\n\nIn resume mode `start_block` is ignored and decoding begins at the resume\nstate's block index, but the inverted-range guard still checks the\ncaller-supplied `start_block`. Passing `end_block` below the resume block\ntherefore returns an empty decode instead of an error. This test fails on\nthe current code (it gets Ok(empty)) and will pass once the guard\nvalidates the effective start.\n\n* fix(decoding): guard resume against frame mismatch and inverted range\n\n- Validate the resumed block range against the effective start (resume\n  mode ignores the caller's start_block and begins at the resume block),\n  so an end_block below the resume block errors as an inverted range\n  instead of silently returning an empty decode.\n- Add a frame-shape identity (FrameKey: window size, content size,\n  dictionary id, single-segment flag, content-checksum flag, magicless)\n  to ResumeState, checked before any entropy/repcode restore. Applying a\n  snapshot to a frame of a different shape now returns the typed\n  ResumeFrameMismatch instead of byte-wrong output.\n- Correct the ResumeWindowTooShort message to name the current `resume`\n  API (was the removed `resume_at`).\n\nAdds regression tests for the inverted-range guard and the frame-shape\nmismatch rejection.\n\n* fix(decoding): strengthen resume identity (window hash + active dict)\n\nHarden the ResumeState identity guard so a snapshot can only be applied\nto the decode context it was captured from:\n\n- Content-exact window check (feature = \"hash\"): record the XXH64 of the\n  window-prime bytes at emit and verify the caller-supplied window_prime\n  hashes to the same value before any restore. Catches a same-shape but\n  different-frame snapshot and a wrong/corrupted window_prime, which the\n  header-shape key alone cannot. One O(window) pass per resume.\n- Active-dictionary identity: FrameKey now keys on the applied dictionary\n  (state.using_dict), not just the header's dictionary_id. A dictless\n  header decoded with an explicit dictionary (reset_with_dict_handle /\n  force_dict) no longer compares equal to one decoded with a different\n  (or no) dictionary; mismatches return ResumeFrameMismatch.\n- Document that ResumeState carries neither the window nor the\n  dictionary: the caller re-attaches the dictionary on reset (it already\n  holds it from encode time), and the snapshot stores only its identity.\n\nAdds regression tests for the corrupted-window-prime rejection and the\ndifferent-active-dictionary rejection.\n\n* test(decoding): add regression test for terminal-block resume snapshot\n\nemit_resume currently produces a ResumeState even when the decode reaches\nthe frame's last block, with block_index one past EOF and no valid next\nblock source for the caller. This test asserts resume_state is None once\nframe_finished is true; it fails on the current code (gets Some) and will\npass once the terminal-block snapshot is suppressed.\n\n* fix(decoding): suppress resume snapshot on the terminal block\n\nWhen a partial decode reaches the frame's last block, block_counter is\none past EOF and there is no next-block source position to resume from\n(callers only have per-block offset_in_frame). Emitting a ResumeState\nthere produced a dangling snapshot that a later resume would use to read\na block header past end-of-frame. Gate emission on !frame_finished so the\nterminal block yields resume_state = None.\n\nAlso corrects the PartialDecode::start_block doc: in resume mode it is the\nresume block index, not the (ignored) caller-supplied start_block.\n\n* docs(decoding): note resume_state is None at end-of-frame\n\nPartialDecode::resume_state and the decode_blocks_partial resume docs\nsaid the snapshot is present whenever emit_resume = true. Since the\nterminal block now suppresses emission, document that None also means\nthe frame's last block was reached (frame_finished), so an incremental\nwalk stops on frame_finished rather than treating None as\n\"emission disabled\".\n\n* test(decoding): add regression test for resume error-path state mutation\n\nThe effective-range check runs after restore_entropy / prime_window /\ncursor rewrites, so an inverted end_block leaves the decoder in a\nsynthetic resumed state before the error returns. This test asserts the\nblock cursor is unchanged after the rejected resume; it fails on the\ncurrent code (cursor advanced to the resume block) and will pass once\nvalidation precedes priming.\n\n* fix(decoding): validate resume range before priming decoder state\n\nThe effective-range check ran after restore_entropy / prime_window /\ncursor rewrites, so an inverted end_block returned InvalidBlockRange only\nafter the decoder had already been mutated into a half-resumed state. Move\nthe check ahead of all mutations (and validate the fresh-decode range in\nits own branch), so a bad range fails cleanly and leaves the decoder\nre-resettable.",
+          "timestamp": "2026-06-08T00:20:26+03:00",
+          "tree_id": "71a6952c927ca95e2e930fd3c029648f89dcb137",
+          "url": "https://github.com/structured-world/structured-zstd/commit/34c20c78a92cb05d441fedf54254b48be85b3c3f"
+        },
+        "date": 1780869669540,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.125,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.085,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 352.416,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 247.781,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.668,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.741,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.424,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.017,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.308,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.966,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.099,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.202,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.099,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.202,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.018,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.008,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 15.862,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 4.585,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 1.142,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.323,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.999,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.198,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.792,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.069,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.097,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.201,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.097,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.2,
             "unit": "ms"
           }
         ]
