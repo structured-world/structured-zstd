@@ -51,6 +51,7 @@ const out = await compress(payload);
 | `decompress` | `(data: Uint8Array) => Promise<Uint8Array>` | Rejects on a malformed/incomplete frame. |
 | `compressUsingDict` | `(data: Uint8Array, dict: Uint8Array, level?: number) => Promise<Uint8Array>` | Dictionary compression (raw zstd dictionary, e.g. `zstd --train`). |
 | `decompressUsingDict` | `(data: Uint8Array, dict: Uint8Array) => Promise<Uint8Array>` | `dict` must match the one used to compress. |
+| `createCompressStream` | `(level?: number) => Promise<CompressStream>` | Incremental streaming encoder (see below); `level` defaults to `3`. |
 | `createDecompressStream` | `() => Promise<DecompressStream>` | Incremental streaming decoder (see below). |
 | `init` | `() => Promise<void>` | Optional pre-warm; idempotent. |
 
@@ -59,6 +60,27 @@ import { compressUsingDict, decompressUsingDict } from "@structured-world/struct
 const framed = await compressUsingDict(record, dictionary, 19);
 const back = await decompressUsingDict(framed, dictionary);
 ```
+
+### Streaming compression
+
+Compress a large or unbounded source incrementally — push plaintext chunks and
+emit compressed blocks as the matcher window fills, so peak memory is
+O(window), not O(input):
+
+```ts
+import { createCompressStream } from "@structured-world/structured-zstd";
+
+const stream = await createCompressStream(19);
+const out: Uint8Array[] = [];
+for await (const chunk of source) out.push(stream.push(chunk));
+out.push(stream.finish()); // final block + checksum, seals the frame
+stream.free();             // release the wasm handle
+```
+
+`push(chunk)` returns the compressed bytes complete so far (possibly empty
+while the current block is still filling). The frame omits `Frame_Content_Size`
+(unknown while streaming) yet decodes in any compliant zstd decoder, including
+`decompress` / `createDecompressStream` here and the native C library.
 
 ### Streaming decompression
 

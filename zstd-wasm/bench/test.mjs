@@ -27,6 +27,7 @@ async function loadOurPayload(dir) {
     compressUsingDict: glue.compressUsingDict,
     decompressUsingDict: glue.decompressUsingDict,
     StreamCtor: glue.ZstdDecompressStream,
+    CompressStreamCtor: glue.ZstdCompressStream,
   };
 }
 async function loadBokuweb() {
@@ -146,6 +147,53 @@ for (const [name, data] of fixtures()) {
       }
       if (!eq(streamDecode(scalar.StreamCtor, framed, chunk), data)) {
         fail(`stream ${name} L${level} chunk=${chunk}: scalar streaming != one-shot`);
+      }
+    }
+  }
+}
+
+// --- Streaming compressor: chunked plaintext must produce a valid frame -----
+// Feed each payload to ZstdCompressStream in several chunk granularities and
+// concatenate the emitted compressed bytes; the resulting frame omits FCS
+// (unknown size while streaming). MANDATORY: it must decode back to the input
+// BOTH in our own decoder AND in the C reference (@bokuweb/zstd-wasm) — output
+// need NOT be byte-identical to one-shot, only decode to the same bytes.
+function streamCompress(ctor, data, level, chunkSize) {
+  const s = new ctor(level);
+  const parts = [];
+  for (let i = 0; i < data.length; i += chunkSize) {
+    parts.push(s.push(data.subarray(i, Math.min(i + chunkSize, data.length))));
+  }
+  parts.push(s.finish());
+  s.free();
+  const total = parts.reduce((n, p) => n + p.length, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) { out.set(p, off); off += p.length; }
+  return out;
+}
+for (const [name, data] of fixtures()) {
+  if (data.length === 0) continue; // empty input: covered by one-shot; skip sweep
+  // L22 advertises the 128 MiB max window verbatim in the no-FCS streaming
+  // header — included here to pin that our own decoder (and the C reference)
+  // accept it, i.e. the encoder↔decoder window cap stays aligned.
+  for (const level of [-3, 1, 3, 19, 22]) {
+    for (const chunk of [1, 3, 7, 64, data.length]) {
+      const simdFrame = streamCompress(simd.CompressStreamCtor, data, level, chunk);
+      const scalarFrame = streamCompress(scalar.CompressStreamCtor, data, level, chunk);
+      // MANDATORY: our decoder round-trips the streamed frame.
+      if (!eq(simd.decompress(simdFrame), data)) {
+        fail(`compress-stream ${name} L${level} chunk=${chunk}: simd round-trip`);
+      }
+      if (!eq(scalar.decompress(scalarFrame), data)) {
+        fail(`compress-stream ${name} L${level} chunk=${chunk}: scalar round-trip`);
+      }
+      // MANDATORY: the C reference decodes our no-FCS streamed frame (both payloads).
+      if (!eq(boku.decompress(simdFrame), data)) {
+        fail(`compress-stream ${name} L${level} chunk=${chunk}: C ref cannot decode our simd frame`);
+      }
+      if (!eq(boku.decompress(scalarFrame), data)) {
+        fail(`compress-stream ${name} L${level} chunk=${chunk}: C ref cannot decode our scalar frame`);
       }
     }
   }

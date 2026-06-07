@@ -29,6 +29,7 @@ interface Payload {
   compressUsingDict: (data: Uint8Array, dict: Uint8Array, level: number) => Uint8Array;
   decompressUsingDict: (data: Uint8Array, dict: Uint8Array) => Uint8Array;
   ZstdDecompressStream: new () => DecompressStream;
+  ZstdCompressStream: new (level: number) => CompressStream;
 }
 
 /**
@@ -42,6 +43,24 @@ export interface DecompressStream {
   /** Feed compressed bytes; returns decompressed output available so far. */
   push(chunk: Uint8Array): Uint8Array;
   /** Signal end of input; returns the final bytes. Throws if incomplete. */
+  finish(): Uint8Array;
+  /** Release the underlying wasm handle. */
+  free(): void;
+}
+
+/**
+ * Incremental streaming compressor handle. Feed plaintext chunks with
+ * {@link CompressStream.push} and read complete compressed blocks as the
+ * matcher window fills; call {@link CompressStream.finish} to seal the frame
+ * (final block + checksum). Peak memory is O(window), not O(input) — the frame
+ * is emitted block-by-block instead of buffered whole. The frame omits
+ * `Frame_Content_Size` (unknown while streaming) yet decodes in any compliant
+ * zstd decoder. Call {@link CompressStream.free} when done.
+ */
+export interface CompressStream {
+  /** Feed plaintext; returns compressed bytes complete so far (may be empty). */
+  push(chunk: Uint8Array): Uint8Array;
+  /** Seal the frame; returns the final block + checksum. */
   finish(): Uint8Array;
   /** Release the underlying wasm handle. */
   free(): void;
@@ -156,4 +175,20 @@ export async function decompressUsingDict(
 export async function createDecompressStream(): Promise<DecompressStream> {
   loading ??= load();
   return new (await loading).ZstdDecompressStream();
+}
+
+/**
+ * Create an incremental streaming compressor at `level` (zstd scale: `1..=22`,
+ * negatives for the ultra-fast tier; defaults to {@link DEFAULT_LEVEL}). Push
+ * plaintext chunks and read compressed blocks as they complete, then
+ * `finish()`; `free()` when done. Peak memory is O(window), not O(input) — the
+ * frame is emitted block-by-block rather than buffered whole — and the result
+ * decodes in any compliant zstd decoder. Symmetric with
+ * {@link createDecompressStream}.
+ */
+export async function createCompressStream(
+  level: number = DEFAULT_LEVEL,
+): Promise<CompressStream> {
+  loading ??= load();
+  return new (await loading).ZstdCompressStream(level);
 }

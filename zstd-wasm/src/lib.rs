@@ -15,8 +15,10 @@
 #![cfg(target_arch = "wasm32")]
 
 use structured_zstd::decoding::{BlockDecodingStrategy, FrameDecoder, StreamingDecoder};
-use structured_zstd::encoding::{CompressionLevel, FrameCompressor, compress_slice_to_vec};
-use structured_zstd::io::Read;
+use structured_zstd::encoding::{
+    CompressionLevel, FrameCompressor, StreamingEncoder, compress_slice_to_vec,
+};
+use structured_zstd::io::{Read, Write};
 use wasm_bindgen::prelude::*;
 
 /// Compress `data` into a standard Zstandard frame at compression `level`.
@@ -219,5 +221,61 @@ impl ZstdDecompressStream {
             }
         }
         Ok(out)
+    }
+}
+
+/// Incremental streaming compressor: feed plaintext chunks via
+/// [`ZstdCompressStream::push`] and receive complete compressed blocks as the
+/// matcher window fills, then [`ZstdCompressStream::finish`] to seal the frame
+/// (final block + content checksum). Peak working set is O(window), not
+/// O(input) — emitted blocks are flushed to the caller while only the matcher
+/// window is retained — so a large payload never has to be buffered whole. The
+/// produced frame omits `Frame_Content_Size` (the total is unknown while
+/// streaming) and decodes in any compliant zstd decoder. Mirrors
+/// [`ZstdDecompressStream`], making the wasm streaming API symmetric.
+#[wasm_bindgen]
+pub struct ZstdCompressStream {
+    // `None` once `finish` has consumed the encoder; further calls then throw
+    // instead of silently producing a second (empty) frame.
+    encoder: Option<StreamingEncoder<Vec<u8>>>,
+}
+
+#[wasm_bindgen]
+impl ZstdCompressStream {
+    /// Open a streaming compressor at `level` (zstd scale: `1..=22`, negatives
+    /// for the ultra-fast tier).
+    #[wasm_bindgen(constructor)]
+    pub fn new(level: i32) -> ZstdCompressStream {
+        ZstdCompressStream {
+            encoder: Some(StreamingEncoder::new(
+                Vec::new(),
+                CompressionLevel::Level(level),
+            )),
+        }
+    }
+
+    /// Feed more plaintext; returns whatever compressed bytes are now complete
+    /// (possibly empty while the current block is still filling).
+    pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<u8>, JsError> {
+        let enc = self
+            .encoder
+            .as_mut()
+            .ok_or_else(|| JsError::new("structured-zstd: compress stream already finished"))?;
+        enc.write_all(chunk)
+            .map_err(|err| JsError::new(&format!("structured-zstd: compress failed: {err:?}")))?;
+        // Drain the bytes flushed into the backing Vec since the last call,
+        // leaving an empty Vec for the encoder to keep appending to.
+        Ok(core::mem::take(enc.get_mut()))
+    }
+
+    /// Seal the frame; returns the final block plus the content checksum. Throws
+    /// if the stream was already finished.
+    pub fn finish(&mut self) -> Result<Vec<u8>, JsError> {
+        let enc = self
+            .encoder
+            .take()
+            .ok_or_else(|| JsError::new("structured-zstd: compress stream already finished"))?;
+        enc.finish()
+            .map_err(|err| JsError::new(&format!("structured-zstd: finish failed: {err:?}")))
     }
 }
