@@ -159,6 +159,13 @@ struct HcConfig {
     chain_log: usize,
     search_depth: usize,
     target_len: usize,
+    /// Binary-tree finder hash width (donor `mls = BOUNDED(4, minMatch, 6)`),
+    /// carried explicitly per level so it is NOT inferred from `target_len`
+    /// (a `target_length` override must not silently flip the finder between
+    /// 5- and 4-byte hashing). Only the BT body reads it; HC/lazy levels keep
+    /// it at 4 (their `hash_position` is always 4-byte). 5 for the
+    /// minMatch=5 BT levels (btlazy2 + btopt L16), 4 elsewhere.
+    search_mls: usize,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -184,6 +191,7 @@ const HC_CONFIG: HcConfig = HcConfig {
     chain_log: HC_CHAIN_LOG,
     search_depth: HC_SEARCH_DEPTH,
     target_len: HC_TARGET_LEN,
+    search_mls: 4,
 };
 
 /// Base HashChain config synthesized when a public-parameter strategy
@@ -196,6 +204,7 @@ const HC_OVERRIDE_DEFAULT: HcConfig = HcConfig {
     chain_log: super::match_table::storage::HC_CHAIN_LOG,
     search_depth: HC_SEARCH_DEPTH,
     target_len: HC_TARGET_LEN,
+    search_mls: 4,
 };
 
 const BTULTRA2_HC_CONFIG: HcConfig = HcConfig {
@@ -203,6 +212,7 @@ const BTULTRA2_HC_CONFIG: HcConfig = HcConfig {
     chain_log: 24,
     search_depth: 512,
     target_len: 256,
+    search_mls: 4,
 };
 
 const BTULTRA2_HC_CONFIG_L22: HcConfig = HcConfig {
@@ -210,6 +220,7 @@ const BTULTRA2_HC_CONFIG_L22: HcConfig = HcConfig {
     chain_log: 27,
     search_depth: 512,
     target_len: 999,
+    search_mls: 4,
 };
 
 const BTULTRA2_HC_CONFIG_L22_256K: HcConfig = HcConfig {
@@ -217,6 +228,7 @@ const BTULTRA2_HC_CONFIG_L22_256K: HcConfig = HcConfig {
     chain_log: 19,
     search_depth: 1 << 13,
     target_len: 999,
+    search_mls: 4,
 };
 
 const BTULTRA2_HC_CONFIG_L22_128K: HcConfig = HcConfig {
@@ -224,6 +236,7 @@ const BTULTRA2_HC_CONFIG_L22_128K: HcConfig = HcConfig {
     chain_log: 18,
     search_depth: 1 << 11,
     target_len: 999,
+    search_mls: 4,
 };
 
 const BTULTRA2_HC_CONFIG_L22_16K: HcConfig = HcConfig {
@@ -231,6 +244,7 @@ const BTULTRA2_HC_CONFIG_L22_16K: HcConfig = HcConfig {
     chain_log: 15,
     search_depth: 1 << 10,
     target_len: 999,
+    search_mls: 4,
 };
 
 // Default Row config: only used by tests and the test-only parse×search
@@ -633,13 +647,13 @@ const LEVEL_TABLE: [LevelParams; 22] = [
     // long-enough match — the dominant cost in the L5..=L15 speed
     // regression vs FFI (see lazy_band_target_len_matches_donor_default_table).
     /* 5 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Greedy, search: super::strategy::SearchMethod::RowHash, window_log: 21, lazy_depth: 0, fast: None, dfast: None, hc: None, row: Some(ROW_L5) },
-    /* 6 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 21, lazy_depth: 1, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 19, chain_log: 18, search_depth: 8,  target_len: 4 }), row: None },
-    /* 7 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 21, lazy_depth: 1, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 20, chain_log: 19, search_depth: 16, target_len: 8 }), row: None },
-    /* 8 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 21, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 20, chain_log: 19, search_depth: 16, target_len: 16 }), row: None },
-    /* 9 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 21, chain_log: 20, search_depth: 16, target_len: 16 }), row: None },
-    /*10 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 16 }), row: None },
-    /*11 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 21, search_depth: 64, target_len: 16 }), row: None },
-    /*12 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 23, chain_log: 22, search_depth: 64, target_len: 32 }), row: None },
+    /* 6 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 21, lazy_depth: 1, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 19, chain_log: 18, search_depth: 8,  target_len: 4, search_mls: 4 }), row: None },
+    /* 7 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 21, lazy_depth: 1, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 20, chain_log: 19, search_depth: 16, target_len: 8, search_mls: 4 }), row: None },
+    /* 8 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 21, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 20, chain_log: 19, search_depth: 16, target_len: 16, search_mls: 4 }), row: None },
+    /* 9 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 21, chain_log: 20, search_depth: 16, target_len: 16, search_mls: 4 }), row: None },
+    /*10 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 16, search_mls: 4 }), row: None },
+    /*11 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 21, search_depth: 64, target_len: 16, search_mls: 4 }), row: None },
+    /*12 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 23, chain_log: 22, search_depth: 64, target_len: 32, search_mls: 4 }), row: None },
     // L13-15: reference uses btlazy2 (binary-tree finder) with searchLog 4/5/6
     // (search_depth 16/32/64) and targetLength 32. We run the hash-chain Lazy
     // parser here, so we mirror the reference search budget rather than inflate
@@ -648,14 +662,14 @@ const LEVEL_TABLE: [LevelParams; 22] = [
     // smaller searchLog find longer matches (and re-establish a strict ratio
     // ladder above L12) is tracked separately; until it lands these levels sit
     // close to L12 on hash-chain inputs by design.
-    /*13 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Btlazy2, search: super::strategy::SearchMethod::BinaryTree, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 22, search_depth: 16, target_len: 32 }), row: None },
-    /*14 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Btlazy2, search: super::strategy::SearchMethod::BinaryTree, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 23, chain_log: 22, search_depth: 32, target_len: 32 }), row: None },
-    /*15 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Btlazy2, search: super::strategy::SearchMethod::BinaryTree, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 23, chain_log: 23, search_depth: 64, target_len: 32 }), row: None },
-    /*16 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtOpt, search: super::strategy::SearchMethod::BinaryTree, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 22, search_depth: 32, target_len: 48 }), row: None },
-    /*17 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtOpt, search: super::strategy::SearchMethod::BinaryTree, window_log: 23, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 23, search_depth: 32, target_len: 64 }), row: None },
-    /*18 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra, search: super::strategy::SearchMethod::BinaryTree, window_log: 23, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 23, search_depth: 64, target_len: 64 }), row: None },
-    /*19 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, search: super::strategy::SearchMethod::BinaryTree, window_log: 23, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 24, search_depth: 128, target_len: 256 }), row: None },
-    /*20 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, search: super::strategy::SearchMethod::BinaryTree, window_log: 25, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 23, chain_log: 25, search_depth: 128, target_len: 256 }), row: None },
+    /*13 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Btlazy2, search: super::strategy::SearchMethod::BinaryTree, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 22, search_depth: 16, target_len: 32, search_mls: 5 }), row: None },
+    /*14 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Btlazy2, search: super::strategy::SearchMethod::BinaryTree, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 23, chain_log: 22, search_depth: 32, target_len: 32, search_mls: 5 }), row: None },
+    /*15 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Btlazy2, search: super::strategy::SearchMethod::BinaryTree, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 23, chain_log: 23, search_depth: 64, target_len: 32, search_mls: 5 }), row: None },
+    /*16 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtOpt, search: super::strategy::SearchMethod::BinaryTree, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 22, search_depth: 32, target_len: 48, search_mls: 5 }), row: None },
+    /*17 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtOpt, search: super::strategy::SearchMethod::BinaryTree, window_log: 23, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 23, search_depth: 32, target_len: 64, search_mls: 4 }), row: None },
+    /*18 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra, search: super::strategy::SearchMethod::BinaryTree, window_log: 23, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 23, search_depth: 64, target_len: 64, search_mls: 4 }), row: None },
+    /*19 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, search: super::strategy::SearchMethod::BinaryTree, window_log: 23, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 24, search_depth: 128, target_len: 256, search_mls: 4 }), row: None },
+    /*20 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, search: super::strategy::SearchMethod::BinaryTree, window_log: 25, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 23, chain_log: 25, search_depth: 128, target_len: 256, search_mls: 4 }), row: None },
     /*21 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, search: super::strategy::SearchMethod::BinaryTree, window_log: 26, lazy_depth: 2, fast: None, dfast: None, hc: Some(BTULTRA2_HC_CONFIG), row: None },
     /*22 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, search: super::strategy::SearchMethod::BinaryTree, window_log: 27, lazy_depth: 2, fast: None, dfast: None, hc: Some(BTULTRA2_HC_CONFIG_L22), row: None },
 ];
@@ -4222,19 +4236,14 @@ impl HcMatchGenerator {
         self.table.search_depth = self.hc.search_depth;
         self.table.is_btultra2 = is_btultra2;
         self.table.uses_bt = uses_bt;
-        // BT finder hash width, donor `mls = BOUNDED(4, cParams.minMatch, 6)`.
-        // clevels.h (srcSize > 256 KiB tier): btlazy2 L13-15 and btopt L16 are
-        // minMatch=5; btopt L17 is minMatch=4; btultra/btultra2 are minMatch=3
-        // (4-byte main hash + the hash3 short-match probe). The 5-byte hash
-        // shortens the BT walk vs our prior 4-byte everywhere (speed). Only the
-        // BT body reads `search_mls`. `window_log` here is source-clamped (so it
-        // can't tell L16 from L17 on a small source); `config.target_len` is the
-        // level's own value (L16=48, L17=64) and distinguishes them reliably.
-        self.table.search_mls = match tag {
-            StrategyTag::Btlazy2 => 5,
-            StrategyTag::BtOpt if config.target_len <= 48 => 5,
-            _ => 4,
-        };
+        // BT finder hash width, donor `mls = BOUNDED(4, cParams.minMatch, 6)`,
+        // carried explicitly in the level config so a `target_length` override
+        // cannot silently flip the finder between 5- and 4-byte hashing. Only
+        // the BT body reads it; HC/lazy levels leave it at 4. clevels.h
+        // (srcSize > 256 KiB tier): btlazy2 L13-15 + btopt L16 are minMatch=5,
+        // btopt L17 is minMatch=4, btultra/btultra2 are minMatch=3 (4-byte main
+        // hash + the hash3 short-match probe).
+        self.table.search_mls = config.search_mls;
         // Stage D: promote the backend discriminator. HC modes drop the
         // BT scratch buffers entirely; switching back into a BT mode
         // allocates a fresh `BtMatcher` on demand.
@@ -6949,6 +6958,7 @@ fn btultra_and_btultra2_both_keep_dictionary_candidates() {
         chain_log: 22,
         search_depth: 32,
         target_len: 256,
+        search_mls: 4,
     };
     let window_log = 20u8;
 
