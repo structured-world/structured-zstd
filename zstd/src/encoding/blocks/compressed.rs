@@ -311,7 +311,7 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
         .estimator_inner
         .take()
         .map(|b| *b)
-        .unwrap_or_else(super::CompressedBlockScratch::new);
+        .unwrap_or_default();
     let mut estimator = SplitEstimator {
         parts: &scratch.parts,
         prefix_sums: &scratch.prefix_sums,
