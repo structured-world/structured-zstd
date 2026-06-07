@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.31](https://github.com/structured-world/structured-zstd/compare/v0.0.30...v0.0.31) - 2026-06-07
+
+### Added
+
+- *(wasm)* streaming compress ZstdCompressStream + align decoder window cap to zstd default ([#367](https://github.com/structured-world/structured-zstd/pull/367))
+- *(wasm)* simd128 kernel tier + npm package; LDM bench matrix variants ([#364](https://github.com/structured-world/structured-zstd/pull/364))
+- *(encode)* configurable compression parameters API ([#360](https://github.com/structured-world/structured-zstd/pull/360))
+
+### Harden
+
+- *(decode)* uniform FrameContentSizeMismatch on Compressed overshoot ([#363](https://github.com/structured-world/structured-zstd/pull/363))
+
 ## [0.0.30](https://github.com/structured-world/structured-zstd/compare/v0.0.29...v0.0.30) - 2026-06-07
 
 ### Added
