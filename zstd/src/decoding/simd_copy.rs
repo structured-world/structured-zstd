@@ -31,6 +31,13 @@ use std::sync::OnceLock;
 ))]
 use core::arch::aarch64::{uint8x16_t, vld1q_u8, vst1q_u8};
 
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "simd128",
+    feature = "kernel_simd128"
+))]
+use core::arch::wasm32::{v128, v128_load, v128_store};
+
 /// Diagnostic-only copy-shape histogram. Compiled out unless the
 /// `copy_shape_stats` feature is on, so production / bench builds carry
 /// zero cost. Buckets mirror the dispatch thresholds in
@@ -367,6 +374,13 @@ pub(crate) unsafe fn copy_bytes_overshooting(
     ))]
     try_chunk_kernel!(16, copy_neon);
 
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel_simd128"
+    ))]
+    try_chunk_kernel!(16, copy_simd128);
+
     // Final fallback: scalar 8-byte chunk loop if alignment permits, else
     // an exact byte copy. Inlined directly to avoid the per-call dispatcher
     // overhead the previous CopyFn function-pointer abstraction imposed.
@@ -510,6 +524,16 @@ unsafe fn single_op_copy_16(src: *const u8, dst: *mut u8, len: usize) {
         return;
     }
     #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel_simd128"
+    ))]
+    unsafe {
+        let v: v128 = v128_load(src.cast::<v128>());
+        v128_store(dst.cast::<v128>(), v);
+        return;
+    }
+    #[cfg(all(
         feature = "std",
         feature = "kernel_sse2",
         any(target_arch = "x86", target_arch = "x86_64")
@@ -547,7 +571,9 @@ unsafe fn single_op_copy_16(src: *const u8, dst: *mut u8, len: usize) {
     //   • std + x86, NO kernel_sse2                    → reaches here
     //   • no-std + x86 + target_feature sse2+kernel_sse2 → arm above returns
     //   • no-std + x86, kernel_sse2 off (or no sse2)   → reaches here
-    //   • any other arch (riscv64, wasm32, …)          → reaches here
+    //   • wasm32 + simd128 + kernel_simd128            → arm above returns
+    //   • wasm32, NO simd128 (or kernel off)           → reaches here
+    //   • any other arch (riscv64, …)                  → reaches here
     // Anything new MUST `return` from its own arm before this comment.
     #[allow(unreachable_code)]
     unsafe {
@@ -879,6 +905,30 @@ unsafe fn copy_neon(mut src: *const u8, mut dst: *mut u8, len: usize) {
         unsafe {
             let v: uint8x16_t = vld1q_u8(src);
             vst1q_u8(dst, v);
+            src = src.add(16);
+            dst = dst.add(16);
+        }
+    }
+}
+
+/// WebAssembly `simd128` 16-byte chunk copy: `v128_load` / `v128_store` per
+/// 16 bytes, mirroring [`copy_neon`]. `len` is a multiple of 16 (the caller
+/// rounds up via `try_chunk_kernel!`). Compiled only under
+/// `target_feature = "simd128"`, so the intrinsics are available without a
+/// `#[target_feature]` attribute (wasm SIMD is a compile-time decision, no
+/// runtime detection); the loads/stores are `unsafe` raw-pointer ops.
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "simd128",
+    feature = "kernel_simd128"
+))]
+#[inline(always)]
+unsafe fn copy_simd128(mut src: *const u8, mut dst: *mut u8, len: usize) {
+    let end = unsafe { src.add(len) };
+    while src < end {
+        unsafe {
+            let v: v128 = v128_load(src.cast::<v128>());
+            v128_store(dst.cast::<v128>(), v);
             src = src.add(16);
             dst = dst.add(16);
         }
