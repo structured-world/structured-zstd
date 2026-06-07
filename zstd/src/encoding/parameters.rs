@@ -10,12 +10,11 @@
 //! # Builder
 //!
 //! [`CompressionParameters`] is built through
-//! [`CompressionParameters::builder`]. A builder starts from a base
-//! [`CompressionLevel`](crate::encoding::CompressionLevel) (defaulting to
-//! [`CompressionLevel::Default`](crate::encoding::CompressionLevel::Default));
-//! every knob left unset inherits that level's resolved value, so a
-//! builder that overrides nothing reproduces plain level-based
-//! compression byte-for-byte.
+//! [`CompressionParameters::builder`], which takes an explicit base
+//! [`CompressionLevel`](crate::encoding::CompressionLevel) (there is no
+//! implicit default). Every knob left unset inherits that base level's
+//! resolved value, so a builder that overrides nothing reproduces plain
+//! level-based compression byte-for-byte.
 //!
 //! ```rust
 //! use structured_zstd::encoding::{CompressionLevel, CompressionParameters, Strategy};
@@ -39,11 +38,12 @@
 //!
 //! LDM is **off at every [`CompressionLevel`](crate::encoding::CompressionLevel)
 //! preset**, matching upstream `libzstd.so.1` where `ZSTD_compress(..., level)`
-//! never enables LDM — even at level 22. The only activation surface is
-//! [`CompressionParametersBuilder::enable_long_distance_matching`]. When
-//! enabled, the LDM producer attaches to the optimal (`btopt` / `btultra` /
-//! `btultra2`) match-finder; pair `enable_long_distance_matching(true)` with
-//! an optimal [`Strategy`] (or a level ≥ 16) for it to take effect.
+//! never enables LDM — even at level 22. It is activated either by
+//! [`CompressionParametersBuilder::enable_long_distance_matching`] or by any of
+//! the `ldm_*` setters, which each imply `enable_long_distance_matching(true)`.
+//! When enabled, the LDM producer attaches to the optimal (`btopt` / `btultra`
+//! / `btultra2`) match-finder; pair it with an optimal [`Strategy`] (or a level
+//! ≥ 16) for it to take effect.
 
 use crate::encoding::CompressionLevel;
 
@@ -411,8 +411,12 @@ impl CompressionParametersBuilder {
     }
 
     /// Enable or disable long-distance matching. C
-    /// `ZSTD_c_enableLongDistanceMatching`. Off at every level preset;
-    /// this is the only activation surface.
+    /// `ZSTD_c_enableLongDistanceMatching`. Off at every level preset.
+    /// This is the explicit activation toggle; the `ldm_*` knob setters
+    /// also enable LDM implicitly. The flag is plain last-write-wins, so
+    /// a trailing `enable_long_distance_matching(false)` disables LDM even
+    /// if an earlier `ldm_*` call set a knob (the knob is then ignored at
+    /// [`build`](Self::build)).
     pub fn enable_long_distance_matching(mut self, enable: bool) -> Self {
         self.enable_ldm = enable;
         self
