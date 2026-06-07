@@ -949,11 +949,17 @@ pub struct MatchGeneratorDriver {
     // resolved shape ([`reset_shape`](Self::reset_shape)), not this bucket.
     reset_size_log: Option<u8>,
     // Hint-resolved matcher shape from the last `reset`: the [`LevelParams`], the
-    // active backend's applied Dfast/Row hash-table width (`0` for HC/Fast), and
-    // the Fast attach-vs-copy mode. Combined with the frame's level into the
-    // [`PrimedKey`] that keys the primed snapshot, so it is only restored into a
-    // reset that resolved the identical matcher. `None` before the first `reset`.
-    reset_shape: Option<(LevelParams, usize, bool)>,
+    // active backend's applied Dfast/Row hash-table width (`0` for HC/Fast), the
+    // Fast attach-vs-copy mode, and the active LDM override (#27). Combined with
+    // the frame's level into the [`PrimedKey`] that keys the primed snapshot, so
+    // it is only restored into a reset that resolved the identical matcher AND
+    // LDM configuration. `None` before the first `reset`.
+    reset_shape: Option<(
+        LevelParams,
+        usize,
+        bool,
+        Option<super::parameters::LdmOverride>,
+    )>,
     // One-shot borrowed block range `[start, end)` staged by the borrowed
     // Fast frame path (`set_borrowed_block`) for the NEXT
     // `start_matching` / `skip_matching_with_hint`. `Some` routes that
@@ -1021,6 +1027,15 @@ struct PrimedKey {
     params: LevelParams,
     table_bits: usize,
     fast_attach: bool,
+    /// Fine-grained LDM override (#27) active at capture time. The
+    /// snapshot's cloned `storage` carries `BtMatcher::ldm_producer`,
+    /// which is configured from this override; restoring a snapshot
+    /// captured under a different LDM configuration (enable flip or
+    /// changed knobs) would reinstate a stale producer. `params` already
+    /// pins `window_log` / `strategy_tag` (the rest of the producer's
+    /// identity), so folding the override completes the LDM identity.
+    /// `None` = LDM off, matching `ParamOverrides::ldm`.
+    ldm: Option<super::parameters::LdmOverride>,
 }
 
 impl MatchGeneratorDriver {
@@ -1482,6 +1497,21 @@ impl Matcher for MatchGeneratorDriver {
             && !ov.is_empty()
         {
             apply_param_overrides(&mut params, &ov);
+            // `Self::level_params(level, hint)` applied the source-size cap
+            // for the LEVEL's native backend. If a strategy override moved
+            // the frame onto a different backend, `apply_param_overrides`
+            // synthesized that backend's DEFAULT config (FAST_L1 /
+            // HC_OVERRIDE_DEFAULT) with full-size table logs AFTER that cap
+            // ran. Re-apply the hint cap so a tiny hinted frame doesn't
+            // allocate the new backend's full-size tables. An explicit
+            // `window_log` override is the user's hard request and must
+            // survive the re-cap, so restore it afterwards.
+            if let Some(hint_size) = hint {
+                params = adjust_params_for_source_size(params, hint_size);
+                if let Some(window_log) = ov.window_log {
+                    params.window_log = window_log;
+                }
+            }
         }
         let next_backend = params.backend();
         let max_window_size = 1usize << params.window_log;
@@ -1719,7 +1749,10 @@ impl Matcher for MatchGeneratorDriver {
             && self
                 .reset_size_log
                 .is_none_or(|log| log <= FAST_ATTACH_DICT_CUTOFF_LOG);
-        self.reset_shape = Some((params, resolved_table_bits, fast_attach));
+        // The LDM override (if any) is part of the snapshot identity: the
+        // restored `storage` carries the producer this override configured.
+        let active_ldm = self.param_overrides.and_then(|ov| ov.ldm);
+        self.reset_shape = Some((params, resolved_table_bits, fast_attach, active_ldm));
     }
 
     fn prime_with_dictionary(&mut self, dict_content: &[u8], offset_hist: [u32; 3]) {
@@ -1901,7 +1934,7 @@ impl Matcher for MatchGeneratorDriver {
         // match this reset. Restoring it would let the encoder search past the
         // frame header's window (an undecodable match), so on a key mismatch we
         // refuse and the caller re-primes.
-        let Some((params, table_bits, fast_attach)) = self.reset_shape else {
+        let Some((params, table_bits, fast_attach, ldm)) = self.reset_shape else {
             return false;
         };
         let key = PrimedKey {
@@ -1909,6 +1942,7 @@ impl Matcher for MatchGeneratorDriver {
             params,
             table_bits,
             fast_attach,
+            ldm,
         };
         let (storage, budget) = match &self.primed {
             Some((storage, budget, captured_key)) if *captured_key == key => {
@@ -1924,7 +1958,7 @@ impl Matcher for MatchGeneratorDriver {
     fn capture_primed_dictionary(&mut self, level: super::CompressionLevel) {
         // No resolved shape means `reset` has not run for this frame — nothing
         // valid to key a snapshot on, so skip the capture.
-        let Some((params, table_bits, fast_attach)) = self.reset_shape else {
+        let Some((params, table_bits, fast_attach, ldm)) = self.reset_shape else {
             return;
         };
         let key = PrimedKey {
@@ -1932,6 +1966,7 @@ impl Matcher for MatchGeneratorDriver {
             params,
             table_bits,
             fast_attach,
+            ldm,
         };
         self.primed = Some((self.storage.clone(), self.dictionary_retained_budget, key));
     }
