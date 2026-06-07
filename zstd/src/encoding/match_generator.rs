@@ -7186,6 +7186,55 @@ fn hc_prime_with_empty_dictionary_disables_btultra2_seed_pass() {
 }
 
 #[test]
+fn primed_snapshot_not_restored_across_ldm_config_change() {
+    // The CDict-equivalent primed snapshot clones `storage`, which on the
+    // BT backend carries `BtMatcher::ldm_producer`. A snapshot captured
+    // under one LDM configuration must NOT be restored into a reset that
+    // resolved a different LDM configuration (else the restored producer
+    // is stale). `PrimedKey` must fold the LDM override into the key so
+    // such a restore is refused and the caller re-primes.
+    use super::parameters::CompressionParameters;
+
+    let dict = b"abcdefghabcdefghabcdefgh";
+    let ldm_on = CompressionParameters::builder(CompressionLevel::Level(19))
+        .enable_long_distance_matching(true)
+        .build()
+        .unwrap()
+        .overrides();
+    let ldm_off = CompressionParameters::builder(CompressionLevel::Level(19))
+        .build()
+        .unwrap()
+        .overrides();
+
+    let mut driver = MatchGeneratorDriver::new(1024, 1);
+
+    // Capture a snapshot primed under LDM-on at level 19.
+    driver.set_param_overrides(Some(ldm_on));
+    driver.reset(CompressionLevel::Level(19));
+    driver.prime_with_dictionary(dict, [1, 4, 8]);
+    driver.capture_primed_dictionary(CompressionLevel::Level(19));
+
+    // Same dictionary + level, but LDM now OFF: the snapshot's LDM state
+    // is stale, so restore must be refused.
+    driver.set_param_overrides(Some(ldm_off));
+    driver.reset(CompressionLevel::Level(19));
+    assert!(
+        !driver.restore_primed_dictionary(CompressionLevel::Level(19)),
+        "primed snapshot restored across an LDM config change (stale producer)",
+    );
+
+    // Sanity: re-priming + capturing under LDM-off, then restoring under
+    // the IDENTICAL LDM-off config DOES match (the key is not over-tight).
+    driver.prime_with_dictionary(dict, [1, 4, 8]);
+    driver.capture_primed_dictionary(CompressionLevel::Level(19));
+    driver.reset(CompressionLevel::Level(19));
+    assert!(
+        driver.restore_primed_dictionary(CompressionLevel::Level(19)),
+        "primed snapshot not restored under identical LDM config",
+    );
+}
+
+#[test]
 fn hc_prime_with_dictionary_disables_btultra2_seed_pass() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
     driver.reset(CompressionLevel::Better);
