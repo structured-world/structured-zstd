@@ -130,6 +130,13 @@ pub struct FrameCompressor<
     /// the per-block sizes. Cleared and refilled per frame.
     #[cfg(feature = "lsm")]
     block_decompressed_sizes: alloc::vec::Vec<u32>,
+    /// Effective strategy tag when a public-parameter
+    /// [`Strategy`](crate::encoding::Strategy) override (#27) is active.
+    /// `Some` overrides the level-derived `state.strategy_tag` so the
+    /// literal-compression gates and dict-attach cutoff see the strategy
+    /// the matcher actually runs, not the base level's. `None` keeps the
+    /// level-derived tag.
+    strategy_override: Option<crate::encoding::strategy::StrategyTag>,
 }
 
 #[derive(Clone, Default)]
@@ -602,7 +609,43 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             block_checksums: None,
             #[cfg(feature = "lsm")]
             block_decompressed_sizes: alloc::vec::Vec::new(),
+            strategy_override: None,
         }
+    }
+
+    /// Configure fine-grained compression parameters (#27).
+    ///
+    /// Resets the base [`CompressionLevel`](crate::encoding::CompressionLevel)
+    /// to the parameters' level and installs the per-knob overrides
+    /// (window/hash/chain/search logs, strategy, LDM) applied at the next
+    /// frame. Pass `None`-equivalent (a builder that overrides nothing)
+    /// to fall back to plain level-based compression.
+    ///
+    /// ```rust
+    /// use structured_zstd::encoding::{
+    ///     CompressionLevel, CompressionParameters, FrameCompressor, Strategy,
+    /// };
+    /// let params = CompressionParameters::builder(CompressionLevel::Level(19))
+    ///     .strategy(Strategy::Btultra2)
+    ///     .enable_long_distance_matching(true)
+    ///     .build()
+    ///     .unwrap();
+    /// let mut compressor: FrameCompressor = FrameCompressor::new(CompressionLevel::Default);
+    /// compressor.set_parameters(&params);
+    /// let compressed = compressor.compress_independent_frame(b"some data to compress");
+    /// assert!(!compressed.is_empty());
+    /// ```
+    pub fn set_parameters(&mut self, params: &crate::encoding::CompressionParameters) {
+        self.compression_level = params.level();
+        let overrides = params.overrides();
+        self.strategy_override = overrides.strategy.map(|s| s.tag());
+        // Keep `state.strategy_tag` consistent immediately so the borrowed
+        // one-shot eligibility gate (`borrowed_eligible`) and literal gates
+        // are correct even before the next `compress()` re-sync.
+        self.state.strategy_tag = self.strategy_override.unwrap_or_else(|| {
+            crate::encoding::strategy::StrategyTag::for_compression_level(self.compression_level)
+        });
+        self.state.matcher.set_param_overrides(Some(overrides));
     }
 
     /// Whether the borrowed (no per-block history copy) one-shot loop is
@@ -855,6 +898,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             block_checksums: None,
             #[cfg(feature = "lsm")]
             block_decompressed_sizes: alloc::vec::Vec::new(),
+            strategy_override: None,
         }
     }
 
@@ -963,8 +1007,12 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // strategy for the next frame. Frame-by-frame level changes go
         // through this same `compress()` entry point, so re-syncing here
         // covers level switches without touching the matcher dispatch.
-        self.state.strategy_tag =
-            crate::encoding::strategy::StrategyTag::for_compression_level(self.compression_level);
+        // A public-parameter strategy override (#27) wins over the level's
+        // derived tag so the literal-compression gates and dict-attach
+        // cutoff below see the strategy the matcher actually runs.
+        self.state.strategy_tag = self.strategy_override.unwrap_or_else(|| {
+            crate::encoding::strategy::StrategyTag::for_compression_level(self.compression_level)
+        });
         let cached_entropy = if use_dictionary_state {
             self.dictionary_entropy_cache.as_ref()
         } else {
@@ -1606,13 +1654,22 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         match_generator
     }
 
-    /// Before calling [FrameCompressor::compress] you can replace the compression level
+    /// Before calling [FrameCompressor::compress] you can replace the compression level.
+    ///
+    /// This also clears any fine-grained parameter overrides installed via
+    /// [`set_parameters`](Self::set_parameters): reverting to a bare level
+    /// means plain level-based tuning, not the previous frame's customized
+    /// strategy / LDM / log overrides. To keep overriding, call
+    /// [`set_parameters`](Self::set_parameters) again with the new base level.
     pub fn set_compression_level(
         &mut self,
         compression_level: CompressionLevel,
     ) -> CompressionLevel {
         let old = self.compression_level;
         self.compression_level = compression_level;
+        // Drop sticky overrides so the level switch yields plain geometry.
+        self.strategy_override = None;
+        self.state.matcher.clear_param_overrides();
         old
     }
 

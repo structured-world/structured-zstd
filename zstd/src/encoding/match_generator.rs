@@ -186,6 +186,18 @@ const HC_CONFIG: HcConfig = HcConfig {
     target_len: HC_TARGET_LEN,
 };
 
+/// Base HashChain config synthesized when a public-parameter strategy
+/// override ([`super::parameters`]) routes a level to the HC / BT
+/// backend whose native level row didn't populate `hc` (e.g. forcing
+/// `Strategy::Lazy2` onto a level the table resolves to Fast). Mirrors
+/// the mid-band lazy defaults; the per-knob overrides then refine it.
+const HC_OVERRIDE_DEFAULT: HcConfig = HcConfig {
+    hash_log: super::match_table::storage::HC_HASH_LOG,
+    chain_log: super::match_table::storage::HC_CHAIN_LOG,
+    search_depth: HC_SEARCH_DEPTH,
+    target_len: HC_TARGET_LEN,
+};
+
 const BTULTRA2_HC_CONFIG: HcConfig = HcConfig {
     hash_log: 24,
     chain_log: 24,
@@ -378,6 +390,132 @@ impl LevelParams {
             | super::strategy::StrategyTag::BtUltra
             | super::strategy::StrategyTag::BtUltra2 => Some(4),
         }
+    }
+}
+
+/// Apply the public-parameter per-knob overrides (#27) onto the
+/// level-resolved [`LevelParams`], in place. Runs in [`Matcher::reset`]
+/// after the level params are computed and before backend selection, so
+/// a strategy override re-routes the backend uniformly. An all-`None`
+/// override is a no-op the caller skips via
+/// [`super::parameters::ParamOverrides::is_empty`], keeping the default
+/// level geometry byte-identical.
+fn apply_param_overrides(params: &mut LevelParams, ov: &super::parameters::ParamOverrides) {
+    use super::strategy::SearchMethod;
+
+    // 1. Strategy override re-derives tag / search / lazy depth.
+    if let Some(strategy) = ov.strategy {
+        let tag = strategy.tag();
+        params.strategy_tag = tag;
+        params.search = tag.search();
+        params.lazy_depth = strategy.lazy_depth();
+    }
+
+    // 2. Ensure the active backend's config row exists (synthesize a
+    //    default when a strategy override moved off the native row).
+    match params.search {
+        SearchMethod::Fast => {
+            params.fast.get_or_insert(FAST_L1);
+        }
+        SearchMethod::DoubleFast => {
+            params.dfast.get_or_insert(DFAST_L3);
+        }
+        SearchMethod::RowHash => {
+            params.row.get_or_insert(ROW_L5);
+        }
+        SearchMethod::HashChain | SearchMethod::BinaryTree => {
+            params.hc.get_or_insert(HC_OVERRIDE_DEFAULT);
+        }
+    }
+
+    // 3. window_log (bounds-checked at <= 30 by the builder).
+    if let Some(window_log) = ov.window_log {
+        params.window_log = window_log;
+    }
+
+    // 4. Per-backend numeric knobs map into the active config, mirroring
+    //    the donor `cParams` -> matcher translation documented on each
+    //    config struct.
+    match params.search {
+        SearchMethod::Fast => {
+            if let Some(fast) = params.fast.as_mut() {
+                if let Some(hash_log) = ov.hash_log {
+                    fast.hash_log = hash_log;
+                }
+                if let Some(min_match) = ov.min_match {
+                    fast.mls = min_match;
+                }
+            }
+        }
+        SearchMethod::DoubleFast => {
+            if let Some(dfast) = params.dfast.as_mut() {
+                // hashLog -> long table, chainLog -> short table (the
+                // dfast secondary index). Both bounds-checked <= 30, so
+                // the `u8` casts are lossless.
+                if let Some(hash_log) = ov.hash_log {
+                    dfast.long_hash_log = hash_log as u8;
+                }
+                if let Some(chain_log) = ov.chain_log {
+                    dfast.short_hash_log = chain_log as u8;
+                }
+            }
+        }
+        SearchMethod::RowHash => {
+            if let Some(row) = params.row.as_mut() {
+                if let Some(search_log) = ov.search_log {
+                    // Donor: rowLog = clamp(searchLog, 4, 6);
+                    //        nbAttempts = 1 << min(searchLog, rowLog).
+                    let row_log = (search_log as usize).clamp(4, 6);
+                    row.row_log = row_log;
+                    row.search_depth = 1usize << (search_log as usize).min(row_log);
+                }
+                if let Some(target_length) = ov.target_length {
+                    row.target_len = target_length as usize;
+                }
+                if let Some(min_match) = ov.min_match {
+                    row.mls = min_match as usize;
+                }
+            }
+        }
+        SearchMethod::HashChain | SearchMethod::BinaryTree => {
+            if let Some(hc) = params.hc.as_mut() {
+                if let Some(hash_log) = ov.hash_log {
+                    hc.hash_log = hash_log as usize;
+                }
+                if let Some(chain_log) = ov.chain_log {
+                    hc.chain_log = chain_log as usize;
+                }
+                if let Some(search_log) = ov.search_log {
+                    hc.search_depth = 1usize << search_log;
+                }
+                if let Some(target_length) = ov.target_length {
+                    hc.target_len = target_length as usize;
+                }
+            }
+        }
+    }
+}
+
+/// Map the resolved runtime strategy to the donor LDM strategy ordinal
+/// (1..=9) that [`super::ldm::params::LdmParams::adjust_for`] expects.
+/// The collapsed `Lazy` tag splits on `lazy_depth` (lazy = 4, lazy2 = 5).
+#[cfg(feature = "hash")]
+fn ldm_strategy_ordinal(tag: super::strategy::StrategyTag, lazy_depth: u8) -> u32 {
+    use super::strategy::StrategyTag;
+    match tag {
+        StrategyTag::Fast => 1,
+        StrategyTag::Dfast => 2,
+        StrategyTag::Greedy => 3,
+        StrategyTag::Lazy => {
+            if lazy_depth >= 2 {
+                5
+            } else {
+                4
+            }
+        }
+        StrategyTag::BtOpt => 7,
+        StrategyTag::BtUltra => 8,
+        StrategyTag::BtUltra2 => 9,
     }
 }
 
@@ -782,6 +920,15 @@ pub struct MatchGeneratorDriver {
     /// without editing `LEVEL_TABLE`; never compiled into production.
     #[cfg(test)]
     config_override: Option<(super::strategy::SearchMethod, super::strategy::ParseMode)>,
+    /// Fine-grained per-knob overrides from the public
+    /// [`super::parameters::CompressionParameters`] surface (#27).
+    /// `None` (or an all-`None` [`super::parameters::ParamOverrides`])
+    /// keeps the resolved level geometry byte-identical to plain
+    /// level-based compression. Applied in [`Matcher::reset`] after the
+    /// level params are resolved, before backend selection. Persists
+    /// across resets (it is frame configuration, not a one-shot) until
+    /// the caller changes it.
+    param_overrides: Option<super::parameters::ParamOverrides>,
     slice_size: usize,
     base_slice_size: usize,
     // Frame header window size must stay at the configured live-window budget.
@@ -802,11 +949,17 @@ pub struct MatchGeneratorDriver {
     // resolved shape ([`reset_shape`](Self::reset_shape)), not this bucket.
     reset_size_log: Option<u8>,
     // Hint-resolved matcher shape from the last `reset`: the [`LevelParams`], the
-    // active backend's applied Dfast/Row hash-table width (`0` for HC/Fast), and
-    // the Fast attach-vs-copy mode. Combined with the frame's level into the
-    // [`PrimedKey`] that keys the primed snapshot, so it is only restored into a
-    // reset that resolved the identical matcher. `None` before the first `reset`.
-    reset_shape: Option<(LevelParams, usize, bool)>,
+    // active backend's applied Dfast/Row hash-table width (`0` for HC/Fast), the
+    // Fast attach-vs-copy mode, and the active LDM override (#27). Combined with
+    // the frame's level into the [`PrimedKey`] that keys the primed snapshot, so
+    // it is only restored into a reset that resolved the identical matcher AND
+    // LDM configuration. `None` before the first `reset`.
+    reset_shape: Option<(
+        LevelParams,
+        usize,
+        bool,
+        Option<super::parameters::LdmOverride>,
+    )>,
     // One-shot borrowed block range `[start, end)` staged by the borrowed
     // Fast frame path (`set_borrowed_block`) for the NEXT
     // `start_matching` / `skip_matching_with_hint`. `Some` routes that
@@ -874,6 +1027,15 @@ struct PrimedKey {
     params: LevelParams,
     table_bits: usize,
     fast_attach: bool,
+    /// Fine-grained LDM override (#27) active at capture time. The
+    /// snapshot's cloned `storage` carries `BtMatcher::ldm_producer`,
+    /// which is configured from this override; restoring a snapshot
+    /// captured under a different LDM configuration (enable flip or
+    /// changed knobs) would reinstate a stale producer. `params` already
+    /// pins `window_log` / `strategy_tag` (the rest of the producer's
+    /// identity), so folding the override completes the LDM identity.
+    /// `None` = LDM off, matching `ParamOverrides::ldm`.
+    ldm: Option<super::parameters::LdmOverride>,
 }
 
 impl MatchGeneratorDriver {
@@ -941,6 +1103,7 @@ impl MatchGeneratorDriver {
             parse: super::strategy::ParseMode::Greedy,
             #[cfg(test)]
             config_override: None,
+            param_overrides: None,
             slice_size,
             base_slice_size: slice_size,
             // Report the ROUNDED-UP window size that the matcher
@@ -963,6 +1126,16 @@ impl MatchGeneratorDriver {
 
     fn level_params(level: CompressionLevel, source_size: Option<u64>) -> LevelParams {
         resolve_level_params(level, source_size)
+    }
+
+    /// Install the public-parameter per-knob overrides (#27) applied at
+    /// the next [`Matcher::reset`]. `None` (or an all-`None` set) restores
+    /// plain level-based geometry. Persists across resets until changed.
+    pub(crate) fn set_param_overrides(
+        &mut self,
+        overrides: Option<super::parameters::ParamOverrides>,
+    ) {
+        self.param_overrides = overrides;
     }
 
     /// Active backend family derived from the storage variant. Single
@@ -1269,6 +1442,10 @@ impl Matcher for MatchGeneratorDriver {
         self.source_size_hint = Some(size);
     }
 
+    fn clear_param_overrides(&mut self) {
+        self.param_overrides = None;
+    }
+
     fn reset(&mut self, level: CompressionLevel) {
         let hint = self.source_size_hint.take();
         // Snapshot the hint's normalized ceil-log bucket for the primed-snapshot
@@ -1308,6 +1485,31 @@ impl Matcher for MatchGeneratorDriver {
                 }
                 SearchMethod::HashChain | SearchMethod::BinaryTree => {
                     params.hc.get_or_insert(HC_CONFIG);
+                }
+            }
+        }
+        // Public-parameter overrides (#27): apply the per-knob set on top
+        // of the level-resolved params. A strategy override re-routes the
+        // backend, so this must precede `next_backend` selection. The
+        // all-`None` case is skipped so default level geometry stays
+        // byte-identical to plain level-based compression.
+        if let Some(ov) = self.param_overrides
+            && !ov.is_empty()
+        {
+            apply_param_overrides(&mut params, &ov);
+            // `Self::level_params(level, hint)` applied the source-size cap
+            // for the LEVEL's native backend. If a strategy override moved
+            // the frame onto a different backend, `apply_param_overrides`
+            // synthesized that backend's DEFAULT config (FAST_L1 /
+            // HC_OVERRIDE_DEFAULT) with full-size table logs AFTER that cap
+            // ran. Re-apply the hint cap so a tiny hinted frame doesn't
+            // allocate the new backend's full-size tables. An explicit
+            // `window_log` override is the user's hard request and must
+            // survive the re-cap, so restore it afterwards.
+            if let Some(hint_size) = hint {
+                params = adjust_params_for_source_size(params, hint_size);
+                if let Some(window_log) = ov.window_log {
+                    params.window_log = window_log;
                 }
             }
         }
@@ -1502,6 +1704,38 @@ impl Matcher for MatchGeneratorDriver {
                 });
             }
         }
+        // LDM wiring (#27): attach (or clear) the long-distance-match
+        // producer on the optimal (BT) backend. LDM is the only
+        // back-reference path that crosses the regular window, so it
+        // only has a home on the `BtMatcher`; non-BT strategies drop the
+        // producer. Built AFTER `hc.reset()` because `BtMatcher::reset`
+        // clears an existing producer's table but does not null the
+        // slot — installing here gives the new frame a fresh producer.
+        #[cfg(feature = "hash")]
+        if let MatcherStorage::HashChain(hc) = &mut self.storage {
+            let producer = self
+                .param_overrides
+                .as_ref()
+                .and_then(|ov| ov.ldm)
+                .map(|ldm_ov| {
+                    let strategy_ord = ldm_strategy_ordinal(params.strategy_tag, params.lazy_depth);
+                    // Seed the caller-pinned knobs, then run the donor
+                    // derivation over the seed so the remaining (zero)
+                    // fields are filled with cross-field consistency
+                    // (e.g. `hash_rate_log = window_log - hash_log`).
+                    // Clobbering after `adjust_for` would break that and
+                    // hand the producer an inconsistent set.
+                    let seed = super::ldm::params::LdmParams {
+                        window_log: params.window_log as u32,
+                        hash_log: ldm_ov.hash_log.unwrap_or(0),
+                        hash_rate_log: ldm_ov.hash_rate_log.unwrap_or(0),
+                        min_match_length: ldm_ov.min_match.unwrap_or(0),
+                        bucket_size_log: ldm_ov.bucket_size_log.unwrap_or(0),
+                    };
+                    super::ldm::LdmProducer::new(seed.derive(strategy_ord))
+                });
+            hc.set_ldm_producer(producer);
+        }
         // Record the resolved matcher shape for the primed-snapshot key. Captured
         // here (post-resolution, after the test-only param override) so the key
         // reflects exactly the geometry the restored `storage` must match. The
@@ -1515,7 +1749,20 @@ impl Matcher for MatchGeneratorDriver {
             && self
                 .reset_size_log
                 .is_none_or(|log| log <= FAST_ATTACH_DICT_CUTOFF_LOG);
-        self.reset_shape = Some((params, resolved_table_bits, fast_attach));
+        // The LDM override is part of the snapshot identity ONLY on the
+        // optimal (BinaryTree) path: that is the only backend whose cloned
+        // `storage` carries a `BtMatcher::ldm_producer`. On Fast / Dfast /
+        // Row and lazy-HashChain resets the producer slot does not exist,
+        // so folding the override there would over-key the snapshot and
+        // force needless re-primes when LDM is toggled. Gated like
+        // `fast_attach` (a key bit only participates where it changes the
+        // cloned matcher shape).
+        let active_ldm = if matches!(params.search, super::strategy::SearchMethod::BinaryTree) {
+            self.param_overrides.and_then(|ov| ov.ldm)
+        } else {
+            None
+        };
+        self.reset_shape = Some((params, resolved_table_bits, fast_attach, active_ldm));
     }
 
     fn prime_with_dictionary(&mut self, dict_content: &[u8], offset_hist: [u32; 3]) {
@@ -1697,7 +1944,7 @@ impl Matcher for MatchGeneratorDriver {
         // match this reset. Restoring it would let the encoder search past the
         // frame header's window (an undecodable match), so on a key mismatch we
         // refuse and the caller re-primes.
-        let Some((params, table_bits, fast_attach)) = self.reset_shape else {
+        let Some((params, table_bits, fast_attach, ldm)) = self.reset_shape else {
             return false;
         };
         let key = PrimedKey {
@@ -1705,6 +1952,7 @@ impl Matcher for MatchGeneratorDriver {
             params,
             table_bits,
             fast_attach,
+            ldm,
         };
         let (storage, budget) = match &self.primed {
             Some((storage, budget, captured_key)) if *captured_key == key => {
@@ -1720,7 +1968,7 @@ impl Matcher for MatchGeneratorDriver {
     fn capture_primed_dictionary(&mut self, level: super::CompressionLevel) {
         // No resolved shape means `reset` has not run for this frame — nothing
         // valid to key a snapshot on, so skip the capture.
-        let Some((params, table_bits, fast_attach)) = self.reset_shape else {
+        let Some((params, table_bits, fast_attach, ldm)) = self.reset_shape else {
             return;
         };
         let key = PrimedKey {
@@ -1728,6 +1976,7 @@ impl Matcher for MatchGeneratorDriver {
             params,
             table_bits,
             fast_attach,
+            ldm,
         };
         self.primed = Some((self.storage.clone(), self.dictionary_retained_budget, key));
     }
@@ -2289,6 +2538,7 @@ macro_rules! build_optimal_plan_impl_body {
         let frontier_limit = $current_len.min(HC_OPT_NUM - 1);
         let initial_reps = $initial_state.reps;
         let initial_litlen = $initial_state.litlen;
+        let ldm_block_offset = $initial_state.block_offset;
         let mut profile = $initial_state.profile;
         profile.sufficient_match_len = $self.hc.sufficient_match_len_for_pass(profile);
         // Const-fold from the strategy's associated `OPT_LEVEL`
@@ -2402,6 +2652,23 @@ macro_rules! build_optimal_plan_impl_body {
         };
         let has_ldm = !$self.backend.bt_mut().ldm_sequences.is_empty();
         if has_ldm {
+            // `ldm_sequences` are emitted in BLOCK-relative coordinates,
+            // but this optimal-parser pass runs over a SEGMENT of the
+            // block starting at block-offset `$block_offset` and uses
+            // segment-relative positions throughout. Fast-forward the raw
+            // seq-store cursor past the bytes covered by earlier segments
+            // so the (segment-relative) LDM windows below land at the
+            // correct positions. Idempotent: `ldm_skip_raw_seq_store_bytes`
+            // recomputes from `pos = 0`, so re-running it per segment is
+            // safe. Without this, every segment after the first re-applied
+            // the block's leading LDM windows at the wrong offset, emitting
+            // matches that copy the wrong bytes (undecodable frame).
+            if ldm_block_offset > 0 {
+                $self
+                    .backend
+                    .bt_mut()
+                    .ldm_skip_raw_seq_store_bytes(&mut opt_ldm.seq_store, ldm_block_offset);
+            }
             $self
                 .backend
                 .bt_mut()
@@ -3689,6 +3956,17 @@ impl HcMatchGenerator {
         }
     }
 
+    /// Install (or clear) the long-distance-match producer (#27). Only
+    /// the BT backend owns an `ldm_producer` slot; on the HC (lazy)
+    /// backend the producer is dropped because there is no optimal-parser
+    /// candidate buffer to seed. Call after [`Self::reset`].
+    #[cfg(feature = "hash")]
+    fn set_ldm_producer(&mut self, producer: Option<super::ldm::LdmProducer>) {
+        if let HcBackend::Bt(bt) = &mut self.backend {
+            bt.ldm_producer = producer;
+        }
+    }
+
     fn reset(&mut self, reuse_space: impl FnMut(Vec<u8>)) {
         self.table.reset(reuse_space);
         if let HcBackend::Bt(bt) = &mut self.backend {
@@ -3903,6 +4181,7 @@ impl HcMatchGenerator {
                 segment_abs_start,
                 remaining_len,
                 HcOptimalPlanState {
+                    block_offset: cursor,
                     reps: plan_reps,
                     litlen: plan_litlen,
                     profile,
@@ -3963,6 +4242,7 @@ impl HcMatchGenerator {
                 segment_abs_start,
                 remaining_len,
                 HcOptimalPlanState {
+                    block_offset: cursor,
                     reps: seed_reps,
                     litlen: seed_litlen,
                     profile: seed_profile,
@@ -6947,6 +7227,55 @@ fn hc_prime_with_empty_dictionary_disables_btultra2_seed_pass() {
             .hc_matcher()
             .should_run_btultra2_seed_pass::<super::strategy::BtUltra2>(HC_PREDEF_THRESHOLD + 1),
         "btultra2 warmup must stay disabled after dictionary priming, even when dict content is empty"
+    );
+}
+
+#[test]
+fn primed_snapshot_not_restored_across_ldm_config_change() {
+    // The CDict-equivalent primed snapshot clones `storage`, which on the
+    // BT backend carries `BtMatcher::ldm_producer`. A snapshot captured
+    // under one LDM configuration must NOT be restored into a reset that
+    // resolved a different LDM configuration (else the restored producer
+    // is stale). `PrimedKey` must fold the LDM override into the key so
+    // such a restore is refused and the caller re-primes.
+    use super::parameters::CompressionParameters;
+
+    let dict = b"abcdefghabcdefghabcdefgh";
+    let ldm_on = CompressionParameters::builder(CompressionLevel::Level(19))
+        .enable_long_distance_matching(true)
+        .build()
+        .unwrap()
+        .overrides();
+    let ldm_off = CompressionParameters::builder(CompressionLevel::Level(19))
+        .build()
+        .unwrap()
+        .overrides();
+
+    let mut driver = MatchGeneratorDriver::new(1024, 1);
+
+    // Capture a snapshot primed under LDM-on at level 19.
+    driver.set_param_overrides(Some(ldm_on));
+    driver.reset(CompressionLevel::Level(19));
+    driver.prime_with_dictionary(dict, [1, 4, 8]);
+    driver.capture_primed_dictionary(CompressionLevel::Level(19));
+
+    // Same dictionary + level, but LDM now OFF: the snapshot's LDM state
+    // is stale, so restore must be refused.
+    driver.set_param_overrides(Some(ldm_off));
+    driver.reset(CompressionLevel::Level(19));
+    assert!(
+        !driver.restore_primed_dictionary(CompressionLevel::Level(19)),
+        "primed snapshot restored across an LDM config change (stale producer)",
+    );
+
+    // Sanity: re-priming + capturing under LDM-off, then restoring under
+    // the IDENTICAL LDM-off config DOES match (the key is not over-tight).
+    driver.prime_with_dictionary(dict, [1, 4, 8]);
+    driver.capture_primed_dictionary(CompressionLevel::Level(19));
+    driver.reset(CompressionLevel::Level(19));
+    assert!(
+        driver.restore_primed_dictionary(CompressionLevel::Level(19)),
+        "primed snapshot not restored under identical LDM config",
     );
 }
 

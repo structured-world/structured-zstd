@@ -57,6 +57,7 @@ All standard compression levels are wired and produce valid Zstandard frames dec
 
 - **Named presets:** `Fastest` (≈1), `Default` (≈3), `Better` (≈7), `Best` (≈11)
 - **Numeric levels:** `0..=22` and negative ultra-fast levels via `CompressionLevel::from_level(n)` — C zstd-compatible numbering
+- **Fine-grained parameters:** override individual knobs (`windowLog`, `hashLog`, `chainLog`, `searchLog`, `minMatch`, `targetLength`, `strategy`) and activate **long-distance matching** via `CompressionParameters::builder(...)`, the drop-in equivalent of C zstd's `ZSTD_CCtx_setParameter` surface
 - **Streaming encoder** via `std::io::Write`
 - **Dictionary compression** with the same dictionary format C zstd consumes
 - **Frame Content Size** — `FrameCompressor` writes FCS automatically; `StreamingEncoder` requires `set_pledged_content_size()` before the first write
@@ -123,6 +124,33 @@ encoder.write_all(b"world")?;
 encoder.finish()?;
 # Ok::<(), std::io::Error>(())
 ```
+
+#### Fine-grained parameters
+
+Override individual compression knobs (the drop-in equivalent of C zstd's
+`ZSTD_CCtx_setParameter`). Every knob left unset inherits the base level's
+default, so a parameter set that overrides nothing reproduces plain
+level-based compression. Long-distance matching is off at every level preset
+and is activated only here:
+
+```rust
+use structured_zstd::encoding::{
+    compress_with_parameters, CompressionLevel, CompressionParameters, Strategy,
+};
+
+let data: &[u8] = b"hello world";
+let params = CompressionParameters::builder(CompressionLevel::Level(19))
+    .window_log(22)
+    .strategy(Strategy::Btultra2)
+    .enable_long_distance_matching(true)
+    .build()
+    .expect("parameters within bounds");
+
+let compressed = compress_with_parameters(data, &params);
+```
+
+Each parameter's valid range is queryable via `CParameter::bounds()` (the
+analogue of `ZSTD_cParam_getBounds`); the builder validates every set knob.
 
 ### Decompression
 
