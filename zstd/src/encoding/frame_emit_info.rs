@@ -66,6 +66,22 @@ pub struct FrameBlock {
     /// `true` only on the final block of the frame (matches the
     /// `Last_Block` flag in `Block_Header`).
     pub last_block: bool,
+    /// Decompressed (regenerated) size of this block's output in bytes.
+    ///
+    /// For Raw and RLE blocks this is recoverable from the wire
+    /// (`block_size_field`), but a Compressed block's regenerated size is
+    /// NOT in its `Block_Header` (the header's `Block_Size` is the
+    /// *compressed* length), so the encoder captures it from the input
+    /// chunk that produced the block. Consumers map a decompressed byte
+    /// offset to a block index via the prefix sum of this field; see
+    /// [`FrameEmitInfo::decompressed_byte_range`].
+    ///
+    /// On the decode error path ([`FailedToReadBlockBodyAt`]), where the
+    /// regenerated size of a failed Compressed block is unknown, this is
+    /// `0` for Compressed blocks (Raw/RLE still carry their wire size).
+    ///
+    /// [`FailedToReadBlockBodyAt`]: crate::decoding::errors::FrameDecoderError::FailedToReadBlockBodyAt
+    pub decompressed_size: u32,
 }
 
 /// Complete layout of an emitted zstd frame.
@@ -92,4 +108,54 @@ pub struct FrameEmitInfo {
     /// Total emitted frame size in bytes (one past the last byte of
     /// the frame).
     pub total_size: u32,
+}
+
+impl FrameEmitInfo {
+    /// Half-open decompressed byte range `[start, end)` of `blocks[block_index]`
+    /// within the frame's full decompressed output, computed as the prefix
+    /// sum of every preceding block's [`FrameBlock::decompressed_size`].
+    ///
+    /// This is the mapping a range-query consumer uses to turn a
+    /// decompressed byte offset into the inner-block index needed by
+    /// [`FrameDecoder::decode_blocks_partial`]: find the first block whose
+    /// range contains the offset.
+    ///
+    /// Returns `None` if `block_index` is out of bounds.
+    ///
+    /// [`FrameDecoder::decode_blocks_partial`]: crate::decoding::FrameDecoder::decode_blocks_partial
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(feature = "lsm")] {
+    /// use structured_zstd::encoding::frame_emit_info::{FrameBlock, FrameEmitInfo, BlockType};
+    /// let info = FrameEmitInfo {
+    ///     frame_header_range: 0..6,
+    ///     blocks: vec![
+    ///         FrameBlock { offset_in_frame: 6, header_size: 3, body_size: 10,
+    ///             block_size_field: 10, block_type: BlockType::Compressed,
+    ///             last_block: false, decompressed_size: 100 },
+    ///         FrameBlock { offset_in_frame: 19, header_size: 3, body_size: 20,
+    ///             block_size_field: 20, block_type: BlockType::Compressed,
+    ///             last_block: true, decompressed_size: 40 },
+    ///     ],
+    ///     checksum_range: None,
+    ///     total_size: 42,
+    /// };
+    /// assert_eq!(info.decompressed_byte_range(0), Some(0..100));
+    /// assert_eq!(info.decompressed_byte_range(1), Some(100..140));
+    /// assert_eq!(info.decompressed_byte_range(2), None);
+    /// # }
+    /// ```
+    pub fn decompressed_byte_range(&self, block_index: usize) -> Option<core::ops::Range<u64>> {
+        let target = self.blocks.get(block_index)?;
+        // Prefix sum over preceding blocks. Block count is bounded by the
+        // frame's block count (each block is >= 3 wire bytes), so the
+        // accumulator stays well within u64.
+        let start: u64 = self.blocks[..block_index]
+            .iter()
+            .map(|b| u64::from(b.decompressed_size))
+            .sum();
+        Some(start..start + u64::from(target.decompressed_size))
+    }
 }

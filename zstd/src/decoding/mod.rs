@@ -34,6 +34,8 @@ mod frame_decoder;
 mod streaming_decoder;
 
 pub use dictionary::{Dictionary, DictionaryHandle};
+#[cfg(feature = "lsm")]
+pub use frame_decoder::PartialDecode;
 pub use frame_decoder::{BlockDecodingStrategy, FrameDecoder};
 pub use streaming_decoder::StreamingDecoder;
 

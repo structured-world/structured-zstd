@@ -173,8 +173,15 @@ stream.read_to_end(&mut sink).unwrap();
 Behind the `lsm` Cargo feature (default **off**), `structured-zstd`
 exposes a typed `SkippableFrame` API
 (`structured_zstd::skippable`) for storage-format authors who need
-to interleave application metadata with zstd data. Enable on the
-command line:
+to interleave application metadata with zstd data, plus a
+block-subset partial decoder: `FrameDecoder::decode_blocks_partial(src,
+start_block, end_block)` decodes only the inner blocks covering a
+requested range (skipping the trailing ones) and preserves the clean
+prefix on a corrupt block, while
+`FrameEmitInfo::decompressed_byte_range(block_index)` returns the
+decompressed byte range of a given block, so a range query can locate
+which inner blocks cover a target byte window. Enable on the command
+line:
 
 ```bash
 cargo add structured-zstd --features lsm

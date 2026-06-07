@@ -249,12 +249,17 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
     state: &mut CompressState<M>,
     last_block: bool,
     output: &mut Vec<u8>,
+    #[cfg(feature = "lsm")] mut block_decompressed_sizes: Option<&mut Vec<u32>>,
     #[cfg(all(feature = "lsm", feature = "hash"))] mut block_checksums: Option<&mut Vec<u32>>,
 ) {
     let mut scratch = core::mem::take(&mut state.block_scratch);
     collect_block_parts(state, &mut scratch.parts);
     if scratch.parts.sequences.len() <= 4 {
         let source_len = state.matcher.get_last_space().len();
+        #[cfg(feature = "lsm")]
+        if let Some(sink) = block_decompressed_sizes.as_deref_mut() {
+            sink.push(source_len as u32);
+        }
         // `block_checksums: Option<&mut Vec<u32>>`; `as_deref_mut` unwraps
         // exactly one level of `&mut`, yielding `Option<&mut Vec<u32>>` here
         // (the blanket `impl<T: ?Sized> Deref for &mut T` has
@@ -334,6 +339,10 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
         } else {
             chunk_lit_len + chunk_match_len
         };
+        #[cfg(feature = "lsm")]
+        if let Some(sink) = block_decompressed_sizes.as_deref_mut() {
+            sink.push(src_size as u32);
+        }
         #[cfg(all(feature = "lsm", feature = "hash"))]
         if let Some(sink) = block_checksums.as_deref_mut() {
             sink.push(crate::encoding::frame_compressor::xxh64_block_low32(

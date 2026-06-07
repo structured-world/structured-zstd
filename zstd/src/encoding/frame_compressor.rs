@@ -122,6 +122,14 @@ pub struct FrameCompressor<
     /// Gated on `all(lsm, hash)` (see `per_block_checksums_enabled`).
     #[cfg(all(feature = "lsm", feature = "hash"))]
     block_checksums: Option<alloc::vec::Vec<u32>>,
+    /// Per-physical-block decompressed (regenerated) sizes captured
+    /// during `compress()`, in block-emit order (1:1 with
+    /// `frame_emit_info.blocks`). Always captured under `lsm` (no
+    /// opt-in, unlike `block_checksums`) because `FrameEmitInfo` is
+    /// always built under `lsm` and `decompressed_byte_range` needs
+    /// the per-block sizes. Cleared and refilled per frame.
+    #[cfg(feature = "lsm")]
+    block_decompressed_sizes: alloc::vec::Vec<u32>,
 }
 
 #[derive(Clone, Default)]
@@ -592,6 +600,8 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             per_block_checksums_enabled: false,
             #[cfg(all(feature = "lsm", feature = "hash"))]
             block_checksums: None,
+            #[cfg(feature = "lsm")]
+            block_decompressed_sizes: alloc::vec::Vec::new(),
         }
     }
 
@@ -740,6 +750,8 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 block_size: 0,
             };
             header.serialize(&mut all_blocks);
+            #[cfg(feature = "lsm")]
+            self.block_decompressed_sizes.push(0);
             #[cfg(all(feature = "lsm", feature = "hash"))]
             if let Some(checksums) = self.block_checksums.as_mut() {
                 checksums.push(xxh64_block_low32(&[]));
@@ -800,6 +812,8 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 start,
                 end,
                 &mut all_blocks,
+                #[cfg(feature = "lsm")]
+                Some(&mut self.block_decompressed_sizes),
                 #[cfg(all(feature = "lsm", feature = "hash"))]
                 self.block_checksums.as_mut(),
             );
@@ -839,6 +853,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             per_block_checksums_enabled: false,
             #[cfg(all(feature = "lsm", feature = "hash"))]
             block_checksums: None,
+            #[cfg(feature = "lsm")]
+            block_decompressed_sizes: alloc::vec::Vec::new(),
         }
     }
 
@@ -915,6 +931,9 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         #[cfg(feature = "lsm")]
         {
             self.frame_emit_info = None;
+            // Always captured under lsm (drives `decompressed_byte_range`);
+            // clear, keep the allocation for a reused compressor.
+            self.block_decompressed_sizes.clear();
         }
         #[cfg(all(feature = "lsm", feature = "hash"))]
         {
@@ -1207,6 +1226,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                     block_size: 0,
                 };
                 header.serialize(&mut all_blocks);
+                #[cfg(feature = "lsm")]
+                self.block_decompressed_sizes.push(0);
                 #[cfg(all(feature = "lsm", feature = "hash"))]
                 if let Some(checksums) = self.block_checksums.as_mut() {
                     checksums.push(xxh64_block_low32(&[]));
@@ -1222,6 +1243,9 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                         block_size: uncompressed_data.len().try_into().unwrap(),
                     };
                     header.serialize(&mut all_blocks);
+                    #[cfg(feature = "lsm")]
+                    self.block_decompressed_sizes
+                        .push(uncompressed_data.len() as u32);
                     #[cfg(all(feature = "lsm", feature = "hash"))]
                     if let Some(checksums) = self.block_checksums.as_mut() {
                         checksums.push(xxh64_block_low32(&uncompressed_data));
@@ -1254,6 +1278,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                         uncompressed_data,
                         &mut all_blocks,
                         dict_active,
+                        #[cfg(feature = "lsm")]
+                        Some(&mut self.block_decompressed_sizes),
                         #[cfg(all(feature = "lsm", feature = "hash"))]
                         self.block_checksums.as_mut(),
                     );
@@ -1409,6 +1435,28 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 Some(v) => v,
                 None => return,
             };
+            // Decompressed (regenerated) size, captured per physical block
+            // during emit (1:1 with the wire blocks scanned here). Raw/RLE are
+            // wire-derivable (`block_size_field`), so a short sidecar still
+            // yields the correct value for them. A Compressed block's size is
+            // NOT on the wire: if the sidecar is missing its entry, fabricating
+            // 0 would publish a silently-wrong `decompressed_byte_range`. Since
+            // this metadata is the authoritative mapping for a successful
+            // encode, bail out (leave `frame_emit_info` at `None`) rather than
+            // hand back a corrupt layout; the 1:1 push invariant makes this
+            // unreachable in practice (debug_assert catches a regression).
+            let decompressed_size = match self.block_decompressed_sizes.get(blocks.len()).copied() {
+                Some(size) => size,
+                None if matches!(block_type, BT::Raw | BT::RLE) => block_size_field,
+                None => {
+                    debug_assert!(
+                        false,
+                        "missing decompressed-size sidecar entry for compressed block {}",
+                        blocks.len()
+                    );
+                    return;
+                }
+            };
             blocks.push(FrameBlock {
                 offset_in_frame,
                 header_size: 3,
@@ -1416,11 +1464,29 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 block_size_field,
                 block_type,
                 last_block,
+                decompressed_size,
             });
             cursor += 3 + physical_body as usize;
             if last_block {
                 break;
             }
+        }
+        // Fail closed on a structurally incomplete scan: the loop must have
+        // consumed the whole block section AND ended on a parsed last block.
+        // A premature `last_block` (bytes left over) or a run-off without any
+        // last block would otherwise publish an invalid public `FrameEmitInfo`.
+        // Unreachable for a well-formed self-produced frame (debug_assert
+        // catches a regression); on release we bail, leaving `frame_emit_info`
+        // at `None` rather than handing back a corrupt layout.
+        if cursor != all_blocks.len() || !blocks.last().is_some_and(|b| b.last_block) {
+            debug_assert!(
+                false,
+                "incomplete block scan in populate_frame_emit_info: cursor={} len={} last_block={:?}",
+                cursor,
+                all_blocks.len(),
+                blocks.last().map(|b| b.last_block)
+            );
+            return;
         }
         let checksum_range = if cfg!(feature = "hash") {
             let cs_start = match frame_header_len.checked_add(all_blocks_len_u32) {
@@ -3079,6 +3145,225 @@ mod tests {
         assert_eq!(
             chksum_from_data1, chksum_from_data2,
             "frame 1 and frame 2 should have the same checksum (same data, hash must reset per frame)"
+        );
+    }
+
+    #[cfg(feature = "lsm")]
+    #[test]
+    fn frame_emit_info_decompressed_ranges_match_decoded_output() {
+        // Part A correctness: the per-block `decompressed_size` captured during
+        // encode (and the `decompressed_byte_range` prefix sum derived from it)
+        // must describe the real decoded output exactly — one entry per
+        // physical block, contiguous, summing to the full decompressed length.
+        // A multi-block compressible payload exercises the Compressed-block
+        // path (whose regenerated size is NOT on the wire, so it relies on the
+        // encode-side capture this test guards).
+        let data = emit_info_fixture_data();
+
+        // Cover both the single-block-per-chunk path (Default) and the
+        // Level(16..=22) post-split path (multiple physical partitions per
+        // input chunk), since lsm-tree compresses at zstd:22 and post-split
+        // is the riskiest capture site (per-partition `src_size`).
+        for level in [
+            super::CompressionLevel::Default,
+            super::CompressionLevel::Level(22),
+        ] {
+            let mut compressed = Vec::new();
+            let mut compressor = FrameCompressor::new(level);
+            // Pledge the source size so the high-level (22) window shrinks to
+            // fit the payload — otherwise level 22's default 128 MiB window
+            // exceeds the decoder's MAXIMUM_ALLOWED_WINDOW_SIZE cap. Still
+            // >= 128 KiB, so post-split eligibility is preserved.
+            compressor.set_source_size_hint(data.len() as u64);
+            compressor.set_source(data.as_slice());
+            compressor.set_drain(&mut compressed);
+            compressor.compress();
+
+            let info = compressor
+                .last_frame_emit_info()
+                .expect("emit info populated after compress")
+                .clone();
+
+            // Reference: full decode of the same frame.
+            let mut decoder = FrameDecoder::new();
+            let mut source = compressed.as_slice();
+            decoder.reset(&mut source).unwrap();
+            while !decoder.is_finished() {
+                decoder
+                    .decode_blocks(&mut source, crate::decoding::BlockDecodingStrategy::All)
+                    .unwrap();
+            }
+            let mut decoded = Vec::new();
+            decoder.collect_to_writer(&mut decoded).unwrap();
+            assert_eq!(decoded, data, "sanity: frame must round-trip ({level:?})");
+
+            assert!(
+                info.blocks.len() >= 2,
+                "fixture must span multiple blocks to exercise the mapping ({level:?}, got {})",
+                info.blocks.len()
+            );
+            assert!(
+                info.blocks.last().unwrap().last_block,
+                "final block must carry last_block ({level:?})"
+            );
+
+            // Pin the Level(22) post-split path: the owned loop feeds the
+            // encoder MAX_BLOCK_SIZE input chunks, so without post-split the
+            // block count cannot exceed the chunk count. More blocks than
+            // chunks proves at least one chunk was split into multiple physical
+            // partitions (the per-partition `src_size` capture under test).
+            if matches!(level, super::CompressionLevel::Level(22)) {
+                let max_block = crate::common::MAX_BLOCK_SIZE as usize;
+                let n_chunks = data.len().div_ceil(max_block);
+                assert!(
+                    info.blocks.len() > n_chunks,
+                    "Level(22) must exercise post-split: {} blocks for {} input chunks",
+                    info.blocks.len(),
+                    n_chunks
+                );
+            }
+
+            // Per-block ranges: contiguous, zero-based, summing to the full output.
+            let mut expected_start = 0u64;
+            for i in 0..info.blocks.len() {
+                let range = info
+                    .decompressed_byte_range(i)
+                    .expect("in-bounds block has a range");
+                assert_eq!(
+                    range.start, expected_start,
+                    "block {i} range must start where the previous ended ({level:?})"
+                );
+                assert_eq!(
+                    u64::from(info.blocks[i].decompressed_size),
+                    range.end - range.start,
+                    "block {i} decompressed_size must equal its range width ({level:?})"
+                );
+                // Validate the mapping against REAL per-block bytes, not just
+                // prefix-sum consistency: decode block `i` alone and require it
+                // to equal the corresponding slice of the full decode. A
+                // sidecar that swapped sizes between adjacent blocks (same sum,
+                // same contiguity) would fail here.
+                let mut psrc = compressed.as_slice();
+                let mut pdec = FrameDecoder::new();
+                pdec.reset(&mut psrc).unwrap();
+                let pd = pdec
+                    .decode_blocks_partial(&mut psrc, i as u32, i as u32 + 1)
+                    .unwrap();
+                assert!(
+                    pd.stopped_at.is_none(),
+                    "block {i} must decode cleanly ({level:?})"
+                );
+                assert_eq!(
+                    pd.data.as_slice(),
+                    &decoded[range.start as usize..range.end as usize],
+                    "block {i} partial-decode bytes must equal the full-decode slice ({level:?})"
+                );
+                expected_start = range.end;
+            }
+            assert_eq!(
+                expected_start,
+                decoded.len() as u64,
+                "block decompressed sizes must sum to the full decoded length ({level:?})"
+            );
+            assert_eq!(
+                info.decompressed_byte_range(info.blocks.len()),
+                None,
+                "out-of-range index yields None ({level:?})"
+            );
+        }
+    }
+
+    /// ~400 KiB semi-repetitive payload (long runs interleaved with a stride
+    /// phrase) that compresses into several multi-block frames across levels.
+    #[cfg(feature = "lsm")]
+    fn emit_info_fixture_data() -> Vec<u8> {
+        let mut data: Vec<u8> = Vec::with_capacity(400 * 1024);
+        let mut x = 0x9E37_79B9u32;
+        while data.len() < 400 * 1024 {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            let run = 16 + (x as usize % 48);
+            let byte = (x >> 24) as u8;
+            for _ in 0..run {
+                data.push(byte);
+            }
+            data.extend_from_slice(b"the quick brown fox jumps over the lazy dog\n");
+        }
+        data
+    }
+
+    #[cfg(feature = "lsm")]
+    #[test]
+    fn frame_emit_info_decompressed_ranges_match_on_borrowed_oneshot_path() {
+        // The borrowed one-shot path (`compress_independent_frame` ->
+        // `run_borrowed_block_loop` -> `compress_block_encoded_borrowed`)
+        // threads the decompressed-size sidecar through a DIFFERENT emit site
+        // than the owned/streaming loop, so it needs its own per-block mapping
+        // check. A Fast level keeps the encoder on the borrowed-eligible
+        // (Simple matcher) path.
+        let data = emit_info_fixture_data();
+
+        let mut compressor: FrameCompressor =
+            FrameCompressor::new(super::CompressionLevel::Fastest);
+        let compressed = compressor.compress_independent_frame(data.as_slice());
+        let info = compressor
+            .last_frame_emit_info()
+            .expect("emit info populated after compress_independent_frame")
+            .clone();
+        // Pin the compressed-block path: without this the fixture could regress
+        // into the raw-fast fallback and still pass via the Raw wire-size
+        // fallback in populate_frame_emit_info, never exercising the borrowed
+        // compressed-block sidecar capture this test targets.
+        assert!(
+            info.blocks
+                .iter()
+                .any(|b| matches!(b.block_type, crate::blocks::block::BlockType::Compressed)),
+            "borrowed-path fixture must emit at least one compressed block"
+        );
+        assert!(
+            info.blocks.len() >= 2,
+            "borrowed fixture must span multiple blocks (got {})",
+            info.blocks.len()
+        );
+        assert!(info.blocks.last().unwrap().last_block);
+
+        // Full decode reference.
+        let mut decoder = FrameDecoder::new();
+        let mut source = compressed.as_slice();
+        decoder.reset(&mut source).unwrap();
+        while !decoder.is_finished() {
+            decoder
+                .decode_blocks(&mut source, crate::decoding::BlockDecodingStrategy::All)
+                .unwrap();
+        }
+        let mut decoded = Vec::new();
+        decoder.collect_to_writer(&mut decoded).unwrap();
+        assert_eq!(decoded, data, "borrowed one-shot frame must round-trip");
+
+        // Each block's mapping must match real per-block bytes.
+        let mut expected_start = 0u64;
+        for i in 0..info.blocks.len() {
+            let range = info.decompressed_byte_range(i).unwrap();
+            assert_eq!(range.start, expected_start, "block {i} range contiguity");
+            let mut psrc = compressed.as_slice();
+            let mut pdec = FrameDecoder::new();
+            pdec.reset(&mut psrc).unwrap();
+            let pd = pdec
+                .decode_blocks_partial(&mut psrc, i as u32, i as u32 + 1)
+                .unwrap();
+            assert!(pd.stopped_at.is_none(), "block {i} must decode cleanly");
+            assert_eq!(
+                pd.data.as_slice(),
+                &decoded[range.start as usize..range.end as usize],
+                "borrowed block {i} partial-decode bytes must equal the full-decode slice"
+            );
+            expected_start = range.end;
+        }
+        assert_eq!(
+            expected_start,
+            decoded.len() as u64,
+            "ranges sum to full length"
         );
     }
 

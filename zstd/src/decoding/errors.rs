@@ -645,6 +645,17 @@ pub enum FrameDecoderError {
         frame_offset: u32,
         block: crate::encoding::frame_emit_info::FrameBlock,
     },
+    /// `FrameDecoder::decode_blocks_partial` was called with
+    /// `start_block > end_block` (the half-open block range is
+    /// empty-or-inverted and cannot describe a valid subset). API
+    /// misuse, surfaced as `Err` rather than a `PartialDecode`
+    /// outcome — distinct from a corrupt-frame stop, which is
+    /// reported via `PartialDecode::stopped_at`.
+    #[cfg(feature = "lsm")]
+    InvalidBlockRange {
+        start_block: u32,
+        end_block: u32,
+    },
 }
 
 #[cfg(feature = "std")]
@@ -791,6 +802,16 @@ impl core::fmt::Display for FrameDecoderError {
                     Some(byte) => write!(f, "0x{byte:02X}"),
                     None => write!(f, "<none> (single-segment frame omits window_descriptor)"),
                 }
+            }
+            #[cfg(feature = "lsm")]
+            FrameDecoderError::InvalidBlockRange {
+                start_block,
+                end_block,
+            } => {
+                write!(
+                    f,
+                    "Invalid block range for partial decode: start_block {start_block} > end_block {end_block}"
+                )
             }
         }
     }

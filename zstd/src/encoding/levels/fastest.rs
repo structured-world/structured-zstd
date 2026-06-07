@@ -29,6 +29,12 @@ use alloc::vec::Vec;
 /// - `uncompressed_data`: A block's worth of uncompressed data, taken from the
 ///   larger input
 /// - `output`: As `uncompressed_data` is compressed, it's appended to `output`.
+// Mirrors the per-block sidecar plumbing of its borrowed sibling
+// (`compress_block_encoded_borrowed`): the lsm decompressed-size and
+// optional XXH64 checksum out-params push the arg count past the lint's
+// threshold. Bundling them into a struct would diverge from the established
+// emit-fn shape for no readability gain.
+#[allow(clippy::too_many_arguments)]
 #[inline]
 pub(crate) fn compress_block_encoded<M: Matcher>(
     state: &mut CompressState<M>,
@@ -42,12 +48,22 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
     // dictionary is never searched and the block is emitted raw. C always
     // searches and only falls back to raw post-hoc; we mirror that here.
     dict_active: bool,
+    // Per-physical-block decompressed (regenerated) size sidecar, in
+    // block-emit order — 1:1 with `FrameEmitInfo.blocks`, same cardinality
+    // discipline as the XXH64 checksum sidecar. Captured under `lsm` alone
+    // (not gated on `hash`, not opt-in) because `FrameEmitInfo` is always
+    // built under `lsm` and every block needs its `decompressed_size`.
+    #[cfg(feature = "lsm")] block_decompressed_sizes: Option<&mut Vec<u32>>,
     #[cfg(all(feature = "lsm", feature = "hash"))] block_checksums: Option<&mut Vec<u32>>,
 ) -> BlockType {
     let block_size = uncompressed_data.len() as u32;
     // First check to see if run length encoding can be used for the entire block
     if uncompressed_data.iter().all(|x| uncompressed_data[0].eq(x)) {
         let rle_byte = uncompressed_data[0];
+        #[cfg(feature = "lsm")]
+        if let Some(sink) = block_decompressed_sizes {
+            sink.push(block_size);
+        }
         #[cfg(all(feature = "lsm", feature = "hash"))]
         if let Some(sink) = block_checksums {
             sink.push(crate::encoding::frame_compressor::xxh64_block_low32(
@@ -72,6 +88,10 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
             &uncompressed_data,
         )
     {
+        #[cfg(feature = "lsm")]
+        if let Some(sink) = block_decompressed_sizes {
+            sink.push(block_size);
+        }
         #[cfg(all(feature = "lsm", feature = "hash"))]
         if let Some(sink) = block_checksums {
             sink.push(crate::encoding::frame_compressor::xxh64_block_low32(
@@ -97,14 +117,27 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
             && state.matcher.window_size() >= (1 << 17)
         {
             // This helper may emit multiple physical blocks (compressed or raw)
-            // into `output`; checksums (if requested) are pushed per physical
-            // block from inside the partition loop so the cardinality matches
-            // the decoder's per-block hash count exactly.
+            // into `output`; the decompressed-size and (if requested) checksum
+            // sidecars are pushed per physical block from inside the partition
+            // loop so the cardinality matches the decoder's per-block count
+            // exactly.
             #[cfg(all(feature = "lsm", feature = "hash"))]
-            compress_block_with_post_split(state, last_block, output, block_checksums);
-            #[cfg(not(all(feature = "lsm", feature = "hash")))]
+            compress_block_with_post_split(
+                state,
+                last_block,
+                output,
+                block_decompressed_sizes,
+                block_checksums,
+            );
+            #[cfg(all(feature = "lsm", not(feature = "hash")))]
+            compress_block_with_post_split(state, last_block, output, block_decompressed_sizes);
+            #[cfg(not(feature = "lsm"))]
             compress_block_with_post_split(state, last_block, output);
             return BlockType::Compressed;
+        }
+        #[cfg(feature = "lsm")]
+        if let Some(sink) = block_decompressed_sizes {
+            sink.push(block_size);
         }
         #[cfg(all(feature = "lsm", feature = "hash"))]
         if let Some(sink) = block_checksums {
@@ -190,11 +223,16 @@ pub(crate) fn compress_block_encoded_borrowed(
     block_start: usize,
     block_end: usize,
     output: &mut Vec<u8>,
+    #[cfg(feature = "lsm")] block_decompressed_sizes: Option<&mut Vec<u32>>,
     #[cfg(all(feature = "lsm", feature = "hash"))] block_checksums: Option<&mut Vec<u32>>,
 ) -> BlockType {
     let block_size = block.len() as u32;
     if !block.is_empty() && block.iter().all(|x| block[0].eq(x)) {
         let rle_byte = block[0];
+        #[cfg(feature = "lsm")]
+        if let Some(sink) = block_decompressed_sizes {
+            sink.push(block_size);
+        }
         #[cfg(all(feature = "lsm", feature = "hash"))]
         if let Some(sink) = block_checksums {
             sink.push(crate::encoding::frame_compressor::xxh64_block_low32(block));
@@ -210,6 +248,10 @@ pub(crate) fn compress_block_encoded_borrowed(
         output.push(rle_byte);
         BlockType::RLE
     } else if should_emit_raw_fast_path(compression_level, state.matcher.window_size(), block) {
+        #[cfg(feature = "lsm")]
+        if let Some(sink) = block_decompressed_sizes {
+            sink.push(block_size);
+        }
         #[cfg(all(feature = "lsm", feature = "hash"))]
         if let Some(sink) = block_checksums {
             sink.push(crate::encoding::frame_compressor::xxh64_block_low32(block));
@@ -233,6 +275,10 @@ pub(crate) fn compress_block_encoded_borrowed(
         // Stage the borrowed range so `compress_block`'s internal
         // `start_matching` scans it in place (no `commit_space` copy).
         state.matcher.set_borrowed_block(block_start, block_end);
+        #[cfg(feature = "lsm")]
+        if let Some(sink) = block_decompressed_sizes {
+            sink.push(block_size);
+        }
         #[cfg(all(feature = "lsm", feature = "hash"))]
         if let Some(sink) = block_checksums {
             // Hash the block bytes directly: the staged borrowed range is
@@ -350,6 +396,8 @@ mod tests {
             vec![0xAB; 1024],
             &mut output,
             false,
+            #[cfg(feature = "lsm")]
+            None,
             #[cfg(all(feature = "lsm", feature = "hash"))]
             None,
         );
@@ -394,6 +442,8 @@ mod tests {
             block.clone(),
             &mut output,
             false,
+            #[cfg(feature = "lsm")]
+            None,
             #[cfg(all(feature = "lsm", feature = "hash"))]
             None,
         );
