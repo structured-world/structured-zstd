@@ -1581,28 +1581,36 @@ impl FrameDecoder {
             if xxh64_of(prime) != r.state.window_hash {
                 return Err(err::ResumeFrameMismatch);
             }
+            // Validate the effective range (resume mode begins at the resume
+            // block, ignoring the caller's `start_block`) BEFORE mutating the
+            // decoder: an inverted `end_block` must fail without priming the
+            // window / entropy or advancing the cursor, leaving the decoder
+            // re-resettable rather than in a half-resumed state.
+            let effective_start = r.state.block_index;
+            if effective_start > end_block {
+                return Err(err::InvalidBlockRange {
+                    start_block: effective_start,
+                    end_block,
+                });
+            }
             state.decoder_scratch.restore_entropy(r.state);
             state.decoder_scratch.prime_window(prime, output_offset);
-            state.block_counter = r.state.block_index as usize;
+            state.block_counter = effective_start as usize;
             // The caller repositions `source` to the resume block; report
             // consumed bytes relative to that point (reset left this at the
             // frame-header size).
             state.bytes_read_counter = 0;
-            r.state.block_index
+            effective_start
         } else {
+            // Fresh decode: validate the caller's range (no state to mutate).
+            if start_block > end_block {
+                return Err(err::InvalidBlockRange {
+                    start_block,
+                    end_block,
+                });
+            }
             start_block
         };
-
-        // Validate the range against the EFFECTIVE start (resume mode ignores
-        // the caller's `start_block` and begins at the resume block), so an
-        // `end_block` below the resume block is reported as an inverted range
-        // rather than silently returning an empty decode.
-        if effective_start > end_block {
-            return Err(err::InvalidBlockRange {
-                start_block: effective_start,
-                end_block,
-            });
-        }
 
         let mut block_dec = decoding::block_decoder::new();
 
