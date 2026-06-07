@@ -1020,6 +1020,32 @@ impl From<crate::decoding::buffer_backend::BackendOverflow> for ExecuteSequences
     }
 }
 
+impl ExecuteSequencesError {
+    /// `Some(requested)` when this error is a fixed-capacity output-buffer
+    /// overshoot from the Compressed-block sequence executor — either the
+    /// donor-inline path ([`Self::OutputBufferOverflow`]) or the
+    /// match-repeat fallback ([`DecodeBufferError::OutputBufferOverflow`]
+    /// wrapped in [`Self::DecodebufferError`]). `requested` is the byte
+    /// count the failing write tried to append past the slice end.
+    ///
+    /// `None` for every non-overflow variant. Used by
+    /// `FrameDecoder::run_direct_decode` to fold an in-block Compressed
+    /// overshoot into the same `FrameContentSizeMismatch` contract the
+    /// Raw/RLE [`DecodeBlockContentError::BackendOverflow`] arm already
+    /// produces — both mean "the frame's content expands past the
+    /// declared `frame_content_size`".
+    pub(crate) fn output_overflow_requested(&self) -> Option<usize> {
+        match self {
+            ExecuteSequencesError::OutputBufferOverflow { requested, .. } => Some(*requested),
+            ExecuteSequencesError::DecodebufferError(DecodeBufferError::OutputBufferOverflow {
+                requested,
+                ..
+            }) => Some(*requested),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum DecodeSequenceError {

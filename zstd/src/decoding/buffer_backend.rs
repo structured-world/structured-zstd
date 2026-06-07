@@ -387,14 +387,21 @@ pub(crate) trait BufferBackend: Sized {
     //
     // Parallel `try_*` methods that return `Err(BackendOverflow)`
     // instead of panicking when the write would exceed the backend's
-    // capacity. Currently wired on Raw and RLE block paths only;
-    // Compressed-block sequence execution still uses the panic-on-
-    // overflow unchecked writes and will be migrated in a follow-up.
-    // Used by the direct-decode path (`decode_all` +
-    // descendants) so a malformed Raw/RLE block whose declared
-    // decompressed payload exceeds the caller-provided output slice
-    // surfaces as a structured `FrameDecoderError::FrameContentSizeMismatch`
-    // instead of an abort.
+    // capacity. Wired across EVERY direct-decode write path: Raw / RLE
+    // blocks (`try_extend` / `try_extend_and_fill`), the Compressed
+    // block's sequence executor (`exec_sequence_inline` returns
+    // `Result`, the fallback chain uses `try_push` +
+    // `repeat_lookahead_prefetched`, tail literals use `try_push`), and
+    // the match-repeat pre-check (`try_reserve`). Used by the
+    // direct-decode path (`decode_all` + descendants) so a malformed
+    // block whose decompressed payload exceeds the caller-provided
+    // output slice surfaces as a structured
+    // `FrameDecoderError::FrameContentSizeMismatch` instead of an abort
+    // — uniformly for Raw, RLE, and Compressed blocks (see
+    // `FrameDecoder::run_direct_decode`, which folds the Compressed
+    // sequence-executor `OutputBufferOverflow` into the same
+    // `FrameContentSizeMismatch` contract as the Raw/RLE
+    // `BackendOverflow` arm).
     //
     // The growable backends (`FlatBuf`, `RingBuffer`) rely on the
     // default impls below — they delegate to the corresponding
@@ -455,12 +462,16 @@ pub(crate) trait BufferBackend: Sized {
     /// satisfy the `Self::extend_from_within_unchecked` safety
     /// contract at the call site.
     ///
-    /// NOTE: Currently unused on production paths. The direct
-    /// decode's Compressed-block sequence executor writes via the
-    /// existing unchecked path; threading `try_*` through the
-    /// fused decode+execute pipeline is the next step toward
-    /// unconditional adversarial-input safety. RLE/Raw blocks
-    /// already use `try_extend_and_fill` / `try_extend`.
+    /// NOTE: Retained for the SAFE-surface test matrix and as the
+    /// wrap-aware reference impl; not called on production paths
+    /// (hence `#[allow(dead_code)]`). The Compressed-block direct path
+    /// is already DoS-safe WITHOUT this method: its match-repeat copies
+    /// go through `DecodeBuffer::repeat_lookahead_prefetched`, which
+    /// pre-checks capacity via [`Self::try_reserve`] before the
+    /// unchecked wildcopy, and its literal+match sequence copies go
+    /// through `exec_sequence_inline` (returns `Result`). RLE/Raw use
+    /// `try_extend_and_fill` / `try_extend`. So every adversarial
+    /// overshoot already surfaces as a structured error.
     #[allow(dead_code)]
     fn try_extend_from_within(&mut self, start: usize, len: usize) -> Result<(), BackendOverflow> {
         // Default impl: a SAFE method must NOT delegate to the
@@ -541,9 +552,12 @@ pub(crate) trait BufferBackend: Sized {
 /// donor-inline paths inside the sequence executor) or
 /// `DecodeBufferError::OutputBufferOverflow` (the match-repeat
 /// `try_reserve` pre-check inside `DecodeBuffer::repeat_inner`).
-/// Both bubble up as a structured `FrameDecoderError` (typically
-/// wrapped in `FailedToReadBlockBody`) — callers never see
-/// `BackendOverflow` directly.
+/// On the direct-decode path both are folded by
+/// `FrameDecoder::run_direct_decode` into
+/// `FrameDecoderError::FrameContentSizeMismatch` — the same
+/// caller-visible error a Raw / RLE overshoot yields, so the
+/// "content exceeded declared size" contract is uniform across block
+/// types. Callers never see `BackendOverflow` directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BackendOverflow {
     /// Current physical write cursor at the moment the write was
