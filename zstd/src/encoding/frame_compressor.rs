@@ -1654,13 +1654,22 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         match_generator
     }
 
-    /// Before calling [FrameCompressor::compress] you can replace the compression level
+    /// Before calling [FrameCompressor::compress] you can replace the compression level.
+    ///
+    /// This also clears any fine-grained parameter overrides installed via
+    /// [`set_parameters`](Self::set_parameters): reverting to a bare level
+    /// means plain level-based tuning, not the previous frame's customized
+    /// strategy / LDM / log overrides. To keep overriding, call
+    /// [`set_parameters`](Self::set_parameters) again with the new base level.
     pub fn set_compression_level(
         &mut self,
         compression_level: CompressionLevel,
     ) -> CompressionLevel {
         let old = self.compression_level;
         self.compression_level = compression_level;
+        // Drop sticky overrides so the level switch yields plain geometry.
+        self.strategy_override = None;
+        self.state.matcher.clear_param_overrides();
         old
     }
 

@@ -370,6 +370,13 @@ pub trait Matcher {
     /// test stubs. The built-in runtime matcher (`MatchGeneratorDriver`)
     /// overrides this hook and applies the hint during level resolution.
     fn set_source_size_hint(&mut self, _size: u64) {}
+    /// Drop any per-frame fine-grained parameter overrides installed via
+    /// the public parameter API, reverting to plain level-based geometry
+    /// at the next [`reset`](Self::reset). Called by
+    /// [`FrameCompressor::set_compression_level`](crate::encoding::FrameCompressor::set_compression_level)
+    /// so switching back to a bare level after a customized frame does not
+    /// keep the old overrides sticky. Default no-op for custom matchers.
+    fn clear_param_overrides(&mut self) {}
     /// Prime matcher state with dictionary history before compressing the next frame.
     /// Default implementation is a no-op for custom matchers that do not support this.
     fn prime_with_dictionary(&mut self, _dict_content: &[u8], _offset_hist: [u32; 3]) {}

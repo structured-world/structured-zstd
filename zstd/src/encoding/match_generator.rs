@@ -1427,6 +1427,10 @@ impl Matcher for MatchGeneratorDriver {
         self.source_size_hint = Some(size);
     }
 
+    fn clear_param_overrides(&mut self) {
+        self.param_overrides = None;
+    }
+
     fn reset(&mut self, level: CompressionLevel) {
         let hint = self.source_size_hint.take();
         // Snapshot the hint's normalized ceil-log bucket for the primed-snapshot
