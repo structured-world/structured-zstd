@@ -196,6 +196,44 @@ pub struct FrameDecoder {
     computed_block_checksums: alloc::vec::Vec<u32>,
 }
 
+/// Decode-relevant identity of a frame, used to reject a [`ResumeState`]
+/// captured from one frame being applied to a frame of a different shape. Covers
+/// every header field that changes how blocks decode (buffer sizing, backend
+/// kind, entropy/dictionary context, trailing-checksum handling, declared
+/// content size, magicless framing).
+///
+/// This is a SHAPE guard, not a content-unique fingerprint: two distinct frames
+/// that happen to share all these header fields produce the same key (no cheap
+/// header field uniquely identifies frame content). It catches the realistic
+/// accidental misuse — applying a snapshot to a frame with a different
+/// window/dictionary/size — with a typed error instead of byte-wrong output.
+/// Pairing a `ResumeState` with the correct frame's compressed source and
+/// `window_prime` remains the caller's contract.
+#[cfg(feature = "lsm")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct FrameKey {
+    window_size: u64,
+    frame_content_size: u64,
+    dictionary_id: Option<u32>,
+    single_segment: bool,
+    content_checksum: bool,
+    magicless: bool,
+}
+
+#[cfg(feature = "lsm")]
+impl FrameKey {
+    fn from_header(header: &frame::FrameHeader, magicless: bool) -> FrameKey {
+        FrameKey {
+            window_size: header.window_size().unwrap_or(0),
+            frame_content_size: header.frame_content_size(),
+            dictionary_id: header.dictionary_id(),
+            single_segment: header.descriptor.single_segment_flag(),
+            content_checksum: header.descriptor.content_checksum_flag(),
+            magicless,
+        }
+    }
+}
+
 /// Cross-block decode state needed to resume a cold partial decode at an inner
 /// block boundary, emitted by [`FrameDecoder::decode_blocks_partial`] when its
 /// `emit_resume` argument is `true` (returned in
@@ -218,6 +256,12 @@ pub struct FrameDecoder {
 #[cfg(feature = "lsm")]
 #[cfg_attr(docsrs, doc(cfg(feature = "lsm")))]
 pub struct ResumeState {
+    /// Identity of the frame this state was captured from. Compared against the
+    /// frame currently reset into the decoder before any state is restored, so a
+    /// snapshot from a different frame shape is rejected with
+    /// [`FrameDecoderError::ResumeFrameMismatch`] instead of silently producing
+    /// byte-wrong output.
+    frame_key: FrameKey,
     /// Index of the block to resume AT (the first block NOT yet decoded).
     block_index: u32,
     /// Cumulative decompressed byte count produced before `block_index`.
@@ -1410,12 +1454,7 @@ impl FrameDecoder {
         emit_resume: bool,
     ) -> Result<PartialDecode, FrameDecoderError> {
         use FrameDecoderError as err;
-        if start_block > end_block {
-            return Err(err::InvalidBlockRange {
-                start_block,
-                end_block,
-            });
-        }
+        let magicless = self.magicless;
         let state = self.state.as_mut().ok_or(err::NotYetInitialized)?;
 
         // Mirror `decode_blocks`: pre-reserve the backing buffer to
@@ -1430,6 +1469,13 @@ impl FrameDecoder {
         // start is the resume state's block index (the passed `start_block` is
         // ignored in resume mode, per the doc).
         let effective_start = if let Some(r) = resume {
+            // Reject a snapshot captured from a different frame shape BEFORE
+            // touching any decoder state: restoring entropy/repcode tables that
+            // belong to another frame would silently produce byte-wrong output.
+            let current_key = FrameKey::from_header(&state.frame_header, magicless);
+            if current_key != r.state.frame_key {
+                return Err(err::ResumeFrameMismatch);
+            }
             let output_offset = r.state.output_offset;
             // The window the resume block can reach back into is bounded by the
             // smaller of the frame's window_size and the bytes produced so far.
@@ -1460,6 +1506,17 @@ impl FrameDecoder {
         } else {
             start_block
         };
+
+        // Validate the range against the EFFECTIVE start (resume mode ignores
+        // the caller's `start_block` and begins at the resume block), so an
+        // `end_block` below the resume block is reported as an inverted range
+        // rather than silently returning an empty decode.
+        if effective_start > end_block {
+            return Err(err::InvalidBlockRange {
+                start_block: effective_start,
+                end_block,
+            });
+        }
 
         let mut block_dec = decoding::block_decoder::new();
 
@@ -1585,6 +1642,7 @@ impl FrameDecoder {
         let resume_state = if emit_resume {
             let (fse, huf, offset_hist) = state.decoder_scratch.export_entropy();
             Some(ResumeState {
+                frame_key: FrameKey::from_header(&state.frame_header, magicless),
                 block_index: state.block_counter as u32,
                 output_offset: state.decoder_scratch.total_output(),
                 fse,
@@ -4122,6 +4180,45 @@ mod tests {
             }
             other => panic!("expected InvalidBlockRange, got {other:?}"),
         }
+    }
+
+    #[cfg(feature = "lsm")]
+    #[test]
+    fn resume_rejects_state_from_a_different_frame() {
+        // A ResumeState captured from one frame must not be applied to a frame
+        // with a different decode shape (window size / single-segment / dict):
+        // restoring foreign entropy tables would yield byte-wrong output. The
+        // frame-identity guard must reject it up front with a typed error.
+        let (frame_a, _full_a, info_a) = multi_block_fixture();
+        let (frame_b, full_b, _info_b) = multi_segment_block_fixture();
+        // Sanity: the two fixtures must differ in decode shape for the guard to
+        // be exercised (single-segment vs multi-segment here).
+        let st = emit_resume_state_at(&frame_a, (info_a.blocks.len() as u32 / 2).max(1));
+
+        let mut header_src = frame_b.as_slice();
+        let mut dec = FrameDecoder::new();
+        dec.reset(&mut header_src).unwrap();
+        // The frame-key check runs before the window-length check, so even a
+        // valid-length window_prime for frame B is rejected on identity.
+        let err = dec
+            .decode_blocks_partial(
+                &mut frame_b.as_slice(),
+                st.block_index(),
+                u32::MAX,
+                Some(super::ResumeInput {
+                    window_prime: &full_b,
+                    state: &st,
+                }),
+                false,
+            )
+            .expect_err("resume state from a different frame must be rejected");
+        assert!(
+            matches!(
+                err,
+                crate::decoding::errors::FrameDecoderError::ResumeFrameMismatch
+            ),
+            "expected ResumeFrameMismatch, got {err:?}"
+        );
     }
 
     #[cfg(feature = "lsm")]
