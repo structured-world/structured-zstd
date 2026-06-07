@@ -2673,6 +2673,35 @@ pub(crate) use bt_insert_step_no_rebase_body;
 /// (`ACCURATE_PRICE`, `FAVOR_SMALL_OFFSETS`) come from the wrapper's
 /// generic parameter list and are referenced as bare identifiers; macro
 /// hygiene resolves them at the expansion site.
+/// Donor `offBase` for the btlazy2 lazy gain heuristic: a match whose offset
+/// equals one of the three active repeat offsets prices as the cheap repcode
+/// code (1/2/3); any other offset prices as `offset + 3`. So an equal-length
+/// repeat-offset match always out-gains an explicit-offset one
+/// (`zstd_lazy.c` `ZSTD_storeSeq` offBase convention).
+#[inline]
+fn btlazy2_offbase(offset: usize, reps: [u32; 3]) -> u32 {
+    let o = offset as u32;
+    if o == reps[0] {
+        1
+    } else if o == reps[1] {
+        2
+    } else if o == reps[2] {
+        3
+    } else {
+        // Offsets are < window (<= 2^27), so `+ 3` never overflows u32.
+        o + 3
+    }
+}
+
+/// Donor lazy match gain (`matchLength * 4 - ZSTD_highbit32(offBase)`): the
+/// selection metric that lets a shorter repeat-offset match beat a longer
+/// explicit-offset one. `offBase >= 1`, so `highbit` is well-defined.
+#[inline]
+fn btlazy2_gain(match_len: usize, offset: usize, reps: [u32; 3]) -> i64 {
+    let offbase = btlazy2_offbase(offset, reps);
+    (match_len as i64) * 4 - (31 - offbase.leading_zeros()) as i64
+}
+
 /// Per-kernel body of the `btlazy2` (levels 13-15) greedy/lazy parse over
 /// the binary-tree match finder. Mirrors `build_optimal_plan_impl_body!`'s
 /// kernel-dispatch discipline: the wrapper carries the `#[target_feature]`
@@ -2681,7 +2710,7 @@ pub(crate) use bt_insert_step_no_rebase_body;
 /// stays under one umbrella — the runtime `select_kernel()` dispatch happens
 /// ONCE per block in the bare `start_matching_btlazy2`, never per position.
 macro_rules! start_matching_btlazy2_body {
-    ($self:ident, $handle_sequence:ident, $collect:ident $(,)?) => {{
+    ($self:ident, $handle_sequence:ident, $collect:ident, $cmf:path $(,)?) => {{
         $self.table.ensure_tables();
         let current_len = *$self.table.chunk_lens.back().unwrap();
         if current_len == 0 {
@@ -2691,6 +2720,16 @@ macro_rules! start_matching_btlazy2_body {
         // Mutates tables but never reallocates `history`, so this tail slice
         // stays valid for the routine's duration (same as the other parsers).
         let current: &[u8] = unsafe { core::slice::from_raw_parts(current_ptr, current_len) };
+        // Full contiguous history (dict + prior blocks + current block) as a
+        // raw slice, for the explicit repcode probe: a rep offset can point
+        // before the current block, which `current` can't reach. Same
+        // no-realloc validity contract as `current`; holds no borrow, so it
+        // coexists with the `&mut self` collector calls below.
+        let history_abs_start = $self.table.history_abs_start;
+        let concat_full: &[u8] = unsafe {
+            let base = $self.table.history.as_ptr().add($self.table.history_start);
+            core::slice::from_raw_parts(base, $self.table.history.len() - $self.table.history_start)
+        };
         let current_abs_start =
             $self.table.history_abs_start + $self.table.window_size - current_len;
         let current_abs_end = current_abs_start + current_len;
@@ -2704,55 +2743,120 @@ macro_rules! start_matching_btlazy2_body {
         let profile = HcOptimalCostProfile::const_for_strategy::<super::strategy::Btlazy2>();
         let mut candidates = core::mem::take(&mut $self.backend.bt_mut().opt_candidates_scratch);
 
+        let depth = $self.hc.lazy_depth as usize;
         let mut pos = 0usize;
         let mut literals_start = 0usize;
-        while pos + HC_OPT_MIN_MATCH_LEN <= current_len {
-            let abs_pos = current_abs_start + pos;
-            let lit_len = pos - literals_start;
-            candidates.clear();
-            let query = HcCandidateQuery {
-                reps: $self.table.offset_hist,
-                lit_len,
-                // No LDM seed: L13-15 run at windowLog 22, below donor's
-                // LDM auto-enable threshold (windowLog >= 27), so long-
-                // distance matching is off for this strategy by default.
-                ldm_candidate: None,
-            };
-            // SAFETY: called inside the wrapper's `#[target_feature]` umbrella
-            // (the scalar wrapper's `$collect` is a safe fn — `unused_unsafe`
-            // is allowed on the wrapper).
-            unsafe {
-                $self.$collect::<super::strategy::Btlazy2, true>(
-                    abs_pos,
-                    current_abs_end,
-                    profile,
-                    query,
-                    &mut candidates,
-                );
-            }
-            // Greedy commit: the ladder is increasing in length, so the last
-            // entry is the longest match found at this position (donor btlazy2
-            // commits the best/longest match).
-            if let Some(best) = candidates.last().copied() {
-                let match_len = best.match_len.min(current_len - pos);
-                if match_len >= HC_OPT_MIN_MATCH_LEN {
-                    let literals = &current[literals_start..pos];
-                    $handle_sequence(Sequence::Triple {
-                        literals,
-                        offset: best.offset,
-                        match_len,
-                    });
-                    let _ = encode_offset_with_history(
-                        best.offset as u32,
-                        lit_len as u32,
-                        &mut $self.table.offset_hist,
+
+        // Collect + select the highest-GAIN match at a position (donor
+        // `ZSTD_searchMax` plus the explicit offset_1 repcode check): scan the
+        // length-sorted BT/dms ladder by gain, then probe rep0 directly since
+        // the ladder's strictly-increasing-length filter drops short cheap
+        // reps. Expands to `(match_len, offset)`; `match_len == 0` = no match.
+        macro_rules! bt_select {
+            ($p:expr) => {{
+                let sel_pos: usize = $p;
+                let sel_abs = current_abs_start + sel_pos;
+                candidates.clear();
+                let query = HcCandidateQuery {
+                    reps: $self.table.offset_hist,
+                    lit_len: sel_pos - literals_start,
+                    // No LDM seed: L13-15 run at windowLog 22, below donor's
+                    // LDM auto-enable threshold (windowLog >= 27).
+                    ldm_candidate: None,
+                };
+                // SAFETY: called inside the wrapper's `#[target_feature]`
+                // umbrella (the scalar wrapper's `$collect` is a safe fn).
+                unsafe {
+                    $self.$collect::<super::strategy::Btlazy2, true>(
+                        sel_abs,
+                        current_abs_end,
+                        profile,
+                        query,
+                        &mut candidates,
                     );
-                    pos += match_len;
-                    literals_start = pos;
-                    continue;
+                }
+                let reps = $self.table.offset_hist;
+                let mut sel_ml = 0usize;
+                let mut sel_off = 0usize;
+                let mut sel_gain = i64::MIN;
+                for c in candidates.iter() {
+                    let ml = c.match_len.min(current_len - sel_pos);
+                    if ml < HC_OPT_MIN_MATCH_LEN {
+                        continue;
+                    }
+                    let g = btlazy2_gain(ml, c.offset, reps);
+                    if g > sel_gain {
+                        sel_gain = g;
+                        sel_ml = ml;
+                        sel_off = c.offset;
+                    }
+                }
+                let sel_idx = sel_abs - history_abs_start;
+                let rep0 = reps[0] as usize;
+                if rep0 != 0 && sel_idx >= rep0 {
+                    let tail = current_len - sel_pos;
+                    // SAFETY: `sel_idx - rep0 < sel_idx`, `sel_idx + tail <=
+                    // concat_full.len()`; same overshoot slack the collector
+                    // relies on for this block.
+                    let rep_ml = unsafe { $cmf(concat_full, sel_idx, sel_idx - rep0, tail, 0) };
+                    if rep_ml >= HC_OPT_MIN_MATCH_LEN && btlazy2_gain(rep_ml, rep0, reps) > sel_gain
+                    {
+                        sel_ml = rep_ml;
+                        sel_off = rep0;
+                    }
+                }
+                (sel_ml, sel_off)
+            }};
+        }
+
+        while pos + HC_OPT_MIN_MATCH_LEN <= current_len {
+            let (mut best_ml, mut best_off) = bt_select!(pos);
+            if best_ml < HC_OPT_MIN_MATCH_LEN {
+                pos += 1;
+                continue;
+            }
+            // Lazy lookahead (donor depth 1/2): advance one byte and accept the
+            // later match only if it out-gains the current one by the donor
+            // margin (deferring costs an extra literal — `+4` at depth 1, `+7`
+            // at depth 2). `start` tracks where the chosen match begins.
+            let mut start = pos;
+            let mut d = 0usize;
+            while d < depth && start + 1 + HC_OPT_MIN_MATCH_LEN <= current_len {
+                let look = start + 1;
+                let (ml2, off2) = bt_select!(look);
+                if ml2 < HC_OPT_MIN_MATCH_LEN {
+                    break;
+                }
+                let reps = $self.table.offset_hist;
+                let margin = if d == 0 { 4 } else { 7 };
+                let gain1 = btlazy2_gain(best_ml, best_off, reps) + margin;
+                let gain2 = btlazy2_gain(ml2, off2, reps);
+                if gain2 > gain1 {
+                    best_ml = ml2;
+                    best_off = off2;
+                    start = look;
+                    d += 1;
+                } else {
+                    break;
                 }
             }
-            pos += 1;
+            // Commit the chosen match at `start`; [literals_start, start) is
+            // emitted as literals. `best_ml` was bounded to `current_len -
+            // start` at selection, so `start + best_ml <= current_len`.
+            let lit_len = start - literals_start;
+            let literals = &current[literals_start..start];
+            $handle_sequence(Sequence::Triple {
+                literals,
+                offset: best_off,
+                match_len: best_ml,
+            });
+            let _ = encode_offset_with_history(
+                best_off as u32,
+                lit_len as u32,
+                &mut $self.table.offset_hist,
+            );
+            pos = start + best_ml;
+            literals_start = pos;
         }
 
         if literals_start < current_len {
@@ -4483,7 +4587,8 @@ impl HcMatchGenerator {
         start_matching_btlazy2_body!(
             self,
             handle_sequence,
-            collect_optimal_candidates_initialized_neon
+            collect_optimal_candidates_initialized_neon,
+            crate::encoding::fastpath::neon::count_match_from_indices
         )
     }
 
@@ -4496,7 +4601,8 @@ impl HcMatchGenerator {
         start_matching_btlazy2_body!(
             self,
             handle_sequence,
-            collect_optimal_candidates_initialized_sse42
+            collect_optimal_candidates_initialized_sse42,
+            crate::encoding::fastpath::sse42::count_match_from_indices
         )
     }
 
@@ -4509,7 +4615,8 @@ impl HcMatchGenerator {
         start_matching_btlazy2_body!(
             self,
             handle_sequence,
-            collect_optimal_candidates_initialized_avx2_bmi2
+            collect_optimal_candidates_initialized_avx2_bmi2,
+            crate::encoding::fastpath::avx2_bmi2::count_match_from_indices
         )
     }
 
@@ -4526,7 +4633,8 @@ impl HcMatchGenerator {
         start_matching_btlazy2_body!(
             self,
             handle_sequence,
-            collect_optimal_candidates_initialized_scalar
+            collect_optimal_candidates_initialized_scalar,
+            crate::encoding::fastpath::scalar::count_match_from_indices
         )
     }
 
