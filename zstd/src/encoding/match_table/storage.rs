@@ -1323,6 +1323,35 @@ impl MatchTable {
         self.next_to_update3 = self.next_to_update3.max(end);
     }
 
+    /// Index a just-emitted match span with the donor skip-threshold cap
+    /// (`ZSTD_row_update_internal`, `zstd_lazy.c:922-940`): when the span
+    /// exceeds `SKIP_THRESHOLD` positions only the first `MAX_START` and last
+    /// `MAX_END` are chained, the interior is skipped. Indexing every interior
+    /// byte of a long match is O(matchlen) and dominates HashChain (lazy)
+    /// encode time on periodic inputs where one match can span a whole block;
+    /// donor's hash-chain finder chains nothing in the interior at all, so the
+    /// 96 + 32 cap is a conservative (ratio-preserving) mirror that still keeps
+    /// boundary anchors for the following search.
+    pub(crate) fn insert_match_span(&mut self, start: usize, end: usize) {
+        const SKIP_THRESHOLD: usize = 384;
+        const MAX_START: usize = 96;
+        const MAX_END: usize = 32;
+        if end.saturating_sub(start) > SKIP_THRESHOLD {
+            // Raw arithmetic is correct by design here, NOT masked with
+            // `saturating_*`. `start` / `end` are absolute stream
+            // positions, and `check_stream_abs_headroom` guarantees
+            // `abs_pos + STREAM_ABS_HEADROOM (= 4112) <= usize::MAX` for
+            // every position in the frame, so `start + MAX_START` (96)
+            // cannot overflow even on a 32-bit target. In this branch
+            // `end - start > SKIP_THRESHOLD (384)`, so `end > 384 >
+            // MAX_END (32)` and `end - MAX_END` cannot underflow.
+            self.insert_positions(start, start + MAX_START);
+            self.insert_positions(end - MAX_END, end);
+        } else {
+            self.insert_positions(start, end);
+        }
+    }
+
     /// Tight hash/chain fill for `[start, end)` when the caller has already
     /// proven every position is `(rel + 1)`-representable (so no rebase and
     /// no `rel == 0` skip can occur). Equivalent to looping

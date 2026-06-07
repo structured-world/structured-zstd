@@ -1,0 +1,146 @@
+//! Shared CDict-style dictionary-attach lifecycle, parameterized by the
+//! matcher's immutable dictionary table type `T`.
+//!
+//! This is the level-1 scaffolding common to every match-finder backend that
+//! supports donor `ZSTD_dictMatchState` attach-by-reference: instead of
+//! re-priming the whole dictionary into the live hash table(s) on every frame
+//! (O(dict) per frame, the dominant cost on small-payload `compress-dict`), the
+//! dictionary is hashed ONCE into a SEPARATE immutable table `T` held here, and
+//! the kernel dual-probes the live table(s) plus this dict table. A reused
+//! compressor keeps `T` across the per-frame `reset` (the dict re-commits to the
+//! same absolute history positions) via the `primed` cache flag — mirroring
+//! C copying / referencing `cdict->matchState` rather than rebuilding it.
+//!
+//! `T` is backend-specific (Fast = single `FastHashTable`; Dfast = a long+short
+//! pair; Row/HC/BT = their own structures); the per-backend BUILD of `T` and the
+//! per-kernel dual-probe LOOKUP are level-2 (kept in each backend, expanded per
+//! SIMD tier). This type only owns the shared lifecycle: presence, the
+//! dict/input boundary, the build-once cache flag, and invalidation.
+
+/// Lifecycle holder for an attached, immutable dictionary table of type `T`.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct DictAttach<T> {
+    /// The immutable dictionary table, built once over the dictionary region.
+    /// `Some` activates the backend's dual-probe kernel; `None` means no dict
+    /// is attached (or it was invalidated, e.g. on history eviction that would
+    /// stale the absolute dict positions) and the plain kernel runs.
+    table: Option<T>,
+    /// Number of dictionary bytes at the front of history — one past the last
+    /// valid dict position. The boundary the dual-probe kernel uses to separate
+    /// live-table (input) matches from dict-table matches. `0` when unattached.
+    region_len: usize,
+    /// CDict-equivalent cache flag: `true` once `table` is fully built for the
+    /// attached dictionary. A reused compressor keeps the built table across
+    /// per-frame `reset` and skips the re-hash. Cleared on parameter change,
+    /// history eviction, or dictionary attach/clear via [`Self::invalidate`].
+    primed: bool,
+}
+
+impl<T> DictAttach<T> {
+    pub(crate) const fn new() -> Self {
+        Self {
+            table: None,
+            region_len: 0,
+            primed: false,
+        }
+    }
+
+    /// Whether a dict table is attached (drives the dual-probe dispatch).
+    #[inline]
+    pub(crate) fn is_attached(&self) -> bool {
+        self.table.is_some()
+    }
+
+    /// Shared reference to the dict table, if attached.
+    #[inline]
+    pub(crate) fn table(&self) -> Option<&T> {
+        self.table.as_ref()
+    }
+
+    /// The dict/input boundary (`dict_end`) for kernel bounds checks.
+    #[inline]
+    pub(crate) fn region_len(&self) -> usize {
+        self.region_len
+    }
+
+    /// Record the dict/input boundary. Set every prime call regardless of
+    /// whether any position was hashable (a sub-min-match dict still bounds the
+    /// input floor).
+    #[inline]
+    pub(crate) fn set_region_len(&mut self, region_len: usize) {
+        self.region_len = region_len;
+    }
+
+    /// CDict cache flag: `true` once the table is fully built. The prime path
+    /// checks this to skip the re-hash on reused frames.
+    #[inline]
+    pub(crate) fn is_primed(&self) -> bool {
+        self.primed
+    }
+
+    /// Mark the table fully built (CDict cache). Only marks when a table
+    /// actually exists — a sub-min-match dict builds no table and must re-run
+    /// the (cheap, no-op) prime path each frame.
+    #[inline]
+    pub(crate) fn mark_primed(&mut self) {
+        if self.table.is_some() {
+            self.primed = true;
+        }
+    }
+
+    /// Get the table for building, initializing it with `init` if absent.
+    /// Backends call this lazily inside their per-backend prime once they know
+    /// at least one position is hashable.
+    #[inline]
+    pub(crate) fn table_mut_or_init(&mut self, init: impl FnOnce() -> T) -> &mut T {
+        self.table.get_or_insert_with(init)
+    }
+
+    /// Mutable reference to the table, if attached (for the build/fill pass).
+    #[inline]
+    pub(crate) fn table_mut(&mut self) -> Option<&mut T> {
+        self.table.as_mut()
+    }
+
+    /// Drop the cached dict table, boundary, and primed flag. Called when the
+    /// next frame carries no dictionary (or on eviction/param change) so the
+    /// kernel never probes a stale dict region.
+    #[inline]
+    pub(crate) fn invalidate(&mut self) {
+        self.table = None;
+        self.region_len = 0;
+        self.primed = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::{vec, vec::Vec};
+
+    #[test]
+    fn lifecycle_attach_prime_invalidate() {
+        let mut da: DictAttach<Vec<u32>> = DictAttach::new();
+        assert!(!da.is_attached());
+        assert!(!da.is_primed());
+        assert_eq!(da.region_len(), 0);
+
+        da.set_region_len(128);
+        // mark_primed is a no-op while no table exists.
+        da.mark_primed();
+        assert!(!da.is_primed());
+
+        da.table_mut_or_init(|| vec![0u32; 16]).fill(7);
+        assert!(da.is_attached());
+        assert_eq!(da.table().unwrap()[0], 7);
+
+        da.mark_primed();
+        assert!(da.is_primed());
+        assert_eq!(da.region_len(), 128);
+
+        da.invalidate();
+        assert!(!da.is_attached());
+        assert!(!da.is_primed());
+        assert_eq!(da.region_len(), 0);
+    }
+}

@@ -265,6 +265,22 @@ const ROW_L5: RowConfig = RowConfig {
     mls: ROW_MIN_MATCH_LEN,
 };
 
+// Level-8 lazy2 routed to the Row finder (donor `useRowMatchFinder`: the row
+// finder is enabled by default for greedy/lazy/lazy2 whenever windowLog > 14,
+// which holds for every lazy level here). Donor `clevels.h` L8 (srcSize > 256
+// KB) is searchLog=4, targetLength=16, minMatch=5, from which the row matcher
+// derives rowLog = clamp(searchLog, 4, 6) = 4, search_depth = 1 << min(searchLog,
+// rowLog) = 16, target_len = 16. Replaces the legacy HashChain config so the
+// bounded row dual-probe (and its dict attach) runs instead of the unbounded
+// hash-chain dict walk.
+const ROW_L8: RowConfig = RowConfig {
+    hash_bits: ROW_HASH_BITS,
+    row_log: 4,
+    search_depth: 16,
+    target_len: 16,
+    mls: ROW_MIN_MATCH_LEN,
+};
+
 /// Per-level Double-Fast hash sizing, mirroring the donor `clevels.h` columns
 /// (config-driven, not a hardcoded constant): `long_hash_log` =
 /// `cParams.hashLog` (the long 8-byte hash table), `short_hash_log` =
@@ -462,6 +478,13 @@ fn apply_param_overrides(params: &mut LevelParams, ov: &super::parameters::Param
         }
         SearchMethod::RowHash => {
             if let Some(row) = params.row.as_mut() {
+                // Row hash-table width override (mirrors dfast `long_hash_log`
+                // / hc `hash_log`). Row has no separate chain table — the
+                // per-row depth comes from `search_log` below — so only
+                // `hash_log` maps here; `chain_log` has no Row analogue.
+                if let Some(hash_log) = ov.hash_log {
+                    row.hash_bits = hash_log as usize;
+                }
                 if let Some(search_log) = ov.search_log {
                     // Donor: rowLog = clamp(searchLog, 4, 6);
                     //        nbAttempts = 1 << min(searchLog, rowLog).
@@ -544,6 +567,22 @@ pub(crate) fn source_size_ceil_log(size: u64) -> u8 {
 /// the primed-snapshot key) and `prime_with_dictionary` (which acts on it).
 const FAST_ATTACH_DICT_CUTOFF_LOG: u8 = 13;
 
+/// Dfast counterpart of [`FAST_ATTACH_DICT_CUTOFF_LOG`]: donor
+/// `ZSTD_dictMatchState` attach cutoff for the double-fast strategy is 16 KiB
+/// (`2^14`), so small / unknown-size inputs ATTACH (separate immutable dict
+/// long+short tables + dual-probe in `start_matching_fast_loop`) and larger
+/// known-size inputs COPY (re-prime the dict into the live tables, where the
+/// dense scan matches it as window history). The attach build also self-gates
+/// on `use_fast_loop` inside `skip_matching_for_dict_attach` — only the
+/// fast-loop levels (L3 / Default / L0) carry the dual-probe.
+const DFAST_ATTACH_DICT_CUTOFF_LOG: u8 = 14;
+
+/// `ZSTD_dictMatchState` attach cutoff for the Row (greedy/lazy) strategy is
+/// 32 KiB (`2^15`, donor `attachDictSizeCutoffs`): small / unknown-size inputs
+/// ATTACH the dict into the separate immutable row index (bounded dual-probe in
+/// `row_candidate_rl`), larger known-size inputs dense-COPY into the live rows.
+const ROW_ATTACH_DICT_CUTOFF_LOG: u8 = 15;
+
 // Source-size cap for the dfast hash bits when a size hint is present: a tiny
 // input needs no larger hash than its window. The donor `cParams.hashLog` /
 // `chainLog` (from `DfastConfig`) caps it from above at the call site.
@@ -555,6 +594,15 @@ fn dfast_hash_bits_for_window(max_window_size: usize) -> usize {
 fn row_hash_bits_for_window(max_window_size: usize) -> usize {
     let window_log = (usize::BITS - 1 - max_window_size.leading_zeros()) as usize;
     window_log.clamp(MIN_WINDOW_LOG as usize, ROW_HASH_BITS)
+}
+
+/// `floor(log2(window))` for the HashChain table-log cap (donor
+/// `ZSTD_adjustCParams_internal`). The caller clamps the level's `hash_log` /
+/// `chain_log` from above with this so a small hinted input doesn't allocate the
+/// full level's tables.
+fn hc_hash_bits_for_window(max_window_size: usize) -> usize {
+    let window_log = (usize::BITS - 1 - max_window_size.leading_zeros()) as usize;
+    window_log.max(MIN_WINDOW_LOG as usize)
 }
 
 /// Parameter table for numeric compression levels 1–22.
@@ -585,7 +633,7 @@ const LEVEL_TABLE: [LevelParams; 22] = [
     /* 5 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Greedy, search: super::strategy::SearchMethod::RowHash, window_log: 21, lazy_depth: 0, fast: None, dfast: None, hc: None, row: Some(ROW_L5) },
     /* 6 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 21, lazy_depth: 1, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 19, chain_log: 18, search_depth: 8,  target_len: 4 }), row: None },
     /* 7 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 21, lazy_depth: 1, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 20, chain_log: 19, search_depth: 16, target_len: 8 }), row: None },
-    /* 8 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 21, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 20, chain_log: 19, search_depth: 16, target_len: 16 }), row: None },
+    /* 8 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::RowHash, window_log: 21, lazy_depth: 2, fast: None, dfast: None, hc: None, row: Some(ROW_L8) },
     /* 9 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 21, chain_log: 20, search_depth: 16, target_len: 16 }), row: None },
     /*10 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 16 }), row: None },
     /*11 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 21, search_depth: 64, target_len: 16 }), row: None },
@@ -1422,9 +1470,43 @@ impl MatchGeneratorDriver {
                 }
                 self.recycle_simple_space();
             }
-            super::strategy::BackendTag::Dfast => self.dfast_matcher_mut().skip_matching_dense(),
+            super::strategy::BackendTag::Dfast => {
+                // Donor `ZSTD_dictMatchState` mode selection for dfast (cutoff
+                // 16 KiB): small / unknown-size inputs ATTACH (build the
+                // separate immutable dict long+short tables; the dual-probe
+                // `start_matching_fast_loop` searches live + dict, the path that
+                // avoids the per-frame dict re-prime that dominates small
+                // `compress-dict`). Larger known-size inputs COPY (re-prime the
+                // dict into the live tables via `skip_matching_dense`, where the
+                // dense scan matches it as window history). `skip_matching_for_dict_attach`
+                // self-gates on `use_fast_loop` (only fast-loop levels carry the
+                // dual-probe; general-path levels fall back to the dense copy).
+                let attach = self
+                    .reset_size_log
+                    .is_none_or(|log| log <= DFAST_ATTACH_DICT_CUTOFF_LOG);
+                if attach {
+                    self.dfast_matcher_mut().skip_matching_for_dict_attach();
+                } else {
+                    self.dfast_matcher_mut().invalidate_dict_cache();
+                    self.dfast_matcher_mut().skip_matching_dense();
+                }
+            }
             super::strategy::BackendTag::Row => {
-                self.row_matcher_mut().skip_matching_with_hint(Some(false))
+                // Donor `ZSTD_RowFindBestMatch` `dictMatchState`: small /
+                // unknown-size inputs ATTACH (build the separate immutable dict
+                // row index; the bounded dual-probe in `row_candidate_rl`
+                // searches live + dict, avoiding the per-frame dict re-index),
+                // larger known-size inputs COPY (dense re-prime into the live
+                // rows).
+                let attach = self
+                    .reset_size_log
+                    .is_none_or(|log| log <= ROW_ATTACH_DICT_CUTOFF_LOG);
+                if attach {
+                    self.row_matcher_mut().prime_dict_attach_current_block();
+                } else {
+                    self.row_matcher_mut().invalidate_dict_cache();
+                    self.row_matcher_mut().skip_matching_with_hint(Some(false));
+                }
             }
             super::strategy::BackendTag::HashChain => {
                 self.hc_matcher_mut().skip_matching(Some(false))
@@ -1692,11 +1774,30 @@ impl Matcher for MatchGeneratorDriver {
             MatcherStorage::HashChain(hc) => {
                 hc.table.max_window_size = max_window_size;
                 hc.hc.lazy_depth = params.lazy_depth;
-                hc.configure(
-                    params.hc.expect("HashChain level row carries an HcConfig"),
-                    strategy_tag,
-                    params.window_log,
-                );
+                let mut hc_cfg = params.hc.expect("HashChain level row carries an HcConfig");
+                // Cap the hash / chain table logs by the hinted window so a small
+                // input doesn't allocate the full level's tables (the donor
+                // `ZSTD_adjustCParams_internal` clamp: `hashLog <= windowLog + 1`,
+                // and `cycleLog <= windowLog` — `cycleLog == chainLog` for the HC
+                // finder, `chainLog - 1` for the BT pair table, so `chainLog <=
+                // windowLog` (+1 for BT)). Ratio-neutral: a hinted window of
+                // `2^wlog` bytes holds at most `2^wlog` positions, so the slots
+                // beyond that are never populated — capping only sheds unused
+                // allocation. Was the source of L10-lazy peak-alloc ~2.15x the
+                // donor on a 1 MiB input. Only applied when hinted; an
+                // unknown-size stream keeps the full level tables.
+                if hinted {
+                    let wlog = hc_hash_bits_for_window(table_window_size);
+                    let uses_bt = matches!(
+                        strategy_tag,
+                        super::strategy::StrategyTag::BtOpt
+                            | super::strategy::StrategyTag::BtUltra
+                            | super::strategy::StrategyTag::BtUltra2
+                    );
+                    hc_cfg.hash_log = hc_cfg.hash_log.min(wlog + 1);
+                    hc_cfg.chain_log = hc_cfg.chain_log.min(if uses_bt { wlog + 1 } else { wlog });
+                }
+                hc.configure(hc_cfg, strategy_tag, params.window_log);
                 let vec_pool = &mut self.vec_pool;
                 hc.reset(|mut data| {
                     data.resize(data.capacity(), 0);
@@ -1928,8 +2029,11 @@ impl Matcher for MatchGeneratorDriver {
         // it (skips the re-hash) while still re-committing the dict bytes to
         // history. No-op when the attach path built no table (copy mode or a
         // sub-8-byte dict) — `mark_dict_primed` self-guards on table presence.
-        if self.active_backend() == super::strategy::BackendTag::Simple {
-            self.simple_mut().mark_dict_primed();
+        match self.active_backend() {
+            super::strategy::BackendTag::Simple => self.simple_mut().mark_dict_primed(),
+            super::strategy::BackendTag::Dfast => self.dfast_matcher_mut().mark_dict_primed(),
+            super::strategy::BackendTag::Row => self.row_matcher_mut().mark_dict_primed(),
+            _ => {}
         }
     }
 
@@ -1987,8 +2091,15 @@ impl Matcher for MatchGeneratorDriver {
         // to the dictionary being removed / replaced. Left in place, the next
         // same-params `reset` would retain it and the kernel would probe a
         // dict region whose bytes are no longer re-committed to history.
-        if self.active_backend() == super::strategy::BackendTag::Simple {
-            self.simple_mut().invalidate_dict_cache();
+        match self.active_backend() {
+            super::strategy::BackendTag::Simple => self.simple_mut().invalidate_dict_cache(),
+            super::strategy::BackendTag::Dfast => self.dfast_matcher_mut().invalidate_dict_cache(),
+            // Row keeps its attach index across frames (like Simple/Dfast),
+            // so a dictionary swap must drop its cached dict rows too;
+            // otherwise the next small/unknown-size frame reuses stale
+            // attach state through `prime_dict_attach_current_block`.
+            super::strategy::BackendTag::Row => self.row_matcher_mut().invalidate_dict_cache(),
+            _ => {}
         }
     }
 
@@ -4067,7 +4178,7 @@ impl HcMatchGenerator {
             let best = self.hc.find_best_match(&self.table, abs_pos, lit_len);
             if let Some(candidate) = self.hc.pick_lazy_match(&self.table, abs_pos, lit_len, best) {
                 self.table
-                    .insert_positions(abs_pos, candidate.start + candidate.match_len);
+                    .insert_match_span(abs_pos, candidate.start + candidate.match_len);
                 let start = candidate.start - current_abs_start;
                 let literals = &current[literals_start..start];
                 handle_sequence(Sequence::Triple {

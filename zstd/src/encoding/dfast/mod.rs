@@ -16,6 +16,7 @@ use core::convert::TryInto;
 
 use super::Sequence;
 use super::blocks::encode_offset_with_history;
+use super::dict_attach::DictAttach;
 use super::incompressible::block_looks_incompressible;
 use super::match_generator::{
     DFAST_EMPTY_SLOT, DFAST_HASH_BITS, DFAST_INCOMPRESSIBLE_SKIP_STEP, DFAST_LOCAL_SKIP_TRIGGER,
@@ -26,7 +27,7 @@ use super::match_table::helpers::{
     LazyMatchConfig, best_len_offset_candidate, common_prefix_len, extend_backwards_shared,
     pick_lazy_match_shared, repcode_candidate_shared,
 };
-use super::match_table::storage::check_stream_abs_headroom;
+use super::match_table::storage::{REBASE_RESET_FLOOR_CEILING, check_stream_abs_headroom};
 use super::opt::types::MatchCandidate;
 
 /// Donor `HASH_READ_SIZE` (`zstd_compress_internal.h`): the largest probe
@@ -109,6 +110,32 @@ pub(crate) struct DfastMatchGenerator {
     pub(crate) use_fast_loop: bool,
     // Lazy match lookahead depth (internal tuning parameter).
     pub(crate) lazy_depth: u8,
+    /// Immutable dictionary long+short hash tables (donor `dictMatchState`)
+    /// plus the CDict cache lifecycle, via the shared [`DictAttach`] level-1
+    /// scaffolding. Built once over the dictionary region at the front of the
+    /// contiguous history (flat `[dict][input]` model like the Fast backend:
+    /// a dict match is `offset = ip - dict_pos` and counts cross the
+    /// dict→input boundary, no `dictBase`/`dictIndexDelta`). Slots store the
+    /// dict position as a +1-biased CONCAT index (offset into
+    /// `history[history_start..]`), NOT the live tables' `position_base`-packed
+    /// encoding — the dict table is never rebased, so it keys off the stable
+    /// concat coordinate and is invalidated on any history eviction (which
+    /// would slide the dict out of the concat) so positions never go stale.
+    /// `is_attached()` activates the dual-probe kernel; `region_len()` is the
+    /// dict/input boundary (`dict_end`, a concat index).
+    pub(crate) dict: DictAttach<DfastDictTables>,
+}
+
+/// The dfast backend's immutable dictionary tables — a long+short pair mirroring
+/// the live [`DfastMatchGenerator::long_hash`] / [`DfastMatchGenerator::short_hash`]
+/// shapes, sized to the same `(long_hash_bits, short_hash_bits)`. Held by the
+/// shared [`DictAttach`] level-1 lifecycle; the per-tier dual-probe LOOKUP is
+/// level-2 in this backend's kernel. Slots hold a +1-biased concat index
+/// (`DFAST_EMPTY_SLOT = 0` is "no entry").
+#[derive(Debug, Default, Clone)]
+pub(crate) struct DfastDictTables {
+    pub(crate) long: alloc::vec::Vec<u32>,
+    pub(crate) short: alloc::vec::Vec<u32>,
 }
 
 impl DfastMatchGenerator {
@@ -136,6 +163,7 @@ impl DfastMatchGenerator {
             short_hash_bits: DFAST_HASH_BITS - DFAST_SHORT_HASH_BITS_DELTA,
             use_fast_loop: false,
             lazy_depth: 1,
+            dict: DictAttach::new(),
         }
     }
 
@@ -148,6 +176,7 @@ impl DfastMatchGenerator {
         let min_bits = MIN_WINDOW_LOG as usize;
         let long_clamped = long_bits.max(min_bits);
         let short_clamped = short_bits.max(min_bits);
+        let resized = self.long_hash_bits != long_clamped || self.short_hash_bits != short_clamped;
         if self.long_hash_bits != long_clamped {
             self.long_hash_bits = long_clamped;
             self.long_hash = Vec::new();
@@ -155,6 +184,12 @@ impl DfastMatchGenerator {
         if self.short_hash_bits != short_clamped {
             self.short_hash_bits = short_clamped;
             self.short_hash = Vec::new();
+        }
+        if resized {
+            // A table-size change makes the cached dict tables (sized to the old
+            // bits) and their hash indices invalid — drop the attach so the next
+            // prime rebuilds at the new shape.
+            self.dict.invalidate();
         }
     }
 
@@ -227,15 +262,41 @@ impl DfastMatchGenerator {
     }
 
     pub(crate) fn reset(&mut self) {
+        // Floor-advance reset (issue #337 technique, completing it for the
+        // dfast backend — `MatchTable` already does this). Instead of
+        // zeroing the long/short tables every frame (a memset proportional
+        // to table size, ~25% of a small reused-context dfast frame),
+        // advance the absolute-position floor past the previous frame's
+        // end. Every slot-decode site rejects a candidate whose absolute
+        // position is below `history_abs_start` before it dereferences a
+        // history byte (audited: fast-loop long/short/long+1/repcode,
+        // `probe_tail_ip0_only`, `probe_slot_match`), so the previous
+        // frame's entries become unreachable without being cleared.
+        // `position_base` is left untouched so stale slots still decode to
+        // their (now sub-floor) absolute positions; `ensure_room_for` /
+        // `reduce` keep the `u32` packing bounded as the cursor climbs.
+        let next_floor = self.history_abs_start + (self.history.len() - self.history_start);
         self.window_size = 0;
         self.history.clear();
         self.history_start = 0;
-        self.history_abs_start = 0;
-        self.position_base = 0;
         self.offset_hist = [1, 4, 8];
-        if !self.short_hash.is_empty() {
-            self.short_hash.fill(DFAST_EMPTY_SLOT);
-            self.long_hash.fill(DFAST_EMPTY_SLOT);
+        if next_floor <= REBASE_RESET_FLOOR_CEILING {
+            // Fast path: advance the floor; tables keep their contents (a
+            // later `ensure_tables`/level change still reallocs them clean
+            // if the dimensions changed). The dict tables key off stable
+            // concat indices and are untouched here.
+            self.history_abs_start = next_floor;
+        } else {
+            // Bounded fallback: rewind the cursor and zero the tables so
+            // `history_abs_start` cannot climb toward `usize::MAX` (keeps
+            // `check_stream_abs_headroom` satisfiable on 32-bit targets;
+            // fires ~once per 2 GiB cumulative input there).
+            self.history_abs_start = 0;
+            self.position_base = 0;
+            if !self.short_hash.is_empty() {
+                self.short_hash.fill(DFAST_EMPTY_SLOT);
+                self.long_hash.fill(DFAST_EMPTY_SLOT);
+            }
         }
         // No Vec<u8> blocks to recycle: `add_data` returns each input
         // Vec to the caller eagerly via its own `reuse_space`, and the
@@ -313,6 +374,13 @@ impl DfastMatchGenerator {
             reuse_space(data);
             return;
         }
+        if self.window_size + data.len() > self.max_window_size {
+            // Eviction advances `history_start`, so the dict tables' concat
+            // indices (primed at `history_start == 0`) no longer address the
+            // dict bytes — drop the attach (dict ratio benefit lost once the
+            // dict slides out of the window, like the Fast backend).
+            self.dict.invalidate();
+        }
         while self.window_size + data.len() > self.max_window_size {
             let removed_len = self.window_blocks.pop_front().unwrap();
             self.window_size -= removed_len;
@@ -375,6 +443,11 @@ impl DfastMatchGenerator {
     /// other lifecycle calls) so adding one more per-backend arm is
     /// free.
     pub(crate) fn trim_to_window(&mut self) {
+        if self.window_size > self.max_window_size || self.history_start != 0 {
+            // Any history shift slides the dictionary out of (or within) the
+            // concat, staling the dict tables' concat indices — drop the attach.
+            self.dict.invalidate();
+        }
         while self.window_size > self.max_window_size {
             let removed_len = self.window_blocks.pop_front().unwrap();
             self.window_size -= removed_len;
@@ -454,6 +527,114 @@ impl DfastMatchGenerator {
             self.insert_positions(backfill_start, current_abs_start);
         }
         self.insert_positions(current_abs_start, current_abs_end);
+    }
+
+    /// Donor `ZSTD_dictMatchState` attach (dfast): hash the dictionary block at
+    /// the front of history into the SEPARATE immutable [`Self::dict`] tables
+    /// (long+short), once, instead of re-priming the live tables every frame
+    /// (`skip_matching_dense`). The dual-probe kernel then searches live + dict
+    /// without per-frame dict cost. Cached via the `DictAttach` primed flag.
+    pub(crate) fn skip_matching_for_dict_attach(&mut self) {
+        self.ensure_hash_tables();
+        // The dual-probe lives only in `start_matching_fast_loop`. The general
+        // path (L1/L2/L4) has no dict probe, so for those levels prime the dict
+        // into the LIVE tables (`skip_matching_dense`), where the dense scan
+        // finds it — keeping the attach win to the fast-loop levels (L3 /
+        // Default / L0) without regressing general-path dict ratio.
+        if !self.use_fast_loop {
+            self.dict.invalidate();
+            self.skip_matching_dense();
+            return;
+        }
+        let current_len = self.window_blocks.back().copied().unwrap_or(0);
+        if current_len == 0 {
+            return;
+        }
+        let current_abs_start = self.history_abs_start + self.window_size - current_len;
+        let current_abs_end = current_abs_start + current_len;
+        // Convert absolute → concat (history-relative) coordinates: the dict
+        // table keys off the stable concat index, not `position_base`.
+        let start_concat = current_abs_start - self.history_abs_start;
+        let end_concat = current_abs_end - self.history_abs_start;
+        self.prime_dict_tables_for_range(start_concat, end_concat);
+    }
+
+    /// Mark the dict tables fully built (CDict cache). The driver calls this
+    /// after the final dictionary chunk so the next frame skips the re-hash.
+    pub(crate) fn mark_dict_primed(&mut self) {
+        self.dict.mark_primed();
+    }
+
+    /// Drop the cached dict tables (next frame carries no dict, or eviction /
+    /// param change staled the concat positions).
+    pub(crate) fn invalidate_dict_cache(&mut self) {
+        self.dict.invalidate();
+    }
+
+    /// Build the immutable dict long+short tables over the contiguous-history
+    /// concat range `[start_concat, end_concat)` (the dictionary bytes at the
+    /// front of history). Mirrors [`Self::insert_positions`]' hash + lookahead
+    /// gating, but writes a +1-biased CONCAT index (`idx + 1`, stable across
+    /// `position_base` rebases) into `self.dict` rather than the live,
+    /// `position_base`-packed tables. `DFAST_EMPTY_SLOT = 0` means "no entry".
+    /// Skips the rehash when the CDict cache is already primed.
+    fn prime_dict_tables_for_range(&mut self, start_concat: usize, end_concat: usize) {
+        const PRIME: u64 = 0xCF1BBCDCB7A56463_u64;
+        // Record the dict/input boundary (concat index) regardless of whether
+        // any position is hashable (a sub-min-match dict still bounds dict_end).
+        self.dict.set_region_len(end_concat);
+        if self.dict.is_primed() {
+            return;
+        }
+        let history_start = self.history_start;
+        let concat_len = self.history.len() - history_start;
+        let long_bits = self.long_hash_bits;
+        let short_bits = self.short_hash_bits;
+        // Lookahead-safe cutoffs within the concat: long needs 8 readable
+        // bytes, short needs 4 (donor parity with `insert_positions`).
+        let long_safe_end = concat_len.saturating_sub(7).min(end_concat);
+        let short_safe_end = concat_len.saturating_sub(3).min(end_concat);
+        if start_concat >= short_safe_end {
+            return;
+        }
+        let dict = self.dict.table_mut_or_init(|| DfastDictTables {
+            long: alloc::vec![DFAST_EMPTY_SLOT; 1usize << long_bits],
+            short: alloc::vec![DFAST_EMPTY_SLOT; 1usize << short_bits],
+        });
+        let short_shift = 64 - short_bits;
+        let long_shift = 64 - long_bits;
+        let base = self.history.as_ptr();
+        let long_ptr = dict.long.as_mut_ptr();
+        let short_ptr = dict.short.as_mut_ptr();
+        // SAFETY: `base.add(history_start + pos)` is in-bounds for
+        // `pos + 8 <= concat_len` (long) / `pos + 4 <= concat_len` (short),
+        // enforced by the `*_safe_end` cutoffs. `*_idx = mixed >> (64 - bits)`
+        // has at most `bits` bits set, in-bounds for the `1 << bits` tables.
+        // `pos + 1` fits u32: concat indices are bounded by the u32 history
+        // gate upstream (`check_stream_abs_headroom`).
+        let mut pos = start_concat;
+        while pos < long_safe_end {
+            unsafe {
+                let load_ptr = base.add(history_start + pos);
+                let v8 = (load_ptr as *const u64).read_unaligned();
+                let v4 = v8 & 0xFFFF_FFFF;
+                let short_idx = (v4.wrapping_mul(PRIME) >> short_shift) as usize;
+                let long_idx = (v8.wrapping_mul(PRIME) >> long_shift) as usize;
+                let packed = (pos as u32) + 1;
+                *short_ptr.add(short_idx) = packed;
+                *long_ptr.add(long_idx) = packed;
+            }
+            pos += 1;
+        }
+        while pos < short_safe_end {
+            unsafe {
+                let load_ptr = base.add(history_start + pos);
+                let v4 = (load_ptr as *const u32).read_unaligned() as u64;
+                let short_idx = (v4.wrapping_mul(PRIME) >> short_shift) as usize;
+                *short_ptr.add(short_idx) = (pos as u32) + 1;
+            }
+            pos += 1;
+        }
     }
 
     pub(crate) fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
@@ -664,6 +845,38 @@ impl DfastMatchGenerator {
         let long_shift = 64 - self.long_hash_bits;
         let mut pos = 1usize;
         let mut literals_start = 0usize;
+
+        // Dict dual-probe (donor `ZSTD_dictMatchState`): snapshot the immutable
+        // dict tables ONCE. Unlike the live tables (which `emit_candidate` may
+        // grow / rebase), the dict tables are never mutated during matching, so
+        // one snapshot before the outer loop stays valid every iteration. The
+        // raw pointers hold no borrow, so the per-iter `&self`/`&mut self`
+        // accesses below coexist. `use_dict` gates every probe so the no-dict
+        // hot path keeps its exact instruction shape. `dict_end` is the
+        // dict/input boundary as a CONCAT index (history_start-relative); the
+        // dict is invalidated on any history eviction, so concat indices stay
+        // valid for the snapshot's lifetime.
+        // `use_dict` MUST track table presence, NOT `is_attached()`:
+        // `prime_dict_tables_for_range` records the dict region (so
+        // `is_attached()` is true) but returns before allocating the
+        // tables when the hashable region is shorter than the short-hash
+        // lookahead. Gating on `table().is_some()` keeps the null dict
+        // pointers out of the probe below, which dereferences them before
+        // the `dict_end` bound is consulted.
+        let (use_dict, dict_long_ptr, dict_short_ptr, dict_end): (
+            bool,
+            *const u32,
+            *const u32,
+            usize,
+        ) = match self.dict.table() {
+            Some(d) => (
+                true,
+                d.long.as_ptr(),
+                d.short.as_ptr(),
+                self.dict.region_len(),
+            ),
+            None => (false, core::ptr::null(), core::ptr::null(), 0),
+        };
 
         'outer: loop {
             // Outer-iter precondition: at least `HASH_READ_SIZE = 8` bytes
@@ -950,6 +1163,64 @@ impl DfastMatchGenerator {
                     }
                 }
 
+                // Dict long fallback (donor `dictMatchState`): the live long
+                // missed (empty / out-of-window / 8-byte mismatch). Probe the
+                // immutable dict long table at the SAME `hl0_idx`. Flat model:
+                // the dict sits in the contiguous history before the input, so
+                // a dict match is `offset = abs_ip0 - dict_abs` and the forward
+                // count crosses the dict→input boundary like any in-window
+                // match (no `dictBase`/`count_2segments`).
+                if use_dict {
+                    // SAFETY: when `use_dict`, `dict_long_ptr` is non-null and
+                    // sized `1 << long_hash_bits`; `hl0_idx < 1 << long_hash_bits`.
+                    let dl = unsafe { *dict_long_ptr.add(hl0_idx) };
+                    if dl != DFAST_EMPTY_SLOT {
+                        let dp = (dl as usize) - 1;
+                        // Dict long slots were only written for positions with
+                        // 8-byte lookahead, so `dp + 8 <= dict_len <= concat_len`;
+                        // `dp < dict_end` keeps the match inside the dict region.
+                        if dp < dict_end {
+                            debug_assert!(
+                                dp + HASH_READ_SIZE <= concat_len,
+                                "dict long load OOB: dp={dp} concat_len={concat_len}",
+                            );
+                            // SAFETY: `dp + 8 <= concat_len` (above) ⇒ the 8-byte
+                            // load at concat `dp` is in-bounds for live history.
+                            let dcand_v8 = unsafe {
+                                (history_base_ptr.add(history_start_offset + dp) as *const u64)
+                                    .read_unaligned()
+                            };
+                            if dcand_v8 == v8_0 {
+                                let mut match_len = 8usize;
+                                let max_fwd = concat_len.saturating_sub(concat_idx0 + 8);
+                                // SAFETY: both ptrs in the same buffer; `max_fwd`
+                                // caps the scan to the live region.
+                                unsafe {
+                                    let lhs = history_base_ptr.add(history_start_offset + dp + 8);
+                                    let rhs = history_base_ptr
+                                        .add(history_start_offset + concat_idx0 + 8);
+                                    let ext =
+                                        crate::encoding::fastpath::dispatch_common_prefix_len_ptr(
+                                            lhs, rhs, max_fwd,
+                                        );
+                                    match_len += ext;
+                                }
+                                let cand_pos = history_abs_start + dp;
+                                let concat = &self.history[history_start_offset..];
+                                let cand = extend_backwards_shared(
+                                    concat,
+                                    history_abs_start,
+                                    cand_pos,
+                                    abs_ip0,
+                                    match_len,
+                                    lit_len_ip0,
+                                );
+                                break 'inner InnerExit::Committed(cand);
+                            }
+                        }
+                    }
+                }
+
                 let idxl1 = unsafe { *long_hash_ptr.add(hl1_idx) };
 
                 // Short match check at ip0 with idxs0 — 4-byte gate
@@ -1006,6 +1277,7 @@ impl DfastMatchGenerator {
                             // If it produces a strictly longer match, use it.
                             let mut chosen = short_cand;
                             let mut retry_upgraded = false;
+                            let mut live_l1_hit = false;
                             if idxl1 != DFAST_EMPTY_SLOT {
                                 let cand_pos_l1 = position_base + (idxl1 as usize) - 1;
                                 if cand_pos_l1 >= history_abs_start && cand_pos_l1 < abs_ip1 {
@@ -1016,6 +1288,7 @@ impl DfastMatchGenerator {
                                             .read_unaligned()
                                     };
                                     if cand_v8_l1 == v8_1 {
+                                        live_l1_hit = true;
                                         let mut l1_match_len = 8usize;
                                         let max_fwd_l1 = concat_len.saturating_sub(concat_idx1 + 8);
                                         unsafe {
@@ -1051,6 +1324,66 @@ impl DfastMatchGenerator {
                                     }
                                 }
                             }
+                            // Dict long match at ip1 (donor `_search_next_long`
+                            // dict arm, zstd_double_fast.c:472-483): probed ONLY
+                            // when the live long+1 missed, mirroring donor's
+                            // `else if dictTagsMatchL3`. Attach-mode keeps the
+                            // dict in a SEPARATE table, so the live long+1 probe
+                            // above never sees dict positions; without this the
+                            // dict-long upgrade the old dense-reprime path got
+                            // for free (dict positions lived in the live table)
+                            // is lost and the loop emits the shorter short match.
+                            if !live_l1_hit && use_dict {
+                                // SAFETY: `use_dict` ⇒ `dict_long_ptr` non-null,
+                                // sized `1 << long_hash_bits`; `hl1_idx` is in range.
+                                let dl1 = unsafe { *dict_long_ptr.add(hl1_idx) };
+                                if dl1 != DFAST_EMPTY_SLOT {
+                                    let dp1 = (dl1 as usize) - 1;
+                                    if dp1 < dict_end {
+                                        debug_assert!(
+                                            dp1 + HASH_READ_SIZE <= concat_len,
+                                            "dict long+1 load OOB: dp1={dp1} concat_len={concat_len}",
+                                        );
+                                        // SAFETY: `dp1 + 8 <= concat_len` ⇒ the
+                                        // 8-byte load at concat `dp1` is in-bounds.
+                                        let dcand_v8_l1 = unsafe {
+                                            (history_base_ptr.add(history_start_offset + dp1)
+                                                as *const u64)
+                                                .read_unaligned()
+                                        };
+                                        if dcand_v8_l1 == v8_1 {
+                                            let mut dl1_match_len = 8usize;
+                                            let max_fwd =
+                                                concat_len.saturating_sub(concat_idx1 + 8);
+                                            // SAFETY: same buffer; `max_fwd` caps
+                                            // the scan to the live region.
+                                            unsafe {
+                                                let lhs = history_base_ptr
+                                                    .add(history_start_offset + dp1 + 8);
+                                                let rhs = history_base_ptr
+                                                    .add(history_start_offset + concat_idx1 + 8);
+                                                let ext = crate::encoding::fastpath::dispatch_common_prefix_len_ptr(
+                                                    lhs, rhs, max_fwd,
+                                                );
+                                                dl1_match_len += ext;
+                                            }
+                                            if dl1_match_len > short_cand.match_len {
+                                                let cand_pos = history_abs_start + dp1;
+                                                let concat = &self.history[history_start_offset..];
+                                                chosen = extend_backwards_shared(
+                                                    concat,
+                                                    history_abs_start,
+                                                    cand_pos,
+                                                    abs_ip1,
+                                                    dl1_match_len,
+                                                    lit_len_ip1,
+                                                );
+                                                retry_upgraded = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             if short_hit_valid || retry_upgraded {
                                 break 'inner InnerExit::Committed(chosen);
                             }
@@ -1065,6 +1398,62 @@ impl DfastMatchGenerator {
                             // and prior offset_hist state — strictly
                             // worse than emitting the 4 bytes as
                             // literals).
+                        }
+                    }
+                }
+
+                // Dict short fallback (donor `dictMatchState`): the live short
+                // missed / was below floor. Probe the immutable dict short
+                // table at the SAME `hs0_idx`, 4-byte gate, forward count, then
+                // enforce the same `DFAST_MIN_MATCH_LEN` floor the live short
+                // path uses (a sub-floor non-rep match mints a wire offset that
+                // costs more than emitting the bytes as literals). No
+                // `_search_next_long` retry: the dict long fallback already
+                // covers the long-upgrade case at `ip0`.
+                if use_dict {
+                    // SAFETY: `use_dict` ⇒ `dict_short_ptr` non-null, sized
+                    // `1 << short_hash_bits`; `hs0_idx < 1 << short_hash_bits`.
+                    let ds = unsafe { *dict_short_ptr.add(hs0_idx) };
+                    if ds != DFAST_EMPTY_SLOT {
+                        let dp = (ds as usize) - 1;
+                        if dp < dict_end {
+                            debug_assert!(
+                                dp + 4 <= concat_len,
+                                "dict short load OOB: dp={dp} concat_len={concat_len}",
+                            );
+                            // SAFETY: short slots were only written with 4 bytes
+                            // of lookahead ⇒ `dp + 4 <= dict_len <= concat_len`.
+                            let dcand4 = unsafe {
+                                (history_base_ptr.add(history_start_offset + dp) as *const u32)
+                                    .read_unaligned()
+                            };
+                            if dcand4 == v4_0 as u32 {
+                                let mut s_match_len = 4usize;
+                                let max_fwd = concat_len.saturating_sub(concat_idx0 + 4);
+                                unsafe {
+                                    let lhs = history_base_ptr.add(history_start_offset + dp + 4);
+                                    let rhs = history_base_ptr
+                                        .add(history_start_offset + concat_idx0 + 4);
+                                    let ext =
+                                        crate::encoding::fastpath::dispatch_common_prefix_len_ptr(
+                                            lhs, rhs, max_fwd,
+                                        );
+                                    s_match_len += ext;
+                                }
+                                let cand_pos = history_abs_start + dp;
+                                let concat = &self.history[history_start_offset..];
+                                let dcand = extend_backwards_shared(
+                                    concat,
+                                    history_abs_start,
+                                    cand_pos,
+                                    abs_ip0,
+                                    s_match_len,
+                                    lit_len_ip0,
+                                );
+                                if dcand.match_len >= DFAST_MIN_MATCH_LEN {
+                                    break 'inner InnerExit::Committed(dcand);
+                                }
+                            }
                         }
                     }
                 }
@@ -1430,10 +1819,33 @@ impl DfastMatchGenerator {
         candidate: MatchCandidate,
         handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
     ) -> usize {
-        self.insert_positions(
-            current_abs_start + *literals_start,
-            candidate.start + candidate.match_len,
-        );
+        // Insert the LITERAL region densely, the MATCH INTERIOR sparsely
+        // (upstream `zstd_double_fast.c` parity). The literal positions
+        // `[literals_start, match_start)` are load-bearing: the producer
+        // loop starts at `pos = 1` and only hashes positions it actually
+        // probes, so the block anchor (position 0) and any stepped-over
+        // literal byte is hashed ONLY here — dropping it loses real match
+        // sources for later positions (and later blocks). The match
+        // interior, by contrast, is never re-probed within the block;
+        // upstream fills only `curr+2` and `ip-2` there, so inserting the
+        // full `[match_start, match_end)` span was ~match_len wasted
+        // single-slot overwrites — the dominant self-time on
+        // dict-heavy / highly-matchable blocks. Mirror the rep-extension
+        // path's audited 3-target set (`curr+2`, `ip-2`, `ip-1`), each
+        // clamped to the open match interval.
+        let match_start = candidate.start;
+        let post_match_end = candidate.start + candidate.match_len;
+        self.insert_positions(current_abs_start + *literals_start, match_start);
+        let insert_targets = [
+            match_start + 2,                  // curr + 2
+            post_match_end.saturating_sub(2), // ip - 2 (post-match cursor)
+            post_match_end.saturating_sub(1), // ip - 1
+        ];
+        for &target in &insert_targets {
+            if target > match_start && target < post_match_end {
+                self.insert_position(target);
+            }
+        }
         // Inline the trailing-block slice rather than calling
         // `get_last_space()` so this matches the gate pattern used by
         // `skip_matching` / `start_matching` (read `window_blocks.back()`

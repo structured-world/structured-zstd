@@ -52,18 +52,19 @@ pub(crate) struct FlatBuf {
     max_capacity: usize,
 }
 
+#[cfg(test)]
 impl FlatBuf {
-    pub fn with_capacity(cap: usize) -> Self {
-        // +WILDCOPY_OVERLENGTH so any future SIMD overshoot write from
-        // a `push` / `repeat` near the buffer boundary lands inside
-        // the allocation. The slack region is intentionally left
-        // uninitialised: FlatBuf's current API only reads bytes
-        // inside `head..buf.len()` (`as_slices`, drain helpers), and
-        // its mutating helpers (`extend`, `extend_and_fill`,
-        // `extend_from_within_unchecked`) only WRITE past `len`
-        // before any matching `set_len`, never read it. Skipping the
-        // zero pass is intentional — it avoids paying O(cap) on every
-        // small single-segment frame reset.
+    /// Test-only pre-sized constructor. Production frame setup builds a
+    /// lazy zero-capacity `FlatBuf` (see `DecoderScratchKind::new_flat`)
+    /// and reserves it on demand; only the unit tests below want a
+    /// backend pre-grown to a known capacity.
+    pub(crate) fn with_capacity(cap: usize) -> Self {
+        // +WILDCOPY_OVERLENGTH so any SIMD overshoot write from a
+        // `push` / `repeat` near the buffer boundary lands inside the
+        // allocation. The slack region is intentionally left
+        // uninitialised: `FlatBuf` only reads bytes inside
+        // `head..buf.len()`, and its mutating helpers only WRITE past
+        // `len` before any matching `set_len`, never read it.
         Self {
             buf: Vec::with_capacity(cap + WILDCOPY_OVERLENGTH),
             head: 0,
@@ -79,9 +80,11 @@ impl BufferBackend for FlatBuf {
     /// architecture-agnostic `portable` module (the `cfg(not(x86_64))`
     /// arm below). FlatBuf is selected for single-segment frames
     /// (frame_content_size known up-front, single block of
-    /// literals+matches). Its `with_capacity(cap + WILDCOPY_OVERLENGTH)`
-    /// reserve already carries the SIMD overshoot slack the inline path
-    /// requires. Both arms are gated on this const, which is
+    /// literals+matches). Production sizing goes through `reserve`
+    /// (which adds `WILDCOPY_OVERLENGTH`); the SIMD overshoot the inline
+    /// path may emit is additionally bounded by the tight-tail copy in
+    /// the inline-exec sites, so a tight buffer never overshoots. Both
+    /// arms are gated on this const, which is
     /// unconditionally `true` because FlatBuf provides an override for
     /// every target.
     const SUPPORTS_INLINE_SEQUENCE_EXEC: bool = true;
@@ -101,7 +104,7 @@ impl BufferBackend for FlatBuf {
         };
         // Fallible capacity check. The caller's per-block
         // `reserve(MAX_BLOCK_SIZE)` plus the `WILDCOPY_OVERLENGTH`
-        // slack baked into `with_capacity` covers well-formed frames,
+        // slack `reserve` adds covers well-formed frames,
         // but a malformed sequence stream can produce a
         // `lit_length + match_length` that exceeds the reserved
         // headroom. Surface that as `OutputBufferOverflow` (mirrors
@@ -180,7 +183,7 @@ impl BufferBackend for FlatBuf {
         };
         // Fallible capacity check mirrors the x86 arm: the 16-byte
         // wildcopy overshoots up to 15 bytes past `tail + total`, which
-        // `with_capacity(... + WILDCOPY_OVERLENGTH)` covers for
+        // the `WILDCOPY_OVERLENGTH` slack `reserve` adds covers for
         // well-formed frames; malformed input surfaces as
         // `OutputBufferOverflow` instead of a write past capacity.
         const MAX_WILDCOPY_OVERSHOOT: usize = 15;
@@ -256,8 +259,8 @@ impl BufferBackend for FlatBuf {
             wildcopy_overlap_8byte_stride,
         };
         // Fallible capacity check. AVX2 32-byte stride overshoots up
-        // to 31 bytes past `tail + total`; FlatBuf's
-        // `with_capacity(... + WILDCOPY_OVERLENGTH = 32)` covers
+        // to 31 bytes past `tail + total`; the
+        // `WILDCOPY_OVERLENGTH = 32` slack `reserve` adds covers
         // well-formed frames, but malformed inputs that exceed the
         // reserved headroom surface as `OutputBufferOverflow` instead
         // of UB.
@@ -511,7 +514,7 @@ impl BufferBackend for FlatBuf {
         // `total_writable >= len` because Vec capacity covers the
         // upfront reserve. The helper may overshoot up to
         // `total_writable` (= cap - dst_off, which includes the
-        // WILDCOPY_OVERLENGTH slack baked into with_capacity).
+        // WILDCOPY_OVERLENGTH slack `reserve` adds).
         unsafe {
             let base = self.buf.as_mut_ptr();
             super::simd_copy::copy_bytes_overshooting(
