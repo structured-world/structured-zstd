@@ -4408,6 +4408,50 @@ mod tests {
 
     #[cfg(feature = "lsm")]
     #[test]
+    fn resume_invalid_range_does_not_mutate_decoder_state() {
+        // An inverted effective range must be rejected WITHOUT priming the
+        // decoder: no entropy restore, no window prime, no cursor advance. As
+        // written before the fix, those mutations ran before the range check,
+        // leaving the decoder in a synthetic resumed state on the error path.
+        let (compressed, full, info) = multi_block_fixture();
+        let nblocks = info.blocks.len() as u32;
+        let n = (nblocks / 2).max(2);
+        let st = emit_resume_state_at(&compressed, n);
+        let output_offset = info.decompressed_byte_range(n as usize).unwrap().start as usize;
+
+        let mut header_src = compressed.as_slice();
+        let mut dec = FrameDecoder::new();
+        dec.reset(&mut header_src).unwrap();
+        // Freshly reset: cursor at block 0.
+        assert_eq!(dec.state.as_ref().unwrap().block_counter, 0);
+
+        let off = info.blocks[n as usize].offset_in_frame as usize;
+        let mut block_src = &compressed[off..];
+        let err = dec
+            .decode_blocks_partial(
+                &mut block_src,
+                0,
+                n - 1, // below the resume block → inverted range
+                Some(super::ResumeInput {
+                    window_prime: &full[..output_offset],
+                    state: &st,
+                }),
+                false,
+            )
+            .expect_err("inverted range must error");
+        assert!(matches!(
+            err,
+            crate::decoding::errors::FrameDecoderError::InvalidBlockRange { .. }
+        ));
+        assert_eq!(
+            dec.state.as_ref().unwrap().block_counter,
+            0,
+            "error path must not advance the cursor (validate before priming)"
+        );
+    }
+
+    #[cfg(feature = "lsm")]
+    #[test]
     fn emit_resume_state_absent_on_terminal_block() {
         // When a decode reaches the frame's last block there is no "next block"
         // to resume at: the snapshot's block_index would be one past EOF and the
