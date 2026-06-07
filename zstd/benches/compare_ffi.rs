@@ -32,17 +32,43 @@ use structured_zstd::dictionary::{
 };
 use structured_zstd::encoding::{EncoderDictionary, FrameCompressor};
 use support::{
-    LevelConfig, Scenario, ScenarioClass, benchmark_scenarios, kernel_report_line,
-    supported_levels_filtered,
+    LevelConfig, Scenario, ScenarioClass, benchmark_scenarios, build_training_samples,
+    dictionary_size_for, kernel_report_line, ldm_parameters, supported_levels_filtered,
 };
 
 static BENCHMARK_SCENARIOS: OnceLock<Vec<Scenario>> = OnceLock::new();
 
+/// Enable `ZSTD_c_enableLongDistanceMatching` on an FFI bulk compressor for
+/// the LDM variants; a no-op for the plain numeric levels.
+fn apply_ffi_ldm(compressor: &mut zstd::bulk::Compressor<'_>, level: &LevelConfig) {
+    if level.ldm {
+        compressor
+            .set_parameter(zstd::zstd_safe::CParameter::EnableLongDistanceMatching(
+                true,
+            ))
+            .expect("FFI bulk compressor accepts EnableLongDistanceMatching");
+    }
+}
+
+/// Build the matching Rust-encoder bytes for a matrix variant. The plain
+/// numeric levels keep the historical `compress_slice_to_vec` path so their
+/// output stays byte-for-byte identical to pre-#362 runs; the LDM variants
+/// route through `compress_with_parameters` with
+/// `enable_long_distance_matching(true)` on the variant's base level.
+fn rust_encode_to_vec(input: &[u8], level: &LevelConfig) -> Vec<u8> {
+    match ldm_parameters(level) {
+        Some(params) => structured_zstd::encoding::compress_with_parameters(input, &params),
+        None => structured_zstd::encoding::compress_slice_to_vec(input, level.rust_level),
+    }
+}
+
 /// FFI encode helper used by criterion's timing loop. Uses
 /// `ZSTD_compressStream2` into a growing-output `Vec` — same shape as
 /// the pure-Rust `compress_to_vec` so output-buffer growth profiles
-/// match cross-side.
-fn ffi_encode_to_vec(input: &[u8], level: i32) -> Vec<u8> {
+/// match cross-side. When `ldm` is set, `ZSTD_c_enableLongDistanceMatching`
+/// is turned on alongside the level so the FFI reference mirrors the Rust
+/// LDM variant (#362).
+fn ffi_encode_to_vec(input: &[u8], level: i32, ldm: bool) -> Vec<u8> {
     use zstd::zstd_safe::zstd_sys;
     // SAFETY: `ZSTD_createCCtx` returns null on OOM, asserted below.
     // The CCtx is freed before returning.
@@ -80,6 +106,18 @@ fn ffi_encode_to_vec(input: &[u8], level: i32) -> Vec<u8> {
             zstd_sys::ZSTD_isError(rc) == 0,
             "set contentSizeFlag failed"
         );
+
+        if ldm {
+            let rc = zstd_sys::ZSTD_CCtx_setParameter(
+                cctx,
+                zstd_sys::ZSTD_cParameter::ZSTD_c_enableLongDistanceMatching,
+                1,
+            );
+            assert!(
+                zstd_sys::ZSTD_isError(rc) == 0,
+                "set enableLongDistanceMatching failed"
+            );
+        }
 
         // Tiny inputs use a 14-bit window so the FFI frame matches
         // the pure-Rust frame on small payloads. Without this the
@@ -228,12 +266,16 @@ fn bench_compress(c: &mut Criterion) {
     }
     for scenario in benchmark_scenarios_cached().iter() {
         for level in supported_levels_filtered() {
+            // Dictionary variants (`*_ldm_dict`) route through
+            // `bench_dictionary`; the plain compress group only covers the
+            // no-dictionary levels (numeric levels + the `*_ldm` variants).
+            if level.dict {
+                continue;
+            }
             if emit_reports {
-                let rust_compressed = structured_zstd::encoding::compress_slice_to_vec(
-                    &scenario.bytes[..],
-                    level.rust_level,
-                );
-                let ffi_compressed = ffi_encode_to_vec(&scenario.bytes[..], level.ffi_level);
+                let rust_compressed = rust_encode_to_vec(&scenario.bytes[..], &level);
+                let ffi_compressed =
+                    ffi_encode_to_vec(&scenario.bytes[..], level.ffi_level, level.ldm);
                 emit_report_line(scenario, level, &rust_compressed, &ffi_compressed);
                 emit_frame_header_report(scenario, level, "rust", &rust_compressed);
                 emit_frame_header_report(scenario, level, "ffi", &ffi_compressed);
@@ -245,16 +287,17 @@ fn bench_compress(c: &mut Criterion) {
             group.throughput(Throughput::Bytes(scenario.throughput_bytes()));
 
             group.bench_function("pure_rust", |b| {
-                b.iter(|| {
-                    black_box(structured_zstd::encoding::compress_slice_to_vec(
-                        &scenario.bytes[..],
-                        level.rust_level,
-                    ))
-                })
+                b.iter(|| black_box(rust_encode_to_vec(&scenario.bytes[..], &level)))
             });
 
             group.bench_function("c_ffi", |b| {
-                b.iter(|| black_box(ffi_encode_to_vec(&scenario.bytes[..], level.ffi_level)))
+                b.iter(|| {
+                    black_box(ffi_encode_to_vec(
+                        &scenario.bytes[..],
+                        level.ffi_level,
+                        level.ldm,
+                    ))
+                })
             });
 
             group.finish();
@@ -269,6 +312,14 @@ fn bench_decompress(c: &mut Criterion) {
     }
     for scenario in benchmark_scenarios_cached().iter() {
         for level in supported_levels_filtered() {
+            // Dictionary variants decode via the dictionary-aware groups in
+            // `bench_dictionary` (`decompress-dict/...`); the plain decode
+            // group only covers the no-dictionary levels. The `*_ldm` frames
+            // decode through the same dictionary-free path as numeric levels
+            // (LDM is an encoder-only concern), just over LDM-encoded bytes.
+            if level.dict {
+                continue;
+            }
             let expected_len = scenario.len();
             bench_decompress_source(
                 c,
@@ -354,11 +405,10 @@ fn bench_decompress_source(
         compressed
             .get_or_init(|| {
                 let bytes = match source {
-                    "rust_stream" => structured_zstd::encoding::compress_slice_to_vec(
-                        &scenario.bytes[..],
-                        level.rust_level,
-                    ),
-                    "c_stream" => ffi_encode_to_vec(&scenario.bytes[..], level.ffi_level),
+                    "rust_stream" => rust_encode_to_vec(&scenario.bytes[..], &level),
+                    "c_stream" => {
+                        ffi_encode_to_vec(&scenario.bytes[..], level.ffi_level, level.ldm)
+                    }
                     other => panic!("bench_decompress_source: unknown source {other}"),
                 };
                 assert_decompress_matches_reference(scenario, &bytes, expected_len);
@@ -591,9 +641,20 @@ fn bench_dictionary(c: &mut Criterion) {
         };
 
         for level in supported_levels_filtered() {
+            // The pure-LDM-no-dict variants (`*_ldm`, `dict = false`) belong to
+            // the plain compress/decompress groups, not the dictionary group.
+            // Everything else runs here: the numeric levels (unchanged
+            // behaviour) and the `*_ldm_dict` variants (`dict = true`), the
+            // latter with LDM enabled on both sides via `apply_ffi_ldm` /
+            // `ldm_parameters` below.
+            if level.ldm && !level.dict {
+                continue;
+            }
             let mut no_dict = zstd::bulk::Compressor::new(level.ffi_level).unwrap();
+            apply_ffi_ldm(&mut no_dict, &level);
             let mut with_dict =
                 zstd::bulk::Compressor::with_dictionary(level.ffi_level, &ffi_dictionary).unwrap();
+            apply_ffi_ldm(&mut with_dict, &level);
             let no_dict_bytes = no_dict.compress(&scenario.bytes).unwrap();
             let with_dict_bytes = with_dict.compress(&scenario.bytes).unwrap();
 
@@ -604,6 +665,12 @@ fn bench_dictionary(c: &mut Criterion) {
             // timing-loop preallocation hint so we compress once, not twice.
             let rust_with_dict_len: Option<usize> = if rust_dict_handle.is_some() {
                 let mut warmup_compressor = FrameCompressor::new(level.rust_level);
+                // Enable LDM before attaching the dictionary — `set_parameters`
+                // resets the base level + installs the LDM override; the dict
+                // attach below is independent and survives it.
+                if let Some(params) = ldm_parameters(&level) {
+                    warmup_compressor.set_parameters(&params);
+                }
                 warmup_compressor
                     .set_dictionary_from_bytes(&ffi_dictionary)
                     .expect("dictionary should attach");
@@ -647,6 +714,7 @@ fn bench_dictionary(c: &mut Criterion) {
             group.bench_function("c_ffi_without_dict", |b| {
                 b.iter(|| {
                     let mut compressor = zstd::bulk::Compressor::new(level.ffi_level).unwrap();
+                    apply_ffi_ldm(&mut compressor, &level);
                     black_box(compressor.compress(&scenario.bytes).unwrap())
                 })
             });
@@ -668,6 +736,7 @@ fn bench_dictionary(c: &mut Criterion) {
                 let mut compressor =
                     zstd::bulk::Compressor::with_dictionary(level.ffi_level, &ffi_dictionary)
                         .unwrap();
+                apply_ffi_ldm(&mut compressor, &level);
                 b.iter(|| black_box(compressor.compress(&scenario.bytes).unwrap()))
             });
 
@@ -687,6 +756,11 @@ fn bench_dictionary(c: &mut Criterion) {
                     // a `set_source`/`set_drain` call — pin them to the
                     // defaults so inference has a concrete type.
                     let mut compressor: FrameCompressor = FrameCompressor::new(level.rust_level);
+                    // Enable LDM before attaching the dictionary (see the
+                    // warmup compressor above for why the order is safe).
+                    if let Some(params) = ldm_parameters(&level) {
+                        compressor.set_parameters(&params);
+                    }
                     compressor
                         .set_encoder_dictionary(
                             EncoderDictionary::from_bytes(&ffi_dictionary)
@@ -1083,43 +1157,6 @@ fn training_sample_count(source: &[u8]) -> usize {
     } else {
         samples
     }
-}
-
-/// Build the same byte-slice samples that `training_sample_count`
-/// counts, for passing into FFI's `zstd::dict::from_samples`. Keeps
-/// the two functions in lockstep: primary chunk-by-`sample_size`,
-/// 2-sample midpoint-split fallback for tiny inputs, single-sample
-/// last-resort fallback. Returning `Vec<&[u8]>` borrows from
-/// `source` for zero-copy.
-fn build_training_samples(source: &[u8]) -> Vec<&[u8]> {
-    let sample_size = source.len().div_ceil(16).clamp(256, 8192);
-    let samples: Vec<&[u8]> = source
-        .chunks(sample_size)
-        .take(64)
-        .filter(|chunk| chunk.len() >= 64)
-        .collect();
-    if samples.len() >= 2 {
-        return samples;
-    }
-    let midpoint = source.len() / 2;
-    let left = &source[..midpoint];
-    let right = &source[midpoint..];
-    if left.len() >= 64 && right.len() >= 64 {
-        return vec![left, right];
-    }
-    // Single-sample last resort — matches the BENCH_WARN path in
-    // `training_sample_count`. FFI rejects this and the caller hits
-    // BENCH_WARN, which is the correct behaviour: tiny inputs can't
-    // train a meaningful dictionary regardless of bench-shape
-    // gymnastics. Return the source even for <64-byte inputs so
-    // `samples.len() == training_sample_count(source)` invariant
-    // holds — the diagnostic value reported in the BENCH_WARN line
-    // stays in lockstep across both helpers.
-    vec![source]
-}
-
-fn dictionary_size_for(input_len: usize) -> usize {
-    input_len.div_ceil(8).clamp(256, 16 * 1024)
 }
 
 fn fastcover_fixed_options() -> FastCoverOptions {

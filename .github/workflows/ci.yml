@@ -426,7 +426,7 @@ jobs:
             },
             {
               "id": "btopt",
-              "levels": "level_16_btopt,level_17_btopt"
+              "levels": "level_16_btopt,level_17_btopt,level_1_fast_ldm,level_22_btultra2_ldm,level_1_fast_ldm_dict,level_22_btultra2_ldm_dict"
             },
             {
               "id": "btultra2",

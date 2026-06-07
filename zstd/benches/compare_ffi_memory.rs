@@ -35,9 +35,11 @@ mod support;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use structured_zstd::decoding::FrameDecoder;
+use structured_zstd::decoding::{DictionaryHandle, FrameDecoder};
+use structured_zstd::encoding::FrameCompressor;
 use support::{
-    LevelConfig, Scenario, benchmark_scenarios, kernel_report_line, supported_levels_filtered,
+    LevelConfig, Scenario, ScenarioClass, benchmark_scenarios, build_training_samples,
+    dictionary_size_for, kernel_report_line, ldm_parameters, supported_levels_filtered,
 };
 
 /// Process-wide byte tracker. Two allocation paths feed the SAME
@@ -287,8 +289,13 @@ fn ffi_custom_mem() -> zstd::zstd_safe::zstd_sys::ZSTD_customMem {
 /// FFI encode via `ZSTD_compressStream2` with customMem hooks. Same
 /// settings as the timing bench's `ffi_encode_to_vec` (level, checksum,
 /// content-size, tiny-source window override) — only the customMem is
-/// added so the libzstd heap is observed.
-fn ffi_encode(input: &[u8], level: i32) -> Vec<u8> {
+/// added so the libzstd heap is observed. When `ldm` is set,
+/// `ZSTD_c_enableLongDistanceMatching` is turned on alongside the level so
+/// the FFI peak mirrors the Rust LDM variant (#362). When `dict` is `Some`,
+/// the dictionary is loaded onto the CCtx (`ZSTD_CCtx_loadDictionary`) so the
+/// observed peak covers the dictionary-driven compress path; the bytes are
+/// copied into the libzstd heap, which the customMem observer counts.
+fn ffi_encode(input: &[u8], level: i32, ldm: bool, dict: Option<&[u8]>) -> Vec<u8> {
     use zstd::zstd_safe::zstd_sys;
     // SAFETY: `ZSTD_createCCtx_advanced` returns null on OOM; we
     // assert and free below.
@@ -307,6 +314,14 @@ fn ffi_encode(input: &[u8], level: i32) -> Vec<u8> {
             if cfg!(feature = "hash") { 1 } else { 0 },
         );
         assert!(zstd_sys::ZSTD_isError(rc) == 0);
+        if ldm {
+            let rc = zstd_sys::ZSTD_CCtx_setParameter(
+                cctx,
+                zstd_sys::ZSTD_cParameter::ZSTD_c_enableLongDistanceMatching,
+                1,
+            );
+            assert!(zstd_sys::ZSTD_isError(rc) == 0);
+        }
         let rc = zstd_sys::ZSTD_CCtx_setParameter(
             cctx,
             zstd_sys::ZSTD_cParameter::ZSTD_c_contentSizeFlag,
@@ -320,6 +335,17 @@ fn ffi_encode(input: &[u8], level: i32) -> Vec<u8> {
                 14,
             );
             assert!(zstd_sys::ZSTD_isError(rc) == 0);
+        }
+        if let Some(dict) = dict {
+            let rc = zstd_sys::ZSTD_CCtx_loadDictionary(
+                cctx,
+                dict.as_ptr() as *const core::ffi::c_void,
+                dict.len(),
+            );
+            assert!(
+                zstd_sys::ZSTD_isError(rc) == 0,
+                "CCtx_loadDictionary failed"
+            );
         }
         let rc = zstd_sys::ZSTD_CCtx_setPledgedSrcSize(cctx, input.len() as u64);
         assert!(zstd_sys::ZSTD_isError(rc) == 0);
@@ -368,12 +394,23 @@ fn ffi_encode(input: &[u8], level: i32) -> Vec<u8> {
     }
 }
 
-fn ffi_decode(compressed: &[u8], expected_len: usize) -> Vec<u8> {
+fn ffi_decode(compressed: &[u8], expected_len: usize, dict: Option<&[u8]>) -> Vec<u8> {
     use zstd::zstd_safe::zstd_sys;
     // SAFETY: same lifetime contract as `ffi_encode`.
     let dctx = unsafe { zstd_sys::ZSTD_createDCtx_advanced(ffi_custom_mem()) };
     assert!(!dctx.is_null(), "ZSTD_createDCtx_advanced returned null");
     unsafe {
+        if let Some(dict) = dict {
+            let rc = zstd_sys::ZSTD_DCtx_loadDictionary(
+                dctx,
+                dict.as_ptr() as *const core::ffi::c_void,
+                dict.len(),
+            );
+            assert!(
+                zstd_sys::ZSTD_isError(rc) == 0,
+                "DCtx_loadDictionary failed"
+            );
+        }
         let mut output = vec![0u8; expected_len];
         let written = zstd_sys::ZSTD_decompressDCtx(
             dctx,
@@ -417,6 +454,20 @@ fn emit_report(
     );
 }
 
+/// Train the canonical FastCOVER dictionary bytes both bench sides apply for
+/// the `*_ldm_dict` variants — the FFI `from_samples` output, mirroring
+/// `compare_ffi::bench_dictionary` (Rust attaches the SAME bytes via
+/// `set_dictionary_from_bytes` / `DictionaryHandle::decode_dict`). Returns
+/// `None` when training fails (e.g. an input too tiny to yield ≥2 samples).
+fn train_ffi_dictionary(source: &[u8]) -> Option<Vec<u8>> {
+    let samples = build_training_samples(source);
+    let max_dict_size = source.len().saturating_sub(64);
+    let dict_size = dictionary_size_for(source.len())
+        .max(256)
+        .min(max_dict_size);
+    zstd::dict::from_samples(&samples, dict_size).ok()
+}
+
 fn main() {
     // Report the CPU kernel tier this run selected, so the dashboard can
     // attribute every REPORT_MEM line to the kernel that produced it. Printed
@@ -428,18 +479,96 @@ fn main() {
     let scenarios = benchmark_scenarios();
     for scenario in &scenarios {
         for level in supported_levels_filtered() {
-            // Compress
-            let (rust_compressed, rust_peak) = measure_peak(|| {
-                structured_zstd::encoding::compress_slice_to_vec(
+            let ldm_params = ldm_parameters(&level);
+            let expected_len = scenario.len();
+
+            // The LDM+dict variants (`*_ldm_dict`) carry a trained dictionary
+            // on both sides — same plumbing as `compare_ffi::bench_dictionary`
+            // (FastCOVER `from_samples` → applied to Rust via
+            // `set_dictionary_from_bytes` / `DictionaryHandle` and to FFI via
+            // `ZSTD_CCtx/DCtx_loadDictionary`). Only the dict-trainable
+            // classes qualify (Small/Corpus, matching the timing matrix); a
+            // too-tiny input that can't train ≥2 samples is skipped rather
+            // than emitting a misleading peak under a `_dict` label.
+            if level.dict {
+                if !matches!(scenario.class, ScenarioClass::Small | ScenarioClass::Corpus) {
+                    continue;
+                }
+                let Some(dict) = train_ffi_dictionary(&scenario.bytes) else {
+                    eprintln!(
+                        "BENCH_WARN skipping dict memory variant for {} (FastCOVER training failed)",
+                        scenario.id
+                    );
+                    continue;
+                };
+
+                let (rust_compressed, rust_peak) = measure_peak(|| {
+                    let mut compressor: FrameCompressor = FrameCompressor::new(level.rust_level);
+                    if let Some(params) = &ldm_params {
+                        compressor.set_parameters(params);
+                    }
+                    compressor
+                        .set_dictionary_from_bytes(&dict)
+                        .expect("dictionary should attach");
+                    let mut out = Vec::new();
+                    compressor.compress_independent_frame_into(&scenario.bytes[..], &mut out);
+                    out
+                });
+                let (ffi_compressed, ffi_peak) = measure_peak(|| {
+                    ffi_encode(&scenario.bytes[..], level.ffi_level, level.ldm, Some(&dict))
+                });
+                emit_report(scenario, level, "compress", rust_peak, ffi_peak);
+
+                for (source, compressed) in [
+                    ("rust_stream", &rust_compressed),
+                    ("c_stream", &ffi_compressed),
+                ] {
+                    let (_, rust_decode_peak) = measure_peak(|| {
+                        // Parse the dictionary handle inside the window so the
+                        // Rust peak covers it, mirroring the FFI side where
+                        // `ZSTD_DCtx_loadDictionary` allocates on the observed
+                        // customMem heap.
+                        let handle = DictionaryHandle::decode_dict(&dict)
+                            .expect("dictionary handle parse should succeed");
+                        let mut target = vec![0u8; expected_len];
+                        let mut decoder = FrameDecoder::new();
+                        let written = decoder
+                            .decode_all_with_dict_handle(
+                                compressed.as_slice(),
+                                &mut target,
+                                &handle,
+                            )
+                            .expect("rust decode-with-dict should succeed");
+                        assert_eq!(written, expected_len);
+                        target
+                    });
+                    let (_, ffi_decode_peak) = measure_peak(|| {
+                        ffi_decode(compressed.as_slice(), expected_len, Some(&dict))
+                    });
+                    emit_report(
+                        scenario,
+                        level,
+                        &format!("decompress-{source}"),
+                        rust_decode_peak,
+                        ffi_decode_peak,
+                    );
+                }
+                continue;
+            }
+
+            // Compress (no dictionary; LDM wired on both sides when set)
+            let (rust_compressed, rust_peak) = measure_peak(|| match &ldm_params {
+                Some(params) => {
+                    structured_zstd::encoding::compress_with_parameters(&scenario.bytes[..], params)
+                }
+                None => structured_zstd::encoding::compress_slice_to_vec(
                     &scenario.bytes[..],
                     level.rust_level,
-                )
+                ),
             });
             let (ffi_compressed, ffi_peak) =
-                measure_peak(|| ffi_encode(&scenario.bytes[..], level.ffi_level));
+                measure_peak(|| ffi_encode(&scenario.bytes[..], level.ffi_level, level.ldm, None));
             emit_report(scenario, level, "compress", rust_peak, ffi_peak);
-
-            let expected_len = scenario.len();
 
             // Decode the Rust-encoded frame on both sides for the
             // `rust_stream` decode stage; mirror with the FFI-encoded
@@ -459,7 +588,7 @@ fn main() {
                     target
                 });
                 let (_, ffi_decode_peak) =
-                    measure_peak(|| ffi_decode(compressed.as_slice(), expected_len));
+                    measure_peak(|| ffi_decode(compressed.as_slice(), expected_len, None));
                 emit_report(
                     scenario,
                     level,
