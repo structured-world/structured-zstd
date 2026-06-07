@@ -47,7 +47,11 @@ enum RowTagKernel {
     Neon,
     // WebAssembly fixed-128-bit SIMD. Compile-time only (wasm has no runtime
     // CPUID): present only when the build enables `simd128`.
-    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel_simd128"
+    ))]
     Simd128,
 }
 
@@ -103,7 +107,11 @@ impl RowTagKernel {
         // wasm32: no runtime CPUID. Resolve purely from the compile-time
         // `simd128` target feature, baked into the build (the variant only
         // exists under that cfg). Mirrors the no_std `cfg!` arms above.
-        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        #[cfg(all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel_simd128"
+        ))]
         {
             return RowTagKernel::Simd128;
         }
@@ -186,10 +194,18 @@ impl RowTags for NeonTags {
     }
 }
 
-#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "simd128",
+    feature = "kernel_simd128"
+))]
 #[derive(Copy, Clone)]
 struct Simd128Tags;
-#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "simd128",
+    feature = "kernel_simd128"
+))]
 impl RowTags for Simd128Tags {
     const USE_MASK: bool = true;
     #[inline]
@@ -211,7 +227,11 @@ macro_rules! dispatch_tag_kernel {
             RowTagKernel::Sse2 => $self.$k_method::<Sse2Tags>($($arg),*),
             #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
             RowTagKernel::Neon => $self.$k_method::<NeonTags>($($arg),*),
-            #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+            #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel_simd128"
+    ))]
             RowTagKernel::Simd128 => $self.$k_method::<Simd128Tags>($($arg),*),
             RowTagKernel::Scalar => $self.$k_method::<ScalarTags>($($arg),*),
         }
@@ -367,7 +387,11 @@ unsafe fn row_tag_match_mask_neon(tags: &[u8], tag: u8) -> u64 {
 /// only under `target_feature = "simd128"`, so the intrinsics are available
 /// without a separate `#[target_feature]` attribute (no runtime detection on
 /// wasm); only `v128_load` is `unsafe` (a raw pointer load).
-#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "simd128",
+    feature = "kernel_simd128"
+))]
 fn row_tag_match_mask_simd128(tags: &[u8], tag: u8) -> u64 {
     use core::arch::wasm32::{i8x16_bitmask, i8x16_eq, i8x16_splat, v128_load};
 

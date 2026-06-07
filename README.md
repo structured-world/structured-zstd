@@ -251,8 +251,10 @@ const plain = await decompress(framed);
 The package ships two WebAssembly payloads — one built with the `simd128`
 SIMD tier, one scalar — and selects the fast one at runtime from the host
 engine's capabilities. Pure ESM, strict TypeScript types. Frames interoperate
-with native zstd. Source lives in [`zstd-wasm/`](zstd-wasm); see the
-[package README](zstd-wasm/npm/README.md).
+with native zstd. Source lives in
+[`zstd-wasm/`](https://github.com/structured-world/structured-zstd/tree/main/zstd-wasm);
+see the
+[package README](https://github.com/structured-world/structured-zstd/blob/main/zstd-wasm/npm/README.md).
 
 ## Project relationship
 

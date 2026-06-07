@@ -10,6 +10,7 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
 const here = (p) => fileURLToPath(new URL(p, import.meta.url));
+const eq = (a, b) => a.length === b.length && Buffer.from(a).equals(Buffer.from(b));
 
 async function loadOurPayload(dir) {
   const glue = await import(`../npm/${dir}/structured_zstd_wasm.js`);
@@ -123,7 +124,7 @@ for (const [scenario, data] of fixtures) {
       const framed = eng.compress(data, level);
       // Round-trip correctness check before timing.
       const back = eng.decompress(framed);
-      const ok = back.length === data.length;
+      const ok = eq(back, data);
       const cNs = medianNsPerOp(() => eng.compress(data, level), BUDGET_MS);
       const dNs = medianNsPerOp(() => eng.decompress(framed), BUDGET_MS);
       const ratio = framed.length / Math.max(1, data.length);
@@ -167,7 +168,7 @@ for (const [scenario, data] of dictSamples) {
   for (const level of [3, 19]) {
     for (const [name, eng] of Object.entries(engines)) {
       const framed = eng.compressUsingDict(data, dict, level);
-      const ok = eng.decompressUsingDict(framed, dict).length === data.length;
+      const ok = eq(eng.decompressUsingDict(framed, dict), data);
       const cNs = medianNsPerOp(() => eng.compressUsingDict(data, dict, level), BUDGET_MS);
       const dNs = medianNsPerOp(() => eng.decompressUsingDict(framed, dict), BUDGET_MS);
       const ratio = framed.length / Math.max(1, data.length);

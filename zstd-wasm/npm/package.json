@@ -69,6 +69,6 @@
     "build:wasm:scalar": "cd .. && wasm-pack build --release --target web --out-dir npm/scalar --out-name structured_zstd_wasm",
     "build:ts": "tsc",
     "build": "npm run build:wasm:simd && npm run build:wasm:scalar && npm run build:ts",
-    "prepublishOnly": "npm run build:ts"
+    "prepublishOnly": "npm run build && cp ../../LICENSE LICENSE"
   }
 }

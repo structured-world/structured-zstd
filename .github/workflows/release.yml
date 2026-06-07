@@ -38,6 +38,10 @@ jobs:
       id-token: write # npm OIDC trusted publishing + provenance
     steps:
       - uses: actions/checkout@v6
+        with:
+          # npm publish authenticates via OIDC, not the checkout token —
+          # don't persist it in git config.
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown

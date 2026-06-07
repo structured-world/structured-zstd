@@ -80,9 +80,12 @@ for (const [name, data] of fixtures()) {
     // MANDATORY: format cross-check with the C reference (skip empty —
     // bokuweb rejects 0-length input).
     if (data.length > 0) {
-      if (!eq(boku.decompress(cs), data)) fail(`${name} L${level}: C reference cannot decode our frame`);
+      // Both directions, both payloads — a scalar-only host must interop too.
+      if (!eq(boku.decompress(cs), data)) fail(`${name} L${level}: C ref cannot decode our simd frame`);
+      if (!eq(boku.decompress(cc), data)) fail(`${name} L${level}: C ref cannot decode our scalar frame`);
       const cb = boku.compress(data, level);
-      if (!eq(simd.decompress(cb), data)) fail(`${name} L${level}: we cannot decode the C reference's frame`);
+      if (!eq(simd.decompress(cb), data)) fail(`${name} L${level}: simd cannot decode C ref's frame`);
+      if (!eq(scalar.decompress(cb), data)) fail(`${name} L${level}: scalar cannot decode C ref's frame`);
     }
     // INFORMATIONAL: note (do not fail) if our two payloads diverge.
     if (!eq(cs, cc)) {
