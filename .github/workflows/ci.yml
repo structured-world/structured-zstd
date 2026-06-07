@@ -22,6 +22,11 @@ on:
       - 'docs/**'
       - 'LICENSE*'
       - '.gitignore'
+  # Manual trigger: lets the wasm dashboard shard (`bench-wasm`) be
+  # refreshed on demand for changes the push path doesn't auto-gate on
+  # — e.g. a wasm bench-harness / parser edit that moves the published
+  # numbers without touching the `rust_core` paths that gate the shard.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -321,7 +326,7 @@ jobs:
     # disjoint files and never race for the same blob.
     name: Bench wasm vs bokuweb (dashboard shard)
     needs: [lint, changes]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.rust_core == 'true'
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.rust_core == 'true')
     timeout-minutes: 30
     runs-on: ubuntu-latest
     steps:
