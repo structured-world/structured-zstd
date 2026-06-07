@@ -951,6 +951,14 @@ fn configure_group<M: criterion::measurement::Measurement>(
     let measurement = match (scenario.class, op) {
         (ScenarioClass::Small, BenchOp::Compress) => Duration::from_millis(500),
         (ScenarioClass::Small, BenchOp::Decompress) => Duration::from_millis(300),
+        // z000033 L22 compress (~0.3 s/iter on i9-x86_64) takes ≈20 s for 10
+        // samples on a GitHub free runner (~6-8x slower), so it emits a benign
+        // "increase target time" notice under any budget below ~22 s — a
+        // pre-existing, CI-only cosmetic warning (it still collects all 10
+        // samples). Raising the budget to silence it would only inflate the
+        // faster corpus-compress levels (they would fill the larger budget)
+        // without helping the slow level, so Corpus compress stays at the 3 s
+        // tier alongside Entropy.
         (ScenarioClass::Corpus | ScenarioClass::Entropy, BenchOp::Compress) => {
             Duration::from_secs(3)
         }
