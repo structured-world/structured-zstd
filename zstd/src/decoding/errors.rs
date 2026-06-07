@@ -1571,9 +1571,45 @@ mod tests {
     use alloc::{string::ToString, vec};
 
     use super::{
-        BlockTypeError, DecodeBlockContentError, DecodeSequenceError, DecompressBlockError,
-        DecompressLiteralsError, FSETableError, FrameDecoderError, HuffmanTableError,
+        BlockTypeError, DecodeBlockContentError, DecodeBufferError, DecodeSequenceError,
+        DecompressBlockError, DecompressLiteralsError, ExecuteSequencesError, FSETableError,
+        FrameDecoderError, HuffmanTableError,
     };
+
+    #[test]
+    fn execute_sequences_output_overflow_requested_covers_all_arms() {
+        // #246: `run_direct_decode` folds a Compressed-block overshoot into
+        // `FrameContentSizeMismatch` by reading `requested` from whichever
+        // overflow shape the executor produced. Cover all three arms:
+        //   1. donor-inline path -> `OutputBufferOverflow` directly,
+        //   2. match-repeat path -> `DecodebufferError(OutputBufferOverflow)`,
+        //   3. any other variant -> None (no fold).
+        let inline = ExecuteSequencesError::OutputBufferOverflow {
+            tail: 10,
+            requested: 7,
+            capacity: 12,
+        };
+        assert_eq!(inline.output_overflow_requested(), Some(7));
+
+        let repeat =
+            ExecuteSequencesError::DecodebufferError(DecodeBufferError::OutputBufferOverflow {
+                tail: 3,
+                requested: 99,
+                capacity: 4,
+            });
+        assert_eq!(repeat.output_overflow_requested(), Some(99));
+
+        // Non-overflow variants (and non-overflow DecodeBufferError) -> None.
+        assert_eq!(
+            ExecuteSequencesError::ZeroOffset.output_overflow_requested(),
+            None
+        );
+        assert_eq!(
+            ExecuteSequencesError::DecodebufferError(DecodeBufferError::ZeroOffset)
+                .output_overflow_requested(),
+            None
+        );
+    }
 
     #[test]
     fn block_and_sequence_display_messages_are_specific() {

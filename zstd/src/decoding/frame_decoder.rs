@@ -2477,39 +2477,31 @@ mod tests {
         compressor.compress();
         // Sanity: the encoder actually compressed (=> a Compressed block,
         // not a raw-stored fallback) so we exercise the sequence path.
-        assert!(
-            frame.len() < payload.len(),
-            "payload must compress to a Compressed block (got {} >= {})",
-            frame.len(),
-            payload.len()
-        );
+        assert!(frame.len() < payload.len());
 
         // Locate the FCS field: it is the last `fcs_len` bytes of the
         // frame header, whose total size `header_size` includes the magic.
+        // A ~4 KiB single-segment frame declares FCS = 4096, which lands in
+        // the 2-byte field range [256, 65791] (RFC 8878 §3.1.1.1.4) — assert
+        // that so the patch logic below stays a single deterministic branch.
         let (header, header_size) =
             super::super::frame::read_frame_header(frame.as_slice()).expect("valid header");
         let fcs_len = header
             .descriptor
             .frame_content_size_bytes()
             .expect("fcs present") as usize;
-        assert!(fcs_len > 0, "encoder must emit an FCS field for this size");
-        let header_size = header_size as usize;
-        let fcs_off = header_size - fcs_len;
+        assert_eq!(
+            fcs_len, 2,
+            "4 KiB single-segment frame must use a 2-byte FCS"
+        );
+        let fcs_off = header_size as usize - fcs_len;
 
-        // Patch FCS to the smallest value the field width can encode.
-        // 2-byte FCS stores `value - 256` (RFC 8878 §3.1.1.1.4), so its
-        // floor is 256; 1/4/8-byte widths store the raw value (floor 0).
-        // Either way the patched declared size (<= 256) is far below the
-        // 4 KiB the block actually decodes to, guaranteeing overflow.
-        let patched_declared: u64 = if fcs_len == 2 { 256 } else { 8 };
-        let stored: u64 = if fcs_len == 2 {
-            patched_declared - 256
-        } else {
-            patched_declared
-        };
-        for i in 0..fcs_len {
-            frame[fcs_off + i] = (stored >> (8 * i)) as u8;
-        }
+        // Patch the 2-byte FCS to its floor: stored bytes 0 decode to 256
+        // (the field's `+256` bias), far below the 4 KiB the block actually
+        // produces, so the sequence executor overflows the output slice.
+        let patched_declared: u64 = 256;
+        frame[fcs_off] = 0;
+        frame[fcs_off + 1] = 0;
 
         // Size the output to declared + WILDCOPY slack so the direct path
         // is eligible (output.len() >= content_size + slack) — the
@@ -2523,10 +2515,7 @@ mod tests {
         match err {
             super::FrameDecoderError::FrameContentSizeMismatch { declared, produced } => {
                 assert_eq!(declared, patched_declared, "declared echoes patched FCS");
-                assert!(
-                    produced > declared,
-                    "produced ({produced}) must exceed declared ({declared})"
-                );
+                assert!(produced > declared, "produced must exceed declared");
             }
             other => panic!("expected FrameContentSizeMismatch, got {other:?}"),
         }
