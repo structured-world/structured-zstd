@@ -566,6 +566,14 @@ fn bench_dictionary(c: &mut Criterion) {
             continue;
         };
         let ffi_train_ms = ffi_train_started.elapsed().as_secs_f64() * 1_000.0;
+        // Diagnostic: dump the exact trained dict per scenario so the
+        // sequence comparator can diff against the SAME dict the
+        // compress-dict bench/REPORT use. Gated on an env var so normal
+        // bench runs are unaffected.
+        if let Ok(dir) = std::env::var("STRUCTURED_ZSTD_DUMP_DICT_DIR") {
+            let path = format!("{dir}/{}.dict", scenario.id);
+            std::fs::write(&path, &ffi_dictionary).expect("dump dict");
+        }
 
         if emit_reports {
             emit_dictionary_training_report(
