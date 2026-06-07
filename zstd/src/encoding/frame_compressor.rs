@@ -1471,6 +1471,23 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 break;
             }
         }
+        // Fail closed on a structurally incomplete scan: the loop must have
+        // consumed the whole block section AND ended on a parsed last block.
+        // A premature `last_block` (bytes left over) or a run-off without any
+        // last block would otherwise publish an invalid public `FrameEmitInfo`.
+        // Unreachable for a well-formed self-produced frame (debug_assert
+        // catches a regression); on release we bail, leaving `frame_emit_info`
+        // at `None` rather than handing back a corrupt layout.
+        if cursor != all_blocks.len() || !blocks.last().is_some_and(|b| b.last_block) {
+            debug_assert!(
+                false,
+                "incomplete block scan in populate_frame_emit_info: cursor={} len={} last_block={:?}",
+                cursor,
+                all_blocks.len(),
+                blocks.last().map(|b| b.last_block)
+            );
+            return;
+        }
         let checksum_range = if cfg!(feature = "hash") {
             let cs_start = match frame_header_len.checked_add(all_blocks_len_u32) {
                 Some(v) => v,
@@ -3294,6 +3311,16 @@ mod tests {
             .last_frame_emit_info()
             .expect("emit info populated after compress_independent_frame")
             .clone();
+        // Pin the compressed-block path: without this the fixture could regress
+        // into the raw-fast fallback and still pass via the Raw wire-size
+        // fallback in populate_frame_emit_info, never exercising the borrowed
+        // compressed-block sidecar capture this test targets.
+        assert!(
+            info.blocks
+                .iter()
+                .any(|b| matches!(b.block_type, crate::blocks::block::BlockType::Compressed)),
+            "borrowed-path fixture must emit at least one compressed block"
+        );
         assert!(
             info.blocks.len() >= 2,
             "borrowed fixture must span multiple blocks (got {})",
