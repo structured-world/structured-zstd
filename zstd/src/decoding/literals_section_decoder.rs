@@ -213,7 +213,16 @@ fn decompress_literals_impl<K: CpuKernel>(
     let regen = section.regenerated_size as usize;
 
     target.reserve(regen);
-    let source = &source[0..compressed_size];
+    // Bounds-check the header-derived `compressed_size` before slicing: a
+    // truncated/corrupt frame can claim more compressed literal bytes than
+    // the source carries. Return a structured error instead of panicking on
+    // `source[0..compressed_size]` (decoder DoS), matching the Raw/RLE paths.
+    let source = source
+        .get(..compressed_size)
+        .ok_or(err::MissingBytesForLiterals {
+            got: source.len(),
+            needed: compressed_size,
+        })?;
     let mut bytes_read = 0;
 
     match section.ls_type {
