@@ -152,6 +152,10 @@ jobs:
       UPSTREAM_TAG: v1.5.7
     steps:
       - uses: actions/checkout@v6
+        with:
+          # Build + test + header-diff job (no push); don't leave the token
+          # in the checkout's git config.
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -223,6 +227,22 @@ jobs:
           cc -std=c11 -Wall -Wextra -Ic-api/include c-api/tests/c_consumer.c \
             -Ltarget/debug -lstructured_zstd -o /tmp/c_consumer
           LD_LIBRARY_PATH=target/debug /tmp/c_consumer
+      - name: musl static drop-in builds + exports symbols
+        # musl is a std target (not no-std); its default `+crt-static` profile
+        # makes the static archive `libstructured_zstd.a` the canonical drop-in
+        # for Alpine / fully-static binaries (the cdylib is dropped under
+        # crt-static, which is expected). Verify the archive builds and carries
+        # the exported wrappers.
+        run: |
+          set -euo pipefail
+          rustup target add x86_64-unknown-linux-musl
+          cargo build -p structured-zstd-c --target x86_64-unknown-linux-musl
+          a=target/x86_64-unknown-linux-musl/debug/libstructured_zstd.a
+          test -f "$a"
+          for sym in ZSTD_compress ZSTD_decompress ZSTD_versionNumber ZSTD_getFrameHeader; do
+            nm "$a" | grep -qE " T ${sym}$" || { echo "::error::$sym missing from musl staticlib"; exit 1; }
+          done
+          echo "musl staticlib OK ($(du -h "$a" | cut -f1))"
 
   test:
     needs: lint
