@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.33](https://github.com/structured-world/structured-zstd/compare/v0.0.32...v0.0.33) - 2026-06-08
+
+### Performance
+
+- dict-attach across match finders + decode peak-alloc ([#359](https://github.com/structured-world/structured-zstd/pull/359))
+
 ## [0.0.31](https://github.com/structured-world/structured-zstd/compare/v0.0.30...v0.0.31) - 2026-06-07
 
 ### Added
