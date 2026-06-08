@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780927717047,
+  "lastUpdate": 1780959237189,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -61730,6 +61730,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.26,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "2082bfc78d6bc5fb56458c556f7594dff1bf05dc",
+          "message": "feat: content-checksum modes + npm bindings, RingBuffer wrapped inline match-copy (#385)\n\n* perf(decode): allow inline match-copy on contiguous wrapped ring\n\nRingBuffer::inline_exec_ok vetoed the donor inline ZSTD_execSequence body\nwhenever the ring had wrapped (head > tail). The streaming path drains to\nwindow_size after each read, so on any input larger than the window the ring\nis perpetually wrapped and the whole frame tail ran the slow push/repeat\nfallback while the flat slice path always took the fast inline copy.\n\nRelax the gate: on a wrapped ring still take the inline path when the\nsequence linear write + overshoot stays in the free gap before head and the\nmatch source is the contiguous lower live segment (offset <= tail + lit). The\nmatch offset is now passed into inline_exec_ok so the ring can verify source\ncontiguity; linear backends ignore it. The three RingBuffer\nexec_sequence_inline bodies drop their head<=tail assumption (which underflowed\nlive_len on a wrapped ring) for a wrap-aware match-source assert.\n\n* feat(checksum): add content-checksum modes and encoder toggle\n\nDecoder gains a ContentChecksum mode (None / EmitOnly / Verify, default\nEmitOnly) via FrameDecoder::set_content_checksum:\n- None skips the XXH64 pass entirely on both the direct and streaming/drain\n  paths (the pass is a large share of decode time on checksum-flagged frames)\n- Verify compares the stored digest against the computed one per frame and\n  fails with the new FrameDecoderError::ChecksumMismatch { expected, calculated }\n  from decode_all and the streaming finish\n\nEncoder gains a binary toggle (FrameCompressor and StreamingEncoder\nset_content_checksum, semantics of ZSTD_c_checksumFlag, default emit). When\noff, frames set Content_Checksum_flag = 0 and carry no trailing digest; such\nframes are valid and decode in any mode.\n\nThe enum, field, error variant, and setters compile without the hash feature\n(no-std + alloc); only the XXH64 work stays hash-gated, so Verify without hash\ndegrades to no compute rather than a spurious error.\n\n* feat(wasm): expose content-checksum params and accessors\n\nSurface the content-checksum controls through the wasm/npm bindings:\n- compress / compressUsingDict / ZstdCompressStream take an optional checksum\n  bool (emit the trailing XXH64 digest or not)\n- decompress / decompressUsingDict / ZstdDecompressStream take an optional\n  ContentChecksum mode (None / EmitOnly / Verify); Verify throws on a digest\n  mismatch so TypeScript callers see a corrupt frame as a rejected promise\n- ZstdDecompressStream gains storedChecksum() / calculatedChecksum() accessors\n\nDefaults are off (None / no emit) to preserve the package's prior behaviour\n(it shipped without the checksum code) and libzstd's checksumFlag=0 default,\nand to skip the XXH64 cost when no digest is needed. The core hash feature is\nenabled for the wasm crate (twox-hash is no_std, so no std is pulled).\nFrameDecoder::verify_content_checksum is made public so callers driving\ndecode_blocks directly (the wasm streaming path) can verify per frame.\n\n* perf(decode): bound streaming ring growth via interleaved drain\n\nStreamingDecoder::read accumulated the whole read_to_end request in the decode\nRingBuffer before a single end-of-call drain, so a large request grew the ring\nfar past window_size through repeated reserve_amortized (alloc_zeroed + copy)\nsteps. Decode at most one block per step and drain what is collectable into the\ncaller's buffer before the next step, mirroring the donor's window-bounded\nflush loop, so the ring's live region stays within window_size + MAX_BLOCK_SIZE.\n\nOn the create-decode-drop streaming pattern this removes the per-frame ring\ngrowth: a fresh decoder now matches a reused one (the growth cost was ~24% of\nfresh streaming decode locally). Add a regression test that streams a frame\nwhose content far exceeds its window so the ring cycles many times.\n\n* fix(checksum): gate streaming hash on frame flag, correct wasm default docs, frame_emit_info checksum range\n\n- decode_blocks computes the drain XXH64 only when the mode wants it AND the\n  frame's content_checksum_flag is set (a flag-off frame has nothing to verify\n  or expose), matching the direct path and get_calculated_checksum\n- wasm/npm docs stated the decode default was EmitOnly; the actual default is\n  None (skip the pass). Corrected the decompress and stream-constructor docs\n- populate_frame_emit_info takes an emit_checksum flag so a checksum-disabled\n  frame reports no checksum_range and a total_size without the 4-byte trailer\n\n* fix(decode): keep output counter current on ring/flat inline-exec\n\nThe inline exec_sequence path advances the backend tail directly, bypassing\nDecodeBuffer::total_output_counter (the direct UserSlice path reads tail, so it\nintentionally skips the per-sequence counter RMW for ~9% on the hot path). But\nRingBuffer/FlatBuf read that counter for the resume output_offset and the\ndict-reachability gate, so once any sequence took the inline path the cumulative\ncount undercounted by the inline-produced bytes — breaking resume_at\n(output_offset disagreed with frame_emit_info) on the non-direct path.\n\nAdd BufferBackend::INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER (true for Ring/Flat,\nfalse for UserSlice) and bump the counter at every inline-exec dispatch site\nwhen it is set; const-folded away for UserSlice so the direct hot path keeps\nits saving. Fixes the two resume regression tests.\n\n* test(decode): drop ring-growth probe example\n\n* fix(decode): honor content-checksum mode in decode_from_to\n\ndecode_from_to has its own block loop (not decode_blocks), so it never set\ncompute_hash from the mode (always hashed, ignoring None) and never verified\n(Verify silently accepted a corrupt trailer). Set compute_hash from the mode +\nframe flag before the loop, and verify the digest once the frame is fully\ndecoded and drained, mirroring the streaming reader. Also drop the misleading\n'(default)' on the EmitOnly enum doc (the default is None) and lock the\nChecksumMismatch Display string with a test.\n\n* fix(decode): verify checksum on decode_from_to trailer-only call\n\nThe checksum-only early-return in decode_from_to (trailer delivered on a\nseparate call after the frame drained) returned Ok before reaching the\npost-drain verify, so a corrupt trailer arriving incrementally slipped through\nin Verify mode. Verify inline on that path too. Extend the regression test to\nsplit the trailer into its own call. Also add @param checksum JSDoc to the npm\ncompress/decompress/stream wrappers.\n\n* fix(decode): flush buffered tail on decode_from_to trailer call + verify on same-call finish\n\ndecode_from_to's checksum-only branch returned early on the trailer-only call,\nskipping the shared self.read drain — so a prior small-target call's buffered\ntail was never flushed. Consume the trailer and fall through to the shared\nread + post-drain verify instead (guard the block loop with frame_finished so\nit never misreads leftover bytes). StreamingDecoder::read now also verifies\nwhen a frame both finishes and fully drains within one call, so a caller that\nreads exactly the frame length and stops still sees a checksum mismatch. Add a\nsmall-target split-trailer regression test.\n\n* test(encode): cover StreamingEncoder set_content_checksum + fix finish() docs\n\n- add regression tests: checksum(false) clears the header flag, omits the\n  4-byte XXH64 trailer (hash feature), and a post-write toggle errors\n- CompressStream.finish() JSDoc no longer claims an unconditional checksum\n  trailer (it is emitted only when the stream was created with checksum on)\n\n* test(decode): add regression for StreamingDecoder Read-contract on checksum\n\nA read() that drains the final bytes of a Verify-mode frame AND finishes\nit must not return the checksum Err (Read mandates no bytes on error). This\ntest fails on the current post-loop verify (returns Err with written > 0)\nand passes once the verify is gated to the zero-byte case.\n\n* fix(decode): defer same-call checksum verify when read delivered bytes\n\nGate the post-loop content-checksum verify on written == 0. When a read()\nboth finishes the frame and drains its last bytes, returning the mismatch\nErr there would violate the Read contract (no bytes on error) and drop the\ndelivered bytes. The verify is deferred to the next zero-byte read(), where\nthe top early-return reports it safely. The top check already handled the\ncommon multi-call case; only the single-large-buffer call was affected.",
+          "timestamp": "2026-06-09T01:06:25+03:00",
+          "tree_id": "5eb1cfe809218261a561c1a2a7aec6a11ac29070",
+          "url": "https://github.com/structured-world/structured-zstd/commit/2082bfc78d6bc5fb56458c556f7594dff1bf05dc"
+        },
+        "date": 1780959227053,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.126,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.088,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 289.911,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 203.306,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.353,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.508,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.499,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.082,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.377,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 2.025,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.122,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.121,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.015,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 17.533,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.752,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.277,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.3,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.851,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.27,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.589,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.128,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.3,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.141,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.108,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.272,
             "unit": "ms"
           }
         ]
