@@ -189,6 +189,22 @@ fn main() {
                 total = total.wrapping_add(wrote);
             }
         }
+        "stream" => {
+            // Streaming decode path: `StreamingDecoder` is backed by the
+            // wrapping `RingBuffer` (the `source=rust_stream` dashboard arm),
+            // distinct from `decode_all`'s flat/UserSlice backend.
+            use std::io::Read as _;
+            use structured_zstd::decoding::StreamingDecoder;
+            let mut sink = Vec::with_capacity(n + WILDCOPY_OVERLENGTH);
+            for _ in 0..iters {
+                sink.clear();
+                let mut decoder =
+                    StreamingDecoder::new(std::hint::black_box(compressed.as_slice()))
+                        .expect("StreamingDecoder::new");
+                decoder.read_to_end(&mut sink).expect("stream decode");
+                total = total.wrapping_add(sink.len());
+            }
+        }
         _ => {
             let mut decoder = FrameDecoder::new();
             for _ in 0..iters {
