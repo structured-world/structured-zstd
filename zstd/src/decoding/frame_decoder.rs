@@ -2344,15 +2344,44 @@ impl FrameDecoder {
     ) -> Result<(), FrameDecoderError> {
         let len = output.len();
         let cap = output.capacity();
-        output.resize(cap, 0);
+        // Expose the spare capacity `[len..cap]` as the decode target WITHOUT
+        // a `resize(cap, 0)` zero-fill. The decoder overwrites every byte it
+        // reports written, so pre-zeroing the whole buffer is wasted work — a
+        // full-output `__memset_avx2` per call that dominated decode time on
+        // capacity-sized output (`Vec::with_capacity(fcs)`).
+        //
+        // SAFETY: `set_len(cap)` exposes the allocated-but-uninitialised tail
+        // `[len..cap]`. Sound because:
+        //  * `u8` has no invalid bit patterns, so an uninitialised byte is
+        //    never an invalid *value* (UB only on *reading* it as a real u8).
+        //  * `decode_all` only WRITES into the slice and reads back solely
+        //    bytes it has already written: match copies reference earlier
+        //    output positions `pos - offset` with `offset <= pos`, validated
+        //    before the read, so they never touch the uninitialised tail.
+        //  * On both success and error we set the length to a span that is
+        //    fully written (`len + bytes_written`, clamped) or back to the
+        //    original `len`, so the uninitialised tail is never observable to
+        //    the caller. `u8` has no `Drop`, so a panic mid-decode that drops
+        //    the `Vec` at `len == cap` carries no teardown obligation.
+        unsafe {
+            output.set_len(cap);
+        }
         match self.decode_all(input, &mut output[len..]) {
             Ok(bytes_written) => {
                 let new_len = core::cmp::min(len + bytes_written, cap); // Sanitizes `bytes_written`.
-                output.resize(new_len, 0);
+                // SAFETY: bytes `[len..new_len]` were written by `decode_all`;
+                // the rest returns to (unobservable) spare capacity.
+                unsafe {
+                    output.set_len(new_len);
+                }
                 Ok(())
             }
             Err(e) => {
-                output.resize(len, 0);
+                // SAFETY: restore the pre-call length; the tail returns to
+                // spare capacity, never observed by the caller.
+                unsafe {
+                    output.set_len(len);
+                }
                 Err(e)
             }
         }
