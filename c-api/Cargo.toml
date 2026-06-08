@@ -1,0 +1,27 @@
+[package]
+name = "structured-zstd-c"
+version = "0.0.33"
+rust-version = "1.92"
+authors = ["Structured World Foundation <foundation@sw.foundation>"]
+edition = "2024"
+license = "Apache-2.0"
+homepage = "https://github.com/structured-world/structured-zstd"
+repository = "https://github.com/structured-world/structured-zstd"
+description = "C ABI (libzstd-compatible) front end for the structured-zstd pure-Rust codec."
+# The cdylib is consumed as a system library (drop-in for libzstd.so.1), not
+# from crates.io, so it stays out of the release-plz publish set for now.
+publish = false
+
+[lib]
+# The output artifacts are `libstructured_zstd.so` / `.a`; the SONAME is
+# rewritten to `libzstd.so.1` by build.rs so a consumer linked against
+# upstream libzstd resolves against this build with no rebuild.
+name = "structured_zstd"
+# `lib` (rlib) is added alongside the C artifacts so the crate's own test
+# harness can link the wrappers; the shipped artifacts are the cdylib + staticlib.
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+# Default features pull in std + hash (checksums/LDM) + the per-CPU kernel
+# tiers — the C ABI is a host library, so std is always available here.
+structured-zstd = { path = "../zstd" }

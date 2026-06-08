@@ -39,6 +39,48 @@ pub use frame_decoder::{BlockDecodingStrategy, ContentChecksum, FrameDecoder};
 pub use frame_decoder::{PartialDecode, ResumeInput, ResumeState};
 pub use streaming_decoder::StreamingDecoder;
 
+/// Decompressed size a frame declares in its header, as read by
+/// [`read_frame_content_size`] without decoding the frame body.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FrameContentSize {
+    /// The header carried an explicit `Frame_Content_Size` field (in bytes).
+    Known(u64),
+    /// The header did not declare a content size; the true size is only
+    /// known after decoding (or from out-of-band knowledge).
+    Unknown,
+}
+
+/// Read the decompressed size a frame declares in its header, without
+/// decoding the frame body.
+///
+/// Parses only the leading frame header of `src`. Returns
+/// [`FrameContentSize::Known`] when the header carries an explicit
+/// `Frame_Content_Size`, or [`FrameContentSize::Unknown`] when it does not.
+/// This backs the C `ZSTD_getFrameContentSize` entry point, where the two
+/// variants map to a concrete size and `ZSTD_CONTENTSIZE_UNKNOWN`.
+///
+/// # Errors
+/// Returns [`ReadFrameHeaderError`](errors::ReadFrameHeaderError) when `src`
+/// is too short to hold a header, carries a bad magic number, or begins with
+/// a skippable frame.
+///
+/// ```rust
+/// use structured_zstd::encoding::{compress_slice_to_vec, CompressionLevel};
+/// use structured_zstd::decoding::{read_frame_content_size, FrameContentSize};
+/// let frame = compress_slice_to_vec(&[42u8; 100], CompressionLevel::Default);
+/// assert_eq!(read_frame_content_size(&frame).unwrap(), FrameContentSize::Known(100));
+/// ```
+pub fn read_frame_content_size(
+    src: &[u8],
+) -> Result<FrameContentSize, errors::ReadFrameHeaderError> {
+    let (header, _consumed) = frame::read_frame_header_with_format(src, false)?;
+    Ok(if header.fcs_declared() {
+        FrameContentSize::Known(header.frame_content_size())
+    } else {
+        FrameContentSize::Unknown
+    })
+}
+
 pub(crate) mod block_decoder;
 pub(crate) mod buffer_backend;
 pub(crate) mod decode_buffer;
