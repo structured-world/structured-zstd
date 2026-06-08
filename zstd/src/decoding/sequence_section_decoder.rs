@@ -1020,6 +1020,9 @@ pub(crate) fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBac
     // 16 != 1` — keeping the donor inline path active on more
     // sequences near the end of the literals buffer.
     let inline_path_safe = B::SUPPORTS_INLINE_SEQUENCE_EXEC
+        && buffer
+            .buffer_mut()
+            .inline_exec_ok(seq.ll as usize, seq.ml as usize)
         && lit_cur_before.checked_add(16).is_some_and(|b| b <= lit_len)
         && (seq.ll as usize <= 16
             || lit_cur_before
@@ -1165,6 +1168,9 @@ pub(crate) unsafe fn execute_one_sequence_pipelined_avx2<
     // literal copy (the divergence is on match-copy only, see
     // `UserSliceBackend::exec_sequence_inline_avx2`).
     let inline_path_safe = B::SUPPORTS_INLINE_SEQUENCE_EXEC
+        && buffer
+            .buffer_mut()
+            .inline_exec_ok(seq.ll as usize, seq.ml as usize)
         && lit_cur_before.checked_add(16).is_some_and(|b| b <= lit_len)
         && (seq.ll as usize <= 16
             || lit_cur_before

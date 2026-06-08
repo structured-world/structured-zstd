@@ -274,6 +274,25 @@ pub(crate) trait BufferBackend: Sized {
         unreachable!("inline_exec_commit on a backend without inline-sequence support")
     }
 
+    /// Whether the inline `ZSTD_execSequence` body (the `exec_sequence_*`
+    /// macros / [`Self::exec_sequence_inline`]) may run for this
+    /// `(lit_length, match_length)` at the current cursor. The inline body
+    /// addresses the output linearly (`base + tail …`, match source
+    /// `base + tail + lit_length - offset`) with up to 31 bytes of wildcopy
+    /// overshoot, so it is only sound when that region is one contiguous run.
+    ///
+    /// Linear backends (`FlatBuf`, `UserSliceBackend`) are always contiguous,
+    /// so the default returns `true` and their `sequence_output_fits` /
+    /// tight-tail / grow handling covers capacity. `RingBuffer` overrides this
+    /// to reject the cases where the live region has wrapped or the write
+    /// would cross `cap`; the caller then takes the wrap-correct cold
+    /// `push` / `repeat` path instead.
+    #[allow(unused_variables)]
+    #[inline(always)]
+    fn inline_exec_ok(&self, lit_length: usize, match_length: usize) -> bool {
+        true
+    }
+
     /// Construct an empty backend. Backend-specific sizing is done
     /// via `with_capacity` constructors on the concrete types (see
     /// [`super::flat_buf::FlatBuf::with_capacity`]).
