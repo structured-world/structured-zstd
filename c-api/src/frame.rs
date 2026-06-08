@@ -183,7 +183,12 @@ pub unsafe extern "C" fn ZSTD_findDecompressedSize(src: *const u8, src_size: usi
     let mut total: u64 = 0;
     while !rest.is_empty() {
         match read_frame_content_size(rest) {
-            Ok(FrameContentSize::Known(size)) => total = total.saturating_add(size),
+            // checked_add, not saturating: a saturated u64::MAX would alias the
+            // CONTENTSIZE_UNKNOWN sentinel and mask the overflow.
+            Ok(FrameContentSize::Known(size)) => match total.checked_add(size) {
+                Some(sum) => total = sum,
+                None => return CONTENTSIZE_ERROR,
+            },
             Ok(FrameContentSize::Unknown) => return CONTENTSIZE_UNKNOWN,
             // Skippable frames add nothing to the decompressed size.
             Err(ReadFrameHeaderError::SkipFrame { .. }) => {}
@@ -211,7 +216,12 @@ pub unsafe extern "C" fn ZSTD_decompressBound(src: *const u8, src_size: usize) -
     let mut total: u64 = 0;
     while !rest.is_empty() {
         match frame_decompressed_bound(rest) {
-            Ok(bound) => total = total.saturating_add(bound),
+            // checked_add, not saturating: a saturated u64::MAX would alias the
+            // CONTENTSIZE_UNKNOWN sentinel and mask the overflow.
+            Ok(bound) => match total.checked_add(bound) {
+                Some(sum) => total = sum,
+                None => return CONTENTSIZE_ERROR,
+            },
             Err(_) => return CONTENTSIZE_ERROR,
         }
         match find_frame_compressed_size(rest) {
