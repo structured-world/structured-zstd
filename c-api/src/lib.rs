@@ -12,6 +12,15 @@
 //!
 //! Every wrapper here is `unsafe extern "C"`; the safety contracts mirror the
 //! upstream documentation (valid `(ptr, len)` buffers, live context handles).
+//!
+//! This crate is intentionally std-only — it has no `no_std` prologue and no
+//! `std` feature gate. It exists solely to emit a host shared object / static
+//! archive (`libzstd.so.1` / `libzstd.a`) and every `extern "C"` wrapper guards
+//! the boundary with [`std::panic::catch_unwind`], which is mandatory for
+//! soundness: a Rust panic must not unwind into C. `catch_unwind` requires the
+//! standard library, so the wrappers cannot build under `no_std`. The
+//! `no_std + alloc` surface lives in the pure-Rust [`codec`] crate this depends
+//! on; consumers wanting an embedded build link `codec` directly.
 
 mod context;
 mod error;
