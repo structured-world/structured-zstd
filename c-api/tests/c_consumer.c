@@ -57,8 +57,15 @@ int main(void) {
     ZSTD_DCtx *dctx = ZSTD_createDCtx();
     if (!cctx || !dctx) return 10;
     size_t c2 = ZSTD_compressCCtx(cctx, comp, bound, input, n, 5);
+    /* Validate c2 before it is reused as srcSize: on error it is an
+       error-encoded size_t, and passing that to decompress would feed a bogus
+       (huge) length and read out of bounds. */
+    if (ZSTD_isError(c2)) {
+        fprintf(stderr, "compressCCtx: %s\n", ZSTD_getErrorName(c2));
+        return 11;
+    }
     size_t d2 = ZSTD_decompressDCtx(dctx, out, n, comp, c2);
-    if (ZSTD_isError(c2) || ZSTD_isError(d2) || d2 != n || memcmp(out, input, n) != 0) {
+    if (ZSTD_isError(d2) || d2 != n || memcmp(out, input, n) != 0) {
         return 11;
     }
     ZSTD_freeCCtx(cctx);

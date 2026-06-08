@@ -215,17 +215,25 @@ jobs:
       - name: pkg-config reports upstream version
         run: |
           set -euo pipefail
-          pc=$(find target -name libzstd.pc | head -1)
-          echo "found $pc"; cat "$pc"
-          grep -qx "Version: 1.5.7" "$pc"
+          # Validate every discovered libzstd.pc, not just the first hit: a
+          # restored cache can leave a stale file ahead of the fresh build.
+          mapfile -t pcs < <(find target -type f -name libzstd.pc)
+          test "${#pcs[@]}" -gt 0
+          for pc in "${pcs[@]}"; do
+            echo "checking $pc"; cat "$pc"
+            grep -qx "Version: 1.5.7" "$pc"
+          done
       - name: Real C consumer links + round-trips
         run: |
           set -euo pipefail
           # The cdylib advertises SONAME libzstd.so.1, so a consumer records a
-          # NEEDED dependency on that name — provide it via a symlink.
+          # NEEDED dependency on that name; provide it via a symlink. Also
+          # expose the canonical `libzstd.so` link name and link with `-lzstd`,
+          # exactly the path a real drop-in C consumer uses.
           ln -sf libstructured_zstd.so target/debug/libzstd.so.1
+          ln -sf libstructured_zstd.so target/debug/libzstd.so
           cc -std=c11 -Wall -Wextra -Ic-api/include c-api/tests/c_consumer.c \
-            -Ltarget/debug -lstructured_zstd -o /tmp/c_consumer
+            -Ltarget/debug -lzstd -o /tmp/c_consumer
           LD_LIBRARY_PATH=target/debug /tmp/c_consumer
       - name: musl static drop-in builds + exports symbols
         # musl is a std target (not no-std); its default `+crt-static` profile
