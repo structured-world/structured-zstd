@@ -34,7 +34,10 @@ wasm-bindgen = "0.2"
 # go stale on the next core bump and break packaging again. The requirement
 # is purely ceremonial: `path` always wins for local/workspace builds and
 # this crate is never published to crates.io.
-structured-zstd = { version = "0", path = "../zstd", default-features = false, features = ["kernel_simd128"] }
+# `hash` enables XXH64 content-checksum support (the `ContentChecksum` modes +
+# encoder toggle exposed below). twox-hash is `no_std`, so this adds the
+# checksum code without pulling `std`.
+structured-zstd = { version = "0", path = "../zstd", default-features = false, features = ["kernel_simd128", "hash"] }
 
 # Size-tuned wasm-pack release profile: optimise for size + a wasm-opt -Oz
 # post-pass, since payload bytes are the budget for a published wasm module.

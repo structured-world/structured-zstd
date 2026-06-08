@@ -17,6 +17,19 @@
 
 import { simd } from "wasm-feature-detect";
 
+/**
+ * How the decoder treats a frame's optional XXH64 content checksum. Numeric
+ * values match the wasm-bindgen `ContentChecksum` enum.
+ */
+export enum ContentChecksum {
+  /** Skip the XXH64 pass entirely (fastest; no verification). */
+  None = 0,
+  /** Compute the checksum but do not error on a mismatch (default). */
+  EmitOnly = 1,
+  /** Compute and verify; a mismatch rejects the decode. */
+  Verify = 2,
+}
+
 /** Shape of a wasm-pack `web`-target payload glue module (simd or scalar). */
 interface Payload {
   /** Async wasm initialiser. Accepts wasm bytes / a URL, or nothing (browser). */
@@ -24,12 +37,21 @@ interface Payload {
   // (bytes / URL / Response / Module), and Node's `fs.readFile` returns
   // `Buffer<ArrayBufferLike>`, wider than the DOM `BufferSource` in the .d.ts.
   default: (moduleOrPath?: unknown) => Promise<unknown>;
-  compress: (data: Uint8Array, level: number) => Uint8Array;
-  decompress: (data: Uint8Array) => Uint8Array;
-  compressUsingDict: (data: Uint8Array, dict: Uint8Array, level: number) => Uint8Array;
-  decompressUsingDict: (data: Uint8Array, dict: Uint8Array) => Uint8Array;
-  ZstdDecompressStream: new () => DecompressStream;
-  ZstdCompressStream: new (level: number) => CompressStream;
+  compress: (data: Uint8Array, level: number, checksum?: boolean) => Uint8Array;
+  decompress: (data: Uint8Array, checksum?: ContentChecksum) => Uint8Array;
+  compressUsingDict: (
+    data: Uint8Array,
+    dict: Uint8Array,
+    level: number,
+    checksum?: boolean,
+  ) => Uint8Array;
+  decompressUsingDict: (
+    data: Uint8Array,
+    dict: Uint8Array,
+    checksum?: ContentChecksum,
+  ) => Uint8Array;
+  ZstdDecompressStream: new (checksum?: ContentChecksum) => DecompressStream;
+  ZstdCompressStream: new (level: number, checksum?: boolean) => CompressStream;
 }
 
 /**
@@ -42,8 +64,22 @@ interface Payload {
 export interface DecompressStream {
   /** Feed compressed bytes; returns decompressed output available so far. */
   push(chunk: Uint8Array): Uint8Array;
-  /** Signal end of input; returns the final bytes. Throws if incomplete. */
+  /**
+   * Signal end of input; returns the final bytes. Throws if incomplete, or
+   * (in {@link ContentChecksum.Verify} mode) if the content checksum is wrong.
+   */
   finish(): Uint8Array;
+  /**
+   * Content checksum stored in the frame trailer, or `undefined` if none.
+   * Meaningful after {@link DecompressStream.finish}.
+   */
+  storedChecksum(): number | undefined;
+  /**
+   * XXH64 digest computed over the output (low 32 bits), or `undefined` under
+   * {@link ContentChecksum.None} or when the frame carried no checksum. Lets
+   * callers verify manually under {@link ContentChecksum.EmitOnly}.
+   */
+  calculatedChecksum(): number | undefined;
   /** Release the underlying wasm handle. */
   free(): void;
 }
@@ -124,18 +160,25 @@ export async function init(): Promise<void> {
 export async function compress(
   data: Uint8Array,
   level: number = DEFAULT_LEVEL,
+  checksum?: boolean,
 ): Promise<Uint8Array> {
   loading ??= load();
-  return (await loading).compress(data, level);
+  return (await loading).compress(data, level, checksum);
 }
 
 /**
  * Decompress a complete Zstandard frame. Rejects if the input is not a valid,
- * complete frame.
+ * complete frame, or — when `checksum` is {@link ContentChecksum.Verify} — if
+ * the content checksum does not match. Defaults to
+ * {@link ContentChecksum.EmitOnly}; pass {@link ContentChecksum.None} to skip
+ * the XXH64 pass for speed.
  */
-export async function decompress(data: Uint8Array): Promise<Uint8Array> {
+export async function decompress(
+  data: Uint8Array,
+  checksum?: ContentChecksum,
+): Promise<Uint8Array> {
   loading ??= load();
-  return (await loading).decompress(data);
+  return (await loading).decompress(data, checksum);
 }
 
 /**
@@ -148,9 +191,10 @@ export async function compressUsingDict(
   data: Uint8Array,
   dict: Uint8Array,
   level: number = DEFAULT_LEVEL,
+  checksum?: boolean,
 ): Promise<Uint8Array> {
   loading ??= load();
-  return (await loading).compressUsingDict(data, dict, level);
+  return (await loading).compressUsingDict(data, dict, level, checksum);
 }
 
 /**
@@ -161,9 +205,10 @@ export async function compressUsingDict(
 export async function decompressUsingDict(
   data: Uint8Array,
   dict: Uint8Array,
+  checksum?: ContentChecksum,
 ): Promise<Uint8Array> {
   loading ??= load();
-  return (await loading).decompressUsingDict(data, dict);
+  return (await loading).decompressUsingDict(data, dict, checksum);
 }
 
 /**
@@ -172,9 +217,11 @@ export async function decompressUsingDict(
  * Unlike the common npm wasm zstd packages, the frame need not be fully
  * buffered — the decoder window lives on the wasm side across chunks.
  */
-export async function createDecompressStream(): Promise<DecompressStream> {
+export async function createDecompressStream(
+  checksum?: ContentChecksum,
+): Promise<DecompressStream> {
   loading ??= load();
-  return new (await loading).ZstdDecompressStream();
+  return new (await loading).ZstdDecompressStream(checksum);
 }
 
 /**
@@ -188,7 +235,8 @@ export async function createDecompressStream(): Promise<DecompressStream> {
  */
 export async function createCompressStream(
   level: number = DEFAULT_LEVEL,
+  checksum?: boolean,
 ): Promise<CompressStream> {
   loading ??= load();
-  return new (await loading).ZstdCompressStream(level);
+  return new (await loading).ZstdCompressStream(level, checksum);
 }
