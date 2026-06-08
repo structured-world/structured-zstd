@@ -300,6 +300,14 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         }
     }
 
+    /// Heap bytes owned by this table. The `decode` table is a fixed inline
+    /// array (counted by `size_of`, not here); only the build-scratch vectors
+    /// are heap-allocated.
+    pub fn heap_bytes(&self) -> usize {
+        self.symbol_spread_buffer.capacity()
+            + self.symbol_probabilities.capacity() * core::mem::size_of::<i32>()
+    }
+
     /// Live decode entries (`decode[..decode_len]`).
     #[inline(always)]
     pub fn decode(&self) -> &[E] {

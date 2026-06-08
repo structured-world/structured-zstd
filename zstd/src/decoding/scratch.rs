@@ -160,6 +160,18 @@ impl<B: BufferBackend> DecoderScratch<B> {
         }
     }
 
+    /// Total heap bytes this scratch holds: the decode-window buffer plus the
+    /// per-block literal and block-content buffers and the entropy tables. The
+    /// window dominates and scales with the frame; the rest are bounded by the
+    /// block maximum and the entropy alphabet.
+    pub fn workspace_bytes(&self) -> usize {
+        self.buffer.capacity()
+            + self.literals_buffer.capacity()
+            + self.block_content_buffer.capacity()
+            + self.huf.heap_bytes()
+            + self.fse.heap_bytes()
+    }
+
     pub fn reset(&mut self, window_size: usize) {
         self.offset_hist = [1, 4, 8];
         self.literals_buffer.clear();
@@ -281,6 +293,14 @@ impl HuffmanScratch {
         }
     }
 
+    /// Heap bytes owned by this scratch: the locally-built Huffman table.
+    /// A `Dict`-sourced table is read through a shared, ref-counted handle
+    /// (not owned here), so it is excluded, mirroring upstream not charging
+    /// `refDDict` memory to the decode context.
+    pub fn heap_bytes(&self) -> usize {
+        self.table.heap_bytes()
+    }
+
     /// Live Huffman literals table: the shared dictionary's (zero-copy)
     /// while the source is still `Dict`, else the locally-built one.
     pub(crate) fn huf_table(&self) -> &HuffmanTable {
@@ -390,6 +410,16 @@ pub struct FSEScratch {
 }
 
 impl FSEScratch {
+    /// Heap bytes owned by the three locally-built sequence FSE tables
+    /// (LL/ML/OF). The fixed-size decode arrays are inline (counted by
+    /// `size_of`); this sums their build-scratch vectors. `Dict`-sourced
+    /// tables read a shared handle and are not owned here.
+    pub fn heap_bytes(&self) -> usize {
+        self.offsets.heap_bytes()
+            + self.literal_lengths.heap_bytes()
+            + self.match_lengths.heap_bytes()
+    }
+
     pub fn new() -> FSEScratch {
         FSEScratch {
             offsets: AlignedFSETable::new(MAX_OFFSET_CODE),

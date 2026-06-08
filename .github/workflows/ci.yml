@@ -140,6 +140,120 @@ jobs:
             exit 1
           fi
 
+  c-abi:
+    # Builds the libzstd-compatible C ABI front end and verifies it is a real
+    # drop-in: vendored headers match upstream verbatim, the cdylib advertises
+    # SONAME libzstd.so.1, every declared symbol is exported, and a genuine C
+    # consumer links + round-trips through the vendored header.
+    needs: lint
+    timeout-minutes: 12
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_TAG: v1.5.7
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Build + test + header-diff job (no push); don't leave the token
+          # in the checkout's git config.
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: c-abi
+      - name: Clippy (c-api)
+        run: cargo clippy -p structured-zstd-c --all-targets -- -D warnings
+      - name: Unit + ABI tests
+        run: cargo test -p structured-zstd-c
+      - name: Vendored headers match upstream verbatim
+        # The headers are copied byte-for-byte from the pinned upstream tag; a
+        # diff means someone edited a vendored header (forbidden) or the pin
+        # moved without re-vendoring.
+        run: |
+          set -euo pipefail
+          base="https://raw.githubusercontent.com/facebook/zstd/${UPSTREAM_TAG}/lib"
+          for h in zstd.h zdict.h zstd_errors.h; do
+            curl -fsSL "${base}/${h}" -o "/tmp/${h}.upstream"
+            if ! diff -u "/tmp/${h}.upstream" "c-api/include/${h}"; then
+              echo "::error::c-api/include/${h} diverges from upstream ${UPSTREAM_TAG}"
+              exit 1
+            fi
+          done
+          echo "vendored headers identical to upstream ${UPSTREAM_TAG}"
+      - name: Build cdylib + staticlib
+        run: cargo build -p structured-zstd-c
+      - name: SONAME is libzstd.so.1
+        run: |
+          set -euo pipefail
+          so=target/debug/libstructured_zstd.so
+          soname=$(readelf -d "$so" | sed -n 's/.*SONAME.*\[\(.*\)\]/\1/p')
+          echo "SONAME=$soname"
+          test "$soname" = "libzstd.so.1"
+      - name: All declared symbols are exported
+        run: |
+          set -euo pipefail
+          so=target/debug/libstructured_zstd.so
+          exported=$(nm -D --defined-only "$so" | awk '{print $NF}')
+          missing=0
+          for sym in \
+            ZSTD_compress ZSTD_decompress ZSTD_compressBound \
+            ZSTD_getFrameContentSize ZSTD_findFrameCompressedSize \
+            ZSTD_isError ZSTD_getErrorCode ZSTD_getErrorName ZSTD_getErrorString \
+            ZSTD_minCLevel ZSTD_maxCLevel ZSTD_defaultCLevel \
+            ZSTD_versionNumber ZSTD_versionString \
+            ZSTD_createCCtx ZSTD_freeCCtx ZSTD_createDCtx ZSTD_freeDCtx \
+            ZSTD_compressCCtx ZSTD_decompressDCtx ZSTD_sizeof_CCtx ZSTD_sizeof_DCtx \
+            ZSTD_frameHeaderSize ZSTD_getFrameHeader ZSTD_getFrameHeader_advanced \
+            ZSTD_findDecompressedSize ZSTD_decompressBound \
+            ZDICT_trainFromBuffer ZDICT_finalizeDictionary ZDICT_getDictID \
+            ZDICT_getDictHeaderSize ZDICT_isError ZDICT_getErrorName; do
+            if ! grep -qx "$sym" <<<"$exported"; then
+              echo "::error::symbol $sym not exported from $so"
+              missing=1
+            fi
+          done
+          test "$missing" -eq 0
+      - name: pkg-config reports upstream version
+        run: |
+          set -euo pipefail
+          # Validate every discovered libzstd.pc, not just the first hit: a
+          # restored cache can leave a stale file ahead of the fresh build.
+          mapfile -t pcs < <(find target -type f -name libzstd.pc)
+          test "${#pcs[@]}" -gt 0
+          for pc in "${pcs[@]}"; do
+            echo "checking $pc"; cat "$pc"
+            grep -qx "Version: 1.5.7" "$pc"
+          done
+      - name: Real C consumer links + round-trips
+        run: |
+          set -euo pipefail
+          # The cdylib advertises SONAME libzstd.so.1, so a consumer records a
+          # NEEDED dependency on that name; provide it via a symlink. Also
+          # expose the canonical `libzstd.so` link name and link with `-lzstd`,
+          # exactly the path a real drop-in C consumer uses.
+          ln -sf libstructured_zstd.so target/debug/libzstd.so.1
+          ln -sf libstructured_zstd.so target/debug/libzstd.so
+          cc -std=c11 -Wall -Wextra -Ic-api/include c-api/tests/c_consumer.c \
+            -Ltarget/debug -lzstd -o /tmp/c_consumer
+          LD_LIBRARY_PATH=target/debug /tmp/c_consumer
+      - name: musl static drop-in builds + exports symbols
+        # musl is a std target (not no-std); its default `+crt-static` profile
+        # makes the static archive `libstructured_zstd.a` the canonical drop-in
+        # for Alpine / fully-static binaries (the cdylib is dropped under
+        # crt-static, which is expected). Verify the archive builds and carries
+        # the exported wrappers.
+        run: |
+          set -euo pipefail
+          rustup target add x86_64-unknown-linux-musl
+          cargo build -p structured-zstd-c --target x86_64-unknown-linux-musl
+          a=target/x86_64-unknown-linux-musl/debug/libstructured_zstd.a
+          test -f "$a"
+          for sym in ZSTD_compress ZSTD_decompress ZSTD_versionNumber ZSTD_getFrameHeader; do
+            nm "$a" | grep -qE " T ${sym}$" || { echo "::error::$sym missing from musl staticlib"; exit 1; }
+          done
+          echo "musl staticlib OK ($(du -h "$a" | cut -f1))"
+
   test:
     needs: lint
     timeout-minutes: 15

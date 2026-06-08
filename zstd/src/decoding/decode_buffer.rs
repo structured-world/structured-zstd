@@ -182,6 +182,14 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         self.buffer.len()
     }
 
+    /// Allocated byte capacity of the backing buffer (the decode window).
+    /// Backs the workspace-footprint reporting; the value is the backend's
+    /// `cap()` (RingBuffer's ring-indexing capacity / FlatBuf's `Vec`
+    /// capacity), so it tracks the real heap reservation.
+    pub fn capacity(&self) -> usize {
+        self.buffer.cap()
+    }
+
     /// Active dictionary content bytes, borrowed through the shared handle
     /// (no copy). Empty slice when no dictionary is attached.
     #[inline]

@@ -488,6 +488,13 @@ impl DecoderScratchKind {
         }
     }
 
+    fn workspace_bytes(&self) -> usize {
+        match self {
+            Self::Ring(s) => s.workspace_bytes(),
+            Self::Flat(s) => s.workspace_bytes(),
+        }
+    }
+
     /// Pre-reserve the backing buffer to `window_size` in a single
     /// allocation. Called once on the non-direct (`decode_blocks`) path
     /// after direct-eligibility is ruled out, so multi-segment fallback
@@ -888,6 +895,20 @@ impl FrameDecoder {
             #[cfg(all(feature = "lsm", feature = "hash"))]
             computed_block_checksums: alloc::vec::Vec::new(),
         }
+    }
+
+    /// Heap bytes currently held by the decoder's lazily-grown workspace:
+    /// the decode-window buffer plus the per-block literal/content buffers
+    /// and the entropy tables. Returns 0 before the first frame is initialised
+    /// (no workspace allocated yet). The window allocation dominates and grows
+    /// with the frame's window size; this is the value to track for decode-time
+    /// memory pressure, mirroring the workspace term of upstream
+    /// `ZSTD_sizeof_DCtx`. Shared dictionaries (ref-counted handles) are not
+    /// counted, matching upstream excluding `refDDict` memory.
+    pub fn workspace_size(&self) -> usize {
+        self.state
+            .as_ref()
+            .map_or(0, |s| s.decoder_scratch.workspace_bytes())
     }
 
     /// Select how the frame's optional content checksum is handled
@@ -1642,8 +1663,20 @@ impl FrameDecoder {
         emit_resume: bool,
     ) -> Result<PartialDecode, FrameDecoderError> {
         use FrameDecoderError as err;
+        #[cfg(feature = "hash")]
+        let checksum_mode = self.content_checksum;
         let magicless = self.magicless;
         let state = self.state.as_mut().ok_or(err::NotYetInitialized)?;
+
+        // Honor the checksum mode before any drain/read can hash: `None` must
+        // compute no XXH64. `decode_blocks` sets this; the partial path must too,
+        // or a reused scratch keeps hashing with the default-enabled state.
+        #[cfg(feature = "hash")]
+        {
+            let compute_hash = checksum_mode != ContentChecksum::None
+                && state.frame_header.descriptor.content_checksum_flag();
+            state.decoder_scratch.set_compute_hash(compute_hash);
+        }
 
         // Mirror `decode_blocks`: pre-reserve the backing buffer to
         // `window_size` so multi-block frames don't pay repeated grow steps.

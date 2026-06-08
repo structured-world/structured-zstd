@@ -15,9 +15,7 @@
 #![cfg(target_arch = "wasm32")]
 
 use structured_zstd::decoding::{BlockDecodingStrategy, FrameDecoder, StreamingDecoder};
-use structured_zstd::encoding::{
-    CompressionLevel, FrameCompressor, StreamingEncoder, compress_slice_to_vec,
-};
+use structured_zstd::encoding::{CompressionLevel, FrameCompressor, StreamingEncoder};
 use structured_zstd::io::{Read, Write};
 use wasm_bindgen::prelude::*;
 
@@ -54,19 +52,16 @@ fn core_checksum(mode: Option<ContentChecksum>) -> structured_zstd::decoding::Co
 /// negative levels (`-7..=-1`) for the ultra-fast tier. The returned frame
 /// decodes in any compliant zstd decoder, including the native C library.
 ///
-/// `checksum` is optional (default `true`): pass `false` to emit a frame
-/// without the trailing XXH64 content checksum (semantics of
-/// `ZSTD_c_checksumFlag`).
+/// `checksum` is optional (default `false`, matching libzstd's
+/// `ZSTD_c_checksumFlag = 0`): pass `true` to append the trailing XXH64 content
+/// checksum.
 #[wasm_bindgen]
 pub fn compress(data: &[u8], level: i32, checksum: Option<bool>) -> Vec<u8> {
-    if checksum.unwrap_or(true) {
-        // Default: keep the historical fast path verbatim.
-        compress_slice_to_vec(data, CompressionLevel::Level(level))
-    } else {
-        let mut enc: FrameCompressor = FrameCompressor::new(CompressionLevel::Level(level));
-        enc.set_content_checksum(false);
-        enc.compress_independent_frame(data)
-    }
+    // Set the checksum flag explicitly in both cases rather than leaning on the
+    // encoder's own default, so the wasm default stays decoupled from it.
+    let mut enc: FrameCompressor = FrameCompressor::new(CompressionLevel::Level(level));
+    enc.set_content_checksum(checksum.unwrap_or(false));
+    enc.compress_independent_frame(data)
 }
 
 /// Decompress a complete Zstandard frame back into its original bytes.
@@ -98,6 +93,9 @@ pub fn decompress(data: &[u8], checksum: Option<ContentChecksum>) -> Result<Vec<
 /// Mirrors C `ZSTD_compress_usingDict`: the dictionary primes the encoder so
 /// small, similar payloads compress far better. The dictionary is the raw
 /// zstd dictionary blob (e.g. from `zstd --train`). Throws if it is invalid.
+///
+/// `checksum` is optional (default `false`, matching libzstd's
+/// `ZSTD_c_checksumFlag = 0`); pass `true` to append the XXH64 trailer.
 #[wasm_bindgen(js_name = compressUsingDict)]
 pub fn compress_using_dict(
     data: &[u8],
@@ -106,7 +104,7 @@ pub fn compress_using_dict(
     checksum: Option<bool>,
 ) -> Result<Vec<u8>, JsError> {
     let mut enc: FrameCompressor = FrameCompressor::new(CompressionLevel::Level(level));
-    enc.set_content_checksum(checksum.unwrap_or(true));
+    enc.set_content_checksum(checksum.unwrap_or(false));
     enc.set_dictionary_from_bytes(dict)
         .map_err(|err| JsError::new(&format!("structured-zstd: invalid dictionary: {err:?}")))?;
     Ok(enc.compress_independent_frame(data))
@@ -315,7 +313,8 @@ impl ZstdDecompressStream {
 /// Incremental streaming compressor: feed plaintext chunks via
 /// [`ZstdCompressStream::push`] and receive complete compressed blocks as the
 /// matcher window fills, then [`ZstdCompressStream::finish`] to seal the frame
-/// (final block + content checksum). Peak working set is O(window), not
+/// (final block, plus the XXH64 trailer only when `checksum` was enabled).
+/// Peak working set is O(window), not
 /// O(input) — emitted blocks are flushed to the caller while only the matcher
 /// window is retained — so a large payload never has to be buffered whole. The
 /// produced frame omits `Frame_Content_Size` (the total is unknown while
@@ -331,15 +330,16 @@ pub struct ZstdCompressStream {
 #[wasm_bindgen]
 impl ZstdCompressStream {
     /// Open a streaming compressor at `level` (zstd scale: `1..=22`, negatives
-    /// for the ultra-fast tier). `checksum` is optional (default `true`): pass
-    /// `false` to seal the frame without a trailing content checksum.
+    /// for the ultra-fast tier). `checksum` is optional (default `false`,
+    /// matching libzstd's `ZSTD_c_checksumFlag = 0`): pass `true` to seal the
+    /// frame with a trailing content checksum.
     #[wasm_bindgen(constructor)]
     pub fn new(level: i32, checksum: Option<bool>) -> ZstdCompressStream {
         let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Level(level));
         // Provably Ok: the encoder is fresh, so no frame header has been
         // emitted yet (the only failure mode of this setter).
         encoder
-            .set_content_checksum(checksum.unwrap_or(true))
+            .set_content_checksum(checksum.unwrap_or(false))
             .expect("fresh streaming encoder accepts the content-checksum toggle");
         ZstdCompressStream {
             encoder: Some(encoder),

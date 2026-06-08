@@ -198,6 +198,41 @@ pub fn compress_slice_to_vec(source: &[u8], level: CompressionLevel) -> Vec<u8> 
     enc.compress_independent_frame(source)
 }
 
+/// Worst-case compressed-frame size for an input of `src_size` bytes.
+///
+/// A destination buffer of this size is always large enough to hold the
+/// output of [`compress_slice_to_vec`] (or any single-frame compression) for
+/// an input of `src_size` bytes, so a caller sizing a fixed buffer once (the
+/// shape the C `ZSTD_compress` entry point needs) never has to grow it.
+///
+/// Mirrors the upstream `ZSTD_COMPRESSBOUND` formula exactly:
+/// `src_size + (src_size >> 8) + margin`, where `margin` is
+/// `(128 KiB - src_size) >> 11` for inputs below 128 KiB and `0` otherwise.
+/// The margin guarantees `bound(a) + bound(b) <= bound(a + b)` for blocks of
+/// at least 128 KiB, which keeps multi-frame concatenation sizing sound.
+///
+/// Saturates at [`usize::MAX`] if the formula would overflow on a
+/// pathologically large `src_size` — no allocation that large can exist, so
+/// the saturated value is the correct "cannot fit" sentinel rather than a
+/// masked wrap.
+///
+/// ```rust
+/// use structured_zstd::encoding::{compress_bound, compress_slice_to_vec, CompressionLevel};
+/// let data = [7u8; 4096];
+/// assert!(compress_slice_to_vec(&data, CompressionLevel::Default).len() <= compress_bound(data.len()));
+/// ```
+pub const fn compress_bound(src_size: usize) -> usize {
+    const LOWER: usize = 128 * 1024;
+    let margin = if src_size < LOWER {
+        (LOWER - src_size) >> 11
+    } else {
+        0
+    };
+    src_size
+        .saturating_add(src_size >> 8)
+        .saturating_add(margin)
+}
+
 /// Compress a byte slice into a fresh `Vec<u8>` using fine-grained
 /// [`CompressionParameters`] (#27) instead of a bare
 /// [`CompressionLevel`].
@@ -439,4 +474,38 @@ pub enum Sequence<'data> {
     ///
     /// These literals will just be copied at the end of the sequence execution by the decoder
     Literals { literals: &'data [u8] },
+}
+
+#[cfg(test)]
+mod compress_bound_tests {
+    use super::{CompressionLevel, compress_bound, compress_slice_to_vec};
+
+    #[test]
+    fn matches_upstream_formula_below_threshold() {
+        // src_size + (src_size >> 8) + ((128 KiB - src_size) >> 11).
+        assert_eq!(compress_bound(0), 64);
+        assert_eq!(compress_bound(4096), 4096 + 16 + 62);
+    }
+
+    #[test]
+    fn drops_margin_at_and_above_threshold() {
+        let lower = 128 * 1024;
+        assert_eq!(compress_bound(lower), lower + (lower >> 8));
+        assert_eq!(compress_bound(lower + 1), (lower + 1) + ((lower + 1) >> 8));
+    }
+
+    #[test]
+    fn saturates_instead_of_wrapping() {
+        // No allocation this large can exist; the ceiling is the right sentinel.
+        assert_eq!(compress_bound(usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn always_fits_real_compressed_output() {
+        for len in [0usize, 1, 100, 4096, 200_000] {
+            let data = alloc::vec![7u8; len];
+            let out = compress_slice_to_vec(&data, CompressionLevel::Default);
+            assert!(out.len() <= compress_bound(len), "len={len}");
+        }
+    }
 }
