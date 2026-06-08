@@ -2,6 +2,7 @@
 
 use core::borrow::BorrowMut;
 
+use crate::common::MAX_BLOCK_SIZE;
 use crate::decoding::errors::FrameDecoderError;
 use crate::decoding::{BlockDecodingStrategy, DictionaryHandle, FrameDecoder};
 #[cfg(not(feature = "std"))]
@@ -154,34 +155,41 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
             return Ok(0);
         }
 
-        // need to loop. The UpToBytes strategy doesn't take any effort to actually reach that limit.
-        // The first few calls can result in just filling the decode buffer but these bytes can not be collected.
-        // So we need to call this until we can actually collect enough bytes
-
-        // TODO add BlockDecodingStrategy::UntilCollectable(usize) that pushes this logic into the decode_blocks function
-        while decoder.can_collect() < buf.len() && !decoder.is_finished() {
-            //More bytes can be decoded
-            let additional_bytes_needed = buf.len() - decoder.can_collect();
-            match decoder.decode_blocks(
-                &mut self.source,
-                BlockDecodingStrategy::UptoBytes(additional_bytes_needed),
-            ) {
-                Ok(_) => { /*Nothing to do*/ }
-                Err(e) => {
-                    let err;
-                    #[cfg(feature = "std")]
-                    {
-                        err = Error::other(e);
-                    }
-                    #[cfg(not(feature = "std"))]
-                    {
-                        err = Error::new(ErrorKind::Other, alloc::boxed::Box::new(e));
-                    }
-                    return Err(err);
+        // Interleave bounded decode with draining so the decode window
+        // (`RingBuffer`) stays near `window_size` instead of accumulating the
+        // whole request before a single end-of-call drain. `read_to_end` hands
+        // ever-larger buffers; decoding `buf.len()` worth into the ring up
+        // front grew it far past the window (repeated `reserve_amortized`
+        // alloc+copy). Decode at most one block worth per step, then drain
+        // what is now collectable into `buf`, mirroring the donor's
+        // window-bounded flush loop.
+        let mut written = 0;
+        while written < buf.len() {
+            // Drain whatever is collectable now (retaining `window_size` until
+            // the frame finishes). Reclaims the ring promptly so the next
+            // decode step reuses the same capacity.
+            written += decoder.read(&mut buf[written..])?;
+            if written == buf.len() || decoder.is_finished() {
+                break;
+            }
+            // Decode one bounded chunk. `UptoBytes` may overshoot a little but
+            // is capped to one block, so the ring's live region stays within
+            // `window_size + MAX_BLOCK_SIZE`.
+            let step = (buf.len() - written).min(MAX_BLOCK_SIZE as usize);
+            if let Err(e) =
+                decoder.decode_blocks(&mut self.source, BlockDecodingStrategy::UptoBytes(step))
+            {
+                #[cfg(feature = "std")]
+                {
+                    return Err(Error::other(e));
+                }
+                #[cfg(not(feature = "std"))]
+                {
+                    return Err(Error::new(ErrorKind::Other, alloc::boxed::Box::new(e)));
                 }
             }
         }
 
-        decoder.read(buf)
+        Ok(written)
     }
 }
