@@ -3059,6 +3059,39 @@ mod tests {
         assert!(dec.get_calculated_checksum().is_none());
     }
 
+    #[cfg(all(feature = "std", feature = "hash"))]
+    #[test]
+    fn offload_checksum_output_is_byte_identical_to_inline() {
+        // The scoped-worker checksum path must produce exactly the same frame
+        // bytes as the inline path (it only moves the XXH64 work off-thread),
+        // and the frame must still decode + verify.
+        let payload: Vec<u8> = (0..200_000u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+            .collect();
+
+        let mut inline: FrameCompressor = FrameCompressor::new(CompressionLevel::Default);
+        let inline_bytes = inline.compress_independent_frame(&payload);
+
+        let mut offloaded: FrameCompressor = FrameCompressor::new(CompressionLevel::Default);
+        offloaded.set_offload_checksum(true);
+        let offloaded_bytes = offloaded.compress_independent_frame(&payload);
+
+        assert_eq!(
+            inline_bytes, offloaded_bytes,
+            "offloaded checksum must yield byte-identical frame"
+        );
+
+        use crate::decoding::ContentChecksum;
+        let mut dec = FrameDecoder::new();
+        dec.set_content_checksum(ContentChecksum::Verify);
+        let mut out =
+            alloc::vec![0u8; payload.len() + super::super::buffer_backend::WILDCOPY_OVERLENGTH];
+        let n = dec
+            .decode_all(&offloaded_bytes, &mut out)
+            .expect("offloaded-checksum frame must decode and verify");
+        assert_eq!(&out[..n], payload.as_slice());
+    }
+
     #[cfg(feature = "hash")]
     #[test]
     fn encoder_without_checksum_emits_no_trailing_digest() {

@@ -108,8 +108,20 @@ pub struct FrameCompressor<
     /// feature at frame-build time, so without `hash` no checksum is emitted
     /// regardless. Set via [`Self::set_content_checksum`].
     content_checksum: bool,
+    /// When `true` (and `std` + `hash` are active), the one-shot
+    /// (`compress_independent_frame*`) path computes the XXH64 content
+    /// checksum on a scoped worker thread concurrent with compression instead
+    /// of inline. Default `false`. Set via [`Self::set_offload_checksum`]. No
+    /// effect on the streaming `compress()` reader path.
+    #[cfg(feature = "hash")]
+    offload_checksum: bool,
     #[cfg(feature = "hash")]
     hasher: XxHash64,
+    /// Set by the one-shot offload path to the digest a scoped worker computed
+    /// over the whole input; `write_frame_to_vec` uses it in place of the
+    /// inline `hasher.finish()`. `None` on every non-offload path.
+    #[cfg(feature = "hash")]
+    offloaded_digest: Option<u64>,
     /// Block-layout introspection populated at the end of every
     /// successful `compress()`. `None` until the first call.
     /// Behind the `lsm` feature gate.
@@ -607,7 +619,11 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             magicless: false,
             content_checksum: true,
             #[cfg(feature = "hash")]
+            offload_checksum: false,
+            #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
+            #[cfg(feature = "hash")]
+            offloaded_digest: None,
             #[cfg(feature = "lsm")]
             frame_emit_info: None,
             #[cfg(all(feature = "lsm", feature = "hash"))]
@@ -753,8 +769,38 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         // resolved window/header and could flip borrowed eligibility).
         self.source_size_hint = Some(input.len() as u64);
         let prep = self.prepare_frame();
-        let (all_blocks, total_uncompressed) = self.run_one_frame(input, &prep);
+        let (all_blocks, total_uncompressed) = self.run_one_frame_maybe_offload(input, &prep);
         self.write_frame_to_vec(out, all_blocks, total_uncompressed, &prep);
+    }
+
+    /// [`Self::run_one_frame`], optionally with the content checksum computed
+    /// on a scoped worker thread concurrent with compression (when
+    /// `offload_checksum` + `content_checksum` are set and `std` + `hash` are
+    /// available). The worker hashes the whole immutable `input` (a shared
+    /// read, disjoint from the `&mut self` block loop) and the joined digest is
+    /// stashed in `offloaded_digest` for the frame trailer; the inline per-block
+    /// hash is skipped in that case. Output is byte-identical to the inline
+    /// path; only the XXH64 work moves off the compression thread.
+    fn run_one_frame_maybe_offload(&mut self, input: &[u8], prep: &FramePrep) -> (Vec<u8>, u64) {
+        #[cfg(all(feature = "std", feature = "hash"))]
+        if self.offload_checksum && self.content_checksum {
+            use core::hash::Hasher;
+            let mut blocks: Option<(Vec<u8>, u64)> = None;
+            let digest = std::thread::scope(|s| {
+                let worker = s.spawn(move || {
+                    let mut hasher = XxHash64::with_seed(0);
+                    hasher.write(input);
+                    hasher.finish()
+                });
+                blocks = Some(self.run_one_frame(input, prep));
+                worker
+                    .join()
+                    .expect("content-checksum worker thread panicked")
+            });
+            self.offloaded_digest = Some(digest);
+            return blocks.expect("block loop runs inside the checksum scope");
+        }
+        self.run_one_frame(input, prep)
     }
 
     /// Convenience wrapper over [`Self::compress_independent_frame_into`]
@@ -852,8 +898,11 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             let end = (start + block_len).min(input.len());
             let block = &input[start..end];
             let last_block = end == input.len();
+            // Skipped when offloading: the scoped worker hashes the whole
+            // input concurrently, so an inline feed here would just duplicate
+            // the work on the compression thread.
             #[cfg(feature = "hash")]
-            if self.content_checksum {
+            if self.content_checksum && !self.offload_checksum {
                 self.hasher.write(block);
             }
             crate::encoding::levels::compress_block_encoded_borrowed(
@@ -899,7 +948,11 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             magicless: false,
             content_checksum: true,
             #[cfg(feature = "hash")]
+            offload_checksum: false,
+            #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
+            #[cfg(feature = "hash")]
+            offloaded_digest: None,
             #[cfg(feature = "lsm")]
             frame_emit_info: None,
             #[cfg(all(feature = "lsm", feature = "hash"))]
@@ -932,6 +985,17 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// this setting.
     pub fn set_content_checksum(&mut self, emit: bool) {
         self.content_checksum = emit;
+    }
+
+    /// Compute the content checksum on a scoped worker thread (concurrent with
+    /// compression) on the one-shot `compress_independent_frame*` path, instead
+    /// of hashing inline. Default `false`. Requires `std` + `hash`; a no-op
+    /// without them or when the content checksum is disabled. The output is
+    /// byte-identical either way; this only moves the XXH64 work off the
+    /// compression thread.
+    #[cfg(feature = "hash")]
+    pub fn set_offload_checksum(&mut self, offload: bool) {
+        self.offload_checksum = offload;
     }
 
     /// Before calling [FrameCompressor::compress] you need to set the source.
@@ -1452,7 +1516,13 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         out.extend_from_slice(&all_blocks);
         #[cfg(feature = "hash")]
         if self.content_checksum {
-            out.extend_from_slice(&(self.hasher.finish() as u32).to_le_bytes());
+            // Use the scoped worker's digest when the one-shot offload path
+            // produced one; otherwise the inline hasher's.
+            let digest = self
+                .offloaded_digest
+                .take()
+                .unwrap_or_else(|| self.hasher.finish());
+            out.extend_from_slice(&(digest as u32).to_le_bytes());
         }
         #[cfg(feature = "lsm")]
         self.populate_frame_emit_info(header_buf.len(), &all_blocks);
