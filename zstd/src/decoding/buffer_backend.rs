@@ -284,12 +284,17 @@ pub(crate) trait BufferBackend: Sized {
     /// Linear backends (`FlatBuf`, `UserSliceBackend`) are always contiguous,
     /// so the default returns `true` and their `sequence_output_fits` /
     /// tight-tail / grow handling covers capacity. `RingBuffer` overrides this
-    /// to reject the cases where the live region has wrapped or the write
-    /// would cross `cap`; the caller then takes the wrap-correct cold
-    /// `push` / `repeat` path instead.
+    /// to reject only the cases where this specific sequence's linear write or
+    /// its match source would cross the wrap boundary; a wrapped ring whose
+    /// write stays in the contiguous free gap before `head` and whose match
+    /// source is the contiguous lower live segment still takes the fast inline
+    /// path. The caller falls back to the wrap-correct cold `push` / `repeat`
+    /// path only when this returns `false`. `offset` is the resolved match
+    /// offset (post-repcode), needed by the ring to verify the match source is
+    /// contiguous; linear backends ignore it.
     #[allow(unused_variables)]
     #[inline(always)]
-    fn inline_exec_ok(&self, lit_length: usize, match_length: usize) -> bool {
+    fn inline_exec_ok(&self, lit_length: usize, match_length: usize, offset: usize) -> bool {
         true
     }
 
