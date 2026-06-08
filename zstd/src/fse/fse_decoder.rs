@@ -110,6 +110,11 @@ impl<'t, E: FseEntry> FSEDecoderImpl<'t, E> {
     /// unchecked indexing in `read_entry`) into a clear fail-fast
     /// panic that surfaces the API misuse immediately instead of
     /// leaving the bitstream and decode state silently desynchronised.
+    // Checked, refill-per-call state advance. The hot decode paths (sequence
+    // loop, HUF weights decode) batch their refills and use
+    // `update_state_fast`; the only remaining caller is the test/fuzz
+    // `round_trip` helper, which wants the bounds-checked path.
+    #[cfg(any(test, feature = "fuzz_exports"))]
     pub fn update_state<K: CpuKernel>(&mut self, bits: &mut BitReaderReversed<'_, K>) {
         // Public-API safety guard: `FSEDecoder::new` builds a decoder
         // with a zero-default `state` (Entry { new_state: 0, num_bits:

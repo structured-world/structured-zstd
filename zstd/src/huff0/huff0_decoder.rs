@@ -513,11 +513,24 @@ impl HuffmanTable {
 
                 self.weights.clear();
 
+                // The weights FSE table is built with a max accuracy_log of 6
+                // (the `build_decoder(fse_stream, 6)` call above), so each state
+                // update reads at most 6 bits. Refilling once per loop step
+                // (two interleaved updates = up to 12 bits) lets both updates
+                // use the unchecked fast advance instead of a per-symbol refill
+                // branch, mirroring the donor's single reload per decode step.
+                // `bits_remaining()` still tracks end-of-stream via `extra_bits`
+                // (maintained by `refill_slow`), so the termination checks below
+                // fire identically.
+                const WEIGHTS_REFILL_BUDGET: u8 = 12;
+
                 // The two decoders take turns decoding a single symbol and updating their state.
                 loop {
+                    br.ensure_bits(WEIGHTS_REFILL_BUDGET);
+
                     let w = dec1.decode_symbol();
                     self.weights.push(w);
-                    dec1.update_state(&mut br);
+                    dec1.update_state_fast(&mut br);
 
                     if br.bits_remaining() <= -1 {
                         //collect final states
@@ -527,7 +540,7 @@ impl HuffmanTable {
 
                     let w = dec2.decode_symbol();
                     self.weights.push(w);
-                    dec2.update_state(&mut br);
+                    dec2.update_state_fast(&mut br);
 
                     if br.bits_remaining() <= -1 {
                         //collect final states
