@@ -128,8 +128,14 @@ pub unsafe extern "C" fn ZSTD_freeDCtx(dctx: *mut ZSTD_DCtx) -> usize {
     0
 }
 
-/// `size_t ZSTD_sizeof_DCtx(const ZSTD_DCtx* dctx)` — heap footprint of the
-/// context struct, or 0 for `NULL`.
+/// `size_t ZSTD_sizeof_DCtx(const ZSTD_DCtx* dctx)` — total footprint of the
+/// context, or 0 for `NULL`.
+///
+/// Sums the inline struct size and the `FrameDecoder`'s lazily-grown workspace
+/// (decode-window buffer, per-block literal/content buffers, entropy tables),
+/// matching the workspace term of upstream's `ZSTD_sizeof_DCtx`. The workspace
+/// is 0 until the first frame allocates it. Shared dictionaries (ref-counted
+/// handles) are not counted, as upstream excludes `refDDict` memory.
 ///
 /// # Safety
 /// `dctx` must be a live pointer from [`ZSTD_createDCtx`], or `NULL`.
@@ -138,7 +144,8 @@ pub unsafe extern "C" fn ZSTD_sizeof_DCtx(dctx: *const ZSTD_DCtx) -> usize {
     if dctx.is_null() {
         return 0;
     }
-    core::mem::size_of::<ZSTD_DCtx>()
+    let dctx = unsafe { &*dctx };
+    core::mem::size_of::<ZSTD_DCtx>() + dctx.decoder.workspace_size()
 }
 
 /// `size_t ZSTD_decompressDCtx(ZSTD_DCtx* dctx, void* dst, size_t dstCapacity,
