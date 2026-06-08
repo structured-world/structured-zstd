@@ -341,6 +341,18 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         self.total_output_counter += data.len() as u64;
     }
 
+    /// Add `n` to the cumulative produced-byte counter for output produced
+    /// outside `push` / `repeat` — namely the inline `exec_sequence_inline`
+    /// path, which writes through the backend directly and so bypasses the
+    /// counter those methods maintain. Called by the sequence dispatch only
+    /// for backends whose `INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER` is `true`
+    /// (`RingBuffer` / `FlatBuf`), keeping `total_output()` (resume
+    /// `output_offset`) and the dict-reachability gate accurate.
+    #[inline(always)]
+    pub(crate) fn advance_output_counter(&mut self, n: u64) {
+        self.total_output_counter += n;
+    }
+
     /// Fallible variant of [`Self::push`]. Returns `Err(BackendOverflow)`
     /// when the underlying backend's `try_extend` rejects the write
     /// (only possible on fixed-capacity backends like

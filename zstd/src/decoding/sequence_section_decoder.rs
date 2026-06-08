@@ -1096,26 +1096,18 @@ pub(crate) fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBac
                 .exec_sequence_inline(lit_src, seq.ll as usize, offset, seq.ml as usize)
                 .map_err(DecompressBlockError::ExecuteSequencesError)?;
         }
-        // No `advance_output_counter` here: the donor inline path
-        // advances `UserSliceBackend::tail` directly inside
-        // `exec_sequence_inline`, and the post-block FCS check in
-        // `run_direct_decode` now reads `tail` (via
-        // `buffer_ref().tail() as u64`) instead of the separately
-        // maintained `DecodeBuffer::total_output_counter`. Skipping
-        // the per-sequence RMW drops the ~9% of decode time measured
-        // at `addq <ll+ml>, 0x40(%r9)` on z000033 (perf annotate on
-        // `decode_and_execute_sequences_avx2`).
-        //
-        // `total_output_counter` is intentionally NOT maintained on
-        // the inline-exec path. Once any sequence in a block takes
-        // this path, the wrapper-level counter is stale for the
-        // remainder of the block — the legacy
-        // `try_push`/`repeat_lookahead_prefetched` arm below only
-        // accounts for its own bytes, NOT a running total. The
-        // authoritative byte count for the inline-eligible path is
-        // `UserSliceBackend::tail()`; any caller that previously
-        // read `total_output_counter` on this path is migrated to
-        // `buffer_ref().tail()` (see `run_direct_decode`).
+        // The inline path advances the backend's `tail` directly, bypassing the
+        // wrapper-level `DecodeBuffer::total_output_counter`. Backends whose
+        // cumulative-output accounting reads that counter (`RingBuffer` /
+        // `FlatBuf` — the resume `output_offset` and the dict-reachability gate)
+        // must keep it current, so bump it here; `UserSliceBackend` (direct
+        // path, reads `tail()` and never the counter) sets the const to `false`
+        // and this read-modify-write is const-folded away, preserving the ~9%
+        // it costs on the all-inline direct hot path (`addq <ll+ml>, …` on
+        // z000033).
+        if B::INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER {
+            buffer.advance_output_counter((seq.ll + seq.ml) as u64);
+        }
         return Ok(());
     }
 
@@ -1204,6 +1196,11 @@ pub(crate) unsafe fn execute_one_sequence_pipelined_avx2<
                 .buffer_mut()
                 .exec_sequence_inline_avx2(lit_src, seq.ll as usize, offset, seq.ml as usize)
                 .map_err(DecompressBlockError::ExecuteSequencesError)?;
+        }
+        // Inline path bypasses the wrapper's output counter; keep it current for
+        // backends that read it (Ring/Flat). Const-folded away for UserSlice.
+        if B::INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER {
+            buffer.advance_output_counter((seq.ll + seq.ml) as u64);
         }
         return Ok(());
     }

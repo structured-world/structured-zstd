@@ -100,6 +100,19 @@ pub(crate) trait BufferBackend: Sized {
     /// cost.
     const SUPPORTS_INLINE_SEQUENCE_EXEC: bool = false;
 
+    /// Whether the inline `exec_sequence_inline` dispatch must bump the
+    /// `DecodeBuffer::total_output_counter` after each sequence. The non-inline
+    /// `push` / `repeat` path always maintains that counter; the inline path
+    /// bypasses the wrapper, so backends whose cumulative-output accounting
+    /// READS the counter (`RingBuffer` / `FlatBuf` — used by the resume
+    /// `output_offset` and the dict-reachability gate) need the inline path to
+    /// keep it current. `UserSliceBackend` (the direct path) reads its `tail`
+    /// instead and never touches the counter, so it overrides this to `false`
+    /// and the per-sequence read-modify-write is dead-eliminated there (the
+    /// ~9% it costs on the all-inline direct hot path stays saved). Compile-time
+    /// const: the dispatch-site branch folds away per backend.
+    const INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER: bool = true;
+
     /// Donor's `ZSTD_execSequence` body
     /// (zstd_decompress_block.c:1008-1105). Writes `lit_length` bytes
     /// from `lit_src` at the current tail, then writes `match_length`

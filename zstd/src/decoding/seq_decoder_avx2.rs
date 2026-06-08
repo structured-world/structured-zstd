@@ -160,6 +160,12 @@ macro_rules! execute_one_body {
                         offset,
                         seq_ml_v as usize
                     );
+                    // Inline path bypasses the wrapper's output counter; keep it
+                    // current for backends that read it (Ring/Flat resume +
+                    // dict gate). Const-folded away for UserSliceBackend.
+                    if r.is_ok() && B::INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER {
+                        $buffer.advance_output_counter((seq_ll_v + seq_ml_v) as u64);
+                    }
                     break 'exec_inner r.map_err(DecompressBlockError::ExecuteSequencesError);
                 }
             }
