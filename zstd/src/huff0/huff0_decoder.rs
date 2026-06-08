@@ -513,11 +513,24 @@ impl HuffmanTable {
 
                 self.weights.clear();
 
+                // The weights FSE table is built with a max accuracy_log of 6
+                // (the `build_decoder(fse_stream, 6)` call above), so each state
+                // update reads at most 6 bits. Refilling once per loop step
+                // (two interleaved updates = up to 12 bits) lets both updates
+                // use the unchecked fast advance instead of a per-symbol refill
+                // branch, mirroring the donor's single reload per decode step.
+                // `bits_remaining()` still tracks end-of-stream via `extra_bits`
+                // (maintained by `refill_slow`), so the termination checks below
+                // fire identically.
+                const WEIGHTS_REFILL_BUDGET: u8 = 12;
+
                 // The two decoders take turns decoding a single symbol and updating their state.
                 loop {
+                    br.ensure_bits(WEIGHTS_REFILL_BUDGET);
+
                     let w = dec1.decode_symbol();
                     self.weights.push(w);
-                    dec1.update_state(&mut br);
+                    dec1.update_state_fast(&mut br);
 
                     if br.bits_remaining() <= -1 {
                         //collect final states
@@ -527,7 +540,7 @@ impl HuffmanTable {
 
                     let w = dec2.decode_symbol();
                     self.weights.push(w);
-                    dec2.update_state(&mut br);
+                    dec2.update_state_fast(&mut br);
 
                     if br.bits_remaining() <= -1 {
                         //collect final states
@@ -649,8 +662,7 @@ impl HuffmanTable {
             self.bit_ranks[(*num_bits) as usize] += 1;
         }
 
-        //fill with dummy symbols
-        self.packed_decode.resize(1 << self.max_num_bits, 0);
+        let table_size = 1usize << self.max_num_bits;
 
         //starting codes for each rank
         self.rank_indexes.clear();
@@ -662,12 +674,26 @@ impl HuffmanTable {
                 + self.bit_ranks[bits as usize] as usize * (1 << (max_bits - bits));
         }
 
+        // The rank walk partitions [0, table_size) into one contiguous run
+        // per code length (no gaps, no overlap), so the fill loop below
+        // initialises every slot — the donor likewise skips the table
+        // pre-zero (`ZSTD_memset ... is not necessary`). Assert the total
+        // span equals `table_size` before trusting the unchecked `set_len`.
         assert!(
-            self.rank_indexes[0] == self.packed_decode.len(),
+            self.rank_indexes[0] == table_size,
             "rank_idx[0]: {} should be: {}",
             self.rank_indexes[0],
-            self.packed_decode.len()
+            table_size
         );
+
+        // Write into the uninitialised tail (`spare_capacity_mut`) and only
+        // `set_len` after the fill completes, avoiding the redundant
+        // zero-then-overwrite of a `resize(_, 0)`. `slots` borrows only the
+        // `packed_decode` field, so the loop's reads of `bits` and writes to
+        // `rank_indexes` (disjoint fields) coexist.
+        self.packed_decode.clear();
+        self.packed_decode.reserve(table_size);
+        let slots = self.packed_decode.spare_capacity_mut();
 
         for symbol in 0..self.bits.len() {
             let bits_for_symbol = self.bits[symbol];
@@ -679,11 +705,25 @@ impl HuffmanTable {
                 // byte = nbBits. `num_bits ≤ 11` always fits in the
                 // upper byte alongside an 8-bit symbol.
                 let base_idx = self.rank_indexes[bits_for_symbol as usize];
-                let len = 1 << (max_bits - bits_for_symbol);
+                let len = 1usize << (max_bits - bits_for_symbol);
                 self.rank_indexes[bits_for_symbol as usize] += len;
                 let packed = u16::from(symbol as u8) | (u16::from(bits_for_symbol) << 8);
-                self.packed_decode[base_idx..base_idx + len].fill(packed);
+                // Constant-`packed` write of a contiguous run: LLVM lowers
+                // this to the same vectorised broadcast store as `<[u16]>::fill`
+                // (the donor's hand-rolled 64-bit `HUF_DEltX1` broadcast), just
+                // into uninitialised memory.
+                for slot in &mut slots[base_idx..base_idx + len] {
+                    slot.write(packed);
+                }
             }
+        }
+
+        // SAFETY: the rank walk covers [0, table_size) exactly (asserted via
+        // `rank_indexes[0] == table_size`); `reserve(table_size)` guaranteed
+        // capacity; every slot in that range was written by the loop above,
+        // so no uninitialised entry is exposed.
+        unsafe {
+            self.packed_decode.set_len(table_size);
         }
 
         Ok(())
