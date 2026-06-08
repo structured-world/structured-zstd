@@ -454,7 +454,19 @@ fn apply_param_overrides(params: &mut LevelParams, ov: &super::parameters::Param
             params.row.get_or_insert(ROW_L5);
         }
         SearchMethod::HashChain | SearchMethod::BinaryTree => {
-            params.hc.get_or_insert(HC_OVERRIDE_DEFAULT);
+            // A `Btlazy2` strategy override moved off a non-HC row needs the
+            // BT 5-byte finder hash (donor minMatch 5); other synthesized HC
+            // rows keep the 4-byte default. An explicit `min_match` override
+            // below refines this further.
+            params.hc.get_or_insert(HcConfig {
+                search_mls: if matches!(params.strategy_tag, super::strategy::StrategyTag::Btlazy2)
+                {
+                    5
+                } else {
+                    HC_OVERRIDE_DEFAULT.search_mls
+                },
+                ..HC_OVERRIDE_DEFAULT
+            });
         }
     }
 
@@ -527,6 +539,13 @@ fn apply_param_overrides(params: &mut LevelParams, ov: &super::parameters::Param
                 }
                 if let Some(target_length) = ov.target_length {
                     hc.target_len = target_length as usize;
+                }
+                if let Some(min_match) = ov.min_match {
+                    // Donor `mls = BOUNDED(4, cParams.minMatch, 6)`: a BT
+                    // min_match override maps into the finder hash width. Only
+                    // the BT body reads `search_mls`; HC/lazy keep 4-byte
+                    // hashing regardless, so this is a no-op for them.
+                    hc.search_mls = (min_match as usize).clamp(4, 6);
                 }
             }
         }
@@ -2679,9 +2698,25 @@ pub(crate) use bt_insert_step_no_rebase_body;
 /// repeat-offset match always out-gains an explicit-offset one
 /// (`zstd_lazy.c` `ZSTD_storeSeq` offBase convention).
 #[inline]
-fn btlazy2_offbase(offset: usize, reps: [u32; 3]) -> u32 {
+fn btlazy2_offbase(offset: usize, reps: [u32; 3], ll0: bool) -> u32 {
     let o = offset as u32;
-    if o == reps[0] {
+    // Donor repcode mapping shifts by `ll0` (zero-literal position): the cheap
+    // codes become rep1 / rep2 / (rep0 - 1) instead of rep0 / rep1 / rep2,
+    // because at ll0 an offset equal to rep0 is the special rep0-1 case, not
+    // repcode 1. Scoring offsets against the wrong code at ll0 over-rewards a
+    // rep0-distance match that does not actually encode as the cheapest code.
+    if ll0 {
+        if o == reps[1] {
+            1
+        } else if o == reps[2] {
+            2
+        } else if reps[0] > 1 && o == reps[0] - 1 {
+            3
+        } else {
+            // Offsets are < window (<= 2^27), so `+ 3` never overflows u32.
+            o + 3
+        }
+    } else if o == reps[0] {
         1
     } else if o == reps[1] {
         2
@@ -2697,8 +2732,8 @@ fn btlazy2_offbase(offset: usize, reps: [u32; 3]) -> u32 {
 /// selection metric that lets a shorter repeat-offset match beat a longer
 /// explicit-offset one. `offBase >= 1`, so `highbit` is well-defined.
 #[inline]
-fn btlazy2_gain(match_len: usize, offset: usize, reps: [u32; 3]) -> i64 {
-    let offbase = btlazy2_offbase(offset, reps);
+fn btlazy2_gain(match_len: usize, offset: usize, reps: [u32; 3], ll0: bool) -> i64 {
+    let offbase = btlazy2_offbase(offset, reps, ll0);
     (match_len as i64) * 4 - (31 - offbase.leading_zeros()) as i64
 }
 
@@ -2755,6 +2790,9 @@ macro_rules! start_matching_btlazy2_body {
         macro_rules! bt_select {
             ($p:expr) => {{
                 let sel_pos: usize = $p;
+                // `ll0` (donor): zero literals pending before this position, so
+                // the repcode set is shifted (see `btlazy2_offbase`).
+                let ll0 = sel_pos == literals_start;
                 let sel_abs = current_abs_start + sel_pos;
                 candidates.clear();
                 let query = HcCandidateQuery {
@@ -2784,7 +2822,7 @@ macro_rules! start_matching_btlazy2_body {
                     if ml < HC_OPT_MIN_MATCH_LEN {
                         continue;
                     }
-                    let g = btlazy2_gain(ml, c.offset, reps);
+                    let g = btlazy2_gain(ml, c.offset, reps, ll0);
                     if g > sel_gain {
                         sel_gain = g;
                         sel_ml = ml;
@@ -2792,17 +2830,26 @@ macro_rules! start_matching_btlazy2_body {
                     }
                 }
                 let sel_idx = sel_abs - history_abs_start;
-                let rep0 = reps[0] as usize;
-                if rep0 != 0 && sel_idx >= rep0 {
+                // Donor probes `rep[0 + ll0]` directly (the length-sorted ladder
+                // drops short cheap reps): rep0 normally, rep1 at a zero-literal
+                // position where rep0 is not the cheapest code.
+                let probe_rep = if ll0 {
+                    reps[1] as usize
+                } else {
+                    reps[0] as usize
+                };
+                if probe_rep != 0 && sel_idx >= probe_rep {
                     let tail = current_len - sel_pos;
-                    // SAFETY: `sel_idx - rep0 < sel_idx`, `sel_idx + tail <=
+                    // SAFETY: `sel_idx - probe_rep < sel_idx`, `sel_idx + tail <=
                     // concat_full.len()`; same overshoot slack the collector
                     // relies on for this block.
-                    let rep_ml = unsafe { $cmf(concat_full, sel_idx, sel_idx - rep0, tail, 0) };
-                    if rep_ml >= HC_OPT_MIN_MATCH_LEN && btlazy2_gain(rep_ml, rep0, reps) > sel_gain
+                    let rep_ml =
+                        unsafe { $cmf(concat_full, sel_idx, sel_idx - probe_rep, tail, 0) };
+                    if rep_ml >= HC_OPT_MIN_MATCH_LEN
+                        && btlazy2_gain(rep_ml, probe_rep, reps, ll0) > sel_gain
                     {
                         sel_ml = rep_ml;
-                        sel_off = rep0;
+                        sel_off = probe_rep;
                     }
                 }
                 (sel_ml, sel_off)
@@ -2829,8 +2876,10 @@ macro_rules! start_matching_btlazy2_body {
                 }
                 let reps = $self.table.offset_hist;
                 let margin = if d == 0 { 4 } else { 7 };
-                let gain1 = btlazy2_gain(best_ml, best_off, reps) + margin;
-                let gain2 = btlazy2_gain(ml2, off2, reps);
+                // `best` sits at `start` (ll0 iff no literals precede it); the
+                // lookahead match at `start + 1` always has a pending literal.
+                let gain1 = btlazy2_gain(best_ml, best_off, reps, start == literals_start) + margin;
+                let gain2 = btlazy2_gain(ml2, off2, reps, false);
                 if gain2 > gain1 {
                     best_ml = ml2;
                     best_off = off2;
