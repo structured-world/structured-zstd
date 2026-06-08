@@ -21,6 +21,13 @@ name = "structured_zstd"
 # harness can link the wrappers; the shipped artifacts are the cdylib + staticlib.
 crate-type = ["lib", "cdylib", "staticlib"]
 
+# No `[features]` / `std` contract by design: this is a host-only cdylib/
+# staticlib whose `extern "C"` wrappers guard the boundary with
+# `std::panic::catch_unwind` (a Rust panic must not unwind into C), so the
+# crate cannot build without std. A default-on `std` feature would advertise a
+# `--no-default-features` build that fails to compile. The no_std + alloc
+# surface lives in the `codec` crate below.
+
 [dependencies]
 # The codec is imported under the alias `codec` rather than its own name: this
 # lib is itself named `structured_zstd` (so the artifact is `libstructured_zstd.so`),
