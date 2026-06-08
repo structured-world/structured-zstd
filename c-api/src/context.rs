@@ -90,6 +90,8 @@ pub unsafe extern "C" fn ZSTD_compressCCtx(
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         cctx.scratch.clear();
         let mut enc: FrameCompressor = FrameCompressor::new(level);
+        // Upstream ZSTD_compressCCtx defaults ZSTD_c_checksumFlag = 0; match it.
+        enc.set_content_checksum(false);
         enc.compress_independent_frame_into(src, &mut cctx.scratch);
     }));
     if outcome.is_err() {

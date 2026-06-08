@@ -140,12 +140,18 @@ fn context_api_roundtrips_and_reuses() {
 #[test]
 fn decompress_rejects_corrupted_content_checksum() {
     let input = sample(4096);
-    // Frames we emit carry an XXH64 content checksum (the `hash` feature is on
-    // by default), so flipping the trailing 4-byte checksum makes the stored
-    // value disagree with the decoded output while leaving the block data — and
-    // thus the decode itself — intact. A faithful drop-in must report this as
+    // ZSTD_compress mirrors upstream and emits no content checksum by default,
+    // so build a checksum-bearing frame explicitly through the core encoder.
+    // Flipping the trailing 4-byte checksum makes the stored value disagree
+    // with the decoded output while leaving the block data (and the decode
+    // itself) intact. A faithful drop-in must report this as
     // ZSTD_error_checksum_wrong, not silently accept the frame.
-    let mut frame = compress_frame(&input);
+    let mut frame = {
+        let mut enc: codec::encoding::FrameCompressor =
+            codec::encoding::FrameCompressor::new(codec::encoding::CompressionLevel::from_level(3));
+        enc.set_content_checksum(true);
+        enc.compress_independent_frame(&input)
+    };
     let last = frame.len() - 1;
     frame[last] ^= 0xFF;
 
@@ -286,4 +292,63 @@ fn frame_header_abi_layout_is_stable() {
         assert_eq!(size_of::<ZSTD_FrameHeader>(), 48);
         assert_eq!(align_of::<ZSTD_FrameHeader>(), 8);
     }
+}
+
+#[test]
+fn compress_emits_no_content_checksum_by_default() {
+    // Upstream ZSTD_compress defaults ZSTD_c_checksumFlag = 0, so the simple
+    // wrapper must emit no trailing content checksum (cleared flag in header).
+    let input = sample(4096);
+    let bound = ZSTD_compressBound(input.len());
+    let mut frame = vec![0u8; bound];
+    let n = unsafe {
+        ZSTD_compress(
+            frame.as_mut_ptr(),
+            frame.len(),
+            input.as_ptr(),
+            input.len(),
+            3,
+        )
+    };
+    assert_eq!(ZSTD_isError(n), 0);
+    frame.truncate(n);
+    let descriptor = frame[4];
+    assert_eq!(
+        (descriptor >> 2) & 1,
+        0,
+        "default ZSTD_compress frame must not set the content-checksum flag"
+    );
+}
+
+#[test]
+fn compress_cctx_emits_no_content_checksum_by_default() {
+    // Same guarantee for the context path: ZSTD_compressCCtx must also default
+    // to no content checksum, matching upstream's ZSTD_c_checksumFlag = 0.
+    let input = sample(4096);
+    let cctx = ZSTD_createCCtx();
+    assert!(!cctx.is_null());
+
+    let bound = ZSTD_compressBound(input.len());
+    let mut frame = vec![0u8; bound];
+    let n = unsafe {
+        ZSTD_compressCCtx(
+            cctx,
+            frame.as_mut_ptr(),
+            frame.len(),
+            input.as_ptr(),
+            input.len(),
+            3,
+        )
+    };
+    assert_eq!(ZSTD_isError(n), 0);
+    frame.truncate(n);
+
+    let descriptor = frame[4];
+    assert_eq!(
+        (descriptor >> 2) & 1,
+        0,
+        "default ZSTD_compressCCtx frame must not set the content-checksum flag"
+    );
+
+    assert_eq!(unsafe { ZSTD_freeCCtx(cctx) }, 0);
 }

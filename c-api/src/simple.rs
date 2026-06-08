@@ -8,7 +8,7 @@ use codec::decoding::{
     ContentChecksum, FrameContentSize, FrameDecoder, FrameSizeError, find_frame_compressed_size,
     read_frame_content_size,
 };
-use codec::encoding::{CompressionLevel, compress_bound, compress_slice_to_vec};
+use codec::encoding::{CompressionLevel, FrameCompressor, compress_bound};
 
 use crate::error::{ZSTD_ErrorCode, code_for_decoder_error, encode};
 use crate::ffi::{in_slice, out_slice};
@@ -92,7 +92,12 @@ pub unsafe extern "C" fn ZSTD_compress(
     // The bulk encoder aborts via the global allocator on OOM and otherwise
     // does not return errors, but it can panic on an internal invariant
     // break; catch it so a panic never unwinds across the FFI boundary.
-    let compressed = match catch_unwind(AssertUnwindSafe(|| compress_slice_to_vec(src, level))) {
+    let compressed = match catch_unwind(AssertUnwindSafe(|| {
+        let mut enc: FrameCompressor = FrameCompressor::new(level);
+        // Upstream ZSTD_compress defaults ZSTD_c_checksumFlag = 0; match it.
+        enc.set_content_checksum(false);
+        enc.compress_independent_frame(src)
+    })) {
         Ok(buf) => buf,
         Err(_) => return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC),
     };
