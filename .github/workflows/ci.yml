@@ -22,6 +22,11 @@ on:
       - 'docs/**'
       - 'LICENSE*'
       - '.gitignore'
+  # Manual trigger: lets the wasm dashboard shard (`bench-wasm`) be
+  # refreshed on demand for changes the push path doesn't auto-gate on
+  # — e.g. a wasm bench-harness / parser edit that moves the published
+  # numbers without touching the `rust_core` paths that gate the shard.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -47,28 +52,22 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       rust_core: ${{ steps.filter.outputs.rust_core }}
-      wasm_core: ${{ steps.filter.outputs.wasm_core }}
     steps:
       - uses: actions/checkout@v6
       - uses: dorny/paths-filter@v3
         id: filter
         with:
           filters: |
+            # `rust_core` gates BOTH bench pipelines (native `bench-matrix`
+            # and the wasm-vs-bokuweb `bench-wasm` shard). The wasm payload
+            # compiles the core crate to wasm32, so the numbers it tracks
+            # move exactly when the core crate / manifests / toolchain move,
+            # NOT when the wasm-crate / npm glue changes (that path is
+            # validated by the always-on `wasm` job instead). A push that
+            # touches only wasm / npm / ts / js / CI / docs cannot move the
+            # compression behaviour, so both bench cascades skip it.
             rust_core:
               - 'zstd/**'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - 'rust-toolchain.toml'
-            # The wasm-vs-bokuweb dashboard shard (`bench-wasm`) only needs
-            # to re-run when something that can move the wasm payloads'
-            # speed/ratio changed: the core crate (compiled into the wasm
-            # module), the wasm crate / npm glue itself, the bench harness,
-            # or the dep/toolchain pins. A push touching only the native
-            # bench scripts, docs, or unrelated CI leaves the wasm numbers
-            # untouched, so the wasm shard stays green-skipped on it.
-            wasm_core:
-              - 'zstd/**'
-              - 'zstd-wasm/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'rust-toolchain.toml'
@@ -318,16 +317,16 @@ jobs:
     # locally before an npm publish.
     #
     # Push-to-main only (consistent with the rest of the bench pipeline
-    # being push-only — #362) and gated on `wasm_core` so it skips pushes
-    # that can't move the wasm numbers. It is INDEPENDENT of the native
-    # `bench-matrix` cascade (which is `rust_core`-gated): a wasm-only
-    # change must still update the dashboard. It publishes only
+    # being push-only — #362) and gated on `rust_core`, the SAME gate as
+    # the native `bench-matrix` cascade: the wasm payload compiles the core
+    # crate to wasm32, so its numbers move when the Rust compressor changes,
+    # not when the wasm-crate / npm glue changes. It publishes only
     # `benchmark-wasm.json` to gh-pages — `index.html` stays owned by
     # `benchmark-pages` / `pages-only.yml` — so the two publishers write
     # disjoint files and never race for the same blob.
     name: Bench wasm vs bokuweb (dashboard shard)
     needs: [lint, changes]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.wasm_core == 'true'
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.rust_core == 'true')
     timeout-minutes: 30
     runs-on: ubuntu-latest
     steps:

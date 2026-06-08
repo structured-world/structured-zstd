@@ -60,7 +60,7 @@ use std::path::Path;
 
 use structured_zstd::encoding::CompressionLevel;
 use structured_zstd::encoding::sequence_capture::{
-    CapturedRawSequence, compress_and_collect_sequences,
+    CapturedRawSequence, compress_and_collect_sequences, compress_and_collect_sequences_with_dict,
 };
 
 /// Default level set when `STRUCTURED_ZSTD_BENCH_LEVEL` is unset.
@@ -126,16 +126,23 @@ fn main() {
         .ok()
         .and_then(|s| s.trim().parse::<usize>().ok())
         .unwrap_or(default_rows);
+    // Optional dictionary: `STRUCTURED_ZSTD_BENCH_DICT=<path>` attaches
+    // the (serialized or raw-content) dict to BOTH sides before capturing
+    // sequences, so the diff reflects the dict-primed match decisions.
+    let dict_bytes: Option<Vec<u8>> = std::env::var("STRUCTURED_ZSTD_BENCH_DICT")
+        .ok()
+        .map(|p| fs::read(p.trim()).expect("read STRUCTURED_ZSTD_BENCH_DICT path"));
     let fixtures = collect_fixtures();
     println!(
-        "=== compare_ffi_sequences (levels={}, Rust vs C FFI) ===",
+        "=== compare_ffi_sequences (levels={}, dict={}, Rust vs C FFI) ===",
         fmt_levels(&levels),
+        if dict_bytes.is_some() { "yes" } else { "no" },
     );
     println!();
     for (name, bytes) in &fixtures {
         println!("=== fixture: {name} ===");
         for &level in &levels {
-            run_one(name, bytes, level, max_rows);
+            run_one(name, bytes, level, max_rows, dict_bytes.as_deref());
         }
         println!();
     }
@@ -287,7 +294,39 @@ fn collect_fixtures() -> Vec<(String, Vec<u8>)> {
     let log = build_low_entropy_log(16 * 1024);
     out.push((format!("low-entropy log ({} bytes)", log.len()), log));
 
+    // Byte-for-byte the bench `small-4k-log-lines` scenario so the
+    // dict-primed diff reproduces the L3 dfast compress-dict ratio gap
+    // exactly (pair with a dict trained on the same 4 log lines via
+    // `STRUCTURED_ZSTD_BENCH_DICT`).
+    let logs4k = repeated_log_lines(4096);
+    out.push((
+        format!("small-4k-log-lines ({} bytes)", logs4k.len()),
+        logs4k,
+    ));
+
     out
+}
+
+/// Byte-for-byte the bench `repeated_log_lines(len)` fixture (and the
+/// `encode_loop_dict` example's `logs<N>` input).
+fn repeated_log_lines(len: usize) -> Vec<u8> {
+    const LINES: &[&str] = &[
+        "ts=2026-03-26T21:39:28Z level=INFO msg=\"flush memtable\" tenant=demo table=orders region=eu-west\n",
+        "ts=2026-03-26T21:39:29Z level=INFO msg=\"rotate segment\" tenant=demo table=orders region=eu-west\n",
+        "ts=2026-03-26T21:39:30Z level=INFO msg=\"compact level\" tenant=demo table=orders region=eu-west\n",
+        "ts=2026-03-26T21:39:31Z level=INFO msg=\"write block\" tenant=demo table=orders region=eu-west\n",
+    ];
+    let mut bytes = Vec::with_capacity(len);
+    while bytes.len() < len {
+        for line in LINES {
+            if bytes.len() == len {
+                break;
+            }
+            let remaining = len - bytes.len();
+            bytes.extend_from_slice(&line.as_bytes()[..line.len().min(remaining)]);
+        }
+    }
+    bytes
 }
 
 /// Synthesize repeating log-line shapes for `byte_budget` bytes.
@@ -316,9 +355,14 @@ fn build_low_entropy_log(byte_budget: usize) -> Vec<u8> {
     out
 }
 
-fn run_one(_name: &str, input: &[u8], level: i32, max_rows: usize) {
-    let rust_capture = compress_and_collect_sequences(input, CompressionLevel::Level(level));
-    let (ffi_seqs, ffi_tail_lengths) = ffi_generate_sequences(input, level);
+fn run_one(_name: &str, input: &[u8], level: i32, max_rows: usize, dict: Option<&[u8]>) {
+    let rust_capture = match dict {
+        Some(d) => {
+            compress_and_collect_sequences_with_dict(input, CompressionLevel::Level(level), d)
+        }
+        None => compress_and_collect_sequences(input, CompressionLevel::Level(level)),
+    };
+    let (ffi_seqs, ffi_tail_lengths) = ffi_generate_sequences(input, level, dict);
     let rust_seqs = &rust_capture.sequences;
     let rust_tail_lengths = &rust_capture.block_tail_lengths;
 
@@ -588,7 +632,11 @@ fn align_and_diff(
 /// Without this, FFI runs behind Rust by exactly the trailing-literal
 /// count after every block boundary on multi-block inputs (PR #149
 /// review #1-#3).
-fn ffi_generate_sequences(input: &[u8], level: i32) -> (Vec<FfiSeq>, Vec<u32>) {
+fn ffi_generate_sequences(
+    input: &[u8],
+    level: i32,
+    dict: Option<&[u8]>,
+) -> (Vec<FfiSeq>, Vec<u32>) {
     use zstd::zstd_safe::{self, zstd_sys};
     // Mirror of `assert_zstd_ok` in `encoding/match_generator.rs` —
     // surfaces libzstd's symbolic error name in the panic message
@@ -630,6 +678,20 @@ fn ffi_generate_sequences(input: &[u8], level: i32) -> (Vec<FfiSeq>, Vec<u32>) {
                 14,
             );
             assert_zstd_ok(rc, "ZSTD_CCtx_setParameter(ZSTD_c_windowLog=14)");
+        }
+        // Attach the dictionary so the donor parser sees the same primed
+        // state the Rust `set_dictionary_from_bytes` path applies.
+        // `ZSTD_CCtx_loadDictionary` auto-detects a serialized dict
+        // (magic) vs raw content and seeds the matcher tables, offset
+        // history, and entropy tables — the same priming the Rust
+        // capture's dict variant reproduces.
+        if let Some(d) = dict {
+            let rc = zstd_sys::ZSTD_CCtx_loadDictionary(
+                cctx,
+                d.as_ptr() as *const core::ffi::c_void,
+                d.len(),
+            );
+            assert_zstd_ok(rc, "ZSTD_CCtx_loadDictionary");
         }
         let n = zstd_sys::ZSTD_generateSequences(
             cctx,

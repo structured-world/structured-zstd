@@ -40,6 +40,7 @@
 
 pub(crate) mod block_header;
 pub(crate) mod blocks;
+pub(crate) mod dict_attach;
 pub(crate) mod fastpath;
 pub(crate) mod frame_header;
 pub(crate) mod incompressible;

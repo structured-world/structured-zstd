@@ -270,6 +270,33 @@ impl Strategy for Lazy {
     const SUFFICIENT_MATCH_LEN: usize = 32;
 }
 
+/// Levels 13-15 — donor `ZSTD_btlazy2`. Binary-tree match finder driving
+/// a greedy/lazy parse (NOT the optimal DP). Reuses the BT candidate
+/// collector to surface the longest match per position, then commits it
+/// greedily. minMatch = 5 (`search_mls`); the BT find runs to full depth
+/// (no `sufficient_match_len` early bail — donor `ZSTD_BtFindBestMatch`
+/// does not cap by `targetLength`), so `MAX_CHAIN_DEPTH` must be large
+/// enough that the runtime `HcConfig::search_depth` (16/32/64 for
+/// L13/14/15) governs the BT walk, not this const.
+#[derive(Copy, Clone, Debug, Default)]
+pub(crate) struct Btlazy2;
+
+impl Strategy for Btlazy2 {
+    const BACKEND: BackendTag = BackendTag::HashChain;
+    const MIN_MATCH: usize = 5;
+    const ACCURATE_PRICE: bool = false;
+    const FAVOR_SMALL_OFFSETS: bool = true;
+    const USE_HASH3: bool = false;
+    const USE_BT: bool = true;
+    const OPT_LEVEL: u8 = 0;
+    // L15 configures search_depth = 64; keep the cap at 64 so
+    // `max_chain_depth.min(search_depth)` lets the level's search_depth
+    // govern (BtOpt's 32 would silently halve L15's BT walk).
+    const MAX_CHAIN_DEPTH: usize = 64;
+    // Full BT find, no early bail (donor `ZSTD_BtFindBestMatch`).
+    const SUFFICIENT_MATCH_LEN: usize = usize::MAX;
+}
+
 /// Levels 16-17 — donor `ZSTD_btopt`. BT + opt without the ultra
 /// price-table refinements.
 #[derive(Copy, Clone, Debug, Default)]
@@ -340,6 +367,10 @@ pub(crate) enum StrategyTag {
     Dfast,
     Greedy,
     Lazy,
+    /// Donor `ZSTD_btlazy2` (levels 13-15): binary-tree match finder with a
+    /// lazy parse (not the optimal DP). Shares the BT table layout / finder
+    /// with the opt strategies (`uses_bt`) but selects greedily/lazily.
+    Btlazy2,
     BtOpt,
     BtUltra,
     BtUltra2,
@@ -356,9 +387,10 @@ impl StrategyTag {
     /// * 1-2 → `Fast`
     /// * 3-4 → `Dfast`
     /// * 5 → `Greedy`
-    /// * 6-15 → `Lazy` (donor splits 6/7=lazy, 8-12=lazy2,
-    ///   13-15=btlazy2; we collapse all three onto our `Lazy` tag and
-    ///   carry the lazy_depth variance via `LevelParams.lazy_depth`)
+    /// * 6-12 → `Lazy` (donor 6/7=lazy, 8-12=lazy2; we collapse lazy and
+    ///   lazy2 onto our `Lazy` tag and carry the lazy/lazy2 split via
+    ///   `LevelParams.lazy_depth` — 1 for lazy, 2 for lazy2)
+    /// * 13-15 → `Btlazy2` (donor btlazy2: BinaryTree finder + lazy parse)
     /// * 16-17 → `BtOpt`
     /// * 18 → `BtUltra`
     /// * 19-22 → `BtUltra2`
@@ -409,7 +441,9 @@ impl StrategyTag {
             Self::Fast => BackendTag::Simple,
             Self::Dfast => BackendTag::Dfast,
             Self::Greedy => BackendTag::Row,
-            Self::Lazy | Self::BtOpt | Self::BtUltra | Self::BtUltra2 => BackendTag::HashChain,
+            Self::Lazy | Self::Btlazy2 | Self::BtOpt | Self::BtUltra | Self::BtUltra2 => {
+                BackendTag::HashChain
+            }
         }
     }
 
@@ -423,7 +457,9 @@ impl StrategyTag {
             Self::Dfast => SearchMethod::DoubleFast,
             Self::Greedy => SearchMethod::RowHash,
             Self::Lazy => SearchMethod::HashChain,
-            Self::BtOpt | Self::BtUltra | Self::BtUltra2 => SearchMethod::BinaryTree,
+            Self::Btlazy2 | Self::BtOpt | Self::BtUltra | Self::BtUltra2 => {
+                SearchMethod::BinaryTree
+            }
         }
     }
 
@@ -433,7 +469,7 @@ impl StrategyTag {
     pub(crate) const fn parse_mode(self) -> ParseMode {
         match self {
             Self::Fast | Self::Dfast | Self::Greedy => ParseMode::Greedy,
-            Self::Lazy => ParseMode::Lazy,
+            Self::Lazy | Self::Btlazy2 => ParseMode::Lazy,
             Self::BtOpt | Self::BtUltra | Self::BtUltra2 => ParseMode::Optimal,
         }
     }
@@ -453,9 +489,23 @@ mod tests {
         assert_strategy_matches_tag::<Dfast>(StrategyTag::Dfast);
         assert_strategy_matches_tag::<Greedy>(StrategyTag::Greedy);
         assert_strategy_matches_tag::<Lazy>(StrategyTag::Lazy);
+        assert_strategy_matches_tag::<Btlazy2>(StrategyTag::Btlazy2);
         assert_strategy_matches_tag::<BtOpt>(StrategyTag::BtOpt);
         assert_strategy_matches_tag::<BtUltra>(StrategyTag::BtUltra);
         assert_strategy_matches_tag::<BtUltra2>(StrategyTag::BtUltra2);
+    }
+
+    /// Pin the `Btlazy2` tag's full bridge: it runs the BinaryTree finder on
+    /// the HashChain backend with a Lazy parse (donor `ZSTD_btlazy2`).
+    #[test]
+    fn btlazy2_tag_bridge_contract() {
+        assert_eq!(StrategyTag::Btlazy2.backend(), BackendTag::HashChain);
+        assert_eq!(StrategyTag::Btlazy2.search(), SearchMethod::BinaryTree);
+        assert_eq!(StrategyTag::Btlazy2.parse_mode(), ParseMode::Lazy);
+        // The BT walk cap must let L15's search_depth = 64 govern (BtOpt's
+        // 32 would silently halve it); full find, no early bail.
+        assert_eq!(Btlazy2::MAX_CHAIN_DEPTH, 64);
+        assert_eq!(Btlazy2::SUFFICIENT_MATCH_LEN, usize::MAX);
     }
 
     #[test]
@@ -521,6 +571,7 @@ mod tests {
         assert!(!Dfast::USE_BT);
         assert!(!Greedy::USE_BT);
         assert!(!Lazy::USE_BT);
+        assert!(Btlazy2::USE_BT);
         assert!(BtOpt::USE_BT);
         assert!(BtUltra::USE_BT);
         assert!(BtUltra2::USE_BT);
@@ -534,6 +585,8 @@ mod tests {
         assert!(!Dfast::USE_HASH3);
         assert!(!Greedy::USE_HASH3);
         assert!(!Lazy::USE_HASH3);
+        assert!(!Btlazy2::USE_HASH3);
+        assert!(!Btlazy2::TWO_PASS_SEED);
         assert!(!BtOpt::USE_HASH3);
         assert!(BtUltra::USE_HASH3);
         assert!(BtUltra2::USE_HASH3);
@@ -548,9 +601,14 @@ mod tests {
     // silently.
     const _COST_MODEL_LAYOUT: () = {
         assert!(!Lazy::ACCURATE_PRICE && Lazy::FAVOR_SMALL_OFFSETS);
+        assert!(!Btlazy2::ACCURATE_PRICE && Btlazy2::FAVOR_SMALL_OFFSETS);
         assert!(!BtOpt::ACCURATE_PRICE && BtOpt::FAVOR_SMALL_OFFSETS);
         assert!(BtUltra::ACCURATE_PRICE && !BtUltra::FAVOR_SMALL_OFFSETS);
         assert!(BtUltra2::ACCURATE_PRICE && !BtUltra2::FAVOR_SMALL_OFFSETS);
+        // btlazy2 runs the full BT find (no early bail) and a search depth
+        // that lets L15's configured search_depth=64 govern; see `Btlazy2`.
+        assert!(Btlazy2::MAX_CHAIN_DEPTH == 64);
+        assert!(Btlazy2::SUFFICIENT_MATCH_LEN == usize::MAX);
         assert!(BtOpt::MAX_CHAIN_DEPTH == 32);
         // 1 << searchLog for clevels.h level 18 (searchLog = 6).
         assert!(BtUltra::MAX_CHAIN_DEPTH == 64);

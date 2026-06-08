@@ -55,6 +55,7 @@
 use alloc::vec::Vec;
 
 use crate::encoding::Sequence;
+use crate::encoding::dict_attach::DictAttach;
 
 use super::fast_kernel::hash_table::FastHashTable;
 use super::fast_kernel::kernel::compress_block_fast;
@@ -232,32 +233,19 @@ pub(crate) struct FastKernelMatcher {
     /// (`borrowed[start..end]`, zero-copy) for the emit path — the
     /// borrowed analogue of `last_block_start` on the owned path.
     last_borrowed_block: Option<(usize, usize)>,
-    /// Immutable dictionary hash table for the donor `dictMatchState`
-    /// Fast path. Built once during `prime_with_dictionary` over the
-    /// dictionary region at the front of `history` (positions
-    /// `[1, dict_region_len)`), using the same `(hash_log, mls)` as
-    /// [`Self::hash_table`] so a single hash keys both tables. `Some`
-    /// activates the dual-probe [`compress_block_fast_dict`] kernel;
-    /// invalidated to `None` on any history eviction (the absolute dict
-    /// positions would otherwise go stale) so the no-dict kernel takes
-    /// over — correctness-safe, only the dict ratio benefit is lost on
-    /// inputs large enough to slide the dictionary out of the window.
-    dict_table: Option<FastHashTable>,
-    /// Number of dictionary bytes at the front of `history` (one past the
-    /// last valid dict position). The boundary between the dict region and
-    /// the frame input; doubles as the `input_floor` / `dict_end` the
-    /// dict kernel uses to separate main-table (input) from dict-table
-    /// matches. `0` when no dictionary is primed.
-    dict_region_len: usize,
-    /// CDict-equivalent cache flag: `true` once [`Self::dict_table`] has been
-    /// fully built for the attached dictionary. A reused compressor keeps the
-    /// built `dict_table` across the per-frame `reset` (the dictionary
-    /// re-commits to the same absolute history positions, so the hashed
-    /// positions stay valid) and skips re-hashing it — the donor copies /
-    /// references the precomputed `cdict->matchState` rather than rebuilding
-    /// it per frame. Cleared on parameter change, history eviction, or
-    /// dictionary attach/clear (see `invalidate_dict_cache`).
-    dict_primed: bool,
+    /// Immutable dictionary hash table (donor `dictMatchState` Fast path) plus
+    /// its CDict cache lifecycle, via the shared [`DictAttach`] level-1
+    /// scaffolding. The table is built once during `prime_with_dictionary` over
+    /// the dictionary region at the front of `history` (positions
+    /// `[1, region_len)`), using the same `(hash_log, mls)` as
+    /// [`Self::hash_table`] so a single hash keys both. Attached
+    /// (`is_attached()`) activates the dual-probe [`compress_block_fast_dict`]
+    /// kernel; invalidated on any history eviction (absolute dict positions
+    /// would otherwise go stale) so the no-dict kernel takes over —
+    /// correctness-safe, only the dict ratio benefit is lost when the input is
+    /// large enough to slide the dictionary out of the window. `region_len()`
+    /// is the dict/input boundary (`dict_end`).
+    dict: DictAttach<FastHashTable>,
 }
 
 impl FastKernelMatcher {
@@ -345,9 +333,7 @@ impl FastKernelMatcher {
             pending: None,
             borrowed: None,
             last_borrowed_block: None,
-            dict_table: None,
-            dict_region_len: 0,
-            dict_primed: false,
+            dict: DictAttach::new(),
         }
     }
 
@@ -375,9 +361,7 @@ impl FastKernelMatcher {
             // invalidates the cached dict table: its absolute positions
             // index a table whose shape no longer matches.
             self.hash_table = FastHashTable::new(hash_log, mls);
-            self.dict_table = None;
-            self.dict_region_len = 0;
-            self.dict_primed = false;
+            self.dict.invalidate();
         } else {
             // Same shape — keep the allocation, zero the entries via
             // `memset` (ZSTD_window_clear cadence). A primed dict table
@@ -641,9 +625,7 @@ impl FastKernelMatcher {
         // cost is the dict ratio benefit on inputs large enough to evict
         // the dictionary, which is exactly when the dict is no longer
         // reachable anyway.
-        self.dict_table = None;
-        self.dict_region_len = 0;
-        self.dict_primed = false;
+        self.dict.invalidate();
         self.hash_table.clear();
         self.last_block_start = self.last_block_start.saturating_sub(drop_n);
         // Skip position 0 — `prefix_start_index = 1` means the kernel
@@ -784,19 +766,19 @@ impl FastKernelMatcher {
         // additionally requires `pos >= window_low` and `pos < dict_end` so
         // emitted offsets (`ip0 - pos`) stay within the advertised window,
         // including the pre-drain 1x..2x-window band where `window_low > 0`.
-        let use_dict = self.dict_table.is_some();
+        let use_dict = self.dict.is_attached();
         let history: &[u8] = &self.history;
         let rep_out = if use_dict {
             use super::fast_kernel::kernel::PrefixBounds;
-            let dict_end = self.dict_region_len as u32;
+            let dict_end = self.dict.region_len() as u32;
             let bounds = PrefixBounds {
                 prefix_start_index,
                 window_low,
             };
             let main_table = &mut self.hash_table;
             let dict_table = self
-                .dict_table
-                .as_ref()
+                .dict
+                .table()
                 .expect("use_dict implies dict_table is Some");
             run_fast_kernel_block_dict(
                 history,
@@ -1177,18 +1159,14 @@ impl FastKernelMatcher {
     /// table actually exists — a sub-8-byte dict builds no table and must
     /// re-run the (cheap, no-op) prime path each frame.
     pub(crate) fn mark_dict_primed(&mut self) {
-        if self.dict_table.is_some() {
-            self.dict_primed = true;
-        }
+        self.dict.mark_primed();
     }
 
     /// Drop the cached dict table and its primed flag. Called by the driver
     /// when the next frame carries no dictionary, so the kernel never probes
     /// a stale dict region whose bytes are no longer re-committed.
     pub(crate) fn invalidate_dict_cache(&mut self) {
-        self.dict_table = None;
-        self.dict_region_len = 0;
-        self.dict_primed = false;
+        self.dict.invalidate();
     }
 
     /// Build (or extend) [`Self::dict_table`] over `history[range_start..]`,
@@ -1199,8 +1177,8 @@ impl FastKernelMatcher {
         let history_len = self.history.len();
         // Record the dict/input boundary regardless of whether any position
         // is hashable (a sub-8-byte dict still bounds the input floor).
-        self.dict_region_len = history_len;
-        if self.dict_primed {
+        self.dict.set_region_len(history_len);
+        if self.dict.is_primed() {
             // CDict-equivalent fast path: `dict_table` was built over the
             // identical dictionary bytes on a prior frame, and those bytes
             // sit at the same absolute history positions now (the dict is
@@ -1219,11 +1197,10 @@ impl FastKernelMatcher {
         if backfill_start > last_hashable {
             return;
         }
-        if self.dict_table.is_none() {
-            let hash_log = self.hash_table.hash_log();
-            let mls = self.hash_table.mls();
-            self.dict_table = Some(FastHashTable::new(hash_log, mls));
-        }
+        let hash_log = self.hash_table.hash_log();
+        let mls = self.hash_table.mls();
+        self.dict
+            .table_mut_or_init(|| FastHashTable::new(hash_log, mls));
         let base = self.history.as_ptr();
         match self.hash_table.mls() {
             4 => self.prime_dict_table_impl::<4>(base, backfill_start, last_hashable),
@@ -1245,8 +1222,8 @@ impl FastKernelMatcher {
         last_hashable: usize,
     ) {
         let dict_table = self
-            .dict_table
-            .as_mut()
+            .dict
+            .table_mut()
             .expect("prime_dict_table_for_range creates the table before this call");
         for pos in range_start..=last_hashable {
             // SAFETY: pos <= last_hashable = history_len - 8, so `base.add(pos)`
@@ -2066,7 +2043,7 @@ mod tests {
         // A position in the (HASH_READ_SIZE - 1)-byte gap just below the
         // seam: its 8-byte hash read straddles the chunk boundary.
         let p = seam - 4;
-        let dt = m.dict_table.as_ref().expect("dict table primed");
+        let dt = m.dict.table().expect("dict table primed");
         let h = unsafe { dt.hash_ptr::<4>(m.history.as_ptr().add(p)) };
         assert_eq!(
             unsafe { dt.get(h) },

@@ -1,0 +1,30 @@
+# Coverage is collected on a single x86_64 Linux job. The codec carries
+# arch-specific kernel tiers — aarch64 NEON and wasm32 `simd128` — behind
+# `#[cfg(target_arch = ...)]`, so on the x86_64 coverage run that code is
+# compiled out and its source lines can never be executed. codecov still
+# sees those lines in a PR diff and counts them as "missing", which
+# structurally drags patch coverage down on any change that touches a
+# mixed-arch module (e.g. `encoding/row/mod.rs`, which interleaves the
+# SSE4.2 / AVX2 / NEON / simd128 row tiers in one file).
+#
+# Keep the patch status INFORMATIONAL (posted for visibility, never
+# blocking) rather than gating PRs on structurally-uncoverable arch code.
+# The project status still enforces the overall coverage trend, so a real
+# drop in covered native code is still caught.
+coverage:
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 1%
+    patch:
+      default:
+        informational: true
+
+# Whole-file arch-only modules: NEON fastpath kernels are aarch64-only, so
+# they are never compiled on the x86_64 coverage job. Exclude them outright
+# so they neither count as missing nor dilute the project number.
+ignore:
+  - "zstd/src/encoding/fastpath/neon.rs"
+  - "zstd/benches/**"
+  - "zstd/fuzz/**"

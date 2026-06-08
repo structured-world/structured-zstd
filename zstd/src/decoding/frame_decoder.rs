@@ -8,7 +8,6 @@ use super::frame;
 use crate::decoding;
 use crate::decoding::block_decoder::BlockDecoder;
 use crate::decoding::buffer_backend::BufferBackend;
-use crate::decoding::decode_buffer::DecodeBuffer;
 use crate::decoding::dictionary::{Dictionary, DictionaryHandle};
 use crate::decoding::errors::{DecodeBlockContentError, FrameDecoderError};
 use crate::decoding::flat_buf::FlatBuf;
@@ -393,16 +392,23 @@ impl DecoderScratchKind {
         Self::Ring(s)
     }
 
-    /// Construct a flat-backed scratch sized for a single-segment
-    /// frame. `frame_content_size` is the upcoming output size in
-    /// bytes (== `window_size` when the flag is set).
+    /// Construct a flat-backed scratch for a single-segment frame.
+    /// `frame_content_size` is the upcoming output size in bytes
+    /// (== `window_size` when the flag is set).
+    ///
+    /// Lazy buffer allocation (mirrors [`Self::new_ring`]): do NOT
+    /// pre-size the `FlatBuf`. The direct-decode path
+    /// (`run_direct_decode`) writes through `UserSliceBackend` and never
+    /// touches this buffer, so eagerly allocating a full FCS wastes one
+    /// whole content-size of peak memory on the common direct-eligible
+    /// single-segment frame. The non-direct fallback reserves it once via
+    /// `reserve_buffer(window_size)` at frame entry before any block
+    /// write (`FlatBuf::reserve` adds the `WILDCOPY_OVERLENGTH` slack),
+    /// and every inline-exec site (trait method and per-kernel macros)
+    /// now carries a tight-tail bounded copy, so a tight buffer can never
+    /// overshoot regardless of construction-time slack.
     fn new_flat(frame_content_size: usize) -> Self {
-        let flat = FlatBuf::with_capacity(frame_content_size);
-        // DecoderScratch's default ctor would discard the pre-sized
-        // FlatBuf — go through from_backend so the buffer carries the
-        // capacity the constructor wants.
-        let mut s = DecoderScratch::<FlatBuf>::new(frame_content_size);
-        s.buffer = DecodeBuffer::from_backend(flat, frame_content_size);
+        let s = DecoderScratch::<FlatBuf>::new(frame_content_size);
         Self::Flat(s)
     }
 
@@ -418,11 +424,13 @@ impl DecoderScratchKind {
             match self {
                 Self::Flat(s) => {
                     s.reset(window_size);
-                    // DecodeBuffer::reset clears + reserves
-                    // window_size; FlatBuf's reserve grows the
-                    // backing Vec if the new FCS is larger than
-                    // what's already allocated. No alloc when the
-                    // previous flat frame had >= this capacity.
+                    // `DecoderScratch::reset` clears the backing buffer and
+                    // updates `window_size` WITHOUT reserving it (it may still
+                    // resize the per-block scratch Vecs up to
+                    // `min(window_size, MAX_BLOCK_SIZE)`). Backing-buffer
+                    // capacity is decided one layer up: direct-eligible frames
+                    // never touch it, and the non-direct path pre-reserves once
+                    // via `reserve_buffer(window_size)` at frame entry.
                 }
                 Self::Ring(_) => *self = Self::new_flat(window_size),
             }
@@ -455,13 +463,19 @@ impl DecoderScratchKind {
     /// decodes don't pay repeated `reserve_amortized` grow steps
     /// (128 KiB → 256 KiB → ... → window) as blocks accumulate.
     ///
-    /// Direct-eligible ring-backed frames never call this and pay zero
-    /// ring allocation for the window. Flat-backed (single-segment)
-    /// frames eagerly size their `FlatBuf` to `frame_content_size` at
-    /// `new_flat` construction time, so a direct-eligible flat frame
-    /// already paid for that capacity before this helper is reachable;
-    /// the "zero buffer allocation" guarantee here applies to the
-    /// ring path only.
+    /// Direct-eligible frames never call this and pay zero backing-buffer
+    /// allocation for the window, on BOTH backends: `new_ring` and
+    /// `new_flat` are each lazy (no pre-reserve), so a direct-eligible
+    /// frame writes only through `UserSliceBackend` and leaves this
+    /// buffer empty.
+    /// `window_size` is the ADDITIONAL-bytes argument the backend `reserve`
+    /// contract expects (Vec-style `reserve(additional)` → `capacity >= len +
+    /// additional`, plus the backend's wildcopy slack). This is always called at
+    /// frame entry on a freshly-reset buffer (`len == 0`), so the additional
+    /// request equals the desired total window capacity. Do NOT pass
+    /// `window_size - buffer.len()`: when `len == 0` it's identical, and the
+    /// backend `reserve` impls deliberately reject that form because it
+    /// under-reserves on reused buffers (see `FlatBuf::reserve`).
     #[inline]
     fn reserve_buffer(&mut self, window_size: usize) {
         match self {
@@ -728,14 +742,12 @@ impl FrameDecoderState {
     /// from `source`. When `magicless` is `true`, the 4-byte magic
     /// number prefix is NOT consumed (donor `ZSTD_f_zstd1_magicless`).
     /// Crate-internal — reached only via `FrameDecoder::init` /
-    /// `FrameDecoder::init_with_dict_handle`. For multi-segment
-    /// (ring-backed) frames the decode buffer is allocated lazily —
+    /// `FrameDecoder::init_with_dict_handle`. The decode buffer is
+    /// allocated lazily on BOTH backends (`new_ring` and `new_flat`):
     /// direct-eligible frames pay zero buffer allocation, and the
     /// non-direct fallback reserves `window_size` once in
-    /// `decode_all_impl` via `reserve_buffer`. Single-segment
-    /// (flat-backed) frames eagerly size the backing `FlatBuf` to
-    /// `frame_content_size` because the flat path writes the entire
-    /// output into the same buffer and cannot defer that allocation.
+    /// `decode_all_impl` / `decode_blocks` via `reserve_buffer` before
+    /// any block write.
     pub(crate) fn new_with_format(
         source: impl Read,
         magicless: bool,
@@ -772,17 +784,13 @@ impl FrameDecoderState {
     /// only via `FrameDecoder::reset`.
     ///
     /// `DecodeBuffer::reset` no longer reserves window_size for either
-    /// backend — capacity decisions live one layer up. For ring-backed
-    /// scratch, direct-eligible frames pay zero allocation here and
-    /// the non-direct path is pre-reserved by `decode_all_impl` /
-    /// `decode_blocks` via `DecoderScratchKind::reserve_buffer(window_size)`
-    /// before any block writes. Flat-backed scratch is sized to
-    /// `frame_content_size` by `DecoderScratchKind::new_flat` at first
-    /// construction (and on Ring → Flat transition); a reused flat
-    /// scratch whose new frame fits within the prior FCS reuses the
-    /// existing capacity, and one whose new FCS is larger is also
-    /// pre-reserved by the same `reserve_buffer(window_size)` call at
-    /// frame entry (single-segment frames have window_size == FCS).
+    /// backend — capacity decisions live one layer up. Both backends are
+    /// lazy: direct-eligible frames pay zero backing-buffer allocation
+    /// here (they write through `UserSliceBackend`), and the non-direct
+    /// path is pre-reserved by `decode_all_impl` / `decode_blocks` via
+    /// `DecoderScratchKind::reserve_buffer(window_size)` before any block
+    /// write. A reused scratch whose new frame fits within prior capacity
+    /// reuses it; a larger one grows on that same `reserve_buffer` call.
     pub(crate) fn reset_with_format(
         &mut self,
         source: impl Read,
@@ -2070,7 +2078,6 @@ impl FrameDecoder {
         mut output: &mut [u8],
         mut init_frame: impl FnMut(&mut Self, &mut &[u8]) -> Result<(), FrameDecoderError>,
     ) -> Result<usize, FrameDecoderError> {
-        use super::buffer_backend::WILDCOPY_OVERLENGTH;
         let mut total_bytes_written = 0;
         while !input.is_empty() {
             match init_frame(self, &mut input) {
@@ -2106,7 +2113,15 @@ impl FrameDecoder {
                     state_ref.frame_header.window_size().unwrap_or(0),
                 )
             };
-            let needed = content_size.saturating_add(WILDCOPY_OVERLENGTH as u64);
+            // Direct decode requires only that the caller slice holds the
+            // declared content; the inline sequence-exec path no longer
+            // needs `WILDCOPY_OVERLENGTH` trailing slack because the
+            // trailing sequence(s) take the bounded (non-overshooting)
+            // copy in `UserSliceBackend::exec_sequence_bounded`. This is
+            // the universal "decode into an FCS-sized buffer" case (a
+            // caller sizing `output` to exactly `frame_content_size`),
+            // so dropping the slack requirement halves its peak alloc.
+            //
             // Per-block checksums collected inside `run_direct_decode`
             // post-loop (over recorded (start, end) ranges of `output`)
             // so the direct path stays eligible AND keeps the
@@ -2115,7 +2130,7 @@ impl FrameDecoder {
             // validation. Path choice no longer alters checksum
             // semantics.
             let direct_eligible =
-                content_size > 0 && !dict_active && (output.len() as u64) >= needed;
+                content_size > 0 && !dict_active && (output.len() as u64) >= content_size;
             if direct_eligible {
                 let written = self.run_direct_decode(&mut input, output, content_size)?;
                 output = &mut output[written..];
@@ -2184,7 +2199,6 @@ impl FrameDecoder {
         mut init_frame: impl FnMut(&mut Self, &mut &[u8]) -> Result<(), FrameDecoderError>,
         mut skippable_visitor: Option<&mut dyn FnMut(u8, &[u8])>,
     ) -> Result<usize, FrameDecoderError> {
-        use super::buffer_backend::WILDCOPY_OVERLENGTH;
         let mut total_bytes_written = 0;
         while !input.is_empty() {
             match init_frame(self, &mut input) {
@@ -2236,9 +2250,13 @@ impl FrameDecoder {
                     state_ref.frame_header.window_size().unwrap_or(0),
                 )
             };
-            let needed = content_size.saturating_add(WILDCOPY_OVERLENGTH as u64);
+            // Only `cap >= frame_content_size` needed; the trailing
+            // sequence(s) take the bounded copy in
+            // `UserSliceBackend::exec_sequence_bounded`, so no
+            // `WILDCOPY_OVERLENGTH` trailing slack is required (see the
+            // no-lsm path above).
             let direct_eligible =
-                content_size > 0 && !dict_active && (output.len() as u64) >= needed;
+                content_size > 0 && !dict_active && (output.len() as u64) >= content_size;
             if direct_eligible {
                 let written = self.run_direct_decode(&mut input, output, content_size)?;
                 output = &mut output[written..];
@@ -2306,36 +2324,25 @@ impl FrameDecoder {
     ///
     /// `input` must contain an exact number of frames.
     ///
-    /// `output` must have enough extra capacity to hold the decompressed data.
-    /// This function reserves an additional [`WILDCOPY_OVERLENGTH`]
-    /// bytes on top of the caller's capacity so the per-frame direct
-    /// decode path stays eligible — that may grow the vector by up
-    /// to that fixed amount via `Vec::reserve`. It will NOT grow
-    /// further to fit the decompressed payload itself; the caller's
-    /// pre-allocated capacity must already cover the data. If you
-    /// don't know how large the output will be, use
+    /// `output` must have enough spare capacity to hold the decompressed
+    /// data. This adds no extra slack: exact-fit output is now eligible
+    /// for the direct decode path, so a `Vec::with_capacity(fcs)` is
+    /// decoded straight into without a growth/reallocation. It will NOT
+    /// grow the vector to fit the decompressed payload itself; the
+    /// caller's pre-allocated capacity must already cover the data. If
+    /// you don't know how large the output will be, use
     /// [`FrameDecoder::decode_blocks`] instead.
     ///
     /// This calls [`FrameDecoder::init`], and all bytes currently in the decoder will be lost.
     ///
-    /// The length of the output vector is updated to include the decompressed data.
-    /// The length is not changed if an error occurs. The
-    /// `WILDCOPY_OVERLENGTH` slack is internal — `output.len()` on
-    /// return is the actual decompressed size, NOT the inflated
-    /// capacity. Callers who pre-sized the Vec with
-    /// `Vec::with_capacity(fcs)` see no functional change beyond
-    /// the small one-time capacity bump.
+    /// The length of the output vector is updated to include the
+    /// decompressed data. The length is not changed if an error occurs.
     pub fn decode_all_to_vec(
         &mut self,
         input: &[u8],
         output: &mut Vec<u8>,
     ) -> Result<(), FrameDecoderError> {
-        use super::buffer_backend::WILDCOPY_OVERLENGTH;
         let len = output.len();
-        // Reserve WILDCOPY slack on top of the caller's capacity so
-        // `decode_all` can land on the direct path even when the
-        // caller didn't pre-allocate slack themselves.
-        output.reserve(WILDCOPY_OVERLENGTH);
         let cap = output.capacity();
         output.resize(cap, 0);
         match self.decode_all(input, &mut output[len..]) {
@@ -2363,7 +2370,10 @@ impl FrameDecoder {
     /// - `content_size` matches `self.state.frame_header
     ///   .frame_content_size()` and is `> 0` (caller already passed
     ///   the eligibility gate).
-    /// - `output.len() >= content_size + WILDCOPY_OVERLENGTH`.
+    /// - `output.len() >= content_size`. No `WILDCOPY_OVERLENGTH`
+    ///   trailing slack is required: the trailing sequence(s) take the
+    ///   bounded (non-overshooting) copy in
+    ///   [`UserSliceBackend::exec_sequence_bounded`].
     /// - No active dictionary
     ///   (`self.state.using_dict.is_none()`).
     ///
@@ -2657,18 +2667,21 @@ mod tests {
     use alloc::vec::Vec;
 
     #[test]
-    fn decode_all_legacy_drain_matches_direct_path_on_single_segment_frame() {
+    fn decode_all_tight_and_slack_outputs_match_on_single_segment_frame() {
         // Roundtrip a small payload through the encoder, then decode
         // it via `decode_all` on two output shapes that select
-        // different internal paths:
-        //   1. Tight output (no WILDCOPY_OVERLENGTH slack) → legacy
-        //      `decode_blocks` + `read()` drain path.
-        //   2. Output with WILDCOPY slack → direct
-        //      `run_direct_decode` + `UserSliceBackend` path.
-        // Both paths must produce identical output bytes — the only
-        // difference is the internal buffer/drain shape, not the
-        // decoded semantics. This is the regression gate for the
-        // direct-decode wiring.
+        // different internal sequence-exec paths within the direct
+        // decode:
+        //   1. Tight output (exactly `frame_content_size`, no
+        //      WILDCOPY_OVERLENGTH slack) → direct path whose trailing
+        //      sequence(s) take the bounded (non-overshooting) copy in
+        //      `UserSliceBackend::exec_sequence_bounded`.
+        //   2. Output with WILDCOPY slack → direct path whose
+        //      sequences all take the SIMD wildcopy fast path.
+        // Both must produce identical output bytes — the bounded tail
+        // copy must reconstruct the same data as the overshooting fast
+        // path. This is the regression gate for the relaxed
+        // direct-decode gate (`cap >= content_size`).
         let payload: Vec<u8> = (0..4096u32).map(|i| (i & 0xFF) as u8).collect();
         let mut compressor = FrameCompressor::new(CompressionLevel::Default);
         compressor.set_source(payload.as_slice());
@@ -2698,6 +2711,54 @@ mod tests {
             "direct decode produced wrong byte count"
         );
         assert_eq!(&out_b[..n_b], payload.as_slice());
+    }
+
+    #[test]
+    fn decode_all_tight_output_overlapping_tail_match_roundtrips() {
+        // The bounded tail copy must handle an OVERLAPPING match
+        // (offset < match_length) as the trailing sequence when the
+        // output slice is sized to exactly `frame_content_size`. A long
+        // run of a single byte at the end of the payload encodes as an
+        // offset-1 match whose length far exceeds the offset, so the
+        // bounded copy's overlapping (forward byte-by-byte) branch is
+        // exercised at the buffer tail where the SIMD overshoot would
+        // otherwise run past `cap`. Decoding into a tight buffer and
+        // matching the original payload byte-for-byte is the regression
+        // gate for the overlap branch of `exec_sequence_bounded`.
+        let mut payload: Vec<u8> = (0..256u32).map(|i| (i & 0xFF) as u8).collect();
+        payload.extend(core::iter::repeat_n(0xABu8, 8192));
+        let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        compressor.set_source(payload.as_slice());
+        let mut compressed = Vec::new();
+        compressor.set_drain(&mut compressed);
+        compressor.compress();
+
+        // Anti-vacuous precondition: the 8 KiB trailing run of a single
+        // byte must compress to a Compressed block dominated by ONE long
+        // offset-1 (overlapping, offset < match_length) match — not a Raw
+        // block. If the encoder ever stopped emitting that overlapping
+        // tail match the test would pass without exercising
+        // `exec_sequence_bounded`'s overlapping forward-copy branch, so
+        // gate on the output being a tiny fraction of the input (a raw
+        // block would be ~`payload.len()`; an offset-1 run match is tens
+        // of bytes).
+        assert!(
+            compressed.len() < payload.len() / 8,
+            "expected an overlapping-tail match to dominate the frame \
+             (compressed={} payload={}); the bounded overlap branch would \
+             not be exercised otherwise",
+            compressed.len(),
+            payload.len(),
+        );
+
+        // Tight output: exactly content_size, no WILDCOPY slack.
+        let mut dec = FrameDecoder::new();
+        let mut out = alloc::vec![0u8; payload.len()];
+        let n = dec
+            .decode_all(compressed.as_slice(), &mut out)
+            .expect("tight-output decode with overlapping tail match should succeed");
+        assert_eq!(n, payload.len());
+        assert_eq!(out, payload, "bounded overlap tail copy corrupted output");
     }
 
     #[test]
@@ -3007,13 +3068,15 @@ mod tests {
     }
 
     #[test]
-    fn decode_all_falls_back_when_output_too_small_for_wildcopy_slack() {
+    fn decode_all_exact_fit_output_decodes_correctly() {
         // Output sized exactly to frame_content_size (no
-        // WILDCOPY_OVERLENGTH slack) must NOT trigger the direct
-        // path — the burst's `extend_from_within_unchecked` writes
-        // past `tail` into the slack region. Direct dispatcher
-        // recognises this and falls back to the FlatBuf + drain
-        // path which still produces the right output.
+        // WILDCOPY_OVERLENGTH slack) is now eligible for the direct
+        // path: every output-write site is exact-fit-safe (sequence
+        // exec falls back to the bounded, non-overshooting copy on the
+        // trailing sequence(s), Raw/RLE blocks copy exactly). This must
+        // produce the same bytes as a slack-padded buffer. Exercised on
+        // x86 through the per-kernel AVX2/SSE2 inline-exec macros, which
+        // carry the same tight-tail branch.
         let payload: Vec<u8> = (0..2048u32)
             .map(|i| (i.wrapping_mul(31) & 0xFF) as u8)
             .collect();
@@ -3024,11 +3087,11 @@ mod tests {
         compressor.compress();
 
         let mut dec = FrameDecoder::new();
-        // Exactly payload.len(), no slack — direct path is gated out.
+        // Exactly payload.len(), no slack.
         let mut out = alloc::vec![0u8; payload.len()];
         let n = dec
             .decode_all(compressed.as_slice(), &mut out)
-            .expect("decode_all should still succeed via fallback");
+            .expect("exact-fit decode_all should succeed");
         assert_eq!(n, payload.len());
         assert_eq!(&out[..n], payload.as_slice());
     }
@@ -3060,9 +3123,18 @@ mod tests {
         wire.extend_from_slice(&[1u8, 2, 3, 4]);
 
         let mut dec = FrameDecoder::new();
-        // Size output exactly at declared FCS (no WILDCOPY slack)
-        // so the eligibility check gates the direct path out.
-        let mut out = alloc::vec![0u8; 20];
+        // Size output SMALLER than the declared FCS so direct-decode is
+        // gated out (`output.len() >= content_size` is false) and the
+        // frame takes the legacy fallback drain loop — the path this test
+        // guards. The corrupt frame only produces 4 bytes, so 19 is ample
+        // room; the point is `19 != declared FCS (20)`.
+        const DECLARED_FCS: usize = 20;
+        let mut out = alloc::vec![0u8; DECLARED_FCS - 1];
+        assert_ne!(
+            out.len(),
+            DECLARED_FCS,
+            "output must be smaller than FCS to exercise the fallback path",
+        );
         let err = dec
             .decode_all(wire.as_slice(), &mut out)
             .expect_err("fallback must reject corrupt FCS underflow");

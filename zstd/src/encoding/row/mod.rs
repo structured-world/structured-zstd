@@ -17,108 +17,37 @@ use core::convert::TryInto;
 
 use super::Sequence;
 use super::blocks::encode_offset_with_history;
+use super::dict_attach::DictAttach;
 use super::match_generator::{
     ROW_EMPTY_SLOT, ROW_HASH_BITS, ROW_HASH_KEY_LEN, ROW_LOG, ROW_MIN_MATCH_LEN, ROW_SEARCH_DEPTH,
     ROW_TAG_BITS, ROW_TARGET_LEN, RowConfig,
 };
+
+/// Immutable row-hash dictionary index (donor `ZSTD_RowFindBestMatch`'s
+/// `dictMatchState` probe). Built once over the dictionary region and probed as
+/// ONE fixed-width row (`<= row_entries` tag-matched candidates) AFTER the live
+/// row, so the dict search is bounded (unlike a hash-chain walk) and never
+/// re-indexed per frame. `positions` store CONCAT indices (history_start-
+/// relative, floor-rebase-invariant); `ROW_EMPTY_SLOT = u32::MAX` marks empty.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct RowDictTables {
+    pub(crate) heads: Vec<u8>,
+    pub(crate) positions: Vec<u32>,
+    pub(crate) tags: Vec<u8>,
+}
 use super::match_table::helpers::{
-    INCOMPRESSIBLE_SKIP_STEP, LazyMatchConfig, best_len_offset_candidate, common_prefix_len,
-    extend_backwards_shared, pick_lazy_match_shared, repcode_candidate_shared,
+    INCOMPRESSIBLE_SKIP_STEP, LazyMatchConfig, best_len_offset_candidate, extend_backwards_shared,
+    pick_lazy_match_shared, repcode_candidate_shared,
 };
 use super::opt::types::MatchCandidate;
 
-/// Which kernel computes the row tag-match mask. Resolved once per
-/// `RowMatchGenerator` (CPU features don't change mid-process) and stored
-/// so the per-position `row_candidate` hot path avoids a repeated runtime
-/// feature query. `Sse2` covers the SSE2 baseline (always present on
-/// x86_64); `Avx2` is used when the CPU has AVX2; everything else (other
-/// architectures, x86 without SSE2) uses the scalar reference.
-#[derive(Copy, Clone, Eq, PartialEq)]
-enum RowTagKernel {
-    Scalar,
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    Sse2,
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    Avx2,
-    // Little-endian only: the movemask packing reinterprets the lanes
-    // through u16/u32/u64, which groups bytes by native order — correct only
-    // on little-endian. Big-endian aarch64 falls back to the scalar kernel.
-    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-    Neon,
-    // WebAssembly fixed-128-bit SIMD. Compile-time only (wasm has no runtime
-    // CPUID): present only when the build enables `simd128`.
-    #[cfg(all(
-        target_arch = "wasm32",
-        target_feature = "simd128",
-        feature = "kernel_simd128"
-    ))]
-    Simd128,
-}
-
-impl RowTagKernel {
-    /// Resolve the best available tag-match kernel for this build/CPU.
-    fn detect() -> Self {
-        #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
-        {
-            use std::arch::is_x86_feature_detected;
-            if is_x86_feature_detected!("avx2") {
-                return RowTagKernel::Avx2;
-            }
-            if is_x86_feature_detected!("sse2") {
-                return RowTagKernel::Sse2;
-            }
-        }
-        // no_std: resolve from compile-time `target_feature` flags. Use
-        // `if cfg!(...)` (not `#[cfg]`-gated `return` blocks) so the trailing
-        // `RowTagKernel::Scalar` stays reachable and every variant is
-        // "constructed" — `target_feature = "sse2"` / `"neon"` are baseline on
-        // x86_64 / aarch64, so a `#[cfg]`-gated unconditional `return` there
-        // makes the scalar fallback `unreachable_code` and leaves `Avx2`
-        // dead-code under `-D warnings`. `cfg!` const-folds to the same
-        // codegen while keeping every variant constructed; the
-        // `#[allow(unreachable_code)]` on the fallback below guards the case
-        // where `cfg!` folds the baseline-feature `if` to an unconditional
-        // `return` (mirrors `cpu_kernel::detect_cpu_kernel`).
-        #[cfg(all(not(feature = "std"), any(target_arch = "x86", target_arch = "x86_64")))]
-        {
-            if cfg!(target_feature = "avx2") {
-                return RowTagKernel::Avx2;
-            }
-            if cfg!(target_feature = "sse2") {
-                return RowTagKernel::Sse2;
-            }
-        }
-        #[cfg(all(feature = "std", target_arch = "aarch64", target_endian = "little"))]
-        {
-            if std::arch::is_aarch64_feature_detected!("neon") {
-                return RowTagKernel::Neon;
-            }
-        }
-        #[cfg(all(
-            not(feature = "std"),
-            target_arch = "aarch64",
-            target_endian = "little"
-        ))]
-        {
-            if cfg!(target_feature = "neon") {
-                return RowTagKernel::Neon;
-            }
-        }
-        // wasm32: no runtime CPUID. Resolve purely from the compile-time
-        // `simd128` target feature, baked into the build (the variant only
-        // exists under that cfg). Mirrors the no_std `cfg!` arms above.
-        #[cfg(all(
-            target_arch = "wasm32",
-            target_feature = "simd128",
-            feature = "kernel_simd128"
-        ))]
-        {
-            return RowTagKernel::Simd128;
-        }
-        #[allow(unreachable_code)]
-        RowTagKernel::Scalar
-    }
-}
+// The row probe reuses the shared `fastpath::FastpathKernel` selection so each
+// per-tier `#[target_feature]` probe can inline BOTH the tag-match mask AND the
+// matching `fastpath::<tier>::common_prefix_len_ptr` (the tiers must share a
+// feature set for the cpl to inline — `Sse42` is a superset of the SSE2 mask
+// intrinsics, `Avx2Bmi2` of the AVX2 mask). `select_kernel()` does the runtime
+// detect once per process via a `OnceLock`.
+use super::fastpath::FastpathKernel;
 
 /// Compile-time row tag-match kernel. Each ZST monomorphises the per-row
 /// tag compare so the search hot loop drops the runtime `RowTagKernel`
@@ -129,54 +58,80 @@ impl RowTagKernel {
 /// supports its ISA — the same contract `RowTagKernel::detect` upholds for
 /// the enum's `unsafe` SIMD calls.
 pub(crate) trait RowTags: Copy {
-    /// `true` for SIMD tiers: precompute a full match bitmask once, then
-    /// test one bit per probed slot. `false` for scalar: on-the-fly
-    /// per-slot byte compare (cheaper when `search_depth < row_entries`).
-    const USE_MASK: bool;
-    /// Bitmask of slots whose tag byte equals `tag` (bit `j` ⇔ `tags[j]
-    /// == tag`). Only called when `USE_MASK`. `tags.len()` is the row
-    /// width (16 / 32 / 64).
-    fn mask(tags: &[u8], tag: u8) -> u64;
+    /// Run the row match probe (live row + dict dual-probe) for this kernel.
+    /// Forwards to the matcher's per-tier `#[target_feature]` probe method whose
+    /// body expands the tier's `row_tag_mask_*!` SIMD inline (no function call),
+    /// so the vector tag-match inlines straight-line under the kernel's feature
+    /// umbrella instead of crossing the `#[target_feature]` ABI boundary on every
+    /// probe (which it does even for baseline NEON/SSE2 — see `fastpath` module
+    /// docs). Runtime kernel selection happens once at the `dispatch_tag_kernel!`
+    /// site, never inside the per-position hot loop.
+    ///
+    /// # Safety
+    /// The caller (via `dispatch_tag_kernel!`) only selects a kernel whose ISA
+    /// `RowTagKernel::detect` confirmed present, upholding the per-tier
+    /// `#[target_feature]` contract.
+    unsafe fn probe<const ROW_LOG: usize>(
+        matcher: &RowMatchGenerator,
+        abs_pos: usize,
+        lit_len: usize,
+    ) -> Option<MatchCandidate>;
 }
 
+// On wasm32+simd128 the row tier is the compile-time `Simd128Tags`, so the
+// scalar fallback ZST is never constructed there (it stays the fallback on
+// every other target, and on scalar-only wasm builds).
+#[cfg_attr(
+    all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel_simd128"
+    ),
+    allow(dead_code)
+)]
 #[derive(Copy, Clone)]
 struct ScalarTags;
 impl RowTags for ScalarTags {
-    const USE_MASK: bool = false;
-    // `USE_MASK == false` const-folds the mask branch away, so this is never
-    // invoked on the hot path; it delegates to the scalar reference for
-    // completeness (and to keep the reference fn live outside `cfg(test)`).
     #[inline]
-    fn mask(tags: &[u8], tag: u8) -> u64 {
-        row_tag_match_mask_scalar(tags, tag)
+    unsafe fn probe<const ROW_LOG: usize>(
+        matcher: &RowMatchGenerator,
+        abs_pos: usize,
+        lit_len: usize,
+    ) -> Option<MatchCandidate> {
+        // Scalar has no target feature; the probe body runs as-is.
+        unsafe { matcher.row_probe_scalar::<ROW_LOG>(abs_pos, lit_len) }
     }
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[derive(Copy, Clone)]
-struct Sse2Tags;
+struct Sse42Tags;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-impl RowTags for Sse2Tags {
-    const USE_MASK: bool = true;
+impl RowTags for Sse42Tags {
     #[inline]
-    fn mask(tags: &[u8], tag: u8) -> u64 {
-        // SAFETY: only dispatched-to when `tag_kernel == Sse2` (SSE2 is
-        // baseline on x86_64 and confirmed by `detect()` on x86).
-        unsafe { row_tag_match_mask_sse2(tags, tag) }
+    unsafe fn probe<const ROW_LOG: usize>(
+        matcher: &RowMatchGenerator,
+        abs_pos: usize,
+        lit_len: usize,
+    ) -> Option<MatchCandidate> {
+        // SAFETY: dispatched only when `tag_kernel == Sse42` (SSE4.2 confirmed).
+        unsafe { matcher.row_probe_sse42::<ROW_LOG>(abs_pos, lit_len) }
     }
 }
 
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[derive(Copy, Clone)]
-struct Avx2Tags;
+struct Avx2Bmi2Tags;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-impl RowTags for Avx2Tags {
-    const USE_MASK: bool = true;
+impl RowTags for Avx2Bmi2Tags {
     #[inline]
-    fn mask(tags: &[u8], tag: u8) -> u64 {
-        // SAFETY: only dispatched-to when `tag_kernel == Avx2`, set by
-        // `detect()` after confirming AVX2.
-        unsafe { row_tag_match_mask_avx2(tags, tag) }
+    unsafe fn probe<const ROW_LOG: usize>(
+        matcher: &RowMatchGenerator,
+        abs_pos: usize,
+        lit_len: usize,
+    ) -> Option<MatchCandidate> {
+        // SAFETY: dispatched only when `tag_kernel == Avx2Bmi2` (AVX2+BMI2 confirmed).
+        unsafe { matcher.row_probe_avx2bmi2::<ROW_LOG>(abs_pos, lit_len) }
     }
 }
 
@@ -185,15 +140,21 @@ impl RowTags for Avx2Tags {
 struct NeonTags;
 #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
 impl RowTags for NeonTags {
-    const USE_MASK: bool = true;
     #[inline]
-    fn mask(tags: &[u8], tag: u8) -> u64 {
-        // SAFETY: only dispatched-to when `tag_kernel == Neon` (baseline
-        // on little-endian aarch64, confirmed by `detect()`).
-        unsafe { row_tag_match_mask_neon(tags, tag) }
+    unsafe fn probe<const ROW_LOG: usize>(
+        matcher: &RowMatchGenerator,
+        abs_pos: usize,
+        lit_len: usize,
+    ) -> Option<MatchCandidate> {
+        // SAFETY: dispatched only when `tag_kernel == Neon` (NEON confirmed).
+        unsafe { matcher.row_probe_neon::<ROW_LOG>(abs_pos, lit_len) }
     }
 }
 
+// WebAssembly fixed-128-bit SIMD tier. wasm has no runtime CPUID, so this is
+// compile-time only: present (and dispatched-to) exactly when the build enables
+// `simd128`, selected directly in `dispatch_tag_kernel!` rather than via the
+// runtime `FastpathKernel` (which carries no wasm tier).
 #[cfg(all(
     target_arch = "wasm32",
     target_feature = "simd128",
@@ -207,35 +168,52 @@ struct Simd128Tags;
     feature = "kernel_simd128"
 ))]
 impl RowTags for Simd128Tags {
-    const USE_MASK: bool = true;
     #[inline]
-    fn mask(tags: &[u8], tag: u8) -> u64 {
-        row_tag_match_mask_simd128(tags, tag)
+    unsafe fn probe<const ROW_LOG: usize>(
+        matcher: &RowMatchGenerator,
+        abs_pos: usize,
+        lit_len: usize,
+    ) -> Option<MatchCandidate> {
+        // wasm simd128 is compile-time; `row_probe_simd128` needs no
+        // `#[target_feature]` and the intrinsics inline directly.
+        unsafe { matcher.row_probe_simd128::<ROW_LOG>(abs_pos, lit_len) }
     }
 }
 
-/// Resolve the runtime `tag_kernel` to a `RowTags` ZST once, then call a
-/// `*_k::<K>` method that binds the `row_log` const. The kernel branch
-/// runs once per block (cold), so the per-position hot loop is fully
+/// Resolve the runtime `tag_kernel` (`FastpathKernel`) to a `RowTags` ZST once,
+/// then call a `*_k::<K>` method that binds the `row_log` const. The kernel
+/// branch runs once per block (cold), so the per-position hot loop is fully
 /// monomorphised over the selected tier — no runtime kernel enum inside.
 macro_rules! dispatch_tag_kernel {
-    ($self:ident . $k_method:ident ( $($arg:expr),* )) => {
-        match $self.tag_kernel {
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            RowTagKernel::Avx2 => $self.$k_method::<Avx2Tags>($($arg),*),
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            RowTagKernel::Sse2 => $self.$k_method::<Sse2Tags>($($arg),*),
-            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-            RowTagKernel::Neon => $self.$k_method::<NeonTags>($($arg),*),
-            #[cfg(all(
-        target_arch = "wasm32",
-        target_feature = "simd128",
-        feature = "kernel_simd128"
-    ))]
-            RowTagKernel::Simd128 => $self.$k_method::<Simd128Tags>($($arg),*),
-            RowTagKernel::Scalar => $self.$k_method::<ScalarTags>($($arg),*),
+    ($self:ident . $k_method:ident ( $($arg:expr),* )) => {{
+        // wasm32 has no runtime CPUID: when the build enables `simd128`, the
+        // tier is resolved at compile time straight to `Simd128Tags`, so the
+        // runtime `FastpathKernel` match (native-only) is cfg'd out entirely.
+        #[cfg(all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel_simd128"
+        ))]
+        {
+            $self.$k_method::<Simd128Tags>($($arg),*)
         }
-    };
+        #[cfg(not(all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel_simd128"
+        )))]
+        {
+            match $self.tag_kernel {
+                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                FastpathKernel::Avx2Bmi2 => $self.$k_method::<Avx2Bmi2Tags>($($arg),*),
+                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                FastpathKernel::Sse42 => $self.$k_method::<Sse42Tags>($($arg),*),
+                #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+                FastpathKernel::Neon => $self.$k_method::<NeonTags>($($arg),*),
+                FastpathKernel::Scalar => $self.$k_method::<ScalarTags>($($arg),*),
+            }
+        }
+    }};
 }
 
 /// Bind the runtime `row_log` (clamped 4..=6) to the const `ROW_LOG` of a
@@ -252,162 +230,381 @@ macro_rules! dispatch_row_log {
     };
 }
 
-/// Scalar reference: one byte compare per slot. SIMD kernels below compute
-/// the identical mask with a vector compare + movemask (donor
-/// `ZSTD_row_getMatchMask` shape).
-#[inline]
-fn row_tag_match_mask_scalar(tags: &[u8], tag: u8) -> u64 {
-    let mut mask = 0u64;
-    for (j, &t) in tags.iter().enumerate() {
-        if t == tag {
-            mask |= 1u64 << j;
+/// Row tag-match mask kernels as `macro_rules!` bodies (donor
+/// `ZSTD_row_getMatchMask`). Per the SW-Rust SIMD rule, the SIMD body is a macro
+/// expanded at the call site inside each per-kernel `#[target_feature]` probe so
+/// the vector compare + movemask inline straight-line — `#[inline(always)]` +
+/// `#[target_feature]` on a function is forbidden (rust-lang/rust#145574), so a
+/// function call would otherwise cross the feature ABI boundary on every probe.
+/// Each expands to a `u64` bitmask: bit `j` set iff `tags[j] == tag`. The
+/// `row_tag_match_mask_*` wrapper fns below reuse these macros so the
+/// bit-identity tests exercise the exact same code the hot path runs.
+macro_rules! row_tag_mask_scalar {
+    ($tags:expr, $tag:expr) => {{
+        let tags: &[u8] = $tags;
+        let tag: u8 = $tag;
+        let mut mask = 0u64;
+        for (j, &t) in tags.iter().enumerate() {
+            if t == tag {
+                mask |= 1u64 << j;
+            }
         }
-    }
-    mask
+        mask
+    }};
 }
 
-/// SSE2 tag-match mask: `_mm_cmpeq_epi8` + `_mm_movemask_epi8` over each
-/// 16-byte chunk of the row. `tags.len()` is a multiple of 16, so no scalar
-/// tail is needed.
-///
-/// # Safety
-/// Caller must ensure SSE2 is available (always true on x86_64; checked by
-/// `RowTagKernel::detect`).
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "sse2")]
-unsafe fn row_tag_match_mask_sse2(tags: &[u8], tag: u8) -> u64 {
-    #[cfg(target_arch = "x86")]
-    use core::arch::x86::{_mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8};
-    #[cfg(target_arch = "x86_64")]
-    use core::arch::x86_64::{_mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8};
-
-    let needle = _mm_set1_epi8(tag as i8);
-    let mut mask = 0u64;
-    let mut off = 0;
-    while off + 16 <= tags.len() {
-        // SAFETY: `off + 16 <= tags.len()`, so the 16-byte unaligned load is
-        // in bounds.
-        let v = unsafe { _mm_loadu_si128(tags.as_ptr().add(off) as *const _) };
-        let eq = _mm_cmpeq_epi8(v, needle);
-        let bits = _mm_movemask_epi8(eq) as u16 as u64;
-        mask |= bits << off;
-        off += 16;
-    }
-    mask
+macro_rules! row_tag_mask_sse2 {
+    ($tags:expr, $tag:expr) => {{
+        #[cfg(target_arch = "x86")]
+        use core::arch::x86::{_mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8};
+        #[cfg(target_arch = "x86_64")]
+        use core::arch::x86_64::{
+            _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8,
+        };
+        let tags: &[u8] = $tags;
+        let needle = _mm_set1_epi8($tag as i8);
+        let mut mask = 0u64;
+        let mut off = 0;
+        while off + 16 <= tags.len() {
+            // SAFETY: `off + 16 <= tags.len()`, so the 16-byte load is in bounds;
+            // the enclosing fn carries `#[target_feature(enable = "sse2")]`.
+            let v = unsafe { _mm_loadu_si128(tags.as_ptr().add(off) as *const _) };
+            let eq = _mm_cmpeq_epi8(v, needle);
+            mask |= (_mm_movemask_epi8(eq) as u16 as u64) << off;
+            off += 16;
+        }
+        mask
+    }};
 }
 
-/// AVX2 tag-match mask: `_mm256_cmpeq_epi8` + `_mm256_movemask_epi8` over
-/// each 32-byte chunk, falling back to a 16-byte SSE2 chunk for a 16-wide
-/// row. `tags.len()` is 16 / 32 / 64.
-///
-/// # Safety
-/// Caller must ensure AVX2 is available (checked by `RowTagKernel::detect`).
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "avx2")]
-unsafe fn row_tag_match_mask_avx2(tags: &[u8], tag: u8) -> u64 {
-    #[cfg(target_arch = "x86")]
-    use core::arch::x86::{
-        _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8, _mm256_cmpeq_epi8,
-        _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_set1_epi8,
-    };
-    #[cfg(target_arch = "x86_64")]
-    use core::arch::x86_64::{
-        _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8, _mm256_cmpeq_epi8,
-        _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_set1_epi8,
-    };
-
-    let needle = _mm256_set1_epi8(tag as i8);
-    let mut mask = 0u64;
-    let mut off = 0;
-    while off + 32 <= tags.len() {
-        // SAFETY: `off + 32 <= tags.len()`, so the 32-byte load is in bounds.
-        let v = unsafe { _mm256_loadu_si256(tags.as_ptr().add(off) as *const _) };
-        let eq = _mm256_cmpeq_epi8(v, needle);
-        let bits = _mm256_movemask_epi8(eq) as u32 as u64;
-        mask |= bits << off;
-        off += 32;
-    }
-    if off + 16 <= tags.len() {
-        let needle16 = _mm_set1_epi8(tag as i8);
-        // SAFETY: `off + 16 <= tags.len()`, so the 16-byte load is in bounds.
-        let v = unsafe { _mm_loadu_si128(tags.as_ptr().add(off) as *const _) };
-        let eq = _mm_cmpeq_epi8(v, needle16);
-        let bits = _mm_movemask_epi8(eq) as u16 as u64;
-        mask |= bits << off;
-    }
-    mask
+macro_rules! row_tag_mask_avx2 {
+    ($tags:expr, $tag:expr) => {{
+        #[cfg(target_arch = "x86")]
+        use core::arch::x86::{
+            _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8, _mm256_cmpeq_epi8,
+            _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_set1_epi8,
+        };
+        #[cfg(target_arch = "x86_64")]
+        use core::arch::x86_64::{
+            _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8, _mm256_cmpeq_epi8,
+            _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_set1_epi8,
+        };
+        let tags: &[u8] = $tags;
+        let tag = $tag;
+        let needle = _mm256_set1_epi8(tag as i8);
+        let mut mask = 0u64;
+        let mut off = 0;
+        while off + 32 <= tags.len() {
+            // SAFETY: `off + 32 <= tags.len()`; enclosing fn is `target_feature(avx2)`.
+            let v = unsafe { _mm256_loadu_si256(tags.as_ptr().add(off) as *const _) };
+            let eq = _mm256_cmpeq_epi8(v, needle);
+            mask |= (_mm256_movemask_epi8(eq) as u32 as u64) << off;
+            off += 32;
+        }
+        if off + 16 <= tags.len() {
+            let needle16 = _mm_set1_epi8(tag as i8);
+            // SAFETY: `off + 16 <= tags.len()`; enclosing fn is `target_feature(avx2)`.
+            let v = unsafe { _mm_loadu_si128(tags.as_ptr().add(off) as *const _) };
+            let eq = _mm_cmpeq_epi8(v, needle16);
+            mask |= (_mm_movemask_epi8(eq) as u16 as u64) << off;
+        }
+        mask
+    }};
 }
 
-/// NEON tag-match mask: `vceqq_u8` against the broadcast tag, then a
-/// 16-byte-to-16-bit movemask (NEON has no direct equivalent, so pack the
-/// per-lane high bits with the progressive shift-right-accumulate sequence).
-/// `tags.len()` is a multiple of 16.
-///
-/// # Safety
-/// Caller must ensure NEON is available (baseline on aarch64; checked by
-/// `RowTagKernel::detect`).
 #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-#[target_feature(enable = "neon")]
-unsafe fn row_tag_match_mask_neon(tags: &[u8], tag: u8) -> u64 {
-    use core::arch::aarch64::{
-        vceqq_u8, vdupq_n_u8, vgetq_lane_u8, vld1q_u8, vreinterpretq_u8_u64, vreinterpretq_u16_u8,
-        vreinterpretq_u32_u16, vreinterpretq_u64_u32, vshrq_n_u8, vsraq_n_u16, vsraq_n_u32,
-        vsraq_n_u64,
-    };
-
-    let needle = vdupq_n_u8(tag);
-    let mut mask = 0u64;
-    let mut off = 0;
-    while off + 16 <= tags.len() {
-        // SAFETY: `off + 16 <= tags.len()`, so the 16-byte load is in bounds.
-        let v = unsafe { vld1q_u8(tags.as_ptr().add(off)) };
-        let eq = vceqq_u8(v, needle); // 0xFF per lane where equal, else 0x00.
-        // Collapse the 16 lanes' high bits into a 16-bit movemask, matching
-        // `_mm_movemask_epi8` lane order. Each `vsra` shifts a lane right and
-        // adds it into its neighbour, halving the live-lane count each step.
-        let high = vshrq_n_u8(eq, 7); // lane -> 1 if matched, else 0.
-        let paired16 = vreinterpretq_u32_u16(vsraq_n_u16(
-            vreinterpretq_u16_u8(high),
-            vreinterpretq_u16_u8(high),
-            7,
-        ));
-        let paired32 = vreinterpretq_u64_u32(vsraq_n_u32(paired16, paired16, 14));
-        let paired64 = vreinterpretq_u8_u64(vsraq_n_u64(paired32, paired32, 28));
-        let bits = (vgetq_lane_u8(paired64, 0) as u64) | ((vgetq_lane_u8(paired64, 8) as u64) << 8);
-        mask |= bits << off;
-        off += 16;
-    }
-    mask
+macro_rules! row_tag_mask_neon {
+    ($tags:expr, $tag:expr) => {{
+        use core::arch::aarch64::{
+            vceqq_u8, vdupq_n_u8, vgetq_lane_u8, vld1q_u8, vreinterpretq_u8_u64,
+            vreinterpretq_u16_u8, vreinterpretq_u32_u16, vreinterpretq_u64_u32, vshrq_n_u8,
+            vsraq_n_u16, vsraq_n_u32, vsraq_n_u64,
+        };
+        let tags: &[u8] = $tags;
+        let needle = vdupq_n_u8($tag);
+        let mut mask = 0u64;
+        let mut off = 0;
+        while off + 16 <= tags.len() {
+            // SAFETY: `off + 16 <= tags.len()`; enclosing fn is `target_feature(neon)`.
+            let v = unsafe { vld1q_u8(tags.as_ptr().add(off)) };
+            let eq = vceqq_u8(v, needle);
+            let high = vshrq_n_u8(eq, 7);
+            let paired16 = vreinterpretq_u32_u16(vsraq_n_u16(
+                vreinterpretq_u16_u8(high),
+                vreinterpretq_u16_u8(high),
+                7,
+            ));
+            let paired32 = vreinterpretq_u64_u32(vsraq_n_u32(paired16, paired16, 14));
+            let paired64 = vreinterpretq_u8_u64(vsraq_n_u64(paired32, paired32, 28));
+            let bits =
+                (vgetq_lane_u8(paired64, 0) as u64) | ((vgetq_lane_u8(paired64, 8) as u64) << 8);
+            mask |= bits << off;
+            off += 16;
+        }
+        mask
+    }};
 }
 
-/// WebAssembly `simd128` tag-match mask: `i8x16_eq` against the broadcast
-/// tag, then `i8x16_bitmask` (the direct 16-lane-to-16-bit movemask wasm
-/// provides) over each 16-byte chunk. Shape mirrors the SSE2 kernel exactly.
-/// `tags.len()` is a multiple of 16, so no scalar tail is needed. Compiled
-/// only under `target_feature = "simd128"`, so the intrinsics are available
-/// without a separate `#[target_feature]` attribute (no runtime detection on
-/// wasm); only `v128_load` is `unsafe` (a raw pointer load).
+// WebAssembly `simd128` tag-match mask: `i8x16_eq` against the broadcast tag,
+// then `i8x16_bitmask` (wasm's direct 16-lane-to-16-bit movemask) over each
+// 16-byte chunk. Shape mirrors the SSE2 kernel; `tags.len()` is a multiple of
+// 16 so no scalar tail is needed. Compiled only under `target_feature =
+// "simd128"`, so the intrinsics are available without a `#[target_feature]`
+// attribute (no runtime detection on wasm); only `v128_load` is `unsafe`.
 #[cfg(all(
     target_arch = "wasm32",
     target_feature = "simd128",
     feature = "kernel_simd128"
 ))]
-fn row_tag_match_mask_simd128(tags: &[u8], tag: u8) -> u64 {
-    use core::arch::wasm32::{i8x16_bitmask, i8x16_eq, i8x16_splat, v128_load};
+macro_rules! row_tag_mask_simd128 {
+    ($tags:expr, $tag:expr) => {{
+        use core::arch::wasm32::{i8x16_bitmask, i8x16_eq, i8x16_splat, v128_load};
+        let tags: &[u8] = $tags;
+        let needle = i8x16_splat($tag as i8);
+        let mut mask = 0u64;
+        let mut off = 0;
+        while off + 16 <= tags.len() {
+            // SAFETY: `off + 16 <= tags.len()`, so the 16-byte unaligned load is
+            // in bounds.
+            let v = unsafe { v128_load(tags.as_ptr().add(off) as *const _) };
+            let eq = i8x16_eq(v, needle);
+            mask |= (i8x16_bitmask(eq) as u64) << off;
+            off += 16;
+        }
+        mask
+    }};
+}
 
-    let needle = i8x16_splat(tag as i8);
-    let mut mask = 0u64;
-    let mut off = 0;
-    while off + 16 <= tags.len() {
-        // SAFETY: `off + 16 <= tags.len()`, so the 16-byte unaligned load is
-        // in bounds.
-        let v = unsafe { v128_load(tags.as_ptr().add(off) as *const _) };
-        let eq = i8x16_eq(v, needle);
-        let bits = i8x16_bitmask(eq) as u64;
-        mask |= bits << off;
-        off += 16;
-    }
-    mask
+/// Emit a per-kernel row match probe method on `RowMatchGenerator`. The body is
+/// written ONCE here and stamped per tier under that tier's `#[target_feature]`
+/// umbrella; the tag-match SIMD is expanded inline via the `$maskmac` macro (not
+/// a function call), so the vector compare inlines straight-line — no
+/// `#[target_feature]` ABI boundary on the per-probe hot path. Runtime kernel
+/// selection happens once at the `dispatch_tag_kernel!` site; this method is the
+/// per-tier monomorphised hot loop with no kernel branch inside it.
+///
+/// `$use_mask` is the compile-time bitmask-vs-byte-compare choice; `$maskmac` is
+/// the tier's `row_tag_mask_*!`; the optional `$tf` is the `target_feature`.
+/// Mirrors the former generic `row_candidate_rl`: live row probe, dict
+/// dual-probe, speculative tail gate.
+macro_rules! gen_row_probe {
+    ($name:ident, $use_mask:literal, $maskmac:ident, $cpl:path $(, $tf:literal)?) => {
+        $(#[target_feature(enable = $tf)])?
+        #[allow(unused_unsafe)]
+        // wasm32+simd128 selects `row_probe_simd128` at compile time, leaving
+        // `row_probe_scalar` (the only other tier compiled on wasm) unused.
+        #[cfg_attr(
+            all(
+                target_arch = "wasm32",
+                target_feature = "simd128",
+                feature = "kernel_simd128"
+            ),
+            allow(dead_code)
+        )]
+        unsafe fn $name<const ROW_LOG: usize>(
+            &self,
+            abs_pos: usize,
+            lit_len: usize,
+        ) -> Option<MatchCandidate> {
+            debug_assert_eq!(ROW_LOG, self.row_log);
+            let mls = self.mls;
+            let concat = self.live_history();
+            let current_idx = abs_pos - self.history_abs_start;
+            if current_idx + mls > concat.len() {
+                return None;
+            }
+
+            let (row, tag) = self.hash_and_row(abs_pos)?;
+            let row_entries = 1usize << ROW_LOG;
+            let row_mask = row_entries - 1;
+            let row_base = row << ROW_LOG;
+            let head = self.row_heads[row] as usize;
+            let max_walk = self.search_depth.min(row_entries);
+
+            // SIMD tiers precompute the full bitmask once (the tag-match
+            // intrinsic inlines under this method's `#[target_feature]`); the
+            // scalar tier (`USE_MASK == false`) const-folds this away and does
+            // an on-the-fly per-slot byte compare in the loop.
+            let tag_match = if $use_mask {
+                $maskmac!(&self.row_tags[row_base..row_base + row_entries], tag)
+            } else {
+                0
+            };
+
+            let mut best: Option<MatchCandidate> = None;
+            for i in 0..max_walk {
+                let slot = (head + i) & row_mask;
+                let idx = row_base + slot;
+                let matched = if $use_mask {
+                    (tag_match >> slot) & 1 != 0
+                } else {
+                    self.row_tags[idx] == tag
+                };
+                if !matched {
+                    continue;
+                }
+                let raw_pos = self.row_positions[idx];
+                if raw_pos == ROW_EMPTY_SLOT {
+                    continue;
+                }
+                let candidate_pos = raw_pos as usize;
+                if candidate_pos < self.history_abs_start || candidate_pos >= abs_pos {
+                    continue;
+                }
+                let candidate_idx = candidate_pos - self.history_abs_start;
+                // Speculative tail gate (HC `hash_chain_candidate` parity):
+                // a 4-byte compare at the length the candidate must reach to
+                // outgrow `best` proves whether the full `common_prefix_len`
+                // can pay off. Gated on offset-monotonicity since the row walk
+                // is not offset-ordered. Ratio-neutral.
+                if let Some(b) = best {
+                    let new_offset = abs_pos - candidate_pos;
+                    if new_offset >= b.offset
+                        && let Some(tail_off) = b.match_len.checked_sub(lit_len + 3)
+                    {
+                        let m_end = candidate_idx + tail_off + 4;
+                        let i_end = current_idx + tail_off + 4;
+                        if i_end > concat.len()
+                            || m_end > concat.len()
+                            || concat[candidate_idx + tail_off..m_end]
+                                != concat[current_idx + tail_off..i_end]
+                        {
+                            continue;
+                        }
+                    }
+                }
+                // Per-tier `common_prefix_len_ptr` expanded inline (same feature
+                // umbrella as this probe) — no `dispatch_common_prefix_len_ptr`
+                // runtime match + `#[target_feature]` call per candidate. `max =
+                // concat.len() - current_idx` since `candidate_idx < current_idx`.
+                let match_len = unsafe {
+                    $cpl(
+                        concat.as_ptr().add(candidate_idx),
+                        concat.as_ptr().add(current_idx),
+                        concat.len() - current_idx,
+                    )
+                };
+                if match_len >= mls {
+                    let candidate =
+                        self.extend_backwards(candidate_pos, abs_pos, match_len, lit_len);
+                    best = best_len_offset_candidate(best, Some(candidate));
+                    if best.is_some_and(|b| current_idx + b.match_len >= concat.len()) {
+                        return best;
+                    }
+                }
+            }
+
+            // Dict dual-probe (donor `ZSTD_RowFindBestMatch` `dictMatchState`):
+            // one bounded immutable dict row (concat-indexed positions).
+            if let Some(dict) = self.dict.table() {
+                let dict_end = self.dict.region_len();
+                let drow_base = row << ROW_LOG;
+                let dhead = dict.heads[row] as usize;
+                let dtag_match = if $use_mask {
+                    $maskmac!(&dict.tags[drow_base..drow_base + row_entries], tag)
+                } else {
+                    0
+                };
+                for i in 0..max_walk {
+                    let slot = (dhead + i) & row_mask;
+                    let didx = drow_base + slot;
+                    let matched = if $use_mask {
+                        (dtag_match >> slot) & 1 != 0
+                    } else {
+                        dict.tags[didx] == tag
+                    };
+                    if !matched {
+                        continue;
+                    }
+                    let dp = dict.positions[didx];
+                    if dp == ROW_EMPTY_SLOT {
+                        continue;
+                    }
+                    let dp = dp as usize;
+                    if dp >= dict_end || dp + mls > concat.len() {
+                        continue;
+                    }
+                    let cand_abs = self.history_abs_start + dp;
+                    if let Some(b) = best {
+                        let new_offset = abs_pos - cand_abs;
+                        if new_offset >= b.offset
+                            && let Some(tail_off) = b.match_len.checked_sub(lit_len + 3)
+                        {
+                            let m_end = dp + tail_off + 4;
+                            let i_end = current_idx + tail_off + 4;
+                            if i_end > concat.len()
+                                || m_end > concat.len()
+                                || concat[dp + tail_off..m_end]
+                                    != concat[current_idx + tail_off..i_end]
+                            {
+                                continue;
+                            }
+                        }
+                    }
+                    let match_len = unsafe {
+                        $cpl(
+                            concat.as_ptr().add(dp),
+                            concat.as_ptr().add(current_idx),
+                            concat.len() - current_idx,
+                        )
+                    };
+                    if match_len >= mls {
+                        let candidate = self.extend_backwards(cand_abs, abs_pos, match_len, lit_len);
+                        best = best_len_offset_candidate(best, Some(candidate));
+                        if best.is_some_and(|b| current_idx + b.match_len >= concat.len()) {
+                            return best;
+                        }
+                    }
+                }
+            }
+            best
+        }
+    };
+}
+
+// Reference mask wrappers for the bit-identity tests (`tag_mask_tests`). The
+// `row_tag_mask_*!` macros are the production source of truth (expanded inline
+// in the per-kernel `row_probe_*` methods); these fns just give the tests a
+// callable handle to assert SIMD == scalar. Gated to the same cfg as the test
+// module so they carry no weight in production builds.
+#[cfg(test)]
+fn row_tag_match_mask_scalar(tags: &[u8], tag: u8) -> u64 {
+    row_tag_mask_scalar!(tags, tag)
+}
+
+/// # Safety
+/// Caller must ensure SSE2 is available (checked by `RowTagKernel::detect`).
+#[cfg(all(
+    test,
+    feature = "std",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
+#[target_feature(enable = "sse2")]
+unsafe fn row_tag_match_mask_sse2(tags: &[u8], tag: u8) -> u64 {
+    row_tag_mask_sse2!(tags, tag)
+}
+
+/// # Safety
+/// Caller must ensure AVX2 is available (checked by `RowTagKernel::detect`).
+#[cfg(all(
+    test,
+    feature = "std",
+    any(target_arch = "x86", target_arch = "x86_64")
+))]
+#[target_feature(enable = "avx2")]
+unsafe fn row_tag_match_mask_avx2(tags: &[u8], tag: u8) -> u64 {
+    row_tag_mask_avx2!(tags, tag)
+}
+
+/// # Safety
+/// Caller must ensure NEON is available (baseline on aarch64; checked by
+/// `RowTagKernel::detect`).
+#[cfg(all(test, target_arch = "aarch64", target_endian = "little"))]
+#[target_feature(enable = "neon")]
+unsafe fn row_tag_match_mask_neon(tags: &[u8], tag: u8) -> u64 {
+    row_tag_mask_neon!(tags, tag)
 }
 
 #[derive(Clone)]
@@ -451,8 +648,22 @@ pub(crate) struct RowMatchGenerator {
     pub(crate) row_positions: Vec<u32>,
     pub(crate) row_tags: Vec<u8>,
     /// Cached tag-match SIMD kernel; CPU features are fixed per process, so
-    /// resolve once instead of querying per `row_candidate` call.
-    tag_kernel: RowTagKernel,
+    /// resolve once instead of querying per `row_candidate` call. On
+    /// wasm32+simd128 the tier is compile-time (`dispatch_tag_kernel!` selects
+    /// `Simd128Tags` directly), so the field is unread there.
+    #[cfg_attr(
+        all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel_simd128"
+        ),
+        allow(dead_code)
+    )]
+    tag_kernel: FastpathKernel,
+    /// Attached immutable dictionary row index (donor `dictMatchState`). `Some`
+    /// activates the bounded dict probe in `row_candidate_rl`; built once and
+    /// cached across frames via `DictAttach`, invalidated on eviction / resize.
+    pub(crate) dict: DictAttach<RowDictTables>,
 }
 
 impl RowMatchGenerator {
@@ -475,7 +686,8 @@ impl RowMatchGenerator {
             row_heads: Vec::new(),
             row_positions: Vec::new(),
             row_tags: Vec::new(),
-            tag_kernel: RowTagKernel::detect(),
+            tag_kernel: crate::encoding::fastpath::select_kernel(),
+            dict: DictAttach::new(),
         }
     }
 
@@ -487,6 +699,15 @@ impl RowMatchGenerator {
             self.row_heads.clear();
             self.row_positions.clear();
             self.row_tags.clear();
+            // NOTE: do NOT invalidate the dict here. `set_hash_bits` is called
+            // twice per frame during level setup (once from `configure` with
+            // the level's `hash_bits`, once with the hint-resolved table bits),
+            // so `row_hash_log` oscillates every frame even when the level is
+            // unchanged. Invalidating here would drop the CDict cache on every
+            // frame. The dict is rebuilt by `prime_dict_rows` AFTER setup (final
+            // shape), and `prime_dict_rows` self-invalidates a cached index whose
+            // shape no longer matches — so a genuine level change is handled
+            // there, while the per-frame oscillation is ignored.
         }
     }
 
@@ -538,6 +759,11 @@ impl RowMatchGenerator {
         if self.history_abs_start + self.window_size + data.len() >= u32::MAX as usize - 1 {
             self.rebase_positions();
         }
+        if self.window_size + data.len() > self.max_window_size {
+            // Eviction advances `history_start`, staling the dict row index's
+            // concat positions — drop the attach (dict slid within/out window).
+            self.dict.invalidate();
+        }
         while self.window_size + data.len() > self.max_window_size {
             let removed_len = self.chunk_lens.pop_front().unwrap();
             self.window_size -= removed_len;
@@ -555,6 +781,9 @@ impl RowMatchGenerator {
     }
 
     pub(crate) fn trim_to_window(&mut self) {
+        if self.window_size > self.max_window_size {
+            self.dict.invalidate();
+        }
         while self.window_size > self.max_window_size {
             let removed_len = self.chunk_lens.pop_front().unwrap();
             self.window_size -= removed_len;
@@ -896,7 +1125,9 @@ impl RowMatchGenerator {
             // indexes the committed span.
             let chosen = match rep_match {
                 Some(rep) => Some(rep),
-                None => self.row_candidate_rl::<K, ROW_LOG>(abs_pos, lit_len),
+                // SAFETY: `K` selected by `dispatch_tag_kernel!` after `detect`
+                // confirmed its ISA; `K::probe` upholds the feature contract.
+                None => unsafe { K::probe::<ROW_LOG>(self, abs_pos, lit_len) },
             };
 
             let Some(candidate) = chosen else {
@@ -1041,7 +1272,9 @@ impl RowMatchGenerator {
         lit_len: usize,
     ) -> Option<MatchCandidate> {
         let rep = self.repcode_candidate(abs_pos, lit_len);
-        let row = self.row_candidate_rl::<K, ROW_LOG>(abs_pos, lit_len);
+        // SAFETY: `K` selected by `dispatch_tag_kernel!` after `detect` confirmed
+        // its ISA; `K::probe` upholds the per-tier feature contract.
+        let row = unsafe { K::probe::<ROW_LOG>(self, abs_pos, lit_len) };
         best_len_offset_candidate(rep, row)
     }
 
@@ -1143,6 +1376,10 @@ impl RowMatchGenerator {
         dispatch_row_log!(self.pick_lazy_match_rl::<K>(abs_pos, lit_len, best))
     }
 
+    // Per-kernel row match probe. Runtime kernel selection happens ONCE via
+    // `dispatch_tag_kernel!`; the selected tier's `row_probe_*` method is the
+    // monomorphised per-position hot loop with the SIMD tag-match inlined under
+    // its `#[target_feature]` umbrella (no dispatcher branch inside the loop).
     #[allow(dead_code)]
     pub(crate) fn row_candidate(&self, abs_pos: usize, lit_len: usize) -> Option<MatchCandidate> {
         dispatch_tag_kernel!(self.row_candidate_k(abs_pos, lit_len))
@@ -1152,83 +1389,66 @@ impl RowMatchGenerator {
         abs_pos: usize,
         lit_len: usize,
     ) -> Option<MatchCandidate> {
-        dispatch_row_log!(self.row_candidate_rl::<K>(abs_pos, lit_len))
+        // SAFETY: `dispatch_tag_kernel!` only selects a `K` whose ISA `detect`
+        // confirmed present, upholding `K::probe`'s per-tier feature contract.
+        match self.row_log {
+            4 => unsafe { K::probe::<4>(self, abs_pos, lit_len) },
+            5 => unsafe { K::probe::<5>(self, abs_pos, lit_len) },
+            6 => unsafe { K::probe::<6>(self, abs_pos, lit_len) },
+            _ => unreachable!("row_log is clamped to 4..=6 in configure()"),
+        }
     }
 
-    pub(crate) fn row_candidate_rl<K: RowTags, const ROW_LOG: usize>(
-        &self,
-        abs_pos: usize,
-        lit_len: usize,
-    ) -> Option<MatchCandidate> {
-        debug_assert_eq!(ROW_LOG, self.row_log);
-        let mls = self.mls;
-        let concat = self.live_history();
-        let current_idx = abs_pos - self.history_abs_start;
-        if current_idx + mls > concat.len() {
-            return None;
-        }
-
-        let (row, tag) = self.hash_and_row(abs_pos)?;
-        let row_entries = 1usize << ROW_LOG;
-        let row_mask = row_entries - 1;
-        let row_base = row << ROW_LOG;
-        let head = self.row_heads[row] as usize;
-        let max_walk = self.search_depth.min(row_entries);
-
-        // `K::USE_MASK` is a compile-time const per tag kernel, so this whole
-        // branch const-folds: SIMD tiers precompute the full bitmask once and
-        // test one bit per probed slot; the scalar tier drops the mask and
-        // does an on-the-fly byte compare (cheaper when
-        // `search_depth < row_entries`). No runtime kernel enum on the hot
-        // path. `row_entries <= 64` (ROW_LOG 4..=6) so the mask fits a `u64`.
-        let tag_match = if K::USE_MASK {
-            K::mask(&self.row_tags[row_base..row_base + row_entries], tag)
-        } else {
-            0
-        };
-
-        let mut best = None;
-        for i in 0..max_walk {
-            let slot = (head + i) & row_mask;
-            let idx = row_base + slot;
-            let matched = if K::USE_MASK {
-                (tag_match >> slot) & 1 != 0
-            } else {
-                self.row_tags[idx] == tag
-            };
-            if !matched {
-                continue;
-            }
-            let raw_pos = self.row_positions[idx];
-            if raw_pos == ROW_EMPTY_SLOT {
-                continue;
-            }
-            // Stored positions are absolute (`< u32::MAX`, capped per frame in
-            // `add_data`); widen to `usize` for the window-bound checks.
-            let candidate_pos = raw_pos as usize;
-            if candidate_pos < self.history_abs_start || candidate_pos >= abs_pos {
-                continue;
-            }
-            let candidate_idx = candidate_pos - self.history_abs_start;
-            let match_len = common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
-            if match_len >= mls {
-                let candidate = self.extend_backwards(candidate_pos, abs_pos, match_len, lit_len);
-                best = best_len_offset_candidate(best, Some(candidate));
-                // Donor `ZSTD_RowFindBestMatch` walks every probed slot and
-                // keeps the longest; its only early break is "best possible"
-                // (the match already reaches the block end, so no later slot
-                // can beat it). cParams.targetLength is the LAZY outer loop's
-                // nice-match threshold, NOT a row-search cutoff — gating the
-                // row walk on it (target_len=2 at level 5) returned the first
-                // most-recent slot instead of the longest, inflating sequence
-                // count and losing ratio. Keep only the best-possible break.
-                if best.is_some_and(|b| current_idx + b.match_len >= concat.len()) {
-                    return best;
-                }
-            }
-        }
-        best
-    }
+    // Each tier pairs its tag-match mask macro with the matching
+    // `fastpath::<tier>::common_prefix_len_ptr` so BOTH inline under the tier's
+    // `#[target_feature]` umbrella (the cpl features must be a subset of the
+    // probe's: SSE4.2 ⊇ the SSE2 mask intrinsics, AVX2+BMI2 ⊇ the AVX2 mask).
+    // Scalar uses the on-the-fly per-slot byte compare (`use_mask = false`).
+    gen_row_probe!(
+        row_probe_scalar,
+        false,
+        row_tag_mask_scalar,
+        crate::encoding::fastpath::scalar::common_prefix_len_ptr
+    );
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    gen_row_probe!(
+        row_probe_sse42,
+        true,
+        row_tag_mask_sse2,
+        crate::encoding::fastpath::sse42::common_prefix_len_ptr,
+        "sse4.2"
+    );
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    gen_row_probe!(
+        row_probe_avx2bmi2,
+        true,
+        row_tag_mask_avx2,
+        crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr,
+        "avx2,bmi2"
+    );
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    gen_row_probe!(
+        row_probe_neon,
+        true,
+        row_tag_mask_neon,
+        crate::encoding::fastpath::neon::common_prefix_len_ptr,
+        "neon"
+    );
+    // wasm simd128 tag-match mask + scalar (portable) cpl. wasm simd128 is
+    // compile-time, so no `#[target_feature]` umbrella is passed; mirrors the
+    // wasm tier's behavior of vectorising only the tag scan, with the portable
+    // prefix-length kernel.
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel_simd128"
+    ))]
+    gen_row_probe!(
+        row_probe_simd128,
+        true,
+        row_tag_mask_simd128,
+        crate::encoding::fastpath::scalar::common_prefix_len_ptr
+    );
 
     fn extend_backwards(
         &self,
@@ -1326,6 +1546,125 @@ impl RowMatchGenerator {
             // absolute cursor below `u32::MAX`, so the cast is lossless and
             // never collides with the `ROW_EMPTY_SLOT == u32::MAX` sentinel.
             *self.row_positions.get_unchecked_mut(row_base + next) = abs_pos as u32;
+        }
+    }
+
+    /// Mark the attached dict row index fully built (CDict cache).
+    pub(crate) fn mark_dict_primed(&mut self) {
+        self.dict.mark_primed();
+    }
+
+    /// Drop the cached dict row index (next frame carries no dict, or eviction /
+    /// resize staled the concat positions).
+    pub(crate) fn invalidate_dict_cache(&mut self) {
+        self.dict.invalidate();
+    }
+
+    /// Donor `ZSTD_RowFindBestMatch` `dictMatchState` attach: index the
+    /// just-committed dictionary block (current `chunk_lens` tail) into the
+    /// SEPARATE immutable dict row tables instead of the live ones, so the live
+    /// rows carry only input and the dict is never re-indexed per frame. The
+    /// dual-probe in `row_candidate_rl` searches live + dict (one bounded row
+    /// each).
+    pub(crate) fn prime_dict_attach_current_block(&mut self) {
+        self.ensure_tables();
+        let current_len = self.chunk_lens.back().copied().unwrap_or(0);
+        if current_len == 0 {
+            return;
+        }
+        let current_abs_start = self.history_abs_start + self.window_size - current_len;
+        let current_abs_end = current_abs_start + current_len;
+        let start_concat = current_abs_start - self.history_abs_start;
+        let end_concat = current_abs_end - self.history_abs_start;
+        // Backfill the `ROW_HASH_KEY_LEN - 1` bytes immediately before the
+        // block, mirroring the live insert path's `backfill_start`: those
+        // starts only become hashable once this block supplies the
+        // trailing key bytes, so without the backfill seam-spanning row
+        // candidates are dropped from the dict index permanently.
+        let prime_start = start_concat.saturating_sub(ROW_HASH_KEY_LEN - 1);
+        self.prime_dict_rows(prime_start, end_concat);
+    }
+
+    /// Build the immutable dictionary row index over the contiguous-history
+    /// concat range `[start_concat, end_concat)`. Mirrors [`Self::insert_position`]'s
+    /// row-hash + head-decrement slot write, but writes a CONCAT index (stable
+    /// across rebases) into the SEPARATE [`Self::dict`] tables. `ROW_EMPTY_SLOT`
+    /// marks empty. Skips the rehash when the CDict cache is already primed.
+    fn prime_dict_rows(&mut self, start_concat: usize, end_concat: usize) {
+        let row_count = 1usize << self.row_hash_log;
+        let row_entries = 1usize << self.row_log;
+        let total = row_count * row_entries;
+        // Drop a cached dict index built for a different table shape (a genuine
+        // level change resizes `row_hash_log`/`row_log`). `set_hash_bits`'s
+        // per-frame oscillation does NOT reach here — this runs after setup with
+        // the final shape — so a same-level reused frame keeps the cache.
+        // Key on the FULL shape, not just `heads.len()`: a level change that
+        // keeps `row_hash_log` but changes `row_log` leaves `heads.len()`
+        // equal while `positions`/`tags` are sized for the old `row_log`,
+        // and the probe path then indexes `row << row_log` slots that the
+        // cached table doesn't have (OOB / wrong slots).
+        if self.dict.table().is_some_and(|d| {
+            d.heads.len() != row_count || d.positions.len() != total || d.tags.len() != total
+        }) {
+            self.dict.invalidate();
+        }
+        self.dict.set_region_len(end_concat);
+        if self.dict.is_primed() {
+            return;
+        }
+        let row_log = self.row_log;
+        let row_hash_log = self.row_hash_log;
+        let hash_kernel = self.hash_kernel;
+        let history_start = self.history_start;
+        let concat_len = self.history.len() - history_start;
+        // Row hash needs `ROW_HASH_KEY_LEN` readable bytes of lookahead.
+        let safe_end = concat_len
+            .saturating_sub(ROW_HASH_KEY_LEN - 1)
+            .min(end_concat);
+        if start_concat >= safe_end {
+            return;
+        }
+        // `row_count` / `row_entries` / `total` were computed above for the
+        // shape-mismatch check and carry the same values here.
+        let row_mask = row_entries - 1;
+        let row_count_mask = row_count - 1;
+        // Raw history base taken before the mutable dict borrow (disjoint
+        // fields; the raw ptr holds no borrow).
+        let base = self.history.as_ptr();
+        let dict = self.dict.table_mut_or_init(|| RowDictTables {
+            heads: alloc::vec![0u8; row_count],
+            positions: alloc::vec![ROW_EMPTY_SLOT; total],
+            tags: alloc::vec![0u8; total],
+        });
+        let heads = dict.heads.as_mut_ptr();
+        let positions = dict.positions.as_mut_ptr();
+        let tags = dict.tags.as_mut_ptr();
+        let total_bits = row_hash_log + ROW_TAG_BITS;
+        // SAFETY: `base.add(history_start + concat)` is in-bounds for
+        // `concat + ROW_HASH_KEY_LEN <= concat_len` (enforced by `safe_end`).
+        // `row <= row_count_mask < row_count` (= heads.len()); `row_base + next
+        // < total` (= positions.len() = tags.len()). `concat` fits u32 (history
+        // is u32-bounded upstream).
+        for concat in start_concat..safe_end {
+            unsafe {
+                // Little-endian load to match the live probe's
+                // `u32::from_le_bytes` hash (`hash_and_row`); a native-endian
+                // load would bucket dict rows differently on big-endian targets
+                // and lose every attached-dict match there.
+                let value =
+                    u32::from_le((base.add(history_start + concat) as *const u32).read_unaligned())
+                        as u64;
+                let hash = crate::encoding::fastpath::hash_mix_u64_with_kernel(hash_kernel, value);
+                let combined = hash >> (u64::BITS as usize - total_bits);
+                let row = ((combined >> ROW_TAG_BITS) as usize) & row_count_mask;
+                let tag = combined as u8;
+                let row_base = row << row_log;
+                let head = *heads.add(row) as usize;
+                let next = head.wrapping_sub(1) & row_mask;
+                *heads.add(row) = next as u8;
+                *tags.add(row_base + next) = tag;
+                *positions.add(row_base + next) = concat as u32;
+            }
         }
     }
 }

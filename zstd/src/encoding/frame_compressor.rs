@@ -1051,6 +1051,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 crate::encoding::strategy::StrategyTag::Dfast => 14,
                 crate::encoding::strategy::StrategyTag::Greedy
                 | crate::encoding::strategy::StrategyTag::Lazy
+                | crate::encoding::strategy::StrategyTag::Btlazy2
                 | crate::encoding::strategy::StrategyTag::BtOpt => 15,
             };
             let prefer_copy_snapshot = initial_size_hint.is_some_and(|s| {
@@ -2722,6 +2723,81 @@ mod tests {
     }
 
     #[test]
+    fn dict_primed_btlazy2_reused_across_attach_and_copy_boundary_is_byte_identical() {
+        // Btlazy2 (Level 15) uses the 32 KiB dict attach/copy cutoff in
+        // prepare_frame. Exercise BOTH sides of that boundary on a reused
+        // compressor: a sub-cutoff payload (re-prime/attach path) and an
+        // over-cutoff payload (copy-snapshot restore path). In each case the
+        // warm-cache second frame must reproduce the cold-cache first frame
+        // byte-for-byte (the dict cache is a timing optimization, never a
+        // content change), and every frame must round-trip.
+        let dict_raw = include_bytes!("../../dict_tests/dictionary");
+        let dict_id = super::EncoderDictionary::from_bytes(dict_raw)
+            .expect("dict bytes should parse")
+            .id();
+        // Distinct lines so the payload does not trivially self-compress; the
+        // BT finder + dict dual-probe both get exercised.
+        let make_payload = |target: usize| {
+            let mut p = Vec::with_capacity(target);
+            let mut i = 0u64;
+            while p.len() < target {
+                p.extend_from_slice(
+                    format!(
+                        "tenant=demo op=put key={i} value=aaaaabbbbbcccccddddd-{}\n",
+                        i % 97
+                    )
+                    .as_bytes(),
+                );
+                i += 1;
+            }
+            p
+        };
+        // Below the 32 KiB cutoff (attach/re-prime) and above it (copy-snapshot).
+        for target in [16 * 1024usize, 64 * 1024usize] {
+            let payload = make_payload(target);
+            let mut warm: FrameCompressor =
+                FrameCompressor::new(super::CompressionLevel::Level(15));
+            warm.set_encoder_dictionary(
+                super::EncoderDictionary::from_bytes(dict_raw).expect("dict parse"),
+            )
+            .expect("dict attach");
+            // Frame 1 builds + marks the dict tables; frame 2 reuses them.
+            let frame1 = warm.compress_independent_frame(payload.as_slice());
+            let frame2 = warm.compress_independent_frame(payload.as_slice());
+            assert_eq!(
+                frame1, frame2,
+                "reused dict cache must reproduce the freshly-primed frame byte-for-byte \
+                 (Level 15, target={target})"
+            );
+            // Cold-cache compressor: must match the warm-cache bytes.
+            let mut cold: FrameCompressor =
+                FrameCompressor::new(super::CompressionLevel::Level(15));
+            cold.set_encoder_dictionary(
+                super::EncoderDictionary::from_bytes(dict_raw).expect("dict parse"),
+            )
+            .expect("dict attach");
+            let cold_frame = cold.compress_independent_frame(payload.as_slice());
+            assert_eq!(
+                cold_frame, frame1,
+                "cold-cache compressor must match warm-cache frame (Level 15, target={target})"
+            );
+            // Round-trip through a decoder primed with the same dict.
+            for frame in [&frame1, &frame2] {
+                let (hdr, _) = crate::decoding::frame::read_frame_header(frame.as_slice())
+                    .expect("frame header");
+                assert_eq!(hdr.dictionary_id(), Some(dict_id));
+                let mut decoder = FrameDecoder::new();
+                decoder
+                    .add_dict(crate::decoding::Dictionary::decode_dict(dict_raw).unwrap())
+                    .unwrap();
+                let mut decoded = Vec::with_capacity(payload.len());
+                decoder.decode_all_to_vec(frame, &mut decoded).unwrap();
+                assert_eq!(decoded.as_slice(), payload.as_slice());
+            }
+        }
+    }
+
+    #[test]
     fn set_dictionary_from_bytes_matches_full_decode_byte_for_byte() {
         // The encoder-only dict parse (`decode_dict_for_encoding`, used by
         // `set_dictionary_from_bytes`) skips the FSE/HUF decoder-table build and
@@ -2845,6 +2921,223 @@ mod tests {
         let mut decoded = Vec::with_capacity(payload.len());
         decoder.decode_all_to_vec(&output, &mut decoded).unwrap();
         assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn default_level_tiny_raw_dict_compresses_cleanly() {
+        // Coverage for the dfast dict-attach fast path with a
+        // sub-min-match raw-content dictionary: the dict-table probe in
+        // `start_matching_fast_loop` is gated on the dict table actually
+        // existing (`table().is_some()`), not merely on `is_attached()`,
+        // so a dictionary whose hashable region is shorter than the
+        // short-hash lookahead (where `prime_dict_tables_for_range`
+        // returns before allocating the tables) never dereferences a
+        // null dict pointer. Compressing at the default (dfast) level
+        // with such a dict must succeed.
+        let dict_id = 0xABCD_0009;
+        let dict = crate::decoding::Dictionary::from_raw_content(dict_id, b"abc".to_vec())
+            .expect("raw dictionary should be valid");
+        let payload = b"the quick brown fox jumps over the lazy dog, repeatedly and at length";
+        let mut output = Vec::new();
+        let mut compressor = FrameCompressor::new(super::CompressionLevel::Default);
+        compressor
+            .set_dictionary(dict)
+            .expect("tiny raw dictionary should attach");
+        compressor.set_source(payload.as_slice());
+        compressor.set_drain(&mut output);
+        compressor.compress();
+        assert!(!output.is_empty(), "compression should produce a frame");
+
+        // The emitted frame must advertise the attached dictionary id, proving
+        // the tiny-dict path stayed active (the payload round-trips either way,
+        // so without this the test would also pass on a silent no-dict frame).
+        let (frame_header, _) = crate::decoding::frame::read_frame_header(output.as_slice())
+            .expect("encoded frame should have a readable header");
+        assert_eq!(
+            frame_header.dictionary_id(),
+            Some(dict_id),
+            "tiny raw dict frame should still advertise its dictionary id",
+        );
+
+        // Full roundtrip: decode the dict-compressed frame with the SAME
+        // dictionary attached and confirm byte-exact recovery — proves the
+        // tiny-dict fast path produces a correct frame, not just a non-empty
+        // one.
+        let decode_dict = crate::decoding::Dictionary::from_raw_content(dict_id, b"abc".to_vec())
+            .expect("raw dictionary should be valid");
+        let mut decoder = FrameDecoder::new();
+        decoder
+            .add_dict(decode_dict)
+            .expect("decoder dict should attach");
+        let mut decoded = Vec::with_capacity(payload.len());
+        decoder
+            .decode_all_to_vec(&output, &mut decoded)
+            .expect("dict roundtrip should decode");
+        assert_eq!(decoded, payload, "tiny-dict roundtrip mismatch");
+    }
+
+    /// Exercises the dictionary dual-probe (live + immutable dict tables)
+    /// in the Fast / dfast / Row match finders with a dict whose content
+    /// the payload actually reuses, so each backend's dict long/short
+    /// probe (and the dfast `ip+1` dict-long retry) is reached and the
+    /// dict-compressed frame round-trips through a decoder primed with the
+    /// same dict. The 3-byte-dict test above only proves the null-table
+    /// guard; this proves the full attach path produces correct frames.
+    #[test]
+    fn dict_attach_roundtrips_across_backends_with_matching_payload() {
+        let dict_id = 0xD1C7_0001;
+        // Distinct lines so the payload does NOT self-compress: each line
+        // appears exactly once in the payload, so without the dictionary there
+        // are no in-frame back-references to exploit. The dictionary holds the
+        // SAME lines, so the only way the output shrinks is if the dict probe
+        // actually fires. A no-dict baseline below pins that the dict path ran
+        // (self-compressible payloads would round-trip + stay small via
+        // in-frame matches alone, proving nothing).
+        let line = |i: u32| {
+            alloc::format!(
+                "ts=2026-03-26T21:{:02}:{:02}Z level=INFO msg=\"event {i:05}\" tenant=t{i} region=eu\n",
+                i / 60 % 60,
+                i % 60,
+            )
+            .into_bytes()
+        };
+        let mut dict_content = Vec::new();
+        for i in 0..256u32 {
+            dict_content.extend_from_slice(&line(i));
+        }
+        // Payload = the same distinct lines in a different (stride) order, each
+        // once → no self-repeats, every line is a dictionary match.
+        let mut payload = Vec::new();
+        let mut i = 0u32;
+        for _ in 0..256u32 {
+            payload.extend_from_slice(&line(i));
+            i = (i + 97) % 256; // coprime stride → permutation, no adjacency
+        }
+
+        let compress_at = |level, dict: Option<Vec<u8>>| -> Vec<u8> {
+            let mut compressor = FrameCompressor::new(level);
+            if let Some(bytes) = dict {
+                let d = crate::decoding::Dictionary::from_raw_content(dict_id, bytes)
+                    .expect("raw dictionary should be valid");
+                compressor
+                    .set_dictionary(d)
+                    .expect("dictionary should attach");
+            }
+            let mut out = Vec::new();
+            compressor.set_source(payload.as_slice());
+            compressor.set_drain(&mut out);
+            compressor.compress();
+            out
+        };
+
+        for level in [
+            super::CompressionLevel::Level(-5), // Fast (negative)
+            super::CompressionLevel::Level(1),  // Fast
+            super::CompressionLevel::Default,   // dfast (L3)
+            super::CompressionLevel::Level(8),  // Row-backed lazy2
+        ] {
+            let out = compress_at(level, Some(dict_content.clone()));
+            let no_dict = compress_at(level, None);
+            // The dict path MUST measurably beat no-dict on this
+            // non-self-compressible payload — otherwise the dict probe never
+            // fired and the roundtrip below would prove nothing.
+            assert!(
+                out.len() < no_dict.len(),
+                "level {level:?}: dict-primed output ({}) must beat no-dict ({}) — dict probe did not fire",
+                out.len(),
+                no_dict.len(),
+            );
+
+            let ddict =
+                crate::decoding::Dictionary::from_raw_content(dict_id, dict_content.clone())
+                    .expect("raw dictionary should be valid");
+            let mut decoder = FrameDecoder::new();
+            decoder.add_dict(ddict).expect("decoder dict should attach");
+            let mut decoded = Vec::with_capacity(payload.len());
+            decoder
+                .decode_all_to_vec(&out, &mut decoded)
+                .unwrap_or_else(|e| panic!("level {level:?}: dict roundtrip decode failed: {e:?}"));
+            assert_eq!(decoded, payload, "level {level:?}: dict roundtrip mismatch");
+        }
+    }
+
+    /// Reusing one compressor across independent frames with DIFFERENT
+    /// dictionaries must drop the per-backend dict cache on each swap
+    /// (Simple/Dfast/Row keep the attach index across frames). Without the
+    /// invalidation a later frame would reuse the previous dict's rows.
+    /// Each frame round-trips through a decoder primed with its own dict.
+    #[test]
+    fn dict_swap_across_reused_compressor_roundtrips() {
+        // Distinct lines per dict (not a single repeated line) so payloads do
+        // NOT self-compress: each line appears once, so a frame only shrinks if
+        // the dict probe fires, and — crucially for the invalidation check — if
+        // frame B reused dict A's stale rows it would emit offsets into A's
+        // distinct content, which decode under dict B reconstructs as WRONG
+        // bytes (caught by the roundtrip). A single repeated line would hide
+        // pollution behind in-frame matches.
+        let lines = |tag: &str| -> (Vec<u8>, Vec<u8>) {
+            let line =
+                |i: u32| alloc::format!("{tag} record {i:05} field=value{i} end\n").into_bytes();
+            let mut dict = Vec::new();
+            for i in 0..256u32 {
+                dict.extend_from_slice(&line(i));
+            }
+            let mut payload = Vec::new();
+            let mut i = 0u32;
+            for _ in 0..256u32 {
+                payload.extend_from_slice(&line(i));
+                i = (i + 97) % 256;
+            }
+            (dict, payload)
+        };
+        let (dict_a, payload_a) = lines("alpha");
+        let (dict_b, payload_b) = lines("bravo");
+
+        for level in [
+            super::CompressionLevel::Default,
+            super::CompressionLevel::Level(8),
+        ] {
+            let no_dict = |payload: &[u8]| -> usize {
+                let mut c: FrameCompressor = FrameCompressor::new(level);
+                c.compress_independent_frame(payload).len()
+            };
+            let no_dict_a = no_dict(&payload_a);
+            let no_dict_b = no_dict(&payload_b);
+
+            let mut compressor: FrameCompressor = FrameCompressor::new(level);
+            for (dict_bytes, payload, no_dict_len) in [
+                (&dict_a, &payload_a, no_dict_a),
+                (&dict_b, &payload_b, no_dict_b),
+            ] {
+                let dict =
+                    crate::decoding::Dictionary::from_raw_content(0xD1C7_0002, dict_bytes.clone())
+                        .expect("raw dictionary should be valid");
+                compressor
+                    .set_dictionary(dict)
+                    .expect("dictionary should attach");
+                let out = compressor.compress_independent_frame(payload.as_slice());
+                assert!(
+                    out.len() < no_dict_len,
+                    "level {level:?}: dict frame ({}) must beat no-dict ({}) — dict probe did not fire",
+                    out.len(),
+                    no_dict_len,
+                );
+
+                let ddict =
+                    crate::decoding::Dictionary::from_raw_content(0xD1C7_0002, dict_bytes.clone())
+                        .expect("raw dictionary should be valid");
+                let mut decoder = FrameDecoder::new();
+                decoder.add_dict(ddict).expect("decoder dict should attach");
+                let mut decoded = Vec::with_capacity(payload.len());
+                decoder
+                    .decode_all_to_vec(&out, &mut decoded)
+                    .unwrap_or_else(|e| panic!("level {level:?}: dict-swap decode failed: {e:?}"));
+                assert_eq!(
+                    decoded, *payload,
+                    "level {level:?}: dict-swap roundtrip mismatch (stale dict rows?)"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3594,13 +3887,69 @@ mod tests {
         assert_eq!(level_pre_split(CompressionLevel::Level(4)), Some(1)); // dfast
         assert_eq!(level_pre_split(CompressionLevel::Level(5)), Some(2)); // greedy
         assert_eq!(level_pre_split(CompressionLevel::Level(7)), Some(2)); // lazy (depth 1)
-        assert_eq!(level_pre_split(CompressionLevel::Level(8)), Some(3)); // lazy2 lower bound
-        assert_eq!(level_pre_split(CompressionLevel::Level(11)), Some(3)); // lazy2 (depth 2)
-        assert_eq!(level_pre_split(CompressionLevel::Level(12)), Some(3)); // lazy2 upper bound
-        assert_eq!(level_pre_split(CompressionLevel::Level(13)), Some(3)); // btlazy2 lower bound
-        assert_eq!(level_pre_split(CompressionLevel::Level(15)), Some(3)); // btlazy2 (depth 2)
+        // lazy2 / btlazy2 use the rate-1 full-scan splitter (4), not the
+        // rate-5 sampler (3): the sampler phantom-splits homogeneous periodic
+        // input (see `pre_split` comment + `periodic_stream_not_oversplit`).
+        assert_eq!(level_pre_split(CompressionLevel::Level(8)), Some(4)); // lazy2 lower bound
+        assert_eq!(level_pre_split(CompressionLevel::Level(11)), Some(4)); // lazy2 (depth 2)
+        assert_eq!(level_pre_split(CompressionLevel::Level(12)), Some(4)); // lazy2 upper bound
+        assert_eq!(level_pre_split(CompressionLevel::Level(13)), Some(4)); // btlazy2 lower bound
+        assert_eq!(level_pre_split(CompressionLevel::Level(15)), Some(4)); // btlazy2 (depth 2)
         assert_eq!(level_pre_split(CompressionLevel::Level(16)), Some(4)); // btopt
         assert_eq!(level_pre_split(CompressionLevel::Level(22)), Some(4)); // btultra2
+    }
+
+    /// Regression: a homogeneous but periodic multi-block stream must not be
+    /// pre-split into tiny blocks at the lazy2 / btlazy2 levels. The rate-5
+    /// chunk sampler used to phantom-split such input at every 8 KB chunk,
+    /// cascading a large stream into hundreds of tiny blocks whose per-block
+    /// headers ballooned the output (~5x vs the lazy level next door). With
+    /// the rate-1 full-scan splitter the periodic stream is seen as uniform
+    /// and stays a few full blocks. We assert the lazy2 (L8) and btlazy2 (L15)
+    /// outputs stay within 2x of the lazy (L7) output on the same input, and
+    /// that every output round-trips.
+    #[test]
+    fn periodic_stream_not_oversplit() {
+        use crate::encoding::{CompressionLevel, compress_slice_to_vec};
+        const LINES: &[&str] = &[
+            "ts=2026-03-26T21:39:28Z level=INFO msg=\"flush memtable\" tenant=demo table=orders region=eu-west\n",
+            "ts=2026-03-26T21:39:29Z level=INFO msg=\"rotate segment\" tenant=demo table=orders region=eu-west\n",
+            "ts=2026-03-26T21:39:30Z level=INFO msg=\"compact level\" tenant=demo table=orders region=eu-west\n",
+            "ts=2026-03-26T21:39:31Z level=INFO msg=\"write block\" tenant=demo table=orders region=eu-west\n",
+        ];
+        // 512 KB = 4 donor blocks, enough for the cascade to manifest.
+        let target = 512 * 1024usize;
+        let mut data = Vec::with_capacity(target);
+        let mut i = 0;
+        while data.len() < target {
+            let line = LINES[i % LINES.len()].as_bytes();
+            let take = line.len().min(target - data.len());
+            data.extend_from_slice(&line[..take]);
+            i += 1;
+        }
+        let l7 = compress_slice_to_vec(&data, CompressionLevel::Level(7)); // lazy depth1
+        let l8 = compress_slice_to_vec(&data, CompressionLevel::Level(8)); // lazy2
+        let l15 = compress_slice_to_vec(&data, CompressionLevel::Level(15)); // btlazy2
+        assert!(
+            l8.len() < l7.len() * 2,
+            "lazy2 over-split periodic stream: l7={} l8={}",
+            l7.len(),
+            l8.len()
+        );
+        assert!(
+            l15.len() < l7.len() * 2,
+            "btlazy2 over-split periodic stream: l7={} l15={}",
+            l7.len(),
+            l15.len()
+        );
+        for out in [&l7, &l8, &l15] {
+            let mut decoder = FrameDecoder::new();
+            let mut round = Vec::with_capacity(data.len());
+            decoder
+                .decode_all_to_vec(out, &mut round)
+                .expect("decode periodic stream");
+            assert_eq!(round, data, "periodic stream roundtrip mismatch");
+        }
     }
 
     /// End-to-end: a 256 KB payload whose SECOND 128 KB donor block carries

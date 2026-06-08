@@ -16,6 +16,7 @@ use core::convert::TryInto;
 
 use super::Sequence;
 use super::blocks::encode_offset_with_history;
+use super::dict_attach::DictAttach;
 use super::incompressible::block_looks_incompressible;
 use super::match_generator::{
     DFAST_EMPTY_SLOT, DFAST_HASH_BITS, DFAST_INCOMPRESSIBLE_SKIP_STEP, DFAST_LOCAL_SKIP_TRIGGER,
@@ -26,7 +27,7 @@ use super::match_table::helpers::{
     LazyMatchConfig, best_len_offset_candidate, common_prefix_len, extend_backwards_shared,
     pick_lazy_match_shared, repcode_candidate_shared,
 };
-use super::match_table::storage::check_stream_abs_headroom;
+use super::match_table::storage::{REBASE_RESET_FLOOR_CEILING, check_stream_abs_headroom};
 use super::opt::types::MatchCandidate;
 
 /// Donor `HASH_READ_SIZE` (`zstd_compress_internal.h`): the largest probe
@@ -109,6 +110,32 @@ pub(crate) struct DfastMatchGenerator {
     pub(crate) use_fast_loop: bool,
     // Lazy match lookahead depth (internal tuning parameter).
     pub(crate) lazy_depth: u8,
+    /// Immutable dictionary long+short hash tables (donor `dictMatchState`)
+    /// plus the CDict cache lifecycle, via the shared [`DictAttach`] level-1
+    /// scaffolding. Built once over the dictionary region at the front of the
+    /// contiguous history (flat `[dict][input]` model like the Fast backend:
+    /// a dict match is `offset = ip - dict_pos` and counts cross the
+    /// dict→input boundary, no `dictBase`/`dictIndexDelta`). Slots store the
+    /// dict position as a +1-biased CONCAT index (offset into
+    /// `history[history_start..]`), NOT the live tables' `position_base`-packed
+    /// encoding — the dict table is never rebased, so it keys off the stable
+    /// concat coordinate and is invalidated on any history eviction (which
+    /// would slide the dict out of the concat) so positions never go stale.
+    /// `is_attached()` activates the dual-probe kernel; `region_len()` is the
+    /// dict/input boundary (`dict_end`, a concat index).
+    pub(crate) dict: DictAttach<DfastDictTables>,
+}
+
+/// The dfast backend's immutable dictionary tables — a long+short pair mirroring
+/// the live [`DfastMatchGenerator::long_hash`] / [`DfastMatchGenerator::short_hash`]
+/// shapes, sized to the same `(long_hash_bits, short_hash_bits)`. Held by the
+/// shared [`DictAttach`] level-1 lifecycle; the per-tier dual-probe LOOKUP is
+/// level-2 in this backend's kernel. Slots hold a +1-biased concat index
+/// (`DFAST_EMPTY_SLOT = 0` is "no entry").
+#[derive(Debug, Default, Clone)]
+pub(crate) struct DfastDictTables {
+    pub(crate) long: alloc::vec::Vec<u32>,
+    pub(crate) short: alloc::vec::Vec<u32>,
 }
 
 impl DfastMatchGenerator {
@@ -136,6 +163,7 @@ impl DfastMatchGenerator {
             short_hash_bits: DFAST_HASH_BITS - DFAST_SHORT_HASH_BITS_DELTA,
             use_fast_loop: false,
             lazy_depth: 1,
+            dict: DictAttach::new(),
         }
     }
 
@@ -148,6 +176,7 @@ impl DfastMatchGenerator {
         let min_bits = MIN_WINDOW_LOG as usize;
         let long_clamped = long_bits.max(min_bits);
         let short_clamped = short_bits.max(min_bits);
+        let resized = self.long_hash_bits != long_clamped || self.short_hash_bits != short_clamped;
         if self.long_hash_bits != long_clamped {
             self.long_hash_bits = long_clamped;
             self.long_hash = Vec::new();
@@ -155,6 +184,12 @@ impl DfastMatchGenerator {
         if self.short_hash_bits != short_clamped {
             self.short_hash_bits = short_clamped;
             self.short_hash = Vec::new();
+        }
+        if resized {
+            // A table-size change makes the cached dict tables (sized to the old
+            // bits) and their hash indices invalid — drop the attach so the next
+            // prime rebuilds at the new shape.
+            self.dict.invalidate();
         }
     }
 
@@ -227,15 +262,41 @@ impl DfastMatchGenerator {
     }
 
     pub(crate) fn reset(&mut self) {
+        // Floor-advance reset (issue #337 technique, completing it for the
+        // dfast backend — `MatchTable` already does this). Instead of
+        // zeroing the long/short tables every frame (a memset proportional
+        // to table size, ~25% of a small reused-context dfast frame),
+        // advance the absolute-position floor past the previous frame's
+        // end. Every slot-decode site rejects a candidate whose absolute
+        // position is below `history_abs_start` before it dereferences a
+        // history byte (audited: fast-loop long/short/long+1/repcode,
+        // `probe_tail_ip0_only`, `probe_slot_match`), so the previous
+        // frame's entries become unreachable without being cleared.
+        // `position_base` is left untouched so stale slots still decode to
+        // their (now sub-floor) absolute positions; `ensure_room_for` /
+        // `reduce` keep the `u32` packing bounded as the cursor climbs.
+        let next_floor = self.history_abs_start + (self.history.len() - self.history_start);
         self.window_size = 0;
         self.history.clear();
         self.history_start = 0;
-        self.history_abs_start = 0;
-        self.position_base = 0;
         self.offset_hist = [1, 4, 8];
-        if !self.short_hash.is_empty() {
-            self.short_hash.fill(DFAST_EMPTY_SLOT);
-            self.long_hash.fill(DFAST_EMPTY_SLOT);
+        if next_floor <= REBASE_RESET_FLOOR_CEILING {
+            // Fast path: advance the floor; tables keep their contents (a
+            // later `ensure_tables`/level change still reallocs them clean
+            // if the dimensions changed). The dict tables key off stable
+            // concat indices and are untouched here.
+            self.history_abs_start = next_floor;
+        } else {
+            // Bounded fallback: rewind the cursor and zero the tables so
+            // `history_abs_start` cannot climb toward `usize::MAX` (keeps
+            // `check_stream_abs_headroom` satisfiable on 32-bit targets;
+            // fires ~once per 2 GiB cumulative input there).
+            self.history_abs_start = 0;
+            self.position_base = 0;
+            if !self.short_hash.is_empty() {
+                self.short_hash.fill(DFAST_EMPTY_SLOT);
+                self.long_hash.fill(DFAST_EMPTY_SLOT);
+            }
         }
         // No Vec<u8> blocks to recycle: `add_data` returns each input
         // Vec to the caller eagerly via its own `reuse_space`, and the
@@ -313,6 +374,13 @@ impl DfastMatchGenerator {
             reuse_space(data);
             return;
         }
+        if self.window_size + data.len() > self.max_window_size {
+            // Eviction advances `history_start`, so the dict tables' concat
+            // indices (primed at `history_start == 0`) no longer address the
+            // dict bytes — drop the attach (dict ratio benefit lost once the
+            // dict slides out of the window, like the Fast backend).
+            self.dict.invalidate();
+        }
         while self.window_size + data.len() > self.max_window_size {
             let removed_len = self.window_blocks.pop_front().unwrap();
             self.window_size -= removed_len;
@@ -375,6 +443,11 @@ impl DfastMatchGenerator {
     /// other lifecycle calls) so adding one more per-backend arm is
     /// free.
     pub(crate) fn trim_to_window(&mut self) {
+        if self.window_size > self.max_window_size || self.history_start != 0 {
+            // Any history shift slides the dictionary out of (or within) the
+            // concat, staling the dict tables' concat indices — drop the attach.
+            self.dict.invalidate();
+        }
         while self.window_size > self.max_window_size {
             let removed_len = self.window_blocks.pop_front().unwrap();
             self.window_size -= removed_len;
@@ -454,6 +527,138 @@ impl DfastMatchGenerator {
             self.insert_positions(backfill_start, current_abs_start);
         }
         self.insert_positions(current_abs_start, current_abs_end);
+    }
+
+    /// Donor `ZSTD_dictMatchState` attach (dfast): hash the dictionary block at
+    /// the front of history into the SEPARATE immutable [`Self::dict`] tables
+    /// (long+short), once, instead of re-priming the live tables every frame
+    /// (`skip_matching_dense`). The dual-probe kernel then searches live + dict
+    /// without per-frame dict cost. Cached via the `DictAttach` primed flag.
+    pub(crate) fn skip_matching_for_dict_attach(&mut self) {
+        self.ensure_hash_tables();
+        // The dual-probe lives only in `start_matching_fast_loop`. The general
+        // path (L1/L2/L4) has no dict probe, so for those levels prime the dict
+        // into the LIVE tables (`skip_matching_dense`), where the dense scan
+        // finds it — keeping the attach win to the fast-loop levels (L3 /
+        // Default / L0) without regressing general-path dict ratio.
+        if !self.use_fast_loop {
+            self.dict.invalidate();
+            self.skip_matching_dense();
+            return;
+        }
+        let current_len = self.window_blocks.back().copied().unwrap_or(0);
+        if current_len == 0 {
+            return;
+        }
+        let current_abs_start = self.history_abs_start + self.window_size - current_len;
+        let current_abs_end = current_abs_start + current_len;
+        // Convert absolute → concat (history-relative) coordinates: the dict
+        // table keys off the stable concat index, not `position_base`.
+        let start_concat = current_abs_start - self.history_abs_start;
+        let end_concat = current_abs_end - self.history_abs_start;
+        self.prime_dict_tables_for_range(start_concat, end_concat);
+    }
+
+    /// Mark the dict tables fully built (CDict cache). The driver calls this
+    /// after the final dictionary chunk so the next frame skips the re-hash.
+    ///
+    /// Only the fast-loop path builds the immutable dict tables; the
+    /// general-path levels (L1/L2/L4) prime the dict into the LIVE tables and
+    /// `invalidate()` the attach cache (see [`Self::skip_matching_for_dict_attach`]),
+    /// leaving `self.dict.table()` empty. Gate on `use_fast_loop` so a
+    /// general-path frame can never flip the primed flag, which would let a
+    /// later fast-loop frame short-circuit [`Self::prime_dict_tables_for_range`]
+    /// with no dict tables built. ([`DictAttach::mark_primed`] also self-guards
+    /// on `table.is_some()`, so this is belt-and-suspenders making the
+    /// precondition explicit at the call site.)
+    pub(crate) fn mark_dict_primed(&mut self) {
+        if self.use_fast_loop {
+            self.dict.mark_primed();
+        }
+    }
+
+    /// Drop the cached dict tables (next frame carries no dict, or eviction /
+    /// param change staled the concat positions).
+    pub(crate) fn invalidate_dict_cache(&mut self) {
+        self.dict.invalidate();
+    }
+
+    /// Build the immutable dict long+short tables over the contiguous-history
+    /// concat range `[start_concat, end_concat)` (the dictionary bytes at the
+    /// front of history). Mirrors [`Self::insert_positions`]' hash + lookahead
+    /// gating, but writes a +1-biased CONCAT index (`idx + 1`, stable across
+    /// `position_base` rebases) into `self.dict` rather than the live,
+    /// `position_base`-packed tables. `DFAST_EMPTY_SLOT = 0` means "no entry".
+    /// Skips the rehash when the CDict cache is already primed.
+    fn prime_dict_tables_for_range(&mut self, start_concat: usize, end_concat: usize) {
+        const PRIME: u64 = 0xCF1BBCDCB7A56463_u64;
+        // Record the dict/input boundary (concat index) regardless of whether
+        // any position is hashable (a sub-min-match dict still bounds dict_end).
+        self.dict.set_region_len(end_concat);
+        if self.dict.is_primed() {
+            return;
+        }
+        let history_start = self.history_start;
+        let concat_len = self.history.len() - history_start;
+        let long_bits = self.long_hash_bits;
+        let short_bits = self.short_hash_bits;
+        // Lookahead-safe cutoffs within the concat: long needs 8 readable
+        // bytes, short needs 4 (donor parity with `insert_positions`).
+        let long_safe_end = concat_len.saturating_sub(7).min(end_concat);
+        let short_safe_end = concat_len.saturating_sub(3).min(end_concat);
+        if start_concat >= short_safe_end {
+            return;
+        }
+        let dict = self.dict.table_mut_or_init(|| DfastDictTables {
+            long: alloc::vec![DFAST_EMPTY_SLOT; 1usize << long_bits],
+            short: alloc::vec![DFAST_EMPTY_SLOT; 1usize << short_bits],
+        });
+        let short_shift = 64 - short_bits;
+        let long_shift = 64 - long_bits;
+        let base = self.history.as_ptr();
+        let long_ptr = dict.long.as_mut_ptr();
+        let short_ptr = dict.short.as_mut_ptr();
+        // SAFETY: `base.add(history_start + pos)` is in-bounds for
+        // `pos + 8 <= concat_len` (long) / `pos + 4 <= concat_len` (short),
+        // enforced by the `*_safe_end` cutoffs. `*_idx = mixed >> (64 - bits)`
+        // has at most `bits` bits set, in-bounds for the `1 << bits` tables.
+        // `pos + 1` fits u32: concat indices are bounded by the u32 history
+        // gate upstream (`check_stream_abs_headroom`).
+        //
+        // Backfill the previous chunk's last 7/3 bytes (the seam), which only
+        // became hashable now that this chunk extended history — mirrors the
+        // dense priming paths' backfill so multi-chunk dictionary priming
+        // doesn't drop seam-spanning candidates.
+        //
+        // `saturating_sub` is a deliberate FLOOR clamp to concat position 0
+        // (the dict start), NOT overflow-masking: `start_concat` is a valid
+        // concat index, and the seam window `[start_concat - tail, start_concat)`
+        // is clamped at 0 because there are no dict bytes before the front.
+        // The first chunk (`start_concat == 0`) clamps to 0 → no seam, no-op.
+        let backfill_floor = start_concat.saturating_sub(Self::BOUNDARY_DENSE_TAIL_LEN);
+        let mut pos = backfill_floor;
+        while pos < long_safe_end {
+            unsafe {
+                let load_ptr = base.add(history_start + pos);
+                let v8 = (load_ptr as *const u64).read_unaligned();
+                let v4 = v8 & 0xFFFF_FFFF;
+                let short_idx = (v4.wrapping_mul(PRIME) >> short_shift) as usize;
+                let long_idx = (v8.wrapping_mul(PRIME) >> long_shift) as usize;
+                let packed = (pos as u32) + 1;
+                *short_ptr.add(short_idx) = packed;
+                *long_ptr.add(long_idx) = packed;
+            }
+            pos += 1;
+        }
+        while pos < short_safe_end {
+            unsafe {
+                let load_ptr = base.add(history_start + pos);
+                let v4 = (load_ptr as *const u32).read_unaligned() as u64;
+                let short_idx = (v4.wrapping_mul(PRIME) >> short_shift) as usize;
+                *short_ptr.add(short_idx) = (pos as u32) + 1;
+            }
+            pos += 1;
+        }
     }
 
     pub(crate) fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
@@ -567,560 +772,6 @@ impl DfastMatchGenerator {
         self.emit_trailing_literals(literals_start, handle_sequence);
     }
 
-    fn start_matching_fast_loop(
-        &mut self,
-        current_abs_start: usize,
-        current_len: usize,
-        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
-    ) {
-        // Behaviour change vs the pre-refactor `start_matching_general`:
-        // this fast loop deliberately drops the strict-incompressible
-        // early-skip path (the `block_looks_incompressible_strict` short
-        // circuit + `miss_run` / `DFAST_LOCAL_SKIP_TRIGGER` thresholding).
-        // The step ramp is now driven purely by distance traveled
-        // (`DFAST_SKIP_STEP_GROWTH_INTERVAL = 64`, donor parity except
-        // donor uses 256 — see "Donor-deviation audit" in the PR body),
-        // so blocks the strict gate used to bail out of early now scan
-        // through the standard ramp. `block_looks_incompressible_strict`
-        // is still used by `levels/fastest.rs` for the Fastest preset
-        // and by `incompressible.rs` unit tests, so the helper itself
-        // stays.
-        //
-        // Donor outer/inner structure (`zstd_double_fast.c:167-322`):
-        //   * outer `while(1)` runs once per match-found-and-stored;
-        //   * inner `do { ... } while (ip1 <= ilimit)` carries `hl0`,
-        //     `idxl0` between iterations, and precomputes `hl1` so the
-        //     next iter's long hash is reused (one long-hash compute per
-        //     two positions scanned, not per position).
-        // We mirror that here. Per-frame invariants are hoisted before
-        // the outer loop; mutable state (`position_base`, `history_abs_start`)
-        // is re-snapshotted inside the outer loop because `emit_candidate`
-        // → `insert_positions` → `ensure_room_for` can advance the rebase
-        // base mid-frame.
-        //
-        // Rebase BEFORE any inner-loop slot pack. The hot loop computes
-        // `packed_curr = (abs_ip0 - position_base) as u32 + 1` and writes
-        // it straight into the hash tables, bypassing `insert_position`
-        // (which is where `ensure_room_for` normally fires). On a long
-        // stream of all-miss / non-hashable blocks the matcher can advance
-        // `current_abs_start` arbitrarily far without any per-byte insert,
-        // so `position_base` may be stale by `> u32::MAX`. The first
-        // fast-loop block after that would silently truncate `packed_curr`
-        // and poison both hash tables. The guard band in `ensure_room_for`
-        // (`DFAST_REBASE_GUARD_BAND`) covers the entire current block's
-        // worth of positions, so a single call at function entry suffices.
-        //
-        // Raw-pointer aliasing invariant. The inner loop caches
-        // `short_hash_ptr = self.short_hash.as_mut_ptr()` and
-        // `long_hash_ptr = self.long_hash.as_mut_ptr()` (and a
-        // `history_base_ptr` for the byte-buffer reads), then over
-        // the rest of the function does:
-        //
-        //   * raw writes / reads via `*short_hash_ptr.add(...) =
-        //     packed_curr`, `*long_hash_ptr.add(...) = packed_curr`,
-        //     and `*long_hash_ptr.add(hl1_idx)`;
-        //   * `&self`-shared reads of `self.offset_hist[0]` for the
-        //     rep1 peek;
-        //   * `&self`-shared slice reads of `self.history` (`let
-        //     concat = &self.history[history_start_offset..]`) for
-        //     `extend_backwards_shared` invocations.
-        //
-        // This is sound under both Stacked Borrows and Tree Borrows
-        // because the three fields touched (`short_hash`, `long_hash`,
-        // `history`, `offset_hist`) are physically disjoint
-        // allocations — `Vec<u32>`/`Vec<u8>` each own their own heap
-        // buffer, and `offset_hist` is an inline `[u32; 3]` inside
-        // the struct. A raw pointer derived from one field's Vec data
-        // has provenance over that field only, so the subsequent
-        // `&self` reads of sibling fields don't reborrow through the
-        // raw pointer's provenance tree.
-        //
-        // CRITICAL: this invariant must be preserved by any future
-        // refactor that adds method calls inside the loop body. A
-        // call that takes `&mut self` (e.g.,
-        // `self.ensure_hash_tables()`, `self.insert_position(...)`)
-        // would reborrow the tables and invalidate the cached raw
-        // pointers — every such call must happen OUTSIDE the
-        // `'outer: loop` (as `ensure_room_for` does, hoisted to the
-        // function preamble above) or be followed by a fresh
-        // `as_mut_ptr()` reload of both `short_hash_ptr` /
-        // `long_hash_ptr`. The outer-loop body already re-snapshots
-        // `history_base_ptr` per iteration for exactly this reason
-        // (`emit_candidate` → `insert_positions` may grow `history`
-        // and trigger a realloc), so the same re-snapshot discipline
-        // applies to the hash-table pointers.
-        //
-        // `current_len > 0` is a precondition of this helper: every
-        // caller (`start_matching`, `skip_matching`, `skip_matching_dense`)
-        // returns early at `current_len == 0`. Encode it as a hard
-        // assert so a future caller that forgets the gate fails loudly
-        // in debug rather than wrap-underflowing the `- 1` below; the
-        // rebase is unconditional in release builds since the
-        // precondition holds.
-        debug_assert!(current_len > 0, "fast_loop precondition: current_len > 0");
-        self.ensure_room_for(current_abs_start + current_len - 1);
-        const PRIME: u64 = 0xCF1BBCDCB7A56463_u64;
-        let short_shift = 64 - self.short_hash_bits;
-        let long_shift = 64 - self.long_hash_bits;
-        let mut pos = 1usize;
-        let mut literals_start = 0usize;
-
-        'outer: loop {
-            // Outer-iter precondition: at least `HASH_READ_SIZE = 8` bytes
-            // ahead of `pos` so the unconditional 8-byte `u64` load below
-            // is in-bounds for the live history buffer. `DFAST_MIN_MATCH_LEN
-            // = 5` is the match acceptance threshold and is NOT a safe
-            // load bound — using it here read up to 3 bytes past
-            // `history.len()` on tiny blocks (CI fuzz `interop` crash,
-            // 7-byte input).
-            // NOTE: when this guard fires on the very first outer-iter
-            // (tiny block, `current_len < 9`), we `break 'outer` BEFORE
-            // `tail_seed_anchor` is even declared. The post-loop
-            // `seed_remaining_hashable_starts(.., pos)` then runs with
-            // `pos` at its initial value (1 on first frame, or the
-            // post-match cursor from a previous outer iter); that's the
-            // correct tail seed for tiny blocks — `seed_pos = pos.min(
-            // current_len).min(boundary_tail_start)` plus the
-            // `seed_pos + DFAST_SHORT_HASH_LOOKAHEAD <= current_len`
-            // guard inside the seeder keeps every insert in-bounds.
-            if pos + HASH_READ_SIZE > current_len {
-                break 'outer;
-            }
-            let mut step = 1usize;
-            let mut next_step_pos = pos + DFAST_SKIP_STEP_GROWTH_INTERVAL;
-            let mut ip0 = pos;
-            let mut ip1 = ip0 + step;
-            // Same `HASH_READ_SIZE` rationale for `ip1`: the inner loop
-            // pre-loads 8 bytes at `concat_idx1` for the `hl1` precompute
-            // and the `_search_next_long` retry, so `ip1 + 8 <= current_len`
-            // must hold before we enter. If `ip0` is still hashable but
-            // `ip1` is not (boundary case `pos == current_len - 8`), we
-            // still want to probe `ip0` — skipping it would leave the
-            // last hashable position to `seed_remaining_hashable_starts`,
-            // which inserts but does NOT search, and that drops real
-            // matches in the tail window vs the upstream reference
-            // (whose single-cursor loop probes every position p with
-            // `p + HASH_READ_SIZE <= iend`). Handle the boundary inline
-            // before exiting: a single-cursor probe at `ip0` (rep peek
-            // and `_search_next_long` retry both depend on `ip1` so
-            // they're skipped — donor accepts that exact tradeoff at
-            // the iend boundary).
-            if ip1 + HASH_READ_SIZE > current_len {
-                if let Some(committed) =
-                    self.probe_tail_ip0_only(current_abs_start, current_len, ip0, literals_start)
-                {
-                    let start = self.emit_candidate(
-                        current_abs_start,
-                        &mut literals_start,
-                        committed,
-                        handle_sequence,
-                    );
-                    pos = start + committed.match_len;
-                    pos = self.extend_with_repcode_after_match(
-                        current_abs_start,
-                        current_len,
-                        pos,
-                        &mut literals_start,
-                        handle_sequence,
-                    );
-                    continue 'outer;
-                }
-                break 'outer;
-            }
-
-            // Re-read every per-frame-mutable cursor here — `emit_candidate`
-            // in the previous outer iteration may have triggered a rebase.
-            let history_abs_start = self.history_abs_start;
-            let position_base = self.position_base;
-            let history_start_offset = self.history_start;
-            let history_base_ptr = self.history.as_ptr();
-            let short_hash_ptr = self.short_hash.as_mut_ptr();
-            let long_hash_ptr = self.long_hash.as_mut_ptr();
-            let concat_len = self.history.len() - history_start_offset;
-
-            // Pre-compute long hash at ip0 ONCE per outer iter.
-            // `concat_idx = (current_abs_start + ip0) - history_abs_start`
-            // is the byte offset within `live_history`.
-            let mut hl0_idx;
-            let mut idxl0;
-            // SAFETY: `current_abs_start + ip0 >= history_abs_start`
-            // (`ip` is inside the current block, which is part of live
-            // history). The 8-byte unaligned load on
-            // `concat[concat_idx..]` is safe because the outer loop
-            // guards above enforce `ip0 + HASH_READ_SIZE <= current_len`,
-            // and `current_abs_start + current_len - history_abs_start
-            // <= concat_len` (live history contains the full current
-            // block plus any retained earlier blocks), giving
-            // `concat_idx + 8 <= concat_len`. The `debug_assert!` below
-            // makes that invariant explicit so a future refactor that
-            // touches eviction / `compact_history` / `trim_to_window`
-            // semantics catches a violation in tests instead of leaking
-            // through to ASan UB.
-            unsafe {
-                let concat_idx = (current_abs_start + ip0) - history_abs_start;
-                debug_assert!(
-                    concat_idx + HASH_READ_SIZE <= concat_len,
-                    "fast-loop 8-byte load OOB: concat_idx={} HASH_READ_SIZE={} concat_len={}",
-                    concat_idx,
-                    HASH_READ_SIZE,
-                    concat_len,
-                );
-                let v8 = (history_base_ptr.add(history_start_offset + concat_idx) as *const u64)
-                    .read_unaligned();
-                hl0_idx = (v8.wrapping_mul(PRIME) >> long_shift) as usize;
-                idxl0 = *long_hash_ptr.add(hl0_idx);
-            }
-
-            // Inner-loop exit shape. Every `break 'inner` produces a
-            // value of this type, so the type system enforces the
-            // previously implicit pairing between "did we commit a
-            // match?" and "where does the tail seeder pick up?":
-            //
-            //   * `Committed(c)` — rep1 / long / short(+next_long retry)
-            //     paths chose `c`; outer arm runs emit + rep-extension.
-            //   * `Tail(seed)` — inner ran out of safe scan room at
-            //     `seed = ip0` (first un-scanned position); outer arm
-            //     hands `seed` to `seed_remaining_hashable_starts` so
-            //     the tail seeder does not redundantly re-pack
-            //     positions the fast loop already wrote (which is what
-            //     restarting from outer-entry `pos` would do on a
-            //     miss-only block — throwing away the skip-step win on
-            //     incompressible data).
-            //
-            // Adding a new `break 'inner` variant now forces the
-            // author to pick a `InnerExit::…` variant explicitly; the
-            // previous `Option<MatchCandidate>` + sibling `usize`
-            // pairing relied on a comment-block to flag the coupling.
-            enum InnerExit {
-                Committed(MatchCandidate),
-                Tail(usize),
-            }
-
-            let inner_exit: InnerExit = 'inner: loop {
-                let abs_ip0 = current_abs_start + ip0;
-                let abs_ip1 = current_abs_start + ip1;
-                let lit_len_ip0 = ip0 - literals_start;
-                let lit_len_ip1 = ip1 - literals_start;
-                let packed_curr = ((abs_ip0 - position_base) as u32) + 1;
-
-                let concat_idx0 = abs_ip0 - history_abs_start;
-                let concat_idx1 = abs_ip1 - history_abs_start;
-
-                // Load 8 bytes at ip0 for both short (low 4) and long
-                // probe equality checks. We already used `v8_at_ip0` to
-                // compute hl0/idxl0 in the outer init / previous iter's
-                // carry; reload now (cheap unaligned read) so the
-                // `read_unaligned` is from the same offset the
-                // probe-eq below will use.
-                let v8_0 = unsafe {
-                    (history_base_ptr.add(history_start_offset + concat_idx0) as *const u64)
-                        .read_unaligned()
-                };
-                let v4_0 = v8_0 & 0xFFFF_FFFF;
-                let hs0_idx = (v4_0.wrapping_mul(PRIME) >> short_shift) as usize;
-                let idxs0 = unsafe { *short_hash_ptr.add(hs0_idx) };
-
-                // Donor parity (`zstd_double_fast.c:187`): update BOTH
-                // tables at curr BEFORE checking matches. The benefit is
-                // for hash-table consumers, NOT the rep peek (rep at ip+1
-                // reads `offset_hist[0]`, never the hash tables). The
-                // donor rationale is the long-hash retry path: the next
-                // inner iter's `idxl1` lookup (`hashLong[hl1_idx]`) can
-                // collide with this iter's `hl0_idx`, and writing curr
-                // first means a self-collision still resolves to a real
-                // match instead of the previous occupant. The short
-                // probe of the same iter and the `_search_next_long`
-                // retry at ip+1 are the other consumers that see the
-                // fresh write.
-                unsafe {
-                    *long_hash_ptr.add(hl0_idx) = packed_curr;
-                    *short_hash_ptr.add(hs0_idx) = packed_curr;
-                }
-
-                // Donor parity (`zstd_double_fast.c:190`): inline rep1
-                // peek at ip+1, 4-byte gate. Donor's hot path checks ONLY
-                // `offset_1` here (full 3-rep walk lives in lazy/btopt).
-                // Since the peek is at `ip+1` with `pos >= literals_start`,
-                // `lit_len_ip1 >= 1`, so `offset_hist[0]` is the donor's
-                // `offset_1`. The `repcode_candidate_shared` helper we used
-                // before walked all three offsets + did a full SIMD
-                // `common_prefix_len` per probe, paying ~3× the work for
-                // rep2/rep3 hits that the dfast fast path never benefits
-                // from (those wins live in the lazy/btopt strategies).
-                let rep1 = self.offset_hist[0] as usize;
-                if rep1 != 0 && rep1 <= abs_ip1 {
-                    let cand_pos_r = abs_ip1 - rep1;
-                    if cand_pos_r >= history_abs_start
-                        && cand_pos_r >= current_abs_start + literals_start
-                    {
-                        let cand_idx_r = cand_pos_r - history_abs_start;
-                        // 4-byte gate; full forward count only if it passes.
-                        let cand4 = unsafe {
-                            (history_base_ptr.add(history_start_offset + cand_idx_r) as *const u32)
-                                .read_unaligned()
-                        };
-                        let cur4 = unsafe {
-                            (history_base_ptr.add(history_start_offset + concat_idx1) as *const u32)
-                                .read_unaligned()
-                        };
-                        if cand4 == cur4 {
-                            let mut match_len = 4usize;
-                            let max_fwd = concat_len.saturating_sub(concat_idx1 + 4);
-                            unsafe {
-                                let lhs =
-                                    history_base_ptr.add(history_start_offset + cand_idx_r + 4);
-                                let rhs =
-                                    history_base_ptr.add(history_start_offset + concat_idx1 + 4);
-                                let ext = crate::encoding::fastpath::dispatch_common_prefix_len_ptr(
-                                    lhs, rhs, max_fwd,
-                                );
-                                match_len += ext;
-                            }
-                            // Rep extensions use the 4-byte
-                            // `DFAST_REP_MIN_MATCH_LEN` floor, NOT the
-                            // hash-search `DFAST_MIN_MATCH_LEN = 5`. Rep
-                            // coding has no on-wire offset cost, so the
-                            // upstream reference accepts 4-byte rep
-                            // hits; gating at 5 here would silently drop
-                            // every 4-byte rep1 the upstream encoder
-                            // produces, and leave the post-match
-                            // `extend_with_repcode_after_match` chain
-                            // (which uses 4) inconsistent with the peek.
-                            if match_len >= DFAST_REP_MIN_MATCH_LEN {
-                                let concat = &self.history[history_start_offset..];
-                                let rep_cand = extend_backwards_shared(
-                                    concat,
-                                    history_abs_start,
-                                    cand_pos_r,
-                                    abs_ip1,
-                                    match_len,
-                                    lit_len_ip1,
-                                );
-                                break 'inner InnerExit::Committed(rep_cand);
-                            }
-                        }
-                    }
-                }
-
-                // Precompute hl1 (donor `_search_next_long` carry, line 197).
-                let v8_1 = unsafe {
-                    (history_base_ptr.add(history_start_offset + concat_idx1) as *const u64)
-                        .read_unaligned()
-                };
-                let hl1_idx = (v8_1.wrapping_mul(PRIME) >> long_shift) as usize;
-
-                // Long match check at ip0 with idxl0. 8-byte equality
-                // gate (`MEM_read64`) — if it passes, candidate is real.
-                if idxl0 != DFAST_EMPTY_SLOT {
-                    let cand_pos = position_base + (idxl0 as usize) - 1;
-                    if cand_pos >= history_abs_start && cand_pos < abs_ip0 {
-                        let cand_idx = cand_pos - history_abs_start;
-                        // SAFETY: same buffer/length bounds as v8_0 above.
-                        let cand_v8 = unsafe {
-                            (history_base_ptr.add(history_start_offset + cand_idx) as *const u64)
-                                .read_unaligned()
-                        };
-                        if cand_v8 == v8_0 {
-                            // 8 bytes match; count forward + extend back.
-                            let mut match_len = 8usize;
-                            let max_fwd = concat_len.saturating_sub(concat_idx0 + 8);
-                            // SAFETY: both ptrs at the same buffer; offsets
-                            // verified above. `max_fwd` caps the scan to
-                            // the live region.
-                            unsafe {
-                                let lhs = history_base_ptr.add(history_start_offset + cand_idx + 8);
-                                let rhs =
-                                    history_base_ptr.add(history_start_offset + concat_idx0 + 8);
-                                let ext = crate::encoding::fastpath::dispatch_common_prefix_len_ptr(
-                                    lhs, rhs, max_fwd,
-                                );
-                                match_len += ext;
-                            }
-                            let concat = &self.history[history_start_offset..];
-                            let cand = extend_backwards_shared(
-                                concat,
-                                history_abs_start,
-                                cand_pos,
-                                abs_ip0,
-                                match_len,
-                                lit_len_ip0,
-                            );
-                            break 'inner InnerExit::Committed(cand);
-                        }
-                    }
-                }
-
-                let idxl1 = unsafe { *long_hash_ptr.add(hl1_idx) };
-
-                // Short match check at ip0 with idxs0 — 4-byte gate
-                // ONLY (donor `zstd_double_fast.c:220`). Forward count
-                // and `_search_next_long` retry happen ONLY on hit.
-                if idxs0 != DFAST_EMPTY_SLOT {
-                    let cand_pos_s = position_base + (idxs0 as usize) - 1;
-                    if cand_pos_s >= history_abs_start && cand_pos_s < abs_ip0 {
-                        let cand_idx_s = cand_pos_s - history_abs_start;
-                        let cand4 = unsafe {
-                            (history_base_ptr.add(history_start_offset + cand_idx_s) as *const u32)
-                                .read_unaligned()
-                        };
-                        if cand4 == v4_0 as u32 {
-                            // Short hit: count forward from byte 4 onwards.
-                            let mut s_match_len = 4usize;
-                            let max_fwd = concat_len.saturating_sub(concat_idx0 + 4);
-                            unsafe {
-                                let lhs =
-                                    history_base_ptr.add(history_start_offset + cand_idx_s + 4);
-                                let rhs =
-                                    history_base_ptr.add(history_start_offset + concat_idx0 + 4);
-                                let ext = crate::encoding::fastpath::dispatch_common_prefix_len_ptr(
-                                    lhs, rhs, max_fwd,
-                                );
-                                s_match_len += ext;
-                            }
-                            let concat = &self.history[history_start_offset..];
-                            let short_cand = extend_backwards_shared(
-                                concat,
-                                history_abs_start,
-                                cand_pos_s,
-                                abs_ip0,
-                                s_match_len,
-                                lit_len_ip0,
-                            );
-
-                            // Enforce the hash-search floor BEFORE
-                            // committing this short hit. The 4-byte
-                            // equality gate plus forward-count extension
-                            // can produce `short_cand.match_len < 5`
-                            // (the literal 4-byte hit, no extension).
-                            // `probe_slot_match` rejects below-floor
-                            // long-hash hits at the same gate; the
-                            // short-hash path must do the same so the
-                            // fast loop never emits a sub-floor non-rep
-                            // match. The retry below can still upgrade
-                            // to a long hit (which has its own 8-byte
-                            // floor, comfortably above `DFAST_MIN_MATCH_LEN`).
-                            let short_hit_valid = short_cand.match_len >= DFAST_MIN_MATCH_LEN;
-
-                            // Donor `_search_next_long` retry (line 260):
-                            // try long match at ip1 with precomputed idxl1.
-                            // If it produces a strictly longer match, use it.
-                            let mut chosen = short_cand;
-                            let mut retry_upgraded = false;
-                            if idxl1 != DFAST_EMPTY_SLOT {
-                                let cand_pos_l1 = position_base + (idxl1 as usize) - 1;
-                                if cand_pos_l1 >= history_abs_start && cand_pos_l1 < abs_ip1 {
-                                    let cand_idx_l1 = cand_pos_l1 - history_abs_start;
-                                    let cand_v8_l1 = unsafe {
-                                        (history_base_ptr.add(history_start_offset + cand_idx_l1)
-                                            as *const u64)
-                                            .read_unaligned()
-                                    };
-                                    if cand_v8_l1 == v8_1 {
-                                        let mut l1_match_len = 8usize;
-                                        let max_fwd_l1 = concat_len.saturating_sub(concat_idx1 + 8);
-                                        unsafe {
-                                            let lhs = history_base_ptr
-                                                .add(history_start_offset + cand_idx_l1 + 8);
-                                            let rhs = history_base_ptr
-                                                .add(history_start_offset + concat_idx1 + 8);
-                                            let ext = crate::encoding::fastpath::dispatch_common_prefix_len_ptr(
-                                                lhs, rhs, max_fwd_l1,
-                                            );
-                                            l1_match_len += ext;
-                                        }
-                                        if l1_match_len > short_cand.match_len {
-                                            let concat = &self.history[history_start_offset..];
-                                            chosen = extend_backwards_shared(
-                                                concat,
-                                                history_abs_start,
-                                                cand_pos_l1,
-                                                abs_ip1,
-                                                l1_match_len,
-                                                lit_len_ip1,
-                                            );
-                                            // Long-hash hits start at 8
-                                            // bytes (`MEM_read64` gate
-                                            // above), well above
-                                            // `DFAST_MIN_MATCH_LEN = 5`,
-                                            // so the retry upgrade is
-                                            // always valid even when
-                                            // the raw short hit was
-                                            // below the floor.
-                                            retry_upgraded = true;
-                                        }
-                                    }
-                                }
-                            }
-                            if short_hit_valid || retry_upgraded {
-                                break 'inner InnerExit::Committed(chosen);
-                            }
-                            // Below-floor short hit with no retry
-                            // upgrade — fall through to the step bump
-                            // and keep scanning. Discarding here is
-                            // correctness-relevant: emitting a 4-byte
-                            // non-rep match would mint an offset on
-                            // wire that costs more than the 4-byte
-                            // payload buys (offsets at level 2/3 dfast
-                            // are 13–17 bits depending on offset class
-                            // and prior offset_hist state — strictly
-                            // worse than emitting the 4 bytes as
-                            // literals).
-                        }
-                    }
-                }
-
-                // Step bump on distance (donor `zstd_double_fast.c:224-228`).
-                if ip1 >= next_step_pos {
-                    step = (step + 1).min(DFAST_MAX_SKIP_STEP);
-                    next_step_pos += DFAST_SKIP_STEP_GROWTH_INTERVAL;
-                }
-
-                // Advance: ip0 = ip1; ip1 += step; carry hl1 → hl0 / idxl1 → idxl0.
-                ip0 = ip1;
-                ip1 += step;
-                hl0_idx = hl1_idx;
-                idxl0 = idxl1;
-                if ip1 + HASH_READ_SIZE > current_len {
-                    // First position the fast loop did NOT pack into the
-                    // hash tables. `seed_remaining_hashable_starts` will
-                    // pick up from `ip0` instead of restarting at the
-                    // outer-entry `pos`.
-                    break 'inner InnerExit::Tail(ip0);
-                }
-            };
-
-            match inner_exit {
-                InnerExit::Committed(candidate) => {
-                    let start = self.emit_candidate(
-                        current_abs_start,
-                        &mut literals_start,
-                        candidate,
-                        handle_sequence,
-                    );
-                    pos = start + candidate.match_len;
-                    pos = self.extend_with_repcode_after_match(
-                        current_abs_start,
-                        current_len,
-                        pos,
-                        &mut literals_start,
-                        handle_sequence,
-                    );
-                }
-                InnerExit::Tail(seed) => {
-                    // Inner loop ran out of safe scan room without
-                    // committing. Hand the tail seeder the first
-                    // un-scanned position so it does not redundantly
-                    // re-pack everything the fast loop already wrote.
-                    pos = seed;
-                    break 'outer;
-                }
-            }
-        }
-
-        self.seed_remaining_hashable_starts(current_abs_start, current_len, pos);
-        self.emit_trailing_literals(literals_start, handle_sequence);
-    }
-
     /// Single-cursor probe at the last hashable position in the
     /// current block. Called from `start_matching_fast_loop` only when
     /// the outer iteration sees `ip0` still hashable but `ip1` past
@@ -1199,6 +850,16 @@ impl DfastMatchGenerator {
         // strictly cheaper than a full inner-loop iter.
         let idxl0 = unsafe { *self.long_hash.as_ptr().add(hl0_idx) };
         let idxs0 = unsafe { *self.short_hash.as_ptr().add(hs0_idx) };
+
+        // Live tables only — no attached-dict probe here, by design. This
+        // helper runs for exactly ONE position per block (the last hashable
+        // `ip0` when `ip1` has fallen off the tail), so a missed dict match
+        // costs at most one sequence per ~128 KiB block (negligible ratio).
+        // `seed_remaining_hashable_starts` inserts this position so it is
+        // dict-searchable in the next block; replicating the full dict
+        // long+short dual-probe here would duplicate ~40 lines for that single
+        // boundary position and defeat the helper's "strictly cheaper than a
+        // full inner-loop iter" purpose.
 
         // Long-hash probe first (upstream priority: an 8-byte hit
         // beats a 4-byte hit even before extension).
@@ -1430,10 +1091,33 @@ impl DfastMatchGenerator {
         candidate: MatchCandidate,
         handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
     ) -> usize {
-        self.insert_positions(
-            current_abs_start + *literals_start,
-            candidate.start + candidate.match_len,
-        );
+        // Insert the LITERAL region densely, the MATCH INTERIOR sparsely
+        // (upstream `zstd_double_fast.c` parity). The literal positions
+        // `[literals_start, match_start)` are load-bearing: the producer
+        // loop starts at `pos = 1` and only hashes positions it actually
+        // probes, so the block anchor (position 0) and any stepped-over
+        // literal byte is hashed ONLY here — dropping it loses real match
+        // sources for later positions (and later blocks). The match
+        // interior, by contrast, is never re-probed within the block;
+        // upstream fills only `curr+2` and `ip-2` there, so inserting the
+        // full `[match_start, match_end)` span was ~match_len wasted
+        // single-slot overwrites — the dominant self-time on
+        // dict-heavy / highly-matchable blocks. Mirror the rep-extension
+        // path's audited 3-target set (`curr+2`, `ip-2`, `ip-1`), each
+        // clamped to the open match interval.
+        let match_start = candidate.start;
+        let post_match_end = candidate.start + candidate.match_len;
+        self.insert_positions(current_abs_start + *literals_start, match_start);
+        let insert_targets = [
+            match_start + 2,                  // curr + 2
+            post_match_end.saturating_sub(2), // ip - 2 (post-match cursor)
+            post_match_end.saturating_sub(1), // ip - 1
+        ];
+        for &target in &insert_targets {
+            if target > match_start && target < post_match_end {
+                self.insert_position(target);
+            }
+        }
         // Inline the trailing-block slice rather than calling
         // `get_last_space()` so this matches the gate pattern used by
         // `skip_matching` / `start_matching` (read `window_blocks.back()`
@@ -1933,6 +1617,891 @@ impl DfastMatchGenerator {
         // path.
         let mixed = value.wrapping_mul(0xCF1BBCDCB7A56463_u64);
         (mixed >> (64 - bits)) as usize
+    }
+}
+
+/// Per-kernel body of the dfast fast match loop. Mirrors the BT/opt
+/// `*_body!` macros: the wrapper carries the `#[target_feature]` umbrella and
+/// passes its tier `common_prefix_len_ptr` as `$cpl`, so the 7 match-extension
+/// cpl calls inline under one umbrella and `select_kernel()` is resolved ONCE
+/// per block in the bare dispatcher, never per cpl call.
+macro_rules! start_matching_fast_loop_body {
+    ($self:ident, $current_abs_start:ident, $current_len:ident, $handle_sequence:ident, $cpl:path) => {{
+        // Behaviour change vs the pre-refactor `start_matching_general`:
+        // this fast loop deliberately drops the strict-incompressible
+        // early-skip path (the `block_looks_incompressible_strict` short
+        // circuit + `miss_run` / `DFAST_LOCAL_SKIP_TRIGGER` thresholding).
+        // The step ramp is now driven purely by distance traveled
+        // (`DFAST_SKIP_STEP_GROWTH_INTERVAL = 64`, donor parity except
+        // donor uses 256 — see "Donor-deviation audit" in the PR body),
+        // so blocks the strict gate used to bail out of early now scan
+        // through the standard ramp. `block_looks_incompressible_strict`
+        // is still used by `levels/fastest.rs` for the Fastest preset
+        // and by `incompressible.rs` unit tests, so the helper itself
+        // stays.
+        //
+        // Donor outer/inner structure (`zstd_double_fast.c:167-322`):
+        //   * outer `while(1)` runs once per match-found-and-stored;
+        //   * inner `do { ... } while (ip1 <= ilimit)` carries `hl0`,
+        //     `idxl0` between iterations, and precomputes `hl1` so the
+        //     next iter's long hash is reused (one long-hash compute per
+        //     two positions scanned, not per position).
+        // We mirror that here. Per-frame invariants are hoisted before
+        // the outer loop; mutable state (`position_base`, `history_abs_start`)
+        // is re-snapshotted inside the outer loop because `emit_candidate`
+        // → `insert_positions` → `ensure_room_for` can advance the rebase
+        // base mid-frame.
+        //
+        // Rebase BEFORE any inner-loop slot pack. The hot loop computes
+        // `packed_curr = (abs_ip0 - position_base) as u32 + 1` and writes
+        // it straight into the hash tables, bypassing `insert_position`
+        // (which is where `ensure_room_for` normally fires). On a long
+        // stream of all-miss / non-hashable blocks the matcher can advance
+        // `$current_abs_start` arbitrarily far without any per-byte insert,
+        // so `position_base` may be stale by `> u32::MAX`. The first
+        // fast-loop block after that would silently truncate `packed_curr`
+        // and poison both hash tables. The guard band in `ensure_room_for`
+        // (`DFAST_REBASE_GUARD_BAND`) covers the entire current block's
+        // worth of positions, so a single call at function entry suffices.
+        //
+        // Raw-pointer aliasing invariant. The inner loop caches
+        // `short_hash_ptr = $self.short_hash.as_mut_ptr()` and
+        // `long_hash_ptr = $self.long_hash.as_mut_ptr()` (and a
+        // `history_base_ptr` for the byte-buffer reads), then over
+        // the rest of the function does:
+        //
+        //   * raw writes / reads via `*short_hash_ptr.add(...) =
+        //     packed_curr`, `*long_hash_ptr.add(...) = packed_curr`,
+        //     and `*long_hash_ptr.add(hl1_idx)`;
+        //   * `&$self`-shared reads of `$self.offset_hist[0]` for the
+        //     rep1 peek;
+        //   * `&$self`-shared slice reads of `$self.history` (`let
+        //     concat = &$self.history[history_start_offset..]`) for
+        //     `extend_backwards_shared` invocations.
+        //
+        // This is sound under both Stacked Borrows and Tree Borrows
+        // because the three fields touched (`short_hash`, `long_hash`,
+        // `history`, `offset_hist`) are physically disjoint
+        // allocations — `Vec<u32>`/`Vec<u8>` each own their own heap
+        // buffer, and `offset_hist` is an inline `[u32; 3]` inside
+        // the struct. A raw pointer derived from one field's Vec data
+        // has provenance over that field only, so the subsequent
+        // `&$self` reads of sibling fields don't reborrow through the
+        // raw pointer's provenance tree.
+        //
+        // CRITICAL: this invariant must be preserved by any future
+        // refactor that adds method calls inside the loop body. A
+        // call that takes `&mut $self` (e.g.,
+        // `$self.ensure_hash_tables()`, `$self.insert_position(...)`)
+        // would reborrow the tables and invalidate the cached raw
+        // pointers — every such call must happen OUTSIDE the
+        // `'outer: loop` (as `ensure_room_for` does, hoisted to the
+        // function preamble above) or be followed by a fresh
+        // `as_mut_ptr()` reload of both `short_hash_ptr` /
+        // `long_hash_ptr`. The outer-loop body already re-snapshots
+        // `history_base_ptr` per iteration for exactly this reason
+        // (`emit_candidate` → `insert_positions` may grow `history`
+        // and trigger a realloc), so the same re-snapshot discipline
+        // applies to the hash-table pointers.
+        //
+        // `$current_len > 0` is a precondition of this helper: every
+        // caller (`start_matching`, `skip_matching`, `skip_matching_dense`)
+        // returns early at `$current_len == 0`. Encode it as a hard
+        // assert so a future caller that forgets the gate fails loudly
+        // in debug rather than wrap-underflowing the `- 1` below; the
+        // rebase is unconditional in release builds since the
+        // precondition holds.
+        debug_assert!($current_len > 0, "fast_loop precondition: $current_len > 0");
+        $self.ensure_room_for($current_abs_start + $current_len - 1);
+        const PRIME: u64 = 0xCF1BBCDCB7A56463_u64;
+        let short_shift = 64 - $self.short_hash_bits;
+        let long_shift = 64 - $self.long_hash_bits;
+        let mut pos = 1usize;
+        let mut literals_start = 0usize;
+
+        // Dict dual-probe (donor `ZSTD_dictMatchState`): snapshot the immutable
+        // dict tables ONCE. Unlike the live tables (which `emit_candidate` may
+        // grow / rebase), the dict tables are never mutated during matching, so
+        // one snapshot before the outer loop stays valid every iteration. The
+        // raw pointers hold no borrow, so the per-iter `&$self`/`&mut $self`
+        // accesses below coexist. `use_dict` gates every probe so the no-dict
+        // hot path keeps its exact instruction shape. `dict_end` is the
+        // dict/input boundary as a CONCAT index (history_start-relative); the
+        // dict is invalidated on any history eviction, so concat indices stay
+        // valid for the snapshot's lifetime.
+        // `use_dict` MUST track table presence, NOT `is_attached()`:
+        // `prime_dict_tables_for_range` records the dict region (so
+        // `is_attached()` is true) but returns before allocating the
+        // tables when the hashable region is shorter than the short-hash
+        // lookahead. Gating on `table().is_some()` keeps the null dict
+        // pointers out of the probe below, which dereferences them before
+        // the `dict_end` bound is consulted.
+        let (use_dict, dict_long_ptr, dict_short_ptr, dict_end): (
+            bool,
+            *const u32,
+            *const u32,
+            usize,
+        ) = match $self.dict.table() {
+            Some(d) => (
+                true,
+                d.long.as_ptr(),
+                d.short.as_ptr(),
+                $self.dict.region_len(),
+            ),
+            None => (false, core::ptr::null(), core::ptr::null(), 0),
+        };
+
+        'outer: loop {
+            // Outer-iter precondition: at least `HASH_READ_SIZE = 8` bytes
+            // ahead of `pos` so the unconditional 8-byte `u64` load below
+            // is in-bounds for the live history buffer. `DFAST_MIN_MATCH_LEN
+            // = 5` is the match acceptance threshold and is NOT a safe
+            // load bound — using it here read up to 3 bytes past
+            // `history.len()` on tiny blocks (CI fuzz `interop` crash,
+            // 7-byte input).
+            // NOTE: when this guard fires on the very first outer-iter
+            // (tiny block, `$current_len < 9`), we `break 'outer` BEFORE
+            // `tail_seed_anchor` is even declared. The post-loop
+            // `seed_remaining_hashable_starts(.., pos)` then runs with
+            // `pos` at its initial value (1 on first frame, or the
+            // post-match cursor from a previous outer iter); that's the
+            // correct tail seed for tiny blocks — `seed_pos = pos.min(
+            // $current_len).min(boundary_tail_start)` plus the
+            // `seed_pos + DFAST_SHORT_HASH_LOOKAHEAD <= $current_len`
+            // guard inside the seeder keeps every insert in-bounds.
+            if pos + HASH_READ_SIZE > $current_len {
+                break 'outer;
+            }
+            let mut step = 1usize;
+            let mut next_step_pos = pos + DFAST_SKIP_STEP_GROWTH_INTERVAL;
+            let mut ip0 = pos;
+            let mut ip1 = ip0 + step;
+            // Same `HASH_READ_SIZE` rationale for `ip1`: the inner loop
+            // pre-loads 8 bytes at `concat_idx1` for the `hl1` precompute
+            // and the `_search_next_long` retry, so `ip1 + 8 <= $current_len`
+            // must hold before we enter. If `ip0` is still hashable but
+            // `ip1` is not (boundary case `pos == $current_len - 8`), we
+            // still want to probe `ip0` — skipping it would leave the
+            // last hashable position to `seed_remaining_hashable_starts`,
+            // which inserts but does NOT search, and that drops real
+            // matches in the tail window vs the upstream reference
+            // (whose single-cursor loop probes every position p with
+            // `p + HASH_READ_SIZE <= iend`). Handle the boundary inline
+            // before exiting: a single-cursor probe at `ip0` (rep peek
+            // and `_search_next_long` retry both depend on `ip1` so
+            // they're skipped — donor accepts that exact tradeoff at
+            // the iend boundary).
+            if ip1 + HASH_READ_SIZE > $current_len {
+                if let Some(committed) =
+                    $self.probe_tail_ip0_only($current_abs_start, $current_len, ip0, literals_start)
+                {
+                    let start = $self.emit_candidate(
+                        $current_abs_start,
+                        &mut literals_start,
+                        committed,
+                        $handle_sequence,
+                    );
+                    pos = start + committed.match_len;
+                    pos = $self.extend_with_repcode_after_match(
+                        $current_abs_start,
+                        $current_len,
+                        pos,
+                        &mut literals_start,
+                        $handle_sequence,
+                    );
+                    continue 'outer;
+                }
+                break 'outer;
+            }
+
+            // Re-read every per-frame-mutable cursor here — `emit_candidate`
+            // in the previous outer iteration may have triggered a rebase.
+            let history_abs_start = $self.history_abs_start;
+            let position_base = $self.position_base;
+            let history_start_offset = $self.history_start;
+            let history_base_ptr = $self.history.as_ptr();
+            let short_hash_ptr = $self.short_hash.as_mut_ptr();
+            let long_hash_ptr = $self.long_hash.as_mut_ptr();
+            let concat_len = $self.history.len() - history_start_offset;
+
+            // Pre-compute long hash at ip0 ONCE per outer iter.
+            // `concat_idx = ($current_abs_start + ip0) - history_abs_start`
+            // is the byte offset within `live_history`.
+            let mut hl0_idx;
+            let mut idxl0;
+            // SAFETY: `$current_abs_start + ip0 >= history_abs_start`
+            // (`ip` is inside the current block, which is part of live
+            // history). The 8-byte unaligned load on
+            // `concat[concat_idx..]` is safe because the outer loop
+            // guards above enforce `ip0 + HASH_READ_SIZE <= $current_len`,
+            // and `$current_abs_start + $current_len - history_abs_start
+            // <= concat_len` (live history contains the full current
+            // block plus any retained earlier blocks), giving
+            // `concat_idx + 8 <= concat_len`. The `debug_assert!` below
+            // makes that invariant explicit so a future refactor that
+            // touches eviction / `compact_history` / `trim_to_window`
+            // semantics catches a violation in tests instead of leaking
+            // through to ASan UB.
+            unsafe {
+                let concat_idx = ($current_abs_start + ip0) - history_abs_start;
+                debug_assert!(
+                    concat_idx + HASH_READ_SIZE <= concat_len,
+                    "fast-loop 8-byte load OOB: concat_idx={} HASH_READ_SIZE={} concat_len={}",
+                    concat_idx,
+                    HASH_READ_SIZE,
+                    concat_len,
+                );
+                let v8 = (history_base_ptr.add(history_start_offset + concat_idx) as *const u64)
+                    .read_unaligned();
+                hl0_idx = (v8.wrapping_mul(PRIME) >> long_shift) as usize;
+                idxl0 = *long_hash_ptr.add(hl0_idx);
+            }
+
+            // Inner-loop exit shape. Every `break 'inner` produces a
+            // value of this type, so the type system enforces the
+            // previously implicit pairing between "did we commit a
+            // match?" and "where does the tail seeder pick up?":
+            //
+            //   * `Committed(c)` — rep1 / long / short(+next_long retry)
+            //     paths chose `c`; outer arm runs emit + rep-extension.
+            //   * `Tail(seed)` — inner ran out of safe scan room at
+            //     `seed = ip0` (first un-scanned position); outer arm
+            //     hands `seed` to `seed_remaining_hashable_starts` so
+            //     the tail seeder does not redundantly re-pack
+            //     positions the fast loop already wrote (which is what
+            //     restarting from outer-entry `pos` would do on a
+            //     miss-only block — throwing away the skip-step win on
+            //     incompressible data).
+            //
+            // Adding a new `break 'inner` variant now forces the
+            // author to pick a `InnerExit::…` variant explicitly; the
+            // previous `Option<MatchCandidate>` + sibling `usize`
+            // pairing relied on a comment-block to flag the coupling.
+            enum InnerExit {
+                Committed(MatchCandidate),
+                Tail(usize),
+            }
+
+            let inner_exit: InnerExit = 'inner: loop {
+                let abs_ip0 = $current_abs_start + ip0;
+                let abs_ip1 = $current_abs_start + ip1;
+                let lit_len_ip0 = ip0 - literals_start;
+                let lit_len_ip1 = ip1 - literals_start;
+                let packed_curr = ((abs_ip0 - position_base) as u32) + 1;
+
+                let concat_idx0 = abs_ip0 - history_abs_start;
+                let concat_idx1 = abs_ip1 - history_abs_start;
+
+                // Load 8 bytes at ip0 for both short (low 4) and long
+                // probe equality checks. We already used `v8_at_ip0` to
+                // compute hl0/idxl0 in the outer init / previous iter's
+                // carry; reload now (cheap unaligned read) so the
+                // `read_unaligned` is from the same offset the
+                // probe-eq below will use.
+                let v8_0 = unsafe {
+                    (history_base_ptr.add(history_start_offset + concat_idx0) as *const u64)
+                        .read_unaligned()
+                };
+                let v4_0 = v8_0 & 0xFFFF_FFFF;
+                let hs0_idx = (v4_0.wrapping_mul(PRIME) >> short_shift) as usize;
+                let idxs0 = unsafe { *short_hash_ptr.add(hs0_idx) };
+
+                // Donor parity (`zstd_double_fast.c:187`): update BOTH
+                // tables at curr BEFORE checking matches. The benefit is
+                // for hash-table consumers, NOT the rep peek (rep at ip+1
+                // reads `offset_hist[0]`, never the hash tables). The
+                // donor rationale is the long-hash retry path: the next
+                // inner iter's `idxl1` lookup (`hashLong[hl1_idx]`) can
+                // collide with this iter's `hl0_idx`, and writing curr
+                // first means a $self-collision still resolves to a real
+                // match instead of the previous occupant. The short
+                // probe of the same iter and the `_search_next_long`
+                // retry at ip+1 are the other consumers that see the
+                // fresh write.
+                unsafe {
+                    *long_hash_ptr.add(hl0_idx) = packed_curr;
+                    *short_hash_ptr.add(hs0_idx) = packed_curr;
+                }
+
+                // Donor parity (`zstd_double_fast.c:190`): inline rep1
+                // peek at ip+1, 4-byte gate. Donor's hot path checks ONLY
+                // `offset_1` here (full 3-rep walk lives in lazy/btopt).
+                // Since the peek is at `ip+1` with `pos >= literals_start`,
+                // `lit_len_ip1 >= 1`, so `offset_hist[0]` is the donor's
+                // `offset_1`. The `repcode_candidate_shared` helper we used
+                // before walked all three offsets + did a full SIMD
+                // `common_prefix_len` per probe, paying ~3× the work for
+                // rep2/rep3 hits that the dfast fast path never benefits
+                // from (those wins live in the lazy/btopt strategies).
+                let rep1 = $self.offset_hist[0] as usize;
+                if rep1 != 0 && rep1 <= abs_ip1 {
+                    let cand_pos_r = abs_ip1 - rep1;
+                    if cand_pos_r >= history_abs_start
+                        && cand_pos_r >= $current_abs_start + literals_start
+                    {
+                        let cand_idx_r = cand_pos_r - history_abs_start;
+                        // 4-byte gate; full forward count only if it passes.
+                        let cand4 = unsafe {
+                            (history_base_ptr.add(history_start_offset + cand_idx_r) as *const u32)
+                                .read_unaligned()
+                        };
+                        let cur4 = unsafe {
+                            (history_base_ptr.add(history_start_offset + concat_idx1) as *const u32)
+                                .read_unaligned()
+                        };
+                        if cand4 == cur4 {
+                            let mut match_len = 4usize;
+                            let max_fwd = concat_len.saturating_sub(concat_idx1 + 4);
+                            unsafe {
+                                let lhs =
+                                    history_base_ptr.add(history_start_offset + cand_idx_r + 4);
+                                let rhs =
+                                    history_base_ptr.add(history_start_offset + concat_idx1 + 4);
+                                let ext = $cpl(
+                                    lhs, rhs, max_fwd,
+                                );
+                                match_len += ext;
+                            }
+                            // Rep extensions use the 4-byte
+                            // `DFAST_REP_MIN_MATCH_LEN` floor, NOT the
+                            // hash-search `DFAST_MIN_MATCH_LEN = 5`. Rep
+                            // coding has no on-wire offset cost, so the
+                            // upstream reference accepts 4-byte rep
+                            // hits; gating at 5 here would silently drop
+                            // every 4-byte rep1 the upstream encoder
+                            // produces, and leave the post-match
+                            // `extend_with_repcode_after_match` chain
+                            // (which uses 4) inconsistent with the peek.
+                            if match_len >= DFAST_REP_MIN_MATCH_LEN {
+                                let concat = &$self.history[history_start_offset..];
+                                let rep_cand = extend_backwards_shared(
+                                    concat,
+                                    history_abs_start,
+                                    cand_pos_r,
+                                    abs_ip1,
+                                    match_len,
+                                    lit_len_ip1,
+                                );
+                                break 'inner InnerExit::Committed(rep_cand);
+                            }
+                        }
+                    }
+                }
+
+                // Precompute hl1 (donor `_search_next_long` carry, line 197).
+                let v8_1 = unsafe {
+                    (history_base_ptr.add(history_start_offset + concat_idx1) as *const u64)
+                        .read_unaligned()
+                };
+                let hl1_idx = (v8_1.wrapping_mul(PRIME) >> long_shift) as usize;
+
+                // Long match check at ip0 with idxl0. 8-byte equality
+                // gate (`MEM_read64`) — if it passes, candidate is real.
+                if idxl0 != DFAST_EMPTY_SLOT {
+                    let cand_pos = position_base + (idxl0 as usize) - 1;
+                    if cand_pos >= history_abs_start && cand_pos < abs_ip0 {
+                        let cand_idx = cand_pos - history_abs_start;
+                        // SAFETY: same buffer/length bounds as v8_0 above.
+                        let cand_v8 = unsafe {
+                            (history_base_ptr.add(history_start_offset + cand_idx) as *const u64)
+                                .read_unaligned()
+                        };
+                        if cand_v8 == v8_0 {
+                            // 8 bytes match; count forward + extend back.
+                            let mut match_len = 8usize;
+                            let max_fwd = concat_len.saturating_sub(concat_idx0 + 8);
+                            // SAFETY: both ptrs at the same buffer; offsets
+                            // verified above. `max_fwd` caps the scan to
+                            // the live region.
+                            unsafe {
+                                let lhs = history_base_ptr.add(history_start_offset + cand_idx + 8);
+                                let rhs =
+                                    history_base_ptr.add(history_start_offset + concat_idx0 + 8);
+                                let ext = $cpl(
+                                    lhs, rhs, max_fwd,
+                                );
+                                match_len += ext;
+                            }
+                            let concat = &$self.history[history_start_offset..];
+                            let cand = extend_backwards_shared(
+                                concat,
+                                history_abs_start,
+                                cand_pos,
+                                abs_ip0,
+                                match_len,
+                                lit_len_ip0,
+                            );
+                            break 'inner InnerExit::Committed(cand);
+                        }
+                    }
+                }
+
+                // Dict long fallback (donor `dictMatchState`): the live long
+                // missed (empty / out-of-window / 8-byte mismatch). Probe the
+                // immutable dict long table at the SAME `hl0_idx`. Flat model:
+                // the dict sits in the contiguous history before the input, so
+                // a dict match is `offset = abs_ip0 - dict_abs` and the forward
+                // count crosses the dict→input boundary like any in-window
+                // match (no `dictBase`/`count_2segments`).
+                if use_dict {
+                    // SAFETY: when `use_dict`, `dict_long_ptr` is non-null and
+                    // sized `1 << long_hash_bits`; `hl0_idx < 1 << long_hash_bits`.
+                    let dl = unsafe { *dict_long_ptr.add(hl0_idx) };
+                    if dl != DFAST_EMPTY_SLOT {
+                        let dp = (dl as usize) - 1;
+                        // Dict long slots were only written for positions with
+                        // 8-byte lookahead, so `dp + 8 <= dict_len <= concat_len`;
+                        // `dp < dict_end` keeps the match inside the dict region.
+                        if dp < dict_end {
+                            debug_assert!(
+                                dp + HASH_READ_SIZE <= concat_len,
+                                "dict long load OOB: dp={dp} concat_len={concat_len}",
+                            );
+                            // SAFETY: `dp + 8 <= concat_len` (above) ⇒ the 8-byte
+                            // load at concat `dp` is in-bounds for live history.
+                            let dcand_v8 = unsafe {
+                                (history_base_ptr.add(history_start_offset + dp) as *const u64)
+                                    .read_unaligned()
+                            };
+                            if dcand_v8 == v8_0 {
+                                let mut match_len = 8usize;
+                                let max_fwd = concat_len.saturating_sub(concat_idx0 + 8);
+                                // SAFETY: both ptrs in the same buffer; `max_fwd`
+                                // caps the scan to the live region.
+                                unsafe {
+                                    let lhs = history_base_ptr.add(history_start_offset + dp + 8);
+                                    let rhs = history_base_ptr
+                                        .add(history_start_offset + concat_idx0 + 8);
+                                    let ext =
+                                        $cpl(
+                                            lhs, rhs, max_fwd,
+                                        );
+                                    match_len += ext;
+                                }
+                                let cand_pos = history_abs_start + dp;
+                                let concat = &$self.history[history_start_offset..];
+                                let cand = extend_backwards_shared(
+                                    concat,
+                                    history_abs_start,
+                                    cand_pos,
+                                    abs_ip0,
+                                    match_len,
+                                    lit_len_ip0,
+                                );
+                                break 'inner InnerExit::Committed(cand);
+                            }
+                        }
+                    }
+                }
+
+                let idxl1 = unsafe { *long_hash_ptr.add(hl1_idx) };
+
+                // Short match check at ip0 with idxs0 — 4-byte gate
+                // ONLY (donor `zstd_double_fast.c:220`). Forward count
+                // and `_search_next_long` retry happen ONLY on hit.
+                if idxs0 != DFAST_EMPTY_SLOT {
+                    let cand_pos_s = position_base + (idxs0 as usize) - 1;
+                    if cand_pos_s >= history_abs_start && cand_pos_s < abs_ip0 {
+                        let cand_idx_s = cand_pos_s - history_abs_start;
+                        let cand4 = unsafe {
+                            (history_base_ptr.add(history_start_offset + cand_idx_s) as *const u32)
+                                .read_unaligned()
+                        };
+                        if cand4 == v4_0 as u32 {
+                            // Short hit: count forward from byte 4 onwards.
+                            let mut s_match_len = 4usize;
+                            let max_fwd = concat_len.saturating_sub(concat_idx0 + 4);
+                            unsafe {
+                                let lhs =
+                                    history_base_ptr.add(history_start_offset + cand_idx_s + 4);
+                                let rhs =
+                                    history_base_ptr.add(history_start_offset + concat_idx0 + 4);
+                                let ext = $cpl(
+                                    lhs, rhs, max_fwd,
+                                );
+                                s_match_len += ext;
+                            }
+                            let concat = &$self.history[history_start_offset..];
+                            let short_cand = extend_backwards_shared(
+                                concat,
+                                history_abs_start,
+                                cand_pos_s,
+                                abs_ip0,
+                                s_match_len,
+                                lit_len_ip0,
+                            );
+
+                            // Enforce the hash-search floor BEFORE
+                            // committing this short hit. The 4-byte
+                            // equality gate plus forward-count extension
+                            // can produce `short_cand.match_len < 5`
+                            // (the literal 4-byte hit, no extension).
+                            // `probe_slot_match` rejects below-floor
+                            // long-hash hits at the same gate; the
+                            // short-hash path must do the same so the
+                            // fast loop never emits a sub-floor non-rep
+                            // match. The retry below can still upgrade
+                            // to a long hit (which has its own 8-byte
+                            // floor, comfortably above `DFAST_MIN_MATCH_LEN`).
+                            let short_hit_valid = short_cand.match_len >= DFAST_MIN_MATCH_LEN;
+
+                            // Donor `_search_next_long` retry (line 260):
+                            // try long match at ip1 with precomputed idxl1.
+                            // If it produces a strictly longer match, use it.
+                            let mut chosen = short_cand;
+                            let mut retry_upgraded = false;
+                            let mut live_l1_hit = false;
+                            if idxl1 != DFAST_EMPTY_SLOT {
+                                let cand_pos_l1 = position_base + (idxl1 as usize) - 1;
+                                if cand_pos_l1 >= history_abs_start && cand_pos_l1 < abs_ip1 {
+                                    let cand_idx_l1 = cand_pos_l1 - history_abs_start;
+                                    let cand_v8_l1 = unsafe {
+                                        (history_base_ptr.add(history_start_offset + cand_idx_l1)
+                                            as *const u64)
+                                            .read_unaligned()
+                                    };
+                                    if cand_v8_l1 == v8_1 {
+                                        live_l1_hit = true;
+                                        let mut l1_match_len = 8usize;
+                                        let max_fwd_l1 = concat_len.saturating_sub(concat_idx1 + 8);
+                                        unsafe {
+                                            let lhs = history_base_ptr
+                                                .add(history_start_offset + cand_idx_l1 + 8);
+                                            let rhs = history_base_ptr
+                                                .add(history_start_offset + concat_idx1 + 8);
+                                            let ext = $cpl(
+                                                lhs, rhs, max_fwd_l1,
+                                            );
+                                            l1_match_len += ext;
+                                        }
+                                        if l1_match_len > short_cand.match_len {
+                                            let concat = &$self.history[history_start_offset..];
+                                            chosen = extend_backwards_shared(
+                                                concat,
+                                                history_abs_start,
+                                                cand_pos_l1,
+                                                abs_ip1,
+                                                l1_match_len,
+                                                lit_len_ip1,
+                                            );
+                                            // Long-hash hits start at 8
+                                            // bytes (`MEM_read64` gate
+                                            // above), well above
+                                            // `DFAST_MIN_MATCH_LEN = 5`,
+                                            // so the retry upgrade is
+                                            // always valid even when
+                                            // the raw short hit was
+                                            // below the floor.
+                                            retry_upgraded = true;
+                                        }
+                                    }
+                                }
+                            }
+                            // Dict long match at ip1 (donor `_search_next_long`
+                            // dict arm, zstd_double_fast.c:472-483): probed ONLY
+                            // when the live long+1 missed, mirroring donor's
+                            // `else if dictTagsMatchL3`. Attach-mode keeps the
+                            // dict in a SEPARATE table, so the live long+1 probe
+                            // above never sees dict positions; without this the
+                            // dict-long upgrade the old dense-reprime path got
+                            // for free (dict positions lived in the live table)
+                            // is lost and the loop emits the shorter short match.
+                            if !live_l1_hit && use_dict {
+                                // SAFETY: `use_dict` ⇒ `dict_long_ptr` non-null,
+                                // sized `1 << long_hash_bits`; `hl1_idx` is in range.
+                                let dl1 = unsafe { *dict_long_ptr.add(hl1_idx) };
+                                if dl1 != DFAST_EMPTY_SLOT {
+                                    let dp1 = (dl1 as usize) - 1;
+                                    if dp1 < dict_end {
+                                        debug_assert!(
+                                            dp1 + HASH_READ_SIZE <= concat_len,
+                                            "dict long+1 load OOB: dp1={dp1} concat_len={concat_len}",
+                                        );
+                                        // SAFETY: `dp1 + 8 <= concat_len` ⇒ the
+                                        // 8-byte load at concat `dp1` is in-bounds.
+                                        let dcand_v8_l1 = unsafe {
+                                            (history_base_ptr.add(history_start_offset + dp1)
+                                                as *const u64)
+                                                .read_unaligned()
+                                        };
+                                        if dcand_v8_l1 == v8_1 {
+                                            let mut dl1_match_len = 8usize;
+                                            let max_fwd =
+                                                concat_len.saturating_sub(concat_idx1 + 8);
+                                            // SAFETY: same buffer; `max_fwd` caps
+                                            // the scan to the live region.
+                                            unsafe {
+                                                let lhs = history_base_ptr
+                                                    .add(history_start_offset + dp1 + 8);
+                                                let rhs = history_base_ptr
+                                                    .add(history_start_offset + concat_idx1 + 8);
+                                                let ext = $cpl(
+                                                    lhs, rhs, max_fwd,
+                                                );
+                                                dl1_match_len += ext;
+                                            }
+                                            if dl1_match_len > short_cand.match_len {
+                                                let cand_pos = history_abs_start + dp1;
+                                                let concat = &$self.history[history_start_offset..];
+                                                chosen = extend_backwards_shared(
+                                                    concat,
+                                                    history_abs_start,
+                                                    cand_pos,
+                                                    abs_ip1,
+                                                    dl1_match_len,
+                                                    lit_len_ip1,
+                                                );
+                                                retry_upgraded = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if short_hit_valid || retry_upgraded {
+                                break 'inner InnerExit::Committed(chosen);
+                            }
+                            // Below-floor short hit with no retry
+                            // upgrade — fall through to the step bump
+                            // and keep scanning. Discarding here is
+                            // correctness-relevant: emitting a 4-byte
+                            // non-rep match would mint an offset on
+                            // wire that costs more than the 4-byte
+                            // payload buys (offsets at level 2/3 dfast
+                            // are 13–17 bits depending on offset class
+                            // and prior offset_hist state — strictly
+                            // worse than emitting the 4 bytes as
+                            // literals).
+                        }
+                    }
+                }
+
+                // Dict short fallback (donor `dictMatchState`): the live short
+                // missed / was below floor. Probe the immutable dict short
+                // table at the SAME `hs0_idx`, 4-byte gate, forward count, then
+                // enforce the same `DFAST_MIN_MATCH_LEN` floor the live short
+                // path uses (a sub-floor non-rep match mints a wire offset that
+                // costs more than emitting the bytes as literals). No
+                // `_search_next_long` retry: the dict long fallback already
+                // covers the long-upgrade case at `ip0`.
+                if use_dict {
+                    // SAFETY: `use_dict` ⇒ `dict_short_ptr` non-null, sized
+                    // `1 << short_hash_bits`; `hs0_idx < 1 << short_hash_bits`.
+                    let ds = unsafe { *dict_short_ptr.add(hs0_idx) };
+                    if ds != DFAST_EMPTY_SLOT {
+                        let dp = (ds as usize) - 1;
+                        if dp < dict_end {
+                            debug_assert!(
+                                dp + 4 <= concat_len,
+                                "dict short load OOB: dp={dp} concat_len={concat_len}",
+                            );
+                            // SAFETY: short slots were only written with 4 bytes
+                            // of lookahead ⇒ `dp + 4 <= dict_len <= concat_len`.
+                            let dcand4 = unsafe {
+                                (history_base_ptr.add(history_start_offset + dp) as *const u32)
+                                    .read_unaligned()
+                            };
+                            if dcand4 == v4_0 as u32 {
+                                let mut s_match_len = 4usize;
+                                let max_fwd = concat_len.saturating_sub(concat_idx0 + 4);
+                                unsafe {
+                                    let lhs = history_base_ptr.add(history_start_offset + dp + 4);
+                                    let rhs = history_base_ptr
+                                        .add(history_start_offset + concat_idx0 + 4);
+                                    let ext =
+                                        $cpl(
+                                            lhs, rhs, max_fwd,
+                                        );
+                                    s_match_len += ext;
+                                }
+                                let cand_pos = history_abs_start + dp;
+                                let concat = &$self.history[history_start_offset..];
+                                let dcand = extend_backwards_shared(
+                                    concat,
+                                    history_abs_start,
+                                    cand_pos,
+                                    abs_ip0,
+                                    s_match_len,
+                                    lit_len_ip0,
+                                );
+                                if dcand.match_len >= DFAST_MIN_MATCH_LEN {
+                                    break 'inner InnerExit::Committed(dcand);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Step bump on distance (donor `zstd_double_fast.c:224-228`).
+                if ip1 >= next_step_pos {
+                    step = (step + 1).min(DFAST_MAX_SKIP_STEP);
+                    next_step_pos += DFAST_SKIP_STEP_GROWTH_INTERVAL;
+                }
+
+                // Advance: ip0 = ip1; ip1 += step; carry hl1 → hl0 / idxl1 → idxl0.
+                ip0 = ip1;
+                ip1 += step;
+                hl0_idx = hl1_idx;
+                idxl0 = idxl1;
+                if ip1 + HASH_READ_SIZE > $current_len {
+                    // First position the fast loop did NOT pack into the
+                    // hash tables. `seed_remaining_hashable_starts` will
+                    // pick up from `ip0` instead of restarting at the
+                    // outer-entry `pos`.
+                    break 'inner InnerExit::Tail(ip0);
+                }
+            };
+
+            match inner_exit {
+                InnerExit::Committed(candidate) => {
+                    let start = $self.emit_candidate(
+                        $current_abs_start,
+                        &mut literals_start,
+                        candidate,
+                        $handle_sequence,
+                    );
+                    pos = start + candidate.match_len;
+                    pos = $self.extend_with_repcode_after_match(
+                        $current_abs_start,
+                        $current_len,
+                        pos,
+                        &mut literals_start,
+                        $handle_sequence,
+                    );
+                }
+                InnerExit::Tail(seed) => {
+                    // Inner loop ran out of safe scan room without
+                    // committing. Hand the tail seeder the first
+                    // un-scanned position so it does not redundantly
+                    // re-pack everything the fast loop already wrote.
+                    pos = seed;
+                    break 'outer;
+                }
+            }
+        }
+
+        $self.seed_remaining_hashable_starts($current_abs_start, $current_len, pos);
+        $self.emit_trailing_literals(literals_start, $handle_sequence);
+    }};
+}
+
+impl DfastMatchGenerator {
+    /// Dispatcher for the per-kernel dfast fast loop: resolve the tier ONCE
+    /// per block via `select_kernel()` and call the matching
+    /// `start_matching_fast_loop_<kernel>` wrapper, so every per-position
+    /// `common_prefix_len_ptr` inlines under one `#[target_feature]` umbrella
+    /// (mirrors `build_optimal_plan_impl`). Replaces the prior per-cpl
+    /// `dispatch_common_prefix_len_ptr` runtime dispatch.
+    fn start_matching_fast_loop(
+        &mut self,
+        current_abs_start: usize,
+        current_len: usize,
+        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        unsafe {
+            self.start_matching_fast_loop_neon(current_abs_start, current_len, handle_sequence)
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
+            match select_kernel() {
+                FastpathKernel::Avx2Bmi2 => unsafe {
+                    self.start_matching_fast_loop_avx2_bmi2(
+                        current_abs_start,
+                        current_len,
+                        handle_sequence,
+                    )
+                },
+                FastpathKernel::Sse42 => unsafe {
+                    self.start_matching_fast_loop_sse42(
+                        current_abs_start,
+                        current_len,
+                        handle_sequence,
+                    )
+                },
+                FastpathKernel::Scalar => self.start_matching_fast_loop_scalar(
+                    current_abs_start,
+                    current_len,
+                    handle_sequence,
+                ),
+            }
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_endian = "little"),
+            target_arch = "x86",
+            target_arch = "x86_64"
+        )))]
+        {
+            self.start_matching_fast_loop_scalar(current_abs_start, current_len, handle_sequence)
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[target_feature(enable = "neon")]
+    unsafe fn start_matching_fast_loop_neon(
+        &mut self,
+        current_abs_start: usize,
+        current_len: usize,
+        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        start_matching_fast_loop_body!(
+            self,
+            current_abs_start,
+            current_len,
+            handle_sequence,
+            crate::encoding::fastpath::neon::common_prefix_len_ptr
+        )
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "sse4.2")]
+    unsafe fn start_matching_fast_loop_sse42(
+        &mut self,
+        current_abs_start: usize,
+        current_len: usize,
+        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        start_matching_fast_loop_body!(
+            self,
+            current_abs_start,
+            current_len,
+            handle_sequence,
+            crate::encoding::fastpath::sse42::common_prefix_len_ptr
+        )
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx2,bmi2")]
+    unsafe fn start_matching_fast_loop_avx2_bmi2(
+        &mut self,
+        current_abs_start: usize,
+        current_len: usize,
+        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        start_matching_fast_loop_body!(
+            self,
+            current_abs_start,
+            current_len,
+            handle_sequence,
+            crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr
+        )
+    }
+
+    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    #[allow(unused_unsafe)]
+    fn start_matching_fast_loop_scalar(
+        &mut self,
+        current_abs_start: usize,
+        current_len: usize,
+        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        start_matching_fast_loop_body!(
+            self,
+            current_abs_start,
+            current_len,
+            handle_sequence,
+            crate::encoding::fastpath::scalar::common_prefix_len_ptr
+        )
     }
 }
 

@@ -27,12 +27,12 @@ const MAX_NB_BLOCK_SPLITS: usize = 196;
 /// strategy 1..6 → 64 bytes, strategy 7 (btopt) → 32, strategy 8 (btultra)
 /// → 16, strategy 9 (btultra2) → 8.
 ///
-/// Our `StrategyTag` enum has seven variants (no separate lazy2/btlazy2 —
-/// the `Lazy` variant covers donor strategies 4..6). Within the
-/// fast..lazy2 band donor's shift table is flat: strategies 1..6 all
-/// pin `shift = MIN(9 - strat, 3) = 3`, so `Lazy → 64-byte floor`
-/// regardless of which donor index (4, 5, or 6) we'd nominally use.
-/// No aggressiveness gradient within this band to preserve.
+/// Our `StrategyTag` enum has eight variants: `Lazy` covers donor strategies
+/// 4..5 (greedy/lazy/lazy2) and `Btlazy2` is the separate donor strategy 6.
+/// Within the fast..btlazy2 band donor's shift table is flat: strategies 1..6
+/// all pin `shift = MIN(9 - strat, 3) = 3`, so both `Lazy` and `Btlazy2` land
+/// on the 64-byte floor. No aggressiveness gradient within this band to
+/// preserve (the gradient only starts at btopt).
 #[inline]
 fn min_literals_to_compress(
     strategy: crate::encoding::strategy::StrategyTag,
@@ -43,7 +43,11 @@ fn min_literals_to_compress(
         return 6;
     }
     let shift: u32 = match strategy {
-        StrategyTag::Fast | StrategyTag::Dfast | StrategyTag::Greedy | StrategyTag::Lazy => 3,
+        StrategyTag::Fast
+        | StrategyTag::Dfast
+        | StrategyTag::Greedy
+        | StrategyTag::Lazy
+        | StrategyTag::Btlazy2 => 3,
         StrategyTag::BtOpt => 2,
         StrategyTag::BtUltra => 1,
         StrategyTag::BtUltra2 => 0,
@@ -138,6 +142,14 @@ pub(crate) struct CompressedBlockScratch {
     compressed: Vec<u8>,
     estimator_sequences: Vec<crate::blocks::sequence_section::Sequence>,
     estimator_workspace: EstimatorWorkspace,
+    /// Reusable scratch for the block-split estimator's inner
+    /// `CompressState` — kept across frames so the estimator does not
+    /// re-allocate a whole `CompressedBlockScratch` (4×`Box<[u32;256]>`
+    /// count tables + Vecs) every frame in a reused compressor. `Box`
+    /// breaks the type recursion; `None` by default (lazily filled on
+    /// first block-split). The estimator uses `EntropyOnlyMatcher` and
+    /// never re-splits, so this nesting is one level deep.
+    estimator_inner: Option<Box<CompressedBlockScratch>>,
 }
 
 impl CompressedBlockScratch {
@@ -296,6 +308,14 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
     scratch.partitions.clear();
     scratch.prefix_sums.rebuild(&scratch.parts.sequences);
     let mut workspace = core::mem::take(&mut scratch.estimator_workspace);
+    // Reuse the estimator's inner scratch across frames instead of
+    // allocating a fresh `CompressedBlockScratch` (count tables + Vecs)
+    // every block-split. Lazily created on the first split.
+    let inner_scratch = scratch
+        .estimator_inner
+        .take()
+        .map(|b| *b)
+        .unwrap_or_default();
     let mut estimator = SplitEstimator {
         parts: &scratch.parts,
         prefix_sums: &scratch.prefix_sums,
@@ -310,7 +330,7 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
             matcher: EntropyOnlyMatcher,
             last_huff_table: state.last_huff_table.clone(),
             fse_tables: clone_fse_tables(&state.fse_tables),
-            block_scratch: super::CompressedBlockScratch::new(),
+            block_scratch: inner_scratch,
             offset_hist: state.offset_hist,
             strategy_tag: state.strategy_tag,
         },
@@ -320,6 +340,9 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
     scratch.partitions.push(scratch.parts.sequences.len());
     workspace = estimator.workspace;
     scratch.estimator_workspace = workspace;
+    // Stash the inner scratch back for the next frame (its buffers stay
+    // allocated; the estimator clears them per use).
+    scratch.estimator_inner = Some(Box::new(estimator.scratch_state.block_scratch));
 
     scratch.compressed.clear();
     let mut seq_start = 0usize;
@@ -2271,6 +2294,7 @@ mod tests {
             StrategyTag::Dfast,
             StrategyTag::Greedy,
             StrategyTag::Lazy,
+            StrategyTag::Btlazy2,
         ] {
             assert_eq!(min_literals_to_compress(strat, false), 64);
             assert_eq!(min_literals_to_compress(strat, true), 6);
@@ -2291,6 +2315,7 @@ mod tests {
             StrategyTag::Dfast,
             StrategyTag::Greedy,
             StrategyTag::Lazy,
+            StrategyTag::Btlazy2,
             StrategyTag::BtOpt,
         ] {
             assert_eq!(min_gain(src, strat), (src >> 6) + 2);
@@ -2368,6 +2393,10 @@ mod tests {
                 "Lazy/{lit_len}"
             );
             assert!(
+                !prefer_repeat_eligible(StrategyTag::Btlazy2, lit_len),
+                "Btlazy2/{lit_len}"
+            );
+            assert!(
                 !prefer_repeat_eligible(StrategyTag::BtOpt, lit_len),
                 "BtOpt/{lit_len}"
             );
@@ -2387,6 +2416,7 @@ mod tests {
             assert!(!prefer_repeat_eligible(StrategyTag::Fast, lit_len));
             assert!(!prefer_repeat_eligible(StrategyTag::Dfast, lit_len));
             assert!(!prefer_repeat_eligible(StrategyTag::Greedy, lit_len));
+            assert!(!prefer_repeat_eligible(StrategyTag::Btlazy2, lit_len));
         }
     }
 
