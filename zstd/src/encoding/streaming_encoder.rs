@@ -1372,6 +1372,85 @@ mod tests {
         assert_eq!(decoded, payload);
     }
 
+    /// `set_content_checksum(false)` before the first write must clear the
+    /// frame header's `Content_Checksum_flag` and the frame must still
+    /// round-trip through the decoder.
+    #[test]
+    fn streaming_encoder_set_content_checksum_false_clears_header_flag() {
+        let payload = b"streaming-checksum-toggle-".repeat(64);
+        let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Fastest);
+        encoder
+            .set_content_checksum(false)
+            .expect("set_content_checksum pre-write");
+        encoder.write_all(&payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let header = crate::decoding::frame::read_frame_header(compressed.as_slice())
+            .unwrap()
+            .0;
+        assert!(
+            !header.descriptor.content_checksum_flag(),
+            "content_checksum(false) must clear the frame header flag",
+        );
+
+        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    /// With the `hash` feature, disabling the checksum must drop exactly the
+    /// 4-byte XXH64 trailer: the same payload encoded with the checksum on is
+    /// 4 bytes longer and its header flag is set.
+    #[cfg(feature = "hash")]
+    #[test]
+    fn streaming_encoder_set_content_checksum_false_omits_trailer() {
+        let payload = b"streaming-checksum-trailer-".repeat(64);
+
+        let mut with = StreamingEncoder::new(Vec::new(), CompressionLevel::Fastest);
+        with.write_all(&payload).unwrap();
+        let with_checksum = with.finish().unwrap();
+
+        let mut without = StreamingEncoder::new(Vec::new(), CompressionLevel::Fastest);
+        without
+            .set_content_checksum(false)
+            .expect("set_content_checksum pre-write");
+        without.write_all(&payload).unwrap();
+        let without_checksum = without.finish().unwrap();
+
+        assert!(
+            crate::decoding::frame::read_frame_header(with_checksum.as_slice())
+                .unwrap()
+                .0
+                .descriptor
+                .content_checksum_flag(),
+            "default checksum-on frame must set the header flag",
+        );
+        assert_eq!(
+            with_checksum.len(),
+            without_checksum.len() + 4,
+            "checksum-on frame must carry exactly the 4-byte XXH64 trailer",
+        );
+    }
+
+    /// `set_content_checksum` after the first write must error: the frame
+    /// header (and its checksum flag) is already emitted, so a late flip would
+    /// desync the header flag from the emitted trailer. Mirrors
+    /// `set_magicless` / `set_pledged_content_size` semantics.
+    #[test]
+    fn streaming_encoder_set_content_checksum_after_first_write_errors() {
+        let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Fastest);
+        encoder.write_all(b"first-block").unwrap();
+        let err = encoder
+            .set_content_checksum(false)
+            .expect_err("set_content_checksum after first write must error");
+        assert_eq!(
+            err.kind(),
+            ErrorKind::InvalidInput,
+            "expected InvalidInput when setting content checksum after frame_started, got {err:?}",
+        );
+    }
+
     #[test]
     fn no_pledged_size_omits_fcs_from_header() {
         let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Fastest);

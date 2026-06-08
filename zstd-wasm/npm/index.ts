@@ -88,7 +88,8 @@ export interface DecompressStream {
  * Incremental streaming compressor handle. Feed plaintext chunks with
  * {@link CompressStream.push} and read complete compressed blocks as the
  * matcher window fills; call {@link CompressStream.finish} to seal the frame
- * (final block + checksum). Peak memory is O(window), not O(input) — the frame
+ * (final block, plus the 4-byte XXH64 trailer only if the stream was created
+ * with `checksum` enabled). Peak memory is O(window), not O(input) — the frame
  * is emitted block-by-block instead of buffered whole. The frame omits
  * `Frame_Content_Size` (unknown while streaming) yet decodes in any compliant
  * zstd decoder. Call {@link CompressStream.free} when done.
@@ -96,7 +97,11 @@ export interface DecompressStream {
 export interface CompressStream {
   /** Feed plaintext; returns compressed bytes complete so far (may be empty). */
   push(chunk: Uint8Array): Uint8Array;
-  /** Seal the frame; returns the final block + checksum. */
+  /**
+   * Seal the frame; returns the final block, followed by the 4-byte XXH64
+   * content-checksum trailer only when the stream was created with `checksum`
+   * enabled (otherwise just the final block, no trailer).
+   */
   finish(): Uint8Array;
   /** Release the underlying wasm handle. */
   free(): void;
