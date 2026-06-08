@@ -234,8 +234,12 @@ pub extern "C" fn ZSTD_getErrorName(result: usize) -> *const c_char {
 }
 
 /// `const char* ZSTD_getErrorString(ZSTD_ErrorCode code)` — readable string
-/// for a code (the `zstd_errors.h` entry point).
+/// for a code (the `zstd_errors.h` entry point). Takes the discriminant as a
+/// primitive `c_uint`, not the `ZSTD_ErrorCode` enum: a C caller may pass a
+/// value outside the known set, and materializing an out-of-range enum
+/// discriminant across the FFI boundary is undefined behavior. `code_from_u32`
+/// maps any unknown value to the generic error.
 #[unsafe(no_mangle)]
-pub extern "C" fn ZSTD_getErrorString(code: ZSTD_ErrorCode) -> *const c_char {
-    message(code).as_ptr()
+pub extern "C" fn ZSTD_getErrorString(code: c_uint) -> *const c_char {
+    message(code_from_u32(code)).as_ptr()
 }
