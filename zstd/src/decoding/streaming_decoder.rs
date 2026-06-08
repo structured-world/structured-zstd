@@ -210,3 +210,58 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
         Ok(written)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::StreamingDecoder;
+    use crate::io::Read;
+
+    /// `Read::read` must not return `Err` after it has already written bytes
+    /// into the caller's buffer (the trait mandates that an error implies no
+    /// bytes were read). When a single `read` call both drains the final bytes
+    /// of a `Verify`-mode frame AND finishes it, a checksum mismatch must be
+    /// deferred: those bytes are delivered as `Ok(n)` and the error surfaces on
+    /// the next (zero-byte) call, where returning `Err` violates no contract.
+    #[cfg(feature = "hash")]
+    #[test]
+    fn read_delivering_bytes_defers_checksum_error_to_next_call() {
+        use crate::decoding::ContentChecksum;
+        use crate::encoding::{CompressionLevel, FrameCompressor};
+        use crate::io::ErrorKind;
+        use alloc::vec;
+        use alloc::vec::Vec;
+
+        let payload: Vec<u8> = (0..8192u32).map(|i| (i & 0xFF) as u8).collect();
+        let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        compressor.set_source(payload.as_slice());
+        let mut compressed = Vec::new();
+        compressor.set_drain(&mut compressed);
+        compressor.compress();
+
+        // Corrupt the trailing 4-byte content checksum: the body still decodes
+        // to the right bytes, but the stored digest no longer matches.
+        let last = compressed.len() - 1;
+        compressed[last] ^= 0xFF;
+
+        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        decoder
+            .decoder
+            .set_content_checksum(ContentChecksum::Verify);
+
+        // A buffer large enough to drain the whole frame in one call: this call
+        // finishes the frame AND writes every payload byte. The mismatch must
+        // NOT abort it (that would drop the delivered bytes).
+        let mut buf = vec![0u8; payload.len() + 4096];
+        let n = decoder
+            .read(&mut buf)
+            .expect("a read that delivered bytes must not return the checksum Err");
+        assert_eq!(n, payload.len());
+        assert_eq!(&buf[..n], payload.as_slice());
+
+        // The deferred mismatch surfaces on the terminating zero-byte read.
+        let err = decoder
+            .read(&mut buf)
+            .expect_err("deferred checksum mismatch must surface on the terminating read");
+        assert_eq!(err.kind(), ErrorKind::Other);
+    }
+}
