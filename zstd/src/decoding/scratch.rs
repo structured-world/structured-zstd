@@ -138,6 +138,8 @@ impl<B: BufferBackend> DecoderScratch<B> {
         DecoderScratch {
             huf: HuffmanScratch {
                 table: HuffmanTable::new(),
+                table_source: TableSource::Local,
+                dict: None,
             },
             fse: FSEScratch {
                 offsets: AlignedFSETable::new(MAX_OFFSET_CODE),
@@ -145,9 +147,9 @@ impl<B: BufferBackend> DecoderScratch<B> {
                 match_lengths: AlignedFSETable::new(MAX_MATCH_LENGTH_CODE),
                 offsets_long_share: 0,
                 ddict_is_cold: false,
-                ll_source: SeqTableSource::Local,
-                of_source: SeqTableSource::Local,
-                ml_source: SeqTableSource::Local,
+                ll_source: TableSource::Local,
+                of_source: TableSource::Local,
+                ml_source: TableSource::Local,
                 dict: None,
             },
             buffer: DecodeBuffer::new(window_size),
@@ -228,6 +230,9 @@ impl<B: BufferBackend> DecoderScratch<B> {
         self.fse.ddict_is_cold = false;
 
         self.huf.table.reset();
+        // Mirror the FSE detach: a reused workspace must not read a
+        // previous frame's dictionary Huffman table.
+        self.huf.detach_dict();
     }
 
     pub fn init_from_dict(&mut self, dict: &DictionaryHandle) {
@@ -238,7 +243,7 @@ impl<B: BufferBackend> DecoderScratch<B> {
         // by reference (Repeat mode) or rebuilds it (FSE/RLE/Predefined
         // mode), so deferring the copy to the rebuild is strictly faster.
         self.fse.attach_dict(dict.clone());
-        self.huf.table.reinit_from(&d.huf.table);
+        self.huf.attach_dict(dict.clone());
         self.offset_hist = d.offset_hist;
         // Share the dictionary content by handle (Arc/Rc clone = refcount
         // bump) instead of copying it into a per-frame buffer; the decoder
@@ -256,13 +261,70 @@ impl<B: BufferBackend> DecoderScratch<B> {
 
 pub struct HuffmanScratch {
     pub table: HuffmanTable,
+    /// Copy-on-write source for the literals Huffman table, mirroring the
+    /// sequence-FSE treatment in [`FSEScratch`]: `Dict` reads the shared
+    /// dictionary's table by reference (no copy), `Local` reads the
+    /// locally-built one. `init_from_dict` attaches as `Dict`; a
+    /// `Compressed` literals section rebuilds and flips to `Local`; a
+    /// `Treeless` section reuses whatever source is current.
+    table_source: TableSource,
+    /// Shared dictionary handle backing the table when `Dict`-sourced.
+    dict: Option<DictionaryHandle>,
 }
 
 impl HuffmanScratch {
     pub fn new() -> HuffmanScratch {
         HuffmanScratch {
             table: HuffmanTable::new(),
+            table_source: TableSource::Local,
+            dict: None,
         }
+    }
+
+    /// Live Huffman literals table: the shared dictionary's (zero-copy)
+    /// while the source is still `Dict`, else the locally-built one.
+    pub(crate) fn huf_table(&self) -> &HuffmanTable {
+        match self.table_source {
+            TableSource::Local => &self.table,
+            TableSource::Dict => {
+                &self
+                    .dict
+                    .as_ref()
+                    .expect("Dict table source requires an attached dictionary handle")
+                    .as_dict()
+                    .huf
+                    .table
+            }
+        }
+    }
+
+    /// Attach a shared dictionary copy-on-write: the literals table now
+    /// reads the dictionary's Huffman table by reference (one handle
+    /// clone, no table copy).
+    pub(crate) fn attach_dict(&mut self, dict: DictionaryHandle) {
+        self.table_source = TableSource::Dict;
+        self.dict = Some(dict);
+    }
+
+    /// Drop any dictionary attachment and revert to the local table.
+    pub(crate) fn detach_dict(&mut self) {
+        self.table_source = TableSource::Local;
+        self.dict = None;
+    }
+
+    /// Flip to the locally-built table (called after a `Compressed`
+    /// literals section rebuilds it — the copy-on-write "write" step).
+    #[inline]
+    pub(crate) fn mark_table_local(&mut self) {
+        self.table_source = TableSource::Local;
+    }
+
+    /// Snapshot the live (COW-resolved) Huffman table into `self` as an
+    /// owned `Local` copy (LSM resume snapshot/restore): materialises a
+    /// `Dict`-sourced table so the result is self-contained.
+    pub(crate) fn reinit_resolved_from(&mut self, other: &HuffmanScratch) {
+        self.table.reinit_from(other.huf_table());
+        self.detach_dict();
     }
 }
 
@@ -272,11 +334,12 @@ impl Default for HuffmanScratch {
     }
 }
 
-/// Whether a sequence FSE table axis reads its own freshly-built
-/// `AlignedFSETable` (`Local`) or the shared dictionary's table by
-/// reference (`Dict`). See [`FSEScratch`] copy-on-write docs.
+/// Whether an entropy table (a sequence FSE axis, or the Huffman
+/// literals table) reads its own freshly-built table (`Local`) or the
+/// shared dictionary's table by reference (`Dict`). The decode
+/// copy-on-write source: see [`FSEScratch`] / [`HuffmanScratch`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum SeqTableSource {
+enum TableSource {
     Local,
     Dict,
 }
@@ -317,9 +380,9 @@ pub struct FSEScratch {
     /// Repeat-mode blocks leave the source untouched, so they read
     /// straight out of the shared dictionary handle until the first
     /// rebuild. On the no-dict path every axis stays `Local`.
-    ll_source: SeqTableSource,
-    of_source: SeqTableSource,
-    ml_source: SeqTableSource,
+    ll_source: TableSource,
+    of_source: TableSource,
+    ml_source: TableSource,
     /// Shared dictionary handle backing any axis whose source is `Dict`.
     /// Held as one `Arc`/`Rc` clone (a refcount bump, not a table copy);
     /// `None` on the no-dict path.
@@ -334,9 +397,9 @@ impl FSEScratch {
             match_lengths: AlignedFSETable::new(MAX_MATCH_LENGTH_CODE),
             offsets_long_share: 0,
             ddict_is_cold: false,
-            ll_source: SeqTableSource::Local,
-            of_source: SeqTableSource::Local,
-            ml_source: SeqTableSource::Local,
+            ll_source: TableSource::Local,
+            of_source: TableSource::Local,
+            ml_source: TableSource::Local,
             dict: None,
         }
     }
@@ -355,9 +418,9 @@ impl FSEScratch {
         // the offsets table; the dict computes it once at build time and
         // it is stale-but-correct across Repeat-mode blocks.
         self.offsets_long_share = other.offsets_long_share;
-        self.ll_source = SeqTableSource::Local;
-        self.of_source = SeqTableSource::Local;
-        self.ml_source = SeqTableSource::Local;
+        self.ll_source = TableSource::Local;
+        self.of_source = TableSource::Local;
+        self.ml_source = TableSource::Local;
         self.dict = None;
     }
 
@@ -365,24 +428,24 @@ impl FSEScratch {
     /// axis is still `Dict`-sourced, else the locally-built one.
     pub(crate) fn ll_table(&self) -> &SeqFSETable {
         match self.ll_source {
-            SeqTableSource::Local => &self.literal_lengths,
-            SeqTableSource::Dict => &self.dict_ref().fse.literal_lengths,
+            TableSource::Local => &self.literal_lengths,
+            TableSource::Dict => &self.dict_ref().fse.literal_lengths,
         }
     }
 
     /// Live OF decode table (see [`Self::ll_table`]).
     pub(crate) fn of_table(&self) -> &SeqFSETable {
         match self.of_source {
-            SeqTableSource::Local => &self.offsets,
-            SeqTableSource::Dict => &self.dict_ref().fse.offsets,
+            TableSource::Local => &self.offsets,
+            TableSource::Dict => &self.dict_ref().fse.offsets,
         }
     }
 
     /// Live ML decode table (see [`Self::ll_table`]).
     pub(crate) fn ml_table(&self) -> &SeqFSETable {
         match self.ml_source {
-            SeqTableSource::Local => &self.match_lengths,
-            SeqTableSource::Dict => &self.dict_ref().fse.match_lengths,
+            TableSource::Local => &self.match_lengths,
+            TableSource::Dict => &self.dict_ref().fse.match_lengths,
         }
     }
 
@@ -400,9 +463,9 @@ impl FSEScratch {
     /// long-offset share scalar.
     pub(crate) fn attach_dict(&mut self, dict: DictionaryHandle) {
         self.offsets_long_share = dict.as_dict().fse.offsets_long_share;
-        self.ll_source = SeqTableSource::Dict;
-        self.of_source = SeqTableSource::Dict;
-        self.ml_source = SeqTableSource::Dict;
+        self.ll_source = TableSource::Dict;
+        self.of_source = TableSource::Dict;
+        self.ml_source = TableSource::Dict;
         self.dict = Some(dict);
     }
 
@@ -411,9 +474,9 @@ impl FSEScratch {
     /// previous frame's dictionary tables).
     pub(crate) fn detach_dict(&mut self) {
         self.dict = None;
-        self.ll_source = SeqTableSource::Local;
-        self.of_source = SeqTableSource::Local;
-        self.ml_source = SeqTableSource::Local;
+        self.ll_source = TableSource::Local;
+        self.of_source = TableSource::Local;
+        self.ml_source = TableSource::Local;
     }
 
     /// Flip an axis to read its locally-built table (called by
@@ -421,15 +484,15 @@ impl FSEScratch {
     /// rebuilds — the copy-on-write "write" step).
     #[inline]
     pub(crate) fn mark_ll_local(&mut self) {
-        self.ll_source = SeqTableSource::Local;
+        self.ll_source = TableSource::Local;
     }
     #[inline]
     pub(crate) fn mark_of_local(&mut self) {
-        self.of_source = SeqTableSource::Local;
+        self.of_source = TableSource::Local;
     }
     #[inline]
     pub(crate) fn mark_ml_local(&mut self) {
-        self.ml_source = SeqTableSource::Local;
+        self.ml_source = TableSource::Local;
     }
 }
 
@@ -529,10 +592,33 @@ mod tests {
             "init_from_dict must not copy table bytes into local scratch (COW)"
         );
 
+        // Same copy-on-write contract for the Huffman literals table: the
+        // accessor resolves to the dictionary's built table while the
+        // local table stays untouched (max_num_bits == 0 means unbuilt).
+        let dict_huf_bits = dict.as_dict().huf.table.max_num_bits;
+        assert!(
+            dict_huf_bits > 0,
+            "dict fixture should carry a built HUF table"
+        );
+        assert_eq!(
+            scratch.huf.huf_table().max_num_bits,
+            dict_huf_bits,
+            "Dict-sourced HUF axis must resolve to the dictionary's table"
+        );
+        assert_eq!(
+            scratch.huf.table.max_num_bits, 0,
+            "init_from_dict must not copy the HUF table into local scratch (COW)"
+        );
+
         scratch.reset(1024);
         assert!(
             scratch.fse.ll_table().decode().is_empty(),
             "reset must detach the dictionary copy-on-write source"
+        );
+        assert_eq!(
+            scratch.huf.huf_table().max_num_bits,
+            0,
+            "reset must detach the HUF dictionary copy-on-write source"
         );
     }
 }

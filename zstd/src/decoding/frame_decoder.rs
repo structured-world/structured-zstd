@@ -613,7 +613,7 @@ impl DecoderScratchKind {
         let mut fse = crate::decoding::scratch::FSEScratch::new();
         fse.reinit_from(fse_src);
         let mut huf = crate::decoding::scratch::HuffmanScratch::new();
-        huf.table.reinit_from(&huf_src.table);
+        huf.reinit_resolved_from(huf_src);
         (fse, huf, offset_hist)
     }
 
@@ -625,12 +625,12 @@ impl DecoderScratchKind {
         match self {
             Self::Ring(s) => {
                 s.fse.reinit_from(&state.fse);
-                s.huf.table.reinit_from(&state.huf.table);
+                s.huf.reinit_resolved_from(&state.huf);
                 s.offset_hist = state.offset_hist;
             }
             Self::Flat(s) => {
                 s.fse.reinit_from(&state.fse);
-                s.huf.table.reinit_from(&state.huf.table);
+                s.huf.reinit_resolved_from(&state.huf);
                 s.offset_hist = state.offset_hist;
             }
         }

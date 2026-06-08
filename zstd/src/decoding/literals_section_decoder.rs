@@ -220,9 +220,12 @@ fn decompress_literals_impl<K: CpuKernel>(
         LiteralsSectionType::Compressed => {
             //read Huffman tree description
             bytes_read += scratch.table.build_decoder(source)?;
+            // Copy-on-write "write": a freshly-built table is local, so the
+            // section no longer reads the shared dictionary's Huffman table.
+            scratch.mark_table_local();
             vprintln!("Built huffman table using {} bytes", bytes_read);
         }
-        LiteralsSectionType::Treeless if scratch.table.max_num_bits == 0 => {
+        LiteralsSectionType::Treeless if scratch.huf_table().max_num_bits == 0 => {
             return Err(err::UninitializedHuffmanTable);
         }
 
@@ -230,6 +233,10 @@ fn decompress_literals_impl<K: CpuKernel>(
     }
 
     let source = &source[bytes_read as usize..];
+
+    // Copy-on-write source: the dictionary's Huffman table (zero-copy) on a
+    // Treeless section that still reads `Dict`, else the locally-built one.
+    let table = scratch.huf_table();
 
     if num_streams == 4 {
         //build jumptable
@@ -258,10 +265,10 @@ fn decompress_literals_impl<K: CpuKernel>(
         ];
 
         let mut decoders: [HuffmanDecoder<'_>; 4] = [
-            HuffmanDecoder::new(&scratch.table),
-            HuffmanDecoder::new(&scratch.table),
-            HuffmanDecoder::new(&scratch.table),
-            HuffmanDecoder::new(&scratch.table),
+            HuffmanDecoder::new(table),
+            HuffmanDecoder::new(table),
+            HuffmanDecoder::new(table),
+            HuffmanDecoder::new(table),
         ];
         let mut brs: [BitReaderReversed<'_, K>; 4] = [
             BitReaderReversed::<K>::new(streams[0]),
@@ -286,7 +293,7 @@ fn decompress_literals_impl<K: CpuKernel>(
             decoders[i].init_state(&mut brs[i]);
         }
 
-        let max_bits = scratch.table.max_num_bits as isize;
+        let max_bits = table.max_num_bits as isize;
 
         // RFC 8878 §3.1.1.3.2: first 3 streams produce ceil(regen_size/4)
         // symbols each, 4th produces the remainder. Pre-allocate target and
@@ -329,7 +336,7 @@ fn decompress_literals_impl<K: CpuKernel>(
         // Each iter decodes `symbols_per_burst` symbols × 4 streams,
         // then reloads all 4 stream registers via `ip[s] -= nb_bytes;
         // MEM_read64(ip[s]) | 1`.
-        let max_num_bits = scratch.table.max_num_bits;
+        let max_num_bits = table.max_num_bits;
         // Safety constraint per donor `HUF_decompress4X1_usingDTable_internal_fast_c_loop`:
         // before each `bits[s] >> table_shift` read, the sentinel-bit position
         // must be strictly below bit `64 - max_num_bits` (i.e. outside the top
@@ -348,7 +355,7 @@ fn decompress_literals_impl<K: CpuKernel>(
         let symbols_per_burst: usize = (63 - 8) / max_num_bits as usize;
         let burst_bits = (symbols_per_burst * max_num_bits as usize) as u8;
         let table_shift = (64 - max_num_bits) as u32;
-        let packed = scratch.table.packed_decode.as_slice();
+        let packed = table.packed_decode.as_slice();
 
         // Lockstep cursor invariant: every burst iter advances all 4
         // cursors by `symbols_per_burst` in step, so `cursors[0]`
@@ -456,7 +463,7 @@ fn decompress_literals_impl<K: CpuKernel>(
     } else {
         //just decode the one stream
         assert!(num_streams == 1);
-        let mut decoder = HuffmanDecoder::new(&scratch.table);
+        let mut decoder = HuffmanDecoder::new(table);
         let mut br = BitReaderReversed::<K>::new(source);
         let mut skipped_bits = 0;
         loop {
@@ -471,10 +478,10 @@ fn decompress_literals_impl<K: CpuKernel>(
             return Err(DecompressLiteralsError::ExtraPadding { skipped_bits });
         }
         decoder.init_state(&mut br);
-        while br.bits_remaining() > -(scratch.table.max_num_bits as isize) {
+        while br.bits_remaining() > -(table.max_num_bits as isize) {
             target.push(decoder.decode_symbol_and_advance(&mut br));
         }
-        let expected = -(scratch.table.max_num_bits as isize);
+        let expected = -(table.max_num_bits as isize);
         if br.bits_remaining() != expected {
             target.truncate(base);
             return Err(DecompressLiteralsError::BitstreamReadMismatch {
@@ -914,7 +921,6 @@ mod zerocopy_robustness_tests {
     use super::{LiteralsView, decode_literals_zerocopy};
     use crate::blocks::literals_section::{LiteralsSection, LiteralsSectionType};
     use crate::decoding::scratch::HuffmanScratch;
-    use crate::huff0::HuffmanTable;
     use alloc::vec::Vec;
 
     fn raw_section(regen: u32) -> LiteralsSection {
@@ -936,9 +942,7 @@ mod zerocopy_robustness_tests {
     }
 
     fn fresh_scratch() -> HuffmanScratch {
-        HuffmanScratch {
-            table: HuffmanTable::new(),
-        }
+        HuffmanScratch::new()
     }
 
     #[test]
