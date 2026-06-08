@@ -303,18 +303,13 @@ impl FSEScratch {
         self.offsets.reinit_from(&other.offsets);
         self.literal_lengths.reinit_from(&other.literal_lengths);
         self.match_lengths.reinit_from(&other.match_lengths);
-        // Recompute the share from the just-copied offsets table
-        // rather than trusting `other.offsets_long_share`. Two source
-        // shapes produce a populated `offsets` table but a still-zero
-        // cached share: (a) `Dictionary::decode_dict` rebuilds the
-        // offsets FSE table from the dictionary's entropy section
-        // without ever calling the sequence-decoder path that updates
-        // the cache, and (b) any future caller that mutates the table
-        // directly. Recomputing here keeps the pipeline gate aligned
-        // with the actual table shape regardless of how the table got
-        // there.
-        self.offsets_long_share =
-            super::sequence_section_decoder::compute_offsets_long_share(&self.offsets);
+        // Copy the precomputed long-offset share instead of re-walking the
+        // offsets table on every reinit. The only caller is `init_from_dict`,
+        // and `Dictionary::decode_dict` now computes the share once when the
+        // dictionary handle is built (the dict is immutable, so it never
+        // changes), so trusting `other.offsets_long_share` is correct and saves
+        // a 256-entry table walk on every `decode_*_with_dict_handle` call.
+        self.offsets_long_share = other.offsets_long_share;
     }
 }
 

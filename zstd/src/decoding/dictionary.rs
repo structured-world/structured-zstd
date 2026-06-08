@@ -166,6 +166,15 @@ impl Dictionary {
                 crate::decoding::sequence_section_decoder::OF_MAX_LOG,
             )?;
             new_dict.fse.offsets.enrich_for_offsets();
+            // Compute the pipeline-gate long-offset share ONCE here, while the
+            // dictionary handle is built, so the per-decode `init_from_dict`
+            // path can COPY it instead of re-walking the offsets table on every
+            // `decode_*_with_dict_handle` call (the dict is immutable, so the
+            // share never changes after this).
+            new_dict.fse.offsets_long_share =
+                crate::decoding::sequence_section_decoder::compute_offsets_long_share(
+                    &new_dict.fse.offsets,
+                );
             n
         } else {
             new_dict.fse.offsets.read_table_probabilities(
