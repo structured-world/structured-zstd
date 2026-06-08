@@ -22,6 +22,11 @@ name = "structured_zstd"
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
+# The codec is imported under the alias `codec` rather than its own name: this
+# lib is itself named `structured_zstd` (so the artifact is `libstructured_zstd.so`),
+# and a same-named extern would make rustdoc's doctest harness see two
+# `structured_zstd` rlibs (E0464). The alias keeps the artifact name while
+# giving the dependency a distinct crate name in this crate.
 # Default features pull in std + hash (checksums/LDM) + the per-CPU kernel
 # tiers — the C ABI is a host library, so std is always available here.
-structured-zstd = { path = "../zstd" }
+codec = { path = "../zstd", package = "structured-zstd" }

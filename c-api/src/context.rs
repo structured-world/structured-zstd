@@ -9,21 +9,21 @@
 use core::ffi::c_int;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use structured_zstd::decoding::FrameDecoder;
-use structured_zstd::encoding::{CompressionLevel, FrameCompressor};
+use codec::decoding::FrameDecoder;
+use codec::encoding::{CompressionLevel, FrameCompressor};
 
 use crate::error::{ZSTD_ErrorCode, code_for_decoder_error, encode};
 use crate::ffi::{in_slice, out_slice};
 
 /// Opaque compression context. Carries a reusable output buffer so repeated
-/// [`ZSTD_compressCCtx`] calls amortise the destination allocation.
+/// `ZSTD_compressCCtx` calls amortise the destination allocation.
 #[allow(non_camel_case_types)]
 pub struct ZSTD_CCtx {
     scratch: Vec<u8>,
 }
 
 /// Opaque decompression context. Wraps a reusable [`FrameDecoder`] so its
-/// internal buffers persist across [`ZSTD_decompressDCtx`] calls.
+/// internal buffers persist across `ZSTD_decompressDCtx` calls.
 #[allow(non_camel_case_types)]
 pub struct ZSTD_DCtx {
     decoder: FrameDecoder,

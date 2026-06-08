@@ -4,8 +4,8 @@
 
 use core::ffi::{c_uint, c_ulonglong};
 
-use structured_zstd::decoding::errors::ReadFrameHeaderError;
-use structured_zstd::decoding::{
+use codec::decoding::errors::ReadFrameHeaderError;
+use codec::decoding::{
     FrameContentSize, find_frame_compressed_size, frame_decompressed_bound, frame_header_size,
     read_frame_content_size, read_frame_header_info,
 };

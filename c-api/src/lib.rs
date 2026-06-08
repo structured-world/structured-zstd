@@ -2,7 +2,7 @@
 //!
 //! This crate exposes hand-written `extern "C"` wrappers whose signatures and
 //! error semantics match upstream zstd v1.5.7 (the vendored headers under
-//! `include/`), bottomed on the pure-Rust [`structured_zstd`] public API. It
+//! `include/`), bottomed on the pure-Rust [`codec`] public API. It
 //! builds as both a `cdylib` (SONAME `libzstd.so.1`) and a `staticlib`.
 //!
 //! Phase 6.1 scope: the synchronous slice of `zstd.h` — the simple one-shot

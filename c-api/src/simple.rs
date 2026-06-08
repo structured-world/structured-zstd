@@ -4,11 +4,11 @@
 use core::ffi::{c_char, c_int, c_uint};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use structured_zstd::decoding::{
+use codec::decoding::{
     FrameContentSize, FrameDecoder, FrameSizeError, find_frame_compressed_size,
     read_frame_content_size,
 };
-use structured_zstd::encoding::{CompressionLevel, compress_bound, compress_slice_to_vec};
+use codec::encoding::{CompressionLevel, compress_bound, compress_slice_to_vec};
 
 use crate::error::{ZSTD_ErrorCode, code_for_decoder_error, encode};
 use crate::ffi::{in_slice, out_slice};

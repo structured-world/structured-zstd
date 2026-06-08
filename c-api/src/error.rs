@@ -8,7 +8,7 @@
 
 use core::ffi::{CStr, c_char, c_uint};
 
-use structured_zstd::decoding::errors::FrameDecoderError;
+use codec::decoding::errors::FrameDecoderError;
 
 /// Error codes from `zstd_errors.h` (upstream v1.5.7), numeric values pinned
 /// since zstd v1.3.1. Exposed `#[repr(u32)]` so the discriminants are the
