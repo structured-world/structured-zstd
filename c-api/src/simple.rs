@@ -104,6 +104,15 @@ pub unsafe extern "C" fn ZSTD_compress(
     compressed.len()
 }
 
+/// Whether the frame's declared content checksum matches the decoded output,
+/// checked after a whole-frame decode. Upstream `ZSTD_decompress` returns
+/// `ZSTD_error_checksum_wrong` when the stored XXH64 disagrees with the bytes
+/// produced; mirror that. Frames without a checksum report `None` from both
+/// accessors, so the comparison is a no-op (returns `true`) for them.
+pub(crate) fn content_checksum_ok(decoder: &FrameDecoder) -> bool {
+    decoder.get_checksum_from_data() == decoder.get_calculated_checksum()
+}
+
 /// `size_t ZSTD_decompress(void* dst, size_t dstCapacity, const void* src,
 /// size_t compressedSize)`.
 ///
@@ -124,10 +133,13 @@ pub unsafe extern "C" fn ZSTD_decompress(
     let dst = unsafe { out_slice(dst, dst_capacity) };
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         let mut decoder = FrameDecoder::new();
-        decoder.decode_all(src, dst)
+        decoder
+            .decode_all(src, dst)
+            .map(|written| (written, content_checksum_ok(&decoder)))
     }));
     match outcome {
-        Ok(Ok(written)) => written,
+        Ok(Ok((written, true))) => written,
+        Ok(Ok((_, false))) => encode(ZSTD_ErrorCode::ZSTD_error_checksum_wrong),
         Ok(Err(err)) => encode(code_for_decoder_error(&err)),
         Err(_) => encode(ZSTD_ErrorCode::ZSTD_error_GENERIC),
     }

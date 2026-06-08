@@ -160,9 +160,14 @@ pub unsafe extern "C" fn ZSTD_decompressDCtx(
     let dctx = unsafe { &mut *dctx };
     let src = unsafe { in_slice(src, src_size) };
     let dst = unsafe { out_slice(dst, dst_capacity) };
-    let outcome = catch_unwind(AssertUnwindSafe(|| dctx.decoder.decode_all(src, dst)));
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        dctx.decoder
+            .decode_all(src, dst)
+            .map(|written| (written, crate::simple::content_checksum_ok(&dctx.decoder)))
+    }));
     match outcome {
-        Ok(Ok(written)) => written,
+        Ok(Ok((written, true))) => written,
+        Ok(Ok((_, false))) => encode(ZSTD_ErrorCode::ZSTD_error_checksum_wrong),
         Ok(Err(err)) => encode(code_for_decoder_error(&err)),
         Err(_) => encode(ZSTD_ErrorCode::ZSTD_error_GENERIC),
     }
