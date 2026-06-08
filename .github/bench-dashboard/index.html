@@ -289,6 +289,10 @@
           <label><input type="checkbox" data-series="ffi_decompress_speed" checked /> FFI decompress</label>
           <label><input type="checkbox" data-series="rust_ratio" checked /> Rust ratio</label>
           <label><input type="checkbox" data-series="ffi_ratio" checked /> FFI ratio</label>
+          <label><input type="checkbox" data-series="rust_compress_dict_speed" checked /> Rust compress-dict</label>
+          <label><input type="checkbox" data-series="ffi_compress_dict_speed" checked /> FFI compress-dict</label>
+          <label><input type="checkbox" data-series="rust_decompress_dict_speed" checked /> Rust decompress-dict</label>
+          <label><input type="checkbox" data-series="ffi_decompress_dict_speed" checked /> FFI decompress-dict</label>
         </div>
         <div class="chart-wrap">
           <canvas id="chart-profile"></canvas>
@@ -421,6 +425,10 @@
           ffi_decompress_speed: true,
           rust_ratio: true,
           ffi_ratio: true,
+          rust_compress_dict_speed: true,
+          ffi_compress_dict_speed: true,
+          rust_decompress_dict_speed: true,
+          ffi_decompress_dict_speed: true,
         },
         aggregateChart: null,
         aggregateSeriesVisibility: {
@@ -536,7 +544,12 @@
       // `supported_levels()` in `zstd/benches/support/mod.rs`. Anything that
       // doesn't match keeps its raw label and sorts to the bottom so legacy
       // / ad-hoc bench names don't disappear from the dropdown.
-      const LEVEL_ID_PATTERN = /^level_(-?\d+)_([a-z][a-z0-9]*)$/i;
+      // `level_<N>_<strategy>` with an optional `_ldm` suffix for the
+      // long-distance-matching matrix anchors (`level_1_fast_ldm`,
+      // `level_22_btultra2_ldm`). The dict variants no longer reach the
+      // dashboard as levels — the CI parser strips their `_dict` suffix and
+      // routes dict-ness through `stage` — so only `_ldm` needs matching.
+      const LEVEL_ID_PATTERN = /^level_(-?\d+)_([a-z][a-z0-9]*)(_ldm)?$/i;
 
       function parseLevelId(raw) {
         const text = String(raw);
@@ -545,6 +558,7 @@
         const numeric = Number.parseInt(match[1], 10);
         if (!Number.isFinite(numeric)) return null;
         const tag = match[2].toLowerCase();
+        const ldm = Boolean(match[3]);
         // Fixed mapping so the dropdown label matches the
         // `StrategyTag` enum spelling (`BtOpt`, `BtUltra`,
         // `BtUltra2`) on the Rust side. Unknown / future tags fall
@@ -562,7 +576,8 @@
         };
         const pretty = STRATEGY_LABELS[tag]
           || tag.charAt(0).toUpperCase() + tag.slice(1);
-        return { numeric, tag, label: `${numeric} :: ${pretty}` };
+        const label = ldm ? `${numeric} :: ${pretty} +LDM` : `${numeric} :: ${pretty}`;
+        return { numeric, tag, ldm, label };
       }
 
       function renderLevelOptions(select, values) {
@@ -1073,19 +1088,21 @@
           return true;
         };
 
-        // Group by (snapshot, logical-metric): each cell averages the
-        // remaining cohort dimensions (target × scenario × source). For
-        // a fully-pinned filter (target/scenario both specific too)
-        // each cell is exactly one (or two — rust_stream + c_stream for
-        // decompress) row, so the mean is degenerate but correct.
+        // Group by (snapshot, kind, logical-metric): each cell averages the
+        // remaining cohort dimensions (target × scenario × source). `kind`
+        // (plain vs dict, from the stage suffix) keeps the dict and plain
+        // measurements of a level distinct — without it a pinned level that
+        // was measured both ways would merge its plain and dict speeds into
+        // one averaged line.
         const bySnapshotLogical = new Map();
         for (const row of state.records) {
           if (!matchesFilter(row)) continue;
           if (typeof row.rust_value !== "number" || typeof row.ffi_value !== "number") continue;
           const lm = profileLogicalMetric(row);
           if (!lm) continue;
+          const kind = stageKind(row.stage);
           const snap = row.generated_at || row.commit_sha || "local-run";
-          const key = `${snap}|${lm}`;
+          const key = `${snap}|${kind}|${lm}`;
           let agg = bySnapshotLogical.get(key);
           if (!agg) {
             agg = { snap, rust_sum: 0, ffi_sum: 0, count: 0 };
@@ -1105,8 +1122,8 @@
           return String(a).localeCompare(String(b));
         });
 
-        const lookup = (snap, lm, side) => {
-          const agg = bySnapshotLogical.get(`${snap}|${lm}`);
+        const lookup = (snap, kind, lm, side) => {
+          const agg = bySnapshotLogical.get(`${snap}|${kind}|${lm}`);
           if (!agg || agg.count === 0) return null;
           const sum = side === "rust" ? agg.rust_sum : agg.ffi_sum;
           const mean = sum / agg.count;
@@ -1116,7 +1133,8 @@
           return mean;
         };
 
-        const series = (lm, side) => snapshots.map((s) => lookup(s, lm, side));
+        const series = (lm, side, kind = "plain") =>
+          snapshots.map((s) => lookup(s, kind, lm, side));
 
         return { snapshots, snapshotCount: snapshots.length, lookup, series };
       }
@@ -1221,31 +1239,28 @@
           agg.count += 1;
         }
 
-        // One X-axis bucket per (level, kind) so the plain and dict variants of
-        // the same level occupy distinct points instead of averaging together.
-        const levelKindMap = new Map();
+        // X-axis = one bucket per REAL level (not per level×kind). Dict and
+        // plain share the level column and are split into separate SERIES
+        // (see `buildProfileSeriesDatasets`' `includeDict`), so a level
+        // measured both ways shows a plain line and a dict line at the same
+        // X position — no doubled "staircase" columns, and dict-ness lives in
+        // the Stage dropdown / series toggles, never in the level axis.
+        const levelSet = new Map();
         for (const agg of byLevelLogical.values()) {
-          const id = `${agg.level}|${agg.kind}`;
-          if (!levelKindMap.has(id)) {
-            levelKindMap.set(id, { value: agg.level, kind: agg.kind });
+          if (!levelSet.has(agg.level)) {
+            levelSet.set(agg.level, { value: agg.level, parsed: parseLevelId(agg.level) });
           }
         }
-        const levels = Array.from(levelKindMap.values())
-          .map((entry) => ({ ...entry, parsed: parseLevelId(entry.value) }))
-          .sort((a, b) => {
-            // Numeric level order first; parsed-less levels last. For the same
-            // level, plain precedes its dict variant so the two sit adjacent.
-            const an = a.parsed ? a.parsed.numeric : Number.POSITIVE_INFINITY;
-            const bn = b.parsed ? b.parsed.numeric : Number.POSITIVE_INFINITY;
-            if (an !== bn) return an - bn;
-            if (a.kind !== b.kind) return a.kind === "plain" ? -1 : 1;
-            return a.value.localeCompare(b.value);
-          });
-
-        const levelLabels = levels.map((entry) => {
-          const base = entry.parsed ? entry.parsed.label : entry.value;
-          return entry.kind === "dict" ? `${base} (dict)` : base;
+        const levels = Array.from(levelSet.values()).sort((a, b) => {
+          if (a.parsed && b.parsed) return a.parsed.numeric - b.parsed.numeric;
+          if (a.parsed) return -1;
+          if (b.parsed) return 1;
+          return a.value.localeCompare(b.value);
         });
+
+        const levelLabels = levels.map((entry) =>
+          entry.parsed ? entry.parsed.label : entry.value,
+        );
 
         // Speed records carry bytes/sec; convert to MiB/s for axis legibility.
         const lookup = (level, kind, lm, side) => {
@@ -1259,13 +1274,15 @@
           return mean;
         };
 
-        const series = (lm, side) =>
-          levels.map((e) => lookup(e.value, e.kind, lm, side));
+        // `kind` defaults to "plain"; the dict datasets pass "dict" to read
+        // the trained-dictionary buckets at the same level positions.
+        const series = (lm, side, kind = "plain") =>
+          levels.map((e) => lookup(e.value, kind, lm, side));
 
         return {
           levels: levelLabels,
           levelCount: levels.length,
-          datasets: buildProfileSeriesDatasets(series),
+          datasets: buildProfileSeriesDatasets(series, { includeDict: true }),
         };
       }
 
@@ -1273,10 +1290,16 @@
       //   - level-axis Level Profile (buildProfileData)
       //   - snapshot-axis level history (buildProfileLevelHistoryData)
       //   - the aggregate-over-levels chart (buildAggregateOverTimeData)
-      // Each caller supplies a `series(lm, side)` closure that returns
-      // the Y-values for its own X-axis labels.
-      function buildProfileSeriesDatasets(series) {
-        return [
+      // Each caller supplies a `series(lm, side, kind)` closure that returns
+      // the Y-values for its own X-axis labels; `kind` is "plain" (default)
+      // or "dict". `includeDict` appends the 4 trained-dictionary series
+      // (Rust/FFI × compress-dict/decompress-dict) — only the level-axis and
+      // pinned-level-history profiles set it; the aggregate chart stays
+      // plain-only. Dict series share the plain X-axis (same level/snapshot
+      // labels) and read the "dict"-kind buckets, so they render as their own
+      // toggleable lines rather than extra X columns.
+      function buildProfileSeriesDatasets(series, { includeDict = false } = {}) {
+        const datasets = [
           {
             seriesKey: "rust_compress_speed",
             label: "Rust compress (MiB/s)",
@@ -1337,6 +1360,52 @@
             borderDash: [6, 4],
           },
         ];
+        if (includeDict) {
+          // Trained-dictionary speed series. Same speed axis (`y`) as the
+          // plain compress/decompress lines, distinct hues + a long dash so
+          // they read as the dict counterparts of the plain pair. No dict
+          // ratio series here (the dict ratio data exists but the profile
+          // tracks dict on speed only, keeping the legend manageable).
+          datasets.push(
+            {
+              seriesKey: "rust_compress_dict_speed",
+              label: "Rust compress-dict (MiB/s)",
+              data: series("compress_speed", "rust", "dict"),
+              yAxisID: "y",
+              borderColor: "hsl(110 70% 30%)",
+              backgroundColor: "hsla(110 70% 30% / 0.18)",
+              borderDash: [8, 3],
+            },
+            {
+              seriesKey: "ffi_compress_dict_speed",
+              label: "FFI compress-dict (MiB/s)",
+              data: series("compress_speed", "ffi", "dict"),
+              yAxisID: "y",
+              borderColor: "hsl(190 70% 42%)",
+              backgroundColor: "hsla(190 70% 42% / 0.18)",
+              borderDash: [8, 3],
+            },
+            {
+              seriesKey: "rust_decompress_dict_speed",
+              label: "Rust decompress-dict (MiB/s)",
+              data: series("decompress_speed", "rust", "dict"),
+              yAxisID: "y",
+              borderColor: "hsl(160 70% 22%)",
+              backgroundColor: "hsla(160 70% 22% / 0.18)",
+              borderDash: [8, 3, 2, 3],
+            },
+            {
+              seriesKey: "ffi_decompress_dict_speed",
+              label: "FFI decompress-dict (MiB/s)",
+              data: series("decompress_speed", "ffi", "dict"),
+              yAxisID: "y",
+              borderColor: "hsl(255 60% 48%)",
+              backgroundColor: "hsla(255 60% 48% / 0.18)",
+              borderDash: [8, 3, 2, 3],
+            },
+          );
+        }
+        return datasets;
       }
 
       // Single source of truth for the chart instance: created once on
@@ -1408,7 +1477,7 @@
         const xLabels = historyMode ? built.snapshots : built.levels;
         const xLabelCount = historyMode ? built.snapshotCount : built.levelCount;
         const datasets = historyMode
-          ? buildProfileSeriesDatasets(built.series)
+          ? buildProfileSeriesDatasets(built.series, { includeDict: true })
           : built.datasets;
         const xAxisTitle = historyMode ? "Snapshot (generated_at / commit)" : "Compression level";
         if (!xLabelCount) {
@@ -1556,6 +1625,11 @@
         for (const row of state.records) {
           if (!matchesFilter(row)) continue;
           if (typeof row.rust_value !== "number" || typeof row.ffi_value !== "number") continue;
+          // Plain only: this chart's 6 series average across every level, so
+          // folding the dict variants in would blend trained-dictionary
+          // throughput into the plain compress/decompress means. Dict lives on
+          // the Level Profile's own dict series instead.
+          if (stageKind(row.stage) !== "plain") continue;
           const lm = profileLogicalMetric(row);
           if (!lm) continue;
           const snap = row.generated_at || row.commit_sha || "local-run";
