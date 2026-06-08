@@ -190,12 +190,27 @@ REGRESSION_SCENARIOS = {
 # in `.github/workflows/ci.yml`.
 ALERT_LEVELS = {"level_3_dfast", "level_22_btultra2"}
 
+def strip_dict_level_suffix(level):
+    """Normalize a bench-variant level id to its real level-axis identity.
+
+    The LDM+dict matrix variants encode the dict discriminator in the
+    level NAME (`level_1_fast_ldm_dict`, `level_22_btultra2_ldm_dict` in
+    `zstd/benches/support/mod.rs`), kept that way so the CI level-filter
+    env var lists them verbatim. But the dashboard `level` field is the
+    chart's X-axis identity, and dict/plain already split via `stage`
+    (`compress-dict` / `decompress-dict`). Stripping the suffix here keeps
+    the Level dropdown to real levels without losing information — the
+    suffix is pure bench-variant bookkeeping, not part of the level.
+    """
+    return level[: -len("_dict")] if level.endswith("_dict") else level
+
+
 def parse_benchmark_name(name):
     parts = name.split("/")
     if len(parts) == 5 and parts[0] == "compress" and parts[3] == "matrix":
         return {
             "stage": "compress",
-            "level": parts[1],
+            "level": strip_dict_level_suffix(parts[1]),
             "scenario": parts[2],
             "source": None,
             "implementation": parts[4],
@@ -203,7 +218,7 @@ def parse_benchmark_name(name):
     if len(parts) == 6 and parts[0] == "decompress" and parts[4] == "matrix":
         return {
             "stage": "decompress",
-            "level": parts[1],
+            "level": strip_dict_level_suffix(parts[1]),
             "scenario": parts[2],
             "source": parts[3],
             "implementation": parts[5],
@@ -211,7 +226,7 @@ def parse_benchmark_name(name):
     if len(parts) == 5 and parts[0] == "compress-dict" and parts[3] == "matrix":
         return {
             "stage": "compress-dict",
-            "level": parts[1],
+            "level": strip_dict_level_suffix(parts[1]),
             "scenario": parts[2],
             "source": None,
             "implementation": parts[4],
@@ -219,7 +234,7 @@ def parse_benchmark_name(name):
     if len(parts) == 5 and parts[0] == "decompress-dict" and parts[3] == "matrix":
         return {
             "stage": "decompress-dict",
-            "level": parts[1],
+            "level": strip_dict_level_suffix(parts[1]),
             "scenario": parts[2],
             "source": None,
             "implementation": parts[4],
@@ -227,7 +242,7 @@ def parse_benchmark_name(name):
     if len(parts) == 5 and parts[0] == "dict-train" and parts[3] == "matrix":
         return {
             "stage": "dict-train",
-            "level": parts[1],
+            "level": strip_dict_level_suffix(parts[1]),
             "scenario": parts[2],
             "source": None,
             "implementation": parts[4],
@@ -738,6 +753,16 @@ for row in delta_rows:
 for row in memory_rows:
     rust_bytes = row["rust_peak_alloc_bytes"]
     ffi_bytes = row["ffi_peak_alloc_bytes"]
+    # The memory bench emits the SAME `compress` / `decompress-<source>`
+    # stage for the plain and dict variants and encodes dict-ness only in
+    # the level name (`*_ldm_dict`). Recover it from the suffix, strip the
+    # suffix off the level (so the dashboard level axis stays clean), and
+    # move it into `stage` — matching the timing bench's `compress-dict` /
+    # `decompress-dict` convention so plain and dict rows for one level
+    # stay distinct instead of colliding on `(level, stage)`.
+    raw_level = row["level"]
+    is_dict = raw_level.endswith("_dict")
+    level = strip_dict_level_suffix(raw_level)
     raw_stage = row["stage"]
     if raw_stage == "compress":
         stage = "compress"
@@ -748,6 +773,8 @@ for row in memory_rows:
     else:
         stage = raw_stage
         source = None
+    if is_dict and stage in ("compress", "decompress"):
+        stage = f"{stage}-dict"
     # delta_ratio = rust_peak / ffi_peak. Values > 1 mean Rust uses
     # MORE memory than FFI (worse for us — same direction as
     # compression_ratio, where >1 means Rust output is larger).
@@ -761,9 +788,9 @@ for row in memory_rows:
             "target": bench_target_id,
             "stage": stage,
             "scenario": row["scenario"],
-            "level": row["level"],
+            "level": level,
             "source": source,
-            "key": canonical_key(stage, row["scenario"], row["level"], source),
+            "key": canonical_key(stage, row["scenario"], level, source),
             "commit_sha": commit_sha,
             "commit_message": commit_message,
             "generated_at": generated_at,
@@ -803,14 +830,15 @@ for row in dictionary_rows:
     if rust_ratio <= 0.0 or ffi_ratio <= 0.0:
         continue
     delta_ratio = rust_ratio / ffi_ratio
+    level = strip_dict_level_suffix(row["level"])
     relative_rows.append(
         {
             "target": bench_target_id,
             "stage": "compress-dict",
             "scenario": row["scenario"],
-            "level": row["level"],
+            "level": level,
             "source": None,
-            "key": canonical_key("compress-dict", row["scenario"], row["level"], None),
+            "key": canonical_key("compress-dict", row["scenario"], level, None),
             "commit_sha": commit_sha,
             "commit_message": commit_message,
             "generated_at": generated_at,
