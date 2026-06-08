@@ -172,7 +172,7 @@ pub unsafe extern "C" fn ZSTD_findFrameCompressedSize(src: *const u8, src_size: 
         Ok(size) => size,
         Err(FrameSizeError::Header(_)) => encode(ZSTD_ErrorCode::ZSTD_error_prefix_unknown),
         Err(FrameSizeError::Truncated) => encode(ZSTD_ErrorCode::ZSTD_error_srcSize_wrong),
-        Err(FrameSizeError::ReservedBlock) => {
+        Err(FrameSizeError::ReservedBlock) | Err(FrameSizeError::OversizedBlock) => {
             encode(ZSTD_ErrorCode::ZSTD_error_corruption_detected)
         }
     }

@@ -91,6 +91,12 @@ pub enum FrameSizeError {
     Truncated,
     /// A block declared the reserved block type, which is invalid per RFC 8878.
     ReservedBlock,
+    /// A block declared a `Block_Size` larger than the frame's
+    /// `Block_Maximum_Size` (`min(Window_Size, 128 KiB)`), which is invalid per
+    /// RFC 8878 §3.1.1.2. Accepting it would let a corrupt frame pass a size
+    /// query and make the no-`Frame_Content_Size` decompressed-bound
+    /// under-count (each block can regenerate at most `Block_Maximum_Size`).
+    OversizedBlock,
 }
 
 /// On-disk byte length of the FIRST frame in `src` — magic number, frame
@@ -124,7 +130,7 @@ pub fn find_frame_compressed_size(src: &[u8]) -> Result<usize, FrameSizeError> {
         Err(e) => return Err(FrameSizeError::Header(e)),
     };
 
-    let walk = walk_blocks(src, header_len as usize)?;
+    let walk = walk_blocks(src, header_len as usize, frame_block_size_max(&header))?;
     if header.descriptor.content_checksum_flag() {
         walk.end
             .checked_add(4)
@@ -144,12 +150,35 @@ struct BlockWalk {
     count: u64,
 }
 
+/// `Block_Maximum_Size` for the frame: `min(Window_Size, 128 KiB)`. Per RFC
+/// 8878 §3.1.1.2 every block's `Block_Size` is bounded by this, and each block
+/// regenerates at most this many bytes. Single-segment frames omit the
+/// `Window_Descriptor`; their window equals the declared content size.
+fn frame_block_size_max(header: &frame::FrameHeader) -> usize {
+    let window_size = match header.window_descriptor() {
+        Some(desc) => {
+            let exponent = u64::from(desc >> 3);
+            let mantissa = u64::from(desc & 0x7);
+            let window_base = 1u64 << (10 + exponent);
+            window_base + (window_base / 8) * mantissa
+        }
+        None => header.frame_content_size(),
+    };
+    // The 128 KiB cap keeps the result within usize on every target.
+    window_size.min(128 * 1024) as usize
+}
+
 /// Walk the block headers of a single frame starting at `start` (the offset of
-/// the first block header), validating each fits in `src`. Does not consume the
-/// trailing content checksum. Shared by [`find_frame_compressed_size`] and
-/// [`frame_decompressed_bound`] so the on-disk-size and block-count views never
-/// diverge.
-fn walk_blocks(src: &[u8], start: usize) -> Result<BlockWalk, FrameSizeError> {
+/// the first block header), validating each fits in `src` and declares a
+/// `Block_Size` no larger than `max_block_size` (the frame's
+/// `Block_Maximum_Size`). Does not consume the trailing content checksum.
+/// Shared by [`find_frame_compressed_size`] and [`frame_decompressed_bound`] so
+/// the on-disk-size and block-count views never diverge.
+fn walk_blocks(
+    src: &[u8],
+    start: usize,
+    max_block_size: usize,
+) -> Result<BlockWalk, FrameSizeError> {
     let mut offset = start;
     let mut count = 0u64;
     loop {
@@ -170,6 +199,14 @@ fn walk_blocks(src: &[u8], start: usize) -> Result<BlockWalk, FrameSizeError> {
             0 | 2 => block_size, // Raw / Compressed
             _ => return Err(FrameSizeError::ReservedBlock),
         };
+        // RFC 8878 §3.1.1.2: Block_Size MUST NOT exceed Block_Maximum_Size for
+        // any block type (it bounds both the on-disk Raw/Compressed payload and
+        // the RLE/Raw regenerated size). Reject rather than accept a corrupt
+        // declaration that would otherwise pass the size query and let the
+        // no-FCS bound under-count.
+        if block_size > max_block_size {
+            return Err(FrameSizeError::OversizedBlock);
+        }
         offset = offset
             .checked_add(3 + on_disk)
             .filter(|end| *end <= src.len())
@@ -209,8 +246,10 @@ pub fn frame_decompressed_bound(src: &[u8]) -> Result<u64, FrameSizeError> {
 
     // Walk the blocks (and the optional checksum trailer) so a truncated frame
     // is rejected even when Frame_Content_Size is declared — without this the
-    // declared-FCS path would return a bound for an incomplete buffer.
-    let walk = walk_blocks(src, header_len as usize)?;
+    // declared-FCS path would return a bound for an incomplete buffer. The
+    // per-frame block maximum both bounds the walk and scales the no-FCS bound.
+    let block_size_max = frame_block_size_max(&header);
+    let walk = walk_blocks(src, header_len as usize, block_size_max)?;
     if header.descriptor.content_checksum_flag() {
         walk.end
             .checked_add(4)
@@ -221,20 +260,12 @@ pub fn frame_decompressed_bound(src: &[u8]) -> Result<u64, FrameSizeError> {
     if header.fcs_declared() {
         return Ok(header.frame_content_size());
     }
-    let window_size = match header.window_descriptor() {
-        Some(desc) => {
-            let exponent = u64::from(desc >> 3);
-            let mantissa = u64::from(desc & 0x7);
-            let window_base = 1u64 << (10 + exponent);
-            window_base + (window_base / 8) * mantissa
-        }
-        None => header.frame_content_size(),
-    };
-    let block_size_max = window_size.min(128 * 1024);
     // Saturating is intentional here: this is an UPPER bound, so capping at the
     // maximum representable value is the correct ceiling for a pathologically
-    // large frame, not a masked arithmetic bug.
-    Ok(walk.count.saturating_mul(block_size_max))
+    // large frame, not a masked arithmetic bug. Each of `walk.count` blocks
+    // regenerates at most `block_size_max` bytes (now enforced by `walk_blocks`,
+    // so the bound can no longer be undercut by an oversized block header).
+    Ok(walk.count.saturating_mul(block_size_max as u64))
 }
 
 /// Frame header fields decoded by [`read_frame_header_info`], mirroring the
@@ -530,6 +561,41 @@ mod frame_inspection_tests {
         assert!(matches!(
             frame_decompressed_bound(&f).unwrap_err(),
             FrameSizeError::Truncated
+        ));
+    }
+
+    /// A block header may declare a `Block_Size` larger than the frame's
+    /// `Block_Maximum_Size` (`min(window, 128 KiB)`). RFC 8878 forbids this;
+    /// accepting it lets a corrupt frame pass the size query and makes the
+    /// no-FCS decompressed bound under-count (the raw block regenerates more
+    /// bytes than `block_count * block_size_max`). Both helpers must reject it.
+    #[test]
+    fn size_helpers_reject_oversized_block_header() {
+        // Window 1024 (WD 0x00) -> Block_Maximum_Size = 1024. Declare a raw
+        // block of Block_Size 2000 with all 2000 payload bytes present, so the
+        // failure is the oversized declaration, not truncation.
+        let block_size = 2000usize;
+        let raw = ((block_size as u32) << 3) | 1; // last_block flag, Raw type (00)
+        let mut f = vec![
+            0x28,
+            0xB5,
+            0x2F,
+            0xFD, // magic
+            0x00, // descriptor: no FCS, multi-segment, no checksum
+            0x00, // window descriptor -> 1024 bytes
+            (raw & 0xFF) as u8,
+            ((raw >> 8) & 0xFF) as u8,
+            ((raw >> 16) & 0xFF) as u8,
+        ];
+        f.resize(f.len() + block_size, 0xAB);
+
+        assert!(matches!(
+            find_frame_compressed_size(&f).unwrap_err(),
+            FrameSizeError::OversizedBlock
+        ));
+        assert!(matches!(
+            frame_decompressed_bound(&f).unwrap_err(),
+            FrameSizeError::OversizedBlock
         ));
     }
 
