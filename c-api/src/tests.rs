@@ -137,6 +137,31 @@ fn context_api_roundtrips_and_reuses() {
     assert_eq!(unsafe { ZSTD_freeCCtx(core::ptr::null_mut()) }, 0);
 }
 
+#[test]
+fn decompress_rejects_corrupted_content_checksum() {
+    let input = sample(4096);
+    // Frames we emit carry an XXH64 content checksum (the `hash` feature is on
+    // by default), so flipping the trailing 4-byte checksum makes the stored
+    // value disagree with the decoded output while leaving the block data — and
+    // thus the decode itself — intact. A faithful drop-in must report this as
+    // ZSTD_error_checksum_wrong, not silently accept the frame.
+    let mut frame = compress_frame(&input);
+    let last = frame.len() - 1;
+    frame[last] ^= 0xFF;
+
+    let mut out = vec![0u8; input.len()];
+    let r = unsafe { ZSTD_decompress(out.as_mut_ptr(), out.len(), frame.as_ptr(), frame.len()) };
+    assert_ne!(
+        ZSTD_isError(r),
+        0,
+        "corrupted content checksum must be rejected"
+    );
+    assert_eq!(
+        ZSTD_getErrorCode(r),
+        ZSTD_ErrorCode::ZSTD_error_checksum_wrong
+    );
+}
+
 fn compress_frame(input: &[u8]) -> Vec<u8> {
     let bound = ZSTD_compressBound(input.len());
     let mut out = vec![0u8; bound];
