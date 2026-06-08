@@ -156,6 +156,9 @@ export async function init(): Promise<void> {
  * Compress `data` into a Zstandard frame at `level` (zstd scale: `1..=22`,
  * negatives for the ultra-fast tier; defaults to {@link DEFAULT_LEVEL}). The
  * frame decodes in any compliant zstd decoder, including the native C library.
+ *
+ * @param checksum Defaults to `true` (emit the trailing XXH64 content
+ * checksum); pass `false` to omit it from the frame.
  */
 export async function compress(
   data: Uint8Array,
@@ -186,6 +189,9 @@ export async function decompress(
  * `level` (defaults to {@link DEFAULT_LEVEL}). Mirrors C
  * `ZSTD_compress_usingDict` — small, similar payloads compress far better.
  * Rejects if the dictionary is invalid.
+ *
+ * @param checksum Defaults to `true` (emit the trailing XXH64 content
+ * checksum); pass `false` to omit it from the frame.
  */
 export async function compressUsingDict(
   data: Uint8Array,
@@ -201,6 +207,9 @@ export async function compressUsingDict(
  * Decompress a dictionary-encoded frame. `dict` must be the same raw
  * dictionary used to compress it. Mirrors C `ZSTD_decompress_usingDict`.
  * Rejects on a malformed frame or dictionary mismatch.
+ *
+ * @param checksum Defaults to {@link ContentChecksum.None} (skip the XXH64
+ * pass); {@link ContentChecksum.Verify} rejects on a checksum mismatch.
  */
 export async function decompressUsingDict(
   data: Uint8Array,
@@ -216,6 +225,10 @@ export async function decompressUsingDict(
  * read decompressed output as it arrives, then `finish()`; `free()` when done.
  * Unlike the common npm wasm zstd packages, the frame need not be fully
  * buffered — the decoder window lives on the wasm side across chunks.
+ *
+ * @param checksum Applies to the whole stream (set at construction). Defaults
+ * to {@link ContentChecksum.None}; {@link ContentChecksum.Verify} validates the
+ * content checksum at `finish()`.
  */
 export async function createDecompressStream(
   checksum?: ContentChecksum,
@@ -232,6 +245,9 @@ export async function createDecompressStream(
  * frame is emitted block-by-block rather than buffered whole — and the result
  * decodes in any compliant zstd decoder. Symmetric with
  * {@link createDecompressStream}.
+ *
+ * @param checksum Defaults to `true` (seal the frame with a trailing XXH64
+ * content checksum); pass `false` to omit it.
  */
 export async function createCompressStream(
   level: number = DEFAULT_LEVEL,

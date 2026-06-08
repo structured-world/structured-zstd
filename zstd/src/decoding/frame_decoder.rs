@@ -2000,6 +2000,24 @@ impl FrameDecoder {
                         let chksum = u32::from_le_bytes(chksum);
                         state.check_sum = Some(chksum);
                     }
+                    // This early-return delivers the trailing checksum on a
+                    // separate call (frame + output already drained on prior
+                    // calls), so it bypasses the post-drain verify below.
+                    // Verify here too, inline (the `&self` helper would conflict
+                    // with the live `state` borrow). The running digest is final
+                    // because the output drained on the earlier calls.
+                    #[cfg(feature = "hash")]
+                    if self.content_checksum == ContentChecksum::Verify
+                        && let Some(expected) = state.check_sum
+                    {
+                        let calculated = state.decoder_scratch.hash_finish() as u32;
+                        if expected != calculated {
+                            return Err(FrameDecoderError::ChecksumMismatch {
+                                expected,
+                                calculated,
+                            });
+                        }
+                    }
                     return Ok((4, 0));
                 }
 
@@ -3081,8 +3099,16 @@ mod tests {
         let mut dec = FrameDecoder::new();
         dec.set_content_checksum(ContentChecksum::Verify);
         let mut out = alloc::vec![0u8; payload.len() + slack];
+
+        // Split the trailing 4-byte checksum into a SEPARATE call so the
+        // verification must happen on the checksum-only early-return path (not
+        // the post-drain path) — the incremental case CodeRabbit flagged.
+        let split = compressed.len() - 4;
+        let (_r1, w1) = dec
+            .decode_from_to(&compressed[..split], &mut out)
+            .expect("blocks decode without the trailer");
         let err = dec
-            .decode_from_to(compressed.as_slice(), &mut out)
+            .decode_from_to(&compressed[split..], &mut out[w1..])
             .expect_err("decode_from_to in Verify mode must reject a corrupted checksum");
         assert!(
             matches!(err, FrameDecoderError::ChecksumMismatch { .. }),
