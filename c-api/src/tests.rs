@@ -10,7 +10,8 @@ use crate::context::{
 use crate::error::{ZSTD_ErrorCode, ZSTD_getErrorCode, ZSTD_isError};
 use crate::simple::{
     ZSTD_compress, ZSTD_compressBound, ZSTD_decompress, ZSTD_defaultCLevel,
-    ZSTD_getFrameContentSize, ZSTD_maxCLevel, ZSTD_minCLevel, ZSTD_versionNumber,
+    ZSTD_findFrameCompressedSize, ZSTD_getFrameContentSize, ZSTD_maxCLevel, ZSTD_minCLevel,
+    ZSTD_versionNumber,
 };
 
 fn sample(len: usize) -> Vec<u8> {
@@ -130,6 +131,38 @@ fn context_api_roundtrips_and_reuses() {
     assert_eq!(unsafe { ZSTD_freeCCtx(cctx) }, 0);
     assert_eq!(unsafe { ZSTD_freeDCtx(dctx) }, 0);
     assert_eq!(unsafe { ZSTD_freeCCtx(core::ptr::null_mut()) }, 0);
+}
+
+fn compress_frame(input: &[u8]) -> Vec<u8> {
+    let bound = ZSTD_compressBound(input.len());
+    let mut out = vec![0u8; bound];
+    let n = unsafe { ZSTD_compress(out.as_mut_ptr(), out.len(), input.as_ptr(), input.len(), 3) };
+    assert_eq!(ZSTD_isError(n), 0);
+    out.truncate(n);
+    out
+}
+
+#[test]
+fn find_frame_compressed_size_locates_frame_boundary() {
+    let frame = compress_frame(&sample(4096));
+    // A lone frame's compressed size is the whole buffer.
+    let size = unsafe { ZSTD_findFrameCompressedSize(frame.as_ptr(), frame.len()) };
+    assert_eq!(ZSTD_isError(size), 0);
+    assert_eq!(size, frame.len());
+
+    // With a second frame appended, it still reports only the first frame, so
+    // a caller can step to the next one.
+    let mut two = frame.clone();
+    two.extend_from_slice(&compress_frame(&sample(100)));
+    let first = unsafe { ZSTD_findFrameCompressedSize(two.as_ptr(), two.len()) };
+    assert_eq!(first, frame.len());
+}
+
+#[test]
+fn find_frame_compressed_size_rejects_garbage() {
+    let garbage = [0u8; 16];
+    let r = unsafe { ZSTD_findFrameCompressedSize(garbage.as_ptr(), garbage.len()) };
+    assert_ne!(ZSTD_isError(r), 0);
 }
 
 #[test]

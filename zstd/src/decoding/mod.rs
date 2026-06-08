@@ -81,6 +81,86 @@ pub fn read_frame_content_size(
     })
 }
 
+/// Error from [`find_frame_compressed_size`].
+#[derive(Debug)]
+pub enum FrameSizeError {
+    /// The frame header could not be parsed.
+    Header(errors::ReadFrameHeaderError),
+    /// The buffer ends before the frame's blocks (or trailing checksum) are
+    /// complete.
+    Truncated,
+    /// A block declared the reserved block type, which is invalid per RFC 8878.
+    ReservedBlock,
+}
+
+/// On-disk byte length of the FIRST frame in `src` — magic number, frame
+/// header, every block, and the trailing content checksum when present —
+/// computed by walking the block headers without decoding any block body.
+///
+/// For a skippable frame, returns its full `8 + Frame_Size` length. This backs
+/// the C `ZSTD_findFrameCompressedSize` entry point; the returned value is the
+/// offset at which a following concatenated frame would begin.
+///
+/// # Errors
+/// [`FrameSizeError`] when the header is unreadable, the buffer is truncated
+/// mid-frame, or a block uses the reserved type.
+///
+/// ```rust
+/// use structured_zstd::encoding::{compress_slice_to_vec, CompressionLevel};
+/// use structured_zstd::decoding::find_frame_compressed_size;
+/// let frame = compress_slice_to_vec(&[5u8; 256], CompressionLevel::Default);
+/// assert_eq!(find_frame_compressed_size(&frame).unwrap(), frame.len());
+/// ```
+pub fn find_frame_compressed_size(src: &[u8]) -> Result<usize, FrameSizeError> {
+    let (header, header_len) = match frame::read_frame_header_with_format(src, false) {
+        Ok(parsed) => parsed,
+        // Skippable frame: magic (4) + Frame_Size field (4) + payload.
+        Err(errors::ReadFrameHeaderError::SkipFrame { length, .. }) => {
+            return 8usize
+                .checked_add(length as usize)
+                .filter(|end| *end <= src.len())
+                .ok_or(FrameSizeError::Truncated);
+        }
+        Err(e) => return Err(FrameSizeError::Header(e)),
+    };
+
+    let mut offset = header_len as usize;
+    loop {
+        // 3-byte block header (RFC 8878 §3.1.1.2): bit0 last-block flag,
+        // bits1-2 block type, bits3-23 Block_Size.
+        let hdr = src
+            .get(offset..offset + 3)
+            .ok_or(FrameSizeError::Truncated)?;
+        let raw = u32::from(hdr[0]) | (u32::from(hdr[1]) << 8) | (u32::from(hdr[2]) << 16);
+        let last_block = (raw & 1) != 0;
+        let block_type = (raw >> 1) & 0b11;
+        let block_size = (raw >> 3) as usize;
+        // On-disk bytes following the header: RLE stores a single byte
+        // regardless of the run length; Raw/Compressed store Block_Size bytes;
+        // the reserved type is invalid.
+        let on_disk = match block_type {
+            1 => 1,              // RLE
+            0 | 2 => block_size, // Raw / Compressed
+            _ => return Err(FrameSizeError::ReservedBlock),
+        };
+        offset = offset
+            .checked_add(3 + on_disk)
+            .filter(|end| *end <= src.len())
+            .ok_or(FrameSizeError::Truncated)?;
+        if last_block {
+            break;
+        }
+    }
+
+    if header.descriptor.content_checksum_flag() {
+        offset = offset
+            .checked_add(4)
+            .filter(|end| *end <= src.len())
+            .ok_or(FrameSizeError::Truncated)?;
+    }
+    Ok(offset)
+}
+
 pub(crate) mod block_decoder;
 pub(crate) mod buffer_backend;
 pub(crate) mod decode_buffer;

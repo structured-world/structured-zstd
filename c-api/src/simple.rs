@@ -4,7 +4,10 @@
 use core::ffi::{c_char, c_int, c_uint};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use structured_zstd::decoding::{FrameContentSize, FrameDecoder, read_frame_content_size};
+use structured_zstd::decoding::{
+    FrameContentSize, FrameDecoder, FrameSizeError, find_frame_compressed_size,
+    read_frame_content_size,
+};
 use structured_zstd::encoding::{CompressionLevel, compress_bound, compress_slice_to_vec};
 
 use crate::error::{ZSTD_ErrorCode, code_for_decoder_error, encode};
@@ -144,5 +147,25 @@ pub unsafe extern "C" fn ZSTD_getFrameContentSize(src: *const u8, src_size: usiz
         Ok(FrameContentSize::Known(size)) => size,
         Ok(FrameContentSize::Unknown) => CONTENTSIZE_UNKNOWN,
         Err(_) => CONTENTSIZE_ERROR,
+    }
+}
+
+/// `size_t ZSTD_findFrameCompressedSize(const void* src, size_t srcSize)`.
+///
+/// Returns the on-disk size of the first frame in `src` (so a caller can step
+/// to the next concatenated frame), or an error code (test with `ZSTD_isError`).
+///
+/// # Safety
+/// `src` must be valid for `src_size` bytes (or `NULL` with `src_size == 0`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_findFrameCompressedSize(src: *const u8, src_size: usize) -> usize {
+    let src = unsafe { in_slice(src, src_size) };
+    match find_frame_compressed_size(src) {
+        Ok(size) => size,
+        Err(FrameSizeError::Header(_)) => encode(ZSTD_ErrorCode::ZSTD_error_prefix_unknown),
+        Err(FrameSizeError::Truncated) => encode(ZSTD_ErrorCode::ZSTD_error_srcSize_wrong),
+        Err(FrameSizeError::ReservedBlock) => {
+            encode(ZSTD_ErrorCode::ZSTD_error_corruption_detected)
+        }
     }
 }
