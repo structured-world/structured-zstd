@@ -145,8 +145,11 @@ pub fn code_for_decoder_error(err: &FrameDecoderError) -> ZSTD_ErrorCode {
         FrameDecoderError::TargetTooSmall => ZSTD_error_dstSize_tooSmall,
         FrameDecoderError::FrameContentSizeMismatch { .. } => ZSTD_error_corruption_detected,
         FrameDecoderError::NotYetInitialized => ZSTD_error_init_missing,
-        // Block-body / checksum / drain / skip failures and any
-        // feature-gated or future variant: a malformed or unparseable frame.
+        // Trailing content checksum disagreed with the decoded output — upstream
+        // reports this distinctly from generic corruption.
+        FrameDecoderError::ChecksumMismatch { .. } => ZSTD_error_checksum_wrong,
+        // Block-body / drain / skip failures and any feature-gated or future
+        // variant: a malformed or unparseable frame.
         _ => ZSTD_error_corruption_detected,
     }
 }

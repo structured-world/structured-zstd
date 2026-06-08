@@ -5,7 +5,7 @@ use core::ffi::{c_char, c_int, c_uint};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use codec::decoding::{
-    FrameContentSize, FrameDecoder, FrameSizeError, find_frame_compressed_size,
+    ContentChecksum, FrameContentSize, FrameDecoder, FrameSizeError, find_frame_compressed_size,
     read_frame_content_size,
 };
 use codec::encoding::{CompressionLevel, compress_bound, compress_slice_to_vec};
@@ -104,15 +104,6 @@ pub unsafe extern "C" fn ZSTD_compress(
     compressed.len()
 }
 
-/// Whether the frame's declared content checksum matches the decoded output,
-/// checked after a whole-frame decode. Upstream `ZSTD_decompress` returns
-/// `ZSTD_error_checksum_wrong` when the stored XXH64 disagrees with the bytes
-/// produced; mirror that. Frames without a checksum report `None` from both
-/// accessors, so the comparison is a no-op (returns `true`) for them.
-pub(crate) fn content_checksum_ok(decoder: &FrameDecoder) -> bool {
-    decoder.get_checksum_from_data() == decoder.get_calculated_checksum()
-}
-
 /// `size_t ZSTD_decompress(void* dst, size_t dstCapacity, const void* src,
 /// size_t compressedSize)`.
 ///
@@ -133,13 +124,13 @@ pub unsafe extern "C" fn ZSTD_decompress(
     let dst = unsafe { out_slice(dst, dst_capacity) };
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         let mut decoder = FrameDecoder::new();
-        decoder
-            .decode_all(src, dst)
-            .map(|written| (written, content_checksum_ok(&decoder)))
+        // Verify the trailing content checksum (when the frame carries one), as
+        // upstream ZSTD_decompress does: a mismatch surfaces as ChecksumMismatch.
+        decoder.set_content_checksum(ContentChecksum::Verify);
+        decoder.decode_all(src, dst)
     }));
     match outcome {
-        Ok(Ok((written, true))) => written,
-        Ok(Ok((_, false))) => encode(ZSTD_ErrorCode::ZSTD_error_checksum_wrong),
+        Ok(Ok(written)) => written,
         Ok(Err(err)) => encode(code_for_decoder_error(&err)),
         Err(_) => encode(ZSTD_ErrorCode::ZSTD_error_GENERIC),
     }

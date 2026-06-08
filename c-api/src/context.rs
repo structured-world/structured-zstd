@@ -9,7 +9,7 @@
 use core::ffi::c_int;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use codec::decoding::FrameDecoder;
+use codec::decoding::{ContentChecksum, FrameDecoder};
 use codec::encoding::{CompressionLevel, FrameCompressor};
 
 use crate::error::{ZSTD_ErrorCode, code_for_decoder_error, encode};
@@ -160,14 +160,12 @@ pub unsafe extern "C" fn ZSTD_decompressDCtx(
     let dctx = unsafe { &mut *dctx };
     let src = unsafe { in_slice(src, src_size) };
     let dst = unsafe { out_slice(dst, dst_capacity) };
-    let outcome = catch_unwind(AssertUnwindSafe(|| {
-        dctx.decoder
-            .decode_all(src, dst)
-            .map(|written| (written, crate::simple::content_checksum_ok(&dctx.decoder)))
-    }));
+    // Verify the trailing content checksum like upstream ZSTD_decompress; the
+    // setter is idempotent, so reapplying it on a reused DCtx is fine.
+    dctx.decoder.set_content_checksum(ContentChecksum::Verify);
+    let outcome = catch_unwind(AssertUnwindSafe(|| dctx.decoder.decode_all(src, dst)));
     match outcome {
-        Ok(Ok((written, true))) => written,
-        Ok(Ok((_, false))) => encode(ZSTD_ErrorCode::ZSTD_error_checksum_wrong),
+        Ok(Ok(written)) => written,
         Ok(Err(err)) => encode(code_for_decoder_error(&err)),
         Err(_) => encode(ZSTD_ErrorCode::ZSTD_error_GENERIC),
     }
