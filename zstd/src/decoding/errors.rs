@@ -580,6 +580,16 @@ pub enum FrameDecoderError {
         declared: u64,
         produced: u64,
     },
+    /// The frame carried a trailing XXH64 content checksum and the decoder
+    /// was set to [`ContentChecksum::Verify`](crate::decoding::ContentChecksum::Verify),
+    /// but the digest computed over the decompressed output did not match the
+    /// stored value. Indicates corruption in the compressed stream or its
+    /// trailing checksum. `expected` is the value read from the frame tail;
+    /// `calculated` is the digest the decoder computed (both low 32 bits).
+    ChecksumMismatch {
+        expected: u32,
+        calculated: u32,
+    },
     DictNotProvided {
         dict_id: u32,
     },
@@ -786,6 +796,15 @@ impl core::fmt::Display for FrameDecoderError {
                 write!(
                     f,
                     "Frame content size mismatch (corrupt frame): declared {declared} bytes, blocks summed to {produced} bytes"
+                )
+            }
+            FrameDecoderError::ChecksumMismatch {
+                expected,
+                calculated,
+            } => {
+                write!(
+                    f,
+                    "Content checksum mismatch (corrupt frame): frame stored 0x{expected:08X}, decoder calculated 0x{calculated:08X}"
                 )
             }
             FrameDecoderError::DictNotProvided { dict_id } => {
