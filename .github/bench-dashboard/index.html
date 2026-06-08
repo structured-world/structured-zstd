@@ -260,14 +260,16 @@
       <section class="card" style="margin-top: 14px">
         <h2 style="margin: 0 0 8px; font-size: 1.2rem">Level Profile (compress + decompress + ratio)</h2>
         <p style="font-size: 0.9rem">
-          Six lines plotted against compression level on the X-axis: Rust vs
-          FFI compression speed (left axis), Rust vs FFI decompression speed
-          (left axis), and Rust vs FFI output ratio (right axis,
-          <code>compressed/input</code>, lower=better). Controlled by the
+          Plain Rust vs FFI compression speed, decompression speed, and output
+          ratio plotted against compression level on the X-axis (speeds on the
+          left axis; ratio on the right axis, <code>compressed/input</code>,
+          lower=better). The four <code>*-dict</code> toggles add
+          trained-dictionary compress and decompress speed series on the same
+          level axis for scenarios measured with a dictionary. Controlled by the
           <strong>Target</strong>, <strong>Scenario</strong>, and
           <strong>Level</strong> selectors at the top of the page (default
           <code>all</code> = cumulative arithmetic mean across that dimension).
-          The <strong>Snapshot</strong> dropdown either pins all six lines to
+          The <strong>Snapshot</strong> dropdown either pins every line to
           one <code>generated_at</code> run, or — on the default
           <code>latest</code> setting — picks each (level, metric) point from
           the most recent snapshot of its own cohort independently, so points
