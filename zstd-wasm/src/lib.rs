@@ -28,7 +28,7 @@ use wasm_bindgen::prelude::*;
 pub enum ContentChecksum {
     /// Skip the XXH64 pass entirely (fastest; no verification).
     None = 0,
-    /// Compute the checksum but do not error on a mismatch (default).
+    /// Compute the checksum and expose it via accessors; does not error on a mismatch.
     EmitOnly = 1,
     /// Compute and verify; a mismatch throws on decode.
     Verify = 2,

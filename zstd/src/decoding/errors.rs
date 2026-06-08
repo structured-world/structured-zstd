@@ -1725,6 +1725,15 @@ mod tests {
             .to_string(),
             "Frame content size mismatch (corrupt frame): declared 100 bytes, blocks summed to 87 bytes"
         );
+        // Locks the wasm-exposed checksum-mismatch contract (exact string).
+        assert_eq!(
+            FrameDecoderError::ChecksumMismatch {
+                expected: 0xDEAD_BEEF,
+                calculated: 0x0BAD_F00D,
+            }
+            .to_string(),
+            "Content checksum mismatch (corrupt frame): frame stored 0xDEADBEEF, decoder calculated 0x0BADF00D"
+        );
     }
 
     #[test]

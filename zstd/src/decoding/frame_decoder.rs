@@ -1978,6 +1978,17 @@ impl FrameDecoder {
                 };
                 let mut block_dec = decoding::block_decoder::new();
 
+                // Honour the content-checksum mode on this hand-rolled decode
+                // loop (it does not go through `decode_blocks`): hash only when
+                // a digest is wanted and the frame carries one. `None` skips the
+                // XXH64 pass; verification happens after the final drain below.
+                #[cfg(feature = "hash")]
+                {
+                    let compute_hash = self.content_checksum != ContentChecksum::None
+                        && state.frame_header.descriptor.content_checksum_flag();
+                    state.decoder_scratch.set_compute_hash(compute_hash);
+                }
+
                 if state.frame_header.descriptor.content_checksum_flag()
                     && state.frame_finished
                     && state.check_sum.is_none()
@@ -2045,6 +2056,13 @@ impl FrameDecoder {
         }
 
         let result_len = self.read(target).map_err(err::FailedToDrainDecodebuffer)?;
+        // Once the frame is fully decoded and drained, the running digest is
+        // final: validate it in `Verify` mode (no-op otherwise). Same finish
+        // point as the streaming reader.
+        #[cfg(feature = "hash")]
+        if self.is_finished() && self.can_collect() == 0 {
+            self.verify_content_checksum()?;
+        }
         let bytes_read_at_end = match &mut self.state {
             Some(s) => s.bytes_read_counter,
             None => panic!("Bug in library"),
@@ -3036,6 +3054,36 @@ mod tests {
         let err = dec
             .decode_all(compressed.as_slice(), &mut out)
             .expect_err("Verify mode must reject a corrupted checksum");
+        assert!(
+            matches!(err, FrameDecoderError::ChecksumMismatch { .. }),
+            "expected ChecksumMismatch, got {err:?}"
+        );
+    }
+
+    #[cfg(feature = "hash")]
+    #[test]
+    fn decode_from_to_verify_rejects_corrupted_checksum() {
+        // decode_from_to has its own block loop (not decode_blocks); it must
+        // still honour Verify and reject a corrupted trailer rather than
+        // silently accept it.
+        use crate::decoding::ContentChecksum;
+        use crate::decoding::errors::FrameDecoderError;
+        let payload: Vec<u8> = (0..8192u32).map(|i| (i & 0xFF) as u8).collect();
+        let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        compressor.set_source(payload.as_slice());
+        let mut compressed = Vec::new();
+        compressor.set_drain(&mut compressed);
+        compressor.compress();
+        let last = compressed.len() - 1;
+        compressed[last] ^= 0xFF;
+
+        let slack = super::super::buffer_backend::WILDCOPY_OVERLENGTH;
+        let mut dec = FrameDecoder::new();
+        dec.set_content_checksum(ContentChecksum::Verify);
+        let mut out = alloc::vec![0u8; payload.len() + slack];
+        let err = dec
+            .decode_from_to(compressed.as_slice(), &mut out)
+            .expect_err("decode_from_to in Verify mode must reject a corrupted checksum");
         assert!(
             matches!(err, FrameDecoderError::ChecksumMismatch { .. }),
             "expected ChecksumMismatch, got {err:?}"

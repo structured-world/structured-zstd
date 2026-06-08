@@ -24,7 +24,7 @@ import { simd } from "wasm-feature-detect";
 export enum ContentChecksum {
   /** Skip the XXH64 pass entirely (fastest; no verification). */
   None = 0,
-  /** Compute the checksum but do not error on a mismatch (default). */
+  /** Compute the checksum and expose it via accessors; does not error on a mismatch. */
   EmitOnly = 1,
   /** Compute and verify; a mismatch rejects the decode. */
   Verify = 2,
