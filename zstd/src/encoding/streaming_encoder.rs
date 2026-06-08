@@ -36,6 +36,11 @@ pub struct StreamingEncoder<W: Write, M: Matcher = MatchGeneratorDriver> {
     /// `ZSTD_f_zstd1_magicless` — omit the 4-byte magic number prefix.
     /// Default false. See [`Self::set_magicless`].
     magicless: bool,
+    /// Whether to emit a trailing XXH64 content checksum and set the frame
+    /// header's `Content_Checksum_flag` (upstream `ZSTD_c_checksumFlag`).
+    /// Default `true`; combined with the `hash` feature, so without `hash`
+    /// no checksum is emitted regardless. See [`Self::set_content_checksum`].
+    content_checksum: bool,
     #[cfg(feature = "hash")]
     hasher: XxHash64,
 }
@@ -82,9 +87,27 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             pledged_content_size: None,
             bytes_consumed: 0,
             magicless: false,
+            content_checksum: true,
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
         }
+    }
+
+    /// Enable or disable the trailing XXH64 content checksum
+    /// (upstream `ZSTD_c_checksumFlag`). Default `true`. Must be called
+    /// before the first [`write`](Write::write); once the frame header is
+    /// emitted the flag is fixed, so a late change returns an error rather
+    /// than producing a header/trailer mismatch. Without the `hash` feature
+    /// no checksum is emitted regardless.
+    pub fn set_content_checksum(&mut self, emit: bool) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.frame_started {
+            return Err(invalid_input_error(
+                "content checksum must be set before the first write",
+            ));
+        }
+        self.content_checksum = emit;
+        Ok(())
     }
 
     /// Enable or disable magicless frame format (`ZSTD_f_zstd1_magicless`).
@@ -203,7 +226,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             .expect("streaming encoder drain must be present when finishing");
 
         #[cfg(feature = "hash")]
-        {
+        if self.content_checksum {
             let checksum = self.hasher.finish() as u32;
             drain
                 .write_all(&checksum.to_le_bytes())
@@ -290,7 +313,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         let header = FrameHeader {
             frame_content_size: self.pledged_content_size,
             single_segment,
-            content_checksum: cfg!(feature = "hash"),
+            content_checksum: cfg!(feature = "hash") && self.content_checksum,
             dictionary_id: None,
             window_size: if single_segment {
                 None
@@ -456,7 +479,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
 
         if moved_into_matcher {
             #[cfg(feature = "hash")]
-            {
+            if self.content_checksum {
                 self.hasher.write(self.state.matcher.get_last_space());
             }
         } else {
@@ -484,7 +507,9 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
 
     #[cfg(feature = "hash")]
     fn hash_block(&mut self, uncompressed_data: &[u8]) {
-        self.hasher.write(uncompressed_data);
+        if self.content_checksum {
+            self.hasher.write(uncompressed_data);
+        }
     }
 
     #[cfg(not(feature = "hash"))]

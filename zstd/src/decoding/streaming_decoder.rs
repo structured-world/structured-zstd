@@ -140,6 +140,16 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
         let decoder = self.decoder.borrow_mut();
         if decoder.is_finished() && decoder.can_collect() == 0 {
+            // Frame fully decoded and fully drained: the running XXH64 digest
+            // is final, so a `Verify`-mode decoder validates the content
+            // checksum at this finish point. No-op in other modes.
+            #[cfg(feature = "hash")]
+            if let Err(e) = decoder.verify_content_checksum() {
+                #[cfg(feature = "std")]
+                return Err(Error::other(e));
+                #[cfg(not(feature = "std"))]
+                return Err(Error::new(ErrorKind::Other, alloc::boxed::Box::new(e)));
+            }
             //No more bytes can ever be decoded
             return Ok(0);
         }

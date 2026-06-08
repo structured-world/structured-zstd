@@ -102,6 +102,12 @@ pub struct FrameCompressor<
     /// matching format — wire-format only round-trips with a
     /// magicless-aware decoder.
     magicless: bool,
+    /// Whether to emit a trailing XXH64 content checksum and set the frame
+    /// header's `Content_Checksum_flag` (semantics of upstream
+    /// `ZSTD_c_checksumFlag`). Default `true`; combined with the `hash`
+    /// feature at frame-build time, so without `hash` no checksum is emitted
+    /// regardless. Set via [`Self::set_content_checksum`].
+    content_checksum: bool,
     #[cfg(feature = "hash")]
     hasher: XxHash64,
     /// Block-layout introspection populated at the end of every
@@ -599,6 +605,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 ),
             },
             magicless: false,
+            content_checksum: true,
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
             #[cfg(feature = "lsm")]
@@ -846,7 +853,9 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             let block = &input[start..end];
             let last_block = end == input.len();
             #[cfg(feature = "hash")]
-            self.hasher.write(block);
+            if self.content_checksum {
+                self.hasher.write(block);
+            }
             crate::encoding::levels::compress_block_encoded_borrowed(
                 &mut self.state,
                 self.compression_level,
@@ -888,6 +897,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             },
             compression_level,
             magicless: false,
+            content_checksum: true,
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
             #[cfg(feature = "lsm")]
@@ -910,6 +920,18 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// magicless-aware decoder.
     pub fn set_magicless(&mut self, magicless: bool) {
         self.magicless = magicless;
+    }
+
+    /// Enable or disable the trailing XXH64 content checksum
+    /// (semantics of upstream `ZSTD_c_checksumFlag`). Default `true`.
+    ///
+    /// When `false`, emitted frames set `Content_Checksum_flag = 0` and carry
+    /// no trailing digest; such frames are valid (RFC 8878) and decode
+    /// correctly in any [`ContentChecksum`](crate::decoding::ContentChecksum)
+    /// mode. Without the `hash` feature no checksum is emitted regardless of
+    /// this setting.
+    pub fn set_content_checksum(&mut self, emit: bool) {
+        self.content_checksum = emit;
     }
 
     /// Before calling [FrameCompressor::compress] you need to set the source.
@@ -1257,9 +1279,12 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                     last_block = false;
                 }
             }
-            // As we read, hash that data too
+            // As we read, hash that data too (skipped when the content
+            // checksum is disabled).
             #[cfg(feature = "hash")]
-            self.hasher.write(&uncompressed_data);
+            if self.content_checksum {
+                self.hasher.write(&uncompressed_data);
+            }
             // Per-physical-block XXH64 (low 32 bits) for the optional
             // per-block checksum sidecar. Hashing happens INSIDE the
             // block emitters (RLE / Raw fast-path / Compressed /
@@ -1356,7 +1381,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         let header = FrameHeader {
             frame_content_size: Some(total_uncompressed),
             single_segment,
-            content_checksum: cfg!(feature = "hash"),
+            content_checksum: cfg!(feature = "hash") && self.content_checksum,
             dictionary_id: if prep.use_dictionary_state {
                 self.dictionary.as_ref().map(|dict| dict.inner.id as u64)
             } else {
@@ -1385,14 +1410,19 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // `self.hasher` read and the `self.compressed_data` write don't
         // both need `&mut self` simultaneously.
         #[cfg(feature = "hash")]
-        let checksum_bytes = (self.hasher.finish() as u32).to_le_bytes();
+        let checksum_bytes = self
+            .content_checksum
+            .then(|| (self.hasher.finish() as u32).to_le_bytes());
         let drain = self.compressed_data.as_mut().unwrap();
         drain.write_all(&header_buf).unwrap();
         drain.write_all(&all_blocks).unwrap();
-        // If the `hash` feature is enabled, `content_checksum` is set in the
-        // header and the 32-bit digest is written at the end of the frame.
+        // With the `hash` feature AND the content checksum enabled, the header
+        // set `Content_Checksum_flag` and the 32-bit digest is written at the
+        // end of the frame. Disabled => no trailing bytes, flag stays 0.
         #[cfg(feature = "hash")]
-        drain.write_all(&checksum_bytes).unwrap();
+        if let Some(checksum_bytes) = checksum_bytes {
+            drain.write_all(&checksum_bytes).unwrap();
+        }
         #[cfg(feature = "lsm")]
         self.populate_frame_emit_info(header_buf.len(), &all_blocks);
     }
@@ -1414,13 +1444,16 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         prep: &FramePrep,
     ) {
         let header_buf = self.build_frame_header(total_uncompressed, prep);
-        let checksum_len = if cfg!(feature = "hash") { 4 } else { 0 };
+        let emit_checksum = cfg!(feature = "hash") && self.content_checksum;
+        let checksum_len = if emit_checksum { 4 } else { 0 };
         out.clear();
         out.reserve(header_buf.len() + all_blocks.len() + checksum_len);
         out.extend_from_slice(&header_buf);
         out.extend_from_slice(&all_blocks);
         #[cfg(feature = "hash")]
-        out.extend_from_slice(&(self.hasher.finish() as u32).to_le_bytes());
+        if self.content_checksum {
+            out.extend_from_slice(&(self.hasher.finish() as u32).to_le_bytes());
+        }
         #[cfg(feature = "lsm")]
         self.populate_frame_emit_info(header_buf.len(), &all_blocks);
     }

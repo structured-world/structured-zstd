@@ -161,6 +161,10 @@ pub struct FrameDecoder {
     /// expect frames without the 4-byte magic number prefix.
     /// Default false (standard zstd format).
     magicless: bool,
+    /// How the optional content checksum is handled. Default
+    /// [`ContentChecksum::EmitOnly`] (compute + expose, no error on
+    /// mismatch). Set via [`Self::set_content_checksum`].
+    content_checksum: ContentChecksum,
     /// Pinned `Dictionary_ID` expectation set via
     /// [`Self::expect_dict_id`]. `None` (default) disables the
     /// check; `Some(0)` matches frames whose header omits the
@@ -193,6 +197,33 @@ pub struct FrameDecoder {
     /// `all(lsm, hash)` (see `per_block_checksums_enabled`).
     #[cfg(all(feature = "lsm", feature = "hash"))]
     computed_block_checksums: alloc::vec::Vec<u32>,
+}
+
+/// How the decoder treats a frame's optional XXH64 content checksum
+/// (RFC 8878 Content_Checksum_flag). The XXH64 pass over the decompressed
+/// output is a measurable share of decode time, so it is made skippable.
+///
+/// ```
+/// use structured_zstd::decoding::{ContentChecksum, FrameDecoder};
+/// let mut decoder = FrameDecoder::new();
+/// decoder.set_content_checksum(ContentChecksum::Verify);
+/// ```
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub enum ContentChecksum {
+    /// Skip the XXH64 pass entirely: no compute, no verify.
+    /// `get_calculated_checksum()` returns `None`.
+    None,
+    /// Compute the checksum and expose it via the accessors, but do not
+    /// error on a mismatch. This is the default and matches the historical
+    /// behaviour (callers verify manually if they wish).
+    #[default]
+    EmitOnly,
+    /// Compute the checksum and compare it against the frame's stored value;
+    /// a disagreement fails the decode with
+    /// [`FrameDecoderError::ChecksumMismatch`](crate::decoding::errors::FrameDecoderError::ChecksumMismatch).
+    /// Without the `hash` feature there is no way to compute a digest, so
+    /// `Verify` cannot detect a mismatch and behaves like `None`.
+    Verify,
 }
 
 /// Decode-relevant identity of a frame, used to reject a [`ResumeState`]
@@ -672,6 +703,17 @@ impl DecoderScratchKind {
             Self::Flat(s) => s.buffer.hash.finish(),
         }
     }
+
+    /// Forward the drain-time hash toggle to the inner `DecodeBuffer`
+    /// (streaming path). Called by the frame layer from the decoder's
+    /// `ContentChecksum` mode before each decode.
+    #[cfg(feature = "hash")]
+    fn set_compute_hash(&mut self, compute: bool) {
+        match self {
+            Self::Ring(s) => s.buffer.set_compute_hash(compute),
+            Self::Flat(s) => s.buffer.set_compute_hash(compute),
+        }
+    }
 }
 
 struct FrameDecoderState {
@@ -836,6 +878,7 @@ impl FrameDecoder {
             #[cfg(not(target_has_atomic = "ptr"))]
             shared_dicts: (),
             magicless: false,
+            content_checksum: ContentChecksum::EmitOnly,
             #[cfg(feature = "lsm")]
             expect_dict_id: None,
             #[cfg(feature = "lsm")]
@@ -845,6 +888,14 @@ impl FrameDecoder {
             #[cfg(all(feature = "lsm", feature = "hash"))]
             computed_block_checksums: alloc::vec::Vec::new(),
         }
+    }
+
+    /// Select how the frame's optional content checksum is handled
+    /// (compute, expose, verify, or skip). See [`ContentChecksum`].
+    /// Default [`ContentChecksum::EmitOnly`]. Takes effect on the next
+    /// decode; safe to call between frames on a reused decoder.
+    pub fn set_content_checksum(&mut self, mode: ContentChecksum) {
+        self.content_checksum = mode;
     }
 
     /// Opt in to per-block XXH64 verification during decode.
@@ -1283,12 +1334,47 @@ impl FrameDecoder {
     #[cfg(feature = "hash")]
     pub fn get_calculated_checksum(&self) -> Option<u32> {
         let state = self.state.as_ref()?;
+        // `ContentChecksum::None` skips the XXH64 pass entirely, so there is
+        // no calculated digest to report.
+        if self.content_checksum == ContentChecksum::None {
+            return None;
+        }
         if !state.frame_header.descriptor.content_checksum_flag() {
             return None;
         }
         let cksum_64bit = state.decoder_scratch.hash_finish();
         //truncate to lower 32bit because reasons...
         Some(cksum_64bit as u32)
+    }
+
+    /// Compare the frame's stored content checksum against the digest the
+    /// decoder computed, returning [`FrameDecoderError::ChecksumMismatch`] on
+    /// disagreement. No-op unless the mode is [`ContentChecksum::Verify`] and
+    /// the frame carries a trailing checksum. Call once per frame after the
+    /// frame is fully decoded (and, on the drain path, fully drained) so both
+    /// the stored value and the running digest are final.
+    #[cfg(feature = "hash")]
+    pub(crate) fn verify_content_checksum(&self) -> Result<(), FrameDecoderError> {
+        if self.content_checksum != ContentChecksum::Verify {
+            return Ok(());
+        }
+        let Some(state) = self.state.as_ref() else {
+            return Ok(());
+        };
+        if !state.frame_header.descriptor.content_checksum_flag() {
+            return Ok(());
+        }
+        let Some(expected) = state.check_sum else {
+            return Ok(());
+        };
+        let calculated = state.decoder_scratch.hash_finish() as u32;
+        if expected != calculated {
+            return Err(FrameDecoderError::ChecksumMismatch {
+                expected,
+                calculated,
+            });
+        }
+        Ok(())
     }
 
     /// Counter for how many bytes have been consumed while decoding the frame
@@ -1334,7 +1420,13 @@ impl FrameDecoder {
         strat: BlockDecodingStrategy,
     ) -> Result<bool, FrameDecoderError> {
         use FrameDecoderError as err;
+        // Apply the content-checksum mode to the streaming drain hash before
+        // any block decodes into the ring. `None` skips the XXH64 pass.
+        #[cfg(feature = "hash")]
+        let compute_hash = self.content_checksum != ContentChecksum::None;
         let state = self.state.as_mut().ok_or(err::NotYetInitialized)?;
+        #[cfg(feature = "hash")]
+        state.decoder_scratch.set_compute_hash(compute_hash);
 
         // Streaming entry point: pre-reserve the backing buffer to
         // `window_size` so multi-block frames don't pay repeated
@@ -2135,6 +2227,10 @@ impl FrameDecoder {
                 let written = self.run_direct_decode(&mut input, output, content_size)?;
                 output = &mut output[written..];
                 total_bytes_written += written;
+                // Per-frame content-checksum verification (no-op unless the
+                // mode is `Verify` and the frame carries a checksum).
+                #[cfg(feature = "hash")]
+                self.verify_content_checksum()?;
                 continue;
             }
             // Non-direct fallback: pre-reserve the backing buffer to
@@ -2175,6 +2271,12 @@ impl FrameDecoder {
                     });
                 }
             }
+            // Per-frame content-checksum verification on the drain path: the
+            // frame is fully decoded and drained here (is_finished + nothing
+            // left to collect), so the running digest and stored value are
+            // final. No-op unless the mode is `Verify`.
+            #[cfg(feature = "hash")]
+            self.verify_content_checksum()?;
         }
 
         Ok(total_bytes_written)
@@ -2261,6 +2363,10 @@ impl FrameDecoder {
                 let written = self.run_direct_decode(&mut input, output, content_size)?;
                 output = &mut output[written..];
                 total_bytes_written += written;
+                // Per-frame content-checksum verification (no-op unless the
+                // mode is `Verify` and the frame carries a checksum).
+                #[cfg(feature = "hash")]
+                self.verify_content_checksum()?;
                 continue;
             }
             // Non-direct fallback: pre-reserve the backing buffer to
@@ -2297,6 +2403,12 @@ impl FrameDecoder {
                     });
                 }
             }
+            // Per-frame content-checksum verification on the drain path: the
+            // frame is fully decoded and drained here (is_finished + nothing
+            // left to collect), so the running digest and stored value are
+            // final. No-op unless the mode is `Verify`.
+            #[cfg(feature = "hash")]
+            self.verify_content_checksum()?;
         }
 
         Ok(total_bytes_written)
@@ -2616,7 +2728,9 @@ impl FrameDecoder {
             }
         }
         #[cfg(feature = "hash")]
-        if state.frame_header.descriptor.content_checksum_flag() {
+        if state.frame_header.descriptor.content_checksum_flag()
+            && self.content_checksum != ContentChecksum::None
+        {
             // Direct path bypasses the per-write hash accounting
             // (DecodeBuffer hashes during drain; the direct path
             // never drains because the user slice IS the buffer).
@@ -2862,6 +2976,116 @@ mod tests {
         assert_eq!(
             stored, calculated,
             "stored vs calculated checksum mismatch on direct path"
+        );
+    }
+
+    #[cfg(feature = "hash")]
+    #[test]
+    fn verify_mode_accepts_a_valid_frame() {
+        use crate::decoding::ContentChecksum;
+        let payload: Vec<u8> = (0..8192u32).map(|i| (i & 0xFF) as u8).collect();
+        let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        compressor.set_source(payload.as_slice());
+        let mut compressed = Vec::new();
+        compressor.set_drain(&mut compressed);
+        compressor.compress();
+
+        let slack = super::super::buffer_backend::WILDCOPY_OVERLENGTH;
+        let mut dec = FrameDecoder::new();
+        dec.set_content_checksum(ContentChecksum::Verify);
+        let mut out = alloc::vec![0u8; payload.len() + slack];
+        let n = dec
+            .decode_all(compressed.as_slice(), &mut out)
+            .expect("Verify mode must accept a frame with a correct checksum");
+        assert_eq!(&out[..n], payload.as_slice());
+    }
+
+    #[cfg(feature = "hash")]
+    #[test]
+    fn verify_mode_rejects_a_corrupted_checksum() {
+        use crate::decoding::ContentChecksum;
+        use crate::decoding::errors::FrameDecoderError;
+        let payload: Vec<u8> = (0..8192u32).map(|i| (i & 0xFF) as u8).collect();
+        let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        compressor.set_source(payload.as_slice());
+        let mut compressed = Vec::new();
+        compressor.set_drain(&mut compressed);
+        compressor.compress();
+
+        // Flip a bit in the trailing 4-byte content checksum: the frame body
+        // still decodes to the correct bytes, but the stored digest no longer
+        // matches the one the decoder computes.
+        let last = compressed.len() - 1;
+        compressed[last] ^= 0xFF;
+
+        let slack = super::super::buffer_backend::WILDCOPY_OVERLENGTH;
+        let mut dec = FrameDecoder::new();
+        dec.set_content_checksum(ContentChecksum::Verify);
+        let mut out = alloc::vec![0u8; payload.len() + slack];
+        let err = dec
+            .decode_all(compressed.as_slice(), &mut out)
+            .expect_err("Verify mode must reject a corrupted checksum");
+        assert!(
+            matches!(err, FrameDecoderError::ChecksumMismatch { .. }),
+            "expected ChecksumMismatch, got {err:?}"
+        );
+    }
+
+    #[cfg(feature = "hash")]
+    #[test]
+    fn none_mode_skips_the_checksum_pass() {
+        use crate::decoding::ContentChecksum;
+        let payload: Vec<u8> = (0..8192u32).map(|i| (i & 0xFF) as u8).collect();
+        let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        compressor.set_source(payload.as_slice());
+        let mut compressed = Vec::new();
+        compressor.set_drain(&mut compressed);
+        compressor.compress();
+
+        let slack = super::super::buffer_backend::WILDCOPY_OVERLENGTH;
+        let mut dec = FrameDecoder::new();
+        dec.set_content_checksum(ContentChecksum::None);
+        let mut out = alloc::vec![0u8; payload.len() + slack];
+        let n = dec
+            .decode_all(compressed.as_slice(), &mut out)
+            .expect("None mode must still decode correctly");
+        assert_eq!(&out[..n], payload.as_slice());
+        // No digest is computed in None mode, even though the frame carries one.
+        assert!(dec.get_checksum_from_data().is_some());
+        assert!(dec.get_calculated_checksum().is_none());
+    }
+
+    #[cfg(feature = "hash")]
+    #[test]
+    fn encoder_without_checksum_emits_no_trailing_digest() {
+        let payload: Vec<u8> = (0..8192u32).map(|i| (i & 0xFF) as u8).collect();
+
+        let mut with = Vec::new();
+        let mut c_with = FrameCompressor::new(CompressionLevel::Default);
+        c_with.set_source(payload.as_slice());
+        c_with.set_drain(&mut with);
+        c_with.compress();
+
+        let mut without = Vec::new();
+        let mut c_without = FrameCompressor::new(CompressionLevel::Default);
+        c_without.set_content_checksum(false);
+        c_without.set_source(payload.as_slice());
+        c_without.set_drain(&mut without);
+        c_without.compress();
+
+        // The checksum-off frame is exactly the 4-byte trailing digest shorter.
+        assert_eq!(with.len(), without.len() + 4);
+
+        let slack = super::super::buffer_backend::WILDCOPY_OVERLENGTH;
+        let mut dec = FrameDecoder::new();
+        let mut out = alloc::vec![0u8; payload.len() + slack];
+        let n = dec
+            .decode_all(without.as_slice(), &mut out)
+            .expect("a frame without a content checksum must decode");
+        assert_eq!(&out[..n], payload.as_slice());
+        assert!(
+            dec.get_checksum_from_data().is_none(),
+            "no trailing checksum should be reported"
         );
     }
 
