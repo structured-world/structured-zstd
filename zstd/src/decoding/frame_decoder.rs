@@ -1966,13 +1966,33 @@ impl FrameDecoder {
         input: &[u8],
         output: &mut [u8],
     ) -> Result<usize, FrameDecoderError> {
+        // SAFETY: `output` is a live, initialised `&mut [u8]`; its ptr/len
+        // are valid for the call and `out_is_uninit = false` keeps the
+        // (now raw-pointer-based) impl on its initialised-memory contract.
         #[cfg(not(feature = "lsm"))]
         {
-            self.decode_all_impl(input, output, |this, src| this.init(src))
+            unsafe {
+                self.decode_all_impl(
+                    input,
+                    output.as_mut_ptr(),
+                    output.len(),
+                    false,
+                    |this, src| this.init(src),
+                )
+            }
         }
         #[cfg(feature = "lsm")]
         {
-            self.decode_all_impl(input, output, |this, src| this.init(src), None)
+            unsafe {
+                self.decode_all_impl(
+                    input,
+                    output.as_mut_ptr(),
+                    output.len(),
+                    false,
+                    |this, src| this.init(src),
+                    None,
+                )
+            }
         }
     }
 
@@ -2020,12 +2040,17 @@ impl FrameDecoder {
     where
         F: FnMut(u8, &[u8]),
     {
-        self.decode_all_impl(
-            input,
-            output,
-            |this, src| this.init(src),
-            Some(&mut visitor),
-        )
+        // SAFETY: `output` is a live initialised slice; out_is_uninit = false.
+        unsafe {
+            self.decode_all_impl(
+                input,
+                output.as_mut_ptr(),
+                output.len(),
+                false,
+                |this, src| this.init(src),
+                Some(&mut visitor),
+            )
+        }
     }
 
     /// Decode multiple frames into the output slice using a pre-parsed dictionary handle.
@@ -2051,31 +2076,54 @@ impl FrameDecoder {
         output: &mut [u8],
         dict: &DictionaryHandle,
     ) -> Result<usize, FrameDecoderError> {
+        // SAFETY: `output` is a live initialised slice; out_is_uninit = false.
         #[cfg(not(feature = "lsm"))]
         {
-            self.decode_all_impl(input, output, |this, src| {
-                this.init_with_dict_handle(src, dict)
-            })
+            unsafe {
+                self.decode_all_impl(
+                    input,
+                    output.as_mut_ptr(),
+                    output.len(),
+                    false,
+                    |this, src| this.init_with_dict_handle(src, dict),
+                )
+            }
         }
         #[cfg(feature = "lsm")]
         {
-            self.decode_all_impl(
-                input,
-                output,
-                |this, src| this.init_with_dict_handle(src, dict),
-                None,
-            )
+            unsafe {
+                self.decode_all_impl(
+                    input,
+                    output.as_mut_ptr(),
+                    output.len(),
+                    false,
+                    |this, src| this.init_with_dict_handle(src, dict),
+                    None,
+                )
+            }
         }
     }
 
     /// Default-feature decode_all_impl: no visitor parameter so the
     /// no-lsm build's call surface and codegen are byte-identical to
     /// the pre-#172 implementation. Compiles only when `lsm` is OFF.
+    ///
+    /// `out_ptr`/`out_cap` are the caller's output region. When
+    /// `out_is_uninit` is `true` the region is uninitialised (a `Vec`'s
+    /// spare capacity from `decode_all_to_vec`): direct-path frames decode
+    /// straight into it (the backend writes through a raw pointer), and the
+    /// rare non-direct fallback initialises its working span before draining.
+    ///
+    /// # Safety
+    /// - `out_ptr` valid for `out_cap` writes for the call.
+    /// - If `out_is_uninit`, no code reads the region before it is written.
     #[cfg(not(feature = "lsm"))]
-    fn decode_all_impl(
+    unsafe fn decode_all_impl(
         &mut self,
         mut input: &[u8],
-        mut output: &mut [u8],
+        mut out_ptr: *mut u8,
+        mut out_cap: usize,
+        out_is_uninit: bool,
         mut init_frame: impl FnMut(&mut Self, &mut &[u8]) -> Result<(), FrameDecoderError>,
     ) -> Result<usize, FrameDecoderError> {
         let mut total_bytes_written = 0;
@@ -2130,10 +2178,17 @@ impl FrameDecoder {
             // validation. Path choice no longer alters checksum
             // semantics.
             let direct_eligible =
-                content_size > 0 && !dict_active && (output.len() as u64) >= content_size;
+                content_size > 0 && !dict_active && (out_cap as u64) >= content_size;
             if direct_eligible {
-                let written = self.run_direct_decode(&mut input, output, content_size)?;
-                output = &mut output[written..];
+                // SAFETY: `out_ptr` valid for `out_cap` writes; `out_cap >=
+                // content_size` (gate above) satisfies run_direct_decode's
+                // contract.
+                let written =
+                    unsafe { self.run_direct_decode(&mut input, out_ptr, out_cap, content_size)? };
+                // SAFETY: `written == content_size <= out_cap`, so the
+                // advanced pointer stays within the region.
+                out_ptr = unsafe { out_ptr.add(written) };
+                out_cap -= written;
                 total_bytes_written += written;
                 continue;
             }
@@ -2147,13 +2202,27 @@ impl FrameDecoder {
             if let Some(state) = self.state.as_mut() {
                 state.decoder_scratch.reserve_buffer(window_size as usize);
             }
+            // The fallback drains through a real `&mut [u8]` (`self.read`).
+            // If the caller's region is uninitialised, initialise this
+            // frame's remaining span once before draining. Direct-eligible
+            // frames — the common `decode_all_to_vec` case — never reach
+            // here, so the zero-fill-free fast path is preserved.
+            if out_is_uninit {
+                // SAFETY: `out_ptr` valid for `out_cap` writes.
+                unsafe { core::ptr::write_bytes(out_ptr, 0, out_cap) };
+            }
             let frame_start_total = total_bytes_written;
             loop {
                 self.decode_blocks(&mut input, BlockDecodingStrategy::UptoBytes(1024 * 1024))?;
+                // SAFETY: `out_ptr` valid for `out_cap` bytes (initialised
+                // above when uninit), so this references valid `u8` memory.
+                let out_slice = unsafe { core::slice::from_raw_parts_mut(out_ptr, out_cap) };
                 let bytes_written = self
-                    .read(output)
+                    .read(out_slice)
                     .map_err(FrameDecoderError::FailedToDrainDecodebuffer)?;
-                output = &mut output[bytes_written..];
+                // SAFETY: `bytes_written <= out_cap`.
+                out_ptr = unsafe { out_ptr.add(bytes_written) };
+                out_cap -= bytes_written;
                 total_bytes_written += bytes_written;
                 if self.can_collect() != 0 {
                     return Err(FrameDecoderError::TargetTooSmall);
@@ -2190,12 +2259,21 @@ impl FrameDecoder {
     /// separate `get(..length)` / `get(length..)` slices and invokes
     /// the visitor (when `Some`) on the borrowed payload before
     /// advancing past it.
+    ///
+    /// `out_ptr`/`out_cap` + `out_is_uninit`: see the no-lsm variant's
+    /// safety docs — identical contract.
+    ///
+    /// # Safety
+    /// - `out_ptr` valid for `out_cap` writes for the call.
+    /// - If `out_is_uninit`, no code reads the region before it is written.
     #[cfg(feature = "lsm")]
     #[allow(clippy::type_complexity)]
-    fn decode_all_impl(
+    unsafe fn decode_all_impl(
         &mut self,
         mut input: &[u8],
-        mut output: &mut [u8],
+        mut out_ptr: *mut u8,
+        mut out_cap: usize,
+        out_is_uninit: bool,
         mut init_frame: impl FnMut(&mut Self, &mut &[u8]) -> Result<(), FrameDecoderError>,
         mut skippable_visitor: Option<&mut dyn FnMut(u8, &[u8])>,
     ) -> Result<usize, FrameDecoderError> {
@@ -2256,10 +2334,15 @@ impl FrameDecoder {
             // `WILDCOPY_OVERLENGTH` trailing slack is required (see the
             // no-lsm path above).
             let direct_eligible =
-                content_size > 0 && !dict_active && (output.len() as u64) >= content_size;
+                content_size > 0 && !dict_active && (out_cap as u64) >= content_size;
             if direct_eligible {
-                let written = self.run_direct_decode(&mut input, output, content_size)?;
-                output = &mut output[written..];
+                // SAFETY: `out_ptr` valid for `out_cap` writes; `out_cap >=
+                // content_size`.
+                let written =
+                    unsafe { self.run_direct_decode(&mut input, out_ptr, out_cap, content_size)? };
+                // SAFETY: `written == content_size <= out_cap`.
+                out_ptr = unsafe { out_ptr.add(written) };
+                out_cap -= written;
                 total_bytes_written += written;
                 continue;
             }
@@ -2269,13 +2352,25 @@ impl FrameDecoder {
             if let Some(state) = self.state.as_mut() {
                 state.decoder_scratch.reserve_buffer(window_size as usize);
             }
+            // Initialise this frame's remaining span when the caller's region
+            // is uninitialised — the fallback drains through a real
+            // `&mut [u8]`. Direct-eligible frames never reach here.
+            if out_is_uninit {
+                // SAFETY: `out_ptr` valid for `out_cap` writes.
+                unsafe { core::ptr::write_bytes(out_ptr, 0, out_cap) };
+            }
             let frame_start_total = total_bytes_written;
             loop {
                 self.decode_blocks(&mut input, BlockDecodingStrategy::UptoBytes(1024 * 1024))?;
+                // SAFETY: `out_ptr` valid for `out_cap` bytes (initialised
+                // above when uninit).
+                let out_slice = unsafe { core::slice::from_raw_parts_mut(out_ptr, out_cap) };
                 let bytes_written = self
-                    .read(output)
+                    .read(out_slice)
                     .map_err(FrameDecoderError::FailedToDrainDecodebuffer)?;
-                output = &mut output[bytes_written..];
+                // SAFETY: `bytes_written <= out_cap`.
+                out_ptr = unsafe { out_ptr.add(bytes_written) };
+                out_cap -= bytes_written;
                 total_bytes_written += bytes_written;
                 if self.can_collect() != 0 {
                     return Err(FrameDecoderError::TargetTooSmall);
@@ -2343,18 +2438,54 @@ impl FrameDecoder {
         output: &mut Vec<u8>,
     ) -> Result<(), FrameDecoderError> {
         let len = output.len();
-        let cap = output.capacity();
-        output.resize(cap, 0);
-        match self.decode_all(input, &mut output[len..]) {
+        // Decode straight into the Vec's UNINITIALISED spare capacity — no
+        // `resize(cap, 0)` zero-fill. The decoder overwrites every byte it
+        // reports written (and C likewise never pre-zeroes `dst`), so the
+        // zero-fill was a wasted full-output memset on every call. `set_len`
+        // exposes only the written prefix; on error the length stays at
+        // `len`, so nothing uninitialised is ever observable.
+        let (spare_ptr, spare_cap) = {
+            let spare = output.spare_capacity_mut();
+            (spare.as_mut_ptr().cast::<u8>(), spare.len())
+        };
+        // SAFETY: `spare_ptr` is valid for `spare_cap` writes (the Vec's own
+        // allocation, exclusively borrowed here — the spare borrow above is
+        // released, and `decode_all_impl` never reallocates `output`, it only
+        // writes through the raw pointer). `out_is_uninit = true` keeps the
+        // impl on its uninitialised-memory contract (writes only, reads back
+        // only written bytes).
+        let result = unsafe {
+            #[cfg(not(feature = "lsm"))]
+            {
+                self.decode_all_impl(input, spare_ptr, spare_cap, true, |this, src| {
+                    this.init(src)
+                })
+            }
+            #[cfg(feature = "lsm")]
+            {
+                self.decode_all_impl(
+                    input,
+                    spare_ptr,
+                    spare_cap,
+                    true,
+                    |this, src| this.init(src),
+                    None,
+                )
+            }
+        };
+        match result {
             Ok(bytes_written) => {
-                let new_len = core::cmp::min(len + bytes_written, cap); // Sanitizes `bytes_written`.
-                output.resize(new_len, 0);
+                // SAFETY: `[len..len + bytes_written]` was written by the
+                // decoder; `bytes_written <= spare_cap` (clamped) keeps the
+                // new length within the allocation.
+                unsafe {
+                    output.set_len(len + core::cmp::min(bytes_written, spare_cap));
+                }
                 Ok(())
             }
-            Err(e) => {
-                output.resize(len, 0);
-                Err(e)
-            }
+            // `output.len()` is still `len` (never grew); the uninitialised
+            // spare is not exposed.
+            Err(e) => Err(e),
         }
     }
 
@@ -2381,10 +2512,21 @@ impl FrameDecoder {
     /// frame's checksum (or after the last block, when the frame
     /// has `content_checksum_flag = 0`). `self.state.frame_finished`
     /// is set so [`Self::is_finished`] reports `true`.
-    fn run_direct_decode(
+    /// `out_ptr`/`out_cap` describe the caller's output region. It may be
+    /// UNINITIALISED (e.g. a `Vec`'s spare capacity from `decode_all_to_vec`):
+    /// the decoder writes through the backend's raw pointer and reads back
+    /// only already-written bytes, and the post-decode checksum passes read
+    /// only `[..written]` / recorded `[start..end]` ranges (all written), so
+    /// no uninitialised byte is ever read.
+    ///
+    /// # Safety
+    /// - `out_ptr` is valid for writes of `out_cap` bytes and outlives the call.
+    /// - `out_cap as u64 >= content_size` (caller's direct-eligibility gate).
+    unsafe fn run_direct_decode(
         &mut self,
         input: &mut &[u8],
-        output: &mut [u8],
+        out_ptr: *mut u8,
+        out_cap: usize,
         content_size: u64,
     ) -> Result<usize, FrameDecoderError> {
         use super::block_decoder;
@@ -2424,7 +2566,9 @@ impl FrameDecoder {
                     s.buffer.window_size,
                 ),
             };
-        let backend = UserSliceBackend::from_slice(output);
+        // SAFETY: caller contract — `out_ptr` valid for `out_cap` writes for
+        // the call duration, exclusively owned (no aliasing live ref).
+        let backend = unsafe { UserSliceBackend::from_raw(out_ptr, out_cap) };
         let buffer = DecodeBuffer::from_backend(backend, window_size);
         let mut direct = DirectScratch {
             huf,
@@ -2611,7 +2755,13 @@ impl FrameDecoder {
             use core::hash::Hasher;
             for (start, end) in &block_ranges {
                 let mut h = twox_hash::XxHash64::with_seed(0);
-                h.write(&output[*start..*end]);
+                // SAFETY: `[start..end]` is a recorded written range within
+                // `[0..written]`; those bytes were initialised by the decode
+                // loop. Reading them as `&[u8]` is sound even when the tail
+                // of `out_ptr` is uninitialised.
+                let bytes =
+                    unsafe { core::slice::from_raw_parts(out_ptr.add(*start), end - start) };
+                h.write(bytes);
                 self.computed_block_checksums.push(h.finish() as u32);
             }
         }
@@ -2632,7 +2782,11 @@ impl FrameDecoder {
             // for flag-off frames, matching this skip.
             use core::hash::Hasher;
             let mut hasher = twox_hash::XxHash64::with_seed(0);
-            hasher.write(&output[..written]);
+            // SAFETY: `[..written]` (== content_size) was fully written by
+            // the decode loop; sound to read even if the backing tail is
+            // uninitialised.
+            let decoded = unsafe { core::slice::from_raw_parts(out_ptr, written) };
+            hasher.write(decoded);
             match &mut state.decoder_scratch {
                 DecoderScratchKind::Flat(s) => s.buffer.hash = hasher,
                 DecoderScratchKind::Ring(s) => s.buffer.hash = hasher,
