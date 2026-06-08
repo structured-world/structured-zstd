@@ -21,26 +21,70 @@ use structured_zstd::encoding::{
 use structured_zstd::io::{Read, Write};
 use wasm_bindgen::prelude::*;
 
+/// How the decoder treats a frame's optional content checksum. Mirrors the
+/// core `structured_zstd::decoding::ContentChecksum`.
+#[wasm_bindgen]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum ContentChecksum {
+    /// Skip the XXH64 pass entirely (fastest; no verification).
+    None = 0,
+    /// Compute the checksum but do not error on a mismatch (default).
+    EmitOnly = 1,
+    /// Compute and verify; a mismatch throws on decode.
+    Verify = 2,
+}
+
+/// Resolve an optional JS-supplied mode to the core enum. Defaults to `None`
+/// (skip the XXH64 pass) when omitted: this matches the package's prior
+/// behaviour (it shipped without the checksum code at all) and libzstd's
+/// `checksumFlag = 0` default, and avoids paying the XXH64 cost on a digest no
+/// wasm accessor even exposes. Callers opt into `Verify` explicitly.
+fn core_checksum(mode: Option<ContentChecksum>) -> structured_zstd::decoding::ContentChecksum {
+    use structured_zstd::decoding::ContentChecksum as Core;
+    match mode.unwrap_or(ContentChecksum::None) {
+        ContentChecksum::None => Core::None,
+        ContentChecksum::EmitOnly => Core::EmitOnly,
+        ContentChecksum::Verify => Core::Verify,
+    }
+}
+
 /// Compress `data` into a standard Zstandard frame at compression `level`.
 ///
 /// `level` follows the zstd scale: `1..=22` (higher = smaller/slower) and
 /// negative levels (`-7..=-1`) for the ultra-fast tier. The returned frame
 /// decodes in any compliant zstd decoder, including the native C library.
+///
+/// `checksum` is optional (default `true`): pass `false` to emit a frame
+/// without the trailing XXH64 content checksum (semantics of
+/// `ZSTD_c_checksumFlag`).
 #[wasm_bindgen]
-pub fn compress(data: &[u8], level: i32) -> Vec<u8> {
-    compress_slice_to_vec(data, CompressionLevel::Level(level))
+pub fn compress(data: &[u8], level: i32, checksum: Option<bool>) -> Vec<u8> {
+    if checksum.unwrap_or(true) {
+        // Default: keep the historical fast path verbatim.
+        compress_slice_to_vec(data, CompressionLevel::Level(level))
+    } else {
+        let mut enc: FrameCompressor = FrameCompressor::new(CompressionLevel::Level(level));
+        enc.set_content_checksum(false);
+        enc.compress_independent_frame(data)
+    }
 }
 
 /// Decompress a complete Zstandard frame back into its original bytes.
 ///
-/// Throws a JavaScript `Error` if the input is not a valid, complete frame.
+/// Throws a JavaScript `Error` if the input is not a valid, complete frame,
+/// or (when `checksum` is `Verify`) if the content checksum does not match.
+/// `checksum` is optional (default `EmitOnly`): pass `ContentChecksum.None`
+/// to skip the XXH64 pass for speed, or `ContentChecksum.Verify` to validate.
 #[wasm_bindgen]
-pub fn decompress(data: &[u8]) -> Result<Vec<u8>, JsError> {
+pub fn decompress(data: &[u8], checksum: Option<ContentChecksum>) -> Result<Vec<u8>, JsError> {
     // Stream the frame so the output Vec grows to fit — works for frames with
     // or without a content-size header (the fixed-size `decode_all_to_vec`
     // requires the caller to know the decoded length up front).
     let mut decoder = StreamingDecoder::new(data)
         .map_err(|err| JsError::new(&format!("structured-zstd: invalid frame: {err:?}")))?;
+    decoder
+        .decoder
+        .set_content_checksum(core_checksum(checksum));
     let mut out = Vec::new();
     decoder
         .read_to_end(&mut out)
@@ -54,8 +98,14 @@ pub fn decompress(data: &[u8]) -> Result<Vec<u8>, JsError> {
 /// small, similar payloads compress far better. The dictionary is the raw
 /// zstd dictionary blob (e.g. from `zstd --train`). Throws if it is invalid.
 #[wasm_bindgen(js_name = compressUsingDict)]
-pub fn compress_using_dict(data: &[u8], dict: &[u8], level: i32) -> Result<Vec<u8>, JsError> {
+pub fn compress_using_dict(
+    data: &[u8],
+    dict: &[u8],
+    level: i32,
+    checksum: Option<bool>,
+) -> Result<Vec<u8>, JsError> {
     let mut enc: FrameCompressor = FrameCompressor::new(CompressionLevel::Level(level));
+    enc.set_content_checksum(checksum.unwrap_or(true));
     enc.set_dictionary_from_bytes(dict)
         .map_err(|err| JsError::new(&format!("structured-zstd: invalid dictionary: {err:?}")))?;
     Ok(enc.compress_independent_frame(data))
@@ -67,12 +117,19 @@ pub fn compress_using_dict(data: &[u8], dict: &[u8], level: i32) -> Result<Vec<u
 /// dictionary the frame was compressed with. Throws on a malformed frame or a
 /// dictionary mismatch.
 #[wasm_bindgen(js_name = decompressUsingDict)]
-pub fn decompress_using_dict(data: &[u8], dict: &[u8]) -> Result<Vec<u8>, JsError> {
+pub fn decompress_using_dict(
+    data: &[u8],
+    dict: &[u8],
+    checksum: Option<ContentChecksum>,
+) -> Result<Vec<u8>, JsError> {
     let mut decoder = StreamingDecoder::new_with_dictionary_bytes(data, dict).map_err(|err| {
         JsError::new(&format!(
             "structured-zstd: dict decode init failed: {err:?}"
         ))
     })?;
+    decoder
+        .decoder
+        .set_content_checksum(core_checksum(checksum));
     let mut out = Vec::new();
     decoder.read_to_end(&mut out).map_err(|err| {
         JsError::new(&format!("structured-zstd: dict decompress failed: {err:?}"))
@@ -145,10 +202,15 @@ pub struct ZstdDecompressStream {
 
 #[wasm_bindgen]
 impl ZstdDecompressStream {
+    /// `checksum` is optional (default `EmitOnly`) and applies to the whole
+    /// stream, so set it here rather than mid-stream: `None` skips the XXH64
+    /// pass, `Verify` validates the content checksum at [`Self::finish`].
     #[wasm_bindgen(constructor)]
-    pub fn new() -> ZstdDecompressStream {
+    pub fn new(checksum: Option<ContentChecksum>) -> ZstdDecompressStream {
+        let mut decoder = FrameDecoder::new();
+        decoder.set_content_checksum(core_checksum(checksum));
         ZstdDecompressStream {
-            decoder: FrameDecoder::new(),
+            decoder,
             pending: Vec::new(),
             header_done: false,
             checksum: false,
@@ -164,7 +226,8 @@ impl ZstdDecompressStream {
     }
 
     /// Signal end of input; returns the final decompressed bytes. Throws if the
-    /// stream ended before the frame completed.
+    /// stream ended before the frame completed, or (in `Verify` mode) if the
+    /// content checksum does not match.
     pub fn finish(&mut self) -> Result<Vec<u8>, JsError> {
         let out = self.pump()?;
         if !self.finished {
@@ -172,13 +235,36 @@ impl ZstdDecompressStream {
                 "structured-zstd: stream ended before the frame completed",
             ));
         }
+        // The frame is fully decoded and drained (pump collects every block),
+        // so the running digest is final: validate it in Verify mode (no-op
+        // otherwise). The Display of `ChecksumMismatch` names it a corrupt
+        // frame, so the thrown JS error reads clearly on the TS side.
+        self.decoder
+            .verify_content_checksum()
+            .map_err(|err| JsError::new(&format!("structured-zstd: {err}")))?;
         Ok(out)
+    }
+
+    /// The content checksum stored in the frame's 4-byte trailer, or
+    /// `undefined` if the frame carried none. Meaningful after [`Self::finish`].
+    #[wasm_bindgen(js_name = storedChecksum)]
+    pub fn stored_checksum(&self) -> Option<u32> {
+        self.decoder.get_checksum_from_data()
+    }
+
+    /// The XXH64 digest the decoder computed over the output (low 32 bits), or
+    /// `undefined` when the mode is `None` or the frame carried no checksum.
+    /// Meaningful after [`Self::finish`]; lets callers verify manually under
+    /// `EmitOnly` without enabling the throwing `Verify` mode.
+    #[wasm_bindgen(js_name = calculatedChecksum)]
+    pub fn calculated_checksum(&self) -> Option<u32> {
+        self.decoder.get_calculated_checksum()
     }
 }
 
 impl Default for ZstdDecompressStream {
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
     }
 }
 
@@ -243,14 +329,18 @@ pub struct ZstdCompressStream {
 #[wasm_bindgen]
 impl ZstdCompressStream {
     /// Open a streaming compressor at `level` (zstd scale: `1..=22`, negatives
-    /// for the ultra-fast tier).
+    /// for the ultra-fast tier). `checksum` is optional (default `true`): pass
+    /// `false` to seal the frame without a trailing content checksum.
     #[wasm_bindgen(constructor)]
-    pub fn new(level: i32) -> ZstdCompressStream {
+    pub fn new(level: i32, checksum: Option<bool>) -> ZstdCompressStream {
+        let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Level(level));
+        // Provably Ok: the encoder is fresh, so no frame header has been
+        // emitted yet (the only failure mode of this setter).
+        encoder
+            .set_content_checksum(checksum.unwrap_or(true))
+            .expect("fresh streaming encoder accepts the content-checksum toggle");
         ZstdCompressStream {
-            encoder: Some(StreamingEncoder::new(
-                Vec::new(),
-                CompressionLevel::Level(level),
-            )),
+            encoder: Some(encoder),
         }
     }
 

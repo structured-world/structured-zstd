@@ -1350,11 +1350,15 @@ impl FrameDecoder {
     /// Compare the frame's stored content checksum against the digest the
     /// decoder computed, returning [`FrameDecoderError::ChecksumMismatch`] on
     /// disagreement. No-op unless the mode is [`ContentChecksum::Verify`] and
-    /// the frame carries a trailing checksum. Call once per frame after the
-    /// frame is fully decoded (and, on the drain path, fully drained) so both
+    /// the frame carries a trailing checksum.
+    ///
+    /// [`decode_all`](Self::decode_all) and the streaming reader call this
+    /// automatically. Callers driving [`decode_blocks`](Self::decode_blocks)
+    /// directly invoke it themselves once per frame, after the frame is fully
+    /// decoded AND fully drained (e.g. via [`collect`](Self::collect)), so both
     /// the stored value and the running digest are final.
     #[cfg(feature = "hash")]
-    pub(crate) fn verify_content_checksum(&self) -> Result<(), FrameDecoderError> {
+    pub fn verify_content_checksum(&self) -> Result<(), FrameDecoderError> {
         if self.content_checksum != ContentChecksum::Verify {
             return Ok(());
         }
