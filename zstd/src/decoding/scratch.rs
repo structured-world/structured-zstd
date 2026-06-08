@@ -418,6 +418,10 @@ impl FSEScratch {
         // the offsets table; the dict computes it once at build time and
         // it is stale-but-correct across Repeat-mode blocks.
         self.offsets_long_share = other.offsets_long_share;
+        // Clear the cold-dict pipeline gate: a local-only snapshot has no
+        // dictionary attached, so carrying a stale `true` here would mis-arm
+        // the prefetch pipeline on the restored frame.
+        self.ddict_is_cold = false;
         self.ll_source = TableSource::Local;
         self.of_source = TableSource::Local;
         self.ml_source = TableSource::Local;
