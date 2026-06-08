@@ -25,6 +25,11 @@ impl<'s> BitReader<'s> {
         self.idx -= n;
     }
 
+    // `#[inline]` so the hot caller (`read_probabilities`, which calls this
+    // per FSE NCount symbol with mostly-constant `n`) folds it in and
+    // const-propagates `n`, collapsing the multi-byte branch for the common
+    // small-width reads instead of paying a call per symbol.
+    #[inline]
     pub fn get_bits(&mut self, n: usize) -> Result<u64, GetBitsError> {
         if n > 64 {
             return Err(GetBitsError::TooManyBits {
@@ -60,13 +65,13 @@ impl<'s> BitReader<'s> {
             let full_bytes_needed = (n - bits_left_in_current_byte) / 8;
             let bits_in_last_byte_needed = n - bits_left_in_current_byte - full_bytes_needed * 8;
 
-            assert!(
+            debug_assert!(
                 bits_left_in_current_byte + full_bytes_needed * 8 + bits_in_last_byte_needed == n
             );
 
             let mut bit_shift = bits_left_in_current_byte; //this many bits are already set in value
 
-            assert!(self.idx.is_multiple_of(8));
+            debug_assert!(self.idx.is_multiple_of(8));
 
             //collect full bytes
             for _ in 0..full_bytes_needed {
@@ -75,7 +80,7 @@ impl<'s> BitReader<'s> {
                 bit_shift += 8;
             }
 
-            assert!(n - bit_shift == bits_in_last_byte_needed);
+            debug_assert!(n - bit_shift == bits_in_last_byte_needed);
 
             if bits_in_last_byte_needed > 0 {
                 let val_las_byte =
@@ -85,7 +90,7 @@ impl<'s> BitReader<'s> {
             }
         }
 
-        assert!(self.idx == old_idx + n);
+        debug_assert!(self.idx == old_idx + n);
 
         Ok(value)
     }
