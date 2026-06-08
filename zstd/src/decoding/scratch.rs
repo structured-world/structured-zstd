@@ -560,6 +560,23 @@ mod tests {
     }
 
     #[test]
+    fn reinit_from_clears_cold_dict_flag() {
+        // `reinit_from` materialises a local-only snapshot (LSM resume
+        // export/restore). It detaches the dict and forces every axis to
+        // Local, so it must also clear `ddict_is_cold` — otherwise a stale
+        // cold-dict pipeline gate from a prior dictionary frame would be
+        // carried into restored entropy state that has no dictionary.
+        let mut dst = FSEScratch::new();
+        dst.ddict_is_cold = true; // simulate a prior cold-dict frame's flag
+        let src = FSEScratch::new(); // clean local-only source, not cold
+        dst.reinit_from(&src);
+        assert!(
+            !dst.ddict_is_cold,
+            "reinit_from must clear ddict_is_cold on a local-only snapshot"
+        );
+    }
+
+    #[test]
     fn init_from_dict_is_zero_copy_cow_then_reset_detaches() {
         // Copy-on-write contract: `init_from_dict` must NOT copy the
         // dictionary's sequence FSE table bytes into the per-frame local
