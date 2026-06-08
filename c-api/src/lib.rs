@@ -16,6 +16,7 @@
 mod context;
 mod error;
 mod ffi;
+mod frame;
 mod simple;
 
 #[cfg(test)]
@@ -25,3 +26,4 @@ mod tests;
 // re-export the public types so rustdoc and in-crate tests can name them.
 pub use context::{ZSTD_CCtx, ZSTD_DCtx};
 pub use error::ZSTD_ErrorCode;
+pub use frame::{ZSTD_FrameHeader, ZSTD_FrameType_e, ZSTD_format_e};

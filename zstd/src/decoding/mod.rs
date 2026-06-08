@@ -124,7 +124,34 @@ pub fn find_frame_compressed_size(src: &[u8]) -> Result<usize, FrameSizeError> {
         Err(e) => return Err(FrameSizeError::Header(e)),
     };
 
-    let mut offset = header_len as usize;
+    let walk = walk_blocks(src, header_len as usize)?;
+    if header.descriptor.content_checksum_flag() {
+        walk.end
+            .checked_add(4)
+            .filter(|end| *end <= src.len())
+            .ok_or(FrameSizeError::Truncated)
+    } else {
+        Ok(walk.end)
+    }
+}
+
+/// Result of walking the block sequence of one frame (between the header and
+/// the optional trailing checksum).
+struct BlockWalk {
+    /// Offset just past the last block (before any content checksum).
+    end: usize,
+    /// Number of blocks in the frame.
+    count: u64,
+}
+
+/// Walk the block headers of a single frame starting at `start` (the offset of
+/// the first block header), validating each fits in `src`. Does not consume the
+/// trailing content checksum. Shared by [`find_frame_compressed_size`] and
+/// [`frame_decompressed_bound`] so the on-disk-size and block-count views never
+/// diverge.
+fn walk_blocks(src: &[u8], start: usize) -> Result<BlockWalk, FrameSizeError> {
+    let mut offset = start;
+    let mut count = 0u64;
     loop {
         // 3-byte block header (RFC 8878 §3.1.1.2): bit0 last-block flag,
         // bits1-2 block type, bits3-23 Block_Size.
@@ -147,18 +174,127 @@ pub fn find_frame_compressed_size(src: &[u8]) -> Result<usize, FrameSizeError> {
             .checked_add(3 + on_disk)
             .filter(|end| *end <= src.len())
             .ok_or(FrameSizeError::Truncated)?;
+        count += 1;
         if last_block {
             break;
         }
     }
+    Ok(BlockWalk { end: offset, count })
+}
 
-    if header.descriptor.content_checksum_flag() {
-        offset = offset
-            .checked_add(4)
-            .filter(|end| *end <= src.len())
-            .ok_or(FrameSizeError::Truncated)?;
+/// Upper bound on the decompressed size of the FIRST frame in `src`, without
+/// decoding the body. Backs the C `ZSTD_decompressBound` (per-frame term).
+///
+/// Returns the exact size when the header declares `Frame_Content_Size`;
+/// otherwise a valid (loose) bound of `block_count * block_size_max`, where
+/// `block_size_max = min(window_size, 128 KiB)` — every block decompresses to
+/// at most that many bytes. Skippable frames contribute `0`.
+///
+/// # Errors
+/// [`FrameSizeError`] on an unreadable header, truncation, or a reserved block.
+pub fn frame_decompressed_bound(src: &[u8]) -> Result<u64, FrameSizeError> {
+    let (header, header_len) = match frame::read_frame_header_with_format(src, false) {
+        Ok(parsed) => parsed,
+        Err(errors::ReadFrameHeaderError::SkipFrame { .. }) => return Ok(0),
+        Err(e) => return Err(FrameSizeError::Header(e)),
+    };
+    if header.fcs_declared() {
+        return Ok(header.frame_content_size());
     }
-    Ok(offset)
+    let window_size = match header.window_descriptor() {
+        Some(desc) => {
+            let exponent = u64::from(desc >> 3);
+            let mantissa = u64::from(desc & 0x7);
+            let window_base = 1u64 << (10 + exponent);
+            window_base + (window_base / 8) * mantissa
+        }
+        None => header.frame_content_size(),
+    };
+    let block_size_max = window_size.min(128 * 1024);
+    let walk = walk_blocks(src, header_len as usize)?;
+    Ok(walk.count.saturating_mul(block_size_max))
+}
+
+/// Frame header fields decoded by [`read_frame_header_info`], mirroring the
+/// values the C `ZSTD_getFrameHeader` fills into a `ZSTD_FrameHeader`.
+#[derive(Copy, Clone, Debug)]
+pub struct FrameHeaderInfo {
+    /// Declared decompressed size, or [`FrameContentSize::Unknown`] when the
+    /// header omits the `Frame_Content_Size` field.
+    pub content_size: FrameContentSize,
+    /// Decoder window size in bytes (the minimum buffer needed to decode the
+    /// frame). For single-segment frames this equals the content size.
+    pub window_size: u64,
+    /// Dictionary id required to decode the frame, if the header carries one.
+    pub dictionary_id: Option<u32>,
+    /// Whether a 32-bit content checksum trails the frame.
+    pub content_checksum: bool,
+    /// Total header length in bytes, including the 4-byte magic number.
+    pub header_size: usize,
+}
+
+/// Length in bytes of the frame header at the start of `src`, including the
+/// 4-byte magic number (the offset at which the first block begins). Backs the
+/// C `ZSTD_frameHeaderSize`.
+///
+/// # Errors
+/// [`ReadFrameHeaderError`](errors::ReadFrameHeaderError) when the header is
+/// too short, has a bad magic number, or is a skippable frame.
+pub fn frame_header_size(src: &[u8]) -> Result<usize, errors::ReadFrameHeaderError> {
+    let (_header, consumed) = frame::read_frame_header_with_format(src, false)?;
+    Ok(consumed as usize)
+}
+
+/// Decode the leading frame header fields of `src` without decoding the body.
+///
+/// Backs the C `ZSTD_getFrameHeader`. When `magicless` is `true` the 4-byte
+/// magic prefix is assumed absent (the `ZSTD_f_zstd1_magicless` format); the
+/// caller must know out-of-band that the stream is magicless. The reported
+/// [`FrameHeaderInfo::window_size`] is the raw value derived from the header
+/// (no maximum-window policy applied here; that bound is enforced at decode
+/// time), so callers see the frame's own declared window even when it exceeds
+/// a decoder limit.
+///
+/// # Errors
+/// As [`read_frame_content_size`].
+///
+/// ```rust
+/// use structured_zstd::encoding::{compress_slice_to_vec, CompressionLevel};
+/// use structured_zstd::decoding::{read_frame_header_info, FrameContentSize};
+/// let frame = compress_slice_to_vec(&[7u8; 512], CompressionLevel::Default);
+/// let info = read_frame_header_info(&frame, false).unwrap();
+/// assert_eq!(info.content_size, FrameContentSize::Known(512));
+/// assert!(info.window_size >= 512);
+/// ```
+pub fn read_frame_header_info(
+    src: &[u8],
+    magicless: bool,
+) -> Result<FrameHeaderInfo, errors::ReadFrameHeaderError> {
+    let (header, consumed) = frame::read_frame_header_with_format(src, magicless)?;
+    let content_size = if header.fcs_declared() {
+        FrameContentSize::Known(header.frame_content_size())
+    } else {
+        FrameContentSize::Unknown
+    };
+    // Compute the window size without the decode-time maximum-window check
+    // (RFC 8878 §3.1.1.1.2). `window_descriptor()` returns `None` for a
+    // single-segment frame, where the window equals the content size.
+    let window_size = match header.window_descriptor() {
+        Some(desc) => {
+            let exponent = u64::from(desc >> 3);
+            let mantissa = u64::from(desc & 0x7);
+            let window_base = 1u64 << (10 + exponent);
+            window_base + (window_base / 8) * mantissa
+        }
+        None => header.frame_content_size(),
+    };
+    Ok(FrameHeaderInfo {
+        content_size,
+        window_size,
+        dictionary_id: header.dictionary_id(),
+        content_checksum: header.descriptor.content_checksum_flag(),
+        header_size: consumed as usize,
+    })
 }
 
 pub(crate) mod block_decoder;

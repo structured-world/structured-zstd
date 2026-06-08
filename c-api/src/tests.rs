@@ -8,6 +8,10 @@ use crate::context::{
     ZSTD_freeDCtx, ZSTD_sizeof_CCtx,
 };
 use crate::error::{ZSTD_ErrorCode, ZSTD_getErrorCode, ZSTD_isError};
+use crate::frame::{
+    ZSTD_FrameHeader, ZSTD_FrameType_e, ZSTD_decompressBound, ZSTD_findDecompressedSize,
+    ZSTD_frameHeaderSize, ZSTD_getFrameHeader,
+};
 use crate::simple::{
     ZSTD_compress, ZSTD_compressBound, ZSTD_decompress, ZSTD_defaultCLevel,
     ZSTD_findFrameCompressedSize, ZSTD_getFrameContentSize, ZSTD_maxCLevel, ZSTD_minCLevel,
@@ -163,6 +167,65 @@ fn find_frame_compressed_size_rejects_garbage() {
     let garbage = [0u8; 16];
     let r = unsafe { ZSTD_findFrameCompressedSize(garbage.as_ptr(), garbage.len()) };
     assert_ne!(ZSTD_isError(r), 0);
+}
+
+#[test]
+fn get_frame_header_fills_fields() {
+    let frame = compress_frame(&sample(2048));
+    let hdr_size = unsafe { ZSTD_frameHeaderSize(frame.as_ptr(), frame.len()) };
+    assert_eq!(ZSTD_isError(hdr_size), 0);
+    assert!((5..=18).contains(&hdr_size));
+
+    let mut zfh = ZSTD_FrameHeader {
+        frameContentSize: 0,
+        windowSize: 0,
+        blockSizeMax: 0,
+        frameType: ZSTD_FrameType_e::ZSTD_skippableFrame,
+        headerSize: 0,
+        dictID: 0,
+        checksumFlag: 7,
+        _reserved1: 0,
+        _reserved2: 0,
+    };
+    let r = unsafe { ZSTD_getFrameHeader(&mut zfh, frame.as_ptr(), frame.len()) };
+    assert_eq!(r, 0, "header complete");
+    assert_eq!(zfh.frameType, ZSTD_FrameType_e::ZSTD_frame);
+    assert_eq!(zfh.frameContentSize, 2048);
+    assert!(zfh.windowSize >= 2048);
+    assert_eq!(zfh.headerSize as usize, hdr_size);
+    assert_eq!(zfh.dictID, 0);
+}
+
+#[test]
+fn get_frame_header_short_input_asks_for_more() {
+    let frame = compress_frame(&sample(2048));
+    let mut zfh = ZSTD_FrameHeader {
+        frameContentSize: 0,
+        windowSize: 0,
+        blockSizeMax: 0,
+        frameType: ZSTD_FrameType_e::ZSTD_frame,
+        headerSize: 0,
+        dictID: 0,
+        checksumFlag: 0,
+        _reserved1: 0,
+        _reserved2: 0,
+    };
+    // Only 2 bytes: too short for even the magic; expect a positive size hint.
+    let r = unsafe { ZSTD_getFrameHeader(&mut zfh, frame.as_ptr(), 2) };
+    assert_eq!(ZSTD_isError(r), 0);
+    assert!(r > 0 && r <= 18);
+}
+
+#[test]
+fn decompressed_size_queries_span_multiple_frames() {
+    let mut two = compress_frame(&sample(4096));
+    two.extend_from_slice(&compress_frame(&sample(1000)));
+
+    let total = unsafe { ZSTD_findDecompressedSize(two.as_ptr(), two.len()) };
+    assert_eq!(total, 4096 + 1000);
+
+    let bound = unsafe { ZSTD_decompressBound(two.as_ptr(), two.len()) };
+    assert!(bound >= 4096 + 1000, "bound must not undercount");
 }
 
 #[test]
