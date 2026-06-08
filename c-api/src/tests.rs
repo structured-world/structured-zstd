@@ -235,3 +235,28 @@ fn level_bounds_match_crate() {
     assert_eq!(ZSTD_defaultCLevel(), 3);
     assert_eq!(ZSTD_versionNumber(), 10_507);
 }
+
+/// ABI layout lock for `ZSTD_FrameHeader`: it is passed by value across the C
+/// boundary, so its field offsets MUST match the `zstd.h` struct. A field
+/// reorder / type change that breaks a C consumer fails here rather than
+/// silently corrupting reads. Offsets are pointer-width independent (the two
+/// leading u64s sit at 0/8 on every ABI); the total size is 8-aligned on
+/// 64-bit targets.
+#[test]
+fn frame_header_abi_layout_is_stable() {
+    use core::mem::{align_of, offset_of, size_of};
+    assert_eq!(offset_of!(ZSTD_FrameHeader, frameContentSize), 0);
+    assert_eq!(offset_of!(ZSTD_FrameHeader, windowSize), 8);
+    assert_eq!(offset_of!(ZSTD_FrameHeader, blockSizeMax), 16);
+    assert_eq!(offset_of!(ZSTD_FrameHeader, frameType), 20);
+    assert_eq!(offset_of!(ZSTD_FrameHeader, headerSize), 24);
+    assert_eq!(offset_of!(ZSTD_FrameHeader, dictID), 28);
+    assert_eq!(offset_of!(ZSTD_FrameHeader, checksumFlag), 32);
+    // C enums and the `unsigned` fields are 4 bytes.
+    assert_eq!(size_of::<ZSTD_FrameType_e>(), 4);
+    #[cfg(target_pointer_width = "64")]
+    {
+        assert_eq!(size_of::<ZSTD_FrameHeader>(), 48);
+        assert_eq!(align_of::<ZSTD_FrameHeader>(), 8);
+    }
+}
