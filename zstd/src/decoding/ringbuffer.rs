@@ -1516,6 +1516,32 @@ mod tests {
     }
 
     #[test]
+    fn inline_exec_ok_respects_block_output_ceiling() {
+        // The inline sequence-exec path bypasses `try_reserve`, so it must
+        // itself honour the per-block output ceiling (`max_capacity`, armed
+        // by `set_block_output_ceiling(MAX_BLOCK_SIZE)`). Otherwise a reused
+        // large-window ring with physical slack could emit past the ceiling
+        // — weakening the streaming-path decompression-bomb guard.
+        use super::super::buffer_backend::BufferBackend;
+        let mut rb = RingBuffer::new();
+        rb.reserve(64 * 1024); // plenty of physical slack
+        rb.extend(&[0u8; 1000]); // head = 0, tail = 1000
+        // Per-block ceiling with only 100 bytes of output budget remaining.
+        rb.set_max_capacity(1000 + 100);
+        // lit+match = 500 exceeds the 100-byte budget but fits physically
+        // (1531 < cap): the inline gate must reject it.
+        assert!(
+            !rb.inline_exec_ok(500, 0),
+            "inline_exec_ok must reject a write past the per-block output ceiling"
+        );
+        // A write within the budget stays eligible for the inline path.
+        assert!(
+            rb.inline_exec_ok(50, 0),
+            "inline_exec_ok must allow a write within the per-block ceiling"
+        );
+    }
+
+    #[test]
     fn smoke() {
         let mut rb = RingBuffer::new();
 
