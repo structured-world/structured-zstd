@@ -1993,35 +1993,28 @@ impl FrameDecoder {
                     && state.frame_finished
                     && state.check_sum.is_none()
                 {
-                    //this block is needed if the checksum were the only 4 bytes that were not included in the last decode_from_to call for a frame
+                    // The trailing checksum arrived on a separate call (the last
+                    // block finished earlier). Consume it and fall through to the
+                    // shared `self.read` + post-drain verify below — NOT an early
+                    // return — so any output still buffered from a prior
+                    // small-`target` call is flushed on this call too, and the
+                    // checksum is verified through the one shared path.
                     if mt_source.len() >= 4 {
                         let chksum = mt_source[..4].try_into().expect("optimized away");
                         state.bytes_read_counter += 4;
                         let chksum = u32::from_le_bytes(chksum);
                         state.check_sum = Some(chksum);
+                        mt_source = &mt_source[4..];
                     }
-                    // This early-return delivers the trailing checksum on a
-                    // separate call (frame + output already drained on prior
-                    // calls), so it bypasses the post-drain verify below.
-                    // Verify here too, inline (the `&self` helper would conflict
-                    // with the live `state` borrow). The running digest is final
-                    // because the output drained on the earlier calls.
-                    #[cfg(feature = "hash")]
-                    if self.content_checksum == ContentChecksum::Verify
-                        && let Some(expected) = state.check_sum
-                    {
-                        let calculated = state.decoder_scratch.hash_finish() as u32;
-                        if expected != calculated {
-                            return Err(FrameDecoderError::ChecksumMismatch {
-                                expected,
-                                calculated,
-                            });
-                        }
-                    }
-                    return Ok((4, 0));
                 }
 
                 loop {
+                    // The frame is fully decoded (last block seen, trailer
+                    // consumed above); no more blocks to read. Any leftover
+                    // bytes are not a block header — stop before misreading them.
+                    if state.frame_finished {
+                        break;
+                    }
                     //check if there are enough bytes for the next header
                     if mt_source.len() < 3 {
                         break;
@@ -3114,6 +3107,37 @@ mod tests {
             matches!(err, FrameDecoderError::ChecksumMismatch { .. }),
             "expected ChecksumMismatch, got {err:?}"
         );
+    }
+
+    #[cfg(feature = "hash")]
+    #[test]
+    fn decode_from_to_small_target_split_trailer_flushes_tail() {
+        // Regression: when a prior call decoded the last block but a small
+        // `target` left output buffered, the trailer-only call must still flush
+        // the buffered tail (it used to early-return Ok((4,0)) and lose it).
+        let payload: Vec<u8> = (0..8192u32).map(|i| (i & 0xFF) as u8).collect();
+        let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        compressor.set_source(payload.as_slice());
+        let mut compressed = Vec::new();
+        compressor.set_drain(&mut compressed);
+        compressor.compress();
+
+        let split = compressed.len() - 4;
+        let mut dec = FrameDecoder::new();
+        let mut out = alloc::vec![0u8; payload.len()];
+        // Call 1: all blocks, but a SMALL (64-byte) target leaves the rest
+        // buffered on the decoder side.
+        let (_r1, w1) = dec
+            .decode_from_to(&compressed[..split], &mut out[..64])
+            .expect("blocks decode with a small target");
+        assert!(w1 <= 64);
+        // Call 2: the 4-byte trailer alone must flush the buffered tail through
+        // the shared read path, not return early and drop it.
+        let (_r2, w2) = dec
+            .decode_from_to(&compressed[split..], &mut out[w1..])
+            .expect("trailer call must flush the buffered tail");
+        assert_eq!(w1 + w2, payload.len(), "buffered tail was dropped");
+        assert_eq!(&out[..w1 + w2], payload.as_slice());
     }
 
     #[cfg(feature = "hash")]
