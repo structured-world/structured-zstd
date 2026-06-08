@@ -1001,23 +1001,10 @@
       // rust_value and ffi_value, so the source dimension is just bench
       // bookkeeping and doesn't change what the chart shows.
       function isCompressStage(stage) {
-        // Prefix match (symmetric with `isDecompressStage`) so the dictionary
-        // stage `compress-dict` is recognised as a compress stage. `decompress`
-        // / `decompress-dict` start the substring `compress` at index 2, so
-        // they are correctly excluded here.
-        return typeof stage === "string" && stage.indexOf("compress") === 0;
+        return stage === "compress";
       }
       function isDecompressStage(stage) {
         return typeof stage === "string" && stage.indexOf("decompress") === 0;
-      }
-      // Payload kind derived from the bench stage: the `-dict` stages
-      // (`compress-dict` / `decompress-dict`) are the trained-dictionary
-      // variants, everything else is plain. Used to keep dict and plain points
-      // on distinct Level-Profile buckets so a level measured both ways (e.g.
-      // a numeric level with and without a dictionary, or the `*_ldm` vs
-      // `*_ldm_dict` pair) does not average its plain and dict metrics together.
-      function stageKind(stage) {
-        return typeof stage === "string" && stage.endsWith("-dict") ? "dict" : "plain";
       }
 
       // Shared mapper from (row.metric, row.stage) → chart logical
@@ -1186,13 +1173,10 @@
           if (typeof row.rust_value !== "number" || typeof row.ffi_value !== "number") continue;
           const lm = profileLogicalMetric(row);
           if (!lm) continue;
-          // Bucket plain and dict separately so a level measured both ways does
-          // not merge its plain and dict metrics (see `stageKind`).
-          const kind = stageKind(row.stage);
-          const key = `${row.level}|${kind}|${lm}`;
+          const key = `${row.level}|${lm}`;
           const cohort = cohortKey(row);
           const latestKey = cohort ? `${key}|${cohort}` : key;
-          matchingRows.push({ row, lm, kind, key, latestKey });
+          matchingRows.push({ row, lm, key, latestKey });
           if (filter.snapshot === PROFILE_LATEST) {
             const previous = latestPerKey.get(latestKey);
             if (!previous || compareSnapshotIdentity(row, previous) > 0) {
@@ -1206,14 +1190,14 @@
           (b.generated_at || b.commit_sha || "local-run");
 
         const byLevelLogical = new Map();
-        for (const { row, kind, key, latestKey } of matchingRows) {
+        for (const { row, lm, key, latestKey } of matchingRows) {
           if (filter.snapshot === PROFILE_LATEST) {
             const winner = latestPerKey.get(latestKey);
             if (!winner || !sameSnapshotLabel(row, winner)) continue;
           }
           let agg = byLevelLogical.get(key);
           if (!agg) {
-            agg = { level: row.level, kind, rust_sum: 0, ffi_sum: 0, count: 0 };
+            agg = { level: row.level, rust_sum: 0, ffi_sum: 0, count: 0 };
             byLevelLogical.set(key, agg);
           }
           agg.rust_sum += row.rust_value;
@@ -1221,35 +1205,24 @@
           agg.count += 1;
         }
 
-        // One X-axis bucket per (level, kind) so the plain and dict variants of
-        // the same level occupy distinct points instead of averaging together.
-        const levelKindMap = new Map();
-        for (const agg of byLevelLogical.values()) {
-          const id = `${agg.level}|${agg.kind}`;
-          if (!levelKindMap.has(id)) {
-            levelKindMap.set(id, { value: agg.level, kind: agg.kind });
-          }
-        }
-        const levels = Array.from(levelKindMap.values())
-          .map((entry) => ({ ...entry, parsed: parseLevelId(entry.value) }))
+        const levelSet = new Set();
+        for (const agg of byLevelLogical.values()) levelSet.add(agg.level);
+        const levels = Array.from(levelSet)
+          .map((value) => ({ value, parsed: parseLevelId(value) }))
           .sort((a, b) => {
-            // Numeric level order first; parsed-less levels last. For the same
-            // level, plain precedes its dict variant so the two sit adjacent.
-            const an = a.parsed ? a.parsed.numeric : Number.POSITIVE_INFINITY;
-            const bn = b.parsed ? b.parsed.numeric : Number.POSITIVE_INFINITY;
-            if (an !== bn) return an - bn;
-            if (a.kind !== b.kind) return a.kind === "plain" ? -1 : 1;
+            if (a.parsed && b.parsed) return a.parsed.numeric - b.parsed.numeric;
+            if (a.parsed) return -1;
+            if (b.parsed) return 1;
             return a.value.localeCompare(b.value);
           });
 
-        const levelLabels = levels.map((entry) => {
-          const base = entry.parsed ? entry.parsed.label : entry.value;
-          return entry.kind === "dict" ? `${base} (dict)` : base;
-        });
+        const levelLabels = levels.map((entry) =>
+          entry.parsed ? entry.parsed.label : entry.value,
+        );
 
         // Speed records carry bytes/sec; convert to MiB/s for axis legibility.
-        const lookup = (level, kind, lm, side) => {
-          const agg = byLevelLogical.get(`${level}|${kind}|${lm}`);
+        const lookup = (level, lm, side) => {
+          const agg = byLevelLogical.get(`${level}|${lm}`);
           if (!agg || agg.count === 0) return null;
           const sum = side === "rust" ? agg.rust_sum : agg.ffi_sum;
           const mean = sum / agg.count;
@@ -1260,7 +1233,7 @@
         };
 
         const series = (lm, side) =>
-          levels.map((e) => lookup(e.value, e.kind, lm, side));
+          levels.map((e) => lookup(e.value, lm, side));
 
         return {
           levels: levelLabels,
