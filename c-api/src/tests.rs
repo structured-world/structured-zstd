@@ -252,6 +252,8 @@ fn frame_header_abi_layout_is_stable() {
     assert_eq!(offset_of!(ZSTD_FrameHeader, headerSize), 24);
     assert_eq!(offset_of!(ZSTD_FrameHeader, dictID), 28);
     assert_eq!(offset_of!(ZSTD_FrameHeader, checksumFlag), 32);
+    assert_eq!(offset_of!(ZSTD_FrameHeader, _reserved1), 36);
+    assert_eq!(offset_of!(ZSTD_FrameHeader, _reserved2), 40);
     // C enums and the `unsigned` fields are 4 bytes.
     assert_eq!(size_of::<ZSTD_FrameType_e>(), 4);
     #[cfg(target_pointer_width = "64")]
