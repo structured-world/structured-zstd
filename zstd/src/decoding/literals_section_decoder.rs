@@ -979,6 +979,29 @@ mod zerocopy_robustness_tests {
     }
 
     #[test]
+    fn compressed_truncated_source_returns_error_no_panic() {
+        // Header claims compressed_size = 10 but the source carries 3 bytes.
+        // Slicing `source[0..10]` for a Compressed/Treeless section would
+        // panic (decoder DoS on truncated input); the fix must turn it into
+        // a structured DecompressLiteralsError, matching the Raw/RLE paths.
+        let section = LiteralsSection {
+            ls_type: LiteralsSectionType::Compressed,
+            regenerated_size: 5,
+            compressed_size: Some(10),
+            num_streams: Some(1),
+        };
+        let source: [u8; 3] = [1, 2, 3];
+        let mut target: Vec<u8> = Vec::new();
+        let mut scratch = fresh_scratch();
+        let result = decode_literals_zerocopy(&section, &mut scratch, &source, &mut target);
+        assert!(
+            result.is_err(),
+            "truncated compressed source must error, not panic; got {:?}",
+            result.map(|_| ())
+        );
+    }
+
+    #[test]
     fn rle_view_excludes_pre_existing_target_bytes() {
         // Even if the caller forgot to clear `target`, the returned
         // LiteralsView::data must point only at the bytes this call
