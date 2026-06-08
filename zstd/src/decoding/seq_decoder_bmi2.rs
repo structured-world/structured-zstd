@@ -106,6 +106,9 @@ macro_rules! execute_one_body {
             }
 
             let inline_path_safe = B::SUPPORTS_INLINE_SEQUENCE_EXEC
+                && $buffer
+                    .buffer_mut()
+                    .inline_exec_ok(seq_ll_v as usize, seq_ml_v as usize)
                 && lit_cur_before
                     .checked_add(16)
                     .is_some_and(|b| b <= literals_buffer_len_v)

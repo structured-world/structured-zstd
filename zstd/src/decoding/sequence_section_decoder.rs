@@ -133,9 +133,13 @@ where
     // RLE-mode axes are handled uniformly: `maybe_update_fse_tables`
     // builds a degenerate single-state table for them, so the fused
     // decode reads every axis the same way (no separate fallback).
-    let mut ll_dec = SeqFSEDecoder::new(&fse.literal_lengths);
-    let mut ml_dec = SeqFSEDecoder::new(&fse.match_lengths);
-    let mut of_dec = SeqFSEDecoder::new(&fse.offsets);
+    // Copy-on-write table source: `ll_table`/`ml_table`/`of_table`
+    // resolve to the shared dictionary's table (zero-copy) on axes still
+    // in `Dict` mode, else the locally-built table. `maybe_update_fse_tables`
+    // above has already flipped any rebuilt axis to `Local`.
+    let mut ll_dec = SeqFSEDecoder::new(fse.ll_table());
+    let mut ml_dec = SeqFSEDecoder::new(fse.ml_table());
+    let mut of_dec = SeqFSEDecoder::new(fse.of_table());
 
     ll_dec
         .init_state(&mut br)
@@ -147,9 +151,8 @@ where
         .init_state(&mut br)
         .map_err(DecodeSequenceError::from)?;
 
-    let max_update_bits = fse.literal_lengths.accuracy_log
-        + fse.match_lengths.accuracy_log
-        + fse.offsets.accuracy_log;
+    let max_update_bits =
+        fse.ll_table().accuracy_log + fse.ml_table().accuracy_log + fse.of_table().accuracy_log;
     debug_assert!(
         max_update_bits <= 56,
         "sequence section update bits exceed 56-bit budget"
@@ -1020,6 +1023,9 @@ pub(crate) fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBac
     // 16 != 1` — keeping the donor inline path active on more
     // sequences near the end of the literals buffer.
     let inline_path_safe = B::SUPPORTS_INLINE_SEQUENCE_EXEC
+        && buffer
+            .buffer_mut()
+            .inline_exec_ok(seq.ll as usize, seq.ml as usize)
         && lit_cur_before.checked_add(16).is_some_and(|b| b <= lit_len)
         && (seq.ll as usize <= 16
             || lit_cur_before
@@ -1165,6 +1171,9 @@ pub(crate) unsafe fn execute_one_sequence_pipelined_avx2<
     // literal copy (the divergence is on match-copy only, see
     // `UserSliceBackend::exec_sequence_inline_avx2`).
     let inline_path_safe = B::SUPPORTS_INLINE_SEQUENCE_EXEC
+        && buffer
+            .buffer_mut()
+            .inline_exec_ok(seq.ll as usize, seq.ml as usize)
         && lit_cur_before.checked_add(16).is_some_and(|b| b <= lit_len)
         && (seq.ll as usize <= 16
             || lit_cur_before
@@ -1361,7 +1370,7 @@ pub(crate) fn compute_offsets_long_share(offsets: &crate::fse::SeqFSETable) -> u
     // (`code` for `code < 32`, `0` otherwise — long codes are
     // bounded by the format spec at 31).
     let raw = offsets
-        .decode
+        .decode()
         .iter()
         .filter(|entry| u32::from(entry.num_additional_bits) > LONG_OFFSET_CODE_THRESHOLD)
         .count() as u32;
@@ -1382,7 +1391,8 @@ pub(crate) fn maybe_update_fse_tables(
 
     let mut bytes_read = 0;
 
-    match modes.ll_mode() {
+    let ll_mode = modes.ll_mode();
+    match ll_mode {
         ModeType::FSECompressed => {
             let bytes = scratch.literal_lengths.build_decoder(source, LL_MAX_LOG)?;
             bytes_read += bytes;
@@ -1433,10 +1443,16 @@ pub(crate) fn maybe_update_fse_tables(
             /* Nothing to do — cached enriched values stay valid. */
         }
     };
+    // Copy-on-write "write" step: any non-Repeat rebuild wrote the local
+    // table, so the axis no longer reads the shared dictionary's.
+    if !matches!(ll_mode, ModeType::Repeat) {
+        scratch.mark_ll_local();
+    }
 
     let of_source = &source[bytes_read..];
 
-    match modes.of_mode() {
+    let of_mode = modes.of_mode();
+    match of_mode {
         ModeType::FSECompressed => {
             let bytes = scratch.offsets.build_decoder(of_source, OF_MAX_LOG)?;
             scratch.offsets.enrich_for_offsets();
@@ -1486,10 +1502,14 @@ pub(crate) fn maybe_update_fse_tables(
             /* Nothing to do — cached enriched values stay valid. */
         }
     };
+    if !matches!(of_mode, ModeType::Repeat) {
+        scratch.mark_of_local();
+    }
 
     let ml_source = &source[bytes_read..];
 
-    match modes.ml_mode() {
+    let ml_mode = modes.ml_mode();
+    match ml_mode {
         ModeType::FSECompressed => {
             let bytes = scratch.match_lengths.build_decoder(ml_source, ML_MAX_LOG)?;
             scratch.match_lengths.enrich_with_packed_seq_meta(&ML_META);
@@ -1533,6 +1553,9 @@ pub(crate) fn maybe_update_fse_tables(
             /* Nothing to do — cached enriched values stay valid. */
         }
     };
+    if !matches!(ml_mode, ModeType::Repeat) {
+        scratch.mark_ml_local();
+    }
 
     Ok(bytes_read)
 }
@@ -1678,11 +1701,11 @@ fn predefined_fse_caches_match_rebuild_output() {
     ll_rebuild.enrich_with_packed_seq_meta(&LL_META);
     let ll_cached = predefined_ll_table();
     assert_eq!(ll_rebuild.accuracy_log, ll_cached.accuracy_log);
-    assert_eq!(ll_rebuild.decode.len(), ll_cached.decode.len());
+    assert_eq!(ll_rebuild.decode().len(), ll_cached.decode().len());
     for (i, (a, b)) in ll_rebuild
-        .decode
+        .decode()
         .iter()
-        .zip(ll_cached.decode.iter())
+        .zip(ll_cached.decode().iter())
         .enumerate()
     {
         assert_eq!(a.num_bits, b.num_bits, "LL entry {i} num_bits mismatch");
@@ -1707,11 +1730,11 @@ fn predefined_fse_caches_match_rebuild_output() {
     ml_rebuild.enrich_with_packed_seq_meta(&ML_META);
     let ml_cached = predefined_ml_table();
     assert_eq!(ml_rebuild.accuracy_log, ml_cached.accuracy_log);
-    assert_eq!(ml_rebuild.decode.len(), ml_cached.decode.len());
+    assert_eq!(ml_rebuild.decode().len(), ml_cached.decode().len());
     for (i, (a, b)) in ml_rebuild
-        .decode
+        .decode()
         .iter()
-        .zip(ml_cached.decode.iter())
+        .zip(ml_cached.decode().iter())
         .enumerate()
     {
         assert_eq!(a.num_bits, b.num_bits, "ML entry {i} num_bits mismatch");
@@ -1737,15 +1760,15 @@ fn predefined_fse_caches_match_rebuild_output() {
     let of_rebuild_share = compute_offsets_long_share(&of_rebuild);
     let (of_cached, of_cached_share) = predefined_of_table();
     assert_eq!(of_rebuild.accuracy_log, of_cached.accuracy_log);
-    assert_eq!(of_rebuild.decode.len(), of_cached.decode.len());
+    assert_eq!(of_rebuild.decode().len(), of_cached.decode().len());
     assert_eq!(
         of_rebuild_share, of_cached_share,
         "OF offsets_long_share mismatch"
     );
     for (i, (a, b)) in of_rebuild
-        .decode
+        .decode()
         .iter()
-        .zip(of_cached.decode.iter())
+        .zip(of_cached.decode().iter())
         .enumerate()
     {
         assert_eq!(a.num_bits, b.num_bits, "OF entry {i} num_bits mismatch");
@@ -1771,23 +1794,23 @@ fn test_ll_default() {
         )
         .unwrap();
 
-    assert!(table.decode.len() == 64);
+    assert!(table.decode().len() == 64);
 
     //just test a few values. TODO test all values
-    assert!(table.decode[0].num_bits == 4);
-    assert!(table.decode[0].new_state == 0);
+    assert!(table.decode()[0].num_bits == 4);
+    assert!(table.decode()[0].new_state == 0);
 
-    assert!(table.decode[19].num_bits == 6);
-    assert!(table.decode[19].new_state == 0);
+    assert!(table.decode()[19].num_bits == 6);
+    assert!(table.decode()[19].new_state == 0);
 
-    assert!(table.decode[39].num_bits == 4);
-    assert!(table.decode[39].new_state == 16);
+    assert!(table.decode()[39].num_bits == 4);
+    assert!(table.decode()[39].new_state == 16);
 
-    assert!(table.decode[60].num_bits == 6);
-    assert!(table.decode[60].new_state == 0);
+    assert!(table.decode()[60].num_bits == 6);
+    assert!(table.decode()[60].new_state == 0);
 
-    assert!(table.decode[59].num_bits == 5);
-    assert!(table.decode[59].new_state == 32);
+    assert!(table.decode()[59].num_bits == 5);
+    assert!(table.decode()[59].new_state == 32);
 }
 
 #[cfg(test)]
@@ -1809,7 +1832,7 @@ mod offsets_long_share_tests {
         );
         let mut t = crate::fse::SeqFSETable::new(31);
         t.accuracy_log = accuracy_log;
-        t.decode = symbols
+        let entries: alloc::vec::Vec<SeqSymbol> = symbols
             .iter()
             .map(|&s| SeqSymbol {
                 new_state: 0,
@@ -1818,6 +1841,7 @@ mod offsets_long_share_tests {
                 base_value: 0,
             })
             .collect();
+        t.set_decode_for_test(&entries);
         t
     }
 

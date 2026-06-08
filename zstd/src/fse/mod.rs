@@ -97,7 +97,7 @@ fn check_tables(dec_table: &fse_decoder::FSETable, enc_table: &fse_encoder::FSET
         }
         for input_state in 0..table_size {
             let next = enc_table.next_state(symbol, input_state);
-            let dec_state = &dec_table.decode[next.index];
+            let dec_state = &dec_table.decode()[next.index];
             assert_eq!(
                 dec_state.symbol, symbol,
                 "encoder transition for symbol {symbol} from state {input_state} \
@@ -216,6 +216,16 @@ pub fn round_trip(data: &[u8]) {
     use crate::bit_io::{BitReaderReversed, BitWriter};
     use fse_encoder::FSEEncoder;
 
+    // The decode side here is `FSETable` = `FSETableImpl<Entry, 64>`, the
+    // HUF-weight FSE table, which production caps at accuracy_log 6 (64 states;
+    // `build_decoder(_, 6)`). Constrain the alphabet to <=32 symbols so the FSE
+    // encoder stays inside that envelope (it needs >= one state per symbol), and
+    // build with max accuracy_log 6 to match. The general high-accuracy_log FSE
+    // path is exercised by the sequence-section `SeqSymbol` tables in the
+    // roundtrip / cross-validation suites.
+    let mapped: alloc::vec::Vec<u8> = data.iter().map(|b| b % 32).collect();
+    let data = mapped.as_slice();
+
     if data.len() < 2 {
         return;
     }
@@ -228,7 +238,7 @@ pub fn round_trip(data: &[u8]) {
 
     let mut writer = BitWriter::new();
     let mut encoder = FSEEncoder::new(
-        fse_encoder::build_table_from_data(data.iter().copied(), 22, false),
+        fse_encoder::build_table_from_data(data.iter().copied(), 6, false),
         &mut writer,
     );
     let mut dec_table = FSETable::new(255);

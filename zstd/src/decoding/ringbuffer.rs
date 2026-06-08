@@ -910,6 +910,232 @@ impl RingBuffer {
 }
 
 impl super::buffer_backend::BufferBackend for RingBuffer {
+    // The ring supports the inline `ZSTD_execSequence` body, but only on the
+    // contiguous (non-wrapped) sub-window — `inline_exec_ok` gates it and the
+    // caller falls back to the wrap-correct `push` / `repeat` path otherwise.
+    const SUPPORTS_INLINE_SEQUENCE_EXEC: bool = true;
+
+    #[inline(always)]
+    fn inline_exec_ok(&self, lit_length: usize, match_length: usize) -> bool {
+        // The inline donor wildcopy addresses the ring linearly from `tail`
+        // (match source at `tail + lit_length - offset`) with up to 31 bytes of
+        // AVX2 wildcopy overshoot. Sound only when the live region has not
+        // wrapped (`head <= tail`) AND the write plus overshoot stay strictly
+        // below `cap`: `< cap` keeps ring invariant 4 (`tail != cap`) and puts
+        // the overshoot inside the trailing WILDCOPY_OVERLENGTH slack. The
+        // caller's `offset <= live + lit_length` invariant then places the
+        // match source at `>= head >= 0`, so it is contiguous and in-bounds.
+        const INLINE_EXEC_MAX_OVERSHOOT: usize = 31;
+        if self.head > self.tail {
+            return false;
+        }
+        // Physical fit: write + AVX2 overshoot stays strictly below `cap`.
+        let physical_fit = self
+            .tail
+            .checked_add(lit_length)
+            .and_then(|v| v.checked_add(match_length))
+            .and_then(|v| v.checked_add(INLINE_EXEC_MAX_OVERSHOOT))
+            .is_some_and(|end| end < self.cap);
+        if !physical_fit {
+            return false;
+        }
+        // Per-block output ceiling: the inline path bypasses `try_reserve`,
+        // so it must enforce the same `max_capacity` bound try_reserve checks
+        // on its growth path (the decompression-bomb guard armed by
+        // `set_block_output_ceiling`). Without this, a reused large-window
+        // ring with physical slack could emit past `len_at_block_start +
+        // MAX_BLOCK_SIZE`. `head <= tail` (just checked) and `physical_fit`
+        // bound `tail + lit + match < cap`, so `new_len` is wrap-free and
+        // cannot overflow. `max_capacity == usize::MAX` between blocks makes
+        // this a no-op for unbounded callers.
+        let new_len = (self.tail - self.head) + lit_length + match_length;
+        new_len <= self.max_capacity
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn inline_exec_base_ptr(&mut self) -> *mut u8 {
+        self.buf.as_ptr()
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    unsafe fn inline_exec_commit(&mut self, new_tail: usize) {
+        // `inline_exec_ok` guaranteed `new_tail < cap`, so the wrap
+        // normalisation (mirroring `extend`) is a defensive no-op here.
+        self.tail = new_tail;
+        if self.tail == self.cap {
+            self.tail = 0;
+        }
+    }
+
+    /// Donor `ZSTD_execSequence` on the contiguous sub-window. Gated by
+    /// [`Self::inline_exec_ok`]: `head <= tail` and the write + 15-byte
+    /// overshoot stay below `cap`, so the linear addressing the FlatBuf body
+    /// uses is valid for the ring too. Mirrors `FlatBuf::exec_sequence_inline`
+    /// with `tail`/`cap`/the ring base in place of the Vec.
+    #[cfg(target_arch = "x86_64")]
+    #[inline]
+    unsafe fn exec_sequence_inline(
+        &mut self,
+        lit_src: *const u8,
+        lit_length: usize,
+        offset: usize,
+        match_length: usize,
+    ) -> Result<(), super::errors::ExecuteSequencesError> {
+        use super::buffer_backend::sequence_output_fits;
+        use super::exec_sequence_inline::x86::{
+            copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_overlap_8byte_stride,
+        };
+        const MAX_WILDCOPY_OVERSHOOT: usize = 15;
+        let cap = self.cap;
+        let tail = self.tail;
+        let total =
+            sequence_output_fits(lit_length, match_length, tail, cap, MAX_WILDCOPY_OVERSHOOT)?;
+        debug_assert!(offset >= 1);
+        debug_assert!(match_length >= 1);
+        debug_assert!(self.head <= tail, "exec_sequence_inline on a wrapped ring");
+        let live_len = tail - self.head;
+        debug_assert!(
+            live_len + lit_length >= offset,
+            "RingBuffer::exec_sequence_inline: offset {offset} exceeds live window",
+        );
+
+        unsafe {
+            let base_mut = self.buf.as_ptr();
+            let op_lit = base_mut.add(tail);
+            copy16(op_lit, lit_src);
+            if lit_length > 16 {
+                wildcopy_no_overlap(op_lit.add(16), lit_src.add(16), lit_length - 16);
+            }
+            let op_match = base_mut.add(tail + lit_length);
+            let match_src = base_mut.cast_const().add(tail + lit_length - offset);
+            if offset >= 16 {
+                wildcopy_no_overlap(op_match, match_src, match_length);
+            } else {
+                let (op2, ip2) = overlap_copy8(op_match, match_src, offset);
+                if match_length > 8 {
+                    wildcopy_overlap_8byte_stride(op2, ip2, match_length - 8);
+                }
+            }
+            self.inline_exec_commit(tail + total);
+        }
+        Ok(())
+    }
+
+    /// Non-x86 port of [`Self::exec_sequence_inline`] — portable u128 / u64
+    /// wildcopy helpers (NEON `ldr q`/`str q` on aarch64). Same contiguity
+    /// contract as the x86 arm.
+    #[cfg(not(target_arch = "x86_64"))]
+    #[inline]
+    unsafe fn exec_sequence_inline(
+        &mut self,
+        lit_src: *const u8,
+        lit_length: usize,
+        offset: usize,
+        match_length: usize,
+    ) -> Result<(), super::errors::ExecuteSequencesError> {
+        use super::buffer_backend::sequence_output_fits;
+        use super::exec_sequence_inline::portable::{
+            copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_overlap_8byte_stride,
+        };
+        const MAX_WILDCOPY_OVERSHOOT: usize = 15;
+        let cap = self.cap;
+        let tail = self.tail;
+        let total =
+            sequence_output_fits(lit_length, match_length, tail, cap, MAX_WILDCOPY_OVERSHOOT)?;
+        debug_assert!(offset >= 1);
+        debug_assert!(match_length >= 1);
+        debug_assert!(self.head <= tail, "exec_sequence_inline on a wrapped ring");
+        let live_len = tail - self.head;
+        debug_assert!(
+            live_len + lit_length >= offset,
+            "RingBuffer::exec_sequence_inline: offset {offset} exceeds live window",
+        );
+
+        unsafe {
+            let base_mut = self.buf.as_ptr();
+            let op_lit = base_mut.add(tail);
+            copy16(op_lit, lit_src);
+            if lit_length > 16 {
+                wildcopy_no_overlap(op_lit.add(16), lit_src.add(16), lit_length - 16);
+            }
+            let op_match = base_mut.add(tail + lit_length);
+            let match_src = base_mut.cast_const().add(tail + lit_length - offset);
+            if offset >= 16 {
+                wildcopy_no_overlap(op_match, match_src, match_length);
+            } else {
+                let (op2, ip2) = overlap_copy8(op_match, match_src, offset);
+                if match_length > 8 {
+                    wildcopy_overlap_8byte_stride(op2, ip2, match_length - 8);
+                }
+            }
+            self.tail = tail + total;
+            if self.tail == self.cap {
+                self.tail = 0;
+            }
+        }
+        Ok(())
+    }
+
+    /// AVX2-tier override — 32-byte ymm match-copy for `offset >= 32`. Same
+    /// contiguity contract; mirrors `FlatBuf::exec_sequence_inline_avx2`.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn exec_sequence_inline_avx2(
+        &mut self,
+        lit_src: *const u8,
+        lit_length: usize,
+        offset: usize,
+        match_length: usize,
+    ) -> Result<(), super::errors::ExecuteSequencesError> {
+        use super::buffer_backend::sequence_output_fits;
+        use super::exec_sequence_inline::x86::{
+            copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_no_overlap_avx2,
+            wildcopy_overlap_8byte_stride,
+        };
+        const MAX_WILDCOPY_OVERSHOOT: usize = 31;
+        let cap = self.cap;
+        let tail = self.tail;
+        let total =
+            sequence_output_fits(lit_length, match_length, tail, cap, MAX_WILDCOPY_OVERSHOOT)?;
+        debug_assert!(offset >= 1);
+        debug_assert!(match_length >= 1);
+        debug_assert!(
+            self.head <= tail,
+            "exec_sequence_inline_avx2 on a wrapped ring"
+        );
+        let live_len = tail - self.head;
+        debug_assert!(
+            live_len + lit_length >= offset,
+            "RingBuffer::exec_sequence_inline_avx2: offset {offset} exceeds live window",
+        );
+
+        unsafe {
+            let base_mut = self.buf.as_ptr();
+            let op_lit = base_mut.add(tail);
+            copy16(op_lit, lit_src);
+            if lit_length > 16 {
+                wildcopy_no_overlap(op_lit.add(16), lit_src.add(16), lit_length - 16);
+            }
+            let op_match = base_mut.add(tail + lit_length);
+            let match_src = base_mut.cast_const().add(tail + lit_length - offset);
+            if offset >= 32 {
+                wildcopy_no_overlap_avx2(op_match, match_src, match_length);
+            } else if offset >= 16 {
+                wildcopy_no_overlap(op_match, match_src, match_length);
+            } else {
+                let (op2, ip2) = overlap_copy8(op_match, match_src, offset);
+                if match_length > 8 {
+                    wildcopy_overlap_8byte_stride(op2, ip2, match_length - 8);
+                }
+            }
+            self.inline_exec_commit(tail + total);
+        }
+        Ok(())
+    }
+
     #[inline]
     fn new() -> Self {
         Self::new()
@@ -1304,6 +1530,32 @@ mod tests {
         }
 
         assert_buffers_equal(&checked, &branchless);
+    }
+
+    #[test]
+    fn inline_exec_ok_respects_block_output_ceiling() {
+        // The inline sequence-exec path bypasses `try_reserve`, so it must
+        // itself honour the per-block output ceiling (`max_capacity`, armed
+        // by `set_block_output_ceiling(MAX_BLOCK_SIZE)`). Otherwise a reused
+        // large-window ring with physical slack could emit past the ceiling
+        // — weakening the streaming-path decompression-bomb guard.
+        use super::super::buffer_backend::BufferBackend;
+        let mut rb = RingBuffer::new();
+        rb.reserve(64 * 1024); // plenty of physical slack
+        rb.extend(&[0u8; 1000]); // head = 0, tail = 1000
+        // Per-block ceiling with only 100 bytes of output budget remaining.
+        rb.set_max_capacity(1000 + 100);
+        // lit+match = 500 exceeds the 100-byte budget but fits physically
+        // (1531 < cap): the inline gate must reject it.
+        assert!(
+            !rb.inline_exec_ok(500, 0),
+            "inline_exec_ok must reject a write past the per-block output ceiling"
+        );
+        // A write within the budget stays eligible for the inline path.
+        assert!(
+            rb.inline_exec_ok(50, 0),
+            "inline_exec_ok must allow a write within the per-block ceiling"
+        );
     }
 
     #[test]

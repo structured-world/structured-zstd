@@ -125,8 +125,13 @@ macro_rules! execute_one_body {
                 break 'exec_inner Err(ExecuteSequencesError::ZeroOffset.into());
             }
 
-            // Donor inline-eligibility gates.
+            // Donor inline-eligibility gates. `inline_exec_ok` lets a wrapping
+            // backend (RingBuffer) veto the inline path when the live region is
+            // not contiguous at `tail`; linear backends fold it to `true`.
             let inline_path_safe = B::SUPPORTS_INLINE_SEQUENCE_EXEC
+                && $buffer
+                    .buffer_mut()
+                    .inline_exec_ok(seq_ll_v as usize, seq_ml_v as usize)
                 && lit_cur_before
                     .checked_add(16)
                     .is_some_and(|b| b <= literals_buffer_len_v)

@@ -159,6 +159,44 @@ fn roundtrip_streaming_api_1000_iterations() {
 }
 
 #[test]
+fn streaming_ringbuffer_wrap_inline_exec_is_byte_identical() {
+    // `roundtrip_at_level` decodes through the `StreamingDecoder`, whose
+    // backend is the wrapping `RingBuffer`. RingBuffer now takes the inline
+    // `exec_sequence` path on its contiguous sub-window and falls back to the
+    // cold push/repeat path near the wrap (gated by `inline_exec_ok`). Decode
+    // a multi-MiB input that mixes small-period runs (many small-offset
+    // matches → the inline `overlap_copy8` body) with random literals, so the
+    // gate flips inline<->cold across the ring boundary repeatedly as the
+    // output wraps the ring. Any off-by-one at the boundary corrupts the
+    // output; the byte-equality assert catches it.
+    let target_len = 6 << 20; // 6 MiB — exceeds the Fastest-level window, forcing ring wrap.
+    let mut data = Vec::with_capacity(target_len + 8192);
+    let mut seed = 0xA5A5_1234_5678_9ABCu64;
+    while data.len() < target_len {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let run = ((seed >> 40) % 4096 + 64) as usize;
+        data.extend(generate_compressible(seed, run));
+        let lits = ((seed >> 26) % 512) as usize;
+        data.extend(generate_data(seed ^ 0xFFFF_FFFF, lits));
+    }
+    for level in [CompressionLevel::Fastest, CompressionLevel::Default] {
+        let result = roundtrip_at_level(&data, level);
+        assert_eq!(
+            data.len(),
+            result.len(),
+            "streaming RingBuffer wrap roundtrip length mismatch at level {level:?}"
+        );
+        assert!(
+            data == result,
+            "streaming RingBuffer wrap roundtrip byte mismatch at level {level:?} (len {})",
+            data.len()
+        );
+    }
+}
+
+#[test]
 fn roundtrip_edge_cases() {
     // Empty data
     assert_eq!(roundtrip_simple(&[]), Vec::<u8>::new());
