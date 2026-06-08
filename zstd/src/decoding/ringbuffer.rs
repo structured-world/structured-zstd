@@ -926,13 +926,30 @@ impl super::buffer_backend::BufferBackend for RingBuffer {
         // caller's `offset <= live + lit_length` invariant then places the
         // match source at `>= head >= 0`, so it is contiguous and in-bounds.
         const INLINE_EXEC_MAX_OVERSHOOT: usize = 31;
-        self.head <= self.tail
-            && self
-                .tail
-                .checked_add(lit_length)
-                .and_then(|v| v.checked_add(match_length))
-                .and_then(|v| v.checked_add(INLINE_EXEC_MAX_OVERSHOOT))
-                .is_some_and(|end| end < self.cap)
+        if self.head > self.tail {
+            return false;
+        }
+        // Physical fit: write + AVX2 overshoot stays strictly below `cap`.
+        let physical_fit = self
+            .tail
+            .checked_add(lit_length)
+            .and_then(|v| v.checked_add(match_length))
+            .and_then(|v| v.checked_add(INLINE_EXEC_MAX_OVERSHOOT))
+            .is_some_and(|end| end < self.cap);
+        if !physical_fit {
+            return false;
+        }
+        // Per-block output ceiling: the inline path bypasses `try_reserve`,
+        // so it must enforce the same `max_capacity` bound try_reserve checks
+        // on its growth path (the decompression-bomb guard armed by
+        // `set_block_output_ceiling`). Without this, a reused large-window
+        // ring with physical slack could emit past `len_at_block_start +
+        // MAX_BLOCK_SIZE`. `head <= tail` (just checked) and `physical_fit`
+        // bound `tail + lit + match < cap`, so `new_len` is wrap-free and
+        // cannot overflow. `max_capacity == usize::MAX` between blocks makes
+        // this a no-op for unbounded callers.
+        let new_len = (self.tail - self.head) + lit_length + match_length;
+        new_len <= self.max_capacity
     }
 
     #[cfg(target_arch = "x86_64")]
