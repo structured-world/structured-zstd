@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780915817057,
+  "lastUpdate": 1780927717047,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -61521,6 +61521,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
             "value": 0.117,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.26,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "56698310a6f3e7b7713aac7d91960f5164d4ab61",
+          "message": "perf(decode): cut per-frame/block overhead (RingBuffer inline exec, FSE arrays, dict copy-on-write) (#381)\n\n* perf(decode): wrap-aware inline sequence exec for RingBuffer\n\nThe streaming decoder's RingBuffer had `SUPPORTS_INLINE_SEQUENCE_EXEC =\nfalse`, so every sequence took the cold `push` + `repeat` fallback —\nper-sequence backend-method calls (literal memcpy, match\nextend_from_within, amortized reserve) instead of the inline donor\n`ZSTD_execSequence` wildcopy the linear backends use. That is a uniform\nper-sequence overhead on the whole streaming decode path (the dashboard\n`source=rust_stream` decode outliers).\n\nGive RingBuffer the inline path on its contiguous sub-window:\n- `inline_exec_ok(lit, match)` gates it on `head <= tail` (not wrapped)\n  and `tail + lit + match + 31 < cap` (write + AVX2 wildcopy overshoot\n  stay below `cap`, inside the trailing WILDCOPY_OVERLENGTH slack, and\n  keep ring invariant 4). The caller's `offset <= live + lit` invariant\n  then places the match source at `>= head`, so it is contiguous too.\n- `inline_exec_base_ptr` / `inline_exec_commit` (macro hooks for the\n  pipelined per-tier monolith) + the `exec_sequence_inline` /\n  `exec_sequence_inline_avx2` trait bodies (non-pipelined path), mirroring\n  FlatBuf with the ring's `tail`/`cap`/base in place of the Vec.\n- The 6 `inline_path_safe` sites (pipelined avx2/bmi2/vbmi2 + the two\n  non-pipelined paths) now AND in `inline_exec_ok`, so when the live\n  region has wrapped the existing wrap-correct cold path runs instead.\n\nLinear backends fold `inline_exec_ok` to `true` (no behaviour change).\nA streaming roundtrip test decodes a 6 MiB mixed input through the ring\n(forcing repeated wrap + inline<->cold flips) and asserts byte-identity.\n\n* test(bench): add streaming (RingBuffer) decode mode to decode_loop_z000033\n\nAdds a `stream` mode that decodes via `StreamingDecoder` (RingBuffer\nbackend, the `source=rust_stream` dashboard arm) so the streaming decode\nhot path can be profiled / A/B-benched in isolation — the default `rust`\nmode uses `decode_all` (flat/UserSlice backend) and never exercises the\nring.\n\n* perf(decode): precompute dict offsets_long_share once, copy on reinit\n\n`FSEScratch::reinit_from` (only caller: `init_from_dict`) re-walked the\noffsets FSE table via `compute_offsets_long_share` on every\n`decode_*_with_dict_handle` call — a per-decode 256-entry walk that the\ndonor has no analogue for. The dictionary is immutable, so the share\nnever changes after the handle is built: compute it once in\n`Dictionary::decode_dict_inner` (right after the offsets table is built +\nenriched) and copy it in `reinit_from`. Removes the walk from the\nper-decode dict path. Verified byte-identical via the dict\ncross-validation + roundtrip suites (the share is a pipeline-routing\nheuristic; the decode result is unchanged).\n\n* perf(decode): monomorphize FSE decode table to a fixed-size array\n\n`FSETableImpl` is now generic over a const `CAP` and stores its decode\ntable inline as `[E; CAP]` + `decode_len` instead of a heap `Vec<E>`,\nmonomorphized per shape: HUF-weight FSE `<Entry, 64>` (accuracy_log <= 6),\nsequence LL/ML/OF FSE `<SeqSymbol, 512>` (accuracy_log <= 9; OF uses the\nfirst 256). `reinit_from` (the dict / predefined-cache copy) now copies\nthe table as one contiguous array assignment (a single memcpy of the\nfixed block) rather than a heap copy through a separate allocation —\nmirroring the donor's fixed-array `ZSTD_entropyDTables_t` copied by\n`ZSTD_copyDDictParameters`.\n\nBuild writes directly into the value-initialised array (no\n`spare_capacity_mut`/`set_len` dance); reads index it unchanged; `decode`\nis private with a `decode()` live-slice accessor for external callers.\nThe `fse::round_trip` unit test is constrained to the Entry table's\nproduction envelope (<=32 symbols, accuracy_log 6); the general\nhigher-accuracy_log FSE path stays covered by the sequence-section\n`SeqSymbol` tables in the roundtrip / cross-validation suites.\n\n783 tests pass; clippy clean on default, --no-default-features\n(kernel_scalar), and x86_64-unknown-linux-musl.\n\n* perf(decode): copy-on-write dictionary FSE tables\n\nAttach a shared dictionary's sequence FSE tables by handle (one Arc/Rc\nrefcount bump) instead of eagerly copying their bytes into per-frame\nscratch on every decode init. The eager copy was always wasted work:\neach block either reads the table by reference (Repeat mode) or rebuilds\nit (FSE_Compressed / RLE / Predefined mode), so deferring any copy to the\nrebuild is strictly faster and never less correct.\n\nEach sequence axis (LL/OF/ML) carries a copy-on-write source: Dict reads\nthe shared dictionary's table zero-copy, Local reads the freshly-built\none. init_from_dict attaches all three as Dict; the first non-Repeat\nrebuild on an axis flips it to Local; reset detaches so a reused\nworkspace never reads a previous frame's dictionary. The LSM resume\nsnapshot (reinit_from) materialises the live COW-resolved tables into\nowned Local copies so the snapshot stays self-contained.\n\nBuilds on the FSE fixed-array monomorphization (the tables are now\ncontiguous POD, so a rebuild is one array write and the by-reference\nread is a plain slice).\n\n784 tests pass; clippy clean on default / no-std scalar / x86_64-musl /\nwasm32 simd128.\n\n* perf(decode): extend dictionary copy-on-write to the Huffman table\n\nThe literals Huffman table now gets the same copy-on-write treatment as\nthe sequence FSE tables: init_from_dict attaches the dictionary's HUF\ntable by reference (one handle clone, no copy) instead of eagerly\ncopying it into per-frame scratch. A Compressed literals section\nrebuilds the local table and flips the source to Local; a Treeless\nsection reads whatever source is current (the shared dictionary's table\nuntil the first rebuild). reset detaches; the LSM resume snapshot\nmaterialises the live table into an owned Local copy.\n\nThis completes the dictionary entropy-table copy-on-write: attaching a\ndictionary now copies zero table bytes (FSE LL/OF/ML + HUF all by\nreference), matching the literal-heavy dict-frame path where the HUF\ncopy was the dominant remaining per-frame cost.\n\n784 tests pass; clippy clean on default / no-std scalar / x86_64-musl /\nwasm32 simd128.\n\n* test(decode): cover RingBuffer inline-exec block-ceiling bypass\n\nThe inline sequence-exec path checks only physical (tail, cap) fit, not\nthe per-block output ceiling (max_capacity) that try_reserve enforces.\nA reused large-window ring with slack can emit past the ceiling. This\ntest fails on the current code and passes once inline_exec_ok honours\nthe ceiling.\n\n* fix(decode): enforce per-block output ceiling on RingBuffer inline exec\n\ninline_exec_ok now rejects a write whose post-write live length would\nexceed max_capacity, mirroring the ceiling check try_reserve performs on\nits growth path. The inline sequence-exec path bypasses try_reserve, so\nwithout this a reused large-window ring with physical slack could emit\npast len_at_block_start + MAX_BLOCK_SIZE, weakening the streaming-path\ndecompression-bomb guard. As the single inline gate, this covers both\nthe SSE2 and AVX2 inline executors. Verified by the regression test in\nthe preceding commit.\n\n* test(decode): cover ddict_is_cold leak through FSEScratch::reinit_from\n\nreinit_from materialises a local-only snapshot but leaves ddict_is_cold\nunchanged, so a stale cold-dict pipeline gate can be carried into\nrestored entropy state with no dictionary attached. This test fails on\nthe current code and passes once reinit_from clears the flag.\n\n* fix(decode): clear ddict_is_cold when reinit_from snapshots local tables\n\nFSEScratch::reinit_from materialises a local-only snapshot (LSM resume\nexport/restore) and detaches the dictionary, but previously preserved\nddict_is_cold. A snapshot taken from a cold-dict frame would carry the\ncold-dict pipeline gate into restored entropy state with no dictionary,\nmis-arming the prefetch pipeline. Verified by the regression test in the\npreceding commit.\n\n* test(decode): cover truncated Compressed/Treeless literals panic\n\nA Compressed/Treeless literals section whose header compressed_size\nexceeds the available source slices source[0..compressed_size] directly,\npanicking on truncated/corrupt input (decoder DoS). The Raw/RLE paths\nalready return a structured error; this test exercises the Compressed\npath and fails (panics) on the current code.\n\n* fix(decode): reject truncated Compressed/Treeless literals before slicing\n\ndecompress_literals_impl sliced source[0..compressed_size] with a\nheader-derived compressed_size, panicking when a truncated/corrupt frame\nclaims more compressed literal bytes than the source carries (decoder\nDoS). Use a bounds-checked .get(..compressed_size) and return\nMissingBytesForLiterals instead, matching the Raw/RLE hardening.\nVerified by the regression test in the preceding commit.\n\n* test(decode): assert exact MissingBytesForLiterals variant on truncation\n\nThe truncated-Compressed regression test asserted only result.is_err(),\nwhich a different failure (MissingNumStreams / UninitializedHuffmanTable)\nwould also satisfy without pinning the new MissingBytesForLiterals\nbehaviour. Tighten to match the exact variant with got/needed.",
+          "timestamp": "2026-06-08T16:27:23+03:00",
+          "tree_id": "9df1712978bed98fdd673e732834d82b467682a8",
+          "url": "https://github.com/structured-world/structured-zstd/commit/56698310a6f3e7b7713aac7d91960f5164d4ab61"
+        },
+        "date": 1780927705413,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.13,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.111,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 302.896,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 265.491,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.455,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.436,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.275,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.03,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.156,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.987,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.11,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.11,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.015,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 17.31,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.277,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.299,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.316,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.953,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.226,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.645,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.103,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.305,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.141,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.12,
             "unit": "ms"
           },
           {
