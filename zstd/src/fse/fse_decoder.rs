@@ -11,21 +11,21 @@ use alloc::vec::Vec;
 // `feature = "fuzz_exports"` the module becomes `pub mod fse` and
 // the struct becomes externally accessible — which is exactly what
 // the fuzz harness needs.
-pub struct FSEDecoderImpl<'table, E: FseEntry> {
+pub struct FSEDecoderImpl<'table, E: FseEntry, const CAP: usize> {
     /// An FSE state value represents an index in the FSE table.
     pub state: E,
     /// A reference to the table used for decoding.
-    table: &'table FSETableImpl<E>,
+    table: &'table FSETableImpl<E, CAP>,
 }
 
 /// Type alias preserved for the HUF-weight-stream callers: the
 /// per-state byte (`decode_symbol`) lives on this alias's `Entry`-only
 /// inherent impl below.
-pub type FSEDecoder<'table> = FSEDecoderImpl<'table, Entry>;
+pub type FSEDecoder<'table> = FSEDecoderImpl<'table, Entry, 64>;
 
-impl<'t, E: FseEntry> FSEDecoderImpl<'t, E> {
+impl<'t, E: FseEntry, const CAP: usize> FSEDecoderImpl<'t, E, CAP> {
     /// Initialize a new Finite State Entropy decoder.
-    pub fn new(table: &'t FSETableImpl<E>) -> FSEDecoderImpl<'t, E> {
+    pub fn new(table: &'t FSETableImpl<E, CAP>) -> FSEDecoderImpl<'t, E, CAP> {
         FSEDecoderImpl {
             state: table.decode.first().copied().unwrap_or_default(),
             table,
@@ -33,14 +33,14 @@ impl<'t, E: FseEntry> FSEDecoderImpl<'t, E> {
     }
 }
 
-impl<'t> FSEDecoderImpl<'t, Entry> {
+impl<'t, const CAP: usize> FSEDecoderImpl<'t, Entry, CAP> {
     /// Returns the byte associated with the symbol the internal cursor is pointing at.
     pub fn decode_symbol(&self) -> u8 {
         self.state.symbol
     }
 }
 
-impl<'t, E: FseEntry> FSEDecoderImpl<'t, E> {
+impl<'t, E: FseEntry, const CAP: usize> FSEDecoderImpl<'t, E, CAP> {
     /// Initialize internal state and prepare for decoding. After this, `decode_symbol` can be called
     /// to read the first symbol and `update_state` can be called to prepare to read the next symbol.
     pub fn init_state<K: CpuKernel>(
@@ -53,7 +53,7 @@ impl<'t, E: FseEntry> FSEDecoderImpl<'t, E> {
         // vec is the real "never built" signal; the `InvalidTableShape`
         // check below still enforces `decode.len() == 1 << accuracy_log`,
         // which holds for the 1-entry RLE table since `1 << 0 == 1`.)
-        if self.table.decode.is_empty() {
+        if self.table.decode_len == 0 {
             return Err(FSEDecoderError::TableIsUninitialized);
         }
         // Defense-in-depth internal-invariant guard: in normal builds
@@ -70,7 +70,7 @@ impl<'t, E: FseEntry> FSEDecoderImpl<'t, E> {
         // Branch cost is a single per-call check; the per-sequence
         // hot path (`update_state_fast`) is unaffected.
         let accuracy_log = self.table.accuracy_log;
-        let decode_len = self.table.decode.len();
+        let decode_len = self.table.decode_len;
         let expected =
             1usize
                 .checked_shl(accuracy_log.into())
@@ -136,7 +136,7 @@ impl<'t, E: FseEntry> FSEDecoderImpl<'t, E> {
         // documented precondition instead of paying for a per-call
         // check.
         assert!(
-            !self.table.decode.is_empty(),
+            self.table.decode_len != 0,
             concat!(
                 "FSEDecoder::update_state called on an uninitialized table; ",
                 "call init_state successfully before any update_state* call",
@@ -231,12 +231,20 @@ impl<'t, E: FseEntry> FSEDecoderImpl<'t, E> {
 /// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#fse-table-description>
 #[derive(Debug, Clone)]
 #[doc(hidden)]
-pub struct FSETableImpl<E: FseEntry> {
+pub struct FSETableImpl<E: FseEntry, const CAP: usize> {
     /// The maximum symbol in the table (inclusive). Limits the probabilities length to max_symbol + 1.
     max_symbol: u8,
-    /// The actual table containing the decoded symbol and the compression data
-    /// connected to that symbol.
-    pub decode: Vec<E>, //used to decode symbols, and calculate the next state
+    /// The decode table: a fixed-size inline array sized to the worst-case
+    /// `1 << max_accuracy_log` for this table's shape (monomorphized per
+    /// strategy — HUF weights `CAP=64`, sequence LL/ML/OF `CAP=512`). Only
+    /// `decode[..decode_len]` is live; the rest is unused capacity. Storing it
+    /// inline (vs a `Vec`) lets `reinit_from` copy the whole table in one
+    /// contiguous `memcpy` (array assignment) — mirroring the donor's
+    /// fixed-array `ZSTD_entropyDTables_t` copied by `ZSTD_copyDDictParameters`
+    /// — instead of a heap copy through a separate allocation.
+    decode: [E; CAP],
+    /// Number of live entries in `decode` (`1 << accuracy_log`).
+    decode_len: usize,
     /// Reused scratch buffer for symbol spreading to avoid per-build allocations.
     symbol_spread_buffer: Vec<u8>,
     /// The size of the table is stored in logarithm base 2 format,
@@ -258,7 +266,9 @@ pub struct FSETableImpl<E: FseEntry> {
 
 /// Type alias preserved for HUF-weight-stream callers and existing
 /// tests; the sequence-section variant is [`SeqFSETable`].
-pub type FSETable = FSETableImpl<Entry>;
+// HUF weight-stream FSE: accuracy_log is capped at 6 (`build_decoder(_, 6)`),
+// so the worst-case table is `1 << 6 = 64` entries.
+pub type FSETable = FSETableImpl<Entry, 64>;
 
 /// Compact sequence-section variant. Backed by 8-byte [`SeqSymbol`]
 /// entries instead of the 12-byte HUF [`Entry`] — matches donor
@@ -269,19 +279,43 @@ pub type FSETable = FSETableImpl<Entry>;
 /// [`FSETableImpl::<SeqSymbol>::enrich_for_offsets`]) populate them
 /// in a second walk over `decode[]`, reading the source byte from
 /// the persisted `symbol_spread_buffer`.
+// Sequence-section FSE (LL / ML / OF): accuracy_log is capped at 9
+// (`LL_MAX_LOG` / `ML_MAX_LOG`; OF at 8), so the worst-case table is
+// `1 << 9 = 512` entries. OF uses only the first 256 — the extra capacity
+// is harmless and keeps a single alias for all three seq tables so the
+// contiguous block in `FSEScratch` copies in one memcpy.
 #[allow(dead_code)]
-pub type SeqFSETable = FSETableImpl<SeqSymbol>;
+pub type SeqFSETable = FSETableImpl<SeqSymbol, 512>;
 
-impl<E: FseEntry> FSETableImpl<E> {
+impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
     /// Initialize a new empty Finite State Entropy decoding table.
     pub fn new(max_symbol: u8) -> Self {
         FSETableImpl {
             max_symbol,
             symbol_probabilities: Vec::with_capacity(256), //will never be more than 256 symbols because u8
             symbol_spread_buffer: Vec::new(),
-            decode: Vec::new(), //depending on acc_log.
+            decode: [E::default(); CAP],
+            decode_len: 0,
             accuracy_log: 0,
         }
+    }
+
+    /// Live decode entries (`decode[..decode_len]`).
+    #[inline(always)]
+    pub fn decode(&self) -> &[E] {
+        // SAFETY-free: decode_len is always <= CAP (set only by the build,
+        // which rejects accuracy_log overflowing the table size).
+        &self.decode[..self.decode_len]
+    }
+
+    /// Test-only: populate the decode table directly from a slice of entries
+    /// (replaces the old `t.decode = entries.collect()` now that `decode` is a
+    /// private fixed array).
+    #[cfg(test)]
+    pub(crate) fn set_decode_for_test(&mut self, entries: &[E]) {
+        assert!(entries.len() <= CAP, "test entries exceed table CAP");
+        self.decode[..entries.len()].copy_from_slice(entries);
+        self.decode_len = entries.len();
     }
 
     /// Reset `self` and update `self`'s state to mirror the provided table.
@@ -300,7 +334,12 @@ impl<E: FseEntry> FSETableImpl<E> {
         // table (`build_decoder`) repopulates the scratch itself. Skipping
         // them mirrors the donor copying just the FSE decode table per frame
         // instead of the full build workspace.
-        self.decode.extend_from_slice(&other.decode);
+        // ONE contiguous memcpy of the whole fixed-size decode array (the
+        // monomorphized-per-shape table), mirroring the donor's single
+        // `ZSTD_copyDDictParameters` memcpy — instead of a heap `Vec` copy
+        // through a separate allocation. `decode_len` carries the live span.
+        self.decode = other.decode;
+        self.decode_len = other.decode_len;
         self.accuracy_log = other.accuracy_log;
     }
 
@@ -308,7 +347,7 @@ impl<E: FseEntry> FSETableImpl<E> {
     pub fn reset(&mut self) {
         self.symbol_probabilities.clear();
         self.symbol_spread_buffer.clear();
-        self.decode.clear();
+        self.decode_len = 0;
         self.accuracy_log = 0;
     }
 
@@ -363,7 +402,7 @@ impl<E: FseEntry> FSETableImpl<E> {
     ) -> Result<usize, FSETableError> {
         let max_log = max_log.min(ENTRY_MAX_ACCURACY_LOG);
         self.accuracy_log = 0;
-        self.decode.clear();
+        self.decode_len = 0;
         self.read_probabilities(source, max_log)
     }
 
@@ -576,18 +615,20 @@ impl<E: FseEntry> FSETableImpl<E> {
         // shape.
         let accuracy_log = self.accuracy_log;
         let table_size_u32 = table_size as u32;
-        // Write entries into `spare_capacity_mut()` (typed as
-        // `&mut [MaybeUninit<E>]`) and only `set_len` AFTER all
-        // writes complete. This keeps the per-push bookkeeping out
-        // of the hot loop (the body becomes a flat strided
-        // `MaybeUninit::write` sequence) while staying sound: the
-        // `set_len` call only ever runs when every slot in
-        // 0..table_size is initialised. The error path returns Err
-        // with `decode.len() == 0` (the preceding `clear()`),
-        // exposing zero uninitialised entries.
-        self.decode.clear();
-        self.decode.reserve(table_size);
-        let slots = &mut self.decode.spare_capacity_mut()[..table_size];
+        // Write the `table_size` live entries directly into the inline,
+        // value-initialised `decode` array (no `MaybeUninit` / `set_len`
+        // dance needed — the array already holds `E::default()` in every
+        // slot). `decode_len = 0` up front means an early `Err` leaves the
+        // table "unbuilt" (empty live span), matching the old
+        // `clear()`-then-`set_len` contract. `table_size <= CAP` holds because
+        // the caller passes `max_log` (OF=8 / LL=ML=9 / HUF=6) and
+        // `read_probabilities` rejects `accuracy_log > max_log`, so
+        // `1 << accuracy_log <= 1 << max_log == CAP`.
+        debug_assert!(
+            table_size <= CAP,
+            "FSE table_size {table_size} exceeds monomorphized CAP {CAP}",
+        );
+        self.decode_len = 0;
 
         // Slice index instead of `spread.iter().take(table_size)`:
         // if `spread.len() < table_size` (a future refactor breaking
@@ -655,17 +696,12 @@ impl<E: FseEntry> FSETableImpl<E> {
             // formula bug instead of silently producing a
             // malformed entry.
             let new_state_u32 = (next_state << nb) - table_size_u32;
-            slots[state_idx].write(E::from_raw(new_state_u32 as u16, symbol, nb));
+            self.decode[state_idx] = E::from_raw(new_state_u32 as u16, symbol, nb);
         }
 
-        // SAFETY: the loop above ran `table_size` iterations and
-        // wrote `slots[state_idx]` for every `state_idx ∈
-        // [0, table_size)`. `reserve(table_size)` guaranteed capacity.
-        // Every Err exit happens BEFORE this `set_len`, so we only
-        // claim initialisation when every slot has been written.
-        unsafe {
-            self.decode.set_len(table_size);
-        }
+        // Commit the live span. The loop wrote every `state_idx ∈
+        // [0, table_size)`; an Err above returns with `decode_len` still 0.
+        self.decode_len = table_size;
 
         Ok(())
     }
@@ -764,7 +800,7 @@ impl<E: FseEntry> FSETableImpl<E> {
     }
 }
 
-impl FSETableImpl<SeqSymbol> {
+impl FSETableImpl<SeqSymbol, 512> {
     /// Populate each entry's `base_value` / `num_additional_bits`
     /// from a packed LL / ML meta table. [`SeqSymbol`] has no
     /// per-state byte; the source symbol for slot `i` is read from
@@ -772,8 +808,8 @@ impl FSETableImpl<SeqSymbol> {
     /// `build_decoding_table` finishes). Mirrors donor
     /// `ZSTD_buildSeqTable` post-build enrich for LL / ML.
     pub(crate) fn enrich_with_packed_seq_meta(&mut self, packed: &[u32]) {
-        debug_assert_eq!(self.decode.len(), self.symbol_spread_buffer.len());
-        for i in 0..self.decode.len() {
+        debug_assert_eq!(self.decode_len, self.symbol_spread_buffer.len());
+        for i in 0..self.decode_len {
             let sym = self.symbol_spread_buffer[i] as usize;
             let entry = &mut self.decode[i];
             if sym < packed.len() {
@@ -790,8 +826,8 @@ impl FSETableImpl<SeqSymbol> {
     /// Closed-form offset-code enrich: `base = 1 << code`, `num_add = code`
     /// for `code < 32`. Source byte read from spread buffer.
     pub(crate) fn enrich_for_offsets(&mut self) {
-        debug_assert_eq!(self.decode.len(), self.symbol_spread_buffer.len());
-        for i in 0..self.decode.len() {
+        debug_assert_eq!(self.decode_len, self.symbol_spread_buffer.len());
+        for i in 0..self.decode_len {
             let code = self.symbol_spread_buffer[i];
             let entry = &mut self.decode[i];
             entry.base_value = 0;
@@ -822,19 +858,21 @@ impl FSETableImpl<SeqSymbol> {
         // `max_symbol` at the axis maximum, which is correct here.
         // Spread buffer drives the enrich pass (symbol per slot); one slot.
         self.symbol_spread_buffer.push(symbol);
-        self.decode.push(SeqSymbol {
+        // Single RLE entry at slot 0 (donor RLE DTable: one state).
+        self.decode[0] = SeqSymbol {
             new_state: 0,
             num_bits: 0,
             num_additional_bits: 0,
             base_value: 0,
-        });
+        };
+        self.decode_len = 1;
         // accuracy_log stays 0 (donor RLE DTable tableLog); init_state
         // reads 0 state bits and update_state keeps the single state.
     }
 }
 
 /// Sequence-section decoder alias: reads 8-byte [`SeqSymbol`] entries.
-pub type SeqFSEDecoder<'t> = FSEDecoderImpl<'t, SeqSymbol>;
+pub type SeqFSEDecoder<'t> = FSEDecoderImpl<'t, SeqSymbol, 512>;
 
 /// A single entry in an FSE table.
 ///

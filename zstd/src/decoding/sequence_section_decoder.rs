@@ -1367,7 +1367,7 @@ pub(crate) fn compute_offsets_long_share(offsets: &crate::fse::SeqFSETable) -> u
     // (`code` for `code < 32`, `0` otherwise — long codes are
     // bounded by the format spec at 31).
     let raw = offsets
-        .decode
+        .decode()
         .iter()
         .filter(|entry| u32::from(entry.num_additional_bits) > LONG_OFFSET_CODE_THRESHOLD)
         .count() as u32;
@@ -1684,11 +1684,11 @@ fn predefined_fse_caches_match_rebuild_output() {
     ll_rebuild.enrich_with_packed_seq_meta(&LL_META);
     let ll_cached = predefined_ll_table();
     assert_eq!(ll_rebuild.accuracy_log, ll_cached.accuracy_log);
-    assert_eq!(ll_rebuild.decode.len(), ll_cached.decode.len());
+    assert_eq!(ll_rebuild.decode().len(), ll_cached.decode().len());
     for (i, (a, b)) in ll_rebuild
-        .decode
+        .decode()
         .iter()
-        .zip(ll_cached.decode.iter())
+        .zip(ll_cached.decode().iter())
         .enumerate()
     {
         assert_eq!(a.num_bits, b.num_bits, "LL entry {i} num_bits mismatch");
@@ -1713,11 +1713,11 @@ fn predefined_fse_caches_match_rebuild_output() {
     ml_rebuild.enrich_with_packed_seq_meta(&ML_META);
     let ml_cached = predefined_ml_table();
     assert_eq!(ml_rebuild.accuracy_log, ml_cached.accuracy_log);
-    assert_eq!(ml_rebuild.decode.len(), ml_cached.decode.len());
+    assert_eq!(ml_rebuild.decode().len(), ml_cached.decode().len());
     for (i, (a, b)) in ml_rebuild
-        .decode
+        .decode()
         .iter()
-        .zip(ml_cached.decode.iter())
+        .zip(ml_cached.decode().iter())
         .enumerate()
     {
         assert_eq!(a.num_bits, b.num_bits, "ML entry {i} num_bits mismatch");
@@ -1743,15 +1743,15 @@ fn predefined_fse_caches_match_rebuild_output() {
     let of_rebuild_share = compute_offsets_long_share(&of_rebuild);
     let (of_cached, of_cached_share) = predefined_of_table();
     assert_eq!(of_rebuild.accuracy_log, of_cached.accuracy_log);
-    assert_eq!(of_rebuild.decode.len(), of_cached.decode.len());
+    assert_eq!(of_rebuild.decode().len(), of_cached.decode().len());
     assert_eq!(
         of_rebuild_share, of_cached_share,
         "OF offsets_long_share mismatch"
     );
     for (i, (a, b)) in of_rebuild
-        .decode
+        .decode()
         .iter()
-        .zip(of_cached.decode.iter())
+        .zip(of_cached.decode().iter())
         .enumerate()
     {
         assert_eq!(a.num_bits, b.num_bits, "OF entry {i} num_bits mismatch");
@@ -1777,23 +1777,23 @@ fn test_ll_default() {
         )
         .unwrap();
 
-    assert!(table.decode.len() == 64);
+    assert!(table.decode().len() == 64);
 
     //just test a few values. TODO test all values
-    assert!(table.decode[0].num_bits == 4);
-    assert!(table.decode[0].new_state == 0);
+    assert!(table.decode()[0].num_bits == 4);
+    assert!(table.decode()[0].new_state == 0);
 
-    assert!(table.decode[19].num_bits == 6);
-    assert!(table.decode[19].new_state == 0);
+    assert!(table.decode()[19].num_bits == 6);
+    assert!(table.decode()[19].new_state == 0);
 
-    assert!(table.decode[39].num_bits == 4);
-    assert!(table.decode[39].new_state == 16);
+    assert!(table.decode()[39].num_bits == 4);
+    assert!(table.decode()[39].new_state == 16);
 
-    assert!(table.decode[60].num_bits == 6);
-    assert!(table.decode[60].new_state == 0);
+    assert!(table.decode()[60].num_bits == 6);
+    assert!(table.decode()[60].new_state == 0);
 
-    assert!(table.decode[59].num_bits == 5);
-    assert!(table.decode[59].new_state == 32);
+    assert!(table.decode()[59].num_bits == 5);
+    assert!(table.decode()[59].new_state == 32);
 }
 
 #[cfg(test)]
@@ -1815,7 +1815,7 @@ mod offsets_long_share_tests {
         );
         let mut t = crate::fse::SeqFSETable::new(31);
         t.accuracy_log = accuracy_log;
-        t.decode = symbols
+        let entries: alloc::vec::Vec<SeqSymbol> = symbols
             .iter()
             .map(|&s| SeqSymbol {
                 new_state: 0,
@@ -1824,6 +1824,7 @@ mod offsets_long_share_tests {
                 base_value: 0,
             })
             .collect();
+        t.set_decode_for_test(&entries);
         t
     }
 
