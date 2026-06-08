@@ -125,16 +125,7 @@ use super::buffer_backend::{BufferBackend, WILDCOPY_OVERLENGTH};
 /// APIs never reach these `assert!`s on malformed input — the
 /// fallible dispatch catches the overshoot one layer up.
 pub(crate) struct UserSliceBackend<'a> {
-    /// Raw write cursor over the caller's output region. Stored as a raw
-    /// pointer + capacity (not `&'a mut [u8]`) so the backend can also wrap
-    /// the UNINITIALISED spare capacity of a `Vec` (`spare_capacity_mut`)
-    /// for the zero-fill-free `decode_all_to_vec` path: forming a
-    /// `&mut [u8]` over uninitialised memory is UB, but writing through a
-    /// raw pointer is not. Every write goes through `ptr`; reads only ever
-    /// touch the already-written `[head..tail]` region, so the
-    /// uninitialised tail is never read as an initialised `u8`.
-    ptr: *mut u8,
-    cap: usize,
+    slice: &'a mut [u8],
     /// Bytes in `slice[..head]` have been drained to the output
     /// stream and are no longer visible through the [`BufferBackend`]
     /// surface. Same semantics as `FlatBuf.head` — see that field's
@@ -145,10 +136,6 @@ pub(crate) struct UserSliceBackend<'a> {
     /// for API parity with `FlatBuf` and `RingBuffer`.
     head: usize,
     tail: usize,
-    /// Ties the raw `ptr`/`cap` to the borrow of the caller's output
-    /// region (`&'a mut [u8]` or `&'a mut [MaybeUninit<u8>]`), so the
-    /// backend cannot outlive it.
-    _lt: core::marker::PhantomData<&'a mut [u8]>,
 }
 
 impl<'a> UserSliceBackend<'a> {
@@ -159,38 +146,11 @@ impl<'a> UserSliceBackend<'a> {
     /// the SIMD wildcopy overshoot would not, the inline exec paths fall
     /// back to [`Self::exec_sequence_bounded`] (exact, non-overshooting
     /// copies) for that trailing sequence.
-    /// Construct a backend wrapping an initialised slice. Test-only: the
-    /// production decode paths build the backend via `from_raw` (from a raw
-    /// output region that may be uninitialised). Tests still exercise the
-    /// backend directly over a plain `&mut [u8]`.
-    #[cfg(test)]
     pub(crate) fn from_slice(slice: &'a mut [u8]) -> Self {
-        // SAFETY: `slice` is a live, initialised `&'a mut [u8]`; its ptr/len
-        // satisfy `from_raw`'s contract and `'a` ties the borrow.
-        unsafe { Self::from_raw(slice.as_mut_ptr(), slice.len()) }
-    }
-
-    /// Construct from a raw write region. `ptr` must be valid for writes of
-    /// `cap` bytes for `'a`; the memory may be UNINITIALISED (the decoder
-    /// writes through `ptr` and reads back only already-written bytes, so the
-    /// backend can wrap either an initialised `&mut [u8]` or a `Vec`'s
-    /// uninitialised spare capacity — `decode_all_to_vec`'s zero-fill-free
-    /// path). C likewise never pre-zeroes `dst`.
-    ///
-    /// # Safety
-    /// - `ptr` is non-null, aligned for `u8` (trivially), and valid for
-    ///   `cap` bytes of writes throughout `'a`.
-    /// - No other live reference aliases `[ptr, ptr+cap)` for `'a`.
-    /// - If the region is uninitialised, the caller must ensure no byte is
-    ///   read before it is written (upheld: the decoder only reads back
-    ///   already-written positions).
-    pub(crate) unsafe fn from_raw(ptr: *mut u8, cap: usize) -> Self {
         Self {
-            ptr,
-            cap,
+            slice,
             head: 0,
             tail: 0,
-            _lt: core::marker::PhantomData,
         }
     }
 
@@ -208,7 +168,7 @@ impl<'a> UserSliceBackend<'a> {
     /// ISA arms.
     ///
     /// # Safety
-    /// - `self.tail + lit_length + match_length <= self.cap`
+    /// - `self.tail + lit_length + match_length <= self.slice.len()`
     ///   (caller asserts exact fit before dispatching here).
     /// - `offset >= 1` and `offset <= (self.tail - self.head) +
     ///   lit_length` (donor's `oLitEnd - offset` precondition), so the
@@ -230,7 +190,7 @@ impl<'a> UserSliceBackend<'a> {
         // `lit_length`, `offset` inside the written region).
         unsafe {
             super::exec_sequence_inline::exec_sequence_bounded_copy(
-                self.ptr,
+                self.slice.as_mut_ptr(),
                 self.tail,
                 lit_src,
                 lit_length,
@@ -285,7 +245,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // wrapping past the slice length and letting the subsequent
         // unsafe pointer math go out of bounds.
         const MAX_WILDCOPY_OVERSHOOT: usize = 15;
-        let cap = self.cap;
+        let cap = self.slice.len();
         // `self.tail <= cap` holds on entry (`from_slice` starts at 0 and
         // every prior sequence advanced `tail` only after this same check),
         // satisfying the `tail <= cap` precondition; see `sequence_output_fits`.
@@ -342,7 +302,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // the unconditional 16-byte load stays in-bounds even when
         // `lit_length < 16`.
         unsafe {
-            let base_mut = self.ptr;
+            let base_mut = self.slice.as_mut_ptr();
 
             // ── Literal copy ──
             // Donor: ZSTD_copy16(op, *litPtr); if (litLength > 16)
@@ -396,7 +356,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
             copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_overlap_8byte_stride,
         };
         const MAX_WILDCOPY_OVERSHOOT: usize = 15;
-        let cap = self.cap;
+        let cap = self.slice.len();
         // `self.tail <= cap` precondition holds as in the SSE2 arm; see
         // `sequence_output_fits`. Hard guard with `overshoot = 0`; the
         // <=15-byte wildcopy slack is handled by the tight-tail branch
@@ -436,7 +396,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // gate guarantees the unconditional 16-byte literal read stays
         // valid).
         unsafe {
-            let base = self.ptr;
+            let base = self.slice.as_mut_ptr();
             let op_lit = base.add(self.tail);
             copy16(op_lit, lit_src);
             if lit_length > 16 {
@@ -503,7 +463,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // this overshoot is handled by the tight-tail bounded branch below
         // rather than absorbed by slice capacity.
         const MAX_WILDCOPY_OVERSHOOT: usize = 31;
-        let cap = self.cap;
+        let cap = self.slice.len();
         // `self.tail <= cap` holds on entry (`from_slice` starts at 0 and every
         // prior sequence advanced `tail` only after this same check), satisfying
         // the `tail <= cap` precondition; see `sequence_output_fits`. Hard guard
@@ -537,7 +497,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         }
 
         unsafe {
-            let base_mut = self.ptr;
+            let base_mut = self.slice.as_mut_ptr();
 
             // Literal copy — UNCHANGED from SSE2 default. 16-byte
             // copy16 + optional 16-byte-stride wildcopy. Donor's
@@ -598,7 +558,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
     unsafe fn inline_exec_base_ptr(&mut self) -> *mut u8 {
-        self.ptr
+        self.slice.as_mut_ptr()
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -624,15 +584,10 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
     /// the entry point on the direct-decode path; non-empty
     /// constructions go through `from_slice` with a real `&'a mut [u8]`.
     fn new() -> Self {
-        // Empty placeholder: zero capacity, dangling-but-aligned ptr (never
-        // dereferenced because `cap == 0` rejects every write). Mirrors
-        // `&mut []`'s NonNull-dangling representation.
         Self {
-            ptr: core::ptr::NonNull::<u8>::dangling().as_ptr(),
-            cap: 0,
+            slice: &mut [],
             head: 0,
             tail: 0,
-            _lt: core::marker::PhantomData,
         }
     }
 
@@ -649,11 +604,11 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // overshoot here instead of via the `assert!` inside
         // `extend_from_within_unchecked` further down the call chain.
         match self.tail.checked_add(n) {
-            Some(new_tail) if new_tail <= self.cap => Ok(()),
+            Some(new_tail) if new_tail <= self.slice.len() => Ok(()),
             _ => Err(super::buffer_backend::BackendOverflow {
                 tail: self.tail,
                 requested: n,
-                capacity: self.cap,
+                capacity: self.slice.len(),
             }),
         }
     }
@@ -680,7 +635,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
 
     #[inline]
     fn cap(&self) -> usize {
-        self.cap
+        self.slice.len()
     }
 
     #[inline]
@@ -691,7 +646,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
     #[inline]
     unsafe fn set_tail(&mut self, new_tail: usize) {
         debug_assert!(new_tail >= self.head);
-        debug_assert!(new_tail <= self.cap);
+        debug_assert!(new_tail <= self.slice.len());
         self.tail = new_tail;
     }
 
@@ -733,10 +688,10 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // root cause rather than letting the subsequent unsafe
         // pointer math go OOB.
         assert!(
-            new_tail <= self.cap,
+            new_tail <= self.slice.len(),
             "UserSliceBackend::extend overflows slice (tail+={}, cap={}) — corrupt frame",
             len,
-            self.cap
+            self.slice.len()
         );
         // Literal pushes (the sequence executor calls this for the
         // literal portion of every sequence) frequently land in the
@@ -745,15 +700,15 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // the cost of the actual copy. Route through
         // `copy_bytes_overshooting` so short pushes inline a single
         // SIMD / overlapping-u64 store instead.
-        let total_writable = self.cap - self.tail;
+        let total_writable = self.slice.len() - self.tail;
         // SAFETY: caller-provided `data` is non-aliasing with the
         // backend's slice (it's the literals buffer or input view).
-        // `new_tail <= self.cap` (release-mode `assert!`
+        // `new_tail <= self.slice.len()` (release-mode `assert!`
         // above), so both regions have ≥ `len` valid bytes.
         unsafe {
             super::simd_copy::copy_bytes_overshooting(
                 (data.as_ptr(), len),
-                (self.ptr.add(self.tail), total_writable),
+                (self.slice.as_mut_ptr().add(self.tail), total_writable),
                 len,
             );
         }
@@ -772,21 +727,17 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // would already have happened up to the slice length. Fail
         // fast with a clear corruption / capacity diagnostic.
         assert!(
-            new_tail <= self.cap,
+            new_tail <= self.slice.len(),
             "UserSliceBackend::extend_and_fill overflows slice (tail+={}, cap={}) — corrupt frame",
             fill_length,
-            self.cap
+            self.slice.len()
         );
         // `slice::fill` lowers to a memset on byte slices; the
         // per-byte loop above the rebased commit replaces it with
         // an explicit assignment, which the optimiser does not
         // always promote back. For large RLE blocks the memset
         // path wins ~3-5x on x86_64.
-        // SAFETY: `new_tail <= self.cap` (checked above); writing through
-        // the raw `ptr` is sound even when the backing is uninitialised
-        // spare capacity (`write_bytes` is a memset, not a read). Lowers to
-        // the same memset `<[u8]>::fill` did.
-        unsafe { core::ptr::write_bytes(self.ptr.add(self.tail), fill_with, new_tail - self.tail) };
+        self.slice[self.tail..new_tail].fill(fill_with);
         self.tail = new_tail;
     }
 
@@ -797,24 +748,12 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
     ) -> Result<(), Error> {
         let old = self.tail;
         let new_tail = old + fill_length;
-        if new_tail > self.cap {
+        if new_tail > self.slice.len() {
             return Err(Error::other(
                 "UserSliceBackend: raw block exceeds caller-provided output capacity",
             ));
         }
-        // A generic `Read` impl is permitted (in safe code) to READ the
-        // buffer it is handed, so we must not expose uninitialised spare as
-        // `&mut [u8]`. Initialise the target region first, then form the
-        // slice over now-valid memory. Raw blocks streamed from a `Read`
-        // never reach the direct `decode_all` path (it copies from a
-        // borrowed input slice), so this `write_bytes(0)` is off the hot
-        // path.
-        // SAFETY: `new_tail <= self.cap` (checked above); raw-ptr memset.
-        unsafe { core::ptr::write_bytes(self.ptr.add(old), 0, new_tail - old) };
-        // SAFETY: `[old..new_tail]` was just initialised and is within
-        // capacity, so this references valid `u8` memory.
-        let region = unsafe { core::slice::from_raw_parts_mut(self.ptr.add(old), new_tail - old) };
-        match read.read_exact(region) {
+        match read.read_exact(&mut self.slice[old..new_tail]) {
             Ok(()) => {
                 self.tail = new_tail;
                 Ok(())
@@ -851,7 +790,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // check has to be inline. Cost: one compare on a path
         // that's already memory-bound.
         assert!(
-            dst_off + len <= self.cap,
+            dst_off + len <= self.slice.len(),
             "UserSliceBackend: match write past slice capacity (corrupt frame)"
         );
         // Route the match copy through `simd_copy::copy_bytes_overshooting`
@@ -866,7 +805,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // sequence for shorter copies without slack — both bypass
         // the libc memmove dispatch entirely.
         let total_readable = self.tail - src_off;
-        let total_writable = self.cap - dst_off;
+        let total_writable = self.slice.len() - dst_off;
         // SAFETY: caller's non-overlap precondition gives
         // `src_off + len <= dst_off` (so src/dst regions don't
         // overlap), `total_readable >= len` follows from
@@ -875,7 +814,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         // helper writes ≤ `total_writable` bytes, so it stays
         // inside the slice even when it overshoots `len`.
         unsafe {
-            let base = self.ptr;
+            let base = self.slice.as_mut_ptr();
             super::simd_copy::copy_bytes_overshooting(
                 (base.add(src_off), total_readable),
                 (base.add(dst_off), total_writable),
@@ -894,13 +833,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
 
     #[inline]
     fn as_slices(&self) -> (&[u8], &[u8]) {
-        // SAFETY: `[head..tail]` is the already-written (initialised)
-        // region; reading it as `&[u8]` is sound. The uninitialised tail
-        // `[tail..cap]` is excluded.
-        (
-            unsafe { core::slice::from_raw_parts(self.ptr.add(self.head), self.tail - self.head) },
-            &[],
-        )
+        (&self.slice[self.head..self.tail], &[])
     }
 
     #[inline]
@@ -922,7 +855,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         let len = data.len();
         // Use `checked_add` to catch adversarial input where
         // `self.tail + len` would wrap `usize` — without the wrap
-        // check, the subsequent `new_tail > self.cap` test
+        // check, the subsequent `new_tail > self.slice.len()` test
         // can be bypassed by an `len` near `usize::MAX`, turning
         // the fallible write into a release-mode panic via
         // `copy_bytes_overshooting`.
@@ -935,23 +868,23 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
                 .ok_or(super::buffer_backend::BackendOverflow {
                     tail: self.tail,
                     requested: len,
-                    capacity: self.cap,
+                    capacity: self.slice.len(),
                 })?;
-        if new_tail > self.cap {
+        if new_tail > self.slice.len() {
             return Err(super::buffer_backend::BackendOverflow {
                 tail: self.tail,
                 requested: len,
-                capacity: self.cap,
+                capacity: self.slice.len(),
             });
         }
-        let total_writable = self.cap - self.tail;
-        // SAFETY: `new_tail <= self.cap` (checked above);
+        let total_writable = self.slice.len() - self.tail;
+        // SAFETY: `new_tail <= self.slice.len()` (checked above);
         // `data` is non-aliasing with the backend's slice (caller
         // contract — literals buffer / input view).
         unsafe {
             super::simd_copy::copy_bytes_overshooting(
                 (data.as_ptr(), len),
-                (self.ptr.add(self.tail), total_writable),
+                (self.slice.as_mut_ptr().add(self.tail), total_writable),
                 len,
             );
         }
@@ -975,20 +908,16 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
                 .ok_or(super::buffer_backend::BackendOverflow {
                     tail: self.tail,
                     requested: fill_length,
-                    capacity: self.cap,
+                    capacity: self.slice.len(),
                 })?;
-        if new_tail > self.cap {
+        if new_tail > self.slice.len() {
             return Err(super::buffer_backend::BackendOverflow {
                 tail: self.tail,
                 requested: fill_length,
-                capacity: self.cap,
+                capacity: self.slice.len(),
             });
         }
-        // SAFETY: `new_tail <= self.cap` (checked above); writing through
-        // the raw `ptr` is sound even when the backing is uninitialised
-        // spare capacity (`write_bytes` is a memset, not a read). Lowers to
-        // the same memset `<[u8]>::fill` did.
-        unsafe { core::ptr::write_bytes(self.ptr.add(self.tail), fill_with, new_tail - self.tail) };
+        self.slice[self.tail..new_tail].fill(fill_with);
         self.tail = new_tail;
         Ok(())
     }
@@ -1011,20 +940,20 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
                 .ok_or(super::buffer_backend::BackendOverflow {
                     tail: self.tail,
                     requested: len,
-                    capacity: self.cap,
+                    capacity: self.slice.len(),
                 })?;
         let abs_end = abs_start
             .checked_add(len)
             .ok_or(super::buffer_backend::BackendOverflow {
                 tail: self.tail,
                 requested: len,
-                capacity: self.cap,
+                capacity: self.slice.len(),
             })?;
         if abs_end > self.tail {
             return Err(super::buffer_backend::BackendOverflow {
                 tail: self.tail,
                 requested: len,
-                capacity: self.cap,
+                capacity: self.slice.len(),
             });
         }
         // Bound 2: destination has capacity for `len`. Same wrap
@@ -1040,13 +969,13 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
                 .ok_or(super::buffer_backend::BackendOverflow {
                     tail: self.tail,
                     requested: len,
-                    capacity: self.cap,
+                    capacity: self.slice.len(),
                 })?;
-        if new_tail > self.cap {
+        if new_tail > self.slice.len() {
             return Err(super::buffer_backend::BackendOverflow {
                 tail: self.tail,
                 requested: len,
-                capacity: self.cap,
+                capacity: self.slice.len(),
             });
         }
         // SAFETY: both bounds checked above. Forward to the unsafe
