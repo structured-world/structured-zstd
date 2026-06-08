@@ -346,11 +346,34 @@ jobs:
         with:
           node-version: "24"
 
+      # `wasm-pack build --release` runs the `-Oz` wasm-opt pass, for which it
+      # downloads a pinned binaryen tarball from GitHub releases at build time.
+      # That download is network-flaky (transient 5xx / rate-limit) and was
+      # failing the whole dashboard shard. Cache wasm-pack's tool dir so the
+      # tarball is fetched at most once across runs.
+      - name: Cache wasm-pack binaryen download
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/.wasm-pack
+          key: wasm-pack-binaryen-${{ runner.os }}
+
       - name: Build npm payloads (simd128 + scalar)
         working-directory: zstd-wasm/npm
         run: |
           npm ci || npm install
-          npm run build
+          # Retry the build: on a cold binaryen cache the wasm-opt tarball
+          # download can transiently fail. Hard-fail after 3 attempts so a real
+          # (non-transient) breakage still fails the shard.
+          attempt=0
+          until npm run build; do
+            attempt=$((attempt + 1))
+            if [ "$attempt" -ge 3 ]; then
+              echo "wasm build failed after $attempt attempts" >&2
+              exit 1
+            fi
+            echo "wasm build attempt $attempt failed (likely transient binaryen fetch); retrying..." >&2
+            sleep 15
+          done
 
       - name: Run wasm bench (capture REPORT* lines)
         working-directory: zstd-wasm/bench
