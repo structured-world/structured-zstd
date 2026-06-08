@@ -191,13 +191,15 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
         }
 
         // The loop can finish AND fully drain a frame within this same call
-        // (decode last block, then drain it into `buf`). A caller that reads
-        // exactly the frame's length and never calls `read` again would then
-        // never hit the top early-return's verify, so validate here too when
-        // the frame is finished and nothing is left to collect. Idempotent with
-        // the top check for callers that do read again.
+        // (decode last block, then drain it into `buf`). Validate here too when
+        // the frame is finished and nothing is left to collect, but ONLY when
+        // this call wrote no bytes: the `Read` contract forbids returning `Err`
+        // after bytes were delivered, so when `written > 0` the verify is
+        // deferred to the next call, where the top early-return runs it and
+        // returns `Err` on the zero-byte path. Idempotent with that top check.
         #[cfg(feature = "hash")]
-        if decoder.is_finished()
+        if written == 0
+            && decoder.is_finished()
             && decoder.can_collect() == 0
             && let Err(e) = decoder.verify_content_checksum()
         {
