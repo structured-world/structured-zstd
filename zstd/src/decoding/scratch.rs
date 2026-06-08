@@ -145,6 +145,10 @@ impl<B: BufferBackend> DecoderScratch<B> {
                 match_lengths: AlignedFSETable::new(MAX_MATCH_LENGTH_CODE),
                 offsets_long_share: 0,
                 ddict_is_cold: false,
+                ll_source: SeqTableSource::Local,
+                of_source: SeqTableSource::Local,
+                ml_source: SeqTableSource::Local,
+                dict: None,
             },
             buffer: DecodeBuffer::new(window_size),
             offset_hist: [1, 4, 8],
@@ -210,6 +214,10 @@ impl<B: BufferBackend> DecoderScratch<B> {
         // (or vice versa: skip the pipeline when the new frame
         // actually has long offsets).
         self.fse.offsets_long_share = 0;
+        // Revert any dictionary copy-on-write attachment: a scratch
+        // reused from a dict-attached frame must not read the previous
+        // dictionary's tables on the next (possibly dict-less) frame.
+        self.fse.detach_dict();
         // Pair the one-shot cold-dict flag with `reset`: a scratch
         // reused from a dictionary-attached frame whose blocks never
         // entered sequence decoding (raw-/RLE-only blocks, zero-seq
@@ -224,7 +232,12 @@ impl<B: BufferBackend> DecoderScratch<B> {
 
     pub fn init_from_dict(&mut self, dict: &DictionaryHandle) {
         let d = dict.as_dict();
-        self.fse.reinit_from(&d.fse);
+        // Copy-on-write: reference the dictionary's sequence FSE tables by
+        // handle instead of copying them into per-frame scratch. The eager
+        // copy was always wasted work: every block either reads the table
+        // by reference (Repeat mode) or rebuilds it (FSE/RLE/Predefined
+        // mode), so deferring the copy to the rebuild is strictly faster.
+        self.fse.attach_dict(dict.clone());
         self.huf.table.reinit_from(&d.huf.table);
         self.offset_hist = d.offset_hist;
         // Share the dictionary content by handle (Arc/Rc clone = refcount
@@ -259,6 +272,15 @@ impl Default for HuffmanScratch {
     }
 }
 
+/// Whether a sequence FSE table axis reads its own freshly-built
+/// `AlignedFSETable` (`Local`) or the shared dictionary's table by
+/// reference (`Dict`). See [`FSEScratch`] copy-on-write docs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SeqTableSource {
+    Local,
+    Dict,
+}
+
 pub struct FSEScratch {
     pub offsets: AlignedFSETable,
     pub literal_lengths: AlignedFSETable,
@@ -286,6 +308,22 @@ pub struct FSEScratch {
     /// predefined and repeat tables is not considered "cold" in the
     /// donor model).
     pub ddict_is_cold: bool,
+    /// Copy-on-write source for each sequence FSE table axis. After
+    /// [`DecoderScratch::init_from_dict`] all three point at the shared
+    /// dictionary (`Dict`) with **no table bytes copied** (the donor's
+    /// eager `ZSTD_copyDDictParameters` memcpy is elided); a block that
+    /// rebuilds an axis (FSE_Compressed / RLE / Predefined mode) writes
+    /// the local `AlignedFSETable` and flips that axis to `Local`.
+    /// Repeat-mode blocks leave the source untouched, so they read
+    /// straight out of the shared dictionary handle until the first
+    /// rebuild. On the no-dict path every axis stays `Local`.
+    ll_source: SeqTableSource,
+    of_source: SeqTableSource,
+    ml_source: SeqTableSource,
+    /// Shared dictionary handle backing any axis whose source is `Dict`.
+    /// Held as one `Arc`/`Rc` clone (a refcount bump, not a table copy);
+    /// `None` on the no-dict path.
+    dict: Option<DictionaryHandle>,
 }
 
 impl FSEScratch {
@@ -296,20 +334,102 @@ impl FSEScratch {
             match_lengths: AlignedFSETable::new(MAX_MATCH_LENGTH_CODE),
             offsets_long_share: 0,
             ddict_is_cold: false,
+            ll_source: SeqTableSource::Local,
+            of_source: SeqTableSource::Local,
+            ml_source: SeqTableSource::Local,
+            dict: None,
         }
     }
 
+    /// Snapshot the live (COW-resolved) sequence tables into `self` as
+    /// owned `Local` copies. Used by the LSM resume snapshot/restore
+    /// path (`FrameDecoder::export_entropy` / `restore_entropy`): the
+    /// result must be self-contained, so any `Dict`-sourced axis in
+    /// `other` is materialised by copying the dictionary's table bytes
+    /// into the local buffer and the source is set to `Local`.
     pub fn reinit_from(&mut self, other: &Self) {
-        self.offsets.reinit_from(&other.offsets);
-        self.literal_lengths.reinit_from(&other.literal_lengths);
-        self.match_lengths.reinit_from(&other.match_lengths);
-        // Copy the precomputed long-offset share instead of re-walking the
-        // offsets table on every reinit. The only caller is `init_from_dict`,
-        // and `Dictionary::decode_dict` now computes the share once when the
-        // dictionary handle is built (the dict is immutable, so it never
-        // changes), so trusting `other.offsets_long_share` is correct and saves
-        // a 256-entry table walk on every `decode_*_with_dict_handle` call.
+        self.literal_lengths.reinit_from(other.ll_table());
+        self.offsets.reinit_from(other.of_table());
+        self.match_lengths.reinit_from(other.ml_table());
+        // Copy the precomputed long-offset share instead of re-walking
+        // the offsets table; the dict computes it once at build time and
+        // it is stale-but-correct across Repeat-mode blocks.
         self.offsets_long_share = other.offsets_long_share;
+        self.ll_source = SeqTableSource::Local;
+        self.of_source = SeqTableSource::Local;
+        self.ml_source = SeqTableSource::Local;
+        self.dict = None;
+    }
+
+    /// Live LL decode table: the shared dictionary's (zero-copy) when the
+    /// axis is still `Dict`-sourced, else the locally-built one.
+    pub(crate) fn ll_table(&self) -> &SeqFSETable {
+        match self.ll_source {
+            SeqTableSource::Local => &self.literal_lengths,
+            SeqTableSource::Dict => &self.dict_ref().fse.literal_lengths,
+        }
+    }
+
+    /// Live OF decode table (see [`Self::ll_table`]).
+    pub(crate) fn of_table(&self) -> &SeqFSETable {
+        match self.of_source {
+            SeqTableSource::Local => &self.offsets,
+            SeqTableSource::Dict => &self.dict_ref().fse.offsets,
+        }
+    }
+
+    /// Live ML decode table (see [`Self::ll_table`]).
+    pub(crate) fn ml_table(&self) -> &SeqFSETable {
+        match self.ml_source {
+            SeqTableSource::Local => &self.match_lengths,
+            SeqTableSource::Dict => &self.dict_ref().fse.match_lengths,
+        }
+    }
+
+    fn dict_ref(&self) -> &crate::decoding::dictionary::Dictionary {
+        self.dict
+            .as_ref()
+            .expect("Dict table source requires an attached dictionary handle")
+            .as_dict()
+    }
+
+    /// Attach a shared dictionary copy-on-write: every sequence FSE axis
+    /// now reads the dictionary's tables by reference. No table bytes are
+    /// copied (the eager per-frame entropy-table memcpy is elided); the
+    /// only cost is one handle clone plus copying the precomputed
+    /// long-offset share scalar.
+    pub(crate) fn attach_dict(&mut self, dict: DictionaryHandle) {
+        self.offsets_long_share = dict.as_dict().fse.offsets_long_share;
+        self.ll_source = SeqTableSource::Dict;
+        self.of_source = SeqTableSource::Dict;
+        self.ml_source = SeqTableSource::Dict;
+        self.dict = Some(dict);
+    }
+
+    /// Drop any dictionary attachment and revert all axes to `Local`
+    /// (called on scratch `reset` so a reused workspace does not read a
+    /// previous frame's dictionary tables).
+    pub(crate) fn detach_dict(&mut self) {
+        self.dict = None;
+        self.ll_source = SeqTableSource::Local;
+        self.of_source = SeqTableSource::Local;
+        self.ml_source = SeqTableSource::Local;
+    }
+
+    /// Flip an axis to read its locally-built table (called by
+    /// `maybe_update_fse_tables` after FSE_Compressed / RLE / Predefined
+    /// rebuilds — the copy-on-write "write" step).
+    #[inline]
+    pub(crate) fn mark_ll_local(&mut self) {
+        self.ll_source = SeqTableSource::Local;
+    }
+    #[inline]
+    pub(crate) fn mark_of_local(&mut self) {
+        self.of_source = SeqTableSource::Local;
+    }
+    #[inline]
+    pub(crate) fn mark_ml_local(&mut self) {
+        self.ml_source = SeqTableSource::Local;
     }
 }
 
@@ -373,6 +493,46 @@ mod tests {
         assert!(
             scratch.fse.ddict_is_cold,
             "init_from_dict must set ddict_is_cold = true"
+        );
+    }
+
+    #[test]
+    fn init_from_dict_is_zero_copy_cow_then_reset_detaches() {
+        // Copy-on-write contract: `init_from_dict` must NOT copy the
+        // dictionary's sequence FSE table bytes into the per-frame local
+        // scratch; the live accessor resolves straight to the shared
+        // dictionary's table. `reset` must then detach so a reused
+        // scratch never reads the previous frame's dictionary tables.
+        extern crate std;
+        let dict_raw =
+            std::fs::read("./dict_tests/dictionary").expect("dictionary fixture should load");
+        let dict = DictionaryHandle::from_dictionary(
+            Dictionary::decode_dict(&dict_raw).expect("dictionary should parse"),
+        );
+        let mut scratch: DecoderScratch = DecoderScratch::new(1024);
+        scratch.init_from_dict(&dict);
+
+        let dict_ll_len = dict.as_dict().fse.literal_lengths.decode().len();
+        assert!(
+            dict_ll_len > 0,
+            "dict fixture should carry a built LL table"
+        );
+        // Dict-sourced axis resolves to the dictionary's table...
+        assert_eq!(
+            scratch.fse.ll_table().decode().len(),
+            dict_ll_len,
+            "Dict-sourced axis must resolve to the shared dictionary's table"
+        );
+        // ...with the local buffer left untouched (no eager copy).
+        assert!(
+            scratch.fse.literal_lengths.decode().is_empty(),
+            "init_from_dict must not copy table bytes into local scratch (COW)"
+        );
+
+        scratch.reset(1024);
+        assert!(
+            scratch.fse.ll_table().decode().is_empty(),
+            "reset must detach the dictionary copy-on-write source"
         );
     }
 }

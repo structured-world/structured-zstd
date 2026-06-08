@@ -133,9 +133,13 @@ where
     // RLE-mode axes are handled uniformly: `maybe_update_fse_tables`
     // builds a degenerate single-state table for them, so the fused
     // decode reads every axis the same way (no separate fallback).
-    let mut ll_dec = SeqFSEDecoder::new(&fse.literal_lengths);
-    let mut ml_dec = SeqFSEDecoder::new(&fse.match_lengths);
-    let mut of_dec = SeqFSEDecoder::new(&fse.offsets);
+    // Copy-on-write table source: `ll_table`/`ml_table`/`of_table`
+    // resolve to the shared dictionary's table (zero-copy) on axes still
+    // in `Dict` mode, else the locally-built table. `maybe_update_fse_tables`
+    // above has already flipped any rebuilt axis to `Local`.
+    let mut ll_dec = SeqFSEDecoder::new(fse.ll_table());
+    let mut ml_dec = SeqFSEDecoder::new(fse.ml_table());
+    let mut of_dec = SeqFSEDecoder::new(fse.of_table());
 
     ll_dec
         .init_state(&mut br)
@@ -147,9 +151,8 @@ where
         .init_state(&mut br)
         .map_err(DecodeSequenceError::from)?;
 
-    let max_update_bits = fse.literal_lengths.accuracy_log
-        + fse.match_lengths.accuracy_log
-        + fse.offsets.accuracy_log;
+    let max_update_bits =
+        fse.ll_table().accuracy_log + fse.ml_table().accuracy_log + fse.of_table().accuracy_log;
     debug_assert!(
         max_update_bits <= 56,
         "sequence section update bits exceed 56-bit budget"
@@ -1388,7 +1391,8 @@ pub(crate) fn maybe_update_fse_tables(
 
     let mut bytes_read = 0;
 
-    match modes.ll_mode() {
+    let ll_mode = modes.ll_mode();
+    match ll_mode {
         ModeType::FSECompressed => {
             let bytes = scratch.literal_lengths.build_decoder(source, LL_MAX_LOG)?;
             bytes_read += bytes;
@@ -1439,10 +1443,16 @@ pub(crate) fn maybe_update_fse_tables(
             /* Nothing to do — cached enriched values stay valid. */
         }
     };
+    // Copy-on-write "write" step: any non-Repeat rebuild wrote the local
+    // table, so the axis no longer reads the shared dictionary's.
+    if !matches!(ll_mode, ModeType::Repeat) {
+        scratch.mark_ll_local();
+    }
 
     let of_source = &source[bytes_read..];
 
-    match modes.of_mode() {
+    let of_mode = modes.of_mode();
+    match of_mode {
         ModeType::FSECompressed => {
             let bytes = scratch.offsets.build_decoder(of_source, OF_MAX_LOG)?;
             scratch.offsets.enrich_for_offsets();
@@ -1492,10 +1502,14 @@ pub(crate) fn maybe_update_fse_tables(
             /* Nothing to do — cached enriched values stay valid. */
         }
     };
+    if !matches!(of_mode, ModeType::Repeat) {
+        scratch.mark_of_local();
+    }
 
     let ml_source = &source[bytes_read..];
 
-    match modes.ml_mode() {
+    let ml_mode = modes.ml_mode();
+    match ml_mode {
         ModeType::FSECompressed => {
             let bytes = scratch.match_lengths.build_decoder(ml_source, ML_MAX_LOG)?;
             scratch.match_lengths.enrich_with_packed_seq_meta(&ML_META);
@@ -1539,6 +1553,9 @@ pub(crate) fn maybe_update_fse_tables(
             /* Nothing to do — cached enriched values stay valid. */
         }
     };
+    if !matches!(ml_mode, ModeType::Repeat) {
+        scratch.mark_ml_local();
+    }
 
     Ok(bytes_read)
 }
