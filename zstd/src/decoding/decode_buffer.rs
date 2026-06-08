@@ -38,6 +38,13 @@ pub struct DecodeBuffer<B: BufferBackend = RingBuffer> {
     total_output_counter: u64,
     #[cfg(feature = "hash")]
     pub hash: twox_hash::XxHash64,
+    /// Whether drain hashes the bytes it emits into `hash`. `false` lets a
+    /// `FrameDecoder` set to [`ContentChecksum::None`](crate::decoding::ContentChecksum::None)
+    /// skip the XXH64 pass on the streaming path. Persists across `reset`
+    /// (it mirrors a decoder-level setting, not per-frame state); the frame
+    /// layer re-applies it before each decode.
+    #[cfg(feature = "hash")]
+    compute_hash: bool,
 }
 
 /// Rollback token produced by [`DecodeBuffer::checkpoint`].
@@ -86,6 +93,8 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             total_output_counter: 0,
             #[cfg(feature = "hash")]
             hash: twox_hash::XxHash64::with_seed(0),
+            #[cfg(feature = "hash")]
+            compute_hash: true,
         }
     }
 
@@ -110,7 +119,18 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             total_output_counter: 0,
             #[cfg(feature = "hash")]
             hash: twox_hash::XxHash64::with_seed(0),
+            #[cfg(feature = "hash")]
+            compute_hash: true,
         }
+    }
+
+    /// Enable or disable the drain-time XXH64 pass. Set by the frame layer
+    /// from the decoder's [`ContentChecksum`](crate::decoding::ContentChecksum)
+    /// mode before each decode (`false` for `None`).
+    #[cfg(feature = "hash")]
+    #[inline]
+    pub(crate) fn set_compute_hash(&mut self, compute: bool) {
+        self.compute_hash = compute;
     }
 
     /// Arm the per-block decompressed-output ceiling for the block about to
@@ -319,6 +339,18 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     pub fn push(&mut self, data: &[u8]) {
         self.buffer.extend(data);
         self.total_output_counter += data.len() as u64;
+    }
+
+    /// Add `n` to the cumulative produced-byte counter for output produced
+    /// outside `push` / `repeat` — namely the inline `exec_sequence_inline`
+    /// path, which writes through the backend directly and so bypasses the
+    /// counter those methods maintain. Called by the sequence dispatch only
+    /// for backends whose `INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER` is `true`
+    /// (`RingBuffer` / `FlatBuf`), keeping `total_output()` (resume
+    /// `output_offset`) and the dict-reachability gate accurate.
+    #[inline(always)]
+    pub(crate) fn advance_output_counter(&mut self, n: u64) {
+        self.total_output_counter += n;
     }
 
     /// Fallible variant of [`Self::push`]. Returns `Err(BackendOverflow)`
@@ -963,7 +995,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     pub fn drain(&mut self) -> Vec<u8> {
         let (slice1, slice2) = self.buffer.as_slices();
         #[cfg(feature = "hash")]
-        {
+        if self.compute_hash {
             self.hash.write(slice1);
             self.hash.write(slice2);
         }
@@ -1029,7 +1061,9 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         if n1 != 0 {
             let (written1, res1) = write_bytes(&slice1[..n1]);
             #[cfg(feature = "hash")]
-            self.hash.write(&slice1[..written1]);
+            if self.compute_hash {
+                self.hash.write(&slice1[..written1]);
+            }
             drain_guard.amount += written1;
 
             // Apparently this is what clippy thinks is the best way of expressing this
@@ -1040,7 +1074,9 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             if written1 == n1 && n2 != 0 {
                 let (written2, res2) = write_bytes(&slice2[..n2]);
                 #[cfg(feature = "hash")]
-                self.hash.write(&slice2[..written2]);
+                if self.compute_hash {
+                    self.hash.write(&slice2[..written2]);
+                }
                 drain_guard.amount += written2;
 
                 // Apparently this is what clippy thinks is the best way of expressing this

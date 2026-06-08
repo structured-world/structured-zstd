@@ -2,6 +2,7 @@
 
 use core::borrow::BorrowMut;
 
+use crate::common::MAX_BLOCK_SIZE;
 use crate::decoding::errors::FrameDecoderError;
 use crate::decoding::{BlockDecodingStrategy, DictionaryHandle, FrameDecoder};
 #[cfg(not(feature = "std"))]
@@ -140,38 +141,129 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
         let decoder = self.decoder.borrow_mut();
         if decoder.is_finished() && decoder.can_collect() == 0 {
+            // Frame fully decoded and fully drained: the running XXH64 digest
+            // is final, so a `Verify`-mode decoder validates the content
+            // checksum at this finish point. No-op in other modes.
+            #[cfg(feature = "hash")]
+            if let Err(e) = decoder.verify_content_checksum() {
+                #[cfg(feature = "std")]
+                return Err(Error::other(e));
+                #[cfg(not(feature = "std"))]
+                return Err(Error::new(ErrorKind::Other, alloc::boxed::Box::new(e)));
+            }
             //No more bytes can ever be decoded
             return Ok(0);
         }
 
-        // need to loop. The UpToBytes strategy doesn't take any effort to actually reach that limit.
-        // The first few calls can result in just filling the decode buffer but these bytes can not be collected.
-        // So we need to call this until we can actually collect enough bytes
-
-        // TODO add BlockDecodingStrategy::UntilCollectable(usize) that pushes this logic into the decode_blocks function
-        while decoder.can_collect() < buf.len() && !decoder.is_finished() {
-            //More bytes can be decoded
-            let additional_bytes_needed = buf.len() - decoder.can_collect();
-            match decoder.decode_blocks(
-                &mut self.source,
-                BlockDecodingStrategy::UptoBytes(additional_bytes_needed),
-            ) {
-                Ok(_) => { /*Nothing to do*/ }
-                Err(e) => {
-                    let err;
-                    #[cfg(feature = "std")]
-                    {
-                        err = Error::other(e);
-                    }
-                    #[cfg(not(feature = "std"))]
-                    {
-                        err = Error::new(ErrorKind::Other, alloc::boxed::Box::new(e));
-                    }
-                    return Err(err);
+        // Interleave bounded decode with draining so the decode window
+        // (`RingBuffer`) stays near `window_size` instead of accumulating the
+        // whole request before a single end-of-call drain. `read_to_end` hands
+        // ever-larger buffers; decoding `buf.len()` worth into the ring up
+        // front grew it far past the window (repeated `reserve_amortized`
+        // alloc+copy). Decode at most one block worth per step, then drain
+        // what is now collectable into `buf`, mirroring the donor's
+        // window-bounded flush loop.
+        let mut written = 0;
+        while written < buf.len() {
+            // Drain whatever is collectable now (retaining `window_size` until
+            // the frame finishes). Reclaims the ring promptly so the next
+            // decode step reuses the same capacity.
+            written += decoder.read(&mut buf[written..])?;
+            if written == buf.len() || decoder.is_finished() {
+                break;
+            }
+            // Decode one bounded chunk. `UptoBytes` may overshoot a little but
+            // is capped to one block, so the ring's live region stays within
+            // `window_size + MAX_BLOCK_SIZE`.
+            let step = (buf.len() - written).min(MAX_BLOCK_SIZE as usize);
+            if let Err(e) =
+                decoder.decode_blocks(&mut self.source, BlockDecodingStrategy::UptoBytes(step))
+            {
+                #[cfg(feature = "std")]
+                {
+                    return Err(Error::other(e));
+                }
+                #[cfg(not(feature = "std"))]
+                {
+                    return Err(Error::new(ErrorKind::Other, alloc::boxed::Box::new(e)));
                 }
             }
         }
 
-        decoder.read(buf)
+        // The loop can finish AND fully drain a frame within this same call
+        // (decode last block, then drain it into `buf`). Validate here too when
+        // the frame is finished and nothing is left to collect, but ONLY when
+        // this call wrote no bytes: the `Read` contract forbids returning `Err`
+        // after bytes were delivered, so when `written > 0` the verify is
+        // deferred to the next call, where the top early-return runs it and
+        // returns `Err` on the zero-byte path. Idempotent with that top check.
+        #[cfg(feature = "hash")]
+        if written == 0
+            && decoder.is_finished()
+            && decoder.can_collect() == 0
+            && let Err(e) = decoder.verify_content_checksum()
+        {
+            #[cfg(feature = "std")]
+            return Err(Error::other(e));
+            #[cfg(not(feature = "std"))]
+            return Err(Error::new(ErrorKind::Other, alloc::boxed::Box::new(e)));
+        }
+
+        Ok(written)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StreamingDecoder;
+    use crate::io::Read;
+
+    /// `Read::read` must not return `Err` after it has already written bytes
+    /// into the caller's buffer (the trait mandates that an error implies no
+    /// bytes were read). When a single `read` call both drains the final bytes
+    /// of a `Verify`-mode frame AND finishes it, a checksum mismatch must be
+    /// deferred: those bytes are delivered as `Ok(n)` and the error surfaces on
+    /// the next (zero-byte) call, where returning `Err` violates no contract.
+    #[cfg(feature = "hash")]
+    #[test]
+    fn read_delivering_bytes_defers_checksum_error_to_next_call() {
+        use crate::decoding::ContentChecksum;
+        use crate::encoding::{CompressionLevel, FrameCompressor};
+        use crate::io::ErrorKind;
+        use alloc::vec;
+        use alloc::vec::Vec;
+
+        let payload: Vec<u8> = (0..8192u32).map(|i| (i & 0xFF) as u8).collect();
+        let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        compressor.set_source(payload.as_slice());
+        let mut compressed = Vec::new();
+        compressor.set_drain(&mut compressed);
+        compressor.compress();
+
+        // Corrupt the trailing 4-byte content checksum: the body still decodes
+        // to the right bytes, but the stored digest no longer matches.
+        let last = compressed.len() - 1;
+        compressed[last] ^= 0xFF;
+
+        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        decoder
+            .decoder
+            .set_content_checksum(ContentChecksum::Verify);
+
+        // A buffer large enough to drain the whole frame in one call: this call
+        // finishes the frame AND writes every payload byte. The mismatch must
+        // NOT abort it (that would drop the delivered bytes).
+        let mut buf = vec![0u8; payload.len() + 4096];
+        let n = decoder
+            .read(&mut buf)
+            .expect("a read that delivered bytes must not return the checksum Err");
+        assert_eq!(n, payload.len());
+        assert_eq!(&buf[..n], payload.as_slice());
+
+        // The deferred mismatch surfaces on the terminating zero-byte read.
+        let err = decoder
+            .read(&mut buf)
+            .expect_err("deferred checksum mismatch must surface on the terminating read");
+        assert_eq!(err.kind(), ErrorKind::Other);
     }
 }

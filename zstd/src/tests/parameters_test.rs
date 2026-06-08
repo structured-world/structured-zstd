@@ -278,6 +278,28 @@ fn ldm_large_window_multi_segment_round_trips() {
     }
 }
 
+/// Streaming decode of a frame whose content far exceeds its window, so the
+/// decoder's `RingBuffer` cycles many times. Exercises the bounded-ring drain
+/// loop in `StreamingDecoder::read` (decode one block, drain into the caller's
+/// buffer, repeat) instead of accumulating the whole `read_to_end` request in
+/// the ring. A fast level keeps the decode dominated by match copies through
+/// the wrapped window.
+#[test]
+fn streaming_decode_cycles_small_window_round_trips() {
+    // 1 MiB content, 128 KiB window (window_log 17): the ring wraps ~8 times.
+    let data = long_range_repetitive(1024 * 1024);
+    let params = CompressionParameters::builder(CompressionLevel::Level(1))
+        .window_log(17)
+        .build()
+        .unwrap();
+    let compressed = compress_with_parameters(&data, &params);
+    assert_eq!(
+        decode(&compressed),
+        data,
+        "streaming decode over a cycling window must round-trip exactly",
+    );
+}
+
 /// Reverting to a plain level via `set_compression_level` after a
 /// customized frame must drop the parameter overrides. Otherwise the
 /// strategy/LDM/log overrides stay sticky and the "plain" frame is still

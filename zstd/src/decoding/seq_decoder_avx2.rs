@@ -129,9 +129,11 @@ macro_rules! execute_one_body {
             // backend (RingBuffer) veto the inline path when the live region is
             // not contiguous at `tail`; linear backends fold it to `true`.
             let inline_path_safe = B::SUPPORTS_INLINE_SEQUENCE_EXEC
-                && $buffer
-                    .buffer_mut()
-                    .inline_exec_ok(seq_ll_v as usize, seq_ml_v as usize)
+                && $buffer.buffer_mut().inline_exec_ok(
+                    seq_ll_v as usize,
+                    seq_ml_v as usize,
+                    resolved_offset_v as usize,
+                )
                 && lit_cur_before
                     .checked_add(16)
                     .is_some_and(|b| b <= literals_buffer_len_v)
@@ -158,6 +160,12 @@ macro_rules! execute_one_body {
                         offset,
                         seq_ml_v as usize
                     );
+                    // Inline path bypasses the wrapper's output counter; keep it
+                    // current for backends that read it (Ring/Flat resume +
+                    // dict gate). Const-folded away for UserSliceBackend.
+                    if r.is_ok() && B::INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER {
+                        $buffer.advance_output_counter((seq_ll_v + seq_ml_v) as u64);
+                    }
                     break 'exec_inner r.map_err(DecompressBlockError::ExecuteSequencesError);
                 }
             }

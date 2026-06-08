@@ -916,26 +916,49 @@ impl super::buffer_backend::BufferBackend for RingBuffer {
     const SUPPORTS_INLINE_SEQUENCE_EXEC: bool = true;
 
     #[inline(always)]
-    fn inline_exec_ok(&self, lit_length: usize, match_length: usize) -> bool {
+    fn inline_exec_ok(&self, lit_length: usize, match_length: usize, offset: usize) -> bool {
         // The inline donor wildcopy addresses the ring linearly from `tail`
-        // (match source at `tail + lit_length - offset`) with up to 31 bytes of
-        // AVX2 wildcopy overshoot. Sound only when the live region has not
-        // wrapped (`head <= tail`) AND the write plus overshoot stay strictly
-        // below `cap`: `< cap` keeps ring invariant 4 (`tail != cap`) and puts
-        // the overshoot inside the trailing WILDCOPY_OVERLENGTH slack. The
-        // caller's `offset <= live + lit_length` invariant then places the
-        // match source at `>= head >= 0`, so it is contiguous and in-bounds.
+        // (literals at `[tail, tail+lit)`, match at `[tail+lit, tail+lit+ml)`,
+        // match source at `tail + lit - offset`) with up to 31 bytes of AVX2
+        // wildcopy overshoot. It is sound whenever that whole span is one
+        // contiguous in-bounds run — which holds in two cases:
+        //
+        // * **Unwrapped** (`head <= tail`): the free region runs `[tail, cap)`.
+        //   The write + overshoot must stay strictly below `cap` (`< cap` keeps
+        //   ring invariant 4, `tail != cap`, and puts the overshoot inside the
+        //   trailing WILDCOPY_OVERLENGTH slack). The caller's
+        //   `offset <= live + lit` invariant then puts the match source at
+        //   `>= head >= 0`, contiguous and in-bounds.
+        //
+        // * **Wrapped** (`head > tail`): the free region is the gap
+        //   `[tail, head)` and live data is split (`[head, cap)` + `[0, tail)`).
+        //   The donor body can still run linearly from `tail` when (a) the write
+        //   + overshoot ends strictly before `head` (so it neither wraps nor
+        //   clobbers the upper live segment) and (b) the match source does not
+        //   underflow into that upper segment: `offset <= tail + lit` keeps
+        //   `tail + lit - offset >= 0`, placing the source in the contiguous
+        //   lower live segment `[0, tail)`. Sequences violating either bound
+        //   (a far-back match across the wrap, or a write that reaches `head`)
+        //   fall back to the wrap-correct `push` / `repeat` path. This is the
+        //   subset the donor handles with its fast `ZSTD_execSequence` body;
+        //   only its `execSequenceEnd` near the buffer boundary is the
+        //   equivalent of our fallback.
         const INLINE_EXEC_MAX_OVERSHOOT: usize = 31;
-        if self.head > self.tail {
-            return false;
-        }
-        // Physical fit: write + AVX2 overshoot stays strictly below `cap`.
-        let physical_fit = self
+        let Some(end) = self
             .tail
             .checked_add(lit_length)
             .and_then(|v| v.checked_add(match_length))
             .and_then(|v| v.checked_add(INLINE_EXEC_MAX_OVERSHOOT))
-            .is_some_and(|end| end < self.cap);
+        else {
+            return false;
+        };
+        let physical_fit = if self.head <= self.tail {
+            end < self.cap
+        } else {
+            // Wrapped: write + overshoot stays in the free gap before `head`,
+            // and the match source stays in the contiguous lower segment.
+            end < self.head && offset <= self.tail + lit_length
+        };
         if !physical_fit {
             return false;
         }
@@ -944,11 +967,11 @@ impl super::buffer_backend::BufferBackend for RingBuffer {
         // on its growth path (the decompression-bomb guard armed by
         // `set_block_output_ceiling`). Without this, a reused large-window
         // ring with physical slack could emit past `len_at_block_start +
-        // MAX_BLOCK_SIZE`. `head <= tail` (just checked) and `physical_fit`
-        // bound `tail + lit + match < cap`, so `new_len` is wrap-free and
-        // cannot overflow. `max_capacity == usize::MAX` between blocks makes
-        // this a no-op for unbounded callers.
-        let new_len = (self.tail - self.head) + lit_length + match_length;
+        // MAX_BLOCK_SIZE`. `physical_fit` bounds the write within the current
+        // allocation in both branches, so `new_len` cannot overflow.
+        // `max_capacity == usize::MAX` between blocks makes this a no-op for
+        // unbounded callers.
+        let new_len = self.len() + lit_length + match_length;
         new_len <= self.max_capacity
     }
 
@@ -994,11 +1017,18 @@ impl super::buffer_backend::BufferBackend for RingBuffer {
             sequence_output_fits(lit_length, match_length, tail, cap, MAX_WILDCOPY_OVERSHOOT)?;
         debug_assert!(offset >= 1);
         debug_assert!(match_length >= 1);
-        debug_assert!(self.head <= tail, "exec_sequence_inline on a wrapped ring");
-        let live_len = tail - self.head;
+        // `inline_exec_ok` admits both the unwrapped run (`head <= tail`) and a
+        // wrapped ring whose write stays in the gap before `head` and whose
+        // match source is the contiguous lower segment (`offset <= tail+lit`).
+        // The match-source contiguity bound differs per case; assert the one
+        // that applies so a future caller bypassing the gate is caught.
         debug_assert!(
-            live_len + lit_length >= offset,
-            "RingBuffer::exec_sequence_inline: offset {offset} exceeds live window",
+            if self.head <= tail {
+                (tail - self.head) + lit_length >= offset
+            } else {
+                offset <= tail + lit_length
+            },
+            "RingBuffer::exec_sequence_inline: match source outside contiguous live region",
         );
 
         unsafe {
@@ -1046,11 +1076,15 @@ impl super::buffer_backend::BufferBackend for RingBuffer {
             sequence_output_fits(lit_length, match_length, tail, cap, MAX_WILDCOPY_OVERSHOOT)?;
         debug_assert!(offset >= 1);
         debug_assert!(match_length >= 1);
-        debug_assert!(self.head <= tail, "exec_sequence_inline on a wrapped ring");
-        let live_len = tail - self.head;
+        // See the x86 arm: gate admits the unwrapped run and the contiguous
+        // wrapped subset; assert the match-source bound that applies.
         debug_assert!(
-            live_len + lit_length >= offset,
-            "RingBuffer::exec_sequence_inline: offset {offset} exceeds live window",
+            if self.head <= tail {
+                (tail - self.head) + lit_length >= offset
+            } else {
+                offset <= tail + lit_length
+            },
+            "RingBuffer::exec_sequence_inline: match source outside contiguous live region",
         );
 
         unsafe {
@@ -1102,14 +1136,15 @@ impl super::buffer_backend::BufferBackend for RingBuffer {
             sequence_output_fits(lit_length, match_length, tail, cap, MAX_WILDCOPY_OVERSHOOT)?;
         debug_assert!(offset >= 1);
         debug_assert!(match_length >= 1);
+        // See the non-avx2 arm: gate admits the unwrapped run and the
+        // contiguous wrapped subset; assert the match-source bound that applies.
         debug_assert!(
-            self.head <= tail,
-            "exec_sequence_inline_avx2 on a wrapped ring"
-        );
-        let live_len = tail - self.head;
-        debug_assert!(
-            live_len + lit_length >= offset,
-            "RingBuffer::exec_sequence_inline_avx2: offset {offset} exceeds live window",
+            if self.head <= tail {
+                (tail - self.head) + lit_length >= offset
+            } else {
+                offset <= tail + lit_length
+            },
+            "RingBuffer::exec_sequence_inline_avx2: match source outside contiguous live region",
         );
 
         unsafe {
@@ -1548,13 +1583,46 @@ mod tests {
         // lit+match = 500 exceeds the 100-byte budget but fits physically
         // (1531 < cap): the inline gate must reject it.
         assert!(
-            !rb.inline_exec_ok(500, 0),
+            !rb.inline_exec_ok(500, 0, 1),
             "inline_exec_ok must reject a write past the per-block output ceiling"
         );
         // A write within the budget stays eligible for the inline path.
         assert!(
-            rb.inline_exec_ok(50, 0),
+            rb.inline_exec_ok(50, 0, 1),
             "inline_exec_ok must allow a write within the per-block ceiling"
+        );
+    }
+
+    #[test]
+    fn inline_exec_ok_admits_contiguous_wrapped_sequence() {
+        // After the ring wraps (`head > tail`), the inline donor path stays
+        // eligible for a sequence whose linear write fits in the free gap
+        // before `head` AND whose match source is the contiguous lower live
+        // segment (`offset <= tail + lit`). A far-back match (source across the
+        // wrap) or a write that would reach `head` must still be vetoed.
+        use super::super::buffer_backend::BufferBackend;
+        let mut rb = RingBuffer::new();
+        rb.reserve(4096);
+        let cap = rb.cap;
+        // Force a wrapped layout: head well ahead of a small tail.
+        rb.head = cap - 64;
+        rb.tail = 32;
+        // Free gap is [32, cap-64): write 16 lit + 16 match + 31 overshoot = 63
+        // ends at 95, far below head, and offset 8 <= tail+lit = 48 -> eligible.
+        assert!(
+            rb.inline_exec_ok(16, 16, 8),
+            "wrapped ring with contiguous write + in-segment source must stay inline-eligible"
+        );
+        // Match source crosses the wrap (offset 100 > tail+lit = 48) -> veto.
+        assert!(
+            !rb.inline_exec_ok(16, 16, 100),
+            "wrapped ring with match source across the wrap must veto the inline path"
+        );
+        // Write + overshoot would reach `head` (huge match) -> veto.
+        let huge_match = cap; // tail + lit + huge_match overflows past head
+        assert!(
+            !rb.inline_exec_ok(16, huge_match, 8),
+            "wrapped ring whose write would reach the upper live segment must veto"
         );
     }
 

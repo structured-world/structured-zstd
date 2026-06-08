@@ -215,6 +215,12 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
     /// the slow `extend` + `repeat` chain.
     const SUPPORTS_INLINE_SEQUENCE_EXEC: bool = true;
 
+    /// Direct path reads `tail` for its output count and never consults
+    /// `total_output_counter`, so the inline path skips the per-sequence
+    /// counter RMW here (preserves the ~9% it costs on the all-inline hot
+    /// path). See the trait const's doc.
+    const INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER: bool = false;
+
     /// Donor `ZSTD_execSequence` body — see trait doc for
     /// preconditions / contract.
     #[cfg(target_arch = "x86_64")]

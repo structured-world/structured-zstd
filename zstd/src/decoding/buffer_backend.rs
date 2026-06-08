@@ -100,6 +100,19 @@ pub(crate) trait BufferBackend: Sized {
     /// cost.
     const SUPPORTS_INLINE_SEQUENCE_EXEC: bool = false;
 
+    /// Whether the inline `exec_sequence_inline` dispatch must bump the
+    /// `DecodeBuffer::total_output_counter` after each sequence. The non-inline
+    /// `push` / `repeat` path always maintains that counter; the inline path
+    /// bypasses the wrapper, so backends whose cumulative-output accounting
+    /// READS the counter (`RingBuffer` / `FlatBuf` — used by the resume
+    /// `output_offset` and the dict-reachability gate) need the inline path to
+    /// keep it current. `UserSliceBackend` (the direct path) reads its `tail`
+    /// instead and never touches the counter, so it overrides this to `false`
+    /// and the per-sequence read-modify-write is dead-eliminated there (the
+    /// ~9% it costs on the all-inline direct hot path stays saved). Compile-time
+    /// const: the dispatch-site branch folds away per backend.
+    const INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER: bool = true;
+
     /// Donor's `ZSTD_execSequence` body
     /// (zstd_decompress_block.c:1008-1105). Writes `lit_length` bytes
     /// from `lit_src` at the current tail, then writes `match_length`
@@ -284,12 +297,17 @@ pub(crate) trait BufferBackend: Sized {
     /// Linear backends (`FlatBuf`, `UserSliceBackend`) are always contiguous,
     /// so the default returns `true` and their `sequence_output_fits` /
     /// tight-tail / grow handling covers capacity. `RingBuffer` overrides this
-    /// to reject the cases where the live region has wrapped or the write
-    /// would cross `cap`; the caller then takes the wrap-correct cold
-    /// `push` / `repeat` path instead.
+    /// to reject only the cases where this specific sequence's linear write or
+    /// its match source would cross the wrap boundary; a wrapped ring whose
+    /// write stays in the contiguous free gap before `head` and whose match
+    /// source is the contiguous lower live segment still takes the fast inline
+    /// path. The caller falls back to the wrap-correct cold `push` / `repeat`
+    /// path only when this returns `false`. `offset` is the resolved match
+    /// offset (post-repcode), needed by the ring to verify the match source is
+    /// contiguous; linear backends ignore it.
     #[allow(unused_variables)]
     #[inline(always)]
-    fn inline_exec_ok(&self, lit_length: usize, match_length: usize) -> bool {
+    fn inline_exec_ok(&self, lit_length: usize, match_length: usize, offset: usize) -> bool {
         true
     }
 
