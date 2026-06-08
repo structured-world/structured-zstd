@@ -1003,9 +1003,21 @@ mod zerocopy_robustness_tests {
         let mut target: Vec<u8> = Vec::new();
         let mut scratch = fresh_scratch();
         let result = decode_literals_zerocopy(&section, &mut scratch, &source, &mut target);
+        // Pin the EXACT contract: a truncated Compressed section must report
+        // MissingBytesForLiterals with the precise got/needed, not just "some
+        // error" (a weaker is_err() would also pass on MissingNumStreams /
+        // UninitializedHuffmanTable, missing the real regression).
         assert!(
-            result.is_err(),
-            "truncated compressed source must error, not panic; got {:?}",
+            matches!(
+                &result,
+                Err(
+                    crate::decoding::errors::DecompressLiteralsError::MissingBytesForLiterals {
+                        got: 3,
+                        needed: 10,
+                    }
+                )
+            ),
+            "truncated compressed source must report MissingBytesForLiterals, got {:?}",
             result.map(|_| ())
         );
     }
