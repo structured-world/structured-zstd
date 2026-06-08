@@ -1424,7 +1424,10 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             drain.write_all(&checksum_bytes).unwrap();
         }
         #[cfg(feature = "lsm")]
-        self.populate_frame_emit_info(header_buf.len(), &all_blocks);
+        {
+            let emit_checksum = cfg!(feature = "hash") && self.content_checksum;
+            self.populate_frame_emit_info(header_buf.len(), &all_blocks, emit_checksum);
+        }
     }
 
     /// Assemble the frame (header + blocks + optional checksum) into the
@@ -1455,7 +1458,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             out.extend_from_slice(&(self.hasher.finish() as u32).to_le_bytes());
         }
         #[cfg(feature = "lsm")]
-        self.populate_frame_emit_info(header_buf.len(), &all_blocks);
+        self.populate_frame_emit_info(header_buf.len(), &all_blocks, emit_checksum);
     }
 
     /// Walk `all_blocks` to recover per-block layout and store it in
@@ -1465,7 +1468,12 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// byte), Raw/Compressed bodies span `block_size`. `header_len` is the
     /// serialized frame-header length (frame offset of the first block).
     #[cfg(feature = "lsm")]
-    fn populate_frame_emit_info(&mut self, header_len: usize, all_blocks: &[u8]) {
+    fn populate_frame_emit_info(
+        &mut self,
+        header_len: usize,
+        all_blocks: &[u8],
+        emit_checksum: bool,
+    ) {
         use crate::blocks::block::BlockType as BT;
         use crate::encoding::frame_emit_info::{FrameBlock, FrameEmitInfo};
         // All frame-offset arithmetic below is bounded by u32 on the wire
@@ -1570,7 +1578,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             );
             return;
         }
-        let checksum_range = if cfg!(feature = "hash") {
+        let checksum_range = if emit_checksum {
             let cs_start = match frame_header_len.checked_add(all_blocks_len_u32) {
                 Some(v) => v,
                 None => return,

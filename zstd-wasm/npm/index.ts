@@ -170,8 +170,8 @@ export async function compress(
  * Decompress a complete Zstandard frame. Rejects if the input is not a valid,
  * complete frame, or — when `checksum` is {@link ContentChecksum.Verify} — if
  * the content checksum does not match. Defaults to
- * {@link ContentChecksum.EmitOnly}; pass {@link ContentChecksum.None} to skip
- * the XXH64 pass for speed.
+ * {@link ContentChecksum.None} (the XXH64 pass is skipped for speed); pass
+ * {@link ContentChecksum.Verify} to validate.
  */
 export async function decompress(
   data: Uint8Array,

@@ -73,8 +73,9 @@ pub fn compress(data: &[u8], level: i32, checksum: Option<bool>) -> Vec<u8> {
 ///
 /// Throws a JavaScript `Error` if the input is not a valid, complete frame,
 /// or (when `checksum` is `Verify`) if the content checksum does not match.
-/// `checksum` is optional (default `EmitOnly`): pass `ContentChecksum.None`
-/// to skip the XXH64 pass for speed, or `ContentChecksum.Verify` to validate.
+/// `checksum` is optional (default `None` — skip the XXH64 pass for speed);
+/// pass `ContentChecksum.Verify` to validate, or `EmitOnly` to compute without
+/// erroring on mismatch.
 #[wasm_bindgen]
 pub fn decompress(data: &[u8], checksum: Option<ContentChecksum>) -> Result<Vec<u8>, JsError> {
     // Stream the frame so the output Vec grows to fit — works for frames with
@@ -202,9 +203,10 @@ pub struct ZstdDecompressStream {
 
 #[wasm_bindgen]
 impl ZstdDecompressStream {
-    /// `checksum` is optional (default `EmitOnly`) and applies to the whole
-    /// stream, so set it here rather than mid-stream: `None` skips the XXH64
-    /// pass, `Verify` validates the content checksum at [`Self::finish`].
+    /// `checksum` is optional (default `None` — skip the XXH64 pass, matching
+    /// the one-shot `decompress` default) and applies to the whole stream, so
+    /// set it here rather than mid-stream: `Verify` validates the content
+    /// checksum at [`Self::finish`], `EmitOnly` computes it without erroring.
     #[wasm_bindgen(constructor)]
     pub fn new(checksum: Option<ContentChecksum>) -> ZstdDecompressStream {
         let mut decoder = FrameDecoder::new();

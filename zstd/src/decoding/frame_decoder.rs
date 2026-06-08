@@ -1425,12 +1425,19 @@ impl FrameDecoder {
     ) -> Result<bool, FrameDecoderError> {
         use FrameDecoderError as err;
         // Apply the content-checksum mode to the streaming drain hash before
-        // any block decodes into the ring. `None` skips the XXH64 pass.
+        // any block decodes into the ring. Hash only when a digest is both
+        // wanted (mode != None) AND present in the frame (content_checksum_flag
+        // set) — a flag-off frame has nothing to verify or expose, so hashing
+        // it is wasted work. Mirrors the direct path and get_calculated_checksum.
         #[cfg(feature = "hash")]
-        let compute_hash = self.content_checksum != ContentChecksum::None;
+        let checksum_mode = self.content_checksum;
         let state = self.state.as_mut().ok_or(err::NotYetInitialized)?;
         #[cfg(feature = "hash")]
-        state.decoder_scratch.set_compute_hash(compute_hash);
+        {
+            let compute_hash = checksum_mode != ContentChecksum::None
+                && state.frame_header.descriptor.content_checksum_flag();
+            state.decoder_scratch.set_compute_hash(compute_hash);
+        }
 
         // Streaming entry point: pre-reserve the backing buffer to
         // `window_size` so multi-block frames don't pay repeated
