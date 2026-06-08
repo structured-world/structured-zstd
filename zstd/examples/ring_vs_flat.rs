@@ -16,7 +16,9 @@ use std::io::Read;
 use std::time::Instant;
 
 use structured_zstd::decoding::{FrameDecoder, StreamingDecoder};
-use structured_zstd::encoding::{CompressionLevel, compress_slice_to_vec};
+use structured_zstd::encoding::{
+    CompressionLevel, CompressionParameters, compress_with_parameters,
+};
 
 fn repeated_pattern_bytes(len: usize) -> Vec<u8> {
     let pattern = b"coordinode:segment:0001|tenant=demo|label=orders|";
@@ -95,28 +97,60 @@ fn time_c_oneshot(compressed: &[u8], expected: usize, iters: u32) -> f64 {
     start.elapsed().as_secs_f64() * 1e3 / f64::from(iters)
 }
 
-fn run(name: &str, raw: &[u8], iters: u32) {
-    let compressed = compress_slice_to_vec(raw, CompressionLevel::Level(3));
+/// C streaming decode (ZSTD_decompressStream via zstd::stream::read::Decoder):
+/// the apples-to-apples peer to our `StreamingDecoder` ring path — C also keeps
+/// a window buffer and flushes (double-copies) into `out`.
+fn time_c_stream(compressed: &[u8], expected: usize, iters: u32) -> f64 {
+    let mut out = Vec::with_capacity(expected);
+    {
+        let mut dec = zstd::stream::read::Decoder::new(compressed).unwrap();
+        out.clear();
+        dec.read_to_end(&mut out).unwrap();
+        assert_eq!(out.len(), expected);
+    }
+    let start = Instant::now();
+    for _ in 0..iters {
+        let mut dec = zstd::stream::read::Decoder::new(black_box(compressed)).unwrap();
+        out.clear();
+        dec.read_to_end(&mut out).unwrap();
+        black_box(&out[..]);
+    }
+    start.elapsed().as_secs_f64() * 1e3 / f64::from(iters)
+}
+
+fn run(name: &str, raw: &[u8], window_log: u32, iters: u32) {
+    // Compress with an explicit small window so the streaming RingBuffer
+    // genuinely cycles (window << src), the realistic streaming case the
+    // dashboard's large-log-stream/low-entropy-1m hit. With src == window the
+    // ring is near-full in steady state (no gap) and the inline path can never
+    // fire regardless of the gate, so that degenerate case measures nothing.
+    let params = CompressionParameters::builder(CompressionLevel::Level(3))
+        .window_log(window_log)
+        .build()
+        .unwrap();
+    let compressed = compress_with_parameters(raw, &params);
     let expected = raw.len();
     let flat = time_flat(&compressed, expected, iters);
     let ring = time_ring(&compressed, expected, iters);
     let c = time_c_oneshot(&compressed, expected, iters);
+    let cs = time_c_stream(&compressed, expected, iters);
     println!(
-        "{name:>20}  raw={:>8}  comp={:>8}  flat={flat:7.3}ms  ring={ring:7.3}ms  c={c:7.3}ms  ring/flat={:.2}x  ring/c={:.2}x  flat/c={:.2}x",
+        "{name:>16} wlog={window_log}  raw={:>9}  flat={flat:7.3}  ring={ring:7.3}  c1={c:7.3}  cstream={cs:7.3} ms  ring/flat={:.2}x  ring/cstream={:.2}x  ring/c1={:.2}x",
         expected,
-        compressed.len(),
         ring / flat,
+        ring / cs,
         ring / c,
-        flat / c,
     );
 }
 
 fn main() {
     let mb = 1024 * 1024;
-    let iters = 50;
-    println!("== RingBuffer (stream) vs FlatBuf (slice) vs C one-shot, dfast level 3 ==");
-    run("low-entropy-1m", &repeated_pattern_bytes(mb), iters);
-    run("low-entropy-4m", &repeated_pattern_bytes(4 * mb), iters);
-    run("large-log-1m", &repeated_log_lines(mb), iters);
-    run("large-log-4m", &repeated_log_lines(4 * mb), iters);
+    println!(
+        "== RingBuffer (stream) vs FlatBuf (slice) vs C one-shot, dfast level 3, small window =="
+    );
+    // window_log 18 = 256 KiB window; src 4/16 MiB => the ring cycles many times.
+    run("low-entropy-4m", &repeated_pattern_bytes(4 * mb), 18, 30);
+    run("low-entropy-16m", &repeated_pattern_bytes(16 * mb), 18, 15);
+    run("large-log-4m", &repeated_log_lines(4 * mb), 18, 30);
+    run("large-log-16m", &repeated_log_lines(16 * mb), 18, 15);
 }
