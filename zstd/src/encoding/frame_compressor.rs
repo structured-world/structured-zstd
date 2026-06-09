@@ -725,10 +725,25 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
     /// stay small), so >4 GiB inputs fall back to it.
     fn borrowed_eligible(&self, input_len: usize, prep: &FramePrep) -> bool {
         use crate::encoding::strategy::StrategyTag;
-        !prep.use_dictionary_state
-            && !matches!(self.compression_level, CompressionLevel::Uncompressed)
-            && self.state.strategy_tag == StrategyTag::Fast
-            && input_len <= u32::MAX as usize
+        if prep.use_dictionary_state
+            || matches!(self.compression_level, CompressionLevel::Uncompressed)
+            || input_len > u32::MAX as usize
+        {
+            return false;
+        }
+        match self.state.strategy_tag {
+            // Fast handles over-window inputs in the borrowed scan via an
+            // explicit `window_low = block_end - advertised_window` bound.
+            StrategyTag::Fast => true,
+            // The Dfast borrowed scan uses `history_abs_start` (== 0 in
+            // borrowed mode) as the candidate lower bound, not `window_low`,
+            // so it reproduces the owned (evicting) path only when the whole
+            // input fits the window — then neither side evicts, so neither
+            // rejects an in-window candidate and the sequence streams match.
+            // Over-window inputs fall back to the owned path.
+            StrategyTag::Dfast => input_len <= self.state.matcher.window_size() as usize,
+            _ => false,
+        }
     }
 
     /// Compress `input` as one frame's worth of blocks: the borrowed

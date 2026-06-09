@@ -1360,13 +1360,25 @@ impl MatchGeneratorDriver {
     /// reused for another frame.
     pub(crate) unsafe fn set_borrowed_window(&mut self, buffer: &[u8]) {
         // SAFETY: forwarded contract — caller upholds liveness/clear.
-        unsafe { self.simple_mut().set_borrowed_window(buffer) };
+        match self.active_backend() {
+            super::strategy::BackendTag::Simple => unsafe {
+                self.simple_mut().set_borrowed_window(buffer)
+            },
+            super::strategy::BackendTag::Dfast => unsafe {
+                self.dfast_matcher_mut().set_borrowed_window(buffer)
+            },
+            other => unreachable!("borrowed window only for Simple/Dfast backends, got {other:?}"),
+        }
     }
 
-    /// Clear the borrowed one-shot window, returning the Simple backend
+    /// Clear the borrowed one-shot window, returning the active backend
     /// to the owned `history` path.
     pub(crate) fn clear_borrowed_window(&mut self) {
-        self.simple_mut().clear_borrowed_window();
+        match self.active_backend() {
+            super::strategy::BackendTag::Simple => self.simple_mut().clear_borrowed_window(),
+            super::strategy::BackendTag::Dfast => self.dfast_matcher_mut().clear_borrowed_window(),
+            _ => {}
+        }
         self.borrowed_pending = None;
     }
 
@@ -1378,10 +1390,12 @@ impl MatchGeneratorDriver {
     /// block. See [`Matcher::start_matching`] /
     /// [`Matcher::skip_matching_with_hint`] on this type.
     pub(crate) fn set_borrowed_block(&mut self, block_start: usize, block_end: usize) {
-        assert_eq!(
-            self.active_backend(),
-            super::strategy::BackendTag::Simple,
-            "borrowed block staging is only valid for the Simple (Fast) backend",
+        assert!(
+            matches!(
+                self.active_backend(),
+                super::strategy::BackendTag::Simple | super::strategy::BackendTag::Dfast
+            ),
+            "borrowed block staging is only valid for the Simple (Fast) / Dfast backends",
         );
         assert!(
             block_start <= block_end,
@@ -1393,8 +1407,15 @@ impl MatchGeneratorDriver {
         // `collect_block_parts` BEFORE `start_matching` consumes the
         // stage, so the staged block (not the whole borrowed window) must
         // be reported now to keep the literal-buffer reservation right.
-        self.simple_mut()
-            .stage_borrowed_block(block_start, block_end);
+        match self.active_backend() {
+            super::strategy::BackendTag::Simple => self
+                .simple_mut()
+                .stage_borrowed_block(block_start, block_end),
+            super::strategy::BackendTag::Dfast => self
+                .dfast_matcher_mut()
+                .stage_borrowed_block(block_start, block_end),
+            _ => unreachable!(),
+        }
     }
 
     #[cfg(test)]
@@ -2573,8 +2594,17 @@ impl Matcher for MatchGeneratorDriver {
         // the Simple backend is instrumented (the gate guarantees it),
         // and the stage is consumed so the next block re-stages.
         if let Some((block_start, block_end)) = self.borrowed_pending.take() {
-            self.simple_mut()
-                .start_matching_borrowed(block_start, block_end, &mut handle_sequence);
+            match self.active_backend() {
+                super::strategy::BackendTag::Simple => self.simple_mut().start_matching_borrowed(
+                    block_start,
+                    block_end,
+                    &mut handle_sequence,
+                ),
+                super::strategy::BackendTag::Dfast => self
+                    .dfast_matcher_mut()
+                    .start_matching_borrowed(block_start, block_end, &mut handle_sequence),
+                other => unreachable!("borrowed scan only for Simple/Dfast, got {other:?}"),
+            }
             return;
         }
         // Decoupled parse×search dispatch (fires once per block). The
@@ -2643,8 +2673,17 @@ impl Matcher for MatchGeneratorDriver {
         // hashes on the dict-priming hint) with no owned-history append
         // and nothing to recycle. Stage is consumed.
         if let Some((block_start, block_end)) = self.borrowed_pending.take() {
-            self.simple_mut()
-                .skip_matching_borrowed(block_start, block_end, incompressible_hint);
+            match self.active_backend() {
+                super::strategy::BackendTag::Simple => self.simple_mut().skip_matching_borrowed(
+                    block_start,
+                    block_end,
+                    incompressible_hint,
+                ),
+                super::strategy::BackendTag::Dfast => self
+                    .dfast_matcher_mut()
+                    .skip_matching_borrowed(block_start, block_end, incompressible_hint),
+                other => unreachable!("borrowed skip only for Simple/Dfast, got {other:?}"),
+            }
             return;
         }
         match self.active_backend() {

@@ -724,6 +724,97 @@ impl DfastMatchGenerator {
         self.start_matching_fast_loop(current_abs_start, current_len, &mut handle_sequence);
     }
 
+    /// Register the caller's in-place input buffer for the borrowed one-shot
+    /// path (donor `ZSTD_CCtx` in-place input). The dfast analog of
+    /// [`super::simple::fast_matcher::FastKernelMatcher::set_borrowed_window`]:
+    /// subsequent blocks scan ranges of `buffer` directly instead of copying
+    /// each into the owned `history` concat.
+    ///
+    /// # Safety
+    /// `buffer` must stay live and unmodified until [`Self::clear_borrowed_window`]
+    /// (or [`Self::reset`]) — the matcher stores a raw pointer into it and
+    /// dereferences it during every staged block scan.
+    pub(crate) unsafe fn set_borrowed_window(&mut self, buffer: &[u8]) {
+        self.borrowed_input = Some((buffer.as_ptr(), buffer.len()));
+        self.borrowed_block = None;
+    }
+
+    /// Drop the borrowed input window (the caller's slice no longer lives).
+    pub(crate) fn clear_borrowed_window(&mut self) {
+        self.borrowed_input = None;
+        self.borrowed_block = None;
+    }
+
+    /// Make `[block_start, block_end)` the active borrowed block BEFORE the
+    /// scan, so the emit pipeline's pre-scan `get_last_space().len()` reserve
+    /// reports this block (not a stale or whole-input range).
+    pub(crate) fn stage_borrowed_block(&mut self, block_start: usize, block_end: usize) {
+        let (_ptr, total) = self
+            .borrowed_input
+            .expect("stage_borrowed_block requires a registered borrowed window");
+        // Always-on (not debug_assert): the range feeds the unsafe slice
+        // builders in `scan_source` / `get_last_space`, so an out-of-range or
+        // inverted range must fault here, not deep in the kernel.
+        assert!(
+            block_start <= block_end && block_end <= total,
+            "borrowed block bounds out of range: start={block_start} end={block_end} total={total}",
+        );
+        self.borrowed_block = Some((block_start, block_end));
+    }
+
+    /// Borrowed one-shot equivalent of [`Self::start_matching`]: scan
+    /// `[block_start, block_end)` of the registered borrowed window in place
+    /// (no `commit_space` copy). Produces a byte-identical sequence stream to
+    /// the owned path for in-window inputs — positions are absolute input
+    /// offsets, candidate reads land in the same buffer, and the seam re-seed
+    /// re-hashes the prior block's short-key tail exactly as the owned loop
+    /// does once `history` spans it.
+    pub(crate) fn start_matching_borrowed(
+        &mut self,
+        block_start: usize,
+        block_end: usize,
+        mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        self.stage_borrowed_block(block_start, block_end);
+        self.ensure_hash_tables();
+        let current_len = block_end - block_start;
+        if current_len == 0 {
+            return;
+        }
+        let current_abs_start = block_start;
+        // Seam re-seed (mirror `start_matching`): re-hash the prior block's
+        // trailing `BOUNDARY_DENSE_TAIL_LEN` bytes now that the readable
+        // length spans them so a position whose 5-byte key could not form at
+        // the prior block end becomes matchable. The borrowed floor is the
+        // input start (0), so the first block (block_start == 0) backfills
+        // nothing.
+        let backfill_start = current_abs_start.saturating_sub(Self::BOUNDARY_DENSE_TAIL_LEN);
+        if backfill_start < current_abs_start {
+            self.insert_positions(backfill_start, current_abs_start);
+        }
+        self.start_matching_fast_loop(current_abs_start, current_len, &mut handle_sequence);
+    }
+
+    /// Borrowed one-shot equivalent of [`Self::skip_matching`]: stage the
+    /// block (so `get_last_space` reports it for the RLE/Raw emit) without
+    /// scanning. The block's bytes already sit in the borrowed buffer at
+    /// their absolute offsets, so a future block reaches them by offset just
+    /// as the owned skip's `history` append makes them reachable; the
+    /// `Some(false)` dictionary-priming case hashes every position so future
+    /// blocks can MATCH them, mirroring the owned skip's prime path.
+    pub(crate) fn skip_matching_borrowed(
+        &mut self,
+        block_start: usize,
+        block_end: usize,
+        incompressible_hint: Option<bool>,
+    ) {
+        self.stage_borrowed_block(block_start, block_end);
+        if incompressible_hint == Some(false) {
+            self.ensure_hash_tables();
+            self.insert_positions(block_start, block_end);
+        }
+    }
+
     /// Single-cursor probe at the last hashable position in the
     /// current block. Called from `start_matching_fast_loop` only when
     /// the outer iteration sees `ip0` still hashable but `ip1` past
@@ -2865,6 +2956,65 @@ mod extend_with_repcode_tests {
              got {} → {} bytes",
             data.len(),
             compressed.len()
+        );
+    }
+
+    /// The borrowed one-shot scan (no per-block `commit_space` copy) must
+    /// emit the byte-identical sequence stream as the owned `history`-copying
+    /// path for an in-window input: the window far exceeds the input so the
+    /// owned path never evicts, making its accumulated `history` identical to
+    /// the borrowed buffer, and the borrowed scan's absolute positions /
+    /// seam re-seed reproduce the same match decisions. This is the
+    /// correctness contract behind routing dfast through `borrowed_eligible`.
+    #[test]
+    fn dfast_borrowed_window_matches_owned_sequence_stream() {
+        // Repeating pattern (period 64) so the matcher emits real matches,
+        // split across two blocks.
+        let mut whole: Vec<u8> = Vec::with_capacity(512);
+        for i in 0..512usize {
+            whole.push((i % 64) as u8);
+        }
+        let split = 300usize;
+        let window = 1usize << 16; // 64 KiB >> 512-byte input: no eviction.
+
+        // Owned: commit each block, then scan.
+        let mut owned = DfastMatchGenerator::new(window);
+        owned.ensure_hash_tables();
+        let mut owned_seqs: Vec<CapturedSeq> = Vec::new();
+        owned.add_data(whole[..split].to_vec(), |_| {});
+        {
+            let mut rec = record_seq(&mut owned_seqs);
+            owned.start_matching(&mut rec);
+        }
+        owned.add_data(whole[split..].to_vec(), |_| {});
+        {
+            let mut rec = record_seq(&mut owned_seqs);
+            owned.start_matching(&mut rec);
+        }
+
+        // Borrowed: same bytes, scanned in place by absolute block range.
+        let mut borrowed = DfastMatchGenerator::new(window);
+        borrowed.ensure_hash_tables();
+        let mut borrowed_seqs: Vec<CapturedSeq> = Vec::new();
+        // SAFETY: `whole` outlives both scans; `borrowed` is dropped at end
+        // of scope before `whole`, so the window never dangles.
+        unsafe { borrowed.set_borrowed_window(&whole) };
+        {
+            let mut rec = record_seq(&mut borrowed_seqs);
+            borrowed.start_matching_borrowed(0, split, &mut rec);
+        }
+        {
+            let mut rec = record_seq(&mut borrowed_seqs);
+            borrowed.start_matching_borrowed(split, whole.len(), &mut rec);
+        }
+
+        assert_eq!(
+            owned_seqs, borrowed_seqs,
+            "dfast borrowed window must emit the identical sequence stream as the owned path",
+        );
+        assert_eq!(
+            owned.offset_hist, borrowed.offset_hist,
+            "rep state must match after both scans",
         );
     }
 }
