@@ -143,6 +143,46 @@ pub(crate) struct DfastDictTables {
     pub(crate) short: alloc::vec::Vec<u32>,
 }
 
+/// Per-kernel body of [`DfastMatchGenerator::probe_slot_match`]. The wrapper
+/// carries the `#[target_feature]` umbrella and passes its tier's
+/// `common_prefix_len_ptr` as `$cpl`, so the forward match-length scan inlines
+/// under that umbrella instead of crossing the target_feature ABI boundary as
+/// a non-inlinable call (`#[inline]` cannot cross it). Mirrors
+/// `start_matching_fast_loop_body!`.
+macro_rules! dfast_probe_slot_match_body {
+    ($self:ident, $slot:ident, $position_base:ident, $history_abs_start:ident,
+     $abs_pos:ident, $current_idx:ident, $concat:ident, $lit_len:ident,
+     $gate_len:ident, $cpl:path) => {{
+        if $slot == DFAST_EMPTY_SLOT {
+            return None;
+        }
+        let candidate_pos = $position_base + ($slot as usize) - 1;
+        if candidate_pos < $history_abs_start || candidate_pos >= $abs_pos {
+            return None;
+        }
+        let candidate_idx = candidate_pos - $history_abs_start;
+        if candidate_idx + $gate_len > $concat.len() || $current_idx + $gate_len > $concat.len() {
+            return None;
+        }
+        if $concat[candidate_idx..candidate_idx + $gate_len]
+            != $concat[$current_idx..$current_idx + $gate_len]
+        {
+            return None;
+        }
+        let a = &$concat[candidate_idx..];
+        let b = &$concat[$current_idx..];
+        let max = a.len().min(b.len());
+        // SAFETY: `a` / `b` each have at least `len()` initialized bytes; `max`
+        // is the minimum, so both pointers are valid for `max` bytes. `$cpl` is
+        // the current tier's kernel, whose target feature this wrapper enables.
+        let match_len = unsafe { $cpl(a.as_ptr(), b.as_ptr(), max) };
+        if match_len < DFAST_MIN_MATCH_LEN {
+            return None;
+        }
+        Some($self.extend_backwards(candidate_pos, $abs_pos, match_len, $lit_len))
+    }};
+}
+
 impl DfastMatchGenerator {
     // Keep a short dense tail at block boundaries for two related reasons:
     // 1) insert_position() needs short (4-byte) and long (8-byte) lookahead,
@@ -1373,41 +1413,222 @@ impl DfastMatchGenerator {
         lit_len: usize,
         gate_len: usize,
     ) -> Option<MatchCandidate> {
-        if slot == DFAST_EMPTY_SLOT {
-            return None;
+        // Dispatch on the cached kernel to the matching `#[target_feature]`
+        // variant so the forward match-length scan inlines under that umbrella.
+        // The previous `common_prefix_len_with_kernel` call crossed the
+        // target_feature ABI boundary and left the SIMD body as a non-inlinable
+        // call (`#[inline]` cannot cross it); the probe-width gate / bounds
+        // checks are scalar and identical across tiers.
+        match self.kernel {
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            FastpathKernel::Avx2Bmi2 => unsafe {
+                self.probe_slot_match_avx2_bmi2(
+                    slot,
+                    position_base,
+                    history_abs_start,
+                    abs_pos,
+                    current_idx,
+                    concat,
+                    lit_len,
+                    gate_len,
+                )
+            },
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            FastpathKernel::Sse42 => unsafe {
+                self.probe_slot_match_sse42(
+                    slot,
+                    position_base,
+                    history_abs_start,
+                    abs_pos,
+                    current_idx,
+                    concat,
+                    lit_len,
+                    gate_len,
+                )
+            },
+            #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+            FastpathKernel::Neon => unsafe {
+                self.probe_slot_match_neon(
+                    slot,
+                    position_base,
+                    history_abs_start,
+                    abs_pos,
+                    current_idx,
+                    concat,
+                    lit_len,
+                    gate_len,
+                )
+            },
+            #[cfg(all(
+                target_arch = "wasm32",
+                target_feature = "simd128",
+                feature = "kernel_simd128"
+            ))]
+            FastpathKernel::Simd128 => unsafe {
+                self.probe_slot_match_simd128(
+                    slot,
+                    position_base,
+                    history_abs_start,
+                    abs_pos,
+                    current_idx,
+                    concat,
+                    lit_len,
+                    gate_len,
+                )
+            },
+            FastpathKernel::Scalar => self.probe_slot_match_scalar(
+                slot,
+                position_base,
+                history_abs_start,
+                abs_pos,
+                current_idx,
+                concat,
+                lit_len,
+                gate_len,
+            ),
         }
-        let candidate_pos = position_base + (slot as usize) - 1;
-        if candidate_pos < history_abs_start || candidate_pos >= abs_pos {
-            return None;
-        }
-        let candidate_idx = candidate_pos - history_abs_start;
-        // Probe-width equality gate before the SIMD walk. The long-hash
-        // callers pass `gate_len = 8` (matches an `MEM_read64`-style
-        // probe in the upstream reference); the short-hash caller
-        // passes `gate_len = 4` (`MEM_read32`-style). A 1-byte
-        // precheck would accept hash collisions whose actual common
-        // prefix runs from 1 byte up to less than the probe width,
-        // paying the full `common_prefix_len` walk for them on every
-        // iteration. The wider gate rejects those collisions early
-        // and matches what the upstream `_search_next_long` path does
-        // after a hit.
-        if candidate_idx + gate_len > concat.len() || current_idx + gate_len > concat.len() {
-            return None;
-        }
-        if concat[candidate_idx..candidate_idx + gate_len]
-            != concat[current_idx..current_idx + gate_len]
-        {
-            return None;
-        }
-        let match_len = common_prefix_len_with_kernel(
-            self.kernel,
-            &concat[candidate_idx..],
-            &concat[current_idx..],
-        );
-        if match_len < DFAST_MIN_MATCH_LEN {
-            return None;
-        }
-        Some(self.extend_backwards(candidate_pos, abs_pos, match_len, lit_len))
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx2,bmi2")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn probe_slot_match_avx2_bmi2(
+        &self,
+        slot: u32,
+        position_base: usize,
+        history_abs_start: usize,
+        abs_pos: usize,
+        current_idx: usize,
+        concat: &[u8],
+        lit_len: usize,
+        gate_len: usize,
+    ) -> Option<MatchCandidate> {
+        dfast_probe_slot_match_body!(
+            self,
+            slot,
+            position_base,
+            history_abs_start,
+            abs_pos,
+            current_idx,
+            concat,
+            lit_len,
+            gate_len,
+            crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr
+        )
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "sse4.2")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn probe_slot_match_sse42(
+        &self,
+        slot: u32,
+        position_base: usize,
+        history_abs_start: usize,
+        abs_pos: usize,
+        current_idx: usize,
+        concat: &[u8],
+        lit_len: usize,
+        gate_len: usize,
+    ) -> Option<MatchCandidate> {
+        dfast_probe_slot_match_body!(
+            self,
+            slot,
+            position_base,
+            history_abs_start,
+            abs_pos,
+            current_idx,
+            concat,
+            lit_len,
+            gate_len,
+            crate::encoding::fastpath::sse42::common_prefix_len_ptr
+        )
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[target_feature(enable = "neon")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn probe_slot_match_neon(
+        &self,
+        slot: u32,
+        position_base: usize,
+        history_abs_start: usize,
+        abs_pos: usize,
+        current_idx: usize,
+        concat: &[u8],
+        lit_len: usize,
+        gate_len: usize,
+    ) -> Option<MatchCandidate> {
+        dfast_probe_slot_match_body!(
+            self,
+            slot,
+            position_base,
+            history_abs_start,
+            abs_pos,
+            current_idx,
+            concat,
+            lit_len,
+            gate_len,
+            crate::encoding::fastpath::neon::common_prefix_len_ptr
+        )
+    }
+
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel_simd128"
+    ))]
+    #[target_feature(enable = "simd128")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn probe_slot_match_simd128(
+        &self,
+        slot: u32,
+        position_base: usize,
+        history_abs_start: usize,
+        abs_pos: usize,
+        current_idx: usize,
+        concat: &[u8],
+        lit_len: usize,
+        gate_len: usize,
+    ) -> Option<MatchCandidate> {
+        dfast_probe_slot_match_body!(
+            self,
+            slot,
+            position_base,
+            history_abs_start,
+            abs_pos,
+            current_idx,
+            concat,
+            lit_len,
+            gate_len,
+            crate::encoding::fastpath::simd128::common_prefix_len_ptr
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn probe_slot_match_scalar(
+        &self,
+        slot: u32,
+        position_base: usize,
+        history_abs_start: usize,
+        abs_pos: usize,
+        current_idx: usize,
+        concat: &[u8],
+        lit_len: usize,
+        gate_len: usize,
+    ) -> Option<MatchCandidate> {
+        dfast_probe_slot_match_body!(
+            self,
+            slot,
+            position_base,
+            history_abs_start,
+            abs_pos,
+            current_idx,
+            concat,
+            lit_len,
+            gate_len,
+            crate::encoding::fastpath::scalar::common_prefix_len_ptr
+        )
     }
 
     #[inline(always)]
@@ -2438,10 +2659,23 @@ impl DfastMatchGenerator {
                 ),
             }
         }
+        #[cfg(all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel_simd128"
+        ))]
+        unsafe {
+            self.start_matching_fast_loop_simd128(current_abs_start, current_len, handle_sequence)
+        }
         #[cfg(not(any(
             all(target_arch = "aarch64", target_endian = "little"),
             target_arch = "x86",
-            target_arch = "x86_64"
+            target_arch = "x86_64",
+            all(
+                target_arch = "wasm32",
+                target_feature = "simd128",
+                feature = "kernel_simd128"
+            )
         )))]
         {
             self.start_matching_fast_loop_scalar(current_abs_start, current_len, handle_sequence)
@@ -2499,7 +2733,35 @@ impl DfastMatchGenerator {
         )
     }
 
-    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel_simd128"
+    ))]
+    #[target_feature(enable = "simd128")]
+    unsafe fn start_matching_fast_loop_simd128(
+        &mut self,
+        current_abs_start: usize,
+        current_len: usize,
+        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        start_matching_fast_loop_body!(
+            self,
+            current_abs_start,
+            current_len,
+            handle_sequence,
+            crate::encoding::fastpath::simd128::common_prefix_len_ptr
+        )
+    }
+
+    #[cfg(not(any(
+        all(target_arch = "aarch64", target_endian = "little"),
+        all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel_simd128"
+        )
+    )))]
     #[allow(unused_unsafe)]
     fn start_matching_fast_loop_scalar(
         &mut self,
