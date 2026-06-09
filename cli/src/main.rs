@@ -197,19 +197,27 @@ fn parse_args(
                         // `--fast` is the level -1 alias.
                         opts.level = -1;
                     } else if let Some(v) = long.strip_prefix("fast=") {
-                        // `--fast=N` is level -N. Exact-match the prefix so a
+                        // `--fast=N` is level -N for a positive N. Parse as
+                        // unsigned so `--fast=-5` is rejected rather than flipping
+                        // sign into a positive level. Exact-match the prefix so a
                         // typo like `--faster` falls through to unknown-option.
-                        opts.level = -(v.parse::<i32>().wrap_err("invalid --fast level")?);
+                        let n = v.parse::<u32>().wrap_err("invalid --fast level")?;
+                        opts.level = -i32::try_from(n).wrap_err("--fast level too large")?;
                     } else if let Some(path) = long.strip_prefix("use-dict=") {
                         opts.dict = Some(PathBuf::from(path));
                     } else if let Some(v) = long.strip_prefix("maxdict=") {
                         opts.max_dict = v.parse::<usize>().wrap_err("invalid --maxdict size")?;
                     } else if let Some(v) = long.strip_prefix("dictID=") {
                         opts.dict_id = Some(v.parse::<u32>().wrap_err("invalid --dictID")?);
-                    } else if long == "long" || long.strip_prefix("long=").is_some() {
-                        // `--long` or `--long=N` (the window-log hint is accepted
-                        // but the encoder derives the LDM window from the level).
-                        // Exact-match so `--longer` is an unknown option.
+                    } else if long == "long" {
+                        opts.long = true;
+                    } else if let Some(v) = long.strip_prefix("long=") {
+                        // `--long=N`: the window-log hint must be numeric (it is
+                        // accepted but the encoder derives the LDM window from the
+                        // level). Reject `--long=` / `--long=abc` instead of
+                        // treating them as a silent no-op. Exact-match so
+                        // `--longer` is an unknown option.
+                        let _ = v.parse::<u32>().wrap_err("invalid --long window log")?;
                         opts.long = true;
                     } else {
                         bail!("unknown option: --{long}");
@@ -595,6 +603,11 @@ fn list_file(path: &Path) -> color_eyre::Result<()> {
         .metadata()
         .wrap_err_with(|| format!("failed to stat {}", path.display()))?
         .len();
+    // An empty file is not a zstd stream: without this guard the walk loop
+    // below never runs and we would print a spurious 0-frame success row.
+    if compressed == 0 {
+        bail!("{}: not a zstd frame: empty file", path.display());
+    }
     let mut offset = 0u64;
     let mut frames = 0u64;
     let mut decompressed = Some(0u64);
@@ -1263,6 +1276,13 @@ mod tests {
         // through to the unknown-option path.
         assert!(parse(&["--faster"]).is_err());
         assert!(parse(&["--longer"]).is_err());
+        // Invalid payloads are rejected, not silently reinterpreted:
+        // `--fast=-5` must not flip into a positive level, and `--long=` /
+        // `--long=abc` must not be accepted as a no-op.
+        assert!(parse(&["--fast=-5"]).is_err());
+        assert!(parse(&["--long="]).is_err());
+        assert!(parse(&["--long=abc"]).is_err());
+        assert!(parse(&["--long=27"]).unwrap().long);
     }
 
     #[test]
