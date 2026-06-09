@@ -1741,9 +1741,17 @@ impl Matcher for MatchGeneratorDriver {
             // un-hinted base widths instead and assign the result directly:
             // `cdict_table_logs` only ever downsizes, so it never exceeds the base
             // level geometry, while the eviction `window_log` stays source-derived so
-            // the dictionary bytes remain referenceable.
-            let base_hc = Self::level_params(level, None).hc;
-            if let (Some(hc), Some(base_hc)) = (params.hc.as_mut(), base_hc) {
+            // the dictionary bytes remain referenceable. Active public-parameter
+            // overrides (#27) are applied to the base too, so a strategy override
+            // that routes onto HashChain/BinaryTree still gets dict-tier sizing and
+            // explicit hash/chain overrides feed through as the geometry ceiling.
+            let mut base_params = Self::level_params(level, None);
+            if let Some(ov) = self.param_overrides
+                && !ov.is_empty()
+            {
+                apply_param_overrides(&mut base_params, &ov);
+            }
+            if let (Some(hc), Some(base_hc)) = (params.hc.as_mut(), base_params.hc) {
                 let uses_bt = matches!(
                     params.strategy_tag,
                     super::strategy::StrategyTag::Btlazy2
