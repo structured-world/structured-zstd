@@ -1966,6 +1966,16 @@ impl Matcher for MatchGeneratorDriver {
                     data.resize(data.capacity(), 0);
                     vec_pool.push(data);
                 });
+                // When the source size is known, pre-size the history mirror to
+                // the expected total (dictionary + payload) so per-block growth
+                // does not overshoot via Vec capacity doubling (donor sizes its
+                // window buffer exactly). Dominates peak once the match-finder
+                // tables are dictionary-tier-small. Unhinted streams skip this
+                // and keep doubling growth.
+                if let Some(src) = hint {
+                    let expected = (src as usize).saturating_add(dict_hint.unwrap_or(0));
+                    hc.table.reserve_history(expected);
+                }
             }
         }
         // LDM wiring (#27): attach (or clear) the long-distance-match
