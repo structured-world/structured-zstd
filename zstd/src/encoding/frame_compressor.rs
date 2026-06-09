@@ -154,6 +154,20 @@ pub(crate) struct CachedDictionaryEntropy {
 }
 
 impl CachedDictionaryEntropy {
+    /// Heap bytes the cached dictionary entropy holds: the literals Huffman
+    /// table plus any `Custom` LL/ML/OF FSE tables (the `Arc`-boxed `FSETable`
+    /// payload and its flat state array). `Default` / `Rle` variants own no heap.
+    pub(crate) fn heap_size(&self) -> usize {
+        let mut total = self.huff.as_ref().map_or(0, |h| h.heap_size());
+        for prev in [&self.ll_previous, &self.ml_previous, &self.of_previous] {
+            if let Some(PreviousFseTable::Custom(table)) = prev {
+                total +=
+                    core::mem::size_of::<crate::fse::fse_encoder::FSETable>() + table.heap_size();
+            }
+        }
+        total
+    }
+
     /// Derive the encoder-side entropy tables a dictionary seeds for the first
     /// block of each frame (the donor `cdict->cBlockState`): the literals
     /// Huffman table plus the literal-length / match-length / offset FSE
@@ -992,14 +1006,19 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// Total heap bytes this compressor's allocations hold, excluding the
     /// inline struct: the match-finder tables / history / recycled buffers and
     /// the primed-dictionary snapshot (via the matcher), the retained
-    /// dictionary content, and the per-block sidecar buffers. Lets a context
-    /// report its true footprint through `ZSTD_sizeof_CCtx`.
+    /// dictionary content, the cached dictionary entropy tables (literals
+    /// Huffman + LL/ML/OF FSE), and the per-block sidecar buffers. Lets a
+    /// context report its true footprint through `ZSTD_sizeof_CCtx`.
     pub fn heap_size(&self) -> usize {
         let mut total = self.state.matcher.heap_size();
         total += self
             .dictionary
             .as_ref()
             .map_or(0, |d| d.inner.dict_content.capacity());
+        total += self
+            .dictionary_entropy_cache
+            .as_ref()
+            .map_or(0, CachedDictionaryEntropy::heap_size);
         #[cfg(all(feature = "lsm", feature = "hash"))]
         {
             total += self
