@@ -25,8 +25,7 @@ use super::match_generator::{
     DFAST_SHORT_HASH_LOOKAHEAD, DFAST_SKIP_STEP_GROWTH_INTERVAL, DFAST_TARGET_LEN, MIN_WINDOW_LOG,
 };
 use super::match_table::helpers::{
-    LazyMatchConfig, best_len_offset_candidate, common_prefix_len_with_kernel,
-    extend_backwards_shared, pick_lazy_match_shared,
+    best_len_offset_candidate, common_prefix_len_with_kernel, extend_backwards_shared,
 };
 use super::match_table::storage::{REBASE_RESET_FLOOR_CEILING, check_stream_abs_headroom};
 use super::opt::types::MatchCandidate;
@@ -393,26 +392,44 @@ macro_rules! dfast_start_matching_general_body {
             let best = best_len_offset_candidate(unsafe { $self.$rep(abs_pos, lit_len) }, unsafe {
                 $self.$hash(abs_pos, lit_len)
             });
-            // Inlined `pick_lazy_match`: the lookahead closure re-probes the
-            // same tier's repcode/hash (one umbrella-boundary hop per deferral,
-            // a cold path versus the per-position search above).
-            let picked = pick_lazy_match_shared(
-                abs_pos,
-                lit_len,
-                best,
-                LazyMatchConfig {
-                    target_len: DFAST_TARGET_LEN,
-                    min_match_len: DFAST_MIN_MATCH_LEN,
-                    lazy_depth: $self.lazy_depth,
-                    history_abs_end: $self.history_abs_end(),
-                },
-                |next_pos, next_lit_len| {
-                    best_len_offset_candidate(
-                        unsafe { $self.$rep(next_pos, next_lit_len) },
-                        unsafe { $self.$hash(next_pos, next_lit_len) },
-                    )
-                },
-            );
+            // Inlined `pick_lazy_match` (donor lazy/lazy2 lookahead): re-probe
+            // the same tier's repcode/hash at `abs_pos + 1` (and `+ 2` for
+            // lazy2) DIRECTLY under this umbrella so the lookahead `$cpl` scans
+            // inline too — no closure (a closure body is a separate
+            // non-`target_feature` MIR body, so its `$rep` / `$hash` calls would
+            // cross the ABI barrier on every deferral). Logic byte-identical to
+            // `pick_lazy_match_shared`.
+            let picked = 'pick: {
+                let Some(b) = best else { break 'pick None };
+                let history_abs_end = $self.history_abs_end();
+                if b.match_len >= DFAST_TARGET_LEN
+                    || abs_pos + 1 + DFAST_MIN_MATCH_LEN > history_abs_end
+                {
+                    break 'pick Some(b);
+                }
+                let next = best_len_offset_candidate(
+                    unsafe { $self.$rep(abs_pos + 1, lit_len + 1) },
+                    unsafe { $self.$hash(abs_pos + 1, lit_len + 1) },
+                );
+                if let Some(n) = next
+                    && (n.match_len > b.match_len
+                        || (n.match_len == b.match_len && n.offset < b.offset))
+                {
+                    break 'pick None;
+                }
+                if $self.lazy_depth >= 2 && abs_pos + 2 + DFAST_MIN_MATCH_LEN <= history_abs_end {
+                    let next2 = best_len_offset_candidate(
+                        unsafe { $self.$rep(abs_pos + 2, lit_len + 2) },
+                        unsafe { $self.$hash(abs_pos + 2, lit_len + 2) },
+                    );
+                    if let Some(n2) = next2
+                        && n2.match_len > b.match_len + 1
+                    {
+                        break 'pick None;
+                    }
+                }
+                Some(b)
+            };
             if let Some(candidate) = picked {
                 let start = $self.emit_candidate(
                     $current_abs_start,
