@@ -123,16 +123,17 @@ pub(crate) struct DfastMatchGenerator {
     /// resolved once at construction so the per-byte match-finder scans skip
     /// the `select_kernel()` `OnceLock` atomic on every call.
     pub(crate) kernel: FastpathKernel,
-    /// Borrowed one-shot scan window: `(input_base_ptr, current_block_end)`.
-    /// When `Some`, the fast loop sources bytes from the caller's in-place
-    /// input slice with absolute input positions (`abs_start = position_base
-    /// = start_offset = 0`, readable length = `current_block_end`) instead of
-    /// copying each block into the owned `history` concat — the dfast analog
-    /// of the Fast backend's borrowed window. The pointer is the input start
-    /// (constant for the frame); the second field is updated to the active
-    /// block's end before each block scan. `None` = owned (history-copying)
-    /// path. Cleared on `reset()`.
-    pub(crate) borrowed: Option<(*const u8, usize)>,
+    /// Borrowed one-shot scan window: `(input_base_ptr, block_start,
+    /// block_end)`. When `Some`, the fast loop sources bytes from the
+    /// caller's in-place input slice with absolute input positions
+    /// (`abs_start = position_base = start_offset = 0`, readable length =
+    /// `block_end`) instead of copying each block into the owned `history`
+    /// concat — the dfast analog of the Fast backend's borrowed window. The
+    /// pointer is the input start (constant for the frame); `block_start..
+    /// block_end` is the active block's absolute range, re-staged before each
+    /// block scan (so `get_last_space` reports the borrowed block to the emit
+    /// pipeline). `None` = owned (history-copying) path. Cleared on `reset()`.
+    pub(crate) borrowed: Option<(*const u8, usize, usize)>,
 }
 
 /// The dfast backend's immutable dictionary tables — a long+short pair mirroring
@@ -350,6 +351,16 @@ impl DfastMatchGenerator {
     /// usage and avoids a panic-vs-gate divergence that would
     /// surprise a future refactor consolidating the call sites.
     pub(crate) fn get_last_space(&self) -> &[u8] {
+        if let Some((ptr, block_start, block_end)) = self.borrowed {
+            // Borrowed window: the active block is the in-place input range
+            // `[block_start, block_end)`, staged before the scan so the emit
+            // pipeline's pre-scan `get_last_space().len()` reserve is correct.
+            // SAFETY: borrowed liveness contract; `block_start <= block_end <=
+            // buffer len` (validated when staged).
+            return unsafe {
+                core::slice::from_raw_parts(ptr.add(block_start), block_end - block_start)
+            };
+        }
         let last_len = self.window_blocks.back().copied().unwrap_or(0);
         &self.history[self.history.len() - last_len..]
     }
@@ -740,11 +751,10 @@ impl DfastMatchGenerator {
 
         let abs_ip0 = current_abs_start + ip0;
         let lit_len_ip0 = ip0 - literals_start;
-        let history_abs_start = self.history_abs_start;
-        let position_base = self.position_base;
-        let history_start_offset = self.history_start;
-        let concat_len = self.history.len() - history_start_offset;
-        let history_base_ptr = self.history.as_ptr();
+        // Byte source through `scan_source()` so the tail probe reads the
+        // borrowed input in place when a borrowed window is active.
+        let (history_base_ptr, history_start_offset, history_abs_start, position_base, concat_len) =
+            self.scan_source();
 
         let concat_idx0 = abs_ip0 - history_abs_start;
 
@@ -818,7 +828,12 @@ impl DfastMatchGenerator {
                         );
                         match_len += ext;
                     }
-                    let concat = &self.history[history_start_offset..];
+                    let concat = unsafe {
+                        core::slice::from_raw_parts(
+                            history_base_ptr.add(history_start_offset),
+                            concat_len,
+                        )
+                    };
                     return Some(extend_backwards_shared(
                         concat,
                         history_abs_start,
@@ -853,7 +868,12 @@ impl DfastMatchGenerator {
                         );
                         s_match_len += ext;
                     }
-                    let concat = &self.history[history_start_offset..];
+                    let concat = unsafe {
+                        core::slice::from_raw_parts(
+                            history_base_ptr.add(history_start_offset),
+                            concat_len,
+                        )
+                    };
                     let short_cand = extend_backwards_shared(
                         concat,
                         history_abs_start,
@@ -913,8 +933,12 @@ impl DfastMatchGenerator {
             if rep == 0 {
                 break;
             }
+            // Source bytes + rebase coordinate through `scan_source()` so a
+            // borrowed window's rep-extension reads the in-place input.
+            let (base_ptr, start_offset, abs_start, _position_base, concat_len) =
+                self.scan_source();
             let abs_pos = current_abs_start + pos;
-            let cur_idx = abs_pos - self.history_abs_start;
+            let cur_idx = abs_pos - abs_start;
             // `checked_sub` is the authoritative bound here: a valid rep
             // can reach beyond the current block into retained history
             // (the contiguous `live_history()` buffer covers
@@ -929,7 +953,12 @@ impl DfastMatchGenerator {
                 Some(idx) => idx,
                 None => break,
             };
-            let concat = &self.history[self.history_start..];
+            // SAFETY: `base_ptr + start_offset` is the live source start and
+            // `concat_len` its readable length (owned history or borrowed
+            // input); the `cur_idx` / `cand_idx` reads below are gated `<
+            // concat.len()`. Raw-ptr backed, no borrow on `self`.
+            let concat =
+                unsafe { core::slice::from_raw_parts(base_ptr.add(start_offset), concat_len) };
             if cur_idx + DFAST_REP_MIN_MATCH_LEN > concat.len() {
                 break;
             }
@@ -1041,7 +1070,7 @@ impl DfastMatchGenerator {
     /// the loop stays sound.
     #[inline(always)]
     fn scan_source(&self) -> (*const u8, usize, usize, usize, usize) {
-        if let Some((ptr, block_end)) = self.borrowed {
+        if let Some((ptr, _block_start, block_end)) = self.borrowed {
             // Borrowed one-shot window: positions are absolute input
             // offsets, so the rebase coordinates collapse to zero
             // (`start_offset = abs_start = position_base = 0`) and the
@@ -1058,6 +1087,29 @@ impl DfastMatchGenerator {
             self.position_base,
             self.history.len() - start_offset,
         )
+    }
+
+    /// `(ptr, len)` of the block currently being emitted, for the literal
+    /// slices in `emit_candidate` / `emit_trailing_literals`. Owned: the
+    /// `history` concat tail (`last_len` bytes). Borrowed: the in-place
+    /// input sub-slice `[current_abs_start, block_end)`. Returns a raw
+    /// pointer (not a `&[u8]` tied to `&self`) so the caller can rebuild
+    /// the slice locally and still take `&mut self` for `offset_hist`.
+    #[inline]
+    fn current_block_ptr_len(&self, current_abs_start: usize) -> (*const u8, usize) {
+        if let Some((ptr, _block_start, block_end)) = self.borrowed {
+            // SAFETY: borrowed liveness contract; `current_abs_start` =
+            // block_start <= block_end <= buffer len (entry-validated).
+            (
+                unsafe { ptr.add(current_abs_start) },
+                block_end - current_abs_start,
+            )
+        } else {
+            let last_len = self.window_blocks.back().copied().unwrap_or(0);
+            let off = self.history.len() - last_len;
+            // SAFETY: `off + last_len == history.len()`, in bounds.
+            (unsafe { self.history.as_ptr().add(off) }, last_len)
+        }
     }
 
     fn emit_candidate(
@@ -1096,12 +1148,15 @@ impl DfastMatchGenerator {
         // `debug_assert!` makes that precondition fail at the source
         // in tests rather than silently produce an empty slice and
         // panic on the literals subslice below.
-        let last_len = self.window_blocks.back().copied().unwrap_or(0);
+        let (cur_ptr, cur_len) = self.current_block_ptr_len(current_abs_start);
         debug_assert!(
-            last_len > 0,
+            cur_len > 0,
             "emit_candidate precondition: active block must be non-empty"
         );
-        let current = &self.history[self.history.len() - last_len..];
+        // SAFETY: raw-ptr backed (no borrow on `self`), so the
+        // `&mut self.offset_hist` below coexists. Bytes are the active block
+        // (owned history tail or borrowed input sub-slice).
+        let current = unsafe { core::slice::from_raw_parts(cur_ptr, cur_len) };
         let start = candidate.start - current_abs_start;
         let literals = &current[*literals_start..start];
         handle_sequence(Sequence::Triple {
@@ -1120,16 +1175,16 @@ impl DfastMatchGenerator {
 
     fn emit_trailing_literals(
         &self,
+        current_abs_start: usize,
         literals_start: usize,
         handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
     ) {
-        let last_len = self.window_blocks.back().copied().unwrap_or(0);
-        if literals_start < last_len {
-            // Inline rather than calling `get_last_space()` so the gate
-            // pattern matches `skip_matching` / `start_matching` /
-            // `emit_candidate`. `last_len > 0` is already established by
-            // the `literals_start < last_len` check above.
-            let current = &self.history[self.history.len() - last_len..];
+        let (cur_ptr, cur_len) = self.current_block_ptr_len(current_abs_start);
+        if literals_start < cur_len {
+            // SAFETY: raw-ptr backed active-block slice (owned history tail
+            // or borrowed input sub-slice); `literals_start < cur_len` gated
+            // above keeps the subslice in range.
+            let current = unsafe { core::slice::from_raw_parts(cur_ptr, cur_len) };
             handle_sequence(Sequence::Literals {
                 literals: &current[literals_start..],
             });
@@ -2266,7 +2321,7 @@ macro_rules! start_matching_fast_loop_body {
         }
 
         $self.seed_remaining_hashable_starts($current_abs_start, $current_len, pos);
-        $self.emit_trailing_literals(literals_start, $handle_sequence);
+        $self.emit_trailing_literals($current_abs_start, literals_start, $handle_sequence);
     }};
 }
 
