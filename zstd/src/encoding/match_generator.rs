@@ -693,6 +693,12 @@ const LEVEL_TABLE: [LevelParams; 22] = [
     /*22 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, search: super::strategy::SearchMethod::BinaryTree, window_log: 27, lazy_depth: 2, fast: None, dfast: None, hc: Some(BTULTRA2_HC_CONFIG_L22), row: None },
 ];
 
+/// Donor `ZSTD_getCParamRowSize` addend for an unknown-source compress that
+/// carries a dictionary (`zstd_compress.c`: `addedSize = unknown && dictSize > 0
+/// ? 500 : 0`). Added to the dictionary size when picking the dict-driven
+/// cParams tier so our tier selection lands on the same column donor would.
+const DICT_CPARAM_ROW_ADDEND: u64 = 500;
+
 /// Smallest window_log the encoder will use regardless of source size.
 pub(crate) const MIN_WINDOW_LOG: u8 = 10;
 /// Conservative floor for source-size-hinted window tuning.
@@ -1022,6 +1028,14 @@ pub struct MatchGeneratorDriver {
     dictionary_retained_budget: usize,
     // Source size hint for next frame (set via set_source_size_hint, cleared on reset).
     source_size_hint: Option<u64>,
+    // Dictionary content size for the next frame (set via set_dictionary_size_hint,
+    // consumed on reset). When present on a binary-tree / hash-chain backend, the
+    // match-finder hash/chain tables are sized from the DICTIONARY (donor CDict
+    // economics: a loaded dictionary supplies the long matches, so the live tables
+    // can shrink to the dict's size tier) while the eviction window stays
+    // source-sized. Mirrors donor `ZSTD_getCParamRowSize`, which picks the cParams
+    // table column from `dictSize` for a dictionary-bearing compress.
+    dictionary_size_hint: Option<usize>,
     // Normalized `ceil_log2` bucket of the frame's source-size hint, captured at
     // `reset` (where `source_size_hint` is consumed) via [`source_size_ceil_log`].
     // `None` means the frame was unhinted. Drives `prime_with_dictionary`'s donor
@@ -1202,6 +1216,7 @@ impl MatchGeneratorDriver {
             reset_shape: None,
             dictionary_retained_budget: 0,
             source_size_hint: None,
+            dictionary_size_hint: None,
             borrowed_pending: None,
             primed: None,
         }
@@ -1568,12 +1583,17 @@ impl Matcher for MatchGeneratorDriver {
         self.source_size_hint = Some(size);
     }
 
+    fn set_dictionary_size_hint(&mut self, size: usize) {
+        self.dictionary_size_hint = Some(size);
+    }
+
     fn clear_param_overrides(&mut self) {
         self.param_overrides = None;
     }
 
     fn reset(&mut self, level: CompressionLevel) {
         let hint = self.source_size_hint.take();
+        let dict_hint = self.dictionary_size_hint.take();
         // Snapshot the hint's normalized ceil-log bucket for the primed-snapshot
         // key and prime_with_dictionary's attach/copy mode decision (the hint is
         // consumed here, but priming happens just after reset). Storing the
@@ -1637,6 +1657,33 @@ impl Matcher for MatchGeneratorDriver {
                 if let Some(window_log) = ov.window_log {
                     params.window_log = window_log;
                 }
+            }
+        }
+        // Dictionary-driven table sizing (donor CDict economics). When a
+        // dictionary is loaded, donor sizes the match-finder hash/chain tables
+        // from the dictionary's `ZSTD_getCParamRowSize` tier, NOT from the
+        // source size: the dictionary supplies the long-distance matches, so a
+        // window-sized live table is wasted memory. The frame's eviction window
+        // (`window_log`) stays source-derived so the dictionary bytes remain
+        // referenceable; only the hash/chain WIDTHS shrink to the dict tier.
+        // This is the encoder-side equivalent of copying a CDict's small tables
+        // while keeping a source-sized window (`ZSTD_resetCCtx_byCopyingCDict`:
+        // `params.cParams = *cdict_cParams; params.cParams.windowLog = windowLog`).
+        // Only the binary-tree / hash-chain backend reads `hc.{hash,chain}_log`;
+        // the Simple/Dfast/Row backends derive their widths from the source
+        // window in their `reset` arms, matching donor's dict handling there.
+        if let (Some(dict_size), Some(hc)) = (dict_hint, params.hc.as_mut()) {
+            // Donor `ZSTD_getCParamRowSize`: for a dictionary-bearing compress
+            // the cParams column is chosen from `dictSize + 500` (the unknown-
+            // source-with-dict row-size). Reuse the level resolver with that
+            // size to read the dict-tier hash/chain widths, then cap (min) so an
+            // explicit larger level table never grows past the dict tier and a
+            // dict bigger than the level's own tables never inflates them.
+            let dict_row_size = (dict_size as u64).saturating_add(DICT_CPARAM_ROW_ADDEND);
+            let dict_params = resolve_level_params(level, Some(dict_row_size));
+            if let Some(dict_hc) = dict_params.hc {
+                hc.hash_log = hc.hash_log.min(dict_hc.hash_log);
+                hc.chain_log = hc.chain_log.min(dict_hc.chain_log);
             }
         }
         let next_backend = params.backend();

@@ -1020,6 +1020,17 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             // is applied separately and should not force larger matcher sizing.
             self.state.matcher.set_source_size_hint(size_hint);
         }
+        // Hand the matcher the dictionary's content size so its binary-tree /
+        // hash-chain tables shrink to the dictionary's cParams tier (donor CDict
+        // economics: the dictionary supplies long matches, so a source-sized live
+        // table is wasted peak memory). The eviction window stays source-sized so
+        // the dictionary bytes remain referenceable. Set before `reset` (which
+        // consumes it) and only when a dictionary will actually be primed.
+        if use_dictionary_state && let Some(dict) = self.dictionary.as_ref() {
+            self.state
+                .matcher
+                .set_dictionary_size_hint(dict.inner.dict_content.len());
+        }
         // Clearing buffers to allow re-using of the compressor
         self.state.matcher.reset(self.compression_level);
         self.state.offset_hist = [1, 4, 8];
