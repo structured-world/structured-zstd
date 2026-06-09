@@ -7,7 +7,7 @@
 //! peak memory stays O(window), not O(file).
 
 mod progress;
-use progress::ProgressMonitor;
+use progress::{ProgressMonitor, fmt_size};
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, ErrorKind, Read, Write};
@@ -28,6 +28,7 @@ enum Mode {
     Compress,
     Decompress,
     Test,
+    List,
 }
 
 /// Parsed command line.
@@ -140,6 +141,7 @@ fn parse_args(
                 "compress" => opts.mode = Mode::Compress,
                 "decompress" | "uncompress" => opts.mode = Mode::Decompress,
                 "test" => opts.mode = Mode::Test,
+                "list" => opts.mode = Mode::List,
                 "stdout" | "to-stdout" => opts.to_stdout = true,
                 "force" => opts.force = true,
                 "keep" => opts.keep = true,
@@ -181,6 +183,7 @@ fn parse_args(
                 'd' => opts.mode = Mode::Decompress,
                 'z' => opts.mode = Mode::Compress,
                 't' => opts.mode = Mode::Test,
+                'l' => opts.mode = Mode::List,
                 'c' => opts.to_stdout = true,
                 'f' => opts.force = true,
                 'k' => opts.keep = true,
@@ -287,6 +290,19 @@ fn run(opts: Options) -> color_eyre::Result<()> {
     };
     let dict = dict_bytes.as_deref();
 
+    // `--list` walks frame headers without decoding; it needs a seekable file
+    // (not a stream), so it is handled separately from the (de)compress flow.
+    if opts.mode == Mode::List {
+        if opts.inputs.is_empty() || opts.inputs.iter().any(|i| i == "-") {
+            bail!("--list requires regular files (cannot list stdin)");
+        }
+        print_list_header();
+        for input in &opts.inputs {
+            list_file(Path::new(input))?;
+        }
+        return Ok(());
+    }
+
     if opts.inputs.is_empty() {
         return process_stdin_stdout(&opts, dict);
     }
@@ -297,6 +313,66 @@ fn run(opts: Options) -> color_eyre::Result<()> {
             process_file(&opts, Path::new(input), dict)?;
         }
     }
+    Ok(())
+}
+
+/// Column header for `--list`, matching upstream's `zstd -l` layout.
+fn print_list_header() {
+    println!("Frames  Compressed  Uncompressed  Ratio  Check  DictID  Filename");
+}
+
+/// Print one `--list` row: walk every frame header in the file (no body
+/// decode), summing compressed + declared content sizes. Decompressed size is
+/// `--` when any frame omits the Frame_Content_Size field.
+fn list_file(path: &Path) -> color_eyre::Result<()> {
+    use structured_zstd::decoding::{
+        FrameContentSize, find_frame_compressed_size, read_frame_header_info,
+    };
+
+    let bytes = fs::read(path).wrap_err_with(|| format!("failed to read {}", path.display()))?;
+    let compressed = bytes.len() as u64;
+    let mut offset = 0usize;
+    let mut frames = 0u64;
+    let mut decompressed = Some(0u64);
+    let mut check = false;
+    let mut dict_id = None;
+
+    while offset < bytes.len() {
+        let rest = &bytes[offset..];
+        let info = read_frame_header_info(rest, false)
+            .map_err(|err| eyre!("{}: not a zstd frame: {err:?}", path.display()))?;
+        let frame_len = find_frame_compressed_size(rest)
+            .map_err(|err| eyre!("{}: malformed frame: {err:?}", path.display()))?;
+        match info.content_size {
+            FrameContentSize::Known(n) => decompressed = decompressed.map(|d| d + n),
+            FrameContentSize::Unknown => decompressed = None,
+        }
+        check |= info.content_checksum;
+        if frames == 0 {
+            dict_id = info.dictionary_id;
+        }
+        frames += 1;
+        offset += frame_len;
+    }
+
+    let ratio = match decompressed {
+        Some(d) if d > 0 => format!("{:.3}", d as f64 / compressed as f64),
+        _ => "--".to_string(),
+    };
+    let decompressed_str = match decompressed {
+        Some(d) => fmt_size(d as f64),
+        None => "--".to_string(),
+    };
+    println!(
+        "{frames:>6}  {:>10}  {:>12}  {ratio:>5}  {:>5}  {:>6}  {}",
+        fmt_size(compressed as f64),
+        decompressed_str,
+        if check { "XXH64" } else { "None" },
+        dict_id
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "0".to_string()),
+        path.display(),
+    );
     Ok(())
 }
 
@@ -316,6 +392,7 @@ fn process_stdin_stdout(opts: &Options, dict: Option<&[u8]>) -> color_eyre::Resu
         Mode::Test => decompress_stream(reader, io::sink(), dict).map(|_| {
             info!("stdin: OK");
         }),
+        Mode::List => unreachable!("--list is handled in run() before streaming"),
     }
 }
 
@@ -336,7 +413,9 @@ fn derive_output_path(opts: &Options, input: &Path) -> color_eyre::Result<PathBu
                 ),
             }
         }
-        Mode::Test => unreachable!("test mode never writes an output file"),
+        Mode::Test | Mode::List => {
+            unreachable!("test / list modes never write an output file")
+        }
     }
 }
 
@@ -371,7 +450,7 @@ fn process_file(opts: &Options, input: &Path, dict: Option<&[u8]>) -> color_eyre
                 Some(source_size as u64),
             )?,
             Mode::Decompress => decompress_stream(&mut reader, &mut out, dict)?,
-            Mode::Test => unreachable!(),
+            Mode::Test | Mode::List => unreachable!(),
         }
         return Ok(());
     }
@@ -395,7 +474,7 @@ fn process_file(opts: &Options, input: &Path, dict: Option<&[u8]>) -> color_eyre
                 Some(source_size as u64),
             )?,
             Mode::Decompress => decompress_stream(&mut reader, &mut sink, dict)?,
-            Mode::Test => unreachable!(),
+            Mode::Test | Mode::List => unreachable!(),
         }
         sink.flush().wrap_err("failed to flush output")?;
         Ok(())
@@ -428,10 +507,13 @@ fn compress_stream<R: Read, W: Write>(
         CompressionLevel::from_level(level)
     };
     let mut encoder = structured_zstd::encoding::StreamingEncoder::new(writer, compression_level);
-    if let Some(hint) = size_hint {
+    if let Some(size) = size_hint {
+        // The size is known (a regular file), so pledge it: the frame records
+        // Frame_Content_Size (decoders can pre-allocate, `zstd -l` reports it)
+        // and the matcher sizes its tables to the source. stdin keeps it unset.
         encoder
-            .set_source_size_hint(hint)
-            .wrap_err("failed to configure source size hint")?;
+            .set_pledged_content_size(size)
+            .wrap_err("failed to set pledged content size")?;
     }
     if let Some(raw) = dict {
         encoder
