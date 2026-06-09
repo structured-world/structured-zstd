@@ -8180,11 +8180,12 @@ fn dfast_prime_with_dictionary_counts_four_byte_tail_budget() {
 #[test]
 fn row_prime_with_dictionary_preserves_history_for_first_full_block() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
-    // Level(4) is greedy Dfast (donor parity: clevels.h L3/L4 = `ZSTD_dfast`,
-    // no lazy). The greedy fast loop needs `HASH_READ_SIZE` (8) bytes ahead, so
-    // use a 16-byte dict + 16-byte block (whole block matches the dict, offset
-    // = dict length = 16).
-    driver.reset(CompressionLevel::Level(4));
+    // Level(5) is the greedy Row backend (LEVEL_TABLE row 5: Greedy / RowHash).
+    // Level(4) now routes to Dfast, so this test must use Level(5) to actually
+    // exercise `RowMatchGenerator`'s dictionary priming. The 16-byte dict +
+    // 16-byte block lets the whole block match the primed dict (offset = dict
+    // length = 16).
+    driver.reset(CompressionLevel::Level(5));
 
     let payload = b"abcdefghijklmnop";
     driver.prime_with_dictionary(payload, [1, 4, 8]);
