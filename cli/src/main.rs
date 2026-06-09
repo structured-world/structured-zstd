@@ -174,7 +174,16 @@ fn parse_args(
                 "keep" => opts.keep = true,
                 "rm" => opts.remove_source = true,
                 "ultra" => ultra = true,
-                "no-check" | "no-content-size" | "no-dictID" | "quiet" | "verbose" => {}
+                // Verbosity aliases are honest no-ops (our logging is fixed).
+                "quiet" | "verbose" => {}
+                // These change the wire format (suppress the checksum, the
+                // Frame_Content_Size field, or the Dictionary_ID). They are not
+                // wired through to the encoder yet, so accepting them silently
+                // would hand the caller the default layout instead of the
+                // requested one. Reject until they are honoured.
+                "no-check" | "no-content-size" | "no-dictID" => {
+                    bail!("--{long} is not supported yet");
+                }
                 "version" => {
                     print_version();
                     return Ok(Parsed::Handled);
@@ -184,21 +193,23 @@ fn parse_args(
                     return Ok(Parsed::Handled);
                 }
                 _ => {
-                    if let Some(n) = long.strip_prefix("fast") {
-                        // `--fast` or `--fast=N`.
-                        opts.level = match n.strip_prefix('=') {
-                            Some(v) => -(v.parse::<i32>().wrap_err("invalid --fast level")?),
-                            None => -1,
-                        };
+                    if long == "fast" {
+                        // `--fast` is the level -1 alias.
+                        opts.level = -1;
+                    } else if let Some(v) = long.strip_prefix("fast=") {
+                        // `--fast=N` is level -N. Exact-match the prefix so a
+                        // typo like `--faster` falls through to unknown-option.
+                        opts.level = -(v.parse::<i32>().wrap_err("invalid --fast level")?);
                     } else if let Some(path) = long.strip_prefix("use-dict=") {
                         opts.dict = Some(PathBuf::from(path));
                     } else if let Some(v) = long.strip_prefix("maxdict=") {
                         opts.max_dict = v.parse::<usize>().wrap_err("invalid --maxdict size")?;
                     } else if let Some(v) = long.strip_prefix("dictID=") {
                         opts.dict_id = Some(v.parse::<u32>().wrap_err("invalid --dictID")?);
-                    } else if long.starts_with("long") {
+                    } else if long == "long" || long.strip_prefix("long=").is_some() {
                         // `--long` or `--long=N` (the window-log hint is accepted
                         // but the encoder derives the LDM window from the level).
+                        // Exact-match so `--longer` is an unknown option.
                         opts.long = true;
                     } else {
                         bail!("unknown option: --{long}");
@@ -541,33 +552,107 @@ fn train_dictionary(opts: &Options) -> color_eyre::Result<()> {
     Ok(())
 }
 
+/// Read into `buf` until it is full or EOF, returning the number of bytes read.
+/// Unlike a single `read`, this fills as much as the source has, so a header
+/// parse sees the whole header even when the OS hands back short reads.
+fn read_filling<R: Read>(reader: &mut R, buf: &mut [u8]) -> color_eyre::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err).wrap_err("failed to read frame header"),
+        }
+    }
+    Ok(filled)
+}
+
 /// Column header for `--list`, matching upstream's `zstd -l` layout.
 fn print_list_header() {
     println!("Frames  Compressed  Uncompressed  Ratio  Check  DictID  Filename");
 }
 
-/// Print one `--list` row: walk every frame header in the file (no body
-/// decode), summing compressed + declared content sizes. Decompressed size is
-/// `--` when any frame omits the Frame_Content_Size field.
-fn list_file(path: &Path) -> color_eyre::Result<()> {
-    use structured_zstd::decoding::{
-        FrameContentSize, find_frame_compressed_size, read_frame_header_info,
-    };
+/// Largest possible zstd frame header: 4-byte magic + 1-byte descriptor + up to
+/// 8-byte Frame_Content_Size + up to 4-byte Dictionary_ID + 1-byte
+/// Window_Descriptor (RFC 8878 §3.1.1.1).
+const MAX_FRAME_HEADER_LEN: usize = 18;
 
-    let bytes = fs::read(path).wrap_err_with(|| format!("failed to read {}", path.display()))?;
-    let compressed = bytes.len() as u64;
-    let mut offset = 0usize;
+/// Print one `--list` row: walk every frame in the file (no body decode),
+/// summing compressed + declared content sizes. Decompressed size is `--` when
+/// any frame omits the Frame_Content_Size field.
+///
+/// Reads each frame header, then walks the 3-byte block headers by `seek`ing
+/// past every block body, so peak memory stays O(1) regardless of archive size
+/// (a multi-GB file is never loaded whole).
+fn list_file(path: &Path) -> color_eyre::Result<()> {
+    use std::io::{Seek, SeekFrom};
+    use structured_zstd::decoding::{FrameContentSize, read_frame_header_info};
+
+    let mut file =
+        File::open(path).wrap_err_with(|| format!("failed to open {}", path.display()))?;
+    let compressed = file
+        .metadata()
+        .wrap_err_with(|| format!("failed to stat {}", path.display()))?
+        .len();
+    let mut offset = 0u64;
     let mut frames = 0u64;
     let mut decompressed = Some(0u64);
     let mut check = false;
     let mut dict_id = None;
 
-    while offset < bytes.len() {
-        let rest = &bytes[offset..];
-        let info = read_frame_header_info(rest, false)
+    while offset < compressed {
+        // Read just enough for the frame header (a short read near EOF is fine —
+        // `read_frame_header_info` reports the exact length it consumed).
+        file.seek(SeekFrom::Start(offset))?;
+        let mut header_buf = [0u8; MAX_FRAME_HEADER_LEN];
+        let header_read = read_filling(&mut file, &mut header_buf)?;
+        let info = read_frame_header_info(&header_buf[..header_read], false)
             .map_err(|err| eyre!("{}: not a zstd frame: {err:?}", path.display()))?;
-        let frame_len = find_frame_compressed_size(rest)
-            .map_err(|err| eyre!("{}: malformed frame: {err:?}", path.display()))?;
+
+        // The frame's Block_Maximum_Size bounds every block (RFC 8878 §3.1.1.2).
+        let block_size_max = info.window_size.min(128 * 1024);
+        // Walk block headers, seeking past each body, to find the frame's end.
+        let mut block_offset = offset + info.header_size as u64;
+        loop {
+            file.seek(SeekFrom::Start(block_offset))?;
+            let mut block_header = [0u8; 3];
+            file.read_exact(&mut block_header)
+                .map_err(|_| eyre!("{}: truncated mid-frame", path.display()))?;
+            let raw = u32::from(block_header[0])
+                | (u32::from(block_header[1]) << 8)
+                | (u32::from(block_header[2]) << 16);
+            let last_block = (raw & 1) != 0;
+            let block_type = (raw >> 1) & 0b11;
+            let block_size = u64::from(raw >> 3);
+            if block_size > block_size_max {
+                bail!("{}: block exceeds Block_Maximum_Size", path.display());
+            }
+            // On-disk bytes after the header: RLE stores one byte, Raw/Compressed
+            // store Block_Size, the reserved type is invalid.
+            let on_disk = match block_type {
+                1 => 1,
+                0 | 2 => block_size,
+                _ => bail!("{}: reserved block type", path.display()),
+            };
+            block_offset = block_offset
+                .checked_add(3 + on_disk)
+                .filter(|end| *end <= compressed)
+                .ok_or_else(|| eyre!("{}: truncated mid-frame", path.display()))?;
+            if last_block {
+                break;
+            }
+        }
+        // A trailing 4-byte content checksum follows the last block when present.
+        let frame_end = if info.content_checksum {
+            block_offset
+                .checked_add(4)
+                .filter(|end| *end <= compressed)
+                .ok_or_else(|| eyre!("{}: truncated content checksum", path.display()))?
+        } else {
+            block_offset
+        };
+
         match info.content_size {
             FrameContentSize::Known(n) => decompressed = decompressed.map(|d| d + n),
             FrameContentSize::Unknown => decompressed = None,
@@ -577,7 +662,7 @@ fn list_file(path: &Path) -> color_eyre::Result<()> {
             dict_id = info.dictionary_id;
         }
         frames += 1;
-        offset += frame_len;
+        offset = frame_end;
     }
 
     let ratio = match decompressed {
@@ -601,10 +686,18 @@ fn list_file(path: &Path) -> color_eyre::Result<()> {
     Ok(())
 }
 
-/// stdin → stdout for a `-` input or no inputs.
+/// stdin → stdout (or → `-o` file) for a `-` input or no inputs.
 fn process_stdin_stdout(opts: &Options, dict: Option<&[u8]>) -> color_eyre::Result<()> {
     let stdin = io::stdin();
     let reader = stdin.lock();
+    // `-o` redirects stdin's (de)compressed output to a file, unless `-c`
+    // explicitly forces stdout. stdin has no declared size, so no size hint.
+    if let Some(output) = &opts.output
+        && !opts.to_stdout
+        && matches!(opts.mode, Mode::Compress | Mode::Decompress)
+    {
+        return write_stream_to_file(opts, reader, output, None, dict);
+    }
     match opts.mode {
         Mode::Compress => {
             let stdout = io::stdout();
@@ -629,6 +722,62 @@ fn process_stdin_stdout(opts: &Options, dict: Option<&[u8]>) -> color_eyre::Resu
             unreachable!("--list / --train handled in run() before streaming")
         }
     }
+}
+
+/// Remove the source file after a successful (de)compression when `--rm` is set
+/// (and `-k` was not). A no-op otherwise.
+fn remove_source_if_requested(opts: &Options, input: &Path) -> color_eyre::Result<()> {
+    if opts.remove_source && !opts.keep {
+        fs::remove_file(input).wrap_err("failed to remove source file after success")?;
+    }
+    Ok(())
+}
+
+/// Run the (de)compression core into an arbitrary writer for the current mode.
+fn run_stream_core<R: Read, W: Write>(
+    opts: &Options,
+    reader: R,
+    writer: W,
+    size_hint: Option<u64>,
+    dict: Option<&[u8]>,
+) -> color_eyre::Result<()> {
+    match opts.mode {
+        Mode::Compress => compress_stream(
+            reader, writer, opts.level, opts.store, dict, size_hint, opts.long,
+        ),
+        Mode::Decompress => decompress_stream(reader, writer, dict),
+        Mode::Test | Mode::List | Mode::Train => {
+            unreachable!("test / list / train modes never stream to a writer here")
+        }
+    }
+}
+
+/// Stream `reader` into `output` atomically: write to a sibling temp file, then
+/// rename into place on success (and clean the temp up on failure). Honours the
+/// `-f` overwrite gate.
+fn write_stream_to_file<R: Read>(
+    opts: &Options,
+    mut reader: R,
+    output: &Path,
+    size_hint: Option<u64>,
+    dict: Option<&[u8]>,
+) -> color_eyre::Result<()> {
+    ensure_regular_output_destination(output)?;
+    if output.exists() && !opts.force {
+        bail!("{} already exists; use -f to overwrite", output.display());
+    }
+    let (temp_path, temp_file) = create_temporary_output_file(output)?;
+    let result: color_eyre::Result<()> = (|| {
+        let mut sink = temp_file;
+        run_stream_core(opts, &mut reader, &mut sink, size_hint, dict)?;
+        sink.flush().wrap_err("failed to flush output")?;
+        Ok(())
+    })();
+    if let Err(err) = result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err);
+    }
+    replace_output_file(&temp_path, output)
 }
 
 /// Resolve the output path for a file input under the current mode.
@@ -671,62 +820,22 @@ fn process_file(opts: &Options, input: &Path, dict: Option<&[u8]>) -> color_eyre
         return Ok(());
     }
 
-    // stdout sink: bypass the temp-file dance.
+    // stdout sink: bypass the temp-file dance. `--rm` still applies to the
+    // source file once the stream completes, so run the removal before
+    // returning rather than short-circuiting past it.
     if opts.to_stdout {
         let stdout = io::stdout();
         let mut out = stdout.lock();
-        match opts.mode {
-            Mode::Compress => compress_stream(
-                &mut reader,
-                &mut out,
-                opts.level,
-                opts.store,
-                dict,
-                Some(source_size as u64),
-                opts.long,
-            )?,
-            Mode::Decompress => decompress_stream(&mut reader, &mut out, dict)?,
-            Mode::Test | Mode::List | Mode::Train => unreachable!(),
-        }
-        return Ok(());
+        run_stream_core(opts, &mut reader, &mut out, Some(source_size as u64), dict)?;
+        return remove_source_if_requested(opts, input);
     }
 
     let output = derive_output_path(opts, input)?;
     ensure_distinct_paths(input, &output)?;
-    ensure_regular_output_destination(&output)?;
-    if output.exists() && !opts.force {
-        bail!("{} already exists; use -f to overwrite", output.display());
-    }
-    let (temp_path, temp_file) = create_temporary_output_file(&output)?;
-    let result: color_eyre::Result<()> = (|| {
-        let mut sink = temp_file;
-        match opts.mode {
-            Mode::Compress => compress_stream(
-                &mut reader,
-                &mut sink,
-                opts.level,
-                opts.store,
-                dict,
-                Some(source_size as u64),
-                opts.long,
-            )?,
-            Mode::Decompress => decompress_stream(&mut reader, &mut sink, dict)?,
-            Mode::Test | Mode::List | Mode::Train => unreachable!(),
-        }
-        sink.flush().wrap_err("failed to flush output")?;
-        Ok(())
-    })();
-    if let Err(err) = result {
-        let _ = fs::remove_file(&temp_path);
-        return Err(err);
-    }
-    replace_output_file(&temp_path, &output)?;
+    write_stream_to_file(opts, reader, &output, Some(source_size as u64), dict)?;
 
     info!("{} -> {}", input.display(), output.display());
-    if opts.remove_source && !opts.keep {
-        fs::remove_file(input).wrap_err("failed to remove source file after success")?;
-    }
-    Ok(())
+    remove_source_if_requested(opts, input)
 }
 
 /// Streaming compression core (file or stdout), optionally dictionary-primed.
@@ -1003,6 +1112,27 @@ mod tests {
     }
 
     #[test]
+    fn list_file_walks_multi_frame_archive_by_seeking() {
+        use structured_zstd::encoding::{CompressionLevel, compress_slice_to_vec};
+        // Two concatenated frames: the seek-based frame walk must land exactly on
+        // the second frame's start, or parsing it would fail. A wrong frame
+        // length (the old fs::read path computed it differently) would surface as
+        // an error here.
+        let mut archive = compress_slice_to_vec(&[7u8; 4096], CompressionLevel::Default);
+        archive.extend_from_slice(&compress_slice_to_vec(
+            b"second frame payload, distinct content",
+            CompressionLevel::Default,
+        ));
+
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("szstd-list-test-{}.zst", std::process::id()));
+        fs::write(&path, &archive).unwrap();
+        let result = list_file(&path);
+        let _ = fs::remove_file(&path);
+        result.expect("list_file must walk both frames without error");
+    }
+
+    #[test]
     fn argv0_unzstd_defaults_to_decompress() {
         assert_eq!(program_mode("unzstd"), (Mode::Decompress, false));
         assert_eq!(program_mode("/usr/bin/unzstd"), (Mode::Decompress, false));
@@ -1121,6 +1251,30 @@ mod tests {
     fn unknown_flag_errors() {
         assert!(parse(&["--definitely-not-a-flag"]).is_err());
         assert!(parse(&["-Z"]).is_err());
+    }
+
+    #[test]
+    fn fast_and_long_match_exactly_not_by_prefix() {
+        // Exact options succeed.
+        assert_eq!(parse(&["--fast"]).unwrap().level, -1);
+        assert_eq!(parse(&["--fast=5"]).unwrap().level, -5);
+        assert!(parse(&["--long"]).unwrap().long);
+        // Typos must NOT be silently accepted as `--fast`/`--long`; they fall
+        // through to the unknown-option path.
+        assert!(parse(&["--faster"]).is_err());
+        assert!(parse(&["--longer"]).is_err());
+    }
+
+    #[test]
+    fn unsupported_format_flags_are_rejected_not_ignored() {
+        // These change the wire format but are not wired through yet — accepting
+        // them silently would hand the caller the wrong frame layout.
+        assert!(parse(&["--no-check"]).is_err());
+        assert!(parse(&["--no-content-size"]).is_err());
+        assert!(parse(&["--no-dictID"]).is_err());
+        // Verbosity aliases stay honest no-ops.
+        assert!(parse(&["--quiet"]).is_ok());
+        assert!(parse(&["--verbose"]).is_ok());
     }
 
     #[test]
