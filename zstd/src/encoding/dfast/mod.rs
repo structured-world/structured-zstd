@@ -1265,7 +1265,11 @@ impl DfastMatchGenerator {
         // hash position and relies on the dense `_search_next_long`
         // retry in `hash_candidate` (via `best_match`) to preserve
         // compression ratio.
-        if idx + 4 <= concat_len {
+        // Short key needs 5 readable bytes (donor `mls = 5`). A position
+        // within 4 bytes of the current history end is not inserted here; the
+        // `start_matching` seam re-seed picks it up once the next block extends
+        // history far enough to form its full 5-byte key.
+        if idx + 5 <= concat_len {
             let concat = &self.history[self.history_start..];
             let short = self.short_hash_index(&concat[idx..]);
             debug_assert!(short < self.short_hash.len());
@@ -1280,20 +1284,20 @@ impl DfastMatchGenerator {
         }
     }
 
+    /// 5-byte short-hash index (donor `ZSTD_hashPtr(ip, hBitsS, mls=5)`). A
+    /// 4-byte key collides more on repetitive / log-stream data, so the
+    /// single-slot table overwrites useful positions the donor's 5-byte key
+    /// keeps. `data` MUST hold at least 5 bytes — every call site gates on a
+    /// 5-byte lookahead, so no zero-padded synthetic key is ever formed (a
+    /// padded short key would populate buckets for starts the donor skips).
     #[inline(always)]
     pub(crate) fn short_hash_index(&self, data: &[u8]) -> usize {
-        // Donor `ZSTD_dfast` keys the short table on a 5-byte hash
-        // (`ZSTD_hashPtr(ip, hBitsS, mls)` with `mls = cParams.minMatch = 5`
-        // for L3/L4), NOT 4 bytes. A 4-byte key collides more on
-        // repetitive/log-stream data, so the single-slot table overwrites
-        // useful positions the donor's 5-byte key keeps. Mirror the donor:
-        // take the low 5 bytes (shifted high like `ZSTD_hash5`) into the
-        // shared multiply-shift mixer. `min(5)` keeps short tail slices
-        // panic-free (zero-padded) without a per-call-site bound change.
-        let mut buf = [0u8; 8];
-        let n = data.len().min(5);
-        buf[..n].copy_from_slice(&data[..n]);
-        let value = u64::from_le_bytes(buf) << 24;
+        debug_assert!(data.len() >= 5, "short hash needs a full 5-byte key");
+        // Low 5 bytes (ZSTD_hash5 shape) shifted into bits 24..63, matching the
+        // raw `v8 << 24` form used by the fast-loop probe / insert sites.
+        let lo4 = u32::from_le_bytes(data[..4].try_into().unwrap()) as u64;
+        let b5 = data[4] as u64;
+        let value = (lo4 | (b5 << 32)) << 24;
         self.hash_index_with_bits(value, self.short_hash_bits)
     }
 

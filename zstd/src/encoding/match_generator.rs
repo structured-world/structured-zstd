@@ -53,7 +53,10 @@ use std::arch::is_aarch64_feature_detected;
 use std::arch::is_x86_feature_detected;
 
 pub(crate) const DFAST_MIN_MATCH_LEN: usize = 5;
-pub(crate) const DFAST_SHORT_HASH_LOOKAHEAD: usize = 4;
+// Bytes the dfast short hash reads (donor `mls = 5`). Seeding / lookahead
+// guards use it so a position is only short-hashed once its full 5-byte key
+// is in range.
+pub(crate) const DFAST_SHORT_HASH_LOOKAHEAD: usize = 5;
 pub(crate) const ROW_MIN_MATCH_LEN: usize = 5;
 // Donor `clevels.h:31` at level 3 large-input bucket sets
 // `hashLog = 17` (the long-hash table) and `chainLog = 16` (the
@@ -10202,11 +10205,11 @@ fn dfast_seed_remaining_hashable_starts_seeds_last_short_hash_positions() {
     let seed_start = current_len - DFAST_MIN_MATCH_LEN;
     matcher.seed_remaining_hashable_starts(current_abs_start, current_len, seed_start);
 
-    let target_abs_pos = current_abs_start + current_len - 4;
+    let target_abs_pos = current_abs_start + current_len - 5;
     let target_rel = target_abs_pos - matcher.history_abs_start;
     let live = matcher.live_history();
     assert!(
-        target_rel + 4 <= live.len(),
+        target_rel + 5 <= live.len(),
         "fixture must leave the last short-hash start valid"
     );
     let short_hash = matcher.short_hash_index(&live[target_rel..]);
@@ -10217,7 +10220,7 @@ fn dfast_seed_remaining_hashable_starts_seeds_last_short_hash_positions() {
     );
     assert_eq!(
         matcher.short_hash[short_hash], target_slot,
-        "tail seeding must include the last 4-byte-hashable start"
+        "tail seeding must include the last 5-byte-hashable start"
     );
 }
 
@@ -10232,11 +10235,11 @@ fn dfast_seed_remaining_hashable_starts_handles_pos_at_block_end() {
     let current_abs_start = matcher.history_abs_start + matcher.window_size - current_len;
     matcher.seed_remaining_hashable_starts(current_abs_start, current_len, current_len);
 
-    let target_abs_pos = current_abs_start + current_len - 4;
+    let target_abs_pos = current_abs_start + current_len - 5;
     let target_rel = target_abs_pos - matcher.history_abs_start;
     let live = matcher.live_history();
     assert!(
-        target_rel + 4 <= live.len(),
+        target_rel + 5 <= live.len(),
         "fixture must leave the last short-hash start valid"
     );
     let short_hash = matcher.short_hash_index(&live[target_rel..]);
@@ -10247,7 +10250,7 @@ fn dfast_seed_remaining_hashable_starts_handles_pos_at_block_end() {
     );
     assert_eq!(
         matcher.short_hash[short_hash], target_slot,
-        "tail seeding must still include the last 4-byte-hashable start when pos is at block end"
+        "tail seeding must still include the last 5-byte-hashable start when pos is at block end"
     );
 }
 
