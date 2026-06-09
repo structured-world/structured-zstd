@@ -114,6 +114,10 @@ pub unsafe extern "C" fn ZSTD_freeCCtx(cctx: *mut ZSTD_CCtx) -> usize {
 /// `size_t ZSTD_sizeof_CCtx(const ZSTD_CCtx* cctx)` — current heap footprint,
 /// or 0 for `NULL`.
 ///
+/// Counts the inline struct and the reusable output `scratch`. The cached
+/// `dict_compressor`'s primed match-finder tables and dictionary snapshot are
+/// not yet summed (the encoder lacks a heap-size accessor); tracked in #388.
+///
 /// # Safety
 /// `cctx` must be a live pointer from [`ZSTD_createCCtx`], or `NULL`.
 #[unsafe(no_mangle)]

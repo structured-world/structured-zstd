@@ -345,7 +345,17 @@ pub unsafe extern "C" fn ZSTD_decompress_usingDDict(
         }));
         match added {
             Ok(Ok(())) => dctx.ddict_serial = key,
-            _ => return encode(ZSTD_ErrorCode::ZSTD_error_dictionary_corrupted),
+            // A clean parse failure leaves the decoder untouched, so it stays
+            // reusable as-is.
+            Ok(Err(_)) => return encode(ZSTD_ErrorCode::ZSTD_error_dictionary_corrupted),
+            // A panic may have mutated the decoder mid-load, leaving it poisoned;
+            // replace it with a fresh one and drop the stale cache key so the
+            // next call re-loads cleanly rather than trusting a broken decoder.
+            Err(_) => {
+                dctx.decoder = codec::decoding::FrameDecoder::new();
+                dctx.ddict_serial = 0;
+                return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
+            }
         }
     }
     dctx.decoder.set_content_checksum(ContentChecksum::Verify);
