@@ -2243,6 +2243,22 @@ impl Matcher for MatchGeneratorDriver {
         if let MatcherStorage::HashChain(hc) = &mut storage {
             hc.table.ensure_tables();
         }
+        // The snapshot does not retain the LDM producer (it holds no dict state;
+        // see `capture_primed_dictionary`). Carry over the frame's freshly-reset
+        // producer — built this frame by `reset` with the same params the
+        // snapshot key pins, and empty (no input processed yet), so it is
+        // equivalent to the producer the snapshot was captured with.
+        #[cfg(feature = "hash")]
+        {
+            let fresh_ldm = if let MatcherStorage::HashChain(hc) = &mut self.storage {
+                hc.take_ldm_producer()
+            } else {
+                None
+            };
+            if let MatcherStorage::HashChain(hc) = &mut storage {
+                hc.set_ldm_producer(fresh_ldm);
+            }
+        }
         self.storage = storage;
         self.dictionary_retained_budget = budget;
         true
@@ -2284,15 +2300,24 @@ impl Matcher for MatchGeneratorDriver {
             let hash_table = core::mem::take(&mut hc.table.hash_table);
             let chain_table = core::mem::take(&mut hc.table.chain_table);
             let hash3_table = core::mem::take(&mut hc.table.hash3_table);
-            // Clone the dict-state-only storage (live tables now empty Vecs).
+            // The LDM producer carries no dictionary state (LDM is not
+            // dict-primed; its hash table is empty at capture), so it is not
+            // retained either — `restore` reinstates the frame's freshly-reset
+            // producer. Take it out so the clone does not duplicate its table.
+            #[cfg(feature = "hash")]
+            let ldm_producer = hc.take_ldm_producer();
+            // Clone the dict-state-only storage (live tables now empty Vecs,
+            // LDM producer detached).
             let snapshot = self.storage.clone();
-            // Move the live tables back into the working storage.
+            // Move the live tables (and LDM producer) back into the working storage.
             let MatcherStorage::HashChain(hc) = &mut self.storage else {
                 unreachable!("storage variant is stable across the take/put");
             };
             hc.table.hash_table = hash_table;
             hc.table.chain_table = chain_table;
             hc.table.hash3_table = hash3_table;
+            #[cfg(feature = "hash")]
+            hc.set_ldm_producer(ldm_producer);
             self.primed = Some((snapshot, self.dictionary_retained_budget, key));
         } else {
             self.primed = Some((self.storage.clone(), self.dictionary_retained_budget, key));
@@ -4609,6 +4634,20 @@ impl HcMatchGenerator {
     fn set_ldm_producer(&mut self, producer: Option<super::ldm::LdmProducer>) {
         if let HcBackend::Bt(bt) = &mut self.backend {
             bt.ldm_producer = producer;
+        }
+    }
+
+    /// Move the LDM producer out of the BT backend, leaving `None`. Used by the
+    /// dictionary snapshot path: the producer carries no dictionary state (LDM
+    /// is not dict-primed; its hash table is empty at capture), so it is not
+    /// retained in the snapshot — the working frame's freshly-reset producer is
+    /// reinstated on restore instead.
+    #[cfg(feature = "hash")]
+    fn take_ldm_producer(&mut self) -> Option<super::ldm::LdmProducer> {
+        if let HcBackend::Bt(bt) = &mut self.backend {
+            bt.ldm_producer.take()
+        } else {
+            None
         }
     }
 

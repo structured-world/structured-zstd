@@ -2936,6 +2936,80 @@ mod tests {
     }
 
     #[test]
+    fn dict_primed_btultra2_ldm_restore_is_byte_identical() {
+        // Same restore-path byte-identity guard as
+        // `dict_primed_btultra2_restore_is_floor_safe_and_byte_identical`, but
+        // with long-distance matching ENABLED. The BtMatcher's LDM producer is
+        // part of the snapshot; a refactor that decouples it (so the snapshot
+        // does not retain the empty LDM table) must reinstate an equivalent
+        // empty producer on restore. This pins that the warm-cache (restore)
+        // frame stays byte-identical to a cold compress when LDM is on.
+        let dict_raw = include_bytes!("../../dict_tests/dictionary");
+        let dict_id = super::EncoderDictionary::from_bytes(dict_raw)
+            .expect("dict bytes should parse")
+            .id();
+        let make_payload = |seed: u64, target: usize| {
+            let mut p = Vec::with_capacity(target);
+            let mut i = seed;
+            while p.len() < target {
+                p.extend_from_slice(
+                    format!(
+                        "tenant=demo op=put key={i} value=aaaaabbbbbcccccddddd-{}\n",
+                        i % 89
+                    )
+                    .as_bytes(),
+                );
+                i = i.wrapping_add(1);
+            }
+            p.truncate(target);
+            p
+        };
+        let ldm_params =
+            crate::encoding::CompressionParameters::builder(super::CompressionLevel::Level(22))
+                .enable_long_distance_matching(true)
+                .build()
+                .expect("LDM-only params build");
+        let size = 48 * 1024usize;
+        let frame_a = make_payload(0, size);
+        let frame_b = make_payload(1_000_000, size);
+
+        let mut warm: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(22));
+        warm.set_parameters(&ldm_params);
+        warm.set_encoder_dictionary(
+            super::EncoderDictionary::from_bytes(dict_raw).expect("dict parse"),
+        )
+        .expect("dict attach");
+        let _wa = warm.compress_independent_frame(frame_a.as_slice());
+        let warm_b = warm.compress_independent_frame(frame_b.as_slice());
+
+        let mut cold: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(22));
+        cold.set_parameters(&ldm_params);
+        cold.set_encoder_dictionary(
+            super::EncoderDictionary::from_bytes(dict_raw).expect("dict parse"),
+        )
+        .expect("dict attach");
+        let cold_b = cold.compress_independent_frame(frame_b.as_slice());
+
+        assert_eq!(
+            warm_b, cold_b,
+            "LDM-on frame B via snapshot restore must be byte-identical to a cold compress"
+        );
+
+        let (hdr, _) =
+            crate::decoding::frame::read_frame_header(warm_b.as_slice()).expect("frame header");
+        assert_eq!(hdr.dictionary_id(), Some(dict_id));
+        let mut decoder = FrameDecoder::new();
+        decoder
+            .add_dict(crate::decoding::Dictionary::decode_dict(dict_raw).unwrap())
+            .unwrap();
+        let mut decoded = Vec::with_capacity(frame_b.len());
+        decoder
+            .decode_all_to_vec(warm_b.as_slice(), &mut decoded)
+            .unwrap();
+        assert_eq!(decoded.as_slice(), frame_b.as_slice());
+    }
+
+    #[test]
     fn set_dictionary_from_bytes_matches_full_decode_byte_for_byte() {
         // The encoder-only dict parse (`decode_dict_for_encoding`, used by
         // `set_dictionary_from_bytes`) skips the FSE/HUF decoder-table build and
