@@ -58,6 +58,10 @@ alloc = { version = "1.0.0", optional = true, package = "rustc-std-workspace-all
 criterion = "0.8"
 rand = "0.10"
 zstd = { version = "0.13.3", features = ["zdict_builder", "experimental"] }
+# Heap profiler for per-allocation-site attribution (the `dhat-heap`
+# feature swaps it in as the global allocator in the reuse profiling
+# example). Dev-only; never linked into the library.
+dhat = "0.3"
 
 [features]
 default = [
@@ -112,6 +116,14 @@ critical-section = ["dep:critical-section"]
 bench_internals = []
 fuzz_exports = []
 std = []
+# Dev-only: route the `encode_loop_reuse_z000033` profiling example through
+# the `dhat` heap profiler (per-allocation-site call-stack attribution) so a
+# reused-compressor run shows which Rust sites allocate, and how many times —
+# the per-frame allocation churn that libc-frame-pointer-broken flamegraphs
+# can't attribute. Off by default (the profiler adds large overhead); enable
+# only for the example. Writes `dhat-heap.json` (view at the dhat viewer or
+# parse for `total_blocks` per site).
+dhat-heap = []
 # Diagnostic-only: atomic histograms of the match/literal copy shape on the
 # decode path (call counts + size buckets + requested-vs-overshoot byte
 # totals). Off in every shipping / bench build (zero codegen impact). Enabled

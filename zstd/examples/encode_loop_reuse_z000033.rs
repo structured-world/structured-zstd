@@ -22,7 +22,18 @@ use std::env;
 
 use structured_zstd::encoding::{CompressionLevel, FrameCompressor};
 
+// With `--features dhat-heap`, route every allocation through the dhat heap
+// profiler so the run records per-call-site allocation counts + bytes (the
+// reused-compressor churn that broken-unwind flamegraphs can't attribute).
+// Writes `dhat-heap.json` on `Profiler` drop.
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 fn main() {
+    #[cfg(feature = "dhat-heap")]
+    let _dhat = dhat::Profiler::new_heap();
+
     let args: Vec<String> = env::args().collect();
     let level: i32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(3);
     let iters: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(2000);
