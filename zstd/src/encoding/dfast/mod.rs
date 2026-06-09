@@ -1844,20 +1844,6 @@ macro_rules! start_matching_fast_loop_body {
                 let concat_idx0 = abs_ip0 - history_abs_start;
                 let concat_idx1 = abs_ip1 - history_abs_start;
 
-                // Donor `PREFETCH_L1(ip + 256)` (zstd_double_fast.c:237): warm
-                // the input line the match-finder will hash/verify a few
-                // positions ahead. The match-find loop is memory-latency bound
-                // (hash-table + candidate-verify loads dominate its self-time),
-                // and the step-accelerated cursor skips past the sequential
-                // stride the hardware prefetcher tracks, so an explicit hint
-                // covers what the HW prefetcher misses. An out-of-bounds
-                // prefetch is an ISA no-op, so no end-of-buffer guard is needed.
-                unsafe {
-                    crate::decoding::prefetch::prefetch_l1_at(
-                        history_base_ptr.add(history_start_offset + concat_idx0 + 256),
-                    );
-                }
-
                 // Load 8 bytes at ip0 for both short (low 4) and long
                 // probe equality checks. We already used `v8_at_ip0` to
                 // compute hl0/idxl0 in the outer init / previous iter's
@@ -1974,6 +1960,26 @@ macro_rules! start_matching_fast_loop_body {
                         .read_unaligned()
                 };
                 let hl1_idx = (v8_1.wrapping_mul(PRIME) >> long_shift) as usize;
+
+                // Prefetch the RANDOM-ACCESS hash-table slots the loop is about
+                // to read, while there is work to hide the latency behind. The
+                // match-find loop is memory-latency bound on these table loads
+                // (perf --call-graph dwarf annotate: ~21% self-time across the
+                // long/short slot reads), and the hardware prefetcher cannot
+                // predict a hash-indexed address. `hl1_idx`'s slot is loaded
+                // ~100 instructions below (the `_search_next_long` retry at
+                // `ip1`); the next inner iteration's short-hash slot is keyed on
+                // these same `v8_1` bytes (this `ip1` becomes the next `ip0`).
+                // Unlike the donor's input `PREFETCH_L1(ip + 256)` — which only
+                // warms the sequential input the HW prefetcher already covers —
+                // these target the loads that actually stall.
+                unsafe {
+                    let hs1_idx = ((v8_1 << 24).wrapping_mul(PRIME) >> short_shift) as usize;
+                    crate::decoding::prefetch::prefetch_l1_at(long_hash_ptr.add(hl1_idx) as *const u8);
+                    crate::decoding::prefetch::prefetch_l1_at(
+                        short_hash_ptr.add(hs1_idx) as *const u8,
+                    );
+                }
 
                 // Long match check at ip0 with idxl0. 8-byte equality
                 // gate (`MEM_read64`) — if it passes, candidate is real.
@@ -2401,14 +2407,6 @@ macro_rules! start_matching_fast_loop_body {
 
                 // Step bump on distance (donor `zstd_double_fast.c:224-228`).
                 if ip1 >= next_step_pos {
-                    // Donor (zstd_double_fast.c:225-226): on a skip-step bump
-                    // the cursor is about to jump well past `ip1`, so warm the
-                    // two cache lines just beyond it. OOB prefetch is a no-op.
-                    unsafe {
-                        let base = history_base_ptr.add(history_start_offset + concat_idx1);
-                        crate::decoding::prefetch::prefetch_l1_at(base.add(64));
-                        crate::decoding::prefetch::prefetch_l1_at(base.add(128));
-                    }
                     step = (step + 1).min(DFAST_MAX_SKIP_STEP);
                     next_step_pos += DFAST_SKIP_STEP_GROWTH_INTERVAL;
                 }
