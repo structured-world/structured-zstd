@@ -123,6 +123,16 @@ pub(crate) struct DfastMatchGenerator {
     /// resolved once at construction so the per-byte match-finder scans skip
     /// the `select_kernel()` `OnceLock` atomic on every call.
     pub(crate) kernel: FastpathKernel,
+    /// Borrowed one-shot scan window: `(input_base_ptr, current_block_end)`.
+    /// When `Some`, the fast loop sources bytes from the caller's in-place
+    /// input slice with absolute input positions (`abs_start = position_base
+    /// = start_offset = 0`, readable length = `current_block_end`) instead of
+    /// copying each block into the owned `history` concat — the dfast analog
+    /// of the Fast backend's borrowed window. The pointer is the input start
+    /// (constant for the frame); the second field is updated to the active
+    /// block's end before each block scan. `None` = owned (history-copying)
+    /// path. Cleared on `reset()`.
+    pub(crate) borrowed: Option<(*const u8, usize)>,
 }
 
 /// The dfast backend's immutable dictionary tables — a long+short pair mirroring
@@ -162,6 +172,7 @@ impl DfastMatchGenerator {
             short_hash_bits: DFAST_HASH_BITS - DFAST_SHORT_HASH_BITS_DELTA,
             dict: DictAttach::new(),
             kernel: select_kernel(),
+            borrowed: None,
         }
     }
 
@@ -317,6 +328,10 @@ impl DfastMatchGenerator {
         // per-block input Vecs internally; the dispatcher in
         // `match_generator.rs` resolves the per-backend shape).
         self.window_blocks.clear();
+        // Drop any borrowed window: the input slice it pointed at does not
+        // outlive the frame, and the next frame re-stages its own (or runs
+        // the owned path). A stale pointer must never survive a reset.
+        self.borrowed = None;
     }
 
     /// Slice of bytes from the most recently appended block. Returns
@@ -1026,6 +1041,15 @@ impl DfastMatchGenerator {
     /// the loop stays sound.
     #[inline(always)]
     fn scan_source(&self) -> (*const u8, usize, usize, usize, usize) {
+        if let Some((ptr, block_end)) = self.borrowed {
+            // Borrowed one-shot window: positions are absolute input
+            // offsets, so the rebase coordinates collapse to zero
+            // (`start_offset = abs_start = position_base = 0`) and the
+            // readable length is the active block's end. No history concat,
+            // no `commit_space` copy. Candidate reads from earlier blocks
+            // land at `ptr + earlier_abs_pos` (< block_end), in range.
+            return (ptr, 0, 0, 0, block_end);
+        }
         let start_offset = self.history_start;
         (
             self.history.as_ptr(),
