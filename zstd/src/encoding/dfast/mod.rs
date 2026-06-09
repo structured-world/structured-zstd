@@ -1014,6 +1014,28 @@ impl DfastMatchGenerator {
         }
     }
 
+    /// Per-outer-iteration byte-source descriptor for the fast loop:
+    /// `(base_ptr, start_offset, abs_start, position_base, concat_len)`.
+    ///
+    /// Read once at the top of every outer iteration so the kernel body
+    /// is agnostic to where its bytes live: the owned path returns the
+    /// `history` concat's (rebased) fields, and a future borrowed
+    /// one-shot window will return its own constant descriptor without
+    /// the kernel body changing. Returns raw pointer + offsets (no borrow
+    /// held), so the subsequent `&mut self` hash-table pointer snapshot in
+    /// the loop stays sound.
+    #[inline(always)]
+    fn scan_source(&self) -> (*const u8, usize, usize, usize, usize) {
+        let start_offset = self.history_start;
+        (
+            self.history.as_ptr(),
+            start_offset,
+            self.history_abs_start,
+            self.position_base,
+            self.history.len() - start_offset,
+        )
+    }
+
     fn emit_candidate(
         &mut self,
         current_abs_start: usize,
@@ -1543,13 +1565,16 @@ macro_rules! start_matching_fast_loop_body {
 
             // Re-read every per-frame-mutable cursor here — `emit_candidate`
             // in the previous outer iteration may have triggered a rebase.
-            let history_abs_start = $self.history_abs_start;
-            let position_base = $self.position_base;
-            let history_start_offset = $self.history_start;
-            let history_base_ptr = $self.history.as_ptr();
+            // The byte-source quintet comes through `scan_source()` so a
+            // borrowed one-shot window can substitute the owned `history`
+            // concat without touching this kernel body: the owned path
+            // returns its rebased fields, a borrowed window its constant
+            // descriptor. The hash-table pointers are mode-invariant (the
+            // tables persist across owned/borrowed) so they stay direct.
+            let (history_base_ptr, history_start_offset, history_abs_start, position_base, concat_len) =
+                $self.scan_source();
             let short_hash_ptr = $self.short_hash.as_mut_ptr();
             let long_hash_ptr = $self.long_hash.as_mut_ptr();
-            let concat_len = $self.history.len() - history_start_offset;
 
             // Pre-compute long hash at ip0 ONCE per outer iter.
             // `concat_idx = ($current_abs_start + ip0) - history_abs_start`
