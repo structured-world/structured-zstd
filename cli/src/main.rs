@@ -60,6 +60,9 @@ struct Options {
     bench: bool,
     bench_start: i32,
     bench_end: i32,
+    /// Long-distance matching (`--long`), enabled on the encoder via the
+    /// compression-parameters API.
+    long: bool,
 }
 
 /// Upstream `zstd --maxdict` default (110 KiB).
@@ -139,6 +142,7 @@ fn parse_args(
         bench: false,
         bench_start: CompressionLevel::DEFAULT_LEVEL,
         bench_end: 0,
+        long: false,
     };
     let mut ultra = false;
     let mut iter = args.iter().enumerate().peekable();
@@ -190,7 +194,9 @@ fn parse_args(
                     } else if let Some(v) = long.strip_prefix("dictID=") {
                         opts.dict_id = Some(v.parse::<u32>().wrap_err("invalid --dictID")?);
                     } else if long.starts_with("long") {
-                        // `--long[=N]` (LDM) — accepted; LDM wiring is a follow-up.
+                        // `--long` or `--long=N` (the window-log hint is accepted
+                        // but the encoder derives the LDM window from the level).
+                        opts.long = true;
                     } else {
                         bail!("unknown option: --{long}");
                     }
@@ -321,12 +327,18 @@ fn print_help() {
          \x20 -z, --compress       compress (default)\n\
          \x20 -d, --decompress     decompress\n\
          \x20 -t, --test           test a compressed file's integrity\n\
+         \x20 -l, --list           list information about .zst files\n\
+         \x20 --train FILEs        train a dictionary from sample files\n\
+         \x20 -b[N] [-e[N]]        benchmark level N (through e)\n\
          \n\
          Options:\n\
          \x20 -<N>                 compression level (1-19; 20-22 need --ultra)\n\
          \x20 --fast[=N]           ultra-fast negative level\n\
          \x20 --ultra              allow levels 20-22\n\
+         \x20 --long[=N]           enable long-distance matching\n\
          \x20 -D FILE              use FILE as a dictionary\n\
+         \x20 --maxdict=N          dictionary size cap for --train\n\
+         \x20 --dictID=N           dictionary ID for --train\n\
          \x20 -o FILE              write output to FILE\n\
          \x20 -c, --stdout         write to stdout\n\
          \x20 -f, --force          overwrite output / allow stdout to terminal\n\
@@ -432,6 +444,7 @@ fn run_benchmark(opts: &Options, dict: Option<&[u8]>) -> color_eyre::Result<()> 
                 opts.store,
                 dict,
                 Some(data.len() as u64),
+                opts.long,
             )?;
             best_compress = best_compress.min(t.elapsed().as_secs_f64());
             if start.elapsed().as_secs_f64() >= BUDGET_SECS {
@@ -582,7 +595,15 @@ fn process_stdin_stdout(opts: &Options, dict: Option<&[u8]>) -> color_eyre::Resu
     match opts.mode {
         Mode::Compress => {
             let stdout = io::stdout();
-            compress_stream(reader, stdout.lock(), opts.level, opts.store, dict, None)
+            compress_stream(
+                reader,
+                stdout.lock(),
+                opts.level,
+                opts.store,
+                dict,
+                None,
+                opts.long,
+            )
         }
         Mode::Decompress => {
             let stdout = io::stdout();
@@ -649,6 +670,7 @@ fn process_file(opts: &Options, input: &Path, dict: Option<&[u8]>) -> color_eyre
                 opts.store,
                 dict,
                 Some(source_size as u64),
+                opts.long,
             )?,
             Mode::Decompress => decompress_stream(&mut reader, &mut out, dict)?,
             Mode::Test | Mode::List | Mode::Train => unreachable!(),
@@ -673,6 +695,7 @@ fn process_file(opts: &Options, input: &Path, dict: Option<&[u8]>) -> color_eyre
                 opts.store,
                 dict,
                 Some(source_size as u64),
+                opts.long,
             )?,
             Mode::Decompress => decompress_stream(&mut reader, &mut sink, dict)?,
             Mode::Test | Mode::List | Mode::Train => unreachable!(),
@@ -694,6 +717,7 @@ fn process_file(opts: &Options, input: &Path, dict: Option<&[u8]>) -> color_eyre
 }
 
 /// Streaming compression core (file or stdout), optionally dictionary-primed.
+#[allow(clippy::too_many_arguments)]
 fn compress_stream<R: Read, W: Write>(
     mut reader: R,
     writer: W,
@@ -701,6 +725,7 @@ fn compress_stream<R: Read, W: Write>(
     store: bool,
     dict: Option<&[u8]>,
     size_hint: Option<u64>,
+    long: bool,
 ) -> color_eyre::Result<()> {
     let compression_level = if store {
         CompressionLevel::Uncompressed
@@ -708,6 +733,17 @@ fn compress_stream<R: Read, W: Write>(
         CompressionLevel::from_level(level)
     };
     let mut encoder = structured_zstd::encoding::StreamingEncoder::new(writer, compression_level);
+    // Long-distance matching (`--long`) is a per-knob override applied via the
+    // compression-parameters API; skip it for `--store` (raw frames don't match).
+    if long && !store {
+        let params = structured_zstd::encoding::CompressionParameters::builder(compression_level)
+            .enable_long_distance_matching(true)
+            .build()
+            .map_err(|err| eyre!("failed to build LDM parameters: {err:?}"))?;
+        encoder
+            .set_parameters(&params)
+            .wrap_err("failed to enable long-distance matching")?;
+    }
     if let Some(size) = size_hint {
         // The size is known (a regular file), so pledge it: the frame records
         // Frame_Content_Size (decoders can pre-allocate, `zstd -l` reports it)
@@ -1038,6 +1074,13 @@ mod tests {
     }
 
     #[test]
+    fn long_flag_enables_ldm() {
+        assert!(parse(&["-19", "--long", "in.txt"]).unwrap().long);
+        assert!(parse(&["--long=27", "in.txt"]).unwrap().long);
+        assert!(!parse(&["-19", "in.txt"]).unwrap().long);
+    }
+
+    #[test]
     fn benchmark_flags_parse_level_range() {
         let opts = parse(&["-b3", "-e7", "in.txt"]).unwrap();
         assert!(opts.bench);
@@ -1085,6 +1128,7 @@ mod tests {
             bench: false,
             bench_start: 3,
             bench_end: 0,
+            long: false,
         };
         assert_eq!(
             derive_output_path(&opts, Path::new("archive.tar.zst")).unwrap(),

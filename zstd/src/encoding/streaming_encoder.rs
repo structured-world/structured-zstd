@@ -65,6 +65,32 @@ impl<W: Write> StreamingEncoder<W, MatchGeneratorDriver> {
             compression_level,
         )
     }
+
+    /// Configure fine-grained compression parameters (#27): resets the level to
+    /// the parameters' level and installs the per-knob overrides (window / hash
+    /// / chain / search logs, strategy, long-distance matching) applied at the
+    /// next frame. Mirrors [`FrameCompressor::set_parameters`]. Must be called
+    /// before the first [`write`](Write::write). Only the built-in
+    /// `MatchGeneratorDriver` exposes the override knobs, so this lives on the
+    /// default-matcher impl.
+    pub fn set_parameters(
+        &mut self,
+        params: &crate::encoding::CompressionParameters,
+    ) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.frame_started {
+            return Err(invalid_input_error(
+                "compression parameters must be set before the first write",
+            ));
+        }
+        self.compression_level = params.level();
+        let overrides = params.overrides();
+        self.state.strategy_tag = overrides.strategy.map(|s| s.tag()).unwrap_or_else(|| {
+            crate::encoding::strategy::StrategyTag::for_compression_level(self.compression_level)
+        });
+        self.state.matcher.set_param_overrides(Some(overrides));
+        Ok(())
+    }
 }
 
 impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
