@@ -85,14 +85,4 @@ fn main() {
         level,
         sink
     );
-    #[cfg(feature = "dhat-heap")]
-    {
-        let calls = structured_zstd::huff0::huff0_encoder::BUILD_FROM_COUNTS_CALLS
-            .load(core::sync::atomic::Ordering::Relaxed);
-        eprintln!(
-            "build_from_counts calls: {} total = {:.1} per frame",
-            calls,
-            calls as f64 / iters as f64
-        );
-    }
 }

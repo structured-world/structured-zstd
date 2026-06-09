@@ -475,14 +475,6 @@ pub struct HuffmanTable {
     cached_encoded_weight_description: CachedDescription,
 }
 
-/// Diagnostic call counter for `build_from_counts` (the Huffman tree builder),
-/// active only under the `dhat-heap` profiling feature. Lets the reuse
-/// profiling example report builds-per-frame so over-build / over-split churn
-/// can be confirmed without guessing from a flamegraph.
-#[cfg(feature = "dhat-heap")]
-pub static BUILD_FROM_COUNTS_CALLS: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-
 impl HuffmanTable {
     /// Heap bytes this table holds: the per-symbol code table and the packed
     /// dual-container codes. The lazily-built weight-description cache is a
@@ -500,8 +492,6 @@ impl HuffmanTable {
     }
 
     pub fn build_from_counts(counts: &[usize]) -> Self {
-        #[cfg(feature = "dhat-heap")]
-        BUILD_FROM_COUNTS_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         assert!(counts.len() <= 256);
         let symbol_cardinality = counts.iter().filter(|&&count| count > 0).count();
         if symbol_cardinality <= 1 {
@@ -510,7 +500,7 @@ impl HuffmanTable {
 
         let min_table_log = symbol_cardinality.ilog2() as usize + 1;
         let mut best_size = usize::MAX - 1;
-        let mut best_weights: Option<alloc::vec::Vec<usize>> = None;
+        let mut best_table = None;
 
         // Outer-loop scoring uses [`cheap_desc_size_proxy`] — an integer
         // entropy estimate of the weight description, no FSE encode.
@@ -540,15 +530,13 @@ impl HuffmanTable {
             if !huffman_weight_sum_is_power_of_two(&weights) {
                 continue;
             }
-            // Derive `max_bits` and the would-be compressed size directly from
-            // the weights instead of materialising a full `HuffmanTable`
-            // (codes + packed_codes Vecs) for every candidate table_log — only
-            // the winning table_log is built, after the loop. The per-symbol
-            // code length is `table_log + 1 - weight[s]` (see
-            // `build_from_weights`), so the maximum is `table_log + 1 -
-            // min_nonzero_weight`. This drops ~8 of every ~9 per-build
-            // HuffmanTable allocations on the entropy hot path.
-            let max_bits = max_bits_from_weights(table_log, &weights);
+            let table = Self::build_from_weights(&weights);
+            let max_bits = table
+                .codes
+                .iter()
+                .map(|&(_, bits)| bits)
+                .max()
+                .unwrap_or_default() as usize;
             if max_bits < table_log && table_log > min_table_log {
                 break;
             }
@@ -570,23 +558,20 @@ impl HuffmanTable {
             let Some(desc_size) = cheap_desc_size_proxy(trimmed) else {
                 continue;
             };
-            let new_size = estimate_compressed_size_from_weights(&weights, counts, table_log)
+            let new_size = table
+                .estimate_compressed_size_from_counts(counts)
                 .saturating_add(desc_size);
             if new_size > best_size + 1 {
                 break;
             }
             if new_size < best_size {
                 best_size = new_size;
-                best_weights = Some(weights);
+                best_table = Some(table);
             }
         }
 
-        // Build the selected table exactly once (winner's weights, or the
-        // donor 11-bit fallback when no candidate scored).
-        match best_weights {
-            Some(weights) => Self::build_from_weights(&weights),
-            None => Self::build_from_weights(&build_donor_limited_weights(counts, 11)),
-        }
+        best_table
+            .unwrap_or_else(|| Self::build_from_weights(&build_donor_limited_weights(counts, 11)))
     }
 
     /// Estimates encoded payload size in bytes for `data` using this table.
@@ -1006,45 +991,6 @@ fn build_huffman_leaf_depths(counts: &[usize]) -> Vec<HuffNode> {
     // changes their `count` / `symbol`. Return just the leaves (with depths).
     nodes.truncate(leaf_count);
     nodes
-}
-
-/// Maximum Huffman code length implied by `weights` at `table_log`, without
-/// materialising the code table. Mirrors `build_from_weights`'s assignment
-/// `nb_bits = table_log + 1 - weight` for every non-zero weight, so the
-/// maximum is `table_log + 1 - min_nonzero_weight` (zero-weight symbols carry
-/// `nb_bits = 0` and never raise the max). Returns `0` when no weight is
-/// non-zero (matching the old `max().unwrap_or_default()` over an all-zero
-/// code table).
-fn max_bits_from_weights(table_log: usize, weights: &[usize]) -> usize {
-    match weights.iter().copied().filter(|&w| w > 0).min() {
-        Some(min_w) => table_log + 1 - min_w,
-        None => 0,
-    }
-}
-
-/// Would-be compressed payload size (bytes) for `counts` under `weights` at
-/// `table_log`, computed straight from the weights instead of building the
-/// table. Byte-for-byte identical to
-/// [`HuffmanTable::estimate_compressed_size_from_counts`]: the per-symbol code
-/// length is `table_log + 1 - weight` for non-zero weights (and `0`
-/// otherwise), and the byte formula is the same `div_ceil(8) + is_multiple_of(8)`.
-fn estimate_compressed_size_from_weights(
-    weights: &[usize],
-    counts: &[usize],
-    table_log: usize,
-) -> usize {
-    let bits: usize = weights
-        .iter()
-        .zip(counts.iter())
-        .map(|(&weight, &count)| {
-            if weight > 0 {
-                (table_log + 1 - weight) * count
-            } else {
-                0
-            }
-        })
-        .sum();
-    bits.div_ceil(8) + usize::from(bits.is_multiple_of(8))
 }
 
 /// Limit the natural Huffman depths in `leaves` (from
