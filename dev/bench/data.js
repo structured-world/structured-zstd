@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1780992753826,
+  "lastUpdate": 1781015907786,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -62138,6 +62138,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.271,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "4e323eee5a91b6a8307cdfa4e5f64f5dd1200408",
+          "message": "feat: dictionary CDict-equivalent (encoder + C ABI + wasm + CLI); L22 dict memory 8.2x->1.13x (#387)\n\n* perf(compress): size dict match-finder tables from dict, not source\n\nWhen a dictionary is loaded, the binary-tree / hash-chain match-finder\ntables were sized from the source window (level 22: hashLog/chainLog 21),\nholding ~17 MB of live tables plus a same-size primed-snapshot clone. The\ndecodecorpus-z000033 L22 ldm+dict peak was 39.7 MB vs C zstd 4.8 MB (8.2x).\n\nC zstd applies CDict economics: a loaded dictionary supplies the\nlong-distance matches, so the live match-finder tables shrink to the\ndictionary's cParams tier (here hashLog 17, chainLog 18) while the frame\nwindow stays source-sized so the dictionary bytes remain referenceable\n(ZSTD_resetCCtx_byCopyingCDict: params.cParams = *cdict_cParams;\nparams.cParams.windowLog = windowLog).\n\nMirror that: thread the dictionary content size into the matcher and, on\nthe BT/HC backend, cap hashLog/chainLog to the dict tier picked the way\ndonor ZSTD_getCParamRowSize does (dictSize + 500). The eviction window,\nsearch depth, and target length stay source-derived, so match quality is\nunchanged. The smaller tables also shrink the primed-snapshot clone.\n\ndecodecorpus-z000033 L22 ldm+dict compress peak 39.7 MB -> 9.3 MB (8.2x\n-> 1.9x). Ratio neutral: rust_with_dict_bytes 420670 -> 421030 vs C\n420424 (+0.09%, within noise). All 799 lib tests pass incl FFI\ncross-validation and reused-compressor byte-identity.\n\n* ci(release-plz): skip baseline diff for structured-zstd-c crate\n\nThe C ABI crate (structured-zstd-c, added after the shared v0.0.33 tag)\nhad no release-plz package override, so release-plz resolved its last\nrelease to the shared v0.0.33 tag and checked out a worktree where the\npackage does not exist, crashing release-pr with \"Failed to find package\nstructured-zstd-c\". Mirror the structured-zstd-wasm fix: a private tag\nnamespace with no matching tag marks it unreleased and skips the broken\nbaseline diff. publish=false already keeps it off crates.io.\n\n* feat(c-api): CDict / DDict prepared-dictionary objects\n\nAdd the compression/decompression dictionary surface from zstd.h:\nZSTD_createCDict[_byReference] / freeCDict / sizeof_CDict /\ngetDictID_fromCDict / compress_usingCDict, and the symmetric DDict set\n(createDDict[_byReference] / freeDDict / sizeof_DDict / getDictID_fromDDict\n/ decompress_usingDDict).\n\nA CDict holds the dictionary bytes + parsed id + the level it is used at;\nthe CCtx caches a FrameCompressor with the dictionary attached, keyed by\nthe CDict pointer, so back-to-back compressions with the same CDict reuse\nthe parsed dictionary and the primed match-finder snapshot instead of\nre-parsing and re-priming. The DCtx caches the loaded dictionary keyed by\nthe DDict pointer. The match-finder tables a dictionary primes are sized\nto the dictionary's own cParams tier, so a CDict does not carry a\nsource-window-sized table.\n\nAdds an in-crate CDict->DDict round-trip + reuse test and a\nnon-dictionary-rejected test.\n\n* perf(compress): match donor createCDict table geometry for dict path\n\nReplace the tier-table lookup for the dictionary match-finder geometry\nwith a direct port of donor `ZSTD_createCDict`\n(`ZSTD_getCParams_internal(.., UNKNOWN, dictSize, ZSTD_cpm_createCDict)` ->\n`ZSTD_adjustCParams_internal`): downsize hashLog/chainLog toward the\ndict-and-window log assuming a `minSrcSize` source, leaving the eviction\nwindow source-derived. `cdict_table_logs` + `dict_and_window_log` mirror\nthe donor formulas (minSrcSize 513, ZSTD_dictAndWindowLog, ZSTD_cycleLog\nchainLog-1 for binary-tree finders).\n\nFor a 16 KiB dictionary at level 22 this resolves to hashLog 16 /\nchainLog 16 (donor parity) vs the previous tier's 17/18. Ratio neutral\n(z000033 rust_with_dict 421132 vs C 420424, +0.17%, noise); all 189\ndict / cross-validation / level22 tests pass.\n\n* test(compress): floor-safe byte-identity guard for dict snapshot restore\n\nRegression guard for the btultra2 dictionary primed-snapshot RESTORE path\n(the path a minimal / decoupled prepared-dict refactor rewrites). A reused\ncompressor compresses frame A (filling the live tables and advancing the\nwindow floor), then frame B of the same resolved shape (snapshot restore\npath) but different content; the restore must be byte-identical to a cold\ncompress of frame B and must round-trip. Pins that a restore leaking stale\nframe-A live-table entries above the restored floor (false matches) fails\nloudly instead of emitting a divergent / undecodable frame.\n\nPasses on the current full-clone restore.\n\n* perf(compress): drop live tables from BT dict snapshot (donor CDict shape)\n\nOn the binary-tree backend the dictionary is decoupled into `dms` (the\ndonor `dictMatchState`): the live hash / chain / hash3 tables hold no\ndict entries at snapshot capture (skip_matching_dict_bt keeps the dict\nout of the live tree), so they are pure zeros. The primed snapshot was\nnonetheless cloning that whole window-tier table set, keeping a second\nresident copy for the entire compress.\n\nCapture now moves the live tables out of the working storage, clones only\nthe dict state (history + dms + window / offset / dict-limit), and moves\nthem back — matching what donor's CDict retains (dict tables, no live /\nhash3 tables). restore_primed_dictionary re-allocates the zeroed live\ntables via ensure_tables (a full storage replace, so no stale prior-frame\nentry can survive the restored floor). HC / lazy levels keep the dict in\nthe live chain and still snapshot the full tables.\n\ndecodecorpus-z000033 L22 ldm+dict compress peak 7.19 -> 6.14 MB\n(1.49x -> 1.27x). Byte-identical: the new floor-safe regression test, the\nexisting dict reuse byte-identity tests, cross-validation and the\n1000-iteration roundtrips all pass (820 lib tests).\n\n* perf(compress): decouple LDM producer from BT dict snapshot\n\nThe dictionary primed-snapshot retained the BtMatcher LDM producer, but\nthe producer carries no dictionary state: LDM is not dict-primed (it runs\nover live input only), so its hash table is empty at capture. Keeping it\nin the snapshot kept a second empty LDM table resident for the whole\ncompress.\n\nCapture now detaches the LDM producer (alongside the live tables) before\ncloning the dict state; restore reinstates the frame's freshly-reset\nproducer (built this frame with the same params the snapshot key pins,\nand empty since no input is processed yet) — equivalent to the captured\none, so output is unchanged. Matches donor's CDict, which holds no LDM\nstate (LDM lives in the CCtx, built per-compress).\n\ndecodecorpus-z000033 L22 ldm+dict compress peak 6.14 -> 5.61 MB\n(1.27x -> 1.16x). Adds an LDM-enabled byte-identity restore guard; 821\nlib tests pass incl cross-validation + 1000-iteration roundtrips.\n\n* perf(compress): pre-size history mirror to known total (no doubling overshoot)\n\nWhen the source size is known (hinted), pre-reserve the contiguous history\nmirror to dictionary + payload bytes (capped to the window eviction bound)\nso the per-block add_data extend_from_slice growth does not overshoot via\nVec capacity doubling. A ~1 MiB history otherwise lands in a 2 MiB\nallocation; donor sizes its window buffer at windowSize + blockSize\nexactly. Correctness-neutral (the mirror still grows on demand if the\nestimate is low); unhinted streams keep doubling growth.\n\ndecodecorpus-z000033 L22 ldm+dict compress peak 5.61 -> 5.47 MB; no-dict\nL22 paths unchanged. 821 lib tests pass.\n\n* feat(encode): dictionary support for StreamingEncoder\n\nStreamingEncoder had no dictionary API (only the one-shot FrameCompressor\ndid), which blocked the CLI `-D` flag and streaming dict use. Add\nset_dictionary_from_bytes / set_encoder_dictionary: the dictionary primes\nthe match-finder, seeds the first block's repeat offsets + entropy tables\n(donor cdict->cBlockState), and its ID is written into the frame header;\nsingle-segment is disabled for dictionary frames (mirrors FrameCompressor).\nThe dict-tier match-finder sizing applies via set_dictionary_size_hint.\n\nFactor the dictionary entropy extraction into\nCachedDictionaryEntropy::from_dictionary, shared by FrameCompressor's\nattach_dictionary and the new streaming path so both seed identically.\n\nThe non-dictionary path is byte-identical (the dict branches gate on\n`dictionary.is_some()`, None for non-dict; the per-block flag replaces a\nhardcoded `false`) — streaming byte-identity + 1000-iteration roundtrips\nunchanged. Adds a streaming dict round-trip test (compress with dict ->\ndecode with the same dict, dict ID carried in the header). 822 lib tests\npass.\n\n* feat(wasm): streaming dictionary support for npm bindings\n\nWire the new StreamingEncoder dictionary support through the wasm\nstreaming classes: ZstdCompressStream.withDictionary(level, dict,\nchecksum) and ZstdDecompressStream.withDictionary(dict, checksum), plus\nthe TS factory wrappers createCompressStreamWithDictionary /\ncreateDecompressStreamWithDictionary. The compress side mirrors\nZSTD_CCtx_loadDictionary on a streaming context (dictionary primes the\nmatcher + first-block entropy, ID written to the frame header); the\ndecompress side primes the FrameDecoder via add_dict_from_bytes.\nSymmetric with the existing one-shot compressUsingDict / decompressUsingDict.\n\nwasm32 build + clippy clean. (index.js/index.d.ts regenerate from index.ts\nvia the package `build:ts` tsc step at publish.)\n\n* feat(cli): upstream-compatible zstd flag dispatch (#128)\n\nReplace the subcommand CLI (`zstd compress <file>`) with upstream zstd\nv1.5.7's flag model so the binary is a drop-in `zstd`:\n\n- argv[0] dispatch: `unzstd` defaults to decompress, `zstdcat`/`zcat`\n  decompress to stdout.\n- mode flags `-z`/`-d`/`-t` (+ `--compress`/`--decompress`/`--test`).\n- bare numeric levels `-1`..`-19`, `--fast[=N]` (negative), `--ultra`\n  gate for `-20`..`-22` (clap derive can't model bare `-N`, so argv is\n  parsed manually with clustered short flags `-dck`).\n- I/O: `-c`/`--stdout`, `-o FILE`, `-f`/`--force`, `-k`/`--keep`,\n  `--rm`, stdin/stdout when no FILE or FILE is `-`.\n- `-D FILE` dictionary on both compress and decompress, routed through\n  the streaming codec's new dictionary support.\n- `--version`/`-V`, `--help`/`-h`.\n\nCompression/decompression stream through StreamingEncoder/Decoder\n(O(window) peak), reusing the atomic temp-write + replace + alias-guard\nfile plumbing. Validated end-to-end: file roundtrip, stdin|stdout pipe,\n`-D` dict roundtrip, `unzstd` argv0 dispatch, `-t` integrity. 15 parse\ntests. Benchmark (-b), list (-l), training (--train), and --long LDM are\nfollow-up increments.\n\n* feat(cli): -l / --list frame inspection + write Frame_Content_Size\n\nAdd `-l` / `--list`: walk every frame header in each file (no body decode)\nand print a `zstd -l`-style row — frame count, compressed size, declared\nuncompressed size, ratio, checksum flag, dictionary ID — via the public\nread_frame_header_info + find_frame_compressed_size. Decompressed size is\n`--` when a frame omits Frame_Content_Size.\n\nAlso pledge the (known) file size on the compress path so the frame records\nFrame_Content_Size (decoders can pre-allocate; `-l` reports the real size),\nmatching upstream `zstd FILE`; stdin stays unsized. 15 parse tests; -l and\nroundtrip validated on real frames.\n\n* feat(cli): --train dictionary builder (--maxdict / --dictID)\n\nAdd `--train` (+ aliases --train-fastcover/-cover/-legacy): concatenate\nthe sample files into a training corpus, build a FastCOVER dictionary via\nthe codec's create_fastcover_dict_from_source, and write it to `-o`\n(default `dictionary`). `--maxdict=N` sets the target size (upstream\ndefault 112640), `--dictID=N` pins the dictionary ID. Enables the\n`dict_builder` feature on the CLI's codec dependency.\n\n`--train` is exempt from the single-input `-o` guard (many samples → one\ndictionary). Validated end-to-end: trained an 8 KiB dict from 200 samples\nand round-tripped a payload through `-D` compress + decompress. 18 tests.\n\n* feat(cli): -b benchmark mode across a level range\n\nAdd `-b[N]` / `-e[N]` / `-i[N]`: benchmark compression + decompression of\nthe input file(s) over the level range `bench_start..=bench_end`,\nreporting per-level compressed size, ratio, and best-of-budget compress /\ndecompress throughput (MB/s). Time-budgeted per level. Honours `-D` so\ndictionary throughput can be measured. Numbers attach to the flag\n(`-b19`), upstream-style; bare `-b` benchmarks the default level.\n\nValidated: `-b3 -e7 FILE` prints a per-level table. 19 parse tests.\n\n* feat(cli): --long LDM + StreamingEncoder set_parameters; help update\n\nWire `--long[=N]`: enable long-distance matching on the compress path via\na new StreamingEncoder::set_parameters (mirrors FrameCompressor — installs\nthe CompressionParameters per-knob overrides, including LDM, on the\nmatch-finder before the first frame). The CLI builds LDM parameters at the\nselected level and applies them; `--store` skips it. Help text now lists\n-l / --train / -b / --long / --maxdict / --dictID.\n\nValidated: `-19 --long` on a 500 KiB redundant file → 30-byte frame,\nround-trips. 20 CLI parse tests; streaming + roundtrip lib tests green.\n\n* feat(cli): -i benchmark time budget; accept -B / -S\n\nWire `-i[N]` to the per-level benchmark time budget (seconds, default 1)\nand accept `-B[N]` (block size) / `-S` (separate files) as no-ops so\n`zstd -b -i3 -B128 -S FILE` parses cleanly. zstdgrep/zstdless are upstream\nshell wrappers (not argv[0] modes of the binary), so they stay out of\nscope. 19 CLI tests.\n\n* fix(c-api): key CDict/DDict context caches by serial, not raw address\n\nA context cached its prepared compressor / loaded dictionary keyed by the\nZSTD_CDict / ZSTD_DDict handle's raw address. An address is recycled when a\ndictionary is freed and a new one is allocated in the same slot, so a reused\ncontext could silently keep using the old prepared state for the new handle\n(ABA) — compressing or decompressing with the wrong dictionary.\n\nAssign each CDict/DDict a never-reused monotonic serial at creation and key the\ncaches by that serial instead. Also clear ddict_serial in the\nZSTD_decompressDCtx panic-recovery path: it replaces the decoder with a fresh\none that no longer holds any loaded dictionary, so a later\nZSTD_decompress_usingDDict with the same handle must re-load it rather than\ntrust the stale key.\n\nThe cache fields are now u64 (serials), not usize, so identity is stable on\n32-bit targets too.\n\n* fix(cli): reject unimplemented flags, honor -o/--rm on stdin, stream --list\n\nFive correctness fixes to the CLI surface:\n\n- Reject --no-check / --no-content-size / --no-dictID instead of accepting them\n  as silent no-ops. They change the wire format but are not wired through, so a\n  silent no-op handed the caller the default layout instead of the requested\n  one. Verbosity aliases (--quiet / --verbose) stay honest no-ops.\n- Match --fast / --long exactly (and --fast=N / --long=N). The loose prefix\n  checks let typos like --faster / --longer silently succeed as --fast / --long;\n  they now fall through to the unknown-option path.\n- Honor -o for stdin / \"-\" inputs. process_stdin_stdout always wrote to stdout,\n  so `zstd -o out.zst < in` never created the file. It now routes through the\n  atomic temp-file writer when -o is set (unless -c forces stdout).\n- Honor --rm on the -c / stdout path. The early return skipped the post-success\n  source deletion, so `zstd -c --rm file` left the source behind.\n- Stream --list instead of fs::read of the whole file. list_file read the entire\n  archive into memory to scan frame headers; it now walks frame + 3-byte block\n  headers by seeking past each block body, keeping peak memory O(1) regardless\n  of archive size (no OOM on multi-GB inputs).\n\n* fix(encode): align StreamingEncoder dict path with FrameCompressor; fix CDict table sizing\n\nThree encoder fixes so the streaming path and the dict-tier geometry match the\none-shot FrameCompressor:\n\n- Preserve the strategy override past frame start. set_parameters computed the\n  overridden strategy_tag, but ensure_frame_started re-derived it from the level\n  alone, so a caller using .strategy(...) ran the matcher with one strategy and\n  the literal-compression gates with another (output drifted from\n  FrameCompressor for the same parameters). Persist a strategy_override field,\n  mirroring FrameCompressor.\n- Gate streaming dictionary state with the same predicate as FrameCompressor:\n  !Uncompressed && matcher.supports_dictionary_priming() && dictionary.is_some().\n  Treating dictionary.is_some() as \"active\" everywhere made Uncompressed /\n  non-priming frames advertise a Dictionary_ID, disable single-segment, and seed\n  dict entropy/offsets — emitting frames that needlessly require a dictionary at\n  decode time.\n- Derive the dictionary-tier HC table geometry from the level's full\n  (un-source-capped) widths. level_params(level, hint) already source-caps\n  params.hc; feeding those capped widths into cdict_table_logs and then min()-ing\n  double-capped, so a small hinted source with a large dictionary collapsed the\n  prepared tables below what the dict needs, defeating the ZSTD_createCDict\n  geometry. Use the un-hinted base widths and assign directly (cdict_table_logs\n  only downsizes, so it never exceeds the base level geometry). Memory-neutral on\n  the tuned fixtures (decodecorpus-z000033 compress-dict L22 stays at 1.13x).\n\nAdds regression tests: strategy override survives frame start, Uncompressed +\ndictionary omits Dictionary_ID.\n\n* fix(c-api): reset decoder when add_dict_from_bytes panics\n\nZSTD_decompress_usingDDict collapsed a clean dictionary parse failure and a\npanic from add_dict_from_bytes into one return arm. A panic can mutate the\ndecoder mid-load, so leaving it alive left the reused ZSTD_DCtx with a poisoned\ndecoder and stale cache key for the next call. Split the arms: a clean Err\nreturns dictionary_corrupted with the decoder untouched; a panic replaces the\ndecoder with a fresh one and clears ddict_serial so the next call re-loads.\n\nAlso note in ZSTD_sizeof_CCtx that the cached dict_compressor's heap is not yet\ncounted (tracked in #388).\n\n* fix(cli): validate --fast=/--long= payloads; reject empty --list input\n\n- --fast=N now parses as unsigned, so --fast=-5 is rejected instead of flipping\n  sign into a positive level. --long=N requires a numeric window-log hint;\n  --long= / --long=abc are rejected rather than treated as silent no-ops.\n- list_file now bails on a zero-byte file instead of printing a spurious\n  0-frame success row for a non-zstd input (the walk loop never ran).\n\nRegression tests extended to cover --fast=-5, --long=, --long=abc, --long=27.\n\n* fix(encode): apply param overrides to dict-base HC geometry\n\nThe dict-tier table sizing derived its base HC widths from\nlevel_params(level, None) only, ignoring any active public-parameter overrides.\nA strategy override routing a native non-HC level onto HashChain/BinaryTree\ncould leave base_hc as None (dict sizing skipped), and explicit hash/chain\noverrides were overwritten by the direct assignment. Apply the active overrides\nto the base params first, so dict frames respect them: the override widths\nbecome the geometry ceiling that cdict_table_logs downsizes from.\n\nMemory-neutral on the tuned fixtures (decodecorpus-z000033 compress-dict L22\nstays at 1.13x).\n\n* fix(c-api): count cached dict compressor in ZSTD_sizeof_CCtx\n\nAfter the first ZSTD_compress_usingCDict the context caches a primed\nFrameCompressor whose match-finder tables and dictionary snapshot dominate its\nreal footprint, but ZSTD_sizeof_CCtx only summed the inline struct and scratch\nand so underreported the context. Upstream ZSTD_sizeof_CCtx includes the\nCDict-copied working tables.\n\nAdd a heap_size() accessor that walks the encoder's owned allocations and\ninclude it in ZSTD_sizeof_CCtx:\n\n- Matcher trait gains heap_size() (default 0); MatchGeneratorDriver sums its\n  vec_pool, the active backend, and the primed-dictionary snapshot.\n- Each backend (Fast / Dfast / Row / HashChain) and its tables (FastHashTable,\n  MatchTable + dict tables, BtMatcher opt/LDM scratch, LdmProducer / LdmHashTable)\n  report their Vec/VecDeque capacities.\n- FrameCompressor::heap_size() = matcher heap + retained dictionary content +\n  per-block sidecar buffers.\n\nMirrors the decoder-side FrameDecoder::workspace_size() used by ZSTD_sizeof_DCtx.\nRead-only accounting, no effect on compressed output. Regression test asserts\nthe reported size jumps once the cached compressor's tables exist.\n\n* fix(encode): treat a zero-length dictionary hint as no dictionary\n\nreset() ran the CDict table-sizing path for a Some(0) dictionary hint. That is\nnot a no-op: cdict_table_logs(.., 0) still collapses the HC/BT tables toward the\n513-byte donor tier via DICT_MIN_SRC_SIZE, so an empty dictionary shrank the\nmatch-finder and tanked ratio/perf on the next frame. Priming already treats\nempty content as empty, so skip the dict-driven downsizing unless dict_size > 0.\n\n* fix(c-api): count cached dictionary entropy in heap_size\n\nFrameCompressor::heap_size omitted the dictionary_entropy_cache, so\nZSTD_sizeof_CCtx still under-reported a dictionary-backed context by the size of\nthe cached literals-Huffman table and the Custom LL/ML/OF FSE tables. Add\nheap_size() to FSETable (its flat state array) and the encoder HuffmanTable (its\ncode Vecs), sum them in CachedDictionaryEntropy::heap_size, and include that in\nFrameCompressor::heap_size.\n\n* fix(encode): drop unused-mut in BtMatcher::heap_size under no-std\n\nBtMatcher::heap_size accumulated the LDM-producer term inside a\n`#[cfg(feature = \"hash\")]` block, so with `--no-default-features` the block was\ncompiled out and `let mut total` was never mutated — tripping `unused_mut` under\nthe no-std clippy job's `-D warnings`. Compute the scratch sum immutably and add\nthe LDM term via a feature-split `let`, so neither feature set carries a stray\n`mut`.",
+          "timestamp": "2026-06-09T16:47:11+03:00",
+          "tree_id": "93dafc0a52da5db3171a2b1748967f8d984fc72f",
+          "url": "https://github.com/structured-world/structured-zstd/commit/4e323eee5a91b6a8307cdfa4e5f64f5dd1200408"
+        },
+        "date": 1781015892873,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.128,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.111,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 294.797,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 264.557,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.392,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.429,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.262,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.037,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.142,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.976,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.115,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.115,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.016,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 17.393,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.655,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.274,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.319,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.835,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.263,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.59,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.128,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.301,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.14,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.108,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.27,
             "unit": "ms"
           }
         ]
