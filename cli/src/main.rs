@@ -56,6 +56,10 @@ struct Options {
     max_dict: usize,
     /// Explicit dictionary ID for `--train` (`--dictID`).
     dict_id: Option<u32>,
+    /// Benchmark mode (`-b`); benchmarks `bench_start..=bench_end`.
+    bench: bool,
+    bench_start: i32,
+    bench_end: i32,
 }
 
 /// Upstream `zstd --maxdict` default (110 KiB).
@@ -132,6 +136,9 @@ fn parse_args(
         inputs: Vec::new(),
         max_dict: DEFAULT_MAX_DICT,
         dict_id: None,
+        bench: false,
+        bench_start: CompressionLevel::DEFAULT_LEVEL,
+        bench_end: 0,
     };
     let mut ultra = false;
     let mut iter = args.iter().enumerate().peekable();
@@ -201,6 +208,36 @@ fn parse_args(
                 'z' => opts.mode = Mode::Compress,
                 't' => opts.mode = Mode::Test,
                 'l' => opts.mode = Mode::List,
+                'b' | 'e' | 'i' => {
+                    // `-b[N]` benchmark (start level), `-e[N]` end level for a
+                    // range, `-i[N]` iteration budget. The number is attached
+                    // (`-b19`), upstream-style; bare `-b` benchmarks the default.
+                    let rest: String = chars[ci + 1..].iter().collect();
+                    let value = if rest.is_empty() {
+                        None
+                    } else {
+                        Some(rest.parse::<i32>().wrap_err("invalid numeric suffix")?)
+                    };
+                    match c {
+                        'b' => {
+                            opts.bench = true;
+                            if let Some(v) = value {
+                                opts.bench_start = v;
+                            }
+                        }
+                        'e' => {
+                            if let Some(v) = value {
+                                opts.bench_end = v;
+                            }
+                        }
+                        // `-i` (iteration seconds) accepted; the basic bench
+                        // uses a fixed time budget, so the value is informational.
+                        'i' => {}
+                        _ => unreachable!(),
+                    }
+                    ci = chars.len();
+                    continue;
+                }
                 'c' => opts.to_stdout = true,
                 'f' => opts.force = true,
                 'k' => opts.keep = true,
@@ -251,8 +288,11 @@ fn parse_args(
     validate_level(opts.level)?;
     // `-o` names a single output, so it can't fan out over multiple inputs —
     // except `--train`, where many sample files legitimately feed one dictionary.
-    if opts.mode != Mode::Train && opts.output.is_some() && opts.inputs.len() > 1 {
+    if opts.mode != Mode::Train && !opts.bench && opts.output.is_some() && opts.inputs.len() > 1 {
         bail!("-o cannot be combined with multiple input files");
+    }
+    if opts.bench && opts.bench_end < opts.bench_start {
+        opts.bench_end = opts.bench_start;
     }
     Ok(Parsed::Run(opts))
 }
@@ -309,6 +349,12 @@ fn run(opts: Options) -> color_eyre::Result<()> {
     };
     let dict = dict_bytes.as_deref();
 
+    // `-b` benchmarks compression/decompression across levels instead of
+    // producing output files; handle it before the streaming flow.
+    if opts.bench {
+        return run_benchmark(&opts, dict);
+    }
+
     // `--train` builds a dictionary from the sample files rather than
     // (de)compressing them; handle it before the streaming flow.
     if opts.mode == Mode::Train {
@@ -337,6 +383,89 @@ fn run(opts: Options) -> color_eyre::Result<()> {
         } else {
             process_file(&opts, Path::new(input), dict)?;
         }
+    }
+    Ok(())
+}
+
+/// `-b`: benchmark compression + decompression of the input across the
+/// requested level range, reporting ratio and best-of throughput. A simplified
+/// `zstd -b#` (per-level row); honours `-D` so dictionary throughput can be
+/// measured. Time-budgeted per level rather than fixed-iteration.
+fn run_benchmark(opts: &Options, dict: Option<&[u8]>) -> color_eyre::Result<()> {
+    use std::time::Instant;
+
+    if opts.inputs.is_empty() || opts.inputs.iter().any(|i| i == "-") {
+        bail!("-b requires one or more regular input files to benchmark");
+    }
+    let mut data = Vec::new();
+    for input in &opts.inputs {
+        data.extend_from_slice(
+            &fs::read(input).wrap_err_with(|| format!("failed to read {input}"))?,
+        );
+    }
+    if data.is_empty() {
+        bail!("-b: input is empty");
+    }
+    // Per-level time budget; best (fastest) pass wins, like upstream's -i loop.
+    const BUDGET_SECS: f64 = 1.0;
+    let mb = data.len() as f64 / 1e6;
+    println!(
+        "benchmarking {} ({})  levels {}..={}",
+        opts.inputs.join(", "),
+        fmt_size(data.len() as f64),
+        opts.bench_start,
+        opts.bench_end,
+    );
+
+    for level in opts.bench_start..=opts.bench_end {
+        validate_level(level)?;
+        let mut compressed = Vec::new();
+        let mut best_compress = f64::MAX;
+        let start = Instant::now();
+        loop {
+            compressed.clear();
+            let t = Instant::now();
+            compress_stream(
+                data.as_slice(),
+                &mut compressed,
+                level,
+                opts.store,
+                dict,
+                Some(data.len() as u64),
+            )?;
+            best_compress = best_compress.min(t.elapsed().as_secs_f64());
+            if start.elapsed().as_secs_f64() >= BUDGET_SECS {
+                break;
+            }
+        }
+
+        let mut best_decompress = f64::MAX;
+        let start = Instant::now();
+        loop {
+            let mut out = Vec::new();
+            let t = Instant::now();
+            decompress_stream(compressed.as_slice(), &mut out, dict)?;
+            best_decompress = best_decompress.min(t.elapsed().as_secs_f64());
+            if start.elapsed().as_secs_f64() >= BUDGET_SECS {
+                break;
+            }
+        }
+
+        let ratio = data.len() as f64 / compressed.len() as f64;
+        let c_speed = if best_compress > 0.0 {
+            mb / best_compress
+        } else {
+            f64::INFINITY
+        };
+        let d_speed = if best_decompress > 0.0 {
+            mb / best_decompress
+        } else {
+            f64::INFINITY
+        };
+        println!(
+            "{level:>3}  {:>10}  {ratio:>7.3}  {c_speed:>7.1} MB/s comp  {d_speed:>8.1} MB/s decomp",
+            fmt_size(compressed.len() as f64),
+        );
     }
     Ok(())
 }
@@ -909,6 +1038,18 @@ mod tests {
     }
 
     #[test]
+    fn benchmark_flags_parse_level_range() {
+        let opts = parse(&["-b3", "-e7", "in.txt"]).unwrap();
+        assert!(opts.bench);
+        assert_eq!(opts.bench_start, 3);
+        assert_eq!(opts.bench_end, 7);
+        // Bare `-b` benchmarks the default level (single-level range).
+        let opts = parse(&["-b", "in.txt"]).unwrap();
+        assert!(opts.bench);
+        assert_eq!(opts.bench_end, opts.bench_start);
+    }
+
+    #[test]
     fn dash_is_a_stdin_input() {
         let opts = parse(&["-d", "-"]).unwrap();
         assert_eq!(opts.inputs, vec!["-".to_string()]);
@@ -941,6 +1082,9 @@ mod tests {
             inputs: vec!["archive.tar.zst".to_string()],
             max_dict: DEFAULT_MAX_DICT,
             dict_id: None,
+            bench: false,
+            bench_start: 3,
+            bench_end: 0,
         };
         assert_eq!(
             derive_output_path(&opts, Path::new("archive.tar.zst")).unwrap(),
