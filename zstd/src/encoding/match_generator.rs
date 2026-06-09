@@ -5660,20 +5660,22 @@ fn driver_level5_selects_row_backend() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
     driver.reset(CompressionLevel::Level(5));
     assert_eq!(driver.active_backend(), super::strategy::BackendTag::Row);
-    // Greedy-specific routing assertion: the `BackendTag::Row` arm of
-    // `MatchGeneratorDriver::compress_block` has a
-    // `debug_assert_eq!(matcher.lazy_depth, 0)` invariant that
-    // dispatches L5 unconditionally into `start_matching_greedy`.
-    // If a future change rerouted L5 through the
-    // `RowMatchGenerator::start_matching` (depth >= 1) path, this
-    // assertion would catch it before the round-trip tests below —
-    // round-trip alone passes on the lazy parser too. Together with
-    // the round-trip suite this pins the greedy-vs-lazy routing
-    // decision at the level table layer.
+    // Greedy-specific routing assertion: `MatchGeneratorDriver::start_matching`
+    // dispatches the Row backend into `start_matching_greedy` iff
+    // `self.parse == ParseMode::Greedy`, so assert that actual selector —
+    // round-trip alone passes on the lazy parser too. `row_matcher().lazy_depth`
+    // is a secondary corroboration of the same routing decision (a mirror of
+    // the parse mode); checking `parse` directly catches a regression even if
+    // the two ever drift apart.
+    assert_eq!(
+        driver.parse,
+        super::strategy::ParseMode::Greedy,
+        "L5 must route to start_matching_greedy (parse == Greedy)",
+    );
     assert_eq!(
         driver.row_matcher().lazy_depth,
         0,
-        "L5 must route to start_matching_greedy (lazy_depth == 0)",
+        "row matcher lazy_depth must mirror the greedy parse mode",
     );
 }
 
