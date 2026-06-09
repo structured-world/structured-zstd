@@ -2226,12 +2226,23 @@ impl Matcher for MatchGeneratorDriver {
             fast_attach,
             ldm,
         };
-        let (storage, budget) = match &self.primed {
+        let (mut storage, budget) = match &self.primed {
             Some((storage, budget, captured_key)) if *captured_key == key => {
                 (storage.clone(), *budget)
             }
             _ => return false,
         };
+        // A binary-tree snapshot is stored WITHOUT its live hash / chain / hash3
+        // tables (they hold no dictionary entries — the dict lives in `dms` +
+        // history; see `capture_primed_dictionary`). Re-allocate them zeroed to
+        // the snapshot's geometry, exactly reproducing the post-prime state (all
+        // `HC_EMPTY`). This is a full storage replace, so no stale live-table
+        // entry from a prior frame can survive — `ensure_tables` only allocates
+        // when the length mismatches, so a full (HC / non-BT) snapshot whose
+        // tables are already present is left untouched.
+        if let MatcherStorage::HashChain(hc) = &mut storage {
+            hc.table.ensure_tables();
+        }
         self.storage = storage;
         self.dictionary_retained_budget = budget;
         true
@@ -2250,7 +2261,42 @@ impl Matcher for MatchGeneratorDriver {
             fast_attach,
             ldm,
         };
-        self.primed = Some((self.storage.clone(), self.dictionary_retained_budget, key));
+        // Donor CDict-equivalent retained state. On the binary-tree backend the
+        // dictionary is decoupled into `dms` (the donor `dictMatchState`); the
+        // live hash / chain / hash3 tables carry NO dict entries at capture
+        // (`skip_matching_dict_bt` keeps the dict out of the live tree), so they
+        // are pure zeros. Storing them in the snapshot wastes the full table
+        // footprint (a second window-tier table set resident for the whole
+        // compress). Instead, move the live tables OUT of the working storage,
+        // clone only the dict-state (history + `dms` + window/offset/dict-limit),
+        // then move the live tables back — the snapshot keeps just what donor's
+        // CDict keeps, and `restore_primed_dictionary` re-allocates the zeroed
+        // live tables. HC / lazy levels keep the dict IN the live chain (no
+        // `dms`), so their snapshot must retain the full tables: full clone.
+        let bt_decoupled = matches!(
+            &self.storage,
+            MatcherStorage::HashChain(hc) if hc.table.uses_bt
+        );
+        if bt_decoupled {
+            let MatcherStorage::HashChain(hc) = &mut self.storage else {
+                unreachable!("bt_decoupled implies HashChain storage");
+            };
+            let hash_table = core::mem::take(&mut hc.table.hash_table);
+            let chain_table = core::mem::take(&mut hc.table.chain_table);
+            let hash3_table = core::mem::take(&mut hc.table.hash3_table);
+            // Clone the dict-state-only storage (live tables now empty Vecs).
+            let snapshot = self.storage.clone();
+            // Move the live tables back into the working storage.
+            let MatcherStorage::HashChain(hc) = &mut self.storage else {
+                unreachable!("storage variant is stable across the take/put");
+            };
+            hc.table.hash_table = hash_table;
+            hc.table.chain_table = chain_table;
+            hc.table.hash3_table = hash3_table;
+            self.primed = Some((snapshot, self.dictionary_retained_budget, key));
+        } else {
+            self.primed = Some((self.storage.clone(), self.dictionary_retained_budget, key));
+        }
     }
 
     fn invalidate_primed_dictionary(&mut self) {
