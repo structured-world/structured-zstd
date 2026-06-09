@@ -56,20 +56,21 @@ pub(crate) unsafe fn free_boxed<T>(ptr: *mut T) {
 ///
 /// For the dictionary path ([`ZSTD_compress_usingCDict`](crate::cdict::ZSTD_compress_usingCDict))
 /// it also caches a [`FrameCompressor`] with the dictionary already attached,
-/// keyed by the `ZSTD_CDict` pointer + level, so back-to-back compressions with
-/// the same `CDict` reuse the parsed dictionary + primed match-finder snapshot
-/// instead of re-parsing and re-priming each call (the encoder-side analogue of
-/// upstream's `ZSTD_CCtx_refCDict` reuse).
+/// keyed by the `ZSTD_CDict`'s never-reused serial + level, so back-to-back
+/// compressions with the same `CDict` reuse the parsed dictionary + primed
+/// match-finder snapshot instead of re-parsing and re-priming each call (the
+/// encoder-side analogue of upstream's `ZSTD_CCtx_refCDict` reuse).
 #[allow(non_camel_case_types)]
 pub struct ZSTD_CCtx {
     pub(crate) scratch: Vec<u8>,
     /// `FrameCompressor` with a dictionary attached, lazily built by the CDict
     /// path. `None` until the first `ZSTD_compress_usingCDict`.
     pub(crate) dict_compressor: Option<FrameCompressor>,
-    /// Identity of the `CDict` currently attached to `dict_compressor`
-    /// (the `ZSTD_CDict` pointer as `usize`; `0` = none) plus the level it was
-    /// built at, so a different CDict or level rebuilds the cached compressor.
-    pub(crate) dict_key: usize,
+    /// Identity of the `CDict` currently attached to `dict_compressor` (its
+    /// never-reused serial; `0` = none) plus the level it was built at, so a
+    /// different CDict or level rebuilds the cached compressor. Keyed by serial
+    /// rather than raw address so a freed-then-realloc'd handle can't alias.
+    pub(crate) dict_serial: u64,
     pub(crate) dict_level: c_int,
 }
 
@@ -79,9 +80,11 @@ pub struct ZSTD_CCtx {
 pub struct ZSTD_DCtx {
     pub(crate) decoder: FrameDecoder,
     /// Identity of the `DDict` whose content was last loaded into `decoder`
-    /// (the `ZSTD_DDict` pointer as `usize`; `0` = none), so repeated
+    /// (its never-reused serial; `0` = none), so repeated
     /// `ZSTD_decompress_usingDDict` calls with the same DDict skip re-adding it.
-    pub(crate) ddict_key: usize,
+    /// Reset to `0` whenever `decoder` is replaced, so a fresh decoder is never
+    /// trusted to still hold the previously-loaded dictionary.
+    pub(crate) ddict_serial: u64,
 }
 
 /// `ZSTD_CCtx* ZSTD_createCCtx(void)`. Returns `NULL` on allocation failure
@@ -91,7 +94,7 @@ pub extern "C" fn ZSTD_createCCtx() -> *mut ZSTD_CCtx {
     try_box(ZSTD_CCtx {
         scratch: Vec::new(),
         dict_compressor: None,
-        dict_key: 0,
+        dict_serial: 0,
         dict_level: 0,
     })
 }
@@ -169,7 +172,7 @@ pub unsafe extern "C" fn ZSTD_compressCCtx(
 pub extern "C" fn ZSTD_createDCtx() -> *mut ZSTD_DCtx {
     try_box(ZSTD_DCtx {
         decoder: FrameDecoder::new(),
-        ddict_key: 0,
+        ddict_serial: 0,
     })
 }
 
@@ -237,8 +240,12 @@ pub unsafe extern "C" fn ZSTD_decompressDCtx(
             // A panic mid-decode can leave the decoder's internal state
             // partially consumed; replace it with a fresh one (same as
             // ZSTD_createDCtx) so a later call on this reused DCtx starts clean
-            // instead of observing a broken invariant.
+            // instead of observing a broken invariant. The fresh decoder no
+            // longer holds any previously-loaded dictionary, so clear the DDict
+            // cache key too — otherwise the next ZSTD_decompress_usingDDict with
+            // the same handle would skip re-loading it and decode without it.
             dctx.decoder = FrameDecoder::new();
+            dctx.ddict_serial = 0;
             encode(ZSTD_ErrorCode::ZSTD_error_GENERIC)
         }
     }

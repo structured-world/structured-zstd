@@ -5,13 +5,15 @@
 //! once into a `CDict` (encoder side) or `DDict` (decoder side) and then used
 //! across many compress / decompress calls. The encoder-side reuse (parsed
 //! dictionary + primed match-finder snapshot) is realised by caching a
-//! [`FrameCompressor`] on the `ZSTD_CCtx`, keyed by the `CDict` pointer; the
-//! decoder caches the loaded dictionary on the `ZSTD_DCtx` keyed by the `DDict`
-//! pointer. The match-finder tables a dictionary primes are sized to the
+//! [`FrameCompressor`] on the `ZSTD_CCtx`, keyed by the `CDict`'s never-reused
+//! serial; the decoder caches the loaded dictionary on the `ZSTD_DCtx` keyed by
+//! the `DDict`'s serial (a raw-address key would be ABA-unsafe across free +
+//! realloc). The match-finder tables a dictionary primes are sized to the
 //! dictionary's own cParams tier (see the codec's `set_dictionary_size_hint`),
 //! so a `CDict` does not drag a source-window-sized table around.
 
 use core::ffi::{c_int, c_uint};
+use core::sync::atomic::{AtomicU64, Ordering};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use codec::decoding::ContentChecksum;
@@ -20,6 +22,20 @@ use codec::encoding::{CompressionLevel, EncoderDictionary, FrameCompressor};
 use crate::context::{ZSTD_CCtx, ZSTD_DCtx, free_boxed, try_box};
 use crate::error::{ZSTD_ErrorCode, code_for_decoder_error, encode};
 use crate::ffi::{in_slice, out_slice};
+
+/// Monotonic source for [`ZSTD_CDict`] / [`ZSTD_DDict`] identities. A context
+/// caches its prepared compressor / loaded dictionary keyed by this serial, not
+/// by the handle's raw address: an address can be recycled when a dictionary is
+/// freed and a new one allocated in the same slot, so a pointer-keyed cache
+/// would silently keep using the old prepared state for the new handle (ABA).
+/// A serial is assigned once at creation and never reused, so identity stays
+/// stable across free + realloc. `0` is reserved for "no dictionary attached".
+static DICT_SERIAL: AtomicU64 = AtomicU64::new(1);
+
+/// Assign the next never-reused dictionary identity. See [`DICT_SERIAL`].
+pub(crate) fn next_dict_serial() -> u64 {
+    DICT_SERIAL.fetch_add(1, Ordering::Relaxed)
+}
 
 /// `ZSTD_dictMagicNumber` (`zstd.h`). A serialized zstd dictionary begins with
 /// this little-endian magic; bytes `[4..8]` hold the dictionary ID. Raw-content
@@ -47,6 +63,8 @@ pub struct ZSTD_CDict {
     pub(crate) raw: Vec<u8>,
     pub(crate) id: u32,
     pub(crate) level: c_int,
+    /// Never-reused identity for context cache validation (see [`DICT_SERIAL`]).
+    pub(crate) serial: u64,
 }
 
 /// Opaque prepared decompression dictionary: the dictionary bytes plus its ID.
@@ -54,6 +72,8 @@ pub struct ZSTD_CDict {
 pub struct ZSTD_DDict {
     pub(crate) raw: Vec<u8>,
     pub(crate) id: u32,
+    /// Never-reused identity for context cache validation (see [`DICT_SERIAL`]).
+    pub(crate) serial: u64,
 }
 
 /// `ZSTD_CDict* ZSTD_createCDict(const void* dictBuffer, size_t dictSize, int
@@ -84,6 +104,7 @@ pub unsafe extern "C" fn ZSTD_createCDict(
         raw: dict.to_vec(),
         id,
         level: compression_level,
+        serial: next_dict_serial(),
     })
 }
 
@@ -145,7 +166,7 @@ pub unsafe extern "C" fn ZSTD_getDictID_fromCDict(cdict: *const ZSTD_CDict) -> c
 /// `size_t ZSTD_compress_usingCDict(ZSTD_CCtx* cctx, void* dst, size_t
 /// dstCapacity, const void* src, size_t srcSize, const ZSTD_CDict* cdict)` —
 /// compress `src` with `cdict` at the level baked into the `CDict`. The `cctx`
-/// caches the parsed dictionary + primed matcher keyed by the `CDict` pointer,
+/// caches the parsed dictionary + primed matcher keyed by the `CDict`'s serial,
 /// so repeated calls with the same `CDict` skip the re-parse / re-prime.
 ///
 /// # Safety
@@ -166,7 +187,7 @@ pub unsafe extern "C" fn ZSTD_compress_usingCDict(
     let cctx = unsafe { &mut *cctx };
     let cdict_ref = unsafe { &*cdict };
     let src = unsafe { in_slice(src, src_size) };
-    let key = cdict as usize;
+    let key = cdict_ref.serial;
 
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         // (Re)build the cached compressor when the attached dictionary or level
@@ -174,7 +195,7 @@ pub unsafe extern "C" fn ZSTD_compress_usingCDict(
         // dict-tier matcher; the snapshot it then captures is reused on the next
         // same-CDict call.
         if cctx.dict_compressor.is_none()
-            || cctx.dict_key != key
+            || cctx.dict_serial != key
             || cctx.dict_level != cdict_ref.level
         {
             let mut enc: FrameCompressor =
@@ -185,7 +206,7 @@ pub unsafe extern "C" fn ZSTD_compress_usingCDict(
             enc.set_dictionary_from_bytes(&cdict_ref.raw)
                 .map_err(|_| ())?;
             cctx.dict_compressor = Some(enc);
-            cctx.dict_key = key;
+            cctx.dict_serial = key;
             cctx.dict_level = cdict_ref.level;
         }
         // Disjoint borrows: the cached compressor and the scratch buffer are
@@ -206,7 +227,7 @@ pub unsafe extern "C" fn ZSTD_compress_usingCDict(
             // A panic / parse failure can leave the cached compressor in an
             // unknown state; drop it so the next call rebuilds cleanly.
             cctx.dict_compressor = None;
-            cctx.dict_key = 0;
+            cctx.dict_serial = 0;
             return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
         }
     }
@@ -235,6 +256,7 @@ pub unsafe extern "C" fn ZSTD_createDDict(
     try_box(ZSTD_DDict {
         raw: dict.to_vec(),
         id,
+        serial: next_dict_serial(),
     })
 }
 
@@ -293,7 +315,7 @@ pub unsafe extern "C" fn ZSTD_getDictID_fromDDict(ddict: *const ZSTD_DDict) -> c
 /// `size_t ZSTD_decompress_usingDDict(ZSTD_DCtx* dctx, void* dst, size_t
 /// dstCapacity, const void* src, size_t srcSize, const ZSTD_DDict* ddict)` —
 /// decompress a dictionary-compressed frame. The `dctx` caches the loaded
-/// dictionary keyed by the `DDict` pointer, so repeated calls with the same
+/// dictionary keyed by the `DDict`'s serial, so repeated calls with the same
 /// `DDict` skip re-loading it.
 ///
 /// # Safety
@@ -315,14 +337,14 @@ pub unsafe extern "C" fn ZSTD_decompress_usingDDict(
     let ddict_ref = unsafe { &*ddict };
     let src = unsafe { in_slice(src, src_size) };
     let dst = unsafe { out_slice(dst, dst_capacity) };
-    let key = ddict as usize;
+    let key = ddict_ref.serial;
 
-    if dctx.ddict_key != key {
+    if dctx.ddict_serial != key {
         let added = catch_unwind(AssertUnwindSafe(|| {
             dctx.decoder.add_dict_from_bytes(&ddict_ref.raw)
         }));
         match added {
-            Ok(Ok(())) => dctx.ddict_key = key,
+            Ok(Ok(())) => dctx.ddict_serial = key,
             _ => return encode(ZSTD_ErrorCode::ZSTD_error_dictionary_corrupted),
         }
     }
@@ -333,7 +355,7 @@ pub unsafe extern "C" fn ZSTD_decompress_usingDDict(
         Ok(Err(err)) => encode(code_for_decoder_error(&err)),
         Err(_) => {
             dctx.decoder = codec::decoding::FrameDecoder::new();
-            dctx.ddict_key = 0;
+            dctx.ddict_serial = 0;
             encode(ZSTD_ErrorCode::ZSTD_error_GENERIC)
         }
     }
