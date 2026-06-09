@@ -29,6 +29,7 @@ enum Mode {
     Decompress,
     Test,
     List,
+    Train,
 }
 
 /// Parsed command line.
@@ -51,7 +52,14 @@ struct Options {
     remove_source: bool,
     /// Positional inputs; empty or a lone `-` means stdin.
     inputs: Vec<String>,
+    /// Target dictionary size for `--train` (`--maxdict`, upstream default 112640).
+    max_dict: usize,
+    /// Explicit dictionary ID for `--train` (`--dictID`).
+    dict_id: Option<u32>,
 }
+
+/// Upstream `zstd --maxdict` default (110 KiB).
+const DEFAULT_MAX_DICT: usize = 112_640;
 
 /// Outcome of argument parsing: either run with `Options`, or a terminal
 /// message already handled (help / version).
@@ -122,6 +130,8 @@ fn parse_args(
         keep: false,
         remove_source: false,
         inputs: Vec::new(),
+        max_dict: DEFAULT_MAX_DICT,
+        dict_id: None,
     };
     let mut ultra = false;
     let mut iter = args.iter().enumerate().peekable();
@@ -142,6 +152,9 @@ fn parse_args(
                 "decompress" | "uncompress" => opts.mode = Mode::Decompress,
                 "test" => opts.mode = Mode::Test,
                 "list" => opts.mode = Mode::List,
+                "train" | "train-fastcover" | "train-cover" | "train-legacy" => {
+                    opts.mode = Mode::Train
+                }
                 "stdout" | "to-stdout" => opts.to_stdout = true,
                 "force" => opts.force = true,
                 "keep" => opts.keep = true,
@@ -165,6 +178,10 @@ fn parse_args(
                         };
                     } else if let Some(path) = long.strip_prefix("use-dict=") {
                         opts.dict = Some(PathBuf::from(path));
+                    } else if let Some(v) = long.strip_prefix("maxdict=") {
+                        opts.max_dict = v.parse::<usize>().wrap_err("invalid --maxdict size")?;
+                    } else if let Some(v) = long.strip_prefix("dictID=") {
+                        opts.dict_id = Some(v.parse::<u32>().wrap_err("invalid --dictID")?);
                     } else if long.starts_with("long") {
                         // `--long[=N]` (LDM) — accepted; LDM wiring is a follow-up.
                     } else {
@@ -232,7 +249,9 @@ fn parse_args(
         bail!("level {} requires --ultra (levels 20-22)", opts.level);
     }
     validate_level(opts.level)?;
-    if opts.output.is_some() && opts.inputs.len() > 1 {
+    // `-o` names a single output, so it can't fan out over multiple inputs —
+    // except `--train`, where many sample files legitimately feed one dictionary.
+    if opts.mode != Mode::Train && opts.output.is_some() && opts.inputs.len() > 1 {
         bail!("-o cannot be combined with multiple input files");
     }
     Ok(Parsed::Run(opts))
@@ -290,6 +309,12 @@ fn run(opts: Options) -> color_eyre::Result<()> {
     };
     let dict = dict_bytes.as_deref();
 
+    // `--train` builds a dictionary from the sample files rather than
+    // (de)compressing them; handle it before the streaming flow.
+    if opts.mode == Mode::Train {
+        return train_dictionary(&opts);
+    }
+
     // `--list` walks frame headers without decoding; it needs a seekable file
     // (not a stream), so it is handled separately from the (de)compress flow.
     if opts.mode == Mode::List {
@@ -313,6 +338,51 @@ fn run(opts: Options) -> color_eyre::Result<()> {
             process_file(&opts, Path::new(input), dict)?;
         }
     }
+    Ok(())
+}
+
+/// `--train`: build a FastCOVER dictionary from the concatenated sample files
+/// and write it to `-o` (default `dictionary`). Mirrors upstream
+/// `zstd --train FILEs -o dict --maxdict=N [--dictID=N]`.
+fn train_dictionary(opts: &Options) -> color_eyre::Result<()> {
+    use structured_zstd::dictionary::{
+        FastCoverOptions, FinalizeOptions, create_fastcover_dict_from_source,
+    };
+
+    if opts.inputs.is_empty() {
+        bail!("--train requires one or more sample files");
+    }
+    let mut corpus = Vec::new();
+    for input in &opts.inputs {
+        let bytes =
+            fs::read(input).wrap_err_with(|| format!("failed to read training sample {input}"))?;
+        corpus.extend_from_slice(&bytes);
+    }
+    let output = opts
+        .output
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("dictionary"));
+
+    let mut dict = Vec::new();
+    create_fastcover_dict_from_source(
+        corpus.as_slice(),
+        &mut dict,
+        opts.max_dict,
+        &FastCoverOptions::default(),
+        FinalizeOptions {
+            dict_id: opts.dict_id,
+        },
+    )
+    .map_err(|err| eyre!("dictionary training failed: {err}"))?;
+
+    fs::write(&output, &dict)
+        .wrap_err_with(|| format!("failed to write dictionary {}", output.display()))?;
+    info!(
+        "trained {} ({}) from {} sample file(s)",
+        output.display(),
+        fmt_size(dict.len() as f64),
+        opts.inputs.len()
+    );
     Ok(())
 }
 
@@ -392,7 +462,9 @@ fn process_stdin_stdout(opts: &Options, dict: Option<&[u8]>) -> color_eyre::Resu
         Mode::Test => decompress_stream(reader, io::sink(), dict).map(|_| {
             info!("stdin: OK");
         }),
-        Mode::List => unreachable!("--list is handled in run() before streaming"),
+        Mode::List | Mode::Train => {
+            unreachable!("--list / --train handled in run() before streaming")
+        }
     }
 }
 
@@ -413,8 +485,8 @@ fn derive_output_path(opts: &Options, input: &Path) -> color_eyre::Result<PathBu
                 ),
             }
         }
-        Mode::Test | Mode::List => {
-            unreachable!("test / list modes never write an output file")
+        Mode::Test | Mode::List | Mode::Train => {
+            unreachable!("test / list / train modes never write an output file")
         }
     }
 }
@@ -450,7 +522,7 @@ fn process_file(opts: &Options, input: &Path, dict: Option<&[u8]>) -> color_eyre
                 Some(source_size as u64),
             )?,
             Mode::Decompress => decompress_stream(&mut reader, &mut out, dict)?,
-            Mode::Test | Mode::List => unreachable!(),
+            Mode::Test | Mode::List | Mode::Train => unreachable!(),
         }
         return Ok(());
     }
@@ -474,7 +546,7 @@ fn process_file(opts: &Options, input: &Path, dict: Option<&[u8]>) -> color_eyre
                 Some(source_size as u64),
             )?,
             Mode::Decompress => decompress_stream(&mut reader, &mut sink, dict)?,
-            Mode::Test | Mode::List => unreachable!(),
+            Mode::Test | Mode::List | Mode::Train => unreachable!(),
         }
         sink.flush().wrap_err("failed to flush output")?;
         Ok(())
@@ -810,6 +882,33 @@ mod tests {
     }
 
     #[test]
+    fn train_flags_parse_and_allow_many_samples_with_output() {
+        let opts = parse(&[
+            "--train",
+            "--maxdict=4096",
+            "--dictID=42",
+            "-o",
+            "dict.bin",
+            "s1.txt",
+            "s2.txt",
+            "s3.txt",
+        ])
+        .unwrap();
+        assert_eq!(opts.mode, Mode::Train);
+        assert_eq!(opts.max_dict, 4096);
+        assert_eq!(opts.dict_id, Some(42));
+        assert_eq!(opts.output, Some(PathBuf::from("dict.bin")));
+        // --train legitimately fans many samples into one -o dictionary.
+        assert_eq!(opts.inputs.len(), 3);
+    }
+
+    #[test]
+    fn list_mode_parses() {
+        assert_eq!(parse(&["-l", "a.zst"]).unwrap().mode, Mode::List);
+        assert_eq!(parse(&["--list", "a.zst"]).unwrap().mode, Mode::List);
+    }
+
+    #[test]
     fn dash_is_a_stdin_input() {
         let opts = parse(&["-d", "-"]).unwrap();
         assert_eq!(opts.inputs, vec!["-".to_string()]);
@@ -840,6 +939,8 @@ mod tests {
             keep: false,
             remove_source: false,
             inputs: vec!["archive.tar.zst".to_string()],
+            max_dict: DEFAULT_MAX_DICT,
+            dict_id: None,
         };
         assert_eq!(
             derive_output_path(&opts, Path::new("archive.tar.zst")).unwrap(),
