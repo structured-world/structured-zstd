@@ -11,8 +11,9 @@ use twox_hash::XxHash64;
 
 use crate::encoding::levels::compress_block_encoded;
 use crate::encoding::{
-    CompressionLevel, MatchGeneratorDriver, Matcher, block_header::BlockHeader,
-    frame_compressor::CompressState, frame_compressor::FseTables, frame_header::FrameHeader,
+    CompressionLevel, EncoderDictionary, MatchGeneratorDriver, Matcher, block_header::BlockHeader,
+    frame_compressor::CachedDictionaryEntropy, frame_compressor::CompressState,
+    frame_compressor::FseTables, frame_compressor::PreviousFseTable, frame_header::FrameHeader,
 };
 use crate::io::{Error, ErrorKind, Write};
 
@@ -41,6 +42,13 @@ pub struct StreamingEncoder<W: Write, M: Matcher = MatchGeneratorDriver> {
     /// Default `true`; combined with the `hash` feature, so without `hash`
     /// no checksum is emitted regardless. See [`Self::set_content_checksum`].
     content_checksum: bool,
+    /// Dictionary applied to the frame (donor `ZSTD_CCtx_loadDictionary` on a
+    /// streaming context). `None` = no dictionary. Set before the first write.
+    dictionary: Option<EncoderDictionary>,
+    /// Encoder entropy tables (literals Huffman + LL/ML/OF FSE "previous"
+    /// tables) the dictionary seeds into the first block, derived once when the
+    /// dictionary is attached so each frame start is a cheap clone.
+    dictionary_entropy_cache: Option<CachedDictionaryEntropy>,
     #[cfg(feature = "hash")]
     hasher: XxHash64,
 }
@@ -88,6 +96,8 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             bytes_consumed: 0,
             magicless: false,
             content_checksum: true,
+            dictionary: None,
+            dictionary_entropy_cache: None,
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
         }
@@ -167,6 +177,42 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             ));
         }
         self.state.matcher.set_source_size_hint(size);
+        Ok(())
+    }
+
+    /// Attach a serialized dictionary blob to the frame (donor
+    /// `ZSTD_CCtx_loadDictionary` on a streaming context). The dictionary primes
+    /// the match-finder and seeds the first block's entropy tables + repeat
+    /// offsets, and its ID is written into the frame header. Must be called
+    /// before the first [`write`](Write::write); the parsed dictionary must have
+    /// a non-zero ID and non-zero repeat offsets.
+    pub fn set_dictionary_from_bytes(&mut self, raw_dictionary: &[u8]) -> Result<(), Error> {
+        let dict = EncoderDictionary::from_bytes(raw_dictionary)
+            .map_err(|err| invalid_input_error(&alloc::format!("invalid dictionary: {err:?}")))?;
+        self.set_encoder_dictionary(dict)
+    }
+
+    /// Attach an already-parsed [`EncoderDictionary`] to the frame. See
+    /// [`set_dictionary_from_bytes`](Self::set_dictionary_from_bytes); must be
+    /// called before the first write.
+    pub fn set_encoder_dictionary(&mut self, dict: EncoderDictionary) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.frame_started {
+            return Err(invalid_input_error(
+                "dictionary must be attached before the first write",
+            ));
+        }
+        let inner = &dict.inner;
+        if inner.id == 0 {
+            return Err(invalid_input_error("dictionary has a zero ID"));
+        }
+        if inner.offset_hist.contains(&0) {
+            return Err(invalid_input_error(
+                "dictionary carries a zero repeat offset",
+            ));
+        }
+        self.dictionary_entropy_cache = Some(CachedDictionaryEntropy::from_dictionary(inner));
+        self.dictionary = Some(dict);
         Ok(())
     }
 
@@ -275,12 +321,72 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         }
 
         self.ensure_level_supported()?;
+        let use_dictionary = self.dictionary.is_some();
+        // The dictionary content size drives dict-tier match-finder sizing
+        // (consumed inside `reset`), so hand it over BEFORE reset.
+        if let Some(dict) = self.dictionary.as_ref() {
+            self.state
+                .matcher
+                .set_dictionary_size_hint(dict.inner.dict_content.len());
+        }
         self.state.matcher.reset(self.compression_level);
-        self.state.offset_hist = [1, 4, 8];
-        self.state.last_huff_table = None;
-        self.state.fse_tables.ll_previous = None;
-        self.state.fse_tables.ml_previous = None;
-        self.state.fse_tables.of_previous = None;
+        // Seed the repeat-offset history from the dictionary (donor
+        // `ZSTD_compress_insertDictionary`), or the default rep codes otherwise.
+        self.state.offset_hist = self
+            .dictionary
+            .as_ref()
+            .map(|dict| dict.inner.offset_hist)
+            .unwrap_or([1, 4, 8]);
+        // Prime the match-finder with the dictionary content + offsets.
+        // `dict` borrows `self.dictionary`; `self.state.matcher` is a disjoint
+        // field, so the immutable dict borrow and the mutable matcher borrow
+        // coexist (field-level borrow splitting) with no conflict.
+        if let Some(dict) = self.dictionary.as_ref() {
+            let offset_hist = dict.inner.offset_hist;
+            self.state
+                .matcher
+                .prime_with_dictionary(dict.inner.dict_content.as_slice(), offset_hist);
+        }
+        // Seed the first block's entropy from the dictionary's cached encoder
+        // tables (donor `cdict->cBlockState`), or clear to defaults.
+        if let Some(cache) = self.dictionary_entropy_cache.as_ref() {
+            self.state.last_huff_table.clone_from(&cache.huff);
+            self.state
+                .fse_tables
+                .ll_previous
+                .clone_from(&cache.ll_previous);
+            self.state
+                .fse_tables
+                .ml_previous
+                .clone_from(&cache.ml_previous);
+            self.state
+                .fse_tables
+                .of_previous
+                .clone_from(&cache.of_previous);
+            let ll_entropy = match cache.ll_previous.as_ref() {
+                Some(PreviousFseTable::Custom(table)) => Some(table.as_ref()),
+                _ => None,
+            };
+            let ml_entropy = match cache.ml_previous.as_ref() {
+                Some(PreviousFseTable::Custom(table)) => Some(table.as_ref()),
+                _ => None,
+            };
+            let of_entropy = match cache.of_previous.as_ref() {
+                Some(PreviousFseTable::Custom(table)) => Some(table.as_ref()),
+                _ => None,
+            };
+            self.state.matcher.seed_dictionary_entropy(
+                self.state.last_huff_table.as_ref(),
+                ll_entropy,
+                ml_entropy,
+                of_entropy,
+            );
+        } else {
+            self.state.last_huff_table = None;
+            self.state.fse_tables.ll_previous = None;
+            self.state.fse_tables.ml_previous = None;
+            self.state.fse_tables.of_previous = None;
+        }
         // Sync `state.strategy_tag` from the active compression level so the
         // literal-compression gates (`min_literals_to_compress`, `min_gain`
         // in `encoding::blocks::compressed`) see the correct strategy for
@@ -300,21 +406,21 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             ));
         }
 
-        // FrameCompressor gates single-segment on dictionary usage state; the
-        // streaming encoder currently has no dictionary API/state, so we only
-        // gate on pledged size and window reach here.
-        // TODO: if streaming dictionary support is added, mirror the
-        // !use_dictionary_state guard from FrameCompressor.
-        let single_segment = self
-            .pledged_content_size
-            .map(|size| (512..=(1 << 14)).contains(&size) && size <= window_size)
-            .unwrap_or(false);
+        // Single-segment is incompatible with a dictionary (the dictionary
+        // pushes referenceable history before the content, so the frame needs
+        // an explicit window descriptor); gate it off when a dict is attached,
+        // mirroring `FrameCompressor`'s `!use_dictionary_state` guard.
+        let single_segment = !use_dictionary
+            && self
+                .pledged_content_size
+                .map(|size| (512..=(1 << 14)).contains(&size) && size <= window_size)
+                .unwrap_or(false);
 
         let header = FrameHeader {
             frame_content_size: self.pledged_content_size,
             single_segment,
             content_checksum: cfg!(feature = "hash") && self.content_checksum,
-            dictionary_id: None,
+            dictionary_id: self.dictionary.as_ref().map(|dict| dict.inner.id as u64),
             window_size: if single_segment {
                 None
             } else {
@@ -451,9 +557,11 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                         last_block,
                         block,
                         &mut encoded,
-                        // The streaming encoder has no dictionary state, so the
-                        // raw-fast-path stays enabled (no dict to match against).
-                        false,
+                        // When a dictionary is attached, the raw-fast-path must
+                        // NOT fire (an incompressible-looking block can still
+                        // match the dictionary); disable it so the dict is
+                        // always searched, mirroring `FrameCompressor`.
+                        self.dictionary.is_some(),
                         // No FrameEmitInfo on the streaming encoder path — it
                         // does not surface per-block layout, so no sidecar.
                         #[cfg(feature = "lsm")]
@@ -1465,5 +1573,63 @@ mod tests {
         // Verify the descriptor confirms FCS field is truly absent (0 bytes),
         // not just FCS present with value 0.
         assert_eq!(header.descriptor.frame_content_size_bytes().unwrap(), 0);
+    }
+
+    #[test]
+    fn streaming_encoder_with_dictionary_roundtrips_and_carries_dict_id() {
+        use alloc::format;
+        let dict_raw = include_bytes!("../../dict_tests/dictionary");
+        let dict_id = crate::decoding::Dictionary::decode_dict(dict_raw)
+            .unwrap()
+            .id;
+
+        // Dictionary-resembling payload (the dict was trained on similar lines),
+        // fed in many small writes so the dict + cross-block matching are both
+        // exercised by the streaming path.
+        let mut payload = Vec::new();
+        for i in 0..400u32 {
+            payload.extend_from_slice(
+                format!("tenant=demo table=orders key={i} region=eu payload=aaaaabbbbbccccc\n")
+                    .as_bytes(),
+            );
+        }
+
+        let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Level(19));
+        encoder
+            .set_dictionary_from_bytes(dict_raw)
+            .expect("attach dictionary");
+        for chunk in payload.chunks(777) {
+            encoder.write_all(chunk).unwrap();
+        }
+        let compressed = encoder.finish().unwrap();
+
+        // The frame header advertises the dictionary ID (single-segment is
+        // disabled for dictionary frames, so an explicit window is present).
+        let header = crate::decoding::frame::read_frame_header(compressed.as_slice())
+            .unwrap()
+            .0;
+        assert_eq!(header.dictionary_id(), Some(dict_id));
+
+        // Round-trip through a decoder primed with the SAME dictionary.
+        let mut decoder =
+            StreamingDecoder::new_with_dictionary_bytes(compressed.as_slice(), dict_raw).unwrap();
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, payload);
+
+        // The dictionary is actually used: the dict frame is no larger than the
+        // no-dictionary frame on this dict-resembling payload (a dict that was
+        // ignored could only ever make the frame the same size or bigger).
+        let mut nodict = StreamingEncoder::new(Vec::new(), CompressionLevel::Level(19));
+        for chunk in payload.chunks(777) {
+            nodict.write_all(chunk).unwrap();
+        }
+        let nodict_frame = nodict.finish().unwrap();
+        assert!(
+            compressed.len() <= nodict_frame.len(),
+            "dict frame {} should not exceed no-dict frame {}",
+            compressed.len(),
+            nodict_frame.len()
+        );
     }
 }

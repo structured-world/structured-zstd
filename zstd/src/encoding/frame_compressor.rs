@@ -146,11 +146,39 @@ pub struct FrameCompressor<
 }
 
 #[derive(Clone, Default)]
-struct CachedDictionaryEntropy {
-    huff: Option<crate::huff0::huff0_encoder::HuffmanTable>,
-    ll_previous: Option<PreviousFseTable>,
-    ml_previous: Option<PreviousFseTable>,
-    of_previous: Option<PreviousFseTable>,
+pub(crate) struct CachedDictionaryEntropy {
+    pub(crate) huff: Option<crate::huff0::huff0_encoder::HuffmanTable>,
+    pub(crate) ll_previous: Option<PreviousFseTable>,
+    pub(crate) ml_previous: Option<PreviousFseTable>,
+    pub(crate) of_previous: Option<PreviousFseTable>,
+}
+
+impl CachedDictionaryEntropy {
+    /// Derive the encoder-side entropy tables a dictionary seeds for the first
+    /// block of each frame (the donor `cdict->cBlockState`): the literals
+    /// Huffman table plus the literal-length / match-length / offset FSE
+    /// "previous" tables. Shared by [`FrameCompressor`] and
+    /// [`crate::encoding::StreamingEncoder`] so both seed identically.
+    pub(crate) fn from_dictionary(dictionary: &crate::decoding::Dictionary) -> Self {
+        Self {
+            huff: dictionary.huf.table.to_encoder_table(),
+            ll_previous: dictionary
+                .fse
+                .literal_lengths
+                .to_encoder_table()
+                .map(|table| PreviousFseTable::Custom(SharedFseTable::new(table))),
+            ml_previous: dictionary
+                .fse
+                .match_lengths
+                .to_encoder_table()
+                .map(|table| PreviousFseTable::Custom(SharedFseTable::new(table))),
+            of_previous: dictionary
+                .fse
+                .offsets
+                .to_encoder_table()
+                .map(|table| PreviousFseTable::Custom(SharedFseTable::new(table))),
+        }
+    }
 }
 
 /// Shared owner for a custom "previous" FSE encoder table. `Arc` on
@@ -1801,24 +1829,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 },
             );
         }
-        self.dictionary_entropy_cache = Some(CachedDictionaryEntropy {
-            huff: dictionary.huf.table.to_encoder_table(),
-            ll_previous: dictionary
-                .fse
-                .literal_lengths
-                .to_encoder_table()
-                .map(|table| PreviousFseTable::Custom(SharedFseTable::new(table))),
-            ml_previous: dictionary
-                .fse
-                .match_lengths
-                .to_encoder_table()
-                .map(|table| PreviousFseTable::Custom(SharedFseTable::new(table))),
-            of_previous: dictionary
-                .fse
-                .offsets
-                .to_encoder_table()
-                .map(|table| PreviousFseTable::Custom(SharedFseTable::new(table))),
-        });
+        self.dictionary_entropy_cache = Some(CachedDictionaryEntropy::from_dictionary(dictionary));
         // A previously-captured CDict prime snapshot belongs to the OLD
         // dictionary; drop it so the first frame with the new dictionary
         // re-primes (and re-captures) instead of restoring stale tables.
