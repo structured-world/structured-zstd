@@ -6,9 +6,10 @@
 //! builds as both a `cdylib` (SONAME `libzstd.so.1`) and a `staticlib`.
 //!
 //! Phase 6.1 scope: the synchronous slice of `zstd.h` — the simple one-shot
-//! API, the synchronous context API, error-code mapping, and frame content
-//! inspection. Streaming, advanced parameters, dictionaries, and the CLI land
-//! in later phases.
+//! API, the synchronous context API, error-code mapping, frame content
+//! inspection, and the stable dictionary-builder API (`ZDICT_*` from
+//! `zdict.h`). Streaming, advanced parameters, the experimental
+//! `ZDICT_STATIC_LINKING_ONLY` trainers, and the CLI land in later phases.
 //!
 //! Every wrapper here is `unsafe extern "C"`; the safety contracts mirror the
 //! upstream documentation (valid `(ptr, len)` buffers, live context handles).

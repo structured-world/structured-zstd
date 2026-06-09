@@ -103,6 +103,11 @@ pub unsafe extern "C" fn ZDICT_trainFromBuffer(
 /// a full zstd dictionary, writing up to `maxDictSize` bytes into
 /// `dstDictBuffer`. Returns the dictionary size or an error code.
 ///
+/// Of `parameters`, only `dictID` is honoured (0 derives a compliant ID). The
+/// FastCOVER finalizer builds the entropy tables directly from the samples, so
+/// `compressionLevel` does not tune them, and `notificationLevel` (builder
+/// verbosity) has no effect here; both are accepted for ABI compatibility.
+///
 /// # Safety
 /// All buffers valid for their stated lengths; `samplesSizes` valid for
 /// `nbSamples` entries.

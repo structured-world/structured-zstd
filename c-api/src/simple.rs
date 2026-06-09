@@ -88,6 +88,12 @@ pub unsafe extern "C" fn ZSTD_compress(
     src_size: usize,
     compression_level: c_int,
 ) -> usize {
+    // Preflight an impossible input before building anything: an `src` at or
+    // above ZSTD_MAX_INPUT_SIZE can never be bounded, so report it up front
+    // instead of allocating a huge frame just to fail (or abort on OOM).
+    if src_size >= MAX_INPUT_SIZE {
+        return encode(ZSTD_ErrorCode::ZSTD_error_srcSize_wrong);
+    }
     let src = unsafe { in_slice(src, src_size) };
     let level = CompressionLevel::from_level(compression_level);
     // The bulk encoder aborts via the global allocator on OOM and otherwise

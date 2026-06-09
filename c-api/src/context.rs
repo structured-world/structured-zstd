@@ -15,6 +15,42 @@ use codec::encoding::{CompressionLevel, FrameCompressor};
 use crate::error::{ZSTD_ErrorCode, code_for_decoder_error, encode};
 use crate::ffi::{in_slice, out_slice};
 
+/// Heap-allocate `value` fallibly, returning a raw owning pointer or `null` on
+/// allocation failure. Unlike `Box::new`, this never aborts the host process on
+/// OOM, matching libzstd's `ZSTD_create*` NULL-on-failure contract. Pair every
+/// non-null result with [`free_boxed`].
+fn try_box<T>(value: T) -> *mut T {
+    let layout = core::alloc::Layout::new::<T>();
+    // Both context types own a `Vec` / `FrameDecoder`, so they are never
+    // zero-sized and the allocator path always applies.
+    debug_assert!(layout.size() != 0);
+    // SAFETY: `layout` has non-zero size.
+    let raw = unsafe { std::alloc::alloc(layout) } as *mut T;
+    if raw.is_null() {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: `raw` is freshly allocated for `T`'s layout and currently
+    // uninitialised, so a plain write (no drop of prior contents) is correct.
+    unsafe { raw.write(value) };
+    raw
+}
+
+/// Drop and free a pointer previously returned by [`try_box`]. `null` is a no-op.
+///
+/// # Safety
+/// `ptr` must be a live, not-yet-freed pointer from [`try_box::<T>`], or `null`.
+unsafe fn free_boxed<T>(ptr: *mut T) {
+    if ptr.is_null() {
+        return;
+    }
+    let layout = core::alloc::Layout::new::<T>();
+    // SAFETY: `ptr` came from `try_box::<T>` (same layout) and is still live.
+    unsafe {
+        core::ptr::drop_in_place(ptr);
+        std::alloc::dealloc(ptr as *mut u8, layout);
+    }
+}
+
 /// Opaque compression context. Carries a reusable output buffer so repeated
 /// `ZSTD_compressCCtx` calls amortise the destination allocation.
 #[allow(non_camel_case_types)]
@@ -29,12 +65,13 @@ pub struct ZSTD_DCtx {
     decoder: FrameDecoder,
 }
 
-/// `ZSTD_CCtx* ZSTD_createCCtx(void)`.
+/// `ZSTD_CCtx* ZSTD_createCCtx(void)`. Returns `NULL` on allocation failure
+/// (never aborts), matching upstream.
 #[unsafe(no_mangle)]
 pub extern "C" fn ZSTD_createCCtx() -> *mut ZSTD_CCtx {
-    Box::into_raw(Box::new(ZSTD_CCtx {
+    try_box(ZSTD_CCtx {
         scratch: Vec::new(),
-    }))
+    })
 }
 
 /// `size_t ZSTD_freeCCtx(ZSTD_CCtx* cctx)` — frees the context; `NULL` is a
@@ -45,9 +82,7 @@ pub extern "C" fn ZSTD_createCCtx() -> *mut ZSTD_CCtx {
 /// freed, or `NULL`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZSTD_freeCCtx(cctx: *mut ZSTD_CCtx) -> usize {
-    if !cctx.is_null() {
-        drop(unsafe { Box::from_raw(cctx) });
-    }
+    unsafe { free_boxed(cctx) };
     0
 }
 
@@ -106,12 +141,13 @@ pub unsafe extern "C" fn ZSTD_compressCCtx(
     len
 }
 
-/// `ZSTD_DCtx* ZSTD_createDCtx(void)`.
+/// `ZSTD_DCtx* ZSTD_createDCtx(void)`. Returns `NULL` on allocation failure
+/// (never aborts), matching upstream.
 #[unsafe(no_mangle)]
 pub extern "C" fn ZSTD_createDCtx() -> *mut ZSTD_DCtx {
-    Box::into_raw(Box::new(ZSTD_DCtx {
+    try_box(ZSTD_DCtx {
         decoder: FrameDecoder::new(),
-    }))
+    })
 }
 
 /// `size_t ZSTD_freeDCtx(ZSTD_DCtx* dctx)` — frees the context; `NULL` is a
@@ -122,9 +158,7 @@ pub extern "C" fn ZSTD_createDCtx() -> *mut ZSTD_DCtx {
 /// `NULL`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZSTD_freeDCtx(dctx: *mut ZSTD_DCtx) -> usize {
-    if !dctx.is_null() {
-        drop(unsafe { Box::from_raw(dctx) });
-    }
+    unsafe { free_boxed(dctx) };
     0
 }
 

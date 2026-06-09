@@ -174,7 +174,7 @@ jobs:
           set -euo pipefail
           base="https://raw.githubusercontent.com/facebook/zstd/${UPSTREAM_TAG}/lib"
           for h in zstd.h zdict.h zstd_errors.h; do
-            curl -fsSL "${base}/${h}" -o "/tmp/${h}.upstream"
+            curl --retry 5 --retry-all-errors --retry-delay 2 -fsSL "${base}/${h}" -o "/tmp/${h}.upstream"
             if ! diff -u "/tmp/${h}.upstream" "c-api/include/${h}"; then
               echo "::error::c-api/include/${h} diverges from upstream ${UPSTREAM_TAG}"
               exit 1

@@ -24,6 +24,8 @@ const FRAMEHEADERSIZE_MAX: usize = 18;
 const BLOCKSIZE_MAX: u64 = 1 << 17;
 /// Base magic of the skippable-frame range; the low nibble is the variant.
 const SKIPPABLE_MAGIC_BASE: u32 = 0x184D_2A50;
+/// `ZSTD_SKIPPABLEHEADERSIZE` = 4-byte magic + 4-byte `Frame_Size`.
+const SKIPPABLE_HEADER_SIZE: usize = 8;
 
 /// `ZSTD_FrameType_e` — `ZSTD_frame` (0) or `ZSTD_skippableFrame` (1).
 #[repr(C)]
@@ -70,7 +72,11 @@ pub unsafe extern "C" fn ZSTD_frameHeaderSize(src: *const u8, src_size: usize) -
     let src = unsafe { in_slice(src, src_size) };
     match frame_header_size(src) {
         Ok(size) => size,
-        Err(ReadFrameHeaderError::BadMagicNumber(_) | ReadFrameHeaderError::SkipFrame { .. }) => {
+        // A skippable frame's header is its fixed 8-byte prefix (4-byte magic +
+        // 4-byte Frame_Size), which is what `fill_frame_header` reports for it
+        // and what upstream returns here, so a caller can step over the frame.
+        Err(ReadFrameHeaderError::SkipFrame { .. }) => SKIPPABLE_HEADER_SIZE,
+        Err(ReadFrameHeaderError::BadMagicNumber(_)) => {
             encode(ZSTD_ErrorCode::ZSTD_error_prefix_unknown)
         }
         // A bad frame descriptor is a corrupt frame, not a too-short read:

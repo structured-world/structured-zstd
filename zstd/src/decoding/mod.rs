@@ -282,7 +282,10 @@ pub struct FrameHeaderInfo {
     pub dictionary_id: Option<u32>,
     /// Whether a 32-bit content checksum trails the frame.
     pub content_checksum: bool,
-    /// Total header length in bytes, including the 4-byte magic number.
+    /// Header length in bytes, measured in the parsed input format: it includes
+    /// the 4-byte magic number in the default format, but excludes it when
+    /// parsed as magicless (`read_frame_header_info(.., true)`), since those 4
+    /// bytes are not present on the wire in that mode.
     pub header_size: usize,
 }
 

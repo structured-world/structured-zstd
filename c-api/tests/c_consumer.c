@@ -7,8 +7,9 @@
  * surface with a 1 MiB round trip. Exits 0 on success; a non-zero code marks
  * which check failed.
  *
- * Compiled + run by the `c-abi` CI job:
- *   cc -Ic-api/include c-api/tests/c_consumer.c -Ltarget/<...> -lstructured_zstd -o consumer
+ * Compiled + run by the `c-abi` CI job, linking via the canonical drop-in
+ * name (a `libzstd.so` symlink to the built `libstructured_zstd.so`):
+ *   cc -Ic-api/include c-api/tests/c_consumer.c -Ltarget/<...> -lzstd -o consumer
  */
 #define ZSTD_STATIC_LINKING_ONLY /* expose the experimental frame-inspection API */
 #include <zstd.h>
