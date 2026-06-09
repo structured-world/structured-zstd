@@ -110,7 +110,6 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         BlockType::Raw
     } else {
         // Compress as a standard compressed block
-        let mut compressed = Vec::new();
         let uncompressed_len = uncompressed_data.len();
         state.matcher.commit_space(uncompressed_data);
         if matches!(compression_level, CompressionLevel::Level(16..=22))
@@ -160,19 +159,28 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         let saved_ll_previous = state.fse_tables.ll_previous.clone();
         let saved_ml_previous = state.fse_tables.ml_previous.clone();
         let saved_of_previous = state.fse_tables.of_previous.clone();
-        compress_block(state, &mut compressed);
+        // Compress directly into `output`: reserve the fixed 3-byte block
+        // header, append the payload after it, then backfill the header in
+        // place once its length is known — no temp `Vec`, no extend-copy.
+        let hdr_off = output.len();
+        output.extend_from_slice(&[0u8; 3]);
+        let payload_off = output.len();
+        compress_block(state, output);
+        let payload_len = output.len() - payload_off;
         // If the compressed data is larger than the maximum allowable
         // block size, store uncompressed. When a dictionary is active we
         // ALSO fall back to raw whenever compression did not actually
-        // shrink the block (`compressed >= block_size`): the raw-fast-path
+        // shrink the block (`payload >= block_size`): the raw-fast-path
         // was bypassed to give dictionary matching a chance, so a block
         // that turns out incompressible-even-with-the-dict must still be
         // emitted raw instead of as a (larger) compressed block. Mirrors
         // the reference's post-hoc raw fallback; gated on `dict_active` so
         // the non-dictionary wire output is byte-identical to before.
-        if compressed.len() >= MAX_BLOCK_SIZE as usize
-            || (dict_active && compressed.len() >= block_size as usize)
+        if payload_len >= MAX_BLOCK_SIZE as usize
+            || (dict_active && payload_len >= block_size as usize)
         {
+            // Roll back the payload + reserved header and the entropy state.
+            output.truncate(hdr_off);
             state.offset_hist = saved_offset_hist;
             state.last_huff_table = saved_huff_table;
             state.fse_tables.ll_previous = saved_ll_previous;
@@ -191,11 +199,10 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
             let header = BlockHeader {
                 last_block,
                 block_type: BlockType::Compressed,
-                block_size: compressed.len() as u32,
+                block_size: payload_len as u32,
             };
-            // Write the header, then the block
-            header.serialize(output);
-            output.extend(compressed);
+            // Backfill the reserved 3-byte header in place.
+            output[hdr_off..hdr_off + 3].copy_from_slice(&header.to_le_bytes());
             BlockType::Compressed
         }
     }
@@ -271,7 +278,6 @@ pub(crate) fn compress_block_encoded_borrowed(
             !matches!(compression_level, CompressionLevel::Level(16..=22)),
             "borrowed one-shot path is gated to Fast levels; post-split is unreachable",
         );
-        let mut compressed = Vec::new();
         // Stage the borrowed range so `compress_block`'s internal
         // `start_matching` scans it in place (no `commit_space` copy).
         state.matcher.set_borrowed_block(block_start, block_end);
@@ -291,8 +297,20 @@ pub(crate) fn compress_block_encoded_borrowed(
         let saved_ll_previous = state.fse_tables.ll_previous.clone();
         let saved_ml_previous = state.fse_tables.ml_previous.clone();
         let saved_of_previous = state.fse_tables.of_previous.clone();
-        compress_block(state, &mut compressed);
-        if compressed.len() >= MAX_BLOCK_SIZE as usize {
+        // Compress directly into `output`: reserve the fixed 3-byte block
+        // header, append the payload after it, then backfill the header in
+        // place once its length is known. Avoids the per-block temp `Vec`
+        // plus the `output.extend(compressed)` copy (the dominant per-frame
+        // memmove on this hot path).
+        let hdr_off = output.len();
+        output.extend_from_slice(&[0u8; 3]);
+        let payload_off = output.len();
+        compress_block(state, output);
+        let payload_len = output.len() - payload_off;
+        if payload_len >= MAX_BLOCK_SIZE as usize {
+            // Incompressible: roll back the payload + reserved header and the
+            // entropy state, then emit a stored Raw block.
+            output.truncate(hdr_off);
             state.offset_hist = saved_offset_hist;
             state.last_huff_table = saved_huff_table;
             state.fse_tables.ll_previous = saved_ll_previous;
@@ -310,10 +328,9 @@ pub(crate) fn compress_block_encoded_borrowed(
             let header = BlockHeader {
                 last_block,
                 block_type: BlockType::Compressed,
-                block_size: compressed.len() as u32,
+                block_size: payload_len as u32,
             };
-            header.serialize(output);
-            output.extend(compressed);
+            output[hdr_off..hdr_off + 3].copy_from_slice(&header.to_le_bytes());
             BlockType::Compressed
         }
     }
