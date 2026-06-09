@@ -25,8 +25,10 @@ crate-type = ["lib", "cdylib", "staticlib"]
 # staticlib whose `extern "C"` wrappers guard the boundary with
 # `std::panic::catch_unwind` (a Rust panic must not unwind into C), so the
 # crate cannot build without std. A default-on `std` feature would advertise a
-# `--no-default-features` build that fails to compile. The no_std + alloc
-# surface lives in the `codec` crate below.
+# `--no-default-features` build that fails to compile. This deliberately
+# deviates from the no-std-library feature convention (which targets crates that
+# must support a no_std build); a host-only binding has no such build. The
+# no_std + alloc surface lives in the `codec` crate below.
 
 [dependencies]
 # The codec is imported under the alias `codec` rather than its own name: this
