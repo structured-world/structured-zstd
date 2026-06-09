@@ -34,6 +34,19 @@ name = "structured-zstd-wasm"
 release = false
 git_tag_name = "structured-zstd-wasm-v{{ version }}"
 
+# C ABI cdylib (drop-in libzstd.so.1) — distributed as a system library, never
+# from crates.io (`publish = false` in c-api/Cargo.toml), so it takes no git
+# release of its own. Same baseline-diff trap as the wasm crate above: added
+# after the last shared `v*` tag (v0.0.33), so resolving its "last release"
+# against the shared `v{{ version }}` pattern checks out the v0.0.33 worktree
+# where this package does not yet exist and crashes `release-pr` with "Failed
+# to find package structured-zstd-c". A private tag namespace with no matching
+# tag makes release-plz treat it as unreleased and skip the broken baseline diff.
+[[package]]
+name = "structured-zstd-c"
+release = false
+git_tag_name = "structured-zstd-c-v{{ version }}"
+
 [changelog]
 commit_parsers = [
     { message = "^chore", skip = true },
