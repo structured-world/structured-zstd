@@ -5993,6 +5993,10 @@ fn config_override_is_consumed_by_reset() {
     );
 }
 
+// Level 4 maps to the greedy Dfast (double-fast) backend — "greedy" here is the
+// parse discipline (no lazy lookahead, donor `ZSTD_dfast`), NOT the Row/Greedy
+// strategy (which is Level 5). This roundtrip is intentional Dfast L4 coverage;
+// the Row backend is exercised by the `Level(5)` fixtures elsewhere in this file.
 #[cfg(test)]
 fn l4_greedy_round_trip(slice_size: usize, max_slices: usize, data: &[u8]) -> (usize, usize) {
     let mut driver = MatchGeneratorDriver::new(slice_size, max_slices);

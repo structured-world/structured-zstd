@@ -583,7 +583,13 @@ impl DfastMatchGenerator {
         // bytes, short needs 5 (donor `mls = 5` for the short hash).
         let long_safe_end = concat_len.saturating_sub(7).min(end_concat);
         let short_safe_end = concat_len.saturating_sub(4).min(end_concat);
-        if start_concat >= short_safe_end {
+        // The seam window `[backfill_floor, start_concat)` holds positions that
+        // only became hashable when THIS chunk extended history (e.g. a `4+1`
+        // or `7+1` dict chunking), so gate the early return on `backfill_floor`,
+        // not `start_concat` — otherwise those seam inserts are dropped and the
+        // attached dict tables stay incomplete.
+        let backfill_floor = start_concat.saturating_sub(Self::BOUNDARY_DENSE_TAIL_LEN);
+        if backfill_floor >= short_safe_end {
             return;
         }
         let dict = self.dict.table_mut_or_init(|| DfastDictTables {
@@ -612,7 +618,6 @@ impl DfastMatchGenerator {
         // concat index, and the seam window `[start_concat - tail, start_concat)`
         // is clamped at 0 because there are no dict bytes before the front.
         // The first chunk (`start_concat == 0`) clamps to 0 → no seam, no-op.
-        let backfill_floor = start_concat.saturating_sub(Self::BOUNDARY_DENSE_TAIL_LEN);
         let mut pos = backfill_floor;
         while pos < long_safe_end {
             unsafe {
@@ -2120,8 +2125,11 @@ impl DfastMatchGenerator {
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
-            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
-            match select_kernel() {
+            use crate::encoding::fastpath::FastpathKernel;
+            // Use the matcher-level cached kernel (resolved once in `new()`),
+            // not a per-block `select_kernel()` — the cache only helps if the
+            // hot path actually reads it. Mirrors the Row backend.
+            match self.kernel {
                 FastpathKernel::Avx2Bmi2 => unsafe {
                     self.start_matching_fast_loop_avx2_bmi2(
                         current_abs_start,
