@@ -1023,6 +1023,16 @@ enum MatcherStorage {
 }
 
 impl MatcherStorage {
+    /// Heap bytes the active backend variant holds (tables, history, scratch).
+    fn heap_size(&self) -> usize {
+        match self {
+            Self::Simple(m) => m.heap_size(),
+            Self::Dfast(m) => m.heap_size(),
+            Self::Row(m) => m.heap_size(),
+            Self::HashChain(m) => m.heap_size(),
+        }
+    }
+
     /// [`super::strategy::BackendTag`] family of the active variant.
     fn backend(&self) -> super::strategy::BackendTag {
         use super::strategy::BackendTag;
@@ -1644,6 +1654,20 @@ impl Matcher for MatchGeneratorDriver {
 
     fn set_dictionary_size_hint(&mut self, size: usize) {
         self.dictionary_size_hint = Some(size);
+    }
+
+    /// Heap bytes this driver owns: the active backend's tables/history, the
+    /// recycled input-buffer pool, and the primed-dictionary snapshot (a cloned
+    /// backend kept for CDict-equivalent reuse). The inline struct itself is
+    /// accounted by the owner's `size_of`.
+    fn heap_size(&self) -> usize {
+        let pool: usize = self.vec_pool.capacity() * core::mem::size_of::<Vec<u8>>()
+            + self.vec_pool.iter().map(Vec::capacity).sum::<usize>();
+        let snapshot = self
+            .primed
+            .as_ref()
+            .map_or(0, |(storage, _, _)| storage.heap_size());
+        pool + self.storage.heap_size() + snapshot
     }
 
     fn clear_param_overrides(&mut self) {
@@ -2691,6 +2715,15 @@ pub(crate) enum HcBackend {
 }
 
 impl HcBackend {
+    /// Heap bytes held by the backend. `Hc` is zero-sized; `Bt` boxes a
+    /// `BtMatcher`, so count the boxed payload plus its own scratch heap.
+    fn heap_size(&self) -> usize {
+        match self {
+            Self::Hc => 0,
+            Self::Bt(bt) => core::mem::size_of::<super::bt::BtMatcher>() + bt.heap_size(),
+        }
+    }
+
     /// Mutable accessor on the BT matcher; panics if the active
     /// backend is `Hc`. The HC-or-Bt branches in orchestrator code use
     /// `let HcBackend::Bt(bt) = &self.backend` directly for readonly
@@ -4533,6 +4566,12 @@ macro_rules! bt_insert_and_collect_matches_body {
 pub(crate) use bt_insert_and_collect_matches_body;
 
 impl HcMatchGenerator {
+    /// Heap bytes this generator owns: the shared match table plus the BT
+    /// backend's optimal-parser / LDM scratch (the HC knobs are inline).
+    fn heap_size(&self) -> usize {
+        self.table.heap_size() + self.backend.heap_size()
+    }
+
     fn should_run_btultra2_seed_pass<S: super::strategy::Strategy>(
         &self,
         current_len: usize,

@@ -680,6 +680,22 @@ impl MatchTable {
     /// dictionary-tier-small. Correctness-neutral: the mirror still grows on
     /// demand if `expected_bytes` underestimates. Only worth calling when the
     /// total is known (source-size hinted); an unhinted stream keeps doubling.
+    /// Heap bytes this table owns: history, the hash / hash3 / chain tables,
+    /// the chunk-length deque, and any attached immutable dictionary tables.
+    pub(crate) fn heap_size(&self) -> usize {
+        let u32_sz = core::mem::size_of::<u32>();
+        let usize_sz = core::mem::size_of::<usize>();
+        self.chunk_lens.capacity() * usize_sz
+            + self.history.capacity()
+            + (self.hash_table.capacity()
+                + self.hash3_table.capacity()
+                + self.chain_table.capacity())
+                * u32_sz
+            + self.dms.table().map_or(0, |t| {
+                (t.hash_table.capacity() + t.chain_table.capacity()) * u32_sz
+            })
+    }
+
     pub(crate) fn reserve_history(&mut self, expected_bytes: usize) {
         // Eviction keeps the live mirror within `max_window_size`; one pending
         // block can sit on top before `add_data` rolls it out, so the tightest

@@ -138,6 +138,11 @@ impl LdmProducer {
         Self::new(LdmParams::adjust_for(window_log, strategy))
     }
 
+    /// Heap bytes this producer owns: the LDM hash table and the split-scratch.
+    pub(crate) fn heap_size(&self) -> usize {
+        self.hash_table.heap_size() + self.splits_scratch.capacity() * core::mem::size_of::<usize>()
+    }
+
     /// Reset bucket cursors, zero the hash entries, and re-seed
     /// the rolling-hash state. Use at frame boundaries.
     pub(crate) fn clear(&mut self) {

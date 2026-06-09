@@ -453,6 +453,12 @@ pub trait Matcher {
     fn supports_dictionary_priming(&self) -> bool {
         false
     }
+    /// Heap bytes this matcher's allocations hold (tables, history, scratch),
+    /// excluding the inline struct itself. Lets a context report its true
+    /// footprint via `ZSTD_sizeof_CCtx`. Defaults to `0` for custom matchers.
+    fn heap_size(&self) -> usize {
+        0
+    }
     /// The size of the window the decoder will need to execute all sequences produced by this matcher.
     ///
     /// Must return a positive (non-zero) value; returning 0 causes

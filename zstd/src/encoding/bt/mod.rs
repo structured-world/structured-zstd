@@ -143,6 +143,29 @@ impl BtMatcher {
         }
     }
 
+    /// Heap bytes the optimal-parser scratch buffers and the optional LDM
+    /// producer hold. The fixed-size price arrays and `opt_state` are inline
+    /// (counted by the owner's `size_of`), so only the `Vec` fields contribute.
+    pub(crate) fn heap_size(&self) -> usize {
+        let u32_sz = core::mem::size_of::<u32>();
+        let mut total = self.opt_nodes_scratch.capacity() * core::mem::size_of::<HcOptimalNode>()
+            + self.opt_candidates_scratch.capacity() * core::mem::size_of::<MatchCandidate>()
+            + self.opt_store_scratch.capacity() * core::mem::size_of::<HcOptimalNode>()
+            + (self.opt_segment_plan_scratch.capacity() + self.opt_seed_plan_scratch.capacity())
+                * core::mem::size_of::<HcOptimalSequence>()
+            + (self.opt_ll_price_scratch.capacity()
+                + self.opt_ll_price_generation.capacity()
+                + self.opt_ml_price_scratch.capacity()
+                + self.opt_ml_price_generation.capacity())
+                * u32_sz
+            + self.ldm_sequences.capacity() * core::mem::size_of::<HcRawSeq>();
+        #[cfg(feature = "hash")]
+        {
+            total += self.ldm_producer.as_ref().map_or(0, |p| p.heap_size());
+        }
+        total
+    }
+
     /// Per-frame reset — clears scratch buffers, resets cost model,
     /// drops cached price stamps.
     pub(crate) fn reset(&mut self) {

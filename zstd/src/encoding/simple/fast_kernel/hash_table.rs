@@ -157,6 +157,11 @@ impl FastHashTable {
         self.mls
     }
 
+    /// Heap bytes held by the table's `Vec<u32>` (its allocated capacity).
+    pub(crate) fn heap_size(&self) -> usize {
+        self.table.capacity() * core::mem::size_of::<u32>()
+    }
+
     /// Clear the table back to all-sentinel. Used on encoder reset
     /// between independent frames so a stale absolute index from the
     /// previous frame can't get mistaken for a current-frame match.

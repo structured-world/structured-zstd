@@ -507,6 +507,48 @@ fn cdict_ddict_roundtrip_and_reuse() {
 }
 
 #[test]
+fn sizeof_cctx_counts_cached_dictionary_compressor() {
+    // After a ZSTD_compress_usingCDict call, the context caches a primed
+    // FrameCompressor whose match-finder tables dominate its real footprint.
+    // ZSTD_sizeof_CCtx must grow to reflect that heap, not just the inline
+    // struct + scratch (regression: it previously omitted the cached compressor).
+    let dict = trained_dictionary();
+    let cdict = unsafe { ZSTD_createCDict(dict.as_ptr(), dict.len(), 19) };
+    assert!(!cdict.is_null());
+    let cctx = ZSTD_createCCtx();
+    assert!(!cctx.is_null());
+
+    let before = unsafe { ZSTD_sizeof_CCtx(cctx) };
+
+    let payload = b"tenant=demo table=orders key=1 region=eu payload=aaaaabbbbbccccc\n";
+    let mut compressed = vec![0u8; ZSTD_compressBound(payload.len())];
+    let clen = unsafe {
+        ZSTD_compress_usingCDict(
+            cctx,
+            compressed.as_mut_ptr(),
+            compressed.len(),
+            payload.as_ptr(),
+            payload.len(),
+            cdict,
+        )
+    };
+    assert_eq!(ZSTD_isError(clen), 0);
+
+    let after = unsafe { ZSTD_sizeof_CCtx(cctx) };
+    // The primed match-finder tables for a level-19 dictionary are well above
+    // 64 KiB, so the reported size must jump substantially once they exist.
+    assert!(
+        after > before + 64 * 1024,
+        "sizeof_CCtx must include the cached dict compressor's heap: before={before}, after={after}"
+    );
+
+    unsafe {
+        ZSTD_freeCCtx(cctx);
+        ZSTD_freeCDict(cdict);
+    }
+}
+
+#[test]
 fn create_cdict_rejects_non_dictionary() {
     // A buffer with no dictionary magic and no valid entropy is not a parseable
     // encoder dictionary; createCDict must return NULL (never crash).

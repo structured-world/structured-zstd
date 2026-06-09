@@ -114,9 +114,11 @@ pub unsafe extern "C" fn ZSTD_freeCCtx(cctx: *mut ZSTD_CCtx) -> usize {
 /// `size_t ZSTD_sizeof_CCtx(const ZSTD_CCtx* cctx)` — current heap footprint,
 /// or 0 for `NULL`.
 ///
-/// Counts the inline struct and the reusable output `scratch`. The cached
-/// `dict_compressor`'s primed match-finder tables and dictionary snapshot are
-/// not yet summed (the encoder lacks a heap-size accessor); tracked in #388.
+/// Counts the inline struct, the reusable output `scratch`, and (after the
+/// first `ZSTD_compress_usingCDict`) the cached `dict_compressor`'s heap: its
+/// primed match-finder tables / history, the recycled-buffer pool, the
+/// dictionary snapshot, and the retained dictionary content. Matches upstream
+/// `ZSTD_sizeof_CCtx`, which includes the CDict-copied working tables.
 ///
 /// # Safety
 /// `cctx` must be a live pointer from [`ZSTD_createCCtx`], or `NULL`.
@@ -126,7 +128,12 @@ pub unsafe extern "C" fn ZSTD_sizeof_CCtx(cctx: *const ZSTD_CCtx) -> usize {
         return 0;
     }
     let cctx = unsafe { &*cctx };
-    core::mem::size_of::<ZSTD_CCtx>() + cctx.scratch.capacity()
+    core::mem::size_of::<ZSTD_CCtx>()
+        + cctx.scratch.capacity()
+        + cctx
+            .dict_compressor
+            .as_ref()
+            .map_or(0, |enc| enc.heap_size())
 }
 
 /// `size_t ZSTD_compressCCtx(ZSTD_CCtx* cctx, void* dst, size_t dstCapacity,

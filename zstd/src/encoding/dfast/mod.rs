@@ -261,6 +261,19 @@ impl DfastMatchGenerator {
         self.position_base += reducer as usize;
     }
 
+    /// Heap bytes this matcher owns: history, the long/short hash tables, the
+    /// window-block deque, and any attached dictionary tables.
+    pub(crate) fn heap_size(&self) -> usize {
+        let u32_sz = core::mem::size_of::<u32>();
+        self.window_blocks.capacity() * core::mem::size_of::<usize>()
+            + self.history.capacity()
+            + (self.short_hash.capacity() + self.long_hash.capacity()) * u32_sz
+            + self
+                .dict
+                .table()
+                .map_or(0, |t| (t.long.capacity() + t.short.capacity()) * u32_sz)
+    }
+
     pub(crate) fn reset(&mut self) {
         // Floor-advance reset (issue #337 technique, completing it for the
         // dfast backend — `MatchTable` already does this). Instead of

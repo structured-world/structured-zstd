@@ -989,6 +989,31 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         self.source_size_hint = Some(size);
     }
 
+    /// Total heap bytes this compressor's allocations hold, excluding the
+    /// inline struct: the match-finder tables / history / recycled buffers and
+    /// the primed-dictionary snapshot (via the matcher), the retained
+    /// dictionary content, and the per-block sidecar buffers. Lets a context
+    /// report its true footprint through `ZSTD_sizeof_CCtx`.
+    pub fn heap_size(&self) -> usize {
+        let mut total = self.state.matcher.heap_size();
+        total += self
+            .dictionary
+            .as_ref()
+            .map_or(0, |d| d.inner.dict_content.capacity());
+        #[cfg(all(feature = "lsm", feature = "hash"))]
+        {
+            total += self
+                .block_checksums
+                .as_ref()
+                .map_or(0, |v| v.capacity() * core::mem::size_of::<u32>());
+        }
+        #[cfg(feature = "lsm")]
+        {
+            total += self.block_decompressed_sizes.capacity() * core::mem::size_of::<u32>();
+        }
+        total
+    }
+
     /// Compress the uncompressed data from the provided source as one Zstd frame and write it to the provided drain
     ///
     /// This will repeatedly call [Read::read] on the source to fill up blocks until the source returns 0 on the read call.
