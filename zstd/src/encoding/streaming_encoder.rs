@@ -34,6 +34,12 @@ pub struct StreamingEncoder<W: Write, M: Matcher = MatchGeneratorDriver> {
     frame_started: bool,
     pledged_content_size: Option<u64>,
     bytes_consumed: u64,
+    /// Effective strategy tag when a public-parameter
+    /// [`Strategy`](crate::encoding::Strategy) override (#27) is active, mirroring
+    /// [`FrameCompressor`](crate::encoding::FrameCompressor)'s field. `Some`
+    /// survives frame start so the literal-compression gates run the same
+    /// strategy the matcher does; `None` keeps the level-derived tag.
+    strategy_override: Option<crate::encoding::strategy::StrategyTag>,
     /// `ZSTD_f_zstd1_magicless` — omit the 4-byte magic number prefix.
     /// Default false. See [`Self::set_magicless`].
     magicless: bool,
@@ -85,7 +91,10 @@ impl<W: Write> StreamingEncoder<W, MatchGeneratorDriver> {
         }
         self.compression_level = params.level();
         let overrides = params.overrides();
-        self.state.strategy_tag = overrides.strategy.map(|s| s.tag()).unwrap_or_else(|| {
+        // Persist the strategy override so `ensure_frame_started`'s level-based
+        // resync does not discard it (matching `FrameCompressor::set_parameters`).
+        self.strategy_override = overrides.strategy.map(|s| s.tag());
+        self.state.strategy_tag = self.strategy_override.unwrap_or_else(|| {
             crate::encoding::strategy::StrategyTag::for_compression_level(self.compression_level)
         });
         self.state.matcher.set_param_overrides(Some(overrides));
@@ -120,6 +129,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             frame_started: false,
             pledged_content_size: None,
             bytes_consumed: 0,
+            strategy_override: None,
             magicless: false,
             content_checksum: true,
             dictionary: None,
@@ -347,10 +357,20 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         }
 
         self.ensure_level_supported()?;
-        let use_dictionary = self.dictionary.is_some();
+        // A dictionary is only active when it can actually be primed: the level
+        // compresses (not `Uncompressed`) AND the matcher supports priming AND a
+        // dictionary is attached. Mirrors `FrameCompressor`'s `use_dictionary_state`
+        // so a streaming frame never advertises a `Dictionary_ID`, disables
+        // single-segment, or seeds dict entropy/offsets unless the dictionary is
+        // genuinely in play (otherwise it would emit frames that needlessly
+        // require a dictionary at decode time).
+        let use_dictionary_state =
+            !matches!(self.compression_level, CompressionLevel::Uncompressed)
+                && self.state.matcher.supports_dictionary_priming()
+                && self.dictionary.is_some();
         // The dictionary content size drives dict-tier match-finder sizing
         // (consumed inside `reset`), so hand it over BEFORE reset.
-        if let Some(dict) = self.dictionary.as_ref() {
+        if use_dictionary_state && let Some(dict) = self.dictionary.as_ref() {
             self.state
                 .matcher
                 .set_dictionary_size_hint(dict.inner.dict_content.len());
@@ -358,16 +378,19 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         self.state.matcher.reset(self.compression_level);
         // Seed the repeat-offset history from the dictionary (donor
         // `ZSTD_compress_insertDictionary`), or the default rep codes otherwise.
-        self.state.offset_hist = self
-            .dictionary
-            .as_ref()
-            .map(|dict| dict.inner.offset_hist)
-            .unwrap_or([1, 4, 8]);
+        self.state.offset_hist = if use_dictionary_state {
+            self.dictionary
+                .as_ref()
+                .map(|dict| dict.inner.offset_hist)
+                .unwrap_or([1, 4, 8])
+        } else {
+            [1, 4, 8]
+        };
         // Prime the match-finder with the dictionary content + offsets.
         // `dict` borrows `self.dictionary`; `self.state.matcher` is a disjoint
         // field, so the immutable dict borrow and the mutable matcher borrow
         // coexist (field-level borrow splitting) with no conflict.
-        if let Some(dict) = self.dictionary.as_ref() {
+        if use_dictionary_state && let Some(dict) = self.dictionary.as_ref() {
             let offset_hist = dict.inner.offset_hist;
             self.state
                 .matcher
@@ -375,7 +398,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         }
         // Seed the first block's entropy from the dictionary's cached encoder
         // tables (donor `cdict->cBlockState`), or clear to defaults.
-        if let Some(cache) = self.dictionary_entropy_cache.as_ref() {
+        if use_dictionary_state && let Some(cache) = self.dictionary_entropy_cache.as_ref() {
             self.state.last_huff_table.clone_from(&cache.huff);
             self.state
                 .fse_tables
@@ -417,9 +440,12 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         // literal-compression gates (`min_literals_to_compress`, `min_gain`
         // in `encoding::blocks::compressed`) see the correct strategy for
         // every frame. Mirrors `FrameCompressor::compress` and keeps both
-        // entry points byte-equivalent at the gate level.
-        self.state.strategy_tag =
-            crate::encoding::strategy::StrategyTag::for_compression_level(self.compression_level);
+        // entry points byte-equivalent at the gate level. A public-parameter
+        // strategy override (#27) wins over the level's derived tag so the
+        // gates see the strategy the matcher actually runs.
+        self.state.strategy_tag = self.strategy_override.unwrap_or_else(|| {
+            crate::encoding::strategy::StrategyTag::for_compression_level(self.compression_level)
+        });
         #[cfg(feature = "hash")]
         {
             self.hasher = XxHash64::with_seed(0);
@@ -436,7 +462,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         // pushes referenceable history before the content, so the frame needs
         // an explicit window descriptor); gate it off when a dict is attached,
         // mirroring `FrameCompressor`'s `!use_dictionary_state` guard.
-        let single_segment = !use_dictionary
+        let single_segment = !use_dictionary_state
             && self
                 .pledged_content_size
                 .map(|size| (512..=(1 << 14)).contains(&size) && size <= window_size)
@@ -446,7 +472,11 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             frame_content_size: self.pledged_content_size,
             single_segment,
             content_checksum: cfg!(feature = "hash") && self.content_checksum,
-            dictionary_id: self.dictionary.as_ref().map(|dict| dict.inner.id as u64),
+            dictionary_id: if use_dictionary_state {
+                self.dictionary.as_ref().map(|dict| dict.inner.id as u64)
+            } else {
+                None
+            },
             window_size: if single_segment {
                 None
             } else {
@@ -577,17 +607,21 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                 | CompressionLevel::Level(_) => {
                     let block = raw_block.take().expect("raw block missing");
                     debug_assert!(!block.is_empty(), "empty blocks handled above");
+                    // A primed dictionary makes "incompressible-looking" blocks
+                    // matchable, so the raw-fast-path must NOT fire. But a dict is
+                    // only PRIMED when the matcher supports priming — a non-priming
+                    // matcher ignores the attached dictionary, so the raw-fast-path
+                    // must stay enabled for it. (This arm is already non-Uncompressed.)
+                    // Mirrors `FrameCompressor`'s `dict_active`.
+                    let dict_active = self.dictionary.is_some()
+                        && self.state.matcher.supports_dictionary_priming();
                     compress_block_encoded(
                         &mut self.state,
                         self.compression_level,
                         last_block,
                         block,
                         &mut encoded,
-                        // When a dictionary is attached, the raw-fast-path must
-                        // NOT fire (an incompressible-looking block can still
-                        // match the dictionary); disable it so the dict is
-                        // always searched, mirroring `FrameCompressor`.
-                        self.dictionary.is_some(),
+                        dict_active,
                         // No FrameEmitInfo on the streaming encoder path — it
                         // does not surface per-block layout, so no sidecar.
                         #[cfg(feature = "lsm")]
@@ -1657,5 +1691,73 @@ mod tests {
             compressed.len(),
             nodict_frame.len()
         );
+    }
+
+    #[test]
+    fn streaming_encoder_strategy_override_survives_frame_start() {
+        // A `.strategy(...)` override must drive BOTH the matcher and the
+        // literal-compression gates (`state.strategy_tag`) once the frame
+        // starts. `ensure_frame_started` re-syncs the tag, so without persisting
+        // the override it would silently fall back to the level's strategy and
+        // diverge from `FrameCompressor` for the same parameters.
+        use crate::encoding::{CompressionParameters, Strategy};
+        let level = CompressionLevel::Fastest;
+        let level_tag = crate::encoding::strategy::StrategyTag::for_compression_level(level);
+        let override_tag = Strategy::Greedy.tag();
+        assert_ne!(
+            level_tag, override_tag,
+            "test needs an override that changes the derived tag"
+        );
+
+        let params = CompressionParameters::builder(level)
+            .strategy(Strategy::Greedy)
+            .build()
+            .unwrap();
+        let payload = b"override must outlive the frame header";
+        let mut encoder = StreamingEncoder::new(Vec::new(), level);
+        encoder.set_parameters(&params).unwrap();
+        encoder.write_all(payload).unwrap();
+        assert_eq!(
+            encoder.state.strategy_tag, override_tag,
+            "strategy override was discarded when the frame started"
+        );
+
+        let compressed = encoder.finish().unwrap();
+        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn streaming_encoder_uncompressed_with_dictionary_omits_dict_id() {
+        // At `Uncompressed` the matcher cannot prime a dictionary, so an
+        // attached dictionary must NOT be reflected in the frame: advertising a
+        // `Dictionary_ID` would force a dictionary at decode time for a frame
+        // that does not actually depend on one. Mirrors `FrameCompressor`'s
+        // `use_dictionary_state` gate.
+        let dict_raw = include_bytes!("../../dict_tests/dictionary");
+        let payload = b"tenant=demo table=orders region=eu payload=aaaaabbbbbccccc";
+        let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Uncompressed);
+        encoder
+            .set_dictionary_from_bytes(dict_raw)
+            .expect("attach dictionary");
+        encoder.write_all(payload).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let header = crate::decoding::frame::read_frame_header(compressed.as_slice())
+            .unwrap()
+            .0;
+        assert_eq!(
+            header.dictionary_id(),
+            None,
+            "uncompressed frame must not require a dictionary at decode time"
+        );
+
+        // Decodes WITHOUT any dictionary.
+        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut decoded = Vec::new();
+        decoder.read_to_end(&mut decoded).unwrap();
+        assert_eq!(decoded, payload);
     }
 }

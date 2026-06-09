@@ -1731,23 +1731,36 @@ impl Matcher for MatchGeneratorDriver {
         // dict never inflates the level tables. Only the binary-tree / hash-chain
         // backend reads `hc.{hash,chain}_log`; Simple/Dfast/Row derive their
         // widths from the source window in their `reset` arms.
-        if let (Some(dict_size), Some(hc)) = (dict_hint, params.hc.as_mut()) {
-            let uses_bt = matches!(
-                params.strategy_tag,
-                super::strategy::StrategyTag::Btlazy2
-                    | super::strategy::StrategyTag::BtOpt
-                    | super::strategy::StrategyTag::BtUltra
-                    | super::strategy::StrategyTag::BtUltra2
-            );
-            let (dict_hash_log, dict_chain_log) = cdict_table_logs(
-                params.window_log,
-                hc.hash_log,
-                hc.chain_log,
-                uses_bt,
-                dict_size,
-            );
-            hc.hash_log = hc.hash_log.min(dict_hash_log);
-            hc.chain_log = hc.chain_log.min(dict_chain_log);
+        if let Some(dict_size) = dict_hint {
+            // Derive the dict-tier geometry from the level's FULL (un-source-capped)
+            // hc widths. `Self::level_params(level, hint)` already source-capped
+            // `params.hc`; feeding those capped widths into `cdict_table_logs` and
+            // then `.min()`-ing would double-cap, so on a small hinted source with a
+            // large dictionary the prepared tables collapse below what the dict needs
+            // — defeating the `ZSTD_createCDict` geometry this mirrors. Take the
+            // un-hinted base widths instead and assign the result directly:
+            // `cdict_table_logs` only ever downsizes, so it never exceeds the base
+            // level geometry, while the eviction `window_log` stays source-derived so
+            // the dictionary bytes remain referenceable.
+            let base_hc = Self::level_params(level, None).hc;
+            if let (Some(hc), Some(base_hc)) = (params.hc.as_mut(), base_hc) {
+                let uses_bt = matches!(
+                    params.strategy_tag,
+                    super::strategy::StrategyTag::Btlazy2
+                        | super::strategy::StrategyTag::BtOpt
+                        | super::strategy::StrategyTag::BtUltra
+                        | super::strategy::StrategyTag::BtUltra2
+                );
+                let (dict_hash_log, dict_chain_log) = cdict_table_logs(
+                    params.window_log,
+                    base_hc.hash_log,
+                    base_hc.chain_log,
+                    uses_bt,
+                    dict_size,
+                );
+                hc.hash_log = dict_hash_log;
+                hc.chain_log = dict_chain_log;
+            }
         }
         let next_backend = params.backend();
         let max_window_size = 1usize << params.window_log;
