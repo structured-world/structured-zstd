@@ -55,7 +55,6 @@ use std::arch::is_x86_feature_detected;
 pub(crate) const DFAST_MIN_MATCH_LEN: usize = 5;
 pub(crate) const DFAST_SHORT_HASH_LOOKAHEAD: usize = 4;
 pub(crate) const ROW_MIN_MATCH_LEN: usize = 5;
-pub(crate) const DFAST_TARGET_LEN: usize = 48;
 // Donor `clevels.h:31` at level 3 large-input bucket sets
 // `hashLog = 17` (the long-hash table) and `chainLog = 16` (the
 // short-hash table — donor names this `chainTable` even though for
@@ -103,7 +102,6 @@ pub(crate) const DFAST_EMPTY_SLOT: u32 = 0;
 pub(crate) const DFAST_REBASE_GUARD_BAND: u32 = 1u32 << 30;
 pub(crate) const DFAST_SKIP_SEARCH_STRENGTH: usize = 6;
 pub(crate) const DFAST_SKIP_STEP_GROWTH_INTERVAL: usize = 1 << DFAST_SKIP_SEARCH_STRENGTH;
-pub(crate) const DFAST_LOCAL_SKIP_TRIGGER: usize = 256;
 pub(crate) const DFAST_MAX_SKIP_STEP: usize = 8;
 pub(crate) const DFAST_INCOMPRESSIBLE_SKIP_STEP: usize = 16;
 pub(crate) const ROW_HASH_BITS: usize = 20;
@@ -1775,14 +1773,6 @@ impl Matcher for MatchGeneratorDriver {
             }
             MatcherStorage::Dfast(dfast) => {
                 dfast.max_window_size = max_window_size;
-                dfast.lazy_depth = params.lazy_depth;
-                // Donor `ZSTD_dfast` is ALWAYS the greedy double-fast
-                // (`zstd_double_fast.c`, no lazy lookahead); lazy parsing is a
-                // separate strategy (`ZSTD_lazy`/`lazy2`). Keying the greedy
-                // loop on the Dfast backend (not the numeric level) keeps a
-                // custom `Strategy::Dfast` set via the parameter API greedy at
-                // every level, matching the donor.
-                dfast.use_fast_loop = true;
                 let dcfg = params
                     .dfast
                     .expect("Dfast level row must carry a DfastConfig");
@@ -5585,7 +5575,12 @@ fn dfast_accepts_exact_five_byte_match() {
     data.extend_from_slice(b"!!!!!!!!!!!!!!!!!!!!!!!"); // 5..28 (23 bytes)
     data.extend_from_slice(b"ABCDE"); // 28..33
     data.push(b'F'); // 33: forces forward extension to stop at length 5
-    assert_eq!(data.len(), 34);
+    // Trailing filler so the match site (28) sits at least HASH_READ_SIZE (8)
+    // bytes before the block end. The greedy double-fast — like the donor —
+    // stops probing at `ilimit = iend - HASH_READ_SIZE`, so a match in the
+    // final 8 bytes is never searched (donor parity, not a regression).
+    data.extend_from_slice(b"GHIJKLMNOPQRSTUVWXYZ"); // 34..54
+    assert_eq!(data.len(), 54);
 
     let mut matcher = DfastMatchGenerator::new(1 << 22);
     matcher.add_data(data.clone(), |_| {});

@@ -20,13 +20,11 @@ use super::dict_attach::DictAttach;
 use super::fastpath::{FastpathKernel, select_kernel};
 use super::incompressible::block_looks_incompressible;
 use super::match_generator::{
-    DFAST_EMPTY_SLOT, DFAST_HASH_BITS, DFAST_INCOMPRESSIBLE_SKIP_STEP, DFAST_LOCAL_SKIP_TRIGGER,
-    DFAST_MAX_SKIP_STEP, DFAST_MIN_MATCH_LEN, DFAST_REBASE_GUARD_BAND, DFAST_SHORT_HASH_BITS_DELTA,
-    DFAST_SHORT_HASH_LOOKAHEAD, DFAST_SKIP_STEP_GROWTH_INTERVAL, DFAST_TARGET_LEN, MIN_WINDOW_LOG,
+    DFAST_EMPTY_SLOT, DFAST_HASH_BITS, DFAST_INCOMPRESSIBLE_SKIP_STEP, DFAST_MAX_SKIP_STEP,
+    DFAST_MIN_MATCH_LEN, DFAST_REBASE_GUARD_BAND, DFAST_SHORT_HASH_BITS_DELTA,
+    DFAST_SHORT_HASH_LOOKAHEAD, DFAST_SKIP_STEP_GROWTH_INTERVAL, MIN_WINDOW_LOG,
 };
-use super::match_table::helpers::{
-    best_len_offset_candidate, common_prefix_len_with_kernel, extend_backwards_shared,
-};
+use super::match_table::helpers::{common_prefix_len_with_kernel, extend_backwards_shared};
 use super::match_table::storage::{REBASE_RESET_FLOOR_CEILING, check_stream_abs_headroom};
 use super::opt::types::MatchCandidate;
 
@@ -107,9 +105,6 @@ pub(crate) struct DfastMatchGenerator {
     /// frequently than the 8-byte long hash on average, so the
     /// smaller bucket count is the donor-correct sizing.
     pub(crate) short_hash_bits: usize,
-    pub(crate) use_fast_loop: bool,
-    // Lazy match lookahead depth (internal tuning parameter).
-    pub(crate) lazy_depth: u8,
     /// Immutable dictionary long+short hash tables (donor `dictMatchState`)
     /// plus the CDict cache lifecycle, via the shared [`DictAttach`] level-1
     /// scaffolding. Built once over the dictionary region at the front of the
@@ -142,352 +137,6 @@ pub(crate) struct DfastDictTables {
     pub(crate) short: alloc::vec::Vec<u32>,
 }
 
-/// Per-kernel body of [`DfastMatchGenerator::probe_slot_match`]. The wrapper
-/// carries the `#[target_feature]` umbrella and passes its tier's
-/// `common_prefix_len_ptr` as `$cpl`, so the forward match-length scan inlines
-/// under that umbrella instead of crossing the target_feature ABI boundary as
-/// a non-inlinable call (`#[inline]` cannot cross it). Mirrors
-/// `start_matching_fast_loop_body!`.
-macro_rules! dfast_probe_slot_match_body {
-    ($self:ident, $slot:ident, $position_base:ident, $history_abs_start:ident,
-     $abs_pos:ident, $current_idx:ident, $concat:ident, $lit_len:ident,
-     $gate_len:ident, $cpl:path) => {{
-        if $slot == DFAST_EMPTY_SLOT {
-            return None;
-        }
-        let candidate_pos = $position_base + ($slot as usize) - 1;
-        if candidate_pos < $history_abs_start || candidate_pos >= $abs_pos {
-            return None;
-        }
-        let candidate_idx = candidate_pos - $history_abs_start;
-        if candidate_idx + $gate_len > $concat.len() || $current_idx + $gate_len > $concat.len() {
-            return None;
-        }
-        // Fixed-width equality gate. `$gate_len` is 4 (short hash) or 8 (long
-        // hash / `_search_next_long` retry); a slice `!=` here lowers to a libc
-        // `__memcmp` CALL (~14% self-time on the dfast L4 profile) instead of a
-        // single load + compare. Read the gate as one unaligned u32/u64 — the
-        // bounds were verified just above (`candidate_idx + $gate_len <= len`
-        // and `$current_idx + $gate_len <= len`).
-        debug_assert!($gate_len == 4 || $gate_len == 8);
-        let gate_eq = unsafe {
-            let cand = $concat.as_ptr().add(candidate_idx);
-            let cur = $concat.as_ptr().add($current_idx);
-            if $gate_len == 8 {
-                cand.cast::<u64>().read_unaligned() == cur.cast::<u64>().read_unaligned()
-            } else {
-                cand.cast::<u32>().read_unaligned() == cur.cast::<u32>().read_unaligned()
-            }
-        };
-        if !gate_eq {
-            return None;
-        }
-        let a = &$concat[candidate_idx..];
-        let b = &$concat[$current_idx..];
-        let max = a.len().min(b.len());
-        // SAFETY: `a` / `b` each have at least `len()` initialized bytes; `max`
-        // is the minimum, so both pointers are valid for `max` bytes. `$cpl` is
-        // the current tier's kernel, whose target feature this wrapper enables.
-        let match_len = unsafe { $cpl(a.as_ptr(), b.as_ptr(), max) };
-        if match_len < DFAST_MIN_MATCH_LEN {
-            return None;
-        }
-        Some($self.extend_backwards(candidate_pos, $abs_pos, match_len, $lit_len))
-    }};
-}
-
-/// Per-kernel body of [`DfastMatchGenerator::repcode_candidate`]. Mirrors
-/// `repcode_candidate_shared` but with the tier's `common_prefix_len_ptr`
-/// (`$cpl`) inlined directly on raw pointers (no `match kernel` dispatch, no
-/// ABI-crossing call), so the 3-rep probe runs straight-line under the
-/// wrapper's `#[target_feature]` umbrella. The 3 probes are hand-unrolled (not
-/// a nested `macro_rules!`) because macro hygiene forbids referencing the outer
-/// macro's `$cpl` metavar from a nested macro body.
-macro_rules! dfast_repcode_candidate_body {
-    ($self:ident, $abs_pos:ident, $lit_len:ident, $cpl:path) => {{
-        let concat = $self.live_history();
-        let history_abs_start = $self.history_abs_start;
-        let offset_hist = $self.offset_hist;
-        let current_idx = $abs_pos - history_abs_start;
-        if current_idx + DFAST_MIN_MATCH_LEN > concat.len() {
-            return None;
-        }
-        let (rep0, rep1, rep2_opt) = if $lit_len == 0 {
-            let r2 = if offset_hist[0] > 1 {
-                Some(offset_hist[0] as usize - 1)
-            } else {
-                None
-            };
-            (offset_hist[1] as usize, offset_hist[2] as usize, r2)
-        } else {
-            (
-                offset_hist[0] as usize,
-                offset_hist[1] as usize,
-                Some(offset_hist[2] as usize),
-            )
-        };
-        let mut best: Option<MatchCandidate> = None;
-        // Hand-unrolled inline probes (NOT a closure: a closure body is a
-        // separate non-`target_feature` MIR body, so calling `$cpl` from it
-        // would cross the ABI barrier and defeat the inline). Each call to the
-        // tier's `$cpl` runs directly in this wrapper's umbrella scope (the
-        // `for` loop body and the `if` block are in-fn, not a closure).
-        for &rep in &[rep0, rep1] {
-            if rep != 0 && rep <= $abs_pos {
-                let candidate_pos = $abs_pos - rep;
-                if candidate_pos >= history_abs_start {
-                    let candidate_idx = candidate_pos - history_abs_start;
-                    let a = &concat[candidate_idx..];
-                    let b = &concat[current_idx..];
-                    let max = a.len().min(b.len());
-                    // SAFETY: `a` / `b` each hold at least `len()` initialized
-                    // bytes; `max` is the minimum so both pointers are valid for
-                    // `max` bytes. `$cpl` is the tier kernel this umbrella enables.
-                    let match_len = unsafe { $cpl(a.as_ptr(), b.as_ptr(), max) };
-                    if match_len >= DFAST_MIN_MATCH_LEN {
-                        let candidate = extend_backwards_shared(
-                            concat,
-                            history_abs_start,
-                            candidate_pos,
-                            $abs_pos,
-                            match_len,
-                            $lit_len,
-                        );
-                        best = best_len_offset_candidate(best, Some(candidate));
-                    }
-                }
-            }
-        }
-        if let Some(rep) = rep2_opt
-            && rep != 0
-            && rep <= $abs_pos
-        {
-            let candidate_pos = $abs_pos - rep;
-            if candidate_pos >= history_abs_start {
-                let candidate_idx = candidate_pos - history_abs_start;
-                let a = &concat[candidate_idx..];
-                let b = &concat[current_idx..];
-                let max = a.len().min(b.len());
-                // SAFETY: as above.
-                let match_len = unsafe { $cpl(a.as_ptr(), b.as_ptr(), max) };
-                if match_len >= DFAST_MIN_MATCH_LEN {
-                    let candidate = extend_backwards_shared(
-                        concat,
-                        history_abs_start,
-                        candidate_pos,
-                        $abs_pos,
-                        match_len,
-                        $lit_len,
-                    );
-                    best = best_len_offset_candidate(best, Some(candidate));
-                }
-            }
-        }
-        best
-    }};
-}
-
-/// Per-kernel body of [`DfastMatchGenerator::hash_candidate`]. `$probe` is the
-/// tier's `probe_slot_match_<kernel>` method; calling it from this wrapper's
-/// matching `#[target_feature]` umbrella inlines the whole long/short probe +
-/// `_search_next_long` retry (and the `$cpl` scan inside each probe) with no
-/// `match kernel` dispatch and no ABI-crossing call per slot.
-macro_rules! dfast_hash_candidate_body {
-    ($self:ident, $abs_pos:ident, $lit_len:ident, $probe:ident) => {{
-        let concat = $self.live_history();
-        let current_idx = $abs_pos - $self.history_abs_start;
-        let history_abs_start = $self.history_abs_start;
-        let position_base = $self.position_base;
-        let mut best = None;
-
-        let long_hit = if current_idx + 8 <= concat.len() {
-            let long_hash = $self.long_hash_index(&concat[current_idx..]);
-            debug_assert!(long_hash < $self.long_hash.len());
-            // SAFETY: `long_hash_index` masks to `long_hash_bits` and
-            // `long_hash.len() == 1 << long_hash_bits` (`ensure_hash_tables`).
-            let slot = unsafe { *$self.long_hash.get_unchecked(long_hash) };
-            unsafe {
-                $self.$probe(
-                    slot,
-                    position_base,
-                    history_abs_start,
-                    $abs_pos,
-                    current_idx,
-                    concat,
-                    $lit_len,
-                    8,
-                )
-            }
-        } else {
-            None
-        };
-        if let Some(cand) = long_hit {
-            best = best_len_offset_candidate(best, Some(cand));
-            if best.is_some_and(|b| b.match_len >= DFAST_TARGET_LEN) {
-                return best;
-            }
-        }
-
-        if current_idx + 4 <= concat.len() {
-            let short_hash = $self.short_hash_index(&concat[current_idx..]);
-            debug_assert!(short_hash < $self.short_hash.len());
-            let slot = unsafe { *$self.short_hash.get_unchecked(short_hash) };
-            if let Some(short_cand) = unsafe {
-                $self.$probe(
-                    slot,
-                    position_base,
-                    history_abs_start,
-                    $abs_pos,
-                    current_idx,
-                    concat,
-                    $lit_len,
-                    4,
-                )
-            } {
-                best = best_len_offset_candidate(best, Some(short_cand));
-                if best.is_some_and(|b| b.match_len >= DFAST_TARGET_LEN) {
-                    return best;
-                }
-                let next_idx = current_idx + 1;
-                if best.is_none_or(|b| b.match_len < DFAST_TARGET_LEN)
-                    && next_idx + 8 <= concat.len()
-                {
-                    let next_long_hash = $self.long_hash_index(&concat[next_idx..]);
-                    debug_assert!(next_long_hash < $self.long_hash.len());
-                    let next_slot = unsafe { *$self.long_hash.get_unchecked(next_long_hash) };
-                    if let Some(retry) = unsafe {
-                        $self.$probe(
-                            next_slot,
-                            position_base,
-                            history_abs_start,
-                            $abs_pos + 1,
-                            next_idx,
-                            concat,
-                            $lit_len.saturating_add(1),
-                            8,
-                        )
-                    } && retry.match_len > short_cand.match_len
-                    {
-                        best = best_len_offset_candidate(best, Some(retry));
-                    }
-                }
-            }
-        }
-        best
-    }};
-}
-
-/// Per-kernel body of the lazy `start_matching_general` loop. `$rep` / `$hash`
-/// are the tier's `repcode_candidate_<kernel>` / `hash_candidate_<kernel>`
-/// methods; calling them from this wrapper's `#[target_feature]` umbrella
-/// inlines the whole per-position match search (repcode 3-probe + hash
-/// long/short probe + every `$cpl` scan) with NO per-position `match kernel`
-/// dispatch and NO ABI-crossing call. The kernel is resolved ONCE per block at
-/// the `start_matching_general` dispatcher, mirroring `start_matching_fast_loop`.
-/// Bookkeeping (`emit_candidate`, `insert_position`,
-/// `extend_with_repcode_after_match`, seeding) stays plain method calls — no
-/// SIMD on those paths.
-macro_rules! dfast_start_matching_general_body {
-    ($self:ident, $current_abs_start:ident, $current_len:ident, $handle_sequence:ident,
-     $rep:ident, $hash:ident) => {{
-        let use_adaptive_skip =
-            $self.block_looks_incompressible($current_abs_start, $current_abs_start + $current_len);
-        let mut pos = 1usize;
-        let mut literals_start = 0usize;
-        let mut skip_step = 1usize;
-        let mut next_skip_growth_pos = DFAST_SKIP_STEP_GROWTH_INTERVAL;
-        let mut miss_run = 0usize;
-        while pos + DFAST_MIN_MATCH_LEN <= $current_len {
-            let abs_pos = $current_abs_start + pos;
-            let lit_len = pos - literals_start;
-
-            // Inlined `best_match`: repcode + hash candidate, both under this
-            // tier's umbrella so the `$cpl` scans inline.
-            let best = best_len_offset_candidate(unsafe { $self.$rep(abs_pos, lit_len) }, unsafe {
-                $self.$hash(abs_pos, lit_len)
-            });
-            // Inlined `pick_lazy_match` (donor lazy/lazy2 lookahead): re-probe
-            // the same tier's repcode/hash at `abs_pos + 1` (and `+ 2` for
-            // lazy2) DIRECTLY under this umbrella so the lookahead `$cpl` scans
-            // inline too — no closure (a closure body is a separate
-            // non-`target_feature` MIR body, so its `$rep` / `$hash` calls would
-            // cross the ABI barrier on every deferral). Logic byte-identical to
-            // `pick_lazy_match_shared`.
-            let picked = 'pick: {
-                let Some(b) = best else { break 'pick None };
-                let history_abs_end = $self.history_abs_end();
-                if b.match_len >= DFAST_TARGET_LEN
-                    || abs_pos + 1 + DFAST_MIN_MATCH_LEN > history_abs_end
-                {
-                    break 'pick Some(b);
-                }
-                let next = best_len_offset_candidate(
-                    unsafe { $self.$rep(abs_pos + 1, lit_len + 1) },
-                    unsafe { $self.$hash(abs_pos + 1, lit_len + 1) },
-                );
-                if let Some(n) = next
-                    && (n.match_len > b.match_len
-                        || (n.match_len == b.match_len && n.offset < b.offset))
-                {
-                    break 'pick None;
-                }
-                if $self.lazy_depth >= 2 && abs_pos + 2 + DFAST_MIN_MATCH_LEN <= history_abs_end {
-                    let next2 = best_len_offset_candidate(
-                        unsafe { $self.$rep(abs_pos + 2, lit_len + 2) },
-                        unsafe { $self.$hash(abs_pos + 2, lit_len + 2) },
-                    );
-                    if let Some(n2) = next2
-                        && n2.match_len > b.match_len + 1
-                    {
-                        break 'pick None;
-                    }
-                }
-                Some(b)
-            };
-            if let Some(candidate) = picked {
-                let start = $self.emit_candidate(
-                    $current_abs_start,
-                    &mut literals_start,
-                    candidate,
-                    $handle_sequence,
-                );
-                pos = start + candidate.match_len;
-                pos = $self.extend_with_repcode_after_match(
-                    $current_abs_start,
-                    $current_len,
-                    pos,
-                    &mut literals_start,
-                    $handle_sequence,
-                );
-                skip_step = 1;
-                next_skip_growth_pos = pos + DFAST_SKIP_STEP_GROWTH_INTERVAL;
-                miss_run = 0;
-            } else {
-                $self.insert_position(abs_pos);
-                miss_run += 1;
-                let use_local_adaptive_skip = miss_run >= DFAST_LOCAL_SKIP_TRIGGER;
-                if use_adaptive_skip || use_local_adaptive_skip {
-                    let skip_cap = if use_adaptive_skip {
-                        DFAST_MAX_SKIP_STEP
-                    } else {
-                        2
-                    };
-                    if pos >= next_skip_growth_pos {
-                        skip_step = (skip_step + 1).min(skip_cap);
-                        next_skip_growth_pos += DFAST_SKIP_STEP_GROWTH_INTERVAL;
-                    }
-                    pos += skip_step;
-                } else {
-                    pos += 1;
-                }
-            }
-        }
-
-        $self.seed_remaining_hashable_starts($current_abs_start, $current_len, pos);
-        $self.emit_trailing_literals(literals_start, $handle_sequence);
-    }};
-}
-
 impl DfastMatchGenerator {
     // Keep a short dense tail at block boundaries for two related reasons:
     // 1) insert_position() needs short (4-byte) and long (8-byte) lookahead,
@@ -511,8 +160,6 @@ impl DfastMatchGenerator {
             position_base: 0,
             long_hash_bits: DFAST_HASH_BITS,
             short_hash_bits: DFAST_HASH_BITS - DFAST_SHORT_HASH_BITS_DELTA,
-            use_fast_loop: false,
-            lazy_depth: 1,
             dict: DictAttach::new(),
             kernel: select_kernel(),
         }
@@ -887,16 +534,6 @@ impl DfastMatchGenerator {
     /// without per-frame dict cost. Cached via the `DictAttach` primed flag.
     pub(crate) fn skip_matching_for_dict_attach(&mut self) {
         self.ensure_hash_tables();
-        // The dual-probe lives only in `start_matching_fast_loop`. The general
-        // path (L1/L2/L4) has no dict probe, so for those levels prime the dict
-        // into the LIVE tables (`skip_matching_dense`), where the dense scan
-        // finds it — keeping the attach win to the fast-loop levels (L3 /
-        // Default / L0) without regressing general-path dict ratio.
-        if !self.use_fast_loop {
-            self.dict.invalidate();
-            self.skip_matching_dense();
-            return;
-        }
         let current_len = self.window_blocks.back().copied().unwrap_or(0);
         if current_len == 0 {
             return;
@@ -913,19 +550,8 @@ impl DfastMatchGenerator {
     /// Mark the dict tables fully built (CDict cache). The driver calls this
     /// after the final dictionary chunk so the next frame skips the re-hash.
     ///
-    /// Only the fast-loop path builds the immutable dict tables; the
-    /// general-path levels (L1/L2/L4) prime the dict into the LIVE tables and
-    /// `invalidate()` the attach cache (see [`Self::skip_matching_for_dict_attach`]),
-    /// leaving `self.dict.table()` empty. Gate on `use_fast_loop` so a
-    /// general-path frame can never flip the primed flag, which would let a
-    /// later fast-loop frame short-circuit [`Self::prime_dict_tables_for_range`]
-    /// with no dict tables built. ([`DictAttach::mark_primed`] also self-guards
-    /// on `table.is_some()`, so this is belt-and-suspenders making the
-    /// precondition explicit at the call site.)
     pub(crate) fn mark_dict_primed(&mut self) {
-        if self.use_fast_loop {
-            self.dict.mark_primed();
-        }
+        self.dict.mark_primed();
     }
 
     /// Drop the cached dict tables (next frame carries no dict, or eviction /
@@ -954,9 +580,9 @@ impl DfastMatchGenerator {
         let long_bits = self.long_hash_bits;
         let short_bits = self.short_hash_bits;
         // Lookahead-safe cutoffs within the concat: long needs 8 readable
-        // bytes, short needs 4 (donor parity with `insert_positions`).
+        // bytes, short needs 5 (donor `mls = 5` for the short hash).
         let long_safe_end = concat_len.saturating_sub(7).min(end_concat);
-        let short_safe_end = concat_len.saturating_sub(3).min(end_concat);
+        let short_safe_end = concat_len.saturating_sub(4).min(end_concat);
         if start_concat >= short_safe_end {
             return;
         }
@@ -1005,8 +631,13 @@ impl DfastMatchGenerator {
         while pos < short_safe_end {
             unsafe {
                 let load_ptr = base.add(history_start + pos);
-                let v4 = (load_ptr as *const u32).read_unaligned() as u64;
-                let short_idx = (v4.wrapping_mul(PRIME) >> short_shift) as usize;
+                // 5-byte short key (donor `mls = 5`), assembled from a 4-byte
+                // load + 1 byte so it never over-reads the <8-byte tail; the
+                // low 5 bytes land in bits 24..63, matching `v8 << 24`.
+                let lo4 = (load_ptr as *const u32).read_unaligned() as u64;
+                let b5 = *load_ptr.add(4) as u64;
+                let v5 = (lo4 | (b5 << 32)) << 24;
+                let short_idx = (v5.wrapping_mul(PRIME) >> short_shift) as usize;
                 *short_ptr.add(short_idx) = (pos as u32) + 1;
             }
             pos += 1;
@@ -1022,180 +653,22 @@ impl DfastMatchGenerator {
         }
 
         let current_abs_start = self.history_abs_start + self.window_size - current_len;
-        if self.use_fast_loop {
-            self.start_matching_fast_loop(current_abs_start, current_len, &mut handle_sequence);
-            return;
+        // Re-seed the previous block's seam. With the donor 5-byte short hash,
+        // a position within `mls - 1` bytes of the prior block end could not
+        // form its full key when that block was processed (the trailing bytes
+        // arrived with THIS block); re-hash that tail now that history spans
+        // it, so cross-block matches anchored in the seam are found. Mirrors
+        // `skip_matching_dense`'s backfill.
+        let backfill_start = current_abs_start
+            .saturating_sub(Self::BOUNDARY_DENSE_TAIL_LEN)
+            .max(self.history_abs_start);
+        if backfill_start < current_abs_start {
+            self.insert_positions(backfill_start, current_abs_start);
         }
-        self.start_matching_general(current_abs_start, current_len, &mut handle_sequence);
-    }
-
-    /// Dispatcher for the per-kernel lazy `start_matching_general` loop:
-    /// resolve the tier ONCE per block via `select_kernel()` and call the
-    /// matching `start_matching_general_<kernel>` wrapper, so the entire
-    /// per-position match search (repcode + hash probe + every
-    /// `common_prefix_len_ptr` scan) inlines under one `#[target_feature]`
-    /// umbrella with no per-position dispatch or ABI-crossing call. Mirrors
-    /// `start_matching_fast_loop`. The loop's safety invariants (block-local
-    /// arithmetic bounded by `current_len`; absolute-position arithmetic gated
-    /// upstream by `check_stream_abs_headroom`) are documented on the body
-    /// macro `dfast_start_matching_general_body!` callers below.
-    fn start_matching_general(
-        &mut self,
-        current_abs_start: usize,
-        current_len: usize,
-        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
-    ) {
-        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-        unsafe {
-            self.start_matching_general_neon(current_abs_start, current_len, handle_sequence)
-        }
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
-            match select_kernel() {
-                FastpathKernel::Avx2Bmi2 => unsafe {
-                    self.start_matching_general_avx2_bmi2(
-                        current_abs_start,
-                        current_len,
-                        handle_sequence,
-                    )
-                },
-                FastpathKernel::Sse42 => unsafe {
-                    self.start_matching_general_sse42(
-                        current_abs_start,
-                        current_len,
-                        handle_sequence,
-                    )
-                },
-                FastpathKernel::Scalar => self.start_matching_general_scalar(
-                    current_abs_start,
-                    current_len,
-                    handle_sequence,
-                ),
-            }
-        }
-        #[cfg(all(
-            target_arch = "wasm32",
-            target_feature = "simd128",
-            feature = "kernel_simd128"
-        ))]
-        unsafe {
-            self.start_matching_general_simd128(current_abs_start, current_len, handle_sequence)
-        }
-        #[cfg(not(any(
-            all(target_arch = "aarch64", target_endian = "little"),
-            target_arch = "x86",
-            target_arch = "x86_64",
-            all(
-                target_arch = "wasm32",
-                target_feature = "simd128",
-                feature = "kernel_simd128"
-            )
-        )))]
-        {
-            self.start_matching_general_scalar(current_abs_start, current_len, handle_sequence)
-        }
-    }
-
-    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-    #[target_feature(enable = "neon")]
-    unsafe fn start_matching_general_neon(
-        &mut self,
-        current_abs_start: usize,
-        current_len: usize,
-        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
-    ) {
-        dfast_start_matching_general_body!(
-            self,
-            current_abs_start,
-            current_len,
-            handle_sequence,
-            repcode_candidate_neon,
-            hash_candidate_neon
-        )
-    }
-
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[target_feature(enable = "sse4.2")]
-    unsafe fn start_matching_general_sse42(
-        &mut self,
-        current_abs_start: usize,
-        current_len: usize,
-        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
-    ) {
-        dfast_start_matching_general_body!(
-            self,
-            current_abs_start,
-            current_len,
-            handle_sequence,
-            repcode_candidate_sse42,
-            hash_candidate_sse42
-        )
-    }
-
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[target_feature(enable = "avx2,bmi2")]
-    unsafe fn start_matching_general_avx2_bmi2(
-        &mut self,
-        current_abs_start: usize,
-        current_len: usize,
-        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
-    ) {
-        dfast_start_matching_general_body!(
-            self,
-            current_abs_start,
-            current_len,
-            handle_sequence,
-            repcode_candidate_avx2_bmi2,
-            hash_candidate_avx2_bmi2
-        )
-    }
-
-    #[cfg(all(
-        target_arch = "wasm32",
-        target_feature = "simd128",
-        feature = "kernel_simd128"
-    ))]
-    #[target_feature(enable = "simd128")]
-    unsafe fn start_matching_general_simd128(
-        &mut self,
-        current_abs_start: usize,
-        current_len: usize,
-        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
-    ) {
-        dfast_start_matching_general_body!(
-            self,
-            current_abs_start,
-            current_len,
-            handle_sequence,
-            repcode_candidate_simd128,
-            hash_candidate_simd128
-        )
-    }
-
-    #[cfg(not(any(
-        all(target_arch = "aarch64", target_endian = "little"),
-        all(
-            target_arch = "wasm32",
-            target_feature = "simd128",
-            feature = "kernel_simd128"
-        )
-    )))]
-    #[allow(unused_unsafe)]
-    fn start_matching_general_scalar(
-        &mut self,
-        current_abs_start: usize,
-        current_len: usize,
-        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
-    ) {
-        dfast_start_matching_general_body!(
-            self,
-            current_abs_start,
-            current_len,
-            handle_sequence,
-            repcode_candidate_scalar,
-            hash_candidate_scalar
-        )
+        // dfast is the donor's greedy double-fast at every level (no lazy
+        // variant exists — lazy parsing is the separate `ZSTD_lazy`/`lazy2`
+        // strategy), so there is a single match path.
+        self.start_matching_fast_loop(current_abs_start, current_len, &mut handle_sequence);
     }
 
     /// Single-cursor probe at the last hashable position in the
@@ -1638,334 +1111,6 @@ impl DfastMatchGenerator {
         self.history_abs_start + self.live_history().len()
     }
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[target_feature(enable = "avx2,bmi2")]
-    unsafe fn repcode_candidate_avx2_bmi2(
-        &self,
-        abs_pos: usize,
-        lit_len: usize,
-    ) -> Option<MatchCandidate> {
-        dfast_repcode_candidate_body!(
-            self,
-            abs_pos,
-            lit_len,
-            crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr
-        )
-    }
-
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[target_feature(enable = "sse4.2")]
-    unsafe fn repcode_candidate_sse42(
-        &self,
-        abs_pos: usize,
-        lit_len: usize,
-    ) -> Option<MatchCandidate> {
-        dfast_repcode_candidate_body!(
-            self,
-            abs_pos,
-            lit_len,
-            crate::encoding::fastpath::sse42::common_prefix_len_ptr
-        )
-    }
-
-    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-    #[target_feature(enable = "neon")]
-    unsafe fn repcode_candidate_neon(
-        &self,
-        abs_pos: usize,
-        lit_len: usize,
-    ) -> Option<MatchCandidate> {
-        dfast_repcode_candidate_body!(
-            self,
-            abs_pos,
-            lit_len,
-            crate::encoding::fastpath::neon::common_prefix_len_ptr
-        )
-    }
-
-    #[cfg(all(
-        target_arch = "wasm32",
-        target_feature = "simd128",
-        feature = "kernel_simd128"
-    ))]
-    #[target_feature(enable = "simd128")]
-    unsafe fn repcode_candidate_simd128(
-        &self,
-        abs_pos: usize,
-        lit_len: usize,
-    ) -> Option<MatchCandidate> {
-        dfast_repcode_candidate_body!(
-            self,
-            abs_pos,
-            lit_len,
-            crate::encoding::fastpath::simd128::common_prefix_len_ptr
-        )
-    }
-
-    // Scalar tier: no target feature, so `unsafe` here is only the inner SIMD-
-    // free `$cpl` (scalar `common_prefix_len_ptr`); the `unsafe fn` keeps a
-    // uniform call shape across tiers for the `start_matching_general` body.
-    // Gated like `start_matching_general_scalar` (its only caller): on aarch64
-    // the lazy loop always dispatches to the neon tier, and on wasm+simd128 to
-    // the simd128 tier, so the scalar candidates would be dead there.
-    #[cfg(not(any(
-        all(target_arch = "aarch64", target_endian = "little"),
-        all(
-            target_arch = "wasm32",
-            target_feature = "simd128",
-            feature = "kernel_simd128"
-        )
-    )))]
-    #[allow(unused_unsafe)]
-    unsafe fn repcode_candidate_scalar(
-        &self,
-        abs_pos: usize,
-        lit_len: usize,
-    ) -> Option<MatchCandidate> {
-        dfast_repcode_candidate_body!(
-            self,
-            abs_pos,
-            lit_len,
-            crate::encoding::fastpath::scalar::common_prefix_len_ptr
-        )
-    }
-
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[target_feature(enable = "avx2,bmi2")]
-    unsafe fn hash_candidate_avx2_bmi2(
-        &self,
-        abs_pos: usize,
-        lit_len: usize,
-    ) -> Option<MatchCandidate> {
-        dfast_hash_candidate_body!(self, abs_pos, lit_len, probe_slot_match_avx2_bmi2)
-    }
-
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[target_feature(enable = "sse4.2")]
-    unsafe fn hash_candidate_sse42(
-        &self,
-        abs_pos: usize,
-        lit_len: usize,
-    ) -> Option<MatchCandidate> {
-        dfast_hash_candidate_body!(self, abs_pos, lit_len, probe_slot_match_sse42)
-    }
-
-    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-    #[target_feature(enable = "neon")]
-    unsafe fn hash_candidate_neon(&self, abs_pos: usize, lit_len: usize) -> Option<MatchCandidate> {
-        dfast_hash_candidate_body!(self, abs_pos, lit_len, probe_slot_match_neon)
-    }
-
-    #[cfg(all(
-        target_arch = "wasm32",
-        target_feature = "simd128",
-        feature = "kernel_simd128"
-    ))]
-    #[target_feature(enable = "simd128")]
-    unsafe fn hash_candidate_simd128(
-        &self,
-        abs_pos: usize,
-        lit_len: usize,
-    ) -> Option<MatchCandidate> {
-        dfast_hash_candidate_body!(self, abs_pos, lit_len, probe_slot_match_simd128)
-    }
-
-    // Gated like `repcode_candidate_scalar` — see that fn's note.
-    #[cfg(not(any(
-        all(target_arch = "aarch64", target_endian = "little"),
-        all(
-            target_arch = "wasm32",
-            target_feature = "simd128",
-            feature = "kernel_simd128"
-        )
-    )))]
-    #[allow(unused_unsafe)]
-    unsafe fn hash_candidate_scalar(
-        &self,
-        abs_pos: usize,
-        lit_len: usize,
-    ) -> Option<MatchCandidate> {
-        dfast_hash_candidate_body!(self, abs_pos, lit_len, probe_slot_match_scalar)
-    }
-
-    /// Resolve a single packed-slot value against the live history and
-    /// return a backward-extended `MatchCandidate` if the bucket holds
-    /// a valid in-range position whose forward extension reaches at
-    /// least `DFAST_MIN_MATCH_LEN` bytes. Shared between the long-hash
-    /// primary probe, the short-hash primary probe, and the
-    /// `_search_next_long` retry — keeps the bounds-checking logic in
-    /// one place so the three call sites can't drift.
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[target_feature(enable = "avx2,bmi2")]
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn probe_slot_match_avx2_bmi2(
-        &self,
-        slot: u32,
-        position_base: usize,
-        history_abs_start: usize,
-        abs_pos: usize,
-        current_idx: usize,
-        concat: &[u8],
-        lit_len: usize,
-        gate_len: usize,
-    ) -> Option<MatchCandidate> {
-        dfast_probe_slot_match_body!(
-            self,
-            slot,
-            position_base,
-            history_abs_start,
-            abs_pos,
-            current_idx,
-            concat,
-            lit_len,
-            gate_len,
-            crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr
-        )
-    }
-
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[target_feature(enable = "sse4.2")]
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn probe_slot_match_sse42(
-        &self,
-        slot: u32,
-        position_base: usize,
-        history_abs_start: usize,
-        abs_pos: usize,
-        current_idx: usize,
-        concat: &[u8],
-        lit_len: usize,
-        gate_len: usize,
-    ) -> Option<MatchCandidate> {
-        dfast_probe_slot_match_body!(
-            self,
-            slot,
-            position_base,
-            history_abs_start,
-            abs_pos,
-            current_idx,
-            concat,
-            lit_len,
-            gate_len,
-            crate::encoding::fastpath::sse42::common_prefix_len_ptr
-        )
-    }
-
-    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-    #[target_feature(enable = "neon")]
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn probe_slot_match_neon(
-        &self,
-        slot: u32,
-        position_base: usize,
-        history_abs_start: usize,
-        abs_pos: usize,
-        current_idx: usize,
-        concat: &[u8],
-        lit_len: usize,
-        gate_len: usize,
-    ) -> Option<MatchCandidate> {
-        dfast_probe_slot_match_body!(
-            self,
-            slot,
-            position_base,
-            history_abs_start,
-            abs_pos,
-            current_idx,
-            concat,
-            lit_len,
-            gate_len,
-            crate::encoding::fastpath::neon::common_prefix_len_ptr
-        )
-    }
-
-    #[cfg(all(
-        target_arch = "wasm32",
-        target_feature = "simd128",
-        feature = "kernel_simd128"
-    ))]
-    #[target_feature(enable = "simd128")]
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn probe_slot_match_simd128(
-        &self,
-        slot: u32,
-        position_base: usize,
-        history_abs_start: usize,
-        abs_pos: usize,
-        current_idx: usize,
-        concat: &[u8],
-        lit_len: usize,
-        gate_len: usize,
-    ) -> Option<MatchCandidate> {
-        dfast_probe_slot_match_body!(
-            self,
-            slot,
-            position_base,
-            history_abs_start,
-            abs_pos,
-            current_idx,
-            concat,
-            lit_len,
-            gate_len,
-            crate::encoding::fastpath::simd128::common_prefix_len_ptr
-        )
-    }
-
-    // Only `hash_candidate_scalar` calls this, and that wrapper is gated out on
-    // aarch64 (neon tier) and wasm+simd128 (simd128 tier), so the scalar probe
-    // would be dead there too.
-    #[cfg(not(any(
-        all(target_arch = "aarch64", target_endian = "little"),
-        all(
-            target_arch = "wasm32",
-            target_feature = "simd128",
-            feature = "kernel_simd128"
-        )
-    )))]
-    #[allow(clippy::too_many_arguments)]
-    fn probe_slot_match_scalar(
-        &self,
-        slot: u32,
-        position_base: usize,
-        history_abs_start: usize,
-        abs_pos: usize,
-        current_idx: usize,
-        concat: &[u8],
-        lit_len: usize,
-        gate_len: usize,
-    ) -> Option<MatchCandidate> {
-        dfast_probe_slot_match_body!(
-            self,
-            slot,
-            position_base,
-            history_abs_start,
-            abs_pos,
-            current_idx,
-            concat,
-            lit_len,
-            gate_len,
-            crate::encoding::fastpath::scalar::common_prefix_len_ptr
-        )
-    }
-
-    #[inline(always)]
-    fn extend_backwards(
-        &self,
-        candidate_pos: usize,
-        abs_pos: usize,
-        match_len: usize,
-        lit_len: usize,
-    ) -> MatchCandidate {
-        extend_backwards_shared(
-            self.live_history(),
-            self.history_abs_start,
-            candidate_pos,
-            abs_pos,
-            match_len,
-            lit_len,
-        )
-    }
-
     pub(crate) fn insert_positions(&mut self, start: usize, end: usize) {
         let start = start.max(self.history_abs_start);
         let end = end.min(self.history_abs_end());
@@ -2011,7 +1156,7 @@ impl DfastMatchGenerator {
         // donor parity is "no insert" — skip entirely.
         let abs_concat_end = history_abs_start + concat_len;
         let long_safe_end = abs_concat_end.saturating_sub(7).min(end);
-        let short_safe_end = abs_concat_end.saturating_sub(3).min(end);
+        let short_safe_end = abs_concat_end.saturating_sub(4).min(end);
 
         // SAFETY: `history_base_ptr.add(history_start + idx)` is
         // in-bounds for `idx + 8 <= concat_len`, which the two
@@ -2048,8 +1193,12 @@ impl DfastMatchGenerator {
                 let idx = pos - history_abs_start;
                 let packed = ((pos - position_base) as u32) + 1;
                 let load_ptr = history_base_ptr.add(history_start + idx);
-                let v4 = (load_ptr as *const u32).read_unaligned() as u64;
-                let mixed_short = v4.wrapping_mul(0xCF1BBCDCB7A56463_u64);
+                // 5-byte short key (donor `mls = 5`): 4-byte load + 1 byte so
+                // the <8-byte tail is never over-read; low 5 bytes in bits
+                // 24..63 to match `v8 << 24`.
+                let lo4 = (load_ptr as *const u32).read_unaligned() as u64;
+                let b5 = *load_ptr.add(4) as u64;
+                let mixed_short = ((lo4 | (b5 << 32)) << 24).wrapping_mul(0xCF1BBCDCB7A56463_u64);
                 let short_idx = (mixed_short >> short_shift) as usize;
                 *short_hash_ptr.add(short_idx) = packed;
             }
@@ -3163,7 +2312,6 @@ mod extend_with_repcode_tests {
         // Window sized to the block so the matcher does not start
         // trimming history mid-test.
         let mut dfast = DfastMatchGenerator::new(data.len().next_power_of_two().max(64));
-        dfast.use_fast_loop = false; // exercise `start_matching_general`
         dfast.ensure_hash_tables();
         dfast.add_data(data.to_vec(), |_| {});
         dfast
@@ -3257,7 +2405,6 @@ mod extend_with_repcode_tests {
         let block_a: Vec<u8> = vec![b'C'; 64];
         let block_b: Vec<u8> = vec![b'C'; 32];
         let mut dfast = DfastMatchGenerator::new(256);
-        dfast.use_fast_loop = false;
         dfast.ensure_hash_tables();
         dfast.add_data(block_a, |_| {});
         dfast.add_data(block_b.clone(), |_| {});
@@ -3335,7 +2482,6 @@ mod extend_with_repcode_tests {
         let data: Vec<u8> = b"ABCD????ABCD!??????????ABCDX????".to_vec();
         assert_eq!(data.len(), 32, "fixture invariant: 32 bytes");
         let mut dfast = DfastMatchGenerator::new(64);
-        dfast.use_fast_loop = false;
         dfast.ensure_hash_tables();
         dfast.add_data(data.clone(), |_| {});
 
