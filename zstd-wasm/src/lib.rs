@@ -218,6 +218,30 @@ impl ZstdDecompressStream {
         }
     }
 
+    /// Open a streaming decompressor primed with a raw zstd dictionary blob
+    /// (`ZSTD_DCtx_loadDictionary`): `dict` must be the same dictionary the
+    /// frame was compressed with (e.g. via [`ZstdCompressStream`]'s
+    /// `withDictionary`). `checksum` behaves as in [`Self::new`]. Throws if the
+    /// dictionary is malformed.
+    #[wasm_bindgen(js_name = withDictionary)]
+    pub fn with_dictionary(
+        dict: &[u8],
+        checksum: Option<ContentChecksum>,
+    ) -> Result<ZstdDecompressStream, JsError> {
+        let mut decoder = FrameDecoder::new();
+        decoder.set_content_checksum(core_checksum(checksum));
+        decoder.add_dict_from_bytes(dict).map_err(|err| {
+            JsError::new(&format!("structured-zstd: invalid dictionary: {err:?}"))
+        })?;
+        Ok(ZstdDecompressStream {
+            decoder,
+            pending: Vec::new(),
+            header_done: false,
+            checksum: false,
+            finished: false,
+        })
+    }
+
     /// Feed more compressed bytes; returns whatever decompressed output is now
     /// available (possibly empty while a block is still incomplete).
     pub fn push(&mut self, chunk: &[u8]) -> Result<Vec<u8>, JsError> {
@@ -344,6 +368,31 @@ impl ZstdCompressStream {
         ZstdCompressStream {
             encoder: Some(encoder),
         }
+    }
+
+    /// Open a streaming compressor at `level` seeded with a raw zstd dictionary
+    /// blob (e.g. from `zstd --train`), mirroring `ZSTD_CCtx_loadDictionary` on
+    /// a streaming context: the dictionary primes the matcher and seeds the
+    /// first block's entropy + repeat offsets, and its ID is written into the
+    /// frame header. Decode the produced frames with [`ZstdDecompressStream`]
+    /// opened via its matching `withDictionary` constructor (or the one-shot
+    /// `decompressUsingDict`). Throws if the dictionary is invalid.
+    #[wasm_bindgen(js_name = withDictionary)]
+    pub fn with_dictionary(
+        level: i32,
+        dict: &[u8],
+        checksum: Option<bool>,
+    ) -> Result<ZstdCompressStream, JsError> {
+        let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Level(level));
+        encoder
+            .set_content_checksum(checksum.unwrap_or(false))
+            .expect("fresh streaming encoder accepts the content-checksum toggle");
+        encoder.set_dictionary_from_bytes(dict).map_err(|err| {
+            JsError::new(&format!("structured-zstd: invalid dictionary: {err:?}"))
+        })?;
+        Ok(ZstdCompressStream {
+            encoder: Some(encoder),
+        })
     }
 
     /// Feed more plaintext; returns whatever compressed bytes are now complete
