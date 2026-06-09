@@ -1988,30 +1988,28 @@ macro_rules! start_matching_fast_loop_body {
 
                 // Long match check at ip0 with idxl0. 8-byte equality
                 // gate (`MEM_read64`) — if it passes, candidate is real.
-                {
-                    // Branchless validity (donor `ZSTD_selectAddr`/cmov): fold
-                    // the slot-empty / out-of-window / past-cursor checks into a
-                    // bitwise `in_long` mask, then mask the candidate index to 0
-                    // (history start, always readable) when invalid so the 8-byte
-                    // load never faults and is never a real candidate. The only
-                    // remaining branch is the rare actual-match `& in_long`,
-                    // which is predictable — this removes the per-position
-                    // validity mispredict that dominated the hot loop.
-                    let cand_pos = position_base.wrapping_add((idxl0 as usize).wrapping_sub(1));
-                    let in_long = (idxl0 != DFAST_EMPTY_SLOT)
-                        & (cand_pos >= history_abs_start)
-                        & (cand_pos < abs_ip0);
-                    let cand_idx =
-                        cand_pos.wrapping_sub(history_abs_start) & (in_long as usize).wrapping_neg();
-                    // SAFETY: `cand_idx` is either a valid in-window concat index
-                    // (when `in_long`) or 0; both leave the 8-byte load inside
-                    // live history (same buffer/length bounds as `v8_0`).
-                    let cand_v8 = unsafe {
-                        (history_base_ptr.add(history_start_offset + cand_idx) as *const u64)
-                            .read_unaligned()
-                    };
-                    if cand_v8 == v8_0 && in_long {
-                        {
+                //
+                // Branchy validity rather than a branchless `in_long` mask: the
+                // slot-populated / in-window / before-cursor checks are highly
+                // predictable once the table is warm, so the branch predictor
+                // speculates the hot 8-byte candidate load past them. A
+                // branchless mask instead makes the load ADDRESS depend on the
+                // mask (`cand_idx &= -(in_long)`), serialising the loop's single
+                // hottest instruction (~13% self-time on z000033) behind the
+                // mask — a stall the predictor cannot hide.
+                if idxl0 != DFAST_EMPTY_SLOT {
+                    let cand_pos = position_base + ((idxl0 as usize) - 1);
+                    if cand_pos >= history_abs_start && cand_pos < abs_ip0 {
+                        let cand_idx = cand_pos - history_abs_start;
+                        // SAFETY: the bounds above make `cand_idx` a valid
+                        // in-window concat index, so the 8-byte load stays in
+                        // live history (same buffer/length bounds as `v8_0`).
+                        let cand_v8 = unsafe {
+                            (history_base_ptr.add(history_start_offset + cand_idx) as *const u64)
+                                .read_unaligned()
+                        };
+                        if cand_v8 == v8_0 {
+                            {
                             // 8 bytes match; count forward + extend back.
                             let mut match_len = 8usize;
                             let max_fwd = concat_len.saturating_sub(concat_idx0 + 8);
@@ -2049,6 +2047,7 @@ macro_rules! start_matching_fast_loop_body {
                             );
                             break 'inner InnerExit::Committed(cand);
                         }
+                    }
                     }
                 }
 
@@ -2126,23 +2125,21 @@ macro_rules! start_matching_fast_loop_body {
                 // Short match check at ip0 with idxs0 — 4-byte gate
                 // ONLY (donor `zstd_double_fast.c:220`). Forward count
                 // and `_search_next_long` retry happen ONLY on hit.
-                {
-                    // Branchless validity (same `ZSTD_selectAddr`/cmov shape as
-                    // the long check above): fold into `in_short`, mask the index
-                    // to 0 when invalid so the 4-byte load never faults, reject
-                    // the dummy read with `& in_short`.
-                    let cand_pos_s = position_base.wrapping_add((idxs0 as usize).wrapping_sub(1));
-                    let in_short = (idxs0 != DFAST_EMPTY_SLOT)
-                        & (cand_pos_s >= history_abs_start)
-                        & (cand_pos_s < abs_ip0);
-                    let cand_idx_s = cand_pos_s.wrapping_sub(history_abs_start)
-                        & (in_short as usize).wrapping_neg();
-                    let cand4 = unsafe {
-                        (history_base_ptr.add(history_start_offset + cand_idx_s) as *const u32)
-                            .read_unaligned()
-                    };
-                    if cand4 == v4_0 as u32 && in_short {
-                        {
+                // Branchy validity, same shape as the ip1 long retry below:
+                // the slot-populated / in-window / before-cursor checks are
+                // predictable after warmup, so the predictor speculates the
+                // 4-byte candidate load past them. A branchless mask would tie
+                // the load address to the mask, serialising it.
+                if idxs0 != DFAST_EMPTY_SLOT {
+                    let cand_pos_s = position_base + ((idxs0 as usize) - 1);
+                    if cand_pos_s >= history_abs_start && cand_pos_s < abs_ip0 {
+                        let cand_idx_s = cand_pos_s - history_abs_start;
+                        let cand4 = unsafe {
+                            (history_base_ptr.add(history_start_offset + cand_idx_s) as *const u32)
+                                .read_unaligned()
+                        };
+                        if cand4 == v4_0 as u32 {
+                            {
                             // Short hit: count forward from byte 4 onwards.
                             let mut s_match_len = 4usize;
                             let max_fwd = concat_len.saturating_sub(concat_idx0 + 4);
@@ -2340,6 +2337,7 @@ macro_rules! start_matching_fast_loop_body {
                             // worse than emitting the 4 bytes as
                             // literals).
                         }
+                    }
                     }
                 }
 
