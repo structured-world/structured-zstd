@@ -693,6 +693,71 @@ const LEVEL_TABLE: [LevelParams; 22] = [
     /*22 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, search: super::strategy::SearchMethod::BinaryTree, window_log: 27, lazy_depth: 2, fast: None, dfast: None, hc: Some(BTULTRA2_HC_CONFIG_L22), row: None },
 ];
 
+/// Donor `minSrcSize` assumption when building a dictionary's prepared cParams
+/// with an unknown source (`zstd_compress.c` `ZSTD_adjustCParams_internal`,
+/// `ZSTD_cpm_createCDict`: `if (dictSize && srcSize == UNKNOWN) srcSize =
+/// minSrcSize` where `minSrcSize = (1<<9) + 1`). Used by [`cdict_table_logs`].
+const DICT_MIN_SRC_SIZE: u64 = 513;
+
+/// Donor `ZSTD_dictAndWindowLog` (`zstd_compress.c`): the window log large
+/// enough to address both the source and the dictionary, used when downsizing
+/// the hash / chain logs for a dictionary-bearing compress. `window_log` is the
+/// (already source-clamped) compress window; `src_size` / `dict_size` are the
+/// assumed source and the dictionary length.
+fn dict_and_window_log(window_log: u8, src_size: u64, dict_size: u64) -> u32 {
+    if dict_size == 0 {
+        return window_log as u32;
+    }
+    let window_size: u64 = 1u64 << window_log;
+    let dict_and_window = dict_size.saturating_add(window_size);
+    if window_size >= dict_size.saturating_add(src_size) {
+        // Window already covers source + dictionary.
+        window_log as u32
+    } else {
+        // ceil(log2(dictAndWindowSize)) = highbit32(x - 1) + 1.
+        source_size_ceil_log(dict_and_window) as u32
+    }
+}
+
+/// Donor `ZSTD_createCDict` table geometry: the `(hash_log, chain_log)` a
+/// dictionary's prepared match-finder tables get, mirroring
+/// `ZSTD_adjustCParams_internal` under `ZSTD_cpm_createCDict`. A dictionary
+/// supplies the long matches, so donor downsizes the table widths toward the
+/// dict-and-window log (assuming a `minSrcSize` source) while the live window
+/// stays source-sized. `window_log` is the resolved compress window; `hash_log`
+/// / `chain_log` are the level's own widths; `uses_bt` selects the binary-tree
+/// `cycleLog` (`chainLog - 1`) vs the hash-chain one (`chainLog`).
+fn cdict_table_logs(
+    window_log: u8,
+    hash_log: usize,
+    chain_log: usize,
+    uses_bt: bool,
+    dict_size: usize,
+) -> (usize, usize) {
+    let dict_size = dict_size as u64;
+    // createCDict assumes a minSrcSize source when the real size is unknown.
+    let src_size = DICT_MIN_SRC_SIZE;
+    // Source-size window resize (donor caps windowLog by ceil_log2(src+dict)).
+    let tsize = src_size.saturating_add(dict_size);
+    let resized_window_log = (window_log as u32)
+        .min(source_size_ceil_log(tsize) as u32)
+        .max(1);
+    let daw = dict_and_window_log(resized_window_log as u8, src_size, dict_size);
+    // `ZSTD_cycleLog(chainLog, strategy)`: chainLog - 1 for binary-tree finders.
+    let cycle_log = (chain_log as u32).saturating_sub(uses_bt as u32);
+    let new_hash_log = if hash_log as u32 > daw + 1 {
+        (daw + 1) as usize
+    } else {
+        hash_log
+    };
+    let new_chain_log = if cycle_log > daw {
+        chain_log.saturating_sub((cycle_log - daw) as usize)
+    } else {
+        chain_log
+    };
+    (new_hash_log, new_chain_log)
+}
+
 /// Smallest window_log the encoder will use regardless of source size.
 pub(crate) const MIN_WINDOW_LOG: u8 = 10;
 /// Conservative floor for source-size-hinted window tuning.
@@ -958,6 +1023,16 @@ enum MatcherStorage {
 }
 
 impl MatcherStorage {
+    /// Heap bytes the active backend variant holds (tables, history, scratch).
+    fn heap_size(&self) -> usize {
+        match self {
+            Self::Simple(m) => m.heap_size(),
+            Self::Dfast(m) => m.heap_size(),
+            Self::Row(m) => m.heap_size(),
+            Self::HashChain(m) => m.heap_size(),
+        }
+    }
+
     /// [`super::strategy::BackendTag`] family of the active variant.
     fn backend(&self) -> super::strategy::BackendTag {
         use super::strategy::BackendTag;
@@ -1022,6 +1097,14 @@ pub struct MatchGeneratorDriver {
     dictionary_retained_budget: usize,
     // Source size hint for next frame (set via set_source_size_hint, cleared on reset).
     source_size_hint: Option<u64>,
+    // Dictionary content size for the next frame (set via set_dictionary_size_hint,
+    // consumed on reset). When present on a binary-tree / hash-chain backend, the
+    // match-finder hash/chain tables are sized from the DICTIONARY (donor CDict
+    // economics: a loaded dictionary supplies the long matches, so the live tables
+    // can shrink to the dict's size tier) while the eviction window stays
+    // source-sized. Mirrors donor `ZSTD_getCParamRowSize`, which picks the cParams
+    // table column from `dictSize` for a dictionary-bearing compress.
+    dictionary_size_hint: Option<usize>,
     // Normalized `ceil_log2` bucket of the frame's source-size hint, captured at
     // `reset` (where `source_size_hint` is consumed) via [`source_size_ceil_log`].
     // `None` means the frame was unhinted. Drives `prime_with_dictionary`'s donor
@@ -1202,6 +1285,7 @@ impl MatchGeneratorDriver {
             reset_shape: None,
             dictionary_retained_budget: 0,
             source_size_hint: None,
+            dictionary_size_hint: None,
             borrowed_pending: None,
             primed: None,
         }
@@ -1568,12 +1652,31 @@ impl Matcher for MatchGeneratorDriver {
         self.source_size_hint = Some(size);
     }
 
+    fn set_dictionary_size_hint(&mut self, size: usize) {
+        self.dictionary_size_hint = Some(size);
+    }
+
+    /// Heap bytes this driver owns: the active backend's tables/history, the
+    /// recycled input-buffer pool, and the primed-dictionary snapshot (a cloned
+    /// backend kept for CDict-equivalent reuse). The inline struct itself is
+    /// accounted by the owner's `size_of`.
+    fn heap_size(&self) -> usize {
+        let pool: usize = self.vec_pool.capacity() * core::mem::size_of::<Vec<u8>>()
+            + self.vec_pool.iter().map(Vec::capacity).sum::<usize>();
+        let snapshot = self
+            .primed
+            .as_ref()
+            .map_or(0, |(storage, _, _)| storage.heap_size());
+        pool + self.storage.heap_size() + snapshot
+    }
+
     fn clear_param_overrides(&mut self) {
         self.param_overrides = None;
     }
 
     fn reset(&mut self, level: CompressionLevel) {
         let hint = self.source_size_hint.take();
+        let dict_hint = self.dictionary_size_hint.take();
         // Snapshot the hint's normalized ceil-log bucket for the primed-snapshot
         // key and prime_with_dictionary's attach/copy mode decision (the hint is
         // consumed here, but priming happens just after reset). Storing the
@@ -1637,6 +1740,63 @@ impl Matcher for MatchGeneratorDriver {
                 if let Some(window_log) = ov.window_log {
                     params.window_log = window_log;
                 }
+            }
+        }
+        // Dictionary-driven table sizing — parity with donor `ZSTD_createCDict`
+        // (`ZSTD_getCParams_internal(level, UNKNOWN, dictSize, ZSTD_cpm_createCDict)`
+        // → `ZSTD_adjustCParams_internal`). A loaded dictionary supplies the
+        // long-distance matches, so donor sizes the prepared match-finder tables
+        // to the DICTIONARY (assuming a `minSrcSize` source), not the live
+        // window: it downsizes `hashLog`/`chainLog` toward the dict-and-window
+        // log while leaving the frame's eviction `window_log` source-derived so
+        // the dictionary bytes stay referenceable (`ZSTD_resetCCtx_byCopyingCDict`
+        // copies the small CDict tables but keeps the source window). We apply
+        // the same downsizing to the level's own hc geometry and cap (min) so a
+        // dict never inflates the level tables. Only the binary-tree / hash-chain
+        // backend reads `hc.{hash,chain}_log`; Simple/Dfast/Row derive their
+        // widths from the source window in their `reset` arms.
+        // A zero-length dictionary is "no dictionary": running the CDict sizing
+        // path for `Some(0)` is not a no-op — `cdict_table_logs(.., 0)` still
+        // collapses the HC/BT tables toward the 513-byte donor tier via
+        // `DICT_MIN_SRC_SIZE`, tanking ratio/perf on the next frame. Priming
+        // already treats empty content as empty, so skip the downsizing here too.
+        if let Some(dict_size) = dict_hint.filter(|&size| size > 0) {
+            // Derive the dict-tier geometry from the level's FULL (un-source-capped)
+            // hc widths. `Self::level_params(level, hint)` already source-capped
+            // `params.hc`; feeding those capped widths into `cdict_table_logs` and
+            // then `.min()`-ing would double-cap, so on a small hinted source with a
+            // large dictionary the prepared tables collapse below what the dict needs
+            // — defeating the `ZSTD_createCDict` geometry this mirrors. Take the
+            // un-hinted base widths instead and assign the result directly:
+            // `cdict_table_logs` only ever downsizes, so it never exceeds the base
+            // level geometry, while the eviction `window_log` stays source-derived so
+            // the dictionary bytes remain referenceable. Active public-parameter
+            // overrides (#27) are applied to the base too, so a strategy override
+            // that routes onto HashChain/BinaryTree still gets dict-tier sizing and
+            // explicit hash/chain overrides feed through as the geometry ceiling.
+            let mut base_params = Self::level_params(level, None);
+            if let Some(ov) = self.param_overrides
+                && !ov.is_empty()
+            {
+                apply_param_overrides(&mut base_params, &ov);
+            }
+            if let (Some(hc), Some(base_hc)) = (params.hc.as_mut(), base_params.hc) {
+                let uses_bt = matches!(
+                    params.strategy_tag,
+                    super::strategy::StrategyTag::Btlazy2
+                        | super::strategy::StrategyTag::BtOpt
+                        | super::strategy::StrategyTag::BtUltra
+                        | super::strategy::StrategyTag::BtUltra2
+                );
+                let (dict_hash_log, dict_chain_log) = cdict_table_logs(
+                    params.window_log,
+                    base_hc.hash_log,
+                    base_hc.chain_log,
+                    uses_bt,
+                    dict_size,
+                );
+                hc.hash_log = dict_hash_log;
+                hc.chain_log = dict_chain_log;
             }
         }
         let next_backend = params.backend();
@@ -1856,6 +2016,16 @@ impl Matcher for MatchGeneratorDriver {
                     data.resize(data.capacity(), 0);
                     vec_pool.push(data);
                 });
+                // When the source size is known, pre-size the history mirror to
+                // the expected total (dictionary + payload) so per-block growth
+                // does not overshoot via Vec capacity doubling (donor sizes its
+                // window buffer exactly). Dominates peak once the match-finder
+                // tables are dictionary-tier-small. Unhinted streams skip this
+                // and keep doubling growth.
+                if let Some(src) = hint {
+                    let expected = (src as usize).saturating_add(dict_hint.unwrap_or(0));
+                    hc.table.reserve_history(expected);
+                }
             }
         }
         // LDM wiring (#27): attach (or clear) the long-distance-match
@@ -2116,12 +2286,39 @@ impl Matcher for MatchGeneratorDriver {
             fast_attach,
             ldm,
         };
-        let (storage, budget) = match &self.primed {
+        let (mut storage, budget) = match &self.primed {
             Some((storage, budget, captured_key)) if *captured_key == key => {
                 (storage.clone(), *budget)
             }
             _ => return false,
         };
+        // A binary-tree snapshot is stored WITHOUT its live hash / chain / hash3
+        // tables (they hold no dictionary entries — the dict lives in `dms` +
+        // history; see `capture_primed_dictionary`). Re-allocate them zeroed to
+        // the snapshot's geometry, exactly reproducing the post-prime state (all
+        // `HC_EMPTY`). This is a full storage replace, so no stale live-table
+        // entry from a prior frame can survive — `ensure_tables` only allocates
+        // when the length mismatches, so a full (HC / non-BT) snapshot whose
+        // tables are already present is left untouched.
+        if let MatcherStorage::HashChain(hc) = &mut storage {
+            hc.table.ensure_tables();
+        }
+        // The snapshot does not retain the LDM producer (it holds no dict state;
+        // see `capture_primed_dictionary`). Carry over the frame's freshly-reset
+        // producer — built this frame by `reset` with the same params the
+        // snapshot key pins, and empty (no input processed yet), so it is
+        // equivalent to the producer the snapshot was captured with.
+        #[cfg(feature = "hash")]
+        {
+            let fresh_ldm = if let MatcherStorage::HashChain(hc) = &mut self.storage {
+                hc.take_ldm_producer()
+            } else {
+                None
+            };
+            if let MatcherStorage::HashChain(hc) = &mut storage {
+                hc.set_ldm_producer(fresh_ldm);
+            }
+        }
         self.storage = storage;
         self.dictionary_retained_budget = budget;
         true
@@ -2140,7 +2337,51 @@ impl Matcher for MatchGeneratorDriver {
             fast_attach,
             ldm,
         };
-        self.primed = Some((self.storage.clone(), self.dictionary_retained_budget, key));
+        // Donor CDict-equivalent retained state. On the binary-tree backend the
+        // dictionary is decoupled into `dms` (the donor `dictMatchState`); the
+        // live hash / chain / hash3 tables carry NO dict entries at capture
+        // (`skip_matching_dict_bt` keeps the dict out of the live tree), so they
+        // are pure zeros. Storing them in the snapshot wastes the full table
+        // footprint (a second window-tier table set resident for the whole
+        // compress). Instead, move the live tables OUT of the working storage,
+        // clone only the dict-state (history + `dms` + window/offset/dict-limit),
+        // then move the live tables back — the snapshot keeps just what donor's
+        // CDict keeps, and `restore_primed_dictionary` re-allocates the zeroed
+        // live tables. HC / lazy levels keep the dict IN the live chain (no
+        // `dms`), so their snapshot must retain the full tables: full clone.
+        let bt_decoupled = matches!(
+            &self.storage,
+            MatcherStorage::HashChain(hc) if hc.table.uses_bt
+        );
+        if bt_decoupled {
+            let MatcherStorage::HashChain(hc) = &mut self.storage else {
+                unreachable!("bt_decoupled implies HashChain storage");
+            };
+            let hash_table = core::mem::take(&mut hc.table.hash_table);
+            let chain_table = core::mem::take(&mut hc.table.chain_table);
+            let hash3_table = core::mem::take(&mut hc.table.hash3_table);
+            // The LDM producer carries no dictionary state (LDM is not
+            // dict-primed; its hash table is empty at capture), so it is not
+            // retained either — `restore` reinstates the frame's freshly-reset
+            // producer. Take it out so the clone does not duplicate its table.
+            #[cfg(feature = "hash")]
+            let ldm_producer = hc.take_ldm_producer();
+            // Clone the dict-state-only storage (live tables now empty Vecs,
+            // LDM producer detached).
+            let snapshot = self.storage.clone();
+            // Move the live tables (and LDM producer) back into the working storage.
+            let MatcherStorage::HashChain(hc) = &mut self.storage else {
+                unreachable!("storage variant is stable across the take/put");
+            };
+            hc.table.hash_table = hash_table;
+            hc.table.chain_table = chain_table;
+            hc.table.hash3_table = hash3_table;
+            #[cfg(feature = "hash")]
+            hc.set_ldm_producer(ldm_producer);
+            self.primed = Some((snapshot, self.dictionary_retained_budget, key));
+        } else {
+            self.primed = Some((self.storage.clone(), self.dictionary_retained_budget, key));
+        }
     }
 
     fn invalidate_primed_dictionary(&mut self) {
@@ -2479,6 +2720,15 @@ pub(crate) enum HcBackend {
 }
 
 impl HcBackend {
+    /// Heap bytes held by the backend. `Hc` is zero-sized; `Bt` boxes a
+    /// `BtMatcher`, so count the boxed payload plus its own scratch heap.
+    fn heap_size(&self) -> usize {
+        match self {
+            Self::Hc => 0,
+            Self::Bt(bt) => core::mem::size_of::<super::bt::BtMatcher>() + bt.heap_size(),
+        }
+    }
+
     /// Mutable accessor on the BT matcher; panics if the active
     /// backend is `Hc`. The HC-or-Bt branches in orchestrator code use
     /// `let HcBackend::Bt(bt) = &self.backend` directly for readonly
@@ -4321,6 +4571,12 @@ macro_rules! bt_insert_and_collect_matches_body {
 pub(crate) use bt_insert_and_collect_matches_body;
 
 impl HcMatchGenerator {
+    /// Heap bytes this generator owns: the shared match table plus the BT
+    /// backend's optimal-parser / LDM scratch (the HC knobs are inline).
+    fn heap_size(&self) -> usize {
+        self.table.heap_size() + self.backend.heap_size()
+    }
+
     fn should_run_btultra2_seed_pass<S: super::strategy::Strategy>(
         &self,
         current_len: usize,
@@ -4453,6 +4709,20 @@ impl HcMatchGenerator {
     fn set_ldm_producer(&mut self, producer: Option<super::ldm::LdmProducer>) {
         if let HcBackend::Bt(bt) = &mut self.backend {
             bt.ldm_producer = producer;
+        }
+    }
+
+    /// Move the LDM producer out of the BT backend, leaving `None`. Used by the
+    /// dictionary snapshot path: the producer carries no dictionary state (LDM
+    /// is not dict-primed; its hash table is empty at capture), so it is not
+    /// retained in the snapshot — the working frame's freshly-reset producer is
+    /// reinstated on restore instead.
+    #[cfg(feature = "hash")]
+    fn take_ldm_producer(&mut self) -> Option<super::ldm::LdmProducer> {
+        if let HcBackend::Bt(bt) = &mut self.backend {
+            bt.ldm_producer.take()
+        } else {
+            None
         }
     }
 

@@ -23,6 +23,7 @@
 //! `no_std + alloc` surface lives in the pure-Rust [`codec`] crate this depends
 //! on; consumers wanting an embedded build link `codec` directly.
 
+mod cdict;
 mod context;
 mod dict;
 mod error;
@@ -35,6 +36,7 @@ mod tests;
 
 // The `extern "C"` entry points are exported by their `#[no_mangle]` symbols;
 // re-export the public types so rustdoc and in-crate tests can name them.
+pub use cdict::{ZSTD_CDict, ZSTD_DDict};
 pub use context::{ZSTD_CCtx, ZSTD_DCtx};
 pub use dict::ZDICT_params_t;
 pub use error::ZSTD_ErrorCode;

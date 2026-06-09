@@ -403,6 +403,16 @@ impl FastKernelMatcher {
         1u64 << self.window_log
     }
 
+    /// Heap bytes this matcher owns: the history buffer, the hash table, the
+    /// recycle/pending slots, and any attached dictionary hash table.
+    pub(crate) fn heap_size(&self) -> usize {
+        self.history.capacity()
+            + self.hash_table.heap_size()
+            + self.pending.as_ref().map_or(0, |v| v.capacity())
+            + self.recycled_space.as_ref().map_or(0, |v| v.capacity())
+            + self.dict.table().map_or(0, |t| t.heap_size())
+    }
+
     /// Flat byte view of the match window the kernel scans against.
     ///
     /// Single read accessor for the window storage so the storage

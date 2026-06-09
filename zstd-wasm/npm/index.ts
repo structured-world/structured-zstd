@@ -50,8 +50,16 @@ interface Payload {
     dict: Uint8Array,
     checksum?: ContentChecksum,
   ) => Uint8Array;
-  ZstdDecompressStream: new (checksum?: ContentChecksum) => DecompressStream;
-  ZstdCompressStream: new (level: number, checksum?: boolean) => CompressStream;
+  ZstdDecompressStream: (new (checksum?: ContentChecksum) => DecompressStream) & {
+    withDictionary: (dict: Uint8Array, checksum?: ContentChecksum) => DecompressStream;
+  };
+  ZstdCompressStream: (new (level: number, checksum?: boolean) => CompressStream) & {
+    withDictionary: (
+      level: number,
+      dict: Uint8Array,
+      checksum?: boolean,
+    ) => CompressStream;
+  };
 }
 
 /**
@@ -263,4 +271,39 @@ export async function createCompressStream(
 ): Promise<CompressStream> {
   loading ??= load();
   return new (await loading).ZstdCompressStream(level, checksum);
+}
+
+/**
+ * Create an incremental streaming compressor seeded with a raw zstd `dict`
+ * (e.g. from `zstd --train`), at `level`. Mirrors `ZSTD_CCtx_loadDictionary` on
+ * a streaming context: the dictionary primes the matcher and the first block's
+ * entropy, so small / similar payloads compress far better. Decode the produced
+ * frames with {@link createDecompressStreamWithDictionary} (same `dict`) or the
+ * one-shot {@link decompressUsingDict}. Rejects if the dictionary is invalid.
+ *
+ * @param checksum Defaults to `false`; pass `true` for a trailing XXH64 checksum.
+ */
+export async function createCompressStreamWithDictionary(
+  dict: Uint8Array,
+  level: number = DEFAULT_LEVEL,
+  checksum?: boolean,
+): Promise<CompressStream> {
+  loading ??= load();
+  return (await loading).ZstdCompressStream.withDictionary(level, dict, checksum);
+}
+
+/**
+ * Create an incremental streaming decompressor primed with a raw zstd `dict`.
+ * `dict` must be the same dictionary the frame was compressed with (e.g. via
+ * {@link createCompressStreamWithDictionary}). Mirrors
+ * `ZSTD_DCtx_loadDictionary`. Rejects if the dictionary is malformed.
+ *
+ * @param checksum Applies to the whole stream; see {@link createDecompressStream}.
+ */
+export async function createDecompressStreamWithDictionary(
+  dict: Uint8Array,
+  checksum?: ContentChecksum,
+): Promise<DecompressStream> {
+  loading ??= load();
+  return (await loading).ZstdDecompressStream.withDictionary(dict, checksum);
 }

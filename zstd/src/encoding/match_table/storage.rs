@@ -671,6 +671,44 @@ impl MatchTable {
     /// bytes, so the input buffer carries no live data. (Callers must
     /// therefore treat the callback as recycle-only, not as an eviction
     /// report; eviction bytes come from the `window_size` delta.)
+    /// Pre-size the contiguous `history` mirror to `expected_bytes` (capped to
+    /// the window eviction bound) so the per-block `add_data`
+    /// `extend_from_slice` growth does not overshoot through `Vec` capacity
+    /// doubling. Donor allocates its window buffer at `windowSize + blockSize`
+    /// exactly; left to `Vec` doubling, a ~1 MiB history lands in a 2 MiB
+    /// allocation — wasted peak that dominates once the match-finder tables are
+    /// dictionary-tier-small. Correctness-neutral: the mirror still grows on
+    /// demand if `expected_bytes` underestimates. Only worth calling when the
+    /// total is known (source-size hinted); an unhinted stream keeps doubling.
+    /// Heap bytes this table owns: history, the hash / hash3 / chain tables,
+    /// the chunk-length deque, and any attached immutable dictionary tables.
+    pub(crate) fn heap_size(&self) -> usize {
+        let u32_sz = core::mem::size_of::<u32>();
+        let usize_sz = core::mem::size_of::<usize>();
+        self.chunk_lens.capacity() * usize_sz
+            + self.history.capacity()
+            + (self.hash_table.capacity()
+                + self.hash3_table.capacity()
+                + self.chain_table.capacity())
+                * u32_sz
+            + self.dms.table().map_or(0, |t| {
+                (t.hash_table.capacity() + t.chain_table.capacity()) * u32_sz
+            })
+    }
+
+    pub(crate) fn reserve_history(&mut self, expected_bytes: usize) {
+        // Eviction keeps the live mirror within `max_window_size`; one pending
+        // block can sit on top before `add_data` rolls it out, so the tightest
+        // sufficient capacity is `max_window_size + MAX_BLOCK_SIZE`.
+        let cap = self
+            .max_window_size
+            .saturating_add(crate::common::MAX_BLOCK_SIZE as usize);
+        let want = expected_bytes.min(cap);
+        if want > self.history.capacity() {
+            self.history.reserve_exact(want - self.history.len());
+        }
+    }
+
     pub(crate) fn add_data(&mut self, data: Vec<u8>, mut reuse_space: impl FnMut(Vec<u8>)) {
         assert!(data.len() <= self.max_window_size);
         check_stream_abs_headroom(self.history_abs_start, self.window_size, data.len());

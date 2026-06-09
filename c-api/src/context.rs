@@ -19,7 +19,7 @@ use crate::ffi::{in_slice, out_slice};
 /// allocation failure. Unlike `Box::new`, this never aborts the host process on
 /// OOM, matching libzstd's `ZSTD_create*` NULL-on-failure contract. Pair every
 /// non-null result with [`free_boxed`].
-fn try_box<T>(value: T) -> *mut T {
+pub(crate) fn try_box<T>(value: T) -> *mut T {
     let layout = core::alloc::Layout::new::<T>();
     // Both context types own a `Vec` / `FrameDecoder`, so they are never
     // zero-sized and the allocator path always applies.
@@ -39,7 +39,7 @@ fn try_box<T>(value: T) -> *mut T {
 ///
 /// # Safety
 /// `ptr` must be a live, not-yet-freed pointer from [`try_box::<T>`], or `null`.
-unsafe fn free_boxed<T>(ptr: *mut T) {
+pub(crate) unsafe fn free_boxed<T>(ptr: *mut T) {
     if ptr.is_null() {
         return;
     }
@@ -53,16 +53,38 @@ unsafe fn free_boxed<T>(ptr: *mut T) {
 
 /// Opaque compression context. Carries a reusable output buffer so repeated
 /// `ZSTD_compressCCtx` calls amortise the destination allocation.
+///
+/// For the dictionary path ([`ZSTD_compress_usingCDict`](crate::cdict::ZSTD_compress_usingCDict))
+/// it also caches a [`FrameCompressor`] with the dictionary already attached,
+/// keyed by the `ZSTD_CDict`'s never-reused serial + level, so back-to-back
+/// compressions with the same `CDict` reuse the parsed dictionary + primed
+/// match-finder snapshot instead of re-parsing and re-priming each call (the
+/// encoder-side analogue of upstream's `ZSTD_CCtx_refCDict` reuse).
 #[allow(non_camel_case_types)]
 pub struct ZSTD_CCtx {
-    scratch: Vec<u8>,
+    pub(crate) scratch: Vec<u8>,
+    /// `FrameCompressor` with a dictionary attached, lazily built by the CDict
+    /// path. `None` until the first `ZSTD_compress_usingCDict`.
+    pub(crate) dict_compressor: Option<FrameCompressor>,
+    /// Identity of the `CDict` currently attached to `dict_compressor` (its
+    /// never-reused serial; `0` = none) plus the level it was built at, so a
+    /// different CDict or level rebuilds the cached compressor. Keyed by serial
+    /// rather than raw address so a freed-then-realloc'd handle can't alias.
+    pub(crate) dict_serial: u64,
+    pub(crate) dict_level: c_int,
 }
 
 /// Opaque decompression context. Wraps a reusable [`FrameDecoder`] so its
 /// internal buffers persist across `ZSTD_decompressDCtx` calls.
 #[allow(non_camel_case_types)]
 pub struct ZSTD_DCtx {
-    decoder: FrameDecoder,
+    pub(crate) decoder: FrameDecoder,
+    /// Identity of the `DDict` whose content was last loaded into `decoder`
+    /// (its never-reused serial; `0` = none), so repeated
+    /// `ZSTD_decompress_usingDDict` calls with the same DDict skip re-adding it.
+    /// Reset to `0` whenever `decoder` is replaced, so a fresh decoder is never
+    /// trusted to still hold the previously-loaded dictionary.
+    pub(crate) ddict_serial: u64,
 }
 
 /// `ZSTD_CCtx* ZSTD_createCCtx(void)`. Returns `NULL` on allocation failure
@@ -71,6 +93,9 @@ pub struct ZSTD_DCtx {
 pub extern "C" fn ZSTD_createCCtx() -> *mut ZSTD_CCtx {
     try_box(ZSTD_CCtx {
         scratch: Vec::new(),
+        dict_compressor: None,
+        dict_serial: 0,
+        dict_level: 0,
     })
 }
 
@@ -89,6 +114,12 @@ pub unsafe extern "C" fn ZSTD_freeCCtx(cctx: *mut ZSTD_CCtx) -> usize {
 /// `size_t ZSTD_sizeof_CCtx(const ZSTD_CCtx* cctx)` — current heap footprint,
 /// or 0 for `NULL`.
 ///
+/// Counts the inline struct, the reusable output `scratch`, and (after the
+/// first `ZSTD_compress_usingCDict`) the cached `dict_compressor`'s heap: its
+/// primed match-finder tables / history, the recycled-buffer pool, the
+/// dictionary snapshot, and the retained dictionary content. Matches upstream
+/// `ZSTD_sizeof_CCtx`, which includes the CDict-copied working tables.
+///
 /// # Safety
 /// `cctx` must be a live pointer from [`ZSTD_createCCtx`], or `NULL`.
 #[unsafe(no_mangle)]
@@ -97,7 +128,12 @@ pub unsafe extern "C" fn ZSTD_sizeof_CCtx(cctx: *const ZSTD_CCtx) -> usize {
         return 0;
     }
     let cctx = unsafe { &*cctx };
-    core::mem::size_of::<ZSTD_CCtx>() + cctx.scratch.capacity()
+    core::mem::size_of::<ZSTD_CCtx>()
+        + cctx.scratch.capacity()
+        + cctx
+            .dict_compressor
+            .as_ref()
+            .map_or(0, |enc| enc.heap_size())
 }
 
 /// `size_t ZSTD_compressCCtx(ZSTD_CCtx* cctx, void* dst, size_t dstCapacity,
@@ -147,6 +183,7 @@ pub unsafe extern "C" fn ZSTD_compressCCtx(
 pub extern "C" fn ZSTD_createDCtx() -> *mut ZSTD_DCtx {
     try_box(ZSTD_DCtx {
         decoder: FrameDecoder::new(),
+        ddict_serial: 0,
     })
 }
 
@@ -214,8 +251,12 @@ pub unsafe extern "C" fn ZSTD_decompressDCtx(
             // A panic mid-decode can leave the decoder's internal state
             // partially consumed; replace it with a fresh one (same as
             // ZSTD_createDCtx) so a later call on this reused DCtx starts clean
-            // instead of observing a broken invariant.
+            // instead of observing a broken invariant. The fresh decoder no
+            // longer holds any previously-loaded dictionary, so clear the DDict
+            // cache key too — otherwise the next ZSTD_decompress_usingDDict with
+            // the same handle would skip re-loading it and decode without it.
             dctx.decoder = FrameDecoder::new();
+            dctx.ddict_serial = 0;
             encode(ZSTD_ErrorCode::ZSTD_error_GENERIC)
         }
     }
