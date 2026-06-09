@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["zstd", "cli", "zstd-wasm"]
+members = ["zstd", "cli", "zstd-wasm", "c-api"]
 
 # Bench profile inherits from release but overrides LTO/codegen-units so
 # the perf measurement reflects full cross-crate inlining. We deliberately

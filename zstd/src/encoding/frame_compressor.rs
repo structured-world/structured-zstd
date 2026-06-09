@@ -1818,7 +1818,10 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(all(feature = "dict_builder", feature = "std"))]
+    // `format!` is used by ungated tests (e.g. the btlazy2 dict-reuse
+    // byte-identity test), so the import must not be feature-gated — under
+    // default features (no `dict_builder`) the gated form left `format!`
+    // unresolved when the test module is compiled.
     use alloc::format;
     use alloc::vec;
 

@@ -162,8 +162,9 @@ export async function init(): Promise<void> {
  * negatives for the ultra-fast tier; defaults to {@link DEFAULT_LEVEL}). The
  * frame decodes in any compliant zstd decoder, including the native C library.
  *
- * @param checksum Defaults to `true` (emit the trailing XXH64 content
- * checksum); pass `false` to omit it from the frame.
+ * @param checksum Defaults to `false` (no trailing checksum, matching
+ * libzstd's `ZSTD_c_checksumFlag = 0`); pass `true` to append the XXH64
+ * content checksum.
  */
 export async function compress(
   data: Uint8Array,
@@ -195,8 +196,9 @@ export async function decompress(
  * `ZSTD_compress_usingDict` — small, similar payloads compress far better.
  * Rejects if the dictionary is invalid.
  *
- * @param checksum Defaults to `true` (emit the trailing XXH64 content
- * checksum); pass `false` to omit it from the frame.
+ * @param checksum Defaults to `false` (no trailing checksum, matching
+ * libzstd's `ZSTD_c_checksumFlag = 0`); pass `true` to append the XXH64
+ * content checksum.
  */
 export async function compressUsingDict(
   data: Uint8Array,
@@ -251,8 +253,9 @@ export async function createDecompressStream(
  * decodes in any compliant zstd decoder. Symmetric with
  * {@link createDecompressStream}.
  *
- * @param checksum Defaults to `true` (seal the frame with a trailing XXH64
- * content checksum); pass `false` to omit it.
+ * @param checksum Defaults to `false` (no trailing checksum, matching
+ * libzstd's `ZSTD_c_checksumFlag = 0`); pass `true` to seal the frame with a
+ * trailing XXH64 content checksum.
  */
 export async function createCompressStream(
   level: number = DEFAULT_LEVEL,

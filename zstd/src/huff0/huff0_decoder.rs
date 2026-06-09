@@ -337,6 +337,17 @@ pub struct HuffmanTable {
 }
 
 impl HuffmanTable {
+    /// Heap bytes owned by this table (decode lookup table plus the
+    /// weight-decoding scratch vectors and the weight-stream FSE table).
+    pub fn heap_bytes(&self) -> usize {
+        self.packed_decode.capacity() * core::mem::size_of::<u16>()
+            + self.weights.capacity()
+            + self.bits.capacity()
+            + self.bit_ranks.capacity() * core::mem::size_of::<u32>()
+            + self.rank_indexes.capacity() * core::mem::size_of::<usize>()
+            + self.fse_table.heap_bytes()
+    }
+
     /// Create a new, empty table.
     pub fn new() -> HuffmanTable {
         HuffmanTable {
