@@ -1360,13 +1360,25 @@ impl MatchGeneratorDriver {
     /// reused for another frame.
     pub(crate) unsafe fn set_borrowed_window(&mut self, buffer: &[u8]) {
         // SAFETY: forwarded contract — caller upholds liveness/clear.
-        unsafe { self.simple_mut().set_borrowed_window(buffer) };
+        match self.active_backend() {
+            super::strategy::BackendTag::Simple => unsafe {
+                self.simple_mut().set_borrowed_window(buffer)
+            },
+            super::strategy::BackendTag::Dfast => unsafe {
+                self.dfast_matcher_mut().set_borrowed_window(buffer)
+            },
+            other => unreachable!("borrowed window only for Simple/Dfast backends, got {other:?}"),
+        }
     }
 
-    /// Clear the borrowed one-shot window, returning the Simple backend
+    /// Clear the borrowed one-shot window, returning the active backend
     /// to the owned `history` path.
     pub(crate) fn clear_borrowed_window(&mut self) {
-        self.simple_mut().clear_borrowed_window();
+        match self.active_backend() {
+            super::strategy::BackendTag::Simple => self.simple_mut().clear_borrowed_window(),
+            super::strategy::BackendTag::Dfast => self.dfast_matcher_mut().clear_borrowed_window(),
+            _ => {}
+        }
         self.borrowed_pending = None;
     }
 
@@ -1378,10 +1390,12 @@ impl MatchGeneratorDriver {
     /// block. See [`Matcher::start_matching`] /
     /// [`Matcher::skip_matching_with_hint`] on this type.
     pub(crate) fn set_borrowed_block(&mut self, block_start: usize, block_end: usize) {
-        assert_eq!(
-            self.active_backend(),
-            super::strategy::BackendTag::Simple,
-            "borrowed block staging is only valid for the Simple (Fast) backend",
+        assert!(
+            matches!(
+                self.active_backend(),
+                super::strategy::BackendTag::Simple | super::strategy::BackendTag::Dfast
+            ),
+            "borrowed block staging is only valid for the Simple (Fast) / Dfast backends",
         );
         assert!(
             block_start <= block_end,
@@ -1393,8 +1407,15 @@ impl MatchGeneratorDriver {
         // `collect_block_parts` BEFORE `start_matching` consumes the
         // stage, so the staged block (not the whole borrowed window) must
         // be reported now to keep the literal-buffer reservation right.
-        self.simple_mut()
-            .stage_borrowed_block(block_start, block_end);
+        match self.active_backend() {
+            super::strategy::BackendTag::Simple => self
+                .simple_mut()
+                .stage_borrowed_block(block_start, block_end),
+            super::strategy::BackendTag::Dfast => self
+                .dfast_matcher_mut()
+                .stage_borrowed_block(block_start, block_end),
+            _ => unreachable!(),
+        }
     }
 
     #[cfg(test)]
@@ -2573,8 +2594,17 @@ impl Matcher for MatchGeneratorDriver {
         // the Simple backend is instrumented (the gate guarantees it),
         // and the stage is consumed so the next block re-stages.
         if let Some((block_start, block_end)) = self.borrowed_pending.take() {
-            self.simple_mut()
-                .start_matching_borrowed(block_start, block_end, &mut handle_sequence);
+            match self.active_backend() {
+                super::strategy::BackendTag::Simple => self.simple_mut().start_matching_borrowed(
+                    block_start,
+                    block_end,
+                    &mut handle_sequence,
+                ),
+                super::strategy::BackendTag::Dfast => self
+                    .dfast_matcher_mut()
+                    .start_matching_borrowed(block_start, block_end, &mut handle_sequence),
+                other => unreachable!("borrowed scan only for Simple/Dfast, got {other:?}"),
+            }
             return;
         }
         // Decoupled parse×search dispatch (fires once per block). The
@@ -2643,8 +2673,17 @@ impl Matcher for MatchGeneratorDriver {
         // hashes on the dict-priming hint) with no owned-history append
         // and nothing to recycle. Stage is consumed.
         if let Some((block_start, block_end)) = self.borrowed_pending.take() {
-            self.simple_mut()
-                .skip_matching_borrowed(block_start, block_end, incompressible_hint);
+            match self.active_backend() {
+                super::strategy::BackendTag::Simple => self.simple_mut().skip_matching_borrowed(
+                    block_start,
+                    block_end,
+                    incompressible_hint,
+                ),
+                super::strategy::BackendTag::Dfast => self
+                    .dfast_matcher_mut()
+                    .skip_matching_borrowed(block_start, block_end, incompressible_hint),
+                other => unreachable!("borrowed skip only for Simple/Dfast, got {other:?}"),
+            }
             return;
         }
         match self.active_backend() {
@@ -5836,24 +5875,30 @@ fn dfast_matches_roundtrip_multi_block_pattern() {
 #[test]
 fn dfast_accepts_exact_five_byte_match() {
     // Layout the input so that:
-    //   bytes 0..5   = "ABCDE"        (the match source)
-    //   bytes 5..28  = 23 filler bytes that do NOT start with 'A'
-    //   bytes 28..33 = "ABCDE"        (the 5-byte match site)
-    //   byte  33     = 'F'            (differs from byte 5 = '!')
-    // The longest available copy at position 28 is exactly 5 bytes:
-    // the byte at position 33 ('F') differs from the byte at position 5
+    //   byte  0      = 'Z'            (lead byte — keeps the match SOURCE off
+    //                                  position 0, which the greedy loop never
+    //                                  inserts: like the donor it starts the
+    //                                  cursor at ip+1 and hashes only visited
+    //                                  positions)
+    //   bytes 1..6   = "ABCDE"        (the match source — position 1 IS visited)
+    //   bytes 6..29  = 23 filler bytes that do NOT start with 'A'
+    //   bytes 29..34 = "ABCDE"        (the 5-byte match site)
+    //   byte  34     = 'F'            (differs from byte 6 = '!')
+    // The longest available copy at position 29 is exactly 5 bytes:
+    // the byte at position 34 ('F') differs from the byte at position 6
     // ('!'), so the forward extension stops at length 5.
     let mut data = Vec::new();
-    data.extend_from_slice(b"ABCDE"); // 0..5
-    data.extend_from_slice(b"!!!!!!!!!!!!!!!!!!!!!!!"); // 5..28 (23 bytes)
-    data.extend_from_slice(b"ABCDE"); // 28..33
-    data.push(b'F'); // 33: forces forward extension to stop at length 5
-    // Trailing filler so the match site (28) sits at least HASH_READ_SIZE (8)
+    data.push(b'Z'); // 0
+    data.extend_from_slice(b"ABCDE"); // 1..6
+    data.extend_from_slice(b"!!!!!!!!!!!!!!!!!!!!!!!"); // 6..29 (23 bytes)
+    data.extend_from_slice(b"ABCDE"); // 29..34
+    data.push(b'F'); // 34: forces forward extension to stop at length 5
+    // Trailing filler so the match site (29) sits at least HASH_READ_SIZE (8)
     // bytes before the block end. The greedy double-fast — like the donor —
     // stops probing at `ilimit = iend - HASH_READ_SIZE`, so a match in the
     // final 8 bytes is never searched (donor parity, not a regression).
-    data.extend_from_slice(b"GHIJKLMNOPQRSTUVWXYZ"); // 34..54
-    assert_eq!(data.len(), 54);
+    data.extend_from_slice(b"GHIJKLMNOPQRSTUVWXYZ"); // 35..55
+    assert_eq!(data.len(), 55);
 
     let mut matcher = DfastMatchGenerator::new(1 << 22);
     matcher.add_data(data.clone(), |_| {});

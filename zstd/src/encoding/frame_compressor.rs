@@ -725,24 +725,39 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
     /// stay small), so >4 GiB inputs fall back to it.
     fn borrowed_eligible(&self, input_len: usize, prep: &FramePrep) -> bool {
         use crate::encoding::strategy::StrategyTag;
-        !prep.use_dictionary_state
-            && !matches!(self.compression_level, CompressionLevel::Uncompressed)
-            && self.state.strategy_tag == StrategyTag::Fast
-            && input_len <= u32::MAX as usize
+        if prep.use_dictionary_state
+            || matches!(self.compression_level, CompressionLevel::Uncompressed)
+            || input_len > u32::MAX as usize
+        {
+            return false;
+        }
+        match self.state.strategy_tag {
+            // Fast handles over-window inputs in the borrowed scan via an
+            // explicit `window_low = block_end - advertised_window` bound.
+            StrategyTag::Fast => true,
+            // The Dfast borrowed scan uses `history_abs_start` (== 0 in
+            // borrowed mode) as the candidate lower bound, not `window_low`,
+            // so it reproduces the owned (evicting) path only when the whole
+            // input fits the window — then neither side evicts, so neither
+            // rejects an in-window candidate and the sequence streams match.
+            // Over-window inputs fall back to the owned path.
+            StrategyTag::Dfast => input_len <= self.state.matcher.window_size() as usize,
+            _ => false,
+        }
     }
 
-    /// Compress `input` as one frame's worth of blocks: the borrowed
-    /// in-place loop when [`Self::borrowed_eligible`], else the owned
-    /// (history-copying) loop fed an in-place `&[u8]` cursor. Returns
-    /// `(all_blocks, total_uncompressed)`; the caller emits the frame tail
-    /// (`finish_frame` for a configured drain, `write_frame_to_vec` for a
-    /// returned buffer).
-    fn run_one_frame(&mut self, input: &[u8], prep: &FramePrep) -> (Vec<u8>, u64) {
+    /// Compress `input` as one frame's worth of blocks into `out` (appended
+    /// from its current end): the borrowed in-place loop when
+    /// [`Self::borrowed_eligible`], else the owned (history-copying) loop fed
+    /// an in-place `&[u8]` cursor. Returns `total_uncompressed`; the caller
+    /// emits the frame header (before this call, when the content size is
+    /// known) or the drain tail.
+    fn run_one_frame(&mut self, input: &[u8], prep: &FramePrep, out: &mut Vec<u8>) -> u64 {
         if self.borrowed_eligible(input.len(), prep) {
-            self.run_borrowed_block_loop(input, prep.initial_size_hint)
+            self.run_borrowed_block_loop(input, out)
         } else {
             let mut cursor: &[u8] = input;
-            self.run_owned_block_loop(&mut cursor, prep.initial_size_hint)
+            self.run_owned_block_loop(&mut cursor, prep.initial_size_hint, out)
         }
     }
 
@@ -795,8 +810,34 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         // resolved window/header and could flip borrowed eligibility).
         self.source_size_hint = Some(input.len() as u64);
         let prep = self.prepare_frame();
-        let (all_blocks, total_uncompressed) = self.run_one_frame(input, &prep);
-        self.write_frame_to_vec(out, all_blocks, total_uncompressed, &prep);
+        // Content size is known up front (one-shot), so write the frame
+        // header FIRST and emit blocks STRAIGHT into `out` — no separate
+        // `all_blocks` accumulator and no header+blocks copy (which was the
+        // dominant per-frame memmove + the only un-amortized per-frame alloc
+        // even when the compressor is reused).
+        let total_uncompressed = input.len() as u64;
+        let header_buf = self.build_frame_header(total_uncompressed, &prep);
+        let emit_checksum = cfg!(feature = "hash") && self.content_checksum;
+        let checksum_len = if emit_checksum { 4 } else { 0 };
+        out.clear();
+        // Reserve the worst-case compressed size ONCE so the block appends
+        // below never realloc; the caller reuses `out` across frames, so the
+        // reservation is paid on the first frame and amortizes to zero.
+        out.reserve(header_buf.len() + crate::encoding::compress_bound(input.len()) + checksum_len);
+        out.extend_from_slice(&header_buf);
+        let header_len = out.len();
+        let _ = self.run_one_frame(input, &prep, out);
+        #[cfg(feature = "hash")]
+        if self.content_checksum {
+            out.extend_from_slice(&(self.hasher.finish() as u32).to_le_bytes());
+        }
+        #[cfg(feature = "lsm")]
+        {
+            let blocks_end = out.len() - checksum_len;
+            self.populate_frame_emit_info(header_len, &out[header_len..blocks_end], emit_checksum);
+        }
+        #[cfg(not(feature = "lsm"))]
+        let _ = header_len;
     }
 
     /// Convenience wrapper over [`Self::compress_independent_frame_into`]
@@ -826,12 +867,15 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
     /// total_uncompressed)`. Caller guarantees Fast backend + no
     /// dictionary; over-window inputs are fine (matches are bounded by
     /// `window_low` exactly as the owned evicting path).
-    fn run_borrowed_block_loop(
-        &mut self,
-        input: &[u8],
-        initial_size_hint: Option<u64>,
-    ) -> (Vec<u8>, u64) {
-        let mut all_blocks: Vec<u8> = Vec::with_capacity(initial_all_blocks_cap(initial_size_hint));
+    fn run_borrowed_block_loop(&mut self, input: &[u8], out: &mut Vec<u8>) -> u64 {
+        // Blocks are appended to `out` starting here. `out` may already hold
+        // the frame header (the one-shot compress-into-Vec path writes it
+        // first, since the content size is known up front, and the loop
+        // emits blocks straight after it — no separate `all_blocks` Vec and
+        // no header+blocks copy). Output-size reads below are taken RELATIVE
+        // to `blocks_start` so a header prefix never skews the donor split
+        // `savings` gate (which would change block boundaries / wire output).
+        let blocks_start = out.len();
         let total_uncompressed = input.len() as u64;
         // Empty input: emit a single empty last Raw block (mirrors the
         // owned loop's empty-file special case).
@@ -841,14 +885,14 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 block_type: crate::blocks::block::BlockType::Raw,
                 block_size: 0,
             };
-            header.serialize(&mut all_blocks);
+            header.serialize(out);
             #[cfg(feature = "lsm")]
             self.block_decompressed_sizes.push(0);
             #[cfg(all(feature = "lsm", feature = "hash"))]
             if let Some(checksums) = self.block_checksums.as_mut() {
                 checksums.push(xxh64_block_low32(&[]));
             }
-            return (all_blocks, total_uncompressed);
+            return total_uncompressed;
         }
         // SAFETY: `input` outlives this call (held by the caller across
         // the call) and is not mutated. Only the Simple backend is active
@@ -883,7 +927,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             // incompressible input keep the full 128 KiB). The borrowed window
             // already spans the whole input, so a smaller block is just a
             // narrower `(block_start, block_end)` range into it.
-            let savings = start as i64 - all_blocks.len() as i64;
+            let savings = start as i64 - (out.len() - blocks_start) as i64;
             let block_len = optimal_block_size(
                 self.compression_level,
                 &input[start..],
@@ -905,7 +949,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 block,
                 start,
                 end,
-                &mut all_blocks,
+                out,
                 #[cfg(feature = "lsm")]
                 Some(&mut self.block_decompressed_sizes),
                 #[cfg(all(feature = "lsm", feature = "hash"))]
@@ -914,7 +958,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             start = end;
         }
         // `_clear_guard` drops here, clearing the borrowed window.
-        (all_blocks, total_uncompressed)
+        total_uncompressed
     }
 }
 
@@ -1057,8 +1101,13 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             .uncompressed_data
             .take()
             .expect("source must be set via set_source before compress()");
-        let (all_blocks, total_uncompressed) =
-            self.run_owned_block_loop(&mut source, prep.initial_size_hint);
+        // Streaming drain: the content size is only known at EOF, so the
+        // frame header can't precede the blocks — accumulate them in a local
+        // buffer and let `finish_frame` write header + blocks to the drain.
+        let mut all_blocks: Vec<u8> =
+            Vec::with_capacity(initial_all_blocks_cap(prep.initial_size_hint));
+        let total_uncompressed =
+            self.run_owned_block_loop(&mut source, prep.initial_size_hint, &mut all_blocks);
         self.uncompressed_data = Some(source);
         self.finish_frame(all_blocks, total_uncompressed, &prep);
     }
@@ -1253,11 +1302,15 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         &mut self,
         source: &mut Rd,
         initial_size_hint: Option<u64>,
-    ) -> (Vec<u8>, u64) {
-        // Accumulate all compressed blocks; the frame header is written
-        // after all input has been read so Frame_Content_Size is known.
-        // Seed capacity by source-size hint — see `initial_all_blocks_cap`.
-        let mut all_blocks: Vec<u8> = Vec::with_capacity(initial_all_blocks_cap(initial_size_hint));
+        out: &mut Vec<u8>,
+    ) -> u64 {
+        // Compressed blocks are appended to `out` from its current end. The
+        // streaming drain path passes a fresh buffer (the frame header is
+        // written to the drain afterward, since Frame_Content_Size is only
+        // known once the reader hits EOF); the one-shot compress-into-Vec
+        // path passes `out` already holding the header. The donor split
+        // `savings` gate below accumulates block-relative (`before_len`)
+        // output deltas, so a header prefix never skews it.
         let mut total_uncompressed: u64 = 0;
         let mut pending_input: Vec<u8> = Vec::new();
         let mut reached_eof = false;
@@ -1382,7 +1435,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                     block_type: crate::blocks::block::BlockType::Raw,
                     block_size: 0,
                 };
-                header.serialize(&mut all_blocks);
+                header.serialize(out);
                 #[cfg(feature = "lsm")]
                 self.block_decompressed_sizes.push(0);
                 #[cfg(all(feature = "lsm", feature = "hash"))]
@@ -1399,7 +1452,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                         block_type: crate::blocks::block::BlockType::Raw,
                         block_size: uncompressed_data.len().try_into().unwrap(),
                     };
-                    header.serialize(&mut all_blocks);
+                    header.serialize(out);
                     #[cfg(feature = "lsm")]
                     self.block_decompressed_sizes
                         .push(uncompressed_data.len() as u32);
@@ -1407,7 +1460,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                     if let Some(checksums) = self.block_checksums.as_mut() {
                         checksums.push(xxh64_block_low32(&uncompressed_data));
                     }
-                    all_blocks.extend_from_slice(&uncompressed_data);
+                    out.extend_from_slice(&uncompressed_data);
                     savings +=
                         uncompressed_data.len() as i64 - (3 + uncompressed_data.len()) as i64;
                 }
@@ -1416,7 +1469,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 | CompressionLevel::Better
                 | CompressionLevel::Best
                 | CompressionLevel::Level(_) => {
-                    let before_len = all_blocks.len();
+                    let before_len = out.len();
                     let block_len = uncompressed_data.len();
                     // A primed dictionary makes "incompressible-looking"
                     // blocks matchable against the dict, so the raw-fast-
@@ -1433,21 +1486,21 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                         self.compression_level,
                         last_block,
                         uncompressed_data,
-                        &mut all_blocks,
+                        out,
                         dict_active,
                         #[cfg(feature = "lsm")]
                         Some(&mut self.block_decompressed_sizes),
                         #[cfg(all(feature = "lsm", feature = "hash"))]
                         self.block_checksums.as_mut(),
                     );
-                    savings += block_len as i64 - (all_blocks.len() - before_len) as i64;
+                    savings += block_len as i64 - (out.len() - before_len) as i64;
                 }
             }
             if last_block && pending_input.is_empty() {
                 break;
             }
         }
-        (all_blocks, total_uncompressed)
+        total_uncompressed
     }
 
     /// Build the frame header bytes once the total payload size is known
@@ -1522,28 +1575,6 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// `out` is the same one copy `finish_frame` performs writing
     /// `all_blocks` into a `Vec` drain, no extra buffering vs the drain
     /// path.
-    fn write_frame_to_vec(
-        &mut self,
-        out: &mut Vec<u8>,
-        all_blocks: Vec<u8>,
-        total_uncompressed: u64,
-        prep: &FramePrep,
-    ) {
-        let header_buf = self.build_frame_header(total_uncompressed, prep);
-        let emit_checksum = cfg!(feature = "hash") && self.content_checksum;
-        let checksum_len = if emit_checksum { 4 } else { 0 };
-        out.clear();
-        out.reserve(header_buf.len() + all_blocks.len() + checksum_len);
-        out.extend_from_slice(&header_buf);
-        out.extend_from_slice(&all_blocks);
-        #[cfg(feature = "hash")]
-        if self.content_checksum {
-            out.extend_from_slice(&(self.hasher.finish() as u32).to_le_bytes());
-        }
-        #[cfg(feature = "lsm")]
-        self.populate_frame_emit_info(header_buf.len(), &all_blocks, emit_checksum);
-    }
-
     /// Walk `all_blocks` to recover per-block layout and store it in
     /// `frame_emit_info`. Each Block_Header is 3 bytes LE packing
     /// `(block_size << 3) | (block_type << 1) | last_block`. Physical body
