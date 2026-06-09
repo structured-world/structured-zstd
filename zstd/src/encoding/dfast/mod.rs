@@ -1298,45 +1298,53 @@ impl DfastMatchGenerator {
 
     #[inline]
     pub(crate) fn insert_position(&mut self, pos: usize) {
-        let idx = pos.wrapping_sub(self.history_abs_start);
-        let concat_len = self.history.len() - self.history_start;
-        // Pre-rebase guard. The producer that walks `insert_positions*`
-        // can sweep an arbitrary number of positions per block; running
-        // `pack_slot` per-position would call `ensure_room_for` from a
-        // tight inner loop. Hoisting the rebase trigger to the start of
-        // `insert_position` keeps the per-byte hot path branch-free
-        // when the relative window has plenty of headroom (the common
-        // case) while still guaranteeing the slot value below fits in
-        // `u32`. `ensure_room_for` is a single u32 comparison when no
-        // rebase is needed.
-        self.ensure_room_for(pos);
-        let packed = self.pack_slot(pos);
-        // SAFETY: the `*_hash_index` helpers mask the mixed hash to
-        // `long_hash_bits` / `short_hash_bits`, and `ensure_hash_tables`
-        // sizes the two tables to `1 << long_hash_bits` /
-        // `1 << short_hash_bits` respectively, so every produced index
-        // is provably below the table length. Eliding the bounds check
-        // on this per-byte hot path saves ~4 instructions per call.
+        // Source the bytes + rebase coordinates through `scan_source()` so a
+        // borrowed window's seam / tail re-seeds hash the in-place input
+        // exactly as the owned path hashes its `history` concat.
+        let (base_ptr, start_offset, abs_start, _position_base, concat_len) = self.scan_source();
+        let idx = pos.wrapping_sub(abs_start);
+        // Pre-rebase guard (owned only). The producer that walks
+        // `insert_positions*` can sweep an arbitrary number of positions
+        // per block; running `pack_slot` per-position would call
+        // `ensure_room_for` from a tight inner loop. Hoisting the rebase
+        // trigger here keeps the per-byte hot path branch-free when the
+        // relative window has headroom (the common case) while still
+        // guaranteeing the slot value below fits in `u32`. The borrowed
+        // window never rebases (`position_base == 0`, no eviction), so it
+        // packs the absolute position directly with the same +1 bias.
+        let packed = if self.borrowed.is_some() {
+            (pos as u32).wrapping_add(1)
+        } else {
+            self.ensure_room_for(pos);
+            self.pack_slot(pos)
+        };
+        // SAFETY: `base_ptr + start_offset` is the live source start (owned
+        // `history[history_start..]` or the borrowed input slice) and
+        // `concat_len` its readable byte count; the `idx + 5` / `idx + 8`
+        // gates keep both keyed reads in range. The slice is raw-pointer
+        // backed (holds no borrow on `self`), so the `&mut self.short_hash`
+        // / `&mut self.long_hash` writes below stay sound. The `*_hash_index`
+        // helpers mask to `long_hash_bits` / `short_hash_bits` and
+        // `ensure_hash_tables` sizes both tables to `1 << bits`, so every
+        // index is below the table length — eliding the bounds check on this
+        // per-byte hot path saves ~4 instructions per call.
         //
-        // Single-slot overwrite (upstream parity): the previous 4-slot
-        // bucket shift (`copy_within(..)`) is gone — upstream
-        // `ZSTD_compressBlock_doubleFast_*` writes a single `U32` per
-        // hash position and relies on the dense `_search_next_long`
-        // retry in `hash_candidate` (via `best_match`) to preserve
-        // compression ratio.
+        // Single-slot overwrite (upstream parity): upstream
+        // `ZSTD_compressBlock_doubleFast_*` writes a single `U32` per hash
+        // position and relies on the dense `_search_next_long` retry in
+        // `hash_candidate` (via `best_match`) to preserve compression ratio.
         // Short key needs 5 readable bytes (donor `mls = 5`). A position
-        // within 4 bytes of the current history end is not inserted here; the
-        // `start_matching` seam re-seed picks it up once the next block extends
-        // history far enough to form its full 5-byte key.
+        // within 4 bytes of the source end is not inserted here; the
+        // `start_matching` seam re-seed picks it up once the next block
+        // extends the source far enough to form its full 5-byte key.
+        let concat = unsafe { core::slice::from_raw_parts(base_ptr.add(start_offset), concat_len) };
         if idx + 5 <= concat_len {
-            let concat = &self.history[self.history_start..];
             let short = self.short_hash_index(&concat[idx..]);
             debug_assert!(short < self.short_hash.len());
             unsafe { *self.short_hash.get_unchecked_mut(short) = packed };
         }
 
         if idx + 8 <= concat_len {
-            let concat = &self.history[self.history_start..];
             let long = self.long_hash_index(&concat[idx..]);
             debug_assert!(long < self.long_hash.len());
             unsafe { *self.long_hash.get_unchecked_mut(long) = packed };
