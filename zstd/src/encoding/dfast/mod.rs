@@ -602,8 +602,10 @@ impl DfastMatchGenerator {
         let long_ptr = dict.long.as_mut_ptr();
         let short_ptr = dict.short.as_mut_ptr();
         // SAFETY: `base.add(history_start + pos)` is in-bounds for
-        // `pos + 8 <= concat_len` (long) / `pos + 4 <= concat_len` (short),
-        // enforced by the `*_safe_end` cutoffs. `*_idx = mixed >> (64 - bits)`
+        // `pos + 8 <= concat_len` (long) / `pos + 5 <= concat_len` (short, the
+        // donor 5-byte key), enforced by the `*_safe_end` cutoffs (the short
+        // loop reads a 4-byte word + 1 byte, never past `concat_len`).
+        // `*_idx = mixed >> (64 - bits)`
         // has at most `bits` bits set, in-bounds for the `1 << bits` tables.
         // `pos + 1` fits u32: concat indices are bounded by the u32 history
         // gate upstream (`check_stream_abs_headroom`).

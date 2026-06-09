@@ -5663,8 +5663,8 @@ fn driver_level5_selects_row_backend() {
     // Greedy-specific routing assertion: the `BackendTag::Row` arm of
     // `MatchGeneratorDriver::compress_block` has a
     // `debug_assert_eq!(matcher.lazy_depth, 0)` invariant that
-    // dispatches L4 unconditionally into `start_matching_greedy`.
-    // If a future change rerouted L4 through the
+    // dispatches L5 unconditionally into `start_matching_greedy`.
+    // If a future change rerouted L5 through the
     // `RowMatchGenerator::start_matching` (depth >= 1) path, this
     // assertion would catch it before the round-trip tests below —
     // round-trip alone passes on the lazy parser too. Together with
@@ -5673,20 +5673,17 @@ fn driver_level5_selects_row_backend() {
     assert_eq!(
         driver.row_matcher().lazy_depth,
         0,
-        "L4 must route to start_matching_greedy (lazy_depth == 0)",
+        "L5 must route to start_matching_greedy (lazy_depth == 0)",
     );
 }
 
-/// Level 4 maps to `StrategyTag::Greedy` which dispatches into
-/// [`super::row::RowMatchGenerator::start_matching_greedy`]. Round-trip
-/// alone doesn't pin the greedy-vs-lazy choice (a lazy parser would
-/// also reconstruct the input correctly) — that piece is locked down
-/// by the `lazy_depth == 0` assertion in
-/// [`driver_level4_selects_row_backend`]. This test guards the parse
-/// output itself: a small repeating pattern must produce at least one
-/// `Sequence::Triple`, so a future regression that emits literals-only
-/// (e.g. a `min_match` or rep-probe guard regression) is caught
-/// independently of routing.
+/// Level 4 maps to `StrategyTag::Dfast` (the greedy double-fast, donor
+/// `ZSTD_dfast` — "greedy" is the parse discipline, not the Row/Greedy
+/// strategy at Level 5). Round-trip alone doesn't pin match quality (a lazy
+/// parser would also reconstruct the input correctly), so this test guards the
+/// parse output itself: a small repeating pattern must produce at least one
+/// `Sequence::Triple`, so a future regression that emits literals-only (e.g. a
+/// `min_match` or rep-probe guard regression) is caught.
 #[test]
 fn driver_level4_greedy_round_trip_single_slice() {
     let mut driver = MatchGeneratorDriver::new(64, 2);
