@@ -15,6 +15,7 @@
 //! change is `pub(crate)` visibility on the moved items.
 
 use super::super::opt::types::MatchCandidate;
+use crate::encoding::fastpath::FastpathKernel;
 
 /// Minimum match length emitted by the Simple / level-1 matcher (and the
 /// donor `ZSTD_fast.c` baseline). Lives here so every matcher and the
@@ -43,6 +44,23 @@ pub(crate) fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
     // bytes.
     unsafe {
         crate::encoding::fastpath::dispatch_common_prefix_len_ptr(a.as_ptr(), b.as_ptr(), max)
+    }
+}
+
+/// As [`common_prefix_len`] but against an already-resolved [`FastpathKernel`].
+/// Hot match-finder loops resolve the kernel once per block and pass it in,
+/// so each byte-compare skips the per-call `select_kernel()` `OnceLock` atomic.
+#[inline(always)]
+pub(crate) fn common_prefix_len_with_kernel(kernel: FastpathKernel, a: &[u8], b: &[u8]) -> usize {
+    let max = a.len().min(b.len());
+    // SAFETY: as `common_prefix_len` — both pointers are valid for `max` bytes.
+    unsafe {
+        crate::encoding::fastpath::dispatch_common_prefix_len_ptr_with_kernel(
+            kernel,
+            a.as_ptr(),
+            b.as_ptr(),
+            max,
+        )
     }
 }
 
@@ -114,6 +132,7 @@ pub(crate) fn extend_backwards_shared(
 /// (~10% exclusive on the default-level profile).
 #[inline]
 pub(crate) fn repcode_candidate_shared(
+    kernel: FastpathKernel,
     concat: &[u8],
     history_abs_start: usize,
     offset_hist: [u32; 3],
@@ -156,8 +175,11 @@ pub(crate) fn repcode_candidate_shared(
                 let candidate_pos = abs_pos - rep;
                 if candidate_pos >= history_abs_start {
                     let candidate_idx = candidate_pos - history_abs_start;
-                    let match_len =
-                        common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
+                    let match_len = common_prefix_len_with_kernel(
+                        kernel,
+                        &concat[candidate_idx..],
+                        &concat[current_idx..],
+                    );
                     if match_len >= min_match_len {
                         let candidate = extend_backwards_shared(
                             concat,

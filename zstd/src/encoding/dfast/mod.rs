@@ -17,16 +17,14 @@ use core::convert::TryInto;
 use super::Sequence;
 use super::blocks::encode_offset_with_history;
 use super::dict_attach::DictAttach;
+use super::fastpath::{FastpathKernel, select_kernel};
 use super::incompressible::block_looks_incompressible;
 use super::match_generator::{
-    DFAST_EMPTY_SLOT, DFAST_HASH_BITS, DFAST_INCOMPRESSIBLE_SKIP_STEP, DFAST_LOCAL_SKIP_TRIGGER,
-    DFAST_MAX_SKIP_STEP, DFAST_MIN_MATCH_LEN, DFAST_REBASE_GUARD_BAND, DFAST_SHORT_HASH_BITS_DELTA,
-    DFAST_SHORT_HASH_LOOKAHEAD, DFAST_SKIP_STEP_GROWTH_INTERVAL, DFAST_TARGET_LEN, MIN_WINDOW_LOG,
+    DFAST_EMPTY_SLOT, DFAST_HASH_BITS, DFAST_INCOMPRESSIBLE_SKIP_STEP, DFAST_MAX_SKIP_STEP,
+    DFAST_MIN_MATCH_LEN, DFAST_REBASE_GUARD_BAND, DFAST_SHORT_HASH_BITS_DELTA,
+    DFAST_SHORT_HASH_LOOKAHEAD, DFAST_SKIP_STEP_GROWTH_INTERVAL, MIN_WINDOW_LOG,
 };
-use super::match_table::helpers::{
-    LazyMatchConfig, best_len_offset_candidate, common_prefix_len, extend_backwards_shared,
-    pick_lazy_match_shared, repcode_candidate_shared,
-};
+use super::match_table::helpers::{common_prefix_len_with_kernel, extend_backwards_shared};
 use super::match_table::storage::{REBASE_RESET_FLOOR_CEILING, check_stream_abs_headroom};
 use super::opt::types::MatchCandidate;
 
@@ -107,9 +105,6 @@ pub(crate) struct DfastMatchGenerator {
     /// frequently than the 8-byte long hash on average, so the
     /// smaller bucket count is the donor-correct sizing.
     pub(crate) short_hash_bits: usize,
-    pub(crate) use_fast_loop: bool,
-    // Lazy match lookahead depth (internal tuning parameter).
-    pub(crate) lazy_depth: u8,
     /// Immutable dictionary long+short hash tables (donor `dictMatchState`)
     /// plus the CDict cache lifecycle, via the shared [`DictAttach`] level-1
     /// scaffolding. Built once over the dictionary region at the front of the
@@ -124,6 +119,10 @@ pub(crate) struct DfastMatchGenerator {
     /// `is_attached()` activates the dual-probe kernel; `region_len()` is the
     /// dict/input boundary (`dict_end`, a concat index).
     pub(crate) dict: DictAttach<DfastDictTables>,
+    /// CPU kernel for the `common_prefix_len` / repcode byte-compares,
+    /// resolved once at construction so the per-byte match-finder scans skip
+    /// the `select_kernel()` `OnceLock` atomic on every call.
+    pub(crate) kernel: FastpathKernel,
 }
 
 /// The dfast backend's immutable dictionary tables — a long+short pair mirroring
@@ -161,9 +160,8 @@ impl DfastMatchGenerator {
             position_base: 0,
             long_hash_bits: DFAST_HASH_BITS,
             short_hash_bits: DFAST_HASH_BITS - DFAST_SHORT_HASH_BITS_DELTA,
-            use_fast_loop: false,
-            lazy_depth: 1,
             dict: DictAttach::new(),
+            kernel: select_kernel(),
         }
     }
 
@@ -549,16 +547,6 @@ impl DfastMatchGenerator {
     /// without per-frame dict cost. Cached via the `DictAttach` primed flag.
     pub(crate) fn skip_matching_for_dict_attach(&mut self) {
         self.ensure_hash_tables();
-        // The dual-probe lives only in `start_matching_fast_loop`. The general
-        // path (L1/L2/L4) has no dict probe, so for those levels prime the dict
-        // into the LIVE tables (`skip_matching_dense`), where the dense scan
-        // finds it — keeping the attach win to the fast-loop levels (L3 /
-        // Default / L0) without regressing general-path dict ratio.
-        if !self.use_fast_loop {
-            self.dict.invalidate();
-            self.skip_matching_dense();
-            return;
-        }
         let current_len = self.window_blocks.back().copied().unwrap_or(0);
         if current_len == 0 {
             return;
@@ -575,19 +563,8 @@ impl DfastMatchGenerator {
     /// Mark the dict tables fully built (CDict cache). The driver calls this
     /// after the final dictionary chunk so the next frame skips the re-hash.
     ///
-    /// Only the fast-loop path builds the immutable dict tables; the
-    /// general-path levels (L1/L2/L4) prime the dict into the LIVE tables and
-    /// `invalidate()` the attach cache (see [`Self::skip_matching_for_dict_attach`]),
-    /// leaving `self.dict.table()` empty. Gate on `use_fast_loop` so a
-    /// general-path frame can never flip the primed flag, which would let a
-    /// later fast-loop frame short-circuit [`Self::prime_dict_tables_for_range`]
-    /// with no dict tables built. ([`DictAttach::mark_primed`] also self-guards
-    /// on `table.is_some()`, so this is belt-and-suspenders making the
-    /// precondition explicit at the call site.)
     pub(crate) fn mark_dict_primed(&mut self) {
-        if self.use_fast_loop {
-            self.dict.mark_primed();
-        }
+        self.dict.mark_primed();
     }
 
     /// Drop the cached dict tables (next frame carries no dict, or eviction /
@@ -616,10 +593,16 @@ impl DfastMatchGenerator {
         let long_bits = self.long_hash_bits;
         let short_bits = self.short_hash_bits;
         // Lookahead-safe cutoffs within the concat: long needs 8 readable
-        // bytes, short needs 4 (donor parity with `insert_positions`).
+        // bytes, short needs 5 (donor `mls = 5` for the short hash).
         let long_safe_end = concat_len.saturating_sub(7).min(end_concat);
-        let short_safe_end = concat_len.saturating_sub(3).min(end_concat);
-        if start_concat >= short_safe_end {
+        let short_safe_end = concat_len.saturating_sub(4).min(end_concat);
+        // The seam window `[backfill_floor, start_concat)` holds positions that
+        // only became hashable when THIS chunk extended history (e.g. a `4+1`
+        // or `7+1` dict chunking), so gate the early return on `backfill_floor`,
+        // not `start_concat` — otherwise those seam inserts are dropped and the
+        // attached dict tables stay incomplete.
+        let backfill_floor = start_concat.saturating_sub(Self::BOUNDARY_DENSE_TAIL_LEN);
+        if backfill_floor >= short_safe_end {
             return;
         }
         let dict = self.dict.table_mut_or_init(|| DfastDictTables {
@@ -632,8 +615,10 @@ impl DfastMatchGenerator {
         let long_ptr = dict.long.as_mut_ptr();
         let short_ptr = dict.short.as_mut_ptr();
         // SAFETY: `base.add(history_start + pos)` is in-bounds for
-        // `pos + 8 <= concat_len` (long) / `pos + 4 <= concat_len` (short),
-        // enforced by the `*_safe_end` cutoffs. `*_idx = mixed >> (64 - bits)`
+        // `pos + 8 <= concat_len` (long) / `pos + 5 <= concat_len` (short, the
+        // donor 5-byte key), enforced by the `*_safe_end` cutoffs (the short
+        // loop reads a 4-byte word + 1 byte, never past `concat_len`).
+        // `*_idx = mixed >> (64 - bits)`
         // has at most `bits` bits set, in-bounds for the `1 << bits` tables.
         // `pos + 1` fits u32: concat indices are bounded by the u32 history
         // gate upstream (`check_stream_abs_headroom`).
@@ -648,14 +633,14 @@ impl DfastMatchGenerator {
         // concat index, and the seam window `[start_concat - tail, start_concat)`
         // is clamped at 0 because there are no dict bytes before the front.
         // The first chunk (`start_concat == 0`) clamps to 0 → no seam, no-op.
-        let backfill_floor = start_concat.saturating_sub(Self::BOUNDARY_DENSE_TAIL_LEN);
         let mut pos = backfill_floor;
         while pos < long_safe_end {
             unsafe {
                 let load_ptr = base.add(history_start + pos);
                 let v8 = (load_ptr as *const u64).read_unaligned();
-                let v4 = v8 & 0xFFFF_FFFF;
-                let short_idx = (v4.wrapping_mul(PRIME) >> short_shift) as usize;
+                // Donor 5-byte short hash (ZSTD_hash5 shape): low 5 bytes in
+                // the high 40 bits (`v8 << 24`), matching `short_hash_index`.
+                let short_idx = ((v8 << 24).wrapping_mul(PRIME) >> short_shift) as usize;
                 let long_idx = (v8.wrapping_mul(PRIME) >> long_shift) as usize;
                 let packed = (pos as u32) + 1;
                 *short_ptr.add(short_idx) = packed;
@@ -666,8 +651,13 @@ impl DfastMatchGenerator {
         while pos < short_safe_end {
             unsafe {
                 let load_ptr = base.add(history_start + pos);
-                let v4 = (load_ptr as *const u32).read_unaligned() as u64;
-                let short_idx = (v4.wrapping_mul(PRIME) >> short_shift) as usize;
+                // 5-byte short key (donor `mls = 5`), assembled from a 4-byte
+                // load + 1 byte so it never over-reads the <8-byte tail; the
+                // low 5 bytes land in bits 24..63, matching `v8 << 24`.
+                let lo4 = (load_ptr as *const u32).read_unaligned() as u64;
+                let b5 = *load_ptr.add(4) as u64;
+                let v5 = (lo4 | (b5 << 32)) << 24;
+                let short_idx = (v5.wrapping_mul(PRIME) >> short_shift) as usize;
                 *short_ptr.add(short_idx) = (pos as u32) + 1;
             }
             pos += 1;
@@ -683,106 +673,22 @@ impl DfastMatchGenerator {
         }
 
         let current_abs_start = self.history_abs_start + self.window_size - current_len;
-        if self.use_fast_loop {
-            self.start_matching_fast_loop(current_abs_start, current_len, &mut handle_sequence);
-            return;
+        // Re-seed the previous block's seam. With the donor 5-byte short hash,
+        // a position within `mls - 1` bytes of the prior block end could not
+        // form its full key when that block was processed (the trailing bytes
+        // arrived with THIS block); re-hash that tail now that history spans
+        // it, so cross-block matches anchored in the seam are found. Mirrors
+        // `skip_matching_dense`'s backfill.
+        let backfill_start = current_abs_start
+            .saturating_sub(Self::BOUNDARY_DENSE_TAIL_LEN)
+            .max(self.history_abs_start);
+        if backfill_start < current_abs_start {
+            self.insert_positions(backfill_start, current_abs_start);
         }
-        self.start_matching_general(current_abs_start, current_len, &mut handle_sequence);
-    }
-
-    fn start_matching_general(
-        &mut self,
-        current_abs_start: usize,
-        current_len: usize,
-        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
-    ) {
-        let use_adaptive_skip =
-            self.block_looks_incompressible(current_abs_start, current_abs_start + current_len);
-        let mut pos = 1usize;
-        let mut literals_start = 0usize;
-        let mut skip_step = 1usize;
-        let mut next_skip_growth_pos = DFAST_SKIP_STEP_GROWTH_INTERVAL;
-        let mut miss_run = 0usize;
-        // Loop invariants:
-        //
-        // 1. Block-local arithmetic (`pos`, `skip_step`, `start +
-        //    candidate.match_len`, `DFAST_SKIP_STEP_GROWTH_INTERVAL`):
-        //    the dynamic bound is `current_len` itself — the `while
-        //    pos + DFAST_MIN_MATCH_LEN <= current_len` guard keeps
-        //    every offset within that bound regardless of how the
-        //    caller sized `max_window_size`. The general path's
-        //    `best_match` → `hash_candidate` chain uses SAFE slicing
-        //    (`data[..8].try_into()`) which panics on a short slice
-        //    rather than reading uninitialised bytes — UB-free even
-        //    when this guard lets `pos` land within 3 bytes of the
-        //    block tail. The fast loop has stricter `+ HASH_READ_SIZE`
-        //    guards because it does raw-pointer `read_unaligned` for
-        //    speed; see `start_matching_fast_loop`. In production this
-        //    also happens to be `≤ HC_BLOCKSIZE_MAX (128 KiB)` because
-        //    the frame compressor never hands out larger blocks, but
-        //    the safety argument above does not rely on that limit.
-        // 2. Absolute-position arithmetic (`current_abs_start + pos`):
-        //    `current_abs_start` is the frame-lifetime cursor and
-        //    advances with total bytes processed, NOT with the
-        //    retained window size. A long streaming encode on i686
-        //    can therefore push `current_abs_start + pos` past
-        //    `usize::MAX` even though memory usage stays bounded by
-        //    `window_size`. The runtime enforcement lives in
-        //    `DfastMatchGenerator::add_data`, which routes through
-        //    `check_stream_abs_headroom` (the same gate used by
-        //    `MatchTable::add_data`): every ingest fails fast with a
-        //    clear panic if cumulative input would push the cursor
-        //    within `STREAM_ABS_HEADROOM` (`= HC_OPT_NUM + 16`) of
-        //    `usize::MAX`. Raw `+` here is donor parity and is
-        //    correct precisely because that upstream gate runs before
-        //    this loop sees any new bytes.
-        while pos + DFAST_MIN_MATCH_LEN <= current_len {
-            let abs_pos = current_abs_start + pos;
-            let lit_len = pos - literals_start;
-
-            let best = self.best_match(abs_pos, lit_len);
-            if let Some(candidate) = self.pick_lazy_match(abs_pos, lit_len, best) {
-                let start = self.emit_candidate(
-                    current_abs_start,
-                    &mut literals_start,
-                    candidate,
-                    handle_sequence,
-                );
-                pos = start + candidate.match_len;
-                // Donor's opportunistic rep-0 extension after every emit.
-                pos = self.extend_with_repcode_after_match(
-                    current_abs_start,
-                    current_len,
-                    pos,
-                    &mut literals_start,
-                    handle_sequence,
-                );
-                skip_step = 1;
-                next_skip_growth_pos = pos + DFAST_SKIP_STEP_GROWTH_INTERVAL;
-                miss_run = 0;
-            } else {
-                self.insert_position(abs_pos);
-                miss_run += 1;
-                let use_local_adaptive_skip = miss_run >= DFAST_LOCAL_SKIP_TRIGGER;
-                if use_adaptive_skip || use_local_adaptive_skip {
-                    let skip_cap = if use_adaptive_skip {
-                        DFAST_MAX_SKIP_STEP
-                    } else {
-                        2
-                    };
-                    if pos >= next_skip_growth_pos {
-                        skip_step = (skip_step + 1).min(skip_cap);
-                        next_skip_growth_pos += DFAST_SKIP_STEP_GROWTH_INTERVAL;
-                    }
-                    pos += skip_step;
-                } else {
-                    pos += 1;
-                }
-            }
-        }
-
-        self.seed_remaining_hashable_starts(current_abs_start, current_len, pos);
-        self.emit_trailing_literals(literals_start, handle_sequence);
+        // dfast is the donor's greedy double-fast at every level (no lazy
+        // variant exists — lazy parsing is the separate `ZSTD_lazy`/`lazy2`
+        // strategy), so there is a single match path.
+        self.start_matching_fast_loop(current_abs_start, current_len, &mut handle_sequence);
     }
 
     /// Single-cursor probe at the last hashable position in the
@@ -834,9 +740,11 @@ impl DfastMatchGenerator {
             (history_base_ptr.add(history_start_offset + concat_idx0) as *const u64)
                 .read_unaligned()
         };
+        // `v4_0` (low 4 bytes) is the 4-byte equality-gate key below; the short
+        // HASH keys on the donor 5-byte window (`v8_0 << 24`, ZSTD_hash5 shape).
         let v4_0 = v8_0 & 0xFFFF_FFFF;
         let hl0_idx = (v8_0.wrapping_mul(PRIME) >> long_shift) as usize;
-        let hs0_idx = (v4_0.wrapping_mul(PRIME) >> short_shift) as usize;
+        let hs0_idx = ((v8_0 << 24).wrapping_mul(PRIME) >> short_shift) as usize;
 
         // Read-only on the hash tables here — unlike the inner loop's
         // "update-before-check" pattern, the writes at `hl0_idx` /
@@ -1010,11 +918,20 @@ impl DfastMatchGenerator {
             if cur_idx + DFAST_REP_MIN_MATCH_LEN > concat.len() {
                 break;
             }
-            // Cheap 4-byte gate before the SIMD `common_prefix_len`.
-            if concat[cur_idx..cur_idx + 4] != concat[cand_idx..cand_idx + 4] {
+            // Cheap 4-byte gate before the SIMD `common_prefix_len`. Read it as
+            // one unaligned u32 rather than a slice `!=` (which lowers to a libc
+            // `memcmp` CALL). Bounds: `cur_idx + 4 <= len` from the
+            // `DFAST_REP_MIN_MATCH_LEN` (= 4) check above, and
+            // `cand_idx = cur_idx - rep < cur_idx` so `cand_idx + 4 <= len` too.
+            let gate_eq = unsafe {
+                concat.as_ptr().add(cur_idx).cast::<u32>().read_unaligned()
+                    == concat.as_ptr().add(cand_idx).cast::<u32>().read_unaligned()
+            };
+            if !gate_eq {
                 break;
             }
-            let match_len = common_prefix_len(&concat[cand_idx..], &concat[cur_idx..]);
+            let match_len =
+                common_prefix_len_with_kernel(self.kernel, &concat[cand_idx..], &concat[cur_idx..]);
             if match_len < DFAST_REP_MIN_MATCH_LEN {
                 break;
             }
@@ -1214,221 +1131,6 @@ impl DfastMatchGenerator {
         self.history_abs_start + self.live_history().len()
     }
 
-    #[inline(always)]
-    pub(crate) fn best_match(&self, abs_pos: usize, lit_len: usize) -> Option<MatchCandidate> {
-        let rep = self.repcode_candidate(abs_pos, lit_len);
-        let hash = self.hash_candidate(abs_pos, lit_len);
-        best_len_offset_candidate(rep, hash)
-    }
-
-    pub(crate) fn pick_lazy_match(
-        &self,
-        abs_pos: usize,
-        lit_len: usize,
-        best: Option<MatchCandidate>,
-    ) -> Option<MatchCandidate> {
-        pick_lazy_match_shared(
-            abs_pos,
-            lit_len,
-            best,
-            LazyMatchConfig {
-                target_len: DFAST_TARGET_LEN,
-                min_match_len: DFAST_MIN_MATCH_LEN,
-                lazy_depth: self.lazy_depth,
-                history_abs_end: self.history_abs_end(),
-            },
-            |next_pos, next_lit_len| self.best_match(next_pos, next_lit_len),
-        )
-    }
-
-    #[inline(always)]
-    pub(crate) fn repcode_candidate(
-        &self,
-        abs_pos: usize,
-        lit_len: usize,
-    ) -> Option<MatchCandidate> {
-        repcode_candidate_shared(
-            self.live_history(),
-            self.history_abs_start,
-            self.offset_hist,
-            abs_pos,
-            lit_len,
-            DFAST_MIN_MATCH_LEN,
-        )
-    }
-
-    #[inline(always)]
-    pub(crate) fn hash_candidate(&self, abs_pos: usize, lit_len: usize) -> Option<MatchCandidate> {
-        // Hoist all the per-loop invariants out of the combinator chains.
-        // `short_candidates`/`long_candidates` each re-fetch `live_history`
-        // and recompute `idx` from scratch inside their Option/flatten/filter
-        // adapters; on a per-byte hot path (32% exclusive on default-level
-        // profile) that's measurable Option/Iterator scaffolding the
-        // compiler can't always erase.
-        let concat = self.live_history();
-        let current_idx = abs_pos - self.history_abs_start;
-        let history_abs_start = self.history_abs_start;
-        // Hoist the rebase base out of the bucket-walk loop so each
-        // slot-to-absolute conversion is a single add instead of a
-        // `&self` dereference per iteration. The base only changes
-        // via `reduce`, which is called between match-finding calls.
-        let position_base = self.position_base;
-        let mut best = None;
-
-        // Long-hash probe first (8-byte hash → longer matches more
-        // likely). Single-slot per bucket — donor parity, no chain
-        // walking. The retry policy below mirrors donor
-        // `_search_next_long`: if the long-hash misses but the
-        // short-hash hits, peek the long-hash at `abs_pos + 1` and
-        // pick the longer of the two matches.
-        let long_hit = if current_idx + 8 <= concat.len() {
-            let long_hash = self.long_hash_index(&concat[current_idx..]);
-            // SAFETY: `long_hash_index` masks to `long_hash_bits` and
-            // `long_hash.len() == 1 << long_hash_bits` (`ensure_hash_tables`).
-            debug_assert!(long_hash < self.long_hash.len());
-            let slot = unsafe { *self.long_hash.get_unchecked(long_hash) };
-            self.probe_slot_match(
-                slot,
-                position_base,
-                history_abs_start,
-                abs_pos,
-                current_idx,
-                concat,
-                lit_len,
-                8, // long-hash equality gate
-            )
-        } else {
-            None
-        };
-        if let Some(cand) = long_hit {
-            best = best_len_offset_candidate(best, Some(cand));
-            if best.is_some_and(|b| b.match_len >= DFAST_TARGET_LEN) {
-                return best;
-            }
-        }
-
-        if current_idx + 4 <= concat.len() {
-            let short_hash = self.short_hash_index(&concat[current_idx..]);
-            debug_assert!(short_hash < self.short_hash.len());
-            let slot = unsafe { *self.short_hash.get_unchecked(short_hash) };
-            if let Some(short_cand) = self.probe_slot_match(
-                slot,
-                position_base,
-                history_abs_start,
-                abs_pos,
-                current_idx,
-                concat,
-                lit_len,
-                4, // short-hash equality gate
-            ) {
-                best = best_len_offset_candidate(best, Some(short_cand));
-                if best.is_some_and(|b| b.match_len >= DFAST_TARGET_LEN) {
-                    return best;
-                }
-                // Donor `_search_next_long` retry: short hit landed but
-                // a long hit at `abs_pos + 1` could be even longer. The
-                // donor inner loop precomputes `hashLong[hl1]` for
-                // exactly this case (line 213 in `zstd_double_fast.c`);
-                // we lift it inline here so the single-slot table
-                // retains the compression-quality donor gets from its
-                // overlapping probe pattern.
-                let next_idx = current_idx + 1;
-                if best.is_none_or(|b| b.match_len < DFAST_TARGET_LEN)
-                    && next_idx + 8 <= concat.len()
-                {
-                    let next_long_hash = self.long_hash_index(&concat[next_idx..]);
-                    debug_assert!(next_long_hash < self.long_hash.len());
-                    let next_slot = unsafe { *self.long_hash.get_unchecked(next_long_hash) };
-                    if let Some(retry) = self.probe_slot_match(
-                        next_slot,
-                        position_base,
-                        history_abs_start,
-                        abs_pos + 1,
-                        next_idx,
-                        concat,
-                        lit_len.saturating_add(1),
-                        8, // long-hash equality gate, `_search_next_long` retry
-                    ) && retry.match_len > short_cand.match_len
-                    {
-                        best = best_len_offset_candidate(best, Some(retry));
-                    }
-                }
-            }
-        }
-        best
-    }
-
-    /// Resolve a single packed-slot value against the live history and
-    /// return a backward-extended `MatchCandidate` if the bucket holds
-    /// a valid in-range position whose forward extension reaches at
-    /// least `DFAST_MIN_MATCH_LEN` bytes. Shared between the long-hash
-    /// primary probe, the short-hash primary probe, and the
-    /// `_search_next_long` retry — keeps the bounds-checking logic in
-    /// one place so the three call sites can't drift.
-    #[inline(always)]
-    #[allow(clippy::too_many_arguments)]
-    fn probe_slot_match(
-        &self,
-        slot: u32,
-        position_base: usize,
-        history_abs_start: usize,
-        abs_pos: usize,
-        current_idx: usize,
-        concat: &[u8],
-        lit_len: usize,
-        gate_len: usize,
-    ) -> Option<MatchCandidate> {
-        if slot == DFAST_EMPTY_SLOT {
-            return None;
-        }
-        let candidate_pos = position_base + (slot as usize) - 1;
-        if candidate_pos < history_abs_start || candidate_pos >= abs_pos {
-            return None;
-        }
-        let candidate_idx = candidate_pos - history_abs_start;
-        // Probe-width equality gate before the SIMD walk. The long-hash
-        // callers pass `gate_len = 8` (matches an `MEM_read64`-style
-        // probe in the upstream reference); the short-hash caller
-        // passes `gate_len = 4` (`MEM_read32`-style). A 1-byte
-        // precheck would accept hash collisions whose actual common
-        // prefix runs from 1 byte up to less than the probe width,
-        // paying the full `common_prefix_len` walk for them on every
-        // iteration. The wider gate rejects those collisions early
-        // and matches what the upstream `_search_next_long` path does
-        // after a hit.
-        if candidate_idx + gate_len > concat.len() || current_idx + gate_len > concat.len() {
-            return None;
-        }
-        if concat[candidate_idx..candidate_idx + gate_len]
-            != concat[current_idx..current_idx + gate_len]
-        {
-            return None;
-        }
-        let match_len = common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
-        if match_len < DFAST_MIN_MATCH_LEN {
-            return None;
-        }
-        Some(self.extend_backwards(candidate_pos, abs_pos, match_len, lit_len))
-    }
-
-    #[inline(always)]
-    fn extend_backwards(
-        &self,
-        candidate_pos: usize,
-        abs_pos: usize,
-        match_len: usize,
-        lit_len: usize,
-    ) -> MatchCandidate {
-        extend_backwards_shared(
-            self.live_history(),
-            self.history_abs_start,
-            candidate_pos,
-            abs_pos,
-            match_len,
-            lit_len,
-        )
-    }
-
     pub(crate) fn insert_positions(&mut self, start: usize, end: usize) {
         let start = start.max(self.history_abs_start);
         let end = end.min(self.history_abs_end());
@@ -1474,7 +1176,7 @@ impl DfastMatchGenerator {
         // donor parity is "no insert" — skip entirely.
         let abs_concat_end = history_abs_start + concat_len;
         let long_safe_end = abs_concat_end.saturating_sub(7).min(end);
-        let short_safe_end = abs_concat_end.saturating_sub(3).min(end);
+        let short_safe_end = abs_concat_end.saturating_sub(4).min(end);
 
         // SAFETY: `history_base_ptr.add(history_start + idx)` is
         // in-bounds for `idx + 8 <= concat_len`, which the two
@@ -1492,12 +1194,12 @@ impl DfastMatchGenerator {
                 let packed = ((pos - position_base) as u32) + 1;
                 let load_ptr = history_base_ptr.add(history_start + idx);
                 let v8 = (load_ptr as *const u64).read_unaligned();
-                let v4 = v8 & 0xFFFF_FFFF;
                 // Donor parity (`zstd_compress_internal.h:923-924`):
                 // scalar `* prime8bytes` then shift to high bits. Drops
                 // the CRC32d-based kernel dispatch (3-4 instructions) for
-                // a single mul on the per-byte insert path.
-                let mixed_short = v4.wrapping_mul(0xCF1BBCDCB7A56463_u64);
+                // a single mul on the per-byte insert path. Short hash keys
+                // on the donor 5-byte window (`v8 << 24`, ZSTD_hash5 shape).
+                let mixed_short = (v8 << 24).wrapping_mul(0xCF1BBCDCB7A56463_u64);
                 let mixed_long = v8.wrapping_mul(0xCF1BBCDCB7A56463_u64);
                 let short_idx = (mixed_short >> short_shift) as usize;
                 let long_idx = (mixed_long >> long_shift) as usize;
@@ -1511,8 +1213,12 @@ impl DfastMatchGenerator {
                 let idx = pos - history_abs_start;
                 let packed = ((pos - position_base) as u32) + 1;
                 let load_ptr = history_base_ptr.add(history_start + idx);
-                let v4 = (load_ptr as *const u32).read_unaligned() as u64;
-                let mixed_short = v4.wrapping_mul(0xCF1BBCDCB7A56463_u64);
+                // 5-byte short key (donor `mls = 5`): 4-byte load + 1 byte so
+                // the <8-byte tail is never over-read; low 5 bytes in bits
+                // 24..63 to match `v8 << 24`.
+                let lo4 = (load_ptr as *const u32).read_unaligned() as u64;
+                let b5 = *load_ptr.add(4) as u64;
+                let mixed_short = ((lo4 | (b5 << 32)) << 24).wrapping_mul(0xCF1BBCDCB7A56463_u64);
                 let short_idx = (mixed_short >> short_shift) as usize;
                 *short_hash_ptr.add(short_idx) = packed;
             }
@@ -1579,7 +1285,11 @@ impl DfastMatchGenerator {
         // hash position and relies on the dense `_search_next_long`
         // retry in `hash_candidate` (via `best_match`) to preserve
         // compression ratio.
-        if idx + 4 <= concat_len {
+        // Short key needs 5 readable bytes (donor `mls = 5`). A position
+        // within 4 bytes of the current history end is not inserted here; the
+        // `start_matching` seam re-seed picks it up once the next block extends
+        // history far enough to form its full 5-byte key.
+        if idx + 5 <= concat_len {
             let concat = &self.history[self.history_start..];
             let short = self.short_hash_index(&concat[idx..]);
             debug_assert!(short < self.short_hash.len());
@@ -1594,9 +1304,20 @@ impl DfastMatchGenerator {
         }
     }
 
+    /// 5-byte short-hash index (donor `ZSTD_hashPtr(ip, hBitsS, mls=5)`). A
+    /// 4-byte key collides more on repetitive / log-stream data, so the
+    /// single-slot table overwrites useful positions the donor's 5-byte key
+    /// keeps. `data` MUST hold at least 5 bytes — every call site gates on a
+    /// 5-byte lookahead, so no zero-padded synthetic key is ever formed (a
+    /// padded short key would populate buckets for starts the donor skips).
     #[inline(always)]
     pub(crate) fn short_hash_index(&self, data: &[u8]) -> usize {
-        let value = u32::from_le_bytes(data[..4].try_into().unwrap()) as u64;
+        debug_assert!(data.len() >= 5, "short hash needs a full 5-byte key");
+        // Low 5 bytes (ZSTD_hash5 shape) shifted into bits 24..63, matching the
+        // raw `v8 << 24` form used by the fast-loop probe / insert sites.
+        let lo4 = u32::from_le_bytes(data[..4].try_into().unwrap()) as u64;
+        let b5 = data[4] as u64;
+        let value = (lo4 | (b5 << 32)) << 24;
         self.hash_index_with_bits(value, self.short_hash_bits)
     }
 
@@ -1915,8 +1636,11 @@ macro_rules! start_matching_fast_loop_body {
                     (history_base_ptr.add(history_start_offset + concat_idx0) as *const u64)
                         .read_unaligned()
                 };
+                // `v4_0` (low 4 bytes) is the cheap 4-byte equality-gate key
+                // below; the short HASH keys on the donor 5-byte window
+                // (`v8_0 << 24`, ZSTD_hash5 shape) to match `short_hash_index`.
                 let v4_0 = v8_0 & 0xFFFF_FFFF;
-                let hs0_idx = (v4_0.wrapping_mul(PRIME) >> short_shift) as usize;
+                let hs0_idx = ((v8_0 << 24).wrapping_mul(PRIME) >> short_shift) as usize;
                 let idxs0 = unsafe { *short_hash_ptr.add(hs0_idx) };
 
                 // Donor parity (`zstd_double_fast.c:187`): update BOTH
@@ -2416,8 +2140,11 @@ impl DfastMatchGenerator {
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
-            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
-            match select_kernel() {
+            use crate::encoding::fastpath::FastpathKernel;
+            // Use the matcher-level cached kernel (resolved once in `new()`),
+            // not a per-block `select_kernel()` — the cache only helps if the
+            // hot path actually reads it. Mirrors the Row backend.
+            match self.kernel {
                 FastpathKernel::Avx2Bmi2 => unsafe {
                     self.start_matching_fast_loop_avx2_bmi2(
                         current_abs_start,
@@ -2439,10 +2166,23 @@ impl DfastMatchGenerator {
                 ),
             }
         }
+        #[cfg(all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel_simd128"
+        ))]
+        unsafe {
+            self.start_matching_fast_loop_simd128(current_abs_start, current_len, handle_sequence)
+        }
         #[cfg(not(any(
             all(target_arch = "aarch64", target_endian = "little"),
             target_arch = "x86",
-            target_arch = "x86_64"
+            target_arch = "x86_64",
+            all(
+                target_arch = "wasm32",
+                target_feature = "simd128",
+                feature = "kernel_simd128"
+            )
         )))]
         {
             self.start_matching_fast_loop_scalar(current_abs_start, current_len, handle_sequence)
@@ -2500,7 +2240,35 @@ impl DfastMatchGenerator {
         )
     }
 
-    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel_simd128"
+    ))]
+    #[target_feature(enable = "simd128")]
+    unsafe fn start_matching_fast_loop_simd128(
+        &mut self,
+        current_abs_start: usize,
+        current_len: usize,
+        handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        start_matching_fast_loop_body!(
+            self,
+            current_abs_start,
+            current_len,
+            handle_sequence,
+            crate::encoding::fastpath::simd128::common_prefix_len_ptr
+        )
+    }
+
+    #[cfg(not(any(
+        all(target_arch = "aarch64", target_endian = "little"),
+        all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel_simd128"
+        )
+    )))]
     #[allow(unused_unsafe)]
     fn start_matching_fast_loop_scalar(
         &mut self,
@@ -2571,7 +2339,6 @@ mod extend_with_repcode_tests {
         // Window sized to the block so the matcher does not start
         // trimming history mid-test.
         let mut dfast = DfastMatchGenerator::new(data.len().next_power_of_two().max(64));
-        dfast.use_fast_loop = false; // exercise `start_matching_general`
         dfast.ensure_hash_tables();
         dfast.add_data(data.to_vec(), |_| {});
         dfast
@@ -2665,7 +2432,6 @@ mod extend_with_repcode_tests {
         let block_a: Vec<u8> = vec![b'C'; 64];
         let block_b: Vec<u8> = vec![b'C'; 32];
         let mut dfast = DfastMatchGenerator::new(256);
-        dfast.use_fast_loop = false;
         dfast.ensure_hash_tables();
         dfast.add_data(block_a, |_| {});
         dfast.add_data(block_b.clone(), |_| {});
@@ -2743,7 +2509,6 @@ mod extend_with_repcode_tests {
         let data: Vec<u8> = b"ABCD????ABCD!??????????ABCDX????".to_vec();
         assert_eq!(data.len(), 32, "fixture invariant: 32 bytes");
         let mut dfast = DfastMatchGenerator::new(64);
-        dfast.use_fast_loop = false;
         dfast.ensure_hash_tables();
         dfast.add_data(data.clone(), |_| {});
 

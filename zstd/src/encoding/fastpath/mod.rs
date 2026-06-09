@@ -77,6 +77,13 @@ pub(crate) mod sse42;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 pub(crate) mod avx2_bmi2;
 
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "simd128",
+    feature = "kernel_simd128"
+))]
+pub(crate) mod simd128;
+
 /// Runtime-selected variant tag. Picked once per process by [`select_kernel`].
 ///
 /// Each variant corresponds to one of the submodules above and dictates which
@@ -90,6 +97,12 @@ pub(crate) enum FastpathKernel {
     Sse42,
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     Avx2Bmi2,
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel_simd128"
+    ))]
+    Simd128,
 }
 
 /// Select the best supported variant for the running CPU. Cached after first
@@ -111,6 +124,17 @@ pub(crate) fn select_kernel() -> FastpathKernel {
 }
 
 #[inline]
+// On wasm32+simd128 the tier is resolved unconditionally to `Simd128` (no
+// runtime CPUID), so the trailing `Scalar` fallback is statically unreachable
+// there; it stays the reachable fallback on every other target.
+#[cfg_attr(
+    all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel_simd128"
+    ),
+    allow(unreachable_code)
+)]
 fn detect_kernel_uncached() -> FastpathKernel {
     // Each kernel's `hash_mix_u64` uses a hardware CRC instruction
     // (`_mm_crc32_u64` on x86, `__crc32d` on AArch64) for the donor-style
@@ -175,6 +199,19 @@ fn detect_kernel_uncached() -> FastpathKernel {
         }
     }
 
+    // wasm SIMD is a compile-time feature (no runtime detection), so the
+    // `+simd128` payload selects the SIMD kernel and the scalar payload never
+    // compiles the variant. `hash_mix_u64` routes through the scalar mixer
+    // (wasm has no CRC), so there's no extra feature to gate on here.
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel_simd128"
+    ))]
+    {
+        return FastpathKernel::Simd128;
+    }
+
     FastpathKernel::Scalar
 }
 
@@ -225,6 +262,20 @@ pub(crate) fn dispatch_count_match_from_indices(
                 seed_len,
             )
         },
+        #[cfg(all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel_simd128"
+        ))]
+        FastpathKernel::Simd128 => unsafe {
+            simd128::count_match_from_indices(
+                concat,
+                current_idx,
+                candidate_idx,
+                tail_limit,
+                seed_len,
+            )
+        },
     }
 }
 
@@ -246,6 +297,12 @@ pub(crate) fn hash_mix_u64_with_kernel(kernel: FastpathKernel, value: u64) -> u6
         FastpathKernel::Sse42 => unsafe { sse42::hash_mix_u64(value) },
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         FastpathKernel::Avx2Bmi2 => unsafe { avx2_bmi2::hash_mix_u64(value) },
+        #[cfg(all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel_simd128"
+        ))]
+        FastpathKernel::Simd128 => simd128::hash_mix_u64(value),
     }
 }
 
@@ -270,7 +327,26 @@ pub(crate) unsafe fn dispatch_common_prefix_len_ptr(
     rhs: *const u8,
     max: usize,
 ) -> usize {
-    match select_kernel() {
+    // Cold-path shim: resolves the kernel via `select_kernel()` on every call.
+    // Hot match-finder loops resolve the kernel once per block and call
+    // [`dispatch_common_prefix_len_ptr_with_kernel`] directly.
+    unsafe { dispatch_common_prefix_len_ptr_with_kernel(select_kernel(), lhs, rhs, max) }
+}
+
+/// Prefix-length scan against an already-resolved [`FastpathKernel`], so a hot
+/// loop pays the kernel-select once per block (caller-cached) instead of the
+/// `OnceLock` atomic + branch on every byte-compare.
+///
+/// # Safety
+/// `lhs` / `rhs` must each point to at least `max` initialized bytes.
+#[inline(always)]
+pub(crate) unsafe fn dispatch_common_prefix_len_ptr_with_kernel(
+    kernel: FastpathKernel,
+    lhs: *const u8,
+    rhs: *const u8,
+    max: usize,
+) -> usize {
+    match kernel {
         FastpathKernel::Scalar => unsafe { scalar::common_prefix_len_ptr(lhs, rhs, max) },
         #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
         FastpathKernel::Neon => unsafe { neon::common_prefix_len_ptr(lhs, rhs, max) },
@@ -278,6 +354,12 @@ pub(crate) unsafe fn dispatch_common_prefix_len_ptr(
         FastpathKernel::Sse42 => unsafe { sse42::common_prefix_len_ptr(lhs, rhs, max) },
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         FastpathKernel::Avx2Bmi2 => unsafe { avx2_bmi2::common_prefix_len_ptr(lhs, rhs, max) },
+        #[cfg(all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel_simd128"
+        ))]
+        FastpathKernel::Simd128 => unsafe { simd128::common_prefix_len_ptr(lhs, rhs, max) },
     }
 }
 
@@ -300,6 +382,12 @@ mod tests {
             FastpathKernel::Sse42 => {}
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             FastpathKernel::Avx2Bmi2 => {}
+            #[cfg(all(
+                target_arch = "wasm32",
+                target_feature = "simd128",
+                feature = "kernel_simd128"
+            ))]
+            FastpathKernel::Simd128 => {}
         }
     }
 

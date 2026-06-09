@@ -53,9 +53,11 @@ use std::arch::is_aarch64_feature_detected;
 use std::arch::is_x86_feature_detected;
 
 pub(crate) const DFAST_MIN_MATCH_LEN: usize = 5;
-pub(crate) const DFAST_SHORT_HASH_LOOKAHEAD: usize = 4;
+// Bytes the dfast short hash reads (donor `mls = 5`). Seeding / lookahead
+// guards use it so a position is only short-hashed once its full 5-byte key
+// is in range.
+pub(crate) const DFAST_SHORT_HASH_LOOKAHEAD: usize = 5;
 pub(crate) const ROW_MIN_MATCH_LEN: usize = 5;
-pub(crate) const DFAST_TARGET_LEN: usize = 48;
 // Donor `clevels.h:31` at level 3 large-input bucket sets
 // `hashLog = 17` (the long-hash table) and `chainLog = 16` (the
 // short-hash table — donor names this `chainTable` even though for
@@ -103,7 +105,6 @@ pub(crate) const DFAST_EMPTY_SLOT: u32 = 0;
 pub(crate) const DFAST_REBASE_GUARD_BAND: u32 = 1u32 << 30;
 pub(crate) const DFAST_SKIP_SEARCH_STRENGTH: usize = 6;
 pub(crate) const DFAST_SKIP_STEP_GROWTH_INTERVAL: usize = 1 << DFAST_SKIP_SEARCH_STRENGTH;
-pub(crate) const DFAST_LOCAL_SKIP_TRIGGER: usize = 256;
 pub(crate) const DFAST_MAX_SKIP_STEP: usize = 8;
 pub(crate) const DFAST_INCOMPRESSIBLE_SKIP_STEP: usize = 16;
 pub(crate) const ROW_HASH_BITS: usize = 20;
@@ -1935,13 +1936,6 @@ impl Matcher for MatchGeneratorDriver {
             }
             MatcherStorage::Dfast(dfast) => {
                 dfast.max_window_size = max_window_size;
-                dfast.lazy_depth = params.lazy_depth;
-                dfast.use_fast_loop = matches!(
-                    level,
-                    CompressionLevel::Default
-                        | CompressionLevel::Level(0)
-                        | CompressionLevel::Level(3)
-                );
                 let dcfg = params
                     .dfast
                     .expect("Dfast level row must carry a DfastConfig");
@@ -5854,7 +5848,12 @@ fn dfast_accepts_exact_five_byte_match() {
     data.extend_from_slice(b"!!!!!!!!!!!!!!!!!!!!!!!"); // 5..28 (23 bytes)
     data.extend_from_slice(b"ABCDE"); // 28..33
     data.push(b'F'); // 33: forces forward extension to stop at length 5
-    assert_eq!(data.len(), 34);
+    // Trailing filler so the match site (28) sits at least HASH_READ_SIZE (8)
+    // bytes before the block end. The greedy double-fast — like the donor —
+    // stops probing at `ilimit = iend - HASH_READ_SIZE`, so a match in the
+    // final 8 bytes is never searched (donor parity, not a regression).
+    data.extend_from_slice(b"GHIJKLMNOPQRSTUVWXYZ"); // 34..54
+    assert_eq!(data.len(), 54);
 
     let mut matcher = DfastMatchGenerator::new(1 << 22);
     matcher.add_data(data.clone(), |_| {});
@@ -5931,33 +5930,32 @@ fn driver_level5_selects_row_backend() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
     driver.reset(CompressionLevel::Level(5));
     assert_eq!(driver.active_backend(), super::strategy::BackendTag::Row);
-    // Greedy-specific routing assertion: the `BackendTag::Row` arm of
-    // `MatchGeneratorDriver::compress_block` has a
-    // `debug_assert_eq!(matcher.lazy_depth, 0)` invariant that
-    // dispatches L4 unconditionally into `start_matching_greedy`.
-    // If a future change rerouted L4 through the
-    // `RowMatchGenerator::start_matching` (depth >= 1) path, this
-    // assertion would catch it before the round-trip tests below —
-    // round-trip alone passes on the lazy parser too. Together with
-    // the round-trip suite this pins the greedy-vs-lazy routing
-    // decision at the level table layer.
+    // Greedy-specific routing assertion: `MatchGeneratorDriver::start_matching`
+    // dispatches the Row backend into `start_matching_greedy` iff
+    // `self.parse == ParseMode::Greedy`, so assert that actual selector —
+    // round-trip alone passes on the lazy parser too. `row_matcher().lazy_depth`
+    // is a secondary corroboration of the same routing decision (a mirror of
+    // the parse mode); checking `parse` directly catches a regression even if
+    // the two ever drift apart.
+    assert_eq!(
+        driver.parse,
+        super::strategy::ParseMode::Greedy,
+        "L5 must route to start_matching_greedy (parse == Greedy)",
+    );
     assert_eq!(
         driver.row_matcher().lazy_depth,
         0,
-        "L4 must route to start_matching_greedy (lazy_depth == 0)",
+        "row matcher lazy_depth must mirror the greedy parse mode",
     );
 }
 
-/// Level 4 maps to `StrategyTag::Greedy` which dispatches into
-/// [`super::row::RowMatchGenerator::start_matching_greedy`]. Round-trip
-/// alone doesn't pin the greedy-vs-lazy choice (a lazy parser would
-/// also reconstruct the input correctly) — that piece is locked down
-/// by the `lazy_depth == 0` assertion in
-/// [`driver_level4_selects_row_backend`]. This test guards the parse
-/// output itself: a small repeating pattern must produce at least one
-/// `Sequence::Triple`, so a future regression that emits literals-only
-/// (e.g. a `min_match` or rep-probe guard regression) is caught
-/// independently of routing.
+/// Level 4 maps to `StrategyTag::Dfast` (the greedy double-fast, donor
+/// `ZSTD_dfast` — "greedy" is the parse discipline, not the Row/Greedy
+/// strategy at Level 5). Round-trip alone doesn't pin match quality (a lazy
+/// parser would also reconstruct the input correctly), so this test guards the
+/// parse output itself: a small repeating pattern must produce at least one
+/// `Sequence::Triple`, so a future regression that emits literals-only (e.g. a
+/// `min_match` or rep-probe guard regression) is caught.
 #[test]
 fn driver_level4_greedy_round_trip_single_slice() {
     let mut driver = MatchGeneratorDriver::new(64, 2);
@@ -6264,6 +6262,10 @@ fn config_override_is_consumed_by_reset() {
     );
 }
 
+// Level 4 maps to the greedy Dfast (double-fast) backend — "greedy" here is the
+// parse discipline (no lazy lookahead, donor `ZSTD_dfast`), NOT the Row/Greedy
+// strategy (which is Level 5). This roundtrip is intentional Dfast L4 coverage;
+// the Row backend is exercised by the `Level(5)` fixtures elsewhere in this file.
 #[cfg(test)]
 fn l4_greedy_round_trip(slice_size: usize, max_slices: usize, data: &[u8]) -> (usize, usize) {
     let mut driver = MatchGeneratorDriver::new(slice_size, max_slices);
@@ -8164,17 +8166,19 @@ fn hc_prime_with_dictionary_disables_btultra2_seed_pass() {
 #[test]
 fn dfast_prime_with_dictionary_preserves_history_for_first_full_block() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
-    // Use Level(4) — Dfast with `use_fast_loop=false`. Level(3) is
-    // also Dfast but flips `use_fast_loop=true`, which routes through
-    // a different scan path that bails early on the tiny 8-byte
-    // dict + 8-byte block scenario this test exercises.
+    // Level(4) is Dfast with the greedy double-fast loop (donor parity:
+    // clevels.h L3/L4 are both `ZSTD_dfast`, which has no lazy lookahead).
+    // The fast loop needs at least `HASH_READ_SIZE` (8) bytes ahead of the
+    // probe cursor, so this exercises a 16-byte dict + 16-byte block (the
+    // whole block matches the dict, offset = dict length = 16).
     driver.reset(CompressionLevel::Level(4));
 
-    driver.prime_with_dictionary(b"abcdefgh", [1, 4, 8]);
+    let payload = b"abcdefghijklmnop";
+    driver.prime_with_dictionary(payload, [1, 4, 8]);
 
     let mut space = driver.get_next_space();
     space.clear();
-    space.extend_from_slice(b"abcdefgh");
+    space.extend_from_slice(payload);
     driver.commit_space(space);
 
     let mut saw_match = false;
@@ -8185,7 +8189,7 @@ fn dfast_prime_with_dictionary_preserves_history_for_first_full_block() {
             match_len,
         } = seq
             && literals.is_empty()
-            && offset == 8
+            && offset == payload.len()
             && match_len >= DFAST_MIN_MATCH_LEN
         {
             saw_match = true;
@@ -8452,13 +8456,19 @@ fn dfast_prime_with_dictionary_counts_four_byte_tail_budget() {
 #[test]
 fn row_prime_with_dictionary_preserves_history_for_first_full_block() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
-    driver.reset(CompressionLevel::Level(4));
+    // Level(5) is the greedy Row backend (LEVEL_TABLE row 5: Greedy / RowHash).
+    // Level(4) now routes to Dfast, so this test must use Level(5) to actually
+    // exercise `RowMatchGenerator`'s dictionary priming. The 16-byte dict +
+    // 16-byte block lets the whole block match the primed dict (offset = dict
+    // length = 16).
+    driver.reset(CompressionLevel::Level(5));
 
-    driver.prime_with_dictionary(b"abcdefgh", [1, 4, 8]);
+    let payload = b"abcdefghijklmnop";
+    driver.prime_with_dictionary(payload, [1, 4, 8]);
 
     let mut space = driver.get_next_space();
     space.clear();
-    space.extend_from_slice(b"abcdefgh");
+    space.extend_from_slice(payload);
     driver.commit_space(space);
 
     let mut saw_match = false;
@@ -8469,7 +8479,7 @@ fn row_prime_with_dictionary_preserves_history_for_first_full_block() {
             match_len,
         } = seq
             && literals.is_empty()
-            && offset == 8
+            && offset == payload.len()
             && match_len >= ROW_MIN_MATCH_LEN
         {
             saw_match = true;
@@ -10468,11 +10478,11 @@ fn dfast_seed_remaining_hashable_starts_seeds_last_short_hash_positions() {
     let seed_start = current_len - DFAST_MIN_MATCH_LEN;
     matcher.seed_remaining_hashable_starts(current_abs_start, current_len, seed_start);
 
-    let target_abs_pos = current_abs_start + current_len - 4;
+    let target_abs_pos = current_abs_start + current_len - 5;
     let target_rel = target_abs_pos - matcher.history_abs_start;
     let live = matcher.live_history();
     assert!(
-        target_rel + 4 <= live.len(),
+        target_rel + 5 <= live.len(),
         "fixture must leave the last short-hash start valid"
     );
     let short_hash = matcher.short_hash_index(&live[target_rel..]);
@@ -10483,7 +10493,7 @@ fn dfast_seed_remaining_hashable_starts_seeds_last_short_hash_positions() {
     );
     assert_eq!(
         matcher.short_hash[short_hash], target_slot,
-        "tail seeding must include the last 4-byte-hashable start"
+        "tail seeding must include the last 5-byte-hashable start"
     );
 }
 
@@ -10498,11 +10508,11 @@ fn dfast_seed_remaining_hashable_starts_handles_pos_at_block_end() {
     let current_abs_start = matcher.history_abs_start + matcher.window_size - current_len;
     matcher.seed_remaining_hashable_starts(current_abs_start, current_len, current_len);
 
-    let target_abs_pos = current_abs_start + current_len - 4;
+    let target_abs_pos = current_abs_start + current_len - 5;
     let target_rel = target_abs_pos - matcher.history_abs_start;
     let live = matcher.live_history();
     assert!(
-        target_rel + 4 <= live.len(),
+        target_rel + 5 <= live.len(),
         "fixture must leave the last short-hash start valid"
     );
     let short_hash = matcher.short_hash_index(&live[target_rel..]);
@@ -10513,7 +10523,7 @@ fn dfast_seed_remaining_hashable_starts_handles_pos_at_block_end() {
     );
     assert_eq!(
         matcher.short_hash[short_hash], target_slot,
-        "tail seeding must still include the last 4-byte-hashable start when pos is at block end"
+        "tail seeding must still include the last 5-byte-hashable start when pos is at block end"
     );
 }
 
