@@ -163,9 +163,23 @@ macro_rules! dfast_probe_slot_match_body {
         if candidate_idx + $gate_len > $concat.len() || $current_idx + $gate_len > $concat.len() {
             return None;
         }
-        if $concat[candidate_idx..candidate_idx + $gate_len]
-            != $concat[$current_idx..$current_idx + $gate_len]
-        {
+        // Fixed-width equality gate. `$gate_len` is 4 (short hash) or 8 (long
+        // hash / `_search_next_long` retry); a slice `!=` here lowers to a libc
+        // `__memcmp` CALL (~14% self-time on the dfast L4 profile) instead of a
+        // single load + compare. Read the gate as one unaligned u32/u64 — the
+        // bounds were verified just above (`candidate_idx + $gate_len <= len`
+        // and `$current_idx + $gate_len <= len`).
+        debug_assert!($gate_len == 4 || $gate_len == 8);
+        let gate_eq = unsafe {
+            let cand = $concat.as_ptr().add(candidate_idx);
+            let cur = $concat.as_ptr().add($current_idx);
+            if $gate_len == 8 {
+                cand.cast::<u64>().read_unaligned() == cur.cast::<u64>().read_unaligned()
+            } else {
+                cand.cast::<u32>().read_unaligned() == cur.cast::<u32>().read_unaligned()
+            }
+        };
+        if !gate_eq {
             return None;
         }
         let a = &$concat[candidate_idx..];
@@ -1408,8 +1422,16 @@ impl DfastMatchGenerator {
             if cur_idx + DFAST_REP_MIN_MATCH_LEN > concat.len() {
                 break;
             }
-            // Cheap 4-byte gate before the SIMD `common_prefix_len`.
-            if concat[cur_idx..cur_idx + 4] != concat[cand_idx..cand_idx + 4] {
+            // Cheap 4-byte gate before the SIMD `common_prefix_len`. Read it as
+            // one unaligned u32 rather than a slice `!=` (which lowers to a libc
+            // `memcmp` CALL). Bounds: `cur_idx + 4 <= len` from the
+            // `DFAST_REP_MIN_MATCH_LEN` (= 4) check above, and
+            // `cand_idx = cur_idx - rep < cur_idx` so `cand_idx + 4 <= len` too.
+            let gate_eq = unsafe {
+                concat.as_ptr().add(cur_idx).cast::<u32>().read_unaligned()
+                    == concat.as_ptr().add(cand_idx).cast::<u32>().read_unaligned()
+            };
+            if !gate_eq {
                 break;
             }
             let match_len =
