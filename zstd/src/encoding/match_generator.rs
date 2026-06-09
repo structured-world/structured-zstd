@@ -1776,13 +1776,13 @@ impl Matcher for MatchGeneratorDriver {
             MatcherStorage::Dfast(dfast) => {
                 dfast.max_window_size = max_window_size;
                 dfast.lazy_depth = params.lazy_depth;
-                dfast.use_fast_loop = matches!(
-                    level,
-                    CompressionLevel::Default
-                        | CompressionLevel::Level(0)
-                        | CompressionLevel::Level(3)
-                        | CompressionLevel::Level(4)
-                );
+                // Donor `ZSTD_dfast` is ALWAYS the greedy double-fast
+                // (`zstd_double_fast.c`, no lazy lookahead); lazy parsing is a
+                // separate strategy (`ZSTD_lazy`/`lazy2`). Keying the greedy
+                // loop on the Dfast backend (not the numeric level) keeps a
+                // custom `Strategy::Dfast` set via the parameter API greedy at
+                // every level, matching the donor.
+                dfast.use_fast_loop = true;
                 let dcfg = params
                     .dfast
                     .expect("Dfast level row must carry a DfastConfig");
