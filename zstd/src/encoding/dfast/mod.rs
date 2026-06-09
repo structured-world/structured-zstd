@@ -1760,7 +1760,18 @@ macro_rules! start_matching_fast_loop_body {
                             // `extend_with_repcode_after_match` chain
                             // (which uses 4) inconsistent with the peek.
                             if match_len >= DFAST_REP_MIN_MATCH_LEN {
-                                let concat = &$self.history[history_start_offset..];
+                                // SAFETY: `history_base_ptr + history_start_offset` is the live
+                                // source start (owned `history[history_start..]` or the
+                                // borrowed input slice) and `concat_len` its readable byte
+                                // count, both from `scan_source()` at the top of this outer
+                                // iter; `extend_backwards_shared` only indexes within the
+                                // candidate/cursor range it is handed, all `< concat_len`.
+                                let concat = unsafe {
+                                    core::slice::from_raw_parts(
+                                        history_base_ptr.add(history_start_offset),
+                                        concat_len,
+                                    )
+                                };
                                 let rep_cand = extend_backwards_shared(
                                     concat,
                                     history_abs_start,
@@ -1823,7 +1834,18 @@ macro_rules! start_matching_fast_loop_body {
                                 );
                                 match_len += ext;
                             }
-                            let concat = &$self.history[history_start_offset..];
+                            // SAFETY: `history_base_ptr + history_start_offset` is the live
+                                // source start (owned `history[history_start..]` or the
+                                // borrowed input slice) and `concat_len` its readable byte
+                                // count, both from `scan_source()` at the top of this outer
+                                // iter; `extend_backwards_shared` only indexes within the
+                                // candidate/cursor range it is handed, all `< concat_len`.
+                                let concat = unsafe {
+                                    core::slice::from_raw_parts(
+                                        history_base_ptr.add(history_start_offset),
+                                        concat_len,
+                                    )
+                                };
                             let cand = extend_backwards_shared(
                                 concat,
                                 history_abs_start,
@@ -1880,7 +1902,18 @@ macro_rules! start_matching_fast_loop_body {
                                     match_len += ext;
                                 }
                                 let cand_pos = history_abs_start + dp;
-                                let concat = &$self.history[history_start_offset..];
+                                // SAFETY: `history_base_ptr + history_start_offset` is the live
+                                // source start (owned `history[history_start..]` or the
+                                // borrowed input slice) and `concat_len` its readable byte
+                                // count, both from `scan_source()` at the top of this outer
+                                // iter; `extend_backwards_shared` only indexes within the
+                                // candidate/cursor range it is handed, all `< concat_len`.
+                                let concat = unsafe {
+                                    core::slice::from_raw_parts(
+                                        history_base_ptr.add(history_start_offset),
+                                        concat_len,
+                                    )
+                                };
                                 let cand = extend_backwards_shared(
                                     concat,
                                     history_abs_start,
@@ -1930,7 +1963,18 @@ macro_rules! start_matching_fast_loop_body {
                                 );
                                 s_match_len += ext;
                             }
-                            let concat = &$self.history[history_start_offset..];
+                            // SAFETY: `history_base_ptr + history_start_offset` is the live
+                                // source start (owned `history[history_start..]` or the
+                                // borrowed input slice) and `concat_len` its readable byte
+                                // count, both from `scan_source()` at the top of this outer
+                                // iter; `extend_backwards_shared` only indexes within the
+                                // candidate/cursor range it is handed, all `< concat_len`.
+                                let concat = unsafe {
+                                    core::slice::from_raw_parts(
+                                        history_base_ptr.add(history_start_offset),
+                                        concat_len,
+                                    )
+                                };
                             let short_cand = extend_backwards_shared(
                                 concat,
                                 history_abs_start,
@@ -1984,7 +2028,18 @@ macro_rules! start_matching_fast_loop_body {
                                             l1_match_len += ext;
                                         }
                                         if l1_match_len > short_cand.match_len {
-                                            let concat = &$self.history[history_start_offset..];
+                                            // SAFETY: `history_base_ptr + history_start_offset` is the live
+                                // source start (owned `history[history_start..]` or the
+                                // borrowed input slice) and `concat_len` its readable byte
+                                // count, both from `scan_source()` at the top of this outer
+                                // iter; `extend_backwards_shared` only indexes within the
+                                // candidate/cursor range it is handed, all `< concat_len`.
+                                let concat = unsafe {
+                                    core::slice::from_raw_parts(
+                                        history_base_ptr.add(history_start_offset),
+                                        concat_len,
+                                    )
+                                };
                                             chosen = extend_backwards_shared(
                                                 concat,
                                                 history_abs_start,
@@ -2051,7 +2106,18 @@ macro_rules! start_matching_fast_loop_body {
                                             }
                                             if dl1_match_len > short_cand.match_len {
                                                 let cand_pos = history_abs_start + dp1;
-                                                let concat = &$self.history[history_start_offset..];
+                                                // SAFETY: `history_base_ptr + history_start_offset` is the live
+                                // source start (owned `history[history_start..]` or the
+                                // borrowed input slice) and `concat_len` its readable byte
+                                // count, both from `scan_source()` at the top of this outer
+                                // iter; `extend_backwards_shared` only indexes within the
+                                // candidate/cursor range it is handed, all `< concat_len`.
+                                let concat = unsafe {
+                                    core::slice::from_raw_parts(
+                                        history_base_ptr.add(history_start_offset),
+                                        concat_len,
+                                    )
+                                };
                                                 chosen = extend_backwards_shared(
                                                     concat,
                                                     history_abs_start,
@@ -2123,7 +2189,18 @@ macro_rules! start_matching_fast_loop_body {
                                     s_match_len += ext;
                                 }
                                 let cand_pos = history_abs_start + dp;
-                                let concat = &$self.history[history_start_offset..];
+                                // SAFETY: `history_base_ptr + history_start_offset` is the live
+                                // source start (owned `history[history_start..]` or the
+                                // borrowed input slice) and `concat_len` its readable byte
+                                // count, both from `scan_source()` at the top of this outer
+                                // iter; `extend_backwards_shared` only indexes within the
+                                // candidate/cursor range it is handed, all `< concat_len`.
+                                let concat = unsafe {
+                                    core::slice::from_raw_parts(
+                                        history_base_ptr.add(history_start_offset),
+                                        concat_len,
+                                    )
+                                };
                                 let dcand = extend_backwards_shared(
                                     concat,
                                     history_abs_start,
