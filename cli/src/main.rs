@@ -60,6 +60,8 @@ struct Options {
     bench: bool,
     bench_start: i32,
     bench_end: i32,
+    /// Per-level benchmark time budget in seconds (`-i`, default 1).
+    bench_secs: f64,
     /// Long-distance matching (`--long`), enabled on the encoder via the
     /// compression-parameters API.
     long: bool,
@@ -142,6 +144,7 @@ fn parse_args(
         bench: false,
         bench_start: CompressionLevel::DEFAULT_LEVEL,
         bench_end: 0,
+        bench_secs: 1.0,
         long: false,
     };
     let mut ultra = false;
@@ -236,9 +239,12 @@ fn parse_args(
                                 opts.bench_end = v;
                             }
                         }
-                        // `-i` (iteration seconds) accepted; the basic bench
-                        // uses a fixed time budget, so the value is informational.
-                        'i' => {}
+                        // `-i[N]`: per-level benchmark time budget in seconds.
+                        'i' => {
+                            if let Some(v) = value {
+                                opts.bench_secs = (v.max(1)) as f64;
+                            }
+                        }
                         _ => unreachable!(),
                     }
                     ci = chars.len();
@@ -247,7 +253,15 @@ fn parse_args(
                 'c' => opts.to_stdout = true,
                 'f' => opts.force = true,
                 'k' => opts.keep = true,
-                'q' | 'v' => {}
+                // `-S` (benchmark each file separately) is the default here;
+                // `-q`/`-v` verbosity are accepted no-ops.
+                'q' | 'v' | 'S' => {}
+                'B' => {
+                    // `-B[N]` benchmark block size: accepted (the encoder uses
+                    // its fixed block size); consume any attached value.
+                    ci = chars.len();
+                    continue;
+                }
                 'V' => {
                     print_version();
                     return Ok(Parsed::Handled);
@@ -419,7 +433,6 @@ fn run_benchmark(opts: &Options, dict: Option<&[u8]>) -> color_eyre::Result<()> 
         bail!("-b: input is empty");
     }
     // Per-level time budget; best (fastest) pass wins, like upstream's -i loop.
-    const BUDGET_SECS: f64 = 1.0;
     let mb = data.len() as f64 / 1e6;
     println!(
         "benchmarking {} ({})  levels {}..={}",
@@ -447,7 +460,7 @@ fn run_benchmark(opts: &Options, dict: Option<&[u8]>) -> color_eyre::Result<()> 
                 opts.long,
             )?;
             best_compress = best_compress.min(t.elapsed().as_secs_f64());
-            if start.elapsed().as_secs_f64() >= BUDGET_SECS {
+            if start.elapsed().as_secs_f64() >= opts.bench_secs {
                 break;
             }
         }
@@ -459,7 +472,7 @@ fn run_benchmark(opts: &Options, dict: Option<&[u8]>) -> color_eyre::Result<()> 
             let t = Instant::now();
             decompress_stream(compressed.as_slice(), &mut out, dict)?;
             best_decompress = best_decompress.min(t.elapsed().as_secs_f64());
-            if start.elapsed().as_secs_f64() >= BUDGET_SECS {
+            if start.elapsed().as_secs_f64() >= opts.bench_secs {
                 break;
             }
         }
@@ -1128,6 +1141,7 @@ mod tests {
             bench: false,
             bench_start: 3,
             bench_end: 0,
+            bench_secs: 1.0,
             long: false,
         };
         assert_eq!(
