@@ -1189,6 +1189,40 @@ impl DfastMatchGenerator {
         )
     }
 
+    /// Byte-source descriptor for the BORROWED kernel: `(input_ptr,
+    /// block_end)`. The borrowed window packs absolute input offsets, so the
+    /// owned rebase coordinates (`start_offset`, `abs_start`, `position_base`)
+    /// are constant `0` and the hot loop supplies them as literals — folding
+    /// every per-position `abs - abs_start` / `>= abs_start` term to the bare
+    /// absolute position (donor `base + index` shape). Split out from
+    /// [`Self::scan_source`] so the `BORROWED` const kernel never materialises
+    /// the owned-path arithmetic.
+    #[inline(always)]
+    fn borrowed_scan_descriptor(&self) -> (*const u8, usize) {
+        let (ptr, _total) = self
+            .borrowed_input
+            .expect("BORROWED kernel dispatched without a borrowed window");
+        let (_block_start, block_end) = self
+            .borrowed_block
+            .expect("BORROWED kernel dispatched without a staged block");
+        (ptr, block_end)
+    }
+
+    /// Byte-source descriptor for the owned (history-concat) kernel. Mirrors
+    /// the owned arm of [`Self::scan_source`] without the borrowed branch, so
+    /// the `!BORROWED` const kernel reads the rebased fields directly.
+    #[inline(always)]
+    fn owned_scan_descriptor(&self) -> (*const u8, usize, usize, usize, usize) {
+        let start_offset = self.history_start;
+        (
+            self.history.as_ptr(),
+            start_offset,
+            self.history_abs_start,
+            self.position_base,
+            self.history.len() - start_offset,
+        )
+    }
+
     /// `(ptr, len)` of the block currently being emitted, for the literal
     /// slices in `emit_candidate` / `emit_trailing_literals`. Owned: the
     /// `history` concat tail (`last_len` bytes). Borrowed: the in-place
@@ -1568,7 +1602,7 @@ impl DfastMatchGenerator {
 /// cpl calls inline under one umbrella and `select_kernel()` is resolved ONCE
 /// per block in the bare dispatcher, never per cpl call.
 macro_rules! start_matching_fast_loop_body {
-    ($self:ident, $current_abs_start:ident, $current_len:ident, $handle_sequence:ident, $cpl:path, $use_dict:expr) => {{
+    ($self:ident, $current_abs_start:ident, $current_len:ident, $handle_sequence:ident, $cpl:path, $use_dict:expr, $borrowed:expr) => {{
         // Behaviour change vs the pre-refactor `start_matching_general`:
         // this fast loop deliberately drops the strict-incompressible
         // early-skip path (the `block_looks_incompressible_strict` short
@@ -1659,7 +1693,7 @@ macro_rules! start_matching_fast_loop_body {
         // 0` (the eligibility gate caps `input_len <= u32::MAX`, so every
         // `abs + 1` slot fits without a reduce), and a `reduce()` here would
         // subtract from every live slot and corrupt that absolute encoding.
-        if $self.borrowed_block.is_none() {
+        if !$borrowed {
             $self.ensure_room_for($current_abs_start + $current_len - 1);
         }
         const PRIME: u64 = 0xCF1BBCDCB7A56463_u64;
@@ -1776,8 +1810,19 @@ macro_rules! start_matching_fast_loop_body {
             // returns its rebased fields, a borrowed window its constant
             // descriptor. The hash-table pointers are mode-invariant (the
             // tables persist across owned/borrowed) so they stay direct.
+            // `$borrowed` is a compile-time const (the kernel is monomorphised
+            // per borrowed/owned), so only one arm survives. On the borrowed
+            // kernel `history_start_offset / history_abs_start / position_base`
+            // are LITERAL `0`, collapsing every per-position `abs - abs_start`
+            // term and the always-true `cand_pos >= abs_start` lower-bound
+            // check to the bare absolute position (donor `base + index` shape).
             let (history_base_ptr, history_start_offset, history_abs_start, position_base, concat_len) =
-                $self.scan_source();
+                if $borrowed {
+                    let (ptr, block_end) = $self.borrowed_scan_descriptor();
+                    (ptr, 0usize, 0usize, 0usize, block_end)
+                } else {
+                    $self.owned_scan_descriptor()
+                };
             let short_hash_ptr = $self.short_hash.as_mut_ptr();
             let long_hash_ptr = $self.long_hash.as_mut_ptr();
 
@@ -2480,13 +2525,27 @@ impl DfastMatchGenerator {
         // loop-invariant runtime check inside the scan. The no-dict kernel
         // carries zero dict code (donor keeps the noDict / dictMatchState loops
         // as separate functions for exactly this reason).
+        // Two orthogonal axes resolved ONCE here, off the hot path, into a
+        // const-monomorphised kernel:
+        //   * `USE_DICT` — dict probe compiled in or out (donor keeps noDict /
+        //     dictMatchState as separate functions for the same reason).
+        //   * `BORROWED` — borrowed-window scan vs owned history concat. The
+        //     borrowed kernel folds the rebase coordinates to literal `0`,
+        //     erasing the per-position abstraction arithmetic the owned path
+        //     needs (donor `base + index` shape).
+        // A borrowed block never carries a dict (`borrowed_eligible` rejects
+        // `use_dictionary_state`), so only three of the four combinations are
+        // ever instantiated; the `<true, true>` arm is unreachable.
         let use_dict = self.dict.table().is_some();
+        let borrowed = self.borrowed_block.is_some();
         macro_rules! dispatch_dict {
             ($kernel:ident) => {
-                if use_dict {
-                    self.$kernel::<true>(current_abs_start, current_len, handle_sequence)
+                if borrowed {
+                    self.$kernel::<false, true>(current_abs_start, current_len, handle_sequence)
+                } else if use_dict {
+                    self.$kernel::<true, false>(current_abs_start, current_len, handle_sequence)
                 } else {
-                    self.$kernel::<false>(current_abs_start, current_len, handle_sequence)
+                    self.$kernel::<false, false>(current_abs_start, current_len, handle_sequence)
                 }
             };
         }
@@ -2533,7 +2592,7 @@ impl DfastMatchGenerator {
 
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     #[target_feature(enable = "neon")]
-    unsafe fn start_matching_fast_loop_neon<const USE_DICT: bool>(
+    unsafe fn start_matching_fast_loop_neon<const USE_DICT: bool, const BORROWED: bool>(
         &mut self,
         current_abs_start: usize,
         current_len: usize,
@@ -2545,13 +2604,14 @@ impl DfastMatchGenerator {
             current_len,
             handle_sequence,
             crate::encoding::fastpath::neon::common_prefix_len_ptr,
-            USE_DICT
+            USE_DICT,
+            BORROWED
         )
     }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[target_feature(enable = "sse4.2")]
-    unsafe fn start_matching_fast_loop_sse42<const USE_DICT: bool>(
+    unsafe fn start_matching_fast_loop_sse42<const USE_DICT: bool, const BORROWED: bool>(
         &mut self,
         current_abs_start: usize,
         current_len: usize,
@@ -2563,13 +2623,14 @@ impl DfastMatchGenerator {
             current_len,
             handle_sequence,
             crate::encoding::fastpath::sse42::common_prefix_len_ptr,
-            USE_DICT
+            USE_DICT,
+            BORROWED
         )
     }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[target_feature(enable = "avx2,bmi2")]
-    unsafe fn start_matching_fast_loop_avx2_bmi2<const USE_DICT: bool>(
+    unsafe fn start_matching_fast_loop_avx2_bmi2<const USE_DICT: bool, const BORROWED: bool>(
         &mut self,
         current_abs_start: usize,
         current_len: usize,
@@ -2581,7 +2642,8 @@ impl DfastMatchGenerator {
             current_len,
             handle_sequence,
             crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr,
-            USE_DICT
+            USE_DICT,
+            BORROWED
         )
     }
 
@@ -2591,7 +2653,7 @@ impl DfastMatchGenerator {
         feature = "kernel_simd128"
     ))]
     #[target_feature(enable = "simd128")]
-    unsafe fn start_matching_fast_loop_simd128<const USE_DICT: bool>(
+    unsafe fn start_matching_fast_loop_simd128<const USE_DICT: bool, const BORROWED: bool>(
         &mut self,
         current_abs_start: usize,
         current_len: usize,
@@ -2603,7 +2665,8 @@ impl DfastMatchGenerator {
             current_len,
             handle_sequence,
             crate::encoding::fastpath::simd128::common_prefix_len_ptr,
-            USE_DICT
+            USE_DICT,
+            BORROWED
         )
     }
 
@@ -2616,7 +2679,7 @@ impl DfastMatchGenerator {
         )
     )))]
     #[allow(unused_unsafe)]
-    fn start_matching_fast_loop_scalar<const USE_DICT: bool>(
+    fn start_matching_fast_loop_scalar<const USE_DICT: bool, const BORROWED: bool>(
         &mut self,
         current_abs_start: usize,
         current_len: usize,
@@ -2628,7 +2691,8 @@ impl DfastMatchGenerator {
             current_len,
             handle_sequence,
             crate::encoding::fastpath::scalar::common_prefix_len_ptr,
-            USE_DICT
+            USE_DICT,
+            BORROWED
         )
     }
 }
