@@ -992,8 +992,9 @@ impl DfastMatchGenerator {
             unsafe {
                 let load_ptr = base.add(history_start + pos);
                 let v8 = (load_ptr as *const u64).read_unaligned();
-                let v4 = v8 & 0xFFFF_FFFF;
-                let short_idx = (v4.wrapping_mul(PRIME) >> short_shift) as usize;
+                // Donor 5-byte short hash (ZSTD_hash5 shape): low 5 bytes in
+                // the high 40 bits (`v8 << 24`), matching `short_hash_index`.
+                let short_idx = ((v8 << 24).wrapping_mul(PRIME) >> short_shift) as usize;
                 let long_idx = (v8.wrapping_mul(PRIME) >> long_shift) as usize;
                 let packed = (pos as u32) + 1;
                 *short_ptr.add(short_idx) = packed;
@@ -1246,9 +1247,11 @@ impl DfastMatchGenerator {
             (history_base_ptr.add(history_start_offset + concat_idx0) as *const u64)
                 .read_unaligned()
         };
+        // `v4_0` (low 4 bytes) is the 4-byte equality-gate key below; the short
+        // HASH keys on the donor 5-byte window (`v8_0 << 24`, ZSTD_hash5 shape).
         let v4_0 = v8_0 & 0xFFFF_FFFF;
         let hl0_idx = (v8_0.wrapping_mul(PRIME) >> long_shift) as usize;
-        let hs0_idx = (v4_0.wrapping_mul(PRIME) >> short_shift) as usize;
+        let hs0_idx = ((v8_0 << 24).wrapping_mul(PRIME) >> short_shift) as usize;
 
         // Read-only on the hash tables here — unlike the inner loop's
         // "update-before-check" pattern, the writes at `hl0_idx` /
@@ -2026,12 +2029,12 @@ impl DfastMatchGenerator {
                 let packed = ((pos - position_base) as u32) + 1;
                 let load_ptr = history_base_ptr.add(history_start + idx);
                 let v8 = (load_ptr as *const u64).read_unaligned();
-                let v4 = v8 & 0xFFFF_FFFF;
                 // Donor parity (`zstd_compress_internal.h:923-924`):
                 // scalar `* prime8bytes` then shift to high bits. Drops
                 // the CRC32d-based kernel dispatch (3-4 instructions) for
-                // a single mul on the per-byte insert path.
-                let mixed_short = v4.wrapping_mul(0xCF1BBCDCB7A56463_u64);
+                // a single mul on the per-byte insert path. Short hash keys
+                // on the donor 5-byte window (`v8 << 24`, ZSTD_hash5 shape).
+                let mixed_short = (v8 << 24).wrapping_mul(0xCF1BBCDCB7A56463_u64);
                 let mixed_long = v8.wrapping_mul(0xCF1BBCDCB7A56463_u64);
                 let short_idx = (mixed_short >> short_shift) as usize;
                 let long_idx = (mixed_long >> long_shift) as usize;
@@ -2130,7 +2133,18 @@ impl DfastMatchGenerator {
 
     #[inline(always)]
     pub(crate) fn short_hash_index(&self, data: &[u8]) -> usize {
-        let value = u32::from_le_bytes(data[..4].try_into().unwrap()) as u64;
+        // Donor `ZSTD_dfast` keys the short table on a 5-byte hash
+        // (`ZSTD_hashPtr(ip, hBitsS, mls)` with `mls = cParams.minMatch = 5`
+        // for L3/L4), NOT 4 bytes. A 4-byte key collides more on
+        // repetitive/log-stream data, so the single-slot table overwrites
+        // useful positions the donor's 5-byte key keeps. Mirror the donor:
+        // take the low 5 bytes (shifted high like `ZSTD_hash5`) into the
+        // shared multiply-shift mixer. `min(5)` keeps short tail slices
+        // panic-free (zero-padded) without a per-call-site bound change.
+        let mut buf = [0u8; 8];
+        let n = data.len().min(5);
+        buf[..n].copy_from_slice(&data[..n]);
+        let value = u64::from_le_bytes(buf) << 24;
         self.hash_index_with_bits(value, self.short_hash_bits)
     }
 
@@ -2449,8 +2463,11 @@ macro_rules! start_matching_fast_loop_body {
                     (history_base_ptr.add(history_start_offset + concat_idx0) as *const u64)
                         .read_unaligned()
                 };
+                // `v4_0` (low 4 bytes) is the cheap 4-byte equality-gate key
+                // below; the short HASH keys on the donor 5-byte window
+                // (`v8_0 << 24`, ZSTD_hash5 shape) to match `short_hash_index`.
                 let v4_0 = v8_0 & 0xFFFF_FFFF;
-                let hs0_idx = (v4_0.wrapping_mul(PRIME) >> short_shift) as usize;
+                let hs0_idx = ((v8_0 << 24).wrapping_mul(PRIME) >> short_shift) as usize;
                 let idxs0 = unsafe { *short_hash_ptr.add(hs0_idx) };
 
                 // Donor parity (`zstd_double_fast.c:187`): update BOTH

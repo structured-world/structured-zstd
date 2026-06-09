@@ -1781,6 +1781,7 @@ impl Matcher for MatchGeneratorDriver {
                     CompressionLevel::Default
                         | CompressionLevel::Level(0)
                         | CompressionLevel::Level(3)
+                        | CompressionLevel::Level(4)
                 );
                 let dcfg = params
                     .dfast
@@ -7894,17 +7895,19 @@ fn hc_prime_with_dictionary_disables_btultra2_seed_pass() {
 #[test]
 fn dfast_prime_with_dictionary_preserves_history_for_first_full_block() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
-    // Use Level(4) — Dfast with `use_fast_loop=false`. Level(3) is
-    // also Dfast but flips `use_fast_loop=true`, which routes through
-    // a different scan path that bails early on the tiny 8-byte
-    // dict + 8-byte block scenario this test exercises.
+    // Level(4) is Dfast with the greedy double-fast loop (donor parity:
+    // clevels.h L3/L4 are both `ZSTD_dfast`, which has no lazy lookahead).
+    // The fast loop needs at least `HASH_READ_SIZE` (8) bytes ahead of the
+    // probe cursor, so this exercises a 16-byte dict + 16-byte block (the
+    // whole block matches the dict, offset = dict length = 16).
     driver.reset(CompressionLevel::Level(4));
 
-    driver.prime_with_dictionary(b"abcdefgh", [1, 4, 8]);
+    let payload = b"abcdefghijklmnop";
+    driver.prime_with_dictionary(payload, [1, 4, 8]);
 
     let mut space = driver.get_next_space();
     space.clear();
-    space.extend_from_slice(b"abcdefgh");
+    space.extend_from_slice(payload);
     driver.commit_space(space);
 
     let mut saw_match = false;
@@ -7915,7 +7918,7 @@ fn dfast_prime_with_dictionary_preserves_history_for_first_full_block() {
             match_len,
         } = seq
             && literals.is_empty()
-            && offset == 8
+            && offset == payload.len()
             && match_len >= DFAST_MIN_MATCH_LEN
         {
             saw_match = true;
@@ -8182,13 +8185,18 @@ fn dfast_prime_with_dictionary_counts_four_byte_tail_budget() {
 #[test]
 fn row_prime_with_dictionary_preserves_history_for_first_full_block() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
+    // Level(4) is greedy Dfast (donor parity: clevels.h L3/L4 = `ZSTD_dfast`,
+    // no lazy). The greedy fast loop needs `HASH_READ_SIZE` (8) bytes ahead, so
+    // use a 16-byte dict + 16-byte block (whole block matches the dict, offset
+    // = dict length = 16).
     driver.reset(CompressionLevel::Level(4));
 
-    driver.prime_with_dictionary(b"abcdefgh", [1, 4, 8]);
+    let payload = b"abcdefghijklmnop";
+    driver.prime_with_dictionary(payload, [1, 4, 8]);
 
     let mut space = driver.get_next_space();
     space.clear();
-    space.extend_from_slice(b"abcdefgh");
+    space.extend_from_slice(payload);
     driver.commit_space(space);
 
     let mut saw_match = false;
@@ -8199,7 +8207,7 @@ fn row_prime_with_dictionary_preserves_history_for_first_full_block() {
             match_len,
         } = seq
             && literals.is_empty()
-            && offset == 8
+            && offset == payload.len()
             && match_len >= ROW_MIN_MATCH_LEN
         {
             saw_match = true;
