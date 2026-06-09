@@ -123,17 +123,20 @@ pub(crate) struct DfastMatchGenerator {
     /// resolved once at construction so the per-byte match-finder scans skip
     /// the `select_kernel()` `OnceLock` atomic on every call.
     pub(crate) kernel: FastpathKernel,
-    /// Borrowed one-shot scan window: `(input_base_ptr, block_start,
-    /// block_end)`. When `Some`, the fast loop sources bytes from the
-    /// caller's in-place input slice with absolute input positions
-    /// (`abs_start = position_base = start_offset = 0`, readable length =
-    /// `block_end`) instead of copying each block into the owned `history`
-    /// concat — the dfast analog of the Fast backend's borrowed window. The
-    /// pointer is the input start (constant for the frame); `block_start..
-    /// block_end` is the active block's absolute range, re-staged before each
-    /// block scan (so `get_last_space` reports the borrowed block to the emit
-    /// pipeline). `None` = owned (history-copying) path. Cleared on `reset()`.
-    pub(crate) borrowed: Option<(*const u8, usize, usize)>,
+    /// Borrowed one-shot input window, registered once per frame:
+    /// `(input_base_ptr, total_len)`. When `Some`, the fast loop sources
+    /// bytes from the caller's in-place input slice with absolute input
+    /// positions (`abs_start = position_base = start_offset = 0`) instead of
+    /// copying each block into the owned `history` concat — the dfast analog
+    /// of the Fast backend's borrowed window. `None` = owned (history-copying)
+    /// path. Cleared on `reset()`.
+    pub(crate) borrowed_input: Option<(*const u8, usize)>,
+    /// Active borrowed block range `[block_start, block_end)` (absolute input
+    /// offsets), re-staged before each block scan so `scan_source` bounds the
+    /// readable length to `block_end` (byte-identical match window to the
+    /// owned evicting path) and `get_last_space` reports the borrowed block
+    /// to the emit pipeline. Only meaningful while `borrowed_input` is `Some`.
+    pub(crate) borrowed_block: Option<(usize, usize)>,
 }
 
 /// The dfast backend's immutable dictionary tables — a long+short pair mirroring
@@ -173,7 +176,8 @@ impl DfastMatchGenerator {
             short_hash_bits: DFAST_HASH_BITS - DFAST_SHORT_HASH_BITS_DELTA,
             dict: DictAttach::new(),
             kernel: select_kernel(),
-            borrowed: None,
+            borrowed_input: None,
+            borrowed_block: None,
         }
     }
 
@@ -332,7 +336,8 @@ impl DfastMatchGenerator {
         // Drop any borrowed window: the input slice it pointed at does not
         // outlive the frame, and the next frame re-stages its own (or runs
         // the owned path). A stale pointer must never survive a reset.
-        self.borrowed = None;
+        self.borrowed_input = None;
+        self.borrowed_block = None;
     }
 
     /// Slice of bytes from the most recently appended block. Returns
@@ -351,7 +356,9 @@ impl DfastMatchGenerator {
     /// usage and avoids a panic-vs-gate divergence that would
     /// surprise a future refactor consolidating the call sites.
     pub(crate) fn get_last_space(&self) -> &[u8] {
-        if let Some((ptr, block_start, block_end)) = self.borrowed {
+        if let (Some((ptr, _total)), Some((block_start, block_end))) =
+            (self.borrowed_input, self.borrowed_block)
+        {
             // Borrowed window: the active block is the in-place input range
             // `[block_start, block_end)`, staged before the scan so the emit
             // pipeline's pre-scan `get_last_space().len()` reserve is correct.
@@ -1070,7 +1077,9 @@ impl DfastMatchGenerator {
     /// the loop stays sound.
     #[inline(always)]
     fn scan_source(&self) -> (*const u8, usize, usize, usize, usize) {
-        if let Some((ptr, _block_start, block_end)) = self.borrowed {
+        if let (Some((ptr, _total)), Some((_block_start, block_end))) =
+            (self.borrowed_input, self.borrowed_block)
+        {
             // Borrowed one-shot window: positions are absolute input
             // offsets, so the rebase coordinates collapse to zero
             // (`start_offset = abs_start = position_base = 0`) and the
@@ -1097,7 +1106,9 @@ impl DfastMatchGenerator {
     /// the slice locally and still take `&mut self` for `offset_hist`.
     #[inline]
     fn current_block_ptr_len(&self, current_abs_start: usize) -> (*const u8, usize) {
-        if let Some((ptr, _block_start, block_end)) = self.borrowed {
+        if let (Some((ptr, _total)), Some((_block_start, block_end))) =
+            (self.borrowed_input, self.borrowed_block)
+        {
             // SAFETY: borrowed liveness contract; `current_abs_start` =
             // block_start <= block_end <= buffer len (entry-validated).
             (
@@ -1226,32 +1237,36 @@ impl DfastMatchGenerator {
     }
 
     pub(crate) fn insert_positions(&mut self, start: usize, end: usize) {
-        let start = start.max(self.history_abs_start);
-        let end = end.min(self.history_abs_end());
+        // Source the byte buffer + rebase coordinates through `scan_source()`
+        // so a borrowed window's batch re-seed hashes the in-place input
+        // (owned returns its `history` fields, byte-identical).
+        let (history_base_ptr, history_start, history_abs_start, _pb0, concat_len) =
+            self.scan_source();
+        let start = start.max(history_abs_start);
+        let end = end.min(history_abs_start + concat_len);
         if start >= end {
             return;
         }
-        // Hoist the rebase trigger out of the inner loop: a single
-        // `ensure_room_for(end - 1)` covers every `pack_slot` in the
-        // range. The per-position `ensure_room_for` call inside
-        // `insert_position` would re-check on every byte and the
-        // compiler cannot prove the call is idempotent through
-        // `&mut self`.
-        self.ensure_room_for(end - 1);
+        // Owned: hoist the rebase trigger out of the inner loop (a single
+        // `ensure_room_for(end - 1)` covers every `pack_slot` in the range);
+        // it may advance `position_base`, so read that AFTER the call. The
+        // borrowed window packs absolute input offsets with `position_base ==
+        // 0` and never rebases (the eligibility gate caps `input_len <=
+        // u32::MAX`), so a `reduce()` here would corrupt the absolute slots.
+        let position_base = if self.borrowed_block.is_none() {
+            self.ensure_room_for(end - 1);
+            self.position_base
+        } else {
+            0
+        };
 
-        // Snapshot every per-call invariant. `&mut self` blocks the
-        // optimiser from hoisting these loads across the inner loop —
-        // the bodies of `short_hash` / `long_hash` writes mutate
-        // through `self`, so each iteration would otherwise reload
-        // `history.len()`, `history_start`, `position_base`,
-        // `*_hash_bits`. With ~1 input byte per
-        // call on the dfast hot path that re-load shape was the
-        // dominant cost in the per-position cluster.
-        let history_abs_start = self.history_abs_start;
-        let position_base = self.position_base;
-        let history_start = self.history_start;
-        let concat_len = self.history.len() - history_start;
-        let history_base_ptr = self.history.as_ptr();
+        // Snapshot the remaining per-call invariants. `&mut self` blocks the
+        // optimiser from hoisting these loads across the inner loop — the
+        // bodies of `short_hash` / `long_hash` writes mutate through `self`,
+        // so each iteration would otherwise reload `*_hash_bits`. With ~1
+        // input byte per call on the dfast hot path that re-load shape was
+        // the dominant cost in the per-position cluster. `history_base_ptr`
+        // stays valid across `ensure_room_for` (it never reallocs `history`).
         let short_hash_bits = self.short_hash_bits;
         let long_hash_bits = self.long_hash_bits;
         let short_hash_ptr = self.short_hash.as_mut_ptr();
@@ -1367,7 +1382,7 @@ impl DfastMatchGenerator {
         // guaranteeing the slot value below fits in `u32`. The borrowed
         // window never rebases (`position_base == 0`, no eviction), so it
         // packs the absolute position directly with the same +1 bias.
-        let packed = if self.borrowed.is_some() {
+        let packed = if self.borrowed_block.is_some() {
             (pos as u32).wrapping_add(1)
         } else {
             self.ensure_room_for(pos);
@@ -1548,7 +1563,14 @@ macro_rules! start_matching_fast_loop_body {
         // rebase is unconditional in release builds since the
         // precondition holds.
         debug_assert!($current_len > 0, "fast_loop precondition: $current_len > 0");
-        $self.ensure_room_for($current_abs_start + $current_len - 1);
+        // Owned only: advance the u32 packing rebase past this block. A
+        // borrowed window packs absolute input offsets with `position_base ==
+        // 0` (the eligibility gate caps `input_len <= u32::MAX`, so every
+        // `abs + 1` slot fits without a reduce), and a `reduce()` here would
+        // subtract from every live slot and corrupt that absolute encoding.
+        if $self.borrowed_block.is_none() {
+            $self.ensure_room_for($current_abs_start + $current_len - 1);
+        }
         const PRIME: u64 = 0xCF1BBCDCB7A56463_u64;
         let short_shift = 64 - $self.short_hash_bits;
         let long_shift = 64 - $self.long_hash_bits;
