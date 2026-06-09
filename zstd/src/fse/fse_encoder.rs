@@ -172,6 +172,13 @@ pub struct FSETable {
 }
 
 impl FSETable {
+    /// Heap bytes this table holds beyond its inline struct: the flat
+    /// state-transition array (`Box<[u16]>`). The `states` / `symbol_tt`
+    /// arrays are fixed-size and inline (accounted by the owner's `size_of`).
+    pub(crate) fn heap_size(&self) -> usize {
+        self.state_table_flat.len() * core::mem::size_of::<u16>()
+    }
+
     /// O(1) next-state lookup mirroring upstream `FSE_encodeSymbol`
     /// (`lib/compress/fse_compress.c`). Was a linear scan over a
     /// `Vec<State>` per symbol; the flat tables that drive the donor

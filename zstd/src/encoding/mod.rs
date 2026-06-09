@@ -406,6 +406,13 @@ pub trait Matcher {
     /// test stubs. The built-in runtime matcher (`MatchGeneratorDriver`)
     /// overrides this hook and applies the hint during level resolution.
     fn set_source_size_hint(&mut self, _size: u64) {}
+    /// Hint the byte size of the dictionary that will be primed into the next
+    /// frame. The built-in runtime matcher uses it to size the binary-tree /
+    /// hash-chain match-finder tables from the dictionary's cParams tier rather
+    /// than the source window (donor CDict economics), while keeping the
+    /// eviction window source-sized. Default no-op for custom matchers and test
+    /// stubs; consumed at the next [`reset`](Self::reset).
+    fn set_dictionary_size_hint(&mut self, _size: usize) {}
     /// Drop any per-frame fine-grained parameter overrides installed via
     /// the public parameter API, reverting to plain level-based geometry
     /// at the next [`reset`](Self::reset). Called by
@@ -445,6 +452,12 @@ pub trait Matcher {
     /// dictionary-dependent sequences. Defaults to `false` for custom matchers.
     fn supports_dictionary_priming(&self) -> bool {
         false
+    }
+    /// Heap bytes this matcher's allocations hold (tables, history, scratch),
+    /// excluding the inline struct itself. Lets a context report its true
+    /// footprint via `ZSTD_sizeof_CCtx`. Defaults to `0` for custom matchers.
+    fn heap_size(&self) -> usize {
+        0
     }
     /// The size of the window the decoder will need to execute all sequences produced by this matcher.
     ///

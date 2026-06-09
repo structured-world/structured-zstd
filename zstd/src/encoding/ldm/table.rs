@@ -163,6 +163,11 @@ impl LdmHashTable {
         }
     }
 
+    /// Heap bytes held by the entry array and the per-bucket offset array.
+    pub(crate) fn heap_size(&self) -> usize {
+        self.entries.capacity() * core::mem::size_of::<LdmEntry>() + self.bucket_offsets.capacity()
+    }
+
     /// Reset every bucket to "empty" without reallocating, and
     /// rewind the rebase base so a fresh frame can start its
     /// absolute positions from any value (including 0) without

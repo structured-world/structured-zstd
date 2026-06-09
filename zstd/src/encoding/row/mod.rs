@@ -691,6 +691,20 @@ impl RowMatchGenerator {
         }
     }
 
+    /// Heap bytes this matcher owns: history, the row head/position/tag tables,
+    /// the chunk-length deque, and any attached dictionary row index.
+    pub(crate) fn heap_size(&self) -> usize {
+        let u32_sz = core::mem::size_of::<u32>();
+        self.chunk_lens.capacity() * core::mem::size_of::<usize>()
+            + self.history.capacity()
+            + self.row_heads.capacity()
+            + self.row_positions.capacity() * u32_sz
+            + self.row_tags.capacity()
+            + self.dict.table().map_or(0, |t| {
+                t.heads.capacity() + t.positions.capacity() * u32_sz + t.tags.capacity()
+            })
+    }
+
     pub(crate) fn set_hash_bits(&mut self, bits: usize) {
         let clamped = bits.clamp(self.row_log + 1, ROW_HASH_BITS);
         let row_hash_log = clamped.saturating_sub(self.row_log);

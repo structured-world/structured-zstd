@@ -476,6 +476,14 @@ pub struct HuffmanTable {
 }
 
 impl HuffmanTable {
+    /// Heap bytes this table holds: the per-symbol code table and the packed
+    /// dual-container codes. The lazily-built weight-description cache is a
+    /// transient and not counted.
+    pub fn heap_size(&self) -> usize {
+        self.codes.capacity() * core::mem::size_of::<(u32, u8)>()
+            + self.packed_codes.capacity() * core::mem::size_of::<u64>()
+    }
+
     pub fn build_from_data(data: &[u8]) -> Self {
         let mut counts = [0; 256];
         let (max_symbol, _) = histogram::count_bytes(data, &mut counts);
