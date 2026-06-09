@@ -1568,7 +1568,7 @@ impl DfastMatchGenerator {
 /// cpl calls inline under one umbrella and `select_kernel()` is resolved ONCE
 /// per block in the bare dispatcher, never per cpl call.
 macro_rules! start_matching_fast_loop_body {
-    ($self:ident, $current_abs_start:ident, $current_len:ident, $handle_sequence:ident, $cpl:path) => {{
+    ($self:ident, $current_abs_start:ident, $current_len:ident, $handle_sequence:ident, $cpl:path, $use_dict:expr) => {{
         // Behaviour change vs the pre-refactor `start_matching_general`:
         // this fast loop deliberately drops the strict-incompressible
         // early-skip path (the `block_looks_incompressible_strict` short
@@ -1685,20 +1685,25 @@ macro_rules! start_matching_fast_loop_body {
         // lookahead. Gating on `table().is_some()` keeps the null dict
         // pointers out of the probe below, which dereferences them before
         // the `dict_end` bound is consulted.
-        let (use_dict, dict_long_ptr, dict_short_ptr, dict_end): (
-            bool,
-            *const u32,
-            *const u32,
-            usize,
-        ) = match $self.dict.table() {
-            Some(d) => (
-                true,
-                d.long.as_ptr(),
-                d.short.as_ptr(),
-                $self.dict.region_len(),
-            ),
-            None => (false, core::ptr::null(), core::ptr::null(), 0),
-        };
+        // Dict probe pointers are materialised ONLY on the `USE_DICT` kernel.
+        // The dispatcher monomorphises a separate no-dict kernel
+        // (`$use_dict == false`, a compile-time const) in which this block and
+        // every `if $use_dict` probe below const-fold away — so the hot no-dict
+        // loop carries zero dict code and zero per-position dict check, instead
+        // of branching on a loop-invariant flag every position (donor keeps the
+        // no-dict and dictMatchState loops as separate functions for the same
+        // reason). `$use_dict == true` is dispatched only when the table is
+        // present, so the `expect` never fires.
+        let (dict_long_ptr, dict_short_ptr, dict_end): (*const u32, *const u32, usize) =
+            if $use_dict {
+                let d = $self
+                    .dict
+                    .table()
+                    .expect("USE_DICT kernel dispatched without a dict table");
+                (d.long.as_ptr(), d.short.as_ptr(), $self.dict.region_len())
+            } else {
+                (core::ptr::null(), core::ptr::null(), 0)
+            };
 
         'outer: loop {
             // Outer-iter precondition: at least `HASH_READ_SIZE = 8` bytes
@@ -2054,7 +2059,7 @@ macro_rules! start_matching_fast_loop_body {
                 // a dict match is `offset = abs_ip0 - dict_abs` and the forward
                 // count crosses the dict→input boundary like any in-window
                 // match (no `dictBase`/`count_2segments`).
-                if use_dict {
+                if $use_dict {
                     // SAFETY: when `use_dict`, `dict_long_ptr` is non-null and
                     // sized `1 << long_hash_bits`; `hl0_idx < 1 << long_hash_bits`.
                     let dl = unsafe { *dict_long_ptr.add(hl0_idx) };
@@ -2258,7 +2263,7 @@ macro_rules! start_matching_fast_loop_body {
                             // dict-long upgrade the old dense-reprime path got
                             // for free (dict positions lived in the live table)
                             // is lost and the loop emits the shorter short match.
-                            if !live_l1_hit && use_dict {
+                            if !live_l1_hit && $use_dict {
                                 // SAFETY: `use_dict` ⇒ `dict_long_ptr` non-null,
                                 // sized `1 << long_hash_bits`; `hl1_idx` is in range.
                                 let dl1 = unsafe { *dict_long_ptr.add(hl1_idx) };
@@ -2346,7 +2351,7 @@ macro_rules! start_matching_fast_loop_body {
                 // costs more than emitting the bytes as literals). No
                 // `_search_next_long` retry: the dict long fallback already
                 // covers the long-upgrade case at `ip0`.
-                if use_dict {
+                if $use_dict {
                     // SAFETY: `use_dict` ⇒ `dict_short_ptr` non-null, sized
                     // `1 << short_hash_bits`; `hs0_idx < 1 << short_hash_bits`.
                     let ds = unsafe { *dict_short_ptr.add(hs0_idx) };
@@ -2471,9 +2476,25 @@ impl DfastMatchGenerator {
         current_len: usize,
         handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
     ) {
+        // Resolve dict presence ONCE here, off the hot path, and select a
+        // const-monomorphised kernel (`USE_DICT` true/false) so the per-position
+        // dict probe is compiled in or out at the call shape — never a
+        // loop-invariant runtime check inside the scan. The no-dict kernel
+        // carries zero dict code (donor keeps the noDict / dictMatchState loops
+        // as separate functions for exactly this reason).
+        let use_dict = self.dict.table().is_some();
+        macro_rules! dispatch_dict {
+            ($kernel:ident) => {
+                if use_dict {
+                    self.$kernel::<true>(current_abs_start, current_len, handle_sequence)
+                } else {
+                    self.$kernel::<false>(current_abs_start, current_len, handle_sequence)
+                }
+            };
+        }
         #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
         unsafe {
-            self.start_matching_fast_loop_neon(current_abs_start, current_len, handle_sequence)
+            dispatch_dict!(start_matching_fast_loop_neon)
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
@@ -2483,24 +2504,10 @@ impl DfastMatchGenerator {
             // hot path actually reads it. Mirrors the Row backend.
             match self.kernel {
                 FastpathKernel::Avx2Bmi2 => unsafe {
-                    self.start_matching_fast_loop_avx2_bmi2(
-                        current_abs_start,
-                        current_len,
-                        handle_sequence,
-                    )
+                    dispatch_dict!(start_matching_fast_loop_avx2_bmi2)
                 },
-                FastpathKernel::Sse42 => unsafe {
-                    self.start_matching_fast_loop_sse42(
-                        current_abs_start,
-                        current_len,
-                        handle_sequence,
-                    )
-                },
-                FastpathKernel::Scalar => self.start_matching_fast_loop_scalar(
-                    current_abs_start,
-                    current_len,
-                    handle_sequence,
-                ),
+                FastpathKernel::Sse42 => unsafe { dispatch_dict!(start_matching_fast_loop_sse42) },
+                FastpathKernel::Scalar => dispatch_dict!(start_matching_fast_loop_scalar),
             }
         }
         #[cfg(all(
@@ -2509,7 +2516,7 @@ impl DfastMatchGenerator {
             feature = "kernel_simd128"
         ))]
         unsafe {
-            self.start_matching_fast_loop_simd128(current_abs_start, current_len, handle_sequence)
+            dispatch_dict!(start_matching_fast_loop_simd128)
         }
         #[cfg(not(any(
             all(target_arch = "aarch64", target_endian = "little"),
@@ -2522,13 +2529,13 @@ impl DfastMatchGenerator {
             )
         )))]
         {
-            self.start_matching_fast_loop_scalar(current_abs_start, current_len, handle_sequence)
+            dispatch_dict!(start_matching_fast_loop_scalar)
         }
     }
 
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     #[target_feature(enable = "neon")]
-    unsafe fn start_matching_fast_loop_neon(
+    unsafe fn start_matching_fast_loop_neon<const USE_DICT: bool>(
         &mut self,
         current_abs_start: usize,
         current_len: usize,
@@ -2539,13 +2546,14 @@ impl DfastMatchGenerator {
             current_abs_start,
             current_len,
             handle_sequence,
-            crate::encoding::fastpath::neon::common_prefix_len_ptr
+            crate::encoding::fastpath::neon::common_prefix_len_ptr,
+            USE_DICT
         )
     }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[target_feature(enable = "sse4.2")]
-    unsafe fn start_matching_fast_loop_sse42(
+    unsafe fn start_matching_fast_loop_sse42<const USE_DICT: bool>(
         &mut self,
         current_abs_start: usize,
         current_len: usize,
@@ -2556,13 +2564,14 @@ impl DfastMatchGenerator {
             current_abs_start,
             current_len,
             handle_sequence,
-            crate::encoding::fastpath::sse42::common_prefix_len_ptr
+            crate::encoding::fastpath::sse42::common_prefix_len_ptr,
+            USE_DICT
         )
     }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[target_feature(enable = "avx2,bmi2")]
-    unsafe fn start_matching_fast_loop_avx2_bmi2(
+    unsafe fn start_matching_fast_loop_avx2_bmi2<const USE_DICT: bool>(
         &mut self,
         current_abs_start: usize,
         current_len: usize,
@@ -2573,7 +2582,8 @@ impl DfastMatchGenerator {
             current_abs_start,
             current_len,
             handle_sequence,
-            crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr
+            crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr,
+            USE_DICT
         )
     }
 
@@ -2583,7 +2593,7 @@ impl DfastMatchGenerator {
         feature = "kernel_simd128"
     ))]
     #[target_feature(enable = "simd128")]
-    unsafe fn start_matching_fast_loop_simd128(
+    unsafe fn start_matching_fast_loop_simd128<const USE_DICT: bool>(
         &mut self,
         current_abs_start: usize,
         current_len: usize,
@@ -2594,7 +2604,8 @@ impl DfastMatchGenerator {
             current_abs_start,
             current_len,
             handle_sequence,
-            crate::encoding::fastpath::simd128::common_prefix_len_ptr
+            crate::encoding::fastpath::simd128::common_prefix_len_ptr,
+            USE_DICT
         )
     }
 
@@ -2607,7 +2618,7 @@ impl DfastMatchGenerator {
         )
     )))]
     #[allow(unused_unsafe)]
-    fn start_matching_fast_loop_scalar(
+    fn start_matching_fast_loop_scalar<const USE_DICT: bool>(
         &mut self,
         current_abs_start: usize,
         current_len: usize,
@@ -2618,7 +2629,8 @@ impl DfastMatchGenerator {
             current_abs_start,
             current_len,
             handle_sequence,
-            crate::encoding::fastpath::scalar::common_prefix_len_ptr
+            crate::encoding::fastpath::scalar::common_prefix_len_ptr,
+            USE_DICT
         )
     }
 }
