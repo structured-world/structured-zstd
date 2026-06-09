@@ -19,7 +19,7 @@ use crate::ffi::{in_slice, out_slice};
 /// allocation failure. Unlike `Box::new`, this never aborts the host process on
 /// OOM, matching libzstd's `ZSTD_create*` NULL-on-failure contract. Pair every
 /// non-null result with [`free_boxed`].
-fn try_box<T>(value: T) -> *mut T {
+pub(crate) fn try_box<T>(value: T) -> *mut T {
     let layout = core::alloc::Layout::new::<T>();
     // Both context types own a `Vec` / `FrameDecoder`, so they are never
     // zero-sized and the allocator path always applies.
@@ -39,7 +39,7 @@ fn try_box<T>(value: T) -> *mut T {
 ///
 /// # Safety
 /// `ptr` must be a live, not-yet-freed pointer from [`try_box::<T>`], or `null`.
-unsafe fn free_boxed<T>(ptr: *mut T) {
+pub(crate) unsafe fn free_boxed<T>(ptr: *mut T) {
     if ptr.is_null() {
         return;
     }
@@ -53,16 +53,35 @@ unsafe fn free_boxed<T>(ptr: *mut T) {
 
 /// Opaque compression context. Carries a reusable output buffer so repeated
 /// `ZSTD_compressCCtx` calls amortise the destination allocation.
+///
+/// For the dictionary path ([`ZSTD_compress_usingCDict`](crate::cdict::ZSTD_compress_usingCDict))
+/// it also caches a [`FrameCompressor`] with the dictionary already attached,
+/// keyed by the `ZSTD_CDict` pointer + level, so back-to-back compressions with
+/// the same `CDict` reuse the parsed dictionary + primed match-finder snapshot
+/// instead of re-parsing and re-priming each call (the encoder-side analogue of
+/// upstream's `ZSTD_CCtx_refCDict` reuse).
 #[allow(non_camel_case_types)]
 pub struct ZSTD_CCtx {
-    scratch: Vec<u8>,
+    pub(crate) scratch: Vec<u8>,
+    /// `FrameCompressor` with a dictionary attached, lazily built by the CDict
+    /// path. `None` until the first `ZSTD_compress_usingCDict`.
+    pub(crate) dict_compressor: Option<FrameCompressor>,
+    /// Identity of the `CDict` currently attached to `dict_compressor`
+    /// (the `ZSTD_CDict` pointer as `usize`; `0` = none) plus the level it was
+    /// built at, so a different CDict or level rebuilds the cached compressor.
+    pub(crate) dict_key: usize,
+    pub(crate) dict_level: c_int,
 }
 
 /// Opaque decompression context. Wraps a reusable [`FrameDecoder`] so its
 /// internal buffers persist across `ZSTD_decompressDCtx` calls.
 #[allow(non_camel_case_types)]
 pub struct ZSTD_DCtx {
-    decoder: FrameDecoder,
+    pub(crate) decoder: FrameDecoder,
+    /// Identity of the `DDict` whose content was last loaded into `decoder`
+    /// (the `ZSTD_DDict` pointer as `usize`; `0` = none), so repeated
+    /// `ZSTD_decompress_usingDDict` calls with the same DDict skip re-adding it.
+    pub(crate) ddict_key: usize,
 }
 
 /// `ZSTD_CCtx* ZSTD_createCCtx(void)`. Returns `NULL` on allocation failure
@@ -71,6 +90,9 @@ pub struct ZSTD_DCtx {
 pub extern "C" fn ZSTD_createCCtx() -> *mut ZSTD_CCtx {
     try_box(ZSTD_CCtx {
         scratch: Vec::new(),
+        dict_compressor: None,
+        dict_key: 0,
+        dict_level: 0,
     })
 }
 
@@ -147,6 +169,7 @@ pub unsafe extern "C" fn ZSTD_compressCCtx(
 pub extern "C" fn ZSTD_createDCtx() -> *mut ZSTD_DCtx {
     try_box(ZSTD_DCtx {
         decoder: FrameDecoder::new(),
+        ddict_key: 0,
     })
 }
 

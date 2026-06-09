@@ -3,6 +3,11 @@
 //! real symbol behaviour; the C-consumer link test in `tests/` is added
 //! separately and verifies a real `#include <zstd.h>` consumer.
 
+use crate::cdict::{
+    ZSTD_compress_usingCDict, ZSTD_createCDict, ZSTD_createDDict, ZSTD_decompress_usingDDict,
+    ZSTD_freeCDict, ZSTD_freeDDict, ZSTD_getDictID_fromCDict, ZSTD_getDictID_fromDDict,
+    ZSTD_sizeof_CDict, ZSTD_sizeof_DDict,
+};
 use crate::context::{
     ZSTD_compressCCtx, ZSTD_createCCtx, ZSTD_createDCtx, ZSTD_decompressDCtx, ZSTD_freeCCtx,
     ZSTD_freeDCtx, ZSTD_sizeof_CCtx,
@@ -397,4 +402,115 @@ fn zdict_train_produces_a_valid_dictionary() {
         unsafe { ZDICT_getDictID(garbage.as_ptr(), garbage.len()) },
         0
     );
+}
+
+/// Train a dictionary from many small similar records and return the bytes.
+fn trained_dictionary() -> Vec<u8> {
+    let mut samples: Vec<u8> = Vec::new();
+    let mut sizes: Vec<usize> = Vec::new();
+    for i in 0..512u32 {
+        let s = format!("tenant=demo table=orders key={i} region=eu payload=aaaaabbbbbccccc\n");
+        sizes.push(s.len());
+        samples.extend_from_slice(s.as_bytes());
+    }
+    let mut dict = vec![0u8; 64 * 1024];
+    let n = unsafe {
+        ZDICT_trainFromBuffer(
+            dict.as_mut_ptr(),
+            dict.len(),
+            samples.as_ptr(),
+            sizes.as_ptr(),
+            sizes.len() as u32,
+        )
+    };
+    assert_eq!(ZDICT_isError(n), 0, "training reported an error");
+    dict.truncate(n);
+    dict
+}
+
+#[test]
+fn cdict_ddict_roundtrip_and_reuse() {
+    let dict = trained_dictionary();
+    let dict_id = unsafe { ZDICT_getDictID(dict.as_ptr(), dict.len()) };
+    assert_ne!(dict_id, 0);
+
+    let cdict = unsafe { ZSTD_createCDict(dict.as_ptr(), dict.len(), 19) };
+    assert!(!cdict.is_null(), "ZSTD_createCDict returned NULL");
+    let ddict = unsafe { ZSTD_createDDict(dict.as_ptr(), dict.len()) };
+    assert!(!ddict.is_null(), "ZSTD_createDDict returned NULL");
+
+    // The prepared dictionaries echo the trained ID and report a non-zero size.
+    assert_eq!(unsafe { ZSTD_getDictID_fromCDict(cdict) }, dict_id);
+    assert_eq!(unsafe { ZSTD_getDictID_fromDDict(ddict) }, dict_id);
+    assert!(unsafe { ZSTD_sizeof_CDict(cdict) } >= dict.len());
+    assert!(unsafe { ZSTD_sizeof_DDict(ddict) } >= dict.len());
+
+    let cctx = ZSTD_createCCtx();
+    let dctx = ZSTD_createDCtx();
+    assert!(!cctx.is_null() && !dctx.is_null());
+
+    // Compress two distinct payloads through the SAME cctx + cdict to exercise
+    // the cached-compressor reuse path (second call must not re-parse/re-prime
+    // yet must still produce a correctly-decodable frame).
+    let payloads = [
+        b"tenant=demo table=orders key=99999 region=eu payload=aaaaabbbbbccccc\n".to_vec(),
+        {
+            let mut v = Vec::new();
+            for i in 1000..1100u32 {
+                v.extend_from_slice(
+                    format!("tenant=demo table=orders key={i} region=eu payload=aaaaabbbbbccccc\n")
+                        .as_bytes(),
+                );
+            }
+            v
+        },
+    ];
+
+    for payload in &payloads {
+        let bound = ZSTD_compressBound(payload.len());
+        let mut compressed = vec![0u8; bound];
+        let clen = unsafe {
+            ZSTD_compress_usingCDict(
+                cctx,
+                compressed.as_mut_ptr(),
+                compressed.len(),
+                payload.as_ptr(),
+                payload.len(),
+                cdict,
+            )
+        };
+        assert_eq!(ZSTD_isError(clen), 0, "compress_usingCDict errored");
+        compressed.truncate(clen);
+
+        let mut restored = vec![0u8; payload.len()];
+        let dlen = unsafe {
+            ZSTD_decompress_usingDDict(
+                dctx,
+                restored.as_mut_ptr(),
+                restored.len(),
+                compressed.as_ptr(),
+                compressed.len(),
+                ddict,
+            )
+        };
+        assert_eq!(ZSTD_isError(dlen), 0, "decompress_usingDDict errored");
+        assert_eq!(dlen, payload.len());
+        assert_eq!(&restored, payload, "dictionary round-trip mismatch");
+    }
+
+    unsafe {
+        ZSTD_freeCCtx(cctx);
+        ZSTD_freeDCtx(dctx);
+        ZSTD_freeCDict(cdict);
+        ZSTD_freeDDict(ddict);
+    }
+}
+
+#[test]
+fn create_cdict_rejects_non_dictionary() {
+    // A buffer with no dictionary magic and no valid entropy is not a parseable
+    // encoder dictionary; createCDict must return NULL (never crash).
+    let garbage = [0xABu8; 64];
+    let cdict = unsafe { ZSTD_createCDict(garbage.as_ptr(), garbage.len(), 3) };
+    assert!(cdict.is_null(), "createCDict accepted a non-dictionary");
 }
