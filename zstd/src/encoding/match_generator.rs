@@ -1755,7 +1755,12 @@ impl Matcher for MatchGeneratorDriver {
         // dict never inflates the level tables. Only the binary-tree / hash-chain
         // backend reads `hc.{hash,chain}_log`; Simple/Dfast/Row derive their
         // widths from the source window in their `reset` arms.
-        if let Some(dict_size) = dict_hint {
+        // A zero-length dictionary is "no dictionary": running the CDict sizing
+        // path for `Some(0)` is not a no-op — `cdict_table_logs(.., 0)` still
+        // collapses the HC/BT tables toward the 513-byte donor tier via
+        // `DICT_MIN_SRC_SIZE`, tanking ratio/perf on the next frame. Priming
+        // already treats empty content as empty, so skip the downsizing here too.
+        if let Some(dict_size) = dict_hint.filter(|&size| size > 0) {
             // Derive the dict-tier geometry from the level's FULL (un-source-capped)
             // hc widths. `Self::level_params(level, hint)` already source-capped
             // `params.hc`; feeding those capped widths into `cdict_table_logs` and
