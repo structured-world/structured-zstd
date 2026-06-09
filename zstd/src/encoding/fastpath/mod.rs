@@ -270,7 +270,26 @@ pub(crate) unsafe fn dispatch_common_prefix_len_ptr(
     rhs: *const u8,
     max: usize,
 ) -> usize {
-    match select_kernel() {
+    // Cold-path shim: resolves the kernel via `select_kernel()` on every call.
+    // Hot match-finder loops resolve the kernel once per block and call
+    // [`dispatch_common_prefix_len_ptr_with_kernel`] directly.
+    unsafe { dispatch_common_prefix_len_ptr_with_kernel(select_kernel(), lhs, rhs, max) }
+}
+
+/// Prefix-length scan against an already-resolved [`FastpathKernel`], so a hot
+/// loop pays the kernel-select once per block (caller-cached) instead of the
+/// `OnceLock` atomic + branch on every byte-compare.
+///
+/// # Safety
+/// `lhs` / `rhs` must each point to at least `max` initialized bytes.
+#[inline(always)]
+pub(crate) unsafe fn dispatch_common_prefix_len_ptr_with_kernel(
+    kernel: FastpathKernel,
+    lhs: *const u8,
+    rhs: *const u8,
+    max: usize,
+) -> usize {
+    match kernel {
         FastpathKernel::Scalar => unsafe { scalar::common_prefix_len_ptr(lhs, rhs, max) },
         #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
         FastpathKernel::Neon => unsafe { neon::common_prefix_len_ptr(lhs, rhs, max) },

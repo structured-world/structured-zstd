@@ -1090,6 +1090,7 @@ impl RowMatchGenerator {
             let rep_probe_lit_len = lit_len + 1;
             let rep_match = if rep_probe_pos + REP_MIN_MATCH_LEN <= self.history_abs_end() {
                 repcode_candidate_shared(
+                    self.hash_kernel,
                     self.live_history(),
                     self.history_abs_start,
                     self.offset_hist,
@@ -1305,6 +1306,7 @@ impl RowMatchGenerator {
         lit_len: usize,
     ) -> Option<MatchCandidate> {
         repcode_candidate_shared(
+            self.hash_kernel,
             self.live_history(),
             self.history_abs_start,
             self.offset_hist,

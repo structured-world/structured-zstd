@@ -17,6 +17,7 @@ use core::convert::TryInto;
 use super::Sequence;
 use super::blocks::encode_offset_with_history;
 use super::dict_attach::DictAttach;
+use super::fastpath::{FastpathKernel, select_kernel};
 use super::incompressible::block_looks_incompressible;
 use super::match_generator::{
     DFAST_EMPTY_SLOT, DFAST_HASH_BITS, DFAST_INCOMPRESSIBLE_SKIP_STEP, DFAST_LOCAL_SKIP_TRIGGER,
@@ -24,8 +25,8 @@ use super::match_generator::{
     DFAST_SHORT_HASH_LOOKAHEAD, DFAST_SKIP_STEP_GROWTH_INTERVAL, DFAST_TARGET_LEN, MIN_WINDOW_LOG,
 };
 use super::match_table::helpers::{
-    LazyMatchConfig, best_len_offset_candidate, common_prefix_len, extend_backwards_shared,
-    pick_lazy_match_shared, repcode_candidate_shared,
+    LazyMatchConfig, best_len_offset_candidate, common_prefix_len_with_kernel,
+    extend_backwards_shared, pick_lazy_match_shared, repcode_candidate_shared,
 };
 use super::match_table::storage::{REBASE_RESET_FLOOR_CEILING, check_stream_abs_headroom};
 use super::opt::types::MatchCandidate;
@@ -124,6 +125,10 @@ pub(crate) struct DfastMatchGenerator {
     /// `is_attached()` activates the dual-probe kernel; `region_len()` is the
     /// dict/input boundary (`dict_end`, a concat index).
     pub(crate) dict: DictAttach<DfastDictTables>,
+    /// CPU kernel for the `common_prefix_len` / repcode byte-compares,
+    /// resolved once at construction so the per-byte match-finder scans skip
+    /// the `select_kernel()` `OnceLock` atomic on every call.
+    pub(crate) kernel: FastpathKernel,
 }
 
 /// The dfast backend's immutable dictionary tables — a long+short pair mirroring
@@ -164,6 +169,7 @@ impl DfastMatchGenerator {
             use_fast_loop: false,
             lazy_depth: 1,
             dict: DictAttach::new(),
+            kernel: select_kernel(),
         }
     }
 
@@ -1001,7 +1007,8 @@ impl DfastMatchGenerator {
             if concat[cur_idx..cur_idx + 4] != concat[cand_idx..cand_idx + 4] {
                 break;
             }
-            let match_len = common_prefix_len(&concat[cand_idx..], &concat[cur_idx..]);
+            let match_len =
+                common_prefix_len_with_kernel(self.kernel, &concat[cand_idx..], &concat[cur_idx..]);
             if match_len < DFAST_REP_MIN_MATCH_LEN {
                 break;
             }
@@ -1235,6 +1242,7 @@ impl DfastMatchGenerator {
         lit_len: usize,
     ) -> Option<MatchCandidate> {
         repcode_candidate_shared(
+            self.kernel,
             self.live_history(),
             self.history_abs_start,
             self.offset_hist,
@@ -1391,7 +1399,11 @@ impl DfastMatchGenerator {
         {
             return None;
         }
-        let match_len = common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
+        let match_len = common_prefix_len_with_kernel(
+            self.kernel,
+            &concat[candidate_idx..],
+            &concat[current_idx..],
+        );
         if match_len < DFAST_MIN_MATCH_LEN {
             return None;
         }
