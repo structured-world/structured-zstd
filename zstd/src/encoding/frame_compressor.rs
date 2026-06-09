@@ -2853,6 +2853,89 @@ mod tests {
     }
 
     #[test]
+    fn dict_primed_btultra2_restore_is_floor_safe_and_byte_identical() {
+        // Regression guard for the dictionary primed-snapshot RESTORE path on
+        // the binary-tree (btultra2 / Level 22) backend — the path a minimal /
+        // decoupled prepared-dict refactor rewrites.
+        //
+        // The trap it pins: a reused compressor compresses frame A (which fills
+        // the live hash/chain tables with frame-A positions and advances the
+        // window floor), then frame B of the SAME resolved shape (same size →
+        // same PrimedKey → the snapshot RESTORE path) but DIFFERENT content. The
+        // restore must reinstate the clean post-prime dict state with NO live
+        // frame-A entries surviving above the restored floor; a restore that
+        // leaks stale frame-A positions would surface FALSE matches and produce
+        // a different (or undecodable) frame B. The invariant: a snapshot
+        // restore is a pure timing optimization and MUST be byte-identical to a
+        // cold compressor compressing frame B from scratch, and must round-trip.
+        let dict_raw = include_bytes!("../../dict_tests/dictionary");
+        let dict_id = super::EncoderDictionary::from_bytes(dict_raw)
+            .expect("dict bytes should parse")
+            .id();
+        // 48 KiB > the btultra2 8 KiB attach cutoff → the copy-snapshot
+        // capture/restore path. Two distinct payloads of the SAME size so frame
+        // B resolves to frame A's snapshot key and takes the restore path.
+        let make_payload = |seed: u64, target: usize| {
+            let mut p = Vec::with_capacity(target);
+            let mut i = seed;
+            while p.len() < target {
+                p.extend_from_slice(
+                    format!(
+                        "tenant=demo op=put key={i} value=aaaaabbbbbcccccddddd-{}\n",
+                        i % 89
+                    )
+                    .as_bytes(),
+                );
+                i = i.wrapping_add(1);
+            }
+            p.truncate(target);
+            p
+        };
+        let size = 48 * 1024usize;
+        let frame_a = make_payload(0, size);
+        let frame_b = make_payload(1_000_000, size);
+
+        let mut warm: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(22));
+        warm.set_encoder_dictionary(
+            super::EncoderDictionary::from_bytes(dict_raw).expect("dict parse"),
+        )
+        .expect("dict attach");
+        // Frame A: cold cache — primes the dict + captures the snapshot, and
+        // fills the live tables with frame-A positions.
+        let _wa = warm.compress_independent_frame(frame_a.as_slice());
+        // Frame B: warm cache — takes the snapshot RESTORE path (same size).
+        let warm_b = warm.compress_independent_frame(frame_b.as_slice());
+
+        // Cold compressor compressing frame B from scratch: the ground truth.
+        let mut cold: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(22));
+        cold.set_encoder_dictionary(
+            super::EncoderDictionary::from_bytes(dict_raw).expect("dict parse"),
+        )
+        .expect("dict attach");
+        let cold_b = cold.compress_independent_frame(frame_b.as_slice());
+
+        assert_eq!(
+            warm_b, cold_b,
+            "frame B via snapshot restore must be byte-identical to a cold compress \
+             (a restore that leaks frame-A live-table entries would diverge here)"
+        );
+
+        // Round-trip frame B through a dict-primed decoder.
+        let (hdr, _) =
+            crate::decoding::frame::read_frame_header(warm_b.as_slice()).expect("frame header");
+        assert_eq!(hdr.dictionary_id(), Some(dict_id));
+        let mut decoder = FrameDecoder::new();
+        decoder
+            .add_dict(crate::decoding::Dictionary::decode_dict(dict_raw).unwrap())
+            .unwrap();
+        let mut decoded = Vec::with_capacity(frame_b.len());
+        decoder
+            .decode_all_to_vec(warm_b.as_slice(), &mut decoded)
+            .unwrap();
+        assert_eq!(decoded.as_slice(), frame_b.as_slice());
+    }
+
+    #[test]
     fn set_dictionary_from_bytes_matches_full_decode_byte_for_byte() {
         // The encoder-only dict parse (`decode_dict_for_encoding`, used by
         // `set_dictionary_from_bytes`) skips the FSE/HUF decoder-table build and
