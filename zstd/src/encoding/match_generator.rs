@@ -5836,24 +5836,30 @@ fn dfast_matches_roundtrip_multi_block_pattern() {
 #[test]
 fn dfast_accepts_exact_five_byte_match() {
     // Layout the input so that:
-    //   bytes 0..5   = "ABCDE"        (the match source)
-    //   bytes 5..28  = 23 filler bytes that do NOT start with 'A'
-    //   bytes 28..33 = "ABCDE"        (the 5-byte match site)
-    //   byte  33     = 'F'            (differs from byte 5 = '!')
-    // The longest available copy at position 28 is exactly 5 bytes:
-    // the byte at position 33 ('F') differs from the byte at position 5
+    //   byte  0      = 'Z'            (lead byte — keeps the match SOURCE off
+    //                                  position 0, which the greedy loop never
+    //                                  inserts: like the donor it starts the
+    //                                  cursor at ip+1 and hashes only visited
+    //                                  positions)
+    //   bytes 1..6   = "ABCDE"        (the match source — position 1 IS visited)
+    //   bytes 6..29  = 23 filler bytes that do NOT start with 'A'
+    //   bytes 29..34 = "ABCDE"        (the 5-byte match site)
+    //   byte  34     = 'F'            (differs from byte 6 = '!')
+    // The longest available copy at position 29 is exactly 5 bytes:
+    // the byte at position 34 ('F') differs from the byte at position 6
     // ('!'), so the forward extension stops at length 5.
     let mut data = Vec::new();
-    data.extend_from_slice(b"ABCDE"); // 0..5
-    data.extend_from_slice(b"!!!!!!!!!!!!!!!!!!!!!!!"); // 5..28 (23 bytes)
-    data.extend_from_slice(b"ABCDE"); // 28..33
-    data.push(b'F'); // 33: forces forward extension to stop at length 5
-    // Trailing filler so the match site (28) sits at least HASH_READ_SIZE (8)
+    data.push(b'Z'); // 0
+    data.extend_from_slice(b"ABCDE"); // 1..6
+    data.extend_from_slice(b"!!!!!!!!!!!!!!!!!!!!!!!"); // 6..29 (23 bytes)
+    data.extend_from_slice(b"ABCDE"); // 29..34
+    data.push(b'F'); // 34: forces forward extension to stop at length 5
+    // Trailing filler so the match site (29) sits at least HASH_READ_SIZE (8)
     // bytes before the block end. The greedy double-fast — like the donor —
     // stops probing at `ilimit = iend - HASH_READ_SIZE`, so a match in the
     // final 8 bytes is never searched (donor parity, not a regression).
-    data.extend_from_slice(b"GHIJKLMNOPQRSTUVWXYZ"); // 34..54
-    assert_eq!(data.len(), 54);
+    data.extend_from_slice(b"GHIJKLMNOPQRSTUVWXYZ"); // 35..55
+    assert_eq!(data.len(), 55);
 
     let mut matcher = DfastMatchGenerator::new(1 << 22);
     matcher.add_data(data.clone(), |_| {});

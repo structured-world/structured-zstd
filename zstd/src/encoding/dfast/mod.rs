@@ -1021,23 +1021,16 @@ impl DfastMatchGenerator {
         candidate: MatchCandidate,
         handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
     ) -> usize {
-        // Insert the LITERAL region densely, the MATCH INTERIOR sparsely
-        // (upstream `zstd_double_fast.c` parity). The literal positions
-        // `[literals_start, match_start)` are load-bearing: the producer
-        // loop starts at `pos = 1` and only hashes positions it actually
-        // probes, so the block anchor (position 0) and any stepped-over
-        // literal byte is hashed ONLY here — dropping it loses real match
-        // sources for later positions (and later blocks). The match
-        // interior, by contrast, is never re-probed within the block;
-        // upstream fills only `curr+2` and `ip-2` there, so inserting the
-        // full `[match_start, match_end)` span was ~match_len wasted
-        // single-slot overwrites — the dominant self-time on
-        // dict-heavy / highly-matchable blocks. Mirror the rep-extension
-        // path's audited 3-target set (`curr+2`, `ip-2`, `ip-1`), each
-        // clamped to the open match interval.
+        // Donor `zstd_double_fast.c` parity: the inner search loop already
+        // inserts every position it VISITS (step-accelerated), so the literal
+        // run is hashed exactly as densely as the donor's cursor swept it —
+        // stepped-over and block-anchor (position 0) positions are NOT
+        // re-inserted here (the donor skips them too via `ip += (ip ==
+        // prefixStart)` + the growing `step`). Match interior: donor fills only
+        // the sparse 3-target set (`curr+2`, `ip-2`, `ip-1`), each clamped to
+        // the open match interval.
         let match_start = candidate.start;
         let post_match_end = candidate.start + candidate.match_len;
-        self.insert_positions(current_abs_start + *literals_start, match_start);
         let insert_targets = [
             match_start + 2,                  // curr + 2
             post_match_end.saturating_sub(2), // ip - 2 (post-match cursor)
