@@ -109,6 +109,18 @@ pub struct FrameCompressor<
     /// time, so without `hash` no checksum is emitted regardless. Set via
     /// [`Self::set_content_checksum`].
     content_checksum: bool,
+    /// Whether to record `Frame_Content_Size` in the frame header when the
+    /// total size is known (semantics of upstream `ZSTD_c_contentSizeFlag`).
+    /// Default `true`, matching upstream. With the flag off the header
+    /// carries a window descriptor instead (single-segment requires an FCS,
+    /// so it is disabled too). Set via [`Self::set_content_size_flag`].
+    content_size_flag: bool,
+    /// Whether to record the dictionary ID in the frame header when a
+    /// dictionary is attached (semantics of upstream `ZSTD_c_dictIDFlag`).
+    /// Default `true`, matching upstream. Decoders can still decode the
+    /// frame by being handed the right dictionary explicitly. Set via
+    /// [`Self::set_dictionary_id_flag`].
+    dict_id_flag: bool,
     #[cfg(feature = "hash")]
     hasher: XxHash64,
     /// Block-layout introspection populated at the end of every
@@ -783,6 +795,8 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             },
             magicless: false,
             content_checksum: false,
+            content_size_flag: true,
+            dict_id_flag: true,
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
             #[cfg(feature = "lsm")]
@@ -1121,6 +1135,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             compression_level,
             magicless: false,
             content_checksum: false,
+            content_size_flag: true,
+            dict_id_flag: true,
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
             #[cfg(feature = "lsm")]
@@ -1158,6 +1174,24 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// this setting.
     pub fn set_content_checksum(&mut self, emit: bool) {
         self.content_checksum = emit;
+    }
+
+    /// Enable or disable recording `Frame_Content_Size` in the frame header
+    /// when the total size is known (semantics of upstream
+    /// `ZSTD_c_contentSizeFlag`). Default `true`, matching upstream. With
+    /// the flag off the header carries a window descriptor instead (and the
+    /// single-segment layout, which requires an FCS, is disabled).
+    pub fn set_content_size_flag(&mut self, emit: bool) {
+        self.content_size_flag = emit;
+    }
+
+    /// Enable or disable recording the dictionary ID in the frame header
+    /// when a dictionary is attached (semantics of upstream
+    /// `ZSTD_c_dictIDFlag`). Default `true`, matching upstream. Frames
+    /// emitted with the flag off still decode when the decoder is handed
+    /// the dictionary explicitly.
+    pub fn set_dictionary_id_flag(&mut self, emit: bool) {
+        self.dict_id_flag = emit;
     }
 
     /// Before calling [FrameCompressor::compress] you need to set the source.
@@ -1647,15 +1681,19 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     fn append_frame_header(&self, total_uncompressed: u64, prep: &FramePrep, out: &mut Vec<u8>) {
         // Match the donor framing policy for pledged one-shot inputs: use a
         // single-segment frame whenever the source fits the active window.
-        let single_segment = !prep.use_dictionary_state
+        // A single-segment frame REQUIRES an FCS field, so suppressing the
+        // content size (`content_size_flag` off) also forces the windowed
+        // layout, mirroring upstream.
+        let single_segment = self.content_size_flag
+            && !prep.use_dictionary_state
             && prep.source_size_hint_known
             && total_uncompressed >= 512
             && total_uncompressed <= prep.window_size;
         let header = FrameHeader {
-            frame_content_size: Some(total_uncompressed),
+            frame_content_size: self.content_size_flag.then_some(total_uncompressed),
             single_segment,
             content_checksum: cfg!(feature = "hash") && self.content_checksum,
-            dictionary_id: if prep.use_dictionary_state {
+            dictionary_id: if prep.use_dictionary_state && self.dict_id_flag {
                 self.dictionary.as_ref().map(|dict| dict.inner.id as u64)
             } else {
                 None
@@ -2825,6 +2863,86 @@ mod tests {
             compressor.state.fse_tables.of_previous.is_some(),
             "dictionary entropy should seed previous of table before first block"
         );
+    }
+
+    // `set_content_size_flag(false)`: the header must omit the FCS field
+    // (and the single-segment layout that requires it) while the frame
+    // still round-trips through our decoder.
+    #[test]
+    fn content_size_flag_off_omits_fcs_and_roundtrips() {
+        let payload = alloc::vec![0x42u8; 4096];
+
+        let mut compressor: FrameCompressor =
+            FrameCompressor::new(super::CompressionLevel::Fastest);
+        let mut with_fcs = Vec::new();
+        compressor.compress_independent_frame_into(&payload, &mut with_fcs);
+
+        compressor.set_content_size_flag(false);
+        let mut without_fcs = Vec::new();
+        compressor.compress_independent_frame_into(&payload, &mut without_fcs);
+
+        let parsed_with = crate::decoding::frame::read_frame_header(with_fcs.as_slice())
+            .expect("flag-on frame header must parse")
+            .0;
+        assert_eq!(parsed_with.frame_content_size(), 4096);
+
+        let parsed_without = crate::decoding::frame::read_frame_header(without_fcs.as_slice())
+            .expect("flag-off frame header must parse")
+            .0;
+        // 0 is the decoder's "unknown content size" sentinel.
+        assert_eq!(
+            parsed_without.frame_content_size(),
+            0,
+            "FCS must be omitted with the content-size flag off"
+        );
+
+        let mut decoder = crate::decoding::FrameDecoder::new();
+        // `decode_all_to_vec` fills existing capacity (no FCS to pre-size
+        // from with the flag off), so reserve the expected payload upfront.
+        let mut decoded = Vec::with_capacity(payload.len() + 64);
+        decoder
+            .decode_all_to_vec(&without_fcs, &mut decoded)
+            .expect("flag-off frame must decode");
+        assert_eq!(decoded, payload);
+    }
+
+    // `set_dictionary_id_flag(false)`: a dict-compressed frame must omit
+    // the dictionary ID and still decode when the dictionary is handed to
+    // the decoder explicitly.
+    #[test]
+    fn dict_id_flag_off_omits_dictionary_id_and_roundtrips() {
+        let dict_raw = include_bytes!("../../dict_tests/dictionary");
+        let payload = b"dictionary-keyed payload dictionary-keyed payload".repeat(8);
+
+        let mut compressor: FrameCompressor =
+            FrameCompressor::new(super::CompressionLevel::Fastest);
+        compressor
+            .set_dictionary_from_bytes(dict_raw)
+            .expect("dictionary bytes should parse");
+        compressor.set_dictionary_id_flag(false);
+        let mut frame = Vec::new();
+        compressor.compress_independent_frame_into(&payload, &mut frame);
+
+        let parsed = crate::decoding::frame::read_frame_header(frame.as_slice())
+            .expect("frame header must parse")
+            .0;
+        assert_eq!(
+            parsed.dictionary_id(),
+            None,
+            "dictionary id must be omitted with the dict-id flag off"
+        );
+
+        // With the ID omitted the decoder cannot look the dictionary up by
+        // header; hand it explicitly (the `reset_with_dict_handle` path).
+        let mut sd = crate::decoding::StreamingDecoder::new_with_dictionary_bytes(
+            frame.as_slice(),
+            dict_raw,
+        )
+        .expect("decoder must accept the dictionary");
+        let mut dec = Vec::new();
+        std::io::Read::read_to_end(&mut sd, &mut dec)
+            .expect("frame must decode with the dictionary handed explicitly");
+        assert_eq!(dec, payload);
     }
 
     // Regression test: `heap_size()` must count the retained Huffman tables
