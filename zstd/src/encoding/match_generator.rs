@@ -1953,7 +1953,22 @@ impl Matcher for MatchGeneratorDriver {
                 // resolve_level_params (see Simple-backend swap
                 // arm above for the (level → params) mapping).
                 let fast = params.fast.expect("Fast level row carries a FastConfig");
-                m.reset(params.window_log, fast.hash_log, fast.mls, fast.step_size);
+                // Same attach/copy split the dict-prime dispatch applies
+                // below (`prime_with_dictionary`): only attach-mode dict
+                // frames may keep the main table across the reset via an
+                // epoch advance — copy-mode and no-dict frames must memset
+                // it back to bias 0 for the raw-slice kernels.
+                let dict_attach_epoch = dict_hint.is_some()
+                    && self
+                        .reset_size_log
+                        .is_none_or(|log| log <= FAST_ATTACH_DICT_CUTOFF_LOG);
+                m.reset(
+                    params.window_log,
+                    fast.hash_log,
+                    fast.mls,
+                    fast.step_size,
+                    dict_attach_epoch,
+                );
             }
             MatcherStorage::Dfast(dfast) => {
                 dfast.max_window_size = max_window_size;

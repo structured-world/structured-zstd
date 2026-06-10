@@ -62,6 +62,17 @@ pub(crate) struct FastHashTable {
     /// Valid range `4..=8`; the kernel monomorphises over this so it
     /// compiles to a constant inside each instantiation.
     mls: u32,
+    /// Epoch bias for continue-mode frame resets (donor `ZSTD_continueCCtx`
+    /// cadence): stored values are `position + bias`, and [`Self::get`]
+    /// reads any entry below the current bias as the empty sentinel `0`.
+    /// Advancing the bias past every previously-stored value
+    /// ([`Self::advance_epoch`]) therefore invalidates the whole table
+    /// without the per-frame full-table memset of [`Self::clear`].
+    ///
+    /// Always `0` on paths that access the table storage directly
+    /// ([`Self::hot_state`] — the no-dict kernels) and on cached dict
+    /// tables; only the dict-attach main table advances it.
+    bias: u32,
 }
 
 impl FastHashTable {
@@ -144,6 +155,7 @@ impl FastHashTable {
             table: vec![0u32; entries],
             hash_log,
             mls,
+            bias: 0,
         }
     }
 
@@ -169,6 +181,28 @@ impl FastHashTable {
         // `fill(0)` lowers to a single `memset` and is significantly
         // faster than re-allocating; the table can be hundreds of KiB.
         self.table.fill(0);
+        self.bias = 0;
+    }
+
+    /// Continue-mode frame reset (donor `ZSTD_continueCCtx` cadence): keep
+    /// the table contents and advance the epoch bias past every entry the
+    /// previous frame stored, so all of them read back as the empty
+    /// sentinel via [`Self::get`]'s epoch filter — no full-table memset.
+    ///
+    /// `span` must be strictly greater than the largest unbiased position
+    /// stored since the last clear/advance (the caller passes its history
+    /// high-water mark). Falls back to a real [`Self::clear`] when the
+    /// biased position space would no longer fit `u32`.
+    pub(crate) fn advance_epoch(&mut self, span: u32) {
+        // Stored positions are bounded by the eviction band (2 * max
+        // window = 2^31, see the matcher's `window_log <= 30` ceiling),
+        // so a bias at or below `u32::MAX - 2^31` can never overflow in
+        // `put`.
+        const POSITION_CEILING: u32 = 1 << 31;
+        match self.bias.checked_add(span) {
+            Some(new_bias) if new_bias <= u32::MAX - POSITION_CEILING => self.bias = new_bias,
+            _ => self.clear(),
+        }
     }
 
     /// Donor-parity `ZSTD_hashPtr` — multiply-shift hash over the first
@@ -222,6 +256,11 @@ impl FastHashTable {
     /// never touches `self` and stays reload-free.
     #[inline(always)]
     pub(crate) fn hot_state(&mut self) -> (&mut [u32], u32) {
+        // The raw-slice consumers (no-dict kernels) store and read
+        // UNBIASED positions; they may only run on a bias-0 table (the
+        // matcher clears — rather than epoch-advances — whenever the next
+        // frame is not a dict-attach frame).
+        debug_assert_eq!(self.bias, 0, "hot_state requires an unbiased table");
         (self.table.as_mut_slice(), self.hash_log)
     }
 
@@ -240,7 +279,13 @@ impl FastHashTable {
         debug_assert!((hash as usize) < self.table.len());
         // SAFETY: see method-level doc — `hash` is bounded by the
         // table-size invariant from `hash_ptr`.
-        unsafe { *self.table.get_unchecked(hash as usize) }
+        let raw = unsafe { *self.table.get_unchecked(hash as usize) };
+        // Epoch filter: entries stored before the last `advance_epoch`
+        // (raw < bias, including the all-zero sentinel) must read as the
+        // empty sentinel 0 — the saturation floor IS the semantics here.
+        // Compiles to sub + cmov; on bias == 0 tables (no-dict, cached
+        // dict) it is the identity.
+        raw.saturating_sub(self.bias)
     }
 
     /// Direct table write — `table[hash] = pos`. Same bounds reasoning
@@ -252,9 +297,12 @@ impl FastHashTable {
     #[inline(always)]
     pub(crate) unsafe fn put(&mut self, hash: u32, pos: u32) {
         debug_assert!((hash as usize) < self.table.len());
+        // Cannot overflow: `advance_epoch` caps the bias at
+        // `u32::MAX - 2^31` and `pos` is bounded by the eviction band.
+        let biased = pos + self.bias;
         // SAFETY: see method-level doc.
         unsafe {
-            *self.table.get_unchecked_mut(hash as usize) = pos;
+            *self.table.get_unchecked_mut(hash as usize) = biased;
         }
     }
 }

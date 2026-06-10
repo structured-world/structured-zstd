@@ -2931,6 +2931,71 @@ mod tests {
     }
 
     #[test]
+    fn dict_fast_epoch_reset_many_frames_and_attach_copy_alternation_byte_identical() {
+        // The Fast attach path invalidates the main hash table between
+        // frames with an epoch-bias advance instead of a memset. Two things
+        // need proving against a fresh-compressor reference:
+        // 1. the bias accumulates across MANY reused frames without ever
+        //    letting a stale entry through (every frame byte-identical);
+        // 2. crossing the 8 KiB attach/copy cutoff in both directions
+        //    (attach → copy clears the bias for the raw-slice kernel,
+        //    copy → attach re-enters epoch mode) stays byte-identical.
+        let dict_raw = include_bytes!("../../dict_tests/dictionary");
+        let mut small = Vec::new();
+        while small.len() < 2 * 1024 {
+            small.extend_from_slice(b"tenant=demo op=put key=1 value=aaaaabbbbbcccccddddd\n");
+        }
+        // Over the Fast 8 KiB attach cutoff → copy-mode frame.
+        let mut large = Vec::new();
+        while large.len() < 64 * 1024 {
+            large.extend_from_slice(b"tenant=demo op=scan range=[k0,k9) limit=500 order=asc\n");
+        }
+
+        let mut reused: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Fastest);
+        reused
+            .set_encoder_dictionary(
+                super::EncoderDictionary::from_bytes(dict_raw).expect("dict bytes should parse"),
+            )
+            .expect("prepared dictionary should attach");
+
+        let reference = |payload: &[u8]| -> alloc::vec::Vec<u8> {
+            let mut fresh: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Fastest);
+            fresh
+                .set_encoder_dictionary(
+                    super::EncoderDictionary::from_bytes(dict_raw)
+                        .expect("dict bytes should parse"),
+                )
+                .expect("prepared dictionary should attach");
+            fresh.compress_independent_frame(payload)
+        };
+
+        let small_expected = reference(&small);
+        let large_expected = reference(&large);
+
+        // 1. Long attach-only run: every frame advances the epoch bias.
+        for i in 0..32 {
+            let frame = reused.compress_independent_frame(small.as_slice());
+            assert_eq!(
+                frame, small_expected,
+                "attach frame {i} diverged from the fresh-compressor reference"
+            );
+        }
+        // 2. Cutoff alternation: attach → copy → attach → copy.
+        for i in 0..4 {
+            let frame = reused.compress_independent_frame(large.as_slice());
+            assert_eq!(
+                frame, large_expected,
+                "copy frame {i} diverged from the fresh-compressor reference"
+            );
+            let frame = reused.compress_independent_frame(small.as_slice());
+            assert_eq!(
+                frame, small_expected,
+                "attach frame after copy {i} diverged from the fresh-compressor reference"
+            );
+        }
+    }
+
+    #[test]
     fn dict_primed_btlazy2_reused_across_attach_and_copy_boundary_is_byte_identical() {
         // Btlazy2 (Level 15) uses the 32 KiB dict attach/copy cutoff in
         // prepare_frame. Exercise BOTH sides of that boundary on a reused
