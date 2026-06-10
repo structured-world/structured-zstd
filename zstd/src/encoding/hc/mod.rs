@@ -216,7 +216,6 @@ impl HcMatcher {
     /// [`Self::chain_candidates`], extends each survivor backwards
     /// over the literal run, and short-circuits as soon as a
     /// candidate crosses `target_len`.
-    #[inline(never)]
     pub(crate) fn hash_chain_candidate(
         &self,
         table: &MatchTable,
@@ -416,7 +415,6 @@ impl HcMatcher {
     /// short, and omitting it only skips an optimisation, never changes the
     /// accepted match (the 4-byte gate stays, which is correctness-safe since
     /// `HC_MIN_MATCH_LEN == 4`).
-    #[inline(never)]
     fn dms_chain_candidate(
         &self,
         table: &MatchTable,
