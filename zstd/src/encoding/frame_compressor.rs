@@ -2816,6 +2816,41 @@ mod tests {
         );
     }
 
+    // Regression test: `heap_size()` must count the retained Huffman tables
+    // (the active `last_huff_table` and the recycled `huff_table_spare`).
+    // A reused context that parks a table would otherwise under-report its
+    // footprint through the public size API.
+    #[test]
+    fn heap_size_counts_active_and_spare_huffman_tables() {
+        let mut compressor: FrameCompressor =
+            FrameCompressor::new(super::CompressionLevel::Fastest);
+        let base = compressor.heap_size();
+
+        let active = crate::huff0::huff0_encoder::HuffmanTable::build_from_data(
+            b"abacabadabacabaeabacabadabacaba",
+        );
+        let active_bytes = active.heap_size();
+        assert!(active_bytes > 0, "built table must own heap buffers");
+        compressor.state.last_huff_table = Some(active);
+        assert_eq!(
+            compressor.heap_size(),
+            base + active_bytes,
+            "heap_size must include the active last_huff_table"
+        );
+
+        let spare = crate::huff0::huff0_encoder::HuffmanTable::build_from_data(
+            b"the quick brown fox jumps over the lazy dog",
+        );
+        let spare_bytes = spare.heap_size();
+        assert!(spare_bytes > 0, "built table must own heap buffers");
+        compressor.state.huff_table_spare = Some(spare);
+        assert_eq!(
+            compressor.heap_size(),
+            base + active_bytes + spare_bytes,
+            "heap_size must include the parked huff_table_spare"
+        );
+    }
+
     #[test]
     fn set_encoder_dictionary_reattaches_prepared_dict_without_reparse() {
         let dict_raw = include_bytes!("../../dict_tests/dictionary");
