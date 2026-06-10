@@ -573,6 +573,11 @@ fn bench_dictionary(c: &mut Criterion) {
         if let Ok(dir) = std::env::var("STRUCTURED_ZSTD_DUMP_DICT_DIR") {
             let path = format!("{dir}/{}.dict", scenario.id);
             std::fs::write(&path, &ffi_dictionary).expect("dump dict");
+            // Scenario input bytes too, so standalone profiling binaries
+            // (`encode_loop_dict` / `decode_loop_dict`) can replay the
+            // exact (input, dict) pair this scenario benches.
+            let path = format!("{dir}/{}.bin", scenario.id);
+            std::fs::write(&path, scenario.bytes.as_slice()).expect("dump scenario bytes");
         }
 
         if emit_reports {
