@@ -2523,7 +2523,13 @@ impl Matcher for MatchGeneratorDriver {
             // otherwise the next small/unknown-size frame reuses stale
             // attach state through `prime_dict_attach_current_block`.
             super::strategy::BackendTag::Row => self.row_matcher_mut().invalidate_dict_cache(),
-            _ => {}
+            // The BT dms tree is keyed to the dict bytes; `prime_dms_bt`
+            // skips the rebuild while its shape matches, so a swapped
+            // dictionary of the same length would otherwise keep serving the
+            // OLD dictionary's tree.
+            super::strategy::BackendTag::HashChain => {
+                self.hc_matcher_mut().table.dms.invalidate();
+            }
         }
     }
 
