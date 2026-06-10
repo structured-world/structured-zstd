@@ -138,7 +138,6 @@ const INITIAL_PREFIX_START_INDEX: u32 = 1;
 ///   across blocks (cleared only on full `reset`).
 /// - `pending` holds the most recently `commit_space`'d block before
 ///   `start_matching` appends it onto `history` and runs the kernel.
-#[derive(Clone)]
 pub(crate) struct FastKernelMatcher {
     /// Concatenated input history: prior-block bytes followed by the
     /// most-recently-committed (still pending-matching) tail.
@@ -255,6 +254,52 @@ pub(crate) struct FastKernelMatcher {
     table_pos_high_water: usize,
 }
 
+impl Clone for FastKernelMatcher {
+    fn clone(&self) -> Self {
+        Self {
+            history: self.history.clone(),
+            prefix_start_index: self.prefix_start_index,
+            rep: self.rep,
+            offset_hist: self.offset_hist,
+            hash_table: self.hash_table.clone(),
+            max_window_size: self.max_window_size,
+            window_log: self.window_log,
+            use_cmov: self.use_cmov,
+            step_size: self.step_size,
+            pending: self.pending.clone(),
+            last_block_start: self.last_block_start,
+            recycled_space: self.recycled_space.clone(),
+            borrowed: self.borrowed,
+            last_borrowed_block: self.last_borrowed_block,
+            dict: self.dict.clone(),
+            table_pos_high_water: self.table_pos_high_water,
+        }
+    }
+
+    // The per-frame dictionary snapshot restore `clone_from`s this whole
+    // matcher; reusing the retained `history` / hash-table / dict-table
+    // buffers turns that restore into pure copies (no allocations), which
+    // is what the donor's CDict table-copy regime pays.
+    fn clone_from(&mut self, source: &Self) {
+        self.history.clone_from(&source.history);
+        self.prefix_start_index = source.prefix_start_index;
+        self.rep = source.rep;
+        self.offset_hist = source.offset_hist;
+        self.hash_table.clone_from(&source.hash_table);
+        self.max_window_size = source.max_window_size;
+        self.window_log = source.window_log;
+        self.use_cmov = source.use_cmov;
+        self.step_size = source.step_size;
+        self.pending.clone_from(&source.pending);
+        self.last_block_start = source.last_block_start;
+        self.recycled_space.clone_from(&source.recycled_space);
+        self.borrowed = source.borrowed;
+        self.last_borrowed_block = source.last_borrowed_block;
+        self.dict.clone_from(&source.dict);
+        self.table_pos_high_water = source.table_pos_high_water;
+    }
+}
+
 impl FastKernelMatcher {
     /// Test-only zero-arg constructor that bakes in the donor's
     /// level-1 defaults. Production code goes through
@@ -367,6 +412,12 @@ impl FastKernelMatcher {
         mls: u32,
         step_size: usize,
         dict_attach_epoch: bool,
+        // The caller (driver) has a primed-snapshot whose key matches this
+        // exact reset shape and WILL `clone_from` it over this matcher
+        // right after the reset (the copy-mode dictionary restore). The
+        // table contents and epoch bias are about to be replaced
+        // wholesale, so the full-table memset here would be pure waste.
+        table_overwritten_by_restore: bool,
     ) {
         assert!(
             step_size >= 2,
@@ -378,7 +429,13 @@ impl FastKernelMatcher {
             window_log <= 30,
             "FastKernelMatcher requires window_log <= 30 (got {window_log})"
         );
-        if self.hash_table.hash_log() != hash_log || self.hash_table.mls() != mls {
+        if table_overwritten_by_restore
+            && self.hash_table.hash_log() == hash_log
+            && self.hash_table.mls() == mls
+        {
+            // Leave the table untouched: the snapshot restore copies the
+            // primed contents (and bias) over it immediately after.
+        } else if self.hash_table.hash_log() != hash_log || self.hash_table.mls() != mls {
             // Parameters changed — rebuild the table at the new size.
             // Cannot reuse the old allocation because the hash table
             // dimensions are baked in at construction. A reshape also
@@ -1559,6 +1616,7 @@ mod tests {
             FAST_LEVEL_1_MLS,
             2,
             false,
+            false,
         );
         // After reset the borrowed window is dropped — back to the
         // (now empty) owned buffer, never the dangling external range.
@@ -1702,6 +1760,7 @@ mod tests {
             FAST_LEVEL_1_MLS,
             2,
             false,
+            false,
         );
 
         // Post-reset: history empty (HISTORY_DRAIN_BASE=0; no
@@ -1724,7 +1783,7 @@ mod tests {
         let mut m = FastKernelMatcher::new();
         // Force a parameter change — every Vec we hand the new
         // FastHashTable will be a fresh allocation.
-        m.reset(16, 10, 4, 2, false);
+        m.reset(16, 10, 4, 2, false, false);
         assert_eq!(m.hash_table.hash_log(), 10);
         assert_eq!(m.hash_table.mls(), 4);
         assert_eq!(m.window_log, 16);

@@ -2045,12 +2045,35 @@ impl Matcher for MatchGeneratorDriver {
                     && self
                         .reset_size_log
                         .is_none_or(|log| log <= FAST_ATTACH_DICT_CUTOFF_LOG);
+                // Copy-mode dictionary frame whose primed snapshot matches
+                // this exact resolved shape: `restore_primed_dictionary`
+                // (called right after this reset; the caller gates the
+                // restore on the same size bucket and the restore re-checks
+                // the same key) will `clone_from` the snapshot over this
+                // matcher, replacing the table contents and bias wholesale —
+                // the reset's full-table memset would be thrown away. The
+                // key components mirror `reset_shape` below: Simple leaves
+                // `resolved_table_bits` 0, never carries an LDM override,
+                // and `fast_attach` is false in copy mode by construction.
+                let table_overwritten_by_restore = matches!(dict_hint, Some(size) if size > 0)
+                    && !dict_attach_epoch
+                    && self.primed.as_ref().is_some_and(|(_, _, captured)| {
+                        *captured
+                            == PrimedKey {
+                                level,
+                                params,
+                                table_bits: 0,
+                                fast_attach: false,
+                                ldm: None,
+                            }
+                    });
                 m.reset(
                     params.window_log,
                     fast.hash_log,
                     fast.mls,
                     fast.step_size,
                     dict_attach_epoch,
+                    table_overwritten_by_restore,
                 );
             }
             MatcherStorage::Dfast(dfast) => {
@@ -2411,40 +2434,57 @@ impl Matcher for MatchGeneratorDriver {
             fast_attach,
             ldm,
         };
-        let (mut storage, budget) = match &self.primed {
-            Some((storage, budget, captured_key)) if *captured_key == key => {
-                (storage.clone(), *budget)
-            }
-            _ => return false,
+        let Some((snapshot, budget, captured_key)) = &self.primed else {
+            return false;
         };
-        // A binary-tree snapshot is stored WITHOUT its live hash / chain / hash3
-        // tables (they hold no dictionary entries — the dict lives in `dms` +
-        // history; see `capture_primed_dictionary`). Re-allocate them zeroed to
-        // the snapshot's geometry, exactly reproducing the post-prime state (all
-        // `HC_EMPTY`). This is a full storage replace, so no stale live-table
-        // entry from a prior frame can survive — `ensure_tables` only allocates
-        // when the length mismatches, so a full (HC / non-BT) snapshot whose
-        // tables are already present is left untouched.
-        if let MatcherStorage::HashChain(hc) = &mut storage {
-            hc.table.ensure_tables();
+        if *captured_key != key {
+            return false;
         }
-        // The snapshot does not retain the LDM producer (it holds no dict state;
-        // see `capture_primed_dictionary`). Carry over the frame's freshly-reset
-        // producer — built this frame by `reset` with the same params the
-        // snapshot key pins, and empty (no input processed yet), so it is
-        // equivalent to the producer the snapshot was captured with.
-        #[cfg(feature = "hash")]
-        {
-            let fresh_ldm = if let MatcherStorage::HashChain(hc) = &mut self.storage {
-                hc.take_ldm_producer()
-            } else {
-                None
-            };
-            if let MatcherStorage::HashChain(hc) = &mut storage {
-                hc.set_ldm_producer(fresh_ldm);
+        let budget = *budget;
+        match (&mut self.storage, snapshot) {
+            // Same-variant Fast restore: copy the snapshot into the retained
+            // live storage. `clone_from` reuses the history / hash-table /
+            // dict-table buffers, so this is the donor CDict table-copy
+            // regime's cost (pure copies) instead of a full per-frame
+            // allocation + copy + drop cycle.
+            (MatcherStorage::Simple(live), MatcherStorage::Simple(snap)) => {
+                live.clone_from(snap);
+            }
+            (live, snapshot_storage) => {
+                let mut storage = snapshot_storage.clone();
+                // A binary-tree snapshot is stored WITHOUT its live hash /
+                // chain / hash3 tables (they hold no dictionary entries — the
+                // dict lives in `dms` + history; see
+                // `capture_primed_dictionary`). Re-allocate them zeroed to the
+                // snapshot's geometry, exactly reproducing the post-prime
+                // state (all `HC_EMPTY`). This is a full storage replace, so
+                // no stale live-table entry from a prior frame can survive —
+                // `ensure_tables` only allocates when the length mismatches,
+                // so a full (HC / non-BT) snapshot whose tables are already
+                // present is left untouched.
+                if let MatcherStorage::HashChain(hc) = &mut storage {
+                    hc.table.ensure_tables();
+                }
+                // The snapshot does not retain the LDM producer (it holds no
+                // dict state; see `capture_primed_dictionary`). Carry over the
+                // frame's freshly-reset producer — built this frame by `reset`
+                // with the same params the snapshot key pins, and empty (no
+                // input processed yet), so it is equivalent to the producer
+                // the snapshot was captured with.
+                #[cfg(feature = "hash")]
+                {
+                    let fresh_ldm = if let MatcherStorage::HashChain(hc) = live {
+                        hc.take_ldm_producer()
+                    } else {
+                        None
+                    };
+                    if let MatcherStorage::HashChain(hc) = &mut storage {
+                        hc.set_ldm_producer(fresh_ldm);
+                    }
+                }
+                *live = storage;
             }
         }
-        self.storage = storage;
         self.dictionary_retained_budget = budget;
         true
     }

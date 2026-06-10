@@ -53,7 +53,6 @@ const PRIME_8_BYTES: u64 = 0xCF1BBCDCB7A56463;
 /// initial prefix (where the `+= (ip0 == prefixStart)` adjustment at
 /// loop entry skips it) or is below `prefixStartIndex` and filtered by
 /// the in-range check.
-#[derive(Clone)]
 pub(crate) struct FastHashTable {
     table: Vec<u32>,
     /// Donor `hash_log` — number of bits the hash output is reduced to.
@@ -73,6 +72,28 @@ pub(crate) struct FastHashTable {
     /// ([`Self::hot_state`] — the no-dict kernels) and on cached dict
     /// tables; only the dict-attach main table advances it.
     bias: u32,
+}
+
+impl Clone for FastHashTable {
+    fn clone(&self) -> Self {
+        Self {
+            table: self.table.clone(),
+            hash_log: self.hash_log,
+            mls: self.mls,
+            bias: self.bias,
+        }
+    }
+
+    // Real buffer reuse: the per-frame dictionary snapshot restore
+    // `clone_from`s the whole matcher, and the table is its dominant
+    // allocation — copying into the retained buffer avoids a fresh
+    // table-sized allocation per frame.
+    fn clone_from(&mut self, source: &Self) {
+        self.table.clone_from(&source.table);
+        self.hash_log = source.hash_log;
+        self.mls = source.mls;
+        self.bias = source.bias;
+    }
 }
 
 impl FastHashTable {
