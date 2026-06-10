@@ -2083,25 +2083,24 @@ impl Matcher for MatchGeneratorDriver {
                 row.lazy_depth = params.lazy_depth;
                 let row_cfg = params.row.expect("Row level row carries a RowConfig");
                 row.configure(row_cfg);
-                // Record the RESOLVED hash width in the primed-snapshot key on
-                // both paths. Leaving the unhinted path at the 0 default keyed
-                // an unhinted capture differently from a hinted reset that
-                // resolves to the IDENTICAL tables (hint >= window makes the
-                // clamp a no-op), forcing a needless dictionary re-prime.
-                resolved_table_bits = if hinted {
+                if hinted {
                     // Clamp the configured hash width by the hinted window
                     // (donor `ZSTD_adjustCParams` caps hashLog by windowLog) —
                     // `min`, not replace, so an explicit `hash_log` param
                     // override (`row_cfg.hash_bits`) survives the hinted path
                     // instead of being overwritten by the window value.
-                    let bits = row_cfg
-                        .hash_bits
-                        .min(row_hash_bits_for_window(table_window_size));
-                    row.set_hash_bits(bits);
-                    bits
-                } else {
-                    row_cfg.hash_bits
-                };
+                    row.set_hash_bits(
+                        row_cfg
+                            .hash_bits
+                            .min(row_hash_bits_for_window(table_window_size)),
+                    );
+                }
+                // Key the primed snapshot on the width the backend ACTUALLY
+                // applied (`set_hash_bits` clamps the request): recording the
+                // request — or the 0 default on the unhinted path — keys
+                // identical table geometries apart and forces needless
+                // dictionary re-primes.
+                resolved_table_bits = row.hash_bits();
                 row.reset();
             }
             MatcherStorage::HashChain(hc) => {

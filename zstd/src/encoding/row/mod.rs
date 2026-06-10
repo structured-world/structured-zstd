@@ -777,14 +777,22 @@ impl RowMatchGenerator {
             })
     }
 
+    /// Effective row hash width currently configured (`row_hash_log +
+    /// row_log`). The primed-snapshot key records THIS value — the
+    /// configured request may exceed the [`ROW_HASH_BITS`] cap below, and
+    /// keying on the request while the tables use the clamped width forces
+    /// needless dictionary re-primes.
+    pub(crate) fn hash_bits(&self) -> usize {
+        self.row_hash_log + self.row_log
+    }
+
     pub(crate) fn set_hash_bits(&mut self, bits: usize) {
-        // Upper bound mirrors the donor `ZSTD_HASHLOG_MAX` (27) rather than
-        // the old `ROW_HASH_BITS` (20) ceiling: the lazy band's donor
-        // configs carry hashLog 21-23 (L9-12), and clamping below the
-        // driver's resolved width would silently shrink the tables while
-        // the primed-snapshot key still recorded the wider geometry.
-        const ROW_HASH_BITS_MAX: usize = 27;
-        let clamped = bits.clamp(self.row_log + 1, ROW_HASH_BITS_MAX);
+        // Deliberate deviation from donor hashLog 21-23 on L9-12: the
+        // 20-bit cap keeps the row table L2/L3-resident. Measured on the
+        // 1 MiB corpus at L10 (tight pair, flat control): the honest
+        // 21-bit table cost +26.8% wall for a 19-byte output delta — our
+        // lazy-band ratio already beats the donor with the capped width.
+        let clamped = bits.clamp(self.row_log + 1, ROW_HASH_BITS);
         let row_hash_log = clamped.saturating_sub(self.row_log);
         if self.row_hash_log != row_hash_log {
             self.row_hash_log = row_hash_log;
