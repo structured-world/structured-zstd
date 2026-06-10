@@ -321,28 +321,6 @@ impl HcMatcher {
             // stop after processing this slot.
             let self_loop = next == cur;
 
-            // Prefetch the NEXT chain candidate's bytes. The chain links into
-            // the dictionary region (a large, randomly-indexed buffer), so each
-            // candidate's byte load is a cache miss; issuing the next one now
-            // hides its latency behind the current candidate's 4-byte gate +
-            // count. An empty / out-of-window link prefetches a harmless
-            // address (ISA no-op).
-            if !self_loop
-                && next != HC_EMPTY
-                && let Some(next_abs) =
-                    super::match_table::storage::MatchTable::stored_abs_position_fast(
-                        next,
-                        table.position_base,
-                        table.index_shift,
-                    )
-                && next_abs >= history_abs_start
-                && next_abs < abs_pos
-            {
-                crate::decoding::prefetch::prefetch_l1_at(
-                    concat.as_ptr().wrapping_add(next_abs - history_abs_start),
-                );
-            }
-
             // Only process candidates in the live window [history_abs_start, abs_pos).
             if let Some(candidate_abs) = candidate_abs_opt
                 && candidate_abs >= history_abs_start
