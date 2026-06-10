@@ -2037,7 +2037,11 @@ impl Matcher for MatchGeneratorDriver {
                 // frames may keep the main table across the reset via an
                 // epoch advance — copy-mode and no-dict frames must memset
                 // it back to bias 0 for the raw-slice kernels.
-                let dict_attach_epoch = dict_hint.is_some()
+                // `Some(0)` is "no dictionary" (the dict-sizing path above
+                // filters it the same way): an empty dict primes nothing, so
+                // an epoch-advance reset would preserve stale attach state
+                // instead of clearing it.
+                let dict_attach_epoch = matches!(dict_hint, Some(size) if size > 0)
                     && self
                         .reset_size_log
                         .is_none_or(|log| log <= FAST_ATTACH_DICT_CUTOFF_LOG);

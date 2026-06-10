@@ -183,26 +183,27 @@ pub(crate) fn repcode_candidate_shared(
                 // call on every non-matching rep. In-bounds: `current_idx +
                 // 4 <= concat.len()` from the entry guard, and
                 // `candidate_idx < current_idx`.
-                if candidate_pos >= history_abs_start && {
+                if candidate_pos >= history_abs_start {
                     let candidate_idx = candidate_pos - history_abs_start;
-                    concat[candidate_idx..candidate_idx + 4] == concat[current_idx..current_idx + 4]
-                } {
-                    let candidate_idx = candidate_pos - history_abs_start;
-                    let match_len = common_prefix_len_with_kernel(
-                        kernel,
-                        &concat[candidate_idx..],
-                        &concat[current_idx..],
-                    );
-                    if match_len >= min_match_len {
-                        let candidate = extend_backwards_shared(
-                            concat,
-                            history_abs_start,
-                            candidate_pos,
-                            abs_pos,
-                            match_len,
-                            lit_len,
+                    if concat[candidate_idx..candidate_idx + 4]
+                        == concat[current_idx..current_idx + 4]
+                    {
+                        let match_len = common_prefix_len_with_kernel(
+                            kernel,
+                            &concat[candidate_idx..],
+                            &concat[current_idx..],
                         );
-                        best = best_len_offset_candidate(best, Some(candidate));
+                        if match_len >= min_match_len {
+                            let candidate = extend_backwards_shared(
+                                concat,
+                                history_abs_start,
+                                candidate_pos,
+                                abs_pos,
+                                match_len,
+                                lit_len,
+                            );
+                            best = best_len_offset_candidate(best, Some(candidate));
+                        }
                     }
                 }
             }

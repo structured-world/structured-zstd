@@ -476,7 +476,10 @@ impl StrategyTag {
     pub(crate) const fn parse_mode(self) -> ParseMode {
         match self {
             Self::Fast | Self::Dfast | Self::Greedy => ParseMode::Greedy,
-            Self::Lazy | Self::Btlazy2 => ParseMode::Lazy,
+            Self::Lazy => ParseMode::Lazy,
+            // Donor btlazy2 = BinaryTree finder + depth-2 lazy parse
+            // (`Strategy::lazy_depth()` reports 2 for it as well).
+            Self::Btlazy2 => ParseMode::Lazy2,
             Self::BtOpt | Self::BtUltra | Self::BtUltra2 => ParseMode::Optimal,
         }
     }
@@ -508,7 +511,7 @@ mod tests {
     fn btlazy2_tag_bridge_contract() {
         assert_eq!(StrategyTag::Btlazy2.backend(), BackendTag::HashChain);
         assert_eq!(StrategyTag::Btlazy2.search(), SearchMethod::BinaryTree);
-        assert_eq!(StrategyTag::Btlazy2.parse_mode(), ParseMode::Lazy);
+        assert_eq!(StrategyTag::Btlazy2.parse_mode(), ParseMode::Lazy2);
         // The BT walk cap must let L15's search_depth = 64 govern (BtOpt's
         // 32 would silently halve it); full find, no early bail.
         assert_eq!(Btlazy2::MAX_CHAIN_DEPTH, 64);
