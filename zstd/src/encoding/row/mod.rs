@@ -434,17 +434,61 @@ macro_rules! gen_row_probe {
             };
 
             let mut best: Option<MatchCandidate> = None;
-            for i in 0..max_walk {
-                let slot = (head + i) & row_mask;
-                let idx = row_base + slot;
-                let matched = if $use_mask {
-                    (tag_match >> slot) & 1 != 0
+            // Donor `ZSTD_RowFindBestMatch` mask iteration: rotate the tag
+            // mask into head (newest-first) order once, then visit ONLY the
+            // set bits via tzcnt + clear-lowest. The former per-slot loop
+            // burned slot arithmetic + a bit test on EVERY entry (rows are
+            // 16-64 wide, typical tag hits 0-2) — ~14% of L10 wall time.
+            // `max_walk` bounds ATTEMPTED candidates (donor `nbAttempts`
+            // decrements per mask hit, not per scanned slot), so a depth
+            // below the row width searches up to `depth` hits across the
+            // WHOLE row — donor semantics on both the SIMD and scalar tiers
+            // (the scalar arm advances to the next on-the-fly tag hit so
+            // its visit order and attempt accounting stay bit-identical to
+            // the mask tiers).
+            let entries_bits: u64 = if row_entries >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << row_entries) - 1
+            };
+            #[allow(unused_mut)]
+            let mut pending: u64 = if $use_mask {
+                let m = tag_match & entries_bits;
+                if head == 0 {
+                    m
                 } else {
-                    self.row_tags[idx] == tag
-                };
-                if !matched {
-                    continue;
+                    ((m >> head) | (m << (row_entries - head))) & entries_bits
                 }
+            } else {
+                0
+            };
+            #[allow(unused_mut)]
+            let mut scan = 0usize;
+            let mut attempts = 0usize;
+            while attempts < max_walk {
+                let slot_opt = if $use_mask {
+                    if pending == 0 {
+                        None
+                    } else {
+                        let i = pending.trailing_zeros() as usize;
+                        pending &= pending - 1;
+                        Some((head + i) & row_mask)
+                    }
+                } else {
+                    let mut found = None;
+                    while scan < row_entries {
+                        let s = (head + scan) & row_mask;
+                        scan += 1;
+                        if self.row_tags[row_base + s] == tag {
+                            found = Some(s);
+                            break;
+                        }
+                    }
+                    found
+                };
+                let Some(slot) = slot_opt else { break };
+                attempts += 1;
+                let idx = row_base + slot;
                 let raw_pos = self.row_positions[idx];
                 if raw_pos == ROW_EMPTY_SLOT {
                     continue;
@@ -507,17 +551,45 @@ macro_rules! gen_row_probe {
                 } else {
                     0
                 };
-                for i in 0..max_walk {
-                    let slot = (dhead + i) & row_mask;
-                    let didx = drow_base + slot;
-                    let matched = if $use_mask {
-                        (dtag_match >> slot) & 1 != 0
+                // Same donor mask iteration as the live row above.
+                #[allow(unused_mut)]
+                let mut dpending: u64 = if $use_mask {
+                    let m = dtag_match & entries_bits;
+                    if dhead == 0 {
+                        m
                     } else {
-                        dict.tags[didx] == tag
-                    };
-                    if !matched {
-                        continue;
+                        ((m >> dhead) | (m << (row_entries - dhead))) & entries_bits
                     }
+                } else {
+                    0
+                };
+                #[allow(unused_mut)]
+                let mut dscan = 0usize;
+                let mut dattempts = 0usize;
+                while dattempts < max_walk {
+                    let slot_opt = if $use_mask {
+                        if dpending == 0 {
+                            None
+                        } else {
+                            let i = dpending.trailing_zeros() as usize;
+                            dpending &= dpending - 1;
+                            Some((dhead + i) & row_mask)
+                        }
+                    } else {
+                        let mut found = None;
+                        while dscan < row_entries {
+                            let s = (dhead + dscan) & row_mask;
+                            dscan += 1;
+                            if dict.tags[drow_base + s] == tag {
+                                found = Some(s);
+                                break;
+                            }
+                        }
+                        found
+                    };
+                    let Some(slot) = slot_opt else { break };
+                    dattempts += 1;
+                    let didx = drow_base + slot;
                     let dp = dict.positions[didx];
                     if dp == ROW_EMPTY_SLOT {
                         continue;
@@ -705,7 +777,21 @@ impl RowMatchGenerator {
             })
     }
 
+    /// Effective row hash width currently configured (`row_hash_log +
+    /// row_log`). The primed-snapshot key records THIS value — the
+    /// configured request may exceed the [`ROW_HASH_BITS`] cap below, and
+    /// keying on the request while the tables use the clamped width forces
+    /// needless dictionary re-primes.
+    pub(crate) fn hash_bits(&self) -> usize {
+        self.row_hash_log + self.row_log
+    }
+
     pub(crate) fn set_hash_bits(&mut self, bits: usize) {
+        // Deliberate deviation from donor hashLog 21-23 on L9-12: the
+        // 20-bit cap keeps the row table L2/L3-resident. Measured on the
+        // 1 MiB corpus at L10 (tight pair, flat control): the honest
+        // 21-bit table cost +26.8% wall for a 19-byte output delta — our
+        // lazy-band ratio already beats the donor with the capped width.
         let clamped = bits.clamp(self.row_log + 1, ROW_HASH_BITS);
         let row_hash_log = clamped.saturating_sub(self.row_log);
         if self.row_hash_log != row_hash_log {

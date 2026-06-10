@@ -107,17 +107,20 @@ impl Strategy {
         })
     }
 
-    /// Internal runtime strategy tag (collapses `btlazy2` onto the lazy
-    /// hash-chain tag at depth 2, matching `LEVEL_TABLE`).
+    /// Internal runtime strategy tag.
     pub(crate) const fn tag(self) -> crate::encoding::strategy::StrategyTag {
         use crate::encoding::strategy::StrategyTag;
         match self {
             Self::Fast => StrategyTag::Fast,
             Self::Dfast => StrategyTag::Dfast,
             Self::Greedy => StrategyTag::Greedy,
-            // Lazy / Lazy2 / Btlazy2 all ride the runtime `Lazy` tag; the
-            // lazy lookahead depth carries the variance (see `lazy_depth`).
-            Self::Lazy | Self::Lazy2 | Self::Btlazy2 => StrategyTag::Lazy,
+            // Lazy / Lazy2 ride the runtime `Lazy` tag (the lazy lookahead
+            // depth carries the variance, see `lazy_depth`). `Btlazy2`
+            // keeps its own tag: `Lazy` resolves to the Row finder, while
+            // btlazy2 is a binary-tree search and must stay on the
+            // HashChain/BT storage.
+            Self::Lazy | Self::Lazy2 => StrategyTag::Lazy,
+            Self::Btlazy2 => StrategyTag::Btlazy2,
             Self::Btopt => StrategyTag::BtOpt,
             Self::Btultra => StrategyTag::BtUltra,
             Self::Btultra2 => StrategyTag::BtUltra2,

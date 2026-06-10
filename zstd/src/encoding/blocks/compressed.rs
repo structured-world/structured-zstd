@@ -150,6 +150,11 @@ pub(crate) struct CompressedBlockScratch {
     /// first block-split). The estimator uses `EntropyOnlyMatcher` and
     /// never re-splits, so this nesting is one level deep.
     estimator_inner: Option<Box<CompressedBlockScratch>>,
+    /// Persistent slot for `compress_block_encoded`'s pre-block entropy
+    /// rollback snapshot. `clone_from` into this slot reuses its `Vec`
+    /// buffers across blocks; a fresh `.clone()` per block paid a
+    /// malloc + free pair on both Huffman code containers every block.
+    pub(crate) huff_rollback: Option<huff0_encoder::HuffmanTable>,
 }
 
 impl CompressedBlockScratch {
@@ -746,11 +751,14 @@ fn estimate_literals_section_bytes(
         return total;
     }
 
-    counts.fill(0);
-    for &b in literals {
-        counts[b as usize] += 1;
+    let (max_sym, largest_count) = crate::histogram::count_bytes(literals, counts);
+    // Mirror `compress_literals`' donor pre-build incompressibility gate
+    // byte-for-byte (flat histogram → raw section, no tree build) so
+    // splitter probe costs match what the emitter writes.
+    if largest_count <= (literals.len() >> 7) + 4 {
+        *last_huff = None;
+        return uncompressed_literals_header_bytes(literals.len()) + literals.len();
     }
-    let max_sym = counts.iter().rposition(|&c| c > 0).unwrap_or_default();
     let new_table = huff0_encoder::HuffmanTable::build_from_counts(&counts[..=max_sym]);
 
     let Some(new_desc) = new_table.writeable_table_description_size() else {
@@ -2144,7 +2152,24 @@ fn compress_literals(
         return emit_reuse_literals(literals, prev, writer, reset_idx, strategy);
     }
 
-    let new_encoder_table = huff0_encoder::HuffmanTable::build_from_data(literals);
+    let mut counts = [0usize; 256];
+    let (max_symbol, largest_count) = crate::histogram::count_bytes(literals, &mut counts);
+    // Donor pre-build incompressibility gate (`huf_compress.c`,
+    // `HUF_compress_internal`): a histogram this flat
+    // (`largest <= (srcSize >> 7) + 4`) is heuristically not worth
+    // compressing — bail to raw BEFORE the tree build and the full
+    // `encode4x` pass. Without it, near-random literals paid histogram +
+    // sort + tree + a full encode of the section only for the post-hoc
+    // `use_raw_literal_fallback` below to throw it all away (~65% of
+    // frame time on the random-payload dict scenarios). The single-symbol
+    // case (`largest == srcSize`) never reaches here: the block emitter
+    // routes all-identical sections to RLE first.
+    if largest_count <= (literals.len() >> 7) + 4 {
+        raw_literals(literals, writer);
+        return HuffmanTableUpdate::Cleared;
+    }
+
+    let new_encoder_table = huff0_encoder::HuffmanTable::build_from_counts(&counts[..=max_symbol]);
 
     let Some(new_table_description_size) = new_encoder_table.writeable_table_description_size()
     else {

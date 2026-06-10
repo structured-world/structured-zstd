@@ -246,6 +246,13 @@ pub(crate) struct FastKernelMatcher {
     /// large enough to slide the dictionary out of the window. `region_len()`
     /// is the dict/input boundary (`dict_end`).
     dict: DictAttach<FastHashTable>,
+    /// High-water mark of any position storable into [`Self::hash_table`]
+    /// since the last table clear / epoch advance: the largest history
+    /// length seen by [`Self::extend_history_with_pending`] and the largest
+    /// borrowed `block_end` scanned. `reset` feeds it to
+    /// [`FastHashTable::advance_epoch`] as the span that makes every
+    /// previously-stored entry stale, then rearms it at 0.
+    table_pos_high_water: usize,
 }
 
 impl FastKernelMatcher {
@@ -334,6 +341,7 @@ impl FastKernelMatcher {
             borrowed: None,
             last_borrowed_block: None,
             dict: DictAttach::new(),
+            table_pos_high_water: 0,
         }
     }
 
@@ -343,7 +351,23 @@ impl FastKernelMatcher {
     /// either clears the existing hash table (if `(hash_log, mls)` are
     /// unchanged) or reallocates it. The window_log update redirects
     /// the soft-eviction bound and the decoder-side reported window.
-    pub(crate) fn reset(&mut self, window_log: u8, hash_log: u32, mls: u32, step_size: usize) {
+    ///
+    /// `dict_attach_epoch`: the upcoming frame re-primes the SAME
+    /// dictionary in attach mode (separate cached dict table, dual-probe
+    /// kernel). When the cached dict table is still primed, the main
+    /// table is then invalidated via an epoch advance (donor
+    /// `ZSTD_continueCCtx` cadence — stale entries filtered by the bias,
+    /// no full-table memset); every other shape keeps the historical
+    /// `clear()` so the raw-slice no-dict kernels always see a bias-0
+    /// table.
+    pub(crate) fn reset(
+        &mut self,
+        window_log: u8,
+        hash_log: u32,
+        mls: u32,
+        step_size: usize,
+        dict_attach_epoch: bool,
+    ) {
         assert!(
             step_size >= 2,
             "FastKernelMatcher requires step_size >= 2 (got {step_size})"
@@ -362,14 +386,27 @@ impl FastKernelMatcher {
             // index a table whose shape no longer matches.
             self.hash_table = FastHashTable::new(hash_log, mls);
             self.dict.invalidate();
+        } else if dict_attach_epoch && self.dict.is_primed() {
+            // Dict-attach frame over the same primed dictionary: advance
+            // the epoch bias past every position the previous frames could
+            // have stored instead of memsetting the whole table (donor
+            // `ZSTD_continueCCtx`). The dual-probe dict kernel reads the
+            // main table only through `FastHashTable::get`, which maps
+            // pre-advance entries to the empty sentinel. The cached dict
+            // table is untouched (its own instance, bias 0): the dictionary
+            // lands at the same absolute history positions every frame, so
+            // its hashes stay valid and the per-frame re-hash is skipped
+            // (CDict-equivalent).
+            let span = u32::try_from(self.table_pos_high_water).unwrap_or(u32::MAX);
+            self.hash_table.advance_epoch(span);
         } else {
             // Same shape — keep the allocation, zero the entries via
             // `memset` (ZSTD_window_clear cadence). A primed dict table
-            // is retained: the dictionary lands at the same absolute
-            // history positions every frame, so its hashes stay valid
-            // and the per-frame re-hash is skipped (CDict-equivalent).
+            // is retained (see the epoch branch above for why that is
+            // sound).
             self.hash_table.clear();
         }
+        self.table_pos_high_water = 0;
         // M8: history starts empty (HISTORY_DRAIN_BASE = 0).
         self.history.clear();
         self.history.resize(HISTORY_DRAIN_BASE, 0);
@@ -672,6 +709,10 @@ impl FastKernelMatcher {
         // max_window_size` already holds — just append.
         let block_start = self.history.len();
         self.history.extend_from_slice(&space);
+        // Track the largest position any kernel scan over this history
+        // could store into the hash table (consumed by `reset`'s epoch
+        // advance).
+        self.table_pos_high_water = self.table_pos_high_water.max(self.history.len());
         // Record where this newly-appended block starts so
         // `last_committed_space` can return its bytes AFTER the
         // kernel call consumes pending.
@@ -862,6 +903,13 @@ impl FastKernelMatcher {
             block_start <= block_end && block_end <= total_len,
             "borrowed block bounds out of range: start={block_start} end={block_end} total={total_len}",
         );
+        // Borrowed scans store raw (bias-0) positions up to `block_end`
+        // through the table's hot-state slice; record them for `reset`'s
+        // epoch-advance span. (A borrowed window never coexists with a
+        // primed dict, so the table bias is 0 here — see `hot_state` —
+        // but the high-water must still cover these positions in case a
+        // dictionary is attached on a later frame.)
+        self.table_pos_high_water = self.table_pos_high_water.max(block_end);
         // Same window math as the owned path, but against the absolute
         // block end in the borrowed buffer rather than the accumulated
         // history length.
@@ -1510,6 +1558,7 @@ mod tests {
             FAST_LEVEL_1_HASH_LOG,
             FAST_LEVEL_1_MLS,
             2,
+            false,
         );
         // After reset the borrowed window is dropped — back to the
         // (now empty) owned buffer, never the dangling external range.
@@ -1652,6 +1701,7 @@ mod tests {
             FAST_LEVEL_1_HASH_LOG,
             FAST_LEVEL_1_MLS,
             2,
+            false,
         );
 
         // Post-reset: history empty (HISTORY_DRAIN_BASE=0; no
@@ -1674,7 +1724,7 @@ mod tests {
         let mut m = FastKernelMatcher::new();
         // Force a parameter change — every Vec we hand the new
         // FastHashTable will be a fresh allocation.
-        m.reset(16, 10, 4, 2);
+        m.reset(16, 10, 4, 2, false);
         assert_eq!(m.hash_table.hash_log(), 10);
         assert_eq!(m.hash_table.mls(), 4);
         assert_eq!(m.window_log, 16);

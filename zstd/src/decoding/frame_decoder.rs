@@ -3022,6 +3022,7 @@ mod tests {
         // into the persistent scratch's hasher.
         let payload: Vec<u8> = (0..8192u32).map(|i| (i & 0xFF) as u8).collect();
         let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        compressor.set_content_checksum(true);
         compressor.set_source(payload.as_slice());
         let mut compressed = Vec::new();
         compressor.set_drain(&mut compressed);
@@ -3058,6 +3059,7 @@ mod tests {
         use crate::decoding::ContentChecksum;
         let payload: Vec<u8> = (0..8192u32).map(|i| (i & 0xFF) as u8).collect();
         let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        compressor.set_content_checksum(true);
         compressor.set_source(payload.as_slice());
         let mut compressed = Vec::new();
         compressor.set_drain(&mut compressed);
@@ -3080,6 +3082,7 @@ mod tests {
         use crate::decoding::errors::FrameDecoderError;
         let payload: Vec<u8> = (0..8192u32).map(|i| (i & 0xFF) as u8).collect();
         let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        compressor.set_content_checksum(true);
         compressor.set_source(payload.as_slice());
         let mut compressed = Vec::new();
         compressor.set_drain(&mut compressed);
@@ -3114,6 +3117,7 @@ mod tests {
         use crate::decoding::errors::FrameDecoderError;
         let payload: Vec<u8> = (0..8192u32).map(|i| (i & 0xFF) as u8).collect();
         let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        compressor.set_content_checksum(true);
         compressor.set_source(payload.as_slice());
         let mut compressed = Vec::new();
         compressor.set_drain(&mut compressed);
@@ -3150,6 +3154,7 @@ mod tests {
         // the buffered tail (it used to early-return Ok((4,0)) and lose it).
         let payload: Vec<u8> = (0..8192u32).map(|i| (i & 0xFF) as u8).collect();
         let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        compressor.set_content_checksum(true);
         compressor.set_source(payload.as_slice());
         let mut compressed = Vec::new();
         compressor.set_drain(&mut compressed);
@@ -3179,6 +3184,7 @@ mod tests {
         use crate::decoding::ContentChecksum;
         let payload: Vec<u8> = (0..8192u32).map(|i| (i & 0xFF) as u8).collect();
         let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        compressor.set_content_checksum(true);
         compressor.set_source(payload.as_slice());
         let mut compressed = Vec::new();
         compressor.set_drain(&mut compressed);
@@ -3204,6 +3210,7 @@ mod tests {
 
         let mut with = Vec::new();
         let mut c_with = FrameCompressor::new(CompressionLevel::Default);
+        c_with.set_content_checksum(true);
         c_with.set_source(payload.as_slice());
         c_with.set_drain(&mut with);
         c_with.compress();

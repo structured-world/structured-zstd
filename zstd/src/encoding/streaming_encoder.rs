@@ -45,8 +45,9 @@ pub struct StreamingEncoder<W: Write, M: Matcher = MatchGeneratorDriver> {
     magicless: bool,
     /// Whether to emit a trailing XXH64 content checksum and set the frame
     /// header's `Content_Checksum_flag` (upstream `ZSTD_c_checksumFlag`).
-    /// Default `true`; combined with the `hash` feature, so without `hash`
-    /// no checksum is emitted regardless. See [`Self::set_content_checksum`].
+    /// Default `false`, matching the upstream library default; combined with
+    /// the `hash` feature, so without `hash` no checksum is emitted
+    /// regardless. See [`Self::set_content_checksum`].
     content_checksum: bool,
     /// Dictionary applied to the frame (donor `ZSTD_CCtx_loadDictionary` on a
     /// streaming context). `None` = no dictionary. Set before the first write.
@@ -131,7 +132,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             bytes_consumed: 0,
             strategy_override: None,
             magicless: false,
-            content_checksum: true,
+            content_checksum: false,
             dictionary: None,
             dictionary_entropy_cache: None,
             #[cfg(feature = "hash")]
@@ -140,7 +141,8 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
     }
 
     /// Enable or disable the trailing XXH64 content checksum
-    /// (upstream `ZSTD_c_checksumFlag`). Default `true`. Must be called
+    /// (upstream `ZSTD_c_checksumFlag`). Default `false`, matching the
+    /// upstream library default (`ZSTD_c_checksumFlag = 0`). Must be called
     /// before the first [`write`](Write::write); once the frame header is
     /// emitted the flag is fixed, so a late change returns an error rather
     /// than producing a header/trailer mismatch. Without the `hash` feature
@@ -1576,6 +1578,9 @@ mod tests {
         let payload = b"streaming-checksum-trailer-".repeat(64);
 
         let mut with = StreamingEncoder::new(Vec::new(), CompressionLevel::Fastest);
+        // Explicit: the encoder default is off (upstream library parity).
+        with.set_content_checksum(true)
+            .expect("set_content_checksum pre-write");
         with.write_all(&payload).unwrap();
         let with_checksum = with.finish().unwrap();
 

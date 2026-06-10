@@ -144,6 +144,9 @@ pub(crate) fn repcode_candidate_shared(
     if current_idx + min_match_len > concat.len() {
         return None;
     }
+    // The 4-byte gate below relies on a first-4-byte mismatch implying the
+    // match can never reach the acceptance floor.
+    debug_assert!(min_match_len >= 4, "repcode gate requires min_match >= 4");
 
     // Called once per input byte (10% exclusive on default-level profile).
     // The previous form built an `[Option<usize>; 3]` and walked it via
@@ -173,23 +176,34 @@ pub(crate) fn repcode_candidate_shared(
             let rep = $rep;
             if rep != 0 && rep <= abs_pos {
                 let candidate_pos = abs_pos - rep;
+                // Donor `MEM_read32` rep gate (`zstd_lazy.c` lazy loop): a
+                // first-4-byte mismatch can never reach the
+                // `>= min_match_len` floor (asserted >= 4 above), so reject
+                // on one scalar compare instead of paying the SIMD count
+                // call on every non-matching rep. In-bounds: `current_idx +
+                // 4 <= concat.len()` from the entry guard, and
+                // `candidate_idx < current_idx`.
                 if candidate_pos >= history_abs_start {
                     let candidate_idx = candidate_pos - history_abs_start;
-                    let match_len = common_prefix_len_with_kernel(
-                        kernel,
-                        &concat[candidate_idx..],
-                        &concat[current_idx..],
-                    );
-                    if match_len >= min_match_len {
-                        let candidate = extend_backwards_shared(
-                            concat,
-                            history_abs_start,
-                            candidate_pos,
-                            abs_pos,
-                            match_len,
-                            lit_len,
+                    if concat[candidate_idx..candidate_idx + 4]
+                        == concat[current_idx..current_idx + 4]
+                    {
+                        let match_len = common_prefix_len_with_kernel(
+                            kernel,
+                            &concat[candidate_idx..],
+                            &concat[current_idx..],
                         );
-                        best = best_len_offset_candidate(best, Some(candidate));
+                        if match_len >= min_match_len {
+                            let candidate = extend_backwards_shared(
+                                concat,
+                                history_abs_start,
+                                candidate_pos,
+                                abs_pos,
+                                match_len,
+                                lit_len,
+                            );
+                            best = best_len_offset_candidate(best, Some(candidate));
+                        }
                     }
                 }
             }

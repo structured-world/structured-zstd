@@ -245,26 +245,27 @@ impl Strategy for Greedy {
     const SUFFICIENT_MATCH_LEN: usize = 32;
 }
 
-/// Levels 5-15 — donor `ZSTD_lazy2` on a hash chain. Levels inside
-/// the band differ only by runtime `HcConfig` fields (`search_depth`,
-/// `hash_log`, `chain_log`, `target_len`, `lazy_depth`), not by
+/// Levels 6-12 — donor `ZSTD_lazy`/`ZSTD_lazy2` on the row finder
+/// (donor row mode is the greedy..lazy2 default). Levels inside the
+/// band differ only by runtime `RowConfig` fields (`search_depth`,
+/// `hash_bits`, `row_log`, `target_len`, `lazy_depth`), not by
 /// compile-time `Strategy` consts, so they share a single type.
 #[derive(Copy, Clone, Debug, Default)]
 pub(crate) struct Lazy;
 
 impl Strategy for Lazy {
-    const BACKEND: BackendTag = BackendTag::HashChain;
+    const BACKEND: BackendTag = BackendTag::Row;
     const MIN_MATCH: usize = 4;
     const ACCURATE_PRICE: bool = false;
     const FAVOR_SMALL_OFFSETS: bool = true;
     const USE_HASH3: bool = false;
     const USE_BT: bool = false;
     const OPT_LEVEL: u8 = 0;
-    // Lazy is HashChain-backed but `USE_BT == false`, so the optimal
-    // parser entry point is unreachable for this strategy. These
-    // values mirror the donor `lazy2` cost profile (would be the
-    // right defaults if a future caller did build a profile for the
-    // lazy/hc path), but with no current reader the same
+    // Lazy runs on the Row backend with `USE_BT == false`, so the
+    // optimal parser entry point is unreachable for this strategy.
+    // These values mirror the donor `lazy2` cost profile (would be
+    // the right defaults if a future caller did build a profile for
+    // the lazy path), but with no current reader the same
     // unreachable-by-design contract from `Fast` applies.
     const MAX_CHAIN_DEPTH: usize = 8;
     const SUFFICIENT_MATCH_LEN: usize = 32;
@@ -399,7 +400,12 @@ impl StrategyTag {
             1 | 2 => Self::Fast,
             3 | 4 => Self::Dfast,
             5 => Self::Greedy,
-            6..=15 => Self::Lazy,
+            6..=12 => Self::Lazy,
+            // 13-15 are btlazy2 in `LEVEL_TABLE` (BinaryTree finder on the
+            // HashChain storage). Folding them onto `Lazy` was harmless
+            // while `Lazy` also meant HashChain; with `Lazy` resolving to
+            // the Row finder the distinction is load-bearing.
+            13..=15 => Self::Btlazy2,
             16 | 17 => Self::BtOpt,
             18 => Self::BtUltra,
             19 => Self::BtUltra2,
@@ -436,14 +442,16 @@ impl StrategyTag {
     }
 
     /// Bridge to [`BackendTag`] for the dispatcher entry point.
+    /// Greedy AND lazy run on the Row finder (donor
+    /// `ZSTD_resolveRowMatchFinderMode`: row mode is the default for
+    /// greedy..lazy2); the BT strategies keep the HashChain storage
+    /// (their tree scratch lives inside it).
     pub(crate) const fn backend(self) -> BackendTag {
         match self {
             Self::Fast => BackendTag::Simple,
             Self::Dfast => BackendTag::Dfast,
-            Self::Greedy => BackendTag::Row,
-            Self::Lazy | Self::Btlazy2 | Self::BtOpt | Self::BtUltra | Self::BtUltra2 => {
-                BackendTag::HashChain
-            }
+            Self::Greedy | Self::Lazy => BackendTag::Row,
+            Self::Btlazy2 | Self::BtOpt | Self::BtUltra | Self::BtUltra2 => BackendTag::HashChain,
         }
     }
 
@@ -455,8 +463,7 @@ impl StrategyTag {
         match self {
             Self::Fast => SearchMethod::Fast,
             Self::Dfast => SearchMethod::DoubleFast,
-            Self::Greedy => SearchMethod::RowHash,
-            Self::Lazy => SearchMethod::HashChain,
+            Self::Greedy | Self::Lazy => SearchMethod::RowHash,
             Self::Btlazy2 | Self::BtOpt | Self::BtUltra | Self::BtUltra2 => {
                 SearchMethod::BinaryTree
             }
@@ -469,7 +476,10 @@ impl StrategyTag {
     pub(crate) const fn parse_mode(self) -> ParseMode {
         match self {
             Self::Fast | Self::Dfast | Self::Greedy => ParseMode::Greedy,
-            Self::Lazy | Self::Btlazy2 => ParseMode::Lazy,
+            Self::Lazy => ParseMode::Lazy,
+            // Donor btlazy2 = BinaryTree finder + depth-2 lazy parse
+            // (`Strategy::lazy_depth()` reports 2 for it as well).
+            Self::Btlazy2 => ParseMode::Lazy2,
             Self::BtOpt | Self::BtUltra | Self::BtUltra2 => ParseMode::Optimal,
         }
     }
@@ -501,7 +511,7 @@ mod tests {
     fn btlazy2_tag_bridge_contract() {
         assert_eq!(StrategyTag::Btlazy2.backend(), BackendTag::HashChain);
         assert_eq!(StrategyTag::Btlazy2.search(), SearchMethod::BinaryTree);
-        assert_eq!(StrategyTag::Btlazy2.parse_mode(), ParseMode::Lazy);
+        assert_eq!(StrategyTag::Btlazy2.parse_mode(), ParseMode::Lazy2);
         // The BT walk cap must let L15's search_depth = 64 govern (BtOpt's
         // 32 would silently halve it); full find, no early bail.
         assert_eq!(Btlazy2::MAX_CHAIN_DEPTH, 64);
@@ -546,7 +556,11 @@ mod tests {
         assert_eq!(StrategyTag::for_level(4), StrategyTag::Dfast);
         assert_eq!(StrategyTag::for_level(5), StrategyTag::Greedy);
         assert_eq!(StrategyTag::for_level(9), StrategyTag::Lazy);
-        assert_eq!(StrategyTag::for_level(15), StrategyTag::Lazy);
+        assert_eq!(StrategyTag::for_level(12), StrategyTag::Lazy);
+        // Donor `clevels.h` 13-15 are `ZSTD_btlazy2` — distinct from the
+        // Row-backed `Lazy` band.
+        assert_eq!(StrategyTag::for_level(13), StrategyTag::Btlazy2);
+        assert_eq!(StrategyTag::for_level(15), StrategyTag::Btlazy2);
         assert_eq!(StrategyTag::for_level(16), StrategyTag::BtOpt);
         assert_eq!(StrategyTag::for_level(17), StrategyTag::BtOpt);
         assert_eq!(StrategyTag::for_level(18), StrategyTag::BtUltra);

@@ -235,6 +235,9 @@ mod tests {
 
         let payload: Vec<u8> = (0..8192u32).map(|i| (i & 0xFF) as u8).collect();
         let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        // Checksum is the subject under test; the encoder default is off
+        // (upstream library parity).
+        compressor.set_content_checksum(true);
         compressor.set_source(payload.as_slice());
         let mut compressed = Vec::new();
         compressor.set_drain(&mut compressed);

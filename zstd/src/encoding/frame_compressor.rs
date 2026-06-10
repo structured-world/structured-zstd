@@ -104,9 +104,10 @@ pub struct FrameCompressor<
     magicless: bool,
     /// Whether to emit a trailing XXH64 content checksum and set the frame
     /// header's `Content_Checksum_flag` (semantics of upstream
-    /// `ZSTD_c_checksumFlag`). Default `true`; combined with the `hash`
-    /// feature at frame-build time, so without `hash` no checksum is emitted
-    /// regardless. Set via [`Self::set_content_checksum`].
+    /// `ZSTD_c_checksumFlag`). Default `false`, matching the upstream
+    /// library default; combined with the `hash` feature at frame-build
+    /// time, so without `hash` no checksum is emitted regardless. Set via
+    /// [`Self::set_content_checksum`].
     content_checksum: bool,
     #[cfg(feature = "hash")]
     hasher: XxHash64,
@@ -626,6 +627,113 @@ fn initial_all_blocks_cap(initial_size_hint: Option<u64>) -> usize {
     }
 }
 
+/// Per-block feeder for `run_owned_block_loop`.
+///
+/// `fill_block` appends source bytes to `buf` (which already holds any
+/// carried pre-split suffix) until `buf.len() == block_capacity` or the
+/// source is exhausted, returning `(bytes_appended, reached_eof)`.
+/// `reached_eof` is true iff the block could NOT be filled to
+/// `block_capacity` — the boundary the historical `Read`-loop produced (an
+/// input that is an exact multiple of the block size still yields a
+/// trailing empty last block on the next iteration).
+///
+/// The slice impl exists so the slice entry points
+/// (`compress_independent_frame_into`, `compress_oneshot_*` fallbacks)
+/// append with one `extend_from_slice` — the generic reader impl must
+/// `resize` an initialized target region before `Read::read` can fill it,
+/// which costs a zero-fill memset of the whole block on every frame.
+pub(crate) trait OwnedBlockSource {
+    fn fill_block(
+        &mut self,
+        buf: &mut Vec<u8>,
+        block_capacity: usize,
+        size_hint_remaining: Option<u64>,
+    ) -> (usize, bool);
+}
+
+impl OwnedBlockSource for &[u8] {
+    fn fill_block(
+        &mut self,
+        buf: &mut Vec<u8>,
+        block_capacity: usize,
+        _size_hint_remaining: Option<u64>,
+    ) -> (usize, bool) {
+        let want = block_capacity - buf.len();
+        let take = want.min(self.len());
+        buf.extend_from_slice(&self[..take]);
+        *self = &self[take..];
+        (take, take < want)
+    }
+}
+
+/// Adapter routing a generic [`Read`] source through [`OwnedBlockSource`]:
+/// preserves the historical sizing behaviour — an initialized target region
+/// bounded by the source-size hint, grown (doubling, capped) only when the
+/// hint under-counted.
+pub(crate) struct ReaderBlockSource<Rd>(pub(crate) Rd);
+
+impl<Rd: Read> OwnedBlockSource for ReaderBlockSource<Rd> {
+    fn fill_block(
+        &mut self,
+        buf: &mut Vec<u8>,
+        block_capacity: usize,
+        size_hint_remaining: Option<u64>,
+    ) -> (usize, bool) {
+        let start = buf.len();
+        let mut filled = start;
+        let mut reached_eof = false;
+        // Size the read buffer to the bytes this block actually expects
+        // rather than always zero-filling a full MAX_BLOCK_SIZE: a small
+        // frame otherwise pays a 128 KiB `resize(_, 0)` memset per block
+        // just to read a few KiB (the zero-fill past `filled` is then
+        // truncated away).
+        //
+        // Overflow-free by construction (no `saturating_*` masking):
+        // `filled <= block_capacity` always (the read only ever targets
+        // `[filled..len]` with `len <= block_capacity`, and a carried-over
+        // pre-split suffix is a `split_off` below `block_capacity`), so
+        // `block_capacity - filled` never underflows; pinning `remaining`
+        // to `block_capacity` before the `usize` cast keeps the cast and
+        // the final add within `usize` on every target.
+        let initial_target = match size_hint_remaining {
+            Some(remaining) => {
+                let remaining = remaining.min(block_capacity as u64) as usize;
+                filled + remaining.min(block_capacity - filled)
+            }
+            // Unknown hint, or an inexact hint already met by prior blocks:
+            // read against the full block window.
+            None => block_capacity,
+        };
+        if buf.len() < initial_target {
+            buf.resize(initial_target, 0);
+        }
+        loop {
+            if reached_eof || filled == block_capacity {
+                break;
+            }
+            if filled == buf.len() {
+                // Hint under-counted the block; grow toward block_capacity
+                // (doubling, capped) so reading continues without paying a
+                // full-buffer zero up front. `len <= block_capacity` so the
+                // double stays well within `usize`; `filled < block_capacity`
+                // here (the `== block_capacity` break fired otherwise), so
+                // `filled + 1 <= block_capacity`.
+                let grow_to = (buf.len() * 2).clamp(filled + 1, block_capacity);
+                buf.resize(grow_to, 0);
+            }
+            let read_end = buf.len();
+            let new_bytes = self.0.read(&mut buf[filled..read_end]).unwrap();
+            if new_bytes == 0 {
+                reached_eof = true;
+                break;
+            }
+            filled += new_bytes;
+        }
+        buf.truncate(filled);
+        (filled - start, reached_eof)
+    }
+}
+
 impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
     /// Create a new `FrameCompressor`
     pub fn new(compression_level: CompressionLevel) -> Self {
@@ -647,7 +755,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 ),
             },
             magicless: false,
-            content_checksum: true,
+            content_checksum: false,
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
             #[cfg(feature = "lsm")]
@@ -983,7 +1091,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             },
             compression_level,
             magicless: false,
-            content_checksum: true,
+            content_checksum: false,
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
             #[cfg(feature = "lsm")]
@@ -1009,7 +1117,10 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     }
 
     /// Enable or disable the trailing XXH64 content checksum
-    /// (semantics of upstream `ZSTD_c_checksumFlag`). Default `true`.
+    /// (semantics of upstream `ZSTD_c_checksumFlag`). Default `false`,
+    /// matching the upstream library default (`ZSTD_c_checksumFlag = 0`)
+    /// so out-of-the-box frames carry the same layout and pay the same
+    /// costs as the reference implementation.
     ///
     /// When `false`, emitted frames set `Content_Checksum_flag = 0` and carry
     /// no trailing digest; such frames are valid (RFC 8878) and decode
@@ -1097,6 +1208,15 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // mutably alongside `&mut self` (the rest of the loop touches
         // `self.state` / `self.hasher`, disjoint from the reader). Restored
         // before the frame tail so a reused compressor keeps its source.
+        //
+        // Deliberately NOT restored on unwind: if the block loop panics the
+        // source has been partially consumed, so handing it back would let a
+        // `catch_unwind` caller "successfully" compress the remaining tail
+        // from an arbitrary midpoint — silent data corruption. Leaving the
+        // slot empty makes any post-panic reuse fail loudly at the `expect`
+        // below (matcher/entropy state is equally unre-usable after an
+        // unwind; the reference implementation likewise requires a context
+        // reset after an error).
         let mut source = self
             .uncompressed_data
             .take()
@@ -1106,8 +1226,9 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // buffer and let `finish_frame` write header + blocks to the drain.
         let mut all_blocks: Vec<u8> =
             Vec::with_capacity(initial_all_blocks_cap(prep.initial_size_hint));
+        let mut block_source = ReaderBlockSource(&mut source);
         let total_uncompressed =
-            self.run_owned_block_loop(&mut source, prep.initial_size_hint, &mut all_blocks);
+            self.run_owned_block_loop(&mut block_source, prep.initial_size_hint, &mut all_blocks);
         self.uncompressed_data = Some(source);
         self.finish_frame(all_blocks, total_uncompressed, &prep);
     }
@@ -1298,9 +1419,9 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// (`compress_oneshot_borrowed`, `compress_independent_frame`) feed an
     /// in-place `&[u8]` cursor without baking its lifetime into the
     /// compressor type.
-    fn run_owned_block_loop<Rd: Read>(
+    fn run_owned_block_loop<S: OwnedBlockSource>(
         &mut self,
-        source: &mut Rd,
+        source: &mut S,
         initial_size_hint: Option<u64>,
         out: &mut Vec<u8>,
     ) -> u64 {
@@ -1332,61 +1453,20 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             let mut uncompressed_data = self.state.matcher.get_next_space();
             uncompressed_data.clear();
             uncompressed_data.extend_from_slice(&pending_input);
-            let mut filled = pending_input.len();
             pending_input.clear();
-            // Size the read buffer to the bytes this block actually expects
-            // rather than always zero-filling a full MAX_BLOCK_SIZE: a small
-            // frame otherwise pays a 128 KiB `resize(_, 0)` memset per block
-            // just to read a few KiB (the zero-fill past `filled` is then
-            // truncated away). Bound the initial fill by the source-size hint
-            // (exact for the slice entry points), and grow toward
-            // `block_capacity` only if the hint under-counted.
-            //
-            // Overflow-free by construction (no `saturating_*` masking):
-            // `filled <= block_capacity` always (the read only ever targets
-            // `[filled..len]` with `len <= block_capacity`, and a carried-over
-            // `pending_input` is a `split_off` below `block_capacity`), so
-            // `block_capacity - filled` never underflows; pinning `remaining`
-            // to `block_capacity` before the `usize` cast keeps the cast and
-            // the final add within `usize` on every target.
-            let initial_target = match initial_size_hint {
-                Some(hint) if hint > total_uncompressed => {
-                    let remaining = (hint - total_uncompressed).min(block_capacity as u64) as usize;
-                    filled + remaining.min(block_capacity - filled)
-                }
-                // Unknown hint, or an inexact hint already met by prior blocks:
-                // read against the full block window.
-                _ => block_capacity,
-            };
-            if uncompressed_data.len() < initial_target {
-                uncompressed_data.resize(initial_target, 0);
+            if !reached_eof {
+                // Remaining-bytes expectation for the reader source's sizing
+                // (`None` = unknown, or an inexact hint already met by prior
+                // blocks). The slice source appends directly and ignores it.
+                let size_hint_remaining = match initial_size_hint {
+                    Some(hint) if hint > total_uncompressed => Some(hint - total_uncompressed),
+                    _ => None,
+                };
+                let (appended, eof) =
+                    source.fill_block(&mut uncompressed_data, block_capacity, size_hint_remaining);
+                total_uncompressed += appended as u64;
+                reached_eof = eof;
             }
-            'read_loop: loop {
-                if reached_eof || filled == block_capacity {
-                    break 'read_loop;
-                }
-                if filled == uncompressed_data.len() {
-                    // Hint under-counted the block; grow toward block_capacity
-                    // (doubling, capped) so reading continues without paying a
-                    // full-buffer zero up front. `len <= block_capacity` so the
-                    // double stays well within `usize`; `filled < block_capacity`
-                    // here (the `== block_capacity` break fired otherwise), so
-                    // `filled + 1 <= block_capacity`.
-                    let grow_to = (uncompressed_data.len() * 2).clamp(filled + 1, block_capacity);
-                    uncompressed_data.resize(grow_to, 0);
-                }
-                let read_end = uncompressed_data.len();
-                let new_bytes = source
-                    .read(&mut uncompressed_data[filled..read_end])
-                    .unwrap();
-                if new_bytes == 0 {
-                    reached_eof = true;
-                    break 'read_loop;
-                }
-                filled += new_bytes;
-                total_uncompressed += new_bytes as u64;
-            }
-            uncompressed_data.truncate(filled);
             let mut last_block = reached_eof;
             let remaining_for_split = if reached_eof {
                 uncompressed_data.len()
@@ -2860,6 +2940,71 @@ mod tests {
             let mut decoded = Vec::with_capacity(payload.len());
             decoder.decode_all_to_vec(frame, &mut decoded).unwrap();
             assert_eq!(decoded.as_slice(), payload.as_slice());
+        }
+    }
+
+    #[test]
+    fn dict_fast_epoch_reset_many_frames_and_attach_copy_alternation_byte_identical() {
+        // The Fast attach path invalidates the main hash table between
+        // frames with an epoch-bias advance instead of a memset. Two things
+        // need proving against a fresh-compressor reference:
+        // 1. the bias accumulates across MANY reused frames without ever
+        //    letting a stale entry through (every frame byte-identical);
+        // 2. crossing the 8 KiB attach/copy cutoff in both directions
+        //    (attach → copy clears the bias for the raw-slice kernel,
+        //    copy → attach re-enters epoch mode) stays byte-identical.
+        let dict_raw = include_bytes!("../../dict_tests/dictionary");
+        let mut small = Vec::new();
+        while small.len() < 2 * 1024 {
+            small.extend_from_slice(b"tenant=demo op=put key=1 value=aaaaabbbbbcccccddddd\n");
+        }
+        // Over the Fast 8 KiB attach cutoff → copy-mode frame.
+        let mut large = Vec::new();
+        while large.len() < 64 * 1024 {
+            large.extend_from_slice(b"tenant=demo op=scan range=[k0,k9) limit=500 order=asc\n");
+        }
+
+        let mut reused: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Fastest);
+        reused
+            .set_encoder_dictionary(
+                super::EncoderDictionary::from_bytes(dict_raw).expect("dict bytes should parse"),
+            )
+            .expect("prepared dictionary should attach");
+
+        let reference = |payload: &[u8]| -> alloc::vec::Vec<u8> {
+            let mut fresh: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Fastest);
+            fresh
+                .set_encoder_dictionary(
+                    super::EncoderDictionary::from_bytes(dict_raw)
+                        .expect("dict bytes should parse"),
+                )
+                .expect("prepared dictionary should attach");
+            fresh.compress_independent_frame(payload)
+        };
+
+        let small_expected = reference(&small);
+        let large_expected = reference(&large);
+
+        // 1. Long attach-only run: every frame advances the epoch bias.
+        for i in 0..32 {
+            let frame = reused.compress_independent_frame(small.as_slice());
+            assert_eq!(
+                frame, small_expected,
+                "attach frame {i} diverged from the fresh-compressor reference"
+            );
+        }
+        // 2. Cutoff alternation: attach → copy → attach → copy.
+        for i in 0..4 {
+            let frame = reused.compress_independent_frame(large.as_slice());
+            assert_eq!(
+                frame, large_expected,
+                "copy frame {i} diverged from the fresh-compressor reference"
+            );
+            let frame = reused.compress_independent_frame(small.as_slice());
+            assert_eq!(
+                frame, small_expected,
+                "attach frame after copy {i} diverged from the fresh-compressor reference"
+            );
         }
     }
 
