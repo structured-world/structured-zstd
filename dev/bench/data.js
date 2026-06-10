@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781084954966,
+  "lastUpdate": 1781115047144,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -63158,6 +63158,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.27,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "8440167267f9aa2d1783837271c3cfd18f78c01c",
+          "message": "perf(encode): cut dict-compress per-frame overhead; shrink wasm payload 18% (#393)\n\n* perf(encode): reuse rollback entropy snapshot buffers per block\n\n- manual HuffmanTable::clone_from reuses destination Vec buffers\n  (derived version degraded to a full clone: 2 mallocs + 2 frees per\n  per-frame dict entropy seed and per-block rollback snapshot)\n- compress_block_encoded (owned + borrowed) snapshots the Huffman\n  table into a persistent scratch slot via clone_from instead of a\n  fresh clone every block\n\nProfiled on small-4k-log-lines level_2_fast compress-dict: per-block\nclone churn (clone memmove + malloc/free pairs) was ~8% of frame time.\n\n* perf(encode): feed slice inputs to owned block loop without zero-fill\n\nOwnedBlockSource trait splits per-block buffer filling: the &[u8] impl\nappends with one extend_from_slice; the generic reader keeps the\nhistorical initialized-resize + Read loop (ReaderBlockSource adapter).\n\nThe slice entry points (compress_independent_frame_into and the owned\nfallbacks) previously paid resize(_, 0) zero-fill of the whole block +\na doubling re-grow before every read — ~10% of dict-compress frame\ntime on small-4k-log-lines level_2_fast. EOF semantics preserved\nexactly (eof iff the block could not be filled), so exact-multiple\ninputs still emit the trailing empty last block.\n\n* perf(encode): epoch-bias Fast table reset for dict-attach frames\n\nDonor ZSTD_continueCCtx cadence: instead of memsetting the whole Fast\nhash table on every dict-attach frame reset, keep the entries and\nadvance an epoch bias past the previous frame's position high-water\nmark. FastHashTable::get maps any pre-advance entry to the empty\nsentinel (saturating_sub, sub+cmov); put stores position + bias.\n\n- bias applies only on the dict-attach main table; no-dict kernels go\n  through hot_state's raw slice and are guarded by a bias==0 debug\n  assert (copy-mode and no-dict resets keep the historical clear)\n- overflow falls back to a real clear (position ceiling 2^31, bias\n  capped at u32::MAX - 2^31)\n- regression test: 32 reused attach frames + attach/copy cutoff\n  alternation, all byte-identical to fresh-compressor reference\n\nPer-frame table memset was 13% of compress-dict frame time on\nsmall-4k-log-lines level_2_fast.\n\n* perf(encode): fold optimal-plan profile dispatch on strategy consts\n\nbuild_optimal_plan dispatched its 4 (accurate, favor_small_offsets)\narms on the RUNTIME profile while debug-asserting it equal to the\nstrategy's associated consts. With build_optimal_plan_impl marked\ninline(always), every BT strategy monomorphisation carried all four\n~16 KB DP bodies. Matching on (S::ACCURATE_PRICE,\nS::FAVOR_SMALL_OFFSETS) folds the three dead arms at monomorphisation.\n\nsimd128 wasm payload: 777006 -> 633482 bytes (-18.5%), back under the\n768 KiB CI budget with ~150 KB headroom. Native: same reachable code,\nsmaller icache footprint.\n\n* test(bench): decode_loop_dict profiling example + dict payload dump\n\n- decode_loop_dict example mirrors the decompress-dict bench arm\n  (DictionaryHandle parsed once, reused FrameDecoder,\n  decode_all_with_dict_handle per iteration) for clean perf profiles\n- compare_ffi dumps the FFI dict-encoded payload per (scenario, level)\n  under the existing STRUCTURED_ZSTD_DUMP_DICT_DIR gate so the example\n  decodes the exact bytes the bench measures\n\n* test(bench): dump scenario input bytes alongside the trained dict\n\n* perf(encode): donor pre-build incompressibility gate for literals\n\nPort HUF_compress_internal's flat-histogram bail\n(largest <= (srcSize >> 7) + 4): emit the raw literals section BEFORE\nbuilding the Huffman tree. Previously near-random literals paid\nhistogram + leaf sort + tree build + a FULL encode4x pass per block,\nonly for the post-hoc use_raw_literal_fallback gate to discard it;\n~65% of frame time on small-10k-random compress-dict level_-7_fast.\n\nThe surviving build path reuses the gate's histogram via\nbuild_from_counts (drops build_from_data's second counting pass).\nEstimator mirrors the gate so splitter probe costs stay byte-equal\nto emitted sections.\n\n* docs(encode): document why compress() source is not restored on unwind\n\nA partially-consumed Read source handed back after a panic would let a\ncatch_unwind caller silently compress the remaining tail from an\narbitrary midpoint; the loud expect on the emptied slot is the safe\npost-panic behavior (context reset required after errors, matching the\nreference implementation's contract).\n\n* perf(encode): run the lazy band (L6-12) on the row match finder\n\nThe donor defaults greedy..lazy2 to the row-based finder whenever SIMD\nis available (ZSTD_resolveRowMatchFinderMode); our lazy levels still\nwalked hash chains, and the dependent chain-table loads were ~75% of\nL10 wall time on the 1 MiB corpus.\n\n- LEVEL_TABLE L6-12 -> SearchMethod::RowHash with per-level RowConfig\n  derived from donor clevels.h (verified via ZSTD_getCParams): rowLog =\n  clamp(searchLog, 4, 6), depth = 1 << min(searchLog, rowLog), donor\n  hashLog/targetLength per level\n- StrategyTag bridge + Lazy::BACKEND follow (Greedy | Lazy -> Row)\n- row_hash_bits_for_window drops its constant 20-bit ceiling (predates\n  the lazy band on Row; L9-12 carry donor hashLog 21-23) — window-\n  derived cap only\n- Row configure records the RESOLVED hash width in the primed-snapshot\n  key on the unhinted path too (a 0 default keyed unhinted-vs-hinted\n  captures apart, forcing needless dict re-primes)\n- HC-specific unit tests keep their coverage through the test-only\n  reset_on_hc_lazy override helper; the HC resize test moves to the\n  BT levels that still own per-level HcConfig widths\n\n* perf(encode): iterate row tag-mask hits instead of scanning every slot\n\nDonor ZSTD_RowFindBestMatch iteration: rotate the tag mask into head\n(newest-first) order once, then visit only the set bits via tzcnt +\nclear-lowest. The former loop burned slot arithmetic + a bit test on\nevery entry (rows are 16-64 wide, typical tag hits 0-2) — ~14% of L10\nwall time after the lazy band moved onto Row.\n\nmax_walk now bounds ATTEMPTED candidates (donor nbAttempts decrements\nper mask hit, not per scanned slot): a search depth below the row width\nsearches up to depth hits across the whole row. Full-row walks\n(L7-L12) keep byte-identical output (same candidates, same head\norder); L5/L6 (depth 8 < 16 entries) gain donor candidate coverage.\nThe scalar tier advances to the next on-the-fly tag hit so its visit\norder and attempt accounting stay bit-identical to the mask tiers.\n\nApplies to both the live row and the dict dual-probe row.\n\n* fix(bench): non-fatal dump writes; validate decode length in decode_loop_dict\n\n- STRUCTURED_ZSTD_DUMP_DICT_DIR dump writes warn (BENCH_WARN) on I/O\n  failure instead of aborting the whole bench run — the artifacts are\n  optional diagnostics\n- decode_loop_dict asserts the decoded length matches expected_len and\n  black_boxes only the written prefix, so a mismatched (payload, dict,\n  expected_len) triple fails loudly instead of profiling a wrong\n  workload\n\n* perf(encode): 4-byte gate before repcode common_prefix_len\n\nDonor MEM_read32 rep gate from the zstd_lazy.c lazy loop: a first-4-byte\nmismatch can never reach the >= min_match_len floor (asserted >= 4), so\nnon-matching rep offsets are rejected on one scalar compare instead of a\nSIMD count call. Same shape as the HC chain gate; byte-identical output.\nrepcode_candidate_shared runs once per encoded byte on lazy/Dfast/Row\n(10.2% self on the L10 row profile).\n\n* perf(encode): prefetch the upcoming row in the lazy scan loop\n\nDonor ZSTD_row_fillHashCache / ZSTD_row_prefetch cadence: each lazy-loop\niteration prefetches the tag bytes + position words of the row 8\npositions ahead (ZSTD_ROW_HASH_CACHE_SIZE). The row address depends only\non input bytes, so the load is not on a serial dependency chain and the\nprefetch genuinely overlaps the current position's work — row-tag load\nlatency was 16.7% self in the L10 probe. Also refreshes the stale\nstart_matching_rl doc (it is the lazy band's hot path now).\n\n* perf(encode): row hash ring cache feeding probe and post-miss insert\n\nDonor ZSTD_row_fillHashCache: the lazy loop hashes the position 8 ahead\nONCE, remembers (row, tag) in an 8-slot ring keyed by exact abs_pos, and\nprefetches that row. The probe and the post-miss insert then reuse the\ncached hash instead of recomputing (hash_and_row was 8% self; the\nprefetch alone was net-neutral because it paid a second hash per\nposition). Ring is poisoned per block scan — add_data may rebase the\nabsolute coordinate origin between blocks. Cache misses (lookahead past\nthe horizon, match-span inserts after jumps) fall back to the plain\nhash; same value either way, byte-identical output.\n\n* fix(encode): keep btlazy2 off the Row finder; donor hashLog cap for row tables\n\nFollow-ups to the lazy-band Row switch:\n\n- public Strategy::Btlazy2 no longer collapses onto the runtime Lazy\n  tag (Lazy resolves to the Row finder now; btlazy2 is a binary-tree\n  search and must stay on the HashChain/BT storage), and\n  StrategyTag::for_level maps 13-15 to Btlazy2, matching LEVEL_TABLE\n  and the donor clevels.h strategy column its doc already cited\n- row_hash_bits_for_window applies the donor ZSTD_adjustCParams cap\n  (hashLog <= windowLog + 1): the +1 is load-bearing for L12 (donor\n  hashLog 23 > windowLog 22) — a plain windowLog cap shrank the L12\n  table on every hinted reset and split primed snapshots between\n  hinted/unhinted frames resolving to identical geometry\n- the remaining HC-pinned tests that reset via the Better/Best aliases\n  (which resolve to Row now) route through the HashChain override so\n  they keep covering the paths their assertions claim\n\n* Revert \"perf(encode): row hash ring cache feeding probe and post-miss insert\"\n\nThis reverts commit ba30e7840244dddb7c6d96c30144696782dd6328.\n\n* Revert \"perf(encode): prefetch the upcoming row in the lazy scan loop\"\n\nThis reverts commit 6b5773c5112e6c86acae2cf2d048183cf5be34e5.\n\n* fix(encode): let donor row hash widths reach the backend; btlazy2 parse depth\n\nReview follow-ups on the lazy-band Row switch:\n\n- RowMatchGenerator::set_hash_bits upper clamp moves from the legacy\n  20-bit ROW_HASH_BITS ceiling to the donor ZSTD_HASHLOG_MAX bound:\n  the driver resolves donor widths 21-23 for L9-12, and the backend\n  silently shrinking them left the primed-snapshot key recording a\n  geometry the tables did not have\n- dict_attach_epoch treats Some(0) as \"no dictionary\", matching the\n  dict-sizing filter above it — an empty dict primes nothing, so an\n  epoch-advance reset would preserve stale attach state\n- StrategyTag::Btlazy2 parse_mode maps to Lazy2 (donor btlazy2 =\n  BT finder + depth-2 lazy parse; lazy_depth() already reported 2)\n- repcode probe hoists candidate_idx (computed once for the gate and\n  the count)\n\n* fix(encode): key row snapshots on the applied hash width, keep 20-bit cap\n\nMeasured follow-up to the donor-width attempt: the honest 21-bit L10\nrow table cost +26.8% wall (flat control) for a 19-byte output delta,\nso the 20-bit ROW_HASH_BITS cap stays as a deliberate deviation (our\nlazy-band ratio already beats the donor with it). The REAL bug was the\nprimed-snapshot key recording the requested width while set_hash_bits\nclamped the tables: the key now reads RowMatchGenerator::hash_bits()\n(the applied width) on both hinted and unhinted paths, so identical\ngeometries key identically.\n\n* fix(bench): checksum parity for the FFI dictionary arms\n\nThe dict-group FFI compressors (bulk::Compressor) never set\nZSTD_c_checksumFlag, so they skipped the XXH64 pass the Rust side pays\nby default (content checksum on) and the no-dict groups' raw-CCtx\nhelper enables under the hash feature. ~6% of frame time on small dict\nframes was charged to the Rust arm only. configure_ffi_bulk_compressor\n(nee the LDM-only helper) now sets the flag under the same feature\ngate; dict-encoded payloads consequently carry a checksum, so the\ndecompress-dict arms verify on BOTH sides too — consistent with the\nplain decompress groups.\n\n* fix(encode)!: default content checksum off (upstream library parity)\n\nOut-of-the-box comparisons run library defaults against library\ndefaults, and the upstream library default is ZSTD_c_checksumFlag = 0.\nOur encoders defaulted the XXH64 content checksum ON, paying a hashing\npass (and 4 trailing bytes) the reference implementation does not — a\nstanding handicap in any external default-vs-default benchmark.\n\n- FrameCompressor and StreamingEncoder default content_checksum =\n  false; set_content_checksum docs note the upstream parity\n- the CLI explicitly enables the checksum (the reference zstd COMMAND\n  defaults it ON, unlike the library API)\n- c-api and wasm already pinned their own explicit defaults and are\n  unaffected\n- benches measure the FULL feature gate on both sides: every Rust arm\n  enables the checksum under the same hash feature that turns on\n  ZSTD_c_checksumFlag for the FFI arms (compare_ffi + memory bench)\n- checksum-intent tests construct their frames with the flag explicit\n\nBREAKING CHANGE: frames produced through encoder defaults no longer\ncarry a trailing XXH64 content checksum; call set_content_checksum(true)\nto restore the previous layout.\n\n* docs(encode): align checksum-default docs and bench config ordering\n\n- StreamingEncoder field doc now states the false default (the method\n  doc was updated with the flip, the field doc was missed)\n- Lazy strategy const comment no longer claims HashChain backing\n- every bench arm configures params before the checksum flag, matching\n  rust_encode_to_vec (set_parameters does not touch the flag today;\n  identical ordering prevents drift if it ever grows a full reset)",
+          "timestamp": "2026-06-10T20:26:49+03:00",
+          "tree_id": "a817e3bc248e36e18e47fc1e91d5993f738a7f18",
+          "url": "https://github.com/structured-world/structured-zstd/commit/8440167267f9aa2d1783837271c3cfd18f78c01c"
+        },
+        "date": 1781115026981,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.129,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.112,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 254.72,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 223.693,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.258,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.312,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.248,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.025,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.146,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.967,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.109,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.109,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.013,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 12.385,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.314,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.214,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.318,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.94,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.217,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.644,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.1,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.396,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.143,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.12,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.261,
             "unit": "ms"
           }
         ]
