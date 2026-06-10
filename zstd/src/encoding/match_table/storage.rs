@@ -681,10 +681,15 @@ impl MatchTable {
             self.dms.invalidate();
             return;
         }
-        // Dict-sized hash log: ceil-log2(region) clamped to [10, hash_log] —
-        // same shaping as the BT dms so a small dict does not over-allocate.
-        let dms_hash_log =
-            (usize::BITS - (region - 1).leading_zeros()).clamp(10, self.hash_log as u32) as usize;
+        // FULL live hash_log (NOT clamped to the dict size like the BT dms):
+        // C's CDict hash chain is built at the live cParams `hashLog`, so dict
+        // positions spread across the same wide bucket space and the per-bucket
+        // chains stay ~1 deep. Clamping to `ceil_log2(region)` packs the dict
+        // into far fewer buckets, lengthening every chain — the lazy walk then
+        // drags ~searchLog dict candidates (cache-miss loads) per input
+        // position instead of the ~1 C walks. The wider table costs a one-time
+        // prepared-dict allocation, amortised across the frame.
+        let dms_hash_log = self.hash_log;
         let mut hash_table = alloc::vec![0u32; 1usize << dms_hash_log];
         let mut chain_table = alloc::vec![0u32; region];
         let mut current = 0usize;
