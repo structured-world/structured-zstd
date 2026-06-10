@@ -663,6 +663,47 @@ impl MatchTable {
         self.dms.mark_primed();
     }
 
+    /// Build a separate immutable dictionary HASH-CHAIN (donor
+    /// `ZSTD_dictMatchState` for the lazy / HC path), so `find_best_match`
+    /// dual-probes the dict with its own bounded chain walk instead of the dict
+    /// being merged into the live chains — which makes the live walk traverse
+    /// dict candidates (dict-region cache misses) on every input position. The
+    /// dict bytes were just committed to the front of `live_history`;
+    /// candidates are dict-relative concat indices `0..region`, packed
+    /// `dict_rel + 1` (`0` = empty), one next-link per position like the live HC
+    /// chain (so `chain_table` is `region` long here, vs the BT dms's
+    /// `2 * region` tree-children layout).
+    pub(crate) fn prime_dms_hc(&mut self, region_len: usize) {
+        let concat = self.live_history();
+        let region = region_len.min(concat.len());
+        // HC hashes a 4-byte key, so a position needs 4 readable bytes.
+        if region < 4 {
+            self.dms.invalidate();
+            return;
+        }
+        // Dict-sized hash log: ceil-log2(region) clamped to [10, hash_log] —
+        // same shaping as the BT dms so a small dict does not over-allocate.
+        let dms_hash_log =
+            (usize::BITS - (region - 1).leading_zeros()).clamp(10, self.hash_log as u32) as usize;
+        let mut hash_table = alloc::vec![0u32; 1usize << dms_hash_log];
+        let mut chain_table = alloc::vec![0u32; region];
+        let mut current = 0usize;
+        while current + 4 <= region {
+            let h = Self::hash_position_at(concat, current, dms_hash_log, 4);
+            chain_table[current] = hash_table[h];
+            hash_table[h] = (current + 1) as u32;
+            current += 1;
+        }
+        // `concat`'s borrow of `self` ends above; now mutate `self.dms`.
+        let tables = self.dms.table_mut_or_init(DmsDictTables::default);
+        tables.hash_table = hash_table;
+        tables.chain_table = chain_table;
+        tables.hash_log = dms_hash_log;
+        tables.mls = 4;
+        self.dms.set_region_len(region);
+        self.dms.mark_primed();
+    }
+
     /// Append a freshly committed buffer to the rolling window. Drops
     /// chunk-length entries for the oldest slices until the new total
     /// fits inside `max_window_size`, extends the contiguous `history`

@@ -1650,16 +1650,13 @@ impl MatchGeneratorDriver {
                 }
             }
             super::strategy::BackendTag::HashChain => {
-                let table = &mut self.hc_matcher_mut().table;
-                if table.uses_bt {
-                    // BT / optimal levels: keep the dict in history for the dms
-                    // but do NOT insert it into the live tree (donor separate
-                    // dictMatchState). Lazy-HC levels still index the dict into
-                    // the live chain (they have no dms).
-                    table.skip_matching_dict_bt();
-                } else {
-                    self.hc_matcher_mut().skip_matching(Some(false));
-                }
+                // BT/optimal AND lazy-HC now both keep the dict in history but
+                // do NOT index it into the live tree/chain — the dict is held in
+                // a separate dms (BT tree via `prime_dms_bt`, HC chain via
+                // `prime_dms_hc`) and dual-probed at search time. This keeps the
+                // live chain input-only so its walk stays short on low-match
+                // input instead of dragging dict-region cache-miss loads.
+                self.hc_matcher_mut().table.skip_matching_dict_bt();
             }
         }
     }
@@ -2260,11 +2257,15 @@ impl Matcher for MatchGeneratorDriver {
         if self.active_backend() == super::strategy::BackendTag::HashChain {
             let table = &mut self.hc_matcher_mut().table;
             table.set_dictionary_limit_from_primed_bytes(committed_dict_budget);
-            // Build the dictMatchState chain for BT/optimal levels so the
-            // collect dual-probes the dictionary with its own compare budget
-            // (the dict bytes were just committed to the front of history).
+            // Build the dictMatchState so the collect / find_best_match
+            // dual-probes the dictionary with its own compare budget instead of
+            // the dict being merged into the live tables (the dict bytes were
+            // just committed to the front of history). BT/optimal levels get the
+            // tree dms; lazy-HC levels get the chain dms.
             if table.uses_bt {
                 table.prime_dms_bt(committed_dict_budget);
+            } else {
+                table.prime_dms_hc(committed_dict_budget);
             }
         }
         // CDict-equivalent: now that every dict chunk is indexed, mark the

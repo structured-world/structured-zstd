@@ -395,6 +395,86 @@ impl HcMatcher {
         best
     }
 
+    /// Donor `ZSTD_dictMatchState` dual-probe for the lazy / HC path: walk the
+    /// SEPARATE immutable dict chain (built by `MatchTable::prime_dms_hc`) with
+    /// its own bounded budget and fold the best dict match into `best`. The
+    /// dict bytes sit at the front of `live_history` (concat `0..region`), so a
+    /// dms candidate `dict_rel` maps to the absolute position
+    /// `history_abs_start + dict_rel`; the match extends through
+    /// `common_prefix_len` / `extend_backwards` exactly as a live candidate (the
+    /// flat contiguous history handles the dict→input boundary transparently).
+    ///
+    /// This replaces merging the dict into the live chains: with the dict held
+    /// separately, the live walk's chain stays input-only (short, terminates
+    /// fast on low-match input) and the dict is probed only here, with its own
+    /// budget — mirroring C's live-nbAttempts-then-dict-nbAttempts shape and
+    /// avoiding the per-input-position dict-region cache-miss loads.
+    ///
+    /// `dms` empty slot is `0` (packed `dict_rel + 1`), distinct from the live
+    /// chain's `HC_EMPTY`. No speculative tail gate here — the dict chains are
+    /// short, and omitting it only skips an optimisation, never changes the
+    /// accepted match (the 4-byte gate stays, which is correctness-safe since
+    /// `HC_MIN_MATCH_LEN == 4`).
+    fn dms_chain_candidate(
+        &self,
+        table: &MatchTable,
+        abs_pos: usize,
+        lit_len: usize,
+        mut best: Option<MatchCandidate>,
+    ) -> Option<MatchCandidate> {
+        let Some(dms) = table.dms.table() else {
+            return best;
+        };
+        let region = table.dms.region_len();
+        if region < HC_MIN_MATCH_LEN {
+            return best;
+        }
+        let concat = table.live_history();
+        let current_idx = abs_pos - table.history_abs_start;
+        let history_tail = concat.len();
+        if current_idx + HC_MIN_MATCH_LEN > history_tail {
+            return best;
+        }
+        let history_abs_start = table.history_abs_start;
+
+        let hash = MatchTable::hash_position_at(concat, current_idx, dms.hash_log, dms.mls);
+        let mut cur = dms.hash_table[hash];
+        let max_chain_steps = self.search_depth.min(MAX_HC_SEARCH_DEPTH);
+        let mut steps = 0usize;
+        while steps < max_chain_steps {
+            if cur == 0 {
+                break;
+            }
+            let dict_rel = (cur - 1) as usize;
+            // Dict positions are concat indices `< region`; a malformed link
+            // is treated as chain end rather than indexing out of range.
+            let next = if dict_rel < region {
+                dms.chain_table[dict_rel]
+            } else {
+                0
+            };
+            steps += 1;
+            // 4-byte gate (donor MEM_read32): HC_MIN_MATCH_LEN == 4, so a
+            // first-4-byte mismatch can never reach the floor.
+            if dict_rel + 4 <= region
+                && concat[dict_rel..dict_rel + 4] == concat[current_idx..current_idx + 4]
+            {
+                let match_len = common_prefix_len(&concat[dict_rel..], &concat[current_idx..]);
+                if match_len >= HC_MIN_MATCH_LEN {
+                    let candidate_abs = history_abs_start + dict_rel;
+                    let candidate =
+                        Self::extend_backwards(table, candidate_abs, abs_pos, match_len, lit_len);
+                    best = Self::better_candidate(best, Some(candidate));
+                }
+            }
+            if next == cur {
+                break;
+            }
+            cur = next;
+        }
+        best
+    }
+
     /// Combine the rep-code and chain-walk candidates and pick the
     /// better of the two.
     pub(crate) fn find_best_match(
@@ -405,7 +485,12 @@ impl HcMatcher {
     ) -> Option<MatchCandidate> {
         let rep = Self::repcode_candidate(table, abs_pos, lit_len);
         let hash = self.hash_chain_candidate(table, abs_pos, lit_len);
-        Self::better_candidate(rep, hash)
+        let best = Self::better_candidate(rep, hash);
+        // Dual-probe the separate dict chain (donor `ZSTD_dictMatchState`) after
+        // the live chain + rep, in C's live-then-dict order. No-op (returns
+        // `best` unchanged) when no dict is attached, so non-dict frames keep
+        // the exact two-candidate shape.
+        self.dms_chain_candidate(table, abs_pos, lit_len, best)
     }
 
     /// Donor `lazy` / `lazy2` lookahead: evaluate the match a byte
