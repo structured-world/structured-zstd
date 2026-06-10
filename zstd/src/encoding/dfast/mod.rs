@@ -1248,6 +1248,7 @@ impl DfastMatchGenerator {
         }
     }
 
+    #[inline(always)]
     fn emit_candidate(
         &mut self,
         current_abs_start: usize,
@@ -1361,6 +1362,7 @@ impl DfastMatchGenerator {
         self.history_abs_start + self.live_history().len()
     }
 
+    #[inline(always)]
     pub(crate) fn insert_positions(&mut self, start: usize, end: usize) {
         // Source the byte buffer + rebase coordinates through `scan_source()`
         // so a borrowed window's batch re-seed hashes the in-place input
