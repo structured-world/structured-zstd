@@ -353,7 +353,22 @@ impl HcMatcher {
                     }
                 }
 
-                if !skip {
+                // Cheap 4-byte equality gate before the wider SIMD count
+                // (donor `MEM_read32` gate in `ZSTD_HcFindBestMatch`).
+                // `HC_MIN_MATCH_LEN == 4`, so a first-4-byte mismatch can never
+                // reach the match floor — reject without the vector
+                // load+count+tzcnt. On dict-primed chains over low-match
+                // (random) input, where `best` stays `None` so the speculative
+                // tail gate above never fires, this rejects the bulk of chain
+                // candidates on a scalar compare instead of a full
+                // `common_prefix_len`. Falls through to the full count when
+                // either side lacks a 4-byte lookahead (the count handles short
+                // tails), so the accepted set is byte-identical.
+                let four_byte_ok = candidate_idx + 4 > history_tail
+                    || current_idx + 4 > history_tail
+                    || concat[candidate_idx..candidate_idx + 4]
+                        == concat[current_idx..current_idx + 4];
+                if !skip && four_byte_ok {
                     let match_len =
                         common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
                     if match_len >= HC_MIN_MATCH_LEN {
