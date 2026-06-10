@@ -154,6 +154,16 @@ impl<'a> UserSliceBackend<'a> {
         }
     }
 
+    /// Physical bytes `slice[from..tail]` — the output written since a
+    /// previously-observed [`BufferBackend::tail`]. The direct decode
+    /// path hashes each block's output through this right after the
+    /// block decodes, while the bytes are still cache-resident; a
+    /// post-decode whole-output hash walk re-reads the entire frame
+    /// cold (a full extra memory pass on large outputs).
+    pub(crate) fn written_since(&self, from: usize) -> &[u8] {
+        &self.slice[from..self.tail]
+    }
+
     /// Exact, non-overshooting copy for the trailing sequence(s) when the
     /// remaining slice capacity is too tight for the SIMD wildcopy
     /// overshoot of the fast path. Lets the direct-decode gate require
