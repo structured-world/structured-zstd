@@ -504,6 +504,8 @@ fn main() {
 
                 let (rust_compressed, rust_peak) = measure_peak(|| {
                     let mut compressor: FrameCompressor = FrameCompressor::new(level.rust_level);
+                    // Full feature gate: checksum on, matching the FFI arm.
+                    compressor.set_content_checksum(cfg!(feature = "hash"));
                     if let Some(params) = &ldm_params {
                         compressor.set_parameters(params);
                     }
@@ -556,15 +558,15 @@ fn main() {
                 continue;
             }
 
-            // Compress (no dictionary; LDM wired on both sides when set)
-            let (rust_compressed, rust_peak) = measure_peak(|| match &ldm_params {
-                Some(params) => {
-                    structured_zstd::encoding::compress_with_parameters(&scenario.bytes[..], params)
+            // Compress (no dictionary; LDM wired on both sides when set).
+            // Full feature gate: checksum on, matching the FFI arm.
+            let (rust_compressed, rust_peak) = measure_peak(|| {
+                let mut compressor: FrameCompressor = FrameCompressor::new(level.rust_level);
+                compressor.set_content_checksum(cfg!(feature = "hash"));
+                if let Some(params) = &ldm_params {
+                    compressor.set_parameters(params);
                 }
-                None => structured_zstd::encoding::compress_slice_to_vec(
-                    &scenario.bytes[..],
-                    level.rust_level,
-                ),
+                compressor.compress_independent_frame(&scenario.bytes[..])
             });
             let (ffi_compressed, ffi_peak) =
                 measure_peak(|| ffi_encode(&scenario.bytes[..], level.ffi_level, level.ldm, None));

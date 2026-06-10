@@ -104,9 +104,10 @@ pub struct FrameCompressor<
     magicless: bool,
     /// Whether to emit a trailing XXH64 content checksum and set the frame
     /// header's `Content_Checksum_flag` (semantics of upstream
-    /// `ZSTD_c_checksumFlag`). Default `true`; combined with the `hash`
-    /// feature at frame-build time, so without `hash` no checksum is emitted
-    /// regardless. Set via [`Self::set_content_checksum`].
+    /// `ZSTD_c_checksumFlag`). Default `false`, matching the upstream
+    /// library default; combined with the `hash` feature at frame-build
+    /// time, so without `hash` no checksum is emitted regardless. Set via
+    /// [`Self::set_content_checksum`].
     content_checksum: bool,
     #[cfg(feature = "hash")]
     hasher: XxHash64,
@@ -754,7 +755,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 ),
             },
             magicless: false,
-            content_checksum: true,
+            content_checksum: false,
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
             #[cfg(feature = "lsm")]
@@ -1090,7 +1091,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             },
             compression_level,
             magicless: false,
-            content_checksum: true,
+            content_checksum: false,
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
             #[cfg(feature = "lsm")]
@@ -1116,7 +1117,10 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     }
 
     /// Enable or disable the trailing XXH64 content checksum
-    /// (semantics of upstream `ZSTD_c_checksumFlag`). Default `true`.
+    /// (semantics of upstream `ZSTD_c_checksumFlag`). Default `false`,
+    /// matching the upstream library default (`ZSTD_c_checksumFlag = 0`)
+    /// so out-of-the-box frames carry the same layout and pay the same
+    /// costs as the reference implementation.
     ///
     /// When `false`, emitted frames set `Content_Checksum_flag = 0` and carry
     /// no trailing digest; such frames are valid (RFC 8878) and decode

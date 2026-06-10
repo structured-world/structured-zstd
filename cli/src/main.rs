@@ -868,6 +868,12 @@ fn compress_stream<R: Read, W: Write>(
         CompressionLevel::from_level(level)
     };
     let mut encoder = structured_zstd::encoding::StreamingEncoder::new(writer, compression_level);
+    // The reference `zstd` COMMAND defaults the content checksum ON (unlike
+    // the library API, whose default is off and which our encoder mirrors) —
+    // set it explicitly so CLI output matches `zstd <file>` byte layout.
+    encoder
+        .set_content_checksum(true)
+        .wrap_err("failed to enable content checksum")?;
     // Long-distance matching (`--long`) is a per-knob override applied via the
     // compression-parameters API; skip it for `--store` (raw frames don't match).
     if long && !store {

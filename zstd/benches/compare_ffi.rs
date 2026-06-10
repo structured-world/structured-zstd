@@ -61,16 +61,19 @@ fn configure_ffi_bulk_compressor(compressor: &mut zstd::bulk::Compressor<'_>, le
     }
 }
 
-/// Build the matching Rust-encoder bytes for a matrix variant. The plain
-/// numeric levels keep the historical `compress_slice_to_vec` path so their
-/// output stays byte-for-byte identical to pre-#362 runs; the LDM variants
-/// route through `compress_with_parameters` with
-/// `enable_long_distance_matching(true)` on the variant's base level.
+/// Build the matching Rust-encoder bytes for a matrix variant. The bench
+/// matrix measures the FULL feature gate on both sides: the content
+/// checksum is enabled explicitly here (the encoder's default mirrors the
+/// upstream library default, OFF) just as `ffi_encode_to_vec` and
+/// `configure_ffi_bulk_compressor` enable `ZSTD_c_checksumFlag`, all under
+/// the same `hash` feature.
 fn rust_encode_to_vec(input: &[u8], level: &LevelConfig) -> Vec<u8> {
-    match ldm_parameters(level) {
-        Some(params) => structured_zstd::encoding::compress_with_parameters(input, &params),
-        None => structured_zstd::encoding::compress_slice_to_vec(input, level.rust_level),
+    let mut enc: FrameCompressor = FrameCompressor::new(level.rust_level);
+    if let Some(params) = ldm_parameters(level) {
+        enc.set_parameters(&params);
     }
+    enc.set_content_checksum(cfg!(feature = "hash"));
+    enc.compress_independent_frame(input)
 }
 
 /// FFI encode helper used by criterion's timing loop. Uses
@@ -713,6 +716,8 @@ fn bench_dictionary(c: &mut Criterion) {
                 if let Some(params) = ldm_parameters(&level) {
                     warmup_compressor.set_parameters(&params);
                 }
+                // Full feature gate: checksum on, matching the FFI arms.
+                warmup_compressor.set_content_checksum(cfg!(feature = "hash"));
                 warmup_compressor
                     .set_dictionary_from_bytes(&ffi_dictionary)
                     .expect("dictionary should attach");
@@ -798,6 +803,8 @@ fn bench_dictionary(c: &mut Criterion) {
                     // a `set_source`/`set_drain` call — pin them to the
                     // defaults so inference has a concrete type.
                     let mut compressor: FrameCompressor = FrameCompressor::new(level.rust_level);
+                    // Full feature gate: checksum on, matching the FFI arms.
+                    compressor.set_content_checksum(cfg!(feature = "hash"));
                     // Enable LDM before attaching the dictionary (see the
                     // warmup compressor above for why the order is safe).
                     if let Some(params) = ldm_parameters(&level) {
