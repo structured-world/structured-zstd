@@ -246,6 +246,13 @@ impl HcMatcher {
         // lazy hot path.
         let hash = table.hash_position(&concat[current_idx..]);
         let chain_mask = (1usize << table.chain_log) - 1;
+        // Hoist the chain table's base pointer out of the walk: read through
+        // `&table.chain_table[idx]` reloads the Vec's (ptr,len) + a bounds check
+        // every iteration (the compiler can't prove them loop-invariant across
+        // the `&table` borrow), which inflates register pressure on this hot
+        // loop. `chain_mask` keeps every index `< 1 << chain_log == len`, so the
+        // raw read is in-bounds — removes the per-iteration base+length reload.
+        let chain_ptr = table.chain_table.as_ptr();
         let mut cur = table.hash_table[hash];
         // Cap loop at MAX_HC_SEARCH_DEPTH so a misconfigured
         // `search_depth > MAX_HC_SEARCH_DEPTH` (BT modes set it from the
@@ -315,7 +322,8 @@ impl HcMatcher {
                     table.position_base,
                     table.index_shift,
                 );
-            let next = table.chain_table[candidate_rel & chain_mask];
+            // SAFETY: `candidate_rel & chain_mask < 1 << chain_log == len`.
+            let next = unsafe { *chain_ptr.add(candidate_rel & chain_mask) };
             steps += 1;
             // Self-loop: two positions share `candidate_rel & chain_mask`;
             // stop after processing this slot.
