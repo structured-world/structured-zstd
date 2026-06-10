@@ -1204,6 +1204,15 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // mutably alongside `&mut self` (the rest of the loop touches
         // `self.state` / `self.hasher`, disjoint from the reader). Restored
         // before the frame tail so a reused compressor keeps its source.
+        //
+        // Deliberately NOT restored on unwind: if the block loop panics the
+        // source has been partially consumed, so handing it back would let a
+        // `catch_unwind` caller "successfully" compress the remaining tail
+        // from an arbitrary midpoint — silent data corruption. Leaving the
+        // slot empty makes any post-panic reuse fail loudly at the `expect`
+        // below (matcher/entropy state is equally unre-usable after an
+        // unwind; the reference implementation likewise requires a context
+        // reset after an error).
         let mut source = self
             .uncompressed_data
             .take()
