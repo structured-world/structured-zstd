@@ -219,12 +219,6 @@ macro_rules! dispatch_tag_kernel {
 /// Bind the runtime `row_log` (clamped 4..=6) to the const `ROW_LOG` of a
 /// `*_rl::<K, ROW_LOG>` hot loop. Mirrors the donor's per-rowLog variant
 /// table; the branch is cold (once per block / call).
-/// Lookahead distance (positions) for the lazy-loop row prefetch —
-/// donor `ZSTD_ROW_HASH_CACHE_SIZE` (8): far enough to cover an L2
-/// round-trip at ~1 position/iteration, close enough that the row is
-/// still resident when the scan arrives.
-const ROW_PREFETCH_DISTANCE: usize = 8;
-
 macro_rules! dispatch_row_log {
     ($self:ident . $rl_method:ident :: <$k:ty> ( $($arg:expr),* )) => {
         match $self.row_log {
@@ -993,9 +987,19 @@ impl RowMatchGenerator {
         }
     }
 
-    /// Lazy-style parse (depth >= 1) for the Row backend — the hot path
-    /// for the lazy band (L6-12), which runs on the Row finder per the
-    /// donor's default row-matchfinder mode.
+    /// Lazy-style parse (depth >= 1) for the Row backend.
+    ///
+    /// Currently unused: the only strategy mapped to `BackendTag::Row`
+    /// is `StrategyTag::Greedy` (level 4), which dispatches to
+    /// [`Self::start_matching_greedy`] via the `debug_assert_eq!` in
+    /// the `BackendTag::Row` arm of
+    /// `MatchGeneratorDriver::compress_block`. This method is kept as
+    /// scaffolding for the case where a future level routes a lazy
+    /// strategy through the Row backend — extracting `pick_lazy_match`
+    /// behavior to a fresh module then would mean re-deriving the
+    /// row-hash machinery, which is wasteful. The `dead_code` allow is
+    /// scoped to this method and its private helpers so any new
+    /// caller will pick them up unmodified.
     pub(crate) fn start_matching_rl<K: RowTags, const ROW_LOG: usize>(
         &mut self,
         mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
@@ -1020,10 +1024,6 @@ impl RowMatchGenerator {
             let abs_pos = current_abs_start + pos;
             let lit_len = pos - literals_start;
 
-            // Donor `ZSTD_row_fillHashCache` cadence: prefetch the row a
-            // few positions ahead so the probe's tag/position loads are
-            // L1-resident by the time the scan reaches them.
-            self.prefetch_row(abs_pos + ROW_PREFETCH_DISTANCE);
             let best = self.best_match_rl::<K, ROW_LOG>(abs_pos, lit_len);
             if let Some(candidate) = self.pick_lazy_match_rl::<K, ROW_LOG>(abs_pos, lit_len, best) {
                 self.insert_match_span::<ROW_LOG>(abs_pos, candidate.start + candidate.match_len);
@@ -1325,41 +1325,6 @@ impl RowMatchGenerator {
 
     fn history_abs_end(&self) -> usize {
         self.history_abs_start + self.live_history().len()
-    }
-
-    /// Donor `ZSTD_row_prefetch`: pull the row's tag bytes and position
-    /// words toward L1 ahead of the probe that will touch them. The row
-    /// address depends only on input bytes (not on table contents), so
-    /// unlike a chain-walk candidate the load is NOT on a serial
-    /// dependency chain and prefetching genuinely overlaps it with the
-    /// current position's work. x86-only (the bench-relevant targets);
-    /// other arches compile it out.
-    #[inline(always)]
-    fn prefetch_row(&self, abs_pos: usize) {
-        #[cfg(target_arch = "x86_64")]
-        if let Some((row, _tag)) = self.hash_and_row(abs_pos) {
-            let row_base = row << self.row_log;
-            let entries = 1usize << self.row_log;
-            // SAFETY: `row_base` indexes a full row inside the tag /
-            // position tables (`row < 1 << row_hash_log`, tables sized
-            // `rows * entries`); prefetch is non-faulting regardless.
-            unsafe {
-                use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
-                _mm_prefetch(
-                    self.row_tags.as_ptr().add(row_base).cast::<i8>(),
-                    _MM_HINT_T0,
-                );
-                let positions = self.row_positions.as_ptr().add(row_base).cast::<i8>();
-                _mm_prefetch(positions, _MM_HINT_T0);
-                // Position words span `entries * 4` bytes — touch the
-                // second cache line too once the row exceeds one line.
-                if entries * core::mem::size_of::<u32>() > 64 {
-                    _mm_prefetch(positions.add(64), _MM_HINT_T0);
-                }
-            }
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        let _ = abs_pos;
     }
 
     pub(crate) fn hash_and_row(&self, abs_pos: usize) -> Option<(usize, u8)> {
