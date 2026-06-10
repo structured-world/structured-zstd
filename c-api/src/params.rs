@@ -463,7 +463,7 @@ pub unsafe extern "C" fn ZSTD_DCtx_setParameter(
     let dctx = unsafe { &mut *dctx };
     match param {
         ZSTD_D_WINDOW_LOG_MAX => {
-            if value != 0 && (value < D_WINDOW_LOG_MIN || value > D_WINDOW_LOG_MAX) {
+            if value != 0 && !(D_WINDOW_LOG_MIN..=D_WINDOW_LOG_MAX).contains(&value) {
                 return encode(ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound);
             }
             dctx.window_log_max = if value == 0 {

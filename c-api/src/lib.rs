@@ -31,6 +31,7 @@ mod ffi;
 mod frame;
 mod params;
 mod simple;
+mod streaming;
 
 #[cfg(test)]
 mod tests;
@@ -43,3 +44,4 @@ pub use dict::ZDICT_params_t;
 pub use error::ZSTD_ErrorCode;
 pub use frame::{ZSTD_FrameHeader, ZSTD_FrameType_e, ZSTD_format_e};
 pub use params::ZSTD_bounds;
+pub use streaming::{ZSTD_inBuffer, ZSTD_outBuffer};

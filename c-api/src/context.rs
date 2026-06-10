@@ -65,6 +65,9 @@ pub struct ZSTD_CCtx {
     pub(crate) scratch: Vec<u8>,
     /// Sticky advanced parameters (`ZSTD_CCtx_setParameter` family).
     pub(crate) params: crate::params::CCtxParams,
+    /// In-flight streaming frame (`ZSTD_compressStream2`). `None` between
+    /// frames.
+    pub(crate) stream: Option<crate::streaming::CStreamState>,
     /// `FrameCompressor` with a dictionary attached, lazily built by the CDict
     /// path. `None` until the first `ZSTD_compress_usingCDict`.
     pub(crate) dict_compressor: Option<FrameCompressor>,
@@ -84,6 +87,9 @@ pub struct ZSTD_DCtx {
     /// `ZSTD_d_windowLogMax`: streaming window-size acceptance ceiling
     /// (log2). Defaults to `ZSTD_WINDOWLOG_LIMIT_DEFAULT`.
     pub(crate) window_log_max: core::ffi::c_int,
+    /// Whether the streaming decoder sits at a frame boundary (the next
+    /// `ZSTD_decompressStream` input starts a new frame). `true` initially.
+    pub(crate) stream_frame_done: bool,
     /// Identity of the `DDict` whose content was last loaded into `decoder`
     /// (its never-reused serial; `0` = none), so repeated
     /// `ZSTD_decompress_usingDDict` calls with the same DDict skip re-adding it.
@@ -99,6 +105,7 @@ pub extern "C" fn ZSTD_createCCtx() -> *mut ZSTD_CCtx {
     try_box(ZSTD_CCtx {
         scratch: Vec::new(),
         params: crate::params::CCtxParams::default(),
+        stream: None,
         dict_compressor: None,
         dict_serial: 0,
         dict_level: 0,
@@ -107,17 +114,16 @@ pub extern "C" fn ZSTD_createCCtx() -> *mut ZSTD_CCtx {
 
 impl ZSTD_CCtx {
     /// Whether a streaming frame is currently mid-flight (parameters are
-    /// frozen until it finishes or the session is reset). The streaming
-    /// surface stores its state on the context; until it lands no frame can
-    /// be in flight.
+    /// frozen until it finishes or the session is reset).
     pub(crate) fn stream_in_progress(&self) -> bool {
-        false
+        self.stream.is_some()
     }
 
     /// `ZSTD_reset_session_only`: abandon any in-flight frame and the
     /// pledged size; sticky parameters and dictionary references survive.
     pub(crate) fn reset_session(&mut self) {
         self.scratch.clear();
+        self.stream = None;
         self.params.pledged_src_size = crate::params::CONTENTSIZE_UNKNOWN;
     }
 
@@ -273,6 +279,7 @@ pub extern "C" fn ZSTD_createDCtx() -> *mut ZSTD_DCtx {
     try_box(ZSTD_DCtx {
         decoder: FrameDecoder::new(),
         window_log_max: crate::params::WINDOW_LOG_LIMIT_DEFAULT,
+        stream_frame_done: true,
         ddict_serial: 0,
     })
 }
@@ -283,8 +290,9 @@ impl ZSTD_DCtx {
     /// and parameters are untouched.
     pub(crate) fn reset_session(&mut self) {
         // A frame mid-decode lives inside `decoder`'s internal state and is
-        // re-initialised by the next `init`/`reset` call, so nothing to
-        // abandon eagerly here.
+        // re-initialised by the next `init`/`reset` call; just mark the
+        // stream as sitting at a frame boundary again.
+        self.stream_frame_done = true;
     }
 
     /// `ZSTD_reset_parameters`: restore parameter defaults and drop
