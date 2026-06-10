@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.34](https://github.com/structured-world/structured-zstd/compare/v0.0.33...v0.0.34) - 2026-06-10
+
+### Added
+
+- dictionary CDict-equivalent (encoder + C ABI + wasm + CLI); L22 dict memory 8.2x->1.13x ([#387](https://github.com/structured-world/structured-zstd/pull/387))
+- *(c-api)* C ABI core (cdylib + vendored headers + simple/context/error/frame/dict wrappers) ([#386](https://github.com/structured-world/structured-zstd/pull/386))
+- content-checksum modes + npm bindings, RingBuffer wrapped inline match-copy ([#385](https://github.com/structured-world/structured-zstd/pull/385))
+
+### Performance
+
+- *(encode)* zero per-frame allocations on the reused-compressor path ([#395](https://github.com/structured-world/structured-zstd/pull/395))
+- *(decode)* hash each block while cache-hot on the direct path ([#394](https://github.com/structured-world/structured-zstd/pull/394))
+- *(encode)* [**breaking**] cut dict-compress per-frame overhead; shrink wasm payload 18% ([#393](https://github.com/structured-world/structured-zstd/pull/393))
+- *(encode)* monolithize dfast per-match helpers into the kernel ([#391](https://github.com/structured-world/structured-zstd/pull/391))
+- *(encode)* 4-byte gate before HC chain common_prefix_len ([#392](https://github.com/structured-world/structured-zstd/pull/392))
+- *(encode)* reshape dfast match-find toward donor structure ([#390](https://github.com/structured-world/structured-zstd/pull/390))
+- *(encode)* close the level-4 dfast speed outlier (donor greedy double-fast) ([#389](https://github.com/structured-world/structured-zstd/pull/389))
+- *(decode)* cut per-frame/block overhead (RingBuffer inline exec, FSE arrays, dict copy-on-write) ([#381](https://github.com/structured-world/structured-zstd/pull/381))
+- *(decode)* cut HUF/FSE entropy-build overhead on the decode hot path ([#377](https://github.com/structured-world/structured-zstd/pull/377))
+
 ## [0.0.33](https://github.com/structured-world/structured-zstd/compare/v0.0.32...v0.0.33) - 2026-06-08
 
 ### Performance
