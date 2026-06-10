@@ -280,6 +280,69 @@ const ROW_L5: RowConfig = RowConfig {
     mls: ROW_MIN_MATCH_LEN,
 };
 
+// Donor `clevels.h` unbounded defaults for the lazy band, verified via
+// `ZSTD_getCParams(level, 0, 0)`:
+//   L6  { w21 c18 h19 s3 mml5 t4  lazy  } → rowLog 4, depth 1<<3 = 8
+//   L7  { w21 c19 h20 s4 mml5 t8  lazy  } → rowLog 4, depth 16
+//   L8  { w21 c19 h20 s4 mml5 t16 lazy2 } → rowLog 4, depth 16
+//   L9  { w22 c20 h21 s4 mml5 t16 lazy2 } → rowLog 4, depth 16
+//   L10 { w22 c21 h22 s5 mml5 t16 lazy2 } → rowLog 5, depth 32
+//   L11 { w22 c21 h22 s6 mml5 t16 lazy2 } → rowLog 6, depth 64
+//   L12 { w22 c22 h23 s6 mml5 t32 lazy2 } → rowLog 6, depth 64
+// `rowLog = clamp(searchLog, 4, 6)`, `depth = 1 << min(searchLog, rowLog)`
+// (same derivation as `ROW_L5` above). `hash_bits` carries the donor
+// `hashLog`; the hinted-source clamp in `configure` caps it by the window
+// exactly like the donor `ZSTD_adjustCParams` path.
+const ROW_L6: RowConfig = RowConfig {
+    hash_bits: 19,
+    row_log: 4,
+    search_depth: 8,
+    target_len: 4,
+    mls: ROW_MIN_MATCH_LEN,
+};
+const ROW_L7: RowConfig = RowConfig {
+    hash_bits: 20,
+    row_log: 4,
+    search_depth: 16,
+    target_len: 8,
+    mls: ROW_MIN_MATCH_LEN,
+};
+const ROW_L8: RowConfig = RowConfig {
+    hash_bits: 20,
+    row_log: 4,
+    search_depth: 16,
+    target_len: 16,
+    mls: ROW_MIN_MATCH_LEN,
+};
+const ROW_L9: RowConfig = RowConfig {
+    hash_bits: 21,
+    row_log: 4,
+    search_depth: 16,
+    target_len: 16,
+    mls: ROW_MIN_MATCH_LEN,
+};
+const ROW_L10: RowConfig = RowConfig {
+    hash_bits: 22,
+    row_log: 5,
+    search_depth: 32,
+    target_len: 16,
+    mls: ROW_MIN_MATCH_LEN,
+};
+const ROW_L11: RowConfig = RowConfig {
+    hash_bits: 22,
+    row_log: 6,
+    search_depth: 64,
+    target_len: 16,
+    mls: ROW_MIN_MATCH_LEN,
+};
+const ROW_L12: RowConfig = RowConfig {
+    hash_bits: 23,
+    row_log: 6,
+    search_depth: 64,
+    target_len: 32,
+    mls: ROW_MIN_MATCH_LEN,
+};
+
 /// Per-level Double-Fast hash sizing, mirroring the donor `clevels.h` columns
 /// (config-driven, not a hardcoded constant): `long_hash_log` =
 /// `cParams.hashLog` (the long 8-byte hash table), `short_hash_log` =
@@ -628,8 +691,14 @@ fn dfast_hash_bits_for_window(max_window_size: usize) -> usize {
 }
 
 fn row_hash_bits_for_window(max_window_size: usize) -> usize {
+    // Window-derived cap on the row hash width (stricter than the donor
+    // `ZSTD_adjustCParams_internal` `hashLog <= windowLog + 1` bound, so a
+    // tiny hinted source keeps the tiny table). No constant upper clamp:
+    // the old `ROW_HASH_BITS` (20) ceiling predates the lazy band moving
+    // onto Row — L9-12 carry donor hashLog 21-23 and must keep it when the
+    // hinted window is large enough.
     let window_log = (usize::BITS - 1 - max_window_size.leading_zeros()) as usize;
-    window_log.clamp(MIN_WINDOW_LOG as usize, ROW_HASH_BITS)
+    window_log.max(MIN_WINDOW_LOG as usize)
 }
 
 /// `floor(log2(window))` for the HashChain table-log cap (donor
@@ -667,13 +736,21 @@ const LEVEL_TABLE: [LevelParams; 22] = [
     // long-enough match — the dominant cost in the L5..=L15 speed
     // regression vs FFI (see lazy_band_target_len_matches_donor_default_table).
     /* 5 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Greedy, search: super::strategy::SearchMethod::RowHash, window_log: 21, lazy_depth: 0, fast: None, dfast: None, hc: None, row: Some(ROW_L5) },
-    /* 6 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 21, lazy_depth: 1, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 19, chain_log: 18, search_depth: 8,  target_len: 4, search_mls: 4 }), row: None },
-    /* 7 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 21, lazy_depth: 1, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 20, chain_log: 19, search_depth: 16, target_len: 8, search_mls: 4 }), row: None },
-    /* 8 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 21, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 20, chain_log: 19, search_depth: 16, target_len: 16, search_mls: 4 }), row: None },
-    /* 9 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 21, chain_log: 20, search_depth: 16, target_len: 16, search_mls: 4 }), row: None },
-    /*10 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 21, search_depth: 32, target_len: 16, search_mls: 4 }), row: None },
-    /*11 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 21, search_depth: 64, target_len: 16, search_mls: 4 }), row: None },
-    /*12 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::HashChain, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 23, chain_log: 22, search_depth: 64, target_len: 32, search_mls: 4 }), row: None },
+    // L6-12: the donor runs the lazy/lazy2 strategies on the ROW-based
+    // match finder by default (`ZSTD_resolveRowMatchFinderMode`: row mode
+    // is on for greedy..lazy2 whenever SIMD is available) — a bounded
+    // SIMD tag scan per row instead of a pointer-chasing hash-chain walk.
+    // Our HashChain walk on these levels was ~75% of L10 wall time on the
+    // 1 MiB corpus (dependent chain-table loads). Same `RowConfig`
+    // derivation as `ROW_L5` above, donor values per level in the
+    // `ROW_L6..ROW_L12` comment block.
+    /* 6 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::RowHash, window_log: 21, lazy_depth: 1, fast: None, dfast: None, hc: None, row: Some(ROW_L6) },
+    /* 7 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::RowHash, window_log: 21, lazy_depth: 1, fast: None, dfast: None, hc: None, row: Some(ROW_L7) },
+    /* 8 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::RowHash, window_log: 21, lazy_depth: 2, fast: None, dfast: None, hc: None, row: Some(ROW_L8) },
+    /* 9 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::RowHash, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: None, row: Some(ROW_L9) },
+    /*10 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::RowHash, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: None, row: Some(ROW_L10) },
+    /*11 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::RowHash, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: None, row: Some(ROW_L11) },
+    /*12 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::RowHash, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: None, row: Some(ROW_L12) },
     // L13-15: reference uses btlazy2 (binary-tree finder) with searchLog 4/5/6
     // (search_depth 16/32/64) and targetLength 32. We run the hash-chain Lazy
     // parser here, so we mirror the reference search budget rather than inflate
@@ -2000,17 +2077,25 @@ impl Matcher for MatchGeneratorDriver {
                 row.lazy_depth = params.lazy_depth;
                 let row_cfg = params.row.expect("Row level row carries a RowConfig");
                 row.configure(row_cfg);
-                if hinted {
+                // Record the RESOLVED hash width in the primed-snapshot key on
+                // both paths. Leaving the unhinted path at the 0 default keyed
+                // an unhinted capture differently from a hinted reset that
+                // resolves to the IDENTICAL tables (hint >= window makes the
+                // clamp a no-op), forcing a needless dictionary re-prime.
+                resolved_table_bits = if hinted {
                     // Clamp the configured hash width by the hinted window
                     // (donor `ZSTD_adjustCParams` caps hashLog by windowLog) —
                     // `min`, not replace, so an explicit `hash_log` param
                     // override (`row_cfg.hash_bits`) survives the hinted path
                     // instead of being overwritten by the window value.
-                    resolved_table_bits = row_cfg
+                    let bits = row_cfg
                         .hash_bits
                         .min(row_hash_bits_for_window(table_window_size));
-                    row.set_hash_bits(resolved_table_bits);
-                }
+                    row.set_hash_bits(bits);
+                    bits
+                } else {
+                    row_cfg.hash_bits
+                };
                 row.reset();
             }
             MatcherStorage::HashChain(hc) => {
@@ -6150,6 +6235,18 @@ impl MatchGeneratorDriver {
     ) {
         self.config_override = Some((search, parse));
     }
+
+    /// Test-only: reset `level` routed onto the lazy HashChain pairing.
+    /// The lazy band runs on the Row backend in production, so HC-specific
+    /// behaviour (live-chain dict prime, eviction budget accounting, seed
+    /// pass gates) is exercised through this override-backed reset.
+    pub(crate) fn reset_on_hc_lazy(&mut self, level: CompressionLevel) {
+        self.set_config_override(
+            super::strategy::SearchMethod::HashChain,
+            super::strategy::ParseMode::Lazy2,
+        );
+        self.reset(level);
+    }
 }
 
 /// Drive a full compress parse for `data` at `level` (optionally with a
@@ -8025,9 +8122,11 @@ fn driver_best_to_fastest_releases_oversized_hc_tables() {
 fn driver_better_to_best_resizes_hc_tables() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
 
-    // Initialize at Better — allocates small HC tables (1M hash, 512K chain).
-    driver.reset(CompressionLevel::Better);
-    assert_eq!(driver.window_size(), (1u64 << 21));
+    // The lazy band runs on the Row backend now, so the HC resize path is
+    // exercised across two BT levels whose native `HcConfig` widths differ:
+    // L13 (hash_log 22, chain_log 22) -> L15 (hash_log 23, chain_log 23).
+    driver.reset(CompressionLevel::Level(13));
+    assert_eq!(driver.window_size(), (1u64 << 22));
 
     let mut space = driver.get_next_space();
     space[..12].copy_from_slice(b"abcabcabcabc");
@@ -8039,8 +8138,8 @@ fn driver_better_to_best_resizes_hc_tables() {
     let better_hash_len = hc.table.hash_table.len();
     let better_chain_len = hc.table.chain_table.len();
 
-    // Switch to Best — must resize to larger tables.
-    driver.reset(CompressionLevel::Best);
+    // Switch to L15 — must resize to larger tables.
+    driver.reset(CompressionLevel::Level(15));
     assert_eq!(driver.window_size(), (1u64 << 22));
 
     // Feed data to trigger ensure_tables with new sizes.
@@ -8053,13 +8152,13 @@ fn driver_better_to_best_resizes_hc_tables() {
     let hc = driver.hc_matcher();
     assert!(
         hc.table.hash_table.len() > better_hash_len,
-        "Best hash_table ({}) should be larger than Better ({})",
+        "L15 hash_table ({}) should be larger than L13 ({})",
         hc.table.hash_table.len(),
         better_hash_len
     );
     assert!(
         hc.table.chain_table.len() > better_chain_len,
-        "Best chain_table ({}) should be larger than Better ({})",
+        "L15 chain_table ({}) should be larger than L13 ({})",
         hc.table.chain_table.len(),
         better_chain_len
     );
@@ -8148,7 +8247,7 @@ fn prime_with_dictionary_applies_offset_history_even_when_content_is_empty() {
 #[test]
 fn hc_prime_with_empty_dictionary_disables_btultra2_seed_pass() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
-    driver.reset(CompressionLevel::Better);
+    driver.reset_on_hc_lazy(CompressionLevel::Better);
 
     driver.prime_with_dictionary(&[], [11, 7, 3]);
 
@@ -8213,7 +8312,7 @@ fn primed_snapshot_not_restored_across_ldm_config_change() {
 #[test]
 fn hc_prime_with_dictionary_disables_btultra2_seed_pass() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
-    driver.reset(CompressionLevel::Better);
+    driver.reset_on_hc_lazy(CompressionLevel::Better);
 
     driver.prime_with_dictionary(b"abcdefgh", [1, 4, 8]);
 
@@ -8432,7 +8531,9 @@ fn primed_snapshot_fast_attach_does_not_over_key_non_simple_backends() {
     // always primed the same way, so the bit must NOT enter their snapshot key
     // — otherwise an unhinted capture (which would record `fast_attach = true`)
     // and a hinted reset that resolves to the IDENTICAL `LevelParams` would key
-    // differently and force a needless re-prime. `Best` is a HashChain level.
+    // differently and force a needless re-prime. `Best` is a Row-backend lazy
+    // level; this also pins the Row arm recording its RESOLVED hash width on
+    // the unhinted path (a 0 default there keyed unhinted-vs-hinted apart).
     let mut driver = MatchGeneratorDriver::new(8, 1);
     let level = CompressionLevel::Best;
 
@@ -9569,7 +9670,7 @@ fn hc_prime_with_dictionary_preserves_history_for_first_full_block() {
 #[test]
 fn prime_with_dictionary_budget_shrinks_after_hc_eviction() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
-    driver.reset(CompressionLevel::Better);
+    driver.reset_on_hc_lazy(CompressionLevel::Better);
     // Use a small live window so dictionary-primed slices are evicted quickly.
     driver.hc_matcher_mut().table.max_window_size = 8;
     driver.reported_window_size = 8;
@@ -9607,7 +9708,7 @@ fn hc_commit_without_eviction_retires_no_dictionary_budget() {
     // as "evicted" and prematurely retire dictionary budget even when the
     // window is nowhere near full.
     let mut driver = MatchGeneratorDriver::new(8, 1);
-    driver.reset(CompressionLevel::Better);
+    driver.reset_on_hc_lazy(CompressionLevel::Better);
     // A large live window so a small committed block evicts nothing.
     driver.hc_matcher_mut().table.max_window_size = 1 << 20;
     driver.reported_window_size = 1 << 20;

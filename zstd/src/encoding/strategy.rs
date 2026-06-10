@@ -245,15 +245,16 @@ impl Strategy for Greedy {
     const SUFFICIENT_MATCH_LEN: usize = 32;
 }
 
-/// Levels 5-15 — donor `ZSTD_lazy2` on a hash chain. Levels inside
-/// the band differ only by runtime `HcConfig` fields (`search_depth`,
-/// `hash_log`, `chain_log`, `target_len`, `lazy_depth`), not by
+/// Levels 6-12 — donor `ZSTD_lazy`/`ZSTD_lazy2` on the row finder
+/// (donor row mode is the greedy..lazy2 default). Levels inside the
+/// band differ only by runtime `RowConfig` fields (`search_depth`,
+/// `hash_bits`, `row_log`, `target_len`, `lazy_depth`), not by
 /// compile-time `Strategy` consts, so they share a single type.
 #[derive(Copy, Clone, Debug, Default)]
 pub(crate) struct Lazy;
 
 impl Strategy for Lazy {
-    const BACKEND: BackendTag = BackendTag::HashChain;
+    const BACKEND: BackendTag = BackendTag::Row;
     const MIN_MATCH: usize = 4;
     const ACCURATE_PRICE: bool = false;
     const FAVOR_SMALL_OFFSETS: bool = true;
@@ -436,14 +437,16 @@ impl StrategyTag {
     }
 
     /// Bridge to [`BackendTag`] for the dispatcher entry point.
+    /// Greedy AND lazy run on the Row finder (donor
+    /// `ZSTD_resolveRowMatchFinderMode`: row mode is the default for
+    /// greedy..lazy2); the BT strategies keep the HashChain storage
+    /// (their tree scratch lives inside it).
     pub(crate) const fn backend(self) -> BackendTag {
         match self {
             Self::Fast => BackendTag::Simple,
             Self::Dfast => BackendTag::Dfast,
-            Self::Greedy => BackendTag::Row,
-            Self::Lazy | Self::Btlazy2 | Self::BtOpt | Self::BtUltra | Self::BtUltra2 => {
-                BackendTag::HashChain
-            }
+            Self::Greedy | Self::Lazy => BackendTag::Row,
+            Self::Btlazy2 | Self::BtOpt | Self::BtUltra | Self::BtUltra2 => BackendTag::HashChain,
         }
     }
 
@@ -455,8 +458,7 @@ impl StrategyTag {
         match self {
             Self::Fast => SearchMethod::Fast,
             Self::Dfast => SearchMethod::DoubleFast,
-            Self::Greedy => SearchMethod::RowHash,
-            Self::Lazy => SearchMethod::HashChain,
+            Self::Greedy | Self::Lazy => SearchMethod::RowHash,
             Self::Btlazy2 | Self::BtOpt | Self::BtUltra | Self::BtUltra2 => {
                 SearchMethod::BinaryTree
             }
