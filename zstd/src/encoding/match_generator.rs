@@ -5202,12 +5202,14 @@ impl HcMatchGenerator {
         );
         // `S::ACCURATE_PRICE` / `S::FAVOR_SMALL_OFFSETS` cannot appear
         // as const-generic arguments yet (`generic_const_exprs` is
-        // still unstable), so we keep the 4-arm runtime dispatch here.
-        // Each S monomorphisation only reaches one arm in practice
-        // (BtOpt → false/true, BtUltra/BtUltra2 → true/false), so the
-        // optimiser folds away the others.
-        let profile = initial_state.profile;
-        match (profile.accurate, profile.favor_small_offsets) {
+        // still unstable), so dispatch over a 4-arm match — but on the
+        // strategy's ASSOCIATED CONSTS, not the runtime profile (the
+        // `debug_assert_eq`s above pin the runtime profile to those
+        // consts). A const scrutinee folds the three dead arms at
+        // monomorphisation; matching the runtime profile instead kept
+        // all four `#[inline(always)]` DP bodies (~16 KB each) alive in
+        // EVERY `S` instantiation — ~360 KB of the wasm payload.
+        match (S::ACCURATE_PRICE, S::FAVOR_SMALL_OFFSETS) {
             (true, false) => self.build_optimal_plan_impl::<S, true, false>(
                 current,
                 current_abs_start,
