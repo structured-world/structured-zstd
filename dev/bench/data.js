@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781082624757,
+  "lastUpdate": 1781084954966,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -62954,6 +62954,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.273,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "26322be75f12478e76e37921244d7664d2fc429b",
+          "message": "perf(encode): close the level-4 dfast speed outlier (donor greedy double-fast) (#389)\n\n* perf(encode): cache fastpath kernel for repcode/cpl scans\n\nPick the FastpathKernel once per matcher (dfast stores it on the struct, row\nreuses its cached hash_kernel) and pass it into repcode_candidate_shared + a\nnew common_prefix_len_with_kernel, so the lazy match-finder byte-compares skip\nthe select_kernel() OnceLock atomic on every call. Behaviour-identical (same\nkernel, same prefix lengths); 819 lib tests pass. Foundation for the per-kernel\ntarget_feature lazy monolith.\n\n* perf(encode): add wasm simd128 fastpath kernel + dfast probe monolith\n\n- new fastpath simd128 module: v128 common_prefix_len / count_match\n  kernel mirroring neon, gated on target_feature=simd128 + kernel_simd128\n- FastpathKernel::Simd128 variant + detect/select + all three fastpath\n  dispatchers (cpl / hash-mix / count-match) wired\n- dfast probe_slot_match + start_matching_fast_loop gain per-kernel\n  simd128 target_feature wrappers so the v128 cpl inlines under one\n  umbrella on wasm (matches the existing x86/aarch64 monolith shape)\n\n819 lib tests pass byte-identical; wasm32 builds clean with and without\nthe simd128 payload.\n\n* perf(encode): lift dfast lazy loop into per-kernel target_feature monolith\n\nThe lazy `start_matching_general` path resolved the CPU kernel and crossed a\ntarget_feature ABI boundary on every per-position `common_prefix_len_ptr`\nscan (`#[inline]` cannot cross that boundary), so the SIMD match-length probe\nran as a non-inlinable call thousands of times per block.\n\nRestructure it the same way as `start_matching_fast_loop`: resolve the tier\nONCE per block, dispatch to a `start_matching_general_<kernel>`\n`#[target_feature]` wrapper, and inline the whole per-position search\n(repcode 3-probe + hash long/short probe + `_search_next_long` retry, each\nwith its `common_prefix_len_ptr` scan) under that one umbrella via body\nmacros. No per-position kernel dispatch, no per-scan ABI call.\n\nThe cold lazy-lookahead closure keeps one umbrella-boundary hop per deferral\n(rare vs the per-position search). The post-match `extend_with_repcode`\nrep-0 scan still uses the cached-kernel helper (shared with the fast loop).\n\n819 lib tests pass byte-identical; aarch64 / x86_64 / wasm32 (with and\nwithout simd128) all build clean.\n\n* perf(encode): inline dfast lazy lookahead into the kernel umbrella\n\nThe per-position search already inlined under one target_feature umbrella,\nbut the lazy lookahead still went through `pick_lazy_match_shared`'s closure,\nwhose body is a separate non-target_feature MIR body. Every deferral therefore\nABI-called the whole `repcode_candidate_<k>` + `hash_candidate_<k>` pair, a\nheavier boundary than the per-scan call it replaced.\n\nInline the donor lazy/lazy2 lookahead directly in the loop body (labeled\nblock, logic byte-identical to `pick_lazy_match_shared`) so the `+1` / `+2`\nre-probes call the tier's repcode/hash in-umbrella and their\n`common_prefix_len_ptr` scans inline. No closure, no per-deferral ABI hop.\n\n819 lib tests pass byte-identical; aarch64 / x86_64 / wasm32 build clean.\n\n* perf(encode): inline dfast fixed-width equality gates (drop libc memcmp)\n\nThe dfast hash-probe and rep-extend equality gates compared fixed 4/8-byte\nwindows with a slice `!=`, which lowers to a libc `__memcmp` CALL. On the\nlevel-4 dfast profile that call was ~14% self-time for what should be a\nsingle load + compare.\n\nRead each gate as one unaligned u32 (4-byte short-hash / rep gate) or u64\n(8-byte long-hash / retry gate) and compare. Bounds are already verified at\neach site, so the raw reads stay in range. Equality is byte-order-agnostic\n(both sides read identically), so output is unchanged.\n\n819 lib tests pass byte-identical; aarch64 / x86_64 build clean.\n\n* perf(encode): align dfast L3/L4 to donor greedy double-fast shape\n\nTwo donor-shape corrections for the dfast (level 3/4) match finder, both\nverified against `zstd_double_fast.c` + `clevels.h` (srcSize>256KB table):\n\n1. Route level 4 through the greedy double-fast loop (`use_fast_loop`), not\n   the lazy `start_matching_general` path. clevels.h marks L3 AND L4 as\n   `ZSTD_dfast`, and `ZSTD_compressBlock_doubleFast` has no lazy lookahead, so\n   L4 was paying ~8x the CPU on a lazy parse the donor never runs. The greedy\n   loop beats the donor on the decodecorpus fixture (rust 493704 vs ffi 526163)\n   at a fraction of the cost.\n\n2. Key the short hash on a 5-byte window (donor `ZSTD_hashPtr(ip, hBitsS, mls)`\n   with `mls = cParams.minMatch = 5`), not 4 bytes. A 4-byte key collides more\n   on repetitive/log-stream data, evicting useful single-slot entries the\n   donor's 5-byte key keeps. Applied to every short-hash site (build, insert,\n   probe, dict probe) for insert/probe consistency. Improves the corpus ratio\n   (general path 494756 -> 489712) and halves the large-log-stream gap.\n\nTail-position inserts keep the 4-byte read (only 4 bytes are in range there)\nand the dict equality gate keeps its 4-byte pre-check; both are bounded\nedges, not the hash key. 819 lib tests pass.\n\n* fix(encode): key dfast greedy double-fast on strategy, not numeric level\n\n`use_fast_loop` selected the greedy double-fast loop only for the numeric\nlevels that map to dfast by default (3/4/0/Default). A custom\n`Strategy::Dfast` set via the parameter API at any other level fell through\nto the lazy `start_matching_general` path — but the donor's `ZSTD_dfast` is\nALWAYS the greedy double-fast (`zstd_double_fast.c` has no lazy lookahead;\nlazy parsing is the separate `ZSTD_lazy`/`lazy2` strategy). Gate the greedy\nloop on the Dfast backend itself so a parameter-API `Strategy::Dfast` stays\ngreedy at every level, matching the donor. 819 lib tests pass.\n\n* refactor(encode): drop the non-donor lazy dfast path, greedy-only\n\nThe donor's `ZSTD_dfast` is the greedy double-fast at every level (no lazy\nlookahead exists — that is the separate `ZSTD_lazy`/`lazy2` strategy). With\nthe greedy loop now keyed on the Dfast backend, the lazy `start_matching_general`\npath was unreachable in production and only a parameter-API `Strategy::Dfast`\nat an off-table level could have hit it (now greedy too). Remove it:\n\n- delete `start_matching_general` + its per-kernel wrappers and the\n  general-only `repcode_candidate_*` / `hash_candidate_*` / `probe_slot_match_*`\n  methods, their body macros, `extend_backwards`, the `use_fast_loop` /\n  `lazy_depth` fields, and the now-dead `DFAST_TARGET_LEN` /\n  `DFAST_LOCAL_SKIP_TRIGGER` constants (~900 lines)\n- collapse the dict-attach branches that distinguished the two paths\n\nSeam fix for the donor 5-byte short hash: a position within `mls-1` bytes of\na block end cannot form its full short key when that block is processed (the\ntrailing bytes arrive with the next block), so `start_matching` now re-seeds\nthe previous block's boundary tail once history spans it (mirrors\n`skip_matching_dense`). Cross-block matches anchored in the seam are found\nagain. Two dfast unit tests that probed near-end / tiny-block positions the\ngreedy `ilimit` guard skips are restructured to donor-faithful sizes.\n\n819 lib tests pass; aarch64 / x86_64 / wasm32 build clean.\n\n* test(encode): exercise the Row backend in row dict-priming test\n\nrow_prime_with_dictionary_preserves_history_for_first_full_block reset\nLevel(4), which now routes to the Dfast backend — so it duplicated the Dfast\ndictionary-priming case and left RowMatchGenerator's priming path uncovered.\nLevel(5) is the greedy Row backend (LEVEL_TABLE row 5: Greedy / RowHash); reset\nthat instead so the test actually drives the Row matcher it asserts on.\n\n* fix(encode): require a full 5-byte key for the dfast short hash\n\n`short_hash_index` zero-padded short slices into a synthetic 5-byte key, so a\n4-byte-gated insert site could populate a short bucket for a start the donor\n(needing 5 bytes) would skip, evicting a valid entry. Make the 5-byte key a\nhard contract: the single short-insert site now gates on a 5-byte lookahead\n(the `start_matching` seam re-seed already covers a position once the next\nblock extends history), `short_hash_index` reads exactly 5 bytes (debug-asserts\nthe precondition), and `DFAST_SHORT_HASH_LOOKAHEAD` is 5 so seeding agrees.\n819 lib tests pass; ratio on z000033 / large-log unchanged.\n\n* perf(encode): use the cached kernel in the dfast fast-loop dispatcher\n\nThe x86 `start_matching_fast_loop` dispatcher still called `select_kernel()`\nper block, so the matcher-level kernel cache never drove the main hot path\n(an `OnceLock` load with std, uncached detection without). Match on the\ncached `self.kernel`, like the Row backend.\n\nAlso fix a dict-table priming gap: the early return in\n`prime_dict_tables_for_range` was keyed on `start_concat`, skipping seam\npositions in `[backfill_floor, start_concat)` that only become hashable once a\nlater dict chunk extends history (e.g. a 4+1 / 7+1 chunking). Gate the return\non `backfill_floor` so those seam inserts land and the attached dict tables\nstay complete.\n\n819 lib tests pass.\n\n* docs(encode): align dfast comments with the 5-byte short hash + Level 4 = Dfast\n\nUpdate the dict-prime SAFETY note to the 5-byte short-key contract (pos + 5),\nand correct stale test docs that described Level 4 as the Row/Greedy backend:\nLevel 4 is StrategyTag::Dfast (greedy double-fast); Level 5 is Row/Greedy. No\nbehaviour change.\n\n* test(encode): assert the real Row dispatch selector (driver.parse)\n\ndriver_level5_selects_row_backend checked row_matcher().lazy_depth, but the\nRow-vs-greedy routing in MatchGeneratorDriver::start_matching branches on\nself.parse == ParseMode::Greedy. Assert that selector directly so a regression\nis caught even if the mirrored lazy_depth field drifts; keep the lazy_depth\ncheck as secondary corroboration.",
+          "timestamp": "2026-06-09T16:49:23+03:00",
+          "tree_id": "6a0d1f4ab78e68ab9939035fa0378bdb6c26ebdc",
+          "url": "https://github.com/structured-world/structured-zstd/commit/26322be75f12478e76e37921244d7664d2fc429b"
+        },
+        "date": 1781084935930,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.125,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.085,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 329.77,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 230.901,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 2.718,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 2.865,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.453,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.009,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.347,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.961,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.101,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.202,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.101,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.202,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.015,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 16.024,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.79,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.274,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.301,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.834,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.257,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.582,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.125,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.388,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.138,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.108,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.27,
             "unit": "ms"
           }
         ]
