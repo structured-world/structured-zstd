@@ -691,14 +691,16 @@ fn dfast_hash_bits_for_window(max_window_size: usize) -> usize {
 }
 
 fn row_hash_bits_for_window(max_window_size: usize) -> usize {
-    // Window-derived cap on the row hash width (stricter than the donor
-    // `ZSTD_adjustCParams_internal` `hashLog <= windowLog + 1` bound, so a
-    // tiny hinted source keeps the tiny table). No constant upper clamp:
-    // the old `ROW_HASH_BITS` (20) ceiling predates the lazy band moving
-    // onto Row — L9-12 carry donor hashLog 21-23 and must keep it when the
-    // hinted window is large enough.
+    // Donor `ZSTD_adjustCParams_internal` cap: `hashLog <= windowLog + 1`.
+    // The `+ 1` is load-bearing for L12, whose donor hashLog (23) exceeds
+    // its windowLog (22) — a plain `windowLog` cap would shrink the L12
+    // table on EVERY hinted reset and split primed snapshots between
+    // hinted and unhinted frames that resolve to the identical geometry.
+    // No constant upper clamp: the old `ROW_HASH_BITS` (20) ceiling
+    // predates the lazy band moving onto Row (L9-12 carry donor hashLog
+    // 21-23).
     let window_log = (usize::BITS - 1 - max_window_size.leading_zeros()) as usize;
-    window_log.max(MIN_WINDOW_LOG as usize)
+    (window_log + 1).max(MIN_WINDOW_LOG as usize)
 }
 
 /// `floor(log2(window))` for the HashChain table-log cap (donor
@@ -7737,12 +7739,12 @@ fn driver_small_source_hint_shrinks_row_hash_tables() {
 
     // Wire `window_log` stays floored, but the row hash table is sized from
     // the RAW 1 KiB source: `table_window = 1 << 10`, so
-    // `row_hash_bits_for_window(1 << 10) = MIN_WINDOW_LOG` and the row count
-    // is `1 << (MIN_WINDOW_LOG - ROW_L5.row_log)`.
+    // `row_hash_bits_for_window(1 << 10) = 11` (donor `hashLog <=
+    // windowLog + 1`) and the row count is `1 << (11 - ROW_L5.row_log)`.
     assert_eq!(driver.window_size(), 1 << MIN_HINTED_WINDOW_LOG);
     assert_eq!(
         hinted_rows,
-        1 << ((MIN_WINDOW_LOG as usize) - ROW_L5.row_log)
+        1 << ((MIN_WINDOW_LOG as usize) + 1 - ROW_L5.row_log)
     );
     assert!(
         hinted_rows < full_rows,
@@ -8088,8 +8090,10 @@ fn pooled_space_keeps_capacity_when_slice_size_shrinks() {
 fn driver_best_to_fastest_releases_oversized_hc_tables() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
 
-    // Initialize at Best — allocates large HC tables (4M hash, 2M chain).
-    driver.reset(CompressionLevel::Best);
+    // Initialize at Best routed onto HashChain (the production `Best`
+    // resolves to Row now) — allocates large HC tables (4M hash, 2M chain)
+    // so the swap below exercises the HC drain path this test pins.
+    driver.reset_on_hc_lazy(CompressionLevel::Best);
     assert_eq!(driver.window_size(), (1u64 << 22));
 
     // Feed data so tables are actually allocated via ensure_tables().
@@ -9635,7 +9639,9 @@ fn prime_with_dictionary_budget_shrinks_after_dfast_eviction() {
 #[test]
 fn hc_prime_with_dictionary_preserves_history_for_first_full_block() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
-    driver.reset(CompressionLevel::Better);
+    // Route onto HashChain explicitly — `Better` resolves to the Row
+    // backend in production, and this test pins HC dict-prime behaviour.
+    driver.reset_on_hc_lazy(CompressionLevel::Better);
 
     driver.prime_with_dictionary(b"abcdefgh", [1, 4, 8]);
 

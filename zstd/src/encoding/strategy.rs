@@ -400,7 +400,12 @@ impl StrategyTag {
             1 | 2 => Self::Fast,
             3 | 4 => Self::Dfast,
             5 => Self::Greedy,
-            6..=15 => Self::Lazy,
+            6..=12 => Self::Lazy,
+            // 13-15 are btlazy2 in `LEVEL_TABLE` (BinaryTree finder on the
+            // HashChain storage). Folding them onto `Lazy` was harmless
+            // while `Lazy` also meant HashChain; with `Lazy` resolving to
+            // the Row finder the distinction is load-bearing.
+            13..=15 => Self::Btlazy2,
             16 | 17 => Self::BtOpt,
             18 => Self::BtUltra,
             19 => Self::BtUltra2,
@@ -548,7 +553,11 @@ mod tests {
         assert_eq!(StrategyTag::for_level(4), StrategyTag::Dfast);
         assert_eq!(StrategyTag::for_level(5), StrategyTag::Greedy);
         assert_eq!(StrategyTag::for_level(9), StrategyTag::Lazy);
-        assert_eq!(StrategyTag::for_level(15), StrategyTag::Lazy);
+        assert_eq!(StrategyTag::for_level(12), StrategyTag::Lazy);
+        // Donor `clevels.h` 13-15 are `ZSTD_btlazy2` — distinct from the
+        // Row-backed `Lazy` band.
+        assert_eq!(StrategyTag::for_level(13), StrategyTag::Btlazy2);
+        assert_eq!(StrategyTag::for_level(15), StrategyTag::Btlazy2);
         assert_eq!(StrategyTag::for_level(16), StrategyTag::BtOpt);
         assert_eq!(StrategyTag::for_level(17), StrategyTag::BtOpt);
         assert_eq!(StrategyTag::for_level(18), StrategyTag::BtUltra);
