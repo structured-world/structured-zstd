@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781015907786,
+  "lastUpdate": 1781052697947,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -62342,6 +62342,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.27,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9bdebb48842da1b68532570c98575e7368708c72",
+          "message": "perf(encode): reshape dfast match-find toward donor structure (#390)\n\n* perf(encode): drop dense literal-region insert in dfast (donor sparse parity)\n\nThe greedy double-fast inner loop already inserts every position it visits\n(step-accelerated), exactly like the donor cursor. emit_candidate ALSO bulk-\ninserted the whole literal run [literals_start, match_start) — re-hashing\nstepped-over and position-0 starts the donor never inserts (its loop starts at\nip+1 and skips on a growing step). Drop that bulk insert: insert_positions was\n~6.7% self-time on the L3 dfast profile. Ratio cost is ~1% on z000033 (still\nbeats the C reference by ~5.5%); the inner-loop + sparse 3-target post-match\ninsert carry the rest. 824 lib tests pass.\n\n* perf(encode): branchless match-validity in the dfast hot loop (donor cmov parity)\n\nThe long and short candidate checks branched on slot-empty / in-window /\nbefore-cursor per position, mispredicting on every miss in the 35%-self-time\ninner loop. Fold each into a bitwise `in_long`/`in_short` mask, mask the\ncandidate index to 0 (history start, always readable) when invalid so the\n8/4-byte load never faults, and reject the dummy read with a final\n`& in_long`/`& in_short` — only the rare actual-match branch remains. Mirrors\nthe donor `ZSTD_selectAddr` cmov trick. Byte-identical output: 824 lib tests\npass unchanged.\n\n* refactor(encode): route dfast fast-loop byte source through scan_source()\n\nThe fast loop re-snapshots its byte-source cursor (history base ptr,\nstart offset, abs start, position base, concat len) at the top of every\nouter iteration. Fold those five reads into one `scan_source()` call so\nthe kernel body no longer hardwires the owned `history` concat: the owned\npath returns its rebased fields unchanged, and a borrowed one-shot window\ncan later return its own constant descriptor without the 760-line kernel\nbody changing. Hash-table pointers stay direct (mode-invariant). Pure\nbyte-identical refactor: 824 lib tests pass unchanged.\n\n* feat(encode): add dfast borrowed-window descriptor (inert until wired)\n\nAdd the `borrowed: Option<(input_ptr, block_end)>` field to the dfast\nmatcher and teach `scan_source()` to return the absolute-offset borrowed\ndescriptor when set. Mirrors the Fast backend's borrowed window so a\nlater one-shot frame path can scan dfast blocks in place instead of\ncopying each into the owned `history` concat. Field stays `None` (owned\npath) until the borrowed entry + dispatch land, so output is unchanged:\n824 lib tests pass byte-identical. Cleared on reset() so no stale input\npointer survives a frame.\n\n* refactor(encode): source dfast insert_position bytes through scan_source()\n\nThe seam re-seed and match-interior 3-target inserts hash bytes read\nstraight from the owned `history` concat. Route them through\n`scan_source()` instead so a borrowed window's out-of-loop re-seeds hash\nthe in-place input with the same keys, and pack the absolute position\ndirectly (no rebase) when a borrowed window is active. Owned path keeps\nits rebase guard + pack_slot exactly: 824 lib tests pass byte-identical.\n\n* refactor(encode): source dfast extend-backwards concat through scan_source ptr\n\nThe 7 in-loop `extend_backwards_shared` call sites built their concat\nslice as `&self.history[history_start_offset..]`, hardwiring the owned\nhistory Vec. Build it from the `scan_source()` raw pointer + concat_len\nalready in scope instead, so a borrowed window's backward match-extension\nreads the in-place input. Byte-identical for the owned path (same slice):\n824 lib tests pass unchanged.\n\n* refactor(encode): source dfast emit + tail-probe bytes through scan_source\n\nRoute the remaining owned-history reads in the emit path through the\nborrowed-aware accessors: emit_candidate / emit_trailing_literals take\nthe active block via current_block_ptr_len(), extend_with_repcode and\nprobe_tail_ip0_only read concat through scan_source, and get_last_space\nreports the staged borrowed block range. The borrowed window descriptor\ngains its block_start so get_last_space can size the literal reserve. All\nraw-ptr backed so the emit path keeps taking &mut self for offset_hist.\nOwned path byte-identical: 824 lib tests pass unchanged.\n\n* feat(encode): borrowed-aware dfast insert_positions + rebase gating\n\nSplit the borrowed descriptor into frame-level borrowed_input (ptr,len)\nand per-block borrowed_block (start,end), mirroring the Fast backend.\nRoute the batch insert_positions byte source through scan_source(), and\ngate every u32-packing rebase (insert_position, insert_positions, the\nfast-loop entry ensure_room_for) to the owned path: a borrowed window\npacks absolute input offsets with position_base==0 and the eligibility\ngate caps input_len<=u32::MAX, so a reduce() would corrupt the absolute\nslots. All read paths now source from the borrowed input when set. Still\ninert (no entry sets the window): 824 lib tests byte-identical.\n\n* feat(encode): scan dfast frames in place via the borrowed one-shot path\n\nWire the borrowed no-copy block loop through to the DoubleFast backend:\nadd set_borrowed_window / start_matching_borrowed / skip_matching_borrowed\nto the dfast matcher, route the driver's borrowed dispatch + block staging\nto Dfast (not just Simple), and extend borrowed_eligible to accept Dfast\nfor in-window inputs (no-dict, <= u32::MAX, input <= advertised window —\nwhere the owned path never evicts so absolute-offset borrowed matching is\nbyte-identical). dfast L3/L4 single-frame compression of an in-window\ninput now scans the input in place instead of copying every block into\nthe owned history concat (the dominant per-frame cost). A new unit test\nasserts the borrowed scan emits the identical sequence stream + rep state\nas the owned path; 825 lib tests pass.\n\n* perf(encode): compress blocks directly into the output buffer\n\nThe Fast/dfast block emit compressed each block into a fresh per-block\n`Vec` then copied it into the frame's output accumulator — a per-block\nalloc/grow/free plus an extend-memcpy, the dominant per-frame memmove on\nthe hot path. Reserve the fixed 3-byte block header in `output`, run\ncompress_block straight into it, then backfill the header in place once\nthe payload length is known (new BlockHeader::to_le_bytes for the no-Vec\nbackfill). On the incompressible fallback, truncate back to the reserved\noffset and emit raw. Applied to both the borrowed one-shot and owned\nemit paths. Byte-identical output: 825 lib tests pass.\n\n* test(bench): reused-compressor encode-loop for amortized-alloc profiling\n\nencode_loop_z000033 constructs a fresh FrameCompressor per iter so its\nflamegraph is dominated by per-frame table alloc/memset/page-faults,\nhiding the compute hot path. This variant reuses one compressor via\ncompress_independent_frame_into so allocation amortizes and the profile\nshows the real match-find + sequence-emit + entropy split (the shape a\ncaller reusing one compressor sees).\n\n* perf(encode): write one-shot frames in place, drop the all_blocks copy\n\nA one-shot frame's content size is known up front, yet we accumulated\nevery compressed block into a fresh per-frame all_blocks Vec and then\ncopied the whole thing (header + ~all of it) into the caller's output via\nwrite_frame_to_vec. A reused-compressor flamegraph showed that copy +\nthe all_blocks grow/free as the dominant per-frame memmove/realloc —\nthe only per-frame allocation that did NOT amortize across reuse.\n\ncompress_independent_frame_into now builds the frame header first (FCS\nknown = input.len()), reserves compress_bound once, and runs the block\nloop straight into the caller's buffer (run_one_frame / the two block\nloops take &mut Vec and append from its end; the borrowed loop's donor\nsplit savings is measured relative to the block-region start so the\nheader prefix can't skew block boundaries). The streaming drain path is\nunchanged (content size unknown until EOF → still accumulates). Drops the\nnow-unused write_frame_to_vec. Byte-identical output: 825 lib tests pass.\n\n* test(bench): dhat per-alloc-site profiling for the reuse encode example (#211)\n\nAdd a `dhat-heap` dev feature that swaps dhat's heap profiler in as the\nglobal allocator for encode_loop_reuse_z000033, giving per-call-site\nallocation count + bytes. libc-frame-pointer-broken flamegraphs cannot\nattribute the encoder's allocation traffic to Rust call sites; dhat does.\nFirst run pinned the reused-compressor churn at ~5065 allocations PER\nFRAME, dominated by the huff0 Huffman-table builder + BitWriter growth.\n\n* perf(encode): score Huffman table_log candidates without building each table\n\nbuild_from_counts ran the table_log search by materialising a full\nHuffmanTable (codes + packed_codes Vecs) for every candidate just to read\nits max code length and estimate compressed size — then discarded all but\nthe winner. Both quantities derive directly from the candidate weights\n(`nb_bits = table_log + 1 - weight`), so compute them via new\nmax_bits_from_weights / estimate_compressed_size_from_weights helpers and\nbuild the selected table exactly once after the loop. Byte-identical\noutput (same table_log selection, same final table): 825 lib tests pass.\nCuts per-frame encoder heap allocations on z000033 L3 reused by ~9%; the\nresidual churn is the per-candidate weight/leaf tree-build scratch (next).\n\nAdds a dhat-heap-gated build_from_counts call counter used to measure it.\n\n* Revert \"perf(encode): score Huffman table_log candidates without building each table\"\n\nThis reverts commit ed98d14ce0c0d5a20d5d6e1d3bc63a7d59dc2663.\n\n* perf(encode): prefetch input ahead in the dfast match-find loop (donor parity)\n\nDWARF profiling (perf --call-graph dwarf, not the libc-unwind-broken\nflamegraph) shows start_matching_fast_loop at 44.72% self-time — the real\ndfast-encode bottleneck — and it is memory-latency bound: hash-table\nloads + the 8-byte candidate verify dominate its hot instructions. Mirror\nthe donor PREFETCH_L1 hints from ZSTD_compressBlock_doubleFast: one\n`ip + 256` input prefetch per inner iteration, plus `ip1 + 64/+128` on\neach skip-step bump (the step-accelerated cursor outruns the hardware\nprefetcher). Portable prefetch_l1_at helper (x86/aarch64 + no-op\nfallback). Prefetch is a hint — byte-identical output, 825 lib tests pass.\n\n* Revert \"perf(encode): prefetch input ahead in the dfast match-find loop (donor parity)\"\n\nThis reverts commit 753ac6eb750f48a6baef2d4de0d6ddd4b95bb317.\n\n* Reapply \"perf(encode): prefetch input ahead in the dfast match-find loop (donor parity)\"\n\nThis reverts commit 7b89e0ba59ad683af344758b929c2155fd30afc3.\n\n* perf(encode): prefetch the dfast hash-table slots, not the input\n\nThe first prefetch attempt mirrored the donor's input PREFETCH_L1(ip+256),\nwhich warms the sequential input the HW prefetcher already covers — no\nhelp, just overhead. perf --call-graph dwarf annotate shows the loop\nstalls on the RANDOM-ACCESS hash-table slot loads (~21% self-time), which\nno prefetcher predicts. Target those instead: right after hl1_idx is\ncomputed (~100 instructions before its slot is read by the _search_next_long\nretry), prefetch long_hash[hl1_idx]; and prefetch short_hash for the next\ninner position (keyed on the same v8_1 bytes that become the next ip0).\nDrop the useless input prefetches. Byte-identical: 825 lib tests pass.\n\n* perf(encode): split dfast scan into const-monomorphised dict/no-dict kernels\n\nThe dfast match-find loop checked a loop-invariant use_dict flag and\ncarried the full dict dual-probe code on EVERY position, even for the\ncommon no-dict path — perf --call-graph dwarf put the loop at 44.7%\nself-time and codegen showed its inner body at ~3x the donor's per-mls\nloop, dominated by the inlined dict probes. Hoist the dict decision to\nthe dispatcher (resolved once, off the hot path) and make each per-kernel\nloop const-generic over USE_DICT, so the dict probe is compiled in or out\nat the call shape. The no-dict kernel now carries zero dict code and zero\nper-position dict branch (donor keeps noDict / dictMatchState as separate\nfunctions for the same reason). Byte-identical: 825 lib tests pass.\n\n* perf(encode): branchy dfast match-validity to speculate candidate load\n\nThe dfast hot loop verified each long/short candidate behind a branchless\nZSTD_selectAddr-style mask: fold slot-populated / in-window / before-cursor\ninto an in_long/in_short bitmask, then mask the candidate index to 0 when\ninvalid so the equality load never faults. That tied the load ADDRESS to\nthe mask, serialising the loop's single hottest instruction (the candidate\n8-byte compare, ~13% self-time on z000033) behind the mask computation.\n\nRestore branchy validity (the shape the ip1 long retry already uses): the\nslot / in-window / before-cursor checks are highly predictable once the\ntable is warm, so the branch predictor speculates the candidate load past\nthem instead of waiting on the mask. Output is byte-identical (177 encode\n+ cross-validation tests).\n\n* perf(encode): monomorphise dfast scan on borrowed vs owned source\n\nThe dfast match-find loop sourced its byte buffer through scan_source()\nevery outer iteration, returning a runtime quintet (base ptr + start\noffset + abs-start + position-base + len). On the borrowed one-shot\nwindow those three rebase coordinates are always 0, but the compiler\ncannot prove it (the value flows through a runtime borrowed/owned branch),\nso the borrowed hot path (the L3/L4 fast scan) carried the full owned\nabstraction arithmetic on every position: an abs-start subtraction per\nload address, plus an always-true cand_pos >= abs_start lower-bound\ncompare per candidate.\n\nAdd a BORROWED const generic alongside USE_DICT and monomorphise the\nkernel per source. The borrowed kernel supplies start_offset / abs_start /\nposition_base as literal 0, so every per-position abs - abs_start term\nfolds to the bare absolute position and the redundant lower-bound check\nconst-folds away (donor base + index shape, single < cursor compare).\nA borrowed block never carries a dict (borrowed_eligible rejects it), so\nonly three of four combinations instantiate; <true, true> is unreachable.\n\nByte-identical: 275 encode + cross-validation + borrowed-equals-owned\nroundtrip tests pass.",
+          "timestamp": "2026-06-10T02:59:02+03:00",
+          "tree_id": "bfb6199f0c4b3e8f34eacd6315f46495ebf93d6c",
+          "url": "https://github.com/structured-world/structured-zstd/commit/9bdebb48842da1b68532570c98575e7368708c72"
+        },
+        "date": 1781052685317,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.129,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.112,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 298.363,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 265.883,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.538,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.407,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.266,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.028,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.151,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.965,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.11,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.11,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.013,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 12.018,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 4.805,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.217,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.316,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.943,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.21,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.635,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.098,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.396,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.143,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.12,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.26,
             "unit": "ms"
           }
         ]
