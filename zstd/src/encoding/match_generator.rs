@@ -53,6 +53,10 @@ use std::arch::is_aarch64_feature_detected;
 use std::arch::is_x86_feature_detected;
 
 pub(crate) const DFAST_MIN_MATCH_LEN: usize = 5;
+// Bytes the dfast short hash reads (donor `mls = 5`). Seeding / lookahead
+// guards use it so a position is only short-hashed once its full 5-byte key
+// is in range.
+pub(crate) const DFAST_SHORT_HASH_LOOKAHEAD: usize = 5;
 pub(crate) const ROW_MIN_MATCH_LEN: usize = 5;
 // Donor `clevels.h:31` at level 3 large-input bucket sets
 // `hashLog = 17` (the long-hash table) and `chainLog = 16` (the
