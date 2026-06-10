@@ -38,15 +38,26 @@ use support::{
 
 static BENCHMARK_SCENARIOS: OnceLock<Vec<Scenario>> = OnceLock::new();
 
-/// Enable `ZSTD_c_enableLongDistanceMatching` on an FFI bulk compressor for
-/// the LDM variants; a no-op for the plain numeric levels.
-fn apply_ffi_ldm(compressor: &mut zstd::bulk::Compressor<'_>, level: &LevelConfig) {
+/// Apply the matrix variant's options to an FFI bulk compressor: LDM for
+/// the `*_ldm*` variants and the checksum flag (parity with both
+/// `ffi_encode_to_vec` and the Rust encoder's default).
+fn configure_ffi_bulk_compressor(compressor: &mut zstd::bulk::Compressor<'_>, level: &LevelConfig) {
     if level.ldm {
         compressor
             .set_parameter(zstd::zstd_safe::CParameter::EnableLongDistanceMatching(
                 true,
             ))
             .expect("FFI bulk compressor accepts EnableLongDistanceMatching");
+    }
+    // Checksum parity with the no-dict groups: `ffi_encode_to_vec` sets
+    // `ZSTD_c_checksumFlag` under the `hash` feature, but the bulk
+    // compressors used by the dictionary arms default it OFF — leaving the
+    // Rust side (content checksum on by default) paying the XXH64 pass the
+    // FFI side skipped (~6% of frame time on small dict frames).
+    if cfg!(feature = "hash") {
+        compressor
+            .set_parameter(zstd::zstd_safe::CParameter::ChecksumFlag(true))
+            .expect("FFI bulk compressor accepts ChecksumFlag");
     }
 }
 
@@ -664,16 +675,16 @@ fn bench_dictionary(c: &mut Criterion) {
             // the plain compress/decompress groups, not the dictionary group.
             // Everything else runs here: the numeric levels (unchanged
             // behaviour) and the `*_ldm_dict` variants (`dict = true`), the
-            // latter with LDM enabled on both sides via `apply_ffi_ldm` /
+            // latter with LDM enabled on both sides via `configure_ffi_bulk_compressor` /
             // `ldm_parameters` below.
             if level.ldm && !level.dict {
                 continue;
             }
             let mut no_dict = zstd::bulk::Compressor::new(level.ffi_level).unwrap();
-            apply_ffi_ldm(&mut no_dict, &level);
+            configure_ffi_bulk_compressor(&mut no_dict, &level);
             let mut with_dict =
                 zstd::bulk::Compressor::with_dictionary(level.ffi_level, &ffi_dictionary).unwrap();
-            apply_ffi_ldm(&mut with_dict, &level);
+            configure_ffi_bulk_compressor(&mut with_dict, &level);
             let no_dict_bytes = no_dict.compress(&scenario.bytes).unwrap();
             let with_dict_bytes = with_dict.compress(&scenario.bytes).unwrap();
 
@@ -745,7 +756,7 @@ fn bench_dictionary(c: &mut Criterion) {
             group.bench_function("c_ffi_without_dict", |b| {
                 b.iter(|| {
                     let mut compressor = zstd::bulk::Compressor::new(level.ffi_level).unwrap();
-                    apply_ffi_ldm(&mut compressor, &level);
+                    configure_ffi_bulk_compressor(&mut compressor, &level);
                     black_box(compressor.compress(&scenario.bytes).unwrap())
                 })
             });
@@ -767,7 +778,7 @@ fn bench_dictionary(c: &mut Criterion) {
                 let mut compressor =
                     zstd::bulk::Compressor::with_dictionary(level.ffi_level, &ffi_dictionary)
                         .unwrap();
-                apply_ffi_ldm(&mut compressor, &level);
+                configure_ffi_bulk_compressor(&mut compressor, &level);
                 b.iter(|| black_box(compressor.compress(&scenario.bytes).unwrap()))
             });
 
