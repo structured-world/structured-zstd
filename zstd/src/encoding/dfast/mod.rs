@@ -2464,6 +2464,26 @@ macro_rules! start_matching_fast_loop_body {
                 ip1 += step;
                 hl0_idx = hl1_idx;
                 idxl0 = idxl1;
+
+                // Prefetch the NEXT iteration's long-match candidate. `idxl0`
+                // (carried from `idxl1`) points at a random hash-indexed match
+                // position that the long check at the top of the next iter
+                // loads + compares against `v8_0` — the loop's single hottest
+                // instruction (~22% self-time), stalling on exactly this fetch.
+                // Issuing it here hides the load latency behind a full
+                // iteration of hash + rep + short-probe work, the maximal
+                // distance available. An empty / out-of-window `idxl0` yields a
+                // wrapping address whose prefetch is a no-op (ISA spec), so no
+                // validity branch is needed. On the borrowed kernel the rebase
+                // coords fold to 0, collapsing this to `base + (idxl0 - 1)`.
+                let pf_cand_off = history_start_offset.wrapping_add(
+                    position_base
+                        .wrapping_add((idxl0 as usize).wrapping_sub(1))
+                        .wrapping_sub(history_abs_start),
+                );
+                crate::decoding::prefetch::prefetch_l1_at(
+                    history_base_ptr.wrapping_add(pf_cand_off),
+                );
                 if ip1 + HASH_READ_SIZE > $current_len {
                     // First position the fast loop did NOT pack into the
                     // hash tables. `seed_remaining_hashable_starts` will
