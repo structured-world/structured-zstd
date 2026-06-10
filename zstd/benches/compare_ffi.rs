@@ -666,6 +666,15 @@ fn bench_dictionary(c: &mut Criterion) {
             let no_dict_bytes = no_dict.compress(&scenario.bytes).unwrap();
             let with_dict_bytes = with_dict.compress(&scenario.bytes).unwrap();
 
+            // Diagnostic: dump the FFI dict-encoded payload next to the
+            // trained dict (same env gate) so standalone profiling binaries
+            // (`decode_loop_dict`) can decode the EXACT bytes the
+            // `decompress-dict/...` bench arm measures.
+            if let Ok(dir) = std::env::var("STRUCTURED_ZSTD_DUMP_DICT_DIR") {
+                let path = format!("{dir}/{}.{}.zst", scenario.id, level.name);
+                std::fs::write(&path, &with_dict_bytes).expect("dump dict payload");
+            }
+
             // Rust dict-compressed output size, for the compress-dict
             // compression-ratio report (rust vs FFI). Only computable when the
             // dictionary parsed into a Rust handle; mirrors the gate the
