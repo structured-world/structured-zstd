@@ -422,7 +422,7 @@ macro_rules! gen_row_probe {
                 return None;
             }
 
-            let (row, tag) = self.hash_and_row_cached(abs_pos)?;
+            let (row, tag) = self.hash_and_row(abs_pos)?;
             let row_entries = 1usize << ROW_LOG;
             let row_mask = row_entries - 1;
             let row_base = row << ROW_LOG;
@@ -742,31 +742,6 @@ pub(crate) struct RowMatchGenerator {
     /// activates the bounded dict probe in `row_candidate_rl`; built once and
     /// cached across frames via `DictAttach`, invalidated on eviction / resize.
     pub(crate) dict: DictAttach<RowDictTables>,
-    /// Donor `ZSTD_row_fillHashCache` ring: `(row, tag)` precomputed for the
-    /// position `ROW_PREFETCH_DISTANCE` ahead of the lazy scan, filled
-    /// together with the row prefetch so the probe (and the post-miss
-    /// insert) reuse the hash instead of recomputing it. Entries are keyed
-    /// by exact `abs_pos` (`usize::MAX` = empty) and the ring is poisoned at
-    /// the top of every block scan — `add_data` may rebase the absolute
-    /// coordinate origin between blocks, which would otherwise let a new
-    /// position collide with a stale entry's key.
-    hash_cache: [RowHashCacheEntry; ROW_PREFETCH_DISTANCE],
-}
-
-/// One [`RowMatchGenerator::hash_cache`] slot.
-#[derive(Copy, Clone)]
-struct RowHashCacheEntry {
-    pos: usize,
-    row: u32,
-    tag: u8,
-}
-
-impl RowHashCacheEntry {
-    const EMPTY: Self = Self {
-        pos: usize::MAX,
-        row: 0,
-        tag: 0,
-    };
 }
 
 impl RowMatchGenerator {
@@ -791,7 +766,6 @@ impl RowMatchGenerator {
             row_tags: Vec::new(),
             tag_kernel: crate::encoding::fastpath::select_kernel(),
             dict: DictAttach::new(),
-            hash_cache: [RowHashCacheEntry::EMPTY; ROW_PREFETCH_DISTANCE],
         }
     }
 
@@ -1039,11 +1013,6 @@ impl RowMatchGenerator {
             self.insert_positions::<ROW_LOG>(backfill_start, current_abs_start);
         }
 
-        // Poison the hash ring at block-scan entry: `add_data` can rebase
-        // the absolute coordinate origin between blocks, so a stale entry's
-        // key could collide with a new position over different bytes.
-        self.hash_cache = [RowHashCacheEntry::EMPTY; ROW_PREFETCH_DISTANCE];
-
         let mls = self.mls;
         let mut pos = 0usize;
         let mut literals_start = 0usize;
@@ -1051,11 +1020,10 @@ impl RowMatchGenerator {
             let abs_pos = current_abs_start + pos;
             let lit_len = pos - literals_start;
 
-            // Donor `ZSTD_row_fillHashCache` cadence: hash + prefetch the
-            // row a few positions ahead so the probe's tag/position loads
-            // are L1-resident by the time the scan reaches them, and the
-            // probe / post-miss insert reuse the cached hash.
-            self.fill_hash_cache_ahead(abs_pos);
+            // Donor `ZSTD_row_fillHashCache` cadence: prefetch the row a
+            // few positions ahead so the probe's tag/position loads are
+            // L1-resident by the time the scan reaches them.
+            self.prefetch_row(abs_pos + ROW_PREFETCH_DISTANCE);
             let best = self.best_match_rl::<K, ROW_LOG>(abs_pos, lit_len);
             if let Some(candidate) = self.pick_lazy_match_rl::<K, ROW_LOG>(abs_pos, lit_len, best) {
                 self.insert_match_span::<ROW_LOG>(abs_pos, candidate.start + candidate.match_len);
@@ -1359,27 +1327,17 @@ impl RowMatchGenerator {
         self.history_abs_start + self.live_history().len()
     }
 
-    /// Donor `ZSTD_row_fillHashCache` step: hash the position
-    /// `ROW_PREFETCH_DISTANCE` ahead of the scan, remember its `(row,
-    /// tag)` in the ring so the probe / post-miss insert reuse it, and
-    /// prefetch the row's tag bytes + position words toward L1 (donor
-    /// `ZSTD_row_prefetch`). The row address depends only on input bytes
-    /// (not on table contents), so unlike a chain-walk candidate the
-    /// load is NOT on a serial dependency chain and the prefetch
-    /// genuinely overlaps the current position's work.
+    /// Donor `ZSTD_row_prefetch`: pull the row's tag bytes and position
+    /// words toward L1 ahead of the probe that will touch them. The row
+    /// address depends only on input bytes (not on table contents), so
+    /// unlike a chain-walk candidate the load is NOT on a serial
+    /// dependency chain and prefetching genuinely overlaps it with the
+    /// current position's work. x86-only (the bench-relevant targets);
+    /// other arches compile it out.
     #[inline(always)]
-    fn fill_hash_cache_ahead(&mut self, abs_pos: usize) {
-        let ahead = abs_pos + ROW_PREFETCH_DISTANCE;
-        let Some((row, tag)) = self.hash_and_row(ahead) else {
-            return;
-        };
-        self.hash_cache[ahead % ROW_PREFETCH_DISTANCE] = RowHashCacheEntry {
-            pos: ahead,
-            row: row as u32,
-            tag,
-        };
+    fn prefetch_row(&self, abs_pos: usize) {
         #[cfg(target_arch = "x86_64")]
-        {
+        if let Some((row, _tag)) = self.hash_and_row(abs_pos) {
             let row_base = row << self.row_log;
             let entries = 1usize << self.row_log;
             // SAFETY: `row_base` indexes a full row inside the tag /
@@ -1400,21 +1358,8 @@ impl RowMatchGenerator {
                 }
             }
         }
-    }
-
-    /// [`Self::hash_and_row`] with a ring-cache fast path: an exact
-    /// `abs_pos` hit returns the precomputed `(row, tag)` from
-    /// [`Self::fill_hash_cache_ahead`]; anything else (lookahead probes
-    /// past the fill horizon, match-span inserts after a jump) falls back
-    /// to the plain hash. Same value either way — the cache is purely a
-    /// recompute saver.
-    #[inline(always)]
-    fn hash_and_row_cached(&self, abs_pos: usize) -> Option<(usize, u8)> {
-        let entry = self.hash_cache[abs_pos % ROW_PREFETCH_DISTANCE];
-        if entry.pos == abs_pos {
-            return Some((entry.row as usize, entry.tag));
-        }
-        self.hash_and_row(abs_pos)
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = abs_pos;
     }
 
     pub(crate) fn hash_and_row(&self, abs_pos: usize) -> Option<(usize, u8)> {
@@ -1696,9 +1641,7 @@ impl RowMatchGenerator {
 
     #[inline]
     fn insert_position<const ROW_LOG: usize>(&mut self, abs_pos: usize) {
-        // Cached lookup: a post-miss insert at the scan position reuses the
-        // hash the probe just consumed for the same `abs_pos`.
-        let Some((row, tag)) = self.hash_and_row_cached(abs_pos) else {
+        let Some((row, tag)) = self.hash_and_row(abs_pos) else {
             return;
         };
         // `ROW_LOG` is the compile-time row width for this monomorphisation;
