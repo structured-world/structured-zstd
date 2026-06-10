@@ -42,8 +42,11 @@ fn main() {
         let n = decoder
             .decode_all_with_dict_handle(payload.as_slice(), output.as_mut_slice(), &handle)
             .expect("dict decode should succeed");
+        // A short decode means the (payload, dict, expected_len) triple is
+        // mismatched — fail loudly instead of profiling the wrong workload.
+        assert_eq!(n, expected_len, "decoded length mismatch");
         sink = sink.wrapping_add(n);
-        core::hint::black_box(&output);
+        core::hint::black_box(&output[..n]);
     }
 
     eprintln!(

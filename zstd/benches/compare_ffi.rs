@@ -571,13 +571,19 @@ fn bench_dictionary(c: &mut Criterion) {
         // compress-dict bench/REPORT use. Gated on an env var so normal
         // bench runs are unaffected.
         if let Ok(dir) = std::env::var("STRUCTURED_ZSTD_DUMP_DICT_DIR") {
+            // Diagnostic artifacts are non-critical: warn and keep benching on
+            // I/O failure instead of aborting the whole run.
             let path = format!("{dir}/{}.dict", scenario.id);
-            std::fs::write(&path, &ffi_dictionary).expect("dump dict");
+            if let Err(err) = std::fs::write(&path, &ffi_dictionary) {
+                eprintln!("BENCH_WARN failed to dump dict {path}: {err}");
+            }
             // Scenario input bytes too, so standalone profiling binaries
             // (`encode_loop_dict` / `decode_loop_dict`) can replay the
             // exact (input, dict) pair this scenario benches.
             let path = format!("{dir}/{}.bin", scenario.id);
-            std::fs::write(&path, scenario.bytes.as_slice()).expect("dump scenario bytes");
+            if let Err(err) = std::fs::write(&path, scenario.bytes.as_slice()) {
+                eprintln!("BENCH_WARN failed to dump scenario bytes {path}: {err}");
+            }
         }
 
         if emit_reports {
@@ -676,8 +682,11 @@ fn bench_dictionary(c: &mut Criterion) {
             // (`decode_loop_dict`) can decode the EXACT bytes the
             // `decompress-dict/...` bench arm measures.
             if let Ok(dir) = std::env::var("STRUCTURED_ZSTD_DUMP_DICT_DIR") {
+                // Non-critical diagnostic: warn, do not abort the bench.
                 let path = format!("{dir}/{}.{}.zst", scenario.id, level.name);
-                std::fs::write(&path, &with_dict_bytes).expect("dump dict payload");
+                if let Err(err) = std::fs::write(&path, &with_dict_bytes) {
+                    eprintln!("BENCH_WARN failed to dump dict payload {path}: {err}");
+                }
             }
 
             // Rust dict-compressed output size, for the compress-dict
