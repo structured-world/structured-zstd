@@ -1248,6 +1248,11 @@ impl DfastMatchGenerator {
         }
     }
 
+    // Force-inline on native (the dfast monolithization speedup) but NOT on
+    // wasm32, where inlining these per-match helpers into every call site
+    // bloats the module past the .wasm size budget; wasm is size-, not
+    // speed-sensitive, so let LLVM keep them out-of-line there.
+    #[cfg_attr(not(target_arch = "wasm32"), inline(always))]
     fn emit_candidate(
         &mut self,
         current_abs_start: usize,
@@ -1361,6 +1366,7 @@ impl DfastMatchGenerator {
         self.history_abs_start + self.live_history().len()
     }
 
+    #[cfg_attr(not(target_arch = "wasm32"), inline(always))]
     pub(crate) fn insert_positions(&mut self, start: usize, end: usize) {
         // Source the byte buffer + rebase coordinates through `scan_source()`
         // so a borrowed window's batch re-seed hashes the in-place input
