@@ -261,11 +261,11 @@ impl Strategy for Lazy {
     const USE_HASH3: bool = false;
     const USE_BT: bool = false;
     const OPT_LEVEL: u8 = 0;
-    // Lazy is HashChain-backed but `USE_BT == false`, so the optimal
-    // parser entry point is unreachable for this strategy. These
-    // values mirror the donor `lazy2` cost profile (would be the
-    // right defaults if a future caller did build a profile for the
-    // lazy/hc path), but with no current reader the same
+    // Lazy runs on the Row backend with `USE_BT == false`, so the
+    // optimal parser entry point is unreachable for this strategy.
+    // These values mirror the donor `lazy2` cost profile (would be
+    // the right defaults if a future caller did build a profile for
+    // the lazy path), but with no current reader the same
     // unreachable-by-design contract from `Fast` applies.
     const MAX_CHAIN_DEPTH: usize = 8;
     const SUFFICIENT_MATCH_LEN: usize = 32;

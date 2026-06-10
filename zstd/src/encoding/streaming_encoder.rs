@@ -45,8 +45,9 @@ pub struct StreamingEncoder<W: Write, M: Matcher = MatchGeneratorDriver> {
     magicless: bool,
     /// Whether to emit a trailing XXH64 content checksum and set the frame
     /// header's `Content_Checksum_flag` (upstream `ZSTD_c_checksumFlag`).
-    /// Default `true`; combined with the `hash` feature, so without `hash`
-    /// no checksum is emitted regardless. See [`Self::set_content_checksum`].
+    /// Default `false`, matching the upstream library default; combined with
+    /// the `hash` feature, so without `hash` no checksum is emitted
+    /// regardless. See [`Self::set_content_checksum`].
     content_checksum: bool,
     /// Dictionary applied to the frame (donor `ZSTD_CCtx_loadDictionary` on a
     /// streaming context). `None` = no dictionary. Set before the first write.

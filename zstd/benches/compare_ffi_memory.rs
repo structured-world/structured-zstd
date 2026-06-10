@@ -504,11 +504,14 @@ fn main() {
 
                 let (rust_compressed, rust_peak) = measure_peak(|| {
                     let mut compressor: FrameCompressor = FrameCompressor::new(level.rust_level);
-                    // Full feature gate: checksum on, matching the FFI arm.
-                    compressor.set_content_checksum(cfg!(feature = "hash"));
+                    // Params before the checksum flag — same ordering as
+                    // `rust_encode_to_vec` so every bench arm configures the
+                    // compressor identically.
                     if let Some(params) = &ldm_params {
                         compressor.set_parameters(params);
                     }
+                    // Full feature gate: checksum on, matching the FFI arm.
+                    compressor.set_content_checksum(cfg!(feature = "hash"));
                     compressor
                         .set_dictionary_from_bytes(&dict)
                         .expect("dictionary should attach");
@@ -562,10 +565,12 @@ fn main() {
             // Full feature gate: checksum on, matching the FFI arm.
             let (rust_compressed, rust_peak) = measure_peak(|| {
                 let mut compressor: FrameCompressor = FrameCompressor::new(level.rust_level);
-                compressor.set_content_checksum(cfg!(feature = "hash"));
+                // Params before the checksum flag — same ordering as
+                // `rust_encode_to_vec`.
                 if let Some(params) = &ldm_params {
                     compressor.set_parameters(params);
                 }
+                compressor.set_content_checksum(cfg!(feature = "hash"));
                 compressor.compress_independent_frame(&scenario.bytes[..])
             });
             let (ffi_compressed, ffi_peak) =

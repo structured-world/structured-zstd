@@ -803,13 +803,13 @@ fn bench_dictionary(c: &mut Criterion) {
                     // a `set_source`/`set_drain` call — pin them to the
                     // defaults so inference has a concrete type.
                     let mut compressor: FrameCompressor = FrameCompressor::new(level.rust_level);
-                    // Full feature gate: checksum on, matching the FFI arms.
-                    compressor.set_content_checksum(cfg!(feature = "hash"));
                     // Enable LDM before attaching the dictionary (see the
                     // warmup compressor above for why the order is safe).
                     if let Some(params) = ldm_parameters(&level) {
                         compressor.set_parameters(&params);
                     }
+                    // Full feature gate: checksum on, matching the FFI arms.
+                    compressor.set_content_checksum(cfg!(feature = "hash"));
                     compressor
                         .set_encoder_dictionary(
                             EncoderDictionary::from_bytes(&ffi_dictionary)
