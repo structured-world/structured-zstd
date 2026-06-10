@@ -420,6 +420,7 @@ mod tests {
         let mut state = CompressState {
             matcher: HintProbeMatcher::default(),
             last_huff_table: None,
+            huff_table_spare: None,
             fse_tables: FseTables::new(),
             block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
             offset_hist: [1, 4, 8],
@@ -453,6 +454,7 @@ mod tests {
         let mut state = CompressState {
             matcher: HintProbeMatcher::default(),
             last_huff_table: None,
+            huff_table_spare: None,
             fse_tables: FseTables::new(),
             block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
             offset_hist: [1, 4, 8],

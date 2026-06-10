@@ -141,7 +141,12 @@ pub(crate) struct CompressedBlockScratch {
     prefix_sums: SequencePrefixSums,
     compressed: Vec<u8>,
     estimator_sequences: Vec<crate::blocks::sequence_section::Sequence>,
-    estimator_workspace: EstimatorWorkspace,
+    /// Lazily allocated: only the block-split estimator path uses it, and
+    /// `compress_block`'s `mem::take` constructs a throwaway `Default`
+    /// scratch every block — an eager workspace made that default pay four
+    /// 2 KiB `Box<[usize; 256]>` allocations per block for paths that never
+    /// probe a split.
+    estimator_workspace: Option<EstimatorWorkspace>,
     /// Reusable scratch for the block-split estimator's inner
     /// `CompressState` — kept across frames so the estimator does not
     /// re-allocate a whole `CompressedBlockScratch` (4×`Box<[u32;256]>`
@@ -312,7 +317,7 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
 
     scratch.partitions.clear();
     scratch.prefix_sums.rebuild(&scratch.parts.sequences);
-    let mut workspace = core::mem::take(&mut scratch.estimator_workspace);
+    let mut workspace = scratch.estimator_workspace.take().unwrap_or_default();
     // Reuse the estimator's inner scratch across frames instead of
     // allocating a fresh `CompressedBlockScratch` (count tables + Vecs)
     // every block-split. Lazily created on the first split.
@@ -334,6 +339,7 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
         scratch_state: CompressState {
             matcher: EntropyOnlyMatcher,
             last_huff_table: state.last_huff_table.clone(),
+            huff_table_spare: None,
             fse_tables: clone_fse_tables(&state.fse_tables),
             block_scratch: inner_scratch,
             offset_hist: state.offset_hist,
@@ -344,7 +350,7 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
     estimator.derive_block_splits(0, scratch.parts.sequences.len(), &mut scratch.partitions);
     scratch.partitions.push(scratch.parts.sequences.len());
     workspace = estimator.workspace;
-    scratch.estimator_workspace = workspace;
+    scratch.estimator_workspace = Some(workspace);
     // Stash the inner scratch back for the next frame (its buffers stay
     // allocated; the estimator clears them per use).
     scratch.estimator_inner = Some(Box::new(estimator.scratch_state.block_scratch));
@@ -541,7 +547,7 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
     // costs match emit byte-for-byte.
     if !literals_vec.is_empty() && all_bytes_identical(literals_vec) {
         rle_literals(literals_vec, &mut writer);
-        state.last_huff_table = None;
+        state.clear_huff_table();
     } else if literals_vec.len() >= min_lits {
         match compress_literals(
             literals_vec,
@@ -550,16 +556,16 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
             strategy,
         ) {
             HuffmanTableUpdate::New(table) => {
-                state.last_huff_table.replace(table);
+                state.replace_huff_table(table);
             }
             HuffmanTableUpdate::Reused => {}
             HuffmanTableUpdate::Cleared => {
-                state.last_huff_table = None;
+                state.clear_huff_table();
             }
         }
     } else {
         raw_literals(literals_vec, &mut writer);
-        state.last_huff_table = None;
+        state.clear_huff_table();
     }
 
     // sequences section
@@ -2604,6 +2610,7 @@ mod tests {
                 let mut est_state = CompressState::<EntropyOnlyMatcher> {
                     matcher: EntropyOnlyMatcher,
                     last_huff_table: seed_table.clone(),
+                    huff_table_spare: None,
                     fse_tables: FseTables::new(),
                     block_scratch: CompressedBlockScratch::new(),
                     offset_hist: [1, 4, 8],
@@ -2612,6 +2619,7 @@ mod tests {
                 let mut emit_state = CompressState::<EntropyOnlyMatcher> {
                     matcher: EntropyOnlyMatcher,
                     last_huff_table: seed_table,
+                    huff_table_spare: None,
                     fse_tables: FseTables::new(),
                     block_scratch: CompressedBlockScratch::new(),
                     offset_hist: [1, 4, 8],
@@ -2655,6 +2663,7 @@ mod tests {
         let mut state = CompressState {
             matcher: super::EntropyOnlyMatcher,
             last_huff_table: None,
+            huff_table_spare: None,
             fse_tables: FseTables::new(),
             block_scratch: super::CompressedBlockScratch::new(),
             offset_hist: [10, 20, 30],

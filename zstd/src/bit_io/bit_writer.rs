@@ -17,6 +17,10 @@ pub(crate) struct BitWriter<V: AsMut<Vec<u8>>> {
 
 impl BitWriter<Vec<u8>> {
     /// Initialize a new writer.
+    // Production encode paths write into caller-owned buffers via `from`;
+    // the owned-`Vec` constructor (and `dump` below) only serve the
+    // dictionary trainer and test/fuzz round-trips.
+    #[cfg(any(test, feature = "fuzz_exports", feature = "dict_builder"))]
     pub fn new() -> Self {
         Self {
             output: Vec::new(),
@@ -412,6 +416,7 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
     ///
     /// This function consumes the writer, so it cannot be used after
     /// dumping
+    #[cfg(any(test, feature = "fuzz_exports", feature = "dict_builder"))]
     pub fn dump(mut self) -> V {
         if self.misaligned() != 0 {
             panic!(

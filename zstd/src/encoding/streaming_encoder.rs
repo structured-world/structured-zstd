@@ -115,6 +115,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             state: CompressState {
                 matcher,
                 last_huff_table: None,
+                huff_table_spare: None,
                 fse_tables: FseTables::new(),
                 block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
                 offset_hist: [1, 4, 8],
