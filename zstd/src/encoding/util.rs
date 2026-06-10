@@ -20,13 +20,13 @@ pub fn find_min_size(val: u64) -> usize {
     8
 }
 
-/// Returns the same value, but represented using the smallest number of bytes needed.
-/// Returned vector will be 1, 2, 4, or 8 bytes in length. Zero is represented as 1 byte.
+/// Appends the value represented using the smallest number of bytes needed
+/// (1, 2, 4, or 8; zero takes 1 byte) directly onto `output`.
 ///
 /// Operates in **little-endian**.
-pub fn minify_val(val: u64) -> Vec<u8> {
+pub fn write_minified_val(val: u64, output: &mut Vec<u8>) {
     let new_size = find_min_size(val);
-    val.to_le_bytes()[0..new_size].to_vec()
+    output.extend_from_slice(&val.to_le_bytes()[0..new_size]);
 }
 
 /// Returns the minimum FCS field size for the given content size.
@@ -56,8 +56,15 @@ pub fn find_fcs_field_size(val: u64, single_segment: bool) -> usize {
 mod tests {
     use super::find_fcs_field_size;
     use super::find_min_size;
-    use super::minify_val;
+    use super::write_minified_val;
     use alloc::vec;
+    use alloc::vec::Vec;
+
+    fn minify_val(val: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_minified_val(val, &mut out);
+        out
+    }
 
     #[test]
     fn min_size_detection() {

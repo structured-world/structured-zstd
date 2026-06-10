@@ -1,4 +1,4 @@
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeSet;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -23,14 +23,40 @@ pub const DEFAULT_K_CANDIDATES: &[usize] = &[64, 128, 256, 512, 1024, 2048];
 pub const DEFAULT_D_CANDIDATES: &[usize] = &[6, 8, 12, 16];
 pub const DEFAULT_F_CANDIDATES: &[u32] = &[16, 18, 20];
 
-fn hash_dmer(dmer: &[u8]) -> u64 {
-    // 64-bit FNV-1a, deterministic and cheap for d-mer hashing.
-    let mut h = 0xcbf29ce484222325u64;
-    for &b in dmer {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x100000001b3);
+// Donor multiplicative hash primes (`ZSTD_hashXPtr` family,
+// `zstd/lib/common/zstd_internal.h`): one unaligned read + one multiply per
+// dmer instead of a per-byte FNV loop.
+const PRIME_4_BYTES: u32 = 2_654_435_761;
+const PRIME_5_BYTES: u64 = 889_523_592_379;
+const PRIME_6_BYTES: u64 = 227_718_039_650_203;
+const PRIME_7_BYTES: u64 = 58_295_818_150_454_627;
+const PRIME_8_BYTES: u64 = 0xCF1B_BCDC_B7A5_6463;
+
+/// Bytes a dmer hash reads at a position: the hash covers the first
+/// `min(d, 8)` bytes but the wide read is always 8 (donor
+/// `readLength = MAX(d, 8)`), except the pure 4-byte hash.
+#[inline]
+fn dmer_read_len(d: usize) -> usize {
+    d.max(8)
+}
+
+/// Donor `FASTCOVER_hashPtrToIndex`: hash the first `min(d, 8)` bytes of the
+/// dmer at `pos` into an `f`-bit table index. Caller guarantees
+/// `pos + dmer_read_len(d) <= sample.len()`.
+#[inline]
+fn hash_dmer_index(sample: &[u8], pos: usize, f: u32, d: usize) -> usize {
+    if d.min(8) == 4 {
+        let v = u32::from_le_bytes(sample[pos..pos + 4].try_into().unwrap());
+        return (v.wrapping_mul(PRIME_4_BYTES) >> (32 - f)) as usize;
     }
-    h
+    let v = u64::from_le_bytes(sample[pos..pos + 8].try_into().unwrap());
+    let h = match d.min(8) {
+        5 => (v << 24).wrapping_mul(PRIME_5_BYTES),
+        6 => (v << 16).wrapping_mul(PRIME_6_BYTES),
+        7 => (v << 8).wrapping_mul(PRIME_7_BYTES),
+        _ => v.wrapping_mul(PRIME_8_BYTES),
+    };
+    (h >> (64 - f)) as usize
 }
 
 fn clamp_table_bits(f: u32) -> u32 {
@@ -48,18 +74,21 @@ pub(crate) fn normalize_fastcover_params(mut params: FastCoverParams) -> FastCov
 fn build_frequency_table(sample: &[u8], d: usize, f: u32, accel: usize) -> Vec<u32> {
     let bits = clamp_table_bits(f);
     let size = 1usize << bits;
-    let mask = size - 1;
+    // Donor accel table: `skip = accel - 1` dmers between counted dmers
+    // (`FASTCOVER_defaultAccelParameters`), i.e. a stride of `accel`.
     let step = accel.max(1);
     let mut table = vec![0u32; size];
 
-    if sample.len() < d || d == 0 {
+    let read_len = dmer_read_len(d);
+    if sample.len() < read_len {
         return table;
     }
 
     let mut i = 0usize;
-    while i + d <= sample.len() {
-        let slot = (hash_dmer(&sample[i..i + d]) as usize) & mask;
-        table[slot] = table[slot].saturating_add(1);
+    while i + read_len <= sample.len() {
+        // A count is bounded by the dmer count (`sample.len()`), far below
+        // `u32::MAX` for any trainable corpus — plain increment.
+        table[hash_dmer_index(sample, i, bits, d)] += 1;
         i += step;
     }
     table
@@ -73,128 +102,136 @@ fn build_raw_dict(sample: &[u8], dict_size: usize, params: FastCoverParams) -> V
     let params = normalize_fastcover_params(params);
     let k = params.k;
     let d = params.d;
-    let mut active = build_frequency_table(sample, d, params.f, params.accel);
-    let mask = active.len().saturating_sub(1);
-
-    // Segment indices are stored as `u32` in the inverted index, so cap
-    // the segment count at `u32::MAX` to keep the `i as u32` cast lossless.
-    // A corpus large enough to hit this (> u32::MAX segments, multiple TB)
-    // is far outside dictionary-training territory; the `take` is a no-op
-    // for any realistic input and only drops the unreachable tail otherwise.
-    let segments: Vec<&[u8]> = sample
-        .chunks(k)
-        .filter(|seg| seg.len() >= d)
-        .take(u32::MAX as usize)
-        .collect();
-    let n = segments.len();
-    let mut out = Vec::with_capacity(dict_size);
-    if n == 0 {
-        return out;
+    let f = clamp_table_bits(params.f);
+    let read_len = dmer_read_len(d);
+    if sample.len() < read_len {
+        // Too short for even one wide-read dmer: no trainable content.
+        // Callers treat an empty raw dict as "sample too small".
+        return Vec::new();
     }
 
-    // Greedy set-cover selection. The plain top-frequency selection picks
-    // several high-frequency segments that cover the SAME d-mers (redundant
-    // coverage), wasting the dictionary budget. Greedy instead picks, each
-    // round, the segment whose STILL-UNCOVERED d-mers score highest, then
-    // marks those d-mers covered so later rounds value only NEW coverage —
-    // diverse coverage in fewer bytes.
-    //
-    // To keep this affordable at any corpus size (no per-size special-
-    // casing), scores are cached and updated incrementally: an inverted
-    // index `slot -> [(segment, count)]` lets "covering" a chosen segment's
-    // d-mers decrement the score of every other segment containing them in
-    // O(shared occurrences), instead of re-scoring all segments each round.
-    // Scores accumulate `count * frequency` products. Both factors are
-    // u32, so the product can reach ~2^64 and a running sum exceeds it —
-    // accumulate in u64 so the arithmetic is exact on 32-bit targets
-    // (i686) too, where `usize` would wrap.
-    let mut scores = vec![0u64; n];
-    let mut inverted: BTreeMap<usize, Vec<(u32, u32)>> = BTreeMap::new();
-    for (i, seg) in segments.iter().enumerate() {
-        let mut local: BTreeMap<usize, u32> = BTreeMap::new();
-        for w in seg.windows(d) {
-            *local.entry((hash_dmer(w) as usize) & mask).or_insert(0) += 1;
-        }
-        for (slot, cnt) in local {
-            scores[i] += u64::from(cnt) * u64::from(active[slot]);
-            inverted.entry(slot).or_default().push((i as u32, cnt));
-        }
+    // Donor `FASTCOVER_buildDictionary` epoch model: split the corpus into
+    // epochs of dmers and round-robin them, taking the best k-byte segment
+    // per visit. A segment's score is the sum of frequencies of its DISTINCT
+    // dmers, maintained incrementally while the candidate window slides
+    // (O(1) per position via the `segment_freqs` occurrence counts), and a
+    // chosen segment's dmer frequencies are zeroed so later picks value only
+    // new coverage. This replaced a global greedy set-cover with a per-
+    // segment inverted index (`BTreeMap` per segment + slot lists): that
+    // shape allocated millions of map nodes on a 1 MiB corpus and ran an
+    // order of magnitude slower than the reference trainer at equal
+    // coverage quality.
+    let nb_dmers = sample.len() - read_len + 1;
+    let mut freqs = build_frequency_table(sample, d, f, params.accel);
+    let dmers_in_k = k - d + 1; // `normalize` guarantees k >= d
+
+    // Donor `COVER_computeEpochs` (passes = 1): target one selection per
+    // epoch, with a floor so epochs stay large enough to contain useful
+    // segments.
+    let min_epoch_size = k * 10;
+    let mut epoch_count = (dict_size / k).max(1);
+    let mut epoch_size = nb_dmers / epoch_count;
+    if epoch_size < min_epoch_size {
+        epoch_size = min_epoch_size.min(nb_dmers);
+        epoch_count = (nb_dmers / epoch_size).max(1);
     }
 
-    let mut used = vec![false; n];
-    while out.len() < dict_size {
-        let mut best: Option<(u64, usize)> = None; // (score, index)
-        for (i, &score) in scores.iter().enumerate() {
-            if used[i] {
-                continue;
+    // Per-window dmer occurrence counts (donor `segmentFreqs`, u16: a window
+    // holds at most `dmers_in_k` <= k occurrences of one index).
+    let mut segment_freqs = vec![0u16; 1usize << f];
+    // Fill from the back (donor layout) so the best segments sit at the end
+    // of the dictionary and get referenced with the smallest offsets.
+    let mut out = vec![0u8; dict_size];
+    let mut tail = dict_size;
+    const MAX_ZERO_SCORE_RUN: usize = 10;
+    let mut zero_score_run = 0usize;
+    let mut epoch = 0usize;
+
+    while tail > 0 {
+        let epoch_begin = epoch * epoch_size;
+        let epoch_end = epoch_begin + epoch_size;
+        epoch = (epoch + 1) % epoch_count;
+
+        // Slide the candidate window across the epoch, tracking the best
+        // segment (donor `FASTCOVER_selectSegment`).
+        let mut best_begin = 0usize;
+        let mut best_end = 0usize;
+        let mut best_score = 0u64;
+        let mut active_begin = epoch_begin;
+        let mut active_end = epoch_begin;
+        let mut active_score = 0u64;
+        while active_end < epoch_end {
+            let idx = hash_dmer_index(sample, active_end, f, d);
+            if segment_freqs[idx] == 0 {
+                active_score += u64::from(freqs[idx]);
             }
-            if best.is_none_or(|(bs, _)| score > bs) {
-                best = Some((score, i));
-            }
-        }
-        // No remaining segment covers any still-active d-mer — every
-        // distinct pattern is already represented, so adding more (now
-        // redundant) segments would only waste budget. Stop early; the
-        // dict may be < dict_size (a compact dict, like the reference's).
-        let Some((_, idx)) = best.filter(|&(s, _)| s > 0) else {
-            break;
-        };
-        used[idx] = true;
-        let seg = segments[idx];
-        let take = seg.len().min(dict_size - out.len());
-        out.extend_from_slice(&seg[..take]);
-        // Cover the d-mers of the bytes we ACTUALLY appended (`seg[..take]`,
-        // not the full segment): zero their remaining frequency and decrement
-        // the cached score of every segment that shared them. The d-mers are
-        // recomputed here (runs once per selected segment, far cheaper than
-        // keeping a per-segment slot list resident for the whole corpus). A
-        // d-mer that recurs within this segment is already zeroed on its
-        // first occurrence, so the `freq == 0` guard makes the repeat a
-        // no-op (correct dedup).
-        for w in seg[..take].windows(d) {
-            let slot = (hash_dmer(w) as usize) & mask;
-            let freq = active[slot];
-            if freq == 0 {
-                continue;
-            }
-            active[slot] = 0;
-            // Each segment's initial score added `count(slot) * freq` for
-            // this exact `slot` (with `freq` = the build-time frequency,
-            // unchanged until this single zeroing), so subtracting it now is
-            // exact and can never underflow — plain subtraction (no
-            // saturating mask, no overflow: u32*u32 fits u64). The
-            // debug_assert documents the invariant; a violation is a
-            // bookkeeping bug, surfaced loudly rather than silently clamped.
-            let contribution = u64::from(freq);
-            if let Some(list) = inverted.get(&slot) {
-                for &(j, cnt) in list {
-                    let delta = u64::from(cnt) * contribution;
-                    debug_assert!(
-                        scores[j as usize] >= delta,
-                        "fastcover score underflow: bookkeeping invariant violated",
-                    );
-                    scores[j as usize] -= delta;
+            active_end += 1;
+            segment_freqs[idx] += 1;
+            if active_end - active_begin == dmers_in_k + 1 {
+                let del = hash_dmer_index(sample, active_begin, f, d);
+                segment_freqs[del] -= 1;
+                if segment_freqs[del] == 0 {
+                    active_score -= u64::from(freqs[del]);
                 }
+                active_begin += 1;
+            }
+            if active_score > best_score {
+                best_begin = active_begin;
+                best_end = active_end;
+                best_score = active_score;
             }
         }
+        // Reset the window counts for the next epoch.
+        while active_begin < epoch_end {
+            let del = hash_dmer_index(sample, active_begin, f, d);
+            segment_freqs[del] -= 1;
+            active_begin += 1;
+        }
+        // Zero the chosen segment's frequencies: its dmers are covered.
+        for pos in best_begin..best_end {
+            freqs[hash_dmer_index(sample, pos, f, d)] = 0;
+        }
+
+        if best_score == 0 {
+            // This epoch has no uncovered content left; other epochs may.
+            // Give up after a run of empty epochs (donor `maxZeroScoreRun`).
+            zero_score_run += 1;
+            if zero_score_run >= MAX_ZERO_SCORE_RUN {
+                break;
+            }
+            continue;
+        }
+        zero_score_run = 0;
+
+        let segment_size = (best_end - best_begin + d - 1).min(tail);
+        if segment_size < d {
+            break;
+        }
+        tail -= segment_size;
+        out[tail..tail + segment_size]
+            .copy_from_slice(&sample[best_begin..best_begin + segment_size]);
     }
+
+    out.drain(..tail);
     out
 }
 
 fn coverage_score(dict: &[u8], eval: &[u8], d: usize, accel: usize) -> usize {
-    if dict.len() < d || eval.len() < d || d == 0 {
+    let read_len = dmer_read_len(d);
+    if dict.len() < read_len || eval.len() < read_len || d == 0 {
         return 0;
     }
+    const COVERAGE_F: u32 = 20;
     let mut seen = BTreeSet::new();
-    for i in 0..=(dict.len() - d) {
-        seen.insert(hash_dmer(&dict[i..i + d]));
+    for i in 0..=(dict.len() - read_len) {
+        seen.insert(hash_dmer_index(dict, i, COVERAGE_F, d));
     }
 
     let mut hits = 0usize;
     let step = accel.max(1);
     let mut i = 0usize;
-    while i + d <= eval.len() {
-        if seen.contains(&hash_dmer(&eval[i..i + d])) {
+    while i + read_len <= eval.len() {
+        if seen.contains(&hash_dmer_index(eval, i, COVERAGE_F, d)) {
             hits += 1;
         }
         i += step;

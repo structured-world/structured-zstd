@@ -33,6 +33,15 @@ use std::env;
 
 use structured_zstd::encoding::{CompressionLevel, FrameCompressor};
 
+// With `--features dhat-heap`, route every allocation through the dhat heap
+// profiler (same pattern as `encode_loop_reuse_z000033`) so the run records
+// per-call-site allocation counts + bytes — the per-frame churn signal that
+// allocator-slow targets (musl) amplify into wall time. Writes
+// `dhat-heap.json` on `Profiler` drop.
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 /// Byte-for-byte the bench `repeated_log_lines(len)` fixture so a `logs<N>`
 /// input reproduces the `*-log-lines` dashboard scenarios exactly.
 fn repeated_log_lines(len: usize) -> Vec<u8> {
@@ -65,6 +74,9 @@ fn resolve_input(spec: &str) -> Vec<u8> {
 }
 
 fn main() {
+    #[cfg(feature = "dhat-heap")]
+    let _dhat = dhat::Profiler::new_heap();
+
     let args: Vec<String> = env::args().collect();
     let level: i32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(22);
     let iters: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(20_000);

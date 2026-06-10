@@ -564,6 +564,12 @@ pub(crate) fn optimal_block_size(
 pub(crate) struct CompressState<M: Matcher> {
     pub(crate) matcher: M,
     pub(crate) last_huff_table: Option<crate::huff0::huff0_encoder::HuffmanTable>,
+    /// Recycled `HuffmanTable` buffers: when a block clears or replaces
+    /// `last_huff_table`, the old table parks here instead of dropping, so
+    /// the next frame's dictionary entropy seed `clone_from`s into existing
+    /// allocations. Without this, every dict-seeded frame whose last block
+    /// ended raw/RLE paid a fresh two-Vec table clone per frame.
+    pub(crate) huff_table_spare: Option<crate::huff0::huff0_encoder::HuffmanTable>,
     pub(crate) fse_tables: FseTables,
     pub(crate) block_scratch: crate::encoding::blocks::CompressedBlockScratch,
     /// Offset history for repeat offset encoding: [rep0, rep1, rep2].
@@ -587,6 +593,26 @@ pub(crate) struct CompressState<M: Matcher> {
     /// encoder constructor) plumb this explicitly. Tests that build
     /// `CompressState` by hand must also supply a value.
     pub(crate) strategy_tag: crate::encoding::strategy::StrategyTag,
+}
+
+impl<M: Matcher> CompressState<M> {
+    /// Clears `last_huff_table`, parking the table's buffers in
+    /// `huff_table_spare` for reuse instead of dropping them.
+    #[inline]
+    pub(crate) fn clear_huff_table(&mut self) {
+        if let Some(table) = self.last_huff_table.take() {
+            self.huff_table_spare = Some(table);
+        }
+    }
+
+    /// Replaces `last_huff_table` with `table`, parking any displaced table
+    /// in `huff_table_spare` for reuse.
+    #[inline]
+    pub(crate) fn replace_huff_table(&mut self, table: crate::huff0::huff0_encoder::HuffmanTable) {
+        if let Some(old) = self.last_huff_table.replace(table) {
+            self.huff_table_spare = Some(old);
+        }
+    }
 }
 
 /// Per-frame setup resolved once by [`FrameCompressor::prepare_frame`] and
@@ -747,6 +773,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             state: CompressState {
                 matcher: MatchGeneratorDriver::new(1024 * 128, 1),
                 last_huff_table: None,
+                huff_table_spare: None,
                 fse_tables: FseTables::new(),
                 block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
                 offset_hist: [1, 4, 8],
@@ -924,15 +951,16 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         // dominant per-frame memmove + the only un-amortized per-frame alloc
         // even when the compressor is reused).
         let total_uncompressed = input.len() as u64;
-        let header_buf = self.build_frame_header(total_uncompressed, &prep);
         let emit_checksum = cfg!(feature = "hash") && self.content_checksum;
         let checksum_len = if emit_checksum { 4 } else { 0 };
         out.clear();
-        // Reserve the worst-case compressed size ONCE so the block appends
-        // below never realloc; the caller reuses `out` across frames, so the
-        // reservation is paid on the first frame and amortizes to zero.
-        out.reserve(header_buf.len() + crate::encoding::compress_bound(input.len()) + checksum_len);
-        out.extend_from_slice(&header_buf);
+        // Reserve the worst-case compressed size ONCE so the header + block
+        // appends below never realloc; the caller reuses `out` across
+        // frames, so the reservation is paid on the first frame and
+        // amortizes to zero. 18 = max frame header (magic 4 + descriptor 1
+        // + window 1 + dict id 4 + FCS 8).
+        out.reserve(18 + crate::encoding::compress_bound(input.len()) + checksum_len);
+        self.append_frame_header(total_uncompressed, &prep, out);
         let header_len = out.len();
         let _ = self.run_one_frame(input, &prep, out);
         #[cfg(feature = "hash")]
@@ -1082,6 +1110,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             state: CompressState {
                 matcher,
                 last_huff_table: None,
+                huff_table_spare: None,
                 fse_tables: FseTables::new(),
                 block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
                 offset_hist: [1, 4, 8],
@@ -1161,11 +1190,22 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// Total heap bytes this compressor's allocations hold, excluding the
     /// inline struct: the match-finder tables / history / recycled buffers and
     /// the primed-dictionary snapshot (via the matcher), the retained
-    /// dictionary content, the cached dictionary entropy tables (literals
-    /// Huffman + LL/ML/OF FSE), and the per-block sidecar buffers. Lets a
-    /// context report its true footprint through `ZSTD_sizeof_CCtx`.
+    /// Huffman tables (active + recycled spare), the retained dictionary
+    /// content, the cached dictionary entropy tables (literals Huffman +
+    /// LL/ML/OF FSE), and the per-block sidecar buffers. Lets a context
+    /// report its true footprint through `ZSTD_sizeof_CCtx`.
     pub fn heap_size(&self) -> usize {
         let mut total = self.state.matcher.heap_size();
+        total += self
+            .state
+            .last_huff_table
+            .as_ref()
+            .map_or(0, |table| table.heap_size());
+        total += self
+            .state
+            .huff_table_spare
+            .as_ref()
+            .map_or(0, |table| table.heap_size());
         total += self
             .dictionary
             .as_ref()
@@ -1350,9 +1390,26 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             }
         }
         if let Some(cache) = cached_entropy {
-            self.state.last_huff_table.clone_from(&cache.huff);
+            // Refill an empty slot from the recycled spare before
+            // `clone_from`: `Option::clone_from(None ← Some)` falls back to
+            // a fresh clone (two Vec allocations), while `Some ← Some`
+            // delegates to the table's buffer-reusing `clone_from`. Frames
+            // whose last block cleared the table would otherwise re-clone
+            // the dict seed every frame.
+            match &cache.huff {
+                Some(src) => {
+                    if self.state.last_huff_table.is_none() {
+                        self.state.last_huff_table = self.state.huff_table_spare.take();
+                    }
+                    match &mut self.state.last_huff_table {
+                        Some(dst) => dst.clone_from(src),
+                        slot => *slot = Some(src.clone()),
+                    }
+                }
+                None => self.state.clear_huff_table(),
+            }
         } else {
-            self.state.last_huff_table = None;
+            self.state.clear_huff_table();
         }
         // `clone_from` keeps frame-to-frame seeding cheap for reused compressors by
         // reusing existing allocations where possible instead of reallocating every frame.
@@ -1583,11 +1640,11 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         total_uncompressed
     }
 
-    /// Build the frame header bytes once the total payload size is known
-    /// (so `Frame_Content_Size` / `single_segment` can be set). Shared by
-    /// the drain (`finish_frame`) and returned-buffer
-    /// (`finish_frame_to_vec`) tails.
-    fn build_frame_header(&self, total_uncompressed: u64, prep: &FramePrep) -> Vec<u8> {
+    /// Append the frame header bytes onto `out` once the total payload size
+    /// is known (so `Frame_Content_Size` / `single_segment` can be set).
+    /// Appends rather than returns so the one-shot path serializes straight
+    /// into the reused output buffer with no per-frame header `Vec`.
+    fn append_frame_header(&self, total_uncompressed: u64, prep: &FramePrep, out: &mut Vec<u8>) {
         // Match the donor framing policy for pledged one-shot inputs: use a
         // single-segment frame whenever the source fits the active window.
         let single_segment = !prep.use_dictionary_state
@@ -1610,9 +1667,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             },
             magicless: self.magicless,
         };
-        let mut header_buf: Vec<u8> = Vec::with_capacity(14);
-        header.serialize(&mut header_buf);
-        header_buf
+        header.serialize(out);
     }
 
     /// Write the frame header, accumulated block bytes, and optional
@@ -1621,7 +1676,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// avoid shifting `all_blocks` to prepend the header. Used by
     /// `compress` and `compress_oneshot_borrowed`.
     fn finish_frame(&mut self, all_blocks: Vec<u8>, total_uncompressed: u64, prep: &FramePrep) {
-        let header_buf = self.build_frame_header(total_uncompressed, prep);
+        let mut header_buf: Vec<u8> = Vec::with_capacity(18);
+        self.append_frame_header(total_uncompressed, prep, &mut header_buf);
         // Snapshot the checksum before borrowing the drain field so the
         // `self.hasher` read and the `self.compressed_data` write don't
         // both need `&mut self` simultaneously.
@@ -2768,6 +2824,41 @@ mod tests {
         assert!(
             compressor.state.fse_tables.of_previous.is_some(),
             "dictionary entropy should seed previous of table before first block"
+        );
+    }
+
+    // Regression test: `heap_size()` must count the retained Huffman tables
+    // (the active `last_huff_table` and the recycled `huff_table_spare`).
+    // A reused context that parks a table would otherwise under-report its
+    // footprint through the public size API.
+    #[test]
+    fn heap_size_counts_active_and_spare_huffman_tables() {
+        let mut compressor: FrameCompressor =
+            FrameCompressor::new(super::CompressionLevel::Fastest);
+        let base = compressor.heap_size();
+
+        let active = crate::huff0::huff0_encoder::HuffmanTable::build_from_data(
+            b"abacabadabacabaeabacabadabacaba",
+        );
+        let active_bytes = active.heap_size();
+        assert!(active_bytes > 0, "built table must own heap buffers");
+        compressor.state.last_huff_table = Some(active);
+        assert_eq!(
+            compressor.heap_size(),
+            base + active_bytes,
+            "heap_size must include the active last_huff_table"
+        );
+
+        let spare = crate::huff0::huff0_encoder::HuffmanTable::build_from_data(
+            b"the quick brown fox jumps over the lazy dog",
+        );
+        let spare_bytes = spare.heap_size();
+        assert!(spare_bytes > 0, "built table must own heap buffers");
+        compressor.state.huff_table_spare = Some(spare);
+        assert_eq!(
+            compressor.heap_size(),
+            base + active_bytes + spare_bytes,
+            "heap_size must include the parked huff_table_spare"
         );
     }
 

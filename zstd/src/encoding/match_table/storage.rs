@@ -588,8 +588,7 @@ impl MatchTable {
         // not in the live tree), not a lower minMatch.
         let mls = self.search_mls;
         let read = if mls >= 5 { 8 } else { 4 };
-        let concat = self.live_history();
-        let region = region_len.min(concat.len());
+        let region = region_len.min(self.live_history().len());
         if region < read {
             self.dms.invalidate();
             return;
@@ -597,13 +596,41 @@ impl MatchTable {
         // Dict-sized hash log: ceil-log2(region) clamped to [10, hash_log].
         let dms_hash_log =
             (usize::BITS - (region - 1).leading_zeros()).clamp(10, self.hash_log as u32) as usize;
+        // CDict cache: the tree depends only on the dict bytes (re-committed
+        // identically to the front of history every frame) and the
+        // (region, mls, hash_log) shape, so a primed same-shape table is
+        // valid as-is. Rebuilding per frame paid two table allocations AND a
+        // full tree-build pass per frame in a reused compressor. A dictionary
+        // swap drops the cache via `invalidate_primed_dictionary`; a level
+        // change lands here with a different shape and rebuilds.
+        if self.dms.is_primed()
+            && self.dms.region_len() == region
+            && self
+                .dms
+                .table()
+                .is_some_and(|t| t.mls == mls && t.hash_log == dms_hash_log)
+        {
+            return;
+        }
         // Build-pass compare budget: the dict is bounded (<= window), so a
         // generous fixed depth keeps the tree well-ordered without the live
         // searchLog cap. Mirrors donor `ZSTD_insertBt1` nbCompares.
         const DMS_BUILD_DEPTH: usize = 1 << 9;
-        let mut hash_table = alloc::vec![0u32; 1usize << dms_hash_log];
+        // Reuse the previous tables' capacity on a genuine rebuild (shape
+        // change): move the Vecs out before `live_history` re-borrows `self`.
+        let (mut hash_table, mut chain_table) = match self.dms.table_mut() {
+            Some(t) => (
+                core::mem::take(&mut t.hash_table),
+                core::mem::take(&mut t.chain_table),
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
+        hash_table.clear();
+        hash_table.resize(1usize << dms_hash_log, 0u32);
         // 2 children per dict position: [smaller, larger].
-        let mut chain_table = alloc::vec![0u32; 2 * region];
+        chain_table.clear();
+        chain_table.resize(2 * region, 0u32);
+        let concat = self.live_history();
         let mut current = 0usize;
         while current + read <= region {
             let h = Self::hash_position_at(concat, current, dms_hash_log, mls);

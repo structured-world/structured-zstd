@@ -2081,20 +2081,25 @@ impl Matcher for MatchGeneratorDriver {
             MatcherStorage::Row(row) => {
                 row.max_window_size = max_window_size;
                 row.lazy_depth = params.lazy_depth;
-                let row_cfg = params.row.expect("Row level row carries a RowConfig");
-                row.configure(row_cfg);
+                let mut row_cfg = params.row.expect("Row level row carries a RowConfig");
                 if hinted {
                     // Clamp the configured hash width by the hinted window
                     // (donor `ZSTD_adjustCParams` caps hashLog by windowLog) —
                     // `min`, not replace, so an explicit `hash_log` param
                     // override (`row_cfg.hash_bits`) survives the hinted path
                     // instead of being overwritten by the window value.
-                    row.set_hash_bits(
-                        row_cfg
-                            .hash_bits
-                            .min(row_hash_bits_for_window(table_window_size)),
-                    );
+                    //
+                    // Clamp BEFORE `configure` so the backend sees ONE width
+                    // per frame. Configuring with the unclamped level width
+                    // and then re-clamping made `row_hash_log` oscillate on
+                    // every hinted frame, and each width change clears the
+                    // row tables — `ensure_tables` then re-filled all three
+                    // every frame in a reused compressor.
+                    row_cfg.hash_bits = row_cfg
+                        .hash_bits
+                        .min(row_hash_bits_for_window(table_window_size));
                 }
+                row.configure(row_cfg);
                 // Key the primed snapshot on the width the backend ACTUALLY
                 // applied (`set_hash_bits` clamps the request): recording the
                 // request — or the 0 default on the unhinted path — keys
@@ -2518,7 +2523,13 @@ impl Matcher for MatchGeneratorDriver {
             // otherwise the next small/unknown-size frame reuses stale
             // attach state through `prime_dict_attach_current_block`.
             super::strategy::BackendTag::Row => self.row_matcher_mut().invalidate_dict_cache(),
-            _ => {}
+            // The BT dms tree is keyed to the dict bytes; `prime_dms_bt`
+            // skips the rebuild while its shape matches, so a swapped
+            // dictionary of the same length would otherwise keep serving the
+            // OLD dictionary's tree.
+            super::strategy::BackendTag::HashChain => {
+                self.hc_matcher_mut().table.dms.invalidate();
+            }
         }
     }
 

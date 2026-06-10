@@ -1,7 +1,6 @@
 //! Utilities and representations for a frame header.
-use crate::bit_io::BitWriter;
 use crate::common::MAGIC_NUM;
-use crate::encoding::util::{find_fcs_field_size, find_min_size, minify_val};
+use crate::encoding::util::{find_fcs_field_size, find_min_size, write_minified_val};
 use alloc::vec::Vec;
 
 /// A header for a single Zstandard frame.
@@ -63,12 +62,12 @@ impl FrameHeader {
         }
 
         if let Some(id) = self.dictionary_id {
-            output.extend(minify_val(id));
+            write_minified_val(id, output);
         }
 
         if let Some(frame_content_size) = self.frame_content_size {
             let field_size = find_fcs_field_size(frame_content_size, self.single_segment);
-            output.extend(serialize_fcs(frame_content_size, field_size));
+            write_fcs(frame_content_size, field_size, output);
         }
     }
 
@@ -76,55 +75,29 @@ impl FrameHeader {
     ///
     /// https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#frame_header_descriptor
     fn descriptor(&self) -> u8 {
-        let mut bw = BitWriter::new();
         // A frame header starts with a frame header descriptor.
         // It describes what other fields are present
         // https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#frame_header_descriptor
-        // Writing the frame header descriptor:
-        // `Frame_Content_Size_flag`:
-        // The Frame_Content_Size_flag specifies if
-        // the Frame_Content_Size field is provided within the header.
-        // TODO: The Frame_Content_Size field isn't set at all, we should prefer to include it always.
-        // If the `Single_Segment_flag` is set and this value is zero,
-        // the size of the FCS field is 1 byte.
-        // Otherwise, the FCS field is omitted.
-        // | Value | Size of field (Bytes)
-        // | 0     | 0 or 1
-        // | 1     | 2
-        // | 2     | 4
-        // | 3     | 8
+        // Built with plain bit arithmetic (LSB-first field order below); a
+        // `BitWriter` here allocated a fresh `Vec` for the single byte on
+        // every frame header.
 
-        // `Dictionary_ID_flag`:
-        if let Some(id) = self.dictionary_id {
-            let flag_value: u8 = match find_min_size(id) {
-                0 => 0,
-                1 => 1,
-                2 => 2,
-                4 => 3,
-                _ => panic!(),
-            };
-            bw.write_bits(flag_value, 2);
-        } else {
-            // A `Dictionary_ID` was not provided
-            bw.write_bits(0u8, 2);
-        }
+        // Bits 0-1, `Dictionary_ID_flag`: size class of the
+        // `Dictionary_ID` field (0 = absent).
+        let dict_id_flag: u8 = match self.dictionary_id.map(find_min_size) {
+            None => 0,
+            Some(1) => 1,
+            Some(2) => 2,
+            Some(4) => 3,
+            _ => panic!(),
+        };
 
-        // `Content_Checksum_flag`:
-        if self.content_checksum {
-            bw.write_bits(1u8, 1);
-        } else {
-            bw.write_bits(0u8, 1);
-        }
+        // Bit 2, `Content_Checksum_flag`.
+        let checksum_flag = u8::from(self.content_checksum);
 
-        // `Reserved_bit`:
-        // This value must be zero
-        bw.write_bits(0u8, 1);
+        // Bits 3-4: `Reserved_bit` + `Unused_bit`, both zero.
 
-        // `Unused_bit`:
-        // An encoder compliant with this spec must set this bit to zero
-        bw.write_bits(0u8, 1);
-
-        // `Single_Segment_flag`:
+        // Bit 5, `Single_Segment_flag`:
         // If this flag is set, data must be regenerated within a single continuous memory segment,
         // and the `Frame_Content_Size` field must be present in the header.
         // If this flag is not set, the `Window_Descriptor` field must be present in the frame header.
@@ -133,32 +106,37 @@ impl FrameHeader {
                 self.frame_content_size.is_some(),
                 "if the `single_segment` flag is set to true, then a frame content size must be provided"
             );
-            bw.write_bits(1u8, 1);
         } else {
             assert!(
                 self.window_size.is_some(),
                 "if the `single_segment` flag is set to false, then a window size must be provided"
             );
-            bw.write_bits(0u8, 1);
         }
+        let single_segment_flag = u8::from(self.single_segment);
 
-        if let Some(frame_content_size) = self.frame_content_size {
-            let field_size = find_fcs_field_size(frame_content_size, self.single_segment);
-            let flag_value: u8 = match field_size {
-                1 => 0,
-                2 => 1,
-                4 => 2,
-                8 => 3,
-                _ => unreachable!(),
-            };
+        // Bits 6-7, `Frame_Content_Size_flag`: size class of the FCS field.
+        // If the `Single_Segment_flag` is set and this value is zero,
+        // the size of the FCS field is 1 byte; otherwise the FCS field is
+        // omitted when the flag is zero.
+        // | Value | Size of field (Bytes)
+        // | 0     | 0 or 1
+        // | 1     | 2
+        // | 2     | 4
+        // | 3     | 8
+        let fcs_flag: u8 = match self.frame_content_size {
+            Some(frame_content_size) => {
+                match find_fcs_field_size(frame_content_size, self.single_segment) {
+                    1 => 0,
+                    2 => 1,
+                    4 => 2,
+                    8 => 3,
+                    _ => unreachable!(),
+                }
+            }
+            None => 0,
+        };
 
-            bw.write_bits(flag_value, 2);
-        } else {
-            // `Frame_Content_Size` was not provided
-            bw.write_bits(0u8, 2);
-        }
-
-        bw.dump()[0]
+        dict_id_flag | (checksum_flag << 2) | (single_segment_flag << 5) | (fcs_flag << 6)
     }
 }
 
@@ -168,7 +146,7 @@ impl FrameHeader {
 /// For 2-byte fields an offset of 256 is subtracted before encoding.
 ///
 /// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#frame_content_size>
-fn serialize_fcs(val: u64, field_size: usize) -> Vec<u8> {
+fn write_fcs(val: u64, field_size: usize, output: &mut Vec<u8>) {
     debug_assert!(matches!(field_size, 1 | 2 | 4 | 8));
     debug_assert!(field_size != 2 || val >= 256);
 
@@ -177,7 +155,7 @@ fn serialize_fcs(val: u64, field_size: usize) -> Vec<u8> {
         1 | 4 | 8 => val,
         _ => unreachable!("invalid Frame_Content_Size field size: {field_size}"),
     };
-    adjusted.to_le_bytes()[..field_size].to_vec()
+    output.extend_from_slice(&adjusted.to_le_bytes()[..field_size]);
 }
 
 #[cfg(test)]
@@ -219,6 +197,73 @@ mod tests {
         let parsed_header = read_frame_header(serialized_header.as_slice()).unwrap().0;
         assert!(parsed_header.dictionary_id().is_none());
         assert_eq!(parsed_header.frame_content_size(), 1);
+    }
+
+    // Locks the descriptor/FCS field-size class boundaries: 255/256 is the
+    // 1-byte (single-segment) vs 2-byte edge, 65791/65792 the 2-byte
+    // (+256 offset) vs 4-byte edge. A drift between `find_fcs_field_size`,
+    // the descriptor flag mapping, and the FCS write would round-trip to a
+    // wrong size through the decoder.
+    #[test]
+    fn frame_header_fcs_boundaries_round_trip() {
+        for (frame_content_size, single_segment) in [
+            (255, true),
+            (256, true),
+            (65791, true),
+            (65792, true),
+            (255, false),
+            (256, false),
+            (65791, false),
+            (65792, false),
+        ] {
+            let header = FrameHeader {
+                frame_content_size: Some(frame_content_size),
+                single_segment,
+                content_checksum: false,
+                dictionary_id: None,
+                window_size: if single_segment { None } else { Some(1024) },
+                magicless: false,
+            };
+
+            let mut serialized_header = Vec::new();
+            header.serialize(&mut serialized_header);
+            let parsed_header = read_frame_header(serialized_header.as_slice())
+                .expect("serialized header must parse")
+                .0;
+            assert_eq!(
+                parsed_header.frame_content_size(),
+                frame_content_size,
+                "FCS must round-trip at boundary {frame_content_size} (single_segment={single_segment})"
+            );
+        }
+    }
+
+    // The dictionary-id field-size classes (1/2/4 bytes by value magnitude)
+    // share the descriptor's bits 0-1; lock their boundaries through the
+    // decoder as well.
+    #[test]
+    fn frame_header_dictionary_id_boundaries_round_trip() {
+        for dictionary_id in [1, 255, 256, 65535, 65536, u32::MAX as u64] {
+            let header = FrameHeader {
+                frame_content_size: Some(4096),
+                single_segment: false,
+                content_checksum: false,
+                dictionary_id: Some(dictionary_id),
+                window_size: Some(1024),
+                magicless: false,
+            };
+
+            let mut serialized_header = Vec::new();
+            header.serialize(&mut serialized_header);
+            let parsed_header = read_frame_header(serialized_header.as_slice())
+                .expect("serialized header must parse")
+                .0;
+            assert_eq!(
+                parsed_header.dictionary_id(),
+                Some(dictionary_id as u32),
+                "dictionary id must round-trip at boundary {dictionary_id}"
+            );
+        }
     }
 
     #[test]

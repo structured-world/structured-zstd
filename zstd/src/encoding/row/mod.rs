@@ -1315,9 +1315,18 @@ impl RowMatchGenerator {
         let row_entries = 1usize << self.row_log;
         let total = row_count * row_entries;
         if self.row_positions.len() != total {
-            self.row_heads = alloc::vec![0; row_count];
-            self.row_positions = alloc::vec![ROW_EMPTY_SLOT; total];
-            self.row_tags = alloc::vec![0; total];
+            // Resize in place: `set_hash_bits` width changes `clear()` the
+            // vecs but keep their capacity. The previous `vec![..]` form
+            // re-allocated all three tables on every width change — three
+            // malloc/free pairs (~40 KiB) per hinted frame while the
+            // configure→hint width pair disagreed, which allocator-slow
+            // targets (musl) amplified into the dominant per-frame cost.
+            self.row_heads.clear();
+            self.row_heads.resize(row_count, 0);
+            self.row_positions.clear();
+            self.row_positions.resize(total, ROW_EMPTY_SLOT);
+            self.row_tags.clear();
+            self.row_tags.resize(total, 0);
         }
     }
 
