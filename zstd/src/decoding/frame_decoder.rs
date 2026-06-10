@@ -2647,6 +2647,23 @@ impl FrameDecoder {
         // post-loop hashing loop are both gated by the same flag.
         #[cfg(all(feature = "lsm", feature = "hash"))]
         let mut block_ranges: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::new();
+        // Frame-level XXH64, accumulated PER BLOCK right after each block
+        // decodes — the bytes are still cache-resident then. The previous
+        // shape hashed the whole output once after the loop, which re-read
+        // the entire frame cold: a full extra memory pass that the
+        // reference implementation does not make (it hashes incrementally
+        // per block). Invisible on outputs that fit L3, ~1.14x wall on a
+        // 100 MiB all-raw decode and the dominant CI gap on
+        // bandwidth-limited hosts.
+        #[cfg(feature = "hash")]
+        let mut running_hash: Option<twox_hash::XxHash64> =
+            if state.frame_header.descriptor.content_checksum_flag()
+                && self.content_checksum != ContentChecksum::None
+            {
+                Some(twox_hash::XxHash64::with_seed(0))
+            } else {
+                None
+            };
         loop {
             #[cfg(all(feature = "lsm", feature = "hash"))]
             let produced_before: Option<usize> = if self.per_block_checksums_enabled {
@@ -2741,6 +2758,15 @@ impl FrameDecoder {
                     ));
                 }
             };
+            // Hash this block's freshly-written bytes while they are hot
+            // (see `running_hash` above). `tail()` is the physical write
+            // cursor: `drop_to_window_size` below only advances the head,
+            // so `[prev_tail, tail)` is exactly this block's output.
+            #[cfg(feature = "hash")]
+            if let Some(hasher) = running_hash.as_mut() {
+                use core::hash::Hasher;
+                hasher.write(direct.buffer.buffer_ref().written_since(produced as usize));
+            }
             produced = direct.buffer.buffer_ref().tail() as u64;
             // Post-decode FCS overflow check.
             if produced > content_size {
@@ -2801,25 +2827,13 @@ impl FrameDecoder {
             }
         }
         #[cfg(feature = "hash")]
-        if state.frame_header.descriptor.content_checksum_flag()
-            && self.content_checksum != ContentChecksum::None
-        {
-            // Direct path bypasses the per-write hash accounting
-            // (DecodeBuffer hashes during drain; the direct path
-            // never drains because the user slice IS the buffer).
-            // Walk the decoded output once and propagate the
-            // resulting hasher state so the frame-tail XXH64 check
-            // (in the block loop above) can verify the digest.
-            //
-            // Gated on `content_checksum_flag`: frames without a
-            // trailing checksum byte have nothing to verify, and the
-            // 1 MiB+ second-pass scan dominated decode wall time
-            // (63 % of total on z000033 L-3 in the standalone perf
-            // loop). `get_calculated_checksum()` now returns `None`
-            // for flag-off frames, matching this skip.
-            use core::hash::Hasher;
-            let mut hasher = twox_hash::XxHash64::with_seed(0);
-            hasher.write(&output[..written]);
+        if let Some(hasher) = running_hash {
+            // Propagate the per-block-accumulated hasher state (see the
+            // `running_hash` rationale above the loop) so the frame-tail
+            // XXH64 check and `get_calculated_checksum()` read the digest.
+            // `running_hash` is `None` for flag-off frames or
+            // `ContentChecksum::None` — nothing to verify there, and
+            // `get_calculated_checksum()` returns `None`, matching the skip.
             match &mut state.decoder_scratch {
                 DecoderScratchKind::Flat(s) => s.buffer.hash = hasher,
                 DecoderScratchKind::Ring(s) => s.buffer.hash = hasher,

@@ -23,10 +23,13 @@
 //!   builds; dict frames stay on the regular path).
 //!
 //! `content_checksum_flag` is NOT a precondition: when set, the
-//! direct-decode caller walks `output[..content_size]` once at end
-//! of decode (single sequential xxhash pass over cache-hot data)
-//! and stores the digest into the persistent scratch's hasher so
-//! `get_calculated_checksum()` reads the right value.
+//! direct-decode caller accumulates the frame XXH64 incrementally —
+//! after each block it hashes that block's freshly-written bytes via
+//! [`UserSliceBackend::written_since`] while they are still
+//! cache-resident — and stores the final digest into the persistent
+//! scratch's hasher so `get_calculated_checksum()` reads the right
+//! value. (A single end-of-frame walk re-read the whole output cold:
+//! one full extra memory pass on large frames.)
 //!
 //! Multi-segment frames work via the caller's per-block
 //! `DecodeBuffer::drop_to_window_size` invocation — bytes drop
@@ -152,6 +155,18 @@ impl<'a> UserSliceBackend<'a> {
             head: 0,
             tail: 0,
         }
+    }
+
+    /// Physical bytes `slice[from..tail]` — the output written since a
+    /// previously-observed [`BufferBackend::tail`]. The direct decode
+    /// path hashes each block's output through this right after the
+    /// block decodes, while the bytes are still cache-resident; a
+    /// post-decode whole-output hash walk re-reads the entire frame
+    /// cold (a full extra memory pass on large outputs). Only the
+    /// XXH64 accumulation reads it, hence the `hash` gate.
+    #[cfg(feature = "hash")]
+    pub(crate) fn written_since(&self, from: usize) -> &[u8] {
+        &self.slice[from..self.tail]
     }
 
     /// Exact, non-overshooting copy for the trailing sequence(s) when the
