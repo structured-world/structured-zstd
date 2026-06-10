@@ -150,6 +150,11 @@ pub(crate) struct CompressedBlockScratch {
     /// first block-split). The estimator uses `EntropyOnlyMatcher` and
     /// never re-splits, so this nesting is one level deep.
     estimator_inner: Option<Box<CompressedBlockScratch>>,
+    /// Persistent slot for `compress_block_encoded`'s pre-block entropy
+    /// rollback snapshot. `clone_from` into this slot reuses its `Vec`
+    /// buffers across blocks; a fresh `.clone()` per block paid a
+    /// malloc + free pair on both Huffman code containers every block.
+    pub(crate) huff_rollback: Option<huff0_encoder::HuffmanTable>,
 }
 
 impl CompressedBlockScratch {

@@ -448,7 +448,6 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
     }
 }
 
-#[derive(Clone)]
 pub struct HuffmanTable {
     /// Index is the symbol, values are the bitstring in the lower bits of the u32 and the amount of bits in the u8
     codes: Vec<(u32, u8)>,
@@ -473,6 +472,33 @@ pub struct HuffmanTable {
     /// `CachedDescription` type-alias doc above for full rationale.
     #[cfg(feature = "std")]
     cached_encoded_weight_description: CachedDescription,
+}
+
+/// Manual impl so `clone_from` reuses the destination's existing `Vec`
+/// buffers; the derived version falls back to `*self = source.clone()`,
+/// re-allocating both code containers on every per-frame entropy seed and
+/// per-block rollback snapshot.
+impl Clone for HuffmanTable {
+    fn clone(&self) -> Self {
+        Self {
+            codes: self.codes.clone(),
+            packed_codes: self.packed_codes.clone(),
+            table_log: self.table_log,
+            #[cfg(feature = "std")]
+            cached_encoded_weight_description: self.cached_encoded_weight_description.clone(),
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.codes.clone_from(&source.codes);
+        self.packed_codes.clone_from(&source.packed_codes);
+        self.table_log = source.table_log;
+        #[cfg(feature = "std")]
+        {
+            self.cached_encoded_weight_description =
+                source.cached_encoded_weight_description.clone();
+        }
+    }
 }
 
 impl HuffmanTable {
