@@ -1190,11 +1190,22 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// Total heap bytes this compressor's allocations hold, excluding the
     /// inline struct: the match-finder tables / history / recycled buffers and
     /// the primed-dictionary snapshot (via the matcher), the retained
-    /// dictionary content, the cached dictionary entropy tables (literals
-    /// Huffman + LL/ML/OF FSE), and the per-block sidecar buffers. Lets a
-    /// context report its true footprint through `ZSTD_sizeof_CCtx`.
+    /// Huffman tables (active + recycled spare), the retained dictionary
+    /// content, the cached dictionary entropy tables (literals Huffman +
+    /// LL/ML/OF FSE), and the per-block sidecar buffers. Lets a context
+    /// report its true footprint through `ZSTD_sizeof_CCtx`.
     pub fn heap_size(&self) -> usize {
         let mut total = self.state.matcher.heap_size();
+        total += self
+            .state
+            .last_huff_table
+            .as_ref()
+            .map_or(0, |table| table.heap_size());
+        total += self
+            .state
+            .huff_table_spare
+            .as_ref()
+            .map_or(0, |table| table.heap_size());
         total += self
             .dictionary
             .as_ref()
