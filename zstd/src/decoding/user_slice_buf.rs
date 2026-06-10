@@ -23,10 +23,13 @@
 //!   builds; dict frames stay on the regular path).
 //!
 //! `content_checksum_flag` is NOT a precondition: when set, the
-//! direct-decode caller walks `output[..content_size]` once at end
-//! of decode (single sequential xxhash pass over cache-hot data)
-//! and stores the digest into the persistent scratch's hasher so
-//! `get_calculated_checksum()` reads the right value.
+//! direct-decode caller accumulates the frame XXH64 incrementally —
+//! after each block it hashes that block's freshly-written bytes via
+//! [`UserSliceBackend::written_since`] while they are still
+//! cache-resident — and stores the final digest into the persistent
+//! scratch's hasher so `get_calculated_checksum()` reads the right
+//! value. (A single end-of-frame walk re-read the whole output cold:
+//! one full extra memory pass on large frames.)
 //!
 //! Multi-segment frames work via the caller's per-block
 //! `DecodeBuffer::drop_to_window_size` invocation — bytes drop
