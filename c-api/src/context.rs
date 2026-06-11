@@ -258,6 +258,9 @@ pub unsafe extern "C" fn ZSTD_compress2(
         enc.set_content_checksum(params.checksum_flag);
         enc.set_content_size_flag(params.content_size_flag);
         enc.set_dictionary_id_flag(params.dict_id_flag);
+        if params.target_cblock_size > 0 {
+            enc.set_target_block_size(Some(params.target_cblock_size as u32));
+        }
         enc.compress_independent_frame_into(src, &mut cctx.scratch);
     }));
     if outcome.is_err() {

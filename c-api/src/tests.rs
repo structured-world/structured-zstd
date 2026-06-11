@@ -955,3 +955,121 @@ fn stream_size_hints_match_upstream() {
         ZSTD_compressBound(128 * 1024) + 3 + 4
     );
 }
+
+#[test]
+fn target_cblock_size_caps_emitted_blocks() {
+    // 512 KiB of incompressible data would normally emit 4 full 128 KiB
+    // blocks; with a 1340-byte target every physical block payload must be
+    // at or under the target.
+    let input = sample(512 * 1024);
+    let cctx = ZSTD_createCCtx();
+    let mut compressed = vec![0u8; ZSTD_compressBound(input.len()) + (input.len() / 1340 + 2) * 3];
+    unsafe {
+        assert_eq!(ZSTD_CCtx_setParameter(cctx, 130, 1340), 0); // targetCBlockSize
+        let csize = crate::context::ZSTD_compress2(
+            cctx,
+            compressed.as_mut_ptr(),
+            compressed.len(),
+            input.as_ptr(),
+            input.len(),
+        );
+        assert_eq!(ZSTD_isError(csize), 0, "compress2 with target errored");
+        ZSTD_freeCCtx(cctx);
+
+        // Walk the frame's block headers: 3-byte LE `(size << 3) | (type
+        // << 1) | last`; Raw/RLE regenerate `size` bytes, Compressed
+        // blocks carry `size` payload bytes — all must be <= target.
+        let mut zfh = core::mem::MaybeUninit::<ZSTD_FrameHeader>::zeroed();
+        assert_eq!(
+            ZSTD_getFrameHeader(zfh.as_mut_ptr(), compressed.as_ptr(), csize),
+            0
+        );
+        let header_len = ZSTD_frameHeaderSize(compressed.as_ptr(), csize);
+        assert_eq!(ZSTD_isError(header_len), 0);
+        let mut pos = header_len;
+        loop {
+            let hdr = u32::from_le_bytes([
+                compressed[pos],
+                compressed[pos + 1],
+                compressed[pos + 2],
+                0,
+            ]);
+            let last = hdr & 1 != 0;
+            let block_type = (hdr >> 1) & 3;
+            let size = (hdr >> 3) as usize;
+            let payload = match block_type {
+                1 => 1,    // RLE carries one byte
+                _ => size, // Raw / Compressed carry `size` bytes
+            };
+            assert!(
+                size <= 1340,
+                "block at {pos} declares {size} bytes, above the 1340 target"
+            );
+            pos += 3 + payload;
+            if last {
+                break;
+            }
+        }
+        ZSTD_freeDCtx(crate::context::ZSTD_createDCtx()); // keep symbol use balanced
+    }
+}
+
+#[test]
+fn dctx_parameter_changes_rejected_mid_frame() {
+    // Compress two frames; feed only a prefix of the first so the decoder
+    // parks mid-frame, then verify parameter mutation is rejected with
+    // stage_wrong until the session is reset.
+    let input = sample(256 * 1024);
+    let cctx = ZSTD_createCCtx();
+    let mut compressed = vec![0u8; ZSTD_compressBound(input.len())];
+    let csize = unsafe {
+        let csize = crate::context::ZSTD_compress2(
+            cctx,
+            compressed.as_mut_ptr(),
+            compressed.len(),
+            input.as_ptr(),
+            input.len(),
+        );
+        ZSTD_freeCCtx(cctx);
+        csize
+    };
+    assert_eq!(ZSTD_isError(csize), 0);
+
+    let zds = crate::streaming::ZSTD_createDStream();
+    unsafe {
+        // Between frames: parameter changes are accepted.
+        assert_eq!(ZSTD_DCtx_setParameter(zds, 100, 25), 0);
+
+        let mut outbuf = vec![0u8; 4096];
+        let mut inb = ZSTD_inBuffer {
+            src: compressed.as_ptr() as *const core::ffi::c_void,
+            size: csize / 2, // truncated input: frame stays in flight
+            pos: 0,
+        };
+        let mut outb = ZSTD_outBuffer {
+            dst: outbuf.as_mut_ptr() as *mut core::ffi::c_void,
+            size: outbuf.len(),
+            pos: 0,
+        };
+        let rc = crate::streaming::ZSTD_decompressStream(zds, &mut outb, &mut inb);
+        assert_eq!(ZSTD_isError(rc), 0);
+        assert_ne!(rc, 0, "frame must still be in flight");
+
+        // Mid-frame: setParameter and a parameters-only reset are rejected.
+        let rc = ZSTD_DCtx_setParameter(zds, 100, 26);
+        assert_eq!(
+            ZSTD_getErrorCode(rc),
+            ZSTD_ErrorCode::ZSTD_error_stage_wrong
+        );
+        let rc = crate::params::ZSTD_DCtx_reset(zds, 2); // ZSTD_reset_parameters
+        assert_eq!(
+            ZSTD_getErrorCode(rc),
+            ZSTD_ErrorCode::ZSTD_error_stage_wrong
+        );
+
+        // A session reset abandons the frame; parameters mutate again.
+        assert_eq!(crate::params::ZSTD_DCtx_reset(zds, 1), 0);
+        assert_eq!(ZSTD_DCtx_setParameter(zds, 100, 26), 0);
+        crate::streaming::ZSTD_freeDStream(zds);
+    }
+}

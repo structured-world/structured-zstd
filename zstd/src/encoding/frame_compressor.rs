@@ -121,6 +121,14 @@ pub struct FrameCompressor<
     /// frame by being handed the right dictionary explicitly. Set via
     /// [`Self::set_dictionary_id_flag`].
     dict_id_flag: bool,
+    /// Upper bound on emitted block sizes (semantics of upstream
+    /// `ZSTD_c_targetCBlockSize`): capping the RAW block length at the
+    /// target bounds every physical block's compressed payload at the
+    /// target too (a compressed block never exceeds its raw input — the
+    /// raw-block fallback fires otherwise), so blocks land at or under
+    /// `target + 3` header bytes on the wire. `None` = no target (full
+    /// 128 KiB blocks). Set via [`Self::set_target_block_size`].
+    target_block_size: Option<u32>,
     #[cfg(feature = "hash")]
     hasher: XxHash64,
     /// Block-layout introspection populated at the end of every
@@ -840,6 +848,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             content_checksum: false,
             content_size_flag: true,
             dict_id_flag: true,
+            target_block_size: None,
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
             #[cfg(feature = "lsm")]
@@ -1116,7 +1125,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             }
         }
         let _clear_guard = ClearBorrowedOnDrop(core::ptr::addr_of_mut!(self.state.matcher));
-        let block_capacity = MAX_BLOCK_SIZE as usize;
+        let block_capacity = self.block_capacity();
         let mut start = 0usize;
         while start < input.len() {
             reserve_for_next_block(out, blocks_start, start as u64, input.len() - start);
@@ -1187,6 +1196,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             content_checksum: false,
             content_size_flag: true,
             dict_id_flag: true,
+            target_block_size: None,
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
             #[cfg(feature = "lsm")]
@@ -1242,6 +1252,23 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// the dictionary explicitly.
     pub fn set_dictionary_id_flag(&mut self, emit: bool) {
         self.dict_id_flag = emit;
+    }
+
+    /// Set an upper bound on emitted block sizes (semantics of upstream
+    /// `ZSTD_c_targetCBlockSize`): every physical block's payload is capped
+    /// at `target` bytes (+3-byte block header on the wire), trading some
+    /// ratio for bounded per-block latency. The value is clamped to
+    /// `[1340, 131072]` (the upstream bounds). `None` removes the target.
+    pub fn set_target_block_size(&mut self, target: Option<u32>) {
+        self.target_block_size =
+            target.map(|t| t.clamp(1340, crate::common::MAX_BLOCK_SIZE));
+    }
+
+    /// The active block-size cap: the configured target, or the format's
+    /// 128 KiB block ceiling.
+    fn block_capacity(&self) -> usize {
+        self.target_block_size
+            .map_or(crate::common::MAX_BLOCK_SIZE as usize, |t| t as usize)
     }
 
     /// Before calling [FrameCompressor::compress] you need to set the source.
@@ -1583,7 +1610,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             // Read up to one donor block. When the pre-block splitter keeps a
             // suffix, top it back up before compressing the next block, matching
             // ZSTD_compress_frameChunk() over a contiguous input buffer.
-            let block_capacity = MAX_BLOCK_SIZE as usize;
+            let block_capacity = self.block_capacity();
             // Always draw the block buffer from the matcher's recycled pool
             // (its capacity already covers the block size, so the resize below
             // stays in-place). Any carried pre-split suffix is copied in, and

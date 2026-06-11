@@ -104,6 +104,9 @@ impl ZSTD_CCtx {
         let mut setup = || -> Result<(), codec::io::Error> {
             enc.set_parameters(&resolved)?;
             enc.set_content_checksum(params.checksum_flag)?;
+            if params.target_cblock_size > 0 {
+                enc.set_target_block_size(Some(params.target_cblock_size as u32))?;
+            }
             // The pledge is single-use (consumed by this frame): record it
             // in the header unless the content-size flag forbids it.
             if params.pledged_src_size != CONTENTSIZE_UNKNOWN && params.content_size_flag {

@@ -55,10 +55,16 @@ const TARGET_CBLOCK_SIZE_MAX: c_int = 131_072;
 /// Upstream `ZSTD_WINDOWLOG_LIMIT_DEFAULT`: the streaming decoder's default
 /// window-size acceptance ceiling, `1 << 27` bytes.
 pub(crate) const WINDOW_LOG_LIMIT_DEFAULT: c_int = 27;
-/// Decoder-side window-log bounds (`ZSTD_WINDOWLOG_ABSOLUTEMIN` .. 64-bit
-/// `ZSTD_WINDOWLOG_MAX`).
+/// Decoder-side window-log bounds (`ZSTD_WINDOWLOG_ABSOLUTEMIN` ..
+/// `ZSTD_WINDOWLOG_MAX`). The ceiling is pointer-width dependent upstream
+/// (`ZSTD_WINDOWLOG_MAX_32` = 30, `ZSTD_WINDOWLOG_MAX_64` = 31 via
+/// `sizeof(size_t)`), so the advertised bounds match the header on 32-bit
+/// builds too.
 const D_WINDOW_LOG_MIN: c_int = 10;
+#[cfg(target_pointer_width = "64")]
 const D_WINDOW_LOG_MAX: c_int = 31;
+#[cfg(not(target_pointer_width = "64"))]
+const D_WINDOW_LOG_MAX: c_int = 30;
 
 /// `ZSTD_bounds` — ABI mirror of the upstream struct: an error slot tested
 /// with `ZSTD_isError` plus an inclusive `[lowerBound, upperBound]` range.
@@ -119,9 +125,10 @@ pub(crate) struct CCtxParams {
     pub(crate) job_size: c_int,
     /// Only meaningful with workers; stored for `getParameter` symmetry.
     pub(crate) overlap_log: c_int,
-    /// Accepted and stored; the encoder's block sizing currently ignores the
-    /// convergence target (upstream documents it as best-effort, not a
-    /// guarantee).
+    /// Applied at frame start: the encoder caps every physical block's
+    /// payload at the target (raw length <= target bounds the compressed
+    /// length too), so blocks land at or under `target + 3` header bytes —
+    /// a strict form of upstream's best-effort convergence target.
     pub(crate) target_cblock_size: c_int,
     /// Pledged size of the next frame (`ZSTD_CCtx_setPledgedSrcSize`).
     /// Consumed by the next frame start, then reset to unknown.
@@ -467,6 +474,12 @@ pub unsafe extern "C" fn ZSTD_DCtx_setParameter(
         return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
     }
     let dctx = unsafe { &mut *dctx };
+    if !dctx.stream_frame_done {
+        // Decoder parameters may only change between frames (upstream
+        // stage contract); mutating the window ceiling mid-frame would
+        // change acceptance rules under the active decode.
+        return encode(ZSTD_ErrorCode::ZSTD_error_stage_wrong);
+    }
     match param {
         ZSTD_D_WINDOW_LOG_MAX => {
             if value != 0 && !(D_WINDOW_LOG_MIN..=D_WINDOW_LOG_MAX).contains(&value) {
@@ -521,6 +534,12 @@ pub unsafe extern "C" fn ZSTD_DCtx_reset(dctx: *mut ZSTD_DCtx, reset: c_int) -> 
             0
         }
         ZSTD_RESET_PARAMETERS => {
+            // Parameters can only be reset between frames (upstream stage
+            // contract); a session reset must accompany the request to
+            // abandon an in-flight frame.
+            if !dctx.stream_frame_done {
+                return encode(ZSTD_ErrorCode::ZSTD_error_stage_wrong);
+            }
             dctx.reset_parameters();
             0
         }
