@@ -32,7 +32,17 @@ pub struct StreamingEncoder<W: Write, M: Matcher = MatchGeneratorDriver> {
     last_error_kind: Option<ErrorKind>,
     last_error_message: Option<String>,
     frame_started: bool,
+    /// Upper bound on emitted block sizes (upstream `ZSTD_c_targetCBlockSize`
+    /// semantics; see `FrameCompressor::set_target_block_size`). `None` =
+    /// the format's 128 KiB ceiling.
+    target_block_size: Option<u32>,
     pledged_content_size: Option<u64>,
+    /// Whether a pledged size is written into the header's
+    /// `Frame_Content_Size` field (upstream `ZSTD_c_contentSizeFlag`).
+    /// Pledge *enforcement* is independent of this flag — upstream
+    /// validates consumed bytes against the pledge at frame end even
+    /// when the header omits the field. Default `true`.
+    content_size_flag: bool,
     bytes_consumed: u64,
     /// Effective strategy tag when a public-parameter
     /// [`Strategy`](crate::encoding::Strategy) override (#27) is active, mirroring
@@ -129,7 +139,9 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             last_error_kind: None,
             last_error_message: None,
             frame_started: false,
+            target_block_size: None,
             pledged_content_size: None,
+            content_size_flag: true,
             bytes_consumed: 0,
             strategy_override: None,
             magicless: false,
@@ -139,6 +151,30 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
         }
+    }
+
+    /// Set an upper bound on each physical block's payload (semantics of
+    /// upstream `ZSTD_c_targetCBlockSize`): every block carries at most
+    /// `target` payload bytes, +3-byte block header on the wire — the
+    /// upstream knob is likewise a convergence target for block sizing,
+    /// not a cap on header-inclusive wire bytes. Clamped to
+    /// `[MIN_TARGET_BLOCK_SIZE, MAX_BLOCK_SIZE]`; mirrors
+    /// `FrameCompressor::set_target_block_size`. Must be set before the
+    /// first write.
+    pub fn set_target_block_size(&mut self, target: Option<u32>) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.frame_started {
+            return Err(invalid_input_error(
+                "the block-size target must be set before the first write",
+            ));
+        }
+        self.target_block_size = target.map(|t| {
+            t.clamp(
+                crate::common::MIN_TARGET_BLOCK_SIZE,
+                crate::common::MAX_BLOCK_SIZE,
+            )
+        });
+        Ok(())
     }
 
     /// Enable or disable the trailing XXH64 content checksum
@@ -198,6 +234,23 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         // Also use pledged size as source-size hint so the matcher
         // can select smaller tables for small inputs.
         self.state.matcher.set_source_size_hint(size);
+        Ok(())
+    }
+
+    /// Control whether the pledged size is written into the header's
+    /// `Frame_Content_Size` field (upstream `ZSTD_c_contentSizeFlag`,
+    /// default on). With the flag off the header omits the field, but a
+    /// pledge set via [`set_pledged_content_size`](Self::set_pledged_content_size)
+    /// is still enforced against the bytes actually written. Must be
+    /// called before the first [`write`](Write::write).
+    pub fn set_content_size_flag(&mut self, emit: bool) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.frame_started {
+            return Err(invalid_input_error(
+                "content size flag must be set before the first write",
+            ));
+        }
+        self.content_size_flag = emit;
         Ok(())
     }
 
@@ -263,6 +316,39 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         self.drain
             .as_ref()
             .expect("streaming encoder drain is present until finish consumes self")
+    }
+
+    /// Total heap bytes this encoder's allocations hold, excluding the
+    /// inline struct and the drain `W` (whose footprint the owner can
+    /// measure through [`get_ref`](Self::get_ref)): match-finder tables /
+    /// history / recycled buffers, retained Huffman tables, the staging
+    /// `pending` / `encoded_scratch` buffers, the retained dictionary
+    /// content, and the cached dictionary entropy tables. Mirrors
+    /// `FrameCompressor::heap_size` so a context can report its true
+    /// footprint through `ZSTD_sizeof_CCtx`.
+    pub fn heap_size(&self) -> usize {
+        let mut total = self.state.matcher.heap_size();
+        total += self
+            .state
+            .last_huff_table
+            .as_ref()
+            .map_or(0, |table| table.heap_size());
+        total += self
+            .state
+            .huff_table_spare
+            .as_ref()
+            .map_or(0, |table| table.heap_size());
+        total += self.pending.capacity();
+        total += self.encoded_scratch.capacity();
+        total += self
+            .dictionary
+            .as_ref()
+            .map_or(0, |d| d.inner.dict_content.capacity());
+        total += self
+            .dictionary_entropy_cache
+            .as_ref()
+            .map_or(0, CachedDictionaryEntropy::heap_size);
+        total
     }
 
     /// Returns a mutable reference to the wrapped output drain.
@@ -465,14 +551,23 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         // pushes referenceable history before the content, so the frame needs
         // an explicit window descriptor); gate it off when a dict is attached,
         // mirroring `FrameCompressor`'s `!use_dictionary_state` guard.
-        let single_segment = !use_dictionary_state
+        // Single-segment also requires the FCS field to be present
+        // (`content_size_flag`): the layout drops the window descriptor,
+        // so the header must carry the content size for decoders to size
+        // their window.
+        let single_segment = self.content_size_flag
+            && !use_dictionary_state
             && self
                 .pledged_content_size
                 .map(|size| (512..=(1 << 14)).contains(&size) && size <= window_size)
                 .unwrap_or(false);
 
         let header = FrameHeader {
-            frame_content_size: self.pledged_content_size,
+            frame_content_size: if self.content_size_flag {
+                self.pledged_content_size
+            } else {
+                None
+            },
             single_segment,
             content_checksum: cfg!(feature = "hash") && self.content_checksum,
             dictionary_id: if use_dictionary_state {
@@ -499,7 +594,10 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
 
     fn block_capacity(&self) -> usize {
         let matcher_window = self.state.matcher.window_size() as usize;
-        core::cmp::max(1, core::cmp::min(matcher_window, MAX_BLOCK_SIZE as usize))
+        let ceiling = self
+            .target_block_size
+            .map_or(MAX_BLOCK_SIZE as usize, |t| t as usize);
+        core::cmp::max(1, core::cmp::min(matcher_window, ceiling))
     }
 
     fn allocate_pending_space(&mut self, block_capacity: usize) -> Vec<u8> {

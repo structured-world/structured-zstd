@@ -5,11 +5,15 @@
 //! `include/`), bottomed on the pure-Rust [`codec`] public API. It
 //! builds as both a `cdylib` (SONAME `libzstd.so.1`) and a `staticlib`.
 //!
-//! Phase 6.1 scope: the synchronous slice of `zstd.h` — the simple one-shot
-//! API, the synchronous context API, error-code mapping, frame content
-//! inspection, and the stable dictionary-builder API (`ZDICT_*` from
-//! `zdict.h`). Streaming, advanced parameters, the experimental
-//! `ZDICT_STATIC_LINKING_ONLY` trainers, and the CLI land in later phases.
+//! Current scope: the simple one-shot API, the synchronous context API,
+//! error-code mapping, frame content inspection, the stable
+//! dictionary-builder API (`ZDICT_*` from `zdict.h`), dictionary contexts
+//! (`ZSTD_CDict` / `ZSTD_DDict`), the streaming API
+//! (`ZSTD_compressStream2` / `ZSTD_decompressStream` and the legacy
+//! `ZSTD_*Stream` entry points), and the advanced-parameter surface
+//! (`ZSTD_CCtx_setParameter` and friends). The experimental
+//! `ZDICT_STATIC_LINKING_ONLY` trainers and dictionary attach/ref
+//! parameters land in later phases.
 //!
 //! Every wrapper here is `unsafe extern "C"`; the safety contracts mirror the
 //! upstream documentation (valid `(ptr, len)` buffers, live context handles).
@@ -29,7 +33,9 @@ mod dict;
 mod error;
 mod ffi;
 mod frame;
+mod params;
 mod simple;
+mod streaming;
 
 #[cfg(test)]
 mod tests;
@@ -41,3 +47,5 @@ pub use context::{ZSTD_CCtx, ZSTD_DCtx};
 pub use dict::ZDICT_params_t;
 pub use error::ZSTD_ErrorCode;
 pub use frame::{ZSTD_FrameHeader, ZSTD_FrameType_e, ZSTD_format_e};
+pub use params::ZSTD_bounds;
+pub use streaming::{ZSTD_inBuffer, ZSTD_outBuffer};

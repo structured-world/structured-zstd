@@ -556,3 +556,1008 @@ fn create_cdict_rejects_non_dictionary() {
     let cdict = unsafe { ZSTD_createCDict(garbage.as_ptr(), garbage.len(), 3) };
     assert!(cdict.is_null(), "createCDict accepted a non-dictionary");
 }
+
+// ---- Phase 6.2: advanced parameters + streaming ----
+
+use crate::params::{
+    ZSTD_CCtx_getParameter, ZSTD_CCtx_reset, ZSTD_CCtx_setParameter, ZSTD_CCtx_setPledgedSrcSize,
+    ZSTD_DCtx_setParameter, ZSTD_bounds, ZSTD_cParam_getBounds, ZSTD_dParam_getBounds,
+};
+use crate::streaming::{
+    ZSTD_CStreamInSize, ZSTD_CStreamOutSize, ZSTD_DStreamInSize, ZSTD_DStreamOutSize,
+    ZSTD_compressStream2, ZSTD_decompressStream, ZSTD_endStream, ZSTD_flushStream, ZSTD_inBuffer,
+    ZSTD_outBuffer,
+};
+use core::ffi::c_int;
+
+// ABI invariants: struct sizes match upstream `sizeof` on 64-bit (on
+// 32-bit targets `size_t` / pointers halve the layouts).
+#[test]
+#[cfg(target_pointer_width = "64")]
+fn streaming_buffer_abi_sizes() {
+    assert_eq!(core::mem::size_of::<ZSTD_inBuffer>(), 24);
+    assert_eq!(core::mem::size_of::<ZSTD_outBuffer>(), 24);
+    assert_eq!(core::mem::size_of::<ZSTD_bounds>(), 16);
+}
+
+#[test]
+fn c_param_bounds_cover_stable_set() {
+    // Every stable v1.5.7 cParameter discriminant must report bounds.
+    for param in [
+        100, 101, 102, 103, 104, 105, 106, 107, 130, 160, 161, 162, 163, 164, 200, 201, 202, 400,
+        401, 402,
+    ] {
+        let b = ZSTD_cParam_getBounds(param);
+        assert_eq!(ZSTD_isError(b.error), 0, "param {param} must have bounds");
+        assert!(b.lowerBound <= b.upperBound, "param {param} bounds order");
+    }
+    // Unknown discriminant errors.
+    let b = ZSTD_cParam_getBounds(99);
+    assert_ne!(ZSTD_isError(b.error), 0);
+    let d = ZSTD_dParam_getBounds(100);
+    assert_eq!(ZSTD_isError(d.error), 0);
+    assert_ne!(ZSTD_isError(ZSTD_dParam_getBounds(99).error), 0);
+}
+
+#[test]
+fn set_parameter_validates_and_reads_back() {
+    let cctx = ZSTD_createCCtx();
+    unsafe {
+        // In-bounds values stick and read back.
+        assert_eq!(ZSTD_CCtx_setParameter(cctx, 100, 7), 0); // level
+        assert_eq!(ZSTD_CCtx_setParameter(cctx, 101, 20), 0); // windowLog
+        assert_eq!(ZSTD_CCtx_setParameter(cctx, 201, 1), 0); // checksum
+        assert_eq!(ZSTD_CCtx_setParameter(cctx, 107, 9), 0); // strategy btultra2
+        let mut v: c_int = -1;
+        assert_eq!(ZSTD_CCtx_getParameter(cctx, 100, &mut v), 0);
+        assert_eq!(v, 7);
+        assert_eq!(ZSTD_CCtx_getParameter(cctx, 101, &mut v), 0);
+        assert_eq!(v, 20);
+        assert_eq!(ZSTD_CCtx_getParameter(cctx, 201, &mut v), 0);
+        assert_eq!(v, 1);
+        assert_eq!(ZSTD_CCtx_getParameter(cctx, 107, &mut v), 0);
+        assert_eq!(v, 9);
+
+        // Out-of-bounds rejected with parameter_outOfBound.
+        let rc = ZSTD_CCtx_setParameter(cctx, 101, 99);
+        assert_ne!(ZSTD_isError(rc), 0);
+        assert_eq!(
+            ZSTD_getErrorCode(rc),
+            ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound
+        );
+        // Unknown parameter rejected as unsupported.
+        let rc = ZSTD_CCtx_setParameter(cctx, 9999, 1);
+        assert_eq!(
+            ZSTD_getErrorCode(rc),
+            ZSTD_ErrorCode::ZSTD_error_parameter_unsupported
+        );
+        // 0 returns a tunable to auto.
+        assert_eq!(ZSTD_CCtx_setParameter(cctx, 101, 0), 0);
+        assert_eq!(ZSTD_CCtx_getParameter(cctx, 101, &mut v), 0);
+        assert_eq!(v, 0);
+
+        // Parameters reset restores defaults.
+        assert_eq!(ZSTD_CCtx_setParameter(cctx, 201, 1), 0);
+        assert_eq!(ZSTD_CCtx_reset(cctx, 3), 0); // session_and_parameters
+        assert_eq!(ZSTD_CCtx_getParameter(cctx, 201, &mut v), 0);
+        assert_eq!(v, 0);
+        assert_eq!(ZSTD_CCtx_getParameter(cctx, 100, &mut v), 0);
+        assert_eq!(v, 3);
+
+        ZSTD_freeCCtx(cctx);
+    }
+}
+
+#[test]
+fn compress2_roundtrips_with_sticky_parameters() {
+    let input = sample(256 * 1024);
+    let cctx = ZSTD_createCCtx();
+    let dctx = ZSTD_createDCtx();
+    let mut compressed = vec![0u8; ZSTD_compressBound(input.len())];
+    unsafe {
+        assert_eq!(ZSTD_CCtx_setParameter(cctx, 100, 5), 0);
+        assert_eq!(ZSTD_CCtx_setParameter(cctx, 201, 1), 0); // checksum on
+        let csize = crate::context::ZSTD_compress2(
+            cctx,
+            compressed.as_mut_ptr(),
+            compressed.len(),
+            input.as_ptr(),
+            input.len(),
+        );
+        assert_eq!(ZSTD_isError(csize), 0, "compress2 reported an error");
+
+        // The checksum flag must show in the frame header.
+        let mut zfh = core::mem::MaybeUninit::<ZSTD_FrameHeader>::zeroed();
+        assert_eq!(
+            ZSTD_getFrameHeader(zfh.as_mut_ptr(), compressed.as_ptr(), csize),
+            0
+        );
+        assert_eq!(zfh.assume_init_ref().checksumFlag, 1);
+
+        let mut restored = vec![0u8; input.len()];
+        let dsize = ZSTD_decompressDCtx(
+            dctx,
+            restored.as_mut_ptr(),
+            restored.len(),
+            compressed.as_ptr(),
+            csize,
+        );
+        assert_eq!(ZSTD_isError(dsize), 0);
+        assert_eq!(dsize, input.len());
+        assert_eq!(restored, input);
+
+        // A mismatching pledge is rejected.
+        assert_eq!(ZSTD_CCtx_setPledgedSrcSize(cctx, 1), 0);
+        let rc = crate::context::ZSTD_compress2(
+            cctx,
+            compressed.as_mut_ptr(),
+            compressed.len(),
+            input.as_ptr(),
+            input.len(),
+        );
+        assert_eq!(
+            ZSTD_getErrorCode(rc),
+            ZSTD_ErrorCode::ZSTD_error_srcSize_wrong
+        );
+
+        ZSTD_freeCCtx(cctx);
+        ZSTD_freeDCtx(dctx);
+    }
+}
+
+#[test]
+fn content_size_and_dict_id_flags_apply() {
+    let input = sample(64 * 1024);
+    let cctx = ZSTD_createCCtx();
+    let mut compressed = vec![0u8; ZSTD_compressBound(input.len())];
+    unsafe {
+        assert_eq!(ZSTD_CCtx_setParameter(cctx, 200, 0), 0); // contentSizeFlag off
+        let csize = crate::context::ZSTD_compress2(
+            cctx,
+            compressed.as_mut_ptr(),
+            compressed.len(),
+            input.as_ptr(),
+            input.len(),
+        );
+        assert_eq!(ZSTD_isError(csize), 0);
+        // ZSTD_CONTENTSIZE_UNKNOWN == -1 as u64.
+        let declared = ZSTD_getFrameContentSize(compressed.as_ptr(), csize);
+        assert_eq!(declared, u64::MAX, "FCS must be omitted");
+        ZSTD_freeCCtx(cctx);
+    }
+}
+
+/// Drive a full streaming round-trip with deliberately tiny output buffers
+/// so the flush/end loops exercise the partial-drain paths.
+#[test]
+fn streaming_roundtrip_chunked() {
+    let input = sample(1 << 20);
+    let zcs = crate::streaming::ZSTD_createCStream();
+    assert!(!zcs.is_null(), "ZSTD_createCStream returned NULL");
+    let mut compressed: Vec<u8> = Vec::new();
+    unsafe {
+        assert_eq!(ZSTD_CCtx_setParameter(zcs, 100, 3), 0);
+        assert_eq!(ZSTD_CCtx_setParameter(zcs, 201, 1), 0); // checksum
+
+        // Feed in 64 KiB slices with a 1 KiB output buffer.
+        let mut outbuf = vec![0u8; 1024];
+        for chunk in input.chunks(64 * 1024) {
+            let mut inb = ZSTD_inBuffer {
+                src: chunk.as_ptr() as *const core::ffi::c_void,
+                size: chunk.len(),
+                pos: 0,
+            };
+            loop {
+                let mut outb = ZSTD_outBuffer {
+                    dst: outbuf.as_mut_ptr() as *mut core::ffi::c_void,
+                    size: outbuf.len(),
+                    pos: 0,
+                };
+                let rc = ZSTD_compressStream2(zcs, &mut outb, &mut inb, 0);
+                assert_eq!(ZSTD_isError(rc), 0, "continue errored");
+                compressed.extend_from_slice(&outbuf[..outb.pos]);
+                if inb.pos == inb.size && rc == 0 {
+                    break;
+                }
+                if inb.pos == inb.size && outb.pos < outb.size {
+                    // Input consumed; leftovers smaller than the buffer will
+                    // drain on the next call or at end.
+                    break;
+                }
+            }
+        }
+        // Finish the frame, looping until fully flushed.
+        loop {
+            let mut outb = ZSTD_outBuffer {
+                dst: outbuf.as_mut_ptr() as *mut core::ffi::c_void,
+                size: outbuf.len(),
+                pos: 0,
+            };
+            let rc = ZSTD_endStream(zcs, &mut outb);
+            assert_eq!(ZSTD_isError(rc), 0, "end errored");
+            compressed.extend_from_slice(&outbuf[..outb.pos]);
+            if rc == 0 {
+                break;
+            }
+        }
+        crate::streaming::ZSTD_freeCStream(zcs);
+    }
+
+    // Decompress through the streaming decoder with small buffers too.
+    let zds = crate::streaming::ZSTD_createDStream();
+    assert!(!zds.is_null(), "ZSTD_createDStream returned NULL");
+    let mut restored: Vec<u8> = Vec::new();
+    unsafe {
+        assert_ne!(
+            crate::streaming::ZSTD_initDStream(zds),
+            0,
+            "initDStream must return a non-zero recommended input size"
+        );
+        let mut outbuf = vec![0u8; 4096];
+        let mut inb = ZSTD_inBuffer {
+            src: compressed.as_ptr() as *const core::ffi::c_void,
+            size: compressed.len(),
+            pos: 0,
+        };
+        loop {
+            let mut outb = ZSTD_outBuffer {
+                dst: outbuf.as_mut_ptr() as *mut core::ffi::c_void,
+                size: outbuf.len(),
+                pos: 0,
+            };
+            let rc = ZSTD_decompressStream(zds, &mut outb, &mut inb);
+            assert_eq!(ZSTD_isError(rc), 0, "decompressStream errored");
+            restored.extend_from_slice(&outbuf[..outb.pos]);
+            if rc == 0 && inb.pos == inb.size {
+                break;
+            }
+            assert!(
+                outb.pos > 0 || inb.pos < inb.size,
+                "no forward progress in decode loop"
+            );
+        }
+        crate::streaming::ZSTD_freeDStream(zds);
+    }
+    assert_eq!(restored, input, "streaming round-trip must be byte-exact");
+}
+
+#[test]
+fn flush_stream_emits_decodable_prefix_and_two_frames_back_to_back() {
+    let part1 = sample(100_000);
+    let part2 = sample(50_000);
+    let zcs = crate::streaming::ZSTD_createCStream();
+    let mut compressed: Vec<u8> = Vec::new();
+    let mut outbuf = vec![0u8; ZSTD_CStreamOutSize()];
+    unsafe {
+        // Frame 1: write, flush mid-frame, then end.
+        for (data, finish) in [(&part1, false), (&part2, true)] {
+            let mut inb = ZSTD_inBuffer {
+                src: data.as_ptr() as *const core::ffi::c_void,
+                size: data.len(),
+                pos: 0,
+            };
+            let mut outb = ZSTD_outBuffer {
+                dst: outbuf.as_mut_ptr() as *mut core::ffi::c_void,
+                size: outbuf.len(),
+                pos: 0,
+            };
+            let rc = ZSTD_compressStream2(zcs, &mut outb, &mut inb, 0);
+            assert_eq!(ZSTD_isError(rc), 0);
+            compressed.extend_from_slice(&outbuf[..outb.pos]);
+            let mut outb = ZSTD_outBuffer {
+                dst: outbuf.as_mut_ptr() as *mut core::ffi::c_void,
+                size: outbuf.len(),
+                pos: 0,
+            };
+            let rc = if finish {
+                ZSTD_endStream(zcs, &mut outb)
+            } else {
+                ZSTD_flushStream(zcs, &mut outb)
+            };
+            assert_eq!(ZSTD_isError(rc), 0);
+            assert_eq!(rc, 0, "big buffer must fully drain");
+            compressed.extend_from_slice(&outbuf[..outb.pos]);
+        }
+        // Second frame on the same context (sticky params, new frame).
+        let mut inb = ZSTD_inBuffer {
+            src: part1.as_ptr() as *const core::ffi::c_void,
+            size: part1.len(),
+            pos: 0,
+        };
+        let mut outb = ZSTD_outBuffer {
+            dst: outbuf.as_mut_ptr() as *mut core::ffi::c_void,
+            size: outbuf.len(),
+            pos: 0,
+        };
+        let rc = ZSTD_compressStream2(zcs, &mut outb, &mut inb, 2); // e_end
+        assert_eq!(ZSTD_isError(rc), 0);
+        assert_eq!(rc, 0);
+        compressed.extend_from_slice(&outbuf[..outb.pos]);
+        crate::streaming::ZSTD_freeCStream(zcs);
+    }
+
+    // Both frames decode back-to-back via the streaming decoder.
+    let zds = crate::streaming::ZSTD_createDStream();
+    let mut restored: Vec<u8> = Vec::new();
+    unsafe {
+        let mut outbuf = vec![0u8; ZSTD_DStreamOutSize()];
+        let mut inb = ZSTD_inBuffer {
+            src: compressed.as_ptr() as *const core::ffi::c_void,
+            size: compressed.len(),
+            pos: 0,
+        };
+        while inb.pos < inb.size {
+            let mut outb = ZSTD_outBuffer {
+                dst: outbuf.as_mut_ptr() as *mut core::ffi::c_void,
+                size: outbuf.len(),
+                pos: 0,
+            };
+            let rc = ZSTD_decompressStream(zds, &mut outb, &mut inb);
+            assert_eq!(ZSTD_isError(rc), 0);
+            restored.extend_from_slice(&outbuf[..outb.pos]);
+        }
+        crate::streaming::ZSTD_freeDStream(zds);
+    }
+    let mut expected = part1.clone();
+    expected.extend_from_slice(&part2);
+    expected.extend_from_slice(&part1);
+    assert_eq!(restored, expected);
+}
+
+#[test]
+fn d_window_log_max_rejects_oversized_window() {
+    // Compress 1 MiB at a window the decoder limit will reject.
+    let input = sample(1 << 20);
+    let cctx = ZSTD_createCCtx();
+    let mut compressed = vec![0u8; ZSTD_compressBound(input.len())];
+    let csize = unsafe {
+        assert_eq!(ZSTD_CCtx_setParameter(cctx, 101, 20), 0); // windowLog 20
+        // Suppress the FCS so the header carries a window descriptor (a
+        // known content size lets decoders ignore the window entirely).
+        assert_eq!(ZSTD_CCtx_setParameter(cctx, 200, 0), 0);
+        let csize = crate::context::ZSTD_compress2(
+            cctx,
+            compressed.as_mut_ptr(),
+            compressed.len(),
+            input.as_ptr(),
+            input.len(),
+        );
+        ZSTD_freeCCtx(cctx);
+        csize
+    };
+    assert_eq!(ZSTD_isError(csize), 0);
+
+    let zds = crate::streaming::ZSTD_createDStream();
+    unsafe {
+        // Limit below the frame's window log → rejected.
+        assert_eq!(ZSTD_DCtx_setParameter(zds, 100, 10), 0);
+        let mut outbuf = vec![0u8; 4096];
+        let mut inb = ZSTD_inBuffer {
+            src: compressed.as_ptr() as *const core::ffi::c_void,
+            size: compressed.len(),
+            pos: 0,
+        };
+        let mut outb = ZSTD_outBuffer {
+            dst: outbuf.as_mut_ptr() as *mut core::ffi::c_void,
+            size: outbuf.len(),
+            pos: 0,
+        };
+        let rc = ZSTD_decompressStream(zds, &mut outb, &mut inb);
+        assert_eq!(
+            ZSTD_getErrorCode(rc),
+            ZSTD_ErrorCode::ZSTD_error_frameParameter_windowTooLarge
+        );
+        crate::streaming::ZSTD_freeDStream(zds);
+    }
+}
+
+#[test]
+fn stream_size_hints_match_upstream() {
+    assert_eq!(ZSTD_CStreamInSize(), 128 * 1024);
+    assert_eq!(ZSTD_DStreamInSize(), 128 * 1024 + 3);
+    assert_eq!(ZSTD_DStreamOutSize(), 128 * 1024);
+    assert_eq!(
+        ZSTD_CStreamOutSize(),
+        ZSTD_compressBound(128 * 1024) + 3 + 4
+    );
+}
+
+#[test]
+fn target_cblock_size_caps_emitted_blocks() {
+    // 512 KiB of incompressible data would normally emit 4 full 128 KiB
+    // blocks; with a 1340-byte target every physical block payload must be
+    // at or under the target.
+    let input = sample(512 * 1024);
+    let cctx = ZSTD_createCCtx();
+    let mut compressed = vec![0u8; ZSTD_compressBound(input.len()) + (input.len() / 1340 + 2) * 3];
+    unsafe {
+        assert_eq!(ZSTD_CCtx_setParameter(cctx, 130, 1340), 0); // targetCBlockSize
+        let csize = crate::context::ZSTD_compress2(
+            cctx,
+            compressed.as_mut_ptr(),
+            compressed.len(),
+            input.as_ptr(),
+            input.len(),
+        );
+        assert_eq!(ZSTD_isError(csize), 0, "compress2 with target errored");
+        ZSTD_freeCCtx(cctx);
+
+        // Walk the frame's block headers: 3-byte LE `(size << 3) | (type
+        // << 1) | last`; Raw/RLE regenerate `size` bytes, Compressed
+        // blocks carry `size` payload bytes — all must be <= target.
+        let mut zfh = core::mem::MaybeUninit::<ZSTD_FrameHeader>::zeroed();
+        assert_eq!(
+            ZSTD_getFrameHeader(zfh.as_mut_ptr(), compressed.as_ptr(), csize),
+            0
+        );
+        let header_len = ZSTD_frameHeaderSize(compressed.as_ptr(), csize);
+        assert_eq!(ZSTD_isError(header_len), 0);
+        let mut pos = header_len;
+        loop {
+            let hdr =
+                u32::from_le_bytes([compressed[pos], compressed[pos + 1], compressed[pos + 2], 0]);
+            let last = hdr & 1 != 0;
+            let block_type = (hdr >> 1) & 3;
+            let size = (hdr >> 3) as usize;
+            let payload = match block_type {
+                1 => 1,    // RLE carries one byte
+                _ => size, // Raw / Compressed carry `size` bytes
+            };
+            // The assertion checks the header's logical `Block_Size`, not
+            // the physical payload: for RLE blocks the field is the repeat
+            // count (regenerated bytes) while the body is a single byte.
+            // `set_target_block_size` caps each block's uncompressed chunk,
+            // so the logical size is the right thing to bound here.
+            assert!(
+                size <= 1340,
+                "block at {pos} declares {size} bytes, above the 1340 target"
+            );
+            pos += 3 + payload;
+            if last {
+                break;
+            }
+        }
+    }
+}
+
+#[test]
+fn dctx_parameter_changes_rejected_mid_frame() {
+    // Compress two frames; feed only a prefix of the first so the decoder
+    // parks mid-frame, then verify parameter mutation is rejected with
+    // stage_wrong until the session is reset.
+    let input = sample(256 * 1024);
+    let cctx = ZSTD_createCCtx();
+    let mut compressed = vec![0u8; ZSTD_compressBound(input.len())];
+    let csize = unsafe {
+        let csize = crate::context::ZSTD_compress2(
+            cctx,
+            compressed.as_mut_ptr(),
+            compressed.len(),
+            input.as_ptr(),
+            input.len(),
+        );
+        ZSTD_freeCCtx(cctx);
+        csize
+    };
+    assert_eq!(ZSTD_isError(csize), 0);
+
+    let zds = crate::streaming::ZSTD_createDStream();
+    unsafe {
+        // Between frames: parameter changes are accepted.
+        assert_eq!(ZSTD_DCtx_setParameter(zds, 100, 25), 0);
+
+        let mut outbuf = vec![0u8; 4096];
+        let mut inb = ZSTD_inBuffer {
+            src: compressed.as_ptr() as *const core::ffi::c_void,
+            size: csize / 2, // truncated input: frame stays in flight
+            pos: 0,
+        };
+        let mut outb = ZSTD_outBuffer {
+            dst: outbuf.as_mut_ptr() as *mut core::ffi::c_void,
+            size: outbuf.len(),
+            pos: 0,
+        };
+        let rc = crate::streaming::ZSTD_decompressStream(zds, &mut outb, &mut inb);
+        assert_eq!(ZSTD_isError(rc), 0);
+        assert_ne!(rc, 0, "frame must still be in flight");
+
+        // Mid-frame: setParameter and a parameters-only reset are rejected.
+        let rc = ZSTD_DCtx_setParameter(zds, 100, 26);
+        assert_eq!(
+            ZSTD_getErrorCode(rc),
+            ZSTD_ErrorCode::ZSTD_error_stage_wrong
+        );
+        let rc = crate::params::ZSTD_DCtx_reset(zds, 2); // ZSTD_reset_parameters
+        assert_eq!(
+            ZSTD_getErrorCode(rc),
+            ZSTD_ErrorCode::ZSTD_error_stage_wrong
+        );
+
+        // A session reset abandons the frame; parameters mutate again.
+        assert_eq!(crate::params::ZSTD_DCtx_reset(zds, 1), 0);
+        assert_eq!(ZSTD_DCtx_setParameter(zds, 100, 26), 0);
+        crate::streaming::ZSTD_freeDStream(zds);
+    }
+}
+
+// Bug regression: ZSTD_compress2 on a context with a streaming frame in
+// flight must be rejected with stage_wrong — starting a one-shot frame
+// mid-stream would interleave two frame lifecycles on one context (and
+// consume the pledge that belongs to the streaming frame).
+#[test]
+fn compress2_rejected_while_stream_in_flight() {
+    let input = sample(64 * 1024);
+    let zcs = crate::streaming::ZSTD_createCStream();
+    let mut outbuf = vec![0u8; 1024];
+    unsafe {
+        // Open a streaming frame and leave it unfinished.
+        let mut inb = ZSTD_inBuffer {
+            src: input.as_ptr() as *const core::ffi::c_void,
+            size: input.len(),
+            pos: 0,
+        };
+        let mut outb = ZSTD_outBuffer {
+            dst: outbuf.as_mut_ptr() as *mut core::ffi::c_void,
+            size: outbuf.len(),
+            pos: 0,
+        };
+        let rc = ZSTD_compressStream2(zcs, &mut outb, &mut inb, 0);
+        assert_eq!(ZSTD_isError(rc), 0);
+
+        let mut compressed = vec![0u8; ZSTD_compressBound(input.len())];
+        let rc = crate::context::ZSTD_compress2(
+            zcs,
+            compressed.as_mut_ptr(),
+            compressed.len(),
+            input.as_ptr(),
+            input.len(),
+        );
+        assert_eq!(
+            ZSTD_getErrorCode(rc),
+            ZSTD_ErrorCode::ZSTD_error_stage_wrong,
+            "compress2 mid-stream must be rejected"
+        );
+
+        // After ending the stream the context accepts one-shots again.
+        loop {
+            let mut outb = ZSTD_outBuffer {
+                dst: outbuf.as_mut_ptr() as *mut core::ffi::c_void,
+                size: outbuf.len(),
+                pos: 0,
+            };
+            let rc = ZSTD_endStream(zcs, &mut outb);
+            assert_eq!(ZSTD_isError(rc), 0);
+            if rc == 0 {
+                break;
+            }
+        }
+        let rc = crate::context::ZSTD_compress2(
+            zcs,
+            compressed.as_mut_ptr(),
+            compressed.len(),
+            input.as_ptr(),
+            input.len(),
+        );
+        assert_eq!(ZSTD_isError(rc), 0, "compress2 must work between frames");
+        crate::streaming::ZSTD_freeCStream(zcs);
+    }
+}
+
+// Bug regression: a malformed frame header fed to ZSTD_decompressStream
+// must surface a decode error, not the "need more input" hint — the hint
+// with no input consumed sends a spec-conformant caller into a spin.
+#[test]
+fn decompress_stream_errors_on_malformed_header() {
+    let zds = crate::streaming::ZSTD_createDStream();
+    let garbage = [0xA5u8; 64]; // wrong magic, plenty of bytes
+    let mut outbuf = vec![0u8; 4096];
+    unsafe {
+        let mut inb = ZSTD_inBuffer {
+            src: garbage.as_ptr() as *const core::ffi::c_void,
+            size: garbage.len(),
+            pos: 0,
+        };
+        let mut outb = ZSTD_outBuffer {
+            dst: outbuf.as_mut_ptr() as *mut core::ffi::c_void,
+            size: outbuf.len(),
+            pos: 0,
+        };
+        let rc = crate::streaming::ZSTD_decompressStream(zds, &mut outb, &mut inb);
+        assert_ne!(
+            ZSTD_isError(rc),
+            0,
+            "malformed header must error, not ask for more input (rc={rc})"
+        );
+        crate::streaming::ZSTD_freeDStream(zds);
+    }
+}
+
+// Bug regression: the pledged source size must be enforced even when
+// `ZSTD_c_contentSizeFlag = 0` omits the FCS field from the header.
+// Upstream validates `consumedSrcSize` against the pledge at frame end
+// regardless of the flag; only the header field is gated on it.
+#[test]
+fn streaming_pledge_enforced_when_fcs_flag_off() {
+    let input = sample(4096);
+    let mut outbuf = vec![0u8; ZSTD_CStreamOutSize()];
+
+    // Undersized stream: pledge 4096, write 1000, end -> must error.
+    let zcs = crate::streaming::ZSTD_createCStream();
+    unsafe {
+        assert_eq!(ZSTD_CCtx_setParameter(zcs, 200, 0), 0); // contentSizeFlag off
+        assert_eq!(ZSTD_CCtx_setPledgedSrcSize(zcs, input.len() as u64), 0);
+        let mut inb = ZSTD_inBuffer {
+            src: input.as_ptr() as *const core::ffi::c_void,
+            size: 1000,
+            pos: 0,
+        };
+        let mut outb = ZSTD_outBuffer {
+            dst: outbuf.as_mut_ptr() as *mut core::ffi::c_void,
+            size: outbuf.len(),
+            pos: 0,
+        };
+        let rc = ZSTD_compressStream2(zcs, &mut outb, &mut inb, 2); // ZSTD_e_end
+        assert_eq!(
+            ZSTD_getErrorCode(rc),
+            ZSTD_ErrorCode::ZSTD_error_srcSize_wrong,
+            "ending an undersized pledged frame must fail with srcSize_wrong even with contentSizeFlag=0"
+        );
+        crate::streaming::ZSTD_freeCStream(zcs);
+    }
+
+    // Exact-sized stream: succeeds AND the header carries no FCS field.
+    let zcs = crate::streaming::ZSTD_createCStream();
+    let mut compressed: Vec<u8> = Vec::new();
+    unsafe {
+        assert_eq!(ZSTD_CCtx_setParameter(zcs, 200, 0), 0);
+        assert_eq!(ZSTD_CCtx_setPledgedSrcSize(zcs, input.len() as u64), 0);
+        let mut inb = ZSTD_inBuffer {
+            src: input.as_ptr() as *const core::ffi::c_void,
+            size: input.len(),
+            pos: 0,
+        };
+        loop {
+            let mut outb = ZSTD_outBuffer {
+                dst: outbuf.as_mut_ptr() as *mut core::ffi::c_void,
+                size: outbuf.len(),
+                pos: 0,
+            };
+            let rc = ZSTD_compressStream2(zcs, &mut outb, &mut inb, 2);
+            assert_eq!(ZSTD_isError(rc), 0, "exact pledged frame must succeed");
+            compressed.extend_from_slice(&outbuf[..outb.pos]);
+            if rc == 0 {
+                break;
+            }
+        }
+        let declared = ZSTD_getFrameContentSize(compressed.as_ptr(), compressed.len());
+        assert_eq!(declared, u64::MAX, "FCS field must be omitted from header");
+        crate::streaming::ZSTD_freeCStream(zcs);
+    }
+}
+
+// Bug regression: when input overruns the pledged size, `inp.pos` must
+// reflect the bytes the encoder actually consumed (up to the pledge)
+// before the call errors — a desynced `pos` tells the C caller none of
+// its input was taken when most of it was.
+#[test]
+fn streaming_input_pos_tracks_consumed_bytes_at_pledge_boundary() {
+    let input = sample(1500);
+    let pledged = 1000u64;
+    let mut outbuf = vec![0u8; ZSTD_CStreamOutSize()];
+    let zcs = crate::streaming::ZSTD_createCStream();
+    unsafe {
+        assert_eq!(ZSTD_CCtx_setPledgedSrcSize(zcs, pledged), 0);
+        let mut inb = ZSTD_inBuffer {
+            src: input.as_ptr() as *const core::ffi::c_void,
+            size: input.len(),
+            pos: 0,
+        };
+        let mut outb = ZSTD_outBuffer {
+            dst: outbuf.as_mut_ptr() as *mut core::ffi::c_void,
+            size: outbuf.len(),
+            pos: 0,
+        };
+        let rc = ZSTD_compressStream2(zcs, &mut outb, &mut inb, 0);
+        assert_ne!(ZSTD_isError(rc), 0, "overrunning the pledge must error");
+        assert_eq!(
+            inb.pos, pledged as usize,
+            "pos must reflect the bytes consumed up to the pledge boundary"
+        );
+        crate::streaming::ZSTD_freeCStream(zcs);
+    }
+}
+
+// Bug regression: ZSTD_decompressStream must verify the trailing XXH64
+// content checksum like ZSTD_decompressDCtx does — a corrupted trailer
+// has to surface ZSTD_error_checksum_wrong, not decode silently.
+#[test]
+fn streaming_decompress_rejects_corrupted_content_checksum() {
+    let input = sample(64 * 1024);
+    let cctx = ZSTD_createCCtx();
+    let mut compressed = vec![0u8; ZSTD_compressBound(input.len())];
+    let csize = unsafe {
+        assert_eq!(ZSTD_CCtx_setParameter(cctx, 201, 1), 0); // checksum on
+        let rc = crate::context::ZSTD_compress2(
+            cctx,
+            compressed.as_mut_ptr(),
+            compressed.len(),
+            input.as_ptr(),
+            input.len(),
+        );
+        assert_eq!(ZSTD_isError(rc), 0);
+        ZSTD_freeCCtx(cctx);
+        rc
+    };
+    compressed.truncate(csize);
+    // Flip a bit in the 4-byte checksum trailer.
+    let last = compressed.len() - 1;
+    compressed[last] ^= 0xFF;
+
+    let zds = crate::streaming::ZSTD_createDStream();
+    let mut outbuf = vec![0u8; input.len() + 4096];
+    unsafe {
+        let mut inb = ZSTD_inBuffer {
+            src: compressed.as_ptr() as *const core::ffi::c_void,
+            size: compressed.len(),
+            pos: 0,
+        };
+        let mut rc;
+        loop {
+            let mut outb = ZSTD_outBuffer {
+                dst: outbuf.as_mut_ptr() as *mut core::ffi::c_void,
+                size: outbuf.len(),
+                pos: 0,
+            };
+            rc = ZSTD_decompressStream(zds, &mut outb, &mut inb);
+            if ZSTD_isError(rc) != 0 || (rc == 0 && inb.pos == inb.size) {
+                break;
+            }
+            assert!(
+                outb.pos > 0 || inb.pos < inb.size,
+                "no forward progress in decode loop"
+            );
+        }
+        assert_eq!(
+            ZSTD_getErrorCode(rc),
+            ZSTD_ErrorCode::ZSTD_error_checksum_wrong,
+            "corrupted checksum trailer must be rejected in streaming mode"
+        );
+        crate::streaming::ZSTD_freeDStream(zds);
+    }
+}
+
+// Bug regression: a one-shot ZSTD_decompressDCtx on a context whose
+// streaming decode was abandoned MID-FRAME must leave the context at a
+// frame boundary; the next ZSTD_decompressStream call has to start the
+// new frame instead of stalling on the finished decoder.
+#[test]
+fn decompress_stream_recovers_after_oneshot_on_midframe_context() {
+    let input = sample(256 * 1024);
+    let frame = compress_frame(&input);
+    let zds = crate::streaming::ZSTD_createDStream();
+    let mut outbuf = vec![0u8; input.len() + 4096];
+    unsafe {
+        // Feed a TRUNCATED frame so the stream parks mid-frame.
+        let mut inb = ZSTD_inBuffer {
+            src: frame.as_ptr() as *const core::ffi::c_void,
+            size: frame.len() / 2,
+            pos: 0,
+        };
+        let mut outb = ZSTD_outBuffer {
+            dst: outbuf.as_mut_ptr() as *mut core::ffi::c_void,
+            size: outbuf.len(),
+            pos: 0,
+        };
+        let rc = ZSTD_decompressStream(zds, &mut outb, &mut inb);
+        assert_eq!(ZSTD_isError(rc), 0, "truncated feed must just ask for more");
+        assert_ne!(rc, 0, "mid-frame stream must report more input needed");
+
+        // One-shot decode of a COMPLETE frame on the same context.
+        let mut once = vec![0u8; input.len()];
+        let n = crate::context::ZSTD_decompressDCtx(
+            zds,
+            once.as_mut_ptr(),
+            once.len(),
+            frame.as_ptr(),
+            frame.len(),
+        );
+        assert_eq!(ZSTD_isError(n), 0);
+        assert_eq!(n, input.len());
+
+        // Streaming decode of a fresh complete frame: the FIRST call must
+        // already consume input (start the new frame). A context left
+        // "mid-frame" by the one-shot instead burns a call returning 0
+        // ("frame complete") without touching the fresh input.
+        let mut inb = ZSTD_inBuffer {
+            src: frame.as_ptr() as *const core::ffi::c_void,
+            size: frame.len(),
+            pos: 0,
+        };
+        let mut restored: Vec<u8> = Vec::new();
+        let mut first_call = true;
+        loop {
+            let mut outb = ZSTD_outBuffer {
+                dst: outbuf.as_mut_ptr() as *mut core::ffi::c_void,
+                size: outbuf.len(),
+                pos: 0,
+            };
+            let rc = ZSTD_decompressStream(zds, &mut outb, &mut inb);
+            assert_eq!(ZSTD_isError(rc), 0, "post-oneshot stream decode errored");
+            if first_call {
+                assert!(
+                    inb.pos > 0,
+                    "first call after the one-shot must start the new frame, \
+                     not report the previous frame complete (rc={rc})"
+                );
+                first_call = false;
+            }
+            restored.extend_from_slice(&outbuf[..outb.pos]);
+            if rc == 0 && inb.pos == inb.size {
+                break;
+            }
+            assert!(
+                outb.pos > 0 || inb.pos < inb.size,
+                "stream stalled: context stuck mid-frame after one-shot decode"
+            );
+        }
+        assert_eq!(restored, input, "post-oneshot streaming must be byte-exact");
+        crate::streaming::ZSTD_freeDStream(zds);
+    }
+}
+
+// Bug regression: when the post-ZSTD_e_end tail is drained by a LATER
+// call under a different directive (tiny output buffer forces the
+// split), the finished stream state must still be dropped — otherwise
+// the context wedges into "Some { encoder: None, pending: [] }" and
+// every next input-bearing call fails with stage_wrong forever.
+#[test]
+fn stream_resets_after_tail_drained_by_non_end_directive() {
+    let input = sample(256 * 1024);
+    let zcs = crate::streaming::ZSTD_createCStream();
+    let mut tiny = vec![0u8; 1024];
+    unsafe {
+        // Feed everything and finish with e_end into a TINY buffer so a
+        // tail stays pending after the encoder is consumed.
+        let mut inb = ZSTD_inBuffer {
+            src: input.as_ptr() as *const core::ffi::c_void,
+            size: input.len(),
+            pos: 0,
+        };
+        let mut outb = ZSTD_outBuffer {
+            dst: tiny.as_mut_ptr() as *mut core::ffi::c_void,
+            size: tiny.len(),
+            pos: 0,
+        };
+        let rc = ZSTD_compressStream2(zcs, &mut outb, &mut inb, 2); // e_end
+        assert_eq!(ZSTD_isError(rc), 0);
+        assert_ne!(rc, 0, "tiny buffer must leave a pending tail");
+
+        // Drain the remaining tail with e_flush (NOT e_end) calls.
+        loop {
+            let mut outb = ZSTD_outBuffer {
+                dst: tiny.as_mut_ptr() as *mut core::ffi::c_void,
+                size: tiny.len(),
+                pos: 0,
+            };
+            let mut empty = ZSTD_inBuffer {
+                src: core::ptr::null(),
+                size: 0,
+                pos: 0,
+            };
+            let rc = ZSTD_compressStream2(zcs, &mut outb, &mut empty, 1); // e_flush
+            assert_eq!(ZSTD_isError(rc), 0, "tail drain under e_flush errored");
+            if rc == 0 {
+                break;
+            }
+        }
+
+        // The frame is complete and fully drained: a new frame must start.
+        let mut inb = ZSTD_inBuffer {
+            src: input.as_ptr() as *const core::ffi::c_void,
+            size: 4096,
+            pos: 0,
+        };
+        let mut outb = ZSTD_outBuffer {
+            dst: tiny.as_mut_ptr() as *mut core::ffi::c_void,
+            size: tiny.len(),
+            pos: 0,
+        };
+        let rc = ZSTD_compressStream2(zcs, &mut outb, &mut inb, 0); // e_continue
+        assert_eq!(
+            ZSTD_isError(rc),
+            0,
+            "new frame after fully-drained end must start, not stage_wrong"
+        );
+        crate::streaming::ZSTD_freeCStream(zcs);
+    }
+}
+
+// Bug regression: a FAILED one-shot decode on a context abandoned
+// mid-stream must still leave the context at a frame boundary — the
+// next ZSTD_decompressStream call has to start the new frame instead
+// of resuming the failed one-shot's frame state.
+#[test]
+fn decompress_stream_recovers_after_failed_oneshot_on_midframe_context() {
+    let input = sample(256 * 1024);
+    let frame = compress_frame(&input);
+    let zds = crate::streaming::ZSTD_createDStream();
+    let mut outbuf = vec![0u8; input.len() + 4096];
+    unsafe {
+        // Park the stream mid-frame with a truncated feed.
+        let mut inb = ZSTD_inBuffer {
+            src: frame.as_ptr() as *const core::ffi::c_void,
+            size: frame.len() / 2,
+            pos: 0,
+        };
+        let mut outb = ZSTD_outBuffer {
+            dst: outbuf.as_mut_ptr() as *mut core::ffi::c_void,
+            size: outbuf.len(),
+            pos: 0,
+        };
+        let rc = ZSTD_decompressStream(zds, &mut outb, &mut inb);
+        assert_eq!(ZSTD_isError(rc), 0);
+        assert_ne!(rc, 0, "mid-frame stream must report more input needed");
+
+        // One-shot decode of a CORRUPT frame on the same context: fails.
+        // Deterministic failure with maximal state mutation: a
+        // checksum-bearing frame with a flipped trailer decodes ALL blocks
+        // (the decoder state is fully exercised) and then reliably fails
+        // verification — unlike flipping payload bytes, which a block
+        // layout might happily decode into wrong output.
+        let mut corrupt = {
+            let mut enc: codec::encoding::FrameCompressor = codec::encoding::FrameCompressor::new(
+                codec::encoding::CompressionLevel::from_level(3),
+            );
+            enc.set_content_checksum(true);
+            enc.compress_independent_frame(&input)
+        };
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0xFF;
+        let mut once = vec![0u8; input.len()];
+        let n = crate::context::ZSTD_decompressDCtx(
+            zds,
+            once.as_mut_ptr(),
+            once.len(),
+            corrupt.as_ptr(),
+            corrupt.len(),
+        );
+        assert_ne!(ZSTD_isError(n), 0, "corrupt one-shot must fail");
+
+        // Streaming decode of a fresh complete frame: the FIRST call must
+        // consume input (start the new frame), not resume the failed
+        // one-shot's frame state.
+        let mut inb = ZSTD_inBuffer {
+            src: frame.as_ptr() as *const core::ffi::c_void,
+            size: frame.len(),
+            pos: 0,
+        };
+        let mut restored: Vec<u8> = Vec::new();
+        let mut first_call = true;
+        loop {
+            let mut outb = ZSTD_outBuffer {
+                dst: outbuf.as_mut_ptr() as *mut core::ffi::c_void,
+                size: outbuf.len(),
+                pos: 0,
+            };
+            let rc = ZSTD_decompressStream(zds, &mut outb, &mut inb);
+            assert_eq!(ZSTD_isError(rc), 0, "post-failed-oneshot stream errored");
+            if first_call {
+                assert!(
+                    inb.pos > 0,
+                    "first call after a failed one-shot must start the new frame (rc={rc})"
+                );
+                first_call = false;
+            }
+            restored.extend_from_slice(&outbuf[..outb.pos]);
+            if rc == 0 && inb.pos == inb.size {
+                break;
+            }
+            assert!(
+                outb.pos > 0 || inb.pos < inb.size,
+                "stream stalled after failed one-shot"
+            );
+        }
+        assert_eq!(restored, input, "post-failure streaming must be byte-exact");
+        crate::streaming::ZSTD_freeDStream(zds);
+    }
+}
