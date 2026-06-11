@@ -1197,10 +1197,10 @@ fn streaming_pledge_enforced_when_fcs_flag_off() {
             pos: 0,
         };
         let rc = ZSTD_compressStream2(zcs, &mut outb, &mut inb, 2); // ZSTD_e_end
-        assert_ne!(
-            ZSTD_isError(rc),
-            0,
-            "ending an undersized pledged frame must fail even with contentSizeFlag=0"
+        assert_eq!(
+            ZSTD_getErrorCode(rc),
+            ZSTD_ErrorCode::ZSTD_error_srcSize_wrong,
+            "ending an undersized pledged frame must fail with srcSize_wrong even with contentSizeFlag=0"
         );
         crate::streaming::ZSTD_freeCStream(zcs);
     }
