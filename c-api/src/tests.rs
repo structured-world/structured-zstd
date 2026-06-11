@@ -1068,3 +1068,95 @@ fn dctx_parameter_changes_rejected_mid_frame() {
         crate::streaming::ZSTD_freeDStream(zds);
     }
 }
+
+// Bug regression: ZSTD_compress2 on a context with a streaming frame in
+// flight must be rejected with stage_wrong — starting a one-shot frame
+// mid-stream would interleave two frame lifecycles on one context (and
+// consume the pledge that belongs to the streaming frame).
+#[test]
+fn compress2_rejected_while_stream_in_flight() {
+    let input = sample(64 * 1024);
+    let zcs = crate::streaming::ZSTD_createCStream();
+    let mut outbuf = vec![0u8; 1024];
+    unsafe {
+        // Open a streaming frame and leave it unfinished.
+        let mut inb = ZSTD_inBuffer {
+            src: input.as_ptr() as *const core::ffi::c_void,
+            size: input.len(),
+            pos: 0,
+        };
+        let mut outb = ZSTD_outBuffer {
+            dst: outbuf.as_mut_ptr() as *mut core::ffi::c_void,
+            size: outbuf.len(),
+            pos: 0,
+        };
+        let rc = ZSTD_compressStream2(zcs, &mut outb, &mut inb, 0);
+        assert_eq!(ZSTD_isError(rc), 0);
+
+        let mut compressed = vec![0u8; ZSTD_compressBound(input.len())];
+        let rc = crate::context::ZSTD_compress2(
+            zcs,
+            compressed.as_mut_ptr(),
+            compressed.len(),
+            input.as_ptr(),
+            input.len(),
+        );
+        assert_eq!(
+            ZSTD_getErrorCode(rc),
+            ZSTD_ErrorCode::ZSTD_error_stage_wrong,
+            "compress2 mid-stream must be rejected"
+        );
+
+        // After ending the stream the context accepts one-shots again.
+        loop {
+            let mut outb = ZSTD_outBuffer {
+                dst: outbuf.as_mut_ptr() as *mut core::ffi::c_void,
+                size: outbuf.len(),
+                pos: 0,
+            };
+            let rc = ZSTD_endStream(zcs, &mut outb);
+            assert_eq!(ZSTD_isError(rc), 0);
+            if rc == 0 {
+                break;
+            }
+        }
+        let rc = crate::context::ZSTD_compress2(
+            zcs,
+            compressed.as_mut_ptr(),
+            compressed.len(),
+            input.as_ptr(),
+            input.len(),
+        );
+        assert_eq!(ZSTD_isError(rc), 0, "compress2 must work between frames");
+        crate::streaming::ZSTD_freeCStream(zcs);
+    }
+}
+
+// Bug regression: a malformed frame header fed to ZSTD_decompressStream
+// must surface a decode error, not the "need more input" hint — the hint
+// with no input consumed sends a spec-conformant caller into a spin.
+#[test]
+fn decompress_stream_errors_on_malformed_header() {
+    let zds = crate::streaming::ZSTD_createDStream();
+    let garbage = [0xA5u8; 64]; // wrong magic, plenty of bytes
+    let mut outbuf = vec![0u8; 4096];
+    unsafe {
+        let mut inb = ZSTD_inBuffer {
+            src: garbage.as_ptr() as *const core::ffi::c_void,
+            size: garbage.len(),
+            pos: 0,
+        };
+        let mut outb = ZSTD_outBuffer {
+            dst: outbuf.as_mut_ptr() as *mut core::ffi::c_void,
+            size: outbuf.len(),
+            pos: 0,
+        };
+        let rc = crate::streaming::ZSTD_decompressStream(zds, &mut outb, &mut inb);
+        assert_ne!(
+            ZSTD_isError(rc),
+            0,
+            "malformed header must error, not ask for more input (rc={rc})"
+        );
+        crate::streaming::ZSTD_freeDStream(zds);
+    }
+}
