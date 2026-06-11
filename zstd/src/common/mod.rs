@@ -19,6 +19,9 @@ pub const MAX_WINDOW_SIZE: u64 = (1 << 41) + 7 * (1 << 38);
 ///
 /// <https://github.com/facebook/zstd/blob/eca205fc7849a61ab287492931a04960ac58e031/doc/educational_decoder/zstd_decompress.c#L28-L29>
 pub const MAX_BLOCK_SIZE: u32 = 128 * 1024;
+/// Smallest accepted block-size target (upstream `ZSTD_TARGETCBLOCKSIZE_MIN`):
+/// below this the per-block header overhead dominates any latency benefit.
+pub const MIN_TARGET_BLOCK_SIZE: u32 = 1340;
 
 /// Decoder window-size limit (128 MiB = `1 << 27`), matching upstream zstd's
 /// default `ZSTD_d_windowLogMax` (`ZSTD_WINDOWLOG_LIMIT_DEFAULT = 27`). Frames

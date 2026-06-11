@@ -1006,7 +1006,6 @@ fn target_cblock_size_caps_emitted_blocks() {
                 break;
             }
         }
-        ZSTD_freeDCtx(crate::context::ZSTD_createDCtx()); // keep symbol use balanced
     }
 }
 

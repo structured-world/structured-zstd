@@ -146,16 +146,10 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         }
     }
 
-    /// Enable or disable the trailing XXH64 content checksum
-    /// (upstream `ZSTD_c_checksumFlag`). Default `false`, matching the
-    /// upstream library default (`ZSTD_c_checksumFlag = 0`). Must be called
-    /// before the first [`write`](Write::write); once the frame header is
-    /// emitted the flag is fixed, so a late change returns an error rather
-    /// than producing a header/trailer mismatch. Without the `hash` feature
-    /// no checksum is emitted regardless.
     /// Set an upper bound on emitted block sizes (upstream
-    /// `ZSTD_c_targetCBlockSize` semantics; clamped to `[1340, 131072]`).
-    /// Must be set before the first write.
+    /// `ZSTD_c_targetCBlockSize` semantics; clamped to
+    /// `[MIN_TARGET_BLOCK_SIZE, MAX_BLOCK_SIZE]`). Must be set before the
+    /// first write.
     pub fn set_target_block_size(&mut self, target: Option<u32>) -> Result<(), Error> {
         self.ensure_open()?;
         if self.frame_started {
@@ -163,10 +157,22 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                 "the block-size target must be set before the first write",
             ));
         }
-        self.target_block_size = target.map(|t| t.clamp(1340, crate::common::MAX_BLOCK_SIZE));
+        self.target_block_size = target.map(|t| {
+            t.clamp(
+                crate::common::MIN_TARGET_BLOCK_SIZE,
+                crate::common::MAX_BLOCK_SIZE,
+            )
+        });
         Ok(())
     }
 
+    /// Enable or disable the trailing XXH64 content checksum
+    /// (upstream `ZSTD_c_checksumFlag`). Default `false`, matching the
+    /// upstream library default (`ZSTD_c_checksumFlag = 0`). Must be called
+    /// before the first [`write`](Write::write); once the frame header is
+    /// emitted the flag is fixed, so a late change returns an error rather
+    /// than producing a header/trailer mismatch. Without the `hash` feature
+    /// no checksum is emitted regardless.
     pub fn set_content_checksum(&mut self, emit: bool) -> Result<(), Error> {
         self.ensure_open()?;
         if self.frame_started {

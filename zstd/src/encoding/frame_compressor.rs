@@ -958,7 +958,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             self.run_borrowed_block_loop(input, out)
         } else {
             let mut cursor: &[u8] = input;
-            self.run_owned_block_loop(&mut cursor, prep.initial_size_hint, out)
+            self.run_owned_block_loop(&mut cursor, prep.initial_size_hint, true, out)
         }
     }
 
@@ -1258,9 +1258,15 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// `ZSTD_c_targetCBlockSize`): every physical block's payload is capped
     /// at `target` bytes (+3-byte block header on the wire), trading some
     /// ratio for bounded per-block latency. The value is clamped to
-    /// `[1340, 131072]` (the upstream bounds). `None` removes the target.
+    /// `[MIN_TARGET_BLOCK_SIZE, MAX_BLOCK_SIZE]` (the upstream bounds).
+    /// `None` removes the target.
     pub fn set_target_block_size(&mut self, target: Option<u32>) {
-        self.target_block_size = target.map(|t| t.clamp(1340, crate::common::MAX_BLOCK_SIZE));
+        self.target_block_size = target.map(|t| {
+            t.clamp(
+                crate::common::MIN_TARGET_BLOCK_SIZE,
+                crate::common::MAX_BLOCK_SIZE,
+            )
+        });
     }
 
     /// The active block-size cap: the configured target, or the format's
@@ -1378,7 +1384,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             Vec::with_capacity(initial_all_blocks_cap(prep.initial_size_hint));
         let mut block_source = ReaderBlockSource(&mut source);
         let total_uncompressed =
-            self.run_owned_block_loop(&mut block_source, prep.initial_size_hint, &mut all_blocks);
+            self.run_owned_block_loop(&mut block_source, prep.initial_size_hint, false, &mut all_blocks);
         self.uncompressed_data = Some(source);
         self.finish_frame(all_blocks, total_uncompressed, &prep);
     }
@@ -1590,6 +1596,12 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         &mut self,
         source: &mut S,
         initial_size_hint: Option<u64>,
+        // Whether `initial_size_hint` is the input's exact length (the
+        // one-shot slice paths) or a caller-provided estimate (the streaming
+        // `Read` path, where `set_source_size_hint` is advisory). An exact
+        // hint drives the one-shot ratio reservation; an estimate is only
+        // trusted up to a small lookahead past the bytes actually read.
+        hint_is_exact: bool,
         out: &mut Vec<u8>,
     ) -> u64 {
         // Compressed blocks are appended to `out` from its current end. The
@@ -1684,7 +1696,19 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 total_uncompressed - uncompressed_data.len() as u64 - pending_input.len() as u64;
             match initial_size_hint {
                 Some(hint) if hint >= total_uncompressed => {
-                    reserve_for_next_block(out, blocks_start, emitted, (hint - emitted) as usize);
+                    // An advisory hint (streaming path) is only trusted up to
+                    // a small lookahead past the bytes actually read: a hint
+                    // far above the real input would otherwise reserve the
+                    // whole phantom remainder up front.
+                    let hint_remaining = hint - emitted;
+                    let remaining = if hint_is_exact {
+                        hint_remaining
+                    } else {
+                        let buffered = total_uncompressed - emitted;
+                        const HINT_LOOKAHEAD: u64 = 64 * 1024;
+                        hint_remaining.min(buffered + HINT_LOOKAHEAD)
+                    };
+                    reserve_for_next_block(out, blocks_start, emitted, remaining as usize);
                 }
                 _ => {
                     out.reserve(uncompressed_data.len() + 3 + 16);
