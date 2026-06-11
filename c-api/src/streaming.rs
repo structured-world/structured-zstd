@@ -107,11 +107,15 @@ impl ZSTD_CCtx {
             if params.target_cblock_size > 0 {
                 enc.set_target_block_size(Some(params.target_cblock_size as u32))?;
             }
-            // The pledge is single-use (consumed by this frame): record it
-            // in the header unless the content-size flag forbids it.
-            if params.pledged_src_size != CONTENTSIZE_UNKNOWN && params.content_size_flag {
+            // The pledge is single-use (consumed by this frame). It is
+            // always enforced against the bytes actually written; the
+            // content-size flag only controls whether the header carries
+            // the FCS field (upstream validates the pledge at frame end
+            // regardless of the flag).
+            if params.pledged_src_size != CONTENTSIZE_UNKNOWN {
                 enc.set_pledged_content_size(params.pledged_src_size)?;
             }
+            enc.set_content_size_flag(params.content_size_flag)?;
             Ok(())
         };
         if setup().is_err() {
@@ -231,10 +235,25 @@ pub unsafe extern "C" fn ZSTD_compressStream2(
                 return Err(ZSTD_ErrorCode::ZSTD_error_stage_wrong);
             };
             use std::io::Write;
-            if enc.write_all(&src[inp.pos..]).is_err() {
-                return Err(ZSTD_ErrorCode::ZSTD_error_GENERIC);
+            // Loop over partial writes instead of `write_all`: the encoder
+            // legally short-counts at the pledged-size boundary (accepts the
+            // remaining allowance, then errors on the next call), and
+            // `write_all` would discard that partial progress — leaving
+            // `inp.pos` claiming nothing was consumed when most of it was.
+            while inp.pos < inp.size {
+                match enc.write(&src[inp.pos..]) {
+                    Ok(0) => return Err(ZSTD_ErrorCode::ZSTD_error_GENERIC),
+                    Ok(n) => inp.pos += n,
+                    // The encoder reports pledge violations as InvalidInput
+                    // (the only InvalidInput reachable from `write` on the
+                    // in-memory drain); upstream's error for input past the
+                    // pledged size is srcSize_wrong.
+                    Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                        return Err(ZSTD_ErrorCode::ZSTD_error_srcSize_wrong);
+                    }
+                    Err(_) => return Err(ZSTD_ErrorCode::ZSTD_error_GENERIC),
+                }
             }
-            inp.pos = inp.size;
         }
         match end_op {
             ZSTD_E_FLUSH => {
@@ -448,6 +467,12 @@ pub unsafe extern "C" fn ZSTD_decompressStream(
                     return encode(ZSTD_ErrorCode::ZSTD_error_frameParameter_windowTooLarge);
                 }
                 let mut reader = &src[inp.pos..];
+                // Verify the trailing content checksum like
+                // ZSTD_decompressDCtx: the decoder defaults to EmitOnly, so
+                // without this a corrupted trailer would decode silently.
+                // Idempotent, safe to reapply on every frame start.
+                dctx.decoder
+                    .set_content_checksum(codec::decoding::ContentChecksum::Verify);
                 let reset = catch_unwind(AssertUnwindSafe(|| dctx.decoder.reset(&mut reader)));
                 match reset {
                     Ok(Ok(())) => {

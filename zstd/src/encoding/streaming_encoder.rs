@@ -37,6 +37,12 @@ pub struct StreamingEncoder<W: Write, M: Matcher = MatchGeneratorDriver> {
     /// the format's 128 KiB ceiling.
     target_block_size: Option<u32>,
     pledged_content_size: Option<u64>,
+    /// Whether a pledged size is written into the header's
+    /// `Frame_Content_Size` field (upstream `ZSTD_c_contentSizeFlag`).
+    /// Pledge *enforcement* is independent of this flag — upstream
+    /// validates consumed bytes against the pledge at frame end even
+    /// when the header omits the field. Default `true`.
+    content_size_flag: bool,
     bytes_consumed: u64,
     /// Effective strategy tag when a public-parameter
     /// [`Strategy`](crate::encoding::Strategy) override (#27) is active, mirroring
@@ -135,6 +141,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             frame_started: false,
             target_block_size: None,
             pledged_content_size: None,
+            content_size_flag: true,
             bytes_consumed: 0,
             strategy_override: None,
             magicless: false,
@@ -223,6 +230,23 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         // Also use pledged size as source-size hint so the matcher
         // can select smaller tables for small inputs.
         self.state.matcher.set_source_size_hint(size);
+        Ok(())
+    }
+
+    /// Control whether the pledged size is written into the header's
+    /// `Frame_Content_Size` field (upstream `ZSTD_c_contentSizeFlag`,
+    /// default on). With the flag off the header omits the field, but a
+    /// pledge set via [`set_pledged_content_size`](Self::set_pledged_content_size)
+    /// is still enforced against the bytes actually written. Must be
+    /// called before the first [`write`](Write::write).
+    pub fn set_content_size_flag(&mut self, emit: bool) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.frame_started {
+            return Err(invalid_input_error(
+                "content size flag must be set before the first write",
+            ));
+        }
+        self.content_size_flag = emit;
         Ok(())
     }
 
@@ -490,14 +514,23 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         // pushes referenceable history before the content, so the frame needs
         // an explicit window descriptor); gate it off when a dict is attached,
         // mirroring `FrameCompressor`'s `!use_dictionary_state` guard.
-        let single_segment = !use_dictionary_state
+        // Single-segment also requires the FCS field to be present
+        // (`content_size_flag`): the layout drops the window descriptor,
+        // so the header must carry the content size for decoders to size
+        // their window.
+        let single_segment = self.content_size_flag
+            && !use_dictionary_state
             && self
                 .pledged_content_size
                 .map(|size| (512..=(1 << 14)).contains(&size) && size <= window_size)
                 .unwrap_or(false);
 
         let header = FrameHeader {
-            frame_content_size: self.pledged_content_size,
+            frame_content_size: if self.content_size_flag {
+                self.pledged_content_size
+            } else {
+                None
+            },
             single_segment,
             content_checksum: cfg!(feature = "hash") && self.content_checksum,
             dictionary_id: if use_dictionary_state {
