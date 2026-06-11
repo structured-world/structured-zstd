@@ -5,6 +5,7 @@
 [![CI](https://github.com/structured-world/structured-zstd/actions/workflows/ci.yml/badge.svg)](https://github.com/structured-world/structured-zstd/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/structured-zstd.svg)](https://crates.io/crates/structured-zstd)
 [![docs.rs](https://docs.rs/structured-zstd/badge.svg)](https://docs.rs/structured-zstd)
+[![npm downloads](https://img.shields.io/npm/dw/%40structured-world%2Fstructured-zstd?label=npm%20downloads)](https://www.npmjs.com/package/@structured-world/structured-zstd)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 ## Quick start

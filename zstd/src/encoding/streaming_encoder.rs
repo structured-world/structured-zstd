@@ -32,6 +32,10 @@ pub struct StreamingEncoder<W: Write, M: Matcher = MatchGeneratorDriver> {
     last_error_kind: Option<ErrorKind>,
     last_error_message: Option<String>,
     frame_started: bool,
+    /// Upper bound on emitted block sizes (upstream `ZSTD_c_targetCBlockSize`
+    /// semantics; see `FrameCompressor::set_target_block_size`). `None` =
+    /// the format's 128 KiB ceiling.
+    target_block_size: Option<u32>,
     pledged_content_size: Option<u64>,
     bytes_consumed: u64,
     /// Effective strategy tag when a public-parameter
@@ -129,6 +133,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             last_error_kind: None,
             last_error_message: None,
             frame_started: false,
+            target_block_size: None,
             pledged_content_size: None,
             bytes_consumed: 0,
             strategy_override: None,
@@ -139,6 +144,26 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
         }
+    }
+
+    /// Set an upper bound on emitted block sizes (upstream
+    /// `ZSTD_c_targetCBlockSize` semantics; clamped to
+    /// `[MIN_TARGET_BLOCK_SIZE, MAX_BLOCK_SIZE]`). Must be set before the
+    /// first write.
+    pub fn set_target_block_size(&mut self, target: Option<u32>) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.frame_started {
+            return Err(invalid_input_error(
+                "the block-size target must be set before the first write",
+            ));
+        }
+        self.target_block_size = target.map(|t| {
+            t.clamp(
+                crate::common::MIN_TARGET_BLOCK_SIZE,
+                crate::common::MAX_BLOCK_SIZE,
+            )
+        });
+        Ok(())
     }
 
     /// Enable or disable the trailing XXH64 content checksum
@@ -499,7 +524,10 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
 
     fn block_capacity(&self) -> usize {
         let matcher_window = self.state.matcher.window_size() as usize;
-        core::cmp::max(1, core::cmp::min(matcher_window, MAX_BLOCK_SIZE as usize))
+        let ceiling = self
+            .target_block_size
+            .map_or(MAX_BLOCK_SIZE as usize, |t| t as usize);
+        core::cmp::max(1, core::cmp::min(matcher_window, ceiling))
     }
 
     fn allocate_pending_space(&mut self, block_capacity: usize) -> Vec<u8> {

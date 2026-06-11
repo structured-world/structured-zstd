@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.35](https://github.com/structured-world/structured-zstd/compare/v0.0.34...v0.0.35) - 2026-06-11
+
+### Added
+
+- *(c-api)* advanced parameter API + streaming surface (compressStream2 / decompressStream) ([#396](https://github.com/structured-world/structured-zstd/pull/396))
+
+### Performance
+
+- *(encode)* size the output reservation from the observed ratio ([#398](https://github.com/structured-world/structured-zstd/pull/398))
+- *(encode)* allocation-free copy-mode dictionary restore ([#397](https://github.com/structured-world/structured-zstd/pull/397))
+
 ## [0.0.34](https://github.com/structured-world/structured-zstd/compare/v0.0.33...v0.0.34) - 2026-06-10
 
 ### Added
