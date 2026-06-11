@@ -331,7 +331,6 @@ pub struct HuffmanTable {
     state_mask: u64,
     bits: Vec<u8>,
     bit_ranks: Vec<u32>,
-    rank_indexes: Vec<usize>,
     /// Running `sum(1 << (w - 1))` accumulated WHILE weights decode
     /// (donor `HUF_readStats` keeps the same running stats), replacing a
     /// separate post-decode pass over `weights`.
@@ -355,7 +354,6 @@ impl HuffmanTable {
             + self.weights.capacity()
             + self.bits.capacity()
             + self.bit_ranks.capacity() * core::mem::size_of::<u32>()
-            + self.rank_indexes.capacity() * core::mem::size_of::<usize>()
             + self.fse_table.heap_bytes()
     }
 
@@ -369,7 +367,6 @@ impl HuffmanTable {
             state_mask: 0,
             bits: Vec::with_capacity(256),
             bit_ranks: Vec::with_capacity(11),
-            rank_indexes: Vec::with_capacity(11),
             weight_sum: 0,
             weight_rank_count: [0; (MAX_MAX_NUM_BITS as usize) + 1],
             last_weight: 0,
@@ -382,7 +379,7 @@ impl HuffmanTable {
     pub fn reinit_from(&mut self, other: &Self) {
         self.reset();
         // Copy ONLY the decode-time state. `weights` / `bits` /
-        // `rank_indexes` and the weight-decoding `fse_table` are build-time
+        // `rank scratch and the weight-decoding `fse_table` are build-time
         // scratch (repopulated when a block carries a new HUF table); the
         // literal-decode hot path reads only `packed_decode` + `max_num_bits`
         // + `state_mask`. Skipping the rest mirrors the donor copying just the
@@ -400,7 +397,6 @@ impl HuffmanTable {
         self.state_mask = 0;
         self.bits.clear();
         self.bit_ranks.clear();
-        self.rank_indexes.clear();
         self.weight_sum = 0;
         self.weight_rank_count = [0; (MAX_MAX_NUM_BITS as usize) + 1];
         self.last_weight = 0;
@@ -671,7 +667,7 @@ impl HuffmanTable {
     /// parsed `weights`, returning `max_bits`. This is the slice of the
     /// table build the ENCODER side needs: [`Self::to_encoder_table`] reads
     /// only `bits` + `max_num_bits`. The decode lookup-table fill
-    /// (`bit_ranks` / `packed_decode` / `rank_indexes`) is decoder-only and
+    /// (`bit_ranks` / `packed_decode` / rank offsets) is decoder-only and
     /// lives in [`Self::build_table_from_weights`].
     fn compute_huffman_bits(&mut self) -> Result<u8, HuffmanTableError> {
         use HuffmanTableError as err;
@@ -737,13 +733,14 @@ impl HuffmanTable {
 
         let table_size = 1usize << self.max_num_bits;
 
-        //starting codes for each rank
-        self.rank_indexes.clear();
-        self.rank_indexes.resize((max_bits + 1) as usize, 0);
-
-        self.rank_indexes[max_bits as usize] = 0;
-        for bits in (1..self.rank_indexes.len() as u8).rev() {
-            self.rank_indexes[bits as usize - 1] = self.rank_indexes[bits as usize]
+        // Starting offset for each code-length rank, in a fixed local
+        // sized 16 so the fill loop below indexes it with a masked code
+        // length and the optimizer drops the bounds check (code lengths
+        // cap at MAX_MAX_NUM_BITS = 11). Same descending prefix walk as
+        // the previous heap-allocated form.
+        let mut rank_start = [0usize; 16];
+        for bits in (1..=max_bits).rev() {
+            rank_start[bits as usize - 1] = rank_start[bits as usize]
                 + self.bit_ranks[bits as usize] as usize * (1 << (max_bits - bits));
         }
 
@@ -753,61 +750,79 @@ impl HuffmanTable {
         // pre-zero (`ZSTD_memset ... is not necessary`). Assert the total
         // span equals `table_size` before trusting the unchecked `set_len`.
         assert!(
-            self.rank_indexes[0] == table_size,
-            "rank_idx[0]: {} should be: {}",
-            self.rank_indexes[0],
+            rank_start[0] == table_size,
+            "rank_start[0]: {} should be: {}",
+            rank_start[0],
             table_size
         );
 
         // Write into the uninitialised tail (`spare_capacity_mut`) and only
         // `set_len` after the fill completes, avoiding the redundant
-        // zero-then-overwrite of a `resize(_, 0)`. `slots` borrows only the
-        // `packed_decode` field, so the loop's reads of `bits` and writes to
-        // `rank_indexes` (disjoint fields) coexist.
+        // zero-then-overwrite of a `resize(_, 0)`.
         self.packed_decode.clear();
         self.packed_decode.reserve(table_size);
-        let slots = self.packed_decode.spare_capacity_mut();
+        let slots_ptr = self
+            .packed_decode
+            .spare_capacity_mut()
+            .as_mut_ptr()
+            .cast::<u16>();
 
-        for symbol in 0..self.bits.len() {
-            let bits_for_symbol = self.bits[symbol];
-            if bits_for_symbol != 0 {
-                // allocate code for the symbol and set in the table
-                // a code ignores all max_bits - bits[symbol] bits, so it gets
-                // a range that spans all of those in the decoding table.
-                // Donor `HUF_DEltX1` packing: low byte = symbol, high
-                // byte = nbBits. `num_bits ≤ 11` always fits in the
-                // upper byte alongside an 8-bit symbol.
-                let base_idx = self.rank_indexes[bits_for_symbol as usize];
-                let len = 1usize << (max_bits - bits_for_symbol);
-                self.rank_indexes[bits_for_symbol as usize] += len;
-                let packed = u16::from(symbol as u8) | (u16::from(bits_for_symbol) << 8);
-                // Donor `HUF_DEltX1`-style broadcast fill: replicate the
-                // 16-bit entry across a 64-bit lane and store four entries
-                // per write. LLVM does NOT auto-vectorise the per-slot
-                // `MaybeUninit::write` loop (it lowered to scalar `movw`
-                // stores, measured hot on table-dense btopt frames), so the
-                // widening is done by hand; the < 4-entry tail stays scalar.
-                let run = &mut slots[base_idx..base_idx + len];
-                let packed64 = u64::from(packed) * 0x0001_0001_0001_0001;
-                let mut chunks = run.chunks_exact_mut(4);
-                for chunk in &mut chunks {
-                    // SAFETY: `[MaybeUninit<u16>; 4]` is 8 contiguous bytes
-                    // with no padding; an unaligned u64 store initialises
-                    // exactly those four slots.
-                    unsafe {
-                        chunk.as_mut_ptr().cast::<u64>().write_unaligned(packed64);
-                    }
+        // Per-symbol run fill, donor `HUF_DEltX1` shape: every live symbol
+        // claims a contiguous run inside its code-length rank, and the
+        // 16-bit entry broadcasts four-at-a-time through a 64-bit store
+        // (LLVM lowered the per-slot `MaybeUninit::write` loop to scalar
+        // `movw`s, and the heap-Vec rank cursor paid a memory-bound bounds
+        // check per symbol — both measured hot on table-dense frames).
+        // `filled` re-proves full [0, table_size) coverage in release
+        // builds before `set_len` exposes the entries.
+        let mut filled = 0usize;
+        for (symbol, &bits_for_symbol) in self.bits.iter().enumerate() {
+            if bits_for_symbol == 0 {
+                continue;
+            }
+            // Code lengths are `max_bits + 1 - w` with `1 <= w <= max_bits
+            // <= 11`; the mask only helps the optimizer prove the fixed
+            // 16-slot index in range.
+            let rank = (bits_for_symbol & 0xF) as usize;
+            let base_idx = rank_start[rank];
+            let len = 1usize << (max_bits - bits_for_symbol);
+            rank_start[rank] = base_idx + len;
+            // Release-mode run-bounds gate (a register compare, unlike the
+            // slice form's memory-bound check): a desync between
+            // `bit_ranks` and `bits` must fail loudly, not write OOB.
+            assert!(
+                base_idx + len <= table_size,
+                "huffman rank run [{base_idx}, +{len}) escapes table {table_size}",
+            );
+            let packed = u16::from(symbol as u8) | (u16::from(bits_for_symbol) << 8);
+            let packed64 = u64::from(packed) * 0x0001_0001_0001_0001;
+            // SAFETY: `reserve(table_size)` guaranteed the capacity and the
+            // assert above bounds this run inside it; four `u16` slots are
+            // 8 contiguous padding-free bytes, so each unaligned u64 store
+            // initialises exactly four entries.
+            unsafe {
+                let run = slots_ptr.add(base_idx);
+                let mut off = 0usize;
+                while off + 4 <= len {
+                    run.add(off).cast::<u64>().write_unaligned(packed64);
+                    off += 4;
                 }
-                for slot in chunks.into_remainder() {
-                    slot.write(packed);
+                while off < len {
+                    run.add(off).write(packed);
+                    off += 1;
                 }
             }
+            filled += len;
         }
 
-        // SAFETY: the rank walk covers [0, table_size) exactly (asserted via
-        // `rank_indexes[0] == table_size`); `reserve(table_size)` guaranteed
-        // capacity; every slot in that range was written by the loop above,
-        // so no uninitialised entry is exposed.
+        // SAFETY: the rank walk partitions [0, table_size) (anchored by the
+        // `rank_start[0] == table_size` assert) and `filled` proves every
+        // slot in that range was written, so no uninitialised entry is
+        // exposed.
+        assert!(
+            filled == table_size,
+            "huffman table fill covered {filled} of {table_size} slots",
+        );
         unsafe {
             self.packed_decode.set_len(table_size);
         }
@@ -850,7 +865,6 @@ mod tests {
             state_mask: 0b11,
             bits: Vec::new(),
             bit_ranks: Vec::new(),
-            rank_indexes: Vec::new(),
             weight_sum: 0,
             weight_rank_count: [0; (MAX_MAX_NUM_BITS as usize) + 1],
             last_weight: 0,
