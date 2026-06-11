@@ -1471,3 +1471,83 @@ fn stream_resets_after_tail_drained_by_non_end_directive() {
         crate::streaming::ZSTD_freeCStream(zcs);
     }
 }
+
+// Bug regression: a FAILED one-shot decode on a context abandoned
+// mid-stream must still leave the context at a frame boundary — the
+// next ZSTD_decompressStream call has to start the new frame instead
+// of resuming the failed one-shot's frame state.
+#[test]
+fn decompress_stream_recovers_after_failed_oneshot_on_midframe_context() {
+    let input = sample(256 * 1024);
+    let frame = compress_frame(&input);
+    let zds = crate::streaming::ZSTD_createDStream();
+    let mut outbuf = vec![0u8; input.len() + 4096];
+    unsafe {
+        // Park the stream mid-frame with a truncated feed.
+        let mut inb = ZSTD_inBuffer {
+            src: frame.as_ptr() as *const core::ffi::c_void,
+            size: frame.len() / 2,
+            pos: 0,
+        };
+        let mut outb = ZSTD_outBuffer {
+            dst: outbuf.as_mut_ptr() as *mut core::ffi::c_void,
+            size: outbuf.len(),
+            pos: 0,
+        };
+        let rc = ZSTD_decompressStream(zds, &mut outb, &mut inb);
+        assert_eq!(ZSTD_isError(rc), 0);
+        assert_ne!(rc, 0, "mid-frame stream must report more input needed");
+
+        // One-shot decode of a CORRUPT frame on the same context: fails.
+        let mut corrupt = frame.clone();
+        let mid = corrupt.len() / 2;
+        corrupt[mid] ^= 0xFF;
+        corrupt[mid + 1] ^= 0xFF;
+        let mut once = vec![0u8; input.len()];
+        let n = crate::context::ZSTD_decompressDCtx(
+            zds,
+            once.as_mut_ptr(),
+            once.len(),
+            corrupt.as_ptr(),
+            corrupt.len(),
+        );
+        assert_ne!(ZSTD_isError(n), 0, "corrupt one-shot must fail");
+
+        // Streaming decode of a fresh complete frame: the FIRST call must
+        // consume input (start the new frame), not resume the failed
+        // one-shot's frame state.
+        let mut inb = ZSTD_inBuffer {
+            src: frame.as_ptr() as *const core::ffi::c_void,
+            size: frame.len(),
+            pos: 0,
+        };
+        let mut restored: Vec<u8> = Vec::new();
+        let mut first_call = true;
+        loop {
+            let mut outb = ZSTD_outBuffer {
+                dst: outbuf.as_mut_ptr() as *mut core::ffi::c_void,
+                size: outbuf.len(),
+                pos: 0,
+            };
+            let rc = ZSTD_decompressStream(zds, &mut outb, &mut inb);
+            assert_eq!(ZSTD_isError(rc), 0, "post-failed-oneshot stream errored");
+            if first_call {
+                assert!(
+                    inb.pos > 0,
+                    "first call after a failed one-shot must start the new frame (rc={rc})"
+                );
+                first_call = false;
+            }
+            restored.extend_from_slice(&outbuf[..outb.pos]);
+            if rc == 0 && inb.pos == inb.size {
+                break;
+            }
+            assert!(
+                outb.pos > 0 || inb.pos < inb.size,
+                "stream stalled after failed one-shot"
+            );
+        }
+        assert_eq!(restored, input, "post-failure streaming must be byte-exact");
+        crate::streaming::ZSTD_freeDStream(zds);
+    }
+}
