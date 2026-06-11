@@ -233,6 +233,13 @@ pub unsafe extern "C" fn ZSTD_compressStream2(
     if !matches!(end_op, ZSTD_E_CONTINUE | ZSTD_E_FLUSH | ZSTD_E_END) {
         return encode(ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound);
     }
+    // `ensure_stream` runs unconditionally — including for an empty
+    // continue/flush on a fresh context. That intentionally mirrors the
+    // reference implementation: upstream's first compressStream2 call
+    // moves streamStage to zcss_load regardless of input emptiness, and
+    // ZSTD_compress2 / parameter setters report stage_wrong until a
+    // reset ends the session. Short-circuiting the idle case here would
+    // diverge from that drop-in behavior.
     if let Err(code) = cctx.ensure_stream() {
         return encode(code);
     }
