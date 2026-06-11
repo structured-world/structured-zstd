@@ -14,17 +14,6 @@ impl<'s> BitReader<'s> {
         self.source.len() * 8 - self.idx
     }
 
-    pub fn bits_read(&self) -> usize {
-        self.idx
-    }
-
-    pub fn return_bits(&mut self, n: usize) {
-        if n > self.idx {
-            panic!("Cant return this many bits");
-        }
-        self.idx -= n;
-    }
-
     // `#[inline]` so the hot caller (`read_probabilities`, which calls this
     // per FSE NCount symbol with mostly-constant `n`) folds it in and
     // const-propagates `n`, collapsing the multi-byte branch for the common

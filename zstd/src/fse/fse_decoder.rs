@@ -1,4 +1,4 @@
-use crate::bit_io::{BitReader, BitReaderReversed};
+use crate::bit_io::BitReaderReversed;
 use crate::cpu_kernel::CpuKernel;
 use crate::decoding::errors::{FSEDecoderError, FSETableError};
 use alloc::vec::Vec;
@@ -757,8 +757,40 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
     fn read_probabilities(&mut self, source: &[u8], max_log: u8) -> Result<usize, FSETableError> {
         self.symbol_probabilities.clear(); //just clear, we will fill a probability for each entry anyways. No need to force new allocs here
 
-        let mut br = BitReader::new(source);
-        self.accuracy_log = ACC_LOG_OFFSET + (br.get_bits(4)? as u8);
+        // Donor `FSE_readNCount` cursor shape: a flat little-endian bit
+        // position over `source`, extracting each field with one whole-word
+        // load. The generic `BitReader::get_bits` assembled fields
+        // byte-by-byte with per-call divisions — measured ~6% of decode
+        // wall on table-dense btopt frames.
+        let total_bits = source.len() * 8;
+        let mut bit_pos: usize = 0;
+        #[inline(always)]
+        fn field_at(source: &[u8], bit_pos: usize, n: usize) -> u64 {
+            debug_assert!(n <= 32);
+            let byte = bit_pos >> 3;
+            let mut window = [0u8; 8];
+            let take = source.len().saturating_sub(byte).min(8);
+            window[..take].copy_from_slice(&source[byte..byte + take]);
+            (u64::from_le_bytes(window) >> (bit_pos & 7)) & ((1u64 << n) - 1)
+        }
+        macro_rules! read_bits {
+            ($n:expr) => {{
+                let n: usize = $n;
+                if total_bits - bit_pos < n {
+                    return Err(FSETableError::GetBitsError(
+                        crate::bit_io::GetBitsError::NotEnoughRemainingBits {
+                            requested: n,
+                            remaining: total_bits - bit_pos,
+                        },
+                    ));
+                }
+                let v = field_at(source, bit_pos, n);
+                bit_pos += n;
+                v
+            }};
+        }
+
+        self.accuracy_log = ACC_LOG_OFFSET + (read_bits!(4) as u8);
         if self.accuracy_log > ENTRY_MAX_ACCURACY_LOG {
             return Err(FSETableError::AccLogTooBig {
                 got: self.accuracy_log,
@@ -782,14 +814,14 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
             let max_remaining_value = probability_sum - probability_counter + 1;
             let bits_to_read = highest_bit_set(max_remaining_value);
 
-            let unchecked_value = br.get_bits(bits_to_read as usize)? as u32;
+            let unchecked_value = read_bits!(bits_to_read as usize) as u32;
 
             let low_threshold = ((1 << bits_to_read) - 1) - (max_remaining_value);
             let mask = (1 << (bits_to_read - 1)) - 1;
             let small_value = unchecked_value & mask;
 
             let value = if small_value < low_threshold {
-                br.return_bits(1);
+                bit_pos -= 1;
                 small_value
             } else if unchecked_value > mask {
                 unchecked_value - low_threshold
@@ -812,7 +844,7 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
             } else {
                 //fast skip further zero probabilities
                 loop {
-                    let skip_amount = br.get_bits(2)? as usize;
+                    let skip_amount = read_bits!(2) as usize;
 
                     self.symbol_probabilities
                         .resize(self.symbol_probabilities.len() + skip_amount, 0);
@@ -836,10 +868,10 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
             });
         }
 
-        let bytes_read = if br.bits_read().is_multiple_of(8) {
-            br.bits_read() / 8
+        let bytes_read = if bit_pos.is_multiple_of(8) {
+            bit_pos / 8
         } else {
-            (br.bits_read() / 8) + 1
+            (bit_pos / 8) + 1
         };
 
         Ok(bytes_read)
