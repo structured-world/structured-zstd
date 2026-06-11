@@ -129,6 +129,9 @@ int main(void) {
                 ZSTD_outBuffer outb = {sbuf, out_cap, 0};
                 size_t rc = ZSTD_compressStream2(zcs, &outb, &inb, ZSTD_e_continue);
                 if (ZSTD_isError(rc)) return 26;
+                /* Hard capacity guard: a stream-sizing regression must be a
+                 * clean test failure, not an out-of-bounds write. */
+                if (outb.pos > bound + 64 - scomp_len) return 31;
                 memcpy(scomp + scomp_len, sbuf, outb.pos);
                 scomp_len += outb.pos;
             }
@@ -137,6 +140,7 @@ int main(void) {
             ZSTD_outBuffer outb = {sbuf, out_cap, 0};
             size_t rc = ZSTD_endStream(zcs, &outb);
             if (ZSTD_isError(rc)) return 27;
+            if (outb.pos > bound + 64 - scomp_len) return 31;
             memcpy(scomp + scomp_len, sbuf, outb.pos);
             scomp_len += outb.pos;
             if (rc == 0) break;
@@ -153,6 +157,7 @@ int main(void) {
             ZSTD_outBuffer outb = {dbuf, dout_cap, 0};
             size_t rc = ZSTD_decompressStream(zds, &outb, &inb);
             if (ZSTD_isError(rc)) return 28;
+            if (outb.pos > n - restored) return 32;
             memcpy(out + restored, dbuf, outb.pos);
             restored += outb.pos;
             if (rc == 0 && inb.pos == inb.size) break;
