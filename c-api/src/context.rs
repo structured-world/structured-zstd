@@ -374,6 +374,14 @@ pub unsafe extern "C" fn ZSTD_decompressDCtx(
     // Verify the trailing content checksum like upstream ZSTD_decompress; the
     // setter is idempotent, so reapplying it on a reused DCtx is fine.
     //
+    // No explicit decoder restart is needed before this one-shot:
+    // `decode_all` re-initializes per frame (it re-parses the header and
+    // resets the frame state, entropy tables, offset history, and the
+    // scratch backend kind at every frame start), so state left by an
+    // abandoned mid-frame streaming decode cannot leak in. Covered by
+    // the decompress_stream_recovers_after_oneshot_on_midframe_context
+    // regression test.
+    //
     // `ZSTD_d_windowLogMax` is deliberately NOT enforced here: upstream
     // documents it as a streaming-API memory cap ("does not apply for
     // one-pass decoders ... since no additional memory is allocated"), and

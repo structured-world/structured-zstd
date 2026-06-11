@@ -153,9 +153,13 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         }
     }
 
-    /// Set an upper bound on emitted block sizes (upstream
-    /// `ZSTD_c_targetCBlockSize` semantics; clamped to
-    /// `[MIN_TARGET_BLOCK_SIZE, MAX_BLOCK_SIZE]`). Must be set before the
+    /// Set an upper bound on each physical block's payload (semantics of
+    /// upstream `ZSTD_c_targetCBlockSize`): every block carries at most
+    /// `target` payload bytes, +3-byte block header on the wire — the
+    /// upstream knob is likewise a convergence target for block sizing,
+    /// not a cap on header-inclusive wire bytes. Clamped to
+    /// `[MIN_TARGET_BLOCK_SIZE, MAX_BLOCK_SIZE]`; mirrors
+    /// `FrameCompressor::set_target_block_size`. Must be set before the
     /// first write.
     pub fn set_target_block_size(&mut self, target: Option<u32>) -> Result<(), Error> {
         self.ensure_open()?;
