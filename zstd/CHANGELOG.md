@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- *(c-api)* advanced parameter API + streaming surface (compressStream2 / decompressStream) ([#396](https://github.com/structured-world/structured-zstd/pull/396))
+- *(c-api)* advanced parameter API + streaming surface (compressStream2 / decompressStream) ([#400](https://github.com/structured-world/structured-zstd/pull/400))
 
 ### Performance
 

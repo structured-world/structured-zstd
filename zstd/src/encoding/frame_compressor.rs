@@ -3008,11 +3008,21 @@ mod tests {
         let parsed_without = crate::decoding::frame::read_frame_header(without_fcs.as_slice())
             .expect("flag-off frame header must parse")
             .0;
-        // 0 is the decoder's "unknown content size" sentinel.
+        // 0 is the decoder's "unknown content size" sentinel...
         assert_eq!(
             parsed_without.frame_content_size(),
             0,
             "FCS must be omitted with the content-size flag off"
+        );
+        // ...and the descriptor must confirm the field is ABSENT (0 bytes),
+        // not present with an explicit zero value.
+        assert_eq!(
+            parsed_without
+                .descriptor
+                .frame_content_size_bytes()
+                .expect("descriptor must parse"),
+            0,
+            "the FCS field itself must be omitted, not written as zero"
         );
 
         let mut decoder = crate::decoding::FrameDecoder::new();

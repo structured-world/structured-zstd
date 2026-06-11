@@ -65,6 +65,10 @@ macro_rules! vprintln {
 
 mod bit_io;
 mod common;
+/// Smallest accepted block-size target (the `ZSTD_TARGETCBLOCKSIZE_MIN`
+/// bound): the single source of truth shared by the Rust setters
+/// (`set_target_block_size`) and the C ABI parameter surface.
+pub use common::MIN_TARGET_BLOCK_SIZE;
 mod cpu_kernel;
 pub mod decoding;
 #[cfg(feature = "dict_builder")]

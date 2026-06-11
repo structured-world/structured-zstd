@@ -465,7 +465,13 @@ pub unsafe extern "C" fn ZSTD_decompressStream(
             // Skippable frame: consume it whole when fully buffered (magic 4
             // + length 4 + payload), else ask for more input.
             Err(ReadFrameHeaderError::SkipFrame { length, .. }) => {
-                let total = 8usize + length as usize;
+                // `checked_add`: on 32-bit targets a near-u32::MAX declared
+                // length overflows the byte count; such a frame can never be
+                // fully buffered there, so it stays a need-more-input hint
+                // instead of wrapping `pos` past valid data.
+                let Some(total) = 8usize.checked_add(length as usize) else {
+                    return 1;
+                };
                 if inp.size - inp.pos < total {
                     return 1;
                 }
