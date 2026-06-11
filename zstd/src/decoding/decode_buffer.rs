@@ -798,21 +798,16 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         offset: usize,
         match_length: usize,
     ) -> Result<(), DecodeBufferError> {
-        // `total_output_counter` gate: dict-source matches are only
-        // valid while the dictionary content is still inside the
-        // visible window. On the inline-exec path
-        // (`UserSliceBackend`) `total_output_counter` is NOT
-        // maintained — it stays at 0 — so the gate is trivially
-        // satisfied. This does NOT cause incorrect behavior on that
-        // path because `dict_content` is always empty for the direct
-        // decode entry (`run_direct_decode`'s
-        // `DecodeBuffer::from_backend` initializes it to empty), so
-        // `bytes_from_dict > self.dict_content.len()` below catches
-        // every would-be dict-source match and returns
-        // `NotEnoughBytesInDictionary`. The
-        // `RingBuffer` / `FlatBuf` paths still maintain the counter
-        // via `push` / `repeat_inner` and rely on it correctly.
-        if self.total_output_counter <= self.window_size as u64 {
+        // Reachability gate: dict-source matches are only valid while
+        // the dictionary content is still inside the visible window.
+        // `RingBuffer` / `FlatBuf` maintain `total_output_counter`
+        // (push / repeat / inline-exec counter bump). On the direct
+        // path (`UserSliceBackend`) the inline executor skips the
+        // counter, but the backend never drains (`head` stays 0), so
+        // `buffer.len()` IS the cumulative output — take the max of
+        // the two so the gate is accurate for every backend.
+        let total_output = self.total_output_counter.max(self.buffer.len() as u64);
+        if total_output <= self.window_size as u64 {
             // at least part of that repeat is from the dictionary content
             let bytes_from_dict = offset - self.buffer.len();
 

@@ -2262,19 +2262,20 @@ impl FrameDecoder {
             // `UserSliceBackend::exec_sequence_inline` returns
             // `Result<(), ExecuteSequencesError>` instead of
             // panicking on capacity overflow; the error propagates
-            // up as `FrameDecoderError`. Eligibility (FCS > 0, no
-            // active dict, remaining `output` slice has WILDCOPY
-            // slack) puts the frame on the fast path that bypasses
-            // the FlatBuf/Ring -> `read()` drain copy. Ineligible
-            // frames (no FCS, active dict, output too small for
-            // slack) fall through to the legacy `decode_blocks` +
-            // `read` drain loop below.
-            let (content_size, fcs_declared, dict_active, window_size) = {
+            // up as `FrameDecoderError`. Eligibility (FCS > 0,
+            // remaining `output` slice holds the declared content)
+            // puts the frame on the fast path that bypasses the
+            // FlatBuf/Ring -> `read()` drain copy. Ineligible frames
+            // (no FCS, output too small) fall through to the legacy
+            // `decode_blocks` + `read` drain loop below. Dictionary
+            // frames are eligible: `run_direct_decode` hands the
+            // shared dict handle to its buffer, and beyond-prefix
+            // offsets resolve through `repeat_from_dict`.
+            let (content_size, fcs_declared, window_size) = {
                 let state_ref = self.state.as_ref().expect("init populated state");
                 (
                     state_ref.frame_header.frame_content_size(),
                     state_ref.frame_header.fcs_declared(),
-                    state_ref.using_dict.is_some(),
                     state_ref.frame_header.window_size().unwrap_or(0),
                 )
             };
@@ -2294,8 +2295,7 @@ impl FrameDecoder {
             // that the spec relies on for `offset <= window_size`
             // validation. Path choice no longer alters checksum
             // semantics.
-            let direct_eligible =
-                content_size > 0 && !dict_active && (output.len() as u64) >= content_size;
+            let direct_eligible = content_size > 0 && (output.len() as u64) >= content_size;
             if direct_eligible {
                 let written = self.run_direct_decode(&mut input, output, content_size)?;
                 output = &mut output[written..];
@@ -2409,19 +2409,18 @@ impl FrameDecoder {
             // `UserSliceBackend::exec_sequence_inline` returns
             // `Result<(), ExecuteSequencesError>` instead of
             // panicking on capacity overflow; the error propagates
-            // up as `FrameDecoderError`. Eligibility (FCS > 0, no
-            // active dict, remaining `output` slice has WILDCOPY
-            // slack) puts the frame on the fast path that bypasses
-            // the FlatBuf/Ring -> `read()` drain copy. Ineligible
-            // frames (no FCS, active dict, output too small for
-            // slack) fall through to the legacy `decode_blocks` +
-            // `read` drain loop below.
-            let (content_size, fcs_declared, dict_active, window_size) = {
+            // up as `FrameDecoderError`. Eligibility (FCS > 0,
+            // remaining `output` slice holds the declared content)
+            // puts the frame on the fast path that bypasses the
+            // FlatBuf/Ring -> `read()` drain copy. Ineligible frames
+            // (no FCS, output too small) fall through to the legacy
+            // `decode_blocks` + `read` drain loop below. Dictionary
+            // frames are eligible (see the no-lsm path above).
+            let (content_size, fcs_declared, window_size) = {
                 let state_ref = self.state.as_ref().expect("init populated state");
                 (
                     state_ref.frame_header.frame_content_size(),
                     state_ref.frame_header.fcs_declared(),
-                    state_ref.using_dict.is_some(),
                     state_ref.frame_header.window_size().unwrap_or(0),
                 )
             };
@@ -2430,8 +2429,7 @@ impl FrameDecoder {
             // `UserSliceBackend::exec_sequence_bounded`, so no
             // `WILDCOPY_OVERLENGTH` trailing slack is required (see the
             // no-lsm path above).
-            let direct_eligible =
-                content_size > 0 && !dict_active && (output.len() as u64) >= content_size;
+            let direct_eligible = content_size > 0 && (output.len() as u64) >= content_size;
             if direct_eligible {
                 let written = self.run_direct_decode(&mut input, output, content_size)?;
                 output = &mut output[written..];
@@ -2559,8 +2557,11 @@ impl FrameDecoder {
     ///   trailing slack is required: the trailing sequence(s) take the
     ///   bounded (non-overshooting) copy in
     ///   [`UserSliceBackend::exec_sequence_bounded`].
-    /// - No active dictionary
-    ///   (`self.state.using_dict.is_none()`).
+    ///
+    /// Dictionary frames are supported: the scratch buffer's shared
+    /// dict handle is forwarded to the stack-local `DecodeBuffer`, so
+    /// offsets reaching past the frame's own output resolve through
+    /// `repeat_from_dict` (the ext-dict slow path).
     ///
     /// On return, `input` points at the byte immediately after the
     /// frame's checksum (or after the last block, when the frame
@@ -2590,7 +2591,7 @@ impl FrameDecoder {
         // fields; only `buffer` differs and we don't use that here.
         // Macro-style binding avoids the closure / generic
         // gymnastics of returning multiple `&mut` from a match arm.
-        let (huf, fse, offset_hist, literals_buffer, block_content_buffer, window_size) =
+        let (huf, fse, offset_hist, literals_buffer, block_content_buffer, window_size, dict) =
             match &mut state.decoder_scratch {
                 DecoderScratchKind::Flat(s) => (
                     &mut s.huf,
@@ -2599,6 +2600,7 @@ impl FrameDecoder {
                     &mut s.literals_buffer,
                     &mut s.block_content_buffer,
                     s.buffer.window_size,
+                    s.buffer.dict.clone(),
                 ),
                 DecoderScratchKind::Ring(s) => (
                     &mut s.huf,
@@ -2607,10 +2609,21 @@ impl FrameDecoder {
                     &mut s.literals_buffer,
                     &mut s.block_content_buffer,
                     s.buffer.window_size,
+                    s.buffer.dict.clone(),
                 ),
             };
         let backend = UserSliceBackend::from_slice(output);
-        let buffer = DecodeBuffer::from_backend(backend, window_size);
+        let mut buffer = DecodeBuffer::from_backend(backend, window_size);
+        // Dictionary matches on the direct path: hand the shared handle
+        // (refcount bump, no copy) to the stack-local buffer so offsets
+        // reaching past the frame's own output resolve through
+        // `repeat_from_dict` — the same ext-dict slow path the
+        // FlatBuf/Ring backends use. The per-sequence hot path is
+        // untouched: the inline-exec dispatch already routes
+        // beyond-prefix offsets to the cold `repeat()` fallback.
+        if let Some(handle) = dict {
+            buffer.set_dict(handle);
+        }
         let mut direct = DirectScratch {
             huf,
             fse,
@@ -3650,6 +3663,47 @@ mod tests {
         let state = decoder.state.as_ref().expect("state should be initialized");
         assert!(state.frame_header.dictionary_id().is_none());
         assert_eq!(state.using_dict, Some(handle.id()));
+    }
+
+    #[test]
+    fn dict_frame_decodes_through_direct_path() {
+        // A dictionary frame decoded via `decode_all_with_dict_handle`
+        // into a buffer sized exactly to FCS takes the direct path
+        // (UserSliceBackend); matches reaching into the dictionary
+        // content must resolve through `repeat_from_dict`. The payload
+        // embeds dictionary content verbatim so the encoder emits
+        // dict-region matches from the first bytes of the frame.
+        let dict_raw = include_bytes!("../../dict_tests/dictionary");
+        let handle = DictionaryHandle::decode_dict(dict_raw).expect("dictionary should parse");
+        let dict_tail: alloc::vec::Vec<u8> = handle
+            .as_dict()
+            .dict_content
+            .iter()
+            .rev()
+            .take(2048)
+            .rev()
+            .copied()
+            .collect();
+        let mut payload = dict_tail.clone();
+        payload.extend_from_slice(b"unique suffix after dictionary material 0123456789");
+        payload.extend_from_slice(&dict_tail);
+
+        let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        compressor
+            .set_dictionary_from_bytes(dict_raw)
+            .expect("dict load");
+        compressor.set_source(payload.as_slice());
+        let mut compressed = Vec::new();
+        compressor.set_drain(&mut compressed);
+        compressor.compress();
+
+        let mut decoder = FrameDecoder::new();
+        let mut out = alloc::vec![0u8; payload.len()];
+        let n = decoder
+            .decode_all_with_dict_handle(compressed.as_slice(), &mut out, &handle)
+            .expect("dict frame must decode on the direct path");
+        assert_eq!(n, payload.len());
+        assert_eq!(out, payload, "direct-path dict decode must be byte-exact");
     }
 
     #[cfg(feature = "lsm")]
