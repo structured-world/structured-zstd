@@ -378,6 +378,18 @@ impl BufferBackend for FlatBuf {
     }
 
     #[inline]
+    fn reserve_exact(&mut self, n: usize) {
+        // Same contract as `reserve` (n additional + wildcopy slack), but
+        // exact growth: the window pre-reservation must not double a
+        // window-sized buffer when a dictionary prefix already occupies
+        // part of the retained capacity.
+        let additional = n
+            .checked_add(WILDCOPY_OVERLENGTH)
+            .expect("FlatBuf::reserve_exact amount + wildcopy slack overflows usize");
+        self.buf.reserve_exact(additional);
+    }
+
+    #[inline]
     fn set_max_capacity(&mut self, max_capacity: usize) {
         self.max_capacity = max_capacity;
     }

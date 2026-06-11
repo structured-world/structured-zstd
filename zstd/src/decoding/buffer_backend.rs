@@ -323,6 +323,16 @@ pub(crate) trait BufferBackend: Sized {
     /// May or may not allocate depending on current free space.
     fn reserve(&mut self, n: usize);
 
+    /// Like [`Self::reserve`], but growth is sized to the request instead
+    /// of the amortized-doubling policy. For the one-shot window
+    /// pre-reservation: a request that lands one slack past the retained
+    /// capacity (e.g. a dictionary prefix already in the buffer) would
+    /// otherwise DOUBLE a window-sized allocation. Per-block growth keeps
+    /// using `reserve` so streaming paths stay amortized.
+    fn reserve_exact(&mut self, n: usize) {
+        self.reserve(n);
+    }
+
     /// Fallible variant of [`Self::reserve`] for fixed-capacity
     /// backends. Growable backends (`FlatBuf`, `RingBuffer`) call
     /// `reserve` which always succeeds (or aborts on alloc failure)
