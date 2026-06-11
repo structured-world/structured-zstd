@@ -3711,6 +3711,32 @@ mod tests {
     }
 
     #[test]
+    fn reserve_buffer_reserves_the_shortfall_not_the_full_window_again() {
+        // `Vec::reserve_exact` takes ADDITIONAL capacity. The decode_all
+        // fallback loop re-enters decode_blocks once per strategy chunk,
+        // and each entry pre-reserves the window: re-requesting the FULL
+        // window on a buffer already holding ~window bytes of history
+        // would grow it toward 2x window, defeating the peak-memory cap
+        // the exact-growth policy exists for.
+        use super::DecoderScratchKind;
+        let window = 1usize << 20;
+        let mut scratch = DecoderScratchKind::new_flat(window);
+        scratch.reserve_buffer(window);
+        let data = alloc::vec![0u8; window];
+        match &mut scratch {
+            super::DecoderScratchKind::Flat(s) => s.buffer.push(&data),
+            super::DecoderScratchKind::Ring(_) => unreachable!("new_flat builds Flat"),
+        }
+        scratch.reserve_buffer(window);
+        let workspace = scratch.workspace_bytes();
+        assert!(
+            workspace < window * 3 / 2,
+            "second reserve_buffer grew a full window past the buffered \
+             history: workspace {workspace} bytes vs window {window}"
+        );
+    }
+
+    #[test]
     fn dict_frame_decodes_through_direct_path() {
         // A dictionary frame decoded via `decode_all_with_dict_handle`
         // into a buffer sized exactly to FCS takes the direct path
