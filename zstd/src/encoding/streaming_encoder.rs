@@ -314,6 +314,39 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             .expect("streaming encoder drain is present until finish consumes self")
     }
 
+    /// Total heap bytes this encoder's allocations hold, excluding the
+    /// inline struct and the drain `W` (whose footprint the owner can
+    /// measure through [`get_ref`](Self::get_ref)): match-finder tables /
+    /// history / recycled buffers, retained Huffman tables, the staging
+    /// `pending` / `encoded_scratch` buffers, the retained dictionary
+    /// content, and the cached dictionary entropy tables. Mirrors
+    /// `FrameCompressor::heap_size` so a context can report its true
+    /// footprint through `ZSTD_sizeof_CCtx`.
+    pub fn heap_size(&self) -> usize {
+        let mut total = self.state.matcher.heap_size();
+        total += self
+            .state
+            .last_huff_table
+            .as_ref()
+            .map_or(0, |table| table.heap_size());
+        total += self
+            .state
+            .huff_table_spare
+            .as_ref()
+            .map_or(0, |table| table.heap_size());
+        total += self.pending.capacity();
+        total += self.encoded_scratch.capacity();
+        total += self
+            .dictionary
+            .as_ref()
+            .map_or(0, |d| d.inner.dict_content.capacity());
+        total += self
+            .dictionary_entropy_cache
+            .as_ref()
+            .map_or(0, CachedDictionaryEntropy::heap_size);
+        total
+    }
+
     /// Returns a mutable reference to the wrapped output drain.
     ///
     /// It is inadvisable to directly write to the underlying writer, as doing

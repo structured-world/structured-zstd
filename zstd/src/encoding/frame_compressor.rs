@@ -712,16 +712,22 @@ struct FramePrep {
 ///
 /// Shared by the owned (`run_owned_block_loop`) and borrowed
 /// (`run_borrowed_block_loop`) paths so the tier table can't drift between them.
-fn initial_all_blocks_cap(initial_size_hint: Option<u64>) -> usize {
+///
+/// `block_capacity` (the active `targetCBlockSize` cap, or the 128 KiB
+/// format ceiling) bounds every tier: with a small target the first
+/// allocation tracks one capped block + header/checksum slack instead of
+/// keeping the donor-sized floor that only later growth respects.
+fn initial_all_blocks_cap(initial_size_hint: Option<u64>, block_capacity: usize) -> usize {
     const TINY_THRESHOLD: u64 = 4 * 1024;
     const SMALL_THRESHOLD: u64 = 64 * 1024;
     const TINY_CAP: usize = 4 * 1024;
     const SMALL_CAP: usize = 16 * 1024;
     const DEFAULT_CAP: usize = 130 * 1024;
+    let first_block_cap = block_capacity + 3 + 16;
     match initial_size_hint {
-        Some(h) if h <= TINY_THRESHOLD => TINY_CAP,
-        Some(h) if h <= SMALL_THRESHOLD => SMALL_CAP,
-        _ => DEFAULT_CAP,
+        Some(h) if h <= TINY_THRESHOLD => TINY_CAP.min(first_block_cap),
+        Some(h) if h <= SMALL_THRESHOLD => SMALL_CAP.min(first_block_cap),
+        _ => DEFAULT_CAP.min(first_block_cap),
     }
 }
 
@@ -1395,8 +1401,10 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // Streaming drain: the content size is only known at EOF, so the
         // frame header can't precede the blocks — accumulate them in a local
         // buffer and let `finish_frame` write header + blocks to the drain.
-        let mut all_blocks: Vec<u8> =
-            Vec::with_capacity(initial_all_blocks_cap(prep.initial_size_hint));
+        let mut all_blocks: Vec<u8> = Vec::with_capacity(initial_all_blocks_cap(
+            prep.initial_size_hint,
+            self.block_capacity(),
+        ));
         let mut block_source = ReaderBlockSource(&mut source);
         let total_uncompressed = self.run_owned_block_loop(
             &mut block_source,

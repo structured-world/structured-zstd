@@ -59,6 +59,18 @@ pub(crate) struct CStreamState {
 }
 
 impl CStreamState {
+    /// Heap bytes held by the in-flight stream: the encoder's tables and
+    /// staging buffers, its in-memory drain, and the flush-pending copy.
+    /// Feeds `ZSTD_sizeof_CCtx` so a context with an active stream
+    /// reports its true footprint.
+    pub(crate) fn heap_size(&self) -> usize {
+        self.pending.capacity()
+            + self
+                .encoder
+                .as_ref()
+                .map_or(0, |enc| enc.heap_size() + enc.get_ref().capacity())
+    }
+
     fn pending_remaining(&self) -> usize {
         self.pending.len() - self.pending_pos
     }

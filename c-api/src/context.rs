@@ -172,6 +172,7 @@ pub unsafe extern "C" fn ZSTD_sizeof_CCtx(cctx: *const ZSTD_CCtx) -> usize {
             .dict_compressor
             .as_ref()
             .map_or(0, |enc| enc.heap_size())
+        + cctx.stream.as_ref().map_or(0, |s| s.heap_size())
 }
 
 /// `size_t ZSTD_compressCCtx(ZSTD_CCtx* cctx, void* dst, size_t dstCapacity,
