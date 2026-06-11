@@ -16,9 +16,19 @@
 
 use std::env;
 
+// With `--features dhat-heap`, route allocations through the dhat heap
+// profiler (same pattern as `encode_loop_dict`) for per-call-site
+// allocation counts + peak attribution. Writes `dhat-heap.json` on drop.
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
+
 use structured_zstd::decoding::{DictionaryHandle, FrameDecoder};
 
 fn main() {
+    #[cfg(feature = "dhat-heap")]
+    let _dhat = dhat::Profiler::new_heap();
+
     let args: Vec<String> = env::args().collect();
     let iters: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(500_000);
     let payload_path = args

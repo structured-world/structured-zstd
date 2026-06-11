@@ -516,9 +516,14 @@ impl DecoderScratchKind {
     /// under-reserves on reused buffers (see `FlatBuf::reserve`).
     #[inline]
     fn reserve_buffer(&mut self, window_size: usize) {
+        // Exact growth: this is the one-shot pre-reservation, and a request
+        // landing one slack past the retained capacity (e.g. a dictionary
+        // prefix already loaded into the buffer) must not DOUBLE a
+        // window-sized allocation through the amortized policy. Per-block
+        // growth keeps the amortized `reserve`.
         match self {
-            Self::Ring(s) => s.buffer.reserve(window_size),
-            Self::Flat(s) => s.buffer.reserve(window_size),
+            Self::Ring(s) => s.buffer.reserve_exact(window_size),
+            Self::Flat(s) => s.buffer.reserve_exact(window_size),
         }
     }
 
@@ -2314,7 +2319,17 @@ impl FrameDecoder {
             // > 128 KiB otherwise grows through several intermediate
             // sizes with `alloc_zeroed + memcpy` each time).
             if let Some(state) = self.state.as_mut() {
-                state.decoder_scratch.reserve_buffer(window_size as usize);
+                // A declared content size caps the useful window: matches
+                // can never reference further back than the bytes that will
+                // ever exist, so an encoder-declared window above the FCS
+                // (e.g. a level-preset window on a smaller input) must not
+                // inflate the reservation.
+                let useful_window = if fcs_declared {
+                    window_size.min(content_size)
+                } else {
+                    window_size
+                };
+                state.decoder_scratch.reserve_buffer(useful_window as usize);
             }
             let frame_start_total = total_bytes_written;
             loop {
@@ -2446,7 +2461,17 @@ impl FrameDecoder {
             // `window_size` once so the per-block growth cycle is
             // skipped (see same comment on the no-lsm path above).
             if let Some(state) = self.state.as_mut() {
-                state.decoder_scratch.reserve_buffer(window_size as usize);
+                // A declared content size caps the useful window: matches
+                // can never reference further back than the bytes that will
+                // ever exist, so an encoder-declared window above the FCS
+                // (e.g. a level-preset window on a smaller input) must not
+                // inflate the reservation.
+                let useful_window = if fcs_declared {
+                    window_size.min(content_size)
+                } else {
+                    window_size
+                };
+                state.decoder_scratch.reserve_buffer(useful_window as usize);
             }
             let frame_start_total = total_bytes_written;
             loop {

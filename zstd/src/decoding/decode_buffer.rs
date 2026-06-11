@@ -289,6 +289,13 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         self.buffer.reserve(amount);
     }
 
+    /// Exact-growth variant of [`Self::reserve`] for the one-shot window
+    /// pre-reservation (see `BufferBackend::reserve_exact`).
+    #[inline]
+    pub fn reserve_exact(&mut self, amount: usize) {
+        self.buffer.reserve_exact(amount);
+    }
+
     /// Mutable backend handle. Lets the inline sequence executor
     /// write straight into the backend's physical storage; the
     /// `tail()` cursor on the backend is the authoritative output

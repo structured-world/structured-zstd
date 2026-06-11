@@ -158,7 +158,13 @@ where
         "sequence section update bits exceed 56-bit budget"
     );
 
-    buffer.reserve(MAX_BLOCK_SIZE as usize);
+    // Exact growth: this worst-case pre-block reservation is a no-op while
+    // the frame-entry window reservation covers it, and on the frame's LAST
+    // block (where the remaining content is smaller than a full block) the
+    // amortized policy would DOUBLE the window-sized buffer for a tail
+    // worth a fraction of a block. The ring backend keeps its own
+    // amortized growth via the trait default.
+    buffer.reserve_exact(MAX_BLOCK_SIZE as usize);
     // Arm the per-block output ceiling so a malformed / adversarial block
     // whose sequences over-produce cannot grow the buffer past
     // `len + MAX_BLOCK_SIZE` (a decompression-bomb OOM on the growable
