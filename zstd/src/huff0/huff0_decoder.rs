@@ -332,6 +332,17 @@ pub struct HuffmanTable {
     bits: Vec<u8>,
     bit_ranks: Vec<u32>,
     rank_indexes: Vec<usize>,
+    /// Running `sum(1 << (w - 1))` accumulated WHILE weights decode
+    /// (donor `HUF_readStats` keeps the same running stats), replacing a
+    /// separate post-decode pass over `weights`.
+    weight_sum: u32,
+    /// Per-weight occurrence counts accumulated during weight decode
+    /// (donor `rankStats`); `bit_ranks` derives from this without
+    /// re-walking the code-length array.
+    weight_rank_count: [u32; (MAX_MAX_NUM_BITS as usize) + 1],
+    /// Inferred last weight, stashed by `compute_huffman_bits` for the
+    /// `bit_ranks` derivation in `build_table_from_weights`.
+    last_weight: u8,
     /// In some cases, the list of weights is compressed using FSE compression.
     fse_table: FSETable,
 }
@@ -359,6 +370,9 @@ impl HuffmanTable {
             bits: Vec::with_capacity(256),
             bit_ranks: Vec::with_capacity(11),
             rank_indexes: Vec::with_capacity(11),
+            weight_sum: 0,
+            weight_rank_count: [0; (MAX_MAX_NUM_BITS as usize) + 1],
+            last_weight: 0,
             fse_table: FSETable::new(255),
         }
     }
@@ -387,6 +401,9 @@ impl HuffmanTable {
         self.bits.clear();
         self.bit_ranks.clear();
         self.rank_indexes.clear();
+        self.weight_sum = 0;
+        self.weight_rank_count = [0; (MAX_MAX_NUM_BITS as usize) + 1];
+        self.last_weight = 0;
         self.fse_table.reset();
     }
 
@@ -522,7 +539,28 @@ impl HuffmanTable {
                 dec1.init_state(&mut br)?;
                 dec2.init_state(&mut br)?;
 
-                self.weights.clear();
+                // Disjoint-field borrow: `dec1`/`dec2` hold `&self.fse_table`,
+                // so the weight sink is taken as a field borrow. The running
+                // stats (donor `HUF_readStats` shape) accumulate in locals
+                // and commit to `self` after the loop, replacing the
+                // separate weight-sum and rank-count passes.
+                let weights = &mut self.weights;
+                weights.clear();
+                let mut weight_sum = 0u32;
+                let mut weight_rank_count = [0u32; (MAX_MAX_NUM_BITS as usize) + 1];
+                macro_rules! push_weight {
+                    ($w:expr) => {{
+                        let w: u8 = $w;
+                        if w > MAX_MAX_NUM_BITS {
+                            return Err(err::WeightBiggerThanMaxNumBits { got: w });
+                        }
+                        weight_rank_count[w as usize] += 1;
+                        if w > 0 {
+                            weight_sum += 1u32 << (w - 1);
+                        }
+                        weights.push(w);
+                    }};
+                }
 
                 // The weights FSE table is built with a max accuracy_log of 6
                 // (the `build_decoder(fse_stream, 6)` call above), so each state
@@ -539,32 +577,30 @@ impl HuffmanTable {
                 loop {
                     br.ensure_bits(WEIGHTS_REFILL_BUDGET);
 
-                    let w = dec1.decode_symbol();
-                    self.weights.push(w);
+                    push_weight!(dec1.decode_symbol());
                     dec1.update_state_fast(&mut br);
 
                     if br.bits_remaining() <= -1 {
                         //collect final states
-                        self.weights.push(dec2.decode_symbol());
+                        push_weight!(dec2.decode_symbol());
                         break;
                     }
 
-                    let w = dec2.decode_symbol();
-                    self.weights.push(w);
+                    push_weight!(dec2.decode_symbol());
                     dec2.update_state_fast(&mut br);
 
                     if br.bits_remaining() <= -1 {
                         //collect final states
-                        self.weights.push(dec1.decode_symbol());
+                        push_weight!(dec1.decode_symbol());
                         break;
                     }
                     //maximum number of weights is 255 because we use u8 symbols and the last weight is inferred from the sum of all others
-                    if self.weights.len() > 255 {
-                        return Err(err::TooManyWeights {
-                            got: self.weights.len(),
-                        });
+                    if weights.len() > 255 {
+                        return Err(err::TooManyWeights { got: weights.len() });
                     }
                 }
+                self.weight_sum = weight_sum;
+                self.weight_rank_count = weight_rank_count;
             }
             // If the header byte is greater than or equal to 128,
             // weights are directly represented, where each weight is
@@ -576,7 +612,9 @@ impl HuffmanTable {
                 // weights are directly encoded
                 let weights_raw = &source[1..];
                 let num_weights = header - 127;
-                self.weights.resize(num_weights as usize, 0);
+                self.weights.clear();
+                let mut weight_sum = 0u32;
+                let mut weight_rank_count = [0u32; (MAX_MAX_NUM_BITS as usize) + 1];
 
                 let bytes_needed = if num_weights.is_multiple_of(2) {
                     num_weights as usize / 2
@@ -593,16 +631,30 @@ impl HuffmanTable {
 
                 // Unpack both nibbles per source byte in one iteration —
                 // the per-index parity branch defeated unrolling and read
-                // every byte twice.
+                // every byte twice. The running stats accumulate alongside
+                // (donor `HUF_readStats` shape).
+                let mut push_weight = |w: u8, weights: &mut Vec<u8>| -> Result<(), err> {
+                    if w > MAX_MAX_NUM_BITS {
+                        return Err(err::WeightBiggerThanMaxNumBits { got: w });
+                    }
+                    weight_rank_count[w as usize] += 1;
+                    if w > 0 {
+                        weight_sum += 1u32 << (w - 1);
+                    }
+                    weights.push(w);
+                    Ok(())
+                };
                 let mut idx = 0usize;
                 for &byte in &weights_raw[..bytes_needed] {
-                    self.weights[idx] = byte >> 4;
+                    push_weight(byte >> 4, &mut self.weights)?;
                     idx += 1;
                     if idx < num_weights as usize {
-                        self.weights[idx] = byte & 0xF;
+                        push_weight(byte & 0xF, &mut self.weights)?;
                         idx += 1;
                     }
                 }
+                self.weight_sum = weight_sum;
+                self.weight_rank_count = weight_rank_count;
                 bits_read += num_weights as usize * 4;
             }
         }
@@ -627,13 +679,10 @@ impl HuffmanTable {
         self.bits.clear();
         self.bits.resize(self.weights.len() + 1, 0);
 
-        let mut weight_sum: u32 = 0;
-        for w in &self.weights {
-            if *w > MAX_MAX_NUM_BITS {
-                return Err(err::WeightBiggerThanMaxNumBits { got: *w });
-            }
-            weight_sum += if *w > 0 { 1_u32 << (*w - 1) } else { 0 };
-        }
+        // `weight_sum` was accumulated while the weights decoded
+        // (`read_weights` validates each weight <= MAX_MAX_NUM_BITS as it
+        // lands), so no re-walk of `weights` is needed here.
+        let weight_sum: u32 = self.weight_sum;
 
         if weight_sum == 0 {
             return Err(err::MissingWeights);
@@ -648,6 +697,7 @@ impl HuffmanTable {
         }
 
         let last_weight = highest_bit_set(left_over) as u8;
+        self.last_weight = last_weight;
 
         for symbol in 0..self.weights.len() {
             let bits = if self.weights[symbol] > 0 {
@@ -672,11 +722,18 @@ impl HuffmanTable {
     fn build_table_from_weights(&mut self) -> Result<(), HuffmanTableError> {
         let max_bits = self.compute_huffman_bits()?;
 
+        // Derive the code-length histogram from the per-weight counts
+        // accumulated during weight decode instead of re-walking `bits`:
+        // a weight `w > 0` maps to `bits = max_bits + 1 - w`, weight 0
+        // stays code-length 0, and the inferred last symbol contributes
+        // one extra entry at its derived length.
         self.bit_ranks.clear();
         self.bit_ranks.resize((max_bits + 1) as usize, 0);
-        for num_bits in &self.bits {
-            self.bit_ranks[(*num_bits) as usize] += 1;
+        self.bit_ranks[0] = self.weight_rank_count[0];
+        for w in 1..=max_bits {
+            self.bit_ranks[(max_bits + 1 - w) as usize] = self.weight_rank_count[w as usize];
         }
+        self.bit_ranks[(max_bits + 1 - self.last_weight) as usize] += 1;
 
         let table_size = 1usize << self.max_num_bits;
 
@@ -794,6 +851,9 @@ mod tests {
             bits: Vec::new(),
             bit_ranks: Vec::new(),
             rank_indexes: Vec::new(),
+            weight_sum: 0,
+            weight_rank_count: [0; (MAX_MAX_NUM_BITS as usize) + 1],
+            last_weight: 0,
             fse_table: FSETable::new(255),
         }
     }
