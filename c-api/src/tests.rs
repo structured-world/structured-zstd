@@ -988,12 +988,8 @@ fn target_cblock_size_caps_emitted_blocks() {
         assert_eq!(ZSTD_isError(header_len), 0);
         let mut pos = header_len;
         loop {
-            let hdr = u32::from_le_bytes([
-                compressed[pos],
-                compressed[pos + 1],
-                compressed[pos + 2],
-                0,
-            ]);
+            let hdr =
+                u32::from_le_bytes([compressed[pos], compressed[pos + 1], compressed[pos + 2], 0]);
             let last = hdr & 1 != 0;
             let block_type = (hdr >> 1) & 3;
             let size = (hdr >> 3) as usize;

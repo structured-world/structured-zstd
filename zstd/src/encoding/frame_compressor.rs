@@ -1260,8 +1260,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// ratio for bounded per-block latency. The value is clamped to
     /// `[1340, 131072]` (the upstream bounds). `None` removes the target.
     pub fn set_target_block_size(&mut self, target: Option<u32>) {
-        self.target_block_size =
-            target.map(|t| t.clamp(1340, crate::common::MAX_BLOCK_SIZE));
+        self.target_block_size = target.map(|t| t.clamp(1340, crate::common::MAX_BLOCK_SIZE));
     }
 
     /// The active block-size cap: the configured target, or the format's

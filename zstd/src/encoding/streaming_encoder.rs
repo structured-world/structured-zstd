@@ -163,8 +163,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                 "the block-size target must be set before the first write",
             ));
         }
-        self.target_block_size =
-            target.map(|t| t.clamp(1340, crate::common::MAX_BLOCK_SIZE));
+        self.target_block_size = target.map(|t| t.clamp(1340, crate::common::MAX_BLOCK_SIZE));
         Ok(())
     }
 
