@@ -1383,8 +1383,12 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         let mut all_blocks: Vec<u8> =
             Vec::with_capacity(initial_all_blocks_cap(prep.initial_size_hint));
         let mut block_source = ReaderBlockSource(&mut source);
-        let total_uncompressed =
-            self.run_owned_block_loop(&mut block_source, prep.initial_size_hint, false, &mut all_blocks);
+        let total_uncompressed = self.run_owned_block_loop(
+            &mut block_source,
+            prep.initial_size_hint,
+            false,
+            &mut all_blocks,
+        );
         self.uncompressed_data = Some(source);
         self.finish_frame(all_blocks, total_uncompressed, &prep);
     }
