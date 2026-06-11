@@ -512,14 +512,15 @@ impl DecoderScratchKind {
     /// `new_flat` are each lazy (no pre-reserve), so a direct-eligible
     /// frame writes only through `UserSliceBackend` and leaves this
     /// buffer empty.
-    /// `window_size` is the ADDITIONAL-bytes argument the backend `reserve`
-    /// contract expects (Vec-style `reserve(additional)` → `capacity >= len +
-    /// additional`, plus the backend's wildcopy slack). This is always called at
-    /// frame entry on a freshly-reset buffer (`len == 0`), so the additional
-    /// request equals the desired total window capacity. Do NOT pass
-    /// `window_size - buffer.len()`: when `len == 0` it's identical, and the
-    /// backend `reserve` impls deliberately reject that form because it
-    /// under-reserves on reused buffers (see `FlatBuf::reserve`).
+    ///
+    /// `window_size` is the TARGET visible-window capacity: callers pass
+    /// the full window, and the method itself computes the shortfall past
+    /// the bytes already buffered before calling the backend's
+    /// ADDITIONAL-semantics `reserve_exact`. That keeps re-entries (the
+    /// decode_all fallback loop runs `decode_blocks` once per strategy
+    /// chunk, and streaming callers invoke it per call) from growing a
+    /// window-full buffer toward 2x window, while per-block growth keeps
+    /// the amortized `reserve`.
     #[inline]
     fn reserve_buffer(&mut self, window_size: usize) {
         // Exact growth: this is the one-shot pre-reservation, and a request
