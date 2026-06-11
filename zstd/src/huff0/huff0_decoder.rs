@@ -591,14 +591,19 @@ impl HuffmanTable {
                     });
                 }
 
-                for idx in 0..num_weights {
-                    if idx % 2 == 0 {
-                        self.weights[idx as usize] = weights_raw[idx as usize / 2] >> 4;
-                    } else {
-                        self.weights[idx as usize] = weights_raw[idx as usize / 2] & 0xF;
+                // Unpack both nibbles per source byte in one iteration —
+                // the per-index parity branch defeated unrolling and read
+                // every byte twice.
+                let mut idx = 0usize;
+                for &byte in &weights_raw[..bytes_needed] {
+                    self.weights[idx] = byte >> 4;
+                    idx += 1;
+                    if idx < num_weights as usize {
+                        self.weights[idx] = byte & 0xF;
+                        idx += 1;
                     }
-                    bits_read += 4;
                 }
+                bits_read += num_weights as usize * 4;
             }
         }
 
@@ -719,11 +724,24 @@ impl HuffmanTable {
                 let len = 1usize << (max_bits - bits_for_symbol);
                 self.rank_indexes[bits_for_symbol as usize] += len;
                 let packed = u16::from(symbol as u8) | (u16::from(bits_for_symbol) << 8);
-                // Constant-`packed` write of a contiguous run: LLVM lowers
-                // this to the same vectorised broadcast store as `<[u16]>::fill`
-                // (the donor's hand-rolled 64-bit `HUF_DEltX1` broadcast), just
-                // into uninitialised memory.
-                for slot in &mut slots[base_idx..base_idx + len] {
+                // Donor `HUF_DEltX1`-style broadcast fill: replicate the
+                // 16-bit entry across a 64-bit lane and store four entries
+                // per write. LLVM does NOT auto-vectorise the per-slot
+                // `MaybeUninit::write` loop (it lowered to scalar `movw`
+                // stores, measured hot on table-dense btopt frames), so the
+                // widening is done by hand; the < 4-entry tail stays scalar.
+                let run = &mut slots[base_idx..base_idx + len];
+                let packed64 = u64::from(packed) * 0x0001_0001_0001_0001;
+                let mut chunks = run.chunks_exact_mut(4);
+                for chunk in &mut chunks {
+                    // SAFETY: `[MaybeUninit<u16>; 4]` is 8 contiguous bytes
+                    // with no padding; an unaligned u64 store initialises
+                    // exactly those four slots.
+                    unsafe {
+                        chunk.as_mut_ptr().cast::<u64>().write_unaligned(packed64);
+                    }
+                }
+                for slot in chunks.into_remainder() {
                     slot.write(packed);
                 }
             }
