@@ -345,16 +345,25 @@ impl Default for PreSplitFingerprint {
 /// compression ratio observed so far instead of the whole-input worst case.
 ///
 /// `blocks_start` is where this frame's blocks begin in `out`, `consumed`
-/// the input bytes already emitted as blocks, and `remaining` the input
+/// the input bytes already emitted as blocks, `remaining` the input
 /// bytes still to compress (an estimate is fine: a low one only means one
-/// more re-estimate later). Incompressible input re-estimates to ~the full
-/// `compress_bound` after the first block — the old up-front policy's worst
-/// case — while compressible input stays at output scale.
-fn reserve_for_next_block(out: &mut Vec<u8>, blocks_start: usize, consumed: u64, remaining: usize) {
+/// more re-estimate later), and `block_capacity` the active block-size cap
+/// (`FrameCompressor::block_capacity`) so a small `targetCBlockSize` does
+/// not keep a 128 KiB floor in the buffer or undercount header density.
+/// Incompressible input re-estimates to ~the full `compress_bound` after
+/// the first block — the old up-front policy's worst case — while
+/// compressible input stays at output scale.
+fn reserve_for_next_block(
+    out: &mut Vec<u8>,
+    blocks_start: usize,
+    consumed: u64,
+    remaining: usize,
+    block_capacity: usize,
+) {
     // Worst-case single-block output: 3-byte header + raw payload, plus
     // slack for the 4-byte frame checksum trailer and a few extra sub-block
     // headers from the post-split emitters, so neither can reallocate.
-    let block_bound = remaining.min(crate::common::MAX_BLOCK_SIZE as usize) + 3 + 16;
+    let block_bound = remaining.min(block_capacity) + 3 + 16;
     if out.capacity() - out.len() >= block_bound {
         return;
     }
@@ -368,7 +377,7 @@ fn reserve_for_next_block(out: &mut Vec<u8>, blocks_start: usize, consumed: u64,
         // slightly-worsening tail doesn't force a reallocation per block.
         // u128 keeps the product exact for multi-GiB frames.
         let scaled = ((remaining as u128 * produced as u128) / consumed as u128) as u64;
-        let headers = (remaining as u64 / u64::from(crate::common::MAX_BLOCK_SIZE) + 1) * 3;
+        let headers = (remaining as u64 / block_capacity.max(1) as u64 + 1) * 3;
         usize::try_from(scaled + scaled / 16 + headers + 64).unwrap_or(usize::MAX)
     };
     // `reserve_exact`: the estimate already carries its own slack, and the
@@ -1030,7 +1039,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         // full bound in one shot, so the reused-`out` steady state is
         // unchanged. 18 = max frame header (magic 4 + descriptor 1 + window
         // 1 + dict id 4 + FCS 8).
-        let first_block_bound = input.len().min(crate::common::MAX_BLOCK_SIZE as usize) + 3;
+        let first_block_bound = input.len().min(self.block_capacity()) + 3;
         out.reserve(18 + first_block_bound + checksum_len);
         self.append_frame_header(total_uncompressed, &prep, out);
         let header_len = out.len();
@@ -1128,7 +1137,13 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         let block_capacity = self.block_capacity();
         let mut start = 0usize;
         while start < input.len() {
-            reserve_for_next_block(out, blocks_start, start as u64, input.len() - start);
+            reserve_for_next_block(
+                out,
+                blocks_start,
+                start as u64,
+                input.len() - start,
+                block_capacity,
+            );
             // Donor `ZSTD_compress_frameChunk`: size each block via the cheap
             // fingerprint pre-splitter so a full 128 KiB block is cut at a
             // statistical boundary when it pays. `savings = consumed -
@@ -1712,7 +1727,13 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                         const HINT_LOOKAHEAD: u64 = 64 * 1024;
                         hint_remaining.min(buffered + HINT_LOOKAHEAD)
                     };
-                    reserve_for_next_block(out, blocks_start, emitted, remaining as usize);
+                    reserve_for_next_block(
+                        out,
+                        blocks_start,
+                        emitted,
+                        remaining as usize,
+                        self.block_capacity(),
+                    );
                 }
                 _ => {
                     out.reserve(uncompressed_data.len() + 3 + 16);

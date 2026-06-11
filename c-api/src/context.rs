@@ -370,6 +370,13 @@ pub unsafe extern "C" fn ZSTD_decompressDCtx(
     let dst = unsafe { out_slice(dst, dst_capacity) };
     // Verify the trailing content checksum like upstream ZSTD_decompress; the
     // setter is idempotent, so reapplying it on a reused DCtx is fine.
+    //
+    // `ZSTD_d_windowLogMax` is deliberately NOT enforced here: upstream
+    // documents it as a streaming-API memory cap ("does not apply for
+    // one-pass decoders ... since no additional memory is allocated"), and
+    // its one-shot path checks only the absolute ZSTD_WINDOWLOG_MAX bound.
+    // The single-pass decode writes into the caller's dst with no window
+    // buffer, so there is no allocation for the parameter to limit.
     dctx.decoder.set_content_checksum(ContentChecksum::Verify);
     let outcome = catch_unwind(AssertUnwindSafe(|| dctx.decoder.decode_all(src, dst)));
     match outcome {

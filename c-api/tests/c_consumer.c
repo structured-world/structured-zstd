@@ -115,7 +115,9 @@ int main(void) {
         ZSTD_DStream *zds = ZSTD_createDStream();
         if (!zcs || !zds) return 25;
         size_t out_cap = ZSTD_CStreamOutSize();
-        unsigned char *sbuf = (unsigned char *)malloc(out_cap);
+        /* calloc: the streaming calls initialize exactly the bytes copied
+         * out afterwards, but zero-init keeps static analyzers quiet. */
+        unsigned char *sbuf = (unsigned char *)calloc(1, out_cap);
         unsigned char *scomp = (unsigned char *)malloc(bound + 64);
         if (!sbuf || !scomp) return 2;
         size_t scomp_len = 0;
@@ -145,7 +147,7 @@ int main(void) {
         size_t restored = 0;
         ZSTD_inBuffer inb = {scomp, scomp_len, 0};
         size_t dout_cap = ZSTD_DStreamOutSize();
-        unsigned char *dbuf = (unsigned char *)malloc(dout_cap);
+        unsigned char *dbuf = (unsigned char *)calloc(1, dout_cap);
         if (!dbuf) return 2;
         for (;;) {
             ZSTD_outBuffer outb = {dbuf, dout_cap, 0};
