@@ -353,6 +353,7 @@ pub unsafe extern "C" fn ZSTD_decompress_usingDDict(
             // next call re-loads cleanly rather than trusting a broken decoder.
             Err(_) => {
                 dctx.decoder = codec::decoding::FrameDecoder::new();
+                dctx.stream_frame_done = true;
                 dctx.ddict_serial = 0;
                 return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
             }
@@ -361,10 +362,16 @@ pub unsafe extern "C" fn ZSTD_decompress_usingDDict(
     dctx.decoder.set_content_checksum(ContentChecksum::Verify);
     let outcome = catch_unwind(AssertUnwindSafe(|| dctx.decoder.decode_all(src, dst)));
     match outcome {
-        Ok(Ok(written)) => written,
+        Ok(Ok(written)) => {
+            // One-shot consumed whole frames: the context is back at a
+            // frame boundary (see ZSTD_decompressDCtx for the rationale).
+            dctx.stream_frame_done = true;
+            written
+        }
         Ok(Err(err)) => encode(code_for_decoder_error(&err)),
         Err(_) => {
             dctx.decoder = codec::decoding::FrameDecoder::new();
+            dctx.stream_frame_done = true;
             dctx.ddict_serial = 0;
             encode(ZSTD_ErrorCode::ZSTD_error_GENERIC)
         }

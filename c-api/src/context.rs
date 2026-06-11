@@ -309,8 +309,10 @@ impl ZSTD_DCtx {
     pub(crate) fn reset_parameters(&mut self) {
         self.window_log_max = crate::params::WINDOW_LOG_LIMIT_DEFAULT;
         // Replace the decoder to drop any loaded dictionaries; the
-        // workspace re-grows on the next frame.
+        // workspace re-grows on the next frame. The fresh decoder sits at
+        // a frame boundary, so the streaming flag must say so too.
         self.decoder = FrameDecoder::new();
+        self.stream_frame_done = true;
         self.ddict_serial = 0;
     }
 }
@@ -380,7 +382,15 @@ pub unsafe extern "C" fn ZSTD_decompressDCtx(
     dctx.decoder.set_content_checksum(ContentChecksum::Verify);
     let outcome = catch_unwind(AssertUnwindSafe(|| dctx.decoder.decode_all(src, dst)));
     match outcome {
-        Ok(Ok(written)) => written,
+        Ok(Ok(written)) => {
+            // The one-shot consumed whole frames; the context sits at a
+            // frame boundary again. Without this, a context abandoned
+            // mid-stream earlier would make the next
+            // ZSTD_decompressStream call report the stale frame complete
+            // instead of starting the new one.
+            dctx.stream_frame_done = true;
+            written
+        }
         Ok(Err(err)) => encode(code_for_decoder_error(&err)),
         Err(_) => {
             // A panic mid-decode can leave the decoder's internal state
@@ -391,6 +401,7 @@ pub unsafe extern "C" fn ZSTD_decompressDCtx(
             // cache key too — otherwise the next ZSTD_decompress_usingDDict with
             // the same handle would skip re-loading it and decode without it.
             dctx.decoder = FrameDecoder::new();
+            dctx.stream_frame_done = true;
             dctx.ddict_serial = 0;
             encode(ZSTD_ErrorCode::ZSTD_error_GENERIC)
         }
