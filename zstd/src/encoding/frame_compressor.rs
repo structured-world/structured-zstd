@@ -3182,6 +3182,16 @@ mod tests {
             .decode_all_to_vec(&frame, &mut decoded)
             .expect("single-segment dict frame must decode");
         assert_eq!(decoded, payload);
+
+        // Reference-decoder cross-check: our serializer and parser could
+        // share a bug and still self-roundtrip, so the on-wire
+        // single-segment + dictionary-ID layout must also decode through
+        // the C implementation.
+        let ffi_decoded = zstd::bulk::Decompressor::with_dictionary(dict_raw)
+            .expect("reference decompressor must accept the dictionary")
+            .decompress(&frame, payload.len() + 64)
+            .expect("reference zstd must accept the single-segment dict frame");
+        assert_eq!(ffi_decoded, payload);
     }
 
     // Regression test: `heap_size()` must count the retained Huffman tables
