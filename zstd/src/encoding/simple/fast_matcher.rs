@@ -1790,6 +1790,51 @@ mod tests {
         assert_eq!(m.max_window_size, 1usize << 16);
     }
 
+    // The copy-mode restore fast path: a same-shape reset with
+    // `table_overwritten_by_restore` must leave the table contents
+    // untouched (the snapshot restore replaces them right after), while
+    // the plain same-shape reset must memset them. Guards against a
+    // refactor silently reintroducing the wasted per-frame clear — or,
+    // worse, dropping the clear on the plain path.
+    #[test]
+    fn reset_keeps_table_when_overwritten_by_restore() {
+        let mut m = FastKernelMatcher::new();
+        m.reset(16, 10, 4, 2, false, false);
+        let probe_hash = 7u32;
+        // SAFETY: hash 7 < (1 << hash_log = 1024) table entries.
+        unsafe { m.hash_table.put(probe_hash, 0xCAFE) };
+
+        // Same shape + restore-pending: contents survive the reset.
+        m.reset(16, 10, 4, 2, false, true);
+        // SAFETY: same bounds as the put above.
+        assert_eq!(
+            unsafe { m.hash_table.get(probe_hash) },
+            0xCAFE,
+            "restore-pending reset must not clear the table"
+        );
+
+        // Plain same-shape reset: contents are memset back to empty.
+        m.reset(16, 10, 4, 2, false, false);
+        // SAFETY: same bounds as the put above.
+        assert_eq!(
+            unsafe { m.hash_table.get(probe_hash) },
+            0,
+            "plain reset must clear the table"
+        );
+
+        // Shape change overrides the flag: the table is rebuilt at the
+        // new geometry even when a restore is claimed to be pending.
+        unsafe { m.hash_table.put(probe_hash, 0xCAFE) };
+        m.reset(16, 11, 4, 2, false, true);
+        assert_eq!(m.hash_table.hash_log(), 11);
+        // SAFETY: hash 7 < (1 << 11) table entries.
+        assert_eq!(
+            unsafe { m.hash_table.get(probe_hash) },
+            0,
+            "shape change must rebuild the table regardless of the flag"
+        );
+    }
+
     /// Drive the matcher through a single block whose tail contains
     /// a repeated 4-byte run — the kernel must emit at least one
     /// `Sequence::Triple` with `match_len >= 4` and the bookkeeping
