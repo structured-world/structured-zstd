@@ -527,9 +527,21 @@ impl DecoderScratchKind {
         // prefix already loaded into the buffer) must not DOUBLE a
         // window-sized allocation through the amortized policy. Per-block
         // growth keeps the amortized `reserve`.
+        //
+        // `reserve_exact` takes ADDITIONAL capacity, so request only the
+        // shortfall past the bytes already buffered: the decode_all
+        // fallback loop re-enters `decode_blocks` once per strategy chunk,
+        // and re-requesting the full window each iteration would grow a
+        // window-sized buffer toward 2x window.
         match self {
-            Self::Ring(s) => s.buffer.reserve_exact(window_size),
-            Self::Flat(s) => s.buffer.reserve_exact(window_size),
+            Self::Ring(s) => {
+                let additional = window_size.saturating_sub(s.buffer.len());
+                s.buffer.reserve_exact(additional);
+            }
+            Self::Flat(s) => {
+                let additional = window_size.saturating_sub(s.buffer.len());
+                s.buffer.reserve_exact(additional);
+            }
         }
     }
 
