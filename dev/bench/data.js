@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781157169042,
+  "lastUpdate": 1781204372310,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -64382,6 +64382,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.26,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "a43a23042f6808cf8fe5647551c889041d0e744d",
+          "message": "feat(c-api): advanced parameter API + streaming surface (compressStream2 / decompressStream) (#400)\n\n* feat(c-api): advanced parameter API + streaming surface\n\nPhase 6.2 slice 1: the stable advanced-parameter and streaming C API.\n\nParameters: ZSTD_cParam_getBounds / ZSTD_dParam_getBounds (ZSTD_bounds\nABI struct), ZSTD_CCtx_setParameter / getParameter over the full v1.5.7\nstable cParameter set (sticky CCtxParams; 0 = auto; workers accepted\nbut single-threaded), ZSTD_DCtx_setParameter / getParameter\n(windowLogMax, pointer-width-dependent ceiling), pledged source size,\nZSTD_CCtx_reset / ZSTD_DCtx_reset with stage guards (parameter changes\nmid-frame return stage_wrong on both sides).\n\nOne-shot: ZSTD_compress2 over the sticky set (pledge validated against\nsrcSize; checksum / content-size / dict-id flags land in the frame\nheader; stage-guarded against an in-flight streaming frame).\n\nStreaming: ZSTD_inBuffer / ZSTD_outBuffer (24-byte ABI snapshots),\nCStream / DStream context aliases, ZSTD_compressStream2 with continue /\nflush / end over a push-side StreamingEncoder with a pending-drain\nbuffer, legacy initCStream / compressStream / flushStream / endStream /\ninitDStream, ZSTD_decompressStream over decode_from_to with explicit\nframe restarts at frame boundaries, header-outcome classification\n(truncated = need-more-input, malformed = decode error, fully-buffered\nskippable frames consumed whole), and windowLogMax enforcement.\n\nCodec side: FrameCompressor::set_content_size_flag /\nset_dictionary_id_flag (header-flag knobs), set_target_block_size on\nFrameCompressor + StreamingEncoder applying ZSTD_c_targetCBlockSize\n(raw block capped at the target bounds the compressed block at\ntarget + 3 wire bytes), MIN_TARGET_BLOCK_SIZE, and an advisory-hint\ncap in the owned block loop (a streaming size hint is trusted only up\nto a 64 KiB lookahead past bytes actually read).\n\nRelease groundwork: version bump 0.0.34 -> 0.0.35 + changelog entry\n(the release automation's baseline diff packages the v0.0.34 tag\nworktree, which fails on that tree's bare path dependency; tagging\nv0.0.35 on a tree with the fixed manifest restores a packageable\nbaseline). Weekly npm downloads badge in the README.\n\nTests: 886 workspace (params bounds/get/set/reset, compress2\nround-trips + pledge mismatch, chunked streaming round-trips through\ntiny buffers, two frames per context, window-limit rejection,\nmid-stream compress2 rejection, malformed-header error,\ntarget-cblock-size block-header walk, DCtx mid-frame rejection, ABI\nsize snapshots); C consumer extended with params + streaming sections.\n\n* fix(c-api): checked skippable-frame size; shared block-target floor\n\n- the skippable-frame total uses checked_add: on 32-bit targets a\n  near-u32::MAX declared length wrapped the byte count, either spinning\n  the caller or advancing pos past valid data; overflow now stays a\n  need-more-input hint (no runtime-reachable test: the wrap needs a\n  32-bit usize, which the test hosts don't run)\n- MIN_TARGET_BLOCK_SIZE is re-exported from the crate root and the C\n  ABI bounds import it (the 1340 floor previously lived in two places)\n- the changelog entry points at the recreated PR number\n- the FCS-omission test also pins the descriptor field width (0 bytes),\n  not just the parsed-value sentinel\n\n* docs(common): note the block-target floor re-export contract\n\n* test(c-api): add regression tests for streaming pledge and checksum gaps\n\nThree failing-by-design tests capturing reference behavior:\n- pledge enforcement with contentSizeFlag=0 (undersized end must fail,\n  header must omit FCS on success)\n- input pos reflecting consumed bytes when input overruns the pledge\n- ZSTD_decompressStream rejecting a corrupted XXH64 trailer\n\n* fix(c-api): enforce pledge without FCS, sync input pos, verify stream checksum\n\nThree streaming-surface gaps vs reference behavior:\n- StreamingEncoder grows set_content_size_flag: the pledge is always\n  enforced against bytes written; the flag only gates the header's FCS\n  field (and the single-segment layout, which requires it)\n- ZSTD_compressStream2 loops over partial writes so inp.pos reflects\n  bytes consumed up to the pledge boundary; overrun maps to\n  srcSize_wrong instead of a generic error\n- ZSTD_decompressStream sets ContentChecksum::Verify at every frame\n  start, matching ZSTD_decompressDCtx\n\n* refactor(encode): size output reservations from the active block cap\n\n- reserve_for_next_block and the first-block reserve use block_capacity\n  (targetCBlockSize-aware) instead of the 128 KiB format ceiling, so\n  small targets stop holding a 128 KiB floor and header density is\n  estimated from real block boundaries\n- test assertions: null checks after stream creation, initDStream\n  message, RLE Block_Size semantics note\n- c_consumer: zero-init streaming buffers (silences cppcheck uninitdata\n  false positives)\n- document why windowLogMax stays streaming-only on the one-shot path\n  (reference behavior: no window buffer is allocated single-pass)\n\n* test(c-api): pin frame-boundary state after one-shot decode on a streaming DCtx\n\nA streaming decode abandoned mid-frame followed by a successful\nZSTD_decompressDCtx leaves the context's frame-boundary flag stale: the\nnext ZSTD_decompressStream call reports the PREVIOUS frame complete\n(rc=0, nothing consumed) instead of starting the new frame. Fails until\nthe flag is re-synced.\n\n* fix(c-api): re-sync the frame-boundary flag when the decoder is replaced or a one-shot finishes\n\nstream_frame_done went stale after ZSTD_decompressDCtx /\nZSTD_decompress_usingDDict success, reset_parameters, and the\npanic-recovery branches: a context abandoned mid-stream then used for a\none-shot made the next ZSTD_decompressStream call report the stale\nframe complete (rc=0, nothing consumed) instead of starting the new\nframe. Regression test in the prior commit.\n\n* test(c-api): pin srcSize_wrong for an undersized pledged frame at end\n\nThe pledge violation detected at frame end currently surfaces as a\ngeneric error while the same violation detected during write() maps to\nsrcSize_wrong; the error code must not depend on where the contract\ncheck fires. Fails until finish() maps InvalidInput the same way.\n\n* fix(c-api): report srcSize_wrong for pledge violations detected at frame end\n\nfinish() reports the pledged/consumed mismatch as InvalidInput; map it\nto srcSize_wrong like the write() path so callers get one error code\nfor the pledge contract regardless of detection point.\n\n* perf(encode): bound the first output allocation by the active block cap; count stream state in sizeof\n\n- initial_all_blocks_cap takes block_capacity so a small\n  targetCBlockSize bounds the first allocation instead of only later\n  growth\n- StreamingEncoder::heap_size (mirror of FrameCompressor::heap_size) +\n  CStreamState::heap_size feed ZSTD_sizeof_CCtx, so a context with an\n  active stream reports its real footprint\n\n* test(c-api): bound the streaming copies in the C consumer\n\nCapacity guards before each variable-length memcpy so a stream-sizing\nregression fails the test with a distinct exit code instead of writing\nout of bounds.\n\n* test(c-api): pin stream reset when the end-tail drains under e_flush\n\nA tiny output buffer splits the ZSTD_e_end drain across calls; draining\nthe remaining tail with e_flush leaves the finished stream state behind\nand the next input-bearing call wedges into stage_wrong forever. Fails\nuntil the drop condition keys on the consumed encoder, not on which\ndirective performed the final drain.\n\n* fix(c-api): drop the finished stream once its tail drains, any directive\n\nThe drop condition keyed on the final drain happening under ZSTD_e_end;\na tiny output buffer splits the end-drain across later calls and an\ne_flush that empties the tail left Some { encoder: None, pending: [] }\nbehind, wedging every next input-bearing call into stage_wrong. Key on\nthe consumed encoder + empty pending instead.\n\n* docs: sync the C ABI crate surface, target-block contract, and one-shot reuse notes\n\n- crate-level rustdoc lists the streaming + advanced-parameter exports\n  it actually ships instead of deferring them to later phases\n- StreamingEncoder::set_target_block_size states the payload semantics\n  (+3-byte wire header), mirroring FrameCompressor's contract — the\n  upstream knob is a convergence target, not a header-inclusive cap\n- note at the one-shot decode sites why no decoder restart is needed\n  (decode_all re-initializes per frame; pinned by the mid-frame reuse\n  regression test)\n\n* test(c-api): pin frame-boundary state after a FAILED one-shot decode\n\nA context abandoned mid-stream, then used for a one-shot that errors\non corrupt input, currently keeps the stale mid-frame flag: the next\nZSTD_decompressStream call resumes the failed one-shot's frame state\ninstead of starting the new frame. Fails until the error arm re-syncs\nthe boundary flag like the success and panic arms do.\n\n* fix(c-api): re-sync the frame boundary on one-shot decode errors\n\nThe error arms of ZSTD_decompressDCtx and ZSTD_decompress_usingDDict\nreturned without touching stream_frame_done, so a context abandoned\nmid-stream then used for a failing one-shot resumed the broken frame\nstate on the next ZSTD_decompressStream call. Set the boundary flag\nlike the success and panic arms; the decoder itself is kept — a\nroutine corrupt-input failure leaves coherent state and the warm\nworkspace should survive it.\n\n* docs(c-api): note why an idle continue/flush still opens the stream session\n\nMirrors the reference: upstream's first compressStream2 call moves\nstreamStage to zcss_load regardless of input emptiness, freezing\ncompress2 / parameter setters with stage_wrong until a reset.\nShort-circuiting the idle case would diverge from drop-in behavior.\n\n* test(c-api): deterministic failure injection in the failed-oneshot regression\n\nFlipping two payload bytes in a checksum-less frame is not guaranteed\nto be non-decodable across block layouts. Use a checksum-bearing frame\nwith a flipped trailer instead: every block decodes (the decoder state\nis fully exercised before the failure) and verification reliably\nrejects it.",
+          "timestamp": "2026-06-11T21:15:39+03:00",
+          "tree_id": "57f78ae0ad13091c22205a34d705649fa5a30bb1",
+          "url": "https://github.com/structured-world/structured-zstd/commit/a43a23042f6808cf8fe5647551c889041d0e744d"
+        },
+        "date": 1781204358097,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.128,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.111,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 264.739,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 229.536,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.305,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.357,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.277,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.038,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.15,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.981,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.115,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.115,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.013,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 11.84,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.306,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.205,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.334,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.842,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.26,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.591,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.127,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.385,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.137,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.108,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.272,
             "unit": "ms"
           }
         ]
