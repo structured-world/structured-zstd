@@ -438,6 +438,7 @@ pub unsafe extern "C" fn ZSTD_decompressStream(
             // No active frame and nothing to read: frame-done signal.
             return 0;
         }
+        use codec::decoding::errors::ReadFrameHeaderError;
         match codec::decoding::read_frame_header_info(&src[inp.pos..], false) {
             Ok(info) => {
                 // `ZSTD_d_windowLogMax`: refuse oversized windows before any
@@ -461,9 +462,35 @@ pub unsafe extern "C" fn ZSTD_decompressStream(
                     }
                 }
             }
-            // The header is split across input chunks: consume nothing and
-            // ask for more input.
-            Err(_) => return 1,
+            // Skippable frame: consume it whole when fully buffered (magic 4
+            // + length 4 + payload), else ask for more input.
+            Err(ReadFrameHeaderError::SkipFrame { length, .. }) => {
+                let total = 8usize + length as usize;
+                if inp.size - inp.pos < total {
+                    return 1;
+                }
+                inp.pos += total;
+                // Stay at a frame boundary; the caller's loop re-enters for
+                // whatever follows.
+                return 1;
+            }
+            // A truncated header (the reader hit end-of-input mid-field):
+            // consume nothing and ask for more input.
+            Err(
+                ReadFrameHeaderError::MagicNumberReadError(_)
+                | ReadFrameHeaderError::FrameDescriptorReadError(_)
+                | ReadFrameHeaderError::WindowDescriptorReadError(_)
+                | ReadFrameHeaderError::DictionaryIdReadError(_)
+                | ReadFrameHeaderError::FrameContentSizeReadError(_),
+            ) => return 1,
+            // A malformed header (bad magic, invalid descriptor, ...) is a
+            // decode error: the need-more-input hint with nothing consumed
+            // would spin the caller forever.
+            Err(err) => {
+                return encode(code_for_decoder_error(
+                    &codec::decoding::errors::FrameDecoderError::ReadFrameHeaderError(err),
+                ));
+            }
         }
     }
     let outcome = catch_unwind(AssertUnwindSafe(|| {

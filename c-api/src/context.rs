@@ -234,6 +234,12 @@ pub unsafe extern "C" fn ZSTD_compress2(
         return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
     }
     let cctx = unsafe { &mut *cctx };
+    if cctx.stream_in_progress() {
+        // A one-shot frame would interleave with the unfinished streaming
+        // frame on this context (and consume its pledge); the stream must
+        // be ended or the session reset first.
+        return encode(ZSTD_ErrorCode::ZSTD_error_stage_wrong);
+    }
     let src = unsafe { in_slice(src, src_size) };
     // The pledge is single-use: consumed by this frame regardless of
     // outcome. With all input present in one call the actual srcSize drives
