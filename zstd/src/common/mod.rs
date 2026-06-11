@@ -21,6 +21,8 @@ pub const MAX_WINDOW_SIZE: u64 = (1 << 41) + 7 * (1 << 38);
 pub const MAX_BLOCK_SIZE: u32 = 128 * 1024;
 /// Smallest accepted block-size target (upstream `ZSTD_TARGETCBLOCKSIZE_MIN`):
 /// below this the per-block header overhead dominates any latency benefit.
+/// Re-exported at the crate root as the single source of truth; the C ABI
+/// parameter bounds import it from there.
 pub const MIN_TARGET_BLOCK_SIZE: u32 = 1340;
 
 /// Decoder window-size limit (128 MiB = `1 << 27`), matching upstream zstd's
