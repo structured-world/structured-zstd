@@ -1401,11 +1401,12 @@ pub(crate) fn maybe_update_fse_tables(
     let ll_mode = modes.ll_mode();
     match ll_mode {
         ModeType::FSECompressed => {
-            let bytes = scratch.literal_lengths.build_decoder(source, LL_MAX_LOG)?;
+            let bytes = scratch.literal_lengths.build_decoder_fused(
+                source,
+                LL_MAX_LOG,
+                crate::fse::SeqMeta::Packed(&LL_META),
+            )?;
             bytes_read += bytes;
-            scratch
-                .literal_lengths
-                .enrich_with_packed_seq_meta(&LL_META);
 
             vprintln!("Updating ll table");
             vprintln!("Used bytes: {}", bytes);
@@ -1461,8 +1462,11 @@ pub(crate) fn maybe_update_fse_tables(
     let of_mode = modes.of_mode();
     match of_mode {
         ModeType::FSECompressed => {
-            let bytes = scratch.offsets.build_decoder(of_source, OF_MAX_LOG)?;
-            scratch.offsets.enrich_for_offsets();
+            let bytes = scratch.offsets.build_decoder_fused(
+                of_source,
+                OF_MAX_LOG,
+                crate::fse::SeqMeta::Offsets,
+            )?;
             vprintln!("Updating of table");
             vprintln!("Used bytes: {}", bytes);
             bytes_read += bytes;
@@ -1518,8 +1522,11 @@ pub(crate) fn maybe_update_fse_tables(
     let ml_mode = modes.ml_mode();
     match ml_mode {
         ModeType::FSECompressed => {
-            let bytes = scratch.match_lengths.build_decoder(ml_source, ML_MAX_LOG)?;
-            scratch.match_lengths.enrich_with_packed_seq_meta(&ML_META);
+            let bytes = scratch.match_lengths.build_decoder_fused(
+                ml_source,
+                ML_MAX_LOG,
+                crate::fse::SeqMeta::Packed(&ML_META),
+            )?;
             bytes_read += bytes;
             vprintln!("Updating ml table");
             vprintln!("Used bytes: {}", bytes);
