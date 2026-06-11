@@ -148,6 +148,12 @@ fn block_body_decode_error(
 /// ```
 pub struct FrameDecoder {
     state: Option<FrameDecoderState>,
+    /// Test-only observability: frames decoded via `run_direct_decode`.
+    /// The direct and buffered paths are byte-identical, so dispatch
+    /// regressions (e.g. re-excluding dictionary frames from the direct
+    /// gate) are invisible to output assertions; tests pin the path here.
+    #[cfg(test)]
+    direct_frames: u64,
     // Registered dictionaries are stored by shared handle (Arc/Rc) so a
     // single content copy is referenced by every frame the decoder decodes
     // (donor `ZSTD_refDDict`), rather than re-copied into the decode buffer
@@ -792,6 +798,22 @@ pub struct PartialDecode {
 }
 
 impl FrameDecoderState {
+    /// Window size to actually reserve for this frame's decode buffer.
+    /// A declared content size caps the useful window: matches can never
+    /// reference further back than the bytes that will ever exist, so an
+    /// encoder-declared window above the FCS (e.g. a level-preset window
+    /// on a smaller input) must not inflate the reservation. Every
+    /// `reserve_buffer` site routes through this so the cap is uniform
+    /// across `decode_all_impl`, `decode_blocks`, and the partial path.
+    fn useful_window_size(&self) -> usize {
+        let window_size = self.frame_header.window_size().unwrap_or(0);
+        if self.frame_header.fcs_declared() {
+            window_size.min(self.frame_header.frame_content_size()) as usize
+        } else {
+            window_size as usize
+        }
+    }
+
     /// Construct a new frame decoder state, reading the frame header
     /// from `source`. When `magicless` is `true`, the 4-byte magic
     /// number prefix is NOT consumed (donor `ZSTD_f_zstd1_magicless`).
@@ -884,6 +906,8 @@ impl FrameDecoder {
     pub fn new() -> FrameDecoder {
         FrameDecoder {
             state: None,
+            #[cfg(test)]
+            direct_frames: 0,
             owned_dicts: BTreeMap::new(),
             #[cfg(target_has_atomic = "ptr")]
             shared_dicts: BTreeMap::new(),
@@ -1466,15 +1490,15 @@ impl FrameDecoder {
         }
 
         // Streaming entry point: pre-reserve the backing buffer to
-        // `window_size` so multi-block frames don't pay repeated
+        // the FCS-capped window so multi-block frames don't pay repeated
         // `reserve_amortized` grow steps (128 KiB → 256 KiB → ... →
         // window) as blocks accumulate. `decode_all` does the same up
         // front in `decode_all_impl`; this mirrors it for callers
         // driving `decode_blocks` directly. Idempotent — the
         // backend's `reserve` early-returns when capacity is already
         // sufficient.
-        let window_size = state.frame_header.window_size().unwrap_or(0) as usize;
-        state.decoder_scratch.reserve_buffer(window_size);
+        let useful_window = state.useful_window_size();
+        state.decoder_scratch.reserve_buffer(useful_window);
 
         let mut block_dec = decoding::block_decoder::new();
 
@@ -1683,10 +1707,11 @@ impl FrameDecoder {
             state.decoder_scratch.set_compute_hash(compute_hash);
         }
 
-        // Mirror `decode_blocks`: pre-reserve the backing buffer to
-        // `window_size` so multi-block frames don't pay repeated grow steps.
-        let window_size = state.frame_header.window_size().unwrap_or(0) as usize;
-        state.decoder_scratch.reserve_buffer(window_size);
+        // Mirror `decode_blocks`: pre-reserve the backing buffer to the
+        // FCS-capped window so multi-block frames don't pay repeated grow
+        // steps.
+        let useful_window = state.useful_window_size();
+        state.decoder_scratch.reserve_buffer(useful_window);
 
         // Cold resume: prime the match window + restore entropy/repcode state +
         // advance the block cursor BEFORE the loop, so the first in-range block
@@ -2276,12 +2301,11 @@ impl FrameDecoder {
             // frames are eligible: `run_direct_decode` hands the
             // shared dict handle to its buffer, and beyond-prefix
             // offsets resolve through `repeat_from_dict`.
-            let (content_size, fcs_declared, window_size) = {
+            let (content_size, fcs_declared) = {
                 let state_ref = self.state.as_ref().expect("init populated state");
                 (
                     state_ref.frame_header.frame_content_size(),
                     state_ref.frame_header.fcs_declared(),
-                    state_ref.frame_header.window_size().unwrap_or(0),
                 )
             };
             // Direct decode requires only that the caller slice holds the
@@ -2319,17 +2343,12 @@ impl FrameDecoder {
             // > 128 KiB otherwise grows through several intermediate
             // sizes with `alloc_zeroed + memcpy` each time).
             if let Some(state) = self.state.as_mut() {
-                // A declared content size caps the useful window: matches
-                // can never reference further back than the bytes that will
-                // ever exist, so an encoder-declared window above the FCS
-                // (e.g. a level-preset window on a smaller input) must not
-                // inflate the reservation.
-                let useful_window = if fcs_declared {
-                    window_size.min(content_size)
-                } else {
-                    window_size
-                };
-                state.decoder_scratch.reserve_buffer(useful_window as usize);
+                // FCS-capped via `useful_window_size` — the same cap
+                // `decode_blocks` applies, so its per-iteration reserve in
+                // the loop below cannot grow the buffer back to the raw
+                // frame window.
+                let useful_window = state.useful_window_size();
+                state.decoder_scratch.reserve_buffer(useful_window);
             }
             let frame_start_total = total_bytes_written;
             loop {
@@ -2431,12 +2450,11 @@ impl FrameDecoder {
             // (no FCS, output too small) fall through to the legacy
             // `decode_blocks` + `read` drain loop below. Dictionary
             // frames are eligible (see the no-lsm path above).
-            let (content_size, fcs_declared, window_size) = {
+            let (content_size, fcs_declared) = {
                 let state_ref = self.state.as_ref().expect("init populated state");
                 (
                     state_ref.frame_header.frame_content_size(),
                     state_ref.frame_header.fcs_declared(),
-                    state_ref.frame_header.window_size().unwrap_or(0),
                 )
             };
             // Only `cap >= frame_content_size` needed; the trailing
@@ -2459,17 +2477,12 @@ impl FrameDecoder {
             // `window_size` once so the per-block growth cycle is
             // skipped (see same comment on the no-lsm path above).
             if let Some(state) = self.state.as_mut() {
-                // A declared content size caps the useful window: matches
-                // can never reference further back than the bytes that will
-                // ever exist, so an encoder-declared window above the FCS
-                // (e.g. a level-preset window on a smaller input) must not
-                // inflate the reservation.
-                let useful_window = if fcs_declared {
-                    window_size.min(content_size)
-                } else {
-                    window_size
-                };
-                state.decoder_scratch.reserve_buffer(useful_window as usize);
+                // FCS-capped via `useful_window_size` — the same cap
+                // `decode_blocks` applies, so its per-iteration reserve in
+                // the loop below cannot grow the buffer back to the raw
+                // frame window.
+                let useful_window = state.useful_window_size();
+                state.decoder_scratch.reserve_buffer(useful_window);
             }
             let frame_start_total = total_bytes_written;
             loop {
@@ -2598,6 +2611,10 @@ impl FrameDecoder {
         output: &mut [u8],
         content_size: u64,
     ) -> Result<usize, FrameDecoderError> {
+        #[cfg(test)]
+        {
+            self.direct_frames += 1;
+        }
         use super::block_decoder;
         use super::decode_buffer::DecodeBuffer;
         use super::scratch::DirectScratch;
@@ -3729,6 +3746,13 @@ mod tests {
             .expect("dict frame must decode on the direct path");
         assert_eq!(n, payload.len());
         assert_eq!(out, payload, "direct-path dict decode must be byte-exact");
+        // Both paths are byte-identical, so pin the dispatch itself: a
+        // re-introduced dict exclusion in the direct gate would silently
+        // fall back to the buffered path and leave the asserts above green.
+        assert_eq!(
+            decoder.direct_frames, 1,
+            "dict frame must take the direct path, not the buffered fallback"
+        );
     }
 
     #[cfg(feature = "lsm")]

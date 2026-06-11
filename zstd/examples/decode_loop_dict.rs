@@ -12,6 +12,9 @@
 //!
 //! Build: `cargo build --profile flamegraph -p structured-zstd
 //!          --example decode_loop_dict`
+//! Build with heap profiling (writes `dhat-heap.json` on exit):
+//!        `cargo build --release -p structured-zstd
+//!          --example decode_loop_dict --features dhat-heap`
 //! Run:   `decode_loop_dict <iters> <payload.zst> <dict> <expected_len>`
 
 use std::env;
