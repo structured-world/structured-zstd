@@ -301,9 +301,14 @@ pub unsafe extern "C" fn ZSTD_compressStream2(
         }
         stream.copy_out(out, dst);
         let remaining = stream.pending_remaining();
-        if end_op == ZSTD_E_END && remaining == 0 {
-            // Frame complete and fully flushed: drop the stream state so the
-            // next call starts a new frame from the sticky parameters.
+        // Frame complete and fully flushed: drop the stream state so the
+        // next call starts a new frame from the sticky parameters. Keyed
+        // on the consumed encoder (taken by the e_end arm), NOT on which
+        // directive performed the FINAL drain — a tiny output buffer can
+        // split the end-drain across later e_flush/e_continue calls, and
+        // leaving `Some { encoder: None, pending: [] }` behind would wedge
+        // every next input-bearing call into stage_wrong.
+        if stream.encoder.is_none() && remaining == 0 {
             cctx.stream = None;
         }
         Ok(remaining)
