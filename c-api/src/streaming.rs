@@ -274,6 +274,13 @@ pub unsafe extern "C" fn ZSTD_compressStream2(
                             }
                             stream.pending.extend_from_slice(&drain);
                         }
+                        // Pledge mismatch at frame end surfaces as
+                        // InvalidInput; map it to the same srcSize_wrong
+                        // the write() path reports so the error code does
+                        // not depend on where the contract check fires.
+                        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                            return Err(ZSTD_ErrorCode::ZSTD_error_srcSize_wrong);
+                        }
                         Err(_) => return Err(ZSTD_ErrorCode::ZSTD_error_GENERIC),
                     }
                 }
