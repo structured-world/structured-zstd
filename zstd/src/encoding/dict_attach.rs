@@ -18,7 +18,7 @@
 //! dict/input boundary, the build-once cache flag, and invalidation.
 
 /// Lifecycle holder for an attached, immutable dictionary table of type `T`.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub(crate) struct DictAttach<T> {
     /// The immutable dictionary table, built once over the dictionary region.
     /// `Some` activates the backend's dual-probe kernel; `None` means no dict
@@ -34,6 +34,24 @@ pub(crate) struct DictAttach<T> {
     /// per-frame `reset` and skips the re-hash. Cleared on parameter change,
     /// history eviction, or dictionary attach/clear via [`Self::invalidate`].
     primed: bool,
+}
+
+impl<T: Clone> Clone for DictAttach<T> {
+    fn clone(&self) -> Self {
+        Self {
+            table: self.table.clone(),
+            region_len: self.region_len,
+            primed: self.primed,
+        }
+    }
+
+    // Recurse into the table's `clone_from` (via `Option::clone_from`) so
+    // snapshot restores reuse the retained table buffers.
+    fn clone_from(&mut self, source: &Self) {
+        self.table.clone_from(&source.table);
+        self.region_len = source.region_len;
+        self.primed = source.primed;
+    }
 }
 
 impl<T> DictAttach<T> {
