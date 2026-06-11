@@ -319,6 +319,49 @@ impl Default for PreSplitFingerprint {
     }
 }
 
+/// Grow `out` ahead of the next block so block emission never lands on an
+/// amortized-doubling reallocation mid-frame (whose transient old+new copy
+/// spikes peak memory to ~3x the output), sizing the reservation from the
+/// compression ratio observed so far instead of the whole-input worst case.
+///
+/// `blocks_start` is where this frame's blocks begin in `out`, `consumed`
+/// the input bytes already emitted as blocks, and `remaining` the input
+/// bytes still to compress (an estimate is fine: a low one only means one
+/// more re-estimate later). Incompressible input re-estimates to ~the full
+/// `compress_bound` after the first block — the old up-front policy's worst
+/// case — while compressible input stays at output scale.
+fn reserve_for_next_block(out: &mut Vec<u8>, blocks_start: usize, consumed: u64, remaining: usize) {
+    // Worst-case single-block output: 3-byte header + raw payload, plus
+    // slack for the 4-byte frame checksum trailer and a few extra sub-block
+    // headers from the post-split emitters, so neither can reallocate.
+    let block_bound = remaining.min(crate::common::MAX_BLOCK_SIZE as usize) + 3 + 16;
+    if out.capacity() - out.len() >= block_bound {
+        return;
+    }
+    let produced = (out.len() - blocks_start) as u64;
+    let estimate = if consumed == 0 {
+        // No ratio signal yet (capacity exhausted before the first block —
+        // only reachable with a caller-shrunk `out`): one block's bound.
+        block_bound
+    } else {
+        // remaining * observed ratio + per-block headers + 1/16 slack so a
+        // slightly-worsening tail doesn't force a reallocation per block.
+        // u128 keeps the product exact for multi-GiB frames.
+        let scaled = ((remaining as u128 * produced as u128) / consumed as u128) as u64;
+        let headers = (remaining as u64 / u64::from(crate::common::MAX_BLOCK_SIZE) + 1) * 3;
+        usize::try_from(scaled + scaled / 16 + headers + 64).unwrap_or(usize::MAX)
+    };
+    // `reserve_exact`: the estimate already carries its own slack, and the
+    // whole-buffer doubling policy is exactly what this function exists to
+    // avoid. The `produced`-sized floor keeps growth geometric when the
+    // ratio estimate lands BELOW one block's bound (highly compressible
+    // input): without it every block would trigger a block-sized
+    // reallocation — O(blocks) buffer copies — while with it the buffer at
+    // least doubles its produced span per reallocation (O(log) copies) and
+    // the peak stays at output scale.
+    out.reserve_exact(estimate.max(block_bound + produced as usize));
+}
+
 fn presplit_hash2(bytes: &[u8], hash_log: usize) -> usize {
     debug_assert!(hash_log >= 8);
     if hash_log == 8 {
@@ -954,12 +997,18 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         let emit_checksum = cfg!(feature = "hash") && self.content_checksum;
         let checksum_len = if emit_checksum { 4 } else { 0 };
         out.clear();
-        // Reserve the worst-case compressed size ONCE so the header + block
-        // appends below never realloc; the caller reuses `out` across
-        // frames, so the reservation is paid on the first frame and
-        // amortizes to zero. 18 = max frame header (magic 4 + descriptor 1
-        // + window 1 + dict id 4 + FCS 8).
-        out.reserve(18 + crate::encoding::compress_bound(input.len()) + checksum_len);
+        // Reserve the header plus ONE block's worst case up front; the block
+        // loops then grow `out` from the compression ratio observed so far
+        // (`reserve_for_next_block`). Reserving `compress_bound(input_len)`
+        // here held a whole-input-sized allocation for the entire frame —
+        // ~100 MiB peak on a 100 MiB stream whose compressed output is a few
+        // MiB, where the reference implementation's context peaks at
+        // window-sized state. Small frames (<= one block) still get their
+        // full bound in one shot, so the reused-`out` steady state is
+        // unchanged. 18 = max frame header (magic 4 + descriptor 1 + window
+        // 1 + dict id 4 + FCS 8).
+        let first_block_bound = input.len().min(crate::common::MAX_BLOCK_SIZE as usize) + 3;
+        out.reserve(18 + first_block_bound + checksum_len);
         self.append_frame_header(total_uncompressed, &prep, out);
         let header_len = out.len();
         let _ = self.run_one_frame(input, &prep, out);
@@ -1056,6 +1105,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         let block_capacity = MAX_BLOCK_SIZE as usize;
         let mut start = 0usize;
         while start < input.len() {
+            reserve_for_next_block(out, blocks_start, start as u64, input.len() - start);
             // Donor `ZSTD_compress_frameChunk`: size each block via the cheap
             // fingerprint pre-splitter so a full 128 KiB block is cut at a
             // statistical boundary when it pays. `savings = consumed -
@@ -1489,6 +1539,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // path passes `out` already holding the header. The donor split
         // `savings` gate below accumulates block-relative (`before_len`)
         // output deltas, so a header prefix never skews it.
+        let blocks_start = out.len();
         let mut total_uncompressed: u64 = 0;
         let mut pending_input: Vec<u8> = Vec::new();
         let mut reached_eof = false;
@@ -1565,6 +1616,20 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             // exactly one entry per physical Block_Header written to
             // `all_blocks` — 1:1 with `FrameEmitInfo.blocks`. See
             // `enable_per_block_checksums` rustdoc.
+            // Size the output ahead of this block's emission from the ratio
+            // observed so far (see `reserve_for_next_block`); with no usable
+            // size hint, ensure one block's worst case and let the doubling
+            // growth policy amortize across blocks.
+            let emitted =
+                total_uncompressed - uncompressed_data.len() as u64 - pending_input.len() as u64;
+            match initial_size_hint {
+                Some(hint) if hint >= total_uncompressed => {
+                    reserve_for_next_block(out, blocks_start, emitted, (hint - emitted) as usize);
+                }
+                _ => {
+                    out.reserve(uncompressed_data.len() + 3 + 16);
+                }
+            }
             // Special handling is needed for compression of a totally empty file
             if uncompressed_data.is_empty() {
                 let header = BlockHeader {
@@ -2825,6 +2890,44 @@ mod tests {
             compressor.state.fse_tables.of_previous.is_some(),
             "dictionary entropy should seed previous of table before first block"
         );
+    }
+
+    // The output reservation must track the observed compression ratio, not
+    // the whole-input `compress_bound`: a multi-MiB compressible stream's
+    // output buffer stays at output scale (the old up-front bound held an
+    // input-sized allocation for the whole frame). Incompressible input may
+    // still re-estimate to ~the full bound — that is the genuine worst case.
+    #[test]
+    fn compressible_stream_output_capacity_stays_at_output_scale() {
+        // 4 MiB of highly repetitive log-like lines.
+        let line = b"ts=2026-03-26T21:39:28Z level=INFO msg=\"flush memtable\" tenant=demo\n";
+        let mut input = Vec::with_capacity(4 << 20);
+        while input.len() < (4 << 20) {
+            let take = line.len().min((4 << 20) - input.len());
+            input.extend_from_slice(&line[..take]);
+        }
+
+        let mut compressor: FrameCompressor =
+            FrameCompressor::new(super::CompressionLevel::Fastest);
+        let mut out = Vec::new();
+        compressor.compress_independent_frame_into(&input, &mut out);
+
+        assert!(!out.is_empty());
+        assert!(
+            out.capacity() < input.len() / 4,
+            "capacity {} must stay at output scale (input {}, output {})",
+            out.capacity(),
+            input.len(),
+            out.len()
+        );
+
+        // Round-trip: the adaptive reservation must not affect the bytes.
+        let mut decoder = crate::decoding::FrameDecoder::new();
+        let mut decoded = Vec::with_capacity(input.len() + 64);
+        decoder
+            .decode_all_to_vec(&out, &mut decoded)
+            .expect("frame must decode");
+        assert_eq!(decoded, input);
     }
 
     // Regression test: `heap_size()` must count the retained Huffman tables
