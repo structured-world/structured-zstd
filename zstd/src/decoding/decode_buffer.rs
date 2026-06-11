@@ -280,17 +280,11 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         true
     }
 
-    /// Pre-allocate capacity for `amount` additional bytes.
-    ///
-    /// Call this before a batch of `push`/`repeat` operations to avoid
-    /// repeated re-allocations inside the hot decode loop.
-    #[inline]
-    pub fn reserve(&mut self, amount: usize) {
-        self.buffer.reserve(amount);
-    }
-
-    /// Exact-growth variant of [`Self::reserve`] for the one-shot window
-    /// pre-reservation (see `BufferBackend::reserve_exact`).
+    /// Pre-allocate capacity for `amount` additional bytes ahead of a batch
+    /// of `push`/`repeat` operations, growing exactly (see
+    /// `BufferBackend::reserve_exact`): every call site is a one-shot
+    /// window-scale reservation where amortized doubling would hold up to
+    /// 2x the window.
     #[inline]
     pub fn reserve_exact(&mut self, amount: usize) {
         self.buffer.reserve_exact(amount);
@@ -1208,7 +1202,7 @@ mod tests {
         // Mirror the fused sequence executor: reserve upfront so no
         // RingBuffer reallocation happens between checkpoint and restore
         // (restore_checkpoint requires a stable underlying allocation).
-        buf.reserve(64);
+        buf.reserve_exact(64);
         buf.push(&[1, 2, 3]);
         let cp = buf.checkpoint();
         buf.push(&[4, 5, 6, 7]);
@@ -1248,7 +1242,7 @@ mod tests {
         // Force a reallocation. RingBuffer grows by powers of two and
         // 4 MiB is well above the initial 64-byte starting capacity, so
         // reserve() must hit reserve_amortized().
-        buf.reserve(4 * 1024 * 1024);
+        buf.reserve_exact(4 * 1024 * 1024);
         buf.push(&[0; 16]);
         assert!(
             !buf.try_restore_checkpoint(cp),
@@ -1630,7 +1624,7 @@ mod tests {
         // Prefetch hints are unobservable from Rust — the assertion is
         // simply that the call completes without panic / UB.
         let mut buf = DecodeBuffer::<RingBuffer>::new(1024);
-        buf.reserve(512);
+        buf.reserve_exact(512);
         buf.push(&[0xAA; 256]);
         buf.prefetch_lookahead_match_source(0);
         buf.prefetch_lookahead_match_source(128);
@@ -1644,7 +1638,7 @@ mod tests {
         // The helper must early-return (bound check) and never touch a
         // slice past the live region.
         let mut buf = DecodeBuffer::<RingBuffer>::new(1024);
-        buf.reserve(64);
+        buf.reserve_exact(64);
         buf.push(&[0x55; 32]);
         buf.prefetch_lookahead_match_source(buf.len());
         buf.prefetch_lookahead_match_source(buf.len() + 1);
