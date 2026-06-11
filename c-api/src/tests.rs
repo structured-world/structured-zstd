@@ -570,8 +570,10 @@ use crate::streaming::{
 };
 use core::ffi::c_int;
 
-// ABI invariants: struct sizes match upstream `sizeof` on 64-bit.
+// ABI invariants: struct sizes match upstream `sizeof` on 64-bit (on
+// 32-bit targets `size_t` / pointers halve the layouts).
 #[test]
+#[cfg(target_pointer_width = "64")]
 fn streaming_buffer_abi_sizes() {
     assert_eq!(core::mem::size_of::<ZSTD_inBuffer>(), 24);
     assert_eq!(core::mem::size_of::<ZSTD_outBuffer>(), 24);

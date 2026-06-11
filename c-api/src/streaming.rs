@@ -399,7 +399,6 @@ pub unsafe extern "C" fn ZSTD_initDStream(zds: *mut ZSTD_DCtx) -> usize {
     }
     let dctx = unsafe { &mut *zds };
     dctx.reset_session();
-    dctx.stream_frame_done = true;
     ZSTD_DStreamInSize()
 }
 

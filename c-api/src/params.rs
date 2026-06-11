@@ -324,7 +324,13 @@ pub unsafe extern "C" fn ZSTD_CCtx_setParameter(
             p.strategy = if value == 0 {
                 None
             } else {
-                Strategy::from_ordinal(value as u32)
+                // Bounds guarantee 1..=9, which from_ordinal fully covers;
+                // error loudly (not silent auto) if that coverage ever
+                // drifts.
+                match Strategy::from_ordinal(value as u32) {
+                    Some(strategy) => Some(strategy),
+                    None => return encode(ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound),
+                }
             };
         }
         ZSTD_C_TARGET_CBLOCK_SIZE => p.target_cblock_size = value,
