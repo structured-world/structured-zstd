@@ -400,7 +400,19 @@ pub unsafe extern "C" fn ZSTD_decompressDCtx(
             dctx.stream_frame_done = true;
             written
         }
-        Ok(Err(err)) => encode(code_for_decoder_error(&err)),
+        Ok(Err(err)) => {
+            // An ordinary decode error leaves the decoder's state coherent
+            // (the next one-shot re-initializes it per frame), but the
+            // context must still sit at a frame boundary for the STREAMING
+            // entry point — without this, a context abandoned mid-stream
+            // would resume the failed one-shot's frame state on the next
+            // ZSTD_decompressStream call. The decoder itself is kept: its
+            // warm workspace survives routine corrupt-input failures, the
+            // full replacement is reserved for the panic arm where the
+            // state may be torn mid-unwind.
+            dctx.stream_frame_done = true;
+            encode(code_for_decoder_error(&err))
+        }
         Err(_) => {
             // A panic mid-decode can leave the decoder's internal state
             // partially consumed; replace it with a fresh one (same as
