@@ -1709,7 +1709,10 @@ impl FrameDecoder {
 
         // Mirror `decode_blocks`: pre-reserve the backing buffer to the
         // FCS-capped window so multi-block frames don't pay repeated grow
-        // steps.
+        // steps. The RAW frame window stays separately bound — the resume
+        // logic below bounds match reach by the frame's window semantics,
+        // not by the (possibly smaller) reservation cap.
+        let window_size = state.frame_header.window_size().unwrap_or(0) as usize;
         let useful_window = state.useful_window_size();
         state.decoder_scratch.reserve_buffer(useful_window);
 
@@ -4113,6 +4116,10 @@ mod tests {
         // actually emitted into the drain buffer.
         let payload: Vec<u8> = (0..200_000u32).map(|i| (i & 0xFF) as u8).collect();
         let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        // Content checksum is opt-in (library default mirrors libzstd's
+        // checksum-off); request it so the checksum_range assertion below
+        // exercises the hash-gated trailer accounting.
+        compressor.set_content_checksum(true);
         compressor.set_source(payload.as_slice());
         let mut compressed = Vec::new();
         compressor.set_drain(&mut compressed);
