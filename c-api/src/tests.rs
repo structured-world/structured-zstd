@@ -1404,3 +1404,70 @@ fn decompress_stream_recovers_after_oneshot_on_midframe_context() {
         crate::streaming::ZSTD_freeDStream(zds);
     }
 }
+
+// Bug regression: when the post-ZSTD_e_end tail is drained by a LATER
+// call under a different directive (tiny output buffer forces the
+// split), the finished stream state must still be dropped — otherwise
+// the context wedges into "Some { encoder: None, pending: [] }" and
+// every next input-bearing call fails with stage_wrong forever.
+#[test]
+fn stream_resets_after_tail_drained_by_non_end_directive() {
+    let input = sample(256 * 1024);
+    let zcs = crate::streaming::ZSTD_createCStream();
+    let mut tiny = vec![0u8; 1024];
+    unsafe {
+        // Feed everything and finish with e_end into a TINY buffer so a
+        // tail stays pending after the encoder is consumed.
+        let mut inb = ZSTD_inBuffer {
+            src: input.as_ptr() as *const core::ffi::c_void,
+            size: input.len(),
+            pos: 0,
+        };
+        let mut outb = ZSTD_outBuffer {
+            dst: tiny.as_mut_ptr() as *mut core::ffi::c_void,
+            size: tiny.len(),
+            pos: 0,
+        };
+        let rc = ZSTD_compressStream2(zcs, &mut outb, &mut inb, 2); // e_end
+        assert_eq!(ZSTD_isError(rc), 0);
+        assert_ne!(rc, 0, "tiny buffer must leave a pending tail");
+
+        // Drain the remaining tail with e_flush (NOT e_end) calls.
+        loop {
+            let mut outb = ZSTD_outBuffer {
+                dst: tiny.as_mut_ptr() as *mut core::ffi::c_void,
+                size: tiny.len(),
+                pos: 0,
+            };
+            let mut empty = ZSTD_inBuffer {
+                src: core::ptr::null(),
+                size: 0,
+                pos: 0,
+            };
+            let rc = ZSTD_compressStream2(zcs, &mut outb, &mut empty, 1); // e_flush
+            assert_eq!(ZSTD_isError(rc), 0, "tail drain under e_flush errored");
+            if rc == 0 {
+                break;
+            }
+        }
+
+        // The frame is complete and fully drained: a new frame must start.
+        let mut inb = ZSTD_inBuffer {
+            src: input.as_ptr() as *const core::ffi::c_void,
+            size: 4096,
+            pos: 0,
+        };
+        let mut outb = ZSTD_outBuffer {
+            dst: tiny.as_mut_ptr() as *mut core::ffi::c_void,
+            size: tiny.len(),
+            pos: 0,
+        };
+        let rc = ZSTD_compressStream2(zcs, &mut outb, &mut inb, 0); // e_continue
+        assert_eq!(
+            ZSTD_isError(rc),
+            0,
+            "new frame after fully-drained end must start, not stage_wrong"
+        );
+        crate::streaming::ZSTD_freeCStream(zcs);
+    }
+}
