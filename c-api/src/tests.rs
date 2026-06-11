@@ -1499,10 +1499,20 @@ fn decompress_stream_recovers_after_failed_oneshot_on_midframe_context() {
         assert_ne!(rc, 0, "mid-frame stream must report more input needed");
 
         // One-shot decode of a CORRUPT frame on the same context: fails.
-        let mut corrupt = frame.clone();
-        let mid = corrupt.len() / 2;
-        corrupt[mid] ^= 0xFF;
-        corrupt[mid + 1] ^= 0xFF;
+        // Deterministic failure with maximal state mutation: a
+        // checksum-bearing frame with a flipped trailer decodes ALL blocks
+        // (the decoder state is fully exercised) and then reliably fails
+        // verification — unlike flipping payload bytes, which a block
+        // layout might happily decode into wrong output.
+        let mut corrupt = {
+            let mut enc: codec::encoding::FrameCompressor = codec::encoding::FrameCompressor::new(
+                codec::encoding::CompressionLevel::from_level(3),
+            );
+            enc.set_content_checksum(true);
+            enc.compress_independent_frame(&input)
+        };
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0xFF;
         let mut once = vec![0u8; input.len()];
         let n = crate::context::ZSTD_decompressDCtx(
             zds,
