@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781204372310,
+  "lastUpdate": 1781238798023,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -64586,6 +64586,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.272,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "a87224a3200d7bc2e524c2cd2dea69a52b375292",
+          "message": "perf: dict decode peak + direct path + repcode gate + entropy table build (#403)\n\n* perf(decode): exact growth for window-scale reservations\n\nTwo allocation-policy fixes on the decode buffer:\n\n- the frame-entry window pre-reservation (reserve_buffer) and the\n  sequence decoder's worst-case pre-block reservation now grow the\n  backing buffer EXACTLY: on the frame's last block (remaining content\n  a fraction of a block) the amortized policy DOUBLED the window-sized\n  FlatBuf — a 1 MiB dictionary frame held a 2 MiB buffer for a 112 KiB\n  tail. The ring backend keeps its own amortized growth via the trait\n  default, and per-block growth elsewhere stays amortized.\n- the non-direct path clamps the reservation to the declared content\n  size when the header carries one: matches can never reference further\n  back than the bytes that will ever exist, so an encoder-declared\n  window above the FCS must not inflate the reservation.\n\ndecode_loop_dict on the z000033 L22 ldm+dict frame: decoder workspace\n2.08 MiB -> 1.04 MiB; process peak 3.81 -> 2.91 MiB. 831 tests.\n\n* feat(encode): single-segment layout for dictionary frames\n\nDictionary frames with a known content size that fits the window now\ntake the single-segment layout, matching the reference encoder\n(single-segment + dictionary-ID headers): the dictionary is decoder\nsetup state, not part of the regenerated segment. Dropping the window\ndescriptor lets decoders size their buffers from the FCS instead of\nthe level's preset window — our own decoder picks the flat backend and\nreserves content-size instead of a window that could be twice it.\n\n* refactor(decode): fold DecodeBuffer::reserve into the exact variant\n\nEvery call site was a one-shot window-scale reservation; the amortized\nwrapper had no remaining users outside tests.\n\n* perf(decode): route dictionary frames through the direct decode path\n\nDictionary frames were excluded from direct decode (straight into the\ncaller's slice) and staged through a window-sized FlatBuf/Ring plus a\ndrain copy: the residual 1.92x decompress-dict memory peak and an extra\nfull-output copy per frame.\n\nThe exclusion is no longer needed: the per-kernel inline executors\nalready route beyond-prefix offsets to the cold repeat() fallback, and\nrepeat_from_dict is generic over the backend. Wire-up:\n\n- run_direct_decode forwards the scratch buffer's shared dict handle\n  (refcount bump) to the stack-local DecodeBuffer\n- the dict-reachability gate uses max(total_output_counter, len()):\n  the direct backend never drains, so len() is the cumulative output\n  the inline path does not track in the counter\n- regression test decodes a dict frame with dict-region matches into\n  an exactly-FCS-sized buffer (fails without the handle wire-up)\n\n* perf(encode): 4-byte gate before opt repcode prefix scan\n\nDonor ZSTD_readMINMATCH equality probe (zstd_opt.c:657-674) before the\nfull prefix kernel on each of the three per-position rep candidates.\nFiltering is equivalent (mismatch implies match_len < min_match_len),\nbut the common no-hit case on low-redundancy input skips the kernel\ncall; the probe was 12.6% of L22 dict-compress wall on 10k random.\n\n* fix(decode): apply the FCS window cap at every reserve_buffer site\n\nThe cap lived only in decode_all_impl's pre-reserve; decode_blocks (and\nthe partial path) still reserved the raw frame window, growing the\nbuffer right back on the first loop iteration. Hoisted into\nFrameDecoderState::useful_window_size, used by all four sites.\n\nAlso: test-only direct_frames counter pins the dispatch in the dict\ndirect-path regression test (both paths are byte-identical, so output\nasserts alone cannot catch a re-introduced gate exclusion), and the\nheap-profiling build line is documented in decode_loop_dict.\n\n* fix(decode): restore the raw window binding on the partial decode path\n\nThe FCS-cap hoist replaced the window_size local with useful_window in\ndecode_blocks_partial, but the resume logic below bounds match reach by\nthe frame's RAW window semantics — and still referenced the removed\nbinding, breaking lsm builds (the feature is off in default validation,\nso only feature-gated CI sees it). The reservation keeps the capped\nvalue; the resume bounds get the raw window back.\n\n* test(decode): pin reserve_buffer growth on a window-full buffer\n\nVec::reserve_exact takes ADDITIONAL capacity; the decode_all fallback\nloop re-enters decode_blocks per strategy chunk and each entry\npre-reserves the window, so a buffer already holding ~window bytes of\nhistory grows toward 2x window — defeating the peak-memory cap the\nexact-growth policy exists for. Fails until the reservation is computed\nas the shortfall past the buffered bytes.\n\n* fix(decode): reserve only the window shortfall past buffered history\n\nreserve_buffer forwarded the full window to reserve_exact, whose\nADDITIONAL-capacity semantics grew an already window-full buffer toward\n2x window on every decode_blocks re-entry of the decode_all fallback\nloop. Compute the shortfall against the buffered length instead.\n\n* test(encode): cross-check the single-segment dict frame with the reference decoder\n\nSelf-roundtrip alone cannot catch a serializer+parser sharing one bug;\nthe on-wire single-segment + dictionary-ID layout now also decodes\nthrough the C implementation with the same dictionary.\n\n* docs(decode): align the reserve_buffer contract with the shortfall semantics\n\nThe doc block still described the additional-bytes contract and warned\nagainst subtracting the buffered length — exactly what the method now\ndoes internally. Document the target-capacity semantics so the\nshortfall computation reads as intentional.\n\n* perf(decode): widen the Huffman table fill and weight unpack\n\ndecode_and_execute profiling on table-dense btopt frames put 18.6% of\ndecode wall in HuffmanTable::build_decoder. Two scalar shapes against\nthe reference:\n- the per-slot MaybeUninit::write run never auto-vectorised (scalar\n  movw stores); fill four packed entries per unaligned u64 store like\n  the reference HUF_DEltX1 broadcast, scalar only for the <4 tail\n- the direct-weight unpack branched on index parity and read each\n  source byte twice; unpack both nibbles per byte instead\n\n* perf(decode): fuse sequence meta into the FSE table-build pass\n\nBuilding a sequence table then enriching base_value /\nnum_additional_bits in a second full-table walk doubled the entry\ntraffic on every per-block rebuild (the enrich pass alone was 4.1%\nself-time on table-dense btopt frames). SeqMeta threads the LL/ML\npacked meta or the closed-form OF formula into the build loop, exactly\nmatching the reference, which fills both fields during construction.\nThe standalone enrich passes stay for the cold RLE / predefined /\nno_std arms.\n\n* perf(decode): accumulate Huffman weight stats during weight decode\n\nThe table build walked the weight array three extra times per rebuild:\nonce for the weight sum, once deriving code lengths, once counting the\ncode-length histogram. Accumulate the sum and per-weight rank counts\nWHILE the weights decode (both the FSE-interleaved and direct-nibble\npaths, mirroring the reference readStats shape) and derive the\nhistogram arithmetically; per-weight validation moves to the decode\nloop with the same error. The code-length pass stays — the encoder-side\ntable conversion reads it.\n\n* perf(decode): flat little-endian cursor for the FSE table-description parse\n\nread_probabilities pulled every field through the generic\nBitReader::get_bits, which assembles values byte-by-byte with per-call\ndivisions (~6% of decode wall on table-dense frames). Replace it with\nthe reference readNCount cursor shape: one whole-word load per field\noff a flat bit position, identical wire semantics and identical\ntruncation errors. The now-unused BitReader::bits_read / return_bits\nhelpers are removed.\n\n* perf(decode): register-resident rank cursors for the Huffman table fill\n\nThe fill loop kept its rank cursors in a heap Vec, paying a\nmemory-bound bounds check per live symbol (the hottest single\ninstruction in the table build), and the run fill went through slice\nre-borrows per symbol. Rank starts now live in a fixed 16-slot local\nindexed by masked code length, the run fill writes through one raw\ncursor with a register-compare run gate, and a release-mode coverage\ncount anchors the set_len. The dead rank_indexes field is removed.\n\n* test(huff0): add regression test for 256-explicit-weight FSE stream acceptance\n\nThe FSE weight-decode loop can append the final explicit weight on the\ntwo early-break paths before the TooManyWeights guard at the loop\nbottom runs, so a corrupt header producing exactly 256 explicit weights\nis accepted; build_table_from_weights then wraps symbol index 256 to 0\nthrough the u8 packing. The test FSE-encodes 256 alternating weights\nand currently fails (decode returns Ok).\n\n* fix(huff0): reject the 256th explicit weight on early-break paths\n\nMove the 255-weight cap from the loop bottom into push_weight! so the\ntwo early-break final pushes are covered; the cap also remains the\nterminator for zero-bit FSE state cycles since it now runs on every\npush. Regression test in the previous commit.\n\n* test(decode): add regression test for dict reachability after direct window drop\n\nOn the direct path the inline executors skip total_output_counter and\ndrop_to_window_size() caps the visible length back to window_size, so\nthe repeat_from_dict gate max(counter, len) can fall back under the\nwindow even though cumulative output already exceeded it, keeping\ndictionary-backed offsets reachable on an invalid frame. The test\nmimics the direct path at the DecodeBuffer level and currently fails\n(the dict copy is served instead of rejected).\n\n* fix(decode): latch output counter above the window on direct-path drops\n\ndrop_to_window_size() now catches total_output_counter up to the\nvisible length before advancing the head (max, never add: adding would\ndouble-count on backends whose push/repeat already counted the bytes).\nWithout it the direct path, whose inline executors skip the counter,\nfell back under window_size after the first between-blocks drop and\nrepeat_from_dict kept serving dictionary-backed offsets on frames\nwhere the window had already slid past the dictionary. Regression test\nin the previous commit.\n\n* refactor(decode): tighten dict-direct fixture, dhat scope, single-segment rationale\n\n- decode_loop_dict example: arm the dhat profiler after one-time setup\n  so the heap profile attributes the repeated decode path alone\n- dict_frame_decodes_through_direct_path: drop the in-frame duplicate\n  of the dictionary bytes (it gave the encoder an in-frame fallback\n  that could hide a lost dict handle) and assert the fixture actually\n  depends on the dictionary\n- frame_compressor: single-segment rationale no longer claims decoders\n  size buffers from the FCS (reservation is already capped to\n  min(window, FCS)); the real effect is single-segment wire layout",
+          "timestamp": "2026-06-12T06:49:20+03:00",
+          "tree_id": "ac7697c094db587b67fba9a068ffc0f32dc0c720",
+          "url": "https://github.com/structured-world/structured-zstd/commit/a87224a3200d7bc2e524c2cd2dea69a52b375292"
+        },
+        "date": 1781238781557,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.09,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.068,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 222.787,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 161.096,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.075,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.189,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.633,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.62,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.545,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.568,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.094,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.207,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.094,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.207,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.012,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 12.311,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.902,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.206,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.304,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.792,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.264,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.58,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.129,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.367,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.134,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.109,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.273,
             "unit": "ms"
           }
         ]
