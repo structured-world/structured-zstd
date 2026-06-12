@@ -222,6 +222,24 @@ macro_rules! dispatch_tag_kernel {
     }};
 }
 
+/// Per-tier `#[target_feature]` umbrella over the greedy row kernel: with
+/// the umbrella's features a superset of the tier probe's, the
+/// `#[inline(always)]` loop body AND the tier's `row_probe_*` merge into ONE
+/// compiled function (donor `ZSTD_compressBlock_greedy_row` shape) instead
+/// of paying a non-inlinable `#[target_feature]` call per position.
+macro_rules! gen_greedy_kernel {
+    ($name:ident $(, $tf:literal)?) => {
+        $(#[target_feature(enable = $tf)])?
+        #[allow(unused_unsafe)]
+        unsafe fn $name<K: RowTags, const ROW_LOG: usize>(
+            &mut self,
+            handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+        ) {
+            self.start_matching_greedy_rl::<K, ROW_LOG>(handle_sequence)
+        }
+    };
+}
+
 /// Bind the runtime `row_log` (clamped 4..=6) to the const `ROW_LOG` of a
 /// `*_rl::<K, ROW_LOG>` hot loop. Mirrors the donor's per-rowLog variant
 /// table; the branch is cold (once per block / call).
@@ -1149,6 +1167,7 @@ impl RowMatchGenerator {
     ///
     /// `pick_lazy_match` is intentionally not called here — depth == 0
     /// means "no lookahead", emit the first viable hit.
+    #[inline(always)]
     pub(crate) fn start_matching_greedy_rl<K: RowTags, const ROW_LOG: usize>(
         &mut self,
         mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
@@ -1496,14 +1515,59 @@ impl RowMatchGenerator {
         &mut self,
         handle_sequence: impl for<'a> FnMut(Sequence<'a>),
     ) {
-        dispatch_tag_kernel!(self.start_matching_greedy_k(handle_sequence))
+        // SAFETY: each `greedy_*` umbrella is entered only when its kernel
+        // was runtime-detected (`tag_kernel`), upholding the
+        // `#[target_feature]` contract; the wasm tier is compile-time.
+        #[cfg(all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel_simd128"
+        ))]
+        {
+            // SAFETY: simd128 is a compile-time feature here; no runtime gate.
+            unsafe { dispatch_row_log!(self.greedy_simd128::<Simd128Tags>(handle_sequence)) }
+        }
+        #[cfg(not(all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel_simd128"
+        )))]
+        {
+            match self.tag_kernel {
+                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                FastpathKernel::Avx2Bmi2 => unsafe {
+                    dispatch_row_log!(self.greedy_avx2bmi2::<Avx2Bmi2Tags>(handle_sequence))
+                },
+                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                FastpathKernel::Sse42 => unsafe {
+                    dispatch_row_log!(self.greedy_sse42::<Sse42Tags>(handle_sequence))
+                },
+                #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+                FastpathKernel::Neon => unsafe {
+                    dispatch_row_log!(self.greedy_neon::<NeonTags>(handle_sequence))
+                },
+                // SAFETY: the scalar kernel has no `#[target_feature]`; the
+                // fn is `unsafe` only for macro uniformity.
+                FastpathKernel::Scalar => unsafe {
+                    dispatch_row_log!(self.greedy_scalar::<ScalarTags>(handle_sequence))
+                },
+            }
+        }
     }
-    fn start_matching_greedy_k<K: RowTags>(
-        &mut self,
-        handle_sequence: impl for<'a> FnMut(Sequence<'a>),
-    ) {
-        dispatch_row_log!(self.start_matching_greedy_rl::<K>(handle_sequence))
-    }
+
+    gen_greedy_kernel!(greedy_scalar);
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    gen_greedy_kernel!(greedy_sse42, "sse4.2");
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    gen_greedy_kernel!(greedy_avx2bmi2, "avx2,bmi2");
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    gen_greedy_kernel!(greedy_neon, "neon");
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel_simd128"
+    ))]
+    gen_greedy_kernel!(greedy_simd128);
 
     pub(crate) fn skip_matching_with_hint(&mut self, incompressible_hint: Option<bool>) {
         match self.row_log {

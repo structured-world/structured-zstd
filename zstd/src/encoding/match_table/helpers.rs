@@ -130,7 +130,6 @@ pub(crate) fn extend_backwards_shared(
 /// fallback) and return the best match found, if any. Hot path:
 /// invoked once per encoded byte on lazy / Dfast / Row matchers
 /// (~10% exclusive on the default-level profile).
-#[inline]
 #[inline(always)]
 pub(crate) fn repcode_candidate_shared(
     kernel: FastpathKernel,
