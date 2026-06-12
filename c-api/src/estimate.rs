@@ -69,7 +69,20 @@ pub extern "C" fn ZSTD_estimateCCtxSize_usingCParams(cparams: ZSTD_compressionPa
     // loud signal beats a silent widening.
     let bt =
         codec::encoding::estimated_bt_strategy_extra_bytes(cparams.strategy, cparams.windowLog);
-    core::mem::size_of::<ZSTD_CCtx>() + window + hash + chain + bt + 3 * BLOCK_SIZE_MAX
+    // The per-field bounds keep each TERM inside usize, but on a 32-bit
+    // target the SUM can still wrap (e.g. windowLog 30 + hashLog 29 +
+    // chainLog 29) — an under-reported budget is worse than an error for a
+    // sizing contract, so overflow comes back encoded.
+    let Some(total) = core::mem::size_of::<ZSTD_CCtx>()
+        .checked_add(window)
+        .and_then(|v| v.checked_add(hash))
+        .and_then(|v| v.checked_add(chain))
+        .and_then(|v| v.checked_add(bt))
+        .and_then(|v| v.checked_add(3 * BLOCK_SIZE_MAX))
+    else {
+        return crate::error::encode(crate::error::ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound);
+    };
+    total
 }
 
 /// `size_t ZSTD_estimateCStreamSize_usingCParams(ZSTD_compressionParameters
