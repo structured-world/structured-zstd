@@ -449,11 +449,40 @@ macro_rules! row_best_match {
     }};
 }
 
+/// Per-tier standalone search function (upstream zstd's
+/// `ZSTD_RowFindBestMatch` shape, `zstd_lazy.c`): rep + row probe behind ONE
+/// symbol so the lazy parse's two probe sites (current position + lookahead)
+/// share a single copy instead of expanding the whole search body twice —
+/// the duplicated expansion doubled the kernel's icache footprint and left
+/// the lookahead copy as an outlined closure call.
+macro_rules! gen_row_find_monolith {
+    ($name:ident, $use_mask:literal, $maskmac:ident, $cpl:path $(, $tf:literal)?) => {
+        $(#[target_feature(enable = $tf)])?
+        #[cfg_attr(
+            all(
+                target_arch = "wasm32",
+                target_feature = "simd128",
+                feature = "kernel_simd128"
+            ),
+            allow(dead_code)
+        )]
+        #[allow(unused_unsafe)]
+        unsafe fn $name<K: RowTags, const ROW_LOG: usize>(
+            &mut self,
+            abs_pos: usize,
+            lit_len: usize,
+        ) -> Option<MatchCandidate> {
+            row_best_match!(self, abs_pos, lit_len, ROW_LOG, $use_mask, $maskmac, $cpl)
+        }
+    };
+}
+
 /// The lazy row parse BODY as a macro — same per-tier monolith shape as
 /// `greedy_parse_body!` for the lazy levels (lookahead via
-/// `pick_lazy_match_shared`, with both its probe sites expanded inline).
+/// `pick_lazy_match_shared`; both probe sites call the tier's shared
+/// `$find` search function).
 macro_rules! lazy_parse_body {
-    ($m:expr, $handle:expr, $rl:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
+    ($m:expr, $handle:expr, $rl:expr, $find:ident) => {{
         #[allow(unused_labels)]
         'parse: {
             debug_assert_eq!($rl, $m.row_log);
@@ -476,7 +505,7 @@ macro_rules! lazy_parse_body {
                 let abs_pos = current_abs_start + pos;
                 let lit_len = pos - literals_start;
 
-                let best = row_best_match!($m, abs_pos, lit_len, $rl, $use_mask, $maskmac, $cpl);
+                let best = unsafe { $m.$find::<K, $rl>(abs_pos, lit_len) };
                 let picked = pick_lazy_match_shared(
                     abs_pos,
                     lit_len,
@@ -487,9 +516,10 @@ macro_rules! lazy_parse_body {
                         lazy_depth: $m.lazy_depth,
                         history_abs_end: $m.history_abs_end(),
                     },
-                    |next_pos, next_lit_len| {
-                        row_best_match!($m, next_pos, next_lit_len, $rl, $use_mask, $maskmac, $cpl)
-                    },
+                    // SAFETY: the enclosing kernel is only entered when its
+                    // tier was runtime-detected, so the same-feature search
+                    // fn's target_feature contract is upheld.
+                    |next_pos, next_lit_len| unsafe { $m.$find::<K, $rl>(next_pos, next_lit_len) },
                 );
                 if let Some(candidate) = picked {
                     $m.insert_match_span::<$rl>(abs_pos, candidate.start + candidate.match_len);
@@ -531,7 +561,9 @@ macro_rules! lazy_parse_body {
 
 /// Per-tier lazy kernels (see `gen_greedy_monolith` — same SIMD pairing).
 macro_rules! gen_lazy_monolith {
-    ($name:ident, $use_mask:literal, $maskmac:ident, $cpl:path $(, $tf:literal)?) => {
+    ($name:ident, $find:ident, $use_mask:literal, $maskmac:ident, $cpl:path $(, $tf:literal)?) => {
+        gen_row_find_monolith!($find, $use_mask, $maskmac, $cpl $(, $tf)?);
+
         $(#[target_feature(enable = $tf)])?
         // wasm32+simd128 resolves the dispatch at compile time to the
         // simd128 kernel, leaving the scalar monolith uncalled there
@@ -549,7 +581,7 @@ macro_rules! gen_lazy_monolith {
             &mut self,
             mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
         ) {
-            lazy_parse_body!(self, handle_sequence, ROW_LOG, $use_mask, $maskmac, $cpl)
+            lazy_parse_body!(self, handle_sequence, ROW_LOG, $find)
         }
     };
 }
@@ -1670,6 +1702,7 @@ impl RowMatchGenerator {
 
     gen_lazy_monolith!(
         lazy_scalar,
+        find_best_scalar,
         false,
         row_tag_mask_scalar,
         crate::encoding::fastpath::scalar::common_prefix_len_ptr
@@ -1677,6 +1710,7 @@ impl RowMatchGenerator {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     gen_lazy_monolith!(
         lazy_sse42,
+        find_best_sse42,
         true,
         row_tag_mask_sse2,
         crate::encoding::fastpath::sse42::common_prefix_len_ptr,
@@ -1685,6 +1719,7 @@ impl RowMatchGenerator {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     gen_lazy_monolith!(
         lazy_avx2bmi2,
+        find_best_avx2bmi2,
         true,
         row_tag_mask_avx2,
         crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr,
@@ -1693,6 +1728,7 @@ impl RowMatchGenerator {
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     gen_lazy_monolith!(
         lazy_neon,
+        find_best_neon,
         true,
         row_tag_mask_neon,
         crate::encoding::fastpath::neon::common_prefix_len_ptr,
@@ -1705,6 +1741,7 @@ impl RowMatchGenerator {
     ))]
     gen_lazy_monolith!(
         lazy_simd128,
+        find_best_simd128,
         true,
         row_tag_mask_simd128,
         crate::encoding::fastpath::scalar::common_prefix_len_ptr
