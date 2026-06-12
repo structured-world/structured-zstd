@@ -1125,6 +1125,40 @@ mod tests {
     use alloc::vec::Vec;
 
     #[test]
+    fn dict_offsets_rejected_after_direct_path_window_drop() {
+        // The direct decode path writes through the inline executors
+        // (which skip `total_output_counter`) and bounds the visible
+        // buffer with `drop_to_window_size()` between blocks. Once
+        // cumulative output exceeds the window, dictionary-backed
+        // offsets are out of reach per the spec; the reachability gate
+        // must not reopen just because the visible length was capped
+        // back to `window_size`.
+        use crate::decoding::dictionary::Dictionary;
+        use crate::decoding::user_slice_buf::UserSliceBackend;
+
+        let mut out = vec![0u8; 300];
+        let backend = UserSliceBackend::from_slice(out.as_mut_slice());
+        let mut buf = DecodeBuffer::from_backend(backend, 100);
+        let dict = Dictionary::from_raw_content(7, vec![0xAB; 64]).expect("raw-content dictionary");
+        buf.set_dict(dict.into_handle());
+
+        // Mimic the inline executor: produce 250 bytes without touching
+        // `total_output_counter`, exceeding the 100-byte window.
+        BufferBackend::extend(&mut buf.buffer, &[1u8; 250]);
+        buf.drop_to_window_size();
+        assert_eq!(buf.len(), 100, "visible buffer capped to the window");
+
+        // offset 110 > len 100 reaches 10 bytes into the dictionary;
+        // cumulative output (250) already exceeds the window (100), so
+        // this must be rejected, not served from the dictionary.
+        let result = buf.repeat_from_dict(110, 5);
+        assert!(
+            result.is_err(),
+            "dict-backed offset must be unreachable once output exceeded the window, got {result:?}"
+        );
+    }
+
+    #[test]
     fn from_backend_clears_prepopulated_backend() {
         // Regression for the round-8 review fix: `from_backend` must
         // normalise a caller-supplied backend so the logical counters
