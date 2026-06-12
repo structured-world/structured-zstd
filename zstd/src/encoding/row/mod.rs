@@ -543,6 +543,17 @@ macro_rules! lazy_parse_body {
 macro_rules! gen_lazy_monolith {
     ($name:ident, $use_mask:literal, $maskmac:ident, $cpl:path $(, $tf:literal)?) => {
         $(#[target_feature(enable = $tf)])?
+        // wasm32+simd128 resolves the dispatch at compile time to the
+        // simd128 kernel, leaving the scalar monolith uncalled there
+        // (same shape as the `ScalarTags` allowance).
+        #[cfg_attr(
+            all(
+                target_arch = "wasm32",
+                target_feature = "simd128",
+                feature = "kernel_simd128"
+            ),
+            allow(dead_code)
+        )]
         #[allow(unused_unsafe)]
         unsafe fn $name<K: RowTags, const ROW_LOG: usize>(
             &mut self,
@@ -559,6 +570,17 @@ macro_rules! gen_lazy_monolith {
 macro_rules! gen_greedy_monolith {
     ($name:ident, $use_mask:literal, $maskmac:ident, $cpl:path $(, $tf:literal)?) => {
         $(#[target_feature(enable = $tf)])?
+        // wasm32+simd128 resolves the dispatch at compile time to the
+        // simd128 kernel, leaving the scalar monolith uncalled there
+        // (same shape as the `ScalarTags` allowance).
+        #[cfg_attr(
+            all(
+                target_arch = "wasm32",
+                target_feature = "simd128",
+                feature = "kernel_simd128"
+            ),
+            allow(dead_code)
+        )]
         #[allow(unused_unsafe)]
         unsafe fn $name<K: RowTags, const ROW_LOG: usize>(
             &mut self,
