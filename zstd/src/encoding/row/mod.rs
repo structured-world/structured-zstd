@@ -504,6 +504,13 @@ macro_rules! lazy_parse_body {
             let mls = $m.mls;
             let mut pos = 0usize;
             let mut literals_start = 0usize;
+            // Lookahead search result carried into the next iteration
+            // (upstream zstd's lazy chain, `zstd_lazy.c` lazy_generic: a
+            // deferred position's successor is never searched twice — the
+            // depth loop carries the better match forward). `Some(r)` means
+            // this iteration's position was already searched as the previous
+            // iteration's lookahead, with result `r`.
+            let mut carried: Option<Option<MatchCandidate>> = None;
             while pos + mls <= current_len {
                 let abs_pos = current_abs_start + pos;
                 let lit_len = pos - literals_start;
@@ -511,26 +518,51 @@ macro_rules! lazy_parse_body {
                 // Hash the position ONCE per iteration: the probe consumes it
                 // and the defer branch reuses it for the insert (upstream zstd
                 // hashes once per position — `ZSTD_RowFindBestMatch` updates
-                // the row as part of the search, `zstd_lazy.c`).
-                let hash = $m.hash_and_row(abs_pos);
-                let best = unsafe { $m.$find::<K, $rl>(abs_pos, lit_len, hash) };
-                let picked = pick_lazy_match_shared(
-                    abs_pos,
-                    lit_len,
-                    best,
-                    LazyMatchConfig {
-                        target_len: $m.target_len,
-                        min_match_len: $m.mls,
-                        lazy_depth: $m.lazy_depth,
-                        history_abs_end: $m.history_abs_end(),
-                    },
+                // the row as part of the search, `zstd_lazy.c`). A carried
+                // iteration skips both: the search already ran.
+                let (hash, best) = match carried.take() {
+                    Some(best) => (None, best),
+                    None => {
+                        let hash = $m.hash_and_row(abs_pos);
+                        let best = unsafe { $m.$find::<K, $rl>(abs_pos, lit_len, hash) };
+                        (hash, best)
+                    }
+                };
+                let picked = 'pick: {
+                    let Some(best) = best else { break 'pick None };
+                    if best.match_len >= $m.target_len
+                        || abs_pos + 1 + $m.mls > $m.history_abs_end()
+                    {
+                        break 'pick Some(best);
+                    }
                     // SAFETY: the enclosing kernel is only entered when its
                     // tier was runtime-detected, so the same-feature search
                     // fn's target_feature contract is upheld.
-                    |next_pos, next_lit_len| unsafe {
-                        $m.$find::<K, $rl>(next_pos, next_lit_len, None)
-                    },
-                );
+                    let next = unsafe { $m.$find::<K, $rl>(abs_pos + 1, lit_len + 1, None) };
+                    if let Some(n) = next
+                        && (n.match_len > best.match_len
+                            || (n.match_len == best.match_len && n.offset < best.offset))
+                    {
+                        // Defer: the lookahead wins; carry its result so the
+                        // next iteration starts from it instead of searching
+                        // the same position again.
+                        carried = Some(next);
+                        break 'pick None;
+                    }
+                    if $m.lazy_depth >= 2 && abs_pos + 2 + $m.mls <= $m.history_abs_end() {
+                        let next2 = unsafe { $m.$find::<K, $rl>(abs_pos + 2, lit_len + 2, None) };
+                        if let Some(n2) = next2
+                            && n2.match_len > best.match_len + 1
+                        {
+                            // Two-ahead defer: carry the one-ahead result
+                            // (the next iteration's own lookahead re-probes
+                            // two-ahead with the deferred position inserted).
+                            carried = Some(next);
+                            break 'pick None;
+                        }
+                    }
+                    Some(best)
+                };
                 if let Some(candidate) = picked {
                     $m.insert_match_span::<$rl>(abs_pos, candidate.start + candidate.match_len);
                     let current = &$m.history[$m.history.len() - current_len..];
@@ -550,9 +582,11 @@ macro_rules! lazy_parse_body {
                     literals_start = pos;
                 } else {
                     // Reuse the iteration's hash for the defer-path insert
-                    // instead of rehashing the same position.
-                    if let Some((row, tag)) = hash {
-                        $m.insert_at::<$rl>(abs_pos, row, tag);
+                    // when available (a carried iteration never hashed and
+                    // falls back to the rehashing insert).
+                    match hash {
+                        Some((row, tag)) => $m.insert_at::<$rl>(abs_pos, row, tag),
+                        None => $m.insert_position::<$rl>(abs_pos),
                     }
                     pos += 1;
                 }
@@ -908,6 +942,13 @@ macro_rules! row_probe_body {
                     continue;
                 }
                 let candidate_idx = candidate_pos - $m.history_abs_start;
+                // NOTE: upstream zstd's 4-byte head gate (`MEM_read32(match)
+                // == MEM_read32(ip)`, zstd_lazy.c:1265) was measured NEGATIVE
+                // here both unconditionally (+7% on match-dense z000033 L6,
+                // flat control) and best-gated (+3%); the row walk visits few
+                // false tag hits and the SIMD prefix compare's first vector
+                // already serves as the cheap reject. The tail gate below is
+                // the selective filter that pays.
                 // Speculative tail gate (HC `hash_chain_candidate` parity):
                 // a 4-byte compare at the length the candidate must reach to
                 // outgrow `best` proves whether the full `common_prefix_len`
