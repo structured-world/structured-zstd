@@ -442,10 +442,11 @@ pub unsafe extern "C" fn ZSTD_sizeof_DCtx(dctx: *const ZSTD_DCtx) -> usize {
         + dctx.decoder.workspace_size()
         + dctx.attached_ddict.heap_size()
         // The parsed-dictionary cache behind ZSTD_decompress_usingDDict is
-        // context-owned (the parse copy, not the caller's DDict bytes).
+        // context-owned (the parse copy, not the caller's DDict bytes);
+        // same accounting as the attach path: content + entropy-table heap
+        // plus the inline struct.
         + dctx.ddict_handle.as_ref().map_or(0, |h| {
-            h.as_dict().dict_content.len()
-                + core::mem::size_of::<codec::decoding::Dictionary>()
+            h.as_dict().heap_bytes() + core::mem::size_of::<codec::decoding::Dictionary>()
         })
 }
 

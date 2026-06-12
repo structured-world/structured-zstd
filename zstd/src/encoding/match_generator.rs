@@ -983,14 +983,10 @@ pub fn estimated_compression_workspace_bytes(level: CompressionLevel) -> usize {
             .row
             .map(|r| (4usize << r.hash_bits) + (2usize << r.hash_bits))
             .unwrap_or(0);
-    // BT modes box a `BtMatcher` (inline cost-model tables) plus the
-    // optimal-parse scratch arenas, bounded by the `HC_OPT_NUM` node
-    // frontier (node + emitted-store + candidate entries per slot).
+    // BT modes box a `BtMatcher`; its retained scratch layout is budgeted
+    // next to the struct so estimator and allocator evolve together.
     let bt = if uses_bt {
-        core::mem::size_of::<super::bt::BtMatcher>()
-            + HC_OPT_NUM
-                * (2 * core::mem::size_of::<HcOptimalNode>()
-                    + core::mem::size_of::<MatchCandidate>())
+        super::bt::BtMatcher::estimated_workspace_bytes()
     } else {
         0
     };

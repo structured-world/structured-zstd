@@ -98,6 +98,26 @@ impl BtMatcher {
     /// side table only.
     pub(crate) const HASH_MLS: usize = 4;
 
+    /// Steady-state workspace budget for one boxed matcher: the inline
+    /// payload (`HcOptState` cost tables, lit-price arrays) plus the
+    /// retained scratch arenas at their growth bounds — node frontier and
+    /// emitted store (`HC_OPT_NUM + 1` nodes each), the four
+    /// frontier-sized length-price arrays, the per-segment plan buffers,
+    /// and the candidate ladder (`MAX_HC_SEARCH_DEPTH`). LDM is opt-in
+    /// and excluded (`ldm_sequences` stays empty on every level preset).
+    /// Kept next to the struct so the estimator and the real retained
+    /// layout evolve together.
+    pub(crate) fn estimated_workspace_bytes() -> usize {
+        use super::cost_model::HC_OPT_NUM;
+        use super::hc::MAX_HC_SEARCH_DEPTH;
+        let frontier = HC_OPT_NUM + 1;
+        core::mem::size_of::<Self>()
+            + 2 * frontier * core::mem::size_of::<HcOptimalNode>()
+            + 4 * frontier * core::mem::size_of::<u32>()
+            + 2 * frontier * core::mem::size_of::<HcOptimalSequence>()
+            + MAX_HC_SEARCH_DEPTH * core::mem::size_of::<MatchCandidate>()
+    }
+
     /// Append `candidate` to `out` if it's strictly longer than the
     /// best length seen so far (and at least `min_match_len`). Maintains
     /// `best_len_for_skip` so subsequent calls only keep strictly
