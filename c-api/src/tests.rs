@@ -1855,6 +1855,71 @@ fn ref_prefix_is_single_use_and_roundtrips() {
 }
 
 #[test]
+fn cctx_ref_prefix_survives_a_too_small_destination() {
+    // A prefix is single-use, but "use" means a frame was actually
+    // DELIVERED: a dstSize_tooSmall failure must leave the prefix armed so
+    // the caller's retry with a bigger buffer still compresses against it.
+    let prefix = dict_payload();
+    let mut payload = prefix[..2048].to_vec();
+    payload.extend_from_slice(b"unique suffix after prefix material 0123456789");
+
+    let cctx = ZSTD_createCCtx();
+    assert_eq!(
+        ZSTD_isError(unsafe { ZSTD_CCtx_refPrefix(cctx, prefix.as_ptr(), prefix.len()) }),
+        0
+    );
+    let mut tiny = [0u8; 4];
+    let failed = unsafe {
+        ZSTD_compress2(
+            cctx,
+            tiny.as_mut_ptr(),
+            tiny.len(),
+            payload.as_ptr(),
+            payload.len(),
+        )
+    };
+    assert_ne!(ZSTD_isError(failed), 0, "4-byte destination must fail");
+
+    let mut frame = vec![0u8; payload.len() + 512];
+    let written = unsafe {
+        ZSTD_compress2(
+            cctx,
+            frame.as_mut_ptr(),
+            frame.len(),
+            payload.as_ptr(),
+            payload.len(),
+        )
+    };
+    assert_eq!(ZSTD_isError(written), 0);
+    frame.truncate(written);
+
+    // The retried frame must still depend on the prefix: bare decode fails,
+    // prefixed decode roundtrips.
+    let bare = ZSTD_createDCtx();
+    let mut out = vec![0u8; payload.len() + 64];
+    let read =
+        unsafe { ZSTD_decompressDCtx(bare, out.as_mut_ptr(), out.len(), frame.as_ptr(), written) };
+    assert_ne!(
+        ZSTD_isError(read),
+        0,
+        "the retry must still compress against the prefix"
+    );
+    unsafe { ZSTD_freeDCtx(bare) };
+
+    let dctx = ZSTD_createDCtx();
+    assert_eq!(
+        ZSTD_isError(unsafe { ZSTD_DCtx_refPrefix(dctx, prefix.as_ptr(), prefix.len()) }),
+        0
+    );
+    let read =
+        unsafe { ZSTD_decompressDCtx(dctx, out.as_mut_ptr(), out.len(), frame.as_ptr(), written) };
+    assert_eq!(ZSTD_isError(read), 0);
+    assert_eq!(&out[..read], payload.as_slice());
+    unsafe { ZSTD_freeDCtx(dctx) };
+    unsafe { ZSTD_freeCCtx(cctx) };
+}
+
+#[test]
 fn streaming_roundtrips_with_loaded_dictionary() {
     let dict = trained_dictionary();
     let payload = dict_payload();
