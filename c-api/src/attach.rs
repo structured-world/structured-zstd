@@ -217,6 +217,13 @@ impl ZSTD_CCtx {
 
     /// [`Self::apply_attached_dict`] for the streaming encoder: same
     /// semantics, applied to the per-frame [`StreamingEncoder`].
+    ///
+    /// Deliberately does NOT call `set_dictionary_id_flag(false)` for the
+    /// raw-content arms: the synthetic-ID suppression for the streaming
+    /// path lives at the (only) caller, `ensure_stream`, which combines
+    /// [`Self::attach_suppresses_dict_id`] with the sticky
+    /// `ZSTD_c_dictIDFlag` knob right after this returns — setting it here
+    /// too would split one decision across two layers.
     pub(crate) fn apply_attached_dict_streaming(
         &self,
         enc: &mut codec::encoding::StreamingEncoder<Vec<u8>>,

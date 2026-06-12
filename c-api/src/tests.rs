@@ -2423,7 +2423,13 @@ fn by_reference_and_advanced_attach_variants_roundtrip() {
     );
 
     // refPrefix_advanced: rawContent accepted + single-use roundtrip,
-    // fullDict rejected — on both the encoder and decoder sides.
+    // fullDict rejected — on both the encoder and decoder sides. Fresh
+    // contexts: the earlier loadDictionary attaches are sticky and could
+    // mask a refPrefix wrapper regressing to a no-op.
+    unsafe { ZSTD_freeDCtx(dctx) };
+    unsafe { ZSTD_freeCCtx(cctx) };
+    let cctx = ZSTD_createCCtx();
+    let dctx = ZSTD_createDCtx();
     let prefix = dict_payload();
     let mut p2 = prefix[..1024].to_vec();
     p2.extend_from_slice(b"advanced prefix tail 0123456789");
@@ -2443,6 +2449,22 @@ fn by_reference_and_advanced_attach_variants_roundtrip() {
     let written =
         unsafe { ZSTD_compress2(cctx, frame.as_mut_ptr(), frame.len(), p2.as_ptr(), p2.len()) };
     assert_eq!(ZSTD_isError(written), 0);
+    // The frame must really depend on the prefix: no advertised ID and no
+    // bare decode.
+    assert_eq!(
+        unsafe { ZSTD_getDictID_fromFrame(frame.as_ptr(), written) },
+        0,
+        "prefix frame must not advertise a dictionary ID"
+    );
+    let bare = ZSTD_createDCtx();
+    let bare_read =
+        unsafe { ZSTD_decompressDCtx(bare, out.as_mut_ptr(), out.len(), frame.as_ptr(), written) };
+    assert_ne!(
+        ZSTD_isError(bare_read),
+        0,
+        "prefix frame must not decode bare"
+    );
+    unsafe { ZSTD_freeDCtx(bare) };
     assert_ne!(
         ZSTD_isError(unsafe {
             ZSTD_DCtx_refPrefix_advanced(dctx, prefix.as_ptr(), prefix.len(), 2)
