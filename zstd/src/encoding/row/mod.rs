@@ -867,6 +867,25 @@ macro_rules! row_probe_body {
             let head = $m.row_heads[row] as usize;
             let max_walk = $m.search_depth.min(row_entries);
 
+            // Prefetch the dict row before the live scan (upstream zstd
+            // prefetches the dictMatchState rows up front,
+            // zstd_lazy.c:1200 `ZSTD_row_prefetch`), hiding the dict-table
+            // load latency behind the live row's work.
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            if let Some(dict) = $m.dict.table() {
+                #[cfg(target_arch = "x86")]
+                use core::arch::x86::{_MM_HINT_T0, _mm_prefetch};
+                #[cfg(target_arch = "x86_64")]
+                use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+                let drow_base = row << $rl;
+                // SAFETY: prefetch is a hint and never faults; indexes are in
+                // bounds by the dict-table sizing.
+                unsafe {
+                    _mm_prefetch(dict.tags.as_ptr().add(drow_base).cast(), _MM_HINT_T0);
+                    _mm_prefetch(dict.positions.as_ptr().add(drow_base).cast(), _MM_HINT_T0);
+                }
+            }
+
             // SIMD tiers precompute the full bitmask once (the tag-match
             // intrinsic inlines under this method's `#[target_feature]`); the
             // scalar tier (`USE_MASK == false`) const-folds this away and does
@@ -993,7 +1012,14 @@ macro_rules! row_probe_body {
 
             // Dict dual-probe (donor `ZSTD_RowFindBestMatch` `dictMatchState`):
             // one bounded immutable dict row (concat-indexed positions).
-            if let Some(dict) = $m.dict.table() {
+            // The candidate budget is SHARED with the live row (upstream
+            // zstd decrements one `nbAttempts` across both rows,
+            // zstd_lazy.c:1308): the dict probe only spends what the live
+            // walk left over.
+            if attempts < max_walk
+                && let Some(dict) = $m.dict.table()
+            {
+                let dict_walk = max_walk - attempts;
                 let dict_end = $m.dict.region_len();
                 let drow_base = row << $rl;
                 let dhead = dict.heads[row] as usize;
@@ -1017,7 +1043,7 @@ macro_rules! row_probe_body {
                 #[allow(unused_mut)]
                 let mut dscan = 0usize;
                 let mut dattempts = 0usize;
-                while dattempts < max_walk {
+                while dattempts < dict_walk {
                     let slot_opt = if $use_mask {
                         if dpending == 0 {
                             None
