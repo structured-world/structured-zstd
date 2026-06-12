@@ -1525,15 +1525,35 @@ impl RowMatchGenerator {
         self.history_abs_start + self.live_history().len()
     }
 
+    /// Row hash key at `idx`: `key_len` bytes (donor `mls`, 5-6 on the row
+    /// levels) via one masked 8-byte read, degrading to the 4-byte key in
+    /// the last <8 bytes of the window. Shared by the live hash and the
+    /// dictionary row-index build — the two MUST bucket identically or
+    /// dict-region probes go blind.
     #[inline(always)]
+    fn row_key_value(concat: &[u8], idx: usize, key_len: usize) -> u64 {
+        if idx + 8 <= concat.len() {
+            let v = u64::from_le_bytes(concat[idx..idx + 8].try_into().unwrap());
+            v & ((1u64 << (key_len * 8)) - 1)
+        } else {
+            u32::from_le_bytes(concat[idx..idx + ROW_HASH_KEY_LEN].try_into().unwrap()) as u64
+        }
+    }
+
     pub(crate) fn hash_and_row(&self, abs_pos: usize) -> Option<(usize, u8)> {
         let idx = abs_pos - self.history_abs_start;
         let concat = self.live_history();
         if idx + ROW_HASH_KEY_LEN > concat.len() {
             return None;
         }
-        let value =
-            u32::from_le_bytes(concat[idx..idx + ROW_HASH_KEY_LEN].try_into().unwrap()) as u64;
+        // Donor `ZSTD_hashPtrSalted` hashes `mls` bytes (5-6 on the row
+        // levels), not 4: a wider key cuts the false tag hits whose
+        // candidates then cost a data load + reject in the probe. Read 8
+        // bytes and mask to the key width when the tail allows; the last
+        // <8 bytes of the window keep the 4-byte key (a position hashes
+        // identically in the probe and the insert either way, so the
+        // mixed tail stays self-consistent).
+        let value = Self::row_key_value(concat, idx, self.mls.min(6));
         let hash = crate::encoding::fastpath::hash_mix_u64_with_kernel(self.hash_kernel, value);
         let total_bits = self.row_hash_log + ROW_TAG_BITS;
         let combined = hash >> (u64::BITS as usize - total_bits);
@@ -2086,6 +2106,7 @@ impl RowMatchGenerator {
         let row_log = self.row_log;
         let row_hash_log = self.row_hash_log;
         let hash_kernel = self.hash_kernel;
+        let key_len = self.mls.min(6);
         let history_start = self.history_start;
         let concat_len = self.history.len() - history_start;
         // Row hash needs `ROW_HASH_KEY_LEN` readable bytes of lookahead.
@@ -2118,13 +2139,14 @@ impl RowMatchGenerator {
         // is u32-bounded upstream).
         for concat in start_concat..safe_end {
             unsafe {
-                // Little-endian load to match the live probe's
-                // `u32::from_le_bytes` hash (`hash_and_row`); a native-endian
-                // load would bucket dict rows differently on big-endian targets
-                // and lose every attached-dict match there.
-                let value =
-                    u32::from_le((base.add(history_start + concat) as *const u32).read_unaligned())
-                        as u64;
+                // Same key reader as the live `hash_and_row` (width and
+                // endianness): any divergence buckets dict rows differently
+                // and loses every attached-dict match.
+                let value = Self::row_key_value(
+                    core::slice::from_raw_parts(base.add(history_start), concat_len),
+                    concat,
+                    key_len,
+                );
                 let hash = crate::encoding::fastpath::hash_mix_u64_with_kernel(hash_kernel, value);
                 let combined = hash >> (u64::BITS as usize - total_bits);
                 let row = ((combined >> ROW_TAG_BITS) as usize) & row_count_mask;

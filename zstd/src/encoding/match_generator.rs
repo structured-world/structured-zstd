@@ -1022,7 +1022,12 @@ fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> Le
         }
         CompressionLevel::Default => LEVEL_TABLE[2],
         CompressionLevel::Better => LEVEL_TABLE[6],
-        CompressionLevel::Best => LEVEL_TABLE[10],
+        // Level 13: the first dominant point of the deep-lazy band. The
+        // mls-wide row key lifted the shallow band's ratio enough that
+        // level 11 no longer strictly beats level 7 on the ladder corpus;
+        // the `Best` alias belongs on a config that dominates everything
+        // below it rather than on a hair-thin margin.
+        CompressionLevel::Best => LEVEL_TABLE[12],
         CompressionLevel::Level(n) => {
             if n > 0 {
                 let idx = (n as usize).min(CompressionLevel::MAX_LEVEL as usize) - 1;
@@ -6812,7 +6817,8 @@ fn driver_reset_keeps_strategy_tag_in_sync_with_active_backend() {
     check(CompressionLevel::Fastest, StrategyTag::Fast);
     check(CompressionLevel::Default, StrategyTag::Dfast);
     check(CompressionLevel::Better, StrategyTag::Lazy);
-    check(CompressionLevel::Best, StrategyTag::Lazy);
+    // `Best` sits on level 13 (the first dominant point of the deep band).
+    check(CompressionLevel::Best, StrategyTag::Btlazy2);
 }
 
 #[test]
@@ -9067,7 +9073,12 @@ fn row_hash_and_row_extracts_high_bits() {
 
     let idx = pos - matcher.history_abs_start;
     let concat = matcher.live_history();
-    let value = u32::from_le_bytes(concat[idx..idx + ROW_HASH_KEY_LEN].try_into().unwrap()) as u64;
+    // Mirror `row_key_value`: an mls-wide masked key when 8 lookahead bytes
+    // exist, the 4-byte key in the tail. `idx = 8` on a 16-byte history has
+    // exactly 8 bytes left, so the wide arm applies here.
+    let key_len = matcher.mls.min(6);
+    let value = u64::from_le_bytes(concat[idx..idx + 8].try_into().unwrap())
+        & ((1u64 << (key_len * 8)) - 1);
     let hash = crate::encoding::fastpath::hash_mix_u64_with_kernel(matcher.hash_kernel, value);
     let total_bits = matcher.row_hash_log + ROW_TAG_BITS;
     let combined = hash >> (u64::BITS as usize - total_bits);
