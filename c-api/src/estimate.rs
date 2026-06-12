@@ -62,6 +62,11 @@ pub extern "C" fn ZSTD_estimateCCtxSize_usingCParams(cparams: ZSTD_compressionPa
     };
     // Binary-tree strategies retain the optimal-parser workspace (and, for
     // btultra/btultra2, the HC3 side table) on top of the hash/chain tables.
+    // No cast on purpose: this crate only targets platforms where C's
+    // `unsigned int` is 32-bit (it emits the host `libzstd.so.1`), so
+    // `c_uint == u32` here and clippy rejects a redundant conversion. On a
+    // hypothetical 16-bit `c_uint` target this line fails to compile — a
+    // loud signal beats a silent widening.
     let bt =
         codec::encoding::estimated_bt_strategy_extra_bytes(cparams.strategy, cparams.windowLog);
     core::mem::size_of::<ZSTD_CCtx>() + window + hash + chain + bt + 3 * BLOCK_SIZE_MAX
