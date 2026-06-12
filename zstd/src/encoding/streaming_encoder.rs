@@ -62,6 +62,12 @@ pub struct StreamingEncoder<W: Write, M: Matcher = MatchGeneratorDriver> {
     /// Dictionary applied to the frame (donor `ZSTD_CCtx_loadDictionary` on a
     /// streaming context). `None` = no dictionary. Set before the first write.
     dictionary: Option<EncoderDictionary>,
+    /// Whether the frame header records the attached dictionary's ID
+    /// (upstream `ZSTD_c_dictIDFlag`). Default `true`. Raw-content
+    /// dictionaries (upstream `ZSTD_CCtx_refPrefix`) carry a synthetic
+    /// non-zero ID that must not reach the wire, so their attach path
+    /// turns this off. See [`Self::set_dictionary_id_flag`].
+    dictionary_id_flag: bool,
     /// Encoder entropy tables (literals Huffman + LL/ML/OF FSE "previous"
     /// tables) the dictionary seeds into the first block, derived once when the
     /// dictionary is attached so each frame start is a cheap clone.
@@ -147,6 +153,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             magicless: false,
             content_checksum: false,
             dictionary: None,
+            dictionary_id_flag: true,
             dictionary_entropy_cache: None,
             #[cfg(feature = "hash")]
             hasher: XxHash64::with_seed(0),
@@ -282,6 +289,14 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         let dict = EncoderDictionary::from_bytes(raw_dictionary)
             .map_err(|err| invalid_input_error(&alloc::format!("invalid dictionary: {err:?}")))?;
         self.set_encoder_dictionary(dict)
+    }
+
+    /// Whether the frame header records the dictionary ID when a dictionary
+    /// is attached (upstream `ZSTD_c_dictIDFlag` semantics; default `true`).
+    /// Mirrors [`FrameCompressor::set_dictionary_id_flag`]. Decoders can still
+    /// decode such frames by supplying the dictionary explicitly.
+    pub fn set_dictionary_id_flag(&mut self, emit: bool) {
+        self.dictionary_id_flag = emit;
     }
 
     /// Attach an already-parsed [`EncoderDictionary`] to the frame. See
@@ -570,7 +585,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             },
             single_segment,
             content_checksum: cfg!(feature = "hash") && self.content_checksum,
-            dictionary_id: if use_dictionary_state {
+            dictionary_id: if use_dictionary_state && self.dictionary_id_flag {
                 self.dictionary.as_ref().map(|dict| dict.inner.id as u64)
             } else {
                 None

@@ -95,6 +95,183 @@ pub unsafe extern "C" fn ZDICT_trainFromBuffer(
     dict.len()
 }
 
+/// `ZDICT_fastCover_params_t` — FastCOVER tuning, ABI-identical to `zdict.h`.
+#[repr(C)]
+#[derive(Copy, Clone)]
+#[allow(non_camel_case_types, non_snake_case)]
+pub struct ZDICT_fastCover_params_t {
+    /// Segment size (0 = optimize over the default candidate grid).
+    pub k: c_uint,
+    /// Dmer size (0 = optimize; only 6 / 8 are meaningful upstream).
+    pub d: c_uint,
+    /// Frequency-array log size (0 = default 20).
+    pub f: c_uint,
+    /// Optimization step count (0 = default grid).
+    pub steps: c_uint,
+    /// Training thread count; this build trains on the calling thread.
+    pub nbThreads: c_uint,
+    /// Fraction of samples used for training vs testing (0.0 = default).
+    pub splitPoint: f64,
+    /// Acceleration factor (0 = default 1).
+    pub accel: c_uint,
+    /// Shrink-dict toggle (accepted; the trainer always sizes to capacity).
+    pub shrinkDict: c_uint,
+    /// Shrink-dict regression bound (accepted with `shrinkDict`).
+    pub shrinkDictMaxRegression: c_uint,
+    pub zParams: ZDICT_params_t,
+}
+
+/// Map caller FastCOVER parameters onto the trainer's options. `optimize`
+/// distinguishes the plain train entry (explicit k/d required upstream) from
+/// the optimizing entry (0 = sweep the candidate grid).
+fn fastcover_options(params: &ZDICT_fastCover_params_t, optimize: bool) -> FastCoverOptions {
+    let mut opts = FastCoverOptions {
+        optimize,
+        ..FastCoverOptions::default()
+    };
+    if params.k != 0 {
+        opts.k = params.k as usize;
+        if optimize {
+            opts.k_candidates = vec![params.k as usize];
+        }
+    }
+    if params.d != 0 {
+        opts.d = params.d as usize;
+        if optimize {
+            opts.d_candidates = vec![params.d as usize];
+        }
+    }
+    if params.f != 0 {
+        opts.f = params.f;
+        if optimize {
+            opts.f_candidates = vec![params.f];
+        }
+    }
+    if params.accel != 0 {
+        opts.accel = params.accel as usize;
+    }
+    if params.splitPoint > 0.0 {
+        opts.split_point = params.splitPoint;
+    }
+    opts
+}
+
+/// Shared body of the FastCOVER train entry points.
+///
+/// # Safety
+/// Buffer contracts of [`ZDICT_trainFromBuffer`].
+unsafe fn train_fastcover(
+    dict_buffer: *mut u8,
+    dict_capacity: usize,
+    samples_buffer: *const u8,
+    samples_sizes: *const usize,
+    nb_samples: c_uint,
+    params: &ZDICT_fastCover_params_t,
+    optimize: bool,
+) -> usize {
+    let Some(total) = (unsafe { total_sample_len(samples_sizes, nb_samples) }) else {
+        return encode(ZSTD_ErrorCode::ZSTD_error_dictionaryCreation_failed);
+    };
+    let samples = unsafe { in_slice(samples_buffer, total) };
+    let finalize = FinalizeOptions {
+        dict_id: (params.zParams.dictID != 0).then_some(params.zParams.dictID),
+    };
+    let opts = fastcover_options(params, optimize);
+
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        let mut out = Vec::new();
+        create_fastcover_dict_from_source(samples, &mut out, dict_capacity, &opts, finalize)
+            .map(|_| out)
+    }));
+    let dict = match outcome {
+        Ok(Ok(dict)) => dict,
+        _ => return encode(ZSTD_ErrorCode::ZSTD_error_dictionaryCreation_failed),
+    };
+    if dict.len() > dict_capacity {
+        return encode(ZSTD_ErrorCode::ZSTD_error_dstSize_tooSmall);
+    }
+    let out = unsafe { crate::ffi::out_slice(dict_buffer, dict_capacity) };
+    out[..dict.len()].copy_from_slice(&dict);
+    dict.len()
+}
+
+/// `size_t ZDICT_trainFromBuffer_fastCover(void* dictBuffer, size_t
+/// dictBufferCapacity, const void* samplesBuffer, const size_t* samplesSizes,
+/// unsigned nbSamples, ZDICT_fastCover_params_t parameters)` — FastCOVER
+/// training with explicit parameters (no optimization sweep).
+///
+/// # Safety
+/// Buffer contracts of [`ZDICT_trainFromBuffer`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZDICT_trainFromBuffer_fastCover(
+    dict_buffer: *mut u8,
+    dict_capacity: usize,
+    samples_buffer: *const u8,
+    samples_sizes: *const usize,
+    nb_samples: c_uint,
+    parameters: ZDICT_fastCover_params_t,
+) -> usize {
+    unsafe {
+        train_fastcover(
+            dict_buffer,
+            dict_capacity,
+            samples_buffer,
+            samples_sizes,
+            nb_samples,
+            &parameters,
+            false,
+        )
+    }
+}
+
+/// `size_t ZDICT_optimizeTrainFromBuffer_fastCover(void* dictBuffer, size_t
+/// dictBufferCapacity, const void* samplesBuffer, const size_t* samplesSizes,
+/// unsigned nbSamples, ZDICT_fastCover_params_t* parameters)` — FastCOVER
+/// training with a parameter sweep over the candidate grid; explicit non-zero
+/// `k` / `d` / `f` pin that axis. The chosen values are written back into
+/// `parameters` on success, per upstream.
+///
+/// # Safety
+/// Buffer contracts of [`ZDICT_trainFromBuffer`]; `parameters` must be a
+/// valid, writable pointer.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZDICT_optimizeTrainFromBuffer_fastCover(
+    dict_buffer: *mut u8,
+    dict_capacity: usize,
+    samples_buffer: *const u8,
+    samples_sizes: *const usize,
+    nb_samples: c_uint,
+    parameters: *mut ZDICT_fastCover_params_t,
+) -> usize {
+    if parameters.is_null() {
+        return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
+    }
+    let params = unsafe { *parameters };
+    let written = unsafe {
+        train_fastcover(
+            dict_buffer,
+            dict_capacity,
+            samples_buffer,
+            samples_sizes,
+            nb_samples,
+            &params,
+            true,
+        )
+    };
+    if !crate::error::result_is_error(written) {
+        // The trainer does not report the swept winner back, so pin the
+        // write-back to the effective values (defaults where the caller
+        // passed 0). Upstream writes the chosen k/d/f here.
+        let opts = fastcover_options(&params, true);
+        let p = unsafe { &mut *parameters };
+        p.k = opts.k as c_uint;
+        p.d = opts.d as c_uint;
+        p.f = opts.f;
+        p.accel = opts.accel as c_uint;
+    }
+    written
+}
+
 /// `size_t ZDICT_finalizeDictionary(void* dstDictBuffer, size_t maxDictSize,
 /// const void* dictContent, size_t dictContentSize, const void* samplesBuffer,
 /// const size_t* samplesSizes, unsigned nbSamples, ZDICT_params_t parameters)`.

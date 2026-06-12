@@ -77,6 +77,10 @@ pub struct ZSTD_CCtx {
     /// rather than raw address so a freed-then-realloc'd handle can't alias.
     pub(crate) dict_serial: u64,
     pub(crate) dict_level: c_int,
+    /// Context-attached dictionary (`ZSTD_CCtx_loadDictionary` /
+    /// `ZSTD_CCtx_refCDict` / `ZSTD_CCtx_refPrefix`), applied at every frame
+    /// start by `ZSTD_compress2` / `ZSTD_compressStream2`.
+    pub(crate) attached_dict: crate::attach::CCtxDictAttach,
 }
 
 /// Opaque decompression context. Wraps a reusable [`FrameDecoder`] so its
@@ -90,12 +94,19 @@ pub struct ZSTD_DCtx {
     /// Whether the streaming decoder sits at a frame boundary (the next
     /// `ZSTD_decompressStream` input starts a new frame). `true` initially.
     pub(crate) stream_frame_done: bool,
+    /// Context-attached dictionary (`ZSTD_DCtx_loadDictionary` /
+    /// `ZSTD_DCtx_refDDict` / `ZSTD_DCtx_refPrefix`), applied at every frame
+    /// start by `ZSTD_decompressDCtx` / `ZSTD_decompressStream`.
+    pub(crate) attached_ddict: crate::attach::DCtxDictAttach,
     /// Identity of the `DDict` whose content was last loaded into `decoder`
     /// (its never-reused serial; `0` = none), so repeated
     /// `ZSTD_decompress_usingDDict` calls with the same DDict skip re-adding it.
     /// Reset to `0` whenever `decoder` is replaced, so a fresh decoder is never
     /// trusted to still hold the previously-loaded dictionary.
     pub(crate) ddict_serial: u64,
+    /// Parsed-dictionary cache for `ZSTD_decompress_usingDDict`, keyed by
+    /// `ddict_serial`: repeated calls with the same DDict skip the re-parse.
+    pub(crate) ddict_handle: Option<codec::decoding::DictionaryHandle>,
 }
 
 /// `ZSTD_CCtx* ZSTD_createCCtx(void)`. Returns `NULL` on allocation failure
@@ -109,6 +120,7 @@ pub extern "C" fn ZSTD_createCCtx() -> *mut ZSTD_CCtx {
         dict_compressor: None,
         dict_serial: 0,
         dict_level: 0,
+        attached_dict: crate::attach::CCtxDictAttach::None,
     })
 }
 
@@ -134,6 +146,7 @@ impl ZSTD_CCtx {
         self.dict_compressor = None;
         self.dict_serial = 0;
         self.dict_level = 0;
+        self.attached_dict = crate::attach::CCtxDictAttach::None;
     }
 }
 
@@ -257,21 +270,70 @@ pub unsafe extern "C" fn ZSTD_compress2(
         return encode(ZSTD_ErrorCode::ZSTD_error_parameter_combination_unsupported);
     };
     let params = cctx.params;
-    let outcome = catch_unwind(AssertUnwindSafe(|| {
+    let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<(), ZSTD_ErrorCode> {
         cctx.scratch.clear();
-        let mut enc: FrameCompressor =
-            FrameCompressor::new(CompressionLevel::from_level(params.level));
-        enc.set_parameters(&resolved);
-        enc.set_content_checksum(params.checksum_flag);
-        enc.set_content_size_flag(params.content_size_flag);
-        enc.set_dictionary_id_flag(params.dict_id_flag);
-        if params.target_cblock_size > 0 {
-            enc.set_target_block_size(Some(params.target_cblock_size as u32));
+        if cctx.has_attached_dict() {
+            // Dictionary frames route through the context's cached
+            // dict-compressor (same cache as ZSTD_compress_usingCDict, keyed
+            // by attach serial + level) so repeated frames with the same
+            // attach skip the dictionary re-parse / re-prime.
+            let key = cctx.attach_serial();
+            let level = cctx.attach_level();
+            if cctx.dict_compressor.is_none() || cctx.dict_serial != key || cctx.dict_level != level
+            {
+                let mut enc: FrameCompressor =
+                    FrameCompressor::new(CompressionLevel::from_level(level));
+                cctx.apply_attached_dict(&mut enc)?;
+                cctx.dict_compressor = Some(enc);
+                cctx.dict_serial = key;
+                cctx.dict_level = level;
+            }
+            let suppress_id = cctx.attach_suppresses_dict_id();
+            let params_from_cdict = cctx.attach_params_from_cdict();
+            let ZSTD_CCtx {
+                scratch,
+                dict_compressor,
+                ..
+            } = cctx;
+            let enc = dict_compressor.as_mut().expect("just ensured Some");
+            // A referenced CDict's compression parameters win (upstream
+            // rule); every other attach honours the sticky knobs.
+            if !params_from_cdict {
+                enc.set_parameters(&resolved);
+            }
+            enc.set_content_checksum(params.checksum_flag);
+            enc.set_content_size_flag(params.content_size_flag);
+            enc.set_dictionary_id_flag(params.dict_id_flag && !suppress_id);
+            if params.target_cblock_size > 0 {
+                enc.set_target_block_size(Some(params.target_cblock_size as u32));
+            }
+            enc.compress_independent_frame_into(src, scratch);
+        } else {
+            let mut enc: FrameCompressor =
+                FrameCompressor::new(CompressionLevel::from_level(params.level));
+            enc.set_parameters(&resolved);
+            enc.set_content_checksum(params.checksum_flag);
+            enc.set_content_size_flag(params.content_size_flag);
+            enc.set_dictionary_id_flag(params.dict_id_flag);
+            if params.target_cblock_size > 0 {
+                enc.set_target_block_size(Some(params.target_cblock_size as u32));
+            }
+            enc.compress_independent_frame_into(src, &mut cctx.scratch);
         }
-        enc.compress_independent_frame_into(src, &mut cctx.scratch);
+        Ok(())
     }));
-    if outcome.is_err() {
-        return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
+    match outcome {
+        Ok(Ok(())) => cctx.consume_prefix(),
+        Ok(Err(code)) => {
+            cctx.dict_compressor = None;
+            cctx.dict_serial = 0;
+            return encode(code);
+        }
+        Err(_) => {
+            cctx.dict_compressor = None;
+            cctx.dict_serial = 0;
+            return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
+        }
     }
     let len = cctx.scratch.len();
     if len > dst_capacity {
@@ -290,7 +352,9 @@ pub extern "C" fn ZSTD_createDCtx() -> *mut ZSTD_DCtx {
         decoder: FrameDecoder::new(),
         window_log_max: crate::params::WINDOW_LOG_LIMIT_DEFAULT,
         stream_frame_done: true,
+        attached_ddict: crate::attach::DCtxDictAttach::None,
         ddict_serial: 0,
+        ddict_handle: None,
     })
 }
 
@@ -315,6 +379,8 @@ impl ZSTD_DCtx {
         self.decoder = FrameDecoder::new();
         self.stream_frame_done = true;
         self.ddict_serial = 0;
+        self.ddict_handle = None;
+        self.attached_ddict = crate::attach::DCtxDictAttach::None;
     }
 }
 
@@ -389,7 +455,15 @@ pub unsafe extern "C" fn ZSTD_decompressDCtx(
     // The single-pass decode writes into the caller's dst with no window
     // buffer, so there is no allocation for the parameter to limit.
     dctx.decoder.set_content_checksum(ContentChecksum::Verify);
-    let outcome = catch_unwind(AssertUnwindSafe(|| dctx.decoder.decode_all(src, dst)));
+    // Context-attached dictionary (`ZSTD_DCtx_loadDictionary` / `refDDict` /
+    // `refPrefix`) applies to the frames of this one-shot; a prefix is
+    // single-use and consumed regardless of outcome.
+    let attached = dctx.attached_handle();
+    dctx.consume_prefix();
+    let outcome = catch_unwind(AssertUnwindSafe(|| match &attached {
+        Some(handle) => dctx.decoder.decode_all_with_dict_handle(src, dst, handle),
+        None => dctx.decoder.decode_all(src, dst),
+    }));
     match outcome {
         Ok(Ok(written)) => {
             // The one-shot consumed whole frames; the context sits at a

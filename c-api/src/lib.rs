@@ -27,10 +27,12 @@
 //! `no_std + alloc` surface lives in the pure-Rust [`codec`] crate this depends
 //! on; consumers wanting an embedded build link `codec` directly.
 
+mod attach;
 mod cdict;
 mod context;
 mod dict;
 mod error;
+mod estimate;
 mod ffi;
 mod frame;
 mod params;

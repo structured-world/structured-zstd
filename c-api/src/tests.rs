@@ -549,12 +549,24 @@ fn sizeof_cctx_counts_cached_dictionary_compressor() {
 }
 
 #[test]
-fn create_cdict_rejects_non_dictionary() {
-    // A buffer with no dictionary magic and no valid entropy is not a parseable
-    // encoder dictionary; createCDict must return NULL (never crash).
-    let garbage = [0xABu8; 64];
-    let cdict = unsafe { ZSTD_createCDict(garbage.as_ptr(), garbage.len(), 3) };
-    assert!(cdict.is_null(), "createCDict accepted a non-dictionary");
+fn create_cdict_treats_unmagicked_bytes_as_raw_content() {
+    // Upstream auto content type: a buffer without the dictionary magic is a
+    // raw-content dictionary (ID 0), not a creation failure.
+    let raw = [0xABu8; 64];
+    let cdict = unsafe { ZSTD_createCDict(raw.as_ptr(), raw.len(), 3) };
+    assert!(!cdict.is_null(), "raw-content createCDict must succeed");
+    assert_eq!(unsafe { ZSTD_getDictID_fromCDict(cdict) }, 0);
+    unsafe { ZSTD_freeCDict(cdict) };
+
+    // An empty dictionary is a creation failure.
+    let cdict = unsafe { ZSTD_createCDict(core::ptr::null(), 0, 3) };
+    assert!(cdict.is_null(), "empty createCDict must fail");
+
+    // A magic-prefixed blob whose tables don't parse is corrupt.
+    let mut corrupt = vec![0x37u8, 0xA4, 0x30, 0xEC];
+    corrupt.extend_from_slice(&[0xFF; 60]);
+    let cdict = unsafe { ZSTD_createCDict(corrupt.as_ptr(), corrupt.len(), 3) };
+    assert!(cdict.is_null(), "corrupt full dict must fail");
 }
 
 // ---- Phase 6.2: advanced parameters + streaming ----
@@ -1560,4 +1572,577 @@ fn decompress_stream_recovers_after_failed_oneshot_on_midframe_context() {
         assert_eq!(restored, input, "post-failure streaming must be byte-exact");
         crate::streaming::ZSTD_freeDStream(zds);
     }
+}
+
+// ---- Phase 6.2 slice 2: dictionary attach + estimates + fastCover ----
+
+use crate::attach::{
+    ZSTD_CCtx_loadDictionary, ZSTD_CCtx_refCDict, ZSTD_CCtx_refPrefix, ZSTD_DCtx_loadDictionary,
+    ZSTD_DCtx_refDDict, ZSTD_DCtx_refPrefix, ZSTD_compress_usingDict, ZSTD_decompress_usingDict,
+    ZSTD_getDictID_fromDict, ZSTD_getDictID_fromFrame,
+};
+use crate::cdict::{
+    ZSTD_compress_usingCDict_advanced, ZSTD_compressionParameters, ZSTD_createCDict_advanced,
+    ZSTD_createDDict_advanced, ZSTD_customMem, ZSTD_frameParameters,
+};
+use crate::context::ZSTD_compress2;
+use crate::dict::{
+    ZDICT_fastCover_params_t, ZDICT_optimizeTrainFromBuffer_fastCover, ZDICT_params_t,
+    ZDICT_trainFromBuffer_fastCover,
+};
+use crate::estimate::{
+    ZSTD_estimateCCtxSize, ZSTD_estimateCCtxSize_usingCParams, ZSTD_estimateCStreamSize,
+    ZSTD_estimateDCtxSize, ZSTD_estimateDStreamSize,
+};
+
+/// Dict-friendly payload: repeats material the trained dictionary covers.
+fn dict_payload() -> Vec<u8> {
+    let mut payload = Vec::new();
+    for i in 0..40u32 {
+        payload.extend_from_slice(
+            format!("tenant=demo table=orders key={i} region=eu payload=aaaaabbbbbccccc\n")
+                .as_bytes(),
+        );
+    }
+    payload
+}
+
+#[test]
+fn cctx_load_dictionary_roundtrips_via_compress2() {
+    let dict = trained_dictionary();
+    let payload = dict_payload();
+    let cctx = ZSTD_createCCtx();
+    let n = unsafe { ZSTD_CCtx_loadDictionary(cctx, dict.as_ptr(), dict.len()) };
+    assert_eq!(ZSTD_isError(n), 0);
+    let mut frame = vec![0u8; payload.len() + 512];
+    let written = unsafe {
+        ZSTD_compress2(
+            cctx,
+            frame.as_mut_ptr(),
+            frame.len(),
+            payload.as_ptr(),
+            payload.len(),
+        )
+    };
+    assert_eq!(ZSTD_isError(written), 0);
+    frame.truncate(written);
+
+    // The frame carries the dictionary ID and cannot decode without the dict.
+    let dict_id = unsafe { ZSTD_getDictID_fromDict(dict.as_ptr(), dict.len()) };
+    assert_ne!(dict_id, 0);
+    assert_eq!(
+        unsafe { ZSTD_getDictID_fromFrame(frame.as_ptr(), frame.len()) },
+        dict_id
+    );
+    let dctx = ZSTD_createDCtx();
+    let mut out = vec![0u8; payload.len() + 64];
+    let plain = unsafe {
+        ZSTD_decompressDCtx(
+            dctx,
+            out.as_mut_ptr(),
+            out.len(),
+            frame.as_ptr(),
+            frame.len(),
+        )
+    };
+    assert_ne!(ZSTD_isError(plain), 0, "dict frame must not decode bare");
+
+    // With the dictionary loaded on the DCtx it decodes byte-exact.
+    let n = unsafe { ZSTD_DCtx_loadDictionary(dctx, dict.as_ptr(), dict.len()) };
+    assert_eq!(ZSTD_isError(n), 0);
+    let read = unsafe {
+        ZSTD_decompressDCtx(
+            dctx,
+            out.as_mut_ptr(),
+            out.len(),
+            frame.as_ptr(),
+            frame.len(),
+        )
+    };
+    assert_eq!(ZSTD_isError(read), 0);
+    assert_eq!(&out[..read], payload.as_slice());
+
+    unsafe { ZSTD_freeDCtx(dctx) };
+    unsafe { ZSTD_freeCCtx(cctx) };
+}
+
+#[test]
+fn raw_content_dictionary_roundtrips_without_wire_id() {
+    // Raw bytes (no magic) attach as raw content; the frame must NOT carry
+    // the synthetic dictionary ID and must decode with the same raw bytes
+    // loaded on the decode side.
+    let raw: Vec<u8> = dict_payload();
+    let mut payload = raw[..1024].to_vec();
+    payload.extend_from_slice(b"and a unique tail 0123456789");
+
+    let cctx = ZSTD_createCCtx();
+    let n = unsafe { ZSTD_CCtx_loadDictionary(cctx, raw.as_ptr(), raw.len()) };
+    assert_eq!(ZSTD_isError(n), 0);
+    let mut frame = vec![0u8; payload.len() + 512];
+    let written = unsafe {
+        ZSTD_compress2(
+            cctx,
+            frame.as_mut_ptr(),
+            frame.len(),
+            payload.as_ptr(),
+            payload.len(),
+        )
+    };
+    assert_eq!(ZSTD_isError(written), 0);
+    frame.truncate(written);
+    assert_eq!(
+        unsafe { ZSTD_getDictID_fromFrame(frame.as_ptr(), frame.len()) },
+        0,
+        "raw-content frame must not advertise a dictionary ID"
+    );
+
+    let dctx = ZSTD_createDCtx();
+    let n = unsafe { ZSTD_DCtx_loadDictionary(dctx, raw.as_ptr(), raw.len()) };
+    assert_eq!(ZSTD_isError(n), 0);
+    let mut out = vec![0u8; payload.len() + 64];
+    let read = unsafe {
+        ZSTD_decompressDCtx(
+            dctx,
+            out.as_mut_ptr(),
+            out.len(),
+            frame.as_ptr(),
+            frame.len(),
+        )
+    };
+    assert_eq!(ZSTD_isError(read), 0);
+    assert_eq!(&out[..read], payload.as_slice());
+    unsafe { ZSTD_freeDCtx(dctx) };
+    unsafe { ZSTD_freeCCtx(cctx) };
+}
+
+#[test]
+fn ref_cdict_and_ref_ddict_roundtrip_via_contexts() {
+    let dict = trained_dictionary();
+    let payload = dict_payload();
+    let cdict = unsafe { ZSTD_createCDict(dict.as_ptr(), dict.len(), 7) };
+    assert!(!cdict.is_null());
+    let ddict = unsafe { ZSTD_createDDict(dict.as_ptr(), dict.len()) };
+    assert!(!ddict.is_null());
+
+    let cctx = ZSTD_createCCtx();
+    assert_eq!(ZSTD_isError(unsafe { ZSTD_CCtx_refCDict(cctx, cdict) }), 0);
+    let mut frame = vec![0u8; payload.len() + 512];
+    let written = unsafe {
+        ZSTD_compress2(
+            cctx,
+            frame.as_mut_ptr(),
+            frame.len(),
+            payload.as_ptr(),
+            payload.len(),
+        )
+    };
+    assert_eq!(ZSTD_isError(written), 0);
+    frame.truncate(written);
+
+    let dctx = ZSTD_createDCtx();
+    assert_eq!(ZSTD_isError(unsafe { ZSTD_DCtx_refDDict(dctx, ddict) }), 0);
+    let mut out = vec![0u8; payload.len() + 64];
+    let read = unsafe {
+        ZSTD_decompressDCtx(
+            dctx,
+            out.as_mut_ptr(),
+            out.len(),
+            frame.as_ptr(),
+            frame.len(),
+        )
+    };
+    assert_eq!(ZSTD_isError(read), 0);
+    assert_eq!(&out[..read], payload.as_slice());
+
+    // Detach with NULL: the next frame must be dictionary-independent.
+    assert_eq!(
+        ZSTD_isError(unsafe { ZSTD_CCtx_refCDict(cctx, core::ptr::null()) }),
+        0
+    );
+    let written = unsafe {
+        ZSTD_compress2(
+            cctx,
+            frame.as_mut_ptr(),
+            frame.capacity(),
+            payload.as_ptr(),
+            payload.len(),
+        )
+    };
+    assert_eq!(ZSTD_isError(written), 0);
+    let bare = ZSTD_createDCtx();
+    let read =
+        unsafe { ZSTD_decompressDCtx(bare, out.as_mut_ptr(), out.len(), frame.as_ptr(), written) };
+    assert_eq!(ZSTD_isError(read), 0, "detached frame must decode bare");
+    unsafe { ZSTD_freeDCtx(bare) };
+
+    unsafe { ZSTD_freeDCtx(dctx) };
+    unsafe { ZSTD_freeCCtx(cctx) };
+    unsafe { ZSTD_freeCDict(cdict) };
+    unsafe { ZSTD_freeDDict(ddict) };
+}
+
+#[test]
+fn ref_prefix_is_single_use_and_roundtrips() {
+    let prefix = dict_payload();
+    let mut payload = prefix[..2048].to_vec();
+    payload.extend_from_slice(b"unique suffix after prefix material 0123456789");
+
+    let cctx = ZSTD_createCCtx();
+    assert_eq!(
+        ZSTD_isError(unsafe { ZSTD_CCtx_refPrefix(cctx, prefix.as_ptr(), prefix.len()) }),
+        0
+    );
+    let mut frame = vec![0u8; payload.len() + 512];
+    let written = unsafe {
+        ZSTD_compress2(
+            cctx,
+            frame.as_mut_ptr(),
+            frame.len(),
+            payload.as_ptr(),
+            payload.len(),
+        )
+    };
+    assert_eq!(ZSTD_isError(written), 0);
+    frame.truncate(written);
+    assert_eq!(
+        unsafe { ZSTD_getDictID_fromFrame(frame.as_ptr(), frame.len()) },
+        0
+    );
+
+    // Single-use: the next frame must not depend on the prefix.
+    let mut frame2 = vec![0u8; payload.len() + 512];
+    let written2 = unsafe {
+        ZSTD_compress2(
+            cctx,
+            frame2.as_mut_ptr(),
+            frame2.len(),
+            payload.as_ptr(),
+            payload.len(),
+        )
+    };
+    assert_eq!(ZSTD_isError(written2), 0);
+    let bare = ZSTD_createDCtx();
+    let mut out = vec![0u8; payload.len() + 64];
+    let read = unsafe {
+        ZSTD_decompressDCtx(bare, out.as_mut_ptr(), out.len(), frame2.as_ptr(), written2)
+    };
+    assert_eq!(ZSTD_isError(read), 0, "post-prefix frame must decode bare");
+    assert_eq!(&out[..read], payload.as_slice());
+    unsafe { ZSTD_freeDCtx(bare) };
+
+    // The prefixed frame decodes only with the same prefix referenced.
+    let dctx = ZSTD_createDCtx();
+    assert_eq!(
+        ZSTD_isError(unsafe { ZSTD_DCtx_refPrefix(dctx, prefix.as_ptr(), prefix.len()) }),
+        0
+    );
+    let read = unsafe {
+        ZSTD_decompressDCtx(
+            dctx,
+            out.as_mut_ptr(),
+            out.len(),
+            frame.as_ptr(),
+            frame.len(),
+        )
+    };
+    assert_eq!(ZSTD_isError(read), 0);
+    assert_eq!(&out[..read], payload.as_slice());
+    unsafe { ZSTD_freeDCtx(dctx) };
+    unsafe { ZSTD_freeCCtx(cctx) };
+}
+
+#[test]
+fn streaming_roundtrips_with_loaded_dictionary() {
+    let dict = trained_dictionary();
+    let payload = dict_payload();
+
+    let cctx = ZSTD_createCCtx();
+    assert_eq!(
+        ZSTD_isError(unsafe { ZSTD_CCtx_loadDictionary(cctx, dict.as_ptr(), dict.len()) }),
+        0
+    );
+    let mut frame = vec![0u8; payload.len() + 1024];
+    let mut inb = ZSTD_inBuffer {
+        src: payload.as_ptr().cast(),
+        size: payload.len(),
+        pos: 0,
+    };
+    let mut outb = ZSTD_outBuffer {
+        dst: frame.as_mut_ptr().cast(),
+        size: frame.len(),
+        pos: 0,
+    };
+    let rc = unsafe {
+        ZSTD_compressStream2(cctx, &mut outb, &mut inb, 2 /* ZSTD_e_end */)
+    };
+    assert_eq!(ZSTD_isError(rc), 0);
+    assert_eq!(rc, 0, "single-shot end must finish in one call");
+    frame.truncate(outb.pos);
+
+    let dict_id = unsafe { ZSTD_getDictID_fromDict(dict.as_ptr(), dict.len()) };
+    assert_eq!(
+        unsafe { ZSTD_getDictID_fromFrame(frame.as_ptr(), frame.len()) },
+        dict_id
+    );
+
+    let dctx = ZSTD_createDCtx();
+    assert_eq!(
+        ZSTD_isError(unsafe { ZSTD_DCtx_loadDictionary(dctx, dict.as_ptr(), dict.len()) }),
+        0
+    );
+    let mut out = vec![0u8; payload.len() + 64];
+    let mut inb = ZSTD_inBuffer {
+        src: frame.as_ptr().cast(),
+        size: frame.len(),
+        pos: 0,
+    };
+    let mut outb = ZSTD_outBuffer {
+        dst: out.as_mut_ptr().cast(),
+        size: out.len(),
+        pos: 0,
+    };
+    let rc = unsafe { ZSTD_decompressStream(dctx, &mut outb, &mut inb) };
+    assert_eq!(ZSTD_isError(rc), 0);
+    assert_eq!(rc, 0, "whole frame supplied; decode must finish");
+    assert_eq!(&out[..outb.pos], payload.as_slice());
+    unsafe { ZSTD_freeDCtx(dctx) };
+    unsafe { ZSTD_freeCCtx(cctx) };
+}
+
+#[test]
+fn using_dict_one_shots_roundtrip() {
+    let dict = trained_dictionary();
+    let payload = dict_payload();
+    let cctx = ZSTD_createCCtx();
+    let dctx = ZSTD_createDCtx();
+    let mut frame = vec![0u8; payload.len() + 512];
+    let written = unsafe {
+        ZSTD_compress_usingDict(
+            cctx,
+            frame.as_mut_ptr(),
+            frame.len(),
+            payload.as_ptr(),
+            payload.len(),
+            dict.as_ptr(),
+            dict.len(),
+            5,
+        )
+    };
+    assert_eq!(ZSTD_isError(written), 0);
+    let mut out = vec![0u8; payload.len() + 64];
+    let read = unsafe {
+        ZSTD_decompress_usingDict(
+            dctx,
+            out.as_mut_ptr(),
+            out.len(),
+            frame.as_ptr(),
+            written,
+            dict.as_ptr(),
+            dict.len(),
+        )
+    };
+    assert_eq!(ZSTD_isError(read), 0);
+    assert_eq!(&out[..read], payload.as_slice());
+
+    // Empty dictionary degrades to the plain one-shots.
+    let written = unsafe {
+        ZSTD_compress_usingDict(
+            cctx,
+            frame.as_mut_ptr(),
+            frame.len(),
+            payload.as_ptr(),
+            payload.len(),
+            core::ptr::null(),
+            0,
+            5,
+        )
+    };
+    assert_eq!(ZSTD_isError(written), 0);
+    let read = unsafe {
+        ZSTD_decompress_usingDict(
+            dctx,
+            out.as_mut_ptr(),
+            out.len(),
+            frame.as_ptr(),
+            written,
+            core::ptr::null(),
+            0,
+        )
+    };
+    assert_eq!(ZSTD_isError(read), 0);
+    assert_eq!(&out[..read], payload.as_slice());
+    unsafe { ZSTD_freeDCtx(dctx) };
+    unsafe { ZSTD_freeCCtx(cctx) };
+}
+
+#[test]
+fn cdict_advanced_honours_cparams_and_fparams() {
+    let raw = dict_payload();
+    let mut payload = raw[..1024].to_vec();
+    payload.extend_from_slice(b"advanced unique tail 0123456789");
+    let no_mem = ZSTD_customMem {
+        customAlloc: core::ptr::null(),
+        customFree: core::ptr::null(),
+        opaque: core::ptr::null(),
+    };
+    let cparams = ZSTD_compressionParameters {
+        windowLog: 0,
+        chainLog: 0,
+        hashLog: 0,
+        searchLog: 0,
+        minMatch: 0,
+        targetLength: 0,
+        strategy: 2, // dfast
+    };
+    let cdict = unsafe {
+        ZSTD_createCDict_advanced(
+            raw.as_ptr(),
+            raw.len(),
+            0,
+            1, // rawContent
+            cparams,
+            no_mem,
+        )
+    };
+    assert!(!cdict.is_null());
+    let ddict = unsafe { ZSTD_createDDict_advanced(raw.as_ptr(), raw.len(), 0, 1, no_mem) };
+    assert!(!ddict.is_null());
+
+    let cctx = ZSTD_createCCtx();
+    let fparams = ZSTD_frameParameters {
+        contentSizeFlag: 1,
+        checksumFlag: 1,
+        noDictIDFlag: 1,
+    };
+    let mut frame = vec![0u8; payload.len() + 512];
+    let written = unsafe {
+        ZSTD_compress_usingCDict_advanced(
+            cctx,
+            frame.as_mut_ptr(),
+            frame.len(),
+            payload.as_ptr(),
+            payload.len(),
+            cdict,
+            fparams,
+        )
+    };
+    assert_eq!(ZSTD_isError(written), 0);
+    frame.truncate(written);
+    assert_eq!(
+        unsafe { ZSTD_getDictID_fromFrame(frame.as_ptr(), frame.len()) },
+        0
+    );
+
+    let dctx = ZSTD_createDCtx();
+    let mut out = vec![0u8; payload.len() + 64];
+    let read = unsafe {
+        ZSTD_decompress_usingDDict(
+            dctx,
+            out.as_mut_ptr(),
+            out.len(),
+            frame.as_ptr(),
+            frame.len(),
+            ddict,
+        )
+    };
+    assert_eq!(ZSTD_isError(read), 0);
+    assert_eq!(&out[..read], payload.as_slice());
+
+    // A non-NULL custom allocator is unsupported and must fail creation.
+    let bad_mem = ZSTD_customMem {
+        customAlloc: ZSTD_createCCtx as *const core::ffi::c_void,
+        customFree: core::ptr::null(),
+        opaque: core::ptr::null(),
+    };
+    let rejected =
+        unsafe { ZSTD_createCDict_advanced(raw.as_ptr(), raw.len(), 0, 1, cparams, bad_mem) };
+    assert!(rejected.is_null());
+
+    unsafe { ZSTD_freeDCtx(dctx) };
+    unsafe { ZSTD_freeCCtx(cctx) };
+    unsafe { ZSTD_freeCDict(cdict) };
+    unsafe { ZSTD_freeDDict(ddict) };
+}
+
+#[test]
+fn estimates_are_sane_budgets() {
+    let l3 = ZSTD_estimateCCtxSize(3);
+    let l19 = ZSTD_estimateCCtxSize(19);
+    assert!(l3 > 1 << 19, "estimate must cover at least the window");
+    assert!(l19 > l3, "higher level must budget more");
+    assert!(ZSTD_estimateCStreamSize(3) > l3);
+    let dctx = ZSTD_estimateDCtxSize();
+    assert!(dctx > core::mem::size_of::<crate::context::ZSTD_DCtx>());
+    assert!(ZSTD_estimateDStreamSize(1 << 20) > dctx + (1 << 20));
+    let cparams = ZSTD_compressionParameters {
+        windowLog: 20,
+        chainLog: 17,
+        hashLog: 17,
+        searchLog: 1,
+        minMatch: 5,
+        targetLength: 0,
+        strategy: 2,
+    };
+    assert!(ZSTD_estimateCCtxSize_usingCParams(cparams) > (1 << 20) + 2 * (4 << 17));
+}
+
+#[test]
+fn zdict_fastcover_trains_usable_dictionary() {
+    let mut samples: Vec<u8> = Vec::new();
+    let mut sizes: Vec<usize> = Vec::new();
+    for i in 0..512u32 {
+        let s = format!("tenant=demo table=orders key={i} region=eu payload=aaaaabbbbbccccc\n");
+        sizes.push(s.len());
+        samples.extend_from_slice(s.as_bytes());
+    }
+    let mut dict = vec![0u8; 64 * 1024];
+    let mut params = ZDICT_fastCover_params_t {
+        k: 256,
+        d: 8,
+        f: 20,
+        steps: 0,
+        nbThreads: 0,
+        splitPoint: 0.0,
+        accel: 1,
+        shrinkDict: 0,
+        shrinkDictMaxRegression: 0,
+        zParams: ZDICT_params_t {
+            compressionLevel: 0,
+            notificationLevel: 0,
+            dictID: 0,
+        },
+    };
+    let n = unsafe {
+        ZDICT_trainFromBuffer_fastCover(
+            dict.as_mut_ptr(),
+            dict.len(),
+            samples.as_ptr(),
+            sizes.as_ptr(),
+            sizes.len() as u32,
+            params,
+        )
+    };
+    assert_eq!(ZDICT_isError(n), 0, "fastCover training failed");
+    assert_ne!(
+        unsafe { ZSTD_getDictID_fromDict(dict.as_ptr(), n) },
+        0,
+        "trained dictionary must carry an ID"
+    );
+
+    // The optimizing entry sweeps when k/d are 0 and writes back the choice.
+    params.k = 0;
+    params.d = 0;
+    let n = unsafe {
+        ZDICT_optimizeTrainFromBuffer_fastCover(
+            dict.as_mut_ptr(),
+            dict.len(),
+            samples.as_ptr(),
+            sizes.as_ptr(),
+            sizes.len() as u32,
+            &mut params,
+        )
+    };
+    assert_eq!(ZDICT_isError(n), 0, "optimize fastCover failed");
+    assert_ne!(params.k, 0, "optimize must write back the chosen k");
+    assert_ne!(params.d, 0, "optimize must write back the chosen d");
 }

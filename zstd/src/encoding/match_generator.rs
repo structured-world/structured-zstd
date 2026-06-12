@@ -941,6 +941,33 @@ fn level22_btultra2_params_for_source_size(source_size: Option<u64>) -> LevelPar
     }
 }
 
+/// Estimated steady-state heap footprint of a one-shot compression context
+/// at `level` (window history + match-finder tables + block staging), in
+/// bytes. Computed from the same per-level tuning table the encoder
+/// resolves at frame start, so the estimate tracks the real allocations;
+/// it is an upper-bound style budget figure, not an exact accounting.
+pub fn estimated_compression_workspace_bytes(level: CompressionLevel) -> usize {
+    let params = resolve_level_params(level, None);
+    let window = 1usize << params.window_log;
+    let tables = params.fast.map(|f| 4usize << f.hash_log).unwrap_or(0)
+        + params
+            .dfast
+            .map(|d| (4usize << d.long_hash_log) + (4usize << d.short_hash_log))
+            .unwrap_or(0)
+        + params
+            .hc
+            .map(|h| (4usize << h.hash_log) + (4usize << h.chain_log))
+            .unwrap_or(0)
+        + params
+            .row
+            .map(|r| (4usize << r.hash_bits) + (2usize << r.hash_bits))
+            .unwrap_or(0);
+    // Block staging: literal + sequence buffers plus the compressed-block
+    // scratch, each bounded by the 128 KiB block size.
+    let staging = 3 * (128 * 1024);
+    window + tables + staging
+}
+
 /// Resolve a [`CompressionLevel`] to internal tuning parameters,
 /// optionally adjusted for a known source size.
 fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> LevelParams {
