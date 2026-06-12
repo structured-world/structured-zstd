@@ -230,9 +230,10 @@ pub struct ZSTD_customMem {
 }
 
 /// Representative compression level for an explicit strategy ordinal: feeds
-/// the level-derived defaults for the knobs `cParams` leaves at 0.
-fn level_for_strategy(strategy: c_uint) -> c_int {
-    match strategy {
+/// the level-derived defaults for the knobs `cParams` leaves at 0. `None`
+/// for ordinals outside `ZSTD_strategy`'s 1..=9 (invalid input, not a tier).
+fn level_for_strategy(strategy: c_uint) -> Option<c_int> {
+    Some(match strategy {
         1 => 1,  // fast
         2 => 3,  // dfast
         3 => 5,  // greedy
@@ -241,17 +242,21 @@ fn level_for_strategy(strategy: c_uint) -> c_int {
         6 => 13, // btlazy2
         7 => 16, // btopt
         8 => 18, // btultra
-        _ => 19, // btultra2 (and out-of-range falls into the strongest tier)
-    }
+        9 => 19, // btultra2
+        _ => return None,
+    })
 }
 
 /// Map explicit `ZSTD_compressionParameters` to the sticky-parameter
 /// snapshot the codec resolves (0 = auto for every knob, upstream rule).
-fn cctx_params_from_cparams(cparams: &ZSTD_compressionParameters) -> crate::params::CCtxParams {
+/// `None` when the strategy ordinal is outside `ZSTD_strategy`'s range.
+fn cctx_params_from_cparams(
+    cparams: &ZSTD_compressionParameters,
+) -> Option<crate::params::CCtxParams> {
     use codec::encoding::Strategy;
     let opt = |v: c_uint| if v == 0 { None } else { Some(v) };
-    crate::params::CCtxParams {
-        level: level_for_strategy(cparams.strategy),
+    Some(crate::params::CCtxParams {
+        level: level_for_strategy(cparams.strategy)?,
         window_log: opt(cparams.windowLog),
         hash_log: opt(cparams.hashLog),
         chain_log: opt(cparams.chainLog),
@@ -260,7 +265,7 @@ fn cctx_params_from_cparams(cparams: &ZSTD_compressionParameters) -> crate::para
         target_length: opt(cparams.targetLength),
         strategy: Strategy::from_ordinal(cparams.strategy),
         ..crate::params::CCtxParams::default()
-    }
+    })
 }
 
 /// `ZSTD_CDict* ZSTD_createCDict_advanced(const void* dictBuffer, size_t
@@ -306,10 +311,12 @@ pub unsafe extern "C" fn ZSTD_createCDict_advanced(
             _ => return core::ptr::null_mut(),
         }
     }
-    let params = cctx_params_from_cparams(&cparams);
-    // Validate the explicit parameters up front: an unsupported combination
-    // must fail creation (NULL) rather than silently skip `set_parameters`
-    // at attach time.
+    // Validate the explicit parameters up front: an invalid strategy ordinal
+    // or an unsupported combination must fail creation (NULL) rather than
+    // silently skip `set_parameters` at attach time.
+    let Some(params) = cctx_params_from_cparams(&cparams) else {
+        return core::ptr::null_mut();
+    };
     if params.resolve().is_none() {
         return core::ptr::null_mut();
     }
