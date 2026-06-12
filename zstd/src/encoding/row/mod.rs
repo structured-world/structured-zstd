@@ -1402,6 +1402,7 @@ impl RowMatchGenerator {
         self.history_abs_start + self.live_history().len()
     }
 
+    #[inline(always)]
     pub(crate) fn hash_and_row(&self, abs_pos: usize) -> Option<(usize, u8)> {
         let idx = abs_pos - self.history_abs_start;
         let concat = self.live_history();
@@ -1679,7 +1680,7 @@ impl RowMatchGenerator {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn insert_position<const ROW_LOG: usize>(&mut self, abs_pos: usize) {
         let Some((row, tag)) = self.hash_and_row(abs_pos) else {
             return;
@@ -1717,7 +1718,7 @@ impl RowMatchGenerator {
     /// [`Self::insert_position`] with the (row, tag) pair already computed —
     /// the greedy miss path reuses the probe's hash instead of re-hashing
     /// the same position.
-    #[inline]
+    #[inline(always)]
     fn insert_at<const ROW_LOG: usize>(&mut self, abs_pos: usize, row: usize, tag: u8) {
         // `ROW_LOG` is the compile-time row width for this monomorphisation;
         // the dispatcher guarantees `ROW_LOG == self.row_log` so the table
