@@ -228,6 +228,13 @@ pub unsafe extern "C" fn ZDICT_trainFromBuffer_fastCover(
     nb_samples: c_uint,
     parameters: ZDICT_fastCover_params_t,
 ) -> usize {
+    // The non-optimizing entry requires explicit segment/dmer sizes:
+    // upstream rejects 0 here (the optimizing entry is the one that sweeps
+    // defaults), so silently substituting the candidate-grid defaults would
+    // accept invalid input.
+    if parameters.k == 0 || parameters.d == 0 {
+        return encode(ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound);
+    }
     unsafe {
         train_fastcover(
             dict_buffer,

@@ -353,13 +353,15 @@ pub unsafe extern "C" fn ZSTD_createDDict_advanced(
     if dict.is_empty() {
         return core::ptr::null_mut();
     }
-    if !matches!(
-        dict_content_type,
-        crate::attach::ZSTD_DCT_AUTO
-            | crate::attach::ZSTD_DCT_RAW_CONTENT
-            | crate::attach::ZSTD_DCT_FULL_DICT
-    ) {
-        return core::ptr::null_mut();
+    // FULL_DICT requires the dictionary magic up front: failing here mirrors
+    // the CDict creator and the loadDictionary paths, instead of handing out
+    // a handle that only fails later at decompression time.
+    let has_magic =
+        dict.len() >= 4 && u32::from_le_bytes([dict[0], dict[1], dict[2], dict[3]]) == DICT_MAGIC;
+    match dict_content_type {
+        crate::attach::ZSTD_DCT_AUTO | crate::attach::ZSTD_DCT_RAW_CONTENT => {}
+        crate::attach::ZSTD_DCT_FULL_DICT if has_magic => {}
+        _ => return core::ptr::null_mut(),
     }
     let id = if dict_content_type == crate::attach::ZSTD_DCT_RAW_CONTENT {
         0
