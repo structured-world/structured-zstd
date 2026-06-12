@@ -344,7 +344,7 @@ pub unsafe extern "C" fn ZSTD_compress2(
         Ok(())
     }));
     match outcome {
-        Ok(Ok(())) => cctx.consume_prefix(),
+        Ok(Ok(())) => {}
         Ok(Err(code)) => {
             cctx.dict_compressor = None;
             cctx.dict_serial = 0;
@@ -362,6 +362,10 @@ pub unsafe extern "C" fn ZSTD_compress2(
     }
     let dst = unsafe { out_slice(dst, dst_capacity) };
     dst[..len].copy_from_slice(&cctx.scratch);
+    // The single-use prefix is spent only now that the frame actually
+    // reached the caller: a dstSize_tooSmall failure above must leave it
+    // armed for the retry with a bigger buffer.
+    cctx.consume_prefix();
     len
 }
 
