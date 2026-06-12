@@ -442,9 +442,11 @@ macro_rules! greedy_parse_body {
 /// Rep + row best-of-two probe (the lazy search step) with the probe body
 /// expanded inline under the enclosing tier umbrella.
 macro_rules! row_best_match {
-    ($m:expr, $abs_pos:expr, $lit_len:expr, $rl:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
+    ($m:expr, $abs_pos:expr, $lit_len:expr, $hash:expr, $rl:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
         let rep = $m.repcode_candidate($abs_pos, $lit_len);
-        let row = row_probe_body!($m, $abs_pos, $lit_len, None, $rl, $use_mask, $maskmac, $cpl);
+        let row = row_probe_body!(
+            $m, $abs_pos, $lit_len, $hash, $rl, $use_mask, $maskmac, $cpl
+        );
         best_len_offset_candidate(rep, row)
     }};
 }
@@ -471,8 +473,9 @@ macro_rules! gen_row_find_monolith {
             &mut self,
             abs_pos: usize,
             lit_len: usize,
+            hash: Option<(usize, u8)>,
         ) -> Option<MatchCandidate> {
-            row_best_match!(self, abs_pos, lit_len, ROW_LOG, $use_mask, $maskmac, $cpl)
+            row_best_match!(self, abs_pos, lit_len, hash, ROW_LOG, $use_mask, $maskmac, $cpl)
         }
     };
 }
@@ -505,7 +508,12 @@ macro_rules! lazy_parse_body {
                 let abs_pos = current_abs_start + pos;
                 let lit_len = pos - literals_start;
 
-                let best = unsafe { $m.$find::<K, $rl>(abs_pos, lit_len) };
+                // Hash the position ONCE per iteration: the probe consumes it
+                // and the defer branch reuses it for the insert (upstream zstd
+                // hashes once per position — `ZSTD_RowFindBestMatch` updates
+                // the row as part of the search, `zstd_lazy.c`).
+                let hash = $m.hash_and_row(abs_pos);
+                let best = unsafe { $m.$find::<K, $rl>(abs_pos, lit_len, hash) };
                 let picked = pick_lazy_match_shared(
                     abs_pos,
                     lit_len,
@@ -519,7 +527,9 @@ macro_rules! lazy_parse_body {
                     // SAFETY: the enclosing kernel is only entered when its
                     // tier was runtime-detected, so the same-feature search
                     // fn's target_feature contract is upheld.
-                    |next_pos, next_lit_len| unsafe { $m.$find::<K, $rl>(next_pos, next_lit_len) },
+                    |next_pos, next_lit_len| unsafe {
+                        $m.$find::<K, $rl>(next_pos, next_lit_len, None)
+                    },
                 );
                 if let Some(candidate) = picked {
                     $m.insert_match_span::<$rl>(abs_pos, candidate.start + candidate.match_len);
@@ -539,7 +549,11 @@ macro_rules! lazy_parse_body {
                     pos = start + candidate.match_len;
                     literals_start = pos;
                 } else {
-                    $m.insert_position::<$rl>(abs_pos);
+                    // Reuse the iteration's hash for the defer-path insert
+                    // instead of rehashing the same position.
+                    if let Some((row, tag)) = hash {
+                        $m.insert_at::<$rl>(abs_pos, row, tag);
+                    }
                     pos += 1;
                 }
             }
