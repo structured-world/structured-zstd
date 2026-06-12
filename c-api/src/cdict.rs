@@ -116,7 +116,7 @@ impl ZSTD_CDict {
                 .map_err(|_| ())?;
             enc.set_encoder_dictionary(EncoderDictionary::from_dictionary(dict))
                 .map_err(|_| ())?;
-            enc.set_dictionary_id_flag(false);
+            enc.set_dictionary_id_flag(false).map_err(|_| ())?;
         } else {
             enc.set_dictionary_from_bytes(&self.raw).map_err(|_| ())?;
         }
@@ -148,8 +148,11 @@ pub unsafe extern "C" fn ZSTD_createCDict(
     // parse for encoding (fail-fast entropy-table build; the per-context
     // attach re-parses from the retained bytes), anything else is a
     // raw-content dictionary.
+    // Classify on the 4-byte magic alone; a truncated magic-prefixed blob
+    // then fails the encoder parse below as corrupted (upstream parity)
+    // instead of silently degrading to raw content.
     let raw_content =
-        dict.len() < 8 || u32::from_le_bytes([dict[0], dict[1], dict[2], dict[3]]) != DICT_MAGIC;
+        dict.len() < 4 || u32::from_le_bytes([dict[0], dict[1], dict[2], dict[3]]) != DICT_MAGIC;
     if !raw_content {
         let outcome = catch_unwind(AssertUnwindSafe(|| EncoderDictionary::from_bytes(dict)));
         match outcome {
@@ -278,7 +281,10 @@ pub unsafe extern "C" fn ZSTD_createCDict_advanced(
     cparams: ZSTD_compressionParameters,
     custom_mem: ZSTD_customMem,
 ) -> *mut ZSTD_CDict {
-    if !custom_mem.customAlloc.is_null() || !custom_mem.customFree.is_null() {
+    if !custom_mem.customAlloc.is_null()
+        || !custom_mem.customFree.is_null()
+        || !custom_mem.opaque.is_null()
+    {
         return core::ptr::null_mut();
     }
     let dict = unsafe { in_slice(dict_buffer, dict_size) };
@@ -286,7 +292,7 @@ pub unsafe extern "C" fn ZSTD_createCDict_advanced(
         return core::ptr::null_mut();
     }
     let has_magic =
-        dict.len() >= 8 && u32::from_le_bytes([dict[0], dict[1], dict[2], dict[3]]) == DICT_MAGIC;
+        dict.len() >= 4 && u32::from_le_bytes([dict[0], dict[1], dict[2], dict[3]]) == DICT_MAGIC;
     let raw_content = match dict_content_type {
         crate::attach::ZSTD_DCT_AUTO => !has_magic,
         crate::attach::ZSTD_DCT_RAW_CONTENT => true,
@@ -331,7 +337,10 @@ pub unsafe extern "C" fn ZSTD_createDDict_advanced(
     dict_content_type: c_int,
     custom_mem: ZSTD_customMem,
 ) -> *mut ZSTD_DDict {
-    if !custom_mem.customAlloc.is_null() || !custom_mem.customFree.is_null() {
+    if !custom_mem.customAlloc.is_null()
+        || !custom_mem.customFree.is_null()
+        || !custom_mem.opaque.is_null()
+    {
         return core::ptr::null_mut();
     }
     let dict = unsafe { in_slice(dict_buffer, dict_size) };

@@ -588,7 +588,9 @@ impl ZstdCompressStream {
                 JsError::new(&format!("structured-zstd: invalid dictionary: {err:?}"))
             })?;
         if dict.suppress_id {
-            encoder.set_dictionary_id_flag(false);
+            encoder
+                .set_dictionary_id_flag(false)
+                .expect("flag set before the first write on a fresh encoder");
         }
         Ok(ZstdCompressStream {
             encoder: Some(encoder),

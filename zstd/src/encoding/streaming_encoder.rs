@@ -295,8 +295,15 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
     /// is attached (upstream `ZSTD_c_dictIDFlag` semantics; default `true`).
     /// Mirrors [`FrameCompressor::set_dictionary_id_flag`]. Decoders can still
     /// decode such frames by supplying the dictionary explicitly.
-    pub fn set_dictionary_id_flag(&mut self, emit: bool) {
+    pub fn set_dictionary_id_flag(&mut self, emit: bool) -> Result<(), Error> {
+        self.ensure_open()?;
+        if self.frame_started {
+            return Err(invalid_input_error(
+                "dictionary ID flag must be set before the first write",
+            ));
+        }
         self.dictionary_id_flag = emit;
+        Ok(())
     }
 
     /// Attach an already-parsed [`EncoderDictionary`] to the frame. See

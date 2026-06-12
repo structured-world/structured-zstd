@@ -345,7 +345,7 @@ export async function createDecompressStreamWithDictionary(
  * const dict = await ZstdDict.create(dictBytes);
  * const frame = dict.compress(payload, 19);
  * const back = dict.decompress(frame);
- * const stream = await dict.compressStream(19);
+ * const stream = dict.compressStream(19);
  * ```
  */
 export class ZstdDict {

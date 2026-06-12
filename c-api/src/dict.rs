@@ -8,7 +8,9 @@ use core::ffi::{c_char, c_int, c_uint};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use codec::decoding::Dictionary;
-use codec::dictionary::{FastCoverOptions, FinalizeOptions, create_fastcover_dict_from_source};
+use codec::dictionary::{
+    FastCoverOptions, FastCoverTuned, FinalizeOptions, create_fastcover_dict_from_source,
+};
 
 use crate::error::{ZSTD_ErrorCode, encode};
 use crate::ffi::in_slice;
@@ -160,6 +162,13 @@ fn fastcover_options(params: &ZDICT_fastCover_params_t, optimize: bool) -> FastC
 ///
 /// # Safety
 /// Buffer contracts of [`ZDICT_trainFromBuffer`].
+/// Sweep mode for [`train_fastcover`]: plain training pins the caller's
+/// explicit parameters; optimizing reports the sweep's winner back.
+enum FastCoverMode<'a> {
+    Plain,
+    Optimize(&'a mut FastCoverTuned),
+}
+
 unsafe fn train_fastcover(
     dict_buffer: *mut u8,
     dict_capacity: usize,
@@ -167,7 +176,7 @@ unsafe fn train_fastcover(
     samples_sizes: *const usize,
     nb_samples: c_uint,
     params: &ZDICT_fastCover_params_t,
-    optimize: bool,
+    mode: FastCoverMode<'_>,
 ) -> usize {
     let Some(total) = (unsafe { total_sample_len(samples_sizes, nb_samples) }) else {
         return encode(ZSTD_ErrorCode::ZSTD_error_dictionaryCreation_failed);
@@ -176,17 +185,21 @@ unsafe fn train_fastcover(
     let finalize = FinalizeOptions {
         dict_id: (params.zParams.dictID != 0).then_some(params.zParams.dictID),
     };
+    let optimize = matches!(mode, FastCoverMode::Optimize(_));
     let opts = fastcover_options(params, optimize);
 
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         let mut out = Vec::new();
         create_fastcover_dict_from_source(samples, &mut out, dict_capacity, &opts, finalize)
-            .map(|_| out)
+            .map(|tuned| (out, tuned))
     }));
-    let dict = match outcome {
-        Ok(Ok(dict)) => dict,
+    let (dict, tuned) = match outcome {
+        Ok(Ok(pair)) => pair,
         _ => return encode(ZSTD_ErrorCode::ZSTD_error_dictionaryCreation_failed),
     };
+    if let FastCoverMode::Optimize(slot) = mode {
+        *slot = tuned;
+    }
     if dict.len() > dict_capacity {
         return encode(ZSTD_ErrorCode::ZSTD_error_dstSize_tooSmall);
     }
@@ -219,7 +232,7 @@ pub unsafe extern "C" fn ZDICT_trainFromBuffer_fastCover(
             samples_sizes,
             nb_samples,
             &parameters,
-            false,
+            FastCoverMode::Plain,
         )
     }
 }
@@ -247,6 +260,13 @@ pub unsafe extern "C" fn ZDICT_optimizeTrainFromBuffer_fastCover(
         return encode(ZSTD_ErrorCode::ZSTD_error_GENERIC);
     }
     let params = unsafe { *parameters };
+    let mut tuned = FastCoverTuned {
+        k: 0,
+        d: 0,
+        f: 0,
+        accel: 0,
+        score: 0,
+    };
     let written = unsafe {
         train_fastcover(
             dict_buffer,
@@ -255,19 +275,16 @@ pub unsafe extern "C" fn ZDICT_optimizeTrainFromBuffer_fastCover(
             samples_sizes,
             nb_samples,
             &params,
-            true,
+            FastCoverMode::Optimize(&mut tuned),
         )
     };
     if !crate::error::result_is_error(written) {
-        // The trainer does not report the swept winner back, so pin the
-        // write-back to the effective values (defaults where the caller
-        // passed 0). Upstream writes the chosen k/d/f here.
-        let opts = fastcover_options(&params, true);
+        // Write back the sweep's actual winner (upstream semantics).
         let p = unsafe { &mut *parameters };
-        p.k = opts.k as c_uint;
-        p.d = opts.d as c_uint;
-        p.f = opts.f;
-        p.accel = opts.accel as c_uint;
+        p.k = tuned.k as c_uint;
+        p.d = tuned.d as c_uint;
+        p.f = tuned.f;
+        p.accel = tuned.accel as c_uint;
     }
     written
 }

@@ -186,6 +186,7 @@ pub unsafe extern "C" fn ZSTD_sizeof_CCtx(cctx: *const ZSTD_CCtx) -> usize {
             .as_ref()
             .map_or(0, |enc| enc.heap_size())
         + cctx.stream.as_ref().map_or(0, |s| s.heap_size())
+        + cctx.attached_dict.heap_size()
 }
 
 /// `size_t ZSTD_compressCCtx(ZSTD_CCtx* cctx, void* dst, size_t dstCapacity,
@@ -418,7 +419,9 @@ pub unsafe extern "C" fn ZSTD_sizeof_DCtx(dctx: *const ZSTD_DCtx) -> usize {
         return 0;
     }
     let dctx = unsafe { &*dctx };
-    core::mem::size_of::<ZSTD_DCtx>() + dctx.decoder.workspace_size()
+    core::mem::size_of::<ZSTD_DCtx>()
+        + dctx.decoder.workspace_size()
+        + dctx.attached_ddict.heap_size()
 }
 
 /// `size_t ZSTD_decompressDCtx(ZSTD_DCtx* dctx, void* dst, size_t dstCapacity,

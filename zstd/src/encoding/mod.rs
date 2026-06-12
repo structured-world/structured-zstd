@@ -37,6 +37,10 @@
 //!
 //! All produced frames are valid RFC 8878 Zstandard streams and decode
 //! through both this crate's [`crate::decoding`] module and upstream C zstd.
+//!
+//! For memory budgeting, [`estimated_compression_workspace_bytes`] reports
+//! the approximate steady-state heap footprint of a one-shot compression at
+//! a given level (window + match-finder tables + block staging).
 
 pub(crate) mod block_header;
 pub(crate) mod blocks;

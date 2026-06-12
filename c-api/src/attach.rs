@@ -65,6 +65,19 @@ pub(crate) enum CCtxDictAttach {
     Prefix { content: Vec<u8>, serial: u64 },
 }
 
+impl CCtxDictAttach {
+    /// Heap bytes owned by the attach state. Referenced (`RefCDict`)
+    /// dictionaries are caller-owned and excluded, matching upstream's
+    /// `ZSTD_sizeof_CCtx` treatment of referenced dictionaries.
+    pub(crate) fn heap_size(&self) -> usize {
+        match self {
+            CCtxDictAttach::None | CCtxDictAttach::RefCDict { .. } => 0,
+            CCtxDictAttach::Load { raw, .. } => raw.capacity(),
+            CCtxDictAttach::Prefix { content, .. } => content.capacity(),
+        }
+    }
+}
+
 /// Dictionary state attached to a decompression context. All variants hold
 /// the dictionary pre-parsed as a [`DictionaryHandle`] (`Arc`-shared), so the
 /// per-frame application is a refcount bump.
@@ -86,14 +99,35 @@ pub(crate) enum DCtxDictAttach {
     },
 }
 
+impl DCtxDictAttach {
+    /// Heap bytes owned by the attach state: the parsed dictionary behind
+    /// `loadDictionary` / `refPrefix` is context-owned (counted); a
+    /// referenced `DDict`'s parse is cached here but its bytes belong to
+    /// the caller's handle, so only the parsed copy is reported.
+    pub(crate) fn heap_size(&self) -> usize {
+        match self {
+            DCtxDictAttach::None => 0,
+            DCtxDictAttach::Load { handle }
+            | DCtxDictAttach::RefDDict { handle, .. }
+            | DCtxDictAttach::Prefix { handle } => {
+                handle.as_dict().dict_content.len()
+                    + core::mem::size_of::<codec::decoding::Dictionary>()
+            }
+        }
+    }
+}
+
 /// Parse caller bytes into a decode-side [`DictionaryHandle`] honouring the
 /// `ZSTD_dictContentType_e` selection.
 pub(crate) fn parse_decode_dict(
     dict: &[u8],
     content_type: c_int,
 ) -> Result<DictionaryHandle, ZSTD_ErrorCode> {
+    // The magic is 4 bytes; classify on those alone (a magic-prefixed blob
+    // shorter than a full header then fails the parse as corrupted instead
+    // of silently degrading to raw content).
     let has_magic =
-        dict.len() >= 8 && u32::from_le_bytes([dict[0], dict[1], dict[2], dict[3]]) == DICT_MAGIC;
+        dict.len() >= 4 && u32::from_le_bytes([dict[0], dict[1], dict[2], dict[3]]) == DICT_MAGIC;
     let full = match content_type {
         ZSTD_DCT_AUTO => has_magic,
         ZSTD_DCT_RAW_CONTENT => false,
@@ -118,7 +152,7 @@ pub(crate) fn parse_decode_dict(
 /// Whether `dict` selects raw-content modelling on the encode side.
 fn encode_raw_content(dict: &[u8], content_type: c_int) -> Result<bool, ZSTD_ErrorCode> {
     let has_magic =
-        dict.len() >= 8 && u32::from_le_bytes([dict[0], dict[1], dict[2], dict[3]]) == DICT_MAGIC;
+        dict.len() >= 4 && u32::from_le_bytes([dict[0], dict[1], dict[2], dict[3]]) == DICT_MAGIC;
     match content_type {
         ZSTD_DCT_AUTO => Ok(!has_magic),
         ZSTD_DCT_RAW_CONTENT => Ok(true),
@@ -429,9 +463,10 @@ unsafe fn cctx_ref_prefix(
     if cctx.stream_in_progress() {
         return encode(ZSTD_ErrorCode::ZSTD_error_stage_wrong);
     }
-    // A prefix is raw content by definition; `ZSTD_DCT_FULL_DICT` is the only
-    // rejected selector (upstream refPrefix_advanced accepts auto/rawContent).
-    if content_type == ZSTD_DCT_FULL_DICT {
+    // A prefix is raw content by definition: only the auto / rawContent
+    // selectors are meaningful; everything else (fullDict, out-of-range
+    // discriminants) is rejected.
+    if !matches!(content_type, ZSTD_DCT_AUTO | ZSTD_DCT_RAW_CONTENT) {
         return encode(ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound);
     }
     let prefix = unsafe { in_slice(prefix, prefix_size) };
@@ -631,6 +666,24 @@ pub unsafe extern "C" fn ZSTD_DCtx_refPrefix(
         Ok(Err(code)) => encode(code),
         Err(_) => encode(ZSTD_ErrorCode::ZSTD_error_GENERIC),
     }
+}
+
+/// `ZSTD_DCtx_refPrefix_advanced` — explicit content type (`fullDict` is
+/// rejected; a prefix is raw content).
+///
+/// # Safety
+/// Same as [`ZSTD_DCtx_refPrefix`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_DCtx_refPrefix_advanced(
+    dctx: *mut ZSTD_DCtx,
+    prefix: *const u8,
+    prefix_size: usize,
+    content_type: c_int,
+) -> usize {
+    if !matches!(content_type, ZSTD_DCT_AUTO | ZSTD_DCT_RAW_CONTENT) {
+        return encode(ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound);
+    }
+    unsafe { ZSTD_DCtx_refPrefix(dctx, prefix, prefix_size) }
 }
 
 /// `size_t ZSTD_compress_usingDict(ZSTD_CCtx* ctx, void* dst, size_t

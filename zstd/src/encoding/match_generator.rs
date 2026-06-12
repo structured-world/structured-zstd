@@ -956,7 +956,17 @@ pub fn estimated_compression_workspace_bytes(level: CompressionLevel) -> usize {
             .unwrap_or(0)
         + params
             .hc
-            .map(|h| (4usize << h.hash_log) + (4usize << h.chain_log))
+            .map(|h| {
+                // The btopt/btultra cascade also allocates the HC3
+                // short-match side table (`HC3_HASH_LOG`); HC-mode lazy
+                // levels leave it sized to zero.
+                let hash3 = if matches!(params.search, super::strategy::SearchMethod::BinaryTree) {
+                    4usize << super::match_table::storage::HC3_HASH_LOG
+                } else {
+                    0
+                };
+                (4usize << h.hash_log) + (4usize << h.chain_log) + hash3
+            })
             .unwrap_or(0)
         + params
             .row

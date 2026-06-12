@@ -120,8 +120,8 @@ impl ZSTD_CCtx {
         let mut enc = StreamingEncoder::new(Vec::new(), CompressionLevel::from_level(level));
         if self.has_attached_dict() {
             self.apply_attached_dict_streaming(&mut enc)?;
-            if suppress_id || !params.dict_id_flag {
-                enc.set_dictionary_id_flag(false);
+            if (suppress_id || !params.dict_id_flag) && enc.set_dictionary_id_flag(false).is_err() {
+                return Err(ZSTD_ErrorCode::ZSTD_error_GENERIC);
             }
         }
         let mut setup = || -> Result<(), codec::io::Error> {

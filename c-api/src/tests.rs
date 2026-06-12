@@ -1577,8 +1577,11 @@ fn decompress_stream_recovers_after_failed_oneshot_on_midframe_context() {
 // ---- Phase 6.2 slice 2: dictionary attach + estimates + fastCover ----
 
 use crate::attach::{
-    ZSTD_CCtx_loadDictionary, ZSTD_CCtx_refCDict, ZSTD_CCtx_refPrefix, ZSTD_DCtx_loadDictionary,
-    ZSTD_DCtx_refDDict, ZSTD_DCtx_refPrefix, ZSTD_compress_usingDict, ZSTD_decompress_usingDict,
+    ZSTD_CCtx_loadDictionary, ZSTD_CCtx_loadDictionary_advanced,
+    ZSTD_CCtx_loadDictionary_byReference, ZSTD_CCtx_refCDict, ZSTD_CCtx_refPrefix,
+    ZSTD_DCtx_loadDictionary, ZSTD_DCtx_loadDictionary_advanced,
+    ZSTD_DCtx_loadDictionary_byReference, ZSTD_DCtx_refDDict, ZSTD_DCtx_refPrefix,
+    ZSTD_DCtx_refPrefix_advanced, ZSTD_compress_usingDict, ZSTD_decompress_usingDict,
     ZSTD_getDictID_fromDict, ZSTD_getDictID_fromFrame,
 };
 use crate::cdict::{
@@ -2214,3 +2217,125 @@ fn dict_compressor_cache_drops_stale_target_block_size() {
     unsafe { ZSTD_freeCCtx(cctx) };
 }
 
+#[test]
+fn by_reference_and_advanced_attach_variants_roundtrip() {
+    // The byReference / _advanced wrappers share the load body; exercise
+    // each entry point end-to-end so a signature or routing regression in
+    // any of them fails loudly.
+    let dict = trained_dictionary();
+    let payload = dict_payload();
+    let dict_id = unsafe { ZSTD_getDictID_fromDict(dict.as_ptr(), dict.len()) };
+
+    let cctx = ZSTD_createCCtx();
+    let dctx = ZSTD_createDCtx();
+    let mut frame = vec![0u8; payload.len() + 512];
+    let mut out = vec![0u8; payload.len() + 64];
+
+    // byReference pair.
+    assert_eq!(
+        ZSTD_isError(unsafe {
+            ZSTD_CCtx_loadDictionary_byReference(cctx, dict.as_ptr(), dict.len())
+        }),
+        0
+    );
+    let written = unsafe {
+        ZSTD_compress2(
+            cctx,
+            frame.as_mut_ptr(),
+            frame.len(),
+            payload.as_ptr(),
+            payload.len(),
+        )
+    };
+    assert_eq!(ZSTD_isError(written), 0);
+    assert_eq!(
+        unsafe { ZSTD_getDictID_fromFrame(frame.as_ptr(), written) },
+        dict_id
+    );
+    assert_eq!(
+        ZSTD_isError(unsafe {
+            ZSTD_DCtx_loadDictionary_byReference(dctx, dict.as_ptr(), dict.len())
+        }),
+        0
+    );
+    let read =
+        unsafe { ZSTD_decompressDCtx(dctx, out.as_mut_ptr(), out.len(), frame.as_ptr(), written) };
+    assert_eq!(ZSTD_isError(read), 0);
+    assert_eq!(&out[..read], payload.as_slice());
+
+    // _advanced pair with an explicit fullDict content type.
+    assert_eq!(
+        ZSTD_isError(unsafe {
+            ZSTD_CCtx_loadDictionary_advanced(cctx, dict.as_ptr(), dict.len(), 0, 2)
+        }),
+        0
+    );
+    let written = unsafe {
+        ZSTD_compress2(
+            cctx,
+            frame.as_mut_ptr(),
+            frame.len(),
+            payload.as_ptr(),
+            payload.len(),
+        )
+    };
+    assert_eq!(ZSTD_isError(written), 0);
+    assert_eq!(
+        ZSTD_isError(unsafe {
+            ZSTD_DCtx_loadDictionary_advanced(dctx, dict.as_ptr(), dict.len(), 0, 2)
+        }),
+        0
+    );
+    let read =
+        unsafe { ZSTD_decompressDCtx(dctx, out.as_mut_ptr(), out.len(), frame.as_ptr(), written) };
+    assert_eq!(ZSTD_isError(read), 0);
+    assert_eq!(&out[..read], payload.as_slice());
+
+    // fullDict selector on raw bytes must be rejected on both sides.
+    let raw = [0xCDu8; 64];
+    assert_ne!(
+        ZSTD_isError(unsafe {
+            ZSTD_CCtx_loadDictionary_advanced(cctx, raw.as_ptr(), raw.len(), 0, 2)
+        }),
+        0
+    );
+    assert_ne!(
+        ZSTD_isError(unsafe {
+            ZSTD_DCtx_loadDictionary_advanced(dctx, raw.as_ptr(), raw.len(), 0, 2)
+        }),
+        0
+    );
+
+    // refPrefix_advanced: rawContent accepted + single-use roundtrip,
+    // fullDict rejected.
+    let prefix = dict_payload();
+    let mut p2 = prefix[..1024].to_vec();
+    p2.extend_from_slice(b"advanced prefix tail 0123456789");
+    assert_eq!(
+        ZSTD_isError(unsafe { ZSTD_CCtx_refPrefix(cctx, prefix.as_ptr(), prefix.len()) }),
+        0
+    );
+    let written =
+        unsafe { ZSTD_compress2(cctx, frame.as_mut_ptr(), frame.len(), p2.as_ptr(), p2.len()) };
+    assert_eq!(ZSTD_isError(written), 0);
+    assert_ne!(
+        ZSTD_isError(unsafe {
+            ZSTD_DCtx_refPrefix_advanced(dctx, prefix.as_ptr(), prefix.len(), 2)
+        }),
+        0,
+        "fullDict selector must be rejected for a prefix"
+    );
+    assert_eq!(
+        ZSTD_isError(unsafe {
+            ZSTD_DCtx_refPrefix_advanced(dctx, prefix.as_ptr(), prefix.len(), 1)
+        }),
+        0
+    );
+    let read =
+        unsafe { ZSTD_decompressDCtx(dctx, out.as_mut_ptr(), out.len(), frame.as_ptr(), written) };
+    assert_eq!(ZSTD_isError(read), 0);
+    assert_eq!(&out[..read], p2.as_slice());
+
+    unsafe { ZSTD_freeDCtx(dctx) };
+    unsafe { ZSTD_freeCCtx(cctx) };
+}
