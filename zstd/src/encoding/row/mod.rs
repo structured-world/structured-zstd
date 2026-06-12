@@ -227,15 +227,15 @@ macro_rules! dispatch_tag_kernel {
 /// `#[inline(always)]` loop body AND the tier's `row_probe_*` merge into ONE
 /// compiled function (donor `ZSTD_compressBlock_greedy_row` shape) instead
 /// of paying a non-inlinable `#[target_feature]` call per position.
-macro_rules! gen_greedy_kernel {
-    ($name:ident $(, $tf:literal)?) => {
+macro_rules! gen_row_parse_kernel {
+    ($name:ident, $rl:ident $(, $tf:literal)?) => {
         $(#[target_feature(enable = $tf)])?
         #[allow(unused_unsafe)]
         unsafe fn $name<K: RowTags, const ROW_LOG: usize>(
             &mut self,
             handle_sequence: impl for<'a> FnMut(Sequence<'a>),
         ) {
-            self.start_matching_greedy_rl::<K, ROW_LOG>(handle_sequence)
+            self.$rl::<K, ROW_LOG>(handle_sequence)
         }
     };
 }
@@ -1045,6 +1045,7 @@ impl RowMatchGenerator {
     /// row-hash machinery, which is wasteful. The `dead_code` allow is
     /// scoped to this method and its private helpers so any new
     /// caller will pick them up unmodified.
+    #[inline(always)]
     pub(crate) fn start_matching_rl<K: RowTags, const ROW_LOG: usize>(
         &mut self,
         mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
@@ -1448,6 +1449,7 @@ impl RowMatchGenerator {
     /// Used only by the dead-code [`Self::start_matching`] (lazy-style
     /// row parse). Kept paired with that method so reviving the lazy
     /// path doesn't have to re-derive the rep+row best-of-two pick.
+    #[inline(always)]
     pub(crate) fn best_match_rl<K: RowTags, const ROW_LOG: usize>(
         &self,
         abs_pos: usize,
@@ -1460,6 +1462,7 @@ impl RowMatchGenerator {
         best_len_offset_candidate(rep, row)
     }
 
+    #[inline(always)]
     pub(crate) fn pick_lazy_match_rl<K: RowTags, const ROW_LOG: usize>(
         &self,
         abs_pos: usize,
@@ -1505,11 +1508,57 @@ impl RowMatchGenerator {
     // siblings directly with the type and const already bound. `skip` does
     // no tag compare, so it dispatches on `row_log` only.
     pub(crate) fn start_matching(&mut self, handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
-        dispatch_tag_kernel!(self.start_matching_k(handle_sequence))
+        // SAFETY: same per-tier umbrella contract as `start_matching_greedy`.
+        #[cfg(all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel_simd128"
+        ))]
+        {
+            // SAFETY: simd128 is a compile-time feature here; no runtime gate.
+            unsafe { dispatch_row_log!(self.lazy_simd128::<Simd128Tags>(handle_sequence)) }
+        }
+        #[cfg(not(all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel_simd128"
+        )))]
+        {
+            match self.tag_kernel {
+                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                FastpathKernel::Avx2Bmi2 => unsafe {
+                    dispatch_row_log!(self.lazy_avx2bmi2::<Avx2Bmi2Tags>(handle_sequence))
+                },
+                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                FastpathKernel::Sse42 => unsafe {
+                    dispatch_row_log!(self.lazy_sse42::<Sse42Tags>(handle_sequence))
+                },
+                #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+                FastpathKernel::Neon => unsafe {
+                    dispatch_row_log!(self.lazy_neon::<NeonTags>(handle_sequence))
+                },
+                // SAFETY: the scalar kernel has no `#[target_feature]`; the
+                // fn is `unsafe` only for macro uniformity.
+                FastpathKernel::Scalar => unsafe {
+                    dispatch_row_log!(self.lazy_scalar::<ScalarTags>(handle_sequence))
+                },
+            }
+        }
     }
-    fn start_matching_k<K: RowTags>(&mut self, handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
-        dispatch_row_log!(self.start_matching_rl::<K>(handle_sequence))
-    }
+
+    gen_row_parse_kernel!(lazy_scalar, start_matching_rl);
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    gen_row_parse_kernel!(lazy_sse42, start_matching_rl, "sse4.2");
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    gen_row_parse_kernel!(lazy_avx2bmi2, start_matching_rl, "avx2,bmi2");
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    gen_row_parse_kernel!(lazy_neon, start_matching_rl, "neon");
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel_simd128"
+    ))]
+    gen_row_parse_kernel!(lazy_simd128, start_matching_rl);
 
     pub(crate) fn start_matching_greedy(
         &mut self,
@@ -1555,19 +1604,19 @@ impl RowMatchGenerator {
         }
     }
 
-    gen_greedy_kernel!(greedy_scalar);
+    gen_row_parse_kernel!(greedy_scalar, start_matching_greedy_rl);
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    gen_greedy_kernel!(greedy_sse42, "sse4.2");
+    gen_row_parse_kernel!(greedy_sse42, start_matching_greedy_rl, "sse4.2");
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    gen_greedy_kernel!(greedy_avx2bmi2, "avx2,bmi2");
+    gen_row_parse_kernel!(greedy_avx2bmi2, start_matching_greedy_rl, "avx2,bmi2");
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-    gen_greedy_kernel!(greedy_neon, "neon");
+    gen_row_parse_kernel!(greedy_neon, start_matching_greedy_rl, "neon");
     #[cfg(all(
         target_arch = "wasm32",
         target_feature = "simd128",
         feature = "kernel_simd128"
     ))]
-    gen_greedy_kernel!(greedy_simd128);
+    gen_row_parse_kernel!(greedy_simd128, start_matching_greedy_rl);
 
     pub(crate) fn skip_matching_with_hint(&mut self, incompressible_hint: Option<bool>) {
         match self.row_log {
