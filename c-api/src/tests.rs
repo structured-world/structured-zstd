@@ -2540,6 +2540,40 @@ fn creation_time_validation_rejects_bad_fastcover_and_full_dict_inputs() {
 }
 
 #[test]
+fn cdict_advanced_rejects_invalid_strategy_ordinal() {
+    // ZSTD_strategy spans 1 (fast) … 9 (btultra2); 0 and out-of-range
+    // ordinals are invalid input and must fail creation, not silently map
+    // onto the strongest tier.
+    let raw = [0xABu8; 256];
+    let no_mem = ZSTD_customMem {
+        customAlloc: core::ptr::null(),
+        customFree: core::ptr::null(),
+        opaque: core::ptr::null(),
+    };
+    let base = ZSTD_compressionParameters {
+        windowLog: 0,
+        chainLog: 0,
+        hashLog: 0,
+        searchLog: 0,
+        minMatch: 0,
+        targetLength: 0,
+        strategy: 0,
+    };
+    for bad in [0u32, 10, 42] {
+        let cparams = ZSTD_compressionParameters {
+            strategy: bad,
+            ..base
+        };
+        let cdict =
+            unsafe { ZSTD_createCDict_advanced(raw.as_ptr(), raw.len(), 0, 1, cparams, no_mem) };
+        assert!(
+            cdict.is_null(),
+            "strategy ordinal {bad} must fail CDict creation"
+        );
+    }
+}
+
+#[test]
 fn zdict_train_rejects_null_buffers_with_nonzero_lengths() {
     // A NULL buffer paired with a non-zero length must come back as an
     // encoded error, never reach slice construction: these are documented
