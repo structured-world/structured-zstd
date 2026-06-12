@@ -39,6 +39,7 @@ use super::match_table::helpers::{
     INCOMPRESSIBLE_SKIP_STEP, LazyMatchConfig, best_len_offset_candidate, extend_backwards_shared,
     pick_lazy_match_shared, repcode_candidate_shared,
 };
+use super::match_table::storage::REBASE_RESET_FLOOR_CEILING;
 use super::opt::types::MatchCandidate;
 
 // The row probe reuses the shared `fastpath::FastpathKernel` selection so each
@@ -859,14 +860,33 @@ impl RowMatchGenerator {
     }
 
     pub(crate) fn reset(&mut self) {
+        // Floor-advance reset (same shape as the dfast/HC backends): instead
+        // of re-zeroing the row tables per frame (a multi-MiB memset that
+        // dominated small/medium-frame encode), advance the absolute
+        // coordinate floor past everything ever inserted. Stale entries all
+        // hold positions below the new floor, so the probes' existing
+        // `candidate_pos < self.history_abs_start` window check rejects them
+        // without any clearing — the donor's persistent-index design. Stale
+        // TAGS can still produce the occasional false mask hit whose
+        // candidate then fails the window check; the donor's tag table
+        // persists across frames with the same behaviour.
+        let next_floor = self.history_abs_start + (self.history.len() - self.history_start);
         self.window_size = 0;
         self.history.clear();
         self.history_start = 0;
-        self.history_abs_start = 0;
         self.offset_hist = [1, 4, 8];
-        self.row_heads.fill(0);
-        self.row_positions.fill(ROW_EMPTY_SLOT);
-        self.row_tags.fill(0);
+        if next_floor <= REBASE_RESET_FLOOR_CEILING && !self.row_positions.is_empty() {
+            self.history_abs_start = next_floor;
+        } else {
+            // Bounded fallback: rewind the coordinate space and zero the
+            // tables so the absolute cursor cannot climb without bound
+            // (mirrors dfast; the u32 packing is separately kept in range
+            // by `rebase_positions` in `add_data`).
+            self.history_abs_start = 0;
+            self.row_heads.fill(0);
+            self.row_positions.fill(ROW_EMPTY_SLOT);
+            self.row_tags.fill(0);
+        }
         // Block buffers are returned to the caller's pool per block in
         // `add_data`, so there is nothing window-side to recycle here.
         self.chunk_lens.clear();
