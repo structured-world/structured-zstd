@@ -2564,6 +2564,63 @@ fn creation_time_validation_rejects_bad_fastcover_and_full_dict_inputs() {
 }
 
 #[test]
+fn ref_ddict_honours_raw_content_selection_for_magic_prefixed_bytes() {
+    // A DDict created with the explicit rawContent selector must stay raw
+    // content at use time even when its bytes happen to start with the
+    // dictionary magic — re-classifying on the magic would reject the
+    // (perfectly valid) raw bytes as a corrupt serialized dictionary.
+    let mut raw = vec![0x37u8, 0xA4, 0x30, 0xEC];
+    raw.extend_from_slice(b"raw content that merely starts with the dictionary magic 0123456789");
+    let no_mem = ZSTD_customMem {
+        customAlloc: core::ptr::null(),
+        customFree: core::ptr::null(),
+        opaque: core::ptr::null(),
+    };
+    let ddict = unsafe { ZSTD_createDDict_advanced(raw.as_ptr(), raw.len(), 0, 1, no_mem) };
+    assert!(!ddict.is_null(), "rawContent DDict creation must succeed");
+
+    let dctx = ZSTD_createDCtx();
+    let attached = unsafe { ZSTD_DCtx_refDDict(dctx, ddict) };
+    assert_eq!(
+        ZSTD_isError(attached),
+        0,
+        "refDDict must honour the DDict's rawContent selection"
+    );
+
+    // Functional cross-check: a frame compressed against the same raw bytes
+    // decodes through the referenced DDict.
+    let mut payload = raw.clone();
+    payload.extend_from_slice(b"payload tail referencing the raw dict 9876543210");
+    let cctx = ZSTD_createCCtx();
+    assert_eq!(
+        ZSTD_isError(unsafe {
+            ZSTD_CCtx_loadDictionary_advanced(cctx, raw.as_ptr(), raw.len(), 0, 1)
+        }),
+        0
+    );
+    let mut frame = vec![0u8; payload.len() + 512];
+    let written = unsafe {
+        ZSTD_compress2(
+            cctx,
+            frame.as_mut_ptr(),
+            frame.len(),
+            payload.as_ptr(),
+            payload.len(),
+        )
+    };
+    assert_eq!(ZSTD_isError(written), 0);
+    let mut out = vec![0u8; payload.len() + 64];
+    let read =
+        unsafe { ZSTD_decompressDCtx(dctx, out.as_mut_ptr(), out.len(), frame.as_ptr(), written) };
+    assert_eq!(ZSTD_isError(read), 0);
+    assert_eq!(&out[..read], payload.as_slice());
+
+    unsafe { ZSTD_freeCCtx(cctx) };
+    unsafe { ZSTD_freeDCtx(dctx) };
+    unsafe { ZSTD_freeDDict(ddict) };
+}
+
+#[test]
 fn cdict_advanced_rejects_invalid_strategy_ordinal() {
     // ZSTD_strategy spans 1 (fast) … 9 (btultra2); 0 and out-of-range
     // ordinals are invalid input and must fail creation, not silently map
