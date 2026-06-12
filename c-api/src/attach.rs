@@ -617,8 +617,11 @@ pub unsafe extern "C" fn ZSTD_DCtx_refDDict(
     {
         return 0;
     }
+    // Honour the DDict's creation-time content-type selection (same as
+    // ZSTD_decompress_usingDDict): an explicit rawContent DDict must not be
+    // re-classified on the magic at use time.
     let parsed = catch_unwind(AssertUnwindSafe(|| {
-        parse_decode_dict(&ddict.raw, ZSTD_DCT_AUTO)
+        parse_decode_dict(&ddict.raw, ddict.content_type)
     }));
     match parsed {
         Ok(Ok(handle)) => {
