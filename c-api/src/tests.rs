@@ -2339,3 +2339,60 @@ fn by_reference_and_advanced_attach_variants_roundtrip() {
     unsafe { ZSTD_freeDCtx(dctx) };
     unsafe { ZSTD_freeCCtx(cctx) };
 }
+
+#[test]
+fn dctx_ref_prefix_survives_a_failed_one_shot() {
+    // A referenced prefix is single-use, but "use" means a frame actually
+    // started with it — the streaming path consumes it only after a
+    // successful reset. A one-shot that fails before any frame starts
+    // (garbage input here) must leave the prefix attached so the retry
+    // with the real frame still decodes.
+    let prefix = dict_payload();
+    let mut payload = prefix[..1024].to_vec();
+    payload.extend_from_slice(b"prefix retry tail 0123456789");
+
+    let cctx = ZSTD_createCCtx();
+    assert_eq!(
+        ZSTD_isError(unsafe { ZSTD_CCtx_refPrefix(cctx, prefix.as_ptr(), prefix.len()) }),
+        0
+    );
+    let mut frame = vec![0u8; payload.len() + 512];
+    let written = unsafe {
+        ZSTD_compress2(
+            cctx,
+            frame.as_mut_ptr(),
+            frame.len(),
+            payload.as_ptr(),
+            payload.len(),
+        )
+    };
+    assert_eq!(ZSTD_isError(written), 0);
+
+    let dctx = ZSTD_createDCtx();
+    assert_eq!(
+        ZSTD_isError(unsafe { ZSTD_DCtx_refPrefix(dctx, prefix.as_ptr(), prefix.len()) }),
+        0
+    );
+    let mut out = vec![0u8; payload.len() + 64];
+    let garbage = [0u8; 24];
+    let failed = unsafe {
+        ZSTD_decompressDCtx(
+            dctx,
+            out.as_mut_ptr(),
+            out.len(),
+            garbage.as_ptr(),
+            garbage.len(),
+        )
+    };
+    assert_ne!(ZSTD_isError(failed), 0, "garbage must fail to decode");
+    let read =
+        unsafe { ZSTD_decompressDCtx(dctx, out.as_mut_ptr(), out.len(), frame.as_ptr(), written) };
+    assert_eq!(
+        ZSTD_isError(read),
+        0,
+        "the prefix must survive the failed one-shot"
+    );
+    assert_eq!(&out[..read], payload.as_slice());
+    unsafe { ZSTD_freeDCtx(dctx) };
+    unsafe { ZSTD_freeCCtx(cctx) };
+}
