@@ -306,28 +306,18 @@ macro_rules! greedy_parse_body {
                     None
                 };
 
-                // (2) Donor at `depth == 0` does `goto _storeSequence` on a
-                //     rep hit (commits without comparing against the regular
-                //     search). That trade-off is ratio-negative for us
-                //     because donor recovers the loss via other components
-                //     we don't replicate (smaller `mls=5`, block splitter,
-                //     better regular-search recall). To get the speed shape
-                //     of donor's greedy *without* its ratio cliff, we
-                //     compare both options and pick the longer match. On
-                //     ties / near-ties the rep wins by being cheaper to
-                //     encode (single-digit-bit offset code vs 9-13 bits for
-                //     a regular offset).
-                // Donor greedy (depth 0): a repcode hit commits immediately and
-                // SKIPS the regular row search (`zstd_lazy.c:2039`,
-                // `if (depth==0) goto _storeSequence`). The regular
-                // `row_candidate` (SIMD row scan + match extension) is the
-                // dominant per-position cost; running it on every rep hit made
-                // rep-dense inputs (repetitive logs) up to ~11x slower than the
-                // donor, which short-circuits. So only run the regular search
-                // when there is no rep to take. `row_candidate` is `&self` (a
-                // pure search, no table mutation), so skipping it drops no hash
-                // insert — the post-emit `insert_positions(abs_pos, ..)` still
-                // indexes the committed span.
+                // (2) Upstream zstd greedy (depth 0): a repcode hit commits
+                // immediately and SKIPS the regular row search
+                // (`zstd_lazy.c:2039`, `if (depth==0) goto _storeSequence`).
+                // The regular `row_candidate` (SIMD row scan + match
+                // extension) is the dominant per-position cost; running it on
+                // every rep hit made rep-dense inputs (repetitive logs) up to
+                // ~11x slower than upstream, which short-circuits. So only
+                // run the regular search when there is no rep to take.
+                // `row_candidate` is `&self` (a pure search, no table
+                // mutation), so skipping it drops no hash insert: the
+                // post-emit `insert_positions(abs_pos, ..)` still indexes the
+                // committed span.
                 let hash = match carried.take() {
                     Some((carried_pos, rt)) if carried_pos == abs_pos => Some(rt),
                     _ => None,
