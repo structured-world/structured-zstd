@@ -1579,7 +1579,7 @@ fn decompress_stream_recovers_after_failed_oneshot_on_midframe_context() {
 use crate::attach::{
     ZSTD_CCtx_loadDictionary, ZSTD_CCtx_loadDictionary_advanced,
     ZSTD_CCtx_loadDictionary_byReference, ZSTD_CCtx_refCDict, ZSTD_CCtx_refPrefix,
-    ZSTD_DCtx_loadDictionary, ZSTD_DCtx_loadDictionary_advanced,
+    ZSTD_CCtx_refPrefix_advanced, ZSTD_DCtx_loadDictionary, ZSTD_DCtx_loadDictionary_advanced,
     ZSTD_DCtx_loadDictionary_byReference, ZSTD_DCtx_refDDict, ZSTD_DCtx_refPrefix,
     ZSTD_DCtx_refPrefix_advanced, ZSTD_compress_usingDict, ZSTD_decompress_usingDict,
     ZSTD_getDictID_fromDict, ZSTD_getDictID_fromFrame,
@@ -2389,12 +2389,21 @@ fn by_reference_and_advanced_attach_variants_roundtrip() {
     );
 
     // refPrefix_advanced: rawContent accepted + single-use roundtrip,
-    // fullDict rejected.
+    // fullDict rejected — on both the encoder and decoder sides.
     let prefix = dict_payload();
     let mut p2 = prefix[..1024].to_vec();
     p2.extend_from_slice(b"advanced prefix tail 0123456789");
+    assert_ne!(
+        ZSTD_isError(unsafe {
+            ZSTD_CCtx_refPrefix_advanced(cctx, prefix.as_ptr(), prefix.len(), 2)
+        }),
+        0,
+        "fullDict selector must be rejected for an encoder prefix"
+    );
     assert_eq!(
-        ZSTD_isError(unsafe { ZSTD_CCtx_refPrefix(cctx, prefix.as_ptr(), prefix.len()) }),
+        ZSTD_isError(unsafe {
+            ZSTD_CCtx_refPrefix_advanced(cctx, prefix.as_ptr(), prefix.len(), 1)
+        }),
         0
     );
     let written =
