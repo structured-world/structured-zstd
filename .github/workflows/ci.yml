@@ -224,6 +224,7 @@ jobs:
             ZSTD_compress_usingCDict_advanced \
             ZSTD_getDictID_fromDict ZSTD_getDictID_fromFrame \
             ZSTD_estimateCCtxSize ZSTD_estimateCCtxSize_usingCParams \
+            ZSTD_estimateCStreamSize_usingCParams \
             ZSTD_estimateDCtxSize ZSTD_estimateCStreamSize ZSTD_estimateDStreamSize \
             ZDICT_trainFromBuffer_fastCover ZDICT_optimizeTrainFromBuffer_fastCover; do
             if ! grep -qx "$sym" <<<"$exported"; then

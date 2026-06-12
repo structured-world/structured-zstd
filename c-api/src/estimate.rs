@@ -62,6 +62,22 @@ pub extern "C" fn ZSTD_estimateCCtxSize_usingCParams(cparams: ZSTD_compressionPa
     core::mem::size_of::<ZSTD_CCtx>() + window + hash + chain + 3 * BLOCK_SIZE_MAX
 }
 
+/// `size_t ZSTD_estimateCStreamSize_usingCParams(ZSTD_compressionParameters
+/// cParams)` — streaming budget from explicit compression parameters: the
+/// one-shot estimate plus the streaming input/output staging buffers.
+/// Invalid parameters propagate as an encoded error (test with
+/// `ZSTD_isError`).
+#[unsafe(no_mangle)]
+pub extern "C" fn ZSTD_estimateCStreamSize_usingCParams(
+    cparams: ZSTD_compressionParameters,
+) -> usize {
+    let base = ZSTD_estimateCCtxSize_usingCParams(cparams);
+    if crate::error::result_is_error(base) {
+        return base;
+    }
+    base + 2 * BLOCK_SIZE_MAX
+}
+
 /// `size_t ZSTD_estimateDCtxSize(void)` — budget for a decompression
 /// context before any frame allocates its window (the window itself is
 /// sized per frame; see `ZSTD_estimateDStreamSize`).

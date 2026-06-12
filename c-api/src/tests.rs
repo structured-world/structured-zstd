@@ -1595,7 +1595,7 @@ use crate::dict::{
 };
 use crate::estimate::{
     ZSTD_estimateCCtxSize, ZSTD_estimateCCtxSize_usingCParams, ZSTD_estimateCStreamSize,
-    ZSTD_estimateDCtxSize, ZSTD_estimateDStreamSize,
+    ZSTD_estimateCStreamSize_usingCParams, ZSTD_estimateDCtxSize, ZSTD_estimateDStreamSize,
 };
 
 /// Dict-friendly payload: repeats material the trained dictionary covers.
@@ -2151,7 +2151,22 @@ fn estimates_are_sane_budgets() {
         targetLength: 0,
         strategy: 2,
     };
-    assert!(ZSTD_estimateCCtxSize_usingCParams(cparams) > (1 << 20) + 2 * (4 << 17));
+    let one_shot = ZSTD_estimateCCtxSize_usingCParams(cparams);
+    assert!(one_shot > (1 << 20) + 2 * (4 << 17));
+    assert!(
+        ZSTD_estimateCStreamSize_usingCParams(cparams) > one_shot,
+        "streaming must budget more than the one-shot"
+    );
+    // Invalid parameters propagate the encoded error through the stream
+    // variant too.
+    let bad = ZSTD_compressionParameters {
+        windowLog: 60,
+        ..cparams
+    };
+    assert_ne!(
+        crate::error::ZSTD_isError(ZSTD_estimateCStreamSize_usingCParams(bad)),
+        0
+    );
 }
 
 #[test]
