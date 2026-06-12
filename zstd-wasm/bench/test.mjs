@@ -191,6 +191,15 @@ for (const payload of [simd, scalar]) {
     boku.freeDCtx(dctx2);
   }
   rawPrepared.free();
+  // A truncated magic-prefixed blob is a corrupt serialized dictionary, not
+  // raw content: the constructor must throw instead of silently accepting it.
+  let truncatedThrew = false;
+  try {
+    new payload.Dictionary(new Uint8Array([0x37, 0xa4, 0x30, 0xec, 0x01]));
+  } catch {
+    truncatedThrew = true;
+  }
+  if (!truncatedThrew) fail("prepared dict: truncated magic blob must throw");
   prepared.free();
 }
 

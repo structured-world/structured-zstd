@@ -187,7 +187,10 @@ impl ZstdDictionary {
         if dict.is_empty() {
             return Err(JsError::new("structured-zstd: empty dictionary"));
         }
-        let has_magic = dict.len() >= 8
+        // Any blob long enough to carry the 4-byte magic and starting with
+        // it is a (possibly truncated) serialized dictionary: parse it and
+        // surface corruption instead of silently treating it as raw content.
+        let has_magic = dict.len() >= 4
             && u32::from_le_bytes([dict[0], dict[1], dict[2], dict[3]]) == 0xEC30_A437;
         let parsed = if has_magic {
             Dictionary::decode_dict(dict).map_err(|err| {
