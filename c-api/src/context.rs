@@ -464,16 +464,19 @@ pub unsafe extern "C" fn ZSTD_decompressDCtx(
     // buffer, so there is no allocation for the parameter to limit.
     dctx.decoder.set_content_checksum(ContentChecksum::Verify);
     // Context-attached dictionary (`ZSTD_DCtx_loadDictionary` / `refDDict` /
-    // `refPrefix`) applies to the frames of this one-shot; a prefix is
-    // single-use and consumed regardless of outcome.
+    // `refPrefix`) applies to the frames of this one-shot. A prefix is
+    // single-use, but "use" means a frame actually started with it — the
+    // streaming path consumes it only after a successful reset, so the
+    // one-shot consumes it only on success (a garbage input must not eat
+    // the prefix out from under the retry).
     let attached = dctx.attached_handle();
-    dctx.consume_prefix();
     let outcome = catch_unwind(AssertUnwindSafe(|| match &attached {
         Some(handle) => dctx.decoder.decode_all_with_dict_handle(src, dst, handle),
         None => dctx.decoder.decode_all(src, dst),
     }));
     match outcome {
         Ok(Ok(written)) => {
+            dctx.consume_prefix();
             // The one-shot consumed whole frames; the context sits at a
             // frame boundary again. Without this, a context abandoned
             // mid-stream earlier would make the next
