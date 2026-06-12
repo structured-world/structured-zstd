@@ -598,7 +598,20 @@ macro_rules! lazy_parse_body {
                         Some((row, tag)) => $m.insert_at::<$rl>(abs_pos, row, tag),
                         None => $m.insert_position::<$rl>(abs_pos),
                     }
-                    pos += 1;
+                    if carried.is_some() {
+                        // Defer: the lookahead found a better match — step
+                        // exactly one to take it next iteration.
+                        pos += 1;
+                    } else {
+                        // Complete miss: accelerate through weakly-matching
+                        // stretches (upstream zstd `ip += (ip - anchor) >>
+                        // kSearchStrength + 1`, zstd_lazy.c lazy_generic).
+                        // Same softened `SKIP_STRENGTH = 10` as the greedy
+                        // kernel above: the step stays 1 until the literal
+                        // run hits ~1 KiB, protecting ratio on short runs.
+                        const SKIP_STRENGTH: u32 = 10;
+                        pos += ((lit_len as u32) >> SKIP_STRENGTH) as usize + 1;
+                    }
                 }
             }
 
