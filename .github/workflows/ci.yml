@@ -54,7 +54,7 @@ jobs:
       rust_core: ${{ steps.filter.outputs.rust_core }}
     steps:
       - uses: actions/checkout@v6
-      - uses: dorny/paths-filter@v3
+      - uses: dorny/paths-filter@v4
         id: filter
         with:
           filters: |
@@ -466,7 +466,7 @@ jobs:
       # failing the whole dashboard shard. Cache wasm-pack's tool dir so the
       # tarball is fetched at most once across runs.
       - name: Cache wasm-pack binaryen download
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/.wasm-pack
           key: wasm-pack-binaryen-${{ runner.os }}
@@ -571,7 +571,7 @@ jobs:
       - uses: taiki-e/install-action@cargo-llvm-cov
       - run: cargo llvm-cov -p structured-zstd --features hash,std,dict_builder --lcov --output-path lcov.info
         working-directory: zstd
-      - uses: codecov/codecov-action@v6
+      - uses: codecov/codecov-action@v7
         with:
           files: zstd/lcov.info
         env:
