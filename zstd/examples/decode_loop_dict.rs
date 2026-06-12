@@ -29,9 +29,6 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 use structured_zstd::decoding::{DictionaryHandle, FrameDecoder};
 
 fn main() {
-    #[cfg(feature = "dhat-heap")]
-    let _dhat = dhat::Profiler::new_heap();
-
     let args: Vec<String> = env::args().collect();
     let iters: u32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(500_000);
     let payload_path = args
@@ -50,6 +47,13 @@ fn main() {
 
     let mut decoder = FrameDecoder::new();
     let mut output = vec![0u8; expected_len];
+
+    // Arm the profiler only after the one-time setup (file reads, dict
+    // parse, decoder + output-buffer allocation) so `dhat-heap.json`
+    // attributes allocations to the repeated decode path alone.
+    #[cfg(feature = "dhat-heap")]
+    let _dhat = dhat::Profiler::new_heap();
+
     let mut sink: usize = 0;
     for _ in 0..iters {
         let n = decoder

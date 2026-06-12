@@ -3768,9 +3768,14 @@ mod tests {
             .rev()
             .copied()
             .collect();
-        let mut payload = dict_tail.clone();
+        // No in-frame duplicate of the dictionary bytes: with a second
+        // copy in the payload the encoder may emit the later copy as an
+        // in-frame match, and the test would stay green even if the
+        // direct path stopped forwarding the dictionary handle. A
+        // single copy forces every dict-region match through
+        // `repeat_from_dict`.
+        let mut payload = dict_tail;
         payload.extend_from_slice(b"unique suffix after dictionary material 0123456789");
-        payload.extend_from_slice(&dict_tail);
 
         let mut compressor = FrameCompressor::new(CompressionLevel::Default);
         compressor
@@ -3780,6 +3785,21 @@ mod tests {
         let mut compressed = Vec::new();
         compressor.set_drain(&mut compressed);
         compressor.compress();
+
+        // Fixture sanity: the frame must actually depend on the
+        // dictionary, otherwise the decode below never exercises
+        // dict-region match resolution.
+        let mut plain = Vec::new();
+        let mut no_dict = FrameCompressor::new(CompressionLevel::Default);
+        no_dict.set_source(payload.as_slice());
+        no_dict.set_drain(&mut plain);
+        no_dict.compress();
+        assert!(
+            compressed.len() < plain.len(),
+            "fixture must depend on the dictionary: dict {} bytes vs plain {} bytes",
+            compressed.len(),
+            plain.len()
+        );
 
         let mut decoder = FrameDecoder::new();
         let mut out = alloc::vec![0u8; payload.len()];

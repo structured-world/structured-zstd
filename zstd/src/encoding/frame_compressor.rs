@@ -1834,9 +1834,9 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // layout, mirroring upstream. Dictionary frames qualify (the
         // reference emits single-segment + dictionary-ID headers): the
         // dictionary is decoder setup state, not part of the regenerated
-        // segment, and dropping the window descriptor lets decoders size
-        // their buffer from the FCS instead of the level's (often much
-        // larger) preset window.
+        // segment, so the frame keeps single-segment wire layout and
+        // decoders keep their single-allocation paths (our own decoder
+        // already caps reservation to min(window, FCS) either way).
         let single_segment = self.content_size_flag
             && prep.source_size_hint_known
             && total_uncompressed >= 512
@@ -3146,9 +3146,9 @@ mod tests {
     }
 
     // A dictionary frame with a known content size that fits the window
-    // must take the single-segment layout (reference parity): the window
-    // descriptor would otherwise advertise the level's preset window and
-    // decoders would size their buffers from it instead of the FCS.
+    // must take the single-segment layout (reference parity): the
+    // dictionary is decoder setup state, not part of the regenerated
+    // segment, so it must not force the windowed multi-segment layout.
     #[test]
     fn dict_frame_with_known_size_is_single_segment() {
         let dict_raw = include_bytes!("../../dict_tests/dictionary");
