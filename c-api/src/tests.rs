@@ -1590,8 +1590,8 @@ use crate::cdict::{
 };
 use crate::context::ZSTD_compress2;
 use crate::dict::{
-    ZDICT_fastCover_params_t, ZDICT_optimizeTrainFromBuffer_fastCover, ZDICT_params_t,
-    ZDICT_trainFromBuffer_fastCover,
+    ZDICT_fastCover_params_t, ZDICT_finalizeDictionary, ZDICT_optimizeTrainFromBuffer_fastCover,
+    ZDICT_params_t, ZDICT_trainFromBuffer_fastCover,
 };
 use crate::estimate::{
     ZSTD_estimateCCtxSize, ZSTD_estimateCCtxSize_usingCParams, ZSTD_estimateCStreamSize,
@@ -2472,4 +2472,95 @@ fn creation_time_validation_rejects_bad_fastcover_and_full_dict_inputs() {
         ddict.is_null(),
         "FULL_DICT without the dictionary magic must fail at creation"
     );
+}
+
+#[test]
+fn zdict_train_rejects_null_buffers_with_nonzero_lengths() {
+    // A NULL buffer paired with a non-zero length must come back as an
+    // encoded error, never reach slice construction: these are documented
+    // error-returning entry points, not UB traps.
+    let mut samples: Vec<u8> = Vec::new();
+    let mut sizes: Vec<usize> = Vec::new();
+    for i in 0..64u32 {
+        let s = format!("sample line {i} with shared structure\n");
+        sizes.push(s.len());
+        samples.extend_from_slice(s.as_bytes());
+    }
+    let mut dict = vec![0u8; 16 * 1024];
+    let params = ZDICT_fastCover_params_t {
+        k: 200,
+        d: 8,
+        f: 20,
+        steps: 0,
+        nbThreads: 0,
+        splitPoint: 0.0,
+        accel: 1,
+        shrinkDict: 0,
+        shrinkDictMaxRegression: 0,
+        zParams: ZDICT_params_t {
+            compressionLevel: 0,
+            notificationLevel: 0,
+            dictID: 0,
+        },
+    };
+
+    // NULL samples buffer while the sizes sum to a non-zero total.
+    let n = unsafe {
+        ZDICT_trainFromBuffer(
+            dict.as_mut_ptr(),
+            dict.len(),
+            core::ptr::null(),
+            sizes.as_ptr(),
+            sizes.len() as u32,
+        )
+    };
+    assert_ne!(ZDICT_isError(n), 0, "NULL samplesBuffer must error");
+
+    let n = unsafe {
+        ZDICT_trainFromBuffer_fastCover(
+            dict.as_mut_ptr(),
+            dict.len(),
+            core::ptr::null(),
+            sizes.as_ptr(),
+            sizes.len() as u32,
+            params,
+        )
+    };
+    assert_ne!(
+        ZDICT_isError(n),
+        0,
+        "NULL samplesBuffer must error (fastCover)"
+    );
+
+    // NULL destination buffer with a non-zero capacity.
+    let n = unsafe {
+        ZDICT_trainFromBuffer(
+            core::ptr::null_mut(),
+            dict.len(),
+            samples.as_ptr(),
+            sizes.as_ptr(),
+            sizes.len() as u32,
+        )
+    };
+    assert_ne!(ZDICT_isError(n), 0, "NULL dictBuffer must error");
+
+    // NULL raw content with a non-zero length in the finalizer.
+    let zparams = ZDICT_params_t {
+        compressionLevel: 0,
+        notificationLevel: 0,
+        dictID: 0,
+    };
+    let n = unsafe {
+        ZDICT_finalizeDictionary(
+            dict.as_mut_ptr(),
+            dict.len(),
+            core::ptr::null(),
+            1024,
+            samples.as_ptr(),
+            sizes.as_ptr(),
+            sizes.len() as u32,
+            zparams,
+        )
+    };
+    assert_ne!(ZDICT_isError(n), 0, "NULL dictContent must error");
 }
