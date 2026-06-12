@@ -217,6 +217,28 @@ for (const payload of [simd, scalar]) {
   ds.free();
   if (!eq(new Uint8Array(back), data)) fail("npm wrapper: stream round-trip");
   zd.free();
+
+  // Raw-content dictionary through the same public API: id 0 and ID-less
+  // frames, so the wrapper's prepared decode stream must force the
+  // dictionary per frame.
+  const rawZd = await npm.ZstdDict.create(data);
+  if (rawZd.id !== 0) fail("npm wrapper: raw-content dict id must be 0");
+  const rawTail = new TextEncoder().encode("npm raw tail 0123456789");
+  const rawData = new Uint8Array(data.length + rawTail.length);
+  rawData.set(data); rawData.set(rawTail, data.length);
+  const rawFrame = rawZd.compress(rawData, 3);
+  if (!eq(rawZd.decompress(rawFrame), rawData)) fail("npm wrapper: raw one-shot round-trip");
+  const rcs = rawZd.compressStream(3);
+  const rawStreamed = Buffer.concat([Buffer.from(rcs.push(rawData)), Buffer.from(rcs.finish())]);
+  rcs.free();
+  const rds = rawZd.decompressStream();
+  const rawBack = Buffer.concat([
+    Buffer.from(rds.push(new Uint8Array(rawStreamed))),
+    Buffer.from(rds.finish()),
+  ]);
+  rds.free();
+  if (!eq(new Uint8Array(rawBack), rawData)) fail("npm wrapper: raw stream round-trip");
+  rawZd.free();
 }
 
 // --- Streaming decompressor: chunked input must equal one-shot output -------

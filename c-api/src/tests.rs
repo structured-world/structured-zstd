@@ -2263,7 +2263,13 @@ fn by_reference_and_advanced_attach_variants_roundtrip() {
     assert_eq!(ZSTD_isError(read), 0);
     assert_eq!(&out[..read], payload.as_slice());
 
-    // _advanced pair with an explicit fullDict content type.
+    // _advanced pair with an explicit fullDict content type. Fresh contexts:
+    // reusing the by-reference-attached ones above would mask an _advanced
+    // wrapper regressing into a no-op (the earlier attach is still live).
+    unsafe { ZSTD_freeDCtx(dctx) };
+    unsafe { ZSTD_freeCCtx(cctx) };
+    let cctx = ZSTD_createCCtx();
+    let dctx = ZSTD_createDCtx();
     assert_eq!(
         ZSTD_isError(unsafe {
             ZSTD_CCtx_loadDictionary_advanced(cctx, dict.as_ptr(), dict.len(), 0, 2)
@@ -2290,6 +2296,17 @@ fn by_reference_and_advanced_attach_variants_roundtrip() {
         unsafe { ZSTD_decompressDCtx(dctx, out.as_mut_ptr(), out.len(), frame.as_ptr(), written) };
     assert_eq!(ZSTD_isError(read), 0);
     assert_eq!(&out[..read], payload.as_slice());
+    // The dict frame must NOT decode on a bare context — proves the
+    // _advanced attach (not a leftover) carried the round-trip above.
+    let bare = ZSTD_createDCtx();
+    let bare_read =
+        unsafe { ZSTD_decompressDCtx(bare, out.as_mut_ptr(), out.len(), frame.as_ptr(), written) };
+    assert_ne!(
+        ZSTD_isError(bare_read),
+        0,
+        "dict frame decoding bare means the _advanced attach was not exercised"
+    );
+    unsafe { ZSTD_freeDCtx(bare) };
 
     // fullDict selector on raw bytes must be rejected on both sides.
     let raw = [0xCDu8; 64];

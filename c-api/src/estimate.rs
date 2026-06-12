@@ -19,6 +19,10 @@ const BLOCK_SIZE_MAX: usize = 128 * 1024;
 /// 32-bit, 31 on 64-bit). Inputs past it are rejected with an encoded error.
 const WINDOW_LOG_MAX: core::ffi::c_uint = if usize::BITS >= 64 { 31 } else { 30 };
 
+/// Hash/chain table-log ceiling: upstream's 30, additionally bounded so the
+/// `4 << log` table-size term fits `usize` on 32-bit targets.
+const TABLE_LOG_MAX: core::ffi::c_uint = if usize::BITS >= 64 { 30 } else { 29 };
+
 /// `size_t ZSTD_estimateCCtxSize(int maxCompressionLevel)` — budget for a
 /// one-shot compression context at the given level.
 #[unsafe(no_mangle)]
@@ -35,8 +39,13 @@ pub extern "C" fn ZSTD_estimateCCtxSize_usingCParams(cparams: ZSTD_compressionPa
     // Out-of-range parameters are an error, not a number to clamp: upstream
     // validates cParams here and returns an encoded error code (the size_t
     // ABI carries them — test with ZSTD_isError). The bounds below also
-    // prove the plain arithmetic cannot overflow on any target.
-    if cparams.windowLog > WINDOW_LOG_MAX || cparams.hashLog > 30 || cparams.chainLog > 30 {
+    // prove the plain arithmetic cannot overflow: `TABLE_LOG_MAX` keeps
+    // `4 << log` inside `usize` on 32-bit targets too, where the upstream
+    // 30-bit table-log ceiling alone would let `4 << 30` wrap.
+    if cparams.windowLog > WINDOW_LOG_MAX
+        || cparams.hashLog > TABLE_LOG_MAX
+        || cparams.chainLog > TABLE_LOG_MAX
+    {
         return crate::error::encode(crate::error::ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound);
     }
     let window = 1usize << cparams.windowLog.max(10);

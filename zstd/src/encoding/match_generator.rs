@@ -8686,7 +8686,7 @@ fn primed_snapshot_fast_attach_does_not_over_key_non_simple_backends() {
     let restored = driver.restore_primed_dictionary(level);
     assert!(
         restored,
-        "a HashChain snapshot must restore across an unhinted vs large-hinted \
+        "a Row snapshot must restore across an unhinted vs large-hinted \
          reset that resolves to the identical matcher — `fast_attach` is a Fast \
          backend concept and must not over-key non-Simple shapes"
     );
