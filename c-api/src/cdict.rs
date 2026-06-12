@@ -456,6 +456,9 @@ pub unsafe extern "C" fn ZSTD_compress_usingCDict(
         enc.set_content_checksum(false);
         enc.set_content_size_flag(true);
         enc.set_dictionary_id_flag(!cdict_ref.raw_content);
+        // The cache is shared with ZSTD_compress2's dict path, which may
+        // have set a block-size cap; this entry point is cap-less.
+        enc.set_target_block_size(None);
         scratch.clear();
         enc.compress_independent_frame_into(src, scratch);
         Ok::<(), ()>(())
@@ -527,6 +530,7 @@ pub unsafe extern "C" fn ZSTD_compress_usingCDict_advanced(
         // Raw-content dictionaries never emit their synthetic ID regardless
         // of the flag.
         enc.set_dictionary_id_flag(fparams.noDictIDFlag == 0 && !cdict_ref.raw_content);
+        enc.set_target_block_size(None);
         scratch.clear();
         enc.compress_independent_frame_into(src, scratch);
         Ok::<(), ()>(())

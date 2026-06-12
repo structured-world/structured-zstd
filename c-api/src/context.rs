@@ -304,9 +304,14 @@ pub unsafe extern "C" fn ZSTD_compress2(
             enc.set_content_checksum(params.checksum_flag);
             enc.set_content_size_flag(params.content_size_flag);
             enc.set_dictionary_id_flag(params.dict_id_flag && !suppress_id);
-            if params.target_cblock_size > 0 {
-                enc.set_target_block_size(Some(params.target_cblock_size as u32));
-            }
+            // The cached compressor outlives parameter changes: clear the cap
+            // explicitly when the sticky knob is back at 0 (auto), or a cap
+            // set by an earlier call would silently survive.
+            enc.set_target_block_size(if params.target_cblock_size > 0 {
+                Some(params.target_cblock_size as u32)
+            } else {
+                None
+            });
             enc.compress_independent_frame_into(src, scratch);
         } else {
             let mut enc: FrameCompressor =

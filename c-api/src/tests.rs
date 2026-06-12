@@ -2174,7 +2174,7 @@ fn dict_compressor_cache_drops_stale_target_block_size() {
     // Cap the block size for one frame, then reset the knob to 0 (auto).
     assert_eq!(
         ZSTD_isError(unsafe {
-            ZSTD_CCtx_setParameter(cctx, crate::params::ZSTD_C_TARGET_CBLOCK_SIZE, 256)
+            ZSTD_CCtx_setParameter(cctx, crate::params::ZSTD_C_TARGET_CBLOCK_SIZE, 1536)
         }),
         0
     );
