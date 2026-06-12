@@ -571,7 +571,7 @@ jobs:
       - uses: taiki-e/install-action@cargo-llvm-cov
       - run: cargo llvm-cov -p structured-zstd --features hash,std,dict_builder --lcov --output-path lcov.info
         working-directory: zstd
-      - uses: codecov/codecov-action@v6
+      - uses: codecov/codecov-action@v7
         with:
           files: zstd/lcov.info
         env:
