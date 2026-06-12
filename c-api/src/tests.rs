@@ -2674,6 +2674,29 @@ fn cdict_advanced_rejects_invalid_strategy_ordinal() {
 }
 
 #[test]
+fn cparams_estimate_never_underreports_on_32bit() {
+    // windowLog=30 + hashLog=29 + chainLog=29 each pass the per-field
+    // bounds, but their byte sizes sum past u32::MAX: on a 32-bit target
+    // the plain addition wraps and the estimate UNDER-reports — worse than
+    // an error for a sizing contract. The sum must come back as either an
+    // encoded error or a figure that covers at least the window alone.
+    let cparams = ZSTD_compressionParameters {
+        windowLog: 30,
+        chainLog: 29,
+        hashLog: 29,
+        searchLog: 1,
+        minMatch: 5,
+        targetLength: 0,
+        strategy: 1,
+    };
+    let n = ZSTD_estimateCCtxSize_usingCParams(cparams);
+    assert!(
+        crate::error::ZSTD_isError(n) != 0 || n >= (1usize << 30),
+        "estimate must error or cover the window, got {n}"
+    );
+}
+
+#[test]
 fn zdict_train_rejects_null_buffers_with_nonzero_lengths() {
     // A NULL buffer paired with a non-zero length must come back as an
     // encoded error, never reach slice construction: these are documented
