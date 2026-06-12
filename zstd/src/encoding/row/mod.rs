@@ -1571,6 +1571,7 @@ impl RowMatchGenerator {
         }
     }
 
+    #[inline(always)]
     pub(crate) fn hash_and_row(&self, abs_pos: usize) -> Option<(usize, u8)> {
         let idx = abs_pos - self.history_abs_start;
         let concat = self.live_history();
@@ -1638,6 +1639,7 @@ impl RowMatchGenerator {
     }
 
     #[allow(dead_code)]
+    #[inline(always)]
     pub(crate) fn repcode_candidate(
         &self,
         abs_pos: usize,
