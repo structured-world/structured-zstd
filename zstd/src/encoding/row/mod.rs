@@ -75,6 +75,7 @@ pub(crate) trait RowTags: Copy {
         matcher: &RowMatchGenerator,
         abs_pos: usize,
         lit_len: usize,
+        hash: Option<(usize, u8)>,
     ) -> Option<MatchCandidate>;
 }
 
@@ -97,9 +98,10 @@ impl RowTags for ScalarTags {
         matcher: &RowMatchGenerator,
         abs_pos: usize,
         lit_len: usize,
+        hash: Option<(usize, u8)>,
     ) -> Option<MatchCandidate> {
         // Scalar has no target feature; the probe body runs as-is.
-        unsafe { matcher.row_probe_scalar::<ROW_LOG>(abs_pos, lit_len) }
+        unsafe { matcher.row_probe_scalar::<ROW_LOG>(abs_pos, lit_len, hash) }
     }
 }
 
@@ -113,9 +115,10 @@ impl RowTags for Sse42Tags {
         matcher: &RowMatchGenerator,
         abs_pos: usize,
         lit_len: usize,
+        hash: Option<(usize, u8)>,
     ) -> Option<MatchCandidate> {
         // SAFETY: dispatched only when `tag_kernel == Sse42` (SSE4.2 confirmed).
-        unsafe { matcher.row_probe_sse42::<ROW_LOG>(abs_pos, lit_len) }
+        unsafe { matcher.row_probe_sse42::<ROW_LOG>(abs_pos, lit_len, hash) }
     }
 }
 
@@ -129,9 +132,10 @@ impl RowTags for Avx2Bmi2Tags {
         matcher: &RowMatchGenerator,
         abs_pos: usize,
         lit_len: usize,
+        hash: Option<(usize, u8)>,
     ) -> Option<MatchCandidate> {
         // SAFETY: dispatched only when `tag_kernel == Avx2Bmi2` (AVX2+BMI2 confirmed).
-        unsafe { matcher.row_probe_avx2bmi2::<ROW_LOG>(abs_pos, lit_len) }
+        unsafe { matcher.row_probe_avx2bmi2::<ROW_LOG>(abs_pos, lit_len, hash) }
     }
 }
 
@@ -145,9 +149,10 @@ impl RowTags for NeonTags {
         matcher: &RowMatchGenerator,
         abs_pos: usize,
         lit_len: usize,
+        hash: Option<(usize, u8)>,
     ) -> Option<MatchCandidate> {
         // SAFETY: dispatched only when `tag_kernel == Neon` (NEON confirmed).
-        unsafe { matcher.row_probe_neon::<ROW_LOG>(abs_pos, lit_len) }
+        unsafe { matcher.row_probe_neon::<ROW_LOG>(abs_pos, lit_len, hash) }
     }
 }
 
@@ -173,10 +178,11 @@ impl RowTags for Simd128Tags {
         matcher: &RowMatchGenerator,
         abs_pos: usize,
         lit_len: usize,
+        hash: Option<(usize, u8)>,
     ) -> Option<MatchCandidate> {
         // wasm simd128 is compile-time; `row_probe_simd128` needs no
         // `#[target_feature]` and the intrinsics inline directly.
-        unsafe { matcher.row_probe_simd128::<ROW_LOG>(abs_pos, lit_len) }
+        unsafe { matcher.row_probe_simd128::<ROW_LOG>(abs_pos, lit_len, hash) }
     }
 }
 
@@ -407,6 +413,7 @@ macro_rules! gen_row_probe {
             &self,
             abs_pos: usize,
             lit_len: usize,
+            hash: Option<(usize, u8)>,
         ) -> Option<MatchCandidate> {
             debug_assert_eq!(ROW_LOG, self.row_log);
             let mls = self.mls;
@@ -416,7 +423,13 @@ macro_rules! gen_row_probe {
                 return None;
             }
 
-            let (row, tag) = self.hash_and_row(abs_pos)?;
+            // `hash` carries the (row, tag) the greedy loop already
+            // computed for this position (and prefetched the row for);
+            // recompute only on the uncarried paths.
+            let (row, tag) = match hash {
+                Some(rt) => rt,
+                None => self.hash_and_row(abs_pos)?,
+            };
             let row_entries = 1usize << ROW_LOG;
             let row_mask = row_entries - 1;
             let row_base = row << ROW_LOG;
@@ -1171,6 +1184,14 @@ impl RowMatchGenerator {
 
         let mut pos = 0usize;
         let mut literals_start = 0usize;
+        // Software pipeline over the dependent row load: on a miss the next
+        // position's (row, tag) is computed ahead and its tag/position rows
+        // prefetched, so the probe's row loads (the hottest instructions of
+        // this loop — a hash-dependent cache miss per position) overlap the
+        // current iteration's tail instead of stalling the next probe.
+        // Donor `ZSTD_RowFindBestMatch` gets the same overlap from its
+        // hash-cache + `ZSTD_row_prefetch` pipeline.
+        let mut carried: Option<(usize, (usize, u8))> = None;
 
         while pos + GREEDY_MIN_LOOKAHEAD <= current_len {
             let abs_pos = current_abs_start + pos;
@@ -1224,11 +1245,15 @@ impl RowMatchGenerator {
             // pure search, no table mutation), so skipping it drops no hash
             // insert — the post-emit `insert_positions(abs_pos, ..)` still
             // indexes the committed span.
+            let hash = match carried.take() {
+                Some((carried_pos, rt)) if carried_pos == abs_pos => Some(rt),
+                _ => None,
+            };
             let chosen = match rep_match {
                 Some(rep) => Some(rep),
                 // SAFETY: `K` selected by `dispatch_tag_kernel!` after `detect`
                 // confirmed its ISA; `K::probe` upholds the feature contract.
-                None => unsafe { K::probe::<ROW_LOG>(self, abs_pos, lit_len) },
+                None => unsafe { K::probe::<ROW_LOG>(self, abs_pos, lit_len, hash) },
             };
 
             let Some(candidate) = chosen else {
@@ -1245,7 +1270,21 @@ impl RowMatchGenerator {
                 // drain.
                 const SKIP_STRENGTH: u32 = 10;
                 let step = ((lit_len as u32) >> SKIP_STRENGTH) as usize + 1;
-                self.insert_position::<ROW_LOG>(abs_pos);
+                // Reuse the probe's (row, tag) for the insert (the rep-hit
+                // path never computed one, so fall back to the hashing
+                // insert there — `hash` is `Some` exactly when the probe
+                // ran on this position).
+                match hash {
+                    Some((row, tag)) => self.insert_at::<ROW_LOG>(abs_pos, row, tag),
+                    None => self.insert_position::<ROW_LOG>(abs_pos),
+                }
+                if step == 1 {
+                    let next_abs = abs_pos + 1;
+                    if let Some((row, tag)) = self.hash_and_row(next_abs) {
+                        self.prefetch_row::<ROW_LOG>(row);
+                        carried = Some((next_abs, (row, tag)));
+                    }
+                }
                 pos += step;
                 continue;
             };
@@ -1384,7 +1423,7 @@ impl RowMatchGenerator {
         let rep = self.repcode_candidate(abs_pos, lit_len);
         // SAFETY: `K` selected by `dispatch_tag_kernel!` after `detect` confirmed
         // its ISA; `K::probe` upholds the per-tier feature contract.
-        let row = unsafe { K::probe::<ROW_LOG>(self, abs_pos, lit_len) };
+        let row = unsafe { K::probe::<ROW_LOG>(self, abs_pos, lit_len, None) };
         best_len_offset_candidate(rep, row)
     }
 
@@ -1503,9 +1542,9 @@ impl RowMatchGenerator {
         // SAFETY: `dispatch_tag_kernel!` only selects a `K` whose ISA `detect`
         // confirmed present, upholding `K::probe`'s per-tier feature contract.
         match self.row_log {
-            4 => unsafe { K::probe::<4>(self, abs_pos, lit_len) },
-            5 => unsafe { K::probe::<5>(self, abs_pos, lit_len) },
-            6 => unsafe { K::probe::<6>(self, abs_pos, lit_len) },
+            4 => unsafe { K::probe::<4>(self, abs_pos, lit_len, None) },
+            5 => unsafe { K::probe::<5>(self, abs_pos, lit_len, None) },
+            6 => unsafe { K::probe::<6>(self, abs_pos, lit_len, None) },
             _ => unreachable!("row_log is clamped to 4..=6 in configure()"),
         }
     }
@@ -1632,6 +1671,41 @@ impl RowMatchGenerator {
         let Some((row, tag)) = self.hash_and_row(abs_pos) else {
             return;
         };
+        self.insert_at::<ROW_LOG>(abs_pos, row, tag);
+    }
+
+    /// Prefetch a row's tag bytes and position words into L1 ahead of the
+    /// next iteration's probe (no-op on targets without a prefetch hint).
+    #[inline]
+    fn prefetch_row<const ROW_LOG: usize>(&self, row: usize) {
+        let row_base = row << ROW_LOG;
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            #[cfg(target_arch = "x86")]
+            use core::arch::x86::{_MM_HINT_T0, _mm_prefetch};
+            #[cfg(target_arch = "x86_64")]
+            use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            // SAFETY: prefetch is a hint and never faults; the indexes are in
+            // bounds by the same `ensure_tables` sizing as `insert_at`.
+            unsafe {
+                _mm_prefetch(self.row_tags.as_ptr().add(row_base).cast(), _MM_HINT_T0);
+                _mm_prefetch(
+                    self.row_positions.as_ptr().add(row_base).cast(),
+                    _MM_HINT_T0,
+                );
+            }
+        }
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            let _ = row_base;
+        }
+    }
+
+    /// [`Self::insert_position`] with the (row, tag) pair already computed —
+    /// the greedy miss path reuses the probe's hash instead of re-hashing
+    /// the same position.
+    #[inline]
+    fn insert_at<const ROW_LOG: usize>(&mut self, abs_pos: usize, row: usize, tag: u8) {
         // `ROW_LOG` is the compile-time row width for this monomorphisation;
         // the dispatcher guarantees `ROW_LOG == self.row_log` so the table
         // bounds (`ensure_tables` sized by `self.row_log`) hold.
