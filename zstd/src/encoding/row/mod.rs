@@ -1319,6 +1319,19 @@ impl RowMatchGenerator {
             );
             pos = start + candidate.match_len;
             literals_start = pos;
+            // Same hash + row prefetch carry as the miss path: the next
+            // probe position is known here (right past the emitted match),
+            // and its row is otherwise guaranteed cold after the match-span
+            // insert walked other rows. The rep probe at the next iteration
+            // may consume the position without a row probe — then the
+            // carried hash is only reused by the insert-side, never wasted.
+            if pos + GREEDY_MIN_LOOKAHEAD <= current_len {
+                let next_abs = current_abs_start + pos;
+                if let Some((row, tag)) = self.hash_and_row(next_abs) {
+                    self.prefetch_row::<ROW_LOG>(row);
+                    carried = Some((next_abs, (row, tag)));
+                }
+            }
 
             // Donor's `lazy_generic` has an immediate-repcode loop here
             // (probing `offset_2` after each main emit and swapping
