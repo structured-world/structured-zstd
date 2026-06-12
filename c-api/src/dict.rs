@@ -72,6 +72,11 @@ pub unsafe extern "C" fn ZDICT_trainFromBuffer(
     let Some(total) = (unsafe { total_sample_len(samples_sizes, nb_samples) }) else {
         return encode(ZSTD_ErrorCode::ZSTD_error_dictionaryCreation_failed);
     };
+    // A NULL buffer with a non-zero length is caller error, reported as an
+    // encoded error code — it must never reach slice construction.
+    if (samples_buffer.is_null() && total > 0) || (dict_buffer.is_null() && dict_capacity > 0) {
+        return encode(ZSTD_ErrorCode::ZSTD_error_dictionaryCreation_failed);
+    }
     let samples = unsafe { in_slice(samples_buffer, total) };
 
     let outcome = catch_unwind(AssertUnwindSafe(|| {
@@ -185,6 +190,10 @@ unsafe fn train_fastcover(
     let Some(total) = (unsafe { total_sample_len(samples_sizes, nb_samples) }) else {
         return encode(ZSTD_ErrorCode::ZSTD_error_dictionaryCreation_failed);
     };
+    // NULL + non-zero length is caller error, not a slice to build.
+    if (samples_buffer.is_null() && total > 0) || (dict_buffer.is_null() && dict_capacity > 0) {
+        return encode(ZSTD_ErrorCode::ZSTD_error_dictionaryCreation_failed);
+    }
     let samples = unsafe { in_slice(samples_buffer, total) };
     let finalize = FinalizeOptions {
         dict_id: (params.zParams.dictID != 0).then_some(params.zParams.dictID),
@@ -331,6 +340,13 @@ pub unsafe extern "C" fn ZDICT_finalizeDictionary(
     let Some(total) = (unsafe { total_sample_len(samples_sizes, nb_samples) }) else {
         return encode(ZSTD_ErrorCode::ZSTD_error_dictionaryCreation_failed);
     };
+    // NULL + non-zero length is caller error, not a slice to build.
+    if (samples_buffer.is_null() && total > 0)
+        || (dict_content.is_null() && dict_content_size > 0)
+        || (dst_dict_buffer.is_null() && max_dict_size > 0)
+    {
+        return encode(ZSTD_ErrorCode::ZSTD_error_dictionaryCreation_failed);
+    }
     let content = unsafe { in_slice(dict_content, dict_content_size) };
     let samples = unsafe { in_slice(samples_buffer, total) };
     // dictID 0 means "derive a compliant id"; any non-zero value is forced.
