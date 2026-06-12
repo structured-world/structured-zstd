@@ -58,6 +58,13 @@ pub struct DictionaryHandle {
 pub const MAGIC_NUM: [u8; 4] = [0x37, 0xA4, 0x30, 0xEC];
 
 impl Dictionary {
+    /// Heap bytes owned by this dictionary: the content plus the parsed
+    /// entropy tables' heap (the fixed-size FSE decode arrays are inline,
+    /// counted by `size_of::<Dictionary>()`).
+    pub fn heap_bytes(&self) -> usize {
+        self.dict_content.capacity() + self.fse.heap_bytes() + self.huf.heap_bytes()
+    }
+
     /// Build a dictionary from raw content bytes (without entropy table sections).
     ///
     /// This is primarily intended for dictionaries produced by the `dict_builder`

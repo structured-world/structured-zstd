@@ -110,8 +110,9 @@ impl DCtxDictAttach {
             DCtxDictAttach::Load { handle }
             | DCtxDictAttach::RefDDict { handle, .. }
             | DCtxDictAttach::Prefix { handle } => {
-                handle.as_dict().dict_content.len()
-                    + core::mem::size_of::<codec::decoding::Dictionary>()
+                // Content plus the parsed entropy tables' heap; the inline
+                // FSE decode arrays are covered by the struct size term.
+                handle.as_dict().heap_bytes() + core::mem::size_of::<codec::decoding::Dictionary>()
             }
         }
     }
@@ -771,6 +772,14 @@ pub unsafe extern "C" fn ZSTD_decompress_usingDict(
     let src = unsafe { in_slice(src, src_size) };
     let dst = unsafe { out_slice(dst, dst_capacity) };
     let dict = unsafe { in_slice(dict, dict_size) };
+    // Deliberately NO `stream_frame_done` guard here: the stage_wrong check
+    // is the contract of the ZSTD_DCtx_* dictionary MUTATORS (they must not
+    // swap the dictionary under an open streaming frame). A one-shot decode
+    // owns its frames whole — `decode_all*` re-initializes per frame (header
+    // re-parse, entropy/offset/scratch reset), so a context abandoned
+    // mid-stream cannot leak state in. Same semantics as ZSTD_decompressDCtx,
+    // covered by the decompress_stream_recovers_after_oneshot_on_midframe_context
+    // regression test; every exit path below restores the frame boundary.
     let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<usize, ZSTD_ErrorCode> {
         dctx.decoder.set_content_checksum(ContentChecksum::Verify);
         if dict.is_empty() {
