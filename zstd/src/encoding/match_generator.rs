@@ -947,8 +947,21 @@ fn level22_btultra2_params_for_source_size(source_size: Option<u64>) -> LevelPar
 /// resolves at frame start, so the estimate tracks the real allocations;
 /// it is an upper-bound style budget figure, not an exact accounting.
 pub fn estimated_compression_workspace_bytes(level: CompressionLevel) -> usize {
+    use super::strategy::StrategyTag;
     let params = resolve_level_params(level, None);
     let window = 1usize << params.window_log;
+    // Mirror `configure()`: the HC3 short-match side table exists only on
+    // the btultra/btultra2 tags (minMatch 3), capped by the window log; the
+    // BT pointer-pair layout fits inside the `4 << chain_log` chain term
+    // (pairs over `chain_log - 1` nodes).
+    let wants_hash3 = matches!(
+        params.strategy_tag,
+        StrategyTag::BtUltra | StrategyTag::BtUltra2
+    );
+    let uses_bt = matches!(
+        params.strategy_tag,
+        StrategyTag::Btlazy2 | StrategyTag::BtOpt | StrategyTag::BtUltra | StrategyTag::BtUltra2
+    );
     let tables = params.fast.map(|f| 4usize << f.hash_log).unwrap_or(0)
         + params
             .dfast
@@ -957,11 +970,9 @@ pub fn estimated_compression_workspace_bytes(level: CompressionLevel) -> usize {
         + params
             .hc
             .map(|h| {
-                // The btopt/btultra cascade also allocates the HC3
-                // short-match side table (`HC3_HASH_LOG`); HC-mode lazy
-                // levels leave it sized to zero.
-                let hash3 = if matches!(params.search, super::strategy::SearchMethod::BinaryTree) {
-                    4usize << super::match_table::storage::HC3_HASH_LOG
+                let hash3 = if wants_hash3 {
+                    4usize
+                        << super::match_table::storage::HC3_HASH_LOG.min(params.window_log as usize)
                 } else {
                     0
                 };
@@ -972,10 +983,21 @@ pub fn estimated_compression_workspace_bytes(level: CompressionLevel) -> usize {
             .row
             .map(|r| (4usize << r.hash_bits) + (2usize << r.hash_bits))
             .unwrap_or(0);
+    // BT modes box a `BtMatcher` (inline cost-model tables) plus the
+    // optimal-parse scratch arenas, bounded by the `HC_OPT_NUM` node
+    // frontier (node + emitted-store + candidate entries per slot).
+    let bt = if uses_bt {
+        core::mem::size_of::<super::bt::BtMatcher>()
+            + HC_OPT_NUM
+                * (2 * core::mem::size_of::<HcOptimalNode>()
+                    + core::mem::size_of::<MatchCandidate>())
+    } else {
+        0
+    };
     // Block staging: literal + sequence buffers plus the compressed-block
     // scratch, each bounded by the 128 KiB block size.
     let staging = 3 * (128 * 1024);
-    window + tables + staging
+    window + tables + bt + staging
 }
 
 /// Resolve a [`CompressionLevel`] to internal tuning parameters,
