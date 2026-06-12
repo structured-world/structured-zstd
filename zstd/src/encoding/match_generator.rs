@@ -4495,6 +4495,31 @@ macro_rules! for_each_repcode_candidate_body {
                 continue;
             }
             let candidate_idx = candidate_pos - $table.history_abs_start;
+            // Donor `ZSTD_readMINMATCH` gate (zstd_opt.c:657-674): a
+            // 4-byte (3-byte when min_match_len == 3) equality probe
+            // before the full prefix scan. Equivalent filtering — a
+            // mismatch here means `match_len < min_match_len`, which
+            // the post-scan check rejects anyway — but it skips the
+            // prefix-kernel call for the common no-match case (rep
+            // offsets rarely hit on low-redundancy input).
+            //
+            // SAFETY: `current_idx + 4 <= concat_len` (early return
+            // above) and `candidate_idx < current_idx` (rep >= 1), so
+            // both 4-byte reads stay inside `concat`.
+            let gate_matches = unsafe {
+                let cand = base.add(candidate_idx).cast::<u32>().read_unaligned();
+                let cur = base.add(current_idx).cast::<u32>().read_unaligned();
+                if $min_match_len == 3 {
+                    // Compare the low-address 3 bytes regardless of
+                    // endianness: byte-shift on LE, mask via to_le.
+                    (cand.to_le() & 0x00FF_FFFF) == (cur.to_le() & 0x00FF_FFFF)
+                } else {
+                    cand == cur
+                }
+            };
+            if !gate_matches {
+                continue;
+            }
             // SAFETY: `candidate_idx ≤ current_idx < concat_len` (since
             // candidate_pos ≤ abs_pos and we early-returned on
             // `current_idx + 4 > concat_len`). `max` clamps to the shorter

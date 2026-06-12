@@ -1,4 +1,4 @@
-use crate::bit_io::{BitReader, BitReaderReversed};
+use crate::bit_io::BitReaderReversed;
 use crate::cpu_kernel::CpuKernel;
 use crate::decoding::errors::{FSEDecoderError, FSETableError};
 use alloc::vec::Vec;
@@ -373,11 +373,23 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
 
     /// returns how many BYTEs (not bits) were read while building the decoder
     pub fn build_decoder(&mut self, source: &[u8], max_log: u8) -> Result<usize, FSETableError> {
+        self.build_decoder_fused(source, max_log, SeqMeta::None)
+    }
+
+    /// [`Self::build_decoder`] with the sequence-axis meta fused into the
+    /// build loop — replaces the build-then-enrich double pass on the
+    /// hot per-block table rebuild path.
+    pub(crate) fn build_decoder_fused(
+        &mut self,
+        source: &[u8],
+        max_log: u8,
+        meta: SeqMeta<'_>,
+    ) -> Result<usize, FSETableError> {
         let max_log = max_log.min(ENTRY_MAX_ACCURACY_LOG);
         self.accuracy_log = 0;
 
         let bytes_read = self.read_probabilities(source, max_log)?;
-        self.build_decoding_table()?;
+        self.build_decoding_table_meta(meta)?;
 
         Ok(bytes_read)
     }
@@ -521,8 +533,12 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
     /// well-defined empty state a freshly-constructed `FSETable` has;
     /// any subsequent `init_state` returns `TableIsUninitialized`.
     fn build_decoding_table(&mut self) -> Result<(), FSETableError> {
+        self.build_decoding_table_meta(SeqMeta::None)
+    }
+
+    fn build_decoding_table_meta(&mut self, meta: SeqMeta<'_>) -> Result<(), FSETableError> {
         let mut spread = core::mem::take(&mut self.symbol_spread_buffer);
-        let result = self.build_decoding_table_inner(&mut spread);
+        let result = self.build_decoding_table_inner(&mut spread, meta);
         self.symbol_spread_buffer = spread;
         if result.is_err() {
             self.reset();
@@ -530,7 +546,11 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         result
     }
 
-    fn build_decoding_table_inner(&mut self, spread: &mut Vec<u8>) -> Result<(), FSETableError> {
+    fn build_decoding_table_inner(
+        &mut self,
+        spread: &mut Vec<u8>,
+        meta: SeqMeta<'_>,
+    ) -> Result<(), FSETableError> {
         let nb_symbols = self.symbol_probabilities.len();
         if nb_symbols > self.max_symbol as usize + 1 {
             return Err(FSETableError::TooManySymbols { got: nb_symbols });
@@ -704,7 +724,25 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
             // formula bug instead of silently producing a
             // malformed entry.
             let new_state_u32 = (next_state << nb) - table_size_u32;
-            self.decode[state_idx] = E::from_raw(new_state_u32 as u16, symbol, nb);
+            let entry = E::from_raw(new_state_u32 as u16, symbol, nb);
+            // Fused enrich: write the sequence meta in the same pass
+            // instead of re-walking the finished table. `from_raw`
+            // zero-inits the meta fields, so the no-meta arms match
+            // the post-pass results exactly.
+            self.decode[state_idx] = match meta {
+                SeqMeta::None => entry,
+                SeqMeta::Packed(packed) => {
+                    let m = packed.get(symbol as usize).copied().unwrap_or(0);
+                    entry.with_seq_meta(m & 0x00FF_FFFF, (m >> 24) as u8)
+                }
+                SeqMeta::Offsets => {
+                    if symbol < 32 {
+                        entry.with_seq_meta(1u32 << symbol, symbol)
+                    } else {
+                        entry
+                    }
+                }
+            };
         }
 
         // Commit the live span. The loop wrote every `state_idx ∈
@@ -719,8 +757,40 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
     fn read_probabilities(&mut self, source: &[u8], max_log: u8) -> Result<usize, FSETableError> {
         self.symbol_probabilities.clear(); //just clear, we will fill a probability for each entry anyways. No need to force new allocs here
 
-        let mut br = BitReader::new(source);
-        self.accuracy_log = ACC_LOG_OFFSET + (br.get_bits(4)? as u8);
+        // Donor `FSE_readNCount` cursor shape: a flat little-endian bit
+        // position over `source`, extracting each field with one whole-word
+        // load. The generic `BitReader::get_bits` assembled fields
+        // byte-by-byte with per-call divisions — measured ~6% of decode
+        // wall on table-dense btopt frames.
+        let total_bits = source.len() * 8;
+        let mut bit_pos: usize = 0;
+        #[inline(always)]
+        fn field_at(source: &[u8], bit_pos: usize, n: usize) -> u64 {
+            debug_assert!(n <= 32);
+            let byte = bit_pos >> 3;
+            let mut window = [0u8; 8];
+            let take = source.len().saturating_sub(byte).min(8);
+            window[..take].copy_from_slice(&source[byte..byte + take]);
+            (u64::from_le_bytes(window) >> (bit_pos & 7)) & ((1u64 << n) - 1)
+        }
+        macro_rules! read_bits {
+            ($n:expr) => {{
+                let n: usize = $n;
+                if total_bits - bit_pos < n {
+                    return Err(FSETableError::GetBitsError(
+                        crate::bit_io::GetBitsError::NotEnoughRemainingBits {
+                            requested: n,
+                            remaining: total_bits - bit_pos,
+                        },
+                    ));
+                }
+                let v = field_at(source, bit_pos, n);
+                bit_pos += n;
+                v
+            }};
+        }
+
+        self.accuracy_log = ACC_LOG_OFFSET + (read_bits!(4) as u8);
         if self.accuracy_log > ENTRY_MAX_ACCURACY_LOG {
             return Err(FSETableError::AccLogTooBig {
                 got: self.accuracy_log,
@@ -744,14 +814,14 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
             let max_remaining_value = probability_sum - probability_counter + 1;
             let bits_to_read = highest_bit_set(max_remaining_value);
 
-            let unchecked_value = br.get_bits(bits_to_read as usize)? as u32;
+            let unchecked_value = read_bits!(bits_to_read as usize) as u32;
 
             let low_threshold = ((1 << bits_to_read) - 1) - (max_remaining_value);
             let mask = (1 << (bits_to_read - 1)) - 1;
             let small_value = unchecked_value & mask;
 
             let value = if small_value < low_threshold {
-                br.return_bits(1);
+                bit_pos -= 1;
                 small_value
             } else if unchecked_value > mask {
                 unchecked_value - low_threshold
@@ -774,7 +844,7 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
             } else {
                 //fast skip further zero probabilities
                 loop {
-                    let skip_amount = br.get_bits(2)? as usize;
+                    let skip_amount = read_bits!(2) as usize;
 
                     self.symbol_probabilities
                         .resize(self.symbol_probabilities.len() + skip_amount, 0);
@@ -798,10 +868,10 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
             });
         }
 
-        let bytes_read = if br.bits_read().is_multiple_of(8) {
-            br.bits_read() / 8
+        let bytes_read = if bit_pos.is_multiple_of(8) {
+            bit_pos / 8
         } else {
-            (br.bits_read() / 8) + 1
+            (bit_pos / 8) + 1
         };
 
         Ok(bytes_read)
@@ -982,11 +1052,35 @@ const _: [(); 8] = [(); core::mem::size_of::<SeqSymbol>()];
 /// `num_additional_bits` from caller-provided meta and discards
 /// `symbol`.
 #[doc(hidden)]
+/// Sequence-axis meta source fused into the table-build loop. The donor
+/// fills `baseValue` / `nbAdditionalBits` during table construction
+/// (`ZSTD_buildSeqTable`); building first and enriching in a second
+/// full-table pass doubles the entry traffic on table-dense frames.
+#[derive(Clone, Copy)]
+pub enum SeqMeta<'a> {
+    /// No sequence meta (Huffman-weight / literal tables).
+    None,
+    /// Packed LL / ML meta: `base = m & 0x00FF_FFFF`, `bits = m >> 24`.
+    Packed(&'a [u32]),
+    /// Closed-form OF meta: `base = 1 << code`, `bits = code` for
+    /// `code < 32`; zeros otherwise.
+    Offsets,
+}
+
 pub trait FseEntry: Copy + Default {
     /// Bits to read on state transition. Hot-path access.
     fn num_bits(&self) -> u8;
     /// Base index for next state. Hot-path access.
     fn new_state(&self) -> u16;
+    /// Attach sequence meta (`base_value` / `num_additional_bits`) during
+    /// the build loop. Entries without those fields keep the no-op
+    /// default.
+    #[inline(always)]
+    fn with_seq_meta(self, base_value: u32, num_additional_bits: u8) -> Self {
+        let _ = (base_value, num_additional_bits);
+        self
+    }
+
     /// Build-time constructor from the raw (new_state, symbol, num_bits)
     /// triple produced by `build_decoding_table`. Implementations may
     /// drop `symbol` (e.g. [`SeqSymbol`] mirrors donor `ZSTD_seqSymbol`
@@ -1018,6 +1112,13 @@ impl FseEntry for Entry {
 }
 
 impl FseEntry for SeqSymbol {
+    #[inline(always)]
+    fn with_seq_meta(mut self, base_value: u32, num_additional_bits: u8) -> Self {
+        self.base_value = base_value;
+        self.num_additional_bits = num_additional_bits;
+        self
+    }
+
     #[inline(always)]
     fn num_bits(&self) -> u8 {
         self.num_bits

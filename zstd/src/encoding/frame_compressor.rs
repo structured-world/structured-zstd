@@ -1831,9 +1831,13 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // single-segment frame whenever the source fits the active window.
         // A single-segment frame REQUIRES an FCS field, so suppressing the
         // content size (`content_size_flag` off) also forces the windowed
-        // layout, mirroring upstream.
+        // layout, mirroring upstream. Dictionary frames qualify (the
+        // reference emits single-segment + dictionary-ID headers): the
+        // dictionary is decoder setup state, not part of the regenerated
+        // segment, so the frame keeps single-segment wire layout and
+        // decoders keep their single-allocation paths (our own decoder
+        // already caps reservation to min(window, FCS) either way).
         let single_segment = self.content_size_flag
-            && !prep.use_dictionary_state
             && prep.source_size_hint_known
             && total_uncompressed >= 512
             && total_uncompressed <= prep.window_size;
@@ -3139,6 +3143,55 @@ mod tests {
             .decode_all_to_vec(&out, &mut decoded)
             .expect("frame must decode");
         assert_eq!(decoded, input);
+    }
+
+    // A dictionary frame with a known content size that fits the window
+    // must take the single-segment layout (reference parity): the
+    // dictionary is decoder setup state, not part of the regenerated
+    // segment, so it must not force the windowed multi-segment layout.
+    #[test]
+    fn dict_frame_with_known_size_is_single_segment() {
+        let dict_raw = include_bytes!("../../dict_tests/dictionary");
+        let payload = b"dictionary-keyed payload dictionary-keyed payload".repeat(64);
+
+        let mut compressor: FrameCompressor =
+            FrameCompressor::new(super::CompressionLevel::Fastest);
+        compressor
+            .set_dictionary_from_bytes(dict_raw)
+            .expect("dictionary bytes should parse");
+        let mut frame = Vec::new();
+        compressor.compress_independent_frame_into(&payload, &mut frame);
+
+        let parsed = crate::decoding::frame::read_frame_header(frame.as_slice())
+            .expect("frame header must parse")
+            .0;
+        assert!(
+            parsed.descriptor.single_segment_flag(),
+            "dict frame with known size <= window must be single-segment"
+        );
+        assert!(parsed.dictionary_id().is_some());
+        assert_eq!(parsed.frame_content_size(), payload.len() as u64);
+
+        // Round-trip through our own decoder with the dictionary.
+        let mut decoder = crate::decoding::FrameDecoder::new();
+        decoder
+            .add_dict_from_bytes(dict_raw)
+            .expect("decoder must accept the dictionary");
+        let mut decoded = Vec::with_capacity(payload.len() + 64);
+        decoder
+            .decode_all_to_vec(&frame, &mut decoded)
+            .expect("single-segment dict frame must decode");
+        assert_eq!(decoded, payload);
+
+        // Reference-decoder cross-check: our serializer and parser could
+        // share a bug and still self-roundtrip, so the on-wire
+        // single-segment + dictionary-ID layout must also decode through
+        // the C implementation.
+        let ffi_decoded = zstd::bulk::Decompressor::with_dictionary(dict_raw)
+            .expect("reference decompressor must accept the dictionary")
+            .decompress(&frame, payload.len() + 64)
+            .expect("reference zstd must accept the single-segment dict frame");
+        assert_eq!(ffi_decoded, payload);
     }
 
     // Regression test: `heap_size()` must count the retained Huffman tables

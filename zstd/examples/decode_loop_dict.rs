@@ -12,9 +12,19 @@
 //!
 //! Build: `cargo build --profile flamegraph -p structured-zstd
 //!          --example decode_loop_dict`
+//! Build with heap profiling (writes `dhat-heap.json` on exit):
+//!        `cargo build --release -p structured-zstd
+//!          --example decode_loop_dict --features dhat-heap`
 //! Run:   `decode_loop_dict <iters> <payload.zst> <dict> <expected_len>`
 
 use std::env;
+
+// With `--features dhat-heap`, route allocations through the dhat heap
+// profiler (same pattern as `encode_loop_dict`) for per-call-site
+// allocation counts + peak attribution. Writes `dhat-heap.json` on drop.
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
 
 use structured_zstd::decoding::{DictionaryHandle, FrameDecoder};
 
@@ -37,6 +47,13 @@ fn main() {
 
     let mut decoder = FrameDecoder::new();
     let mut output = vec![0u8; expected_len];
+
+    // Arm the profiler only after the one-time setup (file reads, dict
+    // parse, decoder + output-buffer allocation) so `dhat-heap.json`
+    // attributes allocations to the repeated decode path alone.
+    #[cfg(feature = "dhat-heap")]
+    let _dhat = dhat::Profiler::new_heap();
+
     let mut sink: usize = 0;
     for _ in 0..iters {
         let n = decoder

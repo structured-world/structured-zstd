@@ -280,13 +280,14 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         true
     }
 
-    /// Pre-allocate capacity for `amount` additional bytes.
-    ///
-    /// Call this before a batch of `push`/`repeat` operations to avoid
-    /// repeated re-allocations inside the hot decode loop.
+    /// Pre-allocate capacity for `amount` additional bytes ahead of a batch
+    /// of `push`/`repeat` operations, growing exactly (see
+    /// `BufferBackend::reserve_exact`): every call site is a one-shot
+    /// window-scale reservation where amortized doubling would hold up to
+    /// 2x the window.
     #[inline]
-    pub fn reserve(&mut self, amount: usize) {
-        self.buffer.reserve(amount);
+    pub fn reserve_exact(&mut self, amount: usize) {
+        self.buffer.reserve_exact(amount);
     }
 
     /// Mutable backend handle. Lets the inline sequence executor
@@ -798,21 +799,18 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         offset: usize,
         match_length: usize,
     ) -> Result<(), DecodeBufferError> {
-        // `total_output_counter` gate: dict-source matches are only
-        // valid while the dictionary content is still inside the
-        // visible window. On the inline-exec path
-        // (`UserSliceBackend`) `total_output_counter` is NOT
-        // maintained — it stays at 0 — so the gate is trivially
-        // satisfied. This does NOT cause incorrect behavior on that
-        // path because `dict_content` is always empty for the direct
-        // decode entry (`run_direct_decode`'s
-        // `DecodeBuffer::from_backend` initializes it to empty), so
-        // `bytes_from_dict > self.dict_content.len()` below catches
-        // every would-be dict-source match and returns
-        // `NotEnoughBytesInDictionary`. The
-        // `RingBuffer` / `FlatBuf` paths still maintain the counter
-        // via `push` / `repeat_inner` and rely on it correctly.
-        if self.total_output_counter <= self.window_size as u64 {
+        // Reachability gate: dict-source matches are only valid while
+        // the dictionary content is still inside the visible window.
+        // `RingBuffer` / `FlatBuf` maintain `total_output_counter`
+        // (push / repeat / inline-exec counter bump). On the direct
+        // path (`UserSliceBackend`) the inline executor skips the
+        // counter, so `buffer.len()` carries the cumulative output
+        // until the first between-blocks `drop_to_window_size()`, and
+        // that drop latches the counter above the window before capping
+        // the visible length — the max of the two stays accurate for
+        // every backend.
+        let total_output = self.total_output_counter.max(self.buffer.len() as u64);
+        if total_output <= self.window_size as u64 {
             // at least part of that repeat is from the dictionary content
             let bytes_from_dict = offset - self.buffer.len();
 
@@ -936,16 +934,23 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     ///
     /// Returns the number of bytes whose visibility was discarded.
     ///
-    /// Does NOT mutate `total_output_counter`: that counter tracks
-    /// total bytes produced (incremented by `push` / `repeat` /
-    /// `extend_and_fill`). Advancing `head` just hides
-    /// already-produced bytes from the visible region; counting them
-    /// again would double-count and break `repeat_from_dict`'s offset
-    /// reachability check.
+    /// Catches `total_output_counter` up to the visible length before
+    /// dropping (never adds — adding the dropped amount would
+    /// double-count on backends whose `push` / `repeat` already
+    /// counted those bytes). On the direct path the inline executors
+    /// skip the counter, so without the catch-up the cap below would
+    /// shrink `len()` back under `window_size` and reopen
+    /// `repeat_from_dict`'s reachability gate even though cumulative
+    /// output already exceeded the window. A drop only ever happens
+    /// when `len() > window_size`, so the catch-up permanently latches
+    /// the counter above the window — exactly what the boolean gate
+    /// needs. On `RingBuffer` / `FlatBuf` the counter is already exact
+    /// (`>= len()`) and the `max` is a no-op.
     pub fn drop_to_window_size(&mut self) -> usize {
         match self.can_drain_to_window_size() {
             None => 0,
             Some(can_drop) => {
+                self.total_output_counter = self.total_output_counter.max(self.buffer.len() as u64);
                 self.buffer.drop_first_n(can_drop);
                 can_drop
             }
@@ -1129,6 +1134,40 @@ mod tests {
     use alloc::vec::Vec;
 
     #[test]
+    fn dict_offsets_rejected_after_direct_path_window_drop() {
+        // The direct decode path writes through the inline executors
+        // (which skip `total_output_counter`) and bounds the visible
+        // buffer with `drop_to_window_size()` between blocks. Once
+        // cumulative output exceeds the window, dictionary-backed
+        // offsets are out of reach per the spec; the reachability gate
+        // must not reopen just because the visible length was capped
+        // back to `window_size`.
+        use crate::decoding::dictionary::Dictionary;
+        use crate::decoding::user_slice_buf::UserSliceBackend;
+
+        let mut out = vec![0u8; 300];
+        let backend = UserSliceBackend::from_slice(out.as_mut_slice());
+        let mut buf = DecodeBuffer::from_backend(backend, 100);
+        let dict = Dictionary::from_raw_content(7, vec![0xAB; 64]).expect("raw-content dictionary");
+        buf.set_dict(dict.into_handle());
+
+        // Mimic the inline executor: produce 250 bytes without touching
+        // `total_output_counter`, exceeding the 100-byte window.
+        BufferBackend::extend(&mut buf.buffer, &[1u8; 250]);
+        buf.drop_to_window_size();
+        assert_eq!(buf.len(), 100, "visible buffer capped to the window");
+
+        // offset 110 > len 100 reaches 10 bytes into the dictionary;
+        // cumulative output (250) already exceeds the window (100), so
+        // this must be rejected, not served from the dictionary.
+        let result = buf.repeat_from_dict(110, 5);
+        assert!(
+            result.is_err(),
+            "dict-backed offset must be unreachable once output exceeded the window, got {result:?}"
+        );
+    }
+
+    #[test]
     fn from_backend_clears_prepopulated_backend() {
         // Regression for the round-8 review fix: `from_backend` must
         // normalise a caller-supplied backend so the logical counters
@@ -1201,7 +1240,7 @@ mod tests {
         // Mirror the fused sequence executor: reserve upfront so no
         // RingBuffer reallocation happens between checkpoint and restore
         // (restore_checkpoint requires a stable underlying allocation).
-        buf.reserve(64);
+        buf.reserve_exact(64);
         buf.push(&[1, 2, 3]);
         let cp = buf.checkpoint();
         buf.push(&[4, 5, 6, 7]);
@@ -1241,7 +1280,7 @@ mod tests {
         // Force a reallocation. RingBuffer grows by powers of two and
         // 4 MiB is well above the initial 64-byte starting capacity, so
         // reserve() must hit reserve_amortized().
-        buf.reserve(4 * 1024 * 1024);
+        buf.reserve_exact(4 * 1024 * 1024);
         buf.push(&[0; 16]);
         assert!(
             !buf.try_restore_checkpoint(cp),
@@ -1623,7 +1662,7 @@ mod tests {
         // Prefetch hints are unobservable from Rust — the assertion is
         // simply that the call completes without panic / UB.
         let mut buf = DecodeBuffer::<RingBuffer>::new(1024);
-        buf.reserve(512);
+        buf.reserve_exact(512);
         buf.push(&[0xAA; 256]);
         buf.prefetch_lookahead_match_source(0);
         buf.prefetch_lookahead_match_source(128);
@@ -1637,7 +1676,7 @@ mod tests {
         // The helper must early-return (bound check) and never touch a
         // slice past the live region.
         let mut buf = DecodeBuffer::<RingBuffer>::new(1024);
-        buf.reserve(64);
+        buf.reserve_exact(64);
         buf.push(&[0x55; 32]);
         buf.prefetch_lookahead_match_source(buf.len());
         buf.prefetch_lookahead_match_source(buf.len() + 1);
