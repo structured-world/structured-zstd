@@ -550,6 +550,16 @@ impl HuffmanTable {
                         if w > MAX_MAX_NUM_BITS {
                             return Err(err::WeightBiggerThanMaxNumBits { got: w });
                         }
+                        // The cap lives here, not at the loop bottom: the two
+                        // early-break paths push a final weight after the
+                        // bottom check would have run, and 256 explicit
+                        // weights would wrap symbol index 256 to 0 through
+                        // the u8 entry packing in the table fill.
+                        if weights.len() >= 255 {
+                            return Err(err::TooManyWeights {
+                                got: weights.len() + 1,
+                            });
+                        }
                         weight_rank_count[w as usize] += 1;
                         if w > 0 {
                             weight_sum += 1u32 << (w - 1);
@@ -589,10 +599,6 @@ impl HuffmanTable {
                         //collect final states
                         push_weight!(dec1.decode_symbol());
                         break;
-                    }
-                    //maximum number of weights is 255 because we use u8 symbols and the last weight is inferred from the sum of all others
-                    if weights.len() > 255 {
-                        return Err(err::TooManyWeights { got: weights.len() });
                     }
                 }
                 self.weight_sum = weight_sum;
