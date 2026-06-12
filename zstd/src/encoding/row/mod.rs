@@ -416,6 +416,11 @@ macro_rules! row_tag_mask_simd128 {
 macro_rules! gen_row_probe {
     ($name:ident, $use_mask:literal, $maskmac:ident, $cpl:path $(, $tf:literal)?) => {
         $(#[target_feature(enable = $tf)])?
+        // `#[inline]` hint (NOT always — forbidden with target_feature):
+        // the per-tier parse umbrella enables the same features, so the
+        // probe is inlinable there and LLVM takes the single-call-site
+        // hint, merging probe + parse loop into one body.
+        #[inline]
         #[allow(unused_unsafe)]
         // wasm32+simd128 selects `row_probe_simd128` at compile time, leaving
         // `row_probe_scalar` (the only other tier compiled on wasm) unused.
