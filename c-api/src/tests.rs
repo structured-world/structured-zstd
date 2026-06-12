@@ -2146,3 +2146,71 @@ fn zdict_fastcover_trains_usable_dictionary() {
     assert_ne!(params.k, 0, "optimize must write back the chosen k");
     assert_ne!(params.d, 0, "optimize must write back the chosen d");
 }
+
+#[test]
+fn dict_compressor_cache_drops_stale_target_block_size() {
+    // The cached dict-compressor is keyed by attach serial + level; frame
+    // FLAGS are re-applied per call, and a target-block-size cap set on one
+    // call must not leak into a later call that reset the parameter to 0.
+    let dict = trained_dictionary();
+    let payload = dict_payload();
+    let cctx = ZSTD_createCCtx();
+    assert_eq!(
+        ZSTD_isError(unsafe { ZSTD_CCtx_loadDictionary(cctx, dict.as_ptr(), dict.len()) }),
+        0
+    );
+    let mut reference = vec![0u8; payload.len() + 512];
+    let ref_len = unsafe {
+        ZSTD_compress2(
+            cctx,
+            reference.as_mut_ptr(),
+            reference.len(),
+            payload.as_ptr(),
+            payload.len(),
+        )
+    };
+    assert_eq!(ZSTD_isError(ref_len), 0);
+
+    // Cap the block size for one frame, then reset the knob to 0 (auto).
+    assert_eq!(
+        ZSTD_isError(unsafe {
+            ZSTD_CCtx_setParameter(cctx, crate::params::ZSTD_C_TARGET_CBLOCK_SIZE, 256)
+        }),
+        0
+    );
+    let mut capped = vec![0u8; payload.len() + 1024];
+    let capped_len = unsafe {
+        ZSTD_compress2(
+            cctx,
+            capped.as_mut_ptr(),
+            capped.len(),
+            payload.as_ptr(),
+            payload.len(),
+        )
+    };
+    assert_eq!(ZSTD_isError(capped_len), 0);
+    assert_eq!(
+        ZSTD_isError(unsafe {
+            ZSTD_CCtx_setParameter(cctx, crate::params::ZSTD_C_TARGET_CBLOCK_SIZE, 0)
+        }),
+        0
+    );
+    let mut after = vec![0u8; payload.len() + 512];
+    let after_len = unsafe {
+        ZSTD_compress2(
+            cctx,
+            after.as_mut_ptr(),
+            after.len(),
+            payload.as_ptr(),
+            payload.len(),
+        )
+    };
+    assert_eq!(ZSTD_isError(after_len), 0);
+    assert_eq!(
+        &after[..after_len],
+        &reference[..ref_len],
+        "resetting targetCBlockSize to 0 must restore the uncapped frame"
+    );
+    unsafe { ZSTD_freeCCtx(cctx) };
+}
+
