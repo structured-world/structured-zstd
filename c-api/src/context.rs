@@ -267,8 +267,19 @@ pub unsafe extern "C" fn ZSTD_compress2(
     if pledged != crate::params::CONTENTSIZE_UNKNOWN && pledged != src_size as u64 {
         return encode(ZSTD_ErrorCode::ZSTD_error_srcSize_wrong);
     }
-    let Some(resolved) = cctx.params.resolve() else {
-        return encode(ZSTD_ErrorCode::ZSTD_error_parameter_combination_unsupported);
+    // A referenced CDict's compression parameters are authoritative
+    // (upstream rule), so the sticky knobs are resolved — and can reject —
+    // only when they will actually drive the frame; an unsupported sticky
+    // combination must not break a valid RefCDict path.
+    let resolved = if cctx.attach_params_from_cdict() {
+        None
+    } else {
+        match cctx.params.resolve() {
+            Some(resolved) => Some(resolved),
+            None => {
+                return encode(ZSTD_ErrorCode::ZSTD_error_parameter_combination_unsupported);
+            }
+        }
     };
     let params = cctx.params;
     let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<(), ZSTD_ErrorCode> {
@@ -298,9 +309,10 @@ pub unsafe extern "C" fn ZSTD_compress2(
             } = cctx;
             let enc = dict_compressor.as_mut().expect("just ensured Some");
             // A referenced CDict's compression parameters win (upstream
-            // rule); every other attach honours the sticky knobs.
-            if !params_from_cdict {
-                enc.set_parameters(&resolved);
+            // rule); every other attach honours the sticky knobs
+            // (`resolved` is `Some` exactly when they apply).
+            if !params_from_cdict && let Some(resolved) = &resolved {
+                enc.set_parameters(resolved);
             }
             enc.set_content_checksum(params.checksum_flag);
             enc.set_content_size_flag(params.content_size_flag);
@@ -317,7 +329,10 @@ pub unsafe extern "C" fn ZSTD_compress2(
         } else {
             let mut enc: FrameCompressor =
                 FrameCompressor::new(CompressionLevel::from_level(params.level));
-            enc.set_parameters(&resolved);
+            // No attach on this path, so the sticky knobs always resolved.
+            if let Some(resolved) = &resolved {
+                enc.set_parameters(resolved);
+            }
             enc.set_content_checksum(params.checksum_flag);
             enc.set_content_size_flag(params.content_size_flag);
             enc.set_dictionary_id_flag(params.dict_id_flag);
@@ -422,6 +437,12 @@ pub unsafe extern "C" fn ZSTD_sizeof_DCtx(dctx: *const ZSTD_DCtx) -> usize {
     core::mem::size_of::<ZSTD_DCtx>()
         + dctx.decoder.workspace_size()
         + dctx.attached_ddict.heap_size()
+        // The parsed-dictionary cache behind ZSTD_decompress_usingDDict is
+        // context-owned (the parse copy, not the caller's DDict bytes).
+        + dctx.ddict_handle.as_ref().map_or(0, |h| {
+            h.as_dict().dict_content.len()
+                + core::mem::size_of::<codec::decoding::Dictionary>()
+        })
 }
 
 /// `size_t ZSTD_decompressDCtx(ZSTD_DCtx* dctx, void* dst, size_t dstCapacity,

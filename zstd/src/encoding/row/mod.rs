@@ -1530,6 +1530,15 @@ impl RowMatchGenerator {
     /// the last <8 bytes of the window. Shared by the live hash and the
     /// dictionary row-index build — the two MUST bucket identically or
     /// dict-region probes go blind.
+    ///
+    /// The degradation is per window STATE: within one window a position
+    /// hashes identically in the probe and the insert. The last <8
+    /// positions of a pre-primed dictionary are a separate, unfixable
+    /// case — the bytes following them exist only at probe time, so no
+    /// fixed build-time key (4-byte, zero-padded, or otherwise) can match
+    /// the probe's real-byte key there. Those few dict-tail entries stay
+    /// unreachable, mirroring the donor, whose dictionary load also stops
+    /// hashing short of the dictionary end.
     #[inline(always)]
     fn row_key_value(concat: &[u8], idx: usize, key_len: usize) -> u64 {
         if idx + 8 <= concat.len() {

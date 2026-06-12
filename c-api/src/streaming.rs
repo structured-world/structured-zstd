@@ -109,13 +109,22 @@ impl ZSTD_CCtx {
             return Ok(());
         }
         let params = self.params;
-        let Some(resolved) = params.resolve() else {
-            return Err(ZSTD_ErrorCode::ZSTD_error_parameter_combination_unsupported);
-        };
         // A referenced CDict's compression parameters win over the sticky
-        // knobs (upstream rule); other attaches keep the context level.
+        // knobs (upstream rule); other attaches keep the context level. The
+        // sticky knobs are resolved — and can reject — only when they will
+        // actually drive the frame.
         let level = self.attach_level();
         let params_from_cdict = self.attach_params_from_cdict();
+        let resolved = if params_from_cdict {
+            None
+        } else {
+            match params.resolve() {
+                Some(resolved) => Some(resolved),
+                None => {
+                    return Err(ZSTD_ErrorCode::ZSTD_error_parameter_combination_unsupported);
+                }
+            }
+        };
         let suppress_id = self.attach_suppresses_dict_id();
         let mut enc = StreamingEncoder::new(Vec::new(), CompressionLevel::from_level(level));
         if self.has_attached_dict() {
@@ -125,8 +134,8 @@ impl ZSTD_CCtx {
             }
         }
         let mut setup = || -> Result<(), codec::io::Error> {
-            if !params_from_cdict {
-                enc.set_parameters(&resolved)?;
+            if let Some(resolved) = &resolved {
+                enc.set_parameters(resolved)?;
             }
             enc.set_content_checksum(params.checksum_flag)?;
             if params.target_cblock_size > 0 {

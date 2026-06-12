@@ -307,6 +307,12 @@ pub unsafe extern "C" fn ZSTD_createCDict_advanced(
         }
     }
     let params = cctx_params_from_cparams(&cparams);
+    // Validate the explicit parameters up front: an unsupported combination
+    // must fail creation (NULL) rather than silently skip `set_parameters`
+    // at attach time.
+    if params.resolve().is_none() {
+        return core::ptr::null_mut();
+    }
     try_box(ZSTD_CDict {
         raw: dict.to_vec(),
         id: if raw_content {

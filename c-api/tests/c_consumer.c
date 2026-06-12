@@ -272,6 +272,26 @@ int main(void) {
         if (ZSTD_estimateCStreamSize(3) <= ZSTD_estimateCCtxSize(3)) return 56;
         if (ZSTD_estimateDStreamSize(1 << 20) <= ZSTD_estimateDCtxSize()) return 57;
 
+        /* By-value ABI smoke: structs passed by value across the FFI must
+         * match the Rust-side layout (a drift would misread every field). */
+        {
+            ZSTD_compressionParameters cp = {20, 17, 17, 1, 5, 0, ZSTD_dfast};
+            size_t est = ZSTD_estimateCCtxSize_usingCParams(cp);
+            if (ZSTD_isError(est) || est < ((size_t)1 << 20)) return 58;
+
+            ZDICT_fastCover_params_t fcp;
+            memset(&fcp, 0, sizeof fcp);
+            fcp.k = 256;
+            fcp.d = 8;
+            fcp.f = 20;
+            fcp.accel = 1;
+            unsigned char fdict[16 * 1024];
+            size_t fdict_len = ZDICT_trainFromBuffer_fastCover(
+                fdict, sizeof fdict, samples, sizes, NB_SAMPLES, fcp);
+            if (ZDICT_isError(fdict_len)) return 59;
+            if (ZSTD_getDictID_fromDict(fdict, fdict_len) == 0) return 60;
+        }
+
         ZSTD_freeCDict(cdict);
         ZSTD_freeDDict(ddict);
         ZSTD_freeCCtx(c);

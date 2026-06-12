@@ -168,8 +168,55 @@ for (const payload of [simd, scalar]) {
   if (!eq(boku.decompressUsingDict(dctx, rawFrame, rawDict), rawData))
     fail("prepared raw dict: C ref cannot decode the raw-content frame");
   boku.freeDCtx(dctx);
+  // Raw-content STREAMS: the frames carry no dictionary ID, so this is the
+  // path where the prepared decode stream must force the dictionary per
+  // frame; the C reference cross-checks the produced stream bytes.
+  {
+    const cs = payload.CompressStreamCtor.withPreparedDictionary(3, rawPrepared);
+    const streamFrame = Buffer.concat([
+      Buffer.from(cs.push(rawData)),
+      Buffer.from(cs.finish()),
+    ]);
+    cs.free();
+    const ds = payload.StreamCtor.withPreparedDictionary(rawPrepared);
+    const back = Buffer.concat([
+      Buffer.from(ds.push(new Uint8Array(streamFrame))),
+      Buffer.from(ds.finish()),
+    ]);
+    ds.free();
+    if (!eq(new Uint8Array(back), rawData)) fail("prepared raw dict stream: round-trip");
+    const dctx2 = boku.createDCtx();
+    if (!eq(boku.decompressUsingDict(dctx2, new Uint8Array(streamFrame), rawDict), rawData))
+      fail("prepared raw dict stream: C ref cannot decode the ID-less stream frame");
+    boku.freeDCtx(dctx2);
+  }
   rawPrepared.free();
   prepared.free();
+}
+
+// --- npm wrapper surface (built index.js): the public API users import ------
+// The blocks above exercise the bindgen glue directly; regressions in the
+// TS wrapper (ZstdDict class, stream factories) would slip through, so run
+// one round-trip through the built wrapper as well.
+{
+  const npm = await import("../npm/index.js");
+  const dict = new Uint8Array(await readFile(here("fixtures/service.dict")));
+  const data = new Uint8Array(await readFile(here("fixtures/sample-1.service")));
+  const zd = await npm.ZstdDict.create(dict);
+  if (zd.id === 0) fail("npm wrapper: trained dictionary must carry an ID");
+  const frame = zd.compress(data, 3);
+  if (!eq(zd.decompress(frame), data)) fail("npm wrapper: one-shot round-trip");
+  const cs = zd.compressStream(3);
+  const streamed = Buffer.concat([Buffer.from(cs.push(data)), Buffer.from(cs.finish())]);
+  cs.free();
+  const ds = zd.decompressStream();
+  const back = Buffer.concat([
+    Buffer.from(ds.push(new Uint8Array(streamed))),
+    Buffer.from(ds.finish()),
+  ]);
+  ds.free();
+  if (!eq(new Uint8Array(back), data)) fail("npm wrapper: stream round-trip");
+  zd.free();
 }
 
 // --- Streaming decompressor: chunked input must equal one-shot output -------

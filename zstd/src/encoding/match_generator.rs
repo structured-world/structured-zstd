@@ -8212,9 +8212,10 @@ fn pooled_space_keeps_capacity_when_slice_size_shrinks() {
 fn driver_best_to_fastest_releases_oversized_hc_tables() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
 
-    // Initialize at Best routed onto HashChain (the production `Best`
-    // resolves to Row now) — allocates large HC tables (4M hash, 2M chain)
-    // so the swap below exercises the HC drain path this test pins.
+    // Initialize at Best routed onto HashChain via the test-only override
+    // (production `Best` sits on level 13, whose native backend differs) —
+    // allocates large HC tables (4M hash, 2M chain) so the swap below
+    // exercises the HC drain path this test pins.
     driver.reset_on_hc_lazy(CompressionLevel::Best);
     assert_eq!(driver.window_size(), (1u64 << 22));
 
@@ -8660,8 +8661,10 @@ fn primed_snapshot_fast_attach_does_not_over_key_non_simple_backends() {
     // differently and force a needless re-prime. `Best` is a Row-backend lazy
     // level; this also pins the Row arm recording its RESOLVED hash width on
     // the unhinted path (a 0 default there keyed unhinted-vs-hinted apart).
+    // An explicit Row-backend level: `Best` now sits on level 13 (Btlazy2),
+    // so the named alias no longer reaches the Row arm this test pins.
     let mut driver = MatchGeneratorDriver::new(8, 1);
-    let level = CompressionLevel::Best;
+    let level = CompressionLevel::Level(12);
 
     // Capture with no hint.
     driver.reset(level);

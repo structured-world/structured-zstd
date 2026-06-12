@@ -108,7 +108,11 @@ pub struct ZDICT_fastCover_params_t {
     pub d: c_uint,
     /// Frequency-array log size (0 = default 20).
     pub f: c_uint,
-    /// Optimization step count (0 = default grid).
+    /// Optimization step count. Accepted for ABI compatibility but not a
+    /// sweep bound here: upstream uses `steps` to budget how many (k, d)
+    /// pairs its optimizer tries, while this trainer always sweeps the full
+    /// candidate grid (a superset of any step budget), so honouring a
+    /// smaller `steps` could only degrade the chosen dictionary.
     pub steps: c_uint,
     /// Training thread count; this build trains on the calling thread.
     pub nbThreads: c_uint,
