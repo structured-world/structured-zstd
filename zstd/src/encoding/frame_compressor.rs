@@ -29,6 +29,7 @@ use crate::io::{Read, Write};
 /// [`set_dictionary_from_bytes`](FrameCompressor::set_dictionary_from_bytes))
 /// from ever reaching the decode side — the encoder/decoder dictionary split
 /// mirrors C zstd's `CDict` / `DDict`.
+#[derive(Clone)]
 pub struct EncoderDictionary {
     pub(crate) inner: crate::decoding::Dictionary,
 }

@@ -13,6 +13,7 @@ use crate::decoding::scratch::HuffmanScratch;
 /// during sequence execution.
 ///
 /// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#dictionary-format>
+#[derive(Clone)]
 pub struct Dictionary {
     /// A 4 byte value used by decoders to check if they can use
     /// the correct dictionary. This value must not be zero.

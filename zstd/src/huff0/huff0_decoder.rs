@@ -297,6 +297,7 @@ impl<'t> HuffmanDecoder<'t> {
 }
 
 /// A Huffman decoding table contains a list of Huffman prefix codes and their associated values
+#[derive(Clone)]
 pub struct HuffmanTable {
     /// Packed `symbol | (num_bits << 8)` per state index, exposed
     /// `pub(crate)` because the HUF 4-stream burst hot path in

@@ -52,6 +52,10 @@ interface Payload {
   ) => Uint8Array;
   ZstdDecompressStream: (new (checksum?: ContentChecksum) => DecompressStream) & {
     withDictionary: (dict: Uint8Array, checksum?: ContentChecksum) => DecompressStream;
+    withPreparedDictionary: (
+      dict: WasmDictionary,
+      checksum?: ContentChecksum,
+    ) => DecompressStream;
   };
   ZstdCompressStream: (new (level: number, checksum?: boolean) => CompressStream) & {
     withDictionary: (
@@ -59,7 +63,21 @@ interface Payload {
       dict: Uint8Array,
       checksum?: boolean,
     ) => CompressStream;
+    withPreparedDictionary: (
+      level: number,
+      dict: WasmDictionary,
+      checksum?: boolean,
+    ) => CompressStream;
   };
+  ZstdDictionary: new (dict: Uint8Array) => WasmDictionary;
+}
+
+/** Raw wasm-side prepared-dictionary handle (see {@link ZstdDict}). */
+interface WasmDictionary {
+  readonly id: number;
+  compress(data: Uint8Array, level: number, checksum?: boolean): Uint8Array;
+  decompress(data: Uint8Array, checksum?: ContentChecksum): Uint8Array;
+  free(): void;
 }
 
 /**
@@ -306,4 +324,82 @@ export async function createDecompressStreamWithDictionary(
 ): Promise<DecompressStream> {
   loading ??= load();
   return (await loading).ZstdDecompressStream.withDictionary(dict, checksum);
+}
+
+/**
+ * A dictionary prepared once and reused across many compressions,
+ * decompressions, and streams — the recommended way to use dictionaries when
+ * more than one payload is involved.
+ *
+ * Construction parses the dictionary a single time; afterwards
+ * {@link ZstdDict.compress} reuses a primed encoder (the per-frame dictionary
+ * setup cost disappears), {@link ZstdDict.decompress} reuses one decoder
+ * workspace, and the stream factories seed from the prepared tables instead of
+ * re-parsing the blob. Raw content (no dictionary magic) is accepted; such
+ * dictionaries have `id === 0` and produced frames carry no dictionary ID.
+ *
+ * Call {@link ZstdDict.free} when done to release the wasm-side memory
+ * eagerly (it is otherwise reclaimed with the object).
+ *
+ * ```ts
+ * const dict = await ZstdDict.create(dictBytes);
+ * const frame = dict.compress(payload, 19);
+ * const back = dict.decompress(frame);
+ * const stream = await dict.compressStream(19);
+ * ```
+ */
+export class ZstdDict {
+  /** @internal */
+  private constructor(
+    private readonly inner: WasmDictionary,
+    private readonly module: Payload,
+  ) {}
+
+  /** Parse `dict` once for repeated use. Rejects if a magic-prefixed blob is corrupt. */
+  static async create(dict: Uint8Array): Promise<ZstdDict> {
+    loading ??= load();
+    const module = await loading;
+    return new ZstdDict(new module.ZstdDictionary(dict), module);
+  }
+
+  /** The dictionary ID (0 for raw content). */
+  get id(): number {
+    return this.inner.id;
+  }
+
+  /**
+   * Compress `data` at `level` (defaults to {@link DEFAULT_LEVEL}). The first
+   * call at a given level primes the encoder; following calls reuse the primed
+   * state — the hot path for many small frames against one dictionary.
+   */
+  compress(data: Uint8Array, level: number = DEFAULT_LEVEL, checksum?: boolean): Uint8Array {
+    return this.inner.compress(data, level, checksum);
+  }
+
+  /** Decompress a frame produced with this dictionary. */
+  decompress(data: Uint8Array, checksum?: ContentChecksum): Uint8Array {
+    return this.inner.decompress(data, checksum);
+  }
+
+  /**
+   * Open a streaming compressor seeded from this prepared dictionary (no
+   * per-stream re-parse). Same contract as {@link createCompressStream}.
+   */
+  compressStream(level: number = DEFAULT_LEVEL, checksum?: boolean): CompressStream {
+    return this.module.ZstdCompressStream.withPreparedDictionary(level, this.inner, checksum);
+  }
+
+  /**
+   * Open a streaming decompressor against this prepared dictionary (per-stream
+   * setup is a reference-count bump). Also decodes frames whose headers omit
+   * the dictionary ID. Same contract as {@link createDecompressStream}.
+   */
+  decompressStream(checksum?: ContentChecksum): DecompressStream {
+    return this.module.ZstdDecompressStream.withPreparedDictionary(this.inner, checksum);
+  }
+
+  /** Release the wasm-side dictionary memory eagerly. */
+  free(): void {
+    this.inner.free();
+  }
 }

@@ -28,6 +28,7 @@ async function loadOurPayload(dir) {
     decompressUsingDict: glue.decompressUsingDict,
     StreamCtor: glue.ZstdDecompressStream,
     CompressStreamCtor: glue.ZstdCompressStream,
+    Dictionary: glue.ZstdDictionary,
   };
 }
 async function loadBokuweb() {
@@ -117,6 +118,58 @@ for (const sample of ["sample-1.service", "sample-2.service"]) {
     if (!eq(simd.decompressUsingDict(cb, dict), data)) fail(`dict ${sample} L${level}: we cannot decode C ref's dict frame`);
     if (!eq(cs, cc)) { divergences++; console.log(`note: dict simd128 != scalar bytes for ${sample} L${level} — allowed`); }
   }
+}
+
+// --- Prepared dictionary: hot-path reuse must match the one-shot dict API ---
+// One ZstdDictionary serves repeated one-shot calls (cached primed encoder),
+// streams on both sides (no per-stream re-parse), and the C reference decodes
+// every frame it produces.
+for (const payload of [simd, scalar]) {
+  const prepared = new payload.Dictionary(dict);
+  if (prepared.id === 0) fail("prepared dict: trained dictionary must carry an ID");
+  for (const sample of ["sample-1.service", "sample-2.service"]) {
+    const data = new Uint8Array(await readFile(here(`fixtures/${sample}`)));
+    for (const level of [3, 19]) {
+      // Repeated calls exercise the cached-compressor path (2nd call reuses
+      // the primed snapshot) and must agree with the parse-per-call API.
+      const first = prepared.compress(data, level);
+      const second = prepared.compress(data, level);
+      if (!eq(prepared.decompress(first), data)) fail(`prepared dict L${level}: round-trip (1st)`);
+      if (!eq(prepared.decompress(second), data)) fail(`prepared dict L${level}: round-trip (2nd)`);
+      const dctx = boku.createDCtx();
+      if (!eq(boku.decompressUsingDict(dctx, second, dict), data))
+        fail(`prepared dict L${level}: C ref cannot decode the cached-path frame`);
+      boku.freeDCtx(dctx);
+      if (!eq(prepared.decompress(payload.compressUsingDict(data, dict, level)), data))
+        fail(`prepared dict L${level}: cannot decode the byte-API dict frame`);
+    }
+    // Streams seeded from the prepared dictionary round-trip through the
+    // prepared decode stream.
+    const cs = payload.CompressStreamCtor.withPreparedDictionary(3, prepared);
+    const out = [cs.push(data), cs.finish()];
+    cs.free();
+    const frame = Buffer.concat(out.map((p) => Buffer.from(p)));
+    const ds = payload.StreamCtor.withPreparedDictionary(prepared);
+    const back = Buffer.concat([Buffer.from(ds.push(new Uint8Array(frame))), Buffer.from(ds.finish())]);
+    ds.free();
+    if (!eq(new Uint8Array(back), data)) fail(`prepared dict stream: ${sample} round-trip`);
+  }
+  // Raw-content dictionaries: id 0, frames carry no dictionary ID, and the
+  // C reference decodes them with the same raw bytes.
+  const rawDict = new Uint8Array(await readFile(here("fixtures/sample-1.service")));
+  const rawPrepared = new payload.Dictionary(rawDict);
+  if (rawPrepared.id !== 0) fail("prepared raw dict: id must be 0");
+  const tail = new TextEncoder().encode("unique raw-dict tail 0123456789");
+  const rawData = new Uint8Array(rawDict.length + tail.length);
+  rawData.set(rawDict); rawData.set(tail, rawDict.length);
+  const rawFrame = rawPrepared.compress(rawData, 3);
+  if (!eq(rawPrepared.decompress(rawFrame), rawData)) fail("prepared raw dict: round-trip");
+  const dctx = boku.createDCtx();
+  if (!eq(boku.decompressUsingDict(dctx, rawFrame, rawDict), rawData))
+    fail("prepared raw dict: C ref cannot decode the raw-content frame");
+  boku.freeDCtx(dctx);
+  rawPrepared.free();
+  prepared.free();
 }
 
 // --- Streaming decompressor: chunked input must equal one-shot output -------

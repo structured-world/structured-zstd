@@ -271,6 +271,7 @@ impl<B: BufferBackend> DecoderScratch<B> {
     }
 }
 
+#[derive(Clone)]
 pub struct HuffmanScratch {
     pub table: HuffmanTable,
     /// Copy-on-write source for the literals Huffman table, mirroring the
@@ -364,6 +365,7 @@ enum TableSource {
     Dict,
 }
 
+#[derive(Clone)]
 pub struct FSEScratch {
     pub offsets: AlignedFSETable,
     pub literal_lengths: AlignedFSETable,
@@ -541,6 +543,7 @@ impl Default for FSEScratch {
 // Note: this aligns the table containers, not the `Vec<SeqSymbol>` backing allocations.
 #[cfg_attr(target_arch = "aarch64", repr(align(128)))]
 #[cfg_attr(not(target_arch = "aarch64"), repr(align(64)))]
+#[derive(Clone)]
 pub struct AlignedFSETable(SeqFSETable);
 
 impl AlignedFSETable {
