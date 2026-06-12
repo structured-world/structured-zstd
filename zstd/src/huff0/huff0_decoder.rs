@@ -873,6 +873,52 @@ mod tests {
     }
 
     #[test]
+    fn build_decoder_rejects_fse_streams_with_256_explicit_weights() {
+        // The format caps explicit weights at 255: symbols are u8 and one
+        // more weight is inferred, so 256 explicit weights would create a
+        // 257-symbol table whose last index wraps through `symbol as u8`.
+        // FSE-encode exactly 256 weights (alternating 1/2 keeps the table
+        // otherwise valid: weight_sum 384, leftover 128 = 2^7) the same way
+        // the encoder's weight-description path does, and require a loud
+        // `TooManyWeights` instead of acceptance.
+        use crate::bit_io::BitWriter;
+        use crate::fse::fse_encoder::{FSEEncoder, build_table_from_symbol_counts};
+
+        let weights: Vec<u8> = (0..256).map(|i| if i % 2 == 0 { 1 } else { 2 }).collect();
+
+        let mut encoded = Vec::new();
+        {
+            let mut writer = BitWriter::from(&mut encoded);
+            let mut counts = [0usize; 13];
+            for &w in &weights {
+                counts[w as usize] += 1;
+            }
+            let mut encoder = FSEEncoder::new(
+                build_table_from_symbol_counts(&counts, 6, false),
+                &mut writer,
+            );
+            encoder.encode_interleaved(&weights);
+            writer.flush();
+        }
+        assert!(
+            encoded.len() < 128,
+            "fixture must fit the FSE-described header byte, got {}",
+            encoded.len()
+        );
+
+        let mut description = Vec::with_capacity(encoded.len() + 1);
+        description.push(encoded.len() as u8);
+        description.extend_from_slice(&encoded);
+
+        let mut table = HuffmanTable::new();
+        let result = table.build_decoder(description.as_slice());
+        assert!(
+            matches!(result, Err(HuffmanTableError::TooManyWeights { .. })),
+            "256 explicit weights must be rejected, got {result:?}"
+        );
+    }
+
+    #[test]
     fn decode_symbol_and_advance_scalar_matches_manual_transition() {
         let table = test_table();
         let initial_state = 1_u64;
