@@ -45,6 +45,7 @@ pub extern "C" fn ZSTD_estimateCCtxSize_usingCParams(cparams: ZSTD_compressionPa
     if cparams.windowLog > WINDOW_LOG_MAX
         || cparams.hashLog > TABLE_LOG_MAX
         || cparams.chainLog > TABLE_LOG_MAX
+        || !(1..=9).contains(&cparams.strategy)
     {
         return crate::error::encode(crate::error::ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound);
     }
@@ -59,7 +60,11 @@ pub extern "C" fn ZSTD_estimateCCtxSize_usingCParams(cparams: ZSTD_compressionPa
     } else {
         4usize << cparams.chainLog
     };
-    core::mem::size_of::<ZSTD_CCtx>() + window + hash + chain + 3 * BLOCK_SIZE_MAX
+    // Binary-tree strategies retain the optimal-parser workspace (and, for
+    // btultra/btultra2, the HC3 side table) on top of the hash/chain tables.
+    let bt =
+        codec::encoding::estimated_bt_strategy_extra_bytes(cparams.strategy, cparams.windowLog);
+    core::mem::size_of::<ZSTD_CCtx>() + window + hash + chain + bt + 3 * BLOCK_SIZE_MAX
 }
 
 /// `size_t ZSTD_estimateCStreamSize_usingCParams(ZSTD_compressionParameters

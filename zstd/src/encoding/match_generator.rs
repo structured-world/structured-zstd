@@ -996,6 +996,22 @@ pub fn estimated_compression_workspace_bytes(level: CompressionLevel) -> usize {
     window + tables + bt + staging
 }
 
+/// Extra steady-state workspace the binary-tree strategies (ordinals 6..=9,
+/// btlazy2..btultra2) retain beyond the hash/chain tables: the boxed matcher
+/// plus its scratch arenas, and the HC3 short-match side table for
+/// btultra/btultra2 (capped by the window log). 0 for non-BT ordinals.
+pub fn estimated_bt_strategy_extra_bytes(strategy_ordinal: u32, window_log: u32) -> usize {
+    if !(6..=9).contains(&strategy_ordinal) {
+        return 0;
+    }
+    let hash3 = if matches!(strategy_ordinal, 8 | 9) {
+        4usize << super::match_table::storage::HC3_HASH_LOG.min(window_log as usize)
+    } else {
+        0
+    };
+    super::bt::BtMatcher::estimated_workspace_bytes() + hash3
+}
+
 /// Resolve a [`CompressionLevel`] to internal tuning parameters,
 /// optionally adjusted for a known source size.
 fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> LevelParams {

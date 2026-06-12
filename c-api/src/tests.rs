@@ -2153,6 +2153,25 @@ fn estimates_are_sane_budgets() {
     };
     let one_shot = ZSTD_estimateCCtxSize_usingCParams(cparams);
     assert!(one_shot > (1 << 20) + 2 * (4 << 17));
+    // Binary-tree strategies must budget the retained optimal-parser
+    // workspace on top of the same table logs.
+    let bt_cparams = ZSTD_compressionParameters {
+        strategy: 8,
+        ..cparams
+    };
+    assert!(
+        ZSTD_estimateCCtxSize_usingCParams(bt_cparams) > one_shot,
+        "btultra cParams must budget more than dfast at equal logs"
+    );
+    // Strategy ordinal is validated like the other cParams bounds.
+    let bad_strategy = ZSTD_compressionParameters {
+        strategy: 42,
+        ..cparams
+    };
+    assert_ne!(
+        crate::error::ZSTD_isError(ZSTD_estimateCCtxSize_usingCParams(bad_strategy)),
+        0
+    );
     assert!(
         ZSTD_estimateCStreamSize_usingCParams(cparams) > one_shot,
         "streaming must budget more than the one-shot"
