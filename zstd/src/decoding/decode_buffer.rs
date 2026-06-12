@@ -804,9 +804,11 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         // `RingBuffer` / `FlatBuf` maintain `total_output_counter`
         // (push / repeat / inline-exec counter bump). On the direct
         // path (`UserSliceBackend`) the inline executor skips the
-        // counter, but the backend never drains (`head` stays 0), so
-        // `buffer.len()` IS the cumulative output — take the max of
-        // the two so the gate is accurate for every backend.
+        // counter, so `buffer.len()` carries the cumulative output
+        // until the first between-blocks `drop_to_window_size()`, and
+        // that drop latches the counter above the window before capping
+        // the visible length — the max of the two stays accurate for
+        // every backend.
         let total_output = self.total_output_counter.max(self.buffer.len() as u64);
         if total_output <= self.window_size as u64 {
             // at least part of that repeat is from the dictionary content
@@ -932,16 +934,23 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     ///
     /// Returns the number of bytes whose visibility was discarded.
     ///
-    /// Does NOT mutate `total_output_counter`: that counter tracks
-    /// total bytes produced (incremented by `push` / `repeat` /
-    /// `extend_and_fill`). Advancing `head` just hides
-    /// already-produced bytes from the visible region; counting them
-    /// again would double-count and break `repeat_from_dict`'s offset
-    /// reachability check.
+    /// Catches `total_output_counter` up to the visible length before
+    /// dropping (never adds — adding the dropped amount would
+    /// double-count on backends whose `push` / `repeat` already
+    /// counted those bytes). On the direct path the inline executors
+    /// skip the counter, so without the catch-up the cap below would
+    /// shrink `len()` back under `window_size` and reopen
+    /// `repeat_from_dict`'s reachability gate even though cumulative
+    /// output already exceeded the window. A drop only ever happens
+    /// when `len() > window_size`, so the catch-up permanently latches
+    /// the counter above the window — exactly what the boolean gate
+    /// needs. On `RingBuffer` / `FlatBuf` the counter is already exact
+    /// (`>= len()`) and the `max` is a no-op.
     pub fn drop_to_window_size(&mut self) -> usize {
         match self.can_drain_to_window_size() {
             None => 0,
             Some(can_drop) => {
+                self.total_output_counter = self.total_output_counter.max(self.buffer.len() as u64);
                 self.buffer.drop_first_n(can_drop);
                 can_drop
             }
