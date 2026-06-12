@@ -449,15 +449,106 @@ macro_rules! greedy_parse_body {
     }};
 }
 
-macro_rules! gen_row_parse_kernel {
-    ($name:ident, $rl:ident $(, $tf:literal)?) => {
+/// Rep + row best-of-two probe (the lazy search step) with the probe body
+/// expanded inline under the enclosing tier umbrella.
+macro_rules! row_best_match {
+    ($m:expr, $abs_pos:expr, $lit_len:expr, $rl:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
+        let rep = $m.repcode_candidate($abs_pos, $lit_len);
+        let row = row_probe_body!($m, $abs_pos, $lit_len, None, $rl, $use_mask, $maskmac, $cpl);
+        best_len_offset_candidate(rep, row)
+    }};
+}
+
+/// The lazy row parse BODY as a macro — same per-tier monolith shape as
+/// `greedy_parse_body!` for the lazy levels (lookahead via
+/// `pick_lazy_match_shared`, with both its probe sites expanded inline).
+macro_rules! lazy_parse_body {
+    ($m:expr, $handle:expr, $rl:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
+        #[allow(unused_labels)]
+        'parse: {
+            debug_assert_eq!($rl, $m.row_log);
+            $m.ensure_tables();
+
+            let current_len = *$m.chunk_lens.back().unwrap();
+            if current_len == 0 {
+                break 'parse;
+            }
+            let current_abs_start = $m.history_abs_start + $m.window_size - current_len;
+            let backfill_start = $m.backfill_start(current_abs_start);
+            if backfill_start < current_abs_start {
+                $m.insert_positions::<$rl>(backfill_start, current_abs_start);
+            }
+
+            let mls = $m.mls;
+            let mut pos = 0usize;
+            let mut literals_start = 0usize;
+            while pos + mls <= current_len {
+                let abs_pos = current_abs_start + pos;
+                let lit_len = pos - literals_start;
+
+                let best = row_best_match!($m, abs_pos, lit_len, $rl, $use_mask, $maskmac, $cpl);
+                let picked = pick_lazy_match_shared(
+                    abs_pos,
+                    lit_len,
+                    best,
+                    LazyMatchConfig {
+                        target_len: $m.target_len,
+                        min_match_len: $m.mls,
+                        lazy_depth: $m.lazy_depth,
+                        history_abs_end: $m.history_abs_end(),
+                    },
+                    |next_pos, next_lit_len| {
+                        row_best_match!($m, next_pos, next_lit_len, $rl, $use_mask, $maskmac, $cpl)
+                    },
+                );
+                if let Some(candidate) = picked {
+                    $m.insert_match_span::<$rl>(abs_pos, candidate.start + candidate.match_len);
+                    let current = &$m.history[$m.history.len() - current_len..];
+                    let start = candidate.start - current_abs_start;
+                    let literals = &current[literals_start..start];
+                    $handle(Sequence::Triple {
+                        literals,
+                        offset: candidate.offset,
+                        match_len: candidate.match_len,
+                    });
+                    let _ = encode_offset_with_history(
+                        candidate.offset as u32,
+                        literals.len() as u32,
+                        &mut $m.offset_hist,
+                    );
+                    pos = start + candidate.match_len;
+                    literals_start = pos;
+                } else {
+                    $m.insert_position::<$rl>(abs_pos);
+                    pos += 1;
+                }
+            }
+
+            while pos + ROW_HASH_KEY_LEN <= current_len {
+                $m.insert_position::<$rl>(current_abs_start + pos);
+                pos += 1;
+            }
+
+            if literals_start < current_len {
+                let current = &$m.history[$m.history.len() - current_len..];
+                $handle(Sequence::Literals {
+                    literals: &current[literals_start..],
+                });
+            }
+        }
+    }};
+}
+
+/// Per-tier lazy kernels (see `gen_greedy_monolith` — same SIMD pairing).
+macro_rules! gen_lazy_monolith {
+    ($name:ident, $use_mask:literal, $maskmac:ident, $cpl:path $(, $tf:literal)?) => {
         $(#[target_feature(enable = $tf)])?
         #[allow(unused_unsafe)]
         unsafe fn $name<K: RowTags, const ROW_LOG: usize>(
             &mut self,
-            handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+            mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
         ) {
-            self.$rl::<K, ROW_LOG>(handle_sequence)
+            lazy_parse_body!(self, handle_sequence, ROW_LOG, $use_mask, $maskmac, $cpl)
         }
     };
 }
@@ -1311,82 +1402,6 @@ impl RowMatchGenerator {
             }
         }
     }
-
-    /// Lazy-style parse (depth >= 1) for the Row backend.
-    ///
-    /// Currently unused: the only strategy mapped to `BackendTag::Row`
-    /// is `StrategyTag::Greedy` (level 4), which dispatches to
-    /// [`Self::start_matching_greedy`] via the `debug_assert_eq!` in
-    /// the `BackendTag::Row` arm of
-    /// `MatchGeneratorDriver::compress_block`. This method is kept as
-    /// scaffolding for the case where a future level routes a lazy
-    /// strategy through the Row backend — extracting `pick_lazy_match`
-    /// behavior to a fresh module then would mean re-deriving the
-    /// row-hash machinery, which is wasteful. The `dead_code` allow is
-    /// scoped to this method and its private helpers so any new
-    /// caller will pick them up unmodified.
-    #[inline(always)]
-    pub(crate) fn start_matching_rl<K: RowTags, const ROW_LOG: usize>(
-        &mut self,
-        mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
-    ) {
-        debug_assert_eq!(ROW_LOG, self.row_log);
-        self.ensure_tables();
-
-        let current_len = *self.chunk_lens.back().unwrap();
-        if current_len == 0 {
-            return;
-        }
-        let current_abs_start = self.history_abs_start + self.window_size - current_len;
-        let backfill_start = self.backfill_start(current_abs_start);
-        if backfill_start < current_abs_start {
-            self.insert_positions::<ROW_LOG>(backfill_start, current_abs_start);
-        }
-
-        let mls = self.mls;
-        let mut pos = 0usize;
-        let mut literals_start = 0usize;
-        while pos + mls <= current_len {
-            let abs_pos = current_abs_start + pos;
-            let lit_len = pos - literals_start;
-
-            let best = self.best_match_rl::<K, ROW_LOG>(abs_pos, lit_len);
-            if let Some(candidate) = self.pick_lazy_match_rl::<K, ROW_LOG>(abs_pos, lit_len, best) {
-                self.insert_match_span::<ROW_LOG>(abs_pos, candidate.start + candidate.match_len);
-                let current = &self.history[self.history.len() - current_len..];
-                let start = candidate.start - current_abs_start;
-                let literals = &current[literals_start..start];
-                handle_sequence(Sequence::Triple {
-                    literals,
-                    offset: candidate.offset,
-                    match_len: candidate.match_len,
-                });
-                let _ = encode_offset_with_history(
-                    candidate.offset as u32,
-                    literals.len() as u32,
-                    &mut self.offset_hist,
-                );
-                pos = start + candidate.match_len;
-                literals_start = pos;
-            } else {
-                self.insert_position::<ROW_LOG>(abs_pos);
-                pos += 1;
-            }
-        }
-
-        while pos + ROW_HASH_KEY_LEN <= current_len {
-            self.insert_position::<ROW_LOG>(current_abs_start + pos);
-            pos += 1;
-        }
-
-        if literals_start < current_len {
-            let current = &self.history[self.history.len() - current_len..];
-            handle_sequence(Sequence::Literals {
-                literals: &current[literals_start..],
-            });
-        }
-    }
-
     /// Donor-parity greedy parse for `lazy_depth == 0` (level 5).
     ///
     /// Mirrors `ZSTD_compressBlock_lazy_generic` (`zstd_lazy.c:1560`) with
@@ -1612,19 +1627,47 @@ impl RowMatchGenerator {
         }
     }
 
-    gen_row_parse_kernel!(lazy_scalar, start_matching_rl);
+    gen_lazy_monolith!(
+        lazy_scalar,
+        false,
+        row_tag_mask_scalar,
+        crate::encoding::fastpath::scalar::common_prefix_len_ptr
+    );
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    gen_row_parse_kernel!(lazy_sse42, start_matching_rl, "sse4.2");
+    gen_lazy_monolith!(
+        lazy_sse42,
+        true,
+        row_tag_mask_sse2,
+        crate::encoding::fastpath::sse42::common_prefix_len_ptr,
+        "sse4.2"
+    );
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    gen_row_parse_kernel!(lazy_avx2bmi2, start_matching_rl, "avx2,bmi2");
+    gen_lazy_monolith!(
+        lazy_avx2bmi2,
+        true,
+        row_tag_mask_avx2,
+        crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr,
+        "avx2,bmi2"
+    );
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-    gen_row_parse_kernel!(lazy_neon, start_matching_rl, "neon");
+    gen_lazy_monolith!(
+        lazy_neon,
+        true,
+        row_tag_mask_neon,
+        crate::encoding::fastpath::neon::common_prefix_len_ptr,
+        "neon"
+    );
     #[cfg(all(
         target_arch = "wasm32",
         target_feature = "simd128",
         feature = "kernel_simd128"
     ))]
-    gen_row_parse_kernel!(lazy_simd128, start_matching_rl);
+    gen_lazy_monolith!(
+        lazy_simd128,
+        true,
+        row_tag_mask_simd128,
+        crate::encoding::fastpath::scalar::common_prefix_len_ptr
+    );
 
     pub(crate) fn start_matching_greedy(
         &mut self,
