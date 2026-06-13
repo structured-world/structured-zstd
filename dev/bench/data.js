@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781241798478,
+  "lastUpdate": 1781315687065,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -64989,6 +64989,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
             "value": 0.121,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.26,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "9e175617700ea25b02239fe30f49f83e006123fb",
+          "message": "feat(c-api): dictionary attach surface + estimates + fastCover; wasm prepared dictionary (#409)\n\n* feat(c-api): dictionary attach surface, estimates, fastCover trainers\n\nCompletes the #127 dictionary slice of the v1.5.7 C ABI:\n\n- ZSTD_CCtx_loadDictionary[_byReference/_advanced], ZSTD_CCtx_refCDict,\n  ZSTD_CCtx_refPrefix[_advanced] and the ZSTD_DCtx mirror\n  (loadDictionary x3, refDDict, refPrefix): attach state lives on the\n  context and is applied at every frame start across compress2,\n  compressStream2, decompressDCtx and decompressStream; prefixes are\n  single-use, loads and refs are sticky, NULL clears\n- raw-content dictionaries (and every prefix) model as a parsed\n  dictionary with a synthetic non-zero ID suppressed on the wire; the\n  codec's StreamingEncoder gains set_dictionary_id_flag for this\n- ZSTD_compress_usingDict / ZSTD_decompress_usingDict one-shots\n- ZSTD_createCDict_advanced / ZSTD_createDDict_advanced /\n  ZSTD_compress_usingCDict_advanced with ABI-mirror\n  ZSTD_compressionParameters / ZSTD_frameParameters / ZSTD_customMem\n  (custom allocators rejected); plain createCDict now accepts\n  raw-content bytes per upstream auto semantics\n- ZSTD_getDictID_fromDict / ZSTD_getDictID_fromFrame\n- ZSTD_estimate{CCtx,DCtx,CStream,DStream}Size + _usingCParams, backed\n  by a new codec helper reading the real per-level tuning table\n- ZDICT_trainFromBuffer_fastCover / ZDICT_optimizeTrainFromBuffer_fastCover\n  with ZDICT_fastCover_params_t (optimize writes back chosen k/d/f)\n- decompress_usingDDict reworked onto a parsed-handle cache, which also\n  fixes raw-content DDicts failing at use\n\nc_consumer.c exercises the attach surface end-to-end (exit codes\n33-57); the CI exported-symbol gate covers all 27 new symbols.\n906 workspace tests, clippy clean, doctests green.\n\nPart of #127\n\n* feat(wasm): prepared dictionary object for hot dictionary paths\n\nZstdDictionary (wasm) + ZstdDict (TS): parse the dictionary blob once\nand reuse it everywhere, instead of the parse-per-call / parse-per-\nstream cost of the byte-taking API:\n\n- one-shot compress keeps a cached frame compressor whose dictionary-\n  primed match-finder snapshot is reused across calls (the dominant\n  per-frame cost for small payloads)\n- one-shot decompress reuses one decoder workspace\n- compress streams seed from the prepared tables via a table copy\n  (Clone derived down the Dictionary chain), decode streams via an\n  Arc refcount bump; the prepared decode stream also handles frames\n  whose headers omit the dictionary ID\n- raw-content dictionaries (no magic) accepted with upstream auto\n  semantics: id 0, synthetic internal ID suppressed on the wire\n\nTS wrapper exposes it as a class with compress/decompress/\ncompressStream/decompressStream methods on the dictionary object.\ntest.mjs covers repeated cached-path calls, stream round-trips, raw\ncontent, and C-reference (bokuweb) interop for every produced frame.\n\nPart of #127\n\n* perf(encode): pipeline row hash + prefetch across greedy miss iterations\n\nThe greedy row loop paid the probe's hash-dependent row load as a\ncold-start stall every position (the tag-row compare alone was ~26%\nof L5 wall) and hashed each miss position twice (probe + insert).\nOn a miss the next position's (row, tag) is now computed ahead and\nits tag/position rows prefetched, overlapping the dependent load with\nthe current iteration's tail; the insert reuses the probe's hash.\nSame overlap shape as the donor's hash-cache + row-prefetch pipeline,\nlocalized to the greedy loop. Byte-identical output (the hash just\nmoves earlier).\n\n* perf(encode): carry row hash + prefetch across match emissions too\n\nThe miss-path pipeline left the first probe after every emitted match\ncold (the match-span insert walks other rows in between). The next\nprobe position is known right after the emission, so compute its\n(row, tag) and prefetch the row there as well. Byte-identical.\n\n* perf(encode): force-inline the row greedy loop's per-position helpers\n\nrepcode_candidate_shared / hash_and_row / insert_at showed up as\nSELF-time in the L5 profile — LLVM left them as calls, each\nre-deriving the history slice and packing Option results per\nposition. Force-inline them into the greedy kernel (the dfast\nmonolithization precedent).\n\n* perf(encode): merge the greedy row loop and its probe under one target_feature umbrella\n\nThe greedy loop body and the per-tier row probe compiled as separate\nfunctions (a #[target_feature] boundary is not inlinable from generic\ncode), paying a full call with operand spills per position. Per-tier\numbrella kernels now enable the probe's features on the loop itself,\nso the #[inline(always)] body and the tier probe merge into one\ncompiled function (donor ZSTD_compressBlock_greedy_row shape).\nByte-identical.\n\n* perf(encode): apply the target_feature umbrella to the lazy row parse\n\nSame merge as the greedy kernel: per-tier lazy_* umbrellas inline the\nloop body, its per-position rep + probe helpers, and the tier's row\nprobe into one compiled function for levels 6+ on the row backend.\nByte-identical.\n\n* perf(encode): inline-hint the row probes into the parse umbrellas\n\nThe umbrella merge left row_probe_* as separate compiled functions:\nwithout an inline hint LLVM declined to merge the large probe body\neven under a same-feature caller (inline(always) is unavailable on\ntarget_feature fns). The plain hint plus the single call site per\numbrella merges them. Byte-identical.\n\n* perf(encode): floor-advance reset for the row backend tables\n\nThe row matcher was the last backend re-zeroing its tables per frame\n(multi-MiB memset, about 6 percent of L5 wall on frame-looped encode).\nAdvance the absolute coordinate floor instead: stale entries hold\npositions below the floor and the probes' existing window check\nrejects them, matching the donor's persistent-index design and the\ndfast/HC floor-advance shape (bounded fallback re-zeroes before the\ncursor could overflow). Stale tags can yield occasional false mask\nhits that then fail the window check, identical to the donor's\npersistent tag table.\n\n* perf(encode): expand the row probe into per-tier greedy monolith kernels\n\nThe probe stayed a separate compiled function even under the umbrella\n(multi-site, large body — LLVM declined the inline hint, and\ninline(always) is forbidden with target_feature). Convert the probe\nand greedy parse bodies to macros and expand them together per tier,\neach with its own SIMD pairing (tag-match mask + prefix kernel), into\none compiled function per tier — the literal donor\nZSTD_compressBlock_greedy_row monolith shape. The generic-over-K\ngreedy body is replaced by the expansion; non-kernel probe callers\nkeep the per-tier probe functions. Byte-identical.\n\n* perf(encode): per-tier lazy monolith kernels via probe macro expansion\n\nSame monolith move as the greedy kernel for the lazy levels: the lazy\nparse body, its rep+row best-of-two search, and BOTH probe sites (the\ncurrent position and the lookahead closure) expand inline per tier\nwith the tier's own SIMD pairing. The generic-over-K lazy body and the\nnow-unused parse-kernel generator are removed. Byte-identical.\n\n* test(c-api): add regression test for stale target-block-size on the cached dict compressor\n\nThe dict-compressor cache re-applies frame flags per call, but a\ntargetCBlockSize cap set on an earlier call survives a later reset of\nthe parameter to 0 (auto): the cached encoder keeps the old cap. The\ntest caps one frame, resets the knob, and requires the next frame to\nmatch the never-capped reference. Currently fails.\n\n* fix(c-api): clear a stale target-block-size cap on the cached dict compressor\n\nThe cached dict-compressor survives parameter changes; ZSTD_compress2\nnow clears the cap when the sticky knob is 0, and the cap-less\nusingCDict entry points clear it unconditionally (the cache is shared\nacross all three). Regression test in the previous commit (fixture\nadjusted to a value above ZSTD_TARGETCBLOCKSIZE_MIN).\n\n* fix(c-api): dictionary attach validation + sizeof accounting + fastCover write-back\n\n- add the missing ZSTD_DCtx_refPrefix_advanced wrapper; both refPrefix\n  _advanced variants now reject every selector except auto/rawContent\n- classify dictionaries on the 4-byte magic alone (a truncated\n  magic-prefixed blob fails the parse as corrupted instead of silently\n  degrading to raw content), in the attach paths and both CDict creators\n- reject a non-NULL customMem.opaque like non-NULL allocator pointers\n- ZSTD_sizeof_CCtx/DCtx count attached-dictionary memory (referenced\n  CDicts stay excluded, upstream parity)\n- ZDICT_optimizeTrainFromBuffer_fastCover writes back the sweep's\n  actual winner (FastCoverTuned threaded out of the trainer) instead of\n  the effective inputs; bool+Option params folded into a mode enum\n- StreamingEncoder::set_dictionary_id_flag validates pre-header state\n  and returns Result like its sibling setters\n- estimated_compression_workspace_bytes adds the HC3 side-table term\n  for binary-tree levels; module docs mention the estimator\n- CI symbol gate covers the full CDict/DDict + attach surface\n- tests: byReference/_advanced load + refPrefix_advanced round-trips,\n  fullDict-on-raw rejection; wasm TS doc example drops a stray await\n\n* fix(encode): allow the uncalled scalar row monoliths on wasm simd128\n\nwasm32+simd128 resolves the row dispatch at compile time to the\nsimd128 kernel, leaving greedy_scalar and lazy_scalar dead there;\ncarry the same allowance ScalarTags already has. Caught by the\nsimd128 clippy tier (host targets compile the scalar kernels live).\n\n* perf(encode): one-u32 repcode gate compare (donor MEM_read32 shape)\n\nThe rep probe's 4-byte gate compared two slice ranges, paying two\nbounds checks per probe (one per input byte on the greedy/lazy\nlevels). Replace with a single unaligned u32 compare; the entry guard\nalready proves both reads in bounds. Byte-identical.\n\n* perf(encode): mls-wide row hash key (donor ZSTD_hashPtr width)\n\nThe row levels hashed a 4-byte key where the donor hashes mls bytes\n(5-6); the narrower key admits false tag hits whose candidates cost a\ndata load + reject in the probe, and loses recall the donor has. Hash\nan mls-wide masked 8-byte read, shared verbatim between the live hash\nand the dictionary row-index build (any divergence blinds dict-region\nprobes), degrading to the 4-byte key in the window tail.\n\nRatio on z000033 vs the 4-byte key is better at every row level (L5\n-1113 B, L6 -1240, L7 -1131, L8 -999, L10 -686, L12 -281) and ahead of\nthe donor everywhere (L5 486096 vs 513921). The shallow band gains\nmore, which dropped level 11 a hair behind level 7 on the ladder\ncorpus; the Best alias moves to level 13, the first dominant point of\nthe deep band, keeping the named-level ladder strictly monotone.\n\n* test(c-api): add regression test for refPrefix lost on a failed one-shot\n\nThe one-shot decompress consumes an attached prefix before attempting\nthe decode, while the streaming path consumes it only after a frame\nsuccessfully starts; a garbage input thus eats the prefix and the\nretry with the real frame decodes without it. Currently fails.\n\n* fix(c-api): consume a referenced prefix only when the one-shot succeeds\n\nMirrors the streaming path (prefix consumed after a successful frame\nreset): a one-shot that fails before any frame starts leaves the\nprefix attached for the retry. Regression test in the previous\ncommit.\n\n* fix(c-api): RefCDict parameter authority, sizeof cache accounting, estimate input validation\n\n- sticky-parameter resolution is deferred behind the RefCDict check in\n  ZSTD_compress2 and ensure_stream: a referenced CDict's parameters are\n  authoritative, so an unsupported sticky combination no longer rejects\n  a valid RefCDict frame\n- ZSTD_createCDict_advanced validates the explicit parameters at\n  creation (NULL on an unsupported combination) instead of silently\n  skipping set_parameters at attach time\n- ZSTD_sizeof_DCtx counts the context-owned parsed-dictionary cache\n  behind ZSTD_decompress_usingDDict\n- estimate inputs are validated like upstream (encoded\n  parameter_outOfBound for windowLog/hashLog/chainLog/window beyond the\n  format bounds) with plain provably-in-range arithmetic after — no\n  clamping or saturation of garbage inputs\n- c_consumer gains a by-value ABI smoke (ZSTD_compressionParameters and\n  ZDICT_fastCover_params_t passed by value)\n- test.mjs exercises the built npm wrapper (ZstdDict + stream\n  factories) and the raw-content prepared-dictionary STREAM round-trip\n  incl. C-reference decode of the ID-less frames\n- fastCover steps documented as accepted-not-a-bound (the sweep always\n  covers the full candidate grid, a superset of any step budget);\n  row_key_value documents why dict-tail entries are unreachable under\n  any fixed build-time key (donor-parity)\n- the explicitly-Row primed-snapshot test pins Level(12) now that the\n  Best alias sits on level 13\n\n* test(c-api): add regression tests for creation-time validation gaps\n\nTwo wrong-accepts: the plain (non-optimizing) fastCover entry accepts\nk == 0 / d == 0 and silently substitutes defaults where upstream\nreturns parameter_outOfBound, and ZSTD_createDDict_advanced returns a\nnon-null handle for FULL_DICT bytes without the dictionary magic that\nthen fails at use. Both currently fail.\n\n* fix(c-api): validate plain fastCover k/d and FULL_DICT magic at creation\n\nThe non-optimizing fastCover entry rejects k == 0 / d == 0 with\nparameter_outOfBound (upstream parity) instead of substituting the\ncandidate-grid defaults, and ZSTD_createDDict_advanced rejects\nFULL_DICT bytes without the dictionary magic at creation instead of\nreturning a handle that fails at decompression. Regression tests in\nthe previous commit.\n\n* fix(c-api): 32-bit-safe estimate table logs; isolate and harden attach tests\n\n- the estimate table-log ceiling is per pointer width (29 on 32-bit)\n  so the 4 << log term provably fits usize; out-of-range still returns\n  the encoded parameter_outOfBound\n- the _advanced attach round-trip runs on fresh contexts plus a\n  bare-context negative check, so a wrapper regressing into a no-op\n  can no longer hide behind the earlier by-reference attachment\n- the Row primed-snapshot assertion message names the Row backend\n- test.mjs round-trips a raw-content dictionary through the public npm\n  wrapper (id 0, ID-less frames, one-shot + streams)\n\n* test(c-api): add regression test for NULL buffers in ZDICT entry points\n\nNULL samplesBuffer / dictBuffer / dictContent with a non-zero length\nreaches slice construction and aborts instead of returning an encoded\nerror. Fails on current code (SIGABRT via the stdlib null-slice\nprecondition check); the fix lands separately.\n\n* fix(c-api): reject NULL buffers with non-zero lengths in ZDICT entry points\n\ntrainFromBuffer / fastCover trainers / finalizeDictionary now return\ndictionaryCreation_failed for a NULL samplesBuffer, dictBuffer, or\ndictContent paired with a non-zero length instead of constructing a\nslice from the null pointer.\n\n* test(c-api): add regression test for prefix lost on dstSize_tooSmall\n\nZSTD_compress2 consumes the single-use refPrefix as soon as compression\nsucceeds internally, before the dstCapacity check; a dstSize_tooSmall\nfailure then leaves the retry without the prefix. Fails on current\ncode; the fix lands separately.\n\n* fix(c-api): consume refPrefix only after the frame reaches the caller\n\nMove ZSTD_compress2's consume_prefix past the dstCapacity check and the\noutput copy: a dstSize_tooSmall failure now leaves the single-use prefix\narmed for the retry. The streaming path already consumes at frame-start\ncommit (all ensure_stream error paths exit before consumption).\n\n* test(c-api): add regression test for invalid strategy ordinal acceptance\n\nZSTD_createCDict_advanced silently maps strategy ordinals outside\n1..=9 (including 0) onto the btultra2 tier instead of failing. Fails\non current code; the fix lands separately.\n\n* fix(c-api): reject strategy ordinals outside ZSTD_strategy's 1..=9\n\nlevel_for_strategy now returns None for invalid ordinals (including 0)\nand ZSTD_createCDict_advanced fails creation with NULL instead of\nsilently mapping them onto the btultra2 tier.\n\n* fix(wasm): detect the dictionary magic from 4 bytes, not 8\n\nA 4-7-byte blob starting with ZSTD_MAGIC_DICTIONARY is a truncated\nserialized dictionary and must fail parsing, not silently load as raw\ncontent; matches the C ABI's detection threshold. test.mjs covers the\ntruncated-magic constructor throw on both SIMD tiers.\n\n* fix(c-api): count parsed entropy-table heap in DCtx attach sizing\n\nDCtxDictAttach::heap_size reported only the content bytes plus the\nstruct size; the Huffman decode table's vectors and the FSE build\nscratch live on the heap and were missed. Adds Dictionary::heap_bytes\nsumming content + FSE/HUF scratch heap (the fixed-size FSE decode\narrays are inline and stay covered by the size_of term).\n\n* test(c-api): cover the encoder side of refPrefix_advanced\n\nThe advanced-prefix block exercised only ZSTD_DCtx_refPrefix_advanced;\nthe encoder now goes through ZSTD_CCtx_refPrefix_advanced too,\nincluding the fullDict-rejection negative.\n\n* fix(encode): mirror the real allocator in the workspace estimate\n\nestimated_compression_workspace_bytes now matches configure(): the HC3\nside table is budgeted only on btultra/btultra2 (capped by window log)\ninstead of every binary-tree level, and BT modes add the boxed\nBtMatcher plus the HC_OPT_NUM-bounded optimal-parse scratch arenas.\n\n* docs(encode): drop the stale compare-both note in the greedy rep path\n\nThe rep hit short-circuits the row search; the comment still described\nthe older compare-both-pick-longer behaviour.\n\n* feat(c-api): implement ZSTD_estimateCStreamSize_usingCParams\n\nThe header declares the symbol but the library never exported it. The\nimplementation is the one-shot cParams estimate plus the streaming\nstaging buffers, propagating encoded parameter errors; the CI symbol\ngate now covers it.\n\n* docs(c-api): list the dictionary attach surface in the crate scope\n\nThe crate docs still said dictionary attach/ref parameters land in\nlater phases; the family shipped in this crate.\n\n* test(c-api): add regression test for refDDict ignoring rawContent selection\n\nZSTD_DCtx_refDDict re-parses the DDict bytes with the AUTO selector,\nso a rawContent DDict whose bytes start with the dictionary magic is\nre-classified as a (corrupt) serialized dictionary and rejected;\nZSTD_decompress_usingDDict already honours the stored content type.\nFails on current code; the fix lands separately.\n\n* fix(c-api): honour the DDict content type in ZSTD_DCtx_refDDict\n\nrefDDict re-parsed the DDict bytes with the AUTO selector instead of\nthe creation-time content type, re-classifying rawContent bytes that\nstart with the dictionary magic as corrupt serialized dictionaries;\nnow matches ZSTD_decompress_usingDDict.\n\n* fix(c-api): align DDict-cache sizing and complete the BT workspace budget\n\nZSTD_sizeof_DCtx's usingDDict parse cache now uses the same\nentropy-table-aware accounting as the attach path, and the BT\nworkspace term moves into BtMatcher::estimated_workspace_bytes next to\nthe struct, covering the retained price arrays, plan buffers and the\ncandidate ladder the previous ad-hoc term missed.\n\n* fix(c-api): budget the BT workspace in the cParams estimates too\n\nZSTD_estimateCCtxSize_usingCParams only counted window + hash/chain\ntables; binary-tree strategy ordinals now add the retained\noptimal-parser workspace (and the HC3 side table for btultra tiers)\nvia the new estimated_bt_strategy_extra_bytes codec export, and the\nstrategy ordinal is bounds-checked like the other cParams fields.\n\n* perf(encode): share one row search body across the lazy probe sites\n\nThe lazy parse expanded the full rep+row search twice (current\nposition inline, lookahead as an outlined closure copy), doubling the\nkernel's icache footprint with a call between the copies on every\nlazy step. The search now lives in one per-tier target_feature\nfunction (upstream zstd's ZSTD_RowFindBestMatch shape, zstd_lazy.c)\ncalled from both probe sites. Output is byte-identical.\n\n* perf(encode): inline the row hash and rep probes into the search body\n\nhash_and_row and repcode_candidate were standalone calls inside the\nshared row search (14% combined self time, YMM spills at the call\nboundaries). Both are feature-neutral, so inline(always) folds them\ninto each per-tier search function. i9 z000033: level_12_lazy −10.1%,\nlevel_10_lazy follows (flat c_ffi controls); output byte-identical.\n\n* perf(encode): hash each lazy position once, reuse for the defer insert\n\nThe defer path rehashed the position the probe had just hashed\n(insert_position recomputes hash_and_row). The parse loop now hashes\nonce, feeds the probe, and reuses (row, tag) for insert_at — matching\nupstream zstd's one-hash-per-position discipline (ZSTD_RowFindBestMatch\nupdates the row inside the search, zstd_lazy.c). Time-neutral on i9\nL12 (flat control), strictly less work; output byte-identical.\n\n* perf(encode): carry the lazy lookahead result forward instead of re-searching\n\nThe defer model searched a deferred position twice: once as the\nprevious iteration's lookahead and again as the next main-loop\niteration (upstream zstd's lazy chain never searches a position twice,\nzstd_lazy.c lazy_generic depth loop). The lookahead result is now\ncarried into the next iteration; the carried position skips hash and\nsearch entirely. The two-ahead defer carries the one-ahead result.\n\ni9 z000033, flat c_ffi controls: level_6 −16%, level_10 −5%,\nlevel_12 −8% (session cumulative 58.4→47.2ms, gap 3.27×→2.66×).\nRatio gate: compressed size +25 bytes on 484 KB (L12), every lazy\nlevel stays ~5% below the C reference. Upstream's 4-byte head gate\nwas also tried here and measured negative (comment in the probe).\n\n* perf(encode): share the candidate budget across live and dict rows\n\nThe dict dual-probe ran with its own full search-depth budget on top\nof the live row's, examining up to twice the candidates upstream zstd\nallows (one nbAttempts spans both rows, zstd_lazy.c:1308). The dict\nprobe now spends only what the live walk left over, and the dict row\nis prefetched before the live scan (upstream's ZSTD_row_prefetch of\nthe dictMatchState rows, zstd_lazy.c:1200).\n\ni9 z000033+dict level_5_greedy: −11.7% instructions (10.04G→8.86G,\nidentical output), −12.3% wall in the clean A/B window. Compressed\nsize: +6 bytes on the z000033 dict band, identical on small-10k;\nevery level stays ~5% below the C reference.\n\n* docs(c-api,encode): document the c_uint width contract and the carried-lookahead reuse\n\nThe cParams estimate deliberately passes c_uint fields uncast (this\ncrate only targets 32-bit-unsigned-int platforms; an exotic target\nfails loudly instead of silently widening), and the lazy carry-forward\ndeliberately reuses the pre-insert lookahead result (the insert only\nadds a row entry; measured at +25 bytes on a 484 KB corpus for one\nsearch less per deferral).\n\n* perf(encode): accelerate the lazy parse through weakly-matching stretches\n\nThe lazy kernels probed every byte; upstream zstd's lazy_generic jumps\nahead on a complete miss (ip += (ip - anchor) >> kSearchStrength + 1,\nzstd_lazy.c). Ported with the same softened SKIP_STRENGTH = 10 the\ngreedy kernel already uses (step stays 1 until a ~1 KiB literal run),\nand only on full misses — a lookahead defer still steps exactly one.\n\ni9, flat c_ffi controls: high-entropy-1m level_6 −69% (3.09→0.95 ms),\nsmall-10k-random+dict level_6 −29%, z000033 level_6 −2.6%. Compressed\nsize +326/+309 bytes on the 484 KB z000033 lazy levels (still ~5%\nbelow the C reference), random fixtures byte-identical.\n\n* test(c-api): add regression test for 32-bit overflow in the cParams estimate\n\nwindowLog=30 + hashLog=29 + chainLog=29 pass the per-field bounds but\ntheir byte sizes wrap a 32-bit usize, under-reporting the budget. The\nfailing demonstration cannot run: the crate does not currently compile\nfor 32-bit targets at all (the error-encoding constant in simple.rs is\n64-bit-only), so the test documents the contract on 64-bit and guards\nthe future 32-bit build.\n\n* fix(c-api): return an encoded error when the cParams estimate sum overflows\n\nThe per-field bounds keep each term inside usize, but on a 32-bit\ntarget the aggregate can still wrap and under-report the budget. The\nsum is now checked end-to-end and overflow comes back as\nparameter_outOfBound.\n\n* test(c-api): isolate the refPrefix_advanced block and document streaming ID suppression\n\nThe advanced-prefix assertions now run on fresh contexts (sticky\nloadDictionary attaches from the preceding block could mask a wrapper\nregressing to a no-op) and additionally prove the frame depends on the\nprefix (no advertised dictionary ID, bare decode fails). The streaming\nattach helper documents that synthetic-ID suppression deliberately\nlives at its only caller, ensure_stream.\n\n* test(c-api): add regression test for NULL prefix clear rejected by selector check\n\nrefPrefix_advanced validates content_type before the NULL/empty clear\nfast path, so a clear with the fullDict selector errors and leaves the\nprevious prefix armed. Fails on current code; the fix lands separately.\n\n* fix(c-api): let a NULL refPrefix clear win over selector validation\n\nThe NULL/empty clear fast path now runs before the content-type check\non both context kinds (upstream clears and returns 0 before looking at\nthe selector), so a clear with the fullDict selector disarms the\nprevious prefix instead of erroring and leaving it attached.\n\n* fix(c-api,encode): checked stream-estimate sum and table-routed pre-split\n\nThe streaming cParams estimate now uses the same checked-sum\ndiscipline as the one-shot path (a validated base can sit within\n256 KiB of usize::MAX on 32-bit). level_pre_split resolves named\npresets through resolve_level_params directly instead of the legacy\nnumeric alias, so Best reads the same table row as every other tuning\nknob; the now-unused numeric_level alias is removed.",
+          "timestamp": "2026-06-13T04:10:40+03:00",
+          "tree_id": "c7a57ebb9ae4ecfe2a6b4047de6df7518fdf000b",
+          "url": "https://github.com/structured-world/structured-zstd/commit/9e175617700ea25b02239fe30f49f83e006123fb"
+        },
+        "date": 1781315679051,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.118,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.113,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 252.106,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 229.414,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.208,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.272,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.119,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.026,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.033,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.978,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.11,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.11,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.013,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 12.501,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.293,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.21,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.315,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.886,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.276,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.619,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.147,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.395,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.143,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.12,
             "unit": "ms"
           },
           {
