@@ -298,6 +298,13 @@ fn frame_header_abi_layout_is_stable() {
         assert_eq!(size_of::<ZSTD_FrameHeader>(), 48);
         assert_eq!(align_of::<ZSTD_FrameHeader>(), 8);
     }
+    // i386 ABI aligns u64 to 4, so the struct loses the trailing pad and
+    // the 8-byte alignment; the field offsets above stay identical.
+    #[cfg(target_pointer_width = "32")]
+    {
+        assert_eq!(size_of::<ZSTD_FrameHeader>(), 44);
+        assert_eq!(align_of::<ZSTD_FrameHeader>(), 4);
+    }
 }
 
 #[test]
@@ -582,14 +589,22 @@ use crate::streaming::{
 };
 use core::ffi::c_int;
 
-// ABI invariants: struct sizes match upstream `sizeof` on 64-bit (on
-// 32-bit targets `size_t` / pointers halve the layouts).
+// ABI invariants: struct sizes match upstream `sizeof` per pointer width
+// (`size_t` / pointers halve the layouts on 32-bit).
 #[test]
-#[cfg(target_pointer_width = "64")]
 fn streaming_buffer_abi_sizes() {
-    assert_eq!(core::mem::size_of::<ZSTD_inBuffer>(), 24);
-    assert_eq!(core::mem::size_of::<ZSTD_outBuffer>(), 24);
-    assert_eq!(core::mem::size_of::<ZSTD_bounds>(), 16);
+    #[cfg(target_pointer_width = "64")]
+    {
+        assert_eq!(core::mem::size_of::<ZSTD_inBuffer>(), 24);
+        assert_eq!(core::mem::size_of::<ZSTD_outBuffer>(), 24);
+        assert_eq!(core::mem::size_of::<ZSTD_bounds>(), 16);
+    }
+    #[cfg(target_pointer_width = "32")]
+    {
+        assert_eq!(core::mem::size_of::<ZSTD_inBuffer>(), 12);
+        assert_eq!(core::mem::size_of::<ZSTD_outBuffer>(), 12);
+        assert_eq!(core::mem::size_of::<ZSTD_bounds>(), 12);
+    }
 }
 
 #[test]
