@@ -3859,27 +3859,33 @@ macro_rules! build_optimal_plan_impl_body {
                 }
             }
 
-            let mut base_node = unsafe { *nodes.get_unchecked(pos) };
-            if base_node.price == u32::MAX {
+            // Memory-resident DP (donor parity): read opt[cur] fields on
+            // demand instead of holding a 28-byte node copy live across the
+            // per-position `$collect` call below. The held copy forced LLVM
+            // to spill reps[3] + litlen around the (non-inlinable) call;
+            // reading the fields fresh on each side keeps them out of the
+            // cross-call live set. `nodes[pos]` is stable across `$collect`
+            // (it only fills `candidates`), so post-call reads are identical.
+            let base_cost = unsafe { nodes.get_unchecked(pos).price };
+            if base_cost == u32::MAX {
                 pos += 1;
                 continue;
             }
-            if base_node.mlen > 0 && base_node.litlen == 0 {
-                // Donor parity (zstd_opt.c:1255): `cur >= opt[cur].mlen`.
-                debug_assert!(pos >= base_node.mlen as usize);
-                let prev_pos = pos - base_node.mlen as usize;
-                {
+            {
+                let base_node = unsafe { *nodes.get_unchecked(pos) };
+                if base_node.mlen > 0 && base_node.litlen == 0 {
+                    // Donor parity (zstd_opt.c:1255): `cur >= opt[cur].mlen`.
+                    debug_assert!(pos >= base_node.mlen as usize);
+                    let prev_pos = pos - base_node.mlen as usize;
                     let prev_state = unsafe { *nodes.get_unchecked(prev_pos) };
                     let (_, reps_after_match) = BtMatcher::encode_offset_with_reps(
                         base_node.off,
                         prev_state.litlen as usize,
                         prev_state.reps,
                     );
-                    base_node.reps = reps_after_match;
                     unsafe { nodes.get_unchecked_mut(pos).reps = reps_after_match };
                 }
             }
-            let base_cost = base_node.price;
 
             if pos + 8 > $current_len {
                 pos += 1;
@@ -3910,31 +3916,39 @@ macro_rules! build_optimal_plan_impl_body {
                 None
             };
             candidates.clear();
-            // SAFETY: same umbrella as `$collect`.
+            // SAFETY: same umbrella as `$collect`. Query fields are read
+            // fresh here (consumed into the call's argument) so they do not
+            // stay live across the call; the post-call reads below are a
+            // separate, fresh load of the same stable `nodes[pos]`.
             unsafe {
                 $self.$collect::<$strategy_ty, true>(
                     abs_pos,
                     current_abs_end,
                     profile,
                     HcCandidateQuery {
-                        reps: base_node.reps,
-                        lit_len: base_node.litlen as usize,
+                        reps: nodes.get_unchecked(pos).reps,
+                        lit_len: nodes.get_unchecked(pos).litlen as usize,
                         ldm_candidate,
                     },
                     &mut candidates,
                 )
             };
+            // Post-call reads of opt[cur]: fresh, born after `$collect`, so
+            // never part of the cross-call live set (see memory-resident note
+            // above). `nodes[pos]` is untouched by `$collect`.
+            let base_reps = unsafe { nodes.get_unchecked(pos).reps };
+            let base_litlen = unsafe { nodes.get_unchecked(pos).litlen as usize };
             if let Some(candidate) = candidates.last() {
                 let longest_len = candidate.match_len.min($current_len - pos);
                 if longest_len > sufficient_len
                     || pos + longest_len >= HC_OPT_NUM
                     || pos + longest_len >= $current_len
                 {
-                    let lit_len = base_node.litlen as usize;
+                    let lit_len = base_litlen;
                     let off_base = BtMatcher::encode_offset_base_with_reps(
                         candidate.offset as u32,
                         lit_len,
-                        base_node.reps,
+                        base_reps,
                     );
                     let off_price = profile
                         .offset_price_for::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>($stats, off_base);
@@ -3958,7 +3972,7 @@ macro_rules! build_optimal_plan_impl_body {
                         off: candidate.offset as u32,
                         mlen: longest_len as u32,
                         litlen: 0,
-                        reps: base_node.reps,
+                        reps: base_reps,
                     });
                     break;
                 }
@@ -3986,11 +4000,11 @@ macro_rules! build_optimal_plan_impl_body {
                 if max_next > last_pos {
                     BtMatcher::reset_opt_nodes(&mut nodes, last_pos + 1, max_next);
                 }
-                let lit_len = base_node.litlen as usize;
+                let lit_len = base_litlen;
                 let off_base = BtMatcher::encode_offset_base_with_reps(
                     candidate.offset as u32,
                     lit_len,
-                    base_node.reps,
+                    base_reps,
                 );
                 let off_price = profile
                     .offset_price_for::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>($stats, off_base);
@@ -4019,7 +4033,7 @@ macro_rules! build_optimal_plan_impl_body {
                             off: candidate.offset as u32,
                             mlen: match_len as u32,
                             litlen: 0,
-                            reps: base_node.reps,
+                            reps: base_reps,
                         };
                         if next > last_pos {
                             last_pos = next;
