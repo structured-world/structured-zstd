@@ -24,8 +24,11 @@ const CONTENTSIZE_UNKNOWN: u64 = u64::MAX;
 const CONTENTSIZE_ERROR: u64 = u64::MAX - 1;
 
 /// `ZSTD_MAX_INPUT_SIZE`: above this `ZSTD_compressBound` reports an error.
+/// The 64-bit value is spelled as a `u64` literal because both arms of a
+/// const `if` are type-checked even on targets where only the 32-bit arm is
+/// live — a bare `usize` literal would fail to compile on 32-bit.
 const MAX_INPUT_SIZE: usize = if usize::BITS >= 64 {
-    0xFF00_FF00_FF00_FF00
+    0xFF00_FF00_FF00_FF00u64 as usize
 } else {
     0xFF00_FF00
 };

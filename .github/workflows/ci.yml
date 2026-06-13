@@ -166,6 +166,18 @@ jobs:
         run: cargo clippy -p structured-zstd-c --all-targets -- -D warnings
       - name: Unit + ABI tests
         run: cargo test -p structured-zstd-c
+      - name: 32-bit toolchain (i686)
+        # Upstream libzstd ships on 32-bit platforms; the drop-in C ABI must
+        # keep building and passing there too (size_t error encoding, struct
+        # layouts, and overflow guards all change shape at 32-bit usize).
+        run: |
+          rustup target add i686-unknown-linux-gnu
+          sudo apt-get update
+          sudo apt-get install -y gcc-multilib
+      - name: Clippy (c-api, i686)
+        run: cargo clippy -p structured-zstd-c --all-targets --target i686-unknown-linux-gnu -- -D warnings
+      - name: Unit + ABI tests (i686)
+        run: cargo test -p structured-zstd-c --target i686-unknown-linux-gnu
       - name: Vendored headers match upstream verbatim
         # The headers are copied byte-for-byte from the pinned upstream tag; a
         # diff means someone edited a vendored header (forbidden) or the pin
