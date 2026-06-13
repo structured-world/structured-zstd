@@ -258,32 +258,35 @@ impl HcOptState {
 
     #[inline(always)]
     pub(crate) fn ml_code_and_bits(match_len: usize) -> (usize, u32) {
-        let ml = match_len.clamp(3, 131_074) as u32;
-        let (code, _, extra_bits) = match ml {
-            3..=34 => (ml as u8 - 3, 0, 0),
-            35..=36 => (32, ml - 35, 1),
-            37..=38 => (33, ml - 37, 1),
-            39..=40 => (34, ml - 39, 1),
-            41..=42 => (35, ml - 41, 1),
-            43..=46 => (36, ml - 43, 2),
-            47..=50 => (37, ml - 47, 2),
-            51..=58 => (38, ml - 51, 3),
-            59..=66 => (39, ml - 59, 3),
-            67..=82 => (40, ml - 67, 4),
-            83..=98 => (41, ml - 83, 4),
-            99..=130 => (42, ml - 99, 5),
-            131..=258 => (43, ml - 131, 7),
-            259..=514 => (44, ml - 259, 8),
-            515..=1026 => (45, ml - 515, 9),
-            1027..=2050 => (46, ml - 1027, 10),
-            2051..=4098 => (47, ml - 2051, 11),
-            4099..=8194 => (48, ml - 4099, 12),
-            8195..=16386 => (49, ml - 8195, 13),
-            16387..=32770 => (50, ml - 16387, 14),
-            32771..=65538 => (51, ml - 32771, 15),
-            _ => (52, ml - 65539, 16),
-        };
-        (code as usize, extra_bits as u32)
+        // Donor parity (`ZSTD_MLcode` + `ML_bits`, zstd_compress_internal.h):
+        // direct table lookup on `mlBase = ml - MINMATCH` for mlBase < 128 and
+        // `highbit32(mlBase) + 36` above — same (code, nbBits) values as the
+        // former 22-arm range cascade, replacing its jae ladder. Cold on
+        // random data but hot on the compressible btopt/btultra band, where
+        // the optimal parser calls match_length_price per candidate.
+        const ML_CODE: [u8; 128] = [
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+            24, 25, 26, 27, 28, 29, 30, 31, 32, 32, 33, 33, 34, 34, 35, 35, 36, 36, 36, 36, 37, 37,
+            37, 37, 38, 38, 38, 38, 38, 38, 38, 38, 39, 39, 39, 39, 39, 39, 39, 39, 40, 40, 40, 40,
+            40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41,
+            41, 41, 41, 41, 41, 41, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42,
+            42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42,
+        ];
+        // Extra bits per ML code (index = code, 0..=52).
+        const ML_BITS: [u8; 53] = [
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+        ];
+        let ml = match_len.clamp(3, 131_074);
+        let ml_base = (ml - 3) as u32;
+        if ml_base < 128 {
+            let code = ML_CODE[ml_base as usize] as usize;
+            (code, ML_BITS[code] as u32)
+        } else {
+            // mlBase in 128..=131_071 ⇒ highbit32 in 7..=16; code = hb + 36.
+            let hb = 31 - ml_base.leading_zeros();
+            ((hb + 36) as usize, hb)
+        }
     }
 
     pub(crate) fn rescale_freqs(&mut self, src: &[u8], profile: HcOptimalCostProfile) {
