@@ -3087,6 +3087,11 @@ macro_rules! bt_insert_step_no_rebase_body {
         // triggers early; raw subtraction would underflow into a huge
         // sentinel that ALWAYS triggers.
         let bt_low = $abs_pos.saturating_sub(bt_mask);
+        // Hoist the BT pointer-pair base out of `self` once — see the
+        // collect-matches body for the full rationale (per-step Vec reload +
+        // bounds check through `&mut self` vs the donor's raw `U32*` walk).
+        let chain_ptr = $table.chain_table.as_mut_ptr();
+        debug_assert_eq!($table.chain_table.len(), 2 << $table.bt_log());
         let window_low = $table.window_low_abs_for_target($target_abs);
         // `abs_pos + 9` is safe in raw form: `MatchTable::add_data` caps
         // total input at `usize::MAX - STREAM_ABS_HEADROOM` (where
@@ -3123,8 +3128,11 @@ macro_rules! bt_insert_step_no_rebase_body {
             compares_left -= 1;
 
             let next_pair_idx = $table.bt_pair_index_for_abs(candidate_abs);
-            let next_smaller = $table.chain_table[next_pair_idx];
-            let next_larger = $table.chain_table[next_pair_idx + 1];
+            // SAFETY: `next_pair_idx (+1)` = `2*(candidate_abs & bt_mask) (+1)`
+            // ≤ `chain_table.len()-1`; `chain_ptr` is the hoisted live base,
+            // table not realloc'd during the walk.
+            let next_smaller = unsafe { *chain_ptr.add(next_pair_idx) };
+            let next_larger = unsafe { *chain_ptr.add(next_pair_idx + 1) };
             let seed_len = common_length_smaller.min(common_length_larger);
             let candidate_idx = candidate_abs - $table.history_abs_start;
             // SAFETY: BT walk invariant — `candidate_idx + tail_limit ≤
@@ -3151,7 +3159,10 @@ macro_rules! bt_insert_step_no_rebase_body {
             let candidate_next = candidate_idx + match_len;
             let current_next = idx + match_len;
             if concat[candidate_next] < concat[current_next] {
-                $table.chain_table[smaller_slot] = match_stored;
+                // SAFETY: `smaller_slot` holds a valid pair index (init
+                // `pair_idx`, updated to `next_pair_idx + 1`); the `usize::MAX`
+                // sentinel is set only just before `break`, never written here.
+                unsafe { *chain_ptr.add(smaller_slot) = match_stored };
                 common_length_smaller = match_len;
                 if candidate_abs <= bt_low {
                     smaller_slot = usize::MAX;
@@ -3160,7 +3171,8 @@ macro_rules! bt_insert_step_no_rebase_body {
                 smaller_slot = next_pair_idx + 1;
                 match_stored = next_larger;
             } else {
-                $table.chain_table[larger_slot] = match_stored;
+                // SAFETY: as above for `larger_slot`.
+                unsafe { *chain_ptr.add(larger_slot) = match_stored };
                 common_length_larger = match_len;
                 if candidate_abs <= bt_low {
                     larger_slot = usize::MAX;
@@ -3171,11 +3183,17 @@ macro_rules! bt_insert_step_no_rebase_body {
             }
         }
 
+        // SAFETY: both slots, when not the `usize::MAX` sentinel, hold valid
+        // pair indices into the hoisted `chain_table` base.
         if smaller_slot != usize::MAX {
-            $table.chain_table[smaller_slot] = $crate::encoding::match_table::storage::HC_EMPTY;
+            unsafe {
+                *chain_ptr.add(smaller_slot) = $crate::encoding::match_table::storage::HC_EMPTY
+            };
         }
         if larger_slot != usize::MAX {
-            $table.chain_table[larger_slot] = $crate::encoding::match_table::storage::HC_EMPTY;
+            unsafe {
+                *chain_ptr.add(larger_slot) = $crate::encoding::match_table::storage::HC_EMPTY
+            };
         }
 
         let speed_positions = if best_len > 384 {
@@ -4660,6 +4678,19 @@ macro_rules! bt_insert_and_collect_matches_body {
         };
         let stored = relative_pos + 1;
         let bt_mask = $table.bt_mask();
+        // Hoist the BT pointer-pair table's base out of `self` once: every
+        // access below is `chain_table[computed_index]` through `&mut self`,
+        // which the optimizer cannot prove loop-invariant, so it reloads the
+        // Vec's (ptr,len) from the struct AND bounds-checks on every tree
+        // step (the donor walks a raw `U32* btable`, zstd_opt.c). The raw
+        // base carries no borrow, so the `&self` helper calls in the loop
+        // (`bt_pair_index_for_abs`, `window_low_abs_for_target`,
+        // `relative_position`) coexist — they read other fields, never
+        // `chain_table`. Indices are in bounds by the BT invariants:
+        // `bt_pair_index_for_abs` returns `2*(abs & bt_mask) (+1)` ≤
+        // `chain_table.len()-1`, and the slots only ever hold those values.
+        let chain_ptr = $table.chain_table.as_mut_ptr();
+        debug_assert_eq!($table.chain_table.len(), 2 << $table.bt_log());
         // See `bt_insert_step_no_rebase_body!`: saturating is needed for the
         // first BT walk of a fresh frame where `abs_pos < bt_mask`.
         let bt_low = $abs_pos.saturating_sub(bt_mask);
@@ -4702,8 +4733,11 @@ macro_rules! bt_insert_and_collect_matches_body {
             compares_left -= 1;
 
             let next_pair_idx = $table.bt_pair_index_for_abs(candidate_abs);
-            let next_smaller = $table.chain_table[next_pair_idx];
-            let next_larger = $table.chain_table[next_pair_idx + 1];
+            // SAFETY: `next_pair_idx (+1)` = `2*(candidate_abs & bt_mask) (+1)`
+            // ≤ `chain_table.len()-1`; `chain_ptr` is the hoisted live base,
+            // table not realloc'd during the walk.
+            let next_smaller = unsafe { *chain_ptr.add(next_pair_idx) };
+            let next_larger = unsafe { *chain_ptr.add(next_pair_idx + 1) };
             let seed_len = common_length_smaller.min(common_length_larger);
             let candidate_idx = candidate_abs - $table.history_abs_start;
             // SAFETY: BT walk invariant — `candidate_idx + tail_limit ≤
@@ -4750,7 +4784,10 @@ macro_rules! bt_insert_and_collect_matches_body {
             let candidate_next = candidate_idx + match_len;
             let current_next = idx + match_len;
             if concat[candidate_next] < concat[current_next] {
-                $table.chain_table[smaller_slot] = match_stored;
+                // SAFETY: `smaller_slot` holds a valid pair index (init
+                // `pair_idx`, updated to `next_pair_idx + 1`); the `usize::MAX`
+                // sentinel is set only just before `break`, never written here.
+                unsafe { *chain_ptr.add(smaller_slot) = match_stored };
                 common_length_smaller = match_len;
                 if candidate_abs <= bt_low {
                     smaller_slot = usize::MAX;
@@ -4759,7 +4796,8 @@ macro_rules! bt_insert_and_collect_matches_body {
                 smaller_slot = next_pair_idx + 1;
                 match_stored = next_larger;
             } else {
-                $table.chain_table[larger_slot] = match_stored;
+                // SAFETY: as above for `larger_slot`.
+                unsafe { *chain_ptr.add(larger_slot) = match_stored };
                 common_length_larger = match_len;
                 if candidate_abs <= bt_low {
                     larger_slot = usize::MAX;
@@ -4770,11 +4808,17 @@ macro_rules! bt_insert_and_collect_matches_body {
             }
         }
 
+        // SAFETY: both slots, when not the `usize::MAX` sentinel, hold valid
+        // pair indices into the hoisted `chain_table` base.
         if smaller_slot != usize::MAX {
-            $table.chain_table[smaller_slot] = $crate::encoding::match_table::storage::HC_EMPTY;
+            unsafe {
+                *chain_ptr.add(smaller_slot) = $crate::encoding::match_table::storage::HC_EMPTY
+            };
         }
         if larger_slot != usize::MAX {
-            $table.chain_table[larger_slot] = $crate::encoding::match_table::storage::HC_EMPTY;
+            unsafe {
+                *chain_ptr.add(larger_slot) = $crate::encoding::match_table::storage::HC_EMPTY
+            };
         }
 
         // Dict dual-probe (donor `ZSTD_dictMatchState`, zstd_opt.c:777-813):
