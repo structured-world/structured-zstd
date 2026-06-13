@@ -3204,7 +3204,12 @@ macro_rules! bt_insert_step_no_rebase_body {
 
             let candidate_next = candidate_idx + match_len;
             let current_next = idx + match_len;
-            if concat[candidate_next] < concat[current_next] {
+            // SAFETY: first-differing positions after a match_len-long prefix;
+            // match_len < tail_limit (break above) + BT-walk bound
+            // idx/candidate_idx + tail_limit <= concat.len() keep both in range.
+            if unsafe {
+                *concat.get_unchecked(candidate_next) < *concat.get_unchecked(current_next)
+            } {
                 // SAFETY: `smaller_slot` holds a valid pair index (init
                 // `pair_idx`, updated to `next_pair_idx + 1`); the `usize::MAX`
                 // sentinel is set only just before `break`, never written here.
@@ -4889,7 +4894,12 @@ macro_rules! bt_insert_and_collect_matches_body {
 
             let candidate_next = candidate_idx + match_len;
             let current_next = idx + match_len;
-            if concat[candidate_next] < concat[current_next] {
+            // SAFETY: first-differing positions after a match_len-long prefix;
+            // match_len < tail_limit (break above) + BT-walk bound
+            // idx/candidate_idx + tail_limit <= concat.len() keep both in range.
+            if unsafe {
+                *concat.get_unchecked(candidate_next) < *concat.get_unchecked(current_next)
+            } {
                 // SAFETY: `smaller_slot` holds a valid pair index (init
                 // `pair_idx`, updated to `next_pair_idx + 1`); the `usize::MAX`
                 // sentinel is set only just before `break`, never written here.
