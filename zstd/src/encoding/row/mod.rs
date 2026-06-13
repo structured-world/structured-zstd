@@ -327,7 +327,11 @@ macro_rules! greedy_parse_body {
                     // Probe body expanded inline (tier SIMD pairing via the
                     // enclosing monolith macro), not a function call.
                     None => {
-                        row_probe_body!($m, abs_pos, lit_len, hash, $rl, $use_mask, $maskmac, $cpl)
+                        // Greedy already short-circuited on a rep hit above,
+                        // so the probe starts from no candidate here.
+                        row_probe_body!(
+                            $m, abs_pos, lit_len, hash, None, $rl, $use_mask, $maskmac, $cpl
+                        )
                     }
                 };
 
@@ -444,10 +448,9 @@ macro_rules! greedy_parse_body {
 macro_rules! row_best_match {
     ($m:expr, $abs_pos:expr, $lit_len:expr, $hash:expr, $rl:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
         let rep = $m.repcode_candidate($abs_pos, $lit_len);
-        let row = row_probe_body!(
-            $m, $abs_pos, $lit_len, $hash, $rl, $use_mask, $maskmac, $cpl
-        );
-        best_len_offset_candidate(rep, row)
+        row_probe_body!(
+            $m, $abs_pos, $lit_len, $hash, rep, $rl, $use_mask, $maskmac, $cpl
+        )
     }};
 }
 
@@ -866,7 +869,7 @@ macro_rules! row_tag_mask_simd128 {
 /// because a `return` inside a macro body would return from the EXPANSION
 /// SITE's function.
 macro_rules! row_probe_body {
-    ($m:expr, $abs_pos:expr, $lit_len:expr, $hash:expr, $rl:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
+    ($m:expr, $abs_pos:expr, $lit_len:expr, $hash:expr, $seed:expr, $rl:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
         #[allow(unused_labels)]
         'probe: {
             debug_assert_eq!($rl, $m.row_log);
@@ -919,7 +922,13 @@ macro_rules! row_probe_body {
                 0
             };
 
-            let mut best: Option<MatchCandidate> = None;
+            // Seeded with the rep candidate (when present) so the tail-gate
+            // below prunes row candidates against the rep length from the
+            // first hit, and the rep value need not stay live separately
+            // across the probe. Merge stays byte-identical: the seed is the
+            // permanent lhs, exactly as the former trailing
+            // `best_len_offset_candidate(rep, row)` merge made it.
+            let mut best: Option<MatchCandidate> = $seed;
             // Donor `ZSTD_RowFindBestMatch` mask iteration: rotate the tag
             // mask into head (newest-first) order once, then visit ONLY the
             // set bits via tzcnt + clear-lowest. The former per-slot loop
@@ -1162,7 +1171,9 @@ macro_rules! gen_row_probe {
             lit_len: usize,
             hash: Option<(usize, u8)>,
         ) -> Option<MatchCandidate> {
-            row_probe_body!(self, abs_pos, lit_len, hash, ROW_LOG, $use_mask, $maskmac, $cpl)
+            // Standalone probe: the caller merges the rep candidate, so the
+            // probe itself starts unseeded.
+            row_probe_body!(self, abs_pos, lit_len, hash, None, ROW_LOG, $use_mask, $maskmac, $cpl)
         }
     };
 }
