@@ -1120,11 +1120,15 @@ fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> Le
 /// 128 KiB block. The frame loop reads this instead of hardcoding the
 /// level→split mapping at the call site.
 pub(crate) fn level_pre_split(level: CompressionLevel) -> Option<usize> {
-    // Named presets are pure aliases: resolve to their numeric level and
-    // read the split knob from the same `LevelParams` table as everything
-    // else. `Uncompressed` (raw blocks) has no numeric equivalent.
-    let numeric = level.numeric_level()?;
-    resolve_level_params(CompressionLevel::Level(numeric), None)
+    // Resolve through `resolve_level_params` directly — NOT via the legacy
+    // `numeric_level()` alias — so named presets read the SAME table row as
+    // every other tuning knob (`Best` maps to its own row there, which is
+    // not the row its numeric alias points at). `Uncompressed` (raw
+    // blocks) never splits.
+    if matches!(level, CompressionLevel::Uncompressed) {
+        return None;
+    }
+    resolve_level_params(level, None)
         .pre_split()
         .map(usize::from)
 }

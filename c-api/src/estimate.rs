@@ -98,7 +98,11 @@ pub extern "C" fn ZSTD_estimateCStreamSize_usingCParams(
     if crate::error::result_is_error(base) {
         return base;
     }
-    base + 2 * BLOCK_SIZE_MAX
+    // Same checked-sum discipline as the one-shot estimate: a validated
+    // `base` can still sit within 256 KiB of usize::MAX on a 32-bit target.
+    base.checked_add(2 * BLOCK_SIZE_MAX).unwrap_or_else(|| {
+        crate::error::encode(crate::error::ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound)
+    })
 }
 
 /// `size_t ZSTD_estimateDCtxSize(void)` — budget for a decompression
