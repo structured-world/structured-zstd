@@ -3076,6 +3076,25 @@ macro_rules! bt_insert_step_no_rebase_body {
             $table.hash_log,
             $table.search_mls,
         );
+        // Prefetch the hash bucket now. For the large L16+ hash table over
+        // high-entropy input the bucket is L3/DRAM-cold, and unlike upstream's
+        // monolithic ZSTD_btGetAllMatches (which overlaps this miss with its
+        // inline rep/hash3 prologue) the read+write of `hash_table[hash]`
+        // below is reached with nothing to hide it behind — it stalled a large
+        // share of this function's cycles. Issuing the hint here lets the miss
+        // overlap the address setup that follows.
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            #[cfg(target_arch = "x86")]
+            use core::arch::x86::{_MM_HINT_T0, _mm_prefetch};
+            #[cfg(target_arch = "x86_64")]
+            use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            // SAFETY: prefetch is a hint that never faults; `hash` indexes
+            // `hash_table` directly below, so it is in bounds.
+            unsafe {
+                _mm_prefetch($table.hash_table.as_ptr().add(hash).cast(), _MM_HINT_T0);
+            }
+        }
         let Some(relative_pos) = $table.relative_position($abs_pos) else {
             return 1;
         };
@@ -4692,6 +4711,25 @@ macro_rules! bt_insert_and_collect_matches_body {
             $table.hash_log,
             $table.search_mls,
         );
+        // Prefetch the hash bucket now. For the large L16+ hash table over
+        // high-entropy input the bucket is L3/DRAM-cold, and unlike upstream's
+        // monolithic ZSTD_btGetAllMatches (which overlaps this miss with its
+        // inline rep/hash3 prologue) the read+write of `hash_table[hash]`
+        // below is reached with nothing to hide it behind — it stalled a large
+        // share of this function's cycles. Issuing the hint here lets the miss
+        // overlap the address setup that follows.
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            #[cfg(target_arch = "x86")]
+            use core::arch::x86::{_MM_HINT_T0, _mm_prefetch};
+            #[cfg(target_arch = "x86_64")]
+            use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            // SAFETY: prefetch is a hint that never faults; `hash` indexes
+            // `hash_table` directly below, so it is in bounds.
+            unsafe {
+                _mm_prefetch($table.hash_table.as_ptr().add(hash).cast(), _MM_HINT_T0);
+            }
+        }
         let Some(relative_pos) = $table.relative_position($abs_pos) else {
             return;
         };
