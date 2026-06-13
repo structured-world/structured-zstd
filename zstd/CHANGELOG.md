@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.37](https://github.com/structured-world/structured-zstd/compare/v0.0.36...v0.0.37) - 2026-06-13
+
+### Added
+
+- *(c-api)* dictionary attach surface + estimates + fastCover; wasm prepared dictionary ([#409](https://github.com/structured-world/structured-zstd/pull/409))
+
 ## [0.0.36](https://github.com/structured-world/structured-zstd/compare/v0.0.35...v0.0.36) - 2026-06-12
 
 ### Performance
