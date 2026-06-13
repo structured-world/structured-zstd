@@ -4801,6 +4801,22 @@ macro_rules! bt_insert_and_collect_matches_body {
         // first BT walk of a fresh frame where `abs_pos < bt_mask`.
         let bt_low = $abs_pos.saturating_sub(bt_mask);
         let window_low = $table.window_low_abs_for_target($abs_pos);
+        // Donor-style window bound in stored space so the BT-walk loop
+        // condition rejects out-of-window / HC_EMPTY candidates WITHOUT
+        // decoding them (mirrors upstream `while ... matchIndex >= matchLow`):
+        // one range check on `match_stored` instead of decode-then-break,
+        // dropping the wasted candidate_abs decode on every walk's terminating
+        // step. candidate_abs(s) = (position_base + s - 1) - index_shift =
+        // base + s (wrapping); in-window ⟺ candidate_abs - window_low <
+        // abs_pos - window_low ⟺ s.wrapping_add(win_off) < win_range.
+        // HC_EMPTY (s = 0) maps to base = (lowest representable abs) - 1 <
+        // window_low, so it falls out of range and ends the walk.
+        let win_off = $table
+            .position_base
+            .wrapping_sub(1)
+            .wrapping_sub($table.index_shift)
+            .wrapping_sub(window_low);
+        let win_range = $abs_pos - window_low;
         // Raw `+ 9` is safe here — see `bt_insert_step_no_rebase_body!`
         // for the full discussion of the upstream `STREAM_ABS_HEADROOM`
         // cap in `MatchTable::add_data`.
@@ -4823,25 +4839,18 @@ macro_rules! bt_insert_and_collect_matches_body {
         );
         let mut best_len = (*$best_len_for_skip).max($min_match_len - 1);
 
-        while compares_left > 0 {
-            if match_stored == $crate::encoding::match_table::storage::HC_EMPTY {
-                break;
-            }
-            // Inline decode without the separate underflow branch that
-            // `stored_abs_position_fast` carries: an entry that underflows
-            // `index_shift` (a stale, post-rebase slot) wraps to a
-            // near-`usize::MAX` value, which the `>= abs_pos` window test
-            // below rejects anyway. Folding the underflow check into the
-            // window check mirrors the donor's single `matchIndex < lowLimit`
-            // test — one branch per candidate instead of two on the hottest
-            // BT-walk path. `match_stored != HC_EMPTY` here, so `- 1` cannot
-            // underflow.
+        // Donor-form loop condition: the stored-space window range check
+        // (`s.wrapping_add(win_off) < win_range`) rejects out-of-window and
+        // HC_EMPTY candidates here, so the terminating step never enters the
+        // body — no wasted candidate_abs decode, matching upstream's
+        // `while ... matchIndex >= matchLow`.
+        while compares_left > 0 && (match_stored as usize).wrapping_add(win_off) < win_range {
+            compares_left -= 1;
+            // The condition proved this candidate is in `[window_low,
+            // abs_pos)`, so `match_stored >= 1` (HC_EMPTY is out of range) and
+            // the `- 1` cannot underflow; candidate_abs == base + match_stored.
             let candidate_abs = ($table.position_base + (match_stored as usize - 1))
                 .wrapping_sub($table.index_shift);
-            if candidate_abs < window_low || candidate_abs >= $abs_pos {
-                break;
-            }
-            compares_left -= 1;
 
             let next_pair_idx = $table.bt_pair_index_for_abs(candidate_abs);
             // SAFETY: `next_pair_idx (+1)` = `2*(candidate_abs & bt_mask) (+1)`
