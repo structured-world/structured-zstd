@@ -604,6 +604,10 @@ fn stream_sizeof_aliases_match_context_sizeof() {
     // the stream sizeof entry points must agree with the context ones.
     let cctx = crate::context::ZSTD_createCCtx();
     let dctx = crate::context::ZSTD_createDCtx();
+    // Both `sizeof` calls return 0 on a NULL handle, so the equality checks
+    // would pass vacuously if creation failed — assert non-NULL first.
+    assert!(!cctx.is_null(), "ZSTD_createCCtx returned NULL");
+    assert!(!dctx.is_null(), "ZSTD_createDCtx returned NULL");
     unsafe {
         assert_eq!(
             crate::streaming::ZSTD_sizeof_CStream(cctx),

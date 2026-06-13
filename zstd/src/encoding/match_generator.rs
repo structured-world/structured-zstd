@@ -3083,7 +3083,10 @@ macro_rules! bt_insert_step_no_rebase_body {
         // below is reached with nothing to hide it behind — it stalled a large
         // share of this function's cycles. Issuing the hint here lets the miss
         // overlap the address setup that follows.
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        #[cfg(all(
+            target_feature = "sse",
+            any(target_arch = "x86", target_arch = "x86_64")
+        ))]
         {
             #[cfg(target_arch = "x86")]
             use core::arch::x86::{_MM_HINT_T0, _mm_prefetch};
@@ -3157,17 +3160,20 @@ macro_rules! bt_insert_step_no_rebase_body {
             if match_stored == $crate::encoding::match_table::storage::HC_EMPTY {
                 break;
             }
-            // Inline decode without the separate underflow branch that
-            // `stored_abs_position_fast` carries: an entry that underflows
-            // `index_shift` (a stale, post-rebase slot) wraps to a
-            // near-`usize::MAX` value, which the `>= abs_pos` window test
-            // below rejects anyway. Folding the underflow check into the
-            // window check mirrors the donor's single `matchIndex < lowLimit`
-            // test — one branch per candidate instead of two on the hottest
-            // BT-walk path. `match_stored != HC_EMPTY` here, so `- 1` cannot
-            // underflow.
-            let candidate_abs = ($table.position_base + (match_stored as usize - 1))
-                .wrapping_sub($table.index_shift);
+            // Reject stale post-rebase slots whose pre-shift position is below
+            // `index_shift` explicitly. A `wrapping_sub` maps such a slot to a
+            // near-`usize::MAX` value that the `>= abs_pos` test only rejects
+            // while `abs_pos` is far from the integer ceiling; on a
+            // long-running rebased stream (reachable on 32-bit) `abs_pos` can
+            // approach the ceiling and the wrapped value can land back inside
+            // `[window_low, abs_pos)`. `checked_sub` ends the walk on the
+            // underflow instead. `match_stored != HC_EMPTY` here, so the `- 1`
+            // cannot underflow.
+            let Some(candidate_abs) = ($table.position_base + (match_stored as usize - 1))
+                .checked_sub($table.index_shift)
+            else {
+                break;
+            };
             if candidate_abs < window_low || candidate_abs >= $abs_pos {
                 break;
             }
@@ -4745,7 +4751,10 @@ macro_rules! bt_insert_and_collect_matches_body {
         // below is reached with nothing to hide it behind — it stalled a large
         // share of this function's cycles. Issuing the hint here lets the miss
         // overlap the address setup that follows.
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        #[cfg(all(
+            target_feature = "sse",
+            any(target_arch = "x86", target_arch = "x86_64")
+        ))]
         {
             #[cfg(target_arch = "x86")]
             use core::arch::x86::{_MM_HINT_T0, _mm_prefetch};
