@@ -471,16 +471,19 @@ unsafe fn cctx_ref_prefix(
     if cctx.stream_in_progress() {
         return encode(ZSTD_ErrorCode::ZSTD_error_stage_wrong);
     }
+    // NULL/empty is the API's clear signal and wins over selector
+    // validation (upstream clears and returns 0 before looking at the
+    // content type).
+    let prefix = unsafe { in_slice(prefix, prefix_size) };
+    if prefix.is_empty() {
+        cctx.attached_dict = CCtxDictAttach::None;
+        return 0;
+    }
     // A prefix is raw content by definition: only the auto / rawContent
     // selectors are meaningful; everything else (fullDict, out-of-range
     // discriminants) is rejected.
     if !matches!(content_type, ZSTD_DCT_AUTO | ZSTD_DCT_RAW_CONTENT) {
         return encode(ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound);
-    }
-    let prefix = unsafe { in_slice(prefix, prefix_size) };
-    if prefix.is_empty() {
-        cctx.attached_dict = CCtxDictAttach::None;
-        return 0;
     }
     cctx.attached_dict = CCtxDictAttach::Prefix {
         content: prefix.to_vec(),
@@ -691,7 +694,9 @@ pub unsafe extern "C" fn ZSTD_DCtx_refPrefix_advanced(
     prefix_size: usize,
     content_type: c_int,
 ) -> usize {
-    if !matches!(content_type, ZSTD_DCT_AUTO | ZSTD_DCT_RAW_CONTENT) {
+    // NULL/empty is the clear signal and wins over selector validation
+    // (the delegate runs its own null/stage checks and then clears).
+    if prefix_size > 0 && !matches!(content_type, ZSTD_DCT_AUTO | ZSTD_DCT_RAW_CONTENT) {
         return encode(ZSTD_ErrorCode::ZSTD_error_parameter_outOfBound);
     }
     unsafe { ZSTD_DCtx_refPrefix(dctx, prefix, prefix_size) }
