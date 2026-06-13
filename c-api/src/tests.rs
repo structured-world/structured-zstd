@@ -2696,6 +2696,62 @@ fn cdict_advanced_rejects_invalid_strategy_ordinal() {
 }
 
 #[test]
+fn ref_prefix_advanced_clears_on_null_regardless_of_content_type() {
+    // NULL/empty is the API's clear signal and must win over content-type
+    // validation: a clear with any selector (even fullDict) succeeds and
+    // disarms the previous prefix on both context kinds.
+    let prefix = dict_payload();
+    let mut payload = prefix[..1024].to_vec();
+    payload.extend_from_slice(b"clear ordering tail 0123456789");
+
+    let cctx = ZSTD_createCCtx();
+    assert_eq!(
+        ZSTD_isError(unsafe { ZSTD_CCtx_refPrefix(cctx, prefix.as_ptr(), prefix.len()) }),
+        0
+    );
+    let cleared = unsafe { ZSTD_CCtx_refPrefix_advanced(cctx, core::ptr::null(), 0, 2) };
+    assert_eq!(
+        ZSTD_isError(cleared),
+        0,
+        "NULL clear must succeed regardless of the selector"
+    );
+    // The cleared context must compress WITHOUT the prefix: bare decode works.
+    let mut frame = vec![0u8; payload.len() + 512];
+    let written = unsafe {
+        ZSTD_compress2(
+            cctx,
+            frame.as_mut_ptr(),
+            frame.len(),
+            payload.as_ptr(),
+            payload.len(),
+        )
+    };
+    assert_eq!(ZSTD_isError(written), 0);
+    let bare = ZSTD_createDCtx();
+    let mut out = vec![0u8; payload.len() + 64];
+    let read =
+        unsafe { ZSTD_decompressDCtx(bare, out.as_mut_ptr(), out.len(), frame.as_ptr(), written) };
+    assert_eq!(ZSTD_isError(read), 0, "cleared prefix must not be used");
+    assert_eq!(&out[..read], payload.as_slice());
+    unsafe { ZSTD_freeDCtx(bare) };
+
+    // Decoder mirror: clear with the fullDict selector succeeds too.
+    let dctx = ZSTD_createDCtx();
+    assert_eq!(
+        ZSTD_isError(unsafe { ZSTD_DCtx_refPrefix(dctx, prefix.as_ptr(), prefix.len()) }),
+        0
+    );
+    let dcleared = unsafe { ZSTD_DCtx_refPrefix_advanced(dctx, core::ptr::null(), 0, 2) };
+    assert_eq!(
+        ZSTD_isError(dcleared),
+        0,
+        "decoder NULL clear must succeed regardless of the selector"
+    );
+    unsafe { ZSTD_freeDCtx(dctx) };
+    unsafe { ZSTD_freeCCtx(cctx) };
+}
+
+#[test]
 fn cparams_estimate_never_underreports_on_32bit() {
     // windowLog=30 + hashLog=29 + chainLog=29 each pass the per-field
     // bounds, but their byte sizes sum past u32::MAX: on a 32-bit target
