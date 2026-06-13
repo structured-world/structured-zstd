@@ -3113,15 +3113,20 @@ macro_rules! bt_insert_step_no_rebase_body {
         $table.hash_table[hash] = stored;
 
         while compares_left > 0 {
-            let Some(candidate_abs) =
-                $crate::encoding::match_table::storage::MatchTable::stored_abs_position_fast(
-                    match_stored,
-                    $table.position_base,
-                    $table.index_shift,
-                )
-            else {
+            if match_stored == $crate::encoding::match_table::storage::HC_EMPTY {
                 break;
-            };
+            }
+            // Inline decode without the separate underflow branch that
+            // `stored_abs_position_fast` carries: an entry that underflows
+            // `index_shift` (a stale, post-rebase slot) wraps to a
+            // near-`usize::MAX` value, which the `>= abs_pos` window test
+            // below rejects anyway. Folding the underflow check into the
+            // window check mirrors the donor's single `matchIndex < lowLimit`
+            // test — one branch per candidate instead of two on the hottest
+            // BT-walk path. `match_stored != HC_EMPTY` here, so `- 1` cannot
+            // underflow.
+            let candidate_abs = ($table.position_base + (match_stored as usize - 1))
+                .wrapping_sub($table.index_shift);
             if candidate_abs < window_low || candidate_abs >= $abs_pos {
                 break;
             }
@@ -4718,15 +4723,20 @@ macro_rules! bt_insert_and_collect_matches_body {
         let mut best_len = (*$best_len_for_skip).max($min_match_len - 1);
 
         while compares_left > 0 {
-            let Some(candidate_abs) =
-                $crate::encoding::match_table::storage::MatchTable::stored_abs_position_fast(
-                    match_stored,
-                    $table.position_base,
-                    $table.index_shift,
-                )
-            else {
+            if match_stored == $crate::encoding::match_table::storage::HC_EMPTY {
                 break;
-            };
+            }
+            // Inline decode without the separate underflow branch that
+            // `stored_abs_position_fast` carries: an entry that underflows
+            // `index_shift` (a stale, post-rebase slot) wraps to a
+            // near-`usize::MAX` value, which the `>= abs_pos` window test
+            // below rejects anyway. Folding the underflow check into the
+            // window check mirrors the donor's single `matchIndex < lowLimit`
+            // test — one branch per candidate instead of two on the hottest
+            // BT-walk path. `match_stored != HC_EMPTY` here, so `- 1` cannot
+            // underflow.
+            let candidate_abs = ($table.position_base + (match_stored as usize - 1))
+                .wrapping_sub($table.index_shift);
             if candidate_abs < window_low || candidate_abs >= $abs_pos {
                 break;
             }
