@@ -3094,6 +3094,28 @@ macro_rules! bt_insert_step_no_rebase_body {
             unsafe {
                 _mm_prefetch($table.hash_table.as_ptr().add(hash).cast(), _MM_HINT_T0);
             }
+            // Prefetch the NEXT position's bucket too. The optimal-parser DP
+            // advances one position per iteration, so this miss is issued a
+            // full BT walk plus the next iteration's pre-collect work ahead of
+            // the collect that will read it — far more lead than the same-call
+            // hint above, enough to hide the full DRAM latency.
+            if idx + 1 + 8 <= concat.len() {
+                let hash_next =
+                    $crate::encoding::match_table::storage::MatchTable::hash_position_at(
+                        concat,
+                        idx + 1,
+                        $table.hash_log,
+                        $table.search_mls,
+                    );
+                // SAFETY: prefetch never faults; an out-of-range index is a
+                // harmless no-op hint.
+                unsafe {
+                    _mm_prefetch(
+                        $table.hash_table.as_ptr().add(hash_next).cast(),
+                        _MM_HINT_T0,
+                    );
+                }
+            }
         }
         let Some(relative_pos) = $table.relative_position($abs_pos) else {
             return 1;
@@ -4728,6 +4750,28 @@ macro_rules! bt_insert_and_collect_matches_body {
             // `hash_table` directly below, so it is in bounds.
             unsafe {
                 _mm_prefetch($table.hash_table.as_ptr().add(hash).cast(), _MM_HINT_T0);
+            }
+            // Prefetch the NEXT position's bucket too. The optimal-parser DP
+            // advances one position per iteration, so this miss is issued a
+            // full BT walk plus the next iteration's pre-collect work ahead of
+            // the collect that will read it — far more lead than the same-call
+            // hint above, enough to hide the full DRAM latency.
+            if idx + 1 + 8 <= concat.len() {
+                let hash_next =
+                    $crate::encoding::match_table::storage::MatchTable::hash_position_at(
+                        concat,
+                        idx + 1,
+                        $table.hash_log,
+                        $table.search_mls,
+                    );
+                // SAFETY: prefetch never faults; an out-of-range index is a
+                // harmless no-op hint.
+                unsafe {
+                    _mm_prefetch(
+                        $table.hash_table.as_ptr().add(hash_next).cast(),
+                        _MM_HINT_T0,
+                    );
+                }
             }
         }
         let Some(relative_pos) = $table.relative_position($abs_pos) else {
