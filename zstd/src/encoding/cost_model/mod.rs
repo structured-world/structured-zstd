@@ -229,31 +229,31 @@ impl HcOptState {
 
     #[inline(always)]
     pub(crate) fn lit_code_and_bits(lit_len: usize) -> (usize, u32) {
+        // Donor parity (`ZSTD_LLcode` + `LL_bits`, zstd_compress_internal.h):
+        // a direct table lookup for ll < 64 and `highbit32(ll) + delta` above,
+        // replacing the former 20-arm range cascade (a `jae` comparison ladder
+        // that was ~8% of L16-btopt-dict). Same (code, nbBits) values — only
+        // the derivation changes.
+        const LL_CODE: [u8; 64] = [
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 16, 17, 17, 18, 18, 19, 19,
+            20, 20, 20, 20, 21, 21, 21, 21, 22, 22, 22, 22, 22, 22, 22, 22, 23, 23, 23, 23, 23, 23,
+            23, 23, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+        ];
+        // Extra bits per LL code (index = code, 0..=35).
+        const LL_BITS: [u8; 36] = [
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9,
+            10, 11, 12, 13, 14, 15, 16,
+        ];
         let ll = lit_len.min(131_071) as u32;
-        let (code, _, extra_bits) = match ll {
-            0..=15 => (ll as u8, 0, 0),
-            16..=17 => (16, ll - 16, 1),
-            18..=19 => (17, ll - 18, 1),
-            20..=21 => (18, ll - 20, 1),
-            22..=23 => (19, ll - 22, 1),
-            24..=27 => (20, ll - 24, 2),
-            28..=31 => (21, ll - 28, 2),
-            32..=39 => (22, ll - 32, 3),
-            40..=47 => (23, ll - 40, 3),
-            48..=63 => (24, ll - 48, 4),
-            64..=127 => (25, ll - 64, 6),
-            128..=255 => (26, ll - 128, 7),
-            256..=511 => (27, ll - 256, 8),
-            512..=1023 => (28, ll - 512, 9),
-            1024..=2047 => (29, ll - 1024, 10),
-            2048..=4095 => (30, ll - 2048, 11),
-            4096..=8191 => (31, ll - 4096, 12),
-            8192..=16383 => (32, ll - 8192, 13),
-            16384..=32767 => (33, ll - 16384, 14),
-            32768..=65535 => (34, ll - 32768, 15),
-            _ => (35, ll - 65536, 16),
-        };
-        (code as usize, extra_bits as u32)
+        if ll < 64 {
+            let code = LL_CODE[ll as usize] as usize;
+            (code, LL_BITS[code] as u32)
+        } else {
+            // ll in 64..=131_071 ⇒ highbit32 in 6..=16; code = hb + 19
+            // (25..=35), nbBits = hb. Matches the cascade's upper arms.
+            let hb = 31 - ll.leading_zeros();
+            ((hb + 19) as usize, hb)
+        }
     }
 
     #[inline(always)]
