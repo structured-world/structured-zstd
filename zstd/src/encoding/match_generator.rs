@@ -941,6 +941,77 @@ fn level22_btultra2_params_for_source_size(source_size: Option<u64>) -> LevelPar
     }
 }
 
+/// Estimated steady-state heap footprint of a one-shot compression context
+/// at `level` (window history + match-finder tables + block staging), in
+/// bytes. Computed from the same per-level tuning table the encoder
+/// resolves at frame start, so the estimate tracks the real allocations;
+/// it is an upper-bound style budget figure, not an exact accounting.
+pub fn estimated_compression_workspace_bytes(level: CompressionLevel) -> usize {
+    use super::strategy::StrategyTag;
+    let params = resolve_level_params(level, None);
+    let window = 1usize << params.window_log;
+    // Mirror `configure()`: the HC3 short-match side table exists only on
+    // the btultra/btultra2 tags (minMatch 3), capped by the window log; the
+    // BT pointer-pair layout fits inside the `4 << chain_log` chain term
+    // (pairs over `chain_log - 1` nodes).
+    let wants_hash3 = matches!(
+        params.strategy_tag,
+        StrategyTag::BtUltra | StrategyTag::BtUltra2
+    );
+    let uses_bt = matches!(
+        params.strategy_tag,
+        StrategyTag::Btlazy2 | StrategyTag::BtOpt | StrategyTag::BtUltra | StrategyTag::BtUltra2
+    );
+    let tables = params.fast.map(|f| 4usize << f.hash_log).unwrap_or(0)
+        + params
+            .dfast
+            .map(|d| (4usize << d.long_hash_log) + (4usize << d.short_hash_log))
+            .unwrap_or(0)
+        + params
+            .hc
+            .map(|h| {
+                let hash3 = if wants_hash3 {
+                    4usize
+                        << super::match_table::storage::HC3_HASH_LOG.min(params.window_log as usize)
+                } else {
+                    0
+                };
+                (4usize << h.hash_log) + (4usize << h.chain_log) + hash3
+            })
+            .unwrap_or(0)
+        + params
+            .row
+            .map(|r| (4usize << r.hash_bits) + (2usize << r.hash_bits))
+            .unwrap_or(0);
+    // BT modes box a `BtMatcher`; its retained scratch layout is budgeted
+    // next to the struct so estimator and allocator evolve together.
+    let bt = if uses_bt {
+        super::bt::BtMatcher::estimated_workspace_bytes()
+    } else {
+        0
+    };
+    // Block staging: literal + sequence buffers plus the compressed-block
+    // scratch, each bounded by the 128 KiB block size.
+    let staging = 3 * (128 * 1024);
+    window + tables + bt + staging
+}
+
+/// Extra steady-state workspace the binary-tree strategies (ordinals 6..=9,
+/// btlazy2..btultra2) retain beyond the hash/chain tables: the boxed matcher
+/// plus its scratch arenas, and the HC3 short-match side table for
+/// btultra/btultra2 (capped by the window log). 0 for non-BT ordinals.
+pub fn estimated_bt_strategy_extra_bytes(strategy_ordinal: u32, window_log: u32) -> usize {
+    if !(6..=9).contains(&strategy_ordinal) {
+        return 0;
+    }
+    let hash3 = if matches!(strategy_ordinal, 8 | 9) {
+        4usize << super::match_table::storage::HC3_HASH_LOG.min(window_log as usize)
+    } else {
+        0
+    };
+    super::bt::BtMatcher::estimated_workspace_bytes() + hash3
+}
+
 /// Resolve a [`CompressionLevel`] to internal tuning parameters,
 /// optionally adjusted for a known source size.
 fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> LevelParams {
@@ -985,7 +1056,12 @@ fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> Le
         }
         CompressionLevel::Default => LEVEL_TABLE[2],
         CompressionLevel::Better => LEVEL_TABLE[6],
-        CompressionLevel::Best => LEVEL_TABLE[10],
+        // Level 13: the first dominant point of the deep-lazy band. The
+        // mls-wide row key lifted the shallow band's ratio enough that
+        // level 11 no longer strictly beats level 7 on the ladder corpus;
+        // the `Best` alias belongs on a config that dominates everything
+        // below it rather than on a hair-thin margin.
+        CompressionLevel::Best => LEVEL_TABLE[12],
         CompressionLevel::Level(n) => {
             if n > 0 {
                 let idx = (n as usize).min(CompressionLevel::MAX_LEVEL as usize) - 1;
@@ -1044,11 +1120,15 @@ fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> Le
 /// 128 KiB block. The frame loop reads this instead of hardcoding the
 /// level→split mapping at the call site.
 pub(crate) fn level_pre_split(level: CompressionLevel) -> Option<usize> {
-    // Named presets are pure aliases: resolve to their numeric level and
-    // read the split knob from the same `LevelParams` table as everything
-    // else. `Uncompressed` (raw blocks) has no numeric equivalent.
-    let numeric = level.numeric_level()?;
-    resolve_level_params(CompressionLevel::Level(numeric), None)
+    // Resolve through `resolve_level_params` directly — NOT via the legacy
+    // `numeric_level()` alias — so named presets read the SAME table row as
+    // every other tuning knob (`Best` maps to its own row there, which is
+    // not the row its numeric alias points at). `Uncompressed` (raw
+    // blocks) never splits.
+    if matches!(level, CompressionLevel::Uncompressed) {
+        return None;
+    }
+    resolve_level_params(level, None)
         .pre_split()
         .map(usize::from)
 }
@@ -6775,7 +6855,8 @@ fn driver_reset_keeps_strategy_tag_in_sync_with_active_backend() {
     check(CompressionLevel::Fastest, StrategyTag::Fast);
     check(CompressionLevel::Default, StrategyTag::Dfast);
     check(CompressionLevel::Better, StrategyTag::Lazy);
-    check(CompressionLevel::Best, StrategyTag::Lazy);
+    // `Best` sits on level 13 (the first dominant point of the deep band).
+    check(CompressionLevel::Best, StrategyTag::Btlazy2);
 }
 
 #[test]
@@ -8169,9 +8250,10 @@ fn pooled_space_keeps_capacity_when_slice_size_shrinks() {
 fn driver_best_to_fastest_releases_oversized_hc_tables() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
 
-    // Initialize at Best routed onto HashChain (the production `Best`
-    // resolves to Row now) — allocates large HC tables (4M hash, 2M chain)
-    // so the swap below exercises the HC drain path this test pins.
+    // Initialize at Best routed onto HashChain via the test-only override
+    // (production `Best` sits on level 13, whose native backend differs) —
+    // allocates large HC tables (4M hash, 2M chain) so the swap below
+    // exercises the HC drain path this test pins.
     driver.reset_on_hc_lazy(CompressionLevel::Best);
     assert_eq!(driver.window_size(), (1u64 << 22));
 
@@ -8617,8 +8699,10 @@ fn primed_snapshot_fast_attach_does_not_over_key_non_simple_backends() {
     // differently and force a needless re-prime. `Best` is a Row-backend lazy
     // level; this also pins the Row arm recording its RESOLVED hash width on
     // the unhinted path (a 0 default there keyed unhinted-vs-hinted apart).
+    // An explicit Row-backend level: `Best` now sits on level 13 (Btlazy2),
+    // so the named alias no longer reaches the Row arm this test pins.
     let mut driver = MatchGeneratorDriver::new(8, 1);
-    let level = CompressionLevel::Best;
+    let level = CompressionLevel::Level(12);
 
     // Capture with no hint.
     driver.reset(level);
@@ -8640,7 +8724,7 @@ fn primed_snapshot_fast_attach_does_not_over_key_non_simple_backends() {
     let restored = driver.restore_primed_dictionary(level);
     assert!(
         restored,
-        "a HashChain snapshot must restore across an unhinted vs large-hinted \
+        "a Row snapshot must restore across an unhinted vs large-hinted \
          reset that resolves to the identical matcher — `fast_attach` is a Fast \
          backend concept and must not over-key non-Simple shapes"
     );
@@ -9030,7 +9114,12 @@ fn row_hash_and_row_extracts_high_bits() {
 
     let idx = pos - matcher.history_abs_start;
     let concat = matcher.live_history();
-    let value = u32::from_le_bytes(concat[idx..idx + ROW_HASH_KEY_LEN].try_into().unwrap()) as u64;
+    // Mirror `row_key_value`: an mls-wide masked key when 8 lookahead bytes
+    // exist, the 4-byte key in the tail. `idx = 8` on a 16-byte history has
+    // exactly 8 bytes left, so the wide arm applies here.
+    let key_len = matcher.mls.min(6);
+    let value = u64::from_le_bytes(concat[idx..idx + 8].try_into().unwrap())
+        & ((1u64 << (key_len * 8)) - 1);
     let hash = crate::encoding::fastpath::hash_mix_u64_with_kernel(matcher.hash_kernel, value);
     let total_bits = matcher.row_hash_log + ROW_TAG_BITS;
     let combined = hash >> (u64::BITS as usize - total_bits);

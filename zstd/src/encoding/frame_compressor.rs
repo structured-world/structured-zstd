@@ -29,6 +29,7 @@ use crate::io::{Read, Write};
 /// [`set_dictionary_from_bytes`](FrameCompressor::set_dictionary_from_bytes))
 /// from ever reaching the decode side — the encoder/decoder dictionary split
 /// mirrors C zstd's `CDict` / `DDict`.
+#[derive(Clone)]
 pub struct EncoderDictionary {
     pub(crate) inner: crate::decoding::Dictionary,
 }
@@ -4778,11 +4779,12 @@ mod tests {
             level_pre_split(CompressionLevel::Better),
             level_pre_split(CompressionLevel::Level(7)),
         );
-        // Best is a pure alias for level 11 (lazy): pin it to the numeric
-        // route so the named path can't drift from the pre-split table.
+        // Best resolves to the level-13 table row (btlazy2): pin it to that
+        // numeric route so the named path can't drift from the pre-split
+        // table.
         assert_eq!(
             level_pre_split(CompressionLevel::Best),
-            level_pre_split(CompressionLevel::Level(11)),
+            level_pre_split(CompressionLevel::Level(13)),
         );
         assert_eq!(level_pre_split(CompressionLevel::Level(2)), Some(0)); // fast
         assert_eq!(level_pre_split(CompressionLevel::Level(4)), Some(1)); // dfast

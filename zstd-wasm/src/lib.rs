@@ -14,8 +14,12 @@
 //! [structured-zstd]: https://crates.io/crates/structured-zstd
 #![cfg(target_arch = "wasm32")]
 
-use structured_zstd::decoding::{BlockDecodingStrategy, FrameDecoder, StreamingDecoder};
-use structured_zstd::encoding::{CompressionLevel, FrameCompressor, StreamingEncoder};
+use structured_zstd::decoding::{
+    BlockDecodingStrategy, Dictionary, DictionaryHandle, FrameDecoder, StreamingDecoder,
+};
+use structured_zstd::encoding::{
+    CompressionLevel, EncoderDictionary, FrameCompressor, StreamingEncoder,
+};
 use structured_zstd::io::{Read, Write};
 use wasm_bindgen::prelude::*;
 
@@ -136,6 +140,150 @@ pub fn decompress_using_dict(
     Ok(out)
 }
 
+/// A dictionary prepared once for repeated use across compressions,
+/// decompressions, and streams — the wasm analogue of C's `ZSTD_CDict` +
+/// `ZSTD_DDict` pair behind one object.
+///
+/// Construction parses the dictionary a single time (entropy decode tables +
+/// encoder conversion). The hot paths then avoid every per-call setup cost:
+///
+/// * [`compress`](Self::compress) keeps a cached frame compressor whose
+///   dictionary-primed match-finder snapshot is reused across calls — the
+///   dominant per-frame cost for small payloads;
+/// * [`decompress`](Self::decompress) reuses one decoder workspace;
+/// * the stream constructors seed from the prepared tables (a table copy on
+///   the encode side, a reference-count bump on the decode side) instead of
+///   re-parsing the blob per stream.
+///
+/// Raw content (bytes without the `0xEC30A437` dictionary magic) is accepted
+/// like upstream's auto mode: such dictionaries have ID 0 and produced frames
+/// carry no dictionary ID.
+#[wasm_bindgen]
+pub struct ZstdDictionary {
+    /// Decode-side shared handle (`Arc`): per-use cost is a refcount bump.
+    handle: DictionaryHandle,
+    /// Encode-side template: streams clone its tables instead of re-parsing.
+    enc_template: EncoderDictionary,
+    /// Raw-content dictionaries carry a synthetic non-zero internal ID that
+    /// must never reach the wire.
+    suppress_id: bool,
+    /// Cached one-shot compressor (dictionary attached + primed snapshot),
+    /// rebuilt only when the requested level changes.
+    cached_enc: Option<FrameCompressor>,
+    cached_level: i32,
+    cached_checksum: bool,
+    /// Reusable one-shot decoder workspace.
+    decoder: FrameDecoder,
+    id: u32,
+}
+
+#[wasm_bindgen]
+impl ZstdDictionary {
+    /// Parse `dict` once for repeated use. Magic-prefixed blobs (e.g. from
+    /// `zstd --train`) parse as full dictionaries; anything else is raw
+    /// content. Throws if a magic-prefixed blob is corrupt.
+    #[wasm_bindgen(constructor)]
+    pub fn new(dict: &[u8]) -> Result<ZstdDictionary, JsError> {
+        if dict.is_empty() {
+            return Err(JsError::new("structured-zstd: empty dictionary"));
+        }
+        // Any blob long enough to carry the 4-byte magic and starting with
+        // it is a (possibly truncated) serialized dictionary: parse it and
+        // surface corruption instead of silently treating it as raw content.
+        let has_magic = dict.len() >= 4
+            && u32::from_le_bytes([dict[0], dict[1], dict[2], dict[3]]) == 0xEC30_A437;
+        let parsed = if has_magic {
+            Dictionary::decode_dict(dict).map_err(|err| {
+                JsError::new(&format!("structured-zstd: invalid dictionary: {err:?}"))
+            })?
+        } else {
+            // Synthetic non-zero ID (the encoder attach path requires one);
+            // never emitted — see `suppress_id`.
+            Dictionary::from_raw_content(u32::MAX, dict.to_vec()).map_err(|err| {
+                JsError::new(&format!("structured-zstd: invalid raw dictionary: {err:?}"))
+            })?
+        };
+        let id = if has_magic { parsed.id } else { 0 };
+        let enc_template = EncoderDictionary::from_dictionary(parsed.clone());
+        let handle = DictionaryHandle::from_dictionary(parsed);
+        Ok(ZstdDictionary {
+            handle,
+            enc_template,
+            suppress_id: !has_magic,
+            cached_enc: None,
+            cached_level: i32::MIN,
+            cached_checksum: false,
+            decoder: FrameDecoder::new(),
+            id,
+        })
+    }
+
+    /// The dictionary ID (0 for raw content).
+    #[wasm_bindgen(getter)]
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+
+    /// Compress `data` with this dictionary at `level` — the hot path for
+    /// many small frames against one dictionary: the first call at a given
+    /// level attaches the prepared tables and primes the match finder, and
+    /// every following call reuses that primed snapshot.
+    ///
+    /// `checksum` is optional (default `false`).
+    pub fn compress(
+        &mut self,
+        data: &[u8],
+        level: i32,
+        checksum: Option<bool>,
+    ) -> Result<Vec<u8>, JsError> {
+        let checksum = checksum.unwrap_or(false);
+        if self.cached_enc.is_none()
+            || self.cached_level != level
+            || self.cached_checksum != checksum
+        {
+            let mut enc: FrameCompressor = FrameCompressor::new(CompressionLevel::Level(level));
+            enc.set_content_checksum(checksum);
+            enc.set_encoder_dictionary(self.enc_template.clone())
+                .map_err(|err| {
+                    JsError::new(&format!("structured-zstd: invalid dictionary: {err:?}"))
+                })?;
+            if self.suppress_id {
+                enc.set_dictionary_id_flag(false);
+            }
+            self.cached_enc = Some(enc);
+            self.cached_level = level;
+            self.cached_checksum = checksum;
+        }
+        let enc = self.cached_enc.as_mut().expect("just ensured Some");
+        Ok(enc.compress_independent_frame(data))
+    }
+
+    /// Decompress a frame produced with this dictionary, reusing the
+    /// prepared tables and one decoder workspace across calls. `checksum`
+    /// behaves as in the module-level `decompress`.
+    pub fn decompress(
+        &mut self,
+        data: &[u8],
+        checksum: Option<ContentChecksum>,
+    ) -> Result<Vec<u8>, JsError> {
+        self.decoder.set_content_checksum(core_checksum(checksum));
+        let mut cursor: &[u8] = data;
+        self.decoder
+            .reset_with_dict_handle(&mut cursor, &self.handle)
+            .map_err(|err| JsError::new(&format!("structured-zstd: bad frame header: {err:?}")))?;
+        self.decoder
+            .decode_blocks(&mut cursor, BlockDecodingStrategy::All)
+            .map_err(|err| {
+                JsError::new(&format!("structured-zstd: dict decompress failed: {err:?}"))
+            })?;
+        let out = self.decoder.collect().unwrap_or_default();
+        self.decoder
+            .verify_content_checksum()
+            .map_err(|err| JsError::new(&format!("structured-zstd: {err}")))?;
+        Ok(out)
+    }
+}
+
 /// Length of a standard zstd frame header in `buf`, plus whether the content
 /// checksum flag is set — or `None` if `buf` does not yet hold the full
 /// header. Standard RFC 8878 §3.1.1 layout; skippable frames are not handled
@@ -193,6 +341,10 @@ fn complete_block_len(buf: &[u8], checksum: bool) -> Option<usize> {
 #[wasm_bindgen]
 pub struct ZstdDecompressStream {
     decoder: FrameDecoder,
+    /// Prepared dictionary forced onto every frame of this stream
+    /// (`withPreparedDictionary`); `None` decodes via the registry /
+    /// dictionary-less path.
+    dict: Option<DictionaryHandle>,
     pending: Vec<u8>,
     header_done: bool,
     checksum: bool,
@@ -211,6 +363,7 @@ impl ZstdDecompressStream {
         decoder.set_content_checksum(core_checksum(checksum));
         ZstdDecompressStream {
             decoder,
+            dict: None,
             pending: Vec::new(),
             header_done: false,
             checksum: false,
@@ -235,11 +388,33 @@ impl ZstdDecompressStream {
         })?;
         Ok(ZstdDecompressStream {
             decoder,
+            dict: None,
             pending: Vec::new(),
             header_done: false,
             checksum: false,
             finished: false,
         })
+    }
+
+    /// Open a streaming decompressor against a [`ZstdDictionary`] prepared
+    /// once: per-stream setup is a reference-count bump, no dictionary
+    /// re-parse. Unlike [`Self::with_dictionary`] this also decodes frames
+    /// whose headers omit the dictionary ID (raw-content dictionaries).
+    #[wasm_bindgen(js_name = withPreparedDictionary)]
+    pub fn with_prepared_dictionary(
+        dict: &ZstdDictionary,
+        checksum: Option<ContentChecksum>,
+    ) -> ZstdDecompressStream {
+        let mut decoder = FrameDecoder::new();
+        decoder.set_content_checksum(core_checksum(checksum));
+        ZstdDecompressStream {
+            decoder,
+            dict: Some(dict.handle.clone()),
+            pending: Vec::new(),
+            header_done: false,
+            checksum: false,
+            finished: false,
+        }
     }
 
     /// Feed more compressed bytes; returns whatever decompressed output is now
@@ -309,9 +484,11 @@ impl ZstdDecompressStream {
                 return Ok(out);
             };
             let mut cursor: &[u8] = &self.pending;
-            self.decoder.init(&mut cursor).map_err(|err| {
-                JsError::new(&format!("structured-zstd: bad frame header: {err:?}"))
-            })?;
+            match &self.dict {
+                Some(handle) => self.decoder.init_with_dict_handle(&mut cursor, handle),
+                None => self.decoder.init(&mut cursor),
+            }
+            .map_err(|err| JsError::new(&format!("structured-zstd: bad frame header: {err:?}")))?;
             let advanced = self.pending.len() - cursor.len();
             self.pending.drain(..advanced);
             self.checksum = checksum;
@@ -390,6 +567,34 @@ impl ZstdCompressStream {
         encoder.set_dictionary_from_bytes(dict).map_err(|err| {
             JsError::new(&format!("structured-zstd: invalid dictionary: {err:?}"))
         })?;
+        Ok(ZstdCompressStream {
+            encoder: Some(encoder),
+        })
+    }
+
+    /// Open a streaming compressor at `level` seeded from a [`ZstdDictionary`]
+    /// prepared once: per-stream setup copies the prepared tables instead of
+    /// re-parsing the dictionary blob (no FSE/HUF table rebuild).
+    #[wasm_bindgen(js_name = withPreparedDictionary)]
+    pub fn with_prepared_dictionary(
+        level: i32,
+        dict: &ZstdDictionary,
+        checksum: Option<bool>,
+    ) -> Result<ZstdCompressStream, JsError> {
+        let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Level(level));
+        encoder
+            .set_content_checksum(checksum.unwrap_or(false))
+            .expect("fresh streaming encoder accepts the content-checksum toggle");
+        encoder
+            .set_encoder_dictionary(dict.enc_template.clone())
+            .map_err(|err| {
+                JsError::new(&format!("structured-zstd: invalid dictionary: {err:?}"))
+            })?;
+        if dict.suppress_id {
+            encoder
+                .set_dictionary_id_flag(false)
+                .expect("flag set before the first write on a fresh encoder");
+        }
         Ok(ZstdCompressStream {
             encoder: Some(encoder),
         })

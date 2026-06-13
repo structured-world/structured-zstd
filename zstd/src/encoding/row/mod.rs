@@ -39,6 +39,7 @@ use super::match_table::helpers::{
     INCOMPRESSIBLE_SKIP_STEP, LazyMatchConfig, best_len_offset_candidate, extend_backwards_shared,
     pick_lazy_match_shared, repcode_candidate_shared,
 };
+use super::match_table::storage::REBASE_RESET_FLOOR_CEILING;
 use super::opt::types::MatchCandidate;
 
 // The row probe reuses the shared `fastpath::FastpathKernel` selection so each
@@ -75,6 +76,7 @@ pub(crate) trait RowTags: Copy {
         matcher: &RowMatchGenerator,
         abs_pos: usize,
         lit_len: usize,
+        hash: Option<(usize, u8)>,
     ) -> Option<MatchCandidate>;
 }
 
@@ -97,9 +99,10 @@ impl RowTags for ScalarTags {
         matcher: &RowMatchGenerator,
         abs_pos: usize,
         lit_len: usize,
+        hash: Option<(usize, u8)>,
     ) -> Option<MatchCandidate> {
         // Scalar has no target feature; the probe body runs as-is.
-        unsafe { matcher.row_probe_scalar::<ROW_LOG>(abs_pos, lit_len) }
+        unsafe { matcher.row_probe_scalar::<ROW_LOG>(abs_pos, lit_len, hash) }
     }
 }
 
@@ -113,9 +116,10 @@ impl RowTags for Sse42Tags {
         matcher: &RowMatchGenerator,
         abs_pos: usize,
         lit_len: usize,
+        hash: Option<(usize, u8)>,
     ) -> Option<MatchCandidate> {
         // SAFETY: dispatched only when `tag_kernel == Sse42` (SSE4.2 confirmed).
-        unsafe { matcher.row_probe_sse42::<ROW_LOG>(abs_pos, lit_len) }
+        unsafe { matcher.row_probe_sse42::<ROW_LOG>(abs_pos, lit_len, hash) }
     }
 }
 
@@ -129,9 +133,10 @@ impl RowTags for Avx2Bmi2Tags {
         matcher: &RowMatchGenerator,
         abs_pos: usize,
         lit_len: usize,
+        hash: Option<(usize, u8)>,
     ) -> Option<MatchCandidate> {
         // SAFETY: dispatched only when `tag_kernel == Avx2Bmi2` (AVX2+BMI2 confirmed).
-        unsafe { matcher.row_probe_avx2bmi2::<ROW_LOG>(abs_pos, lit_len) }
+        unsafe { matcher.row_probe_avx2bmi2::<ROW_LOG>(abs_pos, lit_len, hash) }
     }
 }
 
@@ -145,9 +150,10 @@ impl RowTags for NeonTags {
         matcher: &RowMatchGenerator,
         abs_pos: usize,
         lit_len: usize,
+        hash: Option<(usize, u8)>,
     ) -> Option<MatchCandidate> {
         // SAFETY: dispatched only when `tag_kernel == Neon` (NEON confirmed).
-        unsafe { matcher.row_probe_neon::<ROW_LOG>(abs_pos, lit_len) }
+        unsafe { matcher.row_probe_neon::<ROW_LOG>(abs_pos, lit_len, hash) }
     }
 }
 
@@ -173,10 +179,11 @@ impl RowTags for Simd128Tags {
         matcher: &RowMatchGenerator,
         abs_pos: usize,
         lit_len: usize,
+        hash: Option<(usize, u8)>,
     ) -> Option<MatchCandidate> {
         // wasm simd128 is compile-time; `row_probe_simd128` needs no
         // `#[target_feature]` and the intrinsics inline directly.
-        unsafe { matcher.row_probe_simd128::<ROW_LOG>(abs_pos, lit_len) }
+        unsafe { matcher.row_probe_simd128::<ROW_LOG>(abs_pos, lit_len, hash) }
     }
 }
 
@@ -214,6 +221,467 @@ macro_rules! dispatch_tag_kernel {
             }
         }
     }};
+}
+
+/// Per-tier `#[target_feature]` umbrella over the greedy row kernel: with
+/// the umbrella's features a superset of the tier probe's, the
+/// `#[inline(always)]` loop body AND the tier's `row_probe_*` merge into ONE
+/// compiled function (donor `ZSTD_compressBlock_greedy_row` shape) instead
+/// of paying a non-inlinable `#[target_feature]` call per position.
+/// The greedy row parse BODY as a macro: expanded per tier with the tier's
+/// own SIMD pairing (`$maskmac` tag-match + `$cpl` prefix kernel), with the
+/// probe body expanded inline at the search site — the full donor
+/// `ZSTD_compressBlock_greedy_row` monolith, one compiled function per tier.
+macro_rules! greedy_parse_body {
+    ($m:expr, $handle:expr, $rl:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
+        #[allow(unused_labels)]
+        'parse: {
+            debug_assert_eq!($rl, $m.row_log);
+            $m.ensure_tables();
+
+            let current_len = *$m.chunk_lens.back().unwrap();
+            if current_len == 0 {
+                break 'parse;
+            }
+            let current_abs_start = $m.history_abs_start + $m.window_size - current_len;
+            let backfill_start = $m.backfill_start(current_abs_start);
+            if backfill_start < current_abs_start {
+                $m.insert_positions::<$rl>(backfill_start, current_abs_start);
+            }
+
+            // Donor mls for repcode probes is 4 (`MEM_read32` compare on
+            // `ip+1` against `ip+1-offset_1`, length extended by
+            // `ZSTD_count + 4`). The row matcher's `ROW_MIN_MATCH_LEN = 5`
+            // gates the *regular* search via the row-table layout; rep
+            // probes are independent of the row table and benefit from
+            // the lower donor threshold (a 4-byte rep is cheap to
+            // encode and frequently outperforms emitting the bytes as
+            // literals).
+            const REP_MIN_MATCH_LEN: usize = 4;
+            // Outer-loop lookahead floor: at least `REP_MIN_MATCH_LEN + 1`
+            // bytes left so the `abs_pos + 1` repcode probe can succeed even
+            // in the block tail (the rep probe needs `REP_MIN_MATCH_LEN`
+            // bytes one position ahead). This keeps the tail 4-byte rep-only
+            // case from falling through as literals.
+            const GREEDY_MIN_LOOKAHEAD: usize = REP_MIN_MATCH_LEN + 1;
+
+            let mut pos = 0usize;
+            let mut literals_start = 0usize;
+            // Software pipeline over the dependent row load: on a miss the next
+            // position's (row, tag) is computed ahead and its tag/position rows
+            // prefetched, so the probe's row loads (the hottest instructions of
+            // this loop — a hash-dependent cache miss per position) overlap the
+            // current iteration's tail instead of stalling the next probe.
+            // Donor `ZSTD_RowFindBestMatch` gets the same overlap from its
+            // hash-cache + `ZSTD_row_prefetch` pipeline.
+            let mut carried: Option<(usize, (usize, u8))> = None;
+
+            while pos + GREEDY_MIN_LOOKAHEAD <= current_len {
+                let abs_pos = current_abs_start + pos;
+                let lit_len = pos - literals_start;
+
+                // (1) Default start = abs_pos + 1: probe the repcode bank
+                //     at the next byte, treating one byte as already
+                //     committed to the literal run. Donor probes only
+                //     rep1 here; `repcode_candidate_shared` probes all three
+                //     plus the `ll0` fallback because the donor "ll0" trick
+                //     is already baked into our shared helper. The extra
+                //     probes only add candidates that have repcode encoding
+                //     costs (cheap), so the ratio direction is positive vs
+                //     donor while still landing in the "greedy via repcode"
+                //     algorithmic shape.
+                let rep_probe_pos = abs_pos + 1;
+                let rep_probe_lit_len = lit_len + 1;
+                let rep_match = if rep_probe_pos + REP_MIN_MATCH_LEN <= $m.history_abs_end() {
+                    repcode_candidate_shared(
+                        $m.hash_kernel,
+                        $m.live_history(),
+                        $m.history_abs_start,
+                        $m.offset_hist,
+                        rep_probe_pos,
+                        rep_probe_lit_len,
+                        REP_MIN_MATCH_LEN,
+                    )
+                } else {
+                    None
+                };
+
+                // (2) Upstream zstd greedy (depth 0): a repcode hit commits
+                // immediately and SKIPS the regular row search
+                // (`zstd_lazy.c:2039`, `if (depth==0) goto _storeSequence`).
+                // The regular `row_candidate` (SIMD row scan + match
+                // extension) is the dominant per-position cost; running it on
+                // every rep hit made rep-dense inputs (repetitive logs) up to
+                // ~11x slower than upstream, which short-circuits. So only
+                // run the regular search when there is no rep to take.
+                // `row_candidate` is `&self` (a pure search, no table
+                // mutation), so skipping it drops no hash insert: the
+                // post-emit `insert_positions(abs_pos, ..)` still indexes the
+                // committed span.
+                let hash = match carried.take() {
+                    Some((carried_pos, rt)) if carried_pos == abs_pos => Some(rt),
+                    _ => None,
+                };
+                let chosen = match rep_match {
+                    Some(rep) => Some(rep),
+                    // Probe body expanded inline (tier SIMD pairing via the
+                    // enclosing monolith macro), not a function call.
+                    None => {
+                        row_probe_body!($m, abs_pos, lit_len, hash, $rl, $use_mask, $maskmac, $cpl)
+                    }
+                };
+
+                let Some(candidate) = chosen else {
+                    // Donor `kSearchStrength = 8` shifts hard on miss
+                    // (step grows by `lit_len >> 8`). Empirically on our
+                    // corpus that recovers ~30% speed but costs ratio by
+                    // dropping hash inserts on long literal runs that
+                    // would have served future matches. Shift right by
+                    // `SKIP_STRENGTH = 10` instead — same shape, ~4×
+                    // rarer growth, so the step stays at 1 byte until the
+                    // literal run hits ~1 KiB and only then begins
+                    // skipping. Lets us keep most of donor's speed
+                    // characteristic without re-introducing the ratio
+                    // drain.
+                    const SKIP_STRENGTH: u32 = 10;
+                    let step = ((lit_len as u32) >> SKIP_STRENGTH) as usize + 1;
+                    // Reuse the probe's (row, tag) for the insert (the rep-hit
+                    // path never computed one, so fall back to the hashing
+                    // insert there — `hash` is `Some` exactly when the probe
+                    // ran on this position).
+                    match hash {
+                        Some((row, tag)) => $m.insert_at::<$rl>(abs_pos, row, tag),
+                        None => $m.insert_position::<$rl>(abs_pos),
+                    }
+                    if step == 1 {
+                        let next_abs = abs_pos + 1;
+                        if let Some((row, tag)) = $m.hash_and_row(next_abs) {
+                            $m.prefetch_row::<$rl>(row);
+                            carried = Some((next_abs, (row, tag)));
+                        }
+                    }
+                    pos += step;
+                    continue;
+                };
+
+                // Emit sequence.
+                let start = candidate.start - current_abs_start;
+                // Index `[abs_pos, candidate.start + match_len)`, NOT
+                // `[candidate.start, candidate.start + match_len)`.
+                // `extend_backwards_shared` can move `candidate.start`
+                // below `abs_pos` by absorbing literal bytes that the
+                // outer loop already indexed on earlier miss iterations
+                // via `insert_position(abs_pos)`. Re-indexing them here
+                // would write the same `abs_pos -> position` mapping
+                // into the row table a second time, evicting more recent
+                // / more useful slot tenants from the same row's chain.
+                // Measured on `decodecorpus-z000033`: the
+                // `candidate.start` lower bound regresses `rust_bytes` by
+                // ~+447 over `abs_pos` (537897 -> 538344), so the
+                // narrower range is intentional.
+                $m.insert_match_span::<$rl>(abs_pos, candidate.start + candidate.match_len);
+                let current = &$m.history[$m.history.len() - current_len..];
+                let literals = &current[literals_start..start];
+                $handle(Sequence::Triple {
+                    literals,
+                    offset: candidate.offset,
+                    match_len: candidate.match_len,
+                });
+                let _ = encode_offset_with_history(
+                    candidate.offset as u32,
+                    literals.len() as u32,
+                    &mut $m.offset_hist,
+                );
+                pos = start + candidate.match_len;
+                literals_start = pos;
+                // Same hash + row prefetch carry as the miss path: the next
+                // probe position is known here (right past the emitted match),
+                // and its row is otherwise guaranteed cold after the match-span
+                // insert walked other rows. The rep probe at the next iteration
+                // may consume the position without a row probe — then the
+                // carried hash is only reused by the insert-side, never wasted.
+                if pos + GREEDY_MIN_LOOKAHEAD <= current_len {
+                    let next_abs = current_abs_start + pos;
+                    if let Some((row, tag)) = $m.hash_and_row(next_abs) {
+                        $m.prefetch_row::<$rl>(row);
+                        carried = Some((next_abs, (row, tag)));
+                    }
+                }
+
+                // Donor's `lazy_generic` has an immediate-repcode loop here
+                // (probing `offset_2` after each main emit and swapping
+                // `offset_1 ↔ offset_2` on hit). It was implemented and
+                // shipped in earlier iterations of this method but never
+                // fired on any test or benchmark workload — the
+                // `repcode_candidate_shared` probe at the top of the main
+                // loop already evaluates all three rep slots (rep1, rep2,
+                // rep3 + the `ll0` fallback), and the immediate-rep slot
+                // (`offset_hist[1]` at `lit_len = 0`) is subsumed by the
+                // next main-loop iteration's rep probe of the same slot.
+                // Donor's version is single-rep, so the inner loop catches
+                // hits its main-loop probe wouldn't; ours is three-rep, so
+                // the inner loop is dead by construction. Removed to free
+                // the per-iteration check and keep the parser body lean.
+            }
+
+            while pos + ROW_HASH_KEY_LEN <= current_len {
+                $m.insert_position::<$rl>(current_abs_start + pos);
+                pos += 1;
+            }
+
+            if literals_start < current_len {
+                let current = &$m.history[$m.history.len() - current_len..];
+                $handle(Sequence::Literals {
+                    literals: &current[literals_start..],
+                });
+            }
+        }
+    }};
+}
+
+/// Rep + row best-of-two probe (the lazy search step) with the probe body
+/// expanded inline under the enclosing tier umbrella.
+macro_rules! row_best_match {
+    ($m:expr, $abs_pos:expr, $lit_len:expr, $hash:expr, $rl:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
+        let rep = $m.repcode_candidate($abs_pos, $lit_len);
+        let row = row_probe_body!(
+            $m, $abs_pos, $lit_len, $hash, $rl, $use_mask, $maskmac, $cpl
+        );
+        best_len_offset_candidate(rep, row)
+    }};
+}
+
+/// Per-tier standalone search function (upstream zstd's
+/// `ZSTD_RowFindBestMatch` shape, `zstd_lazy.c`): rep + row probe behind ONE
+/// symbol so the lazy parse's two probe sites (current position + lookahead)
+/// share a single copy instead of expanding the whole search body twice —
+/// the duplicated expansion doubled the kernel's icache footprint and left
+/// the lookahead copy as an outlined closure call.
+macro_rules! gen_row_find_monolith {
+    ($name:ident, $use_mask:literal, $maskmac:ident, $cpl:path $(, $tf:literal)?) => {
+        $(#[target_feature(enable = $tf)])?
+        #[cfg_attr(
+            all(
+                target_arch = "wasm32",
+                target_feature = "simd128",
+                feature = "kernel_simd128"
+            ),
+            allow(dead_code)
+        )]
+        #[allow(unused_unsafe)]
+        unsafe fn $name<K: RowTags, const ROW_LOG: usize>(
+            &mut self,
+            abs_pos: usize,
+            lit_len: usize,
+            hash: Option<(usize, u8)>,
+        ) -> Option<MatchCandidate> {
+            row_best_match!(self, abs_pos, lit_len, hash, ROW_LOG, $use_mask, $maskmac, $cpl)
+        }
+    };
+}
+
+/// The lazy row parse BODY as a macro — same per-tier monolith shape as
+/// `greedy_parse_body!` for the lazy levels (lookahead via
+/// `pick_lazy_match_shared`; both probe sites call the tier's shared
+/// `$find` search function).
+macro_rules! lazy_parse_body {
+    ($m:expr, $handle:expr, $rl:expr, $find:ident) => {{
+        #[allow(unused_labels)]
+        'parse: {
+            debug_assert_eq!($rl, $m.row_log);
+            $m.ensure_tables();
+
+            let current_len = *$m.chunk_lens.back().unwrap();
+            if current_len == 0 {
+                break 'parse;
+            }
+            let current_abs_start = $m.history_abs_start + $m.window_size - current_len;
+            let backfill_start = $m.backfill_start(current_abs_start);
+            if backfill_start < current_abs_start {
+                $m.insert_positions::<$rl>(backfill_start, current_abs_start);
+            }
+
+            let mls = $m.mls;
+            let mut pos = 0usize;
+            let mut literals_start = 0usize;
+            // Lookahead search result carried into the next iteration
+            // (upstream zstd's lazy chain, `zstd_lazy.c` lazy_generic: a
+            // deferred position's successor is never searched twice — the
+            // depth loop carries the better match forward). `Some(r)` means
+            // this iteration's position was already searched as the previous
+            // iteration's lookahead, with result `r`.
+            let mut carried: Option<Option<MatchCandidate>> = None;
+            while pos + mls <= current_len {
+                let abs_pos = current_abs_start + pos;
+                let lit_len = pos - literals_start;
+
+                // Hash the position ONCE per iteration: the probe consumes it
+                // and the defer branch reuses it for the insert (upstream zstd
+                // hashes once per position — `ZSTD_RowFindBestMatch` updates
+                // the row as part of the search, `zstd_lazy.c`). A carried
+                // iteration skips both: the search already ran.
+                let (hash, best) = match carried.take() {
+                    Some(best) => (None, best),
+                    None => {
+                        let hash = $m.hash_and_row(abs_pos);
+                        let best = unsafe { $m.$find::<K, $rl>(abs_pos, lit_len, hash) };
+                        (hash, best)
+                    }
+                };
+                let picked = 'pick: {
+                    let Some(best) = best else { break 'pick None };
+                    if best.match_len >= $m.target_len
+                        || abs_pos + 1 + $m.mls > $m.history_abs_end()
+                    {
+                        break 'pick Some(best);
+                    }
+                    // SAFETY: the enclosing kernel is only entered when its
+                    // tier was runtime-detected, so the same-feature search
+                    // fn's target_feature contract is upheld.
+                    let next = unsafe { $m.$find::<K, $rl>(abs_pos + 1, lit_len + 1, None) };
+                    if let Some(n) = next
+                        && (n.match_len > best.match_len
+                            || (n.match_len == best.match_len && n.offset < best.offset))
+                    {
+                        // Defer: the lookahead wins; carry its result so the
+                        // next iteration starts from it instead of searching
+                        // the same position again. Reusing the pre-insert
+                        // result is INTENTIONAL: the deferred-position insert
+                        // only ADDS a row entry, so the carried candidate's
+                        // positions and lengths stay valid — at most the
+                        // carried view misses the just-inserted neighbour as
+                        // a candidate. Upstream zstd's lazy chain has the
+                        // same property (a searched position is never
+                        // searched again, zstd_lazy.c lazy_generic), and the
+                        // size impact is measured at +25 bytes on a 484 KB
+                        // corpus while removing a full duplicate search per
+                        // deferral.
+                        carried = Some(next);
+                        break 'pick None;
+                    }
+                    if $m.lazy_depth >= 2 && abs_pos + 2 + $m.mls <= $m.history_abs_end() {
+                        let next2 = unsafe { $m.$find::<K, $rl>(abs_pos + 2, lit_len + 2, None) };
+                        if let Some(n2) = next2
+                            && n2.match_len > best.match_len + 1
+                        {
+                            // Two-ahead defer: carry the one-ahead result
+                            // (the next iteration's own lookahead re-probes
+                            // two-ahead with the deferred position inserted).
+                            carried = Some(next);
+                            break 'pick None;
+                        }
+                    }
+                    Some(best)
+                };
+                if let Some(candidate) = picked {
+                    $m.insert_match_span::<$rl>(abs_pos, candidate.start + candidate.match_len);
+                    let current = &$m.history[$m.history.len() - current_len..];
+                    let start = candidate.start - current_abs_start;
+                    let literals = &current[literals_start..start];
+                    $handle(Sequence::Triple {
+                        literals,
+                        offset: candidate.offset,
+                        match_len: candidate.match_len,
+                    });
+                    let _ = encode_offset_with_history(
+                        candidate.offset as u32,
+                        literals.len() as u32,
+                        &mut $m.offset_hist,
+                    );
+                    pos = start + candidate.match_len;
+                    literals_start = pos;
+                } else {
+                    // Reuse the iteration's hash for the defer-path insert
+                    // when available (a carried iteration never hashed and
+                    // falls back to the rehashing insert).
+                    match hash {
+                        Some((row, tag)) => $m.insert_at::<$rl>(abs_pos, row, tag),
+                        None => $m.insert_position::<$rl>(abs_pos),
+                    }
+                    if carried.is_some() {
+                        // Defer: the lookahead found a better match — step
+                        // exactly one to take it next iteration.
+                        pos += 1;
+                    } else {
+                        // Complete miss: accelerate through weakly-matching
+                        // stretches (upstream zstd `ip += (ip - anchor) >>
+                        // kSearchStrength + 1`, zstd_lazy.c lazy_generic).
+                        // Same softened `SKIP_STRENGTH = 10` as the greedy
+                        // kernel above: the step stays 1 until the literal
+                        // run hits ~1 KiB, protecting ratio on short runs.
+                        const SKIP_STRENGTH: u32 = 10;
+                        pos += ((lit_len as u32) >> SKIP_STRENGTH) as usize + 1;
+                    }
+                }
+            }
+
+            while pos + ROW_HASH_KEY_LEN <= current_len {
+                $m.insert_position::<$rl>(current_abs_start + pos);
+                pos += 1;
+            }
+
+            if literals_start < current_len {
+                let current = &$m.history[$m.history.len() - current_len..];
+                $handle(Sequence::Literals {
+                    literals: &current[literals_start..],
+                });
+            }
+        }
+    }};
+}
+
+/// Per-tier lazy kernels (see `gen_greedy_monolith` — same SIMD pairing).
+macro_rules! gen_lazy_monolith {
+    ($name:ident, $find:ident, $use_mask:literal, $maskmac:ident, $cpl:path $(, $tf:literal)?) => {
+        gen_row_find_monolith!($find, $use_mask, $maskmac, $cpl $(, $tf)?);
+
+        $(#[target_feature(enable = $tf)])?
+        // wasm32+simd128 resolves the dispatch at compile time to the
+        // simd128 kernel, leaving the scalar monolith uncalled there
+        // (same shape as the `ScalarTags` allowance).
+        #[cfg_attr(
+            all(
+                target_arch = "wasm32",
+                target_feature = "simd128",
+                feature = "kernel_simd128"
+            ),
+            allow(dead_code)
+        )]
+        #[allow(unused_unsafe)]
+        unsafe fn $name<K: RowTags, const ROW_LOG: usize>(
+            &mut self,
+            mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+        ) {
+            lazy_parse_body!(self, handle_sequence, ROW_LOG, $find)
+        }
+    };
+}
+
+/// Per-tier greedy kernels: the parse body AND its probe expand inline under
+/// the tier's `#[target_feature]` umbrella with the tier's own SIMD pairing
+/// (the `K` parameter is kept only so the dispatch site stays uniform).
+macro_rules! gen_greedy_monolith {
+    ($name:ident, $use_mask:literal, $maskmac:ident, $cpl:path $(, $tf:literal)?) => {
+        $(#[target_feature(enable = $tf)])?
+        // wasm32+simd128 resolves the dispatch at compile time to the
+        // simd128 kernel, leaving the scalar monolith uncalled there
+        // (same shape as the `ScalarTags` allowance).
+        #[cfg_attr(
+            all(
+                target_arch = "wasm32",
+                target_feature = "simd128",
+                feature = "kernel_simd128"
+            ),
+            allow(dead_code)
+        )]
+        #[allow(unused_unsafe)]
+        unsafe fn $name<K: RowTags, const ROW_LOG: usize>(
+            &mut self,
+            mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+        ) {
+            greedy_parse_body!(self, handle_sequence, ROW_LOG, $use_mask, $maskmac, $cpl)
+        }
+    };
 }
 
 /// Bind the runtime `row_log` (clamped 4..=6) to the const `ROW_LOG` of a
@@ -389,46 +857,64 @@ macro_rules! row_tag_mask_simd128 {
 /// the tier's `row_tag_mask_*!`; the optional `$tf` is the `target_feature`.
 /// Mirrors the former generic `row_candidate_rl`: live row probe, dict
 /// dual-probe, speculative tail gate.
-macro_rules! gen_row_probe {
-    ($name:ident, $use_mask:literal, $maskmac:ident, $cpl:path $(, $tf:literal)?) => {
-        $(#[target_feature(enable = $tf)])?
-        #[allow(unused_unsafe)]
-        // wasm32+simd128 selects `row_probe_simd128` at compile time, leaving
-        // `row_probe_scalar` (the only other tier compiled on wasm) unused.
-        #[cfg_attr(
-            all(
-                target_arch = "wasm32",
-                target_feature = "simd128",
-                feature = "kernel_simd128"
-            ),
-            allow(dead_code)
-        )]
-        unsafe fn $name<const ROW_LOG: usize>(
-            &self,
-            abs_pos: usize,
-            lit_len: usize,
-        ) -> Option<MatchCandidate> {
-            debug_assert_eq!(ROW_LOG, self.row_log);
-            let mls = self.mls;
-            let concat = self.live_history();
-            let current_idx = abs_pos - self.history_abs_start;
+/// The row probe BODY as a macro, expanded both into the per-tier
+/// `row_probe_*` functions (non-kernel callers) and directly into the
+/// per-tier parse kernels (`greedy_*` / `lazy_*`) where a function-call
+/// boundary — non-inlinable across `#[target_feature]` without an
+/// `inline(always)` the compiler forbids there — cost a call with operand
+/// spills per position. Early exits use the labeled block (`break 'probe`)
+/// because a `return` inside a macro body would return from the EXPANSION
+/// SITE's function.
+macro_rules! row_probe_body {
+    ($m:expr, $abs_pos:expr, $lit_len:expr, $hash:expr, $rl:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
+        #[allow(unused_labels)]
+        'probe: {
+            debug_assert_eq!($rl, $m.row_log);
+            let mls = $m.mls;
+            let concat = $m.live_history();
+            let current_idx = $abs_pos - $m.history_abs_start;
             if current_idx + mls > concat.len() {
-                return None;
+                break 'probe None;
             }
 
-            let (row, tag) = self.hash_and_row(abs_pos)?;
-            let row_entries = 1usize << ROW_LOG;
+            // `hash` carries the (row, tag) the greedy loop already
+            // computed for this position (and prefetched the row for);
+            // recompute only on the uncarried paths.
+            let (row, tag) = match $hash.or_else(|| $m.hash_and_row($abs_pos)) {
+                Some(rt) => rt,
+                None => break 'probe None,
+            };
+            let row_entries = 1usize << $rl;
             let row_mask = row_entries - 1;
-            let row_base = row << ROW_LOG;
-            let head = self.row_heads[row] as usize;
-            let max_walk = self.search_depth.min(row_entries);
+            let row_base = row << $rl;
+            let head = $m.row_heads[row] as usize;
+            let max_walk = $m.search_depth.min(row_entries);
+
+            // Prefetch the dict row before the live scan (upstream zstd
+            // prefetches the dictMatchState rows up front,
+            // zstd_lazy.c:1200 `ZSTD_row_prefetch`), hiding the dict-table
+            // load latency behind the live row's work.
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            if let Some(dict) = $m.dict.table() {
+                #[cfg(target_arch = "x86")]
+                use core::arch::x86::{_MM_HINT_T0, _mm_prefetch};
+                #[cfg(target_arch = "x86_64")]
+                use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+                let drow_base = row << $rl;
+                // SAFETY: prefetch is a hint and never faults; indexes are in
+                // bounds by the dict-table sizing.
+                unsafe {
+                    _mm_prefetch(dict.tags.as_ptr().add(drow_base).cast(), _MM_HINT_T0);
+                    _mm_prefetch(dict.positions.as_ptr().add(drow_base).cast(), _MM_HINT_T0);
+                }
+            }
 
             // SIMD tiers precompute the full bitmask once (the tag-match
             // intrinsic inlines under this method's `#[target_feature]`); the
             // scalar tier (`USE_MASK == false`) const-folds this away and does
             // an on-the-fly per-slot byte compare in the loop.
             let tag_match = if $use_mask {
-                $maskmac!(&self.row_tags[row_base..row_base + row_entries], tag)
+                $maskmac!(&$m.row_tags[row_base..row_base + row_entries], tag)
             } else {
                 0
             };
@@ -479,7 +965,7 @@ macro_rules! gen_row_probe {
                     while scan < row_entries {
                         let s = (head + scan) & row_mask;
                         scan += 1;
-                        if self.row_tags[row_base + s] == tag {
+                        if $m.row_tags[row_base + s] == tag {
                             found = Some(s);
                             break;
                         }
@@ -489,24 +975,31 @@ macro_rules! gen_row_probe {
                 let Some(slot) = slot_opt else { break };
                 attempts += 1;
                 let idx = row_base + slot;
-                let raw_pos = self.row_positions[idx];
+                let raw_pos = $m.row_positions[idx];
                 if raw_pos == ROW_EMPTY_SLOT {
                     continue;
                 }
                 let candidate_pos = raw_pos as usize;
-                if candidate_pos < self.history_abs_start || candidate_pos >= abs_pos {
+                if candidate_pos < $m.history_abs_start || candidate_pos >= $abs_pos {
                     continue;
                 }
-                let candidate_idx = candidate_pos - self.history_abs_start;
+                let candidate_idx = candidate_pos - $m.history_abs_start;
+                // NOTE: upstream zstd's 4-byte head gate (`MEM_read32(match)
+                // == MEM_read32(ip)`, zstd_lazy.c:1265) was measured NEGATIVE
+                // here both unconditionally (+7% on match-dense z000033 L6,
+                // flat control) and best-gated (+3%); the row walk visits few
+                // false tag hits and the SIMD prefix compare's first vector
+                // already serves as the cheap reject. The tail gate below is
+                // the selective filter that pays.
                 // Speculative tail gate (HC `hash_chain_candidate` parity):
                 // a 4-byte compare at the length the candidate must reach to
                 // outgrow `best` proves whether the full `common_prefix_len`
                 // can pay off. Gated on offset-monotonicity since the row walk
                 // is not offset-ordered. Ratio-neutral.
                 if let Some(b) = best {
-                    let new_offset = abs_pos - candidate_pos;
+                    let new_offset = $abs_pos - candidate_pos;
                     if new_offset >= b.offset
-                        && let Some(tail_off) = b.match_len.checked_sub(lit_len + 3)
+                        && let Some(tail_off) = b.match_len.checked_sub($lit_len + 3)
                     {
                         let m_end = candidate_idx + tail_off + 4;
                         let i_end = current_idx + tail_off + 4;
@@ -532,19 +1025,26 @@ macro_rules! gen_row_probe {
                 };
                 if match_len >= mls {
                     let candidate =
-                        self.extend_backwards(candidate_pos, abs_pos, match_len, lit_len);
+                        $m.extend_backwards(candidate_pos, $abs_pos, match_len, $lit_len);
                     best = best_len_offset_candidate(best, Some(candidate));
                     if best.is_some_and(|b| current_idx + b.match_len >= concat.len()) {
-                        return best;
+                        break 'probe best;
                     }
                 }
             }
 
             // Dict dual-probe (donor `ZSTD_RowFindBestMatch` `dictMatchState`):
             // one bounded immutable dict row (concat-indexed positions).
-            if let Some(dict) = self.dict.table() {
-                let dict_end = self.dict.region_len();
-                let drow_base = row << ROW_LOG;
+            // The candidate budget is SHARED with the live row (upstream
+            // zstd decrements one `nbAttempts` across both rows,
+            // zstd_lazy.c:1308): the dict probe only spends what the live
+            // walk left over.
+            if attempts < max_walk
+                && let Some(dict) = $m.dict.table()
+            {
+                let dict_walk = max_walk - attempts;
+                let dict_end = $m.dict.region_len();
+                let drow_base = row << $rl;
                 let dhead = dict.heads[row] as usize;
                 let dtag_match = if $use_mask {
                     $maskmac!(&dict.tags[drow_base..drow_base + row_entries], tag)
@@ -566,7 +1066,7 @@ macro_rules! gen_row_probe {
                 #[allow(unused_mut)]
                 let mut dscan = 0usize;
                 let mut dattempts = 0usize;
-                while dattempts < max_walk {
+                while dattempts < dict_walk {
                     let slot_opt = if $use_mask {
                         if dpending == 0 {
                             None
@@ -598,11 +1098,11 @@ macro_rules! gen_row_probe {
                     if dp >= dict_end || dp + mls > concat.len() {
                         continue;
                     }
-                    let cand_abs = self.history_abs_start + dp;
+                    let cand_abs = $m.history_abs_start + dp;
                     if let Some(b) = best {
-                        let new_offset = abs_pos - cand_abs;
+                        let new_offset = $abs_pos - cand_abs;
                         if new_offset >= b.offset
-                            && let Some(tail_off) = b.match_len.checked_sub(lit_len + 3)
+                            && let Some(tail_off) = b.match_len.checked_sub($lit_len + 3)
                         {
                             let m_end = dp + tail_off + 4;
                             let i_end = current_idx + tail_off + 4;
@@ -623,15 +1123,46 @@ macro_rules! gen_row_probe {
                         )
                     };
                     if match_len >= mls {
-                        let candidate = self.extend_backwards(cand_abs, abs_pos, match_len, lit_len);
+                        let candidate =
+                            $m.extend_backwards(cand_abs, $abs_pos, match_len, $lit_len);
                         best = best_len_offset_candidate(best, Some(candidate));
                         if best.is_some_and(|b| current_idx + b.match_len >= concat.len()) {
-                            return best;
+                            break 'probe best;
                         }
                     }
                 }
             }
             best
+        }
+    }};
+}
+
+macro_rules! gen_row_probe {
+    ($name:ident, $use_mask:literal, $maskmac:ident, $cpl:path $(, $tf:literal)?) => {
+        $(#[target_feature(enable = $tf)])?
+        // `#[inline]` hint (NOT always — forbidden with target_feature):
+        // the per-tier parse umbrella enables the same features, so the
+        // probe is inlinable there and LLVM takes the single-call-site
+        // hint, merging probe + parse loop into one body.
+        #[inline]
+        #[allow(unused_unsafe)]
+        // wasm32+simd128 selects `row_probe_simd128` at compile time, leaving
+        // `row_probe_scalar` (the only other tier compiled on wasm) unused.
+        #[cfg_attr(
+            all(
+                target_arch = "wasm32",
+                target_feature = "simd128",
+                feature = "kernel_simd128"
+            ),
+            allow(dead_code)
+        )]
+        unsafe fn $name<const ROW_LOG: usize>(
+            &self,
+            abs_pos: usize,
+            lit_len: usize,
+            hash: Option<(usize, u8)>,
+        ) -> Option<MatchCandidate> {
+            row_probe_body!(self, abs_pos, lit_len, hash, ROW_LOG, $use_mask, $maskmac, $cpl)
         }
     };
 }
@@ -823,14 +1354,33 @@ impl RowMatchGenerator {
     }
 
     pub(crate) fn reset(&mut self) {
+        // Floor-advance reset (same shape as the dfast/HC backends): instead
+        // of re-zeroing the row tables per frame (a multi-MiB memset that
+        // dominated small/medium-frame encode), advance the absolute
+        // coordinate floor past everything ever inserted. Stale entries all
+        // hold positions below the new floor, so the probes' existing
+        // `candidate_pos < self.history_abs_start` window check rejects them
+        // without any clearing — the donor's persistent-index design. Stale
+        // TAGS can still produce the occasional false mask hit whose
+        // candidate then fails the window check; the donor's tag table
+        // persists across frames with the same behaviour.
+        let next_floor = self.history_abs_start + (self.history.len() - self.history_start);
         self.window_size = 0;
         self.history.clear();
         self.history_start = 0;
-        self.history_abs_start = 0;
         self.offset_hist = [1, 4, 8];
-        self.row_heads.fill(0);
-        self.row_positions.fill(ROW_EMPTY_SLOT);
-        self.row_tags.fill(0);
+        if next_floor <= REBASE_RESET_FLOOR_CEILING && !self.row_positions.is_empty() {
+            self.history_abs_start = next_floor;
+        } else {
+            // Bounded fallback: rewind the coordinate space and zero the
+            // tables so the absolute cursor cannot climb without bound
+            // (mirrors dfast; the u32 packing is separately kept in range
+            // by `rebase_positions` in `add_data`).
+            self.history_abs_start = 0;
+            self.row_heads.fill(0);
+            self.row_positions.fill(ROW_EMPTY_SLOT);
+            self.row_tags.fill(0);
+        }
         // Block buffers are returned to the caller's pool per block in
         // `add_data`, so there is nothing window-side to recycle here.
         self.chunk_lens.clear();
@@ -1000,81 +1550,6 @@ impl RowMatchGenerator {
             }
         }
     }
-
-    /// Lazy-style parse (depth >= 1) for the Row backend.
-    ///
-    /// Currently unused: the only strategy mapped to `BackendTag::Row`
-    /// is `StrategyTag::Greedy` (level 4), which dispatches to
-    /// [`Self::start_matching_greedy`] via the `debug_assert_eq!` in
-    /// the `BackendTag::Row` arm of
-    /// `MatchGeneratorDriver::compress_block`. This method is kept as
-    /// scaffolding for the case where a future level routes a lazy
-    /// strategy through the Row backend — extracting `pick_lazy_match`
-    /// behavior to a fresh module then would mean re-deriving the
-    /// row-hash machinery, which is wasteful. The `dead_code` allow is
-    /// scoped to this method and its private helpers so any new
-    /// caller will pick them up unmodified.
-    pub(crate) fn start_matching_rl<K: RowTags, const ROW_LOG: usize>(
-        &mut self,
-        mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
-    ) {
-        debug_assert_eq!(ROW_LOG, self.row_log);
-        self.ensure_tables();
-
-        let current_len = *self.chunk_lens.back().unwrap();
-        if current_len == 0 {
-            return;
-        }
-        let current_abs_start = self.history_abs_start + self.window_size - current_len;
-        let backfill_start = self.backfill_start(current_abs_start);
-        if backfill_start < current_abs_start {
-            self.insert_positions::<ROW_LOG>(backfill_start, current_abs_start);
-        }
-
-        let mls = self.mls;
-        let mut pos = 0usize;
-        let mut literals_start = 0usize;
-        while pos + mls <= current_len {
-            let abs_pos = current_abs_start + pos;
-            let lit_len = pos - literals_start;
-
-            let best = self.best_match_rl::<K, ROW_LOG>(abs_pos, lit_len);
-            if let Some(candidate) = self.pick_lazy_match_rl::<K, ROW_LOG>(abs_pos, lit_len, best) {
-                self.insert_match_span::<ROW_LOG>(abs_pos, candidate.start + candidate.match_len);
-                let current = &self.history[self.history.len() - current_len..];
-                let start = candidate.start - current_abs_start;
-                let literals = &current[literals_start..start];
-                handle_sequence(Sequence::Triple {
-                    literals,
-                    offset: candidate.offset,
-                    match_len: candidate.match_len,
-                });
-                let _ = encode_offset_with_history(
-                    candidate.offset as u32,
-                    literals.len() as u32,
-                    &mut self.offset_hist,
-                );
-                pos = start + candidate.match_len;
-                literals_start = pos;
-            } else {
-                self.insert_position::<ROW_LOG>(abs_pos);
-                pos += 1;
-            }
-        }
-
-        while pos + ROW_HASH_KEY_LEN <= current_len {
-            self.insert_position::<ROW_LOG>(current_abs_start + pos);
-            pos += 1;
-        }
-
-        if literals_start < current_len {
-            let current = &self.history[self.history.len() - current_len..];
-            handle_sequence(Sequence::Literals {
-                literals: &current[literals_start..],
-            });
-        }
-    }
-
     /// Donor-parity greedy parse for `lazy_depth == 0` (level 5).
     ///
     /// Mirrors `ZSTD_compressBlock_lazy_generic` (`zstd_lazy.c:1560`) with
@@ -1136,180 +1611,6 @@ impl RowMatchGenerator {
     ///
     /// `pick_lazy_match` is intentionally not called here — depth == 0
     /// means "no lookahead", emit the first viable hit.
-    pub(crate) fn start_matching_greedy_rl<K: RowTags, const ROW_LOG: usize>(
-        &mut self,
-        mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
-    ) {
-        debug_assert_eq!(ROW_LOG, self.row_log);
-        self.ensure_tables();
-
-        let current_len = *self.chunk_lens.back().unwrap();
-        if current_len == 0 {
-            return;
-        }
-        let current_abs_start = self.history_abs_start + self.window_size - current_len;
-        let backfill_start = self.backfill_start(current_abs_start);
-        if backfill_start < current_abs_start {
-            self.insert_positions::<ROW_LOG>(backfill_start, current_abs_start);
-        }
-
-        // Donor mls for repcode probes is 4 (`MEM_read32` compare on
-        // `ip+1` against `ip+1-offset_1`, length extended by
-        // `ZSTD_count + 4`). The row matcher's `ROW_MIN_MATCH_LEN = 5`
-        // gates the *regular* search via the row-table layout; rep
-        // probes are independent of the row table and benefit from
-        // the lower donor threshold (a 4-byte rep is cheap to
-        // encode and frequently outperforms emitting the bytes as
-        // literals).
-        const REP_MIN_MATCH_LEN: usize = 4;
-        // Outer-loop lookahead floor: at least `REP_MIN_MATCH_LEN + 1`
-        // bytes left so the `abs_pos + 1` repcode probe can succeed even
-        // in the block tail (the rep probe needs `REP_MIN_MATCH_LEN`
-        // bytes one position ahead). This keeps the tail 4-byte rep-only
-        // case from falling through as literals.
-        const GREEDY_MIN_LOOKAHEAD: usize = REP_MIN_MATCH_LEN + 1;
-
-        let mut pos = 0usize;
-        let mut literals_start = 0usize;
-
-        while pos + GREEDY_MIN_LOOKAHEAD <= current_len {
-            let abs_pos = current_abs_start + pos;
-            let lit_len = pos - literals_start;
-
-            // (1) Default start = abs_pos + 1: probe the repcode bank
-            //     at the next byte, treating one byte as already
-            //     committed to the literal run. Donor probes only
-            //     rep1 here; `repcode_candidate_shared` probes all three
-            //     plus the `ll0` fallback because the donor "ll0" trick
-            //     is already baked into our shared helper. The extra
-            //     probes only add candidates that have repcode encoding
-            //     costs (cheap), so the ratio direction is positive vs
-            //     donor while still landing in the "greedy via repcode"
-            //     algorithmic shape.
-            let rep_probe_pos = abs_pos + 1;
-            let rep_probe_lit_len = lit_len + 1;
-            let rep_match = if rep_probe_pos + REP_MIN_MATCH_LEN <= self.history_abs_end() {
-                repcode_candidate_shared(
-                    self.hash_kernel,
-                    self.live_history(),
-                    self.history_abs_start,
-                    self.offset_hist,
-                    rep_probe_pos,
-                    rep_probe_lit_len,
-                    REP_MIN_MATCH_LEN,
-                )
-            } else {
-                None
-            };
-
-            // (2) Donor at `depth == 0` does `goto _storeSequence` on a
-            //     rep hit (commits without comparing against the regular
-            //     search). That trade-off is ratio-negative for us
-            //     because donor recovers the loss via other components
-            //     we don't replicate (smaller `mls=5`, block splitter,
-            //     better regular-search recall). To get the speed shape
-            //     of donor's greedy *without* its ratio cliff, we
-            //     compare both options and pick the longer match. On
-            //     ties / near-ties the rep wins by being cheaper to
-            //     encode (single-digit-bit offset code vs 9-13 bits for
-            //     a regular offset).
-            // Donor greedy (depth 0): a repcode hit commits immediately and
-            // SKIPS the regular row search (`zstd_lazy.c:2039`,
-            // `if (depth==0) goto _storeSequence`). The regular
-            // `row_candidate` (SIMD row scan + match extension) is the
-            // dominant per-position cost; running it on every rep hit made
-            // rep-dense inputs (repetitive logs) up to ~11x slower than the
-            // donor, which short-circuits. So only run the regular search
-            // when there is no rep to take. `row_candidate` is `&self` (a
-            // pure search, no table mutation), so skipping it drops no hash
-            // insert — the post-emit `insert_positions(abs_pos, ..)` still
-            // indexes the committed span.
-            let chosen = match rep_match {
-                Some(rep) => Some(rep),
-                // SAFETY: `K` selected by `dispatch_tag_kernel!` after `detect`
-                // confirmed its ISA; `K::probe` upholds the feature contract.
-                None => unsafe { K::probe::<ROW_LOG>(self, abs_pos, lit_len) },
-            };
-
-            let Some(candidate) = chosen else {
-                // Donor `kSearchStrength = 8` shifts hard on miss
-                // (step grows by `lit_len >> 8`). Empirically on our
-                // corpus that recovers ~30% speed but costs ratio by
-                // dropping hash inserts on long literal runs that
-                // would have served future matches. Shift right by
-                // `SKIP_STRENGTH = 10` instead — same shape, ~4×
-                // rarer growth, so the step stays at 1 byte until the
-                // literal run hits ~1 KiB and only then begins
-                // skipping. Lets us keep most of donor's speed
-                // characteristic without re-introducing the ratio
-                // drain.
-                const SKIP_STRENGTH: u32 = 10;
-                let step = ((lit_len as u32) >> SKIP_STRENGTH) as usize + 1;
-                self.insert_position::<ROW_LOG>(abs_pos);
-                pos += step;
-                continue;
-            };
-
-            // Emit sequence.
-            let start = candidate.start - current_abs_start;
-            // Index `[abs_pos, candidate.start + match_len)`, NOT
-            // `[candidate.start, candidate.start + match_len)`.
-            // `extend_backwards_shared` can move `candidate.start`
-            // below `abs_pos` by absorbing literal bytes that the
-            // outer loop already indexed on earlier miss iterations
-            // via `insert_position(abs_pos)`. Re-indexing them here
-            // would write the same `abs_pos -> position` mapping
-            // into the row table a second time, evicting more recent
-            // / more useful slot tenants from the same row's chain.
-            // Measured on `decodecorpus-z000033`: the
-            // `candidate.start` lower bound regresses `rust_bytes` by
-            // ~+447 over `abs_pos` (537897 -> 538344), so the
-            // narrower range is intentional.
-            self.insert_match_span::<ROW_LOG>(abs_pos, candidate.start + candidate.match_len);
-            let current = &self.history[self.history.len() - current_len..];
-            let literals = &current[literals_start..start];
-            handle_sequence(Sequence::Triple {
-                literals,
-                offset: candidate.offset,
-                match_len: candidate.match_len,
-            });
-            let _ = encode_offset_with_history(
-                candidate.offset as u32,
-                literals.len() as u32,
-                &mut self.offset_hist,
-            );
-            pos = start + candidate.match_len;
-            literals_start = pos;
-
-            // Donor's `lazy_generic` has an immediate-repcode loop here
-            // (probing `offset_2` after each main emit and swapping
-            // `offset_1 ↔ offset_2` on hit). It was implemented and
-            // shipped in earlier iterations of this method but never
-            // fired on any test or benchmark workload — the
-            // `repcode_candidate_shared` probe at the top of the main
-            // loop already evaluates all three rep slots (rep1, rep2,
-            // rep3 + the `ll0` fallback), and the immediate-rep slot
-            // (`offset_hist[1]` at `lit_len = 0`) is subsumed by the
-            // next main-loop iteration's rep probe of the same slot.
-            // Donor's version is single-rep, so the inner loop catches
-            // hits its main-loop probe wouldn't; ours is three-rep, so
-            // the inner loop is dead by construction. Removed to free
-            // the per-iteration check and keep the parser body lean.
-        }
-
-        while pos + ROW_HASH_KEY_LEN <= current_len {
-            self.insert_position::<ROW_LOG>(current_abs_start + pos);
-            pos += 1;
-        }
-
-        if literals_start < current_len {
-            let current = &self.history[self.history.len() - current_len..];
-            handle_sequence(Sequence::Literals {
-                literals: &current[literals_start..],
-            });
-        }
-    }
-
     pub(crate) fn ensure_tables(&mut self) {
         let row_count = 1usize << self.row_hash_log;
         let row_entries = 1usize << self.row_log;
@@ -1350,14 +1651,45 @@ impl RowMatchGenerator {
         self.history_abs_start + self.live_history().len()
     }
 
+    /// Row hash key at `idx`: `key_len` bytes (donor `mls`, 5-6 on the row
+    /// levels) via one masked 8-byte read, degrading to the 4-byte key in
+    /// the last <8 bytes of the window. Shared by the live hash and the
+    /// dictionary row-index build — the two MUST bucket identically or
+    /// dict-region probes go blind.
+    ///
+    /// The degradation is per window STATE: within one window a position
+    /// hashes identically in the probe and the insert. The last <8
+    /// positions of a pre-primed dictionary are a separate, unfixable
+    /// case — the bytes following them exist only at probe time, so no
+    /// fixed build-time key (4-byte, zero-padded, or otherwise) can match
+    /// the probe's real-byte key there. Those few dict-tail entries stay
+    /// unreachable, mirroring the donor, whose dictionary load also stops
+    /// hashing short of the dictionary end.
+    #[inline(always)]
+    fn row_key_value(concat: &[u8], idx: usize, key_len: usize) -> u64 {
+        if idx + 8 <= concat.len() {
+            let v = u64::from_le_bytes(concat[idx..idx + 8].try_into().unwrap());
+            v & ((1u64 << (key_len * 8)) - 1)
+        } else {
+            u32::from_le_bytes(concat[idx..idx + ROW_HASH_KEY_LEN].try_into().unwrap()) as u64
+        }
+    }
+
+    #[inline(always)]
     pub(crate) fn hash_and_row(&self, abs_pos: usize) -> Option<(usize, u8)> {
         let idx = abs_pos - self.history_abs_start;
         let concat = self.live_history();
         if idx + ROW_HASH_KEY_LEN > concat.len() {
             return None;
         }
-        let value =
-            u32::from_le_bytes(concat[idx..idx + ROW_HASH_KEY_LEN].try_into().unwrap()) as u64;
+        // Donor `ZSTD_hashPtrSalted` hashes `mls` bytes (5-6 on the row
+        // levels), not 4: a wider key cuts the false tag hits whose
+        // candidates then cost a data load + reject in the probe. Read 8
+        // bytes and mask to the key width when the tail allows; the last
+        // <8 bytes of the window keep the 4-byte key (a position hashes
+        // identically in the probe and the insert either way, so the
+        // mixed tail stays self-consistent).
+        let value = Self::row_key_value(concat, idx, self.mls.min(6));
         let hash = crate::encoding::fastpath::hash_mix_u64_with_kernel(self.hash_kernel, value);
         let total_bits = self.row_hash_log + ROW_TAG_BITS;
         let combined = hash >> (u64::BITS as usize - total_bits);
@@ -1376,6 +1708,7 @@ impl RowMatchGenerator {
     /// Used only by the dead-code [`Self::start_matching`] (lazy-style
     /// row parse). Kept paired with that method so reviving the lazy
     /// path doesn't have to re-derive the rep+row best-of-two pick.
+    #[inline(always)]
     pub(crate) fn best_match_rl<K: RowTags, const ROW_LOG: usize>(
         &self,
         abs_pos: usize,
@@ -1384,10 +1717,11 @@ impl RowMatchGenerator {
         let rep = self.repcode_candidate(abs_pos, lit_len);
         // SAFETY: `K` selected by `dispatch_tag_kernel!` after `detect` confirmed
         // its ISA; `K::probe` upholds the per-tier feature contract.
-        let row = unsafe { K::probe::<ROW_LOG>(self, abs_pos, lit_len) };
+        let row = unsafe { K::probe::<ROW_LOG>(self, abs_pos, lit_len, None) };
         best_len_offset_candidate(rep, row)
     }
 
+    #[inline(always)]
     pub(crate) fn pick_lazy_match_rl<K: RowTags, const ROW_LOG: usize>(
         &self,
         abs_pos: usize,
@@ -1409,6 +1743,7 @@ impl RowMatchGenerator {
     }
 
     #[allow(dead_code)]
+    #[inline(always)]
     pub(crate) fn repcode_candidate(
         &self,
         abs_pos: usize,
@@ -1433,24 +1768,176 @@ impl RowMatchGenerator {
     // siblings directly with the type and const already bound. `skip` does
     // no tag compare, so it dispatches on `row_log` only.
     pub(crate) fn start_matching(&mut self, handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
-        dispatch_tag_kernel!(self.start_matching_k(handle_sequence))
+        // SAFETY: same per-tier umbrella contract as `start_matching_greedy`.
+        #[cfg(all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel_simd128"
+        ))]
+        {
+            // SAFETY: simd128 is a compile-time feature here; no runtime gate.
+            unsafe { dispatch_row_log!(self.lazy_simd128::<Simd128Tags>(handle_sequence)) }
+        }
+        #[cfg(not(all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel_simd128"
+        )))]
+        {
+            match self.tag_kernel {
+                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                FastpathKernel::Avx2Bmi2 => unsafe {
+                    dispatch_row_log!(self.lazy_avx2bmi2::<Avx2Bmi2Tags>(handle_sequence))
+                },
+                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                FastpathKernel::Sse42 => unsafe {
+                    dispatch_row_log!(self.lazy_sse42::<Sse42Tags>(handle_sequence))
+                },
+                #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+                FastpathKernel::Neon => unsafe {
+                    dispatch_row_log!(self.lazy_neon::<NeonTags>(handle_sequence))
+                },
+                // SAFETY: the scalar kernel has no `#[target_feature]`; the
+                // fn is `unsafe` only for macro uniformity.
+                FastpathKernel::Scalar => unsafe {
+                    dispatch_row_log!(self.lazy_scalar::<ScalarTags>(handle_sequence))
+                },
+            }
+        }
     }
-    fn start_matching_k<K: RowTags>(&mut self, handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
-        dispatch_row_log!(self.start_matching_rl::<K>(handle_sequence))
-    }
+
+    gen_lazy_monolith!(
+        lazy_scalar,
+        find_best_scalar,
+        false,
+        row_tag_mask_scalar,
+        crate::encoding::fastpath::scalar::common_prefix_len_ptr
+    );
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    gen_lazy_monolith!(
+        lazy_sse42,
+        find_best_sse42,
+        true,
+        row_tag_mask_sse2,
+        crate::encoding::fastpath::sse42::common_prefix_len_ptr,
+        "sse4.2"
+    );
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    gen_lazy_monolith!(
+        lazy_avx2bmi2,
+        find_best_avx2bmi2,
+        true,
+        row_tag_mask_avx2,
+        crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr,
+        "avx2,bmi2"
+    );
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    gen_lazy_monolith!(
+        lazy_neon,
+        find_best_neon,
+        true,
+        row_tag_mask_neon,
+        crate::encoding::fastpath::neon::common_prefix_len_ptr,
+        "neon"
+    );
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel_simd128"
+    ))]
+    gen_lazy_monolith!(
+        lazy_simd128,
+        find_best_simd128,
+        true,
+        row_tag_mask_simd128,
+        crate::encoding::fastpath::scalar::common_prefix_len_ptr
+    );
 
     pub(crate) fn start_matching_greedy(
         &mut self,
         handle_sequence: impl for<'a> FnMut(Sequence<'a>),
     ) {
-        dispatch_tag_kernel!(self.start_matching_greedy_k(handle_sequence))
+        // SAFETY: each `greedy_*` umbrella is entered only when its kernel
+        // was runtime-detected (`tag_kernel`), upholding the
+        // `#[target_feature]` contract; the wasm tier is compile-time.
+        #[cfg(all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel_simd128"
+        ))]
+        {
+            // SAFETY: simd128 is a compile-time feature here; no runtime gate.
+            unsafe { dispatch_row_log!(self.greedy_simd128::<Simd128Tags>(handle_sequence)) }
+        }
+        #[cfg(not(all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel_simd128"
+        )))]
+        {
+            match self.tag_kernel {
+                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                FastpathKernel::Avx2Bmi2 => unsafe {
+                    dispatch_row_log!(self.greedy_avx2bmi2::<Avx2Bmi2Tags>(handle_sequence))
+                },
+                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                FastpathKernel::Sse42 => unsafe {
+                    dispatch_row_log!(self.greedy_sse42::<Sse42Tags>(handle_sequence))
+                },
+                #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+                FastpathKernel::Neon => unsafe {
+                    dispatch_row_log!(self.greedy_neon::<NeonTags>(handle_sequence))
+                },
+                // SAFETY: the scalar kernel has no `#[target_feature]`; the
+                // fn is `unsafe` only for macro uniformity.
+                FastpathKernel::Scalar => unsafe {
+                    dispatch_row_log!(self.greedy_scalar::<ScalarTags>(handle_sequence))
+                },
+            }
+        }
     }
-    fn start_matching_greedy_k<K: RowTags>(
-        &mut self,
-        handle_sequence: impl for<'a> FnMut(Sequence<'a>),
-    ) {
-        dispatch_row_log!(self.start_matching_greedy_rl::<K>(handle_sequence))
-    }
+
+    gen_greedy_monolith!(
+        greedy_scalar,
+        false,
+        row_tag_mask_scalar,
+        crate::encoding::fastpath::scalar::common_prefix_len_ptr
+    );
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    gen_greedy_monolith!(
+        greedy_sse42,
+        true,
+        row_tag_mask_sse2,
+        crate::encoding::fastpath::sse42::common_prefix_len_ptr,
+        "sse4.2"
+    );
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    gen_greedy_monolith!(
+        greedy_avx2bmi2,
+        true,
+        row_tag_mask_avx2,
+        crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr,
+        "avx2,bmi2"
+    );
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    gen_greedy_monolith!(
+        greedy_neon,
+        true,
+        row_tag_mask_neon,
+        crate::encoding::fastpath::neon::common_prefix_len_ptr,
+        "neon"
+    );
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel_simd128"
+    ))]
+    gen_greedy_monolith!(
+        greedy_simd128,
+        true,
+        row_tag_mask_simd128,
+        crate::encoding::fastpath::scalar::common_prefix_len_ptr
+    );
 
     pub(crate) fn skip_matching_with_hint(&mut self, incompressible_hint: Option<bool>) {
         match self.row_log {
@@ -1503,9 +1990,9 @@ impl RowMatchGenerator {
         // SAFETY: `dispatch_tag_kernel!` only selects a `K` whose ISA `detect`
         // confirmed present, upholding `K::probe`'s per-tier feature contract.
         match self.row_log {
-            4 => unsafe { K::probe::<4>(self, abs_pos, lit_len) },
-            5 => unsafe { K::probe::<5>(self, abs_pos, lit_len) },
-            6 => unsafe { K::probe::<6>(self, abs_pos, lit_len) },
+            4 => unsafe { K::probe::<4>(self, abs_pos, lit_len, None) },
+            5 => unsafe { K::probe::<5>(self, abs_pos, lit_len, None) },
+            6 => unsafe { K::probe::<6>(self, abs_pos, lit_len, None) },
             _ => unreachable!("row_log is clamped to 4..=6 in configure()"),
         }
     }
@@ -1627,11 +2114,46 @@ impl RowMatchGenerator {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn insert_position<const ROW_LOG: usize>(&mut self, abs_pos: usize) {
         let Some((row, tag)) = self.hash_and_row(abs_pos) else {
             return;
         };
+        self.insert_at::<ROW_LOG>(abs_pos, row, tag);
+    }
+
+    /// Prefetch a row's tag bytes and position words into L1 ahead of the
+    /// next iteration's probe (no-op on targets without a prefetch hint).
+    #[inline]
+    fn prefetch_row<const ROW_LOG: usize>(&self, row: usize) {
+        let row_base = row << ROW_LOG;
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            #[cfg(target_arch = "x86")]
+            use core::arch::x86::{_MM_HINT_T0, _mm_prefetch};
+            #[cfg(target_arch = "x86_64")]
+            use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+            // SAFETY: prefetch is a hint and never faults; the indexes are in
+            // bounds by the same `ensure_tables` sizing as `insert_at`.
+            unsafe {
+                _mm_prefetch(self.row_tags.as_ptr().add(row_base).cast(), _MM_HINT_T0);
+                _mm_prefetch(
+                    self.row_positions.as_ptr().add(row_base).cast(),
+                    _MM_HINT_T0,
+                );
+            }
+        }
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        {
+            let _ = row_base;
+        }
+    }
+
+    /// [`Self::insert_position`] with the (row, tag) pair already computed —
+    /// the greedy miss path reuses the probe's hash instead of re-hashing
+    /// the same position.
+    #[inline(always)]
+    fn insert_at<const ROW_LOG: usize>(&mut self, abs_pos: usize, row: usize, tag: u8) {
         // `ROW_LOG` is the compile-time row width for this monomorphisation;
         // the dispatcher guarantees `ROW_LOG == self.row_log` so the table
         // bounds (`ensure_tables` sized by `self.row_log`) hold.
@@ -1726,6 +2248,7 @@ impl RowMatchGenerator {
         let row_log = self.row_log;
         let row_hash_log = self.row_hash_log;
         let hash_kernel = self.hash_kernel;
+        let key_len = self.mls.min(6);
         let history_start = self.history_start;
         let concat_len = self.history.len() - history_start;
         // Row hash needs `ROW_HASH_KEY_LEN` readable bytes of lookahead.
@@ -1758,13 +2281,14 @@ impl RowMatchGenerator {
         // is u32-bounded upstream).
         for concat in start_concat..safe_end {
             unsafe {
-                // Little-endian load to match the live probe's
-                // `u32::from_le_bytes` hash (`hash_and_row`); a native-endian
-                // load would bucket dict rows differently on big-endian targets
-                // and lose every attached-dict match there.
-                let value =
-                    u32::from_le((base.add(history_start + concat) as *const u32).read_unaligned())
-                        as u64;
+                // Same key reader as the live `hash_and_row` (width and
+                // endianness): any divergence buckets dict rows differently
+                // and loses every attached-dict match.
+                let value = Self::row_key_value(
+                    core::slice::from_raw_parts(base.add(history_start), concat_len),
+                    concat,
+                    key_len,
+                );
                 let hash = crate::encoding::fastpath::hash_mix_u64_with_kernel(hash_kernel, value);
                 let combined = hash >> (u64::BITS as usize - total_bits);
                 let row = ((combined >> ROW_TAG_BITS) as usize) & row_count_mask;

@@ -207,7 +207,26 @@ jobs:
             ZSTD_frameHeaderSize ZSTD_getFrameHeader ZSTD_getFrameHeader_advanced \
             ZSTD_findDecompressedSize ZSTD_decompressBound \
             ZDICT_trainFromBuffer ZDICT_finalizeDictionary ZDICT_getDictID \
-            ZDICT_getDictHeaderSize ZDICT_isError ZDICT_getErrorName; do
+            ZDICT_getDictHeaderSize ZDICT_isError ZDICT_getErrorName \
+            ZSTD_CCtx_loadDictionary ZSTD_CCtx_loadDictionary_byReference \
+            ZSTD_CCtx_loadDictionary_advanced ZSTD_CCtx_refCDict \
+            ZSTD_CCtx_refPrefix ZSTD_CCtx_refPrefix_advanced \
+            ZSTD_DCtx_loadDictionary ZSTD_DCtx_loadDictionary_byReference \
+            ZSTD_DCtx_loadDictionary_advanced ZSTD_DCtx_refDDict ZSTD_DCtx_refPrefix \
+            ZSTD_DCtx_refPrefix_advanced \
+            ZSTD_compress_usingCDict ZSTD_decompress_usingDDict \
+            ZSTD_createCDict ZSTD_createCDict_byReference ZSTD_freeCDict \
+            ZSTD_createDDict ZSTD_createDDict_byReference ZSTD_freeDDict \
+            ZSTD_sizeof_CDict ZSTD_sizeof_DDict \
+            ZSTD_getDictID_fromCDict ZSTD_getDictID_fromDDict \
+            ZSTD_compress_usingDict ZSTD_decompress_usingDict \
+            ZSTD_createCDict_advanced ZSTD_createDDict_advanced \
+            ZSTD_compress_usingCDict_advanced \
+            ZSTD_getDictID_fromDict ZSTD_getDictID_fromFrame \
+            ZSTD_estimateCCtxSize ZSTD_estimateCCtxSize_usingCParams \
+            ZSTD_estimateCStreamSize_usingCParams \
+            ZSTD_estimateDCtxSize ZSTD_estimateCStreamSize ZSTD_estimateDStreamSize \
+            ZDICT_trainFromBuffer_fastCover ZDICT_optimizeTrainFromBuffer_fastCover; do
             if ! grep -qx "$sym" <<<"$exported"; then
               echo "::error::symbol $sym not exported from $so"
               missing=1

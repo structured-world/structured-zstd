@@ -130,7 +130,7 @@ pub(crate) fn extend_backwards_shared(
 /// fallback) and return the best match found, if any. Hot path:
 /// invoked once per encoded byte on lazy / Dfast / Row matchers
 /// (~10% exclusive on the default-level profile).
-#[inline]
+#[inline(always)]
 pub(crate) fn repcode_candidate_shared(
     kernel: FastpathKernel,
     concat: &[u8],
@@ -185,9 +185,19 @@ pub(crate) fn repcode_candidate_shared(
                 // `candidate_idx < current_idx`.
                 if candidate_pos >= history_abs_start {
                     let candidate_idx = candidate_pos - history_abs_start;
-                    if concat[candidate_idx..candidate_idx + 4]
-                        == concat[current_idx..current_idx + 4]
-                    {
+                    // Donor `MEM_read32` gate: one unaligned u32 compare. The
+                    // slice-range form paid two bounds checks per rep probe
+                    // (per input byte on the greedy/lazy levels).
+                    // SAFETY: the entry guard established `current_idx +
+                    // min_match_len <= concat.len()` with `min_match_len >= 4`
+                    // (debug-asserted above), and `candidate_idx <
+                    // current_idx`, so both 4-byte reads are in bounds.
+                    let gate = unsafe {
+                        let base = concat.as_ptr();
+                        core::ptr::read_unaligned(base.add(candidate_idx).cast::<u32>())
+                            == core::ptr::read_unaligned(base.add(current_idx).cast::<u32>())
+                    };
+                    if gate {
                         let match_len = common_prefix_len_with_kernel(
                             kernel,
                             &concat[candidate_idx..],

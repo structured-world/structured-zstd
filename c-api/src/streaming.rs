@@ -109,12 +109,34 @@ impl ZSTD_CCtx {
             return Ok(());
         }
         let params = self.params;
-        let Some(resolved) = params.resolve() else {
-            return Err(ZSTD_ErrorCode::ZSTD_error_parameter_combination_unsupported);
+        // A referenced CDict's compression parameters win over the sticky
+        // knobs (upstream rule); other attaches keep the context level. The
+        // sticky knobs are resolved — and can reject — only when they will
+        // actually drive the frame.
+        let level = self.attach_level();
+        let params_from_cdict = self.attach_params_from_cdict();
+        let resolved = if params_from_cdict {
+            None
+        } else {
+            match params.resolve() {
+                Some(resolved) => Some(resolved),
+                None => {
+                    return Err(ZSTD_ErrorCode::ZSTD_error_parameter_combination_unsupported);
+                }
+            }
         };
-        let mut enc = StreamingEncoder::new(Vec::new(), CompressionLevel::from_level(params.level));
+        let suppress_id = self.attach_suppresses_dict_id();
+        let mut enc = StreamingEncoder::new(Vec::new(), CompressionLevel::from_level(level));
+        if self.has_attached_dict() {
+            self.apply_attached_dict_streaming(&mut enc)?;
+            if (suppress_id || !params.dict_id_flag) && enc.set_dictionary_id_flag(false).is_err() {
+                return Err(ZSTD_ErrorCode::ZSTD_error_GENERIC);
+            }
+        }
         let mut setup = || -> Result<(), codec::io::Error> {
-            enc.set_parameters(&resolved)?;
+            if let Some(resolved) = &resolved {
+                enc.set_parameters(resolved)?;
+            }
             enc.set_content_checksum(params.checksum_flag)?;
             if params.target_cblock_size > 0 {
                 enc.set_target_block_size(Some(params.target_cblock_size as u32))?;
@@ -134,6 +156,7 @@ impl ZSTD_CCtx {
             return Err(ZSTD_ErrorCode::ZSTD_error_GENERIC);
         }
         self.params.pledged_src_size = CONTENTSIZE_UNKNOWN;
+        self.consume_prefix();
         self.stream = Some(CStreamState {
             encoder: Some(enc),
             pending: Vec::new(),
@@ -349,6 +372,7 @@ pub unsafe extern "C" fn ZSTD_initCStream(zcs: *mut ZSTD_CCtx, compression_level
     cctx.dict_compressor = None;
     cctx.dict_serial = 0;
     cctx.dict_level = 0;
+    cctx.attached_dict = crate::attach::CCtxDictAttach::None;
     cctx.params.level = if compression_level == 0 {
         3
     } else {
@@ -504,11 +528,19 @@ pub unsafe extern "C" fn ZSTD_decompressStream(
                 // Idempotent, safe to reapply on every frame start.
                 dctx.decoder
                     .set_content_checksum(codec::decoding::ContentChecksum::Verify);
-                let reset = catch_unwind(AssertUnwindSafe(|| dctx.decoder.reset(&mut reader)));
+                // Context-attached dictionary (`ZSTD_DCtx_loadDictionary` /
+                // `refDDict` / `refPrefix`): start the frame against it; an
+                // attached prefix is single-use and consumed by this frame.
+                let attached = dctx.attached_handle();
+                let reset = catch_unwind(AssertUnwindSafe(|| match &attached {
+                    Some(handle) => dctx.decoder.reset_with_dict_handle(&mut reader, handle),
+                    None => dctx.decoder.reset(&mut reader),
+                }));
                 match reset {
                     Ok(Ok(())) => {
                         inp.pos = inp.size - reader.len();
                         dctx.stream_frame_done = false;
+                        dctx.consume_prefix();
                     }
                     Ok(Err(err)) => return encode(code_for_decoder_error(&err)),
                     Err(_) => {

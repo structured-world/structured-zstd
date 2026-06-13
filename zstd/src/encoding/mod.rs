@@ -37,6 +37,10 @@
 //!
 //! All produced frames are valid RFC 8878 Zstandard streams and decode
 //! through both this crate's [`crate::decoding`] module and upstream C zstd.
+//!
+//! For memory budgeting, [`estimated_compression_workspace_bytes`] reports
+//! the approximate steady-state heap footprint of a one-shot compression at
+//! a given level (window + match-finder tables + block staging).
 
 pub(crate) mod block_header;
 pub(crate) mod blocks;
@@ -92,7 +96,9 @@ mod streaming_encoder;
 pub use frame_compressor::{EncoderDictionary, FrameCompressor};
 #[cfg(feature = "lsm")]
 pub use frame_emit_info::{BlockType, FrameBlock, FrameEmitInfo};
-pub use match_generator::MatchGeneratorDriver;
+pub use match_generator::{
+    MatchGeneratorDriver, estimated_bt_strategy_extra_bytes, estimated_compression_workspace_bytes,
+};
 pub use parameters::{
     Bounds, CParameter, CompressionParameters, CompressionParametersBuilder, ParameterError,
     Strategy,
@@ -339,22 +345,6 @@ impl CompressionLevel {
             7 => Self::Better,
             11 => Self::Best,
             _ => Self::Level(level),
-        }
-    }
-
-    /// Numeric level a named preset is a shortcut for, so per-level config
-    /// (the `LevelParams` table) is resolved uniformly: named presets are
-    /// pure aliases, never a separate config path. `Uncompressed` is the
-    /// one genuine mode (raw blocks) with no numeric equivalent and returns
-    /// `None`.
-    pub(crate) const fn numeric_level(self) -> Option<i32> {
-        match self {
-            Self::Uncompressed => None,
-            Self::Fastest => Some(1),
-            Self::Default => Some(Self::DEFAULT_LEVEL),
-            Self::Better => Some(7),
-            Self::Best => Some(11),
-            Self::Level(n) => Some(n),
         }
     }
 }

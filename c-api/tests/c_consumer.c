@@ -13,6 +13,8 @@
  */
 #define ZSTD_STATIC_LINKING_ONLY /* expose the experimental frame-inspection API */
 #include <zstd.h>
+#define ZDICT_STATIC_LINKING_ONLY
+#include <zdict.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -168,6 +170,133 @@ int main(void) {
         free(sbuf);
         free(scomp);
         free(dbuf);
+    }
+
+    /* Dictionary attach surface: train, attach on both contexts, round-trip. */
+    {
+        /* Build dict-friendly samples (the random megabyte above doesn't
+         * train a useful dictionary). */
+        enum { NB_SAMPLES = 256, SAMPLE_MAX = 96 };
+        unsigned char *samples = (unsigned char *)malloc((size_t)NB_SAMPLES * SAMPLE_MAX);
+        size_t sizes[NB_SAMPLES];
+        if (!samples) return 2;
+        size_t total = 0;
+        for (int i = 0; i < NB_SAMPLES; i++) {
+            int len = snprintf((char *)samples + total, SAMPLE_MAX,
+                               "tenant=demo table=orders key=%d region=eu "
+                               "payload=aaaaabbbbbccccc\n",
+                               i);
+            if (len <= 0) return 33;
+            sizes[i] = (size_t)len;
+            total += (size_t)len;
+        }
+        unsigned char dict[16 * 1024];
+        size_t dict_len =
+            ZDICT_trainFromBuffer(dict, sizeof dict, samples, sizes, NB_SAMPLES);
+        if (ZDICT_isError(dict_len)) return 34;
+        if (ZSTD_getDictID_fromDict(dict, dict_len) == 0) return 35;
+
+        /* Payload from the same distribution. */
+        unsigned char payload[4096];
+        size_t payload_len = 0;
+        for (int i = 0; i < 40; i++) {
+            int len = snprintf((char *)payload + payload_len,
+                               sizeof payload - payload_len,
+                               "tenant=demo table=orders key=%d region=eu "
+                               "payload=aaaaabbbbbccccc\n",
+                               i);
+            if (len <= 0) return 33;
+            payload_len += (size_t)len;
+        }
+
+        ZSTD_CCtx *c = ZSTD_createCCtx();
+        ZSTD_DCtx *d = ZSTD_createDCtx();
+        if (!c || !d) return 36;
+        if (ZSTD_isError(ZSTD_CCtx_loadDictionary(c, dict, dict_len))) return 37;
+        unsigned char dframe[8192];
+        size_t dframe_len =
+            ZSTD_compress2(c, dframe, sizeof dframe, payload, payload_len);
+        if (ZSTD_isError(dframe_len)) return 38;
+        if (ZSTD_getDictID_fromFrame(dframe, dframe_len) !=
+            ZSTD_getDictID_fromDict(dict, dict_len))
+            return 39;
+        unsigned char dout[8192];
+        if (ZSTD_isError(ZSTD_DCtx_loadDictionary(d, dict, dict_len))) return 40;
+        size_t dread =
+            ZSTD_decompressDCtx(d, dout, sizeof dout, dframe, dframe_len);
+        if (ZSTD_isError(dread) || dread != payload_len ||
+            memcmp(dout, payload, payload_len) != 0)
+            return 41;
+
+        /* CDict / DDict reference attach. */
+        ZSTD_CDict *cdict = ZSTD_createCDict(dict, dict_len, 7);
+        ZSTD_DDict *ddict = ZSTD_createDDict(dict, dict_len);
+        if (!cdict || !ddict) return 42;
+        if (ZSTD_isError(ZSTD_CCtx_reset(c, ZSTD_reset_session_and_parameters)))
+            return 43;
+        if (ZSTD_isError(ZSTD_CCtx_refCDict(c, cdict))) return 44;
+        dframe_len = ZSTD_compress2(c, dframe, sizeof dframe, payload, payload_len);
+        if (ZSTD_isError(dframe_len)) return 45;
+        if (ZSTD_isError(ZSTD_DCtx_refDDict(d, ddict))) return 46;
+        dread = ZSTD_decompressDCtx(d, dout, sizeof dout, dframe, dframe_len);
+        if (ZSTD_isError(dread) || dread != payload_len ||
+            memcmp(dout, payload, payload_len) != 0)
+            return 47;
+
+        /* refPrefix is single-use raw content on both sides. */
+        if (ZSTD_isError(ZSTD_CCtx_reset(c, ZSTD_reset_session_and_parameters)))
+            return 43;
+        if (ZSTD_isError(ZSTD_CCtx_refPrefix(c, samples, total))) return 48;
+        dframe_len = ZSTD_compress2(c, dframe, sizeof dframe, payload, payload_len);
+        if (ZSTD_isError(dframe_len)) return 49;
+        if (ZSTD_getDictID_fromFrame(dframe, dframe_len) != 0) return 50;
+        if (ZSTD_isError(ZSTD_DCtx_refDDict(d, NULL))) return 46;
+        if (ZSTD_isError(ZSTD_DCtx_refPrefix(d, samples, total))) return 51;
+        dread = ZSTD_decompressDCtx(d, dout, sizeof dout, dframe, dframe_len);
+        if (ZSTD_isError(dread) || dread != payload_len ||
+            memcmp(dout, payload, payload_len) != 0)
+            return 52;
+
+        /* One-shot *_usingDict pair. */
+        dframe_len = ZSTD_compress_usingDict(c, dframe, sizeof dframe, payload,
+                                             payload_len, dict, dict_len, 5);
+        if (ZSTD_isError(dframe_len)) return 53;
+        dread = ZSTD_decompress_usingDict(d, dout, sizeof dout, dframe,
+                                          dframe_len, dict, dict_len);
+        if (ZSTD_isError(dread) || dread != payload_len ||
+            memcmp(dout, payload, payload_len) != 0)
+            return 54;
+
+        /* Estimates are non-zero, ordered budgets. */
+        if (ZSTD_estimateCCtxSize(3) == 0) return 55;
+        if (ZSTD_estimateCStreamSize(3) <= ZSTD_estimateCCtxSize(3)) return 56;
+        if (ZSTD_estimateDStreamSize(1 << 20) <= ZSTD_estimateDCtxSize()) return 57;
+
+        /* By-value ABI smoke: structs passed by value across the FFI must
+         * match the Rust-side layout (a drift would misread every field). */
+        {
+            ZSTD_compressionParameters cp = {20, 17, 17, 1, 5, 0, ZSTD_dfast};
+            size_t est = ZSTD_estimateCCtxSize_usingCParams(cp);
+            if (ZSTD_isError(est) || est < ((size_t)1 << 20)) return 58;
+
+            ZDICT_fastCover_params_t fcp;
+            memset(&fcp, 0, sizeof fcp);
+            fcp.k = 256;
+            fcp.d = 8;
+            fcp.f = 20;
+            fcp.accel = 1;
+            unsigned char fdict[16 * 1024];
+            size_t fdict_len = ZDICT_trainFromBuffer_fastCover(
+                fdict, sizeof fdict, samples, sizes, NB_SAMPLES, fcp);
+            if (ZDICT_isError(fdict_len)) return 59;
+            if (ZSTD_getDictID_fromDict(fdict, fdict_len) == 0) return 60;
+        }
+
+        ZSTD_freeCDict(cdict);
+        ZSTD_freeDDict(ddict);
+        ZSTD_freeCCtx(c);
+        ZSTD_freeDCtx(d);
+        free(samples);
     }
 
     free(input);
