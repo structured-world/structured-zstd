@@ -17,8 +17,8 @@ use super::bt::BtMatcher;
 #[cfg(test)]
 use super::cost_model::HC_MAX_LIT;
 use super::cost_model::{
-    HC_BITCOST_MULTIPLIER, HC_FORMAT_MINMATCH, HC_OPT_NUM, HC_PREDEF_THRESHOLD, HcOptState,
-    HcOptimalCostProfile,
+    HC_BITCOST_MULTIPLIER, HC_FORMAT_MINMATCH, HC_OPT_NODE_LEN, HC_OPT_NUM, HC_OPT_PRICE_ARENA_LEN,
+    HC_OPT_PRICE_STRIDE, HC_PREDEF_THRESHOLD, HcOptState, HcOptimalCostProfile,
 };
 #[cfg(test)]
 use super::cost_model::{HC_BLOCKSIZE_MAX, HC_MAX_LL, HC_MAX_ML, HC_MAX_OFF, HcOptPriceType};
@@ -3551,10 +3551,13 @@ macro_rules! build_optimal_plan_impl_body {
             <$strategy_ty as super::strategy::Strategy>::OPT_LEVEL == 0;
         let opt_level: bool = <$strategy_ty as super::strategy::Strategy>::OPT_LEVEL >= 2;
         let mut nodes = core::mem::take(&mut $self.backend.bt_mut().opt_nodes_scratch);
-        // `frontier_limit + 2 <= HC_OPT_NUM + 1` — bounded by const.
+        // `frontier_limit + 2 <= HC_OPT_NODE_LEN` — bounded by const.
         let frontier_buffer_size = frontier_limit + 2;
-        if nodes.len() < frontier_buffer_size {
-            nodes.resize(frontier_buffer_size, HcOptimalNode::default());
+        if nodes.len() < HC_OPT_NODE_LEN {
+            // First optimal-parse use (empty boxed slice) or an undersized
+            // buffer: allocate the fixed donor-sized frontier once. The DP
+            // overwrites the active prefix before reading it.
+            nodes = alloc::vec![HcOptimalNode::default(); HC_OPT_NODE_LEN].into_boxed_slice();
         }
         let mut candidates = core::mem::take(&mut $self.backend.bt_mut().opt_candidates_scratch);
         candidates.clear();
@@ -3563,13 +3566,42 @@ macro_rules! build_optimal_plan_impl_body {
         }
         let mut store = core::mem::take(&mut $self.backend.bt_mut().opt_store_scratch);
         store.clear();
-        let mut ll_prices = core::mem::take(&mut $self.backend.bt_mut().opt_ll_price_scratch);
-        let mut ll_price_generations =
-            core::mem::take(&mut $self.backend.bt_mut().opt_ll_price_generation);
-        if ll_prices.len() <= frontier_limit {
-            ll_prices.resize(frontier_limit + 1, 0);
-            ll_price_generations.resize(frontier_limit + 1, 0);
+        let mut price_arena = core::mem::take(&mut $self.backend.bt_mut().opt_price_arena);
+        if price_arena.len() < HC_OPT_PRICE_ARENA_LEN {
+            price_arena = alloc::vec![0u32; HC_OPT_PRICE_ARENA_LEN].into_boxed_slice();
         }
+        // Single arena → four disjoint fixed-stride regions (LL price, LL
+        // generation, ML price, ML generation): one base pointer + fixed
+        // offsets, mirroring the donor's single opt workspace.
+        // SAFETY: `price_arena` is exactly `HC_OPT_PRICE_ARENA_LEN =
+        // 4 * HC_OPT_PRICE_STRIDE` long (just ensured), so the four
+        // STRIDE-wide regions are in bounds and pairwise disjoint. The
+        // slices alias the heap buffer `price_arena` owns; that heap
+        // address is stable across the later move of the `price_arena` box
+        // into the result bundle (a `Box` move relocates only the pointer,
+        // not the heap data), and the slices are never used after the
+        // bundle is constructed. The fixed STRIDE (independent of
+        // `frontier_limit`) keeps every position's price/generation cell at
+        // a constant offset so the monotonic stamps stay valid across calls
+        // with different frontiers.
+        let arena_base = price_arena.as_mut_ptr();
+        let mut ll_prices: &mut [u32] =
+            unsafe { core::slice::from_raw_parts_mut(arena_base, HC_OPT_PRICE_STRIDE) };
+        let mut ll_price_generations: &mut [u32] = unsafe {
+            core::slice::from_raw_parts_mut(arena_base.add(HC_OPT_PRICE_STRIDE), HC_OPT_PRICE_STRIDE)
+        };
+        let mut ml_prices: &mut [u32] = unsafe {
+            core::slice::from_raw_parts_mut(
+                arena_base.add(2 * HC_OPT_PRICE_STRIDE),
+                HC_OPT_PRICE_STRIDE,
+            )
+        };
+        let mut ml_price_generations: &mut [u32] = unsafe {
+            core::slice::from_raw_parts_mut(
+                arena_base.add(3 * HC_OPT_PRICE_STRIDE),
+                HC_OPT_PRICE_STRIDE,
+            )
+        };
         $self.backend.bt_mut().opt_ll_price_stamp = $self
             .backend
             .bt_mut()
@@ -3584,13 +3616,6 @@ macro_rules! build_optimal_plan_impl_body {
             .wrapping_add(1)
             .max(1);
         let lit_price_stamp = $self.backend.bt_mut().opt_lit_price_stamp;
-        let mut ml_prices = core::mem::take(&mut $self.backend.bt_mut().opt_ml_price_scratch);
-        let mut ml_price_generations =
-            core::mem::take(&mut $self.backend.bt_mut().opt_ml_price_generation);
-        if ml_prices.len() <= frontier_limit {
-            ml_prices.resize(frontier_limit + 1, 0);
-            ml_price_generations.resize(frontier_limit + 1, 0);
-        }
         $self.backend.bt_mut().opt_ml_price_stamp = $self
             .backend
             .bt_mut()
@@ -3699,7 +3724,7 @@ macro_rules! build_optimal_plan_impl_body {
             if !candidates.is_empty() {
                 // `min_match_len >= HC_FORMAT_MINMATCH (3)` by invariant.
                 last_pos = (min_match_len - 1).min(frontier_limit);
-                for p in 1..min_match_len.min(nodes.len()) {
+                for p in 1..min_match_len.min(frontier_buffer_size) {
                     BtMatcher::reset_opt_node(&mut nodes[p]);
                     // `initial_litlen` is the litlen carried from prior
                     // optimal-plan segments — its real bound is the
@@ -3748,7 +3773,7 @@ macro_rules! build_optimal_plan_impl_body {
                         litlen: 0,
                         reps: initial_reps,
                     };
-                    if longest_len < nodes.len() && forced_price < nodes[longest_len].price {
+                    if longest_len < frontier_buffer_size && forced_price < nodes[longest_len].price {
                         nodes[longest_len] = forced_state;
                     }
                     forced_end = Some(longest_len);
@@ -3778,7 +3803,7 @@ macro_rules! build_optimal_plan_impl_body {
                     );
                     let off_price = profile
                         .offset_price_for::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>($stats, off_base);
-                    debug_assert!(max_match_len < nodes.len());
+                    debug_assert!(max_match_len < frontier_buffer_size);
                     let nodes0_price = nodes[0].price;
                     for match_len in (start_len..=max_match_len).rev() {
                         let ml_price = BtMatcher::cached_match_length_price(
@@ -3813,13 +3838,13 @@ macro_rules! build_optimal_plan_impl_body {
                     }
                     prev_max_len = prev_max_len.max(max_match_len);
                 }
-                if last_pos + 1 < nodes.len() {
+                if last_pos + 1 < frontier_buffer_size {
                     nodes[last_pos + 1].price = u32::MAX;
                 }
             }
         }
         while !seed_forced_shortest_path && pos <= last_pos && pos <= frontier_limit {
-            debug_assert!(pos + 1 < nodes.len());
+            debug_assert!(pos + 1 < frontier_buffer_size);
             let prev_node = unsafe { *nodes.get_unchecked(pos - 1) };
             if prev_node.price != u32::MAX {
                 let lit_len = prev_node.litlen as usize + 1;
@@ -4060,7 +4085,7 @@ macro_rules! build_optimal_plan_impl_body {
                 );
                 let off_price = profile
                     .offset_price_for::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>($stats, off_base);
-                debug_assert!(pos + max_match_len < nodes.len());
+                debug_assert!(pos + max_match_len < frontier_buffer_size);
                 for match_len in (start_len..=max_match_len).rev() {
                     let next = pos + match_len;
                     let ml_price = BtMatcher::cached_match_length_price(
@@ -4097,7 +4122,7 @@ macro_rules! build_optimal_plan_impl_body {
                 prev_max_len = prev_max_len.max(max_match_len);
             }
 
-            if last_pos + 1 < nodes.len() {
+            if last_pos + 1 < frontier_buffer_size {
                 unsafe {
                     nodes.get_unchecked_mut(last_pos + 1).price = u32::MAX;
                 }
@@ -4113,10 +4138,7 @@ macro_rules! build_optimal_plan_impl_body {
                         nodes,
                         candidates,
                         store,
-                        ll_prices,
-                        ll_price_generations,
-                        ml_prices,
-                        ml_price_generations,
+                        price_arena,
                     },
                     (price, initial_reps, initial_litlen, 0),
                 );
@@ -4155,10 +4177,7 @@ macro_rules! build_optimal_plan_impl_body {
                     nodes,
                     candidates,
                     store,
-                    ll_prices,
-                    ll_price_generations,
-                    ml_prices,
-                    ml_price_generations,
+                    price_arena,
                 },
                 (price, initial_reps, next_litlen, 1),
             );
@@ -4176,10 +4195,7 @@ macro_rules! build_optimal_plan_impl_body {
                     nodes,
                     candidates,
                     store,
-                    ll_prices,
-                    ll_price_generations,
-                    ml_prices,
-                    ml_price_generations,
+                    price_arena,
                 },
                 (u32::MAX, initial_reps, initial_litlen, $current_len),
             );
@@ -4191,10 +4207,7 @@ macro_rules! build_optimal_plan_impl_body {
                     nodes,
                     candidates,
                     store,
-                    ll_prices,
-                    ll_price_generations,
-                    ml_prices,
-                    ml_price_generations,
+                    price_arena,
                 },
                 (
                     last_stretch.price,
@@ -4222,10 +4235,7 @@ macro_rules! build_optimal_plan_impl_body {
                         nodes,
                         candidates,
                         store,
-                        ll_prices,
-                        ll_price_generations,
-                        ml_prices,
-                        ml_price_generations,
+                        price_arena,
                     },
                     (
                         last_stretch.price,
@@ -4318,10 +4328,7 @@ macro_rules! build_optimal_plan_impl_body {
                 nodes,
                 candidates,
                 store,
-                ll_prices,
-                ll_price_generations,
-                ml_prices,
-                ml_price_generations,
+                price_arena,
             },
             result,
         )

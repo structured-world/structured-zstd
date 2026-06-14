@@ -41,8 +41,10 @@ pub(crate) struct BtMatcher {
     /// Donor `optStatePtr_t` — Huffman / FSE-derived literal and
     /// sequence-symbol cost tables that drive the optimal parser.
     pub(crate) opt_state: HcOptState,
-    /// Per-frame scratch for the optimal-parse node stream.
-    pub(crate) opt_nodes_scratch: Vec<HcOptimalNode>,
+    /// Per-frame scratch for the optimal-parse node stream. Fixed-size
+    /// boxed slice (no `cap` field, no in-parse `resize`/realloc) sized to
+    /// `HC_OPT_NODE_LEN`, mirroring the donor's fixed `opt[ZSTD_OPT_NUM]`.
+    pub(crate) opt_nodes_scratch: alloc::boxed::Box<[HcOptimalNode]>,
     /// Per-frame scratch for collected match candidates.
     pub(crate) opt_candidates_scratch: Vec<MatchCandidate>,
     /// Per-frame scratch for the final emitted node stream.
@@ -51,18 +53,18 @@ pub(crate) struct BtMatcher {
     pub(crate) opt_segment_plan_scratch: Vec<HcOptimalSequence>,
     /// `btultra2` seed-pass plan buffer.
     pub(crate) opt_seed_plan_scratch: Vec<HcOptimalSequence>,
-    /// Cached literal-length cost lookup; `generation` is a stale-tag
-    /// vector and `stamp` is the current frame's generation counter.
-    pub(crate) opt_ll_price_scratch: Vec<u32>,
-    pub(crate) opt_ll_price_generation: Vec<u32>,
+    /// Single backing allocation for the four frontier-sized LL/ML price
+    /// and generation arrays (see [`HcOptimalPlanBuffers::price_arena`]).
+    /// Replaces four separate `Vec<u32>` with one boxed slice split into
+    /// fixed-stride regions: one base pointer + offsets, like the donor's
+    /// single opt workspace. `stamp` counters are the per-pass generation
+    /// tags that let the parser skip re-zeroing the price cells.
+    pub(crate) opt_price_arena: alloc::boxed::Box<[u32]>,
     pub(crate) opt_ll_price_stamp: u32,
     /// Cached literal-symbol cost lookup (per-symbol fixed array).
     pub(crate) opt_lit_price_scratch: [u32; HC_MAX_LIT + 1],
     pub(crate) opt_lit_price_generation: [u32; HC_MAX_LIT + 1],
     pub(crate) opt_lit_price_stamp: u32,
-    /// Cached match-length cost lookup.
-    pub(crate) opt_ml_price_scratch: Vec<u32>,
-    pub(crate) opt_ml_price_generation: Vec<u32>,
     pub(crate) opt_ml_price_stamp: u32,
     /// Long-distance match (LDM) candidates seeded into the optimal
     /// parser. Built per-block during `start_matching_optimal` and
@@ -143,19 +145,19 @@ impl BtMatcher {
     pub(crate) fn new() -> Self {
         Self {
             opt_state: HcOptState::new(),
-            opt_nodes_scratch: Vec::new(),
+            // Empty boxed slices: no allocation until the optimal parser
+            // first runs (non-BT strategies never touch these), matching
+            // the prior lazy `Vec::new()` + grow behaviour.
+            opt_nodes_scratch: alloc::boxed::Box::default(),
             opt_candidates_scratch: Vec::new(),
             opt_store_scratch: Vec::new(),
             opt_segment_plan_scratch: Vec::new(),
             opt_seed_plan_scratch: Vec::new(),
-            opt_ll_price_scratch: Vec::new(),
-            opt_ll_price_generation: Vec::new(),
+            opt_price_arena: alloc::boxed::Box::default(),
             opt_ll_price_stamp: 0,
             opt_lit_price_scratch: [0; HC_MAX_LIT + 1],
             opt_lit_price_generation: [0; HC_MAX_LIT + 1],
             opt_lit_price_stamp: 0,
-            opt_ml_price_scratch: Vec::new(),
-            opt_ml_price_generation: Vec::new(),
             opt_ml_price_stamp: 0,
             ldm_sequences: Vec::new(),
             #[cfg(feature = "hash")]
@@ -168,16 +170,12 @@ impl BtMatcher {
     /// (counted by the owner's `size_of`), so only the `Vec` fields contribute.
     pub(crate) fn heap_size(&self) -> usize {
         let u32_sz = core::mem::size_of::<u32>();
-        let scratch = self.opt_nodes_scratch.capacity() * core::mem::size_of::<HcOptimalNode>()
+        let scratch = self.opt_nodes_scratch.len() * core::mem::size_of::<HcOptimalNode>()
             + self.opt_candidates_scratch.capacity() * core::mem::size_of::<MatchCandidate>()
             + self.opt_store_scratch.capacity() * core::mem::size_of::<HcOptimalNode>()
             + (self.opt_segment_plan_scratch.capacity() + self.opt_seed_plan_scratch.capacity())
                 * core::mem::size_of::<HcOptimalSequence>()
-            + (self.opt_ll_price_scratch.capacity()
-                + self.opt_ll_price_generation.capacity()
-                + self.opt_ml_price_scratch.capacity()
-                + self.opt_ml_price_generation.capacity())
-                * u32_sz
+            + self.opt_price_arena.len() * u32_sz
             + self.ldm_sequences.capacity() * core::mem::size_of::<HcRawSeq>();
         // The LDM producer is only present under the `hash` feature.
         #[cfg(feature = "hash")]
@@ -191,20 +189,23 @@ impl BtMatcher {
     /// drops cached price stamps.
     pub(crate) fn reset(&mut self) {
         self.opt_state.reset();
-        self.opt_nodes_scratch.clear();
+        // The fixed-size `opt_nodes_scratch` / `opt_price_arena` boxed
+        // slices persist across resets (no realloc churn). Per-block
+        // correctness comes from the DP re-initialising the node frontier
+        // it reads and from the generation stamps marking stale price
+        // cells. The LL/ML stamps stay MONOTONIC across resets (never
+        // zeroed): stale generation cells in the persistent arena carry
+        // older, smaller stamps and so can never falsely match the next
+        // pass — zeroing the stamp would risk a stale cell aliasing the
+        // fresh value `1`. The inline lit price/generation arrays are
+        // small and stay zeroed (self-consistent stamp reset).
         self.opt_candidates_scratch.clear();
         self.opt_store_scratch.clear();
         self.opt_segment_plan_scratch.clear();
         self.opt_seed_plan_scratch.clear();
-        self.opt_ll_price_scratch.clear();
-        self.opt_ll_price_generation.clear();
-        self.opt_ll_price_stamp = 0;
         self.opt_lit_price_scratch = [0; HC_MAX_LIT + 1];
         self.opt_lit_price_generation = [0; HC_MAX_LIT + 1];
         self.opt_lit_price_stamp = 0;
-        self.opt_ml_price_scratch.clear();
-        self.opt_ml_price_generation.clear();
-        self.opt_ml_price_stamp = 0;
         self.ldm_sequences.clear();
         #[cfg(feature = "hash")]
         if let Some(producer) = self.ldm_producer.as_mut() {
@@ -361,19 +362,13 @@ impl BtMatcher {
             nodes,
             mut candidates,
             store,
-            ll_prices,
-            ll_price_generations,
-            ml_prices,
-            ml_price_generations,
+            price_arena,
         } = buffers;
         candidates.clear();
         self.opt_nodes_scratch = nodes;
         self.opt_candidates_scratch = candidates;
         self.opt_store_scratch = store;
-        self.opt_ll_price_scratch = ll_prices;
-        self.opt_ll_price_generation = ll_price_generations;
-        self.opt_ml_price_scratch = ml_prices;
-        self.opt_ml_price_generation = ml_price_generations;
+        self.opt_price_arena = price_arena;
         result
     }
 
@@ -674,10 +669,8 @@ impl BtMatcher {
             return profile.lit_length_price(stats, lit_len);
         }
         // SAFETY: the early-return above proves `lit_len < prices.len()`. The
-        // matching `generations` slice is sized identically by the caller in
-        // `build_optimal_plan_impl` (`opt_ll_price_scratch` /
-        // `opt_ll_price_generation` are `resize`d together), so the same
-        // index is in bounds for both.
+        // caller carves `prices` and `generations` as two equal `HC_OPT_PRICE_STRIDE`
+        // wide regions of the same price arena, so the index is in bounds for both.
         unsafe {
             if *generations.get_unchecked(lit_len) == stamp {
                 return *prices.get_unchecked(lit_len);
@@ -724,9 +717,9 @@ impl BtMatcher {
         if match_len >= prices.len() {
             return profile.match_length_price(stats, match_len);
         }
-        // SAFETY: see `cached_lit_length_price` — the caller co-sizes
-        // `opt_ml_price_scratch` and `opt_ml_price_generation`, and the
-        // early return proves `match_len < prices.len()`.
+        // SAFETY: see `cached_lit_length_price` — the caller carves `prices`
+        // and `generations` as two equal-width regions of the price arena,
+        // and the early return proves `match_len < prices.len()`.
         unsafe {
             if *generations.get_unchecked(match_len) == stamp {
                 return *prices.get_unchecked(match_len);
