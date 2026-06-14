@@ -270,10 +270,13 @@ const ROW_CONFIG: RowConfig = RowConfig {
 // The shared `ROW_CONFIG` (row_log=5, search_depth=16, target_len=48) ran a
 // level-12-grade search here: 16 slots per row, never early-exiting until a
 // 48-byte match. That exhaustive walk was the dominant cost in greedy L5's
-// encode-speed regression vs FFI. `hash_bits` stays at the `ROW_HASH_BITS`
-// cap (the row table size is a separate budget).
+// encode-speed regression vs FFI. `hash_bits` matches upstream zstd's
+// `ZSTD_getCParams(5, .., 0).hashLog` = 19 (verified via
+// `donor_cparams_check 5`), so the row table is the same width as upstream's
+// (2^19 slots); the previous `ROW_HASH_BITS` (20) doubled both row tables vs
+// upstream, the dominant peak-memory excess on the greedy band.
 const ROW_L5: RowConfig = RowConfig {
-    hash_bits: ROW_HASH_BITS,
+    hash_bits: 19,
     row_log: 4,
     search_depth: 8,
     target_len: 2,
@@ -878,9 +881,9 @@ fn adjust_params_for_source_size(mut params: LevelParams, src_size: u64) -> Leve
     // zeroing a window-sized table per frame; large inputs keep the level's
     // widths. The cap is applied with the same per-backend headroom the
     // level table uses, so the load factor (and match quality) is unchanged.
-    // The Row / Dfast backends derive their table widths from the source in
-    // `reset` (their `set_hash_bits` recomputes there), so they are not
-    // adjusted here.
+    // The Dfast backend derives its table widths from the source in `reset`
+    // (`set_hash_bits` recomputes there), so it is not adjusted here. The Row
+    // backend's width IS capped here, mirroring the donor (see the Row branch).
     let table_log = raw_src_log.max(MIN_WINDOW_LOG);
     let backend = params.backend();
     if backend == super::strategy::BackendTag::HashChain {
@@ -893,6 +896,22 @@ fn adjust_params_for_source_size(mut params: LevelParams, src_size: u64) -> Leve
         }
         if (table_log + 1) < hc.chain_log as u8 {
             hc.chain_log = (table_log + 1) as usize;
+        }
+    } else if backend == super::strategy::BackendTag::Row {
+        let row = params
+            .row
+            .as_mut()
+            .expect("Row level row carries a RowConfig");
+        // Upstream zstd `ZSTD_adjustCParams_internal` (zstd_compress.c): once
+        // the window is source-capped, `hashLog <= windowLog + 1`. The row
+        // table is `2^hash_bits` slots, exactly upstream's row hashTable
+        // `2^hashLog` slots, so the same cap applies. Without it the row table
+        // stays at the level's unbounded width (e.g. L12 hash_bits 23 = 4x
+        // upstream's source-capped 21), the dominant peak-memory excess on the
+        // row band.
+        let row_cap = (table_log + 1) as usize;
+        if row_cap < row.hash_bits {
+            row.hash_bits = row_cap;
         }
     } else if backend == super::strategy::BackendTag::Simple {
         let fast = params
@@ -8048,9 +8067,10 @@ fn driver_small_source_hint_shrinks_row_hash_tables() {
     driver.commit_space(space);
     driver.skip_matching_with_hint(None);
     let full_rows = driver.row_matcher().row_heads.len();
-    // Level 5 uses the donor row_log (clamp(searchLog=3, 4, 6) = 4), not the
-    // shared ROW_LOG, so the row count is 1 << (hash_bits - ROW_L5.row_log).
-    assert_eq!(full_rows, 1 << (ROW_HASH_BITS - ROW_L5.row_log));
+    // Level 5 uses the upstream row_log (clamp(searchLog=3, 4, 6) = 4) and the
+    // upstream L5 hashLog (`ZSTD_getCParams(5,..).hashLog` = 19), so the row
+    // count is 1 << (ROW_L5.hash_bits - ROW_L5.row_log).
+    assert_eq!(full_rows, 1 << (ROW_L5.hash_bits - ROW_L5.row_log));
 
     driver.set_source_size_hint(1024);
     driver.reset(CompressionLevel::Level(5));
