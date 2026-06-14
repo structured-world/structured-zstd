@@ -182,6 +182,16 @@ pub unsafe extern "C" fn ZSTD_freeCStream(zcs: *mut ZSTD_CCtx) -> usize {
     unsafe { crate::context::ZSTD_freeCCtx(zcs) }
 }
 
+/// `size_t ZSTD_sizeof_CStream(const ZSTD_CStream* zcs)` — `ZSTD_CStream`
+/// is the same object as a `ZSTD_CCtx`, so this is `ZSTD_sizeof_CCtx`.
+///
+/// # Safety
+/// Same as [`ZSTD_freeCStream`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_sizeof_CStream(zcs: *const ZSTD_CCtx) -> usize {
+    unsafe { crate::context::ZSTD_sizeof_CCtx(zcs) }
+}
+
 /// `size_t ZSTD_CStreamInSize(void)` — recommended input granule
 /// (`ZSTD_BLOCKSIZE_MAX`).
 #[unsafe(no_mangle)]
@@ -448,6 +458,16 @@ pub extern "C" fn ZSTD_createDStream() -> *mut ZSTD_DCtx {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ZSTD_freeDStream(zds: *mut ZSTD_DCtx) -> usize {
     unsafe { crate::context::ZSTD_freeDCtx(zds) }
+}
+
+/// `size_t ZSTD_sizeof_DStream(const ZSTD_DStream* zds)` — `ZSTD_DStream`
+/// is the same object as a `ZSTD_DCtx`, so this is `ZSTD_sizeof_DCtx`.
+///
+/// # Safety
+/// Same as [`ZSTD_freeDStream`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_sizeof_DStream(zds: *const ZSTD_DCtx) -> usize {
+    unsafe { crate::context::ZSTD_sizeof_DCtx(zds) }
 }
 
 /// `size_t ZSTD_DStreamInSize(void)` — recommended input granule

@@ -20,8 +20,8 @@ use crate::frame::{
 };
 use crate::simple::{
     ZSTD_compress, ZSTD_compressBound, ZSTD_decompress, ZSTD_defaultCLevel,
-    ZSTD_findFrameCompressedSize, ZSTD_getFrameContentSize, ZSTD_maxCLevel, ZSTD_minCLevel,
-    ZSTD_versionNumber,
+    ZSTD_findFrameCompressedSize, ZSTD_getDecompressedSize, ZSTD_getFrameContentSize,
+    ZSTD_maxCLevel, ZSTD_minCLevel, ZSTD_versionNumber,
 };
 
 fn sample(len: usize) -> Vec<u8> {
@@ -50,6 +50,15 @@ fn simple_roundtrips_one_mib() {
 
     let declared = unsafe { ZSTD_getFrameContentSize(compressed.as_ptr(), csize) };
     assert_eq!(declared, input.len() as u64);
+    // The deprecated alias agrees on known sizes and collapses the
+    // unknown/error sentinels to 0 (garbage header → 0, not a sentinel).
+    let legacy = unsafe { ZSTD_getDecompressedSize(compressed.as_ptr(), csize) };
+    assert_eq!(legacy, input.len() as u64);
+    let garbage = [0u8; 3];
+    assert_eq!(
+        unsafe { ZSTD_getDecompressedSize(garbage.as_ptr(), garbage.len()) },
+        0
+    );
 
     let mut restored = vec![0u8; input.len()];
     let dsize = unsafe {
@@ -588,6 +597,30 @@ use crate::streaming::{
     ZSTD_outBuffer,
 };
 use core::ffi::c_int;
+
+#[test]
+fn stream_sizeof_aliases_match_context_sizeof() {
+    // ZSTD_CStream / ZSTD_DStream are the same objects as the contexts, so
+    // the stream sizeof entry points must agree with the context ones.
+    let cctx = crate::context::ZSTD_createCCtx();
+    let dctx = crate::context::ZSTD_createDCtx();
+    // Both `sizeof` calls return 0 on a NULL handle, so the equality checks
+    // would pass vacuously if creation failed — assert non-NULL first.
+    assert!(!cctx.is_null(), "ZSTD_createCCtx returned NULL");
+    assert!(!dctx.is_null(), "ZSTD_createDCtx returned NULL");
+    unsafe {
+        assert_eq!(
+            crate::streaming::ZSTD_sizeof_CStream(cctx),
+            crate::context::ZSTD_sizeof_CCtx(cctx)
+        );
+        assert_eq!(
+            crate::streaming::ZSTD_sizeof_DStream(dctx),
+            crate::context::ZSTD_sizeof_DCtx(dctx)
+        );
+        crate::context::ZSTD_freeCCtx(cctx);
+        crate::context::ZSTD_freeDCtx(dctx);
+    }
+}
 
 // ABI invariants: struct sizes match upstream `sizeof` per pointer width
 // (`size_t` / pointers halve the layouts on 32-bit).

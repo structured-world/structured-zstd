@@ -168,6 +168,24 @@ pub unsafe extern "C" fn ZSTD_getFrameContentSize(src: *const u8, src_size: usiz
     }
 }
 
+/// `unsigned long long ZSTD_getDecompressedSize(const void* src, size_t
+/// srcSize)` — DEPRECATED upstream alias of [`ZSTD_getFrameContentSize`]
+/// that collapses both `CONTENTSIZE_UNKNOWN` and `CONTENTSIZE_ERROR` to
+/// `0` (the pre-1.3 contract; kept because the symbol is still part of the
+/// stable `ZSTDLIB_API` surface).
+///
+/// # Safety
+/// `src` must be valid for `src_size` bytes (or `NULL` with `src_size == 0`).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ZSTD_getDecompressedSize(src: *const u8, src_size: usize) -> u64 {
+    let size = unsafe { ZSTD_getFrameContentSize(src, src_size) };
+    if size == CONTENTSIZE_UNKNOWN || size == CONTENTSIZE_ERROR {
+        0
+    } else {
+        size
+    }
+}
+
 /// `size_t ZSTD_findFrameCompressedSize(const void* src, size_t srcSize)`.
 ///
 /// Returns the on-disk size of the first frame in `src` (so a caller can step
