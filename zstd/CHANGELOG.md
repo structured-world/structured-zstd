@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.38](https://github.com/structured-world/structured-zstd/compare/v0.0.37...v0.0.38) - 2026-06-14
+
+### Added
+
+- *(c-api)* complete the stable ZSTDLIB_API surface + btopt/btultra perf ([#413](https://github.com/structured-world/structured-zstd/pull/413))
+
 ## [0.0.37](https://github.com/structured-world/structured-zstd/compare/v0.0.36...v0.0.37) - 2026-06-13
 
 ### Added
