@@ -43,7 +43,7 @@ pub(crate) struct BtMatcher {
     pub(crate) opt_state: HcOptState,
     /// Per-frame scratch for the optimal-parse node stream. Fixed-size
     /// boxed slice (no `cap` field, no in-parse `resize`/realloc) sized to
-    /// `HC_OPT_NODE_LEN`, mirroring the donor's fixed `opt[ZSTD_OPT_NUM]`.
+    /// `HC_OPT_NODE_LEN`, mirroring upstream zstd's fixed `opt[ZSTD_OPT_NUM]`.
     pub(crate) opt_nodes_scratch: alloc::boxed::Box<[HcOptimalNode]>,
     /// Per-frame scratch for collected match candidates.
     pub(crate) opt_candidates_scratch: Vec<MatchCandidate>,
@@ -53,13 +53,13 @@ pub(crate) struct BtMatcher {
     pub(crate) opt_segment_plan_scratch: Vec<HcOptimalSequence>,
     /// `btultra2` seed-pass plan buffer.
     pub(crate) opt_seed_plan_scratch: Vec<HcOptimalSequence>,
-    /// Single backing allocation for the four frontier-sized LL/ML price
-    /// and generation arrays (see [`HcOptimalPlanBuffers::price_arena`]).
-    /// Replaces four separate `Vec<u32>` with one boxed slice split into
-    /// fixed-stride regions: one base pointer + offsets, like the donor's
-    /// single opt workspace. `stamp` counters are the per-pass generation
-    /// tags that let the parser skip re-zeroing the price cells.
-    pub(crate) opt_price_arena: alloc::boxed::Box<[u32]>,
+    /// Single backing allocation for the LL/ML price caches as `[price,
+    /// generation]` pairs (see [`HcOptimalPlanBuffers::price_arena`]).
+    /// Replaces four separate `Vec<u32>` with one boxed slice of two
+    /// fixed-stride pair regions: one base pointer + offsets, like upstream
+    /// zstd's single opt workspace. `stamp` counters are the per-pass
+    /// generation tags that let the parser skip re-zeroing the price cells.
+    pub(crate) opt_price_arena: alloc::boxed::Box<[[u32; 2]]>,
     pub(crate) opt_ll_price_stamp: u32,
     /// Cached literal-symbol cost lookup (per-symbol fixed array).
     pub(crate) opt_lit_price_scratch: [u32; HC_MAX_LIT + 1],
@@ -169,13 +169,12 @@ impl BtMatcher {
     /// producer hold. The fixed-size price arrays and `opt_state` are inline
     /// (counted by the owner's `size_of`), so only the `Vec` fields contribute.
     pub(crate) fn heap_size(&self) -> usize {
-        let u32_sz = core::mem::size_of::<u32>();
         let scratch = self.opt_nodes_scratch.len() * core::mem::size_of::<HcOptimalNode>()
             + self.opt_candidates_scratch.capacity() * core::mem::size_of::<MatchCandidate>()
             + self.opt_store_scratch.capacity() * core::mem::size_of::<HcOptimalNode>()
             + (self.opt_segment_plan_scratch.capacity() + self.opt_seed_plan_scratch.capacity())
                 * core::mem::size_of::<HcOptimalSequence>()
-            + self.opt_price_arena.len() * u32_sz
+            + self.opt_price_arena.len() * core::mem::size_of::<[u32; 2]>()
             + self.ldm_sequences.capacity() * core::mem::size_of::<HcRawSeq>();
         // The LDM producer is only present under the `hash` feature.
         #[cfg(feature = "hash")]
@@ -661,23 +660,24 @@ impl BtMatcher {
         profile: HcOptimalCostProfile,
         stats: &HcOptState,
         lit_len: usize,
-        prices: &mut [u32],
-        generations: &mut [u32],
+        cache: &mut [[u32; 2]],
         stamp: u32,
     ) -> u32 {
-        if lit_len >= prices.len() {
+        if lit_len >= cache.len() {
             return profile.lit_length_price(stats, lit_len);
         }
-        // SAFETY: the early-return above proves `lit_len < prices.len()`. The
-        // caller carves `prices` and `generations` as two equal `HC_OPT_PRICE_STRIDE`
-        // wide regions of the same price arena, so the index is in bounds for both.
+        // SAFETY: the early-return above proves `lit_len < cache.len()`.
+        // Each cell pairs `[price, generation]`, so the stamp check and the
+        // price read/write hit ONE cache line instead of two separate
+        // strided regions 16 KiB apart.
         unsafe {
-            if *generations.get_unchecked(lit_len) == stamp {
-                return *prices.get_unchecked(lit_len);
+            let cell = cache.get_unchecked_mut(lit_len);
+            if cell[1] == stamp {
+                return cell[0];
             }
             let price = profile.lit_length_price(stats, lit_len);
-            *prices.get_unchecked_mut(lit_len) = price;
-            *generations.get_unchecked_mut(lit_len) = stamp;
+            cell[0] = price;
+            cell[1] = stamp;
             price
         }
     }
@@ -687,8 +687,7 @@ impl BtMatcher {
         profile: HcOptimalCostProfile,
         stats: &HcOptState,
         lit_len: usize,
-        prices: &mut [u32],
-        generations: &mut [u32],
+        cache: &mut [[u32; 2]],
         stamp: u32,
     ) -> i32 {
         if lit_len == 0 {
@@ -698,10 +697,8 @@ impl BtMatcher {
             // No need to compute `0_usize - 1`.
             return 0;
         }
-        let price =
-            Self::cached_lit_length_price(profile, stats, lit_len, prices, generations, stamp);
-        let previous =
-            Self::cached_lit_length_price(profile, stats, lit_len - 1, prices, generations, stamp);
+        let price = Self::cached_lit_length_price(profile, stats, lit_len, cache, stamp);
+        let previous = Self::cached_lit_length_price(profile, stats, lit_len - 1, cache, stamp);
         price as i32 - previous as i32
     }
 
@@ -710,23 +707,23 @@ impl BtMatcher {
         profile: HcOptimalCostProfile,
         stats: &HcOptState,
         match_len: usize,
-        prices: &mut [u32],
-        generations: &mut [u32],
+        cache: &mut [[u32; 2]],
         stamp: u32,
     ) -> u32 {
-        if match_len >= prices.len() {
+        if match_len >= cache.len() {
             return profile.match_length_price(stats, match_len);
         }
-        // SAFETY: see `cached_lit_length_price` — the caller carves `prices`
-        // and `generations` as two equal-width regions of the price arena,
-        // and the early return proves `match_len < prices.len()`.
+        // SAFETY: see `cached_lit_length_price` — paired `[price, generation]`
+        // cells, one cache line per probe; early return proves
+        // `match_len < cache.len()`.
         unsafe {
-            if *generations.get_unchecked(match_len) == stamp {
-                return *prices.get_unchecked(match_len);
+            let cell = cache.get_unchecked_mut(match_len);
+            if cell[1] == stamp {
+                return cell[0];
             }
             let price = profile.match_length_price(stats, match_len);
-            *prices.get_unchecked_mut(match_len) = price;
-            *generations.get_unchecked_mut(match_len) = stamp;
+            cell[0] = price;
+            cell[1] = stamp;
             price
         }
     }

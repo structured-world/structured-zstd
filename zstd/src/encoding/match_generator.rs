@@ -3555,7 +3555,7 @@ macro_rules! build_optimal_plan_impl_body {
         let frontier_buffer_size = frontier_limit + 2;
         if nodes.len() < HC_OPT_NODE_LEN {
             // First optimal-parse use (empty boxed slice) or an undersized
-            // buffer: allocate the fixed donor-sized frontier once. The DP
+            // buffer: allocate the fixed upstream-zstd-sized frontier once. The DP
             // overwrites the active prefix before reading it.
             nodes = alloc::vec![HcOptimalNode::default(); HC_OPT_NODE_LEN].into_boxed_slice();
         }
@@ -3568,39 +3568,28 @@ macro_rules! build_optimal_plan_impl_body {
         store.clear();
         let mut price_arena = core::mem::take(&mut $self.backend.bt_mut().opt_price_arena);
         if price_arena.len() < HC_OPT_PRICE_ARENA_LEN {
-            price_arena = alloc::vec![0u32; HC_OPT_PRICE_ARENA_LEN].into_boxed_slice();
+            price_arena = alloc::vec![[0u32; 2]; HC_OPT_PRICE_ARENA_LEN].into_boxed_slice();
         }
-        // Single arena → four disjoint fixed-stride regions (LL price, LL
-        // generation, ML price, ML generation): one base pointer + fixed
-        // offsets, mirroring the donor's single opt workspace.
+        // Single arena → two disjoint fixed-stride regions of `[price,
+        // generation]` pairs (LL cache, ML cache): one base pointer + fixed
+        // offsets, mirroring upstream zstd's single opt workspace. Pairing
+        // price+generation per code keeps the optimal parser's cache probe
+        // on ONE line instead of two strided regions.
         // SAFETY: `price_arena` is exactly `HC_OPT_PRICE_ARENA_LEN =
-        // 4 * HC_OPT_PRICE_STRIDE` long (just ensured), so the four
-        // STRIDE-wide regions are in bounds and pairwise disjoint. The
-        // slices alias the heap buffer `price_arena` owns; that heap
-        // address is stable across the later move of the `price_arena` box
-        // into the result bundle (a `Box` move relocates only the pointer,
-        // not the heap data), and the slices are never used after the
-        // bundle is constructed. The fixed STRIDE (independent of
-        // `frontier_limit`) keeps every position's price/generation cell at
-        // a constant offset so the monotonic stamps stay valid across calls
-        // with different frontiers.
+        // 2 * HC_OPT_PRICE_STRIDE` pairs long (just ensured), so the two
+        // STRIDE-wide regions are in bounds and disjoint. The slices alias
+        // the heap buffer `price_arena` owns; that heap address is stable
+        // across the later move of the `price_arena` box into the result
+        // bundle (a `Box` move relocates only the pointer, not the heap
+        // data), and the slices are never used after the bundle is
+        // constructed. The fixed STRIDE (independent of `frontier_limit`)
+        // keeps every code's cell at a constant offset so the monotonic
+        // stamps stay valid across calls with different frontiers.
         let arena_base = price_arena.as_mut_ptr();
-        let mut ll_prices: &mut [u32] =
+        let mut ll_cache: &mut [[u32; 2]] =
             unsafe { core::slice::from_raw_parts_mut(arena_base, HC_OPT_PRICE_STRIDE) };
-        let mut ll_price_generations: &mut [u32] = unsafe {
+        let mut ml_cache: &mut [[u32; 2]] = unsafe {
             core::slice::from_raw_parts_mut(arena_base.add(HC_OPT_PRICE_STRIDE), HC_OPT_PRICE_STRIDE)
-        };
-        let mut ml_prices: &mut [u32] = unsafe {
-            core::slice::from_raw_parts_mut(
-                arena_base.add(2 * HC_OPT_PRICE_STRIDE),
-                HC_OPT_PRICE_STRIDE,
-            )
-        };
-        let mut ml_price_generations: &mut [u32] = unsafe {
-            core::slice::from_raw_parts_mut(
-                arena_base.add(3 * HC_OPT_PRICE_STRIDE),
-                HC_OPT_PRICE_STRIDE,
-            )
         };
         $self.backend.bt_mut().opt_ll_price_stamp = $self
             .backend
@@ -3628,8 +3617,7 @@ macro_rules! build_optimal_plan_impl_body {
                 profile,
                 $stats,
                 initial_litlen,
-                &mut ll_prices,
-                &mut ll_price_generations,
+                &mut ll_cache,
                 ll_price_stamp,
             ),
             litlen: initial_litlen as u32,
@@ -3641,16 +3629,14 @@ macro_rules! build_optimal_plan_impl_body {
             profile,
             $stats,
             0,
-            &mut ll_prices,
-            &mut ll_price_generations,
+            &mut ll_cache,
             ll_price_stamp,
         );
         let ll1_price = BtMatcher::cached_lit_length_price(
             profile,
             $stats,
             1,
-            &mut ll_prices,
-            &mut ll_price_generations,
+            &mut ll_cache,
             ll_price_stamp,
         );
         let mut pos = 1usize;
@@ -3757,8 +3743,7 @@ macro_rules! build_optimal_plan_impl_body {
                         profile,
                         $stats,
                         longest_len,
-                        &mut ml_prices,
-                        &mut ml_price_generations,
+                        &mut ml_cache,
                         ml_price_stamp,
                     );
                     let seq_cost = BtMatcher::add_prices(
@@ -3810,8 +3795,7 @@ macro_rules! build_optimal_plan_impl_body {
                             profile,
                             $stats,
                             match_len,
-                            &mut ml_prices,
-                            &mut ml_price_generations,
+                            &mut ml_cache,
                             ml_price_stamp,
                         );
                         let seq_cost = BtMatcher::add_prices(
@@ -3863,8 +3847,7 @@ macro_rules! build_optimal_plan_impl_body {
                     profile,
                     $stats,
                     lit_len,
-                    &mut ll_prices,
-                    &mut ll_price_generations,
+                    &mut ll_cache,
                     ll_price_stamp,
                 );
                 let lit_cost = BtMatcher::add_price_delta(prev_node.price, lit_price, ll_delta);
@@ -3902,8 +3885,7 @@ macro_rules! build_optimal_plan_impl_body {
                                 profile,
                                 $stats,
                                 lit_len + 1,
-                                &mut ll_prices,
-                                &mut ll_price_generations,
+                                &mut ll_cache,
                                 ll_price_stamp,
                             );
                             let with_more_literals =
@@ -4033,8 +4015,7 @@ macro_rules! build_optimal_plan_impl_body {
                         profile,
                         $stats,
                         longest_len,
-                        &mut ml_prices,
-                        &mut ml_price_generations,
+                        &mut ml_cache,
                         ml_price_stamp,
                     );
                     let seq_cost = BtMatcher::add_prices(
@@ -4092,8 +4073,7 @@ macro_rules! build_optimal_plan_impl_body {
                         profile,
                         $stats,
                         match_len,
-                        &mut ml_prices,
-                        &mut ml_price_generations,
+                        &mut ml_cache,
                         ml_price_stamp,
                     );
                     let seq_cost = BtMatcher::add_prices(
@@ -4167,8 +4147,7 @@ macro_rules! build_optimal_plan_impl_body {
                 profile,
                 $stats,
                 next_litlen,
-                &mut ll_prices,
-                &mut ll_price_generations,
+                &mut ll_cache,
                 ll_price_stamp,
             );
             let price = BtMatcher::add_price_delta(nodes[0].price, lit_price, ll_delta);
