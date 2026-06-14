@@ -30,6 +30,18 @@ pub(crate) const HC_PREDEF_THRESHOLD: usize = 8;
 pub(crate) const HC_BITCOST_MULTIPLIER: u32 = 1 << 8;
 pub(crate) const HC_BLOCKSIZE_MAX: usize = crate::common::MAX_BLOCK_SIZE as usize;
 pub(crate) const HC_OPT_NUM: usize = 1 << 12;
+/// Fixed stride of each price/generation region in the optimal-parser price
+/// arena. The DP frontier never exceeds `HC_OPT_NUM`, so `HC_OPT_NUM + 1`
+/// indices (positions `0..=frontier_limit`) always fit.
+pub(crate) const HC_OPT_PRICE_STRIDE: usize = HC_OPT_NUM + 1;
+/// Backing length (in `[price, generation]` pairs) of the single price
+/// arena: two fixed-stride regions (LL pairs, ML pairs). Each `[u32; 2]`
+/// cell co-locates a code's price and its generation stamp so the optimal
+/// parser's cache probe touches one line instead of two strided regions.
+pub(crate) const HC_OPT_PRICE_ARENA_LEN: usize = 2 * HC_OPT_PRICE_STRIDE;
+/// Node-frontier buffer length (`nodes` / `store`): positions
+/// `0..=frontier_limit` plus the `+2` lookahead slack the DP body uses.
+pub(crate) const HC_OPT_NODE_LEN: usize = HC_OPT_NUM + 2;
 pub(crate) const HC_FORMAT_MINMATCH: usize = 3;
 
 #[derive(Copy, Clone)]

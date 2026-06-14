@@ -89,11 +89,16 @@ pub(crate) struct HcOptimalPlanState {
 /// checker can split the matcher's fields without macro-level
 /// scaffolding.
 pub(crate) struct HcOptimalPlanBuffers {
-    pub(crate) nodes: Vec<HcOptimalNode>,
+    pub(crate) nodes: alloc::boxed::Box<[HcOptimalNode]>,
     pub(crate) candidates: Vec<MatchCandidate>,
     pub(crate) store: Vec<HcOptimalNode>,
-    pub(crate) ll_prices: Vec<u32>,
-    pub(crate) ll_price_generations: Vec<u32>,
-    pub(crate) ml_prices: Vec<u32>,
-    pub(crate) ml_price_generations: Vec<u32>,
+    /// Single backing allocation for the LL/ML price caches as `[price,
+    /// generation]` pairs, laid out as two fixed-stride `HC_OPT_NUM + 1`
+    /// regions (LL pairs, ML pairs). One base pointer + fixed offsets,
+    /// mirroring upstream zstd's single-workspace opt arrays; the DP body
+    /// carves it into two disjoint slices. Pairing price+generation per
+    /// code keeps each cache probe on one line. Fixed stride (not
+    /// `frontier_limit`-dependent) so the generation stamps land in the
+    /// same cell across calls with different frontiers.
+    pub(crate) price_arena: alloc::boxed::Box<[[u32; 2]]>,
 }
