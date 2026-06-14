@@ -8,8 +8,9 @@
 use zstd::zstd_safe::zstd_sys;
 
 fn main() {
-    let src_size = 1022035u64; // bytes in zstd/decodecorpus_files/z000033
-    let level = 1i32;
+    let args: Vec<String> = std::env::args().collect();
+    let level: i32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1);
+    let src_size: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(1022035);
     let dict_size = 0usize;
 
     // SAFETY: standard libzstd query.
