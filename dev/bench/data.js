@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781327599752,
+  "lastUpdate": 1781436566810,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -65402,6 +65402,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.27,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "c57827b9d2cca9f4b79adf986af88def58b0d1da",
+          "message": "feat(c-api): complete the stable ZSTDLIB_API surface + btopt/btultra perf (#413)\n\n* feat(c-api): complete the stable ZSTDLIB_API symbol surface\n\nThe last three stable symbols land: the deprecated\nZSTD_getDecompressedSize alias (getFrameContentSize with the\nunknown/error sentinels collapsed to 0, the pre-1.3 contract) and the\nZSTD_sizeof_CStream / ZSTD_sizeof_DStream context aliases. The CI\nsymbol gate covers them; with this the cdylib exports every stable\nzstd.h / zdict.h entry point except multi-threaded compression and\nlegacy-format decoding.\n\nPart of #127\n\n* perf(encode): seed the lazy row probe with the rep candidate\n\nrow_best_match computed the repcode candidate, ran the row probe from\nan empty best, then merged the two at the end. Seeding the probe's\nbest with the rep candidate instead lets the speculative tail-gate\nprune row candidates against the rep length from the first hit (fewer\nfull common_prefix_len calls) and drops the rep value's separate\nliveness across the probe. The merge is byte-identical: the seed stays\nthe permanent lhs, exactly as the trailing best_len_offset_candidate\nmade it.\n\ni9 z000033 L8 encode_loop: -0.39% instructions (31.97G -> 31.85G,\ndeterministic), output byte-identical (803 tests).\n\n* perf(encode): table-lookup the literal-length code in the cost model\n\nlit_code_and_bits derived the LL code + extra-bit count via a 20-arm\nrange match that lowered to a jae comparison ladder — ~8% of self\ntime in the L16 btopt+dict profile because the optimal parser calls\nlit_length_price per candidate. Replaced with the donor's direct\nLL_Code[64] / LL_bits[36] table lookups for ll < 64 and\nhighbit32(ll)+19 above (ZSTD_LLcode, zstd_compress_internal.h). Same\n(code, nbBits) values — byte-identical output (803 tests).\n\ni9 small-10k-random compress-dict L16 btopt: -5.3% instructions\n(23.23G -> 22.00G deterministic), -8.2% wall (1.162ms -> 1.067ms,\nflat c_ffi control). Helps the whole btopt/btultra band since the\ncost model is shared.\n\n* perf(encode): table-lookup the match-length code in the cost model\n\nSame transform as the literal-length LUT, applied to ml_code_and_bits:\nthe 22-arm range cascade becomes the donor's ML_Code[128] / ML_bits[53]\nlookup on mlBase for mlBase < 128 and highbit32(mlBase)+36 above\n(ZSTD_MLcode). Cold on random data (few matches) but the optimal\nparser calls match_length_price per candidate on compressible input.\n\ni9 z000033 L16 btopt: -2.05% instructions (72.54G -> 71.05G\ndeterministic), byte-identical (803 tests). Stacks with the LL LUT\nacross the whole btopt/btultra band.\n\n* perf(encode): hoist the BT pointer-pair base out of self in the tree walk\n\nbt_insert_and_collect / bt_insert_step walked the binary tree via\nchain_table[idx] through &mut self, forcing a Vec (ptr,len) reload from\nthe struct plus a bounds check on every tree step (the donor uses a raw\nU32* btable). Hoisting the base pointer once and indexing unchecked --\nindices are in bounds by the BT pair-index invariant -- removes both.\ni9 z000033 L16: -2.0% instructions (71.0G->69.6G), byte-identical.\n\n* perf(encode): fold the BT decode underflow branch into the window check\n\nThe BT walk decoded each stored entry via stored_abs_position_fast,\nwhich carries two None branches (HC_EMPTY sentinel + index_shift\nunderflow). The underflow case only ever arises for stale post-rebase\nslots, whose decoded position is below the window and already rejected\nby the candidate-abs window test. Inlining the decode with a wrapping\nsubtraction lets an underflow wrap to a near-usize::MAX value that the\nexisting >= abs_pos test catches, collapsing two per-candidate branches\ninto one -- the donor's single matchIndex < lowLimit shape.\n\ni9 z000033 L16: -0.46% instructions over the chain-hoist baseline,\nbyte-identical (803 tests incl. level22 parity).\n\n* perf(encode): read opt[cur] on demand in DP, drop held node copy\n\nThe per-position optimal-parser loop copied the 28-byte opt[cur] node\ninto a local held live across the (non-inlinable) candidate-collection\ncall, forcing LLVM to spill reps[3]+litlen around it (asm: 112 SIMD\nmoves vs C's 39, the excess being vmovaps stack traffic). Read the\nfields on demand instead: base_cost as a scalar, the rep recompute in a\ntight inner scope, and reps/litlen re-read fresh after the call (nodes\nis stable across collect). Mirrors upstream's memory-resident opt[cur]\naccess. Byte-identical (803 tests incl. level22 parity).\n\n* perf(encode): prefetch BT hash bucket to hide cold-miss stall\n\nThe read+write of hash_table[hash] in the BT match-collect stalled ~35%\nof that function's cycles: for the large L16+ hash table over\nhigh-entropy input the bucket is L3/DRAM-cold, and our split BT-collect\n(rep/hash3 live in the seed, not inlined here) has nothing to overlap the\nmiss, unlike upstream's monolithic ZSTD_btGetAllMatches. Issue an\n_mm_prefetch hint right after the hash is computed so the miss overlaps\nthe address setup before the read. x86-only (cfg-gated), byte-identical\n(803 tests incl. level22 parity).\n\n* perf(encode): prefetch next position's BT hash bucket a full iteration ahead\n\nThe same-call hash prefetch only led the read by ~30 instructions, too\nfew to hide the L3/DRAM miss on the cold bucket. Also prefetch the next\nposition's bucket from the current collect: the optimal-parser DP\nadvances one position per iteration, so the hint is issued a full BT walk\nplus the next iteration's pre-collect work ahead of the read that\nconsumes it. Byte-identical (803 tests incl. level22 parity).\n\n* perf(encode): get_unchecked BT child-descent compare (helps L18/L22)\n\nThe BT walk child-descent compare used checked indexing; both indices are\nfirst-differing positions after a match_len-long prefix bounded by\nconcat.len() (match_len < tail_limit + walk invariant), so get_unchecked\nis safe (donor compares raw match[ml]<ip[ml]). Neutral at L16 but −0.5%\n(L18) / −0.6% (L22) where deeper search walks pay more per-step checks.\n\n* perf(encode): donor-form BT-walk window check in the loop condition\n\nThe BT-walk decoded candidate_abs and then broke on the window test, so\nevery walk's terminating step entered the body and paid a wasted decode\nthat upstream avoids by testing matchIndex >= matchLow in the while\ncondition. Precompute the window bound in stored space and fold it into\nthe loop condition (s.wrapping_add(win_off) < win_range), decoding\ncandidate_abs only for productive steps. Byte-identical (803 tests incl.\nlevel22 parity).\n\n* fix(encode): reject stale BT candidate underflow on rebased streams\n\n- BT insert-walk: use checked_sub instead of wrapping_sub when decoding a\n  candidate absolute position, so a stale post-rebase slot below\n  index_shift ends the walk rather than wrapping into [window_low,\n  abs_pos) when abs_pos nears the integer ceiling (reachable on 32-bit\n  long streams). The collect-walk already rejects this via its\n  stored-space range check anchored at the true lower bound.\n- Gate the BT hash-bucket prefetch blocks on target_feature sse too,\n  since _mm_prefetch is an SSE intrinsic (compiled out on no-SSE x86).\n- c-api: assert created contexts are non-NULL before the sizeof alias\n  equality checks so they cannot pass vacuously.",
+          "timestamp": "2026-06-14T13:39:17+03:00",
+          "tree_id": "f9b73b5ece54670e40b790eee400d50ac60fb977",
+          "url": "https://github.com/structured-world/structured-zstd/commit/c57827b9d2cca9f4b79adf986af88def58b0d1da"
+        },
+        "date": 1781436556510,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.117,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.088,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 259.967,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 207.821,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.344,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.482,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.376,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.078,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.252,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 2.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.121,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.121,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.266,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.012,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 12.442,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.365,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.217,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.355,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.882,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.205,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.622,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.1,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.395,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.143,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.12,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.26,
             "unit": "ms"
           }
         ]
