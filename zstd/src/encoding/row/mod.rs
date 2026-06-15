@@ -1424,6 +1424,20 @@ impl RowMatchGenerator {
             // Eviction advances `history_start`, staling the dict row index's
             // concat positions — drop the attach (dict slid within/out window).
             self.dict.invalidate();
+            // Cap the history buffer near the live window instead of letting
+            // the Vec power-of-two double to ~2x window on long streams. Once
+            // eviction starts, reserve exactly (window + window/4 + one block)
+            // so the buffer grows linearly to that ceiling; `compact_history`'s
+            // quarter-window drain then keeps `len` under it, so the Vec never
+            // reallocates again. Only fires in the eviction regime (large
+            // inputs that fill the window) — small frames keep their tight
+            // data-sized buffer untouched.
+            let target = self.max_window_size
+                + (self.max_window_size >> 2)
+                + crate::common::MAX_BLOCK_SIZE as usize;
+            if target > self.history.len() && self.history.capacity() < target {
+                self.history.reserve_exact(target - self.history.len());
+            }
         }
         while self.window_size + data.len() > self.max_window_size {
             let removed_len = self.chunk_lens.pop_front().unwrap();
@@ -1646,7 +1660,14 @@ impl RowMatchGenerator {
         if self.history_start == 0 {
             return;
         }
-        if self.history_start >= self.max_window_size
+        // Drain the (unreachable) dead prefix once it reaches a quarter window
+        // so the buffer stays near `window + window/4` rather than growing to
+        // ~2x window before the old full-window trigger fired. Paired with the
+        // one-time `reserve_exact` in `add_data`, this keeps the Vec at a fixed
+        // ~1.25x-window capacity on long streams. The drain memmoves the live
+        // window, so a quarter-window trigger bounds the write amplification
+        // (~4x the eviction stride) while closing most of the peak gap.
+        if self.history_start >= (self.max_window_size >> 2)
             || self.history_start * 2 >= self.history.len()
         {
             self.history.drain(..self.history_start);
