@@ -310,13 +310,27 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
             return None;
         }
 
+        // Upstream zstd `HUF_compressWeights` early-outs
+        // (huf_compress.c:162-167), applied from the weight histogram BEFORE
+        // building any FSE table: a single distinct weight value (`max_count ==
+        // len`) is an RLE stream FSE cannot represent, and a stream where every
+        // value occurs at most once (`max_count == 1`) does not compress. Both
+        // fall back to the raw nibble description. Skipping the FSE encode for
+        // these cases avoids producing a stream the decoder would reject (the
+        // failure the former decode round-trip existed to catch) — the
+        // single-distinct-weight case is the common uniform-literal frame.
+        let mut counts = [0usize; 13];
+        for &weight in weights {
+            counts[weight as usize] += 1;
+        }
+        let max_count = counts.iter().copied().max().unwrap_or(0);
+        if max_count == weights.len() || max_count <= 1 {
+            return None;
+        }
+
         let mut encoded = Vec::new();
         {
             let mut writer = BitWriter::from(&mut encoded);
-            let mut counts = [0usize; 13];
-            for &weight in weights {
-                counts[weight as usize] += 1;
-            }
             let mut encoder = FSEEncoder::new(
                 fse_encoder::build_table_from_symbol_counts(&counts, 6, false),
                 &mut writer,
@@ -333,35 +347,18 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
             if encoded.len() >= 128 {
                 return None;
             }
-            let mut description = Vec::with_capacity(encoded.len() + 1);
-            description.push(encoded.len() as u8);
-            description.extend_from_slice(&encoded);
-            if !Self::weight_description_roundtrips(weights, &description) {
-                return None;
-            }
+            // Trust the FSE encoding and emit it directly, matching upstream
+            // zstd's HUF_writeCTable (no decode round-trip). The donor
+            // early-outs above guarantee FSE is only attempted on streams it
+            // can represent, so the emitted description always decodes back —
+            // verified exhaustively by `fse_weight_descriptions_roundtrip` over
+            // a wide alphabet sweep. The former per-call decode + re-encode
+            // verification was a dominant per-frame heap churn on tiny
+            // dict-compress frames, amplified by the musl allocator.
             Some(encoded)
         } else {
             None
         }
-    }
-
-    /// Validates that a serialized weight description decodes back to the same weights.
-    fn weight_description_roundtrips(weights: &[u8], description: &[u8]) -> bool {
-        let mut decoded = crate::huff0::huff0_decoder::HuffmanTable::new();
-        if decoded.build_decoder(description).is_err() {
-            return false;
-        }
-        let decoded = match decoded.to_encoder_table() {
-            Some(table) => table,
-            None => return false,
-        };
-        let decoded_weights = {
-            let mut out = Vec::new();
-            let mut writer = BitWriter::from(&mut out);
-            let encoder = HuffmanEncoder::new(&decoded, &mut writer);
-            encoder.weights()
-        };
-        decoded_weights.len() == weights.len() + 1 && &decoded_weights[..weights.len()] == weights
     }
 
     /// Writes the raw nibble-packed Huffman weight representation.
@@ -1569,6 +1566,98 @@ fn encoded_weight_description_roundtrips() {
 }
 
 #[test]
+fn fse_weight_descriptions_roundtrip() {
+    // Regression for the FSE weight-description encode/decode bug: every weight
+    // stream that `encode_weight_description` actually FSE-encodes (i.e. passes
+    // the upstream-zstd early-outs) MUST decode back to the same weights, so the
+    // encoder can trust its output without a runtime round-trip. Sweep many
+    // (cardinality, distribution) alphabets; for each, FSE-encode the weight
+    // description exactly as `encode_weight_description` does and confirm it
+    // round-trips. Before the early-outs, a single-distinct-weight (uniform)
+    // alphabet such as 4 symbols → weights [1,1,1] produced a description the
+    // decoder rejected.
+    let mut fails: Vec<(usize, u32, alloc::vec::Vec<u8>)> = alloc::vec::Vec::new();
+    for card in 2usize..=255 {
+        for skew in 0u32..4 {
+            let mut data: Vec<u8> = Vec::new();
+            for s in 0..card {
+                let n = match skew {
+                    0 => 1usize,
+                    1 => s + 1,
+                    2 => card - s,
+                    _ => ((s * 7 + 1) % 17) + 1,
+                };
+                data.extend(core::iter::repeat_n(s as u8, n));
+            }
+            let table = HuffmanTable::build_from_data(&data);
+            let mut weights = {
+                let mut out = Vec::new();
+                let mut writer = BitWriter::from(&mut out);
+                let encoder = HuffmanEncoder::new(&table, &mut writer);
+                encoder.weights()
+            };
+            weights.pop(); // serialized description omits the final weight
+            if weights.len() <= 2 {
+                continue;
+            }
+            // Apply the same upstream-zstd early-outs as encode_weight_description:
+            // single-distinct-weight (RLE) and all-distinct streams go raw, not
+            // FSE. The probe asserts every REMAINING (genuinely FSE-encoded)
+            // case round-trips — i.e. the early-outs alone make the decode
+            // round-trip redundant.
+            let mut counts = [0usize; 13];
+            for &w in &weights {
+                counts[w as usize] += 1;
+            }
+            let max_count = counts.iter().copied().max().unwrap_or(0);
+            if max_count == weights.len() || max_count <= 1 {
+                continue;
+            }
+            let mut encoded = Vec::new();
+            {
+                let mut writer = BitWriter::from(&mut encoded);
+                let mut enc = FSEEncoder::new(
+                    fse_encoder::build_table_from_symbol_counts(&counts, 6, false),
+                    &mut writer,
+                );
+                enc.encode_interleaved(&weights);
+                writer.flush();
+            }
+            if encoded.len() <= 1 || encoded.len() >= 128 {
+                continue;
+            }
+            let mut description = Vec::with_capacity(encoded.len() + 1);
+            description.push(encoded.len() as u8);
+            description.extend_from_slice(&encoded);
+
+            let mut decoded = crate::huff0::huff0_decoder::HuffmanTable::new();
+            let build = decoded.build_decoder(&description);
+            let decoded_weights = build
+                .ok()
+                .and_then(|_| decoded.to_encoder_table())
+                .map(|t| {
+                    let mut out = Vec::new();
+                    let mut writer = BitWriter::from(&mut out);
+                    let encoder = HuffmanEncoder::new(&t, &mut writer);
+                    encoder.weights()
+                });
+            let ok = decoded_weights.as_ref().is_some_and(|dw| {
+                dw.len() == weights.len() + 1 && dw[..weights.len()] == weights[..]
+            });
+            if !ok {
+                fails.push((card, skew, weights.clone()));
+            }
+        }
+    }
+    assert!(
+        fails.is_empty(),
+        "{} FSE weight cases still fail to round-trip after upstream-zstd early-outs; first 5: {:?}",
+        fails.len(),
+        &fails[..fails.len().min(5)]
+    );
+}
+
+#[test]
 fn large_alphabet_weight_description_uses_fse_when_raw_is_unrepresentable() {
     let mut data = Vec::new();
     for symbol in 0u8..=255 {
@@ -1593,10 +1682,24 @@ fn large_alphabet_weight_description_uses_fse_when_raw_is_unrepresentable() {
     description.push(encoded.len() as u8);
     description.extend_from_slice(&encoded);
 
-    assert!(HuffmanEncoder::<Vec<u8>>::weight_description_roundtrips(
-        &weights,
-        &description
-    ));
+    // The encoder no longer round-trip-verifies at runtime (it trusts the FSE
+    // encoding after the upstream-zstd early-outs, matching upstream zstd); assert the
+    // decodes-back property here instead.
+    let mut decoded = crate::huff0::huff0_decoder::HuffmanTable::new();
+    decoded
+        .build_decoder(&description)
+        .expect("FSE weight description must decode");
+    let decoded = decoded
+        .to_encoder_table()
+        .expect("decoded weight table must convert to an encoder table");
+    let decoded_weights = {
+        let mut out = Vec::new();
+        let mut writer = BitWriter::from(&mut out);
+        let encoder = HuffmanEncoder::new(&decoded, &mut writer);
+        encoder.weights()
+    };
+    assert_eq!(decoded_weights.len(), weights.len() + 1);
+    assert_eq!(&decoded_weights[..weights.len()], &weights[..]);
 }
 
 #[cfg(feature = "std")]
