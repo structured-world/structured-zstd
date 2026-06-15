@@ -2516,7 +2516,16 @@ impl Matcher for MatchGeneratorDriver {
             if end - start < min_primed_tail {
                 break;
             }
-            let mut space = self.get_next_space();
+            // Stage the dict chunk WITHOUT `get_next_space`'s
+            // `resize(slice_size, 0)` zero-fill: that memsets a full
+            // block-sized buffer (up to ~128 KiB) every frame only to have it
+            // `clear()`-ed and overwritten by the dict bytes on the very next
+            // lines — pure waste (measured ~10% of the small dict encode).
+            // Reuse a pooled buffer's capacity if one is free (the prime/skip
+            // cycle recycles them back), else allocate exactly the chunk.
+            // Mirrors upstream zstd, which references the CDict content rather
+            // than zero-filling a fresh window per frame.
+            let mut space = self.vec_pool.pop().unwrap_or_default();
             space.clear();
             space.extend_from_slice(&dict_content[start..end]);
             self.commit_space(space);
