@@ -578,6 +578,18 @@ impl FastKernelMatcher {
             self.pending.is_none(),
             "set_borrowed_window requires no staged owned block; reset before switching to a borrowed window",
         );
+        // A live borrowed window at entry means a prior frame's window was never
+        // cleared by a `reset()` — and since `clear_borrowed_window` no longer
+        // memsets the table (it relies on the next reset to do so), the table
+        // would still hold the prior scan's virtual `dict_end + input_off`
+        // positions. The borrowed-dict kernel would then read those as current
+        // offsets (`main_idx - dict_end` underflowing to a huge pointer). Catch
+        // that missing-reset regression here rather than letting it silently
+        // corrupt memory; the production caller always resets first.
+        debug_assert!(
+            self.borrowed.is_none(),
+            "set_borrowed_window called without a preceding reset()/clear_borrowed_window",
+        );
         self.borrowed = Some((buffer.as_ptr(), buffer.len()));
         self.last_borrowed_block = None;
         // Stale hash-table entries from a prior window are invalidated by the

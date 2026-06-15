@@ -2077,9 +2077,26 @@ impl Matcher for MatchGeneratorDriver {
                 .row
                 .expect("a RowHash level row must carry a RowConfig");
             params.search = super::strategy::SearchMethod::HashChain;
+            // For a dict-bearing frame, downsize the synthesised HC logs to the
+            // dictionary's content tier via `cdict_table_logs` (the same
+            // correction the native HC dict-prime path applies above), so a dict
+            // much smaller than the window doesn't prime a needlessly sparse
+            // table. No-dict frames keep the level's `hash_bits` (clamped to the
+            // window in the reset arm). Row-finder levels are never BinaryTree,
+            // so `uses_bt = false`.
+            let (hash_log, chain_log) = match dict_hint.filter(|&size| size > 0) {
+                Some(dict_size) => cdict_table_logs(
+                    params.window_log,
+                    row.hash_bits,
+                    row.hash_bits,
+                    false,
+                    dict_size,
+                ),
+                None => (row.hash_bits, row.hash_bits),
+            };
             params.hc = Some(HcConfig {
-                hash_log: row.hash_bits,
-                chain_log: row.hash_bits,
+                hash_log,
+                chain_log,
                 search_depth: row.search_depth,
                 target_len: row.target_len,
                 search_mls: 4,
