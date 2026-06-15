@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.40](https://github.com/structured-world/structured-zstd/compare/v0.0.39...v0.0.40) - 2026-06-15
+
+### Performance
+
+- *(huff0)* hoist bit-stream state into locals in the encode loop ([#423](https://github.com/structured-world/structured-zstd/pull/423))
+- borrowed in-place over-window scan for dfast + row + btlazy2 ([#422](https://github.com/structured-world/structured-zstd/pull/422))
+- *(encode)* cap HC/BT history mirror near the live window ([#421](https://github.com/structured-world/structured-zstd/pull/421))
+- *(encode)* cap dfast history buffer near the live window ([#420](https://github.com/structured-world/structured-zstd/pull/420))
+- *(encode)* cap row history buffer near the live window ([#418](https://github.com/structured-world/structured-zstd/pull/418))
+
 ## [0.0.39](https://github.com/structured-world/structured-zstd/compare/v0.0.38...v0.0.39) - 2026-06-14
 
 ### Performance
