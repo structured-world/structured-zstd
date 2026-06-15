@@ -509,12 +509,18 @@ impl HuffmanTable {
                 .map(|w| 1usize << (w - 1))
                 .sum();
             let wtable_log = highest_bit_set(weight_sum) - 1;
+            // `unwrap_or(1)` is the tightest safe default: weight 1 is the
+            // longest valid code length, so `max_bits` can never exceed a real
+            // code length even if the power-of-two guard were relaxed (a `0`
+            // default would give `max_bits = wtable_log + 1`, larger than any
+            // real length, and risk underflow). A positive weight always exists
+            // here in practice (the `huffman_weight_sum_is_power_of_two` guard).
             let min_positive_weight = weights
                 .iter()
                 .copied()
                 .filter(|&w| w > 0)
                 .min()
-                .unwrap_or(0);
+                .unwrap_or(1);
             let max_bits = wtable_log + 1 - min_positive_weight;
             if max_bits < table_log && table_log > min_table_log {
                 break;
@@ -1600,32 +1606,16 @@ fn fse_weight_descriptions_roundtrip() {
             if weights.len() <= 2 {
                 continue;
             }
-            // Apply the same upstream-zstd early-outs as encode_weight_description:
-            // single-distinct-weight (RLE) and all-distinct streams go raw, not
-            // FSE. The probe asserts every REMAINING (genuinely FSE-encoded)
-            // case round-trips — i.e. the early-outs alone make the decode
-            // round-trip redundant.
-            let mut counts = [0usize; 13];
-            for &w in &weights {
-                counts[w as usize] += 1;
-            }
-            let max_count = counts.iter().copied().max().unwrap_or(0);
-            if max_count == weights.len() || max_count <= 1 {
+            // Call the PRODUCTION encoder directly so the test can never drift
+            // from its early-out / FSE-encode logic (re-implementing the counts
+            // + early-outs inline would silently diverge if the encoder
+            // changed). `encode_weight_description` returns Some(fse_bytes) only
+            // for streams it actually FSE-encodes; None means it chose the raw
+            // description (nothing to round-trip). Every Some MUST decode back.
+            let Some(encoded) = HuffmanEncoder::<Vec<u8>>::encode_weight_description(&weights)
+            else {
                 continue;
-            }
-            let mut encoded = Vec::new();
-            {
-                let mut writer = BitWriter::from(&mut encoded);
-                let mut enc = FSEEncoder::new(
-                    fse_encoder::build_table_from_symbol_counts(&counts, 6, false),
-                    &mut writer,
-                );
-                enc.encode_interleaved(&weights);
-                writer.flush();
-            }
-            if encoded.len() <= 1 || encoded.len() >= 128 {
-                continue;
-            }
+            };
             let mut description = Vec::with_capacity(encoded.len() + 1);
             description.push(encoded.len() as u8);
             description.extend_from_slice(&encoded);
