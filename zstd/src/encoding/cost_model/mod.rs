@@ -315,9 +315,10 @@ impl HcOptState {
                     self.lit_sum = Self::apply_seeded_table(&mut self.lit_freq, &seed.lit_bits, 11);
                 } else if self.literals_compressed() {
                     self.lit_freq.fill(0);
+                    // Plain `+`: lit_freq is u32 and a byte's count is bounded
+                    // by the block size (<= MAX_BLOCK_SIZE), far under u32::MAX.
                     for &byte in src {
-                        self.lit_freq[byte as usize] =
-                            self.lit_freq[byte as usize].saturating_add(1);
+                        self.lit_freq[byte as usize] += 1;
                     }
                     self.lit_sum = Self::downscale_stats(&mut self.lit_freq, 8, false);
                     if self.lit_sum == 0 {
@@ -363,9 +364,10 @@ impl HcOptState {
             } else {
                 if self.literals_compressed() {
                     self.lit_freq.fill(0);
+                    // Plain `+`: lit_freq is u32 and a byte's count is bounded
+                    // by the block size (<= MAX_BLOCK_SIZE), far under u32::MAX.
                     for &byte in src {
-                        self.lit_freq[byte as usize] =
-                            self.lit_freq[byte as usize].saturating_add(1);
+                        self.lit_freq[byte as usize] += 1;
                     }
                     self.lit_sum = Self::downscale_stats(&mut self.lit_freq, 8, false);
                     if self.lit_sum == 0 {

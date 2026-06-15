@@ -792,8 +792,11 @@ fn dict_and_window_log(window_log: u8, src_size: u64, dict_size: u64) -> u32 {
         return window_log as u32;
     }
     let window_size: u64 = 1u64 << window_log;
-    let dict_and_window = dict_size.saturating_add(window_size);
-    if window_size >= dict_size.saturating_add(src_size) {
+    // Plain `+` (matches upstream zstd `ZSTD_dictAndWindowLog`): `window_size` is
+    // `1 << window_log` (window_log <= 31) and dict/src are real data sizes
+    // (<= isize::MAX), so these u64 sums cannot overflow in practice.
+    let dict_and_window = dict_size + window_size;
+    if window_size >= dict_size + src_size {
         // Window already covers source + dictionary.
         window_log as u32
     } else {
@@ -821,7 +824,9 @@ fn cdict_table_logs(
     // createCDict assumes a minSrcSize source when the real size is unknown.
     let src_size = DICT_MIN_SRC_SIZE;
     // Source-size window resize (donor caps windowLog by ceil_log2(src+dict)).
-    let tsize = src_size.saturating_add(dict_size);
+    // Plain `+`: src_size is the tiny DICT_MIN_SRC_SIZE constant and dict_size
+    // is a real dictionary length, so the u64 sum cannot overflow.
+    let tsize = src_size + dict_size;
     let resized_window_log = (window_log as u32)
         .min(source_size_ceil_log(tsize) as u32)
         .max(1);
@@ -2270,7 +2275,14 @@ impl Matcher for MatchGeneratorDriver {
                 // tables are dictionary-tier-small. Unhinted streams skip this
                 // and keep doubling growth.
                 if let Some(src) = hint {
-                    let expected = (src as usize).saturating_add(dict_hint.unwrap_or(0));
+                    // `src` is a u64 hint and may be the u64::MAX "unknown
+                    // size" sentinel, which truncates under `as usize` on
+                    // 32-bit targets and overflows when the dict hint is
+                    // added. Saturate the source size, then saturate the
+                    // dict-hint addition; `reserve_history` applies the
+                    // tighter window ceiling to the result.
+                    let src_hint = usize::try_from(src).unwrap_or(usize::MAX);
+                    let expected = src_hint.saturating_add(dict_hint.unwrap_or(0));
                     hc.table.reserve_history(expected);
                 }
             }
@@ -2779,7 +2791,9 @@ impl Matcher for MatchGeneratorDriver {
                     // when it later reuses the buffer.
                     vec_pool.push(data);
                 });
-                evicted_bytes += pre.saturating_add(space_len).saturating_sub(m.window_size);
+                // Plain `+` (the `saturating_sub` floors at 0): `pre` + one
+                // block are byte counts bounded by the window, no overflow.
+                evicted_bytes += (pre + space_len).saturating_sub(m.window_size);
             }
             MatcherStorage::Row(m) => {
                 // RowMatchGenerator::add_data recycles the *input* buffer
@@ -2799,7 +2813,9 @@ impl Matcher for MatchGeneratorDriver {
                     // `slice_size` on reuse).
                     vec_pool.push(data);
                 });
-                evicted_bytes += pre.saturating_add(space_len).saturating_sub(m.window_size);
+                // Plain `+` (the `saturating_sub` floors at 0): `pre` + one
+                // block are byte counts bounded by the window, no overflow.
+                evicted_bytes += (pre + space_len).saturating_sub(m.window_size);
             }
             MatcherStorage::HashChain(m) => {
                 // MatchTable::add_data now recycles the *incoming* buffer
@@ -2822,9 +2838,9 @@ impl Matcher for MatchGeneratorDriver {
                     // pool retains.
                     vec_pool.push(data);
                 });
-                evicted_bytes += pre
-                    .saturating_add(space_len)
-                    .saturating_sub(m.table.window_size);
+                // Plain `+` (the `saturating_sub` floors at 0): byte counts
+                // bounded by the window, no overflow.
+                evicted_bytes += (pre + space_len).saturating_sub(m.table.window_size);
             }
         }
         // Gate the second backend trim pass on actual budget
@@ -3975,6 +3991,11 @@ macro_rules! build_optimal_plan_impl_body {
             }
 
             let next_price = unsafe { nodes.get_unchecked(pos + 1).price };
+            // `saturating_add` is REQUIRED here, not a masked bug: `base_cost`
+            // is a node price that can be the `u32::MAX` "unreachable" sentinel,
+            // and saturating keeps `base_cost + margin` pinned at MAX so the
+            // comparison stays correct. Plain `+` would wrap the sentinel and
+            // flip the abort decision (a ratio bug / debug overflow panic).
             if abort_on_worse_match
                 && next_price <= base_cost.saturating_add(HC_BITCOST_MULTIPLIER / 2)
             {
@@ -8054,6 +8075,42 @@ fn driver_huge_source_hint_does_not_overflow_table_window_shift() {
         driver.dfast_matcher().long_hash.len() >= 1 << MIN_WINDOW_LOG,
         "huge hint must size the dfast table from the real window, not wrap to zero"
     );
+}
+
+#[test]
+fn driver_huge_source_hint_with_dict_does_not_overflow_hc_reserve() {
+    // Regression: the HC/BT history-mirror pre-size adds the dictionary
+    // hint to the source-size hint before `reserve_history` clamps to the
+    // window ceiling. A `u64::MAX` pledged source size (the "unknown size"
+    // sentinel) plus any positive dictionary hint overflows `usize` in
+    // `(src as usize) + dict_hint` — debug panic / release wrap on 64-bit,
+    // and `src as usize` truncation on 32-bit targets. Level 16 (BtOpt)
+    // routes through the HashChain/BT storage arm that owns this reserve.
+    // Must size the mirror to the real window, never panic, wrap, or
+    // truncate.
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+    driver.set_source_size_hint(u64::MAX);
+    driver.set_dictionary_size_hint(64 * 1024);
+    driver.reset(CompressionLevel::Level(16));
+
+    // The saturated `usize::MAX` reserve target must be clamped to the HC
+    // history ceiling, not reserved literally (which would OOM/panic). Level 16
+    // has window_log 22, so the ceiling is `window + window/4 + one block`
+    // (the `reserve_history` formula). Assert the reserve actually reached it —
+    // a no-panic-only check would also pass on an under-reserved mirror.
+    let window = 1usize << 22;
+    let expected_history_ceiling = window + (window >> 2) + crate::common::MAX_BLOCK_SIZE as usize;
+    assert!(
+        driver.hc_matcher().table.history.capacity() >= expected_history_ceiling,
+        "huge source + dict hint must reserve the clamped HC history ceiling, got {}",
+        driver.hc_matcher().table.history.capacity()
+    );
+
+    let mut space = driver.get_next_space();
+    space[..12].copy_from_slice(b"abcabcabcabc");
+    space.truncate(12);
+    driver.commit_space(space);
+    driver.skip_matching_with_hint(None);
 }
 
 #[test]

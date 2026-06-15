@@ -584,9 +584,9 @@ impl HuffmanTable {
             let Some(desc_size) = cheap_desc_size_proxy(trimmed) else {
                 continue;
             };
-            let new_size = table
-                .estimate_compressed_size_from_counts(counts)
-                .saturating_add(desc_size);
+            // Plain `+`: a compressed-literals-size estimate plus a table
+            // description size, both bounded by the block size — no overflow.
+            let new_size = table.estimate_compressed_size_from_counts(counts) + desc_size;
             if new_size > best_size + 1 {
                 break;
             }
@@ -949,9 +949,10 @@ fn build_huffman_leaf_depths(counts: &[usize]) -> Vec<HuffNode> {
     let node_root = leaf_count + (leaf_count - 1) - 1;
     let mut node_nb = leaf_count;
 
-    nodes[node_nb].count = nodes[low_s as usize]
-        .count
-        .saturating_add(nodes[(low_s - 1) as usize].count);
+    // Plain `+`: node counts are symbol frequencies whose tree-wide sum is the
+    // block's symbol count (<= MAX_BLOCK_SIZE), so a merged parent count cannot
+    // overflow usize. Saturation would only mask a corrupt frequency table.
+    nodes[node_nb].count = nodes[low_s as usize].count + nodes[(low_s - 1) as usize].count;
     nodes[node_nb].symbol = nodes[(low_s - 1) as usize]
         .symbol
         .min(nodes[low_s as usize].symbol);
@@ -995,7 +996,8 @@ fn build_huffman_leaf_depths(counts: &[usize]) -> Vec<HuffNode> {
                 idx
             }
         };
-        nodes[node_nb].count = nodes[first].count.saturating_add(nodes[second].count);
+        // Plain `+`: see the leaf-merge above — counts sum to <= MAX_BLOCK_SIZE.
+        nodes[node_nb].count = nodes[first].count + nodes[second].count;
         nodes[node_nb].symbol = nodes[first].symbol.min(nodes[second].symbol);
         nodes[first].parent = Some(node_nb);
         nodes[second].parent = Some(node_nb);

@@ -724,12 +724,19 @@ impl MatchTable {
     }
 
     pub(crate) fn reserve_history(&mut self, expected_bytes: usize) {
-        // Eviction keeps the live mirror within `max_window_size`; one pending
-        // block can sit on top before `add_data` rolls it out, so the tightest
-        // sufficient capacity is `max_window_size + MAX_BLOCK_SIZE`.
-        let cap = self
-            .max_window_size
-            .saturating_add(crate::common::MAX_BLOCK_SIZE as usize);
+        // Eviction keeps the live mirror within `max_window_size`; the dead
+        // prefix is drained at a quarter window (see `compact_history`) and one
+        // pending block can sit on top, so the steady-state ceiling is
+        // `max_window_size + max_window_size/4 + MAX_BLOCK_SIZE` — matching the
+        // `add_data` eviction reserve so the two never fight over capacity.
+        // Plain arithmetic (not `saturating_*`): `max_window_size = 1 <<
+        // window_log` with `window_log <= ZSTD_WINDOWLOG_MAX` (31), so the sum
+        // is at most `2^31 + 2^29 + 2^17 < usize::MAX` even on 32-bit targets —
+        // overflow is unreachable, and a silent saturation here would only mask
+        // a window_log bound violation upstream.
+        let cap = self.max_window_size
+            + (self.max_window_size >> 2)
+            + crate::common::MAX_BLOCK_SIZE as usize;
         let want = expected_bytes.min(cap);
         if want > self.history.capacity() {
             self.history.reserve_exact(want - self.history.len());
@@ -739,6 +746,20 @@ impl MatchTable {
     pub(crate) fn add_data(&mut self, data: Vec<u8>, mut reuse_space: impl FnMut(Vec<u8>)) {
         assert!(data.len() <= self.max_window_size);
         check_stream_abs_headroom(self.history_abs_start, self.window_size, data.len());
+        if self.window_size + data.len() > self.max_window_size {
+            // Cap the history mirror near the live window once eviction starts:
+            // reserve exactly (window + window/4 + one block) so the Vec grows
+            // linearly to that ceiling instead of power-of-two doubling to ~2x
+            // window; `compact_history`'s quarter-window drain keeps len under
+            // it, so the Vec never reallocates again. Small frames that never
+            // fill the window keep their tight data-sized buffer.
+            let target = self.max_window_size
+                + (self.max_window_size >> 2)
+                + crate::common::MAX_BLOCK_SIZE as usize;
+            if target > self.history.len() && self.history.capacity() < target {
+                self.history.reserve_exact(target - self.history.len());
+            }
+        }
         while self.window_size + data.len() > self.max_window_size {
             let removed_len = self.chunk_lens.pop_front().unwrap();
             self.window_size -= removed_len;
@@ -769,13 +790,17 @@ impl MatchTable {
     }
 
     /// Drain the dead prefix of `history` (already-rolled-out bytes)
-    /// when it has grown to at least half the live region. Keeps the
-    /// contiguous mirror compact so reallocation costs stay amortised.
+    /// once it reaches a quarter window, or when it accounts for at
+    /// least half of the mirror. Keeps the contiguous mirror compact
+    /// so reallocation costs stay amortised.
     pub(crate) fn compact_history(&mut self) {
         if self.history_start == 0 {
             return;
         }
-        if self.history_start >= self.max_window_size
+        // Drain the dead prefix at a quarter window (paired with the eviction
+        // reserve in `add_data`) so the mirror stays near `window + window/4`
+        // rather than doubling to ~2x window on long streams.
+        if self.history_start >= (self.max_window_size >> 2)
             || self.history_start * 2 >= self.history.len()
         {
             self.history.drain(..self.history_start);

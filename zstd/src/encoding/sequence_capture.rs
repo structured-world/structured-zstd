@@ -113,7 +113,9 @@ impl Matcher for CapturingMatcher {
         let tail_ll = self.inner.get_last_space().len() as u32;
         self.inner.skip_matching();
         self.block_tail_lengths.borrow_mut().push(tail_ll);
-        self.current_block = self.current_block.saturating_add(1);
+        // Plain `+`: diagnostic per-block index; the comparator runs on bench
+        // fixtures whose block count is nowhere near u32::MAX.
+        self.current_block += 1;
     }
 
     fn skip_matching_with_hint(&mut self, incompressible_hint: Option<bool>) {
@@ -126,7 +128,9 @@ impl Matcher for CapturingMatcher {
         let tail_ll = self.inner.get_last_space().len() as u32;
         self.inner.skip_matching_with_hint(incompressible_hint);
         self.block_tail_lengths.borrow_mut().push(tail_ll);
-        self.current_block = self.current_block.saturating_add(1);
+        // Plain `+`: diagnostic per-block index; the comparator runs on bench
+        // fixtures whose block count is nowhere near u32::MAX.
+        self.current_block += 1;
     }
 
     fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
@@ -164,7 +168,8 @@ impl Matcher for CapturingMatcher {
                         of: *offset as u32,
                         ml: *match_len as u32,
                     });
-                    seq_in_block = seq_in_block.saturating_add(1);
+                    // Plain `+`: sequences per block <= MAX_BLOCK_SIZE, far under u32::MAX.
+                    seq_in_block += 1;
                 }
                 Sequence::Literals { literals } => {
                     block_tail_ll = literals.len() as u32;
@@ -173,7 +178,9 @@ impl Matcher for CapturingMatcher {
             handle_sequence(seq);
         });
         self.block_tail_lengths.borrow_mut().push(block_tail_ll);
-        self.current_block = self.current_block.saturating_add(1);
+        // Plain `+`: diagnostic per-block index; the comparator runs on bench
+        // fixtures whose block count is nowhere near u32::MAX.
+        self.current_block += 1;
     }
 
     fn reset(&mut self, level: CompressionLevel) {
