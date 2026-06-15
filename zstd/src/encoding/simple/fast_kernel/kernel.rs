@@ -2452,4 +2452,106 @@ mod tests {
              ip bytes coincide with CMOV_DUMMY",
         );
     }
+
+    /// Drive the borrowed dual-base dict kernel directly (Scalar tier — always
+    /// available, deterministic) over a crafted `(dict, input)` pair that
+    /// exercises the dict-match (2-segment + backward extension), input-match,
+    /// repcode and tail-literal branches. Reconstruct against the logical
+    /// `[dict][input]` window to prove every emitted offset is valid, and check
+    /// the byte-accounting invariant.
+    #[test]
+    fn borrowed_dict_kernel_reconstructs_via_dual_base() {
+        use crate::encoding::fastpath::FastpathKernel;
+
+        let hash_log = 12u32;
+        const MLS: u32 = 4;
+        // Distinct dict bytes so each 4-byte key hashes uniquely; the input
+        // both matches the dict prefix (dict match) and repeats itself
+        // (input match + repcode), then ends in a literal tail.
+        let dict: Vec<u8> = (0u8..40).collect();
+        let mut inp: Vec<u8> = Vec::new();
+        inp.extend_from_slice(&dict[0..20]); // dict match against dict[0..]
+        inp.extend_from_slice(&dict[0..20]); // input match against the first copy
+        inp.extend_from_slice(&dict[4..24]); // dict match at a non-zero dict pos
+        inp.extend_from_slice(b"tail-literals-xyz"); // terminal literals
+
+        let dict_end = dict.len();
+
+        // main table (filled during the scan) + immutable dict table primed
+        // over every hashable dict position.
+        let mut main_table = FastHashTable::new(hash_log, MLS);
+        let mut dict_table = FastHashTable::new(hash_log, MLS);
+        for pos in 0..=dict.len() - HASH_READ_SIZE {
+            // SAFETY: pos + 8 <= dict.len(); MLS matches the table.
+            let h = unsafe { dict_table.hash_ptr::<MLS>(dict.as_ptr().add(pos)) };
+            unsafe { dict_table.put(h, pos as u32) };
+        }
+
+        let mut tuples: Vec<(Vec<u8>, usize, usize)> = Vec::new();
+        let mut handle = |seq: Sequence<'_>| match seq {
+            Sequence::Triple {
+                literals,
+                offset,
+                match_len,
+            } => tuples.push((literals.to_vec(), offset, match_len)),
+            Sequence::Literals { literals } => tuples.push((literals.to_vec(), 0, 0)),
+        };
+
+        let result = compress_block_fast_dict_borrowed::<MLS, false>(
+            &inp,
+            &dict,
+            0,
+            inp.len(),
+            &mut main_table,
+            &dict_table,
+            PrefixBounds {
+                prefix_start_index: 1,
+                window_low: 0,
+            },
+            [0, 0],
+            2,
+            &mut handle,
+            FastpathKernel::Scalar,
+        );
+
+        // Reconstruct against the logical [dict][input] window: start from the
+        // dictionary, then replay each sequence. A Triple's offset references
+        // `current_len - offset` in this combined buffer, so a valid dual-base
+        // offset reproduces the original input exactly.
+        let mut window = dict.clone();
+        let mut saw_dict_region_match = false;
+        for (literals, offset, match_len) in &tuples {
+            window.extend_from_slice(literals);
+            if *match_len > 0 {
+                let start = window.len() - offset;
+                // A match whose source lands in the dictionary prefix exercised
+                // the dual-base / 2-segment path (not a plain input back-ref).
+                if start < dict_end {
+                    saw_dict_region_match = true;
+                }
+                for i in 0..*match_len {
+                    let b = window[start + i];
+                    window.push(b);
+                }
+            }
+        }
+        // Append the terminal tail the kernel reports separately.
+        let tail_start = inp.len() - result.tail_literals_len;
+        window.extend_from_slice(&inp[tail_start..]);
+
+        assert_eq!(
+            &window[dict_end..],
+            &inp[..],
+            "borrowed dict kernel must reconstruct the input from the [dict][input] window",
+        );
+
+        assert!(
+            tuples.iter().any(|(_, _, m)| *m >= 4),
+            "expected at least one match Triple",
+        );
+        assert!(
+            saw_dict_region_match,
+            "expected at least one match reading from the dictionary region (dual-base path)",
+        );
+    }
 }
