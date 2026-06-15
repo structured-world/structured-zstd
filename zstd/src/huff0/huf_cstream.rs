@@ -171,22 +171,6 @@ impl<'a> HufCStream<'a> {
         self.bit_pos[idx] = self.bit_pos[idx].wrapping_add(nb_add);
     }
 
-    /// Donor `HUF_zeroIndex1`.
-    #[inline(always)]
-    pub(crate) fn zero_index1(&mut self) {
-        self.bit_container[1] = 0;
-        self.bit_pos[1] = 0;
-    }
-
-    /// Donor `HUF_mergeIndex1`: fold `bit_container[1]` into `[0]`.
-    #[inline(always)]
-    pub(crate) fn merge_index1(&mut self) {
-        let nb_bits_1 = self.bit_pos[1] & 0xFF;
-        self.bit_container[0] >>= nb_bits_1;
-        self.bit_container[0] |= self.bit_container[1];
-        self.bit_pos[0] = self.bit_pos[0].wrapping_add(self.bit_pos[1]);
-    }
-
     /// Donor `HUF_flushBits`: write the top `nb_bytes` of
     /// `bit_container[0]` to `output[cursor..cursor+8]`, advance
     /// `cursor` by `nb_bytes`, keep the trailing `< 8` bits in the
@@ -225,6 +209,149 @@ impl<'a> HufCStream<'a> {
             self.cursor = self.end_ptr;
             self.overflow = true;
         }
+    }
+
+    /// Donor `HUF_compress1X_usingCTable_internal_body_loop`
+    /// (`huf_compress.c:991-1043`) with all mutable bit state hoisted
+    /// into locals so the two containers, their bit positions, and the
+    /// write cursor stay register-resident across the whole encode loop.
+    ///
+    /// The per-call `add_bits`/`flush_bits`/`zero_index1`/`merge_index1`
+    /// path reads and writes `self.bit_container[idx]` etc. through
+    /// `&mut self` every symbol; the optimizer could not prove the
+    /// output-buffer raw writes in `flush_bits` don't alias those struct
+    /// fields, so it conservatively reloaded the containers from memory
+    /// per symbol (donor keeps them in `HUF_CStream_t` locals). Hoisting
+    /// to locals here matches donor's register-resident shape. The
+    /// arithmetic mirrors those four methods byte for byte, so the
+    /// emitted bitstream is identical; only the codegen changes.
+    ///
+    /// Phases match the prior `encode_one_stream_unrolled`: (1) `n %
+    /// K_UNROLL` tail symbols slow, (2) bring `n` to a multiple of
+    /// `2 * K_UNROLL`, (3) dual-container main loop processing
+    /// `2 * K_UNROLL` symbols per iteration. Symbols consumed in reverse
+    /// (`data[--n]`).
+    #[inline]
+    pub(crate) fn encode_unrolled<
+        const K_UNROLL: usize,
+        const K_FAST_FLUSH: bool,
+        const K_LAST_FAST: bool,
+    >(
+        &mut self,
+        table: &[u64],
+        data: &[u8],
+    ) {
+        let mut bc0 = self.bit_container[0];
+        let mut bc1 = self.bit_container[1];
+        let mut bp0 = self.bit_pos[0];
+        let mut bp1 = self.bit_pos[1];
+        let mut cursor = self.cursor;
+        let mut overflow = self.overflow;
+        let end_ptr = self.end_ptr;
+        // Stable raw base: `new()` reserved `dst_capacity` and this method
+        // never pushes to `output`, so no realloc can move the buffer and
+        // every `cursor + 8 <= capacity` write targets spare capacity.
+        let out_base = self.output.as_mut_ptr();
+
+        // Mirror `add_bits`: `$fast` (a `const`-valued bool) const-folds.
+        macro_rules! add0 {
+            ($elt:expr, $fast:expr) => {{
+                let elt = $elt;
+                let nb_bits = elt & 0xFF;
+                bc0 >>= nb_bits;
+                bc0 |= if $fast { elt } else { elt & !0xFFu64 };
+                bp0 = bp0.wrapping_add(if $fast { elt } else { nb_bits });
+            }};
+        }
+        macro_rules! add1 {
+            ($elt:expr, $fast:expr) => {{
+                let elt = $elt;
+                let nb_bits = elt & 0xFF;
+                bc1 >>= nb_bits;
+                bc1 |= if $fast { elt } else { elt & !0xFFu64 };
+                bp1 = bp1.wrapping_add(if $fast { elt } else { nb_bits });
+            }};
+        }
+        // Mirror `flush_bits` on `bc0`/`bp0`/`cursor`.
+        macro_rules! flush0 {
+            ($fast:expr) => {{
+                let nb_bits = (bp0 & 0xFF) as usize;
+                let nb_bytes = nb_bits >> 3;
+                let chunk = if nb_bits == 0 {
+                    0
+                } else {
+                    bc0 >> (HUF_BITS_IN_CONTAINER - nb_bits)
+                };
+                bp0 &= 7;
+                let bytes = chunk.to_le_bytes();
+                // SAFETY: see `out_base` above; `cursor + 8 <= capacity`.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(bytes.as_ptr(), out_base.add(cursor), 8);
+                }
+                cursor += nb_bytes;
+                if !$fast && cursor > end_ptr {
+                    cursor = end_ptr;
+                    overflow = true;
+                }
+            }};
+        }
+
+        let mut n = data.len();
+        let rem = n % K_UNROLL;
+
+        // Phase 1: tail symbols (< K_UNROLL) on the SLOW path.
+        if rem > 0 {
+            for _ in 0..rem {
+                n -= 1;
+                add0!(table[data[n] as usize], false);
+            }
+            flush0!(K_FAST_FLUSH);
+        }
+        debug_assert!(n.is_multiple_of(K_UNROLL));
+
+        // Phase 2: bring n down to a multiple of 2 * K_UNROLL.
+        if !n.is_multiple_of(2 * K_UNROLL) {
+            for u in 1..K_UNROLL {
+                add0!(table[data[n - u] as usize], true);
+            }
+            add0!(table[data[n - K_UNROLL] as usize], K_LAST_FAST);
+            flush0!(K_FAST_FLUSH);
+            n -= K_UNROLL;
+        }
+        debug_assert!(n.is_multiple_of(2 * K_UNROLL));
+
+        // Phase 3: dual-container main loop.
+        while n > 0 {
+            for u in 1..K_UNROLL {
+                add0!(table[data[n - u] as usize], true);
+            }
+            add0!(table[data[n - K_UNROLL] as usize], K_LAST_FAST);
+            flush0!(K_FAST_FLUSH);
+
+            bc1 = 0;
+            bp1 = 0;
+            for u in 1..K_UNROLL {
+                add1!(table[data[n - K_UNROLL - u] as usize], true);
+            }
+            add1!(table[data[n - K_UNROLL - K_UNROLL] as usize], K_LAST_FAST);
+            // merge_index1: fold container 1 into container 0.
+            let nb_bits_1 = bp1 & 0xFF;
+            bc0 >>= nb_bits_1;
+            bc0 |= bc1;
+            bp0 = bp0.wrapping_add(bp1);
+            flush0!(K_FAST_FLUSH);
+
+            n -= 2 * K_UNROLL;
+        }
+        debug_assert_eq!(n, 0);
+
+        // Write the hoisted state back so `close()` sees the final values.
+        self.bit_container[0] = bc0;
+        self.bit_container[1] = bc1;
+        self.bit_pos[0] = bp0;
+        self.bit_pos[1] = bp1;
+        self.cursor = cursor;
+        self.overflow = overflow;
     }
 
     /// Number of bits currently buffered in `bit_container[0]`.
@@ -328,21 +455,24 @@ mod tests {
         assert!(n >= 8);
     }
 
-    /// Dual-container parallel encode: add to idx=1, merge, verify the
-    /// merged stream contains both sub-streams concatenated.
+    /// Dual-container parallel encode through `encode_unrolled` (which
+    /// inlines the zero/merge of container 1 into container 0). With a
+    /// uniform 4-bit code over 16 symbols, the total emitted size is
+    /// order-independent: 16 * 4 = 64 payload bits + a 1-bit end mark =
+    /// 65 bits → 9 bytes. K_UNROLL=4 with 16 symbols runs phase 3 (the
+    /// dual-container loop) twice, so the merge path is exercised.
     #[test]
-    fn merge_index1_concatenates_streams() {
+    fn encode_unrolled_dual_container_size_is_deterministic() {
         let mut out: Vec<u8> = Vec::new();
         let mut s = HufCStream::new(&mut out, 64).expect("init ok");
-        // Stream 0: 4-bit value 0b1100 (12)
-        s.add_bits::<false>(pack_huf_celt(0b1100, 4), 0);
-        // Stream 1: 4-bit value 0b0011 (3)
-        s.zero_index1();
-        s.add_bits::<false>(pack_huf_celt(0b0011, 4), 1);
-        // Merge: stream0 should now contain 8 bits (stream0's 4 + stream1's 4).
-        s.merge_index1();
-        assert_eq!(s.pending_bits(), 8);
+        // Every symbol maps to the same 4-bit code (value 0b1010).
+        let table = [pack_huf_celt(0b1010, 4); 256];
+        let data = [0u8; 16];
+        s.encode_unrolled::<4, false, false>(&table, &data);
         let n = s.close();
-        assert!(n > 0);
+        assert_eq!(
+            n, 9,
+            "16 symbols * 4 bits + 1 end-mark bit = 65 bits = 9 bytes"
+        );
     }
 }
