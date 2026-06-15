@@ -920,6 +920,8 @@ fn borrowed_oneshot_matches_owned_and_roundtrips() {
         // the two must still produce byte-identical frames.
         CompressionLevel::Level(5),
         CompressionLevel::Level(9),
+        // HashChain/BinaryTree btlazy2 borrowed over-window path (L13-15).
+        CompressionLevel::Level(15),
     ] {
         for &(seed, len) in &cases {
             for data in [generate_compressible(seed, len), generate_data(seed, len)] {

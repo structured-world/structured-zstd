@@ -287,23 +287,24 @@ pub(crate) fn compress_block_encoded_borrowed(
         BlockType::Raw
     } else {
         // The borrowed one-shot path emits ONE block per staged range (no
-        // pre-split partition loop). That holds for every borrowed-eligible
-        // backend (Simple / Dfast / Row — none pre-split). Gate on the
-        // resolved BACKEND, not the level number: a strategy override (e.g.
-        // Greedy at level 19) puts a Row-backed scan under a high level, which
-        // is still single-block and borrowed-valid. The HashChain backend
-        // (lazy L13-15 / BT L16+) has no borrowed scan yet and is excluded by
-        // `borrowed_eligible`, so it must never reach here.
-        assert!(
-            !matches!(
-                state.matcher.active_backend(),
-                crate::encoding::strategy::BackendTag::HashChain
-            ),
-            "borrowed one-shot path requires a non-pre-splitting backend (Simple/Dfast/Row)",
+        // pre-split partition loop). `borrowed_supported()` is the single
+        // source of truth for which backend + search configs have a borrowed
+        // scan (Simple / Dfast / Row, and HashChain's lazy CHAIN parser); the
+        // BT/optimal search stays on the owned path. `borrowed_eligible` gates
+        // on the same predicate, so this only ever fires on a wiring bug.
+        debug_assert!(
+            state.matcher.borrowed_supported(),
+            "borrowed one-shot path reached for an unsupported backend/search config",
         );
         // Stage the borrowed range so `compress_block`'s internal
         // `start_matching` scans it in place (no `commit_space` copy).
         state.matcher.set_borrowed_block(block_start, block_end);
+        // No post-split branch here: the optimal levels (16-22), the only
+        // strategies that post-split, are NOT borrowed-eligible
+        // (`borrowed_supported` keeps them owned because the borrowed
+        // continuous-index scan yields ratio-worse candidates for their
+        // cost-based DP). btlazy2 (L13-15) and every other borrowed backend
+        // emit a single block per staged range, handled by the path below.
         #[cfg(feature = "lsm")]
         if let Some(sink) = block_decompressed_sizes {
             sink.push(block_size);

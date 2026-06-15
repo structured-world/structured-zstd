@@ -297,6 +297,15 @@ pub(crate) struct MatchTable {
     /// searched by the BT/optimal collect alongside the live tree. `Some`
     /// once primed from a non-empty dictionary on a BT level.
     pub(crate) dms: DictAttach<DmsDictTables>,
+    /// Borrowed (no-copy) one-shot input window `(ptr, len)`. When set, the
+    /// scan reads candidate/cursor bytes straight from the caller's slice
+    /// instead of the owned `history` mirror, so an over-window one-shot
+    /// input is matched in place (no input->mirror memmove). Raw pointer:
+    /// live until `clear_borrowed_window` / `reset`.
+    pub(crate) borrowed_input: Option<(*const u8, usize)>,
+    /// Active borrowed block range `[start, end)` within `borrowed_input`,
+    /// staged before each borrowed scan.
+    pub(crate) borrowed_block: Option<(usize, usize)>,
 }
 
 impl MatchTable {
@@ -327,6 +336,8 @@ impl MatchTable {
             uses_bt: false,
             search_mls: 4,
             dms: DictAttach::new(),
+            borrowed_input: None,
+            borrowed_block: None,
         }
     }
 
@@ -812,6 +823,21 @@ impl MatchTable {
     /// mirror. Match finders operate on this slice rather than the raw
     /// `history` Vec.
     pub(crate) fn live_history(&self) -> &[u8] {
+        // Borrowed one-shot: expose `[0, block_end)` of the caller's input so
+        // candidate/cursor reads land in place (the owned `history` mirror is
+        // empty under the no-copy path). Loop-invariant branch, inlines.
+        if let Some((_start, end)) = self.borrowed_block {
+            let (ptr, total) = self
+                .borrowed_input
+                .expect("borrowed_block set without a registered borrowed window");
+            debug_assert!(
+                end <= total,
+                "borrowed block end {end} exceeds window {total}"
+            );
+            // SAFETY: `ptr` is the registered window start (live by contract);
+            // `end <= total` in bounds.
+            return unsafe { core::slice::from_raw_parts(ptr, end) };
+        }
         &self.history[self.history_start..]
     }
 
@@ -824,8 +850,63 @@ impl MatchTable {
     /// the most recent buffer in the rolling window — panics if no
     /// data has been committed yet.
     pub(crate) fn get_last_space(&self) -> &[u8] {
+        if let (Some((ptr, _total)), Some((block_start, block_end))) =
+            (self.borrowed_input, self.borrowed_block)
+        {
+            // SAFETY: borrowed liveness contract; range validated when staged.
+            return unsafe {
+                core::slice::from_raw_parts(ptr.add(block_start), block_end - block_start)
+            };
+        }
         let last = *self.chunk_lens.back().unwrap();
         &self.history[self.history.len() - last..]
+    }
+
+    /// Register the borrowed input window. Zeroes `history_abs_start` so
+    /// borrowed positions are absolute input offsets (the owned floor-advance
+    /// reset leaves it non-zero across frames; borrowed never `add_data`s, so
+    /// it stays 0 for the frame). Every probed candidate is byte-verified, so
+    /// stale table entries from a prior frame are rejected (or, if their bytes
+    /// coincidentally match, are genuine in-window matches).
+    ///
+    /// # Safety
+    /// `buffer` must stay live and unmodified until `clear_borrowed_window`
+    /// or `reset`.
+    pub(crate) unsafe fn set_borrowed_window(&mut self, buffer: &[u8]) {
+        self.borrowed_input = Some((buffer.as_ptr(), buffer.len()));
+        self.borrowed_block = None;
+        self.history_abs_start = 0;
+    }
+
+    pub(crate) fn clear_borrowed_window(&mut self) {
+        self.borrowed_input = None;
+        self.borrowed_block = None;
+    }
+
+    /// Stage `[block_start, block_end)` as the active borrowed block.
+    pub(crate) fn stage_borrowed_block(&mut self, block_start: usize, block_end: usize) {
+        let (_ptr, total) = self
+            .borrowed_input
+            .expect("stage_borrowed_block requires a registered borrowed window");
+        assert!(
+            block_start <= block_end && block_end <= total,
+            "borrowed block bounds out of range: start={block_start} end={block_end} total={total}",
+        );
+        self.borrowed_block = Some((block_start, block_end));
+    }
+
+    /// `(current_abs_start, current_len)` for the active scan. Borrowed: the
+    /// staged block range. Owned: the last committed chunk in the live window.
+    pub(crate) fn current_block_range(&self) -> (usize, usize) {
+        if let Some((start, end)) = self.borrowed_block {
+            (start, end - start)
+        } else {
+            let current_len = *self.chunk_lens.back().unwrap();
+            (
+                self.history_abs_start + self.window_size - current_len,
+                current_len,
+            )
+        }
     }
 
     /// Test-only: append a chunk to the live window without eviction /
@@ -961,6 +1042,10 @@ impl MatchTable {
         self.history_start = 0;
         self.offset_hist = [1, 4, 8];
         self.skip_insert_until_abs = 0;
+        // Clear borrowed-window state so a following OWNED frame reads the
+        // owned mirror; a borrowed frame re-arms via `set_borrowed_window`.
+        self.borrowed_input = None;
+        self.borrowed_block = None;
         self.dictionary_limit_abs = None;
         self.dictionary_primed_for_frame = false;
         self.allow_zero_relative_position = false;
@@ -1793,8 +1878,7 @@ impl MatchTable {
 
     pub(crate) fn skip_matching(&mut self, incompressible_hint: Option<bool>) {
         self.ensure_tables();
-        let current_len = *self.chunk_lens.back().unwrap();
-        let current_abs_start = self.history_abs_start + self.window_size - current_len;
+        let (current_abs_start, current_len) = self.current_block_range();
         let current_abs_end = current_abs_start + current_len;
         self.backfill_boundary_positions(current_abs_start, current_abs_end);
         if self.uses_bt {
@@ -1982,10 +2066,16 @@ impl MatchTable {
         plan: &[HcOptimalSequence],
         handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
     ) {
-        // Direct field borrow of `history` (not `get_last_space()`, which
-        // borrows all of `self`) so the per-sequence `&mut self.offset_hist`
-        // write below stays a disjoint-field borrow.
-        let current = &self.history[self.history.len() - current_len..];
+        // Current block bytes. `get_last_space()` is borrowed-aware (owned:
+        // last committed chunk = `history[len-current_len..]`, byte-identical;
+        // borrowed: the staged in-place block). Reborrow-then-raw-ptr so the
+        // slice holds NO borrow and the per-sequence `&mut self.offset_hist`
+        // write below stays valid (the old direct `&self.history[..]` slice
+        // underflowed on the borrowed path, where `history` is empty).
+        let current: &[u8] = unsafe {
+            let ls = self.get_last_space();
+            core::slice::from_raw_parts(ls.as_ptr(), current_len)
+        };
         if plan.is_empty() {
             handle_sequence(Sequence::Literals { literals: current });
             return;

@@ -949,37 +949,20 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
     /// The owned/evicting path keeps the scanned window bounded (positions
     /// stay small), so >4 GiB inputs fall back to it.
     fn borrowed_eligible(&self, input_len: usize, prep: &FramePrep) -> bool {
-        use crate::encoding::strategy::StrategyTag;
         if prep.use_dictionary_state
             || matches!(self.compression_level, CompressionLevel::Uncompressed)
             || input_len > u32::MAX as usize
         {
             return false;
         }
-        match self.state.strategy_tag {
-            // Fast handles over-window inputs in the borrowed scan via an
-            // explicit `window_low = block_end - advertised_window` bound.
-            StrategyTag::Fast => true,
-            // The Dfast borrowed scan now applies an explicit per-position
-            // `window_low = abs_ip - advertised_window` bound (mirroring the
-            // owned eviction's `history_abs_start` cap and the Fast borrowed
-            // scan), so it rejects over-window candidates instead of emitting
-            // an unresolvable offset. Over-window inputs therefore stay on the
-            // borrowed in-place path (no input->history copy) — matching C's
-            // continuous-index + windowLow one-shot behaviour, which also
-            // avoids the eviction/rehash the owned path pays.
-            StrategyTag::Dfast => true,
-            // Greedy / Lazy map to EITHER the Row or HashChain backend
-            // depending on level (L5 greedy + L9-12 lazy = Row; L13-15 lazy =
-            // HashChain). The borrowed in-place scan with the same per-position
-            // `window_low` cap exists for Row; gate on the resolved backend,
-            // not the strategy tag, so only Row-backed levels take it (HashChain
-            // / BT stay on the owned path until their borrowed scan lands).
-            _ => matches!(
-                self.state.matcher.active_backend(),
-                crate::encoding::strategy::BackendTag::Row
-            ),
-        }
+        // The borrowed (no-copy, in-place over-window) scan exists for the
+        // Simple (Fast), Dfast, and Row backends, and for the HashChain
+        // backend's lazy CHAIN parser; BT/optimal (BinaryTree search) stay on
+        // the owned path. Every borrowed scan applies the per-position
+        // `window_low = abs_ip - advertised_window` offset cap so over-window
+        // inputs are matched in place (no input->history copy), matching C's
+        // continuous-index + windowLow one-shot behaviour.
+        self.state.matcher.borrowed_supported()
     }
 
     /// Compress `input` as one frame's worth of blocks into `out` (appended
