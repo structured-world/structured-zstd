@@ -467,7 +467,7 @@ impl HuffmanTable {
 
         let min_table_log = symbol_cardinality.ilog2() as usize + 1;
         let mut best_size = usize::MAX - 1;
-        let mut best_table = None;
+        let mut best_weights: Option<alloc::vec::Vec<usize>> = None;
 
         // Outer-loop scoring uses [`cheap_desc_size_proxy`] — an integer
         // entropy estimate of the weight description, no FSE encode.
@@ -497,13 +497,28 @@ impl HuffmanTable {
             if !huffman_weight_sum_is_power_of_two(&weights) {
                 continue;
             }
-            let table = Self::build_from_weights(&weights);
-            let max_bits = table
-                .codes
+            // Per-symbol code length is `wtable_log + 1 - weight` (weight > 0) —
+            // exactly what `build_from_weights` writes into `codes[..].bits`.
+            // Derive `wtable_log`, `max_bits`, and the count-weighted size
+            // estimate analytically from `weights` so the candidate search
+            // never builds (then discards) a full encoder table; only the
+            // winning weights are built into a table after the loop. The
+            // `huffman_weight_sum_is_power_of_two` check above guarantees
+            // `weight_sum` is a power of two, matching `build_from_weights`.
+            let weight_sum: usize = weights
                 .iter()
-                .map(|&(_, bits)| bits)
-                .max()
-                .unwrap_or_default() as usize;
+                .copied()
+                .filter(|&w| w > 0)
+                .map(|w| 1usize << (w - 1))
+                .sum();
+            let wtable_log = highest_bit_set(weight_sum) - 1;
+            let min_positive_weight = weights
+                .iter()
+                .copied()
+                .filter(|&w| w > 0)
+                .min()
+                .unwrap_or(0);
+            let max_bits = wtable_log + 1 - min_positive_weight;
             if max_bits < table_log && table_log > min_table_log {
                 break;
             }
@@ -525,19 +540,32 @@ impl HuffmanTable {
             let Some(desc_size) = cheap_desc_size_proxy(trimmed) else {
                 continue;
             };
-            // Plain `+`: a compressed-literals-size estimate plus a table
-            // description size, both bounded by the block size — no overflow.
-            let new_size = table.estimate_compressed_size_from_counts(counts) + desc_size;
+            // Mirrors `estimate_compressed_size_from_counts`: per-symbol
+            // `count * nb_bits` summed, then byte-rounded. `nb_bits` is the
+            // same `wtable_log + 1 - weight` the built table would carry.
+            // Plain `+`: estimate + table description, both bounded by the
+            // block size — no overflow.
+            let estimate_bits: usize = weights
+                .iter()
+                .zip(counts.iter())
+                .filter(|&(&w, _)| w > 0)
+                .map(|(&w, &count)| (wtable_log + 1 - w) * count)
+                .sum();
+            let payload = estimate_bits.div_ceil(8) + usize::from(estimate_bits.is_multiple_of(8));
+            let new_size = payload + desc_size;
             if new_size > best_size + 1 {
                 break;
             }
             if new_size < best_size {
                 best_size = new_size;
-                best_table = Some(table);
+                // Move the owned weights in (no clone); the next iteration
+                // allocates fresh weights and the previous best is freed.
+                best_weights = Some(weights);
             }
         }
 
-        best_table
+        best_weights
+            .map(|w| Self::build_from_weights(&w))
             .unwrap_or_else(|| Self::build_from_weights(&build_donor_limited_weights(counts, 11)))
     }
 
