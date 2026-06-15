@@ -569,15 +569,18 @@ impl FastKernelMatcher {
         );
         self.borrowed = Some((buffer.as_ptr(), buffer.len()));
         self.last_borrowed_block = None;
-        // Any hash-table entries left from a prior window are absolute
-        // positions into THAT buffer; once we switch the window backing
-        // to `buffer`, a `start_matching_borrowed` scan would read them
-        // as indices into the new buffer — out of bounds / memory-unsafe.
-        // Today the caller (`compress_oneshot_borrowed`) always resets
-        // first, but make the borrowed-window registration self-contained:
-        // clear the table and re-floor `prefix_start_index` so the window
-        // starts from a clean match state regardless of prior history.
-        self.hash_table.clear();
+        // Stale hash-table entries from a prior window are invalidated by the
+        // `reset()` the caller (`run_borrowed_block_loop` via
+        // `compress_oneshot_borrowed`) ALWAYS runs immediately before this
+        // call — `reset` either memsets the table (no-dict / copy frames) or
+        // epoch-advances the bias past every prior position (dict-attach
+        // frames, donor `ZSTD_continueCCtx`). Re-clearing here would memset the
+        // whole table a SECOND time per frame and, on the dict-attach path,
+        // throw away the epoch advance the reset just performed (measured: the
+        // redundant clear was ~12% of the borrowed-dict encode). The
+        // mode-switch precondition (no stale owned `pending`) is asserted
+        // above. Re-flooring `prefix_start_index` is a single store (not a
+        // memset), so keep it for self-containment.
         self.prefix_start_index = INITIAL_PREFIX_START_INDEX;
     }
 
@@ -586,18 +589,20 @@ impl FastKernelMatcher {
     pub(crate) fn clear_borrowed_window(&mut self) {
         self.borrowed = None;
         self.last_borrowed_block = None;
-        // The hash table still holds absolute positions into the
-        // now-detached borrowed buffer. An owned-path scan would read
-        // them as offsets into `self.history` — out of bounds once the
-        // borrowed buffer is gone (memory-unsafe). Today every frame
-        // begins with `reset` (which clears the table), so an owned
-        // scan never observes the stale entries; but the docstring
-        // promises a return to the owned path, so restore that
-        // invariant here too rather than relying on the caller always
-        // resetting first. Mirrors `reset` / `drain_real_prefix`:
-        // clear the table and re-floor `prefix_start_index` at the
-        // sentinel-0 baseline.
-        self.hash_table.clear();
+        // Detach the window pointer only — do NOT memset the table. The hash
+        // table still holds absolute positions into the now-detached borrowed
+        // buffer, but every frame begins with `reset()` (which memsets the
+        // table for no-dict / copy frames, or epoch-advances the bias for
+        // dict-attach frames) BEFORE any subsequent scan reads it, so an
+        // owned- or borrowed-path scan never observes the stale entries. The
+        // prior unconditional `hash_table.clear()` here was a second
+        // full-table memset per borrowed frame (this runs on the
+        // `ClearBorrowedOnDrop` guard at every frame exit) on top of the next
+        // frame's reset — measured at ~12% of the borrowed-dict encode — with
+        // no correctness role the reset does not already cover. `start_matching`
+        // (the owned path) additionally asserts `borrowed.is_none()`, which the
+        // `self.borrowed = None` above satisfies. Re-floor the sentinel-0
+        // baseline (a single store, not a memset).
         self.prefix_start_index = INITIAL_PREFIX_START_INDEX;
     }
 
@@ -1053,9 +1058,15 @@ impl FastKernelMatcher {
             "borrowed block bounds out of range: start={block_start} end={block_end} total={total_len}",
         );
         self.last_borrowed_block = Some((block_start, block_end));
-        self.table_pos_high_water = self.table_pos_high_water.max(block_end);
 
         let dict_end = self.dict.region_len();
+        // The dual-base kernel stores VIRTUAL positions `dict_end + input_off`
+        // (up to ~`dict_end + block_end`) into the main table, so the next
+        // frame's epoch advance must span past `dict_end + block_end` — NOT
+        // just `block_end` — or stale entries in `[block_end, dict_end +
+        // block_end)` would survive the bias advance and alias as bogus
+        // low positions.
+        self.table_pos_high_water = self.table_pos_high_water.max(dict_end + block_end);
         let advertised_window = 1usize << self.window_log;
         let mls = self.hash_table.mls();
         let use_cmov = self.use_cmov;
