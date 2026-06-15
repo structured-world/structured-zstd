@@ -960,13 +960,15 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             // Fast handles over-window inputs in the borrowed scan via an
             // explicit `window_low = block_end - advertised_window` bound.
             StrategyTag::Fast => true,
-            // The Dfast borrowed scan uses `history_abs_start` (== 0 in
-            // borrowed mode) as the candidate lower bound, not `window_low`,
-            // so it reproduces the owned (evicting) path only when the whole
-            // input fits the window — then neither side evicts, so neither
-            // rejects an in-window candidate and the sequence streams match.
-            // Over-window inputs fall back to the owned path.
-            StrategyTag::Dfast => input_len <= self.state.matcher.window_size() as usize,
+            // The Dfast borrowed scan now applies an explicit per-position
+            // `window_low = abs_ip - advertised_window` bound (mirroring the
+            // owned eviction's `history_abs_start` cap and the Fast borrowed
+            // scan), so it rejects over-window candidates instead of emitting
+            // an unresolvable offset. Over-window inputs therefore stay on the
+            // borrowed in-place path (no input->history copy) — matching C's
+            // continuous-index + windowLow one-shot behaviour, which also
+            // avoids the eviction/rehash the owned path pays.
+            StrategyTag::Dfast => true,
             _ => false,
         }
     }

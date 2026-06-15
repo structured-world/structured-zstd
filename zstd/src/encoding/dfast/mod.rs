@@ -1760,6 +1760,14 @@ macro_rules! start_matching_fast_loop_body {
                 (core::ptr::null(), core::ptr::null(), 0)
             };
 
+        // Advertised window cap = `1 << window_log`. Owned mode evicts, so
+        // `history_abs_start` already bounds candidates to the live window;
+        // borrowed mode keeps the whole input in place (no eviction), so an
+        // OVER-window borrowed scan must explicitly reject candidates whose
+        // offset would exceed the advertised window — otherwise it would emit
+        // an offset the decoder cannot resolve. Hoisted (loop-invariant).
+        let advertised_window = $self.max_window_size;
+
         'outer: loop {
             // Outer-iter precondition: at least `HASH_READ_SIZE = 8` bytes
             // ahead of `pos` so the unconditional 8-byte `u64` load below
@@ -1908,6 +1916,21 @@ macro_rules! start_matching_fast_loop_body {
             let inner_exit: InnerExit = 'inner: loop {
                 let abs_ip0 = $current_abs_start + ip0;
                 let abs_ip1 = $current_abs_start + ip1;
+                // Per-position candidate window-low bound (see `advertised_window`
+                // above). `$borrowed` is const, so owned collapses to
+                // `history_abs_start` (byte-identical) and borrowed-in-window
+                // saturates to 0 (== history_abs_start, also byte-identical);
+                // only borrowed-over-window gains the `abs_ip - window` cap.
+                let wlow0 = if $borrowed {
+                    abs_ip0.saturating_sub(advertised_window)
+                } else {
+                    history_abs_start
+                };
+                let wlow1 = if $borrowed {
+                    abs_ip1.saturating_sub(advertised_window)
+                } else {
+                    history_abs_start
+                };
                 let lit_len_ip0 = ip0 - literals_start;
                 let lit_len_ip1 = ip1 - literals_start;
                 let packed_curr = ((abs_ip0 - position_base) as u32) + 1;
@@ -1962,7 +1985,7 @@ macro_rules! start_matching_fast_loop_body {
                 let rep1 = $self.offset_hist[0] as usize;
                 if rep1 != 0 && rep1 <= abs_ip1 {
                     let cand_pos_r = abs_ip1 - rep1;
-                    if cand_pos_r >= history_abs_start
+                    if cand_pos_r >= wlow1
                         && cand_pos_r >= $current_abs_start + literals_start
                     {
                         let cand_idx_r = cand_pos_r - history_abs_start;
@@ -2065,7 +2088,7 @@ macro_rules! start_matching_fast_loop_body {
                 // mask — a stall the predictor cannot hide.
                 if idxl0 != DFAST_EMPTY_SLOT {
                     let cand_pos = position_base + ((idxl0 as usize) - 1);
-                    if cand_pos >= history_abs_start && cand_pos < abs_ip0 {
+                    if cand_pos >= wlow0 && cand_pos < abs_ip0 {
                         let cand_idx = cand_pos - history_abs_start;
                         // SAFETY: the bounds above make `cand_idx` a valid
                         // in-window concat index, so the 8-byte load stays in
@@ -2198,7 +2221,7 @@ macro_rules! start_matching_fast_loop_body {
                 // the load address to the mask, serialising it.
                 if idxs0 != DFAST_EMPTY_SLOT {
                     let cand_pos_s = position_base + ((idxs0 as usize) - 1);
-                    if cand_pos_s >= history_abs_start && cand_pos_s < abs_ip0 {
+                    if cand_pos_s >= wlow0 && cand_pos_s < abs_ip0 {
                         let cand_idx_s = cand_pos_s - history_abs_start;
                         let cand4 = unsafe {
                             (history_base_ptr.add(history_start_offset + cand_idx_s) as *const u32)
@@ -2262,7 +2285,7 @@ macro_rules! start_matching_fast_loop_body {
                             let mut live_l1_hit = false;
                             if idxl1 != DFAST_EMPTY_SLOT {
                                 let cand_pos_l1 = position_base + (idxl1 as usize) - 1;
-                                if cand_pos_l1 >= history_abs_start && cand_pos_l1 < abs_ip1 {
+                                if cand_pos_l1 >= wlow1 && cand_pos_l1 < abs_ip1 {
                                     let cand_idx_l1 = cand_pos_l1 - history_abs_start;
                                     let cand_v8_l1 = unsafe {
                                         (history_base_ptr.add(history_start_offset + cand_idx_l1)
