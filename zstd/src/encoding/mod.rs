@@ -234,6 +234,11 @@ pub const fn compress_bound(src_size: usize) -> usize {
     } else {
         0
     };
+    // Saturating is the correct UPPER-BOUND semantic here, not a masked bug:
+    // this is a public API over an arbitrary `usize`, and the largest meaningful
+    // bound is `usize::MAX`. A real slice is at most `isize::MAX` bytes, so the
+    // `* 1.004 + margin` cannot overflow for genuine inputs; the saturation only
+    // caps a pathological caller-supplied size at the representable ceiling.
     src_size
         .saturating_add(src_size >> 8)
         .saturating_add(margin)

@@ -659,8 +659,12 @@ impl FastKernelMatcher {
         // just `history.len()` minus the `HISTORY_DRAIN_BASE`
         // sentinel-slot offset — not a placeholder block subtraction.
         let real_len = self.history.len().saturating_sub(HISTORY_DRAIN_BASE);
-        let new_real_total = real_len.saturating_add(space.len());
-        let cap = self.max_window_size.saturating_mul(2);
+        // Plain `+`/`*`: `real_len` <= history length and `space.len()` <= one
+        // block, while `max_window_size = 1 << window_log` (window_log <= 31) so
+        // `* 2` <= 2^32 — neither can overflow usize. (The `saturating_sub`
+        // above stays: it is a real floor at the sentinel slot.)
+        let new_real_total = real_len + space.len();
+        let cap = self.max_window_size * 2;
         // Hard precondition: caller must split blocks into pieces no
         // larger than `2 × max_window_size`. Without this, the
         // eviction math below can't keep post-append history under

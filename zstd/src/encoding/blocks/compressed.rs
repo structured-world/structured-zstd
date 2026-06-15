@@ -1603,8 +1603,10 @@ fn choose_table_from_counts<'a>(
     // wins. The estimate equals the built table's `table_header_bits()`
     // exactly, so the selection is byte-identical.
     let new_total_cost = (distinct_symbols > 1).then(|| {
+        // Plain `+`: both are bit-cost estimates bounded by the block size
+        // (<= MAX_BLOCK_SIZE * 8 bits), far under the integer's range.
         fse_header_bits_for_counts(&counts[..=max_symbol], max_log, use_low_prob_count)
-            .saturating_add(entropy_cost(counts, max_symbol, total))
+            + entropy_cost(counts, max_symbol, total)
     });
 
     let predefined_cost = cross_entropy_cost(counts, max_symbol, default_table);

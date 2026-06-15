@@ -232,7 +232,11 @@ pub fn create_raw_dict_from_source<R: io::Read, W: io::Write>(
     // the lowest scoring items come first
     let mut pool: BinaryHeap<Reverse<Segment>> = BinaryHeap::new();
     let (num_epochs, epoch_size_kmers) = compute_epoch_info(&params, dict_size, source_size / K);
-    let epoch_size = usize::max(K, epoch_size_kmers.saturating_mul(K));
+    // Plain `*`/`+` throughout the epoch walk below: epochs partition the
+    // training source, so `epoch_size_kmers * K`, `epoch_idx * epoch_size`, and
+    // `start + epoch_size` are all bounded by the source length (<= isize::MAX)
+    // and cannot overflow usize.
+    let epoch_size = usize::max(K, epoch_size_kmers * K);
     vprintln!("create_dict: computed epoch info, using {num_epochs} epochs of {epoch_size} bytes");
     let mut epoch_counter = 0;
     let mut ctx = Context {
@@ -242,14 +246,14 @@ pub fn create_raw_dict_from_source<R: io::Read, W: io::Write>(
     // segment for the pool. Keep exactly `num_epochs` windows to avoid
     // emitting more segments than the requested dictionary budget allows.
     for epoch_idx in 0..num_epochs {
-        let start = epoch_idx.saturating_mul(epoch_size);
+        let start = epoch_idx * epoch_size;
         if start >= all.len() {
             break;
         }
         let end = if epoch_idx + 1 == num_epochs {
             all.len()
         } else {
-            usize::min(start.saturating_add(epoch_size), all.len())
+            usize::min(start + epoch_size, all.len())
         };
         let epoch = &all[start..end];
         epoch_counter += 1;

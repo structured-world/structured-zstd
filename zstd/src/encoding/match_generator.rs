@@ -792,8 +792,11 @@ fn dict_and_window_log(window_log: u8, src_size: u64, dict_size: u64) -> u32 {
         return window_log as u32;
     }
     let window_size: u64 = 1u64 << window_log;
-    let dict_and_window = dict_size.saturating_add(window_size);
-    if window_size >= dict_size.saturating_add(src_size) {
+    // Plain `+` (matches upstream zstd `ZSTD_dictAndWindowLog`): `window_size` is
+    // `1 << window_log` (window_log <= 31) and dict/src are real data sizes
+    // (<= isize::MAX), so these u64 sums cannot overflow in practice.
+    let dict_and_window = dict_size + window_size;
+    if window_size >= dict_size + src_size {
         // Window already covers source + dictionary.
         window_log as u32
     } else {
@@ -821,7 +824,9 @@ fn cdict_table_logs(
     // createCDict assumes a minSrcSize source when the real size is unknown.
     let src_size = DICT_MIN_SRC_SIZE;
     // Source-size window resize (donor caps windowLog by ceil_log2(src+dict)).
-    let tsize = src_size.saturating_add(dict_size);
+    // Plain `+`: src_size is the tiny DICT_MIN_SRC_SIZE constant and dict_size
+    // is a real dictionary length, so the u64 sum cannot overflow.
+    let tsize = src_size + dict_size;
     let resized_window_log = (window_log as u32)
         .min(source_size_ceil_log(tsize) as u32)
         .max(1);
@@ -2270,7 +2275,10 @@ impl Matcher for MatchGeneratorDriver {
                 // tables are dictionary-tier-small. Unhinted streams skip this
                 // and keep doubling growth.
                 if let Some(src) = hint {
-                    let expected = (src as usize).saturating_add(dict_hint.unwrap_or(0));
+                    // Plain `+`: source size + dict hint are real data sizes
+                    // (<= isize::MAX), and `reserve_history` clamps the result to
+                    // its window ceiling anyway, so this cannot overflow.
+                    let expected = (src as usize) + dict_hint.unwrap_or(0);
                     hc.table.reserve_history(expected);
                 }
             }
@@ -2779,7 +2787,9 @@ impl Matcher for MatchGeneratorDriver {
                     // when it later reuses the buffer.
                     vec_pool.push(data);
                 });
-                evicted_bytes += pre.saturating_add(space_len).saturating_sub(m.window_size);
+                // Plain `+` (the `saturating_sub` floors at 0): `pre` + one
+                // block are byte counts bounded by the window, no overflow.
+                evicted_bytes += (pre + space_len).saturating_sub(m.window_size);
             }
             MatcherStorage::Row(m) => {
                 // RowMatchGenerator::add_data recycles the *input* buffer
@@ -2799,7 +2809,9 @@ impl Matcher for MatchGeneratorDriver {
                     // `slice_size` on reuse).
                     vec_pool.push(data);
                 });
-                evicted_bytes += pre.saturating_add(space_len).saturating_sub(m.window_size);
+                // Plain `+` (the `saturating_sub` floors at 0): `pre` + one
+                // block are byte counts bounded by the window, no overflow.
+                evicted_bytes += (pre + space_len).saturating_sub(m.window_size);
             }
             MatcherStorage::HashChain(m) => {
                 // MatchTable::add_data now recycles the *incoming* buffer
@@ -2822,9 +2834,9 @@ impl Matcher for MatchGeneratorDriver {
                     // pool retains.
                     vec_pool.push(data);
                 });
-                evicted_bytes += pre
-                    .saturating_add(space_len)
-                    .saturating_sub(m.table.window_size);
+                // Plain `+` (the `saturating_sub` floors at 0): byte counts
+                // bounded by the window, no overflow.
+                evicted_bytes += (pre + space_len).saturating_sub(m.table.window_size);
             }
         }
         // Gate the second backend trim pass on actual budget
@@ -3975,6 +3987,11 @@ macro_rules! build_optimal_plan_impl_body {
             }
 
             let next_price = unsafe { nodes.get_unchecked(pos + 1).price };
+            // `saturating_add` is REQUIRED here, not a masked bug: `base_cost`
+            // is a node price that can be the `u32::MAX` "unreachable" sentinel,
+            // and saturating keeps `base_cost + margin` pinned at MAX so the
+            // comparison stays correct. Plain `+` would wrap the sentinel and
+            // flip the abort decision (a ratio bug / debug overflow panic).
             if abort_on_worse_match
                 && next_price <= base_cost.saturating_add(HC_BITCOST_MULTIPLIER / 2)
             {

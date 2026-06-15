@@ -445,7 +445,10 @@ fn presplit_distance(lhs: &PreSplitFingerprint, rhs: &PreSplitFingerprint, hash_
     for idx in 0..slots {
         let left = lhs.events[idx] as i128 * rhs.nb_events as i128;
         let right = rhs.events[idx] as i128 * lhs.nb_events as i128;
-        distance = distance.saturating_add(left.abs_diff(right) as u64);
+        // Plain `+`: events/nb_events are per-block sample counts (<= block
+        // size), so each |left-right| <= (2^17)^2 and the sum over <= 2^hash_log
+        // slots stays far under u64::MAX — no overflow.
+        distance += left.abs_diff(right) as u64;
     }
     distance
 }
@@ -460,16 +463,21 @@ fn presplit_fingerprints_differ(
     debug_assert!(new_fp.nb_events > 0);
     let p50 = reference.nb_events as u64 * new_fp.nb_events as u64;
     let deviation = presplit_distance(reference, new_fp, hash_log);
-    let threshold = p50.saturating_mul(PRESPLIT_THRESHOLD_BASE + penalty as u64)
-        / PRESPLIT_THRESHOLD_PENALTY_RATE;
+    // Plain `*`: p50 <= (block-sample-count)^2 and the (base+penalty) factor is
+    // a small constant, so the product stays well under u64::MAX.
+    let threshold =
+        p50 * (PRESPLIT_THRESHOLD_BASE + penalty as u64) / PRESPLIT_THRESHOLD_PENALTY_RATE;
     deviation >= threshold
 }
 
 fn presplit_merge_events(acc: &mut PreSplitFingerprint, new_fp: &PreSplitFingerprint) {
+    // Plain `+`: `acc` accumulates only the chunks of a single block (caller
+    // loops within one block, <= MAX_BLOCK_SIZE), so the merged sample counts
+    // stay far under u32 / usize bounds — no overflow.
     for idx in 0..PRESPLIT_HASH_TABLE_SIZE {
-        acc.events[idx] = acc.events[idx].saturating_add(new_fp.events[idx]);
+        acc.events[idx] += new_fp.events[idx];
     }
-    acc.nb_events = acc.nb_events.saturating_add(new_fp.nb_events);
+    acc.nb_events += new_fp.nb_events;
 }
 
 fn split_block_by_chunks(block: &[u8], level: usize) -> usize {
