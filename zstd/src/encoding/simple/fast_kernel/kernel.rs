@@ -1286,7 +1286,7 @@ pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
 /// and, for an input candidate, `cand_off + 4 <= block_end`. `dict` covers the
 /// `[0, dict_end)` prefix and `inp` covers `[0, block_end)`.
 #[inline(always)]
-unsafe fn borrowed_candidate_len(
+unsafe fn borrowed_candidate_len<C: Fn(*const u8, *const u8, usize) -> usize>(
     cand_abs: usize,
     cur_off: usize,
     dict_end: usize,
@@ -1294,20 +1294,24 @@ unsafe fn borrowed_candidate_len(
     inp: &[u8],
     inp_base: *const u8,
     block_end: usize,
+    cpl: &C,
 ) -> usize {
     if cand_abs >= dict_end {
         let cand_off = cand_abs - dict_end;
         // SAFETY: caller guarantees `cur_off + 4 <= block_end` and
-        // `cand_off + 4 <= block_end` (cand_off < cur_off); `count_forward`
-        // is bounded by `inp_base.add(block_end)`.
+        // `cand_off + 4 <= block_end` (cand_off < cur_off). `cpl` (the active
+        // tier's `common_prefix_len_ptr`) is bounded by `max = block_end -
+        // (cur_off + 4)`, so the current side reads `inp[cur_off+4 ..
+        // block_end]` and the candidate side `cand_off < cur_off` more bytes
+        // — both within `inp`.
         if unsafe { read32(inp_base.add(cur_off)) != read32(inp_base.add(cand_off)) } {
             return 0;
         }
         4 + unsafe {
-            count_forward(
+            cpl(
                 inp_base.add(cur_off + 4),
                 inp_base.add(cand_off + 4),
-                inp_base.add(block_end),
+                block_end - (cur_off + 4),
             )
         }
     } else {
@@ -1337,8 +1341,13 @@ unsafe fn borrowed_candidate_len(
 /// [`borrowed_candidate_len`], which routes dict-prefix candidates (the rep
 /// state after dict priming, and the dict-table fallback) through the 2-segment
 /// counter while keeping input candidates on the fast flat path.
+#[inline(always)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn compress_block_fast_dict_borrowed<const MLS: u32, const USE_CMOV: bool>(
+fn compress_block_fast_dict_borrowed_impl<
+    const MLS: u32,
+    const USE_CMOV: bool,
+    C: Fn(*const u8, *const u8, usize) -> usize,
+>(
     inp: &[u8],
     dict: &[u8],
     block_start: usize,
@@ -1349,6 +1358,7 @@ pub(crate) fn compress_block_fast_dict_borrowed<const MLS: u32, const USE_CMOV: 
     rep: [u32; 2],
     step_size: usize,
     mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+    cpl: C,
 ) -> FastBlockResult {
     assert!(
         block_start <= block_end && block_end <= inp.len(),
@@ -1434,6 +1444,7 @@ pub(crate) fn compress_block_fast_dict_borrowed<const MLS: u32, const USE_CMOV: 
                         inp,
                         inp_base,
                         block_end,
+                        &cpl,
                     )
                 };
                 if m_len >= 4 {
@@ -1511,10 +1522,10 @@ pub(crate) fn compress_block_fast_dict_borrowed<const MLS: u32, const USE_CMOV: 
                 let mut match_ip = ip0;
                 let mut match_pos = main_idx as usize - dict_end;
                 let mut m_len = 4 + unsafe {
-                    count_forward(
+                    cpl(
                         inp_base.add(ip0 + 4),
                         inp_base.add(match_pos + 4),
-                        inp_base.add(block_end),
+                        block_end - (ip0 + 4),
                     )
                 };
                 while match_ip > anchor
@@ -1577,7 +1588,9 @@ pub(crate) fn compress_block_fast_dict_borrowed<const MLS: u32, const USE_CMOV: 
             {
                 let rep_abs = dict_end + ip0 - offset_2 as usize;
                 let r_len = unsafe {
-                    borrowed_candidate_len(rep_abs, ip0, dict_end, dict, inp, inp_base, block_end)
+                    borrowed_candidate_len(
+                        rep_abs, ip0, dict_end, dict, inp, inp_base, block_end, &cpl,
+                    )
                 };
                 if r_len < 4 {
                     break;
@@ -1602,6 +1615,226 @@ pub(crate) fn compress_block_fast_dict_borrowed<const MLS: u32, const USE_CMOV: 
     FastBlockResult {
         rep: [offset_1, offset_2],
         tail_literals_len: block_end - anchor,
+    }
+}
+
+// Per-tier `#[target_feature]` wrappers around the borrowed dual-base dict
+// kernel. Each carries the tier's umbrella so the inlined `_impl` (and the
+// `common_prefix_len_ptr` it calls for the hot input-match extension) compiles
+// with that tier's SIMD — the 32-byte AVX2 / 16-byte SSE4.2 / NEON /
+// wasm-simd128 compare instead of the generic word-at-a-time scalar count.
+// Same pattern the Dfast / Row backends use. The dict-prefix 2-segment count
+// (cold fallback) stays scalar inside `_impl`.
+macro_rules! fast_dict_borrowed_wrapper {
+    ($(#[$attr:meta])* $name:ident, $cpl:path) => {
+        $(#[$attr])*
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn $name<const MLS: u32, const USE_CMOV: bool>(
+            inp: &[u8],
+            dict: &[u8],
+            block_start: usize,
+            block_end: usize,
+            main_table: &mut FastHashTable,
+            dict_table: &FastHashTable,
+            bounds: PrefixBounds,
+            rep: [u32; 2],
+            step_size: usize,
+            handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+        ) -> FastBlockResult {
+            compress_block_fast_dict_borrowed_impl::<MLS, USE_CMOV, _>(
+                inp,
+                dict,
+                block_start,
+                block_end,
+                main_table,
+                dict_table,
+                bounds,
+                rep,
+                step_size,
+                handle_sequence,
+                // SAFETY: only invoked from within this `#[target_feature]`
+                // umbrella, so the tier's CPU features are guaranteed present.
+                |l, r, m| unsafe { $cpl(l, r, m) },
+            )
+        }
+    };
+}
+
+fast_dict_borrowed_wrapper!(
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx2,bmi2")]
+    cbfd_borrowed_avx2_bmi2,
+    crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr
+);
+
+fast_dict_borrowed_wrapper!(
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "sse4.2")]
+    cbfd_borrowed_sse42,
+    crate::encoding::fastpath::sse42::common_prefix_len_ptr
+);
+
+fast_dict_borrowed_wrapper!(
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[target_feature(enable = "neon")]
+    cbfd_borrowed_neon,
+    crate::encoding::fastpath::neon::common_prefix_len_ptr
+);
+
+fast_dict_borrowed_wrapper!(
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel_simd128"
+    ))]
+    #[target_feature(enable = "simd128")]
+    cbfd_borrowed_simd128,
+    crate::encoding::fastpath::simd128::common_prefix_len_ptr
+);
+
+/// Dispatch the borrowed dual-base dict kernel to the resolved per-tier SIMD
+/// wrapper. `kernel` is the matcher's once-resolved [`FastpathKernel`]; the
+/// scalar arm carries no `#[target_feature]` (generic word-at-a-time count).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compress_block_fast_dict_borrowed<const MLS: u32, const USE_CMOV: bool>(
+    inp: &[u8],
+    dict: &[u8],
+    block_start: usize,
+    block_end: usize,
+    main_table: &mut FastHashTable,
+    dict_table: &FastHashTable,
+    bounds: PrefixBounds,
+    rep: [u32; 2],
+    step_size: usize,
+    handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+    kernel: crate::encoding::fastpath::FastpathKernel,
+) -> FastBlockResult {
+    use crate::encoding::fastpath::FastpathKernel;
+    // The scalar fallback: generic word-at-a-time `count_forward` for the input
+    // match extension, no SIMD umbrella.
+    let scalar = |inp: &[u8],
+                  dict: &[u8],
+                  main_table: &mut FastHashTable,
+                  dict_table: &FastHashTable,
+                  handle_sequence: &mut dyn for<'a> FnMut(Sequence<'a>)|
+     -> FastBlockResult {
+        compress_block_fast_dict_borrowed_impl::<MLS, USE_CMOV, _>(
+            inp,
+            dict,
+            block_start,
+            block_end,
+            main_table,
+            dict_table,
+            bounds,
+            rep,
+            step_size,
+            handle_sequence,
+            // SAFETY: `count_forward` is a safe word-at-a-time count; the
+            // pointer/length contract is identical to the SIMD tiers.
+            |l, r, m| unsafe { count_forward(l, r, l.add(m)) },
+        )
+    };
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        match kernel {
+            FastpathKernel::Avx2Bmi2 => unsafe {
+                cbfd_borrowed_avx2_bmi2::<MLS, USE_CMOV>(
+                    inp,
+                    dict,
+                    block_start,
+                    block_end,
+                    main_table,
+                    dict_table,
+                    bounds,
+                    rep,
+                    step_size,
+                    handle_sequence,
+                )
+            },
+            FastpathKernel::Sse42 => unsafe {
+                cbfd_borrowed_sse42::<MLS, USE_CMOV>(
+                    inp,
+                    dict,
+                    block_start,
+                    block_end,
+                    main_table,
+                    dict_table,
+                    bounds,
+                    rep,
+                    step_size,
+                    handle_sequence,
+                )
+            },
+            FastpathKernel::Scalar => {
+                let mut hs = handle_sequence;
+                scalar(inp, dict, main_table, dict_table, &mut hs)
+            }
+        }
+    }
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    {
+        match kernel {
+            FastpathKernel::Neon => unsafe {
+                cbfd_borrowed_neon::<MLS, USE_CMOV>(
+                    inp,
+                    dict,
+                    block_start,
+                    block_end,
+                    main_table,
+                    dict_table,
+                    bounds,
+                    rep,
+                    step_size,
+                    handle_sequence,
+                )
+            },
+            FastpathKernel::Scalar => {
+                let mut hs = handle_sequence;
+                scalar(inp, dict, main_table, dict_table, &mut hs)
+            }
+        }
+    }
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel_simd128"
+    ))]
+    {
+        match kernel {
+            FastpathKernel::Simd128 => unsafe {
+                cbfd_borrowed_simd128::<MLS, USE_CMOV>(
+                    inp,
+                    dict,
+                    block_start,
+                    block_end,
+                    main_table,
+                    dict_table,
+                    bounds,
+                    rep,
+                    step_size,
+                    handle_sequence,
+                )
+            },
+            FastpathKernel::Scalar => {
+                let mut hs = handle_sequence;
+                scalar(inp, dict, main_table, dict_table, &mut hs)
+            }
+        }
+    }
+    #[cfg(not(any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_endian = "little"),
+        all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel_simd128"
+        )
+    )))]
+    {
+        let _ = kernel;
+        let mut hs = handle_sequence;
+        scalar(inp, dict, main_table, dict_table, &mut hs)
     }
 }
 
