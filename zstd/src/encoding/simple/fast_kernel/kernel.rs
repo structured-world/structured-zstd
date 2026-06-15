@@ -1508,23 +1508,25 @@ fn compress_block_fast_dict_borrowed_impl<
             // Main match (recent input) — `main_idx` is a virtual input position
             // (`>= dict_end`); the candidate read is at input offset
             // `main_idx - dict_end`.
-            // A main-table entry is only a usable candidate when it is a VIRTUAL
-            // input position: `>= dict_end` (so `main_idx - dict_end` does not
-            // underflow) AND strictly before the current position (`< dict_end +
-            // ip0`). `main_idx >= prefix_start_index` alone is not sufficient —
-            // the borrowed skip-priming path can write raw input offsets (`<
-            // dict_end`) into the main table, and a stale entry in
-            // `[prefix_start_index, dict_end)` would otherwise underflow the
-            // subtraction and feed a bogus pointer to `read32`.
-            let main_abs = main_idx as usize;
-            let main_is_input = main_abs >= dict_end && main_abs < dict_end + ip0;
+            // INVARIANT: every main-table entry is either the empty sentinel 0
+            // or a VIRTUAL input position `>= dict_end` — the scan stores
+            // `dict_end + off` and the borrowed priming rebases primed offsets by
+            // `dict_end` too (no raw offsets in `[1, dict_end)`). So
+            // `main_idx >= prefix_start_index` (which is `>= 1`) already implies
+            // `main_idx >= dict_end`, and `main_idx - dict_end` cannot underflow
+            // — no per-candidate range check is needed on the hot path.
+            debug_assert!(
+                main_idx == 0 || main_idx as usize >= dict_end,
+                "main-table entry must be the sentinel or a virtual input position (>= dict_end)",
+            );
             let main_valid = if USE_CMOV {
-                let in_range = main_idx >= prefix_start_index && main_is_input;
-                // SAFETY: when `in_range`, `main_abs >= dict_end`, so
-                // `main_idx - dict_end` is a valid input offset with ≥ 4 readable
-                // bytes; otherwise `CMOV_DUMMY` (4 bytes) is read instead.
+                let in_range = main_idx >= prefix_start_index;
+                // SAFETY: when `in_range`, `main_idx >= prefix_start_index >= 1`
+                // and (per the invariant) `>= dict_end`, so `main_idx - dict_end`
+                // is a valid input offset with ≥ 4 readable bytes; otherwise
+                // `CMOV_DUMMY` (4 bytes) is read instead.
                 let mval_addr = if in_range {
-                    unsafe { inp_base.add(main_abs - dict_end) }
+                    unsafe { inp_base.add(main_idx as usize - dict_end) }
                 } else {
                     CMOV_DUMMY.as_ptr()
                 };
@@ -1534,9 +1536,9 @@ fn compress_block_fast_dict_borrowed_impl<
                 r
             } else {
                 main_idx >= prefix_start_index
-                    && main_is_input
                     && unsafe {
-                        read32(inp_base.add(ip0)) == read32(inp_base.add(main_abs - dict_end))
+                        read32(inp_base.add(ip0))
+                            == read32(inp_base.add(main_idx as usize - dict_end))
                     }
             };
             if main_valid {

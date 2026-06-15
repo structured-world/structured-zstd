@@ -1302,12 +1302,16 @@ impl FastKernelMatcher {
         let (base, _len) = self
             .borrowed
             .expect("prime_hash_table_for_range_borrowed requires a registered borrowed window");
+        // Store primed input positions in VIRTUAL `[dict][input]` coords so they
+        // match what the dual-base dict kernel reads from the main table; 0 when
+        // no dict is attached.
+        let base_offset = self.dict.region_len();
         match self.hash_table.mls() {
-            4 => self.prime_hash_table_impl::<4>(base, backfill_start, last_hashable),
-            5 => self.prime_hash_table_impl::<5>(base, backfill_start, last_hashable),
-            6 => self.prime_hash_table_impl::<6>(base, backfill_start, last_hashable),
-            7 => self.prime_hash_table_impl::<7>(base, backfill_start, last_hashable),
-            8 => self.prime_hash_table_impl::<8>(base, backfill_start, last_hashable),
+            4 => self.prime_hash_table_impl::<4>(base, backfill_start, last_hashable, base_offset),
+            5 => self.prime_hash_table_impl::<5>(base, backfill_start, last_hashable, base_offset),
+            6 => self.prime_hash_table_impl::<6>(base, backfill_start, last_hashable, base_offset),
+            7 => self.prime_hash_table_impl::<7>(base, backfill_start, last_hashable, base_offset),
+            8 => self.prime_hash_table_impl::<8>(base, backfill_start, last_hashable, base_offset),
             _ => unreachable!("FastHashTable construction rejects mls outside 4..=8"),
         }
     }
@@ -1393,12 +1397,15 @@ impl FastKernelMatcher {
         }
 
         let base = self.history.as_ptr();
+        // Owned path: history offsets are already the flat `[dict][input]`
+        // coordinate (input is appended after the dict in `history`), so no
+        // virtual rebase is needed.
         match self.hash_table.mls() {
-            4 => self.prime_hash_table_impl::<4>(base, backfill_start, last_hashable),
-            5 => self.prime_hash_table_impl::<5>(base, backfill_start, last_hashable),
-            6 => self.prime_hash_table_impl::<6>(base, backfill_start, last_hashable),
-            7 => self.prime_hash_table_impl::<7>(base, backfill_start, last_hashable),
-            8 => self.prime_hash_table_impl::<8>(base, backfill_start, last_hashable),
+            4 => self.prime_hash_table_impl::<4>(base, backfill_start, last_hashable, 0),
+            5 => self.prime_hash_table_impl::<5>(base, backfill_start, last_hashable, 0),
+            6 => self.prime_hash_table_impl::<6>(base, backfill_start, last_hashable, 0),
+            7 => self.prime_hash_table_impl::<7>(base, backfill_start, last_hashable, 0),
+            8 => self.prime_hash_table_impl::<8>(base, backfill_start, last_hashable, 0),
             _ => unreachable!("FastHashTable construction rejects mls outside 4..=8"),
         }
     }
@@ -1408,11 +1415,20 @@ impl FastKernelMatcher {
     /// [`Self::skip_matching_borrowed`] dict-priming paths. `base` is the
     /// window base pointer (owned `history` or the borrowed input
     /// buffer); positions are absolute window offsets in both.
+    /// `base_offset` is added to every stored position so the main table holds
+    /// the SAME coordinate space the active kernel reads. The owned path passes
+    /// 0 (history offsets are already the flat `[dict][input]` coordinate). The
+    /// borrowed dict path passes `dict_end` so a primed input position `pos` is
+    /// stored as the VIRTUAL `dict_end + pos` the dual-base kernel expects —
+    /// without this, a primed raw offset in `[1, dict_end)` would underflow the
+    /// kernel's `main_idx - dict_end`. No-dict borrowed frames pass 0
+    /// (`region_len() == 0`), so their raw offsets are unchanged.
     fn prime_hash_table_impl<const MLS: u32>(
         &mut self,
         base: *const u8,
         range_start: usize,
         last_hashable: usize,
+        base_offset: usize,
     ) {
         for pos in range_start..=last_hashable {
             // SAFETY: pos < history_len (by loop bound), and the load
@@ -1424,7 +1440,7 @@ impl FastKernelMatcher {
             // constant-folded per MLS.
             let ptr = unsafe { base.add(pos) };
             let hash = unsafe { self.hash_table.hash_ptr::<MLS>(ptr) };
-            unsafe { self.hash_table.put(hash, pos as u32) };
+            unsafe { self.hash_table.put(hash, (base_offset + pos) as u32) };
         }
     }
 
