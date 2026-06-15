@@ -2929,14 +2929,15 @@ impl Matcher for MatchGeneratorDriver {
                         .hc_matcher_mut()
                         .start_matching_lazy_borrowed(block_start, block_end, &mut handle_sequence),
                     super::strategy::SearchMethod::BinaryTree => {
-                        // Stage the in-place block, then run the SAME BT
-                        // dispatch as the owned BinaryTree arm below — every
-                        // BT body now reads its range via current_block_range()
-                        // and bytes via live_history() (borrowed-aware), so the
-                        // staged block is scanned in place.
-                        self.hc_matcher_mut()
-                            .table
-                            .stage_borrowed_block(block_start, block_end);
+                        // Run the SAME BT dispatch as the owned BinaryTree arm
+                        // below — every BT body reads its range via
+                        // current_block_range() and bytes via live_history()
+                        // (borrowed-aware), so the staged block is scanned in
+                        // place. The table was already staged by
+                        // `set_borrowed_block` (the HashChain arm at the top of
+                        // this file calls `table.stage_borrowed_block` with the
+                        // same range, and `borrowed_pending` is set only there),
+                        // so no re-stage is needed here.
                         // Only btlazy2 reaches the borrowed BinaryTree scan:
                         // `borrowed_supported()` keeps the optimal parsers
                         // (BtOpt/BtUltra/BtUltra2) on the owned path, and
