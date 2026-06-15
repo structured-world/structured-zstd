@@ -1286,6 +1286,7 @@ pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
 /// and, for an input candidate, `cand_off + 4 <= block_end`. `dict` covers the
 /// `[0, dict_end)` prefix and `inp` covers `[0, block_end)`.
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 unsafe fn borrowed_candidate_len<C: Fn(*const u8, *const u8, usize) -> usize>(
     cand_abs: usize,
     cur_off: usize,
