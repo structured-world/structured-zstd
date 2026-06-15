@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.39](https://github.com/structured-world/structured-zstd/compare/v0.0.38...v0.0.39) - 2026-06-14
+
+### Performance
+
+- *(encode)* cap row match-finder table to upstream hashLog ([#417](https://github.com/structured-world/structured-zstd/pull/417))
+- *(encode)* single price arena + interleaved cache in the optimal parser ([#415](https://github.com/structured-world/structured-zstd/pull/415))
+
 ## [0.0.38](https://github.com/structured-world/structured-zstd/compare/v0.0.37...v0.0.38) - 2026-06-14
 
 ### Added
