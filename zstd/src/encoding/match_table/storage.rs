@@ -790,8 +790,9 @@ impl MatchTable {
     }
 
     /// Drain the dead prefix of `history` (already-rolled-out bytes)
-    /// when it has grown to at least half the live region. Keeps the
-    /// contiguous mirror compact so reallocation costs stay amortised.
+    /// once it reaches a quarter window, or when it accounts for at
+    /// least half of the mirror. Keeps the contiguous mirror compact
+    /// so reallocation costs stay amortised.
     pub(crate) fn compact_history(&mut self) {
         if self.history_start == 0 {
             return;
