@@ -169,6 +169,48 @@ pub(crate) unsafe fn count_forward(ip: *const u8, match_ptr: *const u8, iend: *c
     (ip as usize) - (p_start as usize)
 }
 
+/// Forward match length for a candidate whose bytes begin in the dictionary
+/// prefix and may continue into the active input, compared against the current
+/// input position. This is the 2-segment count the borrowed dict-attach path
+/// needs: the dictionary lives in a buffer SEPARATE from the borrowed input,
+/// so the flat single-base [`count_forward`] cannot reach across the
+/// dict/input boundary. The candidate side reads `dict[cand..]` and, once the
+/// dictionary is exhausted, continues at `inp[0..]` (the logical `[dict][input]`
+/// window); the current side reads `inp[cur..]`. Mirrors upstream zstd
+/// `ZSTD_count_2segments` for a dict-prefix match that extends past the
+/// dictionary boundary into the active input.
+///
+/// Scalar by design: a dict-prefix match is the fallback probe (recent input
+/// wins first), and crossing the dictionary boundary is rare for the short
+/// Fast-strategy matches, so the per-byte boundary check is off the hot path.
+pub(crate) fn count_forward_dict_2segment(
+    dict: &[u8],
+    cand: usize,
+    inp: &[u8],
+    cur: usize,
+) -> usize {
+    let limit = inp.len() - cur;
+    let dict_len = dict.len();
+    let mut k = 0usize;
+    while k < limit {
+        let cand_idx = cand + k;
+        // Candidate reads the dictionary first, then the input that logically
+        // follows it. `cand < dict_len` initially and `cand < cur + dict_len`
+        // (candidate precedes the current position in the `[dict][input]`
+        // window), so the `inp` index here stays `< k <= limit`, in bounds.
+        let cand_byte = if cand_idx < dict_len {
+            dict[cand_idx]
+        } else {
+            inp[cand_idx - dict_len]
+        };
+        if cand_byte != inp[cur + k] {
+            break;
+        }
+        k += 1;
+    }
+    k
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,5 +313,32 @@ mod tests {
         let a = [0u8, 1, 2, 3, 4, 5, 6, 7];
         let b = [9u8, 1, 2, 3, 4, 5, 6, 7];
         assert_eq!(count(&a, &b), 0);
+    }
+
+    #[test]
+    fn dict_2segment_within_dict_only() {
+        // Candidate fully inside the dict; current input matches the dict tail.
+        let dict = [10u8, 20, 30, 40];
+        let inp = [30u8, 40, 99];
+        // cand=2: dict[2]=30 vs inp[0]=30 ✓; dict[3]=40 vs inp[1]=40 ✓;
+        // cand_idx=4 == dict.len() → inp[0]=30 vs inp[2]=99 ✗ → len 2.
+        assert_eq!(count_forward_dict_2segment(&dict, 2, &inp, 0), 2);
+    }
+
+    #[test]
+    fn dict_2segment_crosses_boundary_into_input() {
+        // Match starts in the dict and continues past the boundary into the
+        // input (the logical [dict][input] window), then stops at a mismatch.
+        let dict = [1u8, 2, 3];
+        let inp = [1u8, 2, 3, 1, 2, 3, 9]; // cur=3 → [1,2,3,9...]
+        // cand=0: dict[0..3] match inp[3..6]; cand_idx=3 → inp[0]=1 vs inp[6]=9 ✗ → 3.
+        assert_eq!(count_forward_dict_2segment(&dict, 0, &inp, 3), 3);
+    }
+
+    #[test]
+    fn dict_2segment_stops_at_input_end() {
+        let dict = [7u8, 7];
+        let inp = [7u8, 7, 7, 7]; // cur=2 → only 2 bytes left
+        assert_eq!(count_forward_dict_2segment(&dict, 0, &inp, 2), 2);
     }
 }
