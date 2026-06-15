@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781503194400,
+  "lastUpdate": 1781523532255,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -66830,6 +66830,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.26,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "a2044afa240822e15c034bcf466e4bfee0d944f0",
+          "message": "perf(encode): cap HC/BT history mirror near the live window (#421)\n\n* perf(encode): cap HC/BT history mirror near the live window\n\nMirror the row (#418) and dfast (#420) history-buffer fix for the shared\nHashChain / binary-tree MatchTable (btlazy2 / btopt / btultra, L13-L22).\nOn long streams the history mirror power-of-two doubled to ~2x the window\n(an 8 MiB window peaked at 16 MiB), inflating compress peak memory. Reserve\nwindow + window/4 + one block once eviction starts and drain the dead\nprefix at a quarter window so the Vec grows linearly and never reallocates\nagain; reserve_history's ceiling is bumped to match. Small frames keep\ntheir tight buffer. Byte-identical (buffer management only).\n\n* refactor(encode): plain arithmetic for history cap, not saturating_add\n\nThe reserve_history ceiling used saturating_add, which would silently\nclamp on overflow and mask an upstream window_log bound violation. The\nsum is max_window_size + max_window_size/4 + MAX_BLOCK_SIZE with\nmax_window_size = 1 << window_log and window_log <= 31, so it is at most\n~2^31 + 2^29 + 2^17 < usize::MAX even on 32-bit targets — overflow is\nunreachable. Use plain arithmetic with a bound comment, matching the\nadd_data eviction reserve.\n\n* refactor: drop defensive saturating arithmetic where overflow is unreachable\n\nCodebase-wide audit of saturating_add/saturating_mul against the\nsafe-arithmetic policy (saturating only for a deliberate min/max clamp,\nplain arithmetic when the bound provably holds, so a real overflow fails\nloudly at its cause instead of being silently clamped).\n\nConverted to plain arithmetic (with a bound comment each) where overflow\nis unreachable: huffman tree node counts and literal/symbol frequency\ncounters (<= block size), pre-split fingerprint distance/threshold and\nper-block event merge, FSE/HUF cost estimates, dict+window log helper\n(matches upstream's plain u64 add), FASTCOVER epoch sizing, history\npre-size hint, fast-matcher length/2x-window checks, eviction byte\naccounting.\n\nKept (documented as deliberate, not masking): compress_bound and the\ndecompressed-size upper bounds (saturate to the representable ceiling),\nthe optimal-parser price comparison (base_cost can be the u32::MAX\n\"unreachable\" sentinel — saturating keeps the compare correct), the\nskip-step loop-break idiom (saturate then `next <= pos` detects the end),\nuntrusted-frame size accumulation, and abs-position/index accumulators\nthat rely on the rebase machinery. Behavior-identical; 838 tests pass.\n\n* test(encode): add regression for HC/BT reserve hint overflow\n\ndriver_huge_source_hint_with_dict_does_not_overflow_hc_reserve sets a\nu64::MAX source-size hint (the unknown-size sentinel) plus a positive\ndictionary hint and resets at Level 16 (BtOpt → HashChain/BT storage\narm). On current code `(src as usize) + dict_hint` overflows usize\nbefore reserve_history can clamp: debug panic / release wrap on 64-bit,\nsrc-truncation on 32-bit. Test fails (overflow panic) until the fix.\n\n* fix(encode): saturate HC/BT reserve hint instead of overflowing\n\n(src as usize) + dict_hint.unwrap_or(0) overflowed usize when src is\nthe u64::MAX unknown-size sentinel plus a positive dictionary hint, and\ntruncated src on 32-bit targets. Saturate src via usize::try_from and\nsaturate the dict-hint addition via checked_add; reserve_history applies\nthe tighter window ceiling. Fixes the panic in the regression test added\nin the preceding commit.\n\n* fix(encode): avoid eviction-check overflow on 32-bit; fix stale docs\n\nFastKernelMatcher eviction computed real_len + space.len() before the\nblock-size assert; at window_log = 30 both terms approach cap = 2^31, so\nthe sum overflows usize on 32-bit targets. Reorder to compute cap, assert\nthe block bound, then compare via subtraction (real_len > cap -\nspace.len()) which the assert proves cannot underflow. Correct the stale\nwindow_log <= 31 comment to the enforced <= 30, and refresh the\ncompact_history doc to describe the quarter-window / half-mirror drain.\n\n* fix(encode): use saturating_add for HC/BT reserve hint (clippy)\n\n* test(encode): assert clamped HC reserve ceiling\n\n- Strengthen driver_huge_source_hint_with_dict_does_not_overflow_hc_reserve\n  to assert the post-reset history capacity reaches the clamped ceiling\n  (window + window/4 + block), not just no-panic; an under-reserved mirror\n  would otherwise pass.\n- Correct the FastKernelMatcher eviction overflow-safety doc: the `* 2` is\n  safe because dictionary priming caps max_window_size at\n  MAX_PRIMED_WINDOW_SIZE = (u32::MAX - MAX_BLOCK_SIZE)/2 (so cap*2 < u32::MAX\n  by construction), not because window_log <= 30 (priming widens beyond that).",
+          "timestamp": "2026-06-15T13:53:49+03:00",
+          "tree_id": "7cb0fa86cc40996c0209b17cfe2dc73ff7a7858f",
+          "url": "https://github.com/structured-world/structured-zstd/commit/a2044afa240822e15c034bcf466e4bfee0d944f0"
+        },
+        "date": 1781523514165,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.117,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.114,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 245.349,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 232.725,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.276,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.392,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.119,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.028,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.017,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.974,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.11,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.109,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.012,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 12.16,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.753,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.211,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.658,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.803,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.261,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.58,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.127,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.386,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.138,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.107,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.272,
             "unit": "ms"
           }
         ]
