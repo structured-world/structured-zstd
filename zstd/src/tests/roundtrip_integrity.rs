@@ -912,9 +912,14 @@ fn borrowed_oneshot_matches_owned_and_roundtrips() {
         CompressionLevel::Level(1),
         CompressionLevel::Level(2),
         CompressionLevel::Level(-6),
-        // Non-Fast: pins the owned-fallback branch that
-        // compress_oneshot_borrowed takes for every non-Fast caller.
+        // Dfast (L3) borrowed over-window path.
         CompressionLevel::Default,
+        // Row backend borrowed over-window path: L5 = greedy parse, L9 =
+        // lazy parse. The 3 MiB case forces eviction in the owned baseline
+        // while the borrowed scan applies the per-position window_low cap;
+        // the two must still produce byte-identical frames.
+        CompressionLevel::Level(5),
+        CompressionLevel::Level(9),
     ] {
         for &(seed, len) in &cases {
             for data in [generate_compressible(seed, len), generate_data(seed, len)] {

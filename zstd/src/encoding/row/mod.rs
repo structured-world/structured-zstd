@@ -239,11 +239,10 @@ macro_rules! greedy_parse_body {
             debug_assert_eq!($rl, $m.row_log);
             $m.ensure_tables();
 
-            let current_len = *$m.chunk_lens.back().unwrap();
+            let (current_abs_start, current_len) = $m.current_block_range();
             if current_len == 0 {
                 break 'parse;
             }
-            let current_abs_start = $m.history_abs_start + $m.window_size - current_len;
             let backfill_start = $m.backfill_start(current_abs_start);
             if backfill_start < current_abs_start {
                 $m.insert_positions::<$rl>(backfill_start, current_abs_start);
@@ -384,7 +383,14 @@ macro_rules! greedy_parse_body {
                 // ~+447 over `abs_pos` (537897 -> 538344), so the
                 // narrower range is intentional.
                 $m.insert_match_span::<$rl>(abs_pos, candidate.start + candidate.match_len);
-                let current = &$m.history[$m.history.len() - current_len..];
+                // Trailing literals of the current block. Read via
+                // `live_history()` (borrowed-aware) sliced at the block's
+                // offset within the live region: owned →
+                // `live_history()[window_size - current_len..]` (byte-identical
+                // to the old `history[history.len()-current_len..]`); borrowed →
+                // `live_history()[block_start..]` (the in-place input, since the
+                // owned `history` mirror is empty under the no-copy path).
+                let current = &$m.live_history()[(current_abs_start - $m.history_abs_start)..];
                 let literals = &current[literals_start..start];
                 $handle(Sequence::Triple {
                     literals,
@@ -434,7 +440,14 @@ macro_rules! greedy_parse_body {
             }
 
             if literals_start < current_len {
-                let current = &$m.history[$m.history.len() - current_len..];
+                // Trailing literals of the current block. Read via
+                // `live_history()` (borrowed-aware) sliced at the block's
+                // offset within the live region: owned →
+                // `live_history()[window_size - current_len..]` (byte-identical
+                // to the old `history[history.len()-current_len..]`); borrowed →
+                // `live_history()[block_start..]` (the in-place input, since the
+                // owned `history` mirror is empty under the no-copy path).
+                let current = &$m.live_history()[(current_abs_start - $m.history_abs_start)..];
                 $handle(Sequence::Literals {
                     literals: &current[literals_start..],
                 });
@@ -494,11 +507,10 @@ macro_rules! lazy_parse_body {
             debug_assert_eq!($rl, $m.row_log);
             $m.ensure_tables();
 
-            let current_len = *$m.chunk_lens.back().unwrap();
+            let (current_abs_start, current_len) = $m.current_block_range();
             if current_len == 0 {
                 break 'parse;
             }
-            let current_abs_start = $m.history_abs_start + $m.window_size - current_len;
             let backfill_start = $m.backfill_start(current_abs_start);
             if backfill_start < current_abs_start {
                 $m.insert_positions::<$rl>(backfill_start, current_abs_start);
@@ -578,7 +590,14 @@ macro_rules! lazy_parse_body {
                 };
                 if let Some(candidate) = picked {
                     $m.insert_match_span::<$rl>(abs_pos, candidate.start + candidate.match_len);
-                    let current = &$m.history[$m.history.len() - current_len..];
+                    // Trailing literals of the current block. Read via
+                    // `live_history()` (borrowed-aware) sliced at the block's
+                    // offset within the live region: owned →
+                    // `live_history()[window_size - current_len..]` (byte-identical
+                    // to the old `history[history.len()-current_len..]`); borrowed →
+                    // `live_history()[block_start..]` (the in-place input, since the
+                    // owned `history` mirror is empty under the no-copy path).
+                    let current = &$m.live_history()[(current_abs_start - $m.history_abs_start)..];
                     let start = candidate.start - current_abs_start;
                     let literals = &current[literals_start..start];
                     $handle(Sequence::Triple {
@@ -624,7 +643,14 @@ macro_rules! lazy_parse_body {
             }
 
             if literals_start < current_len {
-                let current = &$m.history[$m.history.len() - current_len..];
+                // Trailing literals of the current block. Read via
+                // `live_history()` (borrowed-aware) sliced at the block's
+                // offset within the live region: owned →
+                // `live_history()[window_size - current_len..]` (byte-identical
+                // to the old `history[history.len()-current_len..]`); borrowed →
+                // `live_history()[block_start..]` (the in-place input, since the
+                // owned `history` mirror is empty under the no-copy path).
+                let current = &$m.live_history()[(current_abs_start - $m.history_abs_start)..];
                 $handle(Sequence::Literals {
                     literals: &current[literals_start..],
                 });
@@ -989,7 +1015,17 @@ macro_rules! row_probe_body {
                     continue;
                 }
                 let candidate_pos = raw_pos as usize;
-                if candidate_pos < $m.history_abs_start || candidate_pos >= $abs_pos {
+                // Lower bound = window low. Owned: `history_abs_start` (eviction
+                // floor) is always >= `abs_pos - max_window_size` (window_size <=
+                // max_window_size), so the `max` picks it — byte-identical to the
+                // pre-window_low check. Borrowed (history_abs_start forced to 0 in
+                // set_borrowed_window): the `max` picks `abs_pos - max_window_size`,
+                // capping the offset to the advertised window so an over-window
+                // in-place scan never emits an unresolvable offset.
+                let window_low = $m
+                    .history_abs_start
+                    .max($abs_pos.saturating_sub($m.max_window_size));
+                if candidate_pos < window_low || candidate_pos >= $abs_pos {
                     continue;
                 }
                 let candidate_idx = candidate_pos - $m.history_abs_start;
@@ -1278,6 +1314,17 @@ pub(crate) struct RowMatchGenerator {
     /// activates the bounded dict probe in `row_candidate_rl`; built once and
     /// cached across frames via `DictAttach`, invalidated on eviction / resize.
     pub(crate) dict: DictAttach<RowDictTables>,
+    /// Borrowed (no-copy) one-shot input window: `(ptr, len)` into the
+    /// caller's slice. When set, the borrowed scan reads candidate/cursor
+    /// bytes straight from here instead of the owned `history` mirror, so an
+    /// over-window one-shot input is matched in place (no input->mirror copy).
+    /// Raw pointer: the slice must stay live until `clear_borrowed_window` /
+    /// `reset` (same contract as the Dfast/Simple borrowed backends).
+    pub(crate) borrowed_input: Option<(*const u8, usize)>,
+    /// Active borrowed block range `[start, end)` within `borrowed_input`,
+    /// staged before each borrowed scan so `live_history()` exposes
+    /// `[0, end)` and the parse loop scans `[start, end)`.
+    pub(crate) borrowed_block: Option<(usize, usize)>,
 }
 
 impl RowMatchGenerator {
@@ -1302,6 +1349,8 @@ impl RowMatchGenerator {
             row_tags: Vec::new(),
             tag_kernel: crate::encoding::fastpath::select_kernel(),
             dict: DictAttach::new(),
+            borrowed_input: None,
+            borrowed_block: None,
         }
     }
 
@@ -1380,6 +1429,12 @@ impl RowMatchGenerator {
         self.history.clear();
         self.history_start = 0;
         self.offset_hist = [1, 4, 8];
+        // Clear borrowed-window state so a following OWNED frame's
+        // `current_block_range()` / `live_history()` read the owned mirror,
+        // not a stale borrowed range. A borrowed frame re-arms via
+        // `set_borrowed_window` after this reset.
+        self.borrowed_input = None;
+        self.borrowed_block = None;
         if next_floor <= REBASE_RESET_FLOOR_CEILING && !self.row_positions.is_empty() {
             self.history_abs_start = next_floor;
         } else {
@@ -1398,6 +1453,18 @@ impl RowMatchGenerator {
     }
 
     pub(crate) fn get_last_space(&self) -> &[u8] {
+        if let (Some((ptr, _total)), Some((block_start, block_end))) =
+            (self.borrowed_input, self.borrowed_block)
+        {
+            // Borrowed window: the active block is the in-place input range
+            // `[block_start, block_end)`, staged before the scan so the emit
+            // pipeline's pre-scan `get_last_space().len()` reserve is correct.
+            // SAFETY: borrowed liveness contract; `block_start <= block_end <=
+            // buffer len` (validated when staged).
+            return unsafe {
+                core::slice::from_raw_parts(ptr.add(block_start), block_end - block_start)
+            };
+        }
         let last = *self.chunk_lens.back().unwrap();
         &self.history[self.history.len() - last..]
     }
@@ -1502,8 +1569,7 @@ impl RowMatchGenerator {
     ) {
         debug_assert_eq!(ROW_LOG, self.row_log);
         self.ensure_tables();
-        let current_len = *self.chunk_lens.back().unwrap();
-        let current_abs_start = self.history_abs_start + self.window_size - current_len;
+        let (current_abs_start, current_len) = self.current_block_range();
         let current_abs_end = current_abs_start + current_len;
         let backfill_start = self.backfill_start(current_abs_start);
         if backfill_start < current_abs_start {
@@ -1676,11 +1742,81 @@ impl RowMatchGenerator {
     }
 
     pub(crate) fn live_history(&self) -> &[u8] {
+        // Borrowed one-shot: candidate/cursor bytes live in the caller's
+        // input slice, not the owned mirror. Expose `[0, block_end)` so the
+        // scan reads every prior byte in place (no input->mirror copy). The
+        // branch is loop-invariant for a whole scan and inlines.
+        if let Some((_start, end)) = self.borrowed_block {
+            let (ptr, total) = self
+                .borrowed_input
+                .expect("borrowed_block set without a registered borrowed window");
+            debug_assert!(
+                end <= total,
+                "borrowed block end {end} exceeds window {total}"
+            );
+            // SAFETY: `ptr` is the registered borrowed window's start (live by
+            // the `set_borrowed_window` contract) and `end <= total` bytes are
+            // in bounds.
+            return unsafe { core::slice::from_raw_parts(ptr, end) };
+        }
         &self.history[self.history_start..]
     }
 
     fn history_abs_end(&self) -> usize {
         self.history_abs_start + self.live_history().len()
+    }
+
+    /// Register the borrowed input window (the whole caller slice). Borrowed
+    /// blocks staged after this read their bytes from `buffer` in place.
+    ///
+    /// Zeroes `history_abs_start`: borrowed positions are absolute input
+    /// offsets (0-based), so the floor-advance reset's persistent non-zero
+    /// floor must be cleared for the duration of the borrowed frame. The
+    /// owned history is unused while borrowed (no `add_data` copy), so this
+    /// is safe; every probed candidate is byte-verified by the prefix
+    /// compare, so any stale table entry left from a prior frame is rejected
+    /// (or, if its bytes coincidentally match, is a genuine in-window match).
+    ///
+    /// # Safety
+    /// `buffer` must stay live and unmodified until `clear_borrowed_window`
+    /// or `reset` — the matcher stores a raw pointer into it.
+    pub(crate) unsafe fn set_borrowed_window(&mut self, buffer: &[u8]) {
+        self.borrowed_input = Some((buffer.as_ptr(), buffer.len()));
+        self.borrowed_block = None;
+        self.history_abs_start = 0;
+    }
+
+    pub(crate) fn clear_borrowed_window(&mut self) {
+        self.borrowed_input = None;
+        self.borrowed_block = None;
+    }
+
+    /// Stage `[block_start, block_end)` as the active borrowed block before a
+    /// scan so `live_history()` / `current_block_range()` report it.
+    pub(crate) fn stage_borrowed_block(&mut self, block_start: usize, block_end: usize) {
+        let (_ptr, total) = self
+            .borrowed_input
+            .expect("stage_borrowed_block requires a registered borrowed window");
+        assert!(
+            block_start <= block_end && block_end <= total,
+            "borrowed block bounds out of range: start={block_start} end={block_end} total={total}",
+        );
+        self.borrowed_block = Some((block_start, block_end));
+    }
+
+    /// `(current_abs_start, current_len)` for the active scan. Borrowed: the
+    /// staged block range (absolute input offsets). Owned: derived from the
+    /// last committed chunk in the live window.
+    fn current_block_range(&self) -> (usize, usize) {
+        if let Some((start, end)) = self.borrowed_block {
+            (start, end - start)
+        } else {
+            let current_len = *self.chunk_lens.back().unwrap();
+            (
+                self.history_abs_start + self.window_size - current_len,
+                current_len,
+            )
+        }
     }
 
     /// Row hash key at `idx`: `key_len` bytes (donor `mls`, 5-6 on the row
@@ -1978,6 +2114,42 @@ impl RowMatchGenerator {
             6 => self.skip_matching_with_hint_rl::<6>(incompressible_hint),
             _ => unreachable!("row_log is clamped to 4..=6 in configure()"),
         }
+    }
+
+    /// Borrowed (no-copy) one-shot equivalent of [`Self::start_matching`]:
+    /// stage `[block_start, block_end)` of the registered borrowed window,
+    /// then run the SAME parse dispatch. The parse body reads its block range
+    /// via `current_block_range()` and its bytes via `live_history()`, both
+    /// borrowed-aware, so the staged block is scanned in place (no
+    /// `add_data` copy into the owned mirror). `history_abs_start` was forced
+    /// to 0 in `set_borrowed_window`, so positions stay absolute input
+    /// offsets and the window-low candidate cap bounds offsets to the window.
+    pub(crate) fn start_matching_borrowed(
+        &mut self,
+        block_start: usize,
+        block_end: usize,
+        greedy: bool,
+        handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        self.stage_borrowed_block(block_start, block_end);
+        if greedy {
+            self.start_matching_greedy(handle_sequence);
+        } else {
+            self.start_matching(handle_sequence);
+        }
+    }
+
+    /// Borrowed equivalent of [`Self::skip_matching_with_hint`]: stage the
+    /// block (so the RLE/Raw emit's `get_last_space` reserve reports it) and
+    /// seed the row tables without a copy, mirroring the owned skip.
+    pub(crate) fn skip_matching_borrowed(
+        &mut self,
+        block_start: usize,
+        block_end: usize,
+        incompressible_hint: Option<bool>,
+    ) {
+        self.stage_borrowed_block(block_start, block_end);
+        self.skip_matching_with_hint(incompressible_hint);
     }
 
     #[allow(dead_code)]

@@ -1491,7 +1491,7 @@ impl MatchGeneratorDriver {
 
     /// Active backend family derived from the storage variant. Single
     /// source of truth — no separate runtime tag to drift against.
-    fn active_backend(&self) -> super::strategy::BackendTag {
+    pub(crate) fn active_backend(&self) -> super::strategy::BackendTag {
         self.storage.backend()
     }
 
@@ -1550,7 +1550,12 @@ impl MatchGeneratorDriver {
             super::strategy::BackendTag::Dfast => unsafe {
                 self.dfast_matcher_mut().set_borrowed_window(buffer)
             },
-            other => unreachable!("borrowed window only for Simple/Dfast backends, got {other:?}"),
+            super::strategy::BackendTag::Row => unsafe {
+                self.row_matcher_mut().set_borrowed_window(buffer)
+            },
+            other => {
+                unreachable!("borrowed window only for Simple/Dfast/Row backends, got {other:?}")
+            }
         }
     }
 
@@ -1560,6 +1565,7 @@ impl MatchGeneratorDriver {
         match self.active_backend() {
             super::strategy::BackendTag::Simple => self.simple_mut().clear_borrowed_window(),
             super::strategy::BackendTag::Dfast => self.dfast_matcher_mut().clear_borrowed_window(),
+            super::strategy::BackendTag::Row => self.row_matcher_mut().clear_borrowed_window(),
             _ => {}
         }
         self.borrowed_pending = None;
@@ -1576,9 +1582,11 @@ impl MatchGeneratorDriver {
         assert!(
             matches!(
                 self.active_backend(),
-                super::strategy::BackendTag::Simple | super::strategy::BackendTag::Dfast
+                super::strategy::BackendTag::Simple
+                    | super::strategy::BackendTag::Dfast
+                    | super::strategy::BackendTag::Row
             ),
-            "borrowed block staging is only valid for the Simple (Fast) / Dfast backends",
+            "borrowed block staging is only valid for the Simple (Fast) / Dfast / Row backends",
         );
         assert!(
             block_start <= block_end,
@@ -1596,6 +1604,9 @@ impl MatchGeneratorDriver {
                 .stage_borrowed_block(block_start, block_end),
             super::strategy::BackendTag::Dfast => self
                 .dfast_matcher_mut()
+                .stage_borrowed_block(block_start, block_end),
+            super::strategy::BackendTag::Row => self
+                .row_matcher_mut()
                 .stage_borrowed_block(block_start, block_end),
             _ => unreachable!(),
         }
@@ -2874,7 +2885,17 @@ impl Matcher for MatchGeneratorDriver {
                 super::strategy::BackendTag::Dfast => self
                     .dfast_matcher_mut()
                     .start_matching_borrowed(block_start, block_end, &mut handle_sequence),
-                other => unreachable!("borrowed scan only for Simple/Dfast, got {other:?}"),
+                super::strategy::BackendTag::Row => {
+                    // Same greedy/lazy parse split as the owned RowHash arm.
+                    let greedy = self.parse == super::strategy::ParseMode::Greedy;
+                    self.row_matcher_mut().start_matching_borrowed(
+                        block_start,
+                        block_end,
+                        greedy,
+                        &mut handle_sequence,
+                    );
+                }
+                other => unreachable!("borrowed scan only for Simple/Dfast/Row, got {other:?}"),
             }
             return;
         }
@@ -2953,7 +2974,12 @@ impl Matcher for MatchGeneratorDriver {
                 super::strategy::BackendTag::Dfast => self
                     .dfast_matcher_mut()
                     .skip_matching_borrowed(block_start, block_end, incompressible_hint),
-                other => unreachable!("borrowed skip only for Simple/Dfast, got {other:?}"),
+                super::strategy::BackendTag::Row => self.row_matcher_mut().skip_matching_borrowed(
+                    block_start,
+                    block_end,
+                    incompressible_hint,
+                ),
+                other => unreachable!("borrowed skip only for Simple/Dfast/Row, got {other:?}"),
             }
             return;
         }

@@ -969,7 +969,16 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             // continuous-index + windowLow one-shot behaviour, which also
             // avoids the eviction/rehash the owned path pays.
             StrategyTag::Dfast => true,
-            _ => false,
+            // Greedy / Lazy map to EITHER the Row or HashChain backend
+            // depending on level (L5 greedy + L9-12 lazy = Row; L13-15 lazy =
+            // HashChain). The borrowed in-place scan with the same per-position
+            // `window_low` cap exists for Row; gate on the resolved backend,
+            // not the strategy tag, so only Row-backed levels take it (HashChain
+            // / BT stay on the owned path until their borrowed scan lands).
+            _ => matches!(
+                self.state.matcher.active_backend(),
+                crate::encoding::strategy::BackendTag::Row
+            ),
         }
     }
 

@@ -286,9 +286,20 @@ pub(crate) fn compress_block_encoded_borrowed(
         output.extend_from_slice(block);
         BlockType::Raw
     } else {
+        // The borrowed one-shot path emits ONE block per staged range (no
+        // pre-split partition loop). That holds for every borrowed-eligible
+        // backend (Simple / Dfast / Row — none pre-split). Gate on the
+        // resolved BACKEND, not the level number: a strategy override (e.g.
+        // Greedy at level 19) puts a Row-backed scan under a high level, which
+        // is still single-block and borrowed-valid. The HashChain backend
+        // (lazy L13-15 / BT L16+) has no borrowed scan yet and is excluded by
+        // `borrowed_eligible`, so it must never reach here.
         assert!(
-            !matches!(compression_level, CompressionLevel::Level(16..=22)),
-            "borrowed one-shot path is gated to Fast levels; post-split is unreachable",
+            !matches!(
+                state.matcher.active_backend(),
+                crate::encoding::strategy::BackendTag::HashChain
+            ),
+            "borrowed one-shot path requires a non-pre-splitting backend (Simple/Dfast/Row)",
         );
         // Stage the borrowed range so `compress_block`'s internal
         // `start_matching` scans it in place (no `commit_space` copy).
