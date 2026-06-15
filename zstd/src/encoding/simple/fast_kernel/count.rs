@@ -191,6 +191,11 @@ pub(crate) unsafe fn count_forward(ip: *const u8, match_ptr: *const u8, iend: *c
 ///
 /// `cand < dict.len()` is required (a dict-prefix candidate); the kernel only
 /// calls this for `cand_abs < dict_end`.
+///
+/// `#[inline]` so the shared 2-segment primitive folds into each backend's
+/// borrowed dual-base dict kernel (Fast/Dfast/Row) rather than paying an
+/// out-of-line call on the dict-match path.
+#[inline]
 pub(crate) fn count_forward_dict_2segment(
     dict: &[u8],
     cand: usize,
