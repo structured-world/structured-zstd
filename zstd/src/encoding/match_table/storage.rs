@@ -729,10 +729,14 @@ impl MatchTable {
         // pending block can sit on top, so the steady-state ceiling is
         // `max_window_size + max_window_size/4 + MAX_BLOCK_SIZE` — matching the
         // `add_data` eviction reserve so the two never fight over capacity.
-        let cap = self
-            .max_window_size
-            .saturating_add(self.max_window_size >> 2)
-            .saturating_add(crate::common::MAX_BLOCK_SIZE as usize);
+        // Plain arithmetic (not `saturating_*`): `max_window_size = 1 <<
+        // window_log` with `window_log <= ZSTD_WINDOWLOG_MAX` (31), so the sum
+        // is at most `2^31 + 2^29 + 2^17 < usize::MAX` even on 32-bit targets —
+        // overflow is unreachable, and a silent saturation here would only mask
+        // a window_log bound violation upstream.
+        let cap = self.max_window_size
+            + (self.max_window_size >> 2)
+            + crate::common::MAX_BLOCK_SIZE as usize;
         let want = expected_bytes.min(cap);
         if want > self.history.capacity() {
             self.history.reserve_exact(want - self.history.len());
