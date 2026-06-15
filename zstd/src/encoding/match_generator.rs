@@ -2059,6 +2059,33 @@ impl Matcher for MatchGeneratorDriver {
                 hc.chain_log = dict_chain_log;
             }
         }
+        // upstream zstd `ZSTD_resolveRowMatchFinderMode` (zstd_compress.c:238-245):
+        // the row matchfinder is used for greedy/lazy/lazy2 ONLY when
+        // `windowLog > 14`; at or below that upstream runs the hash-chain
+        // matcher (`ZSTD_HcFindBestMatch`). We previously hardcoded the Row
+        // backend for these strategies regardless of window, sending every
+        // small-window frame (hinted floor = windowLog 14, e.g. the small-4k/10k
+        // fixtures) through Row where upstream uses HC. Match it: fall back to
+        // the hash-chain matcher (lazy/greedy parse via `lazy_depth`) when the
+        // resolved window is <= 14. The HC config is synthesised from the
+        // level's RowConfig (HC and Row share the same cParams; only the
+        // matchfinder differs) — `hash_log` / `chain_log` are
+        // clamped to the (<= 14) window inside the HashChain reset arm, so the
+        // nominal width here only sets the clamp ceiling.
+        if params.search == super::strategy::SearchMethod::RowHash && params.window_log <= 14 {
+            let row = params
+                .row
+                .expect("a RowHash level row must carry a RowConfig");
+            params.search = super::strategy::SearchMethod::HashChain;
+            params.hc = Some(HcConfig {
+                hash_log: row.hash_bits,
+                chain_log: row.hash_bits,
+                search_depth: row.search_depth,
+                target_len: row.target_len,
+                search_mls: 4,
+            });
+            params.row = None;
+        }
         let next_backend = params.backend();
         let max_window_size = 1usize << params.window_log;
         self.dictionary_retained_budget = 0;
@@ -8311,27 +8338,39 @@ fn driver_small_source_hint_shrinks_row_hash_tables() {
     // count is 1 << (ROW_L5.hash_bits - ROW_L5.row_log).
     assert_eq!(full_rows, 1 << (ROW_L5.hash_bits - ROW_L5.row_log));
 
-    driver.set_source_size_hint(1024);
+    // A hint that keeps the resolved window > 14 STILL uses the Row finder
+    // (upstream `ZSTD_resolveRowMatchFinderMode`: row mode on for windowLog > 14)
+    // and shrinks the row hash table to the source-derived width. 64 KiB →
+    // raw source log 16, so `row_hash_bits_for_window(1 << 16)` < the level's
+    // full hash_bits (19) and the row count drops.
+    driver.set_source_size_hint(1 << 16);
     driver.reset(CompressionLevel::Level(5));
     let mut space = driver.get_next_space();
     space[..12].copy_from_slice(b"xyzxyzxyzxyz");
     space.truncate(12);
     driver.commit_space(space);
     driver.skip_matching_with_hint(None);
-    let hinted_rows = driver.row_matcher().row_heads.len();
-
-    // Wire `window_log` stays floored, but the row hash table is sized from
-    // the RAW 1 KiB source: `table_window = 1 << 10`, so
-    // `row_hash_bits_for_window(1 << 10) = 11` (donor `hashLog <=
-    // windowLog + 1`) and the row count is `1 << (11 - ROW_L5.row_log)`.
-    assert_eq!(driver.window_size(), 1 << MIN_HINTED_WINDOW_LOG);
     assert_eq!(
-        hinted_rows,
-        1 << ((MIN_WINDOW_LOG as usize) + 1 - ROW_L5.row_log)
+        driver.active_backend(),
+        super::strategy::BackendTag::Row,
+        "windowLog > 14 keeps the upstream row matchfinder"
     );
+    let hinted_rows = driver.row_matcher().row_heads.len();
     assert!(
         hinted_rows < full_rows,
-        "tiny source hint should reduce row hash table footprint"
+        "a window>14 source hint should reduce the row hash table footprint"
+    );
+
+    // A tiny hint floors the resolved window at MIN_HINTED_WINDOW_LOG = 14;
+    // upstream uses the HASH-CHAIN matcher (not Row) at windowLog <= 14, so the
+    // driver must route greedy/lazy/lazy2 to the HashChain backend there.
+    driver.set_source_size_hint(1024);
+    driver.reset(CompressionLevel::Level(5));
+    assert_eq!(driver.window_size(), 1 << MIN_HINTED_WINDOW_LOG);
+    assert_eq!(
+        driver.active_backend(),
+        super::strategy::BackendTag::HashChain,
+        "windowLog <= 14 must fall back to the donor hash-chain matchfinder",
     );
 }
 
