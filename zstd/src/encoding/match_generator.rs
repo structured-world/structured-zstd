@@ -2275,10 +2275,16 @@ impl Matcher for MatchGeneratorDriver {
                 // tables are dictionary-tier-small. Unhinted streams skip this
                 // and keep doubling growth.
                 if let Some(src) = hint {
-                    // Plain `+`: source size + dict hint are real data sizes
-                    // (<= isize::MAX), and `reserve_history` clamps the result to
-                    // its window ceiling anyway, so this cannot overflow.
-                    let expected = (src as usize) + dict_hint.unwrap_or(0);
+                    // `src` is a u64 hint and may be the u64::MAX "unknown
+                    // size" sentinel, which truncates under `as usize` on
+                    // 32-bit targets and overflows when the dict hint is
+                    // added. Saturate the source size, then saturate the
+                    // dict-hint addition; `reserve_history` applies the
+                    // tighter window ceiling to the result.
+                    let src_hint = usize::try_from(src).unwrap_or(usize::MAX);
+                    let expected = src_hint
+                        .checked_add(dict_hint.unwrap_or(0))
+                        .unwrap_or(usize::MAX);
                     hc.table.reserve_history(expected);
                 }
             }
