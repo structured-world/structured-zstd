@@ -424,6 +424,18 @@ impl DfastMatchGenerator {
             // dict bytes — drop the attach (dict ratio benefit lost once the
             // dict slides out of the window, like the Fast backend).
             self.dict.invalidate();
+            // Cap the history buffer near the live window: reserve exactly
+            // (window + window/4 + one block) once eviction starts so the Vec
+            // grows linearly to that ceiling instead of power-of-two doubling
+            // to ~2x window; `compact_history`'s quarter-window drain keeps len
+            // under it, so the Vec never reallocates again. Small frames that
+            // never fill the window keep their tight data-sized buffer.
+            let target = self.max_window_size
+                + (self.max_window_size >> 2)
+                + crate::common::MAX_BLOCK_SIZE as usize;
+            if target > self.history.len() && self.history.capacity() < target {
+                self.history.reserve_exact(target - self.history.len());
+            }
         }
         while self.window_size + data.len() > self.max_window_size {
             let removed_len = self.window_blocks.pop_front().unwrap();
@@ -1350,7 +1362,10 @@ impl DfastMatchGenerator {
         if self.history_start == 0 {
             return;
         }
-        if self.history_start >= self.max_window_size
+        // Drain the dead prefix at a quarter window (paired with the one-time
+        // `reserve_exact` in `add_data`) so the buffer stays near
+        // `window + window/4` instead of doubling to ~2x window on long streams.
+        if self.history_start >= (self.max_window_size >> 2)
             || self.history_start * 2 >= self.history.len()
         {
             self.history.drain(..self.history_start);
