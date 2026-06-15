@@ -2282,9 +2282,7 @@ impl Matcher for MatchGeneratorDriver {
                     // dict-hint addition; `reserve_history` applies the
                     // tighter window ceiling to the result.
                     let src_hint = usize::try_from(src).unwrap_or(usize::MAX);
-                    let expected = src_hint
-                        .checked_add(dict_hint.unwrap_or(0))
-                        .unwrap_or(usize::MAX);
+                    let expected = src_hint.saturating_add(dict_hint.unwrap_or(0));
                     hc.table.reserve_history(expected);
                 }
             }
