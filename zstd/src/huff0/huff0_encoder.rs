@@ -220,70 +220,11 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         bit_c: &mut super::huf_cstream::HufCStream<'_>,
         data: &[u8],
     ) {
-        let mut n = data.len();
-        let rem = n % K_UNROLL;
-
-        // Phase 1: tail symbols (< K_UNROLL) on the SLOW path.
-        if rem > 0 {
-            for _ in 0..rem {
-                n -= 1;
-                let elt = table[data[n] as usize];
-                bit_c.add_bits::<false>(elt, 0);
-            }
-            bit_c.flush_bits::<K_FAST_FLUSH>();
-        }
-        debug_assert!(n.is_multiple_of(K_UNROLL));
-
-        // Phase 2: bring n down to a multiple of 2 * K_UNROLL.
-        if !n.is_multiple_of(2 * K_UNROLL) {
-            for u in 1..K_UNROLL {
-                let elt = table[data[n - u] as usize];
-                bit_c.add_bits::<true>(elt, 0);
-            }
-            let last_elt = table[data[n - K_UNROLL] as usize];
-            if K_LAST_FAST {
-                bit_c.add_bits::<true>(last_elt, 0);
-            } else {
-                bit_c.add_bits::<false>(last_elt, 0);
-            }
-            bit_c.flush_bits::<K_FAST_FLUSH>();
-            n -= K_UNROLL;
-        }
-        debug_assert!(n.is_multiple_of(2 * K_UNROLL));
-
-        // Phase 3: dual-container main loop.
-        while n > 0 {
-            // K_UNROLL symbols into stream 0.
-            for u in 1..K_UNROLL {
-                let elt = table[data[n - u] as usize];
-                bit_c.add_bits::<true>(elt, 0);
-            }
-            let last_elt_0 = table[data[n - K_UNROLL] as usize];
-            if K_LAST_FAST {
-                bit_c.add_bits::<true>(last_elt_0, 0);
-            } else {
-                bit_c.add_bits::<false>(last_elt_0, 0);
-            }
-            bit_c.flush_bits::<K_FAST_FLUSH>();
-
-            // K_UNROLL symbols into stream 1 (independent of 0).
-            bit_c.zero_index1();
-            for u in 1..K_UNROLL {
-                let elt = table[data[n - K_UNROLL - u] as usize];
-                bit_c.add_bits::<true>(elt, 1);
-            }
-            let last_elt_1 = table[data[n - K_UNROLL - K_UNROLL] as usize];
-            if K_LAST_FAST {
-                bit_c.add_bits::<true>(last_elt_1, 1);
-            } else {
-                bit_c.add_bits::<false>(last_elt_1, 1);
-            }
-            bit_c.merge_index1();
-            bit_c.flush_bits::<K_FAST_FLUSH>();
-
-            n -= 2 * K_UNROLL;
-        }
-        debug_assert_eq!(n, 0);
+        // Delegate to the hoisted-locals encode loop on `HufCStream`,
+        // which keeps the bit containers / positions / cursor
+        // register-resident (donor's `HUF_CStream_t` shape) instead of
+        // reloading them from `*bit_c` per symbol. Byte-identical output.
+        bit_c.encode_unrolled::<K_UNROLL, K_FAST_FLUSH, K_LAST_FAST>(table, data);
     }
 
     /// Encode one stream and pad it to fill the last byte
