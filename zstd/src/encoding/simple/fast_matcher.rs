@@ -1029,21 +1029,22 @@ impl FastKernelMatcher {
     ///
     /// Live (input) candidates read from the borrowed window and count flat;
     /// dictionary candidates read from `history[0..dict_end]` and extend across
-    /// the dict→input boundary via [`count_forward_dict_2segment`] — the
-    /// 2-segment count C performs with `dictBase` / `ZSTD_count_2segments`,
-    /// which the flat single-base path cannot. Correctness-first scalar greedy
-    /// scan (no repcode / step-ramp / interior inserts yet); validated by
-    /// roundtrip + cross-validation + the FFI ratio gate, not byte-identity to
-    /// the owned SIMD kernel.
+    /// the dict→input boundary via the 2-segment counter — the 2-segment count
+    /// C performs with `dictBase` / `ZSTD_count_2segments`, which the flat
+    /// single-base path cannot. Dispatches the active `(mls, use_cmov)` pair to
+    /// the monomorphised dual-base kernel
+    /// [`compress_block_fast_dict_borrowed`], which carries the owned dict
+    /// kernel's full machinery (repcode probe, step-ramp two-position
+    /// lookahead, dense fills, backward extension, immediate repcode-2 loop) —
+    /// the prior scalar greedy scan had none of these and was +68% slower.
+    /// Validated by roundtrip + cross-validation + the FFI ratio gate.
     pub(crate) fn start_matching_borrowed_dict(
         &mut self,
         block_start: usize,
         block_end: usize,
         mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
     ) {
-        use super::fast_kernel::count::{count_forward, count_forward_dict_2segment};
-        use super::fast_kernel::hash_table::hash_ptr_raw;
-        const HASH_READ: usize = 8;
+        use super::fast_kernel::kernel::{PrefixBounds, compress_block_fast_dict_borrowed};
         let (ptr, total_len) = self
             .borrowed
             .expect("start_matching_borrowed_dict requires a registered borrowed window");
@@ -1056,15 +1057,31 @@ impl FastKernelMatcher {
 
         let dict_end = self.dict.region_len();
         let advertised_window = 1usize << self.window_log;
-        let hash_log = self.hash_table.hash_log();
         let mls = self.hash_table.mls();
+        let use_cmov = self.use_cmov;
+        let step_size = self.step_size;
+        let rep_in = self.rep;
+
+        // Window bounds in VIRTUAL `[dict][input]` coords (length `dict_end +
+        // block_end`), so the kernel's gates match the owned flat dict kernel:
+        // `window_low` is the absolute floor; `prefix_start_index` the
+        // sentinel-aware floor (`>= 1`) for the hash-slot filter.
+        let virtual_len = dict_end + block_end;
+        let window_low = virtual_len.saturating_sub(advertised_window);
+        let prefix_start_index = window_low.max(self.prefix_start_index as usize) as u32;
+        let bounds = PrefixBounds {
+            prefix_start_index,
+            window_low: window_low as u32,
+        };
+
         // SAFETY: `block_end <= total_len` (asserted) and the borrowed window is
         // live for the call; `ptr` is `Copy`d out so `inp` holds no `&self`
         // borrow. The dict slice reborrows `history`'s base through a raw ptr so
-        // it coexists with the `&mut self.hash_table` writes below — disjoint
-        // memory (the dict content is committed at `history[0..dict_end]` and is
-        // not mutated during the scan). The dict hash table likewise reborrows
-        // through a raw ptr (immutable, built once in `prime_dict_table_*`).
+        // it coexists with the `&mut self.hash_table` writes inside the kernel —
+        // disjoint memory (the dict content is committed at `history[0..
+        // dict_end]` and is not mutated during the scan). The dict hash table
+        // likewise reborrows through a raw ptr (immutable, built once in
+        // `prime_dict_table_*`).
         let inp: &[u8] = unsafe { core::slice::from_raw_parts(ptr, block_end) };
         let dict: &[u8] = unsafe { core::slice::from_raw_parts(self.history.as_ptr(), dict_end) };
         let dict_tab_ptr: *const FastHashTable = self
@@ -1073,85 +1090,47 @@ impl FastKernelMatcher {
             .expect("start_matching_borrowed_dict requires an attached dict table");
         // SAFETY: reborrow the immutable dict table (built once in
         // `prime_dict_table_*`, not mutated during the scan) detached from
-        // `&self` so it coexists with the `&mut self.hash_table` writes below.
+        // `&self` so it coexists with the `&mut self.hash_table` borrow below.
         let dict_tab: &FastHashTable = unsafe { &*dict_tab_ptr };
+        let main_table = &mut self.hash_table;
 
-        // Hash the 8 bytes at input offset `p` with the active `mls`
-        // (monomorphised per supported value, matching the table layout).
-        macro_rules! hash_at {
-            ($p:expr) => {{
-                let hp = unsafe { inp.as_ptr().add($p) };
-                match mls {
-                    4 => unsafe { hash_ptr_raw::<4>(hp, hash_log) },
-                    5 => unsafe { hash_ptr_raw::<5>(hp, hash_log) },
-                    6 => unsafe { hash_ptr_raw::<6>(hp, hash_log) },
-                    7 => unsafe { hash_ptr_raw::<7>(hp, hash_log) },
-                    _ => unsafe { hash_ptr_raw::<8>(hp, hash_log) },
-                }
-            }};
+        macro_rules! run {
+            ($mls:literal, $cmov:literal) => {
+                compress_block_fast_dict_borrowed::<$mls, $cmov>(
+                    inp,
+                    dict,
+                    block_start,
+                    block_end,
+                    main_table,
+                    dict_tab,
+                    bounds,
+                    rep_in,
+                    step_size,
+                    &mut handle_sequence,
+                )
+            };
         }
-
-        let mut anchor = block_start;
-        let mut ip = block_start;
-        while ip + HASH_READ <= block_end {
-            let cur_abs = dict_end + ip;
-            let hash = hash_at!(ip);
-            // Prior position stored at this hash, then insert the current one
-            // (absolute coords) so a candidate is always strictly earlier.
-            let live_abs = unsafe { self.hash_table.get(hash) } as usize;
-            unsafe { self.hash_table.put(hash, cur_abs as u32) };
-
-            // Live (input) candidate: real positions are `>= dict_end >= 1`, so
-            // the empty sentinel 0 is naturally distinct.
-            let mut best_len = 0usize;
-            let mut best_off = 0usize;
-            if live_abs >= dict_end && live_abs < cur_abs && cur_abs - live_abs <= advertised_window
-            {
-                let cand = live_abs - dict_end; // input offset
-                if inp[ip..ip + 4] == inp[cand..cand + 4] {
-                    let ext = unsafe {
-                        count_forward(
-                            inp.as_ptr().add(ip + 4),
-                            inp.as_ptr().add(cand + 4),
-                            inp.as_ptr().add(block_end),
-                        )
-                    };
-                    best_len = 4 + ext;
-                    best_off = cur_abs - live_abs;
-                }
+        let result = match (mls, use_cmov) {
+            (4, false) => run!(4, false),
+            (4, true) => run!(4, true),
+            (5, false) => run!(5, false),
+            (5, true) => run!(5, true),
+            (6, false) => run!(6, false),
+            (6, true) => run!(6, true),
+            (7, false) => run!(7, false),
+            (7, true) => run!(7, true),
+            (8, false) => run!(8, false),
+            (8, true) => run!(8, true),
+            _ => {
+                unreachable!("FastHashTable construction rejects mls outside 4..=8 — got mls={mls}")
             }
+        };
+        self.rep = result.rep;
 
-            // Dictionary candidate (fallback): the dict probe is keyed by the
-            // same hash/mls. A dict position `d` is valid when in range and the
-            // emitted offset stays within the advertised window. Extend across
-            // the dict→input boundary with the 2-segment counter.
-            if best_len < 4 {
-                let d = unsafe { dict_tab.get(hash) } as usize;
-                if d != 0 && d < dict_end && cur_abs - d <= advertised_window {
-                    let dlen = count_forward_dict_2segment(dict, d, inp, ip);
-                    if dlen >= 4 {
-                        best_len = dlen;
-                        best_off = cur_abs - d;
-                    }
-                }
-            }
-
-            if best_len >= 4 {
-                handle_sequence(Sequence::Triple {
-                    literals: &inp[anchor..ip],
-                    offset: best_off,
-                    match_len: best_len,
-                });
-                ip += best_len;
-                anchor = ip;
-            } else {
-                ip += 1;
-            }
-        }
-
-        if anchor < block_end {
+        if result.tail_literals_len > 0 {
+            let tail_start = block_end - result.tail_literals_len;
             handle_sequence(Sequence::Literals {
-                literals: &inp[anchor..block_end],
+                literals: &inp[tail_start..block_end],
             });
         }
     }

@@ -180,35 +180,63 @@ pub(crate) unsafe fn count_forward(ip: *const u8, match_ptr: *const u8, iend: *c
 /// `ZSTD_count_2segments` for a dict-prefix match that extends past the
 /// dictionary boundary into the active input.
 ///
-/// Scalar by design: a dict-prefix match is the fallback probe (recent input
-/// wins first), and crossing the dictionary boundary is rare for the short
-/// Fast-strategy matches, so the per-byte boundary check is off the hot path.
+/// Word-at-a-time per segment, mirroring upstream zstd `ZSTD_count_2segments`
+/// (it calls `ZSTD_count` on each side of the split): the candidate's dict
+/// remainder is counted against the current input with [`count_forward`], and
+/// if the candidate exhausts the dict still matching, a second [`count_forward`]
+/// continues from the input start. A dict-attach match on dictionary-trained
+/// data hits the dict on nearly every position, so the dict segment is on the
+/// HOT path — a per-byte boundary loop here was the dominant cost of the
+/// borrowed dict kernel; the segmented word-at-a-time count removes it.
+///
+/// `cand < dict.len()` is required (a dict-prefix candidate); the kernel only
+/// calls this for `cand_abs < dict_end`.
 pub(crate) fn count_forward_dict_2segment(
     dict: &[u8],
     cand: usize,
     inp: &[u8],
     cur: usize,
 ) -> usize {
-    let limit = inp.len() - cur;
     let dict_len = dict.len();
-    let mut k = 0usize;
-    while k < limit {
-        let cand_idx = cand + k;
-        // Candidate reads the dictionary first, then the input that logically
-        // follows it. `cand < dict_len` initially and `cand < cur + dict_len`
-        // (candidate precedes the current position in the `[dict][input]`
-        // window), so the `inp` index here stays `< k <= limit`, in bounds.
-        let cand_byte = if cand_idx < dict_len {
-            dict[cand_idx]
-        } else {
-            inp[cand_idx - dict_len]
-        };
-        if cand_byte != inp[cur + k] {
-            break;
-        }
-        k += 1;
+    let inp_len = inp.len();
+    let cur_avail = inp_len - cur;
+    if cur_avail == 0 {
+        return 0;
     }
-    k
+    // Segment 1: candidate reads `dict[cand..dict_len]`, current reads
+    // `inp[cur..]`. Bounded by whichever side runs out first.
+    let seg1 = (dict_len - cand).min(cur_avail);
+    // SAFETY: reads `inp[cur..cur+seg1]` and `dict[cand..cand+seg1]`; `seg1 <=
+    // cur_avail` keeps the current side in bounds and `seg1 <= dict_len - cand`
+    // keeps the candidate side within the dict.
+    let m1 = unsafe {
+        count_forward(
+            inp.as_ptr().add(cur),
+            dict.as_ptr().add(cand),
+            inp.as_ptr().add(cur + seg1),
+        )
+    };
+    // Mismatch inside the dict segment, or the current input is exhausted →
+    // the match ends here.
+    if m1 < seg1 || seg1 == cur_avail {
+        return m1;
+    }
+    // The candidate exhausted the dict (`m1 == dict_len - cand`) and the current
+    // input still has bytes left. Segment 2: the candidate logically continues
+    // at `inp[0..]` (the input directly follows the dict in the `[dict][input]`
+    // window); the current side continues at `inp[cur + m1..]`.
+    let cur2 = cur + m1;
+    // SAFETY: reads `inp[cur2..inp_len]` (current) and `inp[0..inp_len-cur2]`
+    // (candidate); both stay within `inp`. `count_forward`'s `iend` caps the
+    // current side at the input end.
+    let m2 = unsafe {
+        count_forward(
+            inp.as_ptr().add(cur2),
+            inp.as_ptr(),
+            inp.as_ptr().add(inp_len),
+        )
+    };
+    m1 + m2
 }
 
 #[cfg(test)]
@@ -333,6 +361,17 @@ mod tests {
         let inp = [1u8, 2, 3, 1, 2, 3, 9]; // cur=3 → [1,2,3,9...]
         // cand=0: dict[0..3] match inp[3..6]; cand_idx=3 → inp[0]=1 vs inp[6]=9 ✗ → 3.
         assert_eq!(count_forward_dict_2segment(&dict, 0, &inp, 3), 3);
+    }
+
+    #[test]
+    fn dict_2segment_continues_word_at_a_time_past_boundary() {
+        // Candidate exhausts the dict mid-match and keeps matching into the
+        // input segment — exercises the segment-2 count_forward path.
+        let dict = [1u8, 2, 3];
+        let inp = [1u8, 2, 3, 1, 2, 3, 1, 2]; // cur=3 → [1,2,3,1,2]
+        // seg1: dict[0..3]=[1,2,3] vs inp[3..6]=[1,2,3] → m1=3 (dict exhausted).
+        // seg2: inp[0..]=[1,2,...] vs inp[6..]=[1,2] → m2=2. total 5.
+        assert_eq!(count_forward_dict_2segment(&dict, 0, &inp, 3), 5);
     }
 
     #[test]
