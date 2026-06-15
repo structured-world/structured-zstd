@@ -659,10 +659,13 @@ impl FastKernelMatcher {
         // just `history.len()` minus the `HISTORY_DRAIN_BASE`
         // sentinel-slot offset — not a placeholder block subtraction.
         let real_len = self.history.len().saturating_sub(HISTORY_DRAIN_BASE);
-        // Plain `*`: `max_window_size = 1 << window_log` with `window_log <= 30`
-        // (enforced in `with_params`/`reset`), so `* 2` <= 2^31 fits usize on
-        // 32-bit targets. (The `saturating_sub` above stays: it is a real floor
-        // at the sentinel slot.)
+        // Plain `*`: `max_window_size` starts at `1 << window_log` (window_log
+        // <= 30 from `with_params`/`reset`) but dictionary priming widens it,
+        // always capped via `.min(MAX_PRIMED_WINDOW_SIZE)` where
+        // `MAX_PRIMED_WINDOW_SIZE = (u32::MAX - MAX_BLOCK_SIZE) / 2`. So
+        // `cap = max_window_size * 2 <= u32::MAX - MAX_BLOCK_SIZE < u32::MAX`
+        // by construction — fits usize on 32-bit targets. (The `saturating_sub`
+        // above stays: it is a real floor at the sentinel slot.)
         let cap = self.max_window_size * 2;
         // Hard precondition: caller must split blocks into pieces no
         // larger than `2 × max_window_size`. Without this, the
@@ -678,9 +681,9 @@ impl FastKernelMatcher {
         );
         // Subtraction, not `real_len + space.len() > cap`: the assert above
         // guarantees `space.len() <= cap`, so `cap - space.len()` cannot
-        // underflow, and at `window_log = 30` both `real_len` and `space.len()`
-        // can each approach `cap = 2^31`, so the addition would overflow usize
-        // on 32-bit targets before the comparison.
+        // underflow. With a primed `cap` approaching `u32::MAX - MAX_BLOCK_SIZE`,
+        // both `real_len` and `space.len()` can each be large enough that the
+        // addition would overflow usize on 32-bit targets before the comparison.
         if real_len > cap - space.len() {
             // Compute how many real bytes to KEEP, then drop the
             // delta. Pre-fix code naively kept `max_window_size`

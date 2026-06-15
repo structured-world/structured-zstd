@@ -8093,6 +8093,19 @@ fn driver_huge_source_hint_with_dict_does_not_overflow_hc_reserve() {
     driver.set_dictionary_size_hint(64 * 1024);
     driver.reset(CompressionLevel::Level(16));
 
+    // The saturated `usize::MAX` reserve target must be clamped to the HC
+    // history ceiling, not reserved literally (which would OOM/panic). Level 16
+    // has window_log 22, so the ceiling is `window + window/4 + one block`
+    // (the `reserve_history` formula). Assert the reserve actually reached it —
+    // a no-panic-only check would also pass on an under-reserved mirror.
+    let window = 1usize << 22;
+    let expected_history_ceiling = window + (window >> 2) + crate::common::MAX_BLOCK_SIZE as usize;
+    assert!(
+        driver.hc_matcher().table.history.capacity() >= expected_history_ceiling,
+        "huge source + dict hint must reserve the clamped HC history ceiling, got {}",
+        driver.hc_matcher().table.history.capacity()
+    );
+
     let mut space = driver.get_next_space();
     space[..12].copy_from_slice(b"abcabcabcabc");
     space.truncate(12);
