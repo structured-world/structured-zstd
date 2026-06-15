@@ -8074,6 +8074,29 @@ fn driver_huge_source_hint_does_not_overflow_table_window_shift() {
 }
 
 #[test]
+fn driver_huge_source_hint_with_dict_does_not_overflow_hc_reserve() {
+    // Regression: the HC/BT history-mirror pre-size adds the dictionary
+    // hint to the source-size hint before `reserve_history` clamps to the
+    // window ceiling. A `u64::MAX` pledged source size (the "unknown size"
+    // sentinel) plus any positive dictionary hint overflows `usize` in
+    // `(src as usize) + dict_hint` — debug panic / release wrap on 64-bit,
+    // and `src as usize` truncation on 32-bit targets. Level 16 (BtOpt)
+    // routes through the HashChain/BT storage arm that owns this reserve.
+    // Must size the mirror to the real window, never panic, wrap, or
+    // truncate.
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+    driver.set_source_size_hint(u64::MAX);
+    driver.set_dictionary_size_hint(64 * 1024);
+    driver.reset(CompressionLevel::Level(16));
+
+    let mut space = driver.get_next_space();
+    space[..12].copy_from_slice(b"abcabcabcabc");
+    space.truncate(12);
+    driver.commit_space(space);
+    driver.skip_matching_with_hint(None);
+}
+
+#[test]
 fn driver_small_source_hint_shrinks_row_hash_tables() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
 
