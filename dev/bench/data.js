@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781523532255,
+  "lastUpdate": 1781541212673,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -67034,6 +67034,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.272,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "1ad404adcc17dcb8242ec48e76f2c95ed9846b34",
+          "message": "perf: borrowed in-place over-window scan for dfast + row + btlazy2 (#422)\n\n* perf(dfast): match over-window inputs in-place via borrowed path\n\nThe borrowed (no-copy) one-shot scan was gated to in-window inputs for\nDfast; over-window inputs fell back to the owned path, which copies the\nwhole input into the history mirror. On large over-window streams that\nmemmove dominates: ~75% of L1-dcache misses and a 2.16x cycle gap vs C\n(C matches in place on src). Add a per-position window_low =\nabs_ip - advertised_window candidate bound to the borrowed dfast scan\n(owned eviction's history_abs_start already provides this; borrowed-in-\nwindow saturates to 0, so both stay byte-identical) and drop the\ninput_len <= window_size gate. Over-window dfast now matches in place,\nmirroring C's continuous-index + windowLow one-shot behaviour and\navoiding the input->mirror copy.\n\n* perf(row): match over-window inputs in-place via borrowed path\n\nExtend the borrowed (no-copy) one-shot scan to the Row backend (greedy\nL5, lazy L9-12), mirroring the Dfast over-window fix: over-window inputs\nwere copied into the owned history mirror (the input->mirror memmove that\ndominates L1 misses + the cycle gap vs C). Add borrowed_input/borrowed_block\nstate + set_borrowed_window/stage_borrowed_block/start_matching_borrowed/\nskip_matching_borrowed to RowMatchGenerator; set_borrowed_window zeroes\nhistory_abs_start so positions stay absolute input offsets. The candidate\nlower bound becomes window_low = history_abs_start.max(abs_pos -\nmax_window_size): owned picks history_abs_start (byte-identical), borrowed\n(history_abs_start = 0) picks the window cap so an over-window in-place scan\nnever emits an unresolvable offset. live_history()/get_last_space()/\ncurrent_block_range()/trailing-literals all read the borrowed input in\nplace. borrowed_eligible gates on the resolved backend (Row), not the\nstrategy tag, so HashChain/BT (no borrowed scan yet) stay owned. Driver\nwires set_borrowed_window/block + start/skip routing for Row.\nborrowed_oneshot_matches_owned_and_roundtrips now covers L5/L9 over-window\nbyte-identical to owned.\n\n* perf(bt): match over-window btlazy2 inputs in-place via borrowed path\n\nExtend the borrowed (no-copy) over-window scan to the HashChain backend's\nbtlazy2 binary-tree parser (L13-15). Over-window inputs were copied into\nthe owned history mirror; now matched in place via the per-position\nwindow_low cap.\n\nKey fix: the BT-tree body macros (bt_insert_step_no_rebase_body,\nbt_insert_and_collect_matches_body) and emit_optimal_plan read the live\nregion via `live_history()` (borrowed-aware, reborrow-then-raw-ptr so the\nslice holds no borrow while the tree mutates) instead of\n`&history[history_start..]` directly — the direct read returned the EMPTY\nborrowed mirror, so the tree found no matches and the encoder over-split\n(periodic_stream_not_oversplit: l15 184 -> 318994). MatchTable gains the\nborrowed-window scaffolding (borrowed_input/block, set_borrowed_window\nzeroing history_abs_start, stage, current_block_range, borrowed-aware\nlive_history/get_last_space) + window_low on the HC chain candidate checks.\n\nThe OPTIMAL parsers (BtOpt/BtUltra/BtUltra2, L16-22) stay owned: their\ncost-based DP is sensitive to candidate quality and the borrowed\ncontinuous-index scan yields ratio-worse candidates (diverged from owned +\nfell outside the ffi ratio bound). borrowed_supported is the single gate.\n\nborrowed_oneshot_matches_owned_and_roundtrips covers L15 over-window\nbyte-identical to owned; periodic_stream_not_oversplit + 839 tests pass.\n\n* perf(bt): warm borrowed pre-split window before cold strided read\n\nThe borrowed over-window path matches in place on the caller's input, so\nthe pre-split fingerprint is the first touch of each 128 KiB region: a\ncache-cold, sampling-strided read with interleaved random writes into the\nevents table (latency-bound, ~3x an ERMS streaming read of the same bytes).\nThe owned path never pays this because its history-mirror copy already\nwarmed the bytes. Restore that warmth without the copy's write half via one\nbandwidth-bound sequential pass per pre-split window, gated to exactly the\nconditions under which the splitter reads the block.\n\n* fix(encode): bound borrowed dfast tail probe to advertised window\n\ndfast probe_tail_ip0_only (runs once per block at the iend boundary)\nvalidated candidates only against history_abs_start, which is 0 in\nborrowed mode, so an over-window borrowed scan could emit a match with\noffset > advertised_window from the tail path (an unresolvable offset).\nApply the same wlow = abs_ip - advertised_window bound the fast loop body\nalready uses, threaded via a borrowed flag.\n\nAlso hardens the borrowed staging invariants:\n- borrowed_supported() is search-aware: the HashChain backend admits the\n  lazy CHAIN parser and btlazy2 only, never the optimal BT parsers.\n- set_borrowed_block asserts borrowed_supported() (was a backend-only\n  check); the borrowed BinaryTree dispatch drops the unreachable optimal\n  arms (optimal always takes the owned path via borrowed_eligible).\n- compress_block_encoded_borrowed checks the invariant at function entry\n  so RLE / raw-fast / compressed paths are all covered.\n- emit_optimal_plan debug_asserts current_len <= get_last_space().len()\n  before the unchecked from_raw_parts slice.\n\n839 tests pass; optimal levels stay byte-identical (owned path untouched).\n\n* refactor(encode): drop redundant borrowed BT block re-stage\n\nThe borrowed BinaryTree arm in start_matching re-staged the block on\nhc_matcher().table, but set_borrowed_block already staged the same range\nthere for the HashChain backend (and borrowed_pending, which gates this\narm, is set only by set_borrowed_block). The re-stage was a no-op\noverwrite with an identical range; remove it and note where the stage\nactually happens.",
+          "timestamp": "2026-06-15T18:37:59+03:00",
+          "tree_id": "c9b195482e48c080b6d8e768b6a8d0ebea379f9c",
+          "url": "https://github.com/structured-world/structured-zstd/commit/1ad404adcc17dcb8242ec48e76f2c95ed9846b34"
+        },
+        "date": 1781541201887,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.114,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.111,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 242.157,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 233.215,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.2,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.357,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.101,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.022,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.969,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.109,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.109,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.012,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 12.82,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 4.855,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.234,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.316,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.884,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.214,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.615,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.096,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.396,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.143,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.12,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.26,
             "unit": "ms"
           }
         ]
