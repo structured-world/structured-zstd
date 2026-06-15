@@ -1524,6 +1524,21 @@ impl MatchGeneratorDriver {
         }
     }
 
+    /// Whether a DICTIONARY frame can take the borrowed (no input copy) path.
+    /// Only the Simple (Fast) backend with the dictionary ATTACHED (not the
+    /// copy/merge regime) has a borrowed dict scan — `start_matching_borrowed_dict`
+    /// reads live matches from the borrowed input in place and dict matches
+    /// from the committed dict prefix via the 2-segment counter. Every other
+    /// backend, and copy-mode (large-input) dict frames, stay on the owned
+    /// path. Checked AFTER priming, so `is_attached()` reflects the resolved
+    /// attach-vs-copy decision.
+    pub(crate) fn borrowed_dict_supported(&self) -> bool {
+        matches!(
+            &self.storage,
+            MatcherStorage::Simple(m) if m.dict_is_attached()
+        )
+    }
+
     fn simple_mut(&mut self) -> &mut FastKernelMatcher {
         match &mut self.storage {
             MatcherStorage::Simple(m) => m,
@@ -2906,11 +2921,21 @@ impl Matcher for MatchGeneratorDriver {
         // and the stage is consumed so the next block re-stages.
         if let Some((block_start, block_end)) = self.borrowed_pending.take() {
             match self.active_backend() {
-                super::strategy::BackendTag::Simple => self.simple_mut().start_matching_borrowed(
-                    block_start,
-                    block_end,
-                    &mut handle_sequence,
-                ),
+                super::strategy::BackendTag::Simple => {
+                    let m = self.simple_mut();
+                    if m.dict_is_attached() {
+                        // Dict-attach borrowed scan: live matches read the
+                        // borrowed input in place, dict matches read the
+                        // committed dict prefix via the 2-segment counter.
+                        m.start_matching_borrowed_dict(
+                            block_start,
+                            block_end,
+                            &mut handle_sequence,
+                        );
+                    } else {
+                        m.start_matching_borrowed(block_start, block_end, &mut handle_sequence);
+                    }
+                }
                 super::strategy::BackendTag::Dfast => self
                     .dfast_matcher_mut()
                     .start_matching_borrowed(block_start, block_end, &mut handle_sequence),
