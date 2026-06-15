@@ -245,6 +245,18 @@ pub(crate) fn compress_block_encoded_borrowed(
     #[cfg(feature = "lsm")] block_decompressed_sizes: Option<&mut Vec<u32>>,
     #[cfg(all(feature = "lsm", feature = "hash"))] block_checksums: Option<&mut Vec<u32>>,
 ) -> BlockType {
+    // The borrowed one-shot path emits ONE block per staged range (no
+    // pre-split partition loop). `borrowed_supported()` is the single source
+    // of truth for which backend + search configs have a borrowed scan
+    // (Simple / Dfast / Row, and HashChain's lazy CHAIN parser + btlazy2); the
+    // optimal BT search stays on the owned path. `borrowed_eligible` gates on
+    // the same predicate, so this only ever fires on a wiring bug. Checked at
+    // entry (not per-branch) so RLE / raw-fast / compressed paths all stage
+    // their borrowed range under the same invariant.
+    debug_assert!(
+        state.matcher.borrowed_supported(),
+        "borrowed one-shot path reached for an unsupported backend/search config",
+    );
     let block_size = block.len() as u32;
     if !block.is_empty() && block.iter().all(|x| block[0].eq(x)) {
         let rle_byte = block[0];
@@ -286,16 +298,6 @@ pub(crate) fn compress_block_encoded_borrowed(
         output.extend_from_slice(block);
         BlockType::Raw
     } else {
-        // The borrowed one-shot path emits ONE block per staged range (no
-        // pre-split partition loop). `borrowed_supported()` is the single
-        // source of truth for which backend + search configs have a borrowed
-        // scan (Simple / Dfast / Row, and HashChain's lazy CHAIN parser); the
-        // BT/optimal search stays on the owned path. `borrowed_eligible` gates
-        // on the same predicate, so this only ever fires on a wiring bug.
-        debug_assert!(
-            state.matcher.borrowed_supported(),
-            "borrowed one-shot path reached for an unsupported backend/search config",
-        );
         // Stage the borrowed range so `compress_block`'s internal
         // `start_matching` scans it in place (no `commit_space` copy).
         state.matcher.set_borrowed_block(block_start, block_end);

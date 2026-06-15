@@ -1502,21 +1502,25 @@ impl MatchGeneratorDriver {
     /// (`SearchMethod::BinaryTree`); only the lazy chain has a borrowed scan
     /// so far, so BT/optimal stay on the owned path.
     pub(crate) fn borrowed_supported(&self) -> bool {
-        use super::strategy::{BackendTag, StrategyTag};
+        use super::strategy::{BackendTag, SearchMethod, StrategyTag};
         match self.active_backend() {
             BackendTag::Simple | BackendTag::Dfast | BackendTag::Row => true,
-            // HashChain = BINARY-TREE search: btlazy2 (L13-15) + optimal
-            // BtOpt/BtUltra/BtUltra2 (L16-22). btlazy2's BT-tree borrowed scan
-            // is byte-identical to owned (reads via live_history()), so it
+            // The HashChain backend covers two searches: the lazy CHAIN parser
+            // (borrowed-capable) and the BINARY-TREE search (btlazy2 L13-15 +
+            // optimal BtOpt/BtUltra/BtUltra2 L16-22). btlazy2's BT-tree borrowed
+            // scan is byte-identical to owned (reads via live_history()), so it
             // takes the in-place path. The OPTIMAL parsers stay owned: their
             // cost-based DP is sensitive to candidate quality, and the borrowed
             // continuous-index scan yields slightly different (ratio-worse)
             // candidates than the owned evict+rehash scan — borrowed optimal
             // both diverged from owned and fell outside the ffi ratio bound.
-            BackendTag::HashChain => !matches!(
-                self.strategy_tag,
-                StrategyTag::BtOpt | StrategyTag::BtUltra | StrategyTag::BtUltra2
-            ),
+            // Search-aware (not just strategy_tag) so optimal BT can never be
+            // staged on the borrowed path even via an internal caller.
+            BackendTag::HashChain => match self.search {
+                SearchMethod::HashChain => true,
+                SearchMethod::BinaryTree => matches!(self.strategy_tag, StrategyTag::Btlazy2),
+                _ => false,
+            },
         }
     }
 
@@ -1607,14 +1611,8 @@ impl MatchGeneratorDriver {
     /// [`Matcher::skip_matching_with_hint`] on this type.
     pub(crate) fn set_borrowed_block(&mut self, block_start: usize, block_end: usize) {
         assert!(
-            matches!(
-                self.active_backend(),
-                super::strategy::BackendTag::Simple
-                    | super::strategy::BackendTag::Dfast
-                    | super::strategy::BackendTag::Row
-                    | super::strategy::BackendTag::HashChain
-            ),
-            "borrowed block staging is only valid for the Simple/Dfast/Row/HashChain backends",
+            self.borrowed_supported(),
+            "borrowed block staging is not supported for the active backend/search config",
         );
         assert!(
             block_start <= block_end,
@@ -2939,21 +2937,18 @@ impl Matcher for MatchGeneratorDriver {
                         self.hc_matcher_mut()
                             .table
                             .stage_borrowed_block(block_start, block_end);
+                        // Only btlazy2 reaches the borrowed BinaryTree scan:
+                        // `borrowed_supported()` keeps the optimal parsers
+                        // (BtOpt/BtUltra/BtUltra2) on the owned path, and
+                        // `set_borrowed_block` asserts that predicate before any
+                        // range is staged, so an optimal strategy_tag can never
+                        // arrive here.
                         match self.strategy_tag {
                             StrategyTag::Btlazy2 => self
                                 .hc_matcher_mut()
                                 .start_matching_btlazy2(&mut handle_sequence),
-                            StrategyTag::BtOpt => {
-                                self.compress_block::<strategy::BtOpt>(&mut handle_sequence)
-                            }
-                            StrategyTag::BtUltra => {
-                                self.compress_block::<strategy::BtUltra>(&mut handle_sequence)
-                            }
-                            StrategyTag::BtUltra2 => {
-                                self.compress_block::<strategy::BtUltra2>(&mut handle_sequence)
-                            }
                             other => unreachable!(
-                                "BinaryTree borrowed scan requires a BT strategy tag, got {other:?}"
+                                "borrowed BinaryTree scan is only supported for Btlazy2, got {other:?}"
                             ),
                         }
                     }

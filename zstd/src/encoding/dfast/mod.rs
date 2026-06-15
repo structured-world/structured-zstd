@@ -853,6 +853,7 @@ impl DfastMatchGenerator {
         current_len: usize,
         ip0: usize,
         literals_start: usize,
+        borrowed: bool,
     ) -> Option<MatchCandidate> {
         debug_assert!(ip0 + HASH_READ_SIZE <= current_len);
         const PRIME: u64 = 0xCF1BBCDCB7A56463_u64;
@@ -866,6 +867,19 @@ impl DfastMatchGenerator {
         let (history_base_ptr, history_start_offset, history_abs_start, position_base, concat_len) =
             self.scan_source();
 
+        // Per-position window-low bound, identical to the fast loop's `wlow0`
+        // (see `advertised_window` there). In borrowed mode `history_abs_start`
+        // is 0, so a bare `cand_pos >= history_abs_start` floor admits
+        // candidates older than the advertised window and could emit an
+        // unresolvable offset for over-window inputs; bound by `abs_ip0 -
+        // advertised_window` instead. Owned mode keeps the eviction-floor
+        // `history_abs_start`.
+        let wlow = if borrowed {
+            abs_ip0.saturating_sub(self.max_window_size)
+        } else {
+            history_abs_start
+        };
+
         let concat_idx0 = abs_ip0 - history_abs_start;
 
         // SAFETY: `concat_idx0 + 8 <= concat_len` follows from the
@@ -876,7 +890,7 @@ impl DfastMatchGenerator {
                 .read_unaligned()
         };
         // `v4_0` (low 4 bytes) is the 4-byte equality-gate key below; the short
-        // HASH keys on the donor 5-byte window (`v8_0 << 24`, ZSTD_hash5 shape).
+        // HASH keys on the upstream zstd 5-byte window (`v8_0 << 24`, ZSTD_hash5 shape).
         let v4_0 = v8_0 & 0xFFFF_FFFF;
         let hl0_idx = (v8_0.wrapping_mul(PRIME) >> long_shift) as usize;
         let hs0_idx = ((v8_0 << 24).wrapping_mul(PRIME) >> short_shift) as usize;
@@ -921,7 +935,7 @@ impl DfastMatchGenerator {
         // beats a 4-byte hit even before extension).
         if idxl0 != DFAST_EMPTY_SLOT {
             let cand_pos = position_base + (idxl0 as usize) - 1;
-            if cand_pos >= history_abs_start && cand_pos < abs_ip0 {
+            if cand_pos >= wlow && cand_pos < abs_ip0 {
                 let cand_idx = cand_pos - history_abs_start;
                 let cand_v8 = unsafe {
                     (history_base_ptr.add(history_start_offset + cand_idx) as *const u64)
@@ -961,7 +975,7 @@ impl DfastMatchGenerator {
         // comment there).
         if idxs0 != DFAST_EMPTY_SLOT {
             let cand_pos_s = position_base + (idxs0 as usize) - 1;
-            if cand_pos_s >= history_abs_start && cand_pos_s < abs_ip0 {
+            if cand_pos_s >= wlow && cand_pos_s < abs_ip0 {
                 let cand_idx_s = cand_pos_s - history_abs_start;
                 let cand4 = unsafe {
                     (history_base_ptr.add(history_start_offset + cand_idx_s) as *const u32)
@@ -1806,12 +1820,16 @@ macro_rules! start_matching_fast_loop_body {
             // `p + HASH_READ_SIZE <= iend`). Handle the boundary inline
             // before exiting: a single-cursor probe at `ip0` (rep peek
             // and `_search_next_long` retry both depend on `ip1` so
-            // they're skipped — donor accepts that exact tradeoff at
+            // they're skipped — upstream zstd accepts that exact tradeoff at
             // the iend boundary).
             if ip1 + HASH_READ_SIZE > $current_len {
-                if let Some(committed) =
-                    $self.probe_tail_ip0_only($current_abs_start, $current_len, ip0, literals_start)
-                {
+                if let Some(committed) = $self.probe_tail_ip0_only(
+                    $current_abs_start,
+                    $current_len,
+                    ip0,
+                    literals_start,
+                    $borrowed,
+                ) {
                     let start = $self.emit_candidate(
                         $current_abs_start,
                         &mut literals_start,

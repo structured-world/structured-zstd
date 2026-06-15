@@ -2074,6 +2074,11 @@ impl MatchTable {
         // underflowed on the borrowed path, where `history` is empty).
         let current: &[u8] = unsafe {
             let ls = self.get_last_space();
+            debug_assert!(
+                current_len <= ls.len(),
+                "current_len ({current_len}) exceeds block size ({})",
+                ls.len()
+            );
             core::slice::from_raw_parts(ls.as_ptr(), current_len)
         };
         if plan.is_empty() {
