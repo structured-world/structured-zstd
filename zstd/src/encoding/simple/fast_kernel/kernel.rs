@@ -1710,6 +1710,10 @@ pub(crate) fn compress_block_fast_dict_borrowed<const MLS: u32, const USE_CMOV: 
     handle_sequence: impl for<'a> FnMut(Sequence<'a>),
     kernel: crate::encoding::fastpath::FastpathKernel,
 ) -> FastBlockResult {
+    // Used by the per-tier match arms below; on a target with no SIMD tier
+    // (e.g. wasm32 without simd128) only the scalar fallback compiles and the
+    // import is unused.
+    #[allow(unused_imports)]
     use crate::encoding::fastpath::FastpathKernel;
     // The scalar fallback: generic word-at-a-time `count_forward` for the input
     // match extension, no SIMD umbrella.
