@@ -83,6 +83,13 @@ fn main() {
         core::hint::black_box(&dst);
     }
 
+    // Release the raw C contexts (zstd-sys exposes no Drop wrapper for the bare
+    // pointers). SAFETY: both were created above and not freed elsewhere.
+    unsafe {
+        zstd_sys::ZSTD_freeCCtx(cctx);
+        zstd_sys::ZSTD_freeCDict(cdict);
+    }
+
     eprintln!(
         "ffi encoded {} bytes x {} iters at level {} dict={}; last-out-sum={}",
         src.len(),

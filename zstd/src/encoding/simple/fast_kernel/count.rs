@@ -202,6 +202,20 @@ pub(crate) fn count_forward_dict_2segment(
     inp: &[u8],
     cur: usize,
 ) -> usize {
+    // Release assertions: this is a safe `pub(crate)` fn that does raw pointer
+    // math below. `cand >= dict.len()` would make the dict segment read OOB and
+    // `cur > inp.len()` would underflow `cur_avail`; enforce the kernel's
+    // contract here so a future caller can't silently corrupt memory.
+    assert!(
+        cand < dict.len(),
+        "count_forward_dict_2segment requires cand ({cand}) < dict.len() ({})",
+        dict.len(),
+    );
+    assert!(
+        cur <= inp.len(),
+        "count_forward_dict_2segment requires cur ({cur}) <= inp.len() ({})",
+        inp.len(),
+    );
     let dict_len = dict.len();
     let inp_len = inp.len();
     let cur_avail = inp_len - cur;

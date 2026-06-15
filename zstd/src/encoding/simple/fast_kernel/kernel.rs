@@ -1371,14 +1371,25 @@ fn compress_block_fast_dict_borrowed_impl<
         dict_end >= 1,
         "borrowed dict kernel requires a non-empty dictionary (sentinel-0 safety)",
     );
+    // Checked virtual-length bound: the [dict][input] coordinate floor relies on
+    // `dict_end + block_end` fitting `u32`; validate with `checked_add` rather
+    // than adding then checking after (which could itself overflow `usize`).
     assert!(
-        dict_end + block_end <= u32::MAX as usize,
-        "FastKernel does not support dict_end + block_end ({}) > u32::MAX",
-        dict_end + block_end,
+        dict_end
+            .checked_add(block_end)
+            .is_some_and(|v| v <= u32::MAX as usize),
+        "FastKernel does not support dict_end + block_end > u32::MAX (dict_end={dict_end}, block_end={block_end})",
     );
-    debug_assert_eq!(MLS, main_table.mls());
-    debug_assert_eq!(MLS, dict_table.mls());
-    debug_assert_eq!(main_table.hash_log(), dict_table.hash_log());
+    // Release checks (not debug_assert): these guard UNCHECKED table access in
+    // the hot loop — a mismatched hash_log would hash with `main_table` then
+    // index past `dict_table`, and `step_size < 2` would stall the scan.
+    assert!(
+        step_size >= 2,
+        "borrowed dict kernel requires step_size >= 2 (got {step_size})",
+    );
+    assert_eq!(MLS, main_table.mls());
+    assert_eq!(MLS, dict_table.mls());
+    assert_eq!(main_table.hash_log(), dict_table.hash_log());
 
     // Window bounds in VIRTUAL `[dict][input]` coords, so the gates match the
     // owned flat kernel: `window_low` is the absolute floor, `prefix_start_index`
@@ -1497,14 +1508,23 @@ fn compress_block_fast_dict_borrowed_impl<
             // Main match (recent input) — `main_idx` is a virtual input position
             // (`>= dict_end`); the candidate read is at input offset
             // `main_idx - dict_end`.
+            // A main-table entry is only a usable candidate when it is a VIRTUAL
+            // input position: `>= dict_end` (so `main_idx - dict_end` does not
+            // underflow) AND strictly before the current position (`< dict_end +
+            // ip0`). `main_idx >= prefix_start_index` alone is not sufficient —
+            // the borrowed skip-priming path can write raw input offsets (`<
+            // dict_end`) into the main table, and a stale entry in
+            // `[prefix_start_index, dict_end)` would otherwise underflow the
+            // subtraction and feed a bogus pointer to `read32`.
+            let main_abs = main_idx as usize;
+            let main_is_input = main_abs >= dict_end && main_abs < dict_end + ip0;
             let main_valid = if USE_CMOV {
-                let in_range = main_idx >= prefix_start_index;
-                // SAFETY: when `in_range`, `main_idx >= prefix_start_index >= 1`
-                // and the main table only ever stores `>= dict_end`, so
+                let in_range = main_idx >= prefix_start_index && main_is_input;
+                // SAFETY: when `in_range`, `main_abs >= dict_end`, so
                 // `main_idx - dict_end` is a valid input offset with ≥ 4 readable
                 // bytes; otherwise `CMOV_DUMMY` (4 bytes) is read instead.
                 let mval_addr = if in_range {
-                    unsafe { inp_base.add(main_idx as usize - dict_end) }
+                    unsafe { inp_base.add(main_abs - dict_end) }
                 } else {
                     CMOV_DUMMY.as_ptr()
                 };
@@ -1514,9 +1534,9 @@ fn compress_block_fast_dict_borrowed_impl<
                 r
             } else {
                 main_idx >= prefix_start_index
+                    && main_is_input
                     && unsafe {
-                        read32(inp_base.add(ip0))
-                            == read32(inp_base.add(main_idx as usize - dict_end))
+                        read32(inp_base.add(ip0)) == read32(inp_base.add(main_abs - dict_end))
                     }
             };
             if main_valid {

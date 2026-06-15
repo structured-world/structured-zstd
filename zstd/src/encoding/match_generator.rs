@@ -2081,10 +2081,8 @@ impl Matcher for MatchGeneratorDriver {
             // dictionary's content tier via `cdict_table_logs` (the same
             // correction the native HC dict-prime path applies above), so a dict
             // much smaller than the window doesn't prime a needlessly sparse
-            // table. No-dict frames keep the level's `hash_bits` (clamped to the
-            // window in the reset arm). Row-finder levels are never BinaryTree,
-            // so `uses_bt = false`.
-            let (hash_log, chain_log) = match dict_hint.filter(|&size| size > 0) {
+            // table. Row-finder levels are never BinaryTree, so `uses_bt = false`.
+            let (mut hash_log, mut chain_log) = match dict_hint.filter(|&size| size > 0) {
                 Some(dict_size) => cdict_table_logs(
                     params.window_log,
                     row.hash_bits,
@@ -2094,6 +2092,17 @@ impl Matcher for MatchGeneratorDriver {
                 ),
                 None => (row.hash_bits, row.hash_bits),
             };
+            // No-dict path: the HashChain reset arm only clamps the logs to the
+            // window when `hinted`, but a public `window_log` override can lower
+            // this level to <= 14 with no source hint — clamp the level's full
+            // Row `hash_bits` to the window here too (donor `ZSTD_adjustCParams`:
+            // hashLog <= windowLog + 1, chainLog <= windowLog) so a 16 KiB window
+            // doesn't allocate Row-sized HC tables.
+            if dict_hint.filter(|&size| size > 0).is_none() {
+                let wlog = params.window_log as usize;
+                hash_log = hash_log.min(wlog + 1);
+                chain_log = chain_log.min(wlog);
+            }
             params.hc = Some(HcConfig {
                 hash_log,
                 chain_log,

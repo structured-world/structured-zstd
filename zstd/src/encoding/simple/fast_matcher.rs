@@ -1083,13 +1083,18 @@ impl FastKernelMatcher {
         self.last_borrowed_block = Some((block_start, block_end));
 
         let dict_end = self.dict.region_len();
-        // The dual-base kernel stores VIRTUAL positions `dict_end + input_off`
-        // (up to ~`dict_end + block_end`) into the main table, so the next
-        // frame's epoch advance must span past `dict_end + block_end` — NOT
-        // just `block_end` — or stale entries in `[block_end, dict_end +
-        // block_end)` would survive the bias advance and alias as bogus
-        // low positions.
-        self.table_pos_high_water = self.table_pos_high_water.max(dict_end + block_end);
+        // Single checked virtual length of the [dict][input] window. The dual-base
+        // kernel stores VIRTUAL positions `dict_end + input_off` (up to
+        // `virtual_len`) into the main table, so the next frame's epoch advance
+        // must span past it — NOT just `block_end` — or stale entries in
+        // `[block_end, virtual_len)` would survive the bias advance and alias as
+        // bogus low positions. Checked so the `as u32` casts below cannot
+        // truncate (the kernel asserts the same bound).
+        let virtual_len = dict_end
+            .checked_add(block_end)
+            .filter(|&v| v <= u32::MAX as usize)
+            .expect("dict_end + block_end exceeds the u32 FastKernel position space");
+        self.table_pos_high_water = self.table_pos_high_water.max(virtual_len);
         let advertised_window = 1usize << self.window_log;
         let mls = self.hash_table.mls();
         let use_cmov = self.use_cmov;
@@ -1097,11 +1102,10 @@ impl FastKernelMatcher {
         let rep_in = self.rep;
         let kernel = self.kernel;
 
-        // Window bounds in VIRTUAL `[dict][input]` coords (length `dict_end +
-        // block_end`), so the kernel's gates match the owned flat dict kernel:
-        // `window_low` is the absolute floor; `prefix_start_index` the
-        // sentinel-aware floor (`>= 1`) for the hash-slot filter.
-        let virtual_len = dict_end + block_end;
+        // Window bounds in VIRTUAL `[dict][input]` coords, so the kernel's gates
+        // match the owned flat dict kernel: `window_low` is the absolute floor;
+        // `prefix_start_index` the sentinel-aware floor (`>= 1`) for the
+        // hash-slot filter. `virtual_len` was checked above.
         let window_low = virtual_len.saturating_sub(advertised_window);
         let prefix_start_index = window_low.max(self.prefix_start_index as usize) as u32;
         let bounds = PrefixBounds {
