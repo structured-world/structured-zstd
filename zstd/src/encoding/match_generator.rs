@@ -1491,8 +1491,37 @@ impl MatchGeneratorDriver {
 
     /// Active backend family derived from the storage variant. Single
     /// source of truth — no separate runtime tag to drift against.
-    fn active_backend(&self) -> super::strategy::BackendTag {
+    pub(crate) fn active_backend(&self) -> super::strategy::BackendTag {
         self.storage.backend()
+    }
+
+    /// Whether the borrowed (no-copy, in-place over-window) scan is
+    /// implemented for the current backend + search configuration. The
+    /// HashChain backend serves both the lazy CHAIN parser
+    /// (`SearchMethod::HashChain`) and the BT/optimal parsers
+    /// (`SearchMethod::BinaryTree`); only the lazy chain has a borrowed scan
+    /// so far, so BT/optimal stay on the owned path.
+    pub(crate) fn borrowed_supported(&self) -> bool {
+        use super::strategy::{BackendTag, SearchMethod, StrategyTag};
+        match self.active_backend() {
+            BackendTag::Simple | BackendTag::Dfast | BackendTag::Row => true,
+            // The HashChain backend covers two searches: the lazy CHAIN parser
+            // (borrowed-capable) and the BINARY-TREE search (btlazy2 L13-15 +
+            // optimal BtOpt/BtUltra/BtUltra2 L16-22). btlazy2's BT-tree borrowed
+            // scan is byte-identical to owned (reads via live_history()), so it
+            // takes the in-place path. The OPTIMAL parsers stay owned: their
+            // cost-based DP is sensitive to candidate quality, and the borrowed
+            // continuous-index scan yields slightly different (ratio-worse)
+            // candidates than the owned evict+rehash scan — borrowed optimal
+            // both diverged from owned and fell outside the ffi ratio bound.
+            // Search-aware (not just strategy_tag) so optimal BT can never be
+            // staged on the borrowed path even via an internal caller.
+            BackendTag::HashChain => match self.search {
+                SearchMethod::HashChain => true,
+                SearchMethod::BinaryTree => matches!(self.strategy_tag, StrategyTag::Btlazy2),
+                _ => false,
+            },
+        }
     }
 
     fn simple_mut(&mut self) -> &mut FastKernelMatcher {
@@ -1550,7 +1579,12 @@ impl MatchGeneratorDriver {
             super::strategy::BackendTag::Dfast => unsafe {
                 self.dfast_matcher_mut().set_borrowed_window(buffer)
             },
-            other => unreachable!("borrowed window only for Simple/Dfast backends, got {other:?}"),
+            super::strategy::BackendTag::Row => unsafe {
+                self.row_matcher_mut().set_borrowed_window(buffer)
+            },
+            super::strategy::BackendTag::HashChain => unsafe {
+                self.hc_matcher_mut().set_borrowed_window(buffer)
+            },
         }
     }
 
@@ -1560,6 +1594,9 @@ impl MatchGeneratorDriver {
         match self.active_backend() {
             super::strategy::BackendTag::Simple => self.simple_mut().clear_borrowed_window(),
             super::strategy::BackendTag::Dfast => self.dfast_matcher_mut().clear_borrowed_window(),
+            super::strategy::BackendTag::Row => self.row_matcher_mut().clear_borrowed_window(),
+            super::strategy::BackendTag::HashChain => self.hc_matcher_mut().clear_borrowed_window(),
+            #[allow(unreachable_patterns)]
             _ => {}
         }
         self.borrowed_pending = None;
@@ -1574,11 +1611,8 @@ impl MatchGeneratorDriver {
     /// [`Matcher::skip_matching_with_hint`] on this type.
     pub(crate) fn set_borrowed_block(&mut self, block_start: usize, block_end: usize) {
         assert!(
-            matches!(
-                self.active_backend(),
-                super::strategy::BackendTag::Simple | super::strategy::BackendTag::Dfast
-            ),
-            "borrowed block staging is only valid for the Simple (Fast) / Dfast backends",
+            self.borrowed_supported(),
+            "borrowed block staging is not supported for the active backend/search config",
         );
         assert!(
             block_start <= block_end,
@@ -1597,7 +1631,13 @@ impl MatchGeneratorDriver {
             super::strategy::BackendTag::Dfast => self
                 .dfast_matcher_mut()
                 .stage_borrowed_block(block_start, block_end),
-            _ => unreachable!(),
+            super::strategy::BackendTag::Row => self
+                .row_matcher_mut()
+                .stage_borrowed_block(block_start, block_end),
+            super::strategy::BackendTag::HashChain => self
+                .hc_matcher_mut()
+                .table
+                .stage_borrowed_block(block_start, block_end),
         }
     }
 
@@ -2874,7 +2914,49 @@ impl Matcher for MatchGeneratorDriver {
                 super::strategy::BackendTag::Dfast => self
                     .dfast_matcher_mut()
                     .start_matching_borrowed(block_start, block_end, &mut handle_sequence),
-                other => unreachable!("borrowed scan only for Simple/Dfast, got {other:?}"),
+                super::strategy::BackendTag::Row => {
+                    // Same greedy/lazy parse split as the owned RowHash arm.
+                    let greedy = self.parse == super::strategy::ParseMode::Greedy;
+                    self.row_matcher_mut().start_matching_borrowed(
+                        block_start,
+                        block_end,
+                        greedy,
+                        &mut handle_sequence,
+                    );
+                }
+                super::strategy::BackendTag::HashChain => match self.search {
+                    super::strategy::SearchMethod::HashChain => self
+                        .hc_matcher_mut()
+                        .start_matching_lazy_borrowed(block_start, block_end, &mut handle_sequence),
+                    super::strategy::SearchMethod::BinaryTree => {
+                        // Run the SAME BT dispatch as the owned BinaryTree arm
+                        // below — every BT body reads its range via
+                        // current_block_range() and bytes via live_history()
+                        // (borrowed-aware), so the staged block is scanned in
+                        // place. The table was already staged by
+                        // `set_borrowed_block` (the HashChain arm at the top of
+                        // this file calls `table.stage_borrowed_block` with the
+                        // same range, and `borrowed_pending` is set only there),
+                        // so no re-stage is needed here.
+                        // Only btlazy2 reaches the borrowed BinaryTree scan:
+                        // `borrowed_supported()` keeps the optimal parsers
+                        // (BtOpt/BtUltra/BtUltra2) on the owned path, and
+                        // `set_borrowed_block` asserts that predicate before any
+                        // range is staged, so an optimal strategy_tag can never
+                        // arrive here.
+                        match self.strategy_tag {
+                            StrategyTag::Btlazy2 => self
+                                .hc_matcher_mut()
+                                .start_matching_btlazy2(&mut handle_sequence),
+                            other => unreachable!(
+                                "borrowed BinaryTree scan is only supported for Btlazy2, got {other:?}"
+                            ),
+                        }
+                    }
+                    other => {
+                        unreachable!("HashChain backend with unexpected search {other:?}")
+                    }
+                },
             }
             return;
         }
@@ -2953,7 +3035,14 @@ impl Matcher for MatchGeneratorDriver {
                 super::strategy::BackendTag::Dfast => self
                     .dfast_matcher_mut()
                     .skip_matching_borrowed(block_start, block_end, incompressible_hint),
-                other => unreachable!("borrowed skip only for Simple/Dfast, got {other:?}"),
+                super::strategy::BackendTag::Row => self.row_matcher_mut().skip_matching_borrowed(
+                    block_start,
+                    block_end,
+                    incompressible_hint,
+                ),
+                super::strategy::BackendTag::HashChain => self
+                    .hc_matcher_mut()
+                    .skip_matching_borrowed(block_start, block_end, incompressible_hint),
             }
             return;
         }
@@ -3096,7 +3185,14 @@ struct HcMatchGenerator {
 macro_rules! bt_insert_step_no_rebase_body {
     ($table:expr, $search_depth:expr, $abs_pos:ident, $current_abs_end:ident, $target_abs:ident, $cmf:path) => {{
         let idx = $abs_pos - $table.history_abs_start;
-        let concat = &$table.history[$table.history_start..];
+        // Borrowed-aware live region (owned: `history[history_start..]`;
+        // borrowed: the in-place input `[0, block_end)`). Reborrow-then-raw-ptr
+        // so the slice holds NO borrow and coexists with the `&mut $table`
+        // binary-tree writes below. Owned is byte-identical (same bytes).
+        let concat: &[u8] = unsafe {
+            let lh = $table.live_history();
+            core::slice::from_raw_parts(lh.as_ptr(), lh.len())
+        };
         if idx + 8 > concat.len() {
             return 1;
         }
@@ -3376,7 +3472,8 @@ fn btlazy2_gain(match_len: usize, offset: usize, reps: [u32; 3], ll0: bool) -> i
 macro_rules! start_matching_btlazy2_body {
     ($self:ident, $handle_sequence:ident, $collect:ident, $cmf:path $(,)?) => {{
         $self.table.ensure_tables();
-        let current_len = *$self.table.chunk_lens.back().unwrap();
+        // Borrowed-aware: owned → last committed chunk; borrowed → staged block.
+        let (current_abs_start, current_len) = $self.table.current_block_range();
         if current_len == 0 {
             return;
         }
@@ -3384,18 +3481,18 @@ macro_rules! start_matching_btlazy2_body {
         // Mutates tables but never reallocates `history`, so this tail slice
         // stays valid for the routine's duration (same as the other parsers).
         let current: &[u8] = unsafe { core::slice::from_raw_parts(current_ptr, current_len) };
-        // Full contiguous history (dict + prior blocks + current block) as a
-        // raw slice, for the explicit repcode probe: a rep offset can point
-        // before the current block, which `current` can't reach. Same
-        // no-realloc validity contract as `current`; holds no borrow, so it
-        // coexists with the `&mut self` collector calls below.
+        // Full contiguous live region (owned: dict + prior blocks + current
+        // block in `history`; borrowed: `[0, block_end)` of the in-place
+        // input) as a raw slice, for the explicit repcode probe: a rep offset
+        // can point before the current block, which `current` can't reach.
+        // `live_history()` is borrowed-aware; reborrow-then-raw-ptr so the
+        // slice holds NO borrow and coexists with the `&mut self` collector
+        // calls below. Same no-realloc validity contract as `current`.
         let history_abs_start = $self.table.history_abs_start;
         let concat_full: &[u8] = unsafe {
-            let base = $self.table.history.as_ptr().add($self.table.history_start);
-            core::slice::from_raw_parts(base, $self.table.history.len() - $self.table.history_start)
+            let lh = $self.table.live_history();
+            core::slice::from_raw_parts(lh.as_ptr(), lh.len())
         };
-        let current_abs_start =
-            $self.table.history_abs_start + $self.table.window_size - current_len;
         let current_abs_end = current_abs_start + current_len;
         $self
             .table
@@ -4507,7 +4604,7 @@ macro_rules! collect_optimal_candidates_initialized_body {
         } else if !skip_further_match_search {
             $self.table.insert_position($abs_pos);
             let max_chain_depth = $profile.max_chain_depth.min($self.hc.search_depth);
-            let concat = &$self.table.history[$self.table.history_start..];
+            let concat = $self.table.live_history();
             // Raw `+ 9` is safe here — see `bt_insert_step_no_rebase_body!`
             // for the full discussion of the upstream `STREAM_ABS_HEADROOM`
             // cap in `MatchTable::add_data`.
@@ -4525,7 +4622,9 @@ macro_rules! collect_optimal_candidates_initialized_body {
                     if candidate_abs == usize::MAX {
                         break;
                     }
-                    if candidate_abs < $self.table.history_abs_start || candidate_abs >= $abs_pos {
+                    if candidate_abs < $self.table.window_low_abs_for_target($abs_pos)
+                        || candidate_abs >= $abs_pos
+                    {
                         continue;
                     }
                     let candidate_idx = candidate_abs - $self.table.history_abs_start;
@@ -4755,7 +4854,14 @@ macro_rules! bt_insert_and_collect_matches_body {
         $cmf:path $(,)?
     ) => {{
         let idx = $abs_pos - $table.history_abs_start;
-        let concat = &$table.history[$table.history_start..];
+        // Borrowed-aware live region (owned: `history[history_start..]`;
+        // borrowed: the in-place input `[0, block_end)`). Reborrow-then-raw-ptr
+        // so the slice holds NO borrow and coexists with the `&mut $table`
+        // binary-tree writes below. Owned is byte-identical (same bytes).
+        let concat: &[u8] = unsafe {
+            let lh = $table.live_history();
+            core::slice::from_raw_parts(lh.as_ptr(), lh.len())
+        };
         if idx + 8 > concat.len() {
             return;
         }
@@ -5299,19 +5405,21 @@ impl HcMatchGenerator {
     ) {
         self.table.ensure_tables();
 
-        let current_len = *self.table.chunk_lens.back().unwrap();
+        // `current_block_range()` is borrowed-aware: owned → last committed
+        // chunk; borrowed → the staged in-place block range.
+        let (current_abs_start, current_len) = self.table.current_block_range();
         if current_len == 0 {
             return;
         }
-        // The current block is the tail of `history`. Hoist it as a raw
-        // slice (like `start_matching_optimal`): the routine mutates the
-        // hash/chain tables + `offset_hist` but never reallocates
-        // `history`, so the slice stays valid and we avoid re-borrowing
-        // `self.table` (which would conflict with the `offset_hist` write).
+        // The current block is the tail of `history` (owned) or the staged
+        // borrowed range (`get_last_space()` resolves both). Hoist it as a raw
+        // slice: the routine mutates the hash/chain tables + `offset_hist` but
+        // never reallocates `history`, so the slice stays valid and we avoid
+        // re-borrowing `self.table` (which would conflict with the
+        // `offset_hist` write).
         let current_ptr = self.table.get_last_space().as_ptr();
         let current: &[u8] = unsafe { core::slice::from_raw_parts(current_ptr, current_len) };
 
-        let current_abs_start = self.table.history_abs_start + self.table.window_size - current_len;
         let current_abs_end = current_abs_start + current_len;
         self.table
             .backfill_boundary_positions(current_abs_start, current_abs_end);
@@ -5358,6 +5466,45 @@ impl HcMatchGenerator {
                 literals: &current[literals_start..],
             });
         }
+    }
+
+    /// Register the borrowed input window for the no-copy one-shot path.
+    /// # Safety
+    /// `buffer` must outlive the borrowed scans (see `MatchTable`).
+    pub(crate) unsafe fn set_borrowed_window(&mut self, buffer: &[u8]) {
+        // SAFETY: forwarded liveness contract.
+        unsafe { self.table.set_borrowed_window(buffer) };
+    }
+
+    pub(crate) fn clear_borrowed_window(&mut self) {
+        self.table.clear_borrowed_window();
+    }
+
+    /// Borrowed (no-copy) equivalent of [`Self::start_matching_lazy`]: stage
+    /// the in-place block range, then run the same lazy chain parse. The
+    /// parse reads its range via `current_block_range()` and its bytes via
+    /// `get_last_space()` / `live_history()`, all borrowed-aware, so the block
+    /// is scanned in place with the per-position window_low offset cap.
+    pub(crate) fn start_matching_lazy_borrowed(
+        &mut self,
+        block_start: usize,
+        block_end: usize,
+        handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        self.table.stage_borrowed_block(block_start, block_end);
+        self.start_matching_lazy(handle_sequence);
+    }
+
+    /// Borrowed (no-copy) equivalent of the lazy `skip_matching`: stage the
+    /// in-place block, then seed positions without an owned-history append.
+    pub(crate) fn skip_matching_borrowed(
+        &mut self,
+        block_start: usize,
+        block_end: usize,
+        incompressible_hint: Option<bool>,
+    ) {
+        self.table.stage_borrowed_block(block_start, block_end);
+        self.table.skip_matching(incompressible_hint);
     }
 
     /// Donor `ZSTD_btlazy2` (levels 13-15): binary-tree match finder with a
@@ -5460,7 +5607,9 @@ impl HcMatchGenerator {
         mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
     ) {
         self.table.ensure_tables();
-        let current_len = *self.table.chunk_lens.back().unwrap();
+        // Borrowed-aware: owned → last committed chunk; borrowed → staged
+        // in-place block range.
+        let (current_abs_start, current_len) = self.table.current_block_range();
         if current_len == 0 {
             return;
         }
@@ -5470,7 +5619,6 @@ impl HcMatchGenerator {
         // the duration of the routine and avoids cloning the full block.
         let current = unsafe { core::slice::from_raw_parts(current_ptr, current_len) };
 
-        let current_abs_start = self.table.history_abs_start + self.table.window_size - current_len;
         let current_abs_end = current_abs_start + current_len;
         self.table
             .apply_limited_update_after_long_match(current_abs_start);

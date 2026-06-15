@@ -609,6 +609,32 @@ pub(crate) fn block_splitter_decision_for_bench(block: &[u8], split_level: usize
     }
 }
 
+/// Pull a pre-split window into cache with one bandwidth-bound sequential
+/// pass before the strided fingerprint histogram + match scan read it.
+///
+/// The borrowed (no-copy) over-window path matches in place on the caller's
+/// input, so the pre-split fingerprint is the FIRST touch of that 128 KiB
+/// region — a cache-cold read. `presplit_record_fingerprint` reads it with a
+/// `sampling_rate` stride and interleaved random writes into the 1 KiB events
+/// table, a latency-bound pattern that pays full DRAM miss latency per line
+/// (measured ~3x the cost of an ERMS streaming read of the same bytes). The
+/// owned path never hits this because its history-mirror copy already warmed
+/// the bytes; this restores that warmth without the copy's write half. One
+/// dependent load per 64-byte line (the i9 line size) streams under the
+/// hardware prefetcher, so the cold read is paid once at memory bandwidth and
+/// every subsequent strided sample lands in L1/L2. `black_box` keeps the loop
+/// from being optimized away as a dead read.
+#[inline]
+fn warm_presplit_window(window: &[u8]) {
+    let mut acc = 0u8;
+    let mut i = 0usize;
+    while i < window.len() {
+        acc ^= window[i];
+        i += 64;
+    }
+    core::hint::black_box(acc);
+}
+
 pub(crate) fn optimal_block_size(
     level: CompressionLevel,
     block: &[u8],
@@ -949,26 +975,20 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
     /// The owned/evicting path keeps the scanned window bounded (positions
     /// stay small), so >4 GiB inputs fall back to it.
     fn borrowed_eligible(&self, input_len: usize, prep: &FramePrep) -> bool {
-        use crate::encoding::strategy::StrategyTag;
         if prep.use_dictionary_state
             || matches!(self.compression_level, CompressionLevel::Uncompressed)
             || input_len > u32::MAX as usize
         {
             return false;
         }
-        match self.state.strategy_tag {
-            // Fast handles over-window inputs in the borrowed scan via an
-            // explicit `window_low = block_end - advertised_window` bound.
-            StrategyTag::Fast => true,
-            // The Dfast borrowed scan uses `history_abs_start` (== 0 in
-            // borrowed mode) as the candidate lower bound, not `window_low`,
-            // so it reproduces the owned (evicting) path only when the whole
-            // input fits the window — then neither side evicts, so neither
-            // rejects an in-window candidate and the sequence streams match.
-            // Over-window inputs fall back to the owned path.
-            StrategyTag::Dfast => input_len <= self.state.matcher.window_size() as usize,
-            _ => false,
-        }
+        // The borrowed (no-copy, in-place over-window) scan exists for the
+        // Simple (Fast), Dfast, and Row backends, and for the HashChain
+        // backend's lazy CHAIN parser; BT/optimal (BinaryTree search) stay on
+        // the owned path. Every borrowed scan applies the per-position
+        // `window_low = abs_ip - advertised_window` offset cap so over-window
+        // inputs are matched in place (no input->history copy), matching C's
+        // continuous-index + windowLow one-shot behaviour.
+        self.state.matcher.borrowed_supported()
     }
 
     /// Compress `input` as one frame's worth of blocks into `out` (appended
@@ -1167,6 +1187,22 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             // already spans the whole input, so a smaller block is just a
             // narrower `(block_start, block_end)` range into it.
             let savings = start as i64 - (out.len() - blocks_start) as i64;
+            // Borrowed path only: warm the pre-split window before the
+            // cache-cold strided fingerprint read. Gated to exactly the
+            // conditions under which `optimal_block_size` reads `block`
+            // (a pre-split level, a full 128 KiB block remaining, the
+            // block-size cap admits a full block, and `savings >= 3` so the
+            // splitter actually runs) — so non-pre-split levels, the first
+            // block, and the trailing partial block pay nothing. See
+            // `warm_presplit_window`.
+            if savings >= 3
+                && input.len() - start >= MAX_BLOCK_SIZE as usize
+                && block_capacity >= MAX_BLOCK_SIZE as usize
+                && crate::encoding::match_generator::level_pre_split(self.compression_level)
+                    .is_some()
+            {
+                warm_presplit_window(&input[start..start + MAX_BLOCK_SIZE as usize]);
+            }
             let block_len = optimal_block_size(
                 self.compression_level,
                 &input[start..],

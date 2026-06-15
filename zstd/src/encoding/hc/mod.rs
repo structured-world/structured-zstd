@@ -144,9 +144,12 @@ impl HcMatcher {
             if next == cur {
                 // Self-loop: two positions share chain_idx, stop to
                 // avoid spinning on the same candidate forever.
-                if let Some(candidate_abs) =
-                    candidate_abs.filter(|&p| p >= table.history_abs_start && p < abs_pos)
-                {
+                if let Some(candidate_abs) = candidate_abs.filter(|&p| {
+                    p >= table
+                        .history_abs_start
+                        .max(abs_pos.saturating_sub(table.max_window_size))
+                        && p < abs_pos
+                }) {
                     buf[filled] = candidate_abs;
                 }
                 break;
@@ -155,7 +158,12 @@ impl HcMatcher {
             let Some(candidate_abs) = candidate_abs else {
                 continue;
             };
-            if candidate_abs < table.history_abs_start || candidate_abs >= abs_pos {
+            if candidate_abs
+                < table
+                    .history_abs_start
+                    .max(abs_pos.saturating_sub(table.max_window_size))
+                || candidate_abs >= abs_pos
+            {
                 continue;
             }
             buf[filled] = candidate_abs;
@@ -198,7 +206,11 @@ impl HcMatcher {
                 continue;
             }
             let candidate_pos = abs_pos - rep;
-            if candidate_pos < table.history_abs_start {
+            if candidate_pos
+                < table
+                    .history_abs_start
+                    .max(abs_pos.saturating_sub(table.max_window_size))
+            {
                 continue;
             }
             let candidate_idx = candidate_pos - table.history_abs_start;
@@ -323,7 +335,8 @@ impl HcMatcher {
 
             // Only process candidates in the live window [history_abs_start, abs_pos).
             if let Some(candidate_abs) = candidate_abs_opt
-                && candidate_abs >= history_abs_start
+                && candidate_abs
+                    >= history_abs_start.max(abs_pos.saturating_sub(table.max_window_size))
                 && candidate_abs < abs_pos
             {
                 let candidate_idx = candidate_abs - history_abs_start;
