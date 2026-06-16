@@ -685,12 +685,12 @@ const DFAST_ATTACH_DICT_CUTOFF_LOG: u8 = 14;
 /// `row_candidate_rl`), larger known-size inputs dense-COPY into the live rows.
 const ROW_ATTACH_DICT_CUTOFF_LOG: u8 = 15;
 
-/// 16 KiB (`2^14`, donor `attachDictSizeCutoffs[ZSTD_lazy2]`): small /
+/// 32 KiB (`2^15`, upstream zstd `attachDictSizeCutoffs[ZSTD_lazy2]`): small /
 /// unknown-size inputs ATTACH the dict as a separate hash-chain dms (the dual
 /// search in `find_best_match` walks the live input chain + the dms), larger
 /// known-size inputs dense-COPY (merge the dict into the live chain and search
 /// the one combined chain).
-const HC_ATTACH_DICT_CUTOFF_LOG: u8 = 14;
+const HC_ATTACH_DICT_CUTOFF_LOG: u8 = 15;
 
 // Source-size cap for the dfast hash bits when a size hint is present: a tiny
 // input needs no larger hash than its window. The donor `cParams.hashLog` /
@@ -10215,11 +10215,13 @@ fn primed_snapshot_not_restored_across_fast_attach_copy_boundary() {
 #[test]
 fn primed_snapshot_fast_attach_does_not_over_key_non_simple_backends() {
     // `fast_attach` is a Simple/Fast-backend concept (the 8 KiB attach-vs-copy
-    // table split). Dfast/Row prime the dictionary one way; HashChain has its
-    // OWN attach/copy split (`HC_ATTACH_DICT_CUTOFF_LOG`) but deliberately keeps
-    // it OUT of the snapshot key — both HC modes share the same window geometry,
-    // so a cross-mode restore is decodable (see `prime_with_dictionary` and
-    // `primed_snapshot_hc_cross_mode_roundtrips`). Either way the `fast_attach`
+    // table split). Dfast/Row/HashChain each have their OWN attach/copy regime
+    // (`DFAST_ATTACH_DICT_CUTOFF_LOG`, `ROW_ATTACH_DICT_CUTOFF_LOG`,
+    // `HC_ATTACH_DICT_CUTOFF_LOG`) but those are deliberately kept OUT of the
+    // `fast_attach` key, which only models the Fast table split. Their snapshots
+    // are keyed by the resolved matcher geometry instead, and the HC modes share
+    // one window geometry so an HC cross-mode restore stays decodable (see
+    // `prime_with_dictionary`). Either way the `fast_attach`
     // bit must NOT enter a non-Simple snapshot key — otherwise an unhinted
     // capture (which would record `fast_attach = true`) and a hinted reset that
     // resolves to the IDENTICAL `LevelParams` would key differently and force a
