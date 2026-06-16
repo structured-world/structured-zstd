@@ -1524,6 +1524,21 @@ impl MatchGeneratorDriver {
         }
     }
 
+    /// Whether a DICTIONARY frame can take the borrowed (no input copy) path.
+    /// Only the Simple (Fast) backend with the dictionary ATTACHED (not the
+    /// copy/merge regime) has a borrowed dict scan — `start_matching_borrowed_dict`
+    /// reads live matches from the borrowed input in place and dict matches
+    /// from the committed dict prefix via the 2-segment counter. Every other
+    /// backend, and copy-mode (large-input) dict frames, stay on the owned
+    /// path. Checked AFTER priming, so `is_attached()` reflects the resolved
+    /// attach-vs-copy decision.
+    pub(crate) fn borrowed_dict_supported(&self) -> bool {
+        matches!(
+            &self.storage,
+            MatcherStorage::Simple(m) if m.dict_is_attached()
+        )
+    }
+
     fn simple_mut(&mut self) -> &mut FastKernelMatcher {
         match &mut self.storage {
             MatcherStorage::Simple(m) => m,
@@ -2044,6 +2059,112 @@ impl Matcher for MatchGeneratorDriver {
                 hc.chain_log = dict_chain_log;
             }
         }
+        // upstream zstd `ZSTD_resolveRowMatchFinderMode` (zstd_compress.c:238-245):
+        // the row matchfinder is used for greedy/lazy/lazy2 ONLY when
+        // `windowLog > 14`; at or below that upstream runs the hash-chain
+        // matcher (`ZSTD_HcFindBestMatch`). We previously hardcoded the Row
+        // backend for these strategies regardless of window, sending every
+        // small-window frame (hinted floor = windowLog 14, e.g. the small-4k/10k
+        // fixtures) through Row where upstream uses HC. Match it: fall back to
+        // the hash-chain matcher (lazy/greedy parse via `lazy_depth`) when the
+        // resolved window is <= 14. The HC config is synthesised from the
+        // level's RowConfig (HC and Row share the same cParams; only the
+        // matchfinder differs) — `hash_log` / `chain_log` are
+        // clamped to the (<= 14) window inside the HashChain reset arm, so the
+        // nominal width here only sets the clamp ceiling.
+        if params.search == super::strategy::SearchMethod::RowHash && params.window_log <= 14 {
+            let row = params
+                .row
+                .expect("a RowHash level row must carry a RowConfig");
+            params.search = super::strategy::SearchMethod::HashChain;
+            // For a dict-bearing frame, downsize the synthesised HC logs to the
+            // dictionary's content tier via `cdict_table_logs` (the same
+            // correction the native HC dict-prime path applies above), so a dict
+            // much smaller than the window doesn't prime a needlessly sparse
+            // table. Row-finder levels are never BinaryTree, so `uses_bt = false`.
+            //
+            // Feed `cdict_table_logs` the UN-hinted base Row width, not the
+            // resolved `row.hash_bits`: the latter is already source-capped on a
+            // hinted reset (the `row_cap = table_log + 1` clamp), so passing it
+            // here would double-cap exactly as the native HC dict path warns
+            // above — a small hinted source with a large dictionary would
+            // collapse the prepared table below what the dict needs.
+            // `cdict_table_logs` only ever downsizes, so deriving the ceiling
+            // from the un-hinted base (plus active public overrides) keeps the
+            // dict-tier geometry intact. No source hint => `row.hash_bits` is
+            // already the level's full width, so reuse it directly.
+            let row_cdict_hash_bits = match dict_hint.filter(|&size| size > 0) {
+                Some(_) => {
+                    let mut base_params = Self::level_params(level, None);
+                    if let Some(ov) = self.param_overrides
+                        && !ov.is_empty()
+                    {
+                        apply_param_overrides(&mut base_params, &ov);
+                    }
+                    base_params
+                        .row
+                        .map_or(row.hash_bits, |base_row| base_row.hash_bits)
+                }
+                None => row.hash_bits,
+            };
+            // Row-backed levels carry only `hash_bits`; the HC chain table they
+            // fall back to follows the donor cParams relationship `chainLog =
+            // hashLog - 1` for every Row level (L6 c18 h19 .. L12 c22 h23, see
+            // the ROW_L* tables). Synthesise the chain width as `hash_bits - 1`
+            // so the dict path doesn't leave the chain table one bit too wide
+            // (cdict_table_logs only downsizes, so passing the full hash width
+            // for both would keep a 2x-too-large chain table on dict frames).
+            // Raw `- 1` is underflow-safe: `hash_bits` is either a predefined
+            // ROW_L* width (>= 19) or a public `hash_log` override, and the
+            // override is range-validated to `ZSTD_HASHLOG_MIN = 6` at the
+            // parameter API, so the value is always >= 6 here.
+            //
+            // A public `chain_log` override (#27) is dropped by the RowHash
+            // override arm (Row has no chain table), but once this frame falls
+            // back to HC the chain table is live and must honour it — mirror
+            // the native HC dict path, which feeds the override-applied
+            // `base_hc.chain_log` into `cdict_table_logs`. Use the explicit
+            // override (also API-validated to ZSTD_CHAINLOG_MIN = 6) when set,
+            // else the donor `hashLog - 1` relationship.
+            let explicit_chain_log = self
+                .param_overrides
+                .filter(|ov| !ov.is_empty())
+                .and_then(|ov| ov.chain_log)
+                .map(|chain_log| chain_log as usize);
+            let row_cdict_chain_bits = explicit_chain_log.unwrap_or(row_cdict_hash_bits - 1);
+            let (mut hash_log, mut chain_log) = match dict_hint.filter(|&size| size > 0) {
+                Some(dict_size) => cdict_table_logs(
+                    params.window_log,
+                    row_cdict_hash_bits,
+                    row_cdict_chain_bits,
+                    false,
+                    dict_size,
+                ),
+                None => (
+                    row.hash_bits,
+                    explicit_chain_log.unwrap_or(row.hash_bits - 1),
+                ),
+            };
+            // No-dict path: the HashChain reset arm only clamps the logs to the
+            // window when `hinted`, but a public `window_log` override can lower
+            // this level to <= 14 with no source hint — clamp the level's full
+            // Row `hash_bits` to the window here too (donor `ZSTD_adjustCParams`:
+            // hashLog <= windowLog + 1, chainLog <= windowLog) so a 16 KiB window
+            // doesn't allocate Row-sized HC tables.
+            if dict_hint.filter(|&size| size > 0).is_none() {
+                let wlog = params.window_log as usize;
+                hash_log = hash_log.min(wlog + 1);
+                chain_log = chain_log.min(wlog);
+            }
+            params.hc = Some(HcConfig {
+                hash_log,
+                chain_log,
+                search_depth: row.search_depth,
+                target_len: row.target_len,
+                search_mls: 4,
+            });
+            params.row = None;
+        }
         let next_backend = params.backend();
         let max_window_size = 1usize << params.window_log;
         self.dictionary_retained_budget = 0;
@@ -2290,7 +2411,15 @@ impl Matcher for MatchGeneratorDriver {
                 // allocation. Was the source of L10-lazy peak-alloc ~2.15x the
                 // donor on a 1 MiB input. Only applied when hinted; an
                 // unknown-size stream keeps the full level tables.
-                if hinted {
+                // Skip for dict-bearing frames: their `hc_cfg.{hash,chain}_log`
+                // were already sized to the dictionary content tier via
+                // `cdict_table_logs` (the dict supplies the long-distance
+                // matches, so upstream `ZSTD_createCDict` sizes the prepared
+                // tables to the dict, not the source window). Re-applying the
+                // source-window cap here would collapse those dict-tier logs
+                // back to the small hinted source — the same double-cap the
+                // synthesis sites avoid by using the un-hinted base width.
+                if hinted && !matches!(dict_hint, Some(size) if size > 0) {
                     let wlog = hc_hash_bits_for_window(table_window_size);
                     let uses_bt = matches!(
                         strategy_tag,
@@ -2501,7 +2630,16 @@ impl Matcher for MatchGeneratorDriver {
             if end - start < min_primed_tail {
                 break;
             }
-            let mut space = self.get_next_space();
+            // Stage the dict chunk WITHOUT `get_next_space`'s
+            // `resize(slice_size, 0)` zero-fill: that memsets a full
+            // block-sized buffer (up to ~128 KiB) every frame only to have it
+            // `clear()`-ed and overwritten by the dict bytes on the very next
+            // lines — pure waste (measured ~10% of the small dict encode).
+            // Reuse a pooled buffer's capacity if one is free (the prime/skip
+            // cycle recycles them back), else allocate exactly the chunk.
+            // Mirrors upstream zstd, which references the CDict content rather
+            // than zero-filling a fresh window per frame.
+            let mut space = self.vec_pool.pop().unwrap_or_default();
             space.clear();
             space.extend_from_slice(&dict_content[start..end]);
             self.commit_space(space);
@@ -2906,11 +3044,21 @@ impl Matcher for MatchGeneratorDriver {
         // and the stage is consumed so the next block re-stages.
         if let Some((block_start, block_end)) = self.borrowed_pending.take() {
             match self.active_backend() {
-                super::strategy::BackendTag::Simple => self.simple_mut().start_matching_borrowed(
-                    block_start,
-                    block_end,
-                    &mut handle_sequence,
-                ),
+                super::strategy::BackendTag::Simple => {
+                    let m = self.simple_mut();
+                    if m.dict_is_attached() {
+                        // Dict-attach borrowed scan: live matches read the
+                        // borrowed input in place, dict matches read the
+                        // committed dict prefix via the 2-segment counter.
+                        m.start_matching_borrowed_dict(
+                            block_start,
+                            block_end,
+                            &mut handle_sequence,
+                        );
+                    } else {
+                        m.start_matching_borrowed(block_start, block_end, &mut handle_sequence);
+                    }
+                }
                 super::strategy::BackendTag::Dfast => self
                     .dfast_matcher_mut()
                     .start_matching_borrowed(block_start, block_end, &mut handle_sequence),
@@ -8262,6 +8410,41 @@ fn driver_huge_source_hint_with_dict_does_not_overflow_hc_reserve() {
 }
 
 #[test]
+fn driver_chain_log_override_survives_row_to_hc_fallback() {
+    // Regression: when a RowHash level is forced onto the HashChain backend
+    // (resolved window <= 14, upstream `ZSTD_resolveRowMatchFinderMode`), the
+    // synthesised HC chain table must honour an explicit `chain_log` override.
+    // The RowHash override arm drops `chain_log` (Row has no chain table), so
+    // the synthesis previously replaced the caller's `chain_log` with the donor
+    // `hashLog - 1`, silently ignoring it on small-window frames.
+    let chain_log_override = 10u32;
+    let ov = super::parameters::ParamOverrides {
+        chain_log: Some(chain_log_override),
+        ..Default::default()
+    };
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+    // Small source hint pins the window to the hinted floor (16 KiB =
+    // windowLog 14), so the Level 6 Row finder falls back to HashChain.
+    driver.set_source_size_hint(1 << 12);
+    driver.set_param_overrides(Some(ov));
+    driver.reset(CompressionLevel::Level(6));
+    let mut space = driver.get_next_space();
+    space[..12].copy_from_slice(b"abcabcabcabc");
+    space.truncate(12);
+    driver.commit_space(space);
+    driver.skip_matching_with_hint(None);
+    // The override (10) is below the window cap (14), so the resolved HC chain
+    // table must reflect it — NOT the donor `hashLog - 1` (18, clamped to the
+    // window 14). Pre-fix this resolved to 14.
+    assert_eq!(
+        driver.hc_matcher().table.chain_log,
+        chain_log_override as usize,
+        "explicit chain_log override must survive the Row->HC fallback, got {}",
+        driver.hc_matcher().table.chain_log
+    );
+}
+
+#[test]
 fn driver_small_source_hint_shrinks_row_hash_tables() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
 
@@ -8277,27 +8460,39 @@ fn driver_small_source_hint_shrinks_row_hash_tables() {
     // count is 1 << (ROW_L5.hash_bits - ROW_L5.row_log).
     assert_eq!(full_rows, 1 << (ROW_L5.hash_bits - ROW_L5.row_log));
 
-    driver.set_source_size_hint(1024);
+    // A hint that keeps the resolved window > 14 STILL uses the Row finder
+    // (upstream `ZSTD_resolveRowMatchFinderMode`: row mode on for windowLog > 14)
+    // and shrinks the row hash table to the source-derived width. 64 KiB →
+    // raw source log 16, so `row_hash_bits_for_window(1 << 16)` < the level's
+    // full hash_bits (19) and the row count drops.
+    driver.set_source_size_hint(1 << 16);
     driver.reset(CompressionLevel::Level(5));
     let mut space = driver.get_next_space();
     space[..12].copy_from_slice(b"xyzxyzxyzxyz");
     space.truncate(12);
     driver.commit_space(space);
     driver.skip_matching_with_hint(None);
-    let hinted_rows = driver.row_matcher().row_heads.len();
-
-    // Wire `window_log` stays floored, but the row hash table is sized from
-    // the RAW 1 KiB source: `table_window = 1 << 10`, so
-    // `row_hash_bits_for_window(1 << 10) = 11` (donor `hashLog <=
-    // windowLog + 1`) and the row count is `1 << (11 - ROW_L5.row_log)`.
-    assert_eq!(driver.window_size(), 1 << MIN_HINTED_WINDOW_LOG);
     assert_eq!(
-        hinted_rows,
-        1 << ((MIN_WINDOW_LOG as usize) + 1 - ROW_L5.row_log)
+        driver.active_backend(),
+        super::strategy::BackendTag::Row,
+        "windowLog > 14 keeps the upstream row matchfinder"
     );
+    let hinted_rows = driver.row_matcher().row_heads.len();
     assert!(
         hinted_rows < full_rows,
-        "tiny source hint should reduce row hash table footprint"
+        "a window>14 source hint should reduce the row hash table footprint"
+    );
+
+    // A tiny hint floors the resolved window at MIN_HINTED_WINDOW_LOG = 14;
+    // upstream uses the HASH-CHAIN matcher (not Row) at windowLog <= 14, so the
+    // driver must route greedy/lazy/lazy2 to the HashChain backend there.
+    driver.set_source_size_hint(1024);
+    driver.reset(CompressionLevel::Level(5));
+    assert_eq!(driver.window_size(), 1 << MIN_HINTED_WINDOW_LOG);
+    assert_eq!(
+        driver.active_backend(),
+        super::strategy::BackendTag::HashChain,
+        "windowLog <= 14 must fall back to the donor hash-chain matchfinder",
     );
 }
 

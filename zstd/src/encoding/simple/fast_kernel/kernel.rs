@@ -8,7 +8,7 @@
 //! (`ZSTD_match4Found_branch` + `ZSTD_match4Found_cmov`) selected
 //! per-call via the `USE_CMOV` const generic.
 
-use super::count::count_forward;
+use super::count::{count_forward, count_forward_dict_2segment};
 use super::hash_table::{FastHashTable, hash_ptr_raw};
 use crate::encoding::Sequence;
 
@@ -1270,6 +1270,601 @@ pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
     }
 }
 
+/// Forward match length for a candidate at virtual position `cand_abs` in the
+/// logical `[dict][input]` window, compared against the current input at offset
+/// `cur_off`, for the borrowed dual-base dict kernel. Dispatches ONCE on which
+/// buffer the candidate lives in (never per byte): an input candidate
+/// (`cand_abs >= dict_end`) takes the `read32` 4-byte gate + word-at-a-time
+/// [`count_forward`] hot path over the borrowed input; a dict-prefix candidate
+/// (`cand_abs < dict_end`) falls to the scalar [`count_forward_dict_2segment`]
+/// that crosses the dict→input boundary (the cold fallback, mirroring upstream
+/// zstd's `repBase`/`dictBase` candidate split). Returns 0 when the 4-byte gate
+/// fails so the caller's `>= 4` check rejects it in one place.
+///
+/// # Safety
+/// `inp_base` must have `block_end` readable bytes; `cur_off + 4 <= block_end`
+/// and, for an input candidate, `cand_off + 4 <= block_end`. `dict` covers the
+/// `[0, dict_end)` prefix and `inp` covers `[0, block_end)`.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn borrowed_candidate_len<C: Fn(*const u8, *const u8, usize) -> usize>(
+    cand_abs: usize,
+    cur_off: usize,
+    dict_end: usize,
+    dict: &[u8],
+    inp: &[u8],
+    inp_base: *const u8,
+    block_end: usize,
+    cpl: &C,
+) -> usize {
+    if cand_abs >= dict_end {
+        let cand_off = cand_abs - dict_end;
+        // SAFETY: caller guarantees `cur_off + 4 <= block_end` and
+        // `cand_off + 4 <= block_end` (cand_off < cur_off). `cpl` (the active
+        // tier's `common_prefix_len_ptr`) is bounded by `max = block_end -
+        // (cur_off + 4)`, so the current side reads `inp[cur_off+4 ..
+        // block_end]` and the candidate side `cand_off < cur_off` more bytes
+        // — both within `inp`.
+        if unsafe { read32(inp_base.add(cur_off)) != read32(inp_base.add(cand_off)) } {
+            return 0;
+        }
+        4 + unsafe {
+            cpl(
+                inp_base.add(cur_off + 4),
+                inp_base.add(cand_off + 4),
+                block_end - (cur_off + 4),
+            )
+        }
+    } else {
+        let l = count_forward_dict_2segment(dict, cand_abs, inp, cur_off);
+        if l >= 4 { l } else { 0 }
+    }
+}
+
+/// Dual-base port of [`compress_block_fast_dict`] for the *borrowed* dict-attach
+/// path: the dictionary lives in a buffer (`dict`, the `[0, dict_end)` prefix)
+/// SEPARATE from the borrowed frame input (`inp`, read in place), so the flat
+/// single-base kernel above cannot be used. Positions live in the logical
+/// `[dict][input]` window: a dict byte `d` has virtual position `d`; an input
+/// byte at offset `i` has virtual position `dict_end + i`. The main hash table
+/// stores virtual input positions (`dict_end + i`); the immutable `dict_table`
+/// stores dict positions (`< dict_end`). An emitted offset is `cur_abs -
+/// cand_abs`.
+///
+/// Monomorphised on `MLS` + `USE_CMOV` exactly like the owned kernel, so it
+/// keeps that path's full machinery — `read32` 4-byte gate, word-at-a-time
+/// [`count_forward`], the step-ramped `ip0`/`ip1` two-position lookahead, the
+/// repcode-at-`ip0+1` probe, post-match dense fills, backward catch-up
+/// extension and the immediate repcode-2 loop — none of which the prior scalar
+/// greedy scan had (it was +68% slower than this owned-kernel shape). The only
+/// dual-base divergences: current-position reads are always input
+/// (`inp_base.add(off)`); a candidate's match length goes through
+/// [`borrowed_candidate_len`], which routes dict-prefix candidates (the rep
+/// state after dict priming, and the dict-table fallback) through the 2-segment
+/// counter while keeping input candidates on the fast flat path.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn compress_block_fast_dict_borrowed_impl<
+    const MLS: u32,
+    const USE_CMOV: bool,
+    C: Fn(*const u8, *const u8, usize) -> usize,
+>(
+    inp: &[u8],
+    dict: &[u8],
+    block_start: usize,
+    block_end: usize,
+    main_table: &mut FastHashTable,
+    dict_table: &FastHashTable,
+    bounds: PrefixBounds,
+    rep: [u32; 2],
+    step_size: usize,
+    mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+    cpl: C,
+) -> FastBlockResult {
+    assert!(
+        block_start <= block_end && block_end <= inp.len(),
+        "borrowed dict block bounds out of range: start={block_start} end={block_end} inp_len={}",
+        inp.len(),
+    );
+    let dict_end = dict.len();
+    assert!(
+        dict_end >= 1,
+        "borrowed dict kernel requires a non-empty dictionary (sentinel-0 safety)",
+    );
+    // Checked virtual-length bound: the [dict][input] coordinate floor relies on
+    // `dict_end + block_end` fitting `u32`; validate with `checked_add` rather
+    // than adding then checking after (which could itself overflow `usize`).
+    assert!(
+        dict_end
+            .checked_add(block_end)
+            .is_some_and(|v| v <= u32::MAX as usize),
+        "FastKernel does not support dict_end + block_end > u32::MAX (dict_end={dict_end}, block_end={block_end})",
+    );
+    // Release checks (not debug_assert): these guard UNCHECKED table access in
+    // the hot loop — a mismatched hash_log would hash with `main_table` then
+    // index past `dict_table`, and `step_size < 2` would stall the scan.
+    assert!(
+        step_size >= 2,
+        "borrowed dict kernel requires step_size >= 2 (got {step_size})",
+    );
+    assert_eq!(MLS, main_table.mls());
+    assert_eq!(MLS, dict_table.mls());
+    assert_eq!(main_table.hash_log(), dict_table.hash_log());
+
+    // Window bounds in VIRTUAL `[dict][input]` coords, so the gates match the
+    // owned flat kernel: `window_low` is the absolute floor, `prefix_start_index`
+    // the sentinel-aware floor for the hash-slot filter.
+    let prefix_start_index = bounds.prefix_start_index;
+    let window_low = bounds.window_low as usize;
+
+    if block_end < block_start + HASH_READ_SIZE {
+        return FastBlockResult {
+            rep,
+            tail_literals_len: block_end - block_start,
+        };
+    }
+
+    let inp_base = inp.as_ptr();
+    // Last input offset with HASH_READ_SIZE readable bytes ahead.
+    let ilimit = block_end - HASH_READ_SIZE;
+
+    let mut anchor: usize = block_start;
+    // Input offset 0 maps to virtual `dict_end >= 1`, so it never aliases the
+    // empty-slot sentinel 0 — no `ip0 == 0` fixup needed (unlike the owned flat
+    // kernel where position 0 is the dict's first byte).
+    let mut ip0: usize = block_start;
+    let mut ip1 = ip0 + step_size;
+
+    let mut offset_1: u32 = rep[0];
+    let mut offset_2: u32 = rep[1];
+
+    // Inner-loop result: literals end (input offset), raw match offset, match
+    // length, and the donor `curr` probe offset for the post-match `curr + 2`
+    // fill. `None` → drain to cleanup.
+    struct DictMatch {
+        lit_end: usize,
+        offset: usize,
+        m_len: usize,
+        curr: usize,
+    }
+
+    'outer: while ip1 <= ilimit {
+        // SAFETY: ip0 < ip1 <= ilimit = block_end - 8 ⇒ ≥ 8 readable bytes at ip0.
+        let mut hash0 = unsafe { main_table.hash_ptr::<MLS>(inp_base.add(ip0)) };
+        let mut main_idx = unsafe { main_table.get(hash0) };
+        let mut dict_idx = unsafe { dict_table.get(hash0) };
+        let mut curr = ip0;
+
+        let found: Option<DictMatch> = loop {
+            // SAFETY: ip1 <= ilimit ⇒ ≥ 8 readable bytes at ip1.
+            let hash1 = unsafe { main_table.hash_ptr::<MLS>(inp_base.add(ip1)) };
+            let cur_abs = dict_end + curr;
+            // Insert current virtual position into the MAIN table.
+            unsafe { main_table.put(hash0, cur_abs as u32) };
+
+            // Repcode probe for a match starting at curr + 1. The rep candidate
+            // may sit in the dict (offsets primed from the dictionary's
+            // repToConfirm) or in the input; `borrowed_candidate_len` routes it.
+            if offset_1 > 0 && cur_abs + 1 >= offset_1 as usize + window_low {
+                let rep_abs = cur_abs + 1 - offset_1 as usize;
+                let m_len = unsafe {
+                    borrowed_candidate_len(
+                        rep_abs,
+                        curr + 1,
+                        dict_end,
+                        dict,
+                        inp,
+                        inp_base,
+                        block_end,
+                        &cpl,
+                    )
+                };
+                if m_len >= 4 {
+                    break Some(DictMatch {
+                        lit_end: curr + 1,
+                        offset: offset_1 as usize,
+                        m_len,
+                        curr,
+                    });
+                }
+            }
+
+            // Dictionary match — taken ONLY when the main candidate is below the
+            // window floor (exactly the indices the main probe rejects), keeping
+            // "recent input wins, dict is the fallback".
+            if main_idx < prefix_start_index {
+                let dpos = dict_idx as usize;
+                if dict_idx >= 1 && dpos < dict_end && dpos >= window_low {
+                    let m0 = count_forward_dict_2segment(dict, dpos, inp, curr);
+                    if m0 >= 4 {
+                        let mut match_ip = curr;
+                        let mut match_pos = dpos;
+                        let mut m_len = m0;
+                        // Backward catch-up into the dict (current side in input,
+                        // candidate side in the dict prefix).
+                        while match_ip > anchor
+                            && match_pos > window_low
+                            && unsafe { *inp_base.add(match_ip - 1) == dict[match_pos - 1] }
+                        {
+                            match_ip -= 1;
+                            match_pos -= 1;
+                            m_len += 1;
+                        }
+                        if m_len >= MIN_DICT_MATCH_LEN {
+                            let offset = (dict_end + match_ip) - match_pos;
+                            offset_2 = offset_1;
+                            offset_1 = offset as u32;
+                            break Some(DictMatch {
+                                lit_end: match_ip,
+                                offset,
+                                m_len,
+                                curr,
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Main match (recent input) — `main_idx` is a virtual input position
+            // (`>= dict_end`); the candidate read is at input offset
+            // `main_idx - dict_end`.
+            // INVARIANT: every main-table entry is either the empty sentinel 0
+            // or a VIRTUAL input position `>= dict_end` — the scan stores
+            // `dict_end + off` and the borrowed priming rebases primed offsets by
+            // `dict_end` too (no raw offsets in `[1, dict_end)`). So
+            // `main_idx >= prefix_start_index` (which is `>= 1`) already implies
+            // `main_idx >= dict_end`, and `main_idx - dict_end` cannot underflow
+            // — no per-candidate range check is needed on the hot path.
+            debug_assert!(
+                main_idx == 0 || main_idx as usize >= dict_end,
+                "main-table entry must be the sentinel or a virtual input position (>= dict_end)",
+            );
+            let main_valid = if USE_CMOV {
+                let in_range = main_idx >= prefix_start_index;
+                // SAFETY: when `in_range`, `main_idx >= prefix_start_index >= 1`
+                // and (per the invariant) `>= dict_end`, so `main_idx - dict_end`
+                // is a valid input offset with ≥ 4 readable bytes; otherwise
+                // `CMOV_DUMMY` (4 bytes) is read instead.
+                let mval_addr = if in_range {
+                    unsafe { inp_base.add(main_idx as usize - dict_end) }
+                } else {
+                    CMOV_DUMMY.as_ptr()
+                };
+                let bytes_match = unsafe { read32(inp_base.add(ip0)) == read32(mval_addr) };
+                #[allow(clippy::needless_bitwise_bool)]
+                let r = bytes_match & in_range;
+                r
+            } else {
+                main_idx >= prefix_start_index
+                    && unsafe {
+                        read32(inp_base.add(ip0))
+                            == read32(inp_base.add(main_idx as usize - dict_end))
+                    }
+            };
+            if main_valid {
+                let mut match_ip = ip0;
+                let mut match_pos = main_idx as usize - dict_end;
+                let mut m_len = 4 + unsafe {
+                    cpl(
+                        inp_base.add(ip0 + 4),
+                        inp_base.add(match_pos + 4),
+                        block_end - (ip0 + 4),
+                    )
+                };
+                while match_ip > anchor
+                    && match_pos > 0
+                    && (dict_end + match_pos) > window_low
+                    && unsafe { *inp_base.add(match_ip - 1) == *inp_base.add(match_pos - 1) }
+                {
+                    match_ip -= 1;
+                    match_pos -= 1;
+                    m_len += 1;
+                }
+                let offset = match_ip - match_pos;
+                offset_2 = offset_1;
+                offset_1 = offset as u32;
+                break Some(DictMatch {
+                    lit_end: match_ip,
+                    offset,
+                    m_len,
+                    curr,
+                });
+            }
+
+            // Prepare next iteration.
+            dict_idx = unsafe { dict_table.get(hash1) };
+            main_idx = unsafe { main_table.get(hash1) };
+            ip0 = ip1;
+            ip1 += step_size;
+            if ip1 > ilimit {
+                break None;
+            }
+            curr = ip0;
+            hash0 = hash1;
+        };
+
+        let Some(m) = found else {
+            break 'outer;
+        };
+
+        handle_sequence(Sequence::Triple {
+            literals: &inp[anchor..m.lit_end],
+            offset: m.offset,
+            match_len: m.m_len,
+        });
+        ip0 = m.lit_end + m.m_len;
+        anchor = ip0;
+
+        if ip0 <= ilimit {
+            // Post-match dense fills (virtual positions).
+            if m.curr + 2 + HASH_READ_SIZE <= block_end {
+                let h = unsafe { main_table.hash_ptr::<MLS>(inp_base.add(m.curr + 2)) };
+                unsafe { main_table.put(h, (dict_end + m.curr + 2) as u32) };
+            }
+            if ip0 >= 2 {
+                let h = unsafe { main_table.hash_ptr::<MLS>(inp_base.add(ip0 - 2)) };
+                unsafe { main_table.put(h, (dict_end + ip0 - 2) as u32) };
+            }
+            // Immediate repcode-2 loop. The rep candidate may straddle into the
+            // dict; `borrowed_candidate_len` routes it.
+            while ip0 <= ilimit && offset_2 > 0 && dict_end + ip0 >= offset_2 as usize + window_low
+            {
+                let rep_abs = dict_end + ip0 - offset_2 as usize;
+                let r_len = unsafe {
+                    borrowed_candidate_len(
+                        rep_abs, ip0, dict_end, dict, inp, inp_base, block_end, &cpl,
+                    )
+                };
+                if r_len < 4 {
+                    break;
+                }
+                let r_off = offset_2 as usize;
+                core::mem::swap(&mut offset_1, &mut offset_2);
+                let h = unsafe { main_table.hash_ptr::<MLS>(inp_base.add(ip0)) };
+                unsafe { main_table.put(h, (dict_end + ip0) as u32) };
+                handle_sequence(Sequence::Triple {
+                    literals: &inp[anchor..ip0],
+                    offset: r_off,
+                    match_len: r_len,
+                });
+                ip0 += r_len;
+                anchor = ip0;
+            }
+        }
+
+        ip1 = ip0 + step_size;
+    }
+
+    FastBlockResult {
+        rep: [offset_1, offset_2],
+        tail_literals_len: block_end - anchor,
+    }
+}
+
+// Per-tier `#[target_feature]` wrappers around the borrowed dual-base dict
+// kernel. Each carries the tier's umbrella so the inlined `_impl` (and the
+// `common_prefix_len_ptr` it calls for the hot input-match extension) compiles
+// with that tier's SIMD — the 32-byte AVX2 / 16-byte SSE4.2 / NEON /
+// wasm-simd128 compare instead of the generic word-at-a-time scalar count.
+// Same pattern the Dfast / Row backends use. The dict-prefix 2-segment count
+// (cold fallback) stays scalar inside `_impl`.
+macro_rules! fast_dict_borrowed_wrapper {
+    ($(#[$attr:meta])* $name:ident, $cpl:path) => {
+        $(#[$attr])*
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn $name<const MLS: u32, const USE_CMOV: bool>(
+            inp: &[u8],
+            dict: &[u8],
+            block_start: usize,
+            block_end: usize,
+            main_table: &mut FastHashTable,
+            dict_table: &FastHashTable,
+            bounds: PrefixBounds,
+            rep: [u32; 2],
+            step_size: usize,
+            handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+        ) -> FastBlockResult {
+            compress_block_fast_dict_borrowed_impl::<MLS, USE_CMOV, _>(
+                inp,
+                dict,
+                block_start,
+                block_end,
+                main_table,
+                dict_table,
+                bounds,
+                rep,
+                step_size,
+                handle_sequence,
+                // SAFETY: only invoked from within this `#[target_feature]`
+                // umbrella, so the tier's CPU features are guaranteed present.
+                |l, r, m| unsafe { $cpl(l, r, m) },
+            )
+        }
+    };
+}
+
+fast_dict_borrowed_wrapper!(
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "avx2,bmi2")]
+    cbfd_borrowed_avx2_bmi2,
+    crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr
+);
+
+fast_dict_borrowed_wrapper!(
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "sse4.2")]
+    cbfd_borrowed_sse42,
+    crate::encoding::fastpath::sse42::common_prefix_len_ptr
+);
+
+fast_dict_borrowed_wrapper!(
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[target_feature(enable = "neon")]
+    cbfd_borrowed_neon,
+    crate::encoding::fastpath::neon::common_prefix_len_ptr
+);
+
+fast_dict_borrowed_wrapper!(
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel_simd128"
+    ))]
+    #[target_feature(enable = "simd128")]
+    cbfd_borrowed_simd128,
+    crate::encoding::fastpath::simd128::common_prefix_len_ptr
+);
+
+/// Dispatch the borrowed dual-base dict kernel to the resolved per-tier SIMD
+/// wrapper. `kernel` is the matcher's once-resolved [`FastpathKernel`]; the
+/// scalar arm carries no `#[target_feature]` (generic word-at-a-time count).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compress_block_fast_dict_borrowed<const MLS: u32, const USE_CMOV: bool>(
+    inp: &[u8],
+    dict: &[u8],
+    block_start: usize,
+    block_end: usize,
+    main_table: &mut FastHashTable,
+    dict_table: &FastHashTable,
+    bounds: PrefixBounds,
+    rep: [u32; 2],
+    step_size: usize,
+    handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+    kernel: crate::encoding::fastpath::FastpathKernel,
+) -> FastBlockResult {
+    // Used by the per-tier match arms below; on a target with no SIMD tier
+    // (e.g. wasm32 without simd128) only the scalar fallback compiles and the
+    // import is unused.
+    #[allow(unused_imports)]
+    use crate::encoding::fastpath::FastpathKernel;
+    // The scalar fallback: generic word-at-a-time `count_forward` for the input
+    // match extension, no SIMD umbrella.
+    let scalar = |inp: &[u8],
+                  dict: &[u8],
+                  main_table: &mut FastHashTable,
+                  dict_table: &FastHashTable,
+                  handle_sequence: &mut dyn for<'a> FnMut(Sequence<'a>)|
+     -> FastBlockResult {
+        compress_block_fast_dict_borrowed_impl::<MLS, USE_CMOV, _>(
+            inp,
+            dict,
+            block_start,
+            block_end,
+            main_table,
+            dict_table,
+            bounds,
+            rep,
+            step_size,
+            handle_sequence,
+            // SAFETY: `count_forward` is a safe word-at-a-time count; the
+            // pointer/length contract is identical to the SIMD tiers.
+            |l, r, m| unsafe { count_forward(l, r, l.add(m)) },
+        )
+    };
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        match kernel {
+            FastpathKernel::Avx2Bmi2 => unsafe {
+                cbfd_borrowed_avx2_bmi2::<MLS, USE_CMOV>(
+                    inp,
+                    dict,
+                    block_start,
+                    block_end,
+                    main_table,
+                    dict_table,
+                    bounds,
+                    rep,
+                    step_size,
+                    handle_sequence,
+                )
+            },
+            FastpathKernel::Sse42 => unsafe {
+                cbfd_borrowed_sse42::<MLS, USE_CMOV>(
+                    inp,
+                    dict,
+                    block_start,
+                    block_end,
+                    main_table,
+                    dict_table,
+                    bounds,
+                    rep,
+                    step_size,
+                    handle_sequence,
+                )
+            },
+            FastpathKernel::Scalar => {
+                let mut hs = handle_sequence;
+                scalar(inp, dict, main_table, dict_table, &mut hs)
+            }
+        }
+    }
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    {
+        match kernel {
+            FastpathKernel::Neon => unsafe {
+                cbfd_borrowed_neon::<MLS, USE_CMOV>(
+                    inp,
+                    dict,
+                    block_start,
+                    block_end,
+                    main_table,
+                    dict_table,
+                    bounds,
+                    rep,
+                    step_size,
+                    handle_sequence,
+                )
+            },
+            FastpathKernel::Scalar => {
+                let mut hs = handle_sequence;
+                scalar(inp, dict, main_table, dict_table, &mut hs)
+            }
+        }
+    }
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel_simd128"
+    ))]
+    {
+        match kernel {
+            FastpathKernel::Simd128 => unsafe {
+                cbfd_borrowed_simd128::<MLS, USE_CMOV>(
+                    inp,
+                    dict,
+                    block_start,
+                    block_end,
+                    main_table,
+                    dict_table,
+                    bounds,
+                    rep,
+                    step_size,
+                    handle_sequence,
+                )
+            },
+            FastpathKernel::Scalar => {
+                let mut hs = handle_sequence;
+                scalar(inp, dict, main_table, dict_table, &mut hs)
+            }
+        }
+    }
+    #[cfg(not(any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_endian = "little"),
+        all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel_simd128"
+        )
+    )))]
+    {
+        let _ = kernel;
+        let mut hs = handle_sequence;
+        scalar(inp, dict, main_table, dict_table, &mut hs)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1877,6 +2472,108 @@ mod tests {
             !cmov_result,
             "cmov variant must reject out-of-window match_idx even when \
              ip bytes coincide with CMOV_DUMMY",
+        );
+    }
+
+    /// Drive the borrowed dual-base dict kernel directly (Scalar tier — always
+    /// available, deterministic) over a crafted `(dict, input)` pair that
+    /// exercises the dict-match (2-segment + backward extension), input-match,
+    /// repcode and tail-literal branches. Reconstruct against the logical
+    /// `[dict][input]` window to prove every emitted offset is valid, and check
+    /// the byte-accounting invariant.
+    #[test]
+    fn borrowed_dict_kernel_reconstructs_via_dual_base() {
+        use crate::encoding::fastpath::FastpathKernel;
+
+        let hash_log = 12u32;
+        const MLS: u32 = 4;
+        // Distinct dict bytes so each 4-byte key hashes uniquely; the input
+        // both matches the dict prefix (dict match) and repeats itself
+        // (input match + repcode), then ends in a literal tail.
+        let dict: Vec<u8> = (0u8..40).collect();
+        let mut inp: Vec<u8> = Vec::new();
+        inp.extend_from_slice(&dict[0..20]); // dict match against dict[0..]
+        inp.extend_from_slice(&dict[0..20]); // input match against the first copy
+        inp.extend_from_slice(&dict[4..24]); // dict match at a non-zero dict pos
+        inp.extend_from_slice(b"tail-literals-xyz"); // terminal literals
+
+        let dict_end = dict.len();
+
+        // main table (filled during the scan) + immutable dict table primed
+        // over every hashable dict position.
+        let mut main_table = FastHashTable::new(hash_log, MLS);
+        let mut dict_table = FastHashTable::new(hash_log, MLS);
+        for pos in 0..=dict.len() - HASH_READ_SIZE {
+            // SAFETY: pos + 8 <= dict.len(); MLS matches the table.
+            let h = unsafe { dict_table.hash_ptr::<MLS>(dict.as_ptr().add(pos)) };
+            unsafe { dict_table.put(h, pos as u32) };
+        }
+
+        let mut tuples: Vec<(Vec<u8>, usize, usize)> = Vec::new();
+        let mut handle = |seq: Sequence<'_>| match seq {
+            Sequence::Triple {
+                literals,
+                offset,
+                match_len,
+            } => tuples.push((literals.to_vec(), offset, match_len)),
+            Sequence::Literals { literals } => tuples.push((literals.to_vec(), 0, 0)),
+        };
+
+        let result = compress_block_fast_dict_borrowed::<MLS, false>(
+            &inp,
+            &dict,
+            0,
+            inp.len(),
+            &mut main_table,
+            &dict_table,
+            PrefixBounds {
+                prefix_start_index: 1,
+                window_low: 0,
+            },
+            [0, 0],
+            2,
+            &mut handle,
+            FastpathKernel::Scalar,
+        );
+
+        // Reconstruct against the logical [dict][input] window: start from the
+        // dictionary, then replay each sequence. A Triple's offset references
+        // `current_len - offset` in this combined buffer, so a valid dual-base
+        // offset reproduces the original input exactly.
+        let mut window = dict.clone();
+        let mut saw_dict_region_match = false;
+        for (literals, offset, match_len) in &tuples {
+            window.extend_from_slice(literals);
+            if *match_len > 0 {
+                let start = window.len() - offset;
+                // A match whose source lands in the dictionary prefix exercised
+                // the dual-base / 2-segment path (not a plain input back-ref).
+                if start < dict_end {
+                    saw_dict_region_match = true;
+                }
+                for i in 0..*match_len {
+                    let b = window[start + i];
+                    window.push(b);
+                }
+            }
+        }
+        // Append the terminal tail the kernel reports separately.
+        let tail_start = inp.len() - result.tail_literals_len;
+        window.extend_from_slice(&inp[tail_start..]);
+
+        assert_eq!(
+            &window[dict_end..],
+            &inp[..],
+            "borrowed dict kernel must reconstruct the input from the [dict][input] window",
+        );
+
+        assert!(
+            tuples.iter().any(|(_, _, m)| *m >= 4),
+            "expected at least one match Triple",
+        );
+        assert!(
+            saw_dict_region_match,
+            "expected at least one match reading from the dictionary region (dual-base path)",
         );
     }
 }

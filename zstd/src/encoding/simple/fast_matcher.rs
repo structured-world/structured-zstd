@@ -179,6 +179,14 @@ pub(crate) struct FastKernelMatcher {
     /// `adjust_params_for_source_size` clamps `window_log` below
     /// the donor default of 19, flipping `use_cmov` on).
     use_cmov: bool,
+    /// Cached per-tier SIMD kernel selection (resolved once via
+    /// [`crate::encoding::fastpath::select_kernel`] at construction / reset),
+    /// mirroring the Dfast/Row backends. Drives the `#[target_feature]`
+    /// umbrella dispatch in the borrowed dual-base dict scan so the
+    /// match-length `common_prefix_len_ptr` is the tier's 32-byte AVX2 /
+    /// 16-byte SSE4.2 / NEON / wasm-simd128 compare instead of the generic
+    /// word-at-a-time `count_forward`.
+    kernel: crate::encoding::fastpath::FastpathKernel,
     /// Initial step the kernel uses for the 4-cursor body's skip
     /// schedule. Donor `stepSize = targetLength + !(targetLength) +
     /// 1` (min 2). Negative-level frames set this to 2..8 to
@@ -265,6 +273,7 @@ impl Clone for FastKernelMatcher {
             max_window_size: self.max_window_size,
             window_log: self.window_log,
             use_cmov: self.use_cmov,
+            kernel: self.kernel,
             step_size: self.step_size,
             pending: self.pending.clone(),
             last_block_start: self.last_block_start,
@@ -289,6 +298,7 @@ impl Clone for FastKernelMatcher {
         self.max_window_size = source.max_window_size;
         self.window_log = source.window_log;
         self.use_cmov = source.use_cmov;
+        self.kernel = source.kernel;
         self.step_size = source.step_size;
         self.pending.clone_from(&source.pending);
         self.last_block_start = source.last_block_start;
@@ -328,6 +338,13 @@ impl FastKernelMatcher {
     #[cfg(test)]
     pub(crate) fn hash_log(&self) -> u32 {
         self.hash_table.hash_log()
+    }
+
+    /// Whether a dictionary table is attached (drives the dual-probe dispatch:
+    /// the borrowed scan must consult the dict when set). Mirrors the owned
+    /// path's `self.dict.is_attached()` gate.
+    pub(crate) fn dict_is_attached(&self) -> bool {
+        self.dict.is_attached()
     }
 
     /// Hash table `mls` (delegates to the inner table). Test-only
@@ -381,6 +398,7 @@ impl FastKernelMatcher {
             max_window_size: 1usize << window_log,
             window_log,
             use_cmov: window_log < 19,
+            kernel: crate::encoding::fastpath::select_kernel(),
             step_size,
             pending: None,
             borrowed: None,
@@ -560,17 +578,32 @@ impl FastKernelMatcher {
             self.pending.is_none(),
             "set_borrowed_window requires no staged owned block; reset before switching to a borrowed window",
         );
+        // A live borrowed window at entry means a prior frame's window was never
+        // cleared by a `reset()` — and since `clear_borrowed_window` no longer
+        // memsets the table (it relies on the next reset to do so), the table
+        // would still hold the prior scan's virtual `dict_end + input_off`
+        // positions. The borrowed-dict kernel would then read those as current
+        // offsets (`main_idx - dict_end` underflowing to a huge pointer). Catch
+        // that missing-reset regression here rather than letting it silently
+        // corrupt memory; the production caller always resets first.
+        debug_assert!(
+            self.borrowed.is_none(),
+            "set_borrowed_window called without a preceding reset()/clear_borrowed_window",
+        );
         self.borrowed = Some((buffer.as_ptr(), buffer.len()));
         self.last_borrowed_block = None;
-        // Any hash-table entries left from a prior window are absolute
-        // positions into THAT buffer; once we switch the window backing
-        // to `buffer`, a `start_matching_borrowed` scan would read them
-        // as indices into the new buffer — out of bounds / memory-unsafe.
-        // Today the caller (`compress_oneshot_borrowed`) always resets
-        // first, but make the borrowed-window registration self-contained:
-        // clear the table and re-floor `prefix_start_index` so the window
-        // starts from a clean match state regardless of prior history.
-        self.hash_table.clear();
+        // Stale hash-table entries from a prior window are invalidated by the
+        // `reset()` the caller (`run_borrowed_block_loop` via
+        // `compress_oneshot_borrowed`) ALWAYS runs immediately before this
+        // call — `reset` either memsets the table (no-dict / copy frames) or
+        // epoch-advances the bias past every prior position (dict-attach
+        // frames, donor `ZSTD_continueCCtx`). Re-clearing here would memset the
+        // whole table a SECOND time per frame and, on the dict-attach path,
+        // throw away the epoch advance the reset just performed (measured: the
+        // redundant clear was ~12% of the borrowed-dict encode). The
+        // mode-switch precondition (no stale owned `pending`) is asserted
+        // above. Re-flooring `prefix_start_index` is a single store (not a
+        // memset), so keep it for self-containment.
         self.prefix_start_index = INITIAL_PREFIX_START_INDEX;
     }
 
@@ -579,18 +612,20 @@ impl FastKernelMatcher {
     pub(crate) fn clear_borrowed_window(&mut self) {
         self.borrowed = None;
         self.last_borrowed_block = None;
-        // The hash table still holds absolute positions into the
-        // now-detached borrowed buffer. An owned-path scan would read
-        // them as offsets into `self.history` — out of bounds once the
-        // borrowed buffer is gone (memory-unsafe). Today every frame
-        // begins with `reset` (which clears the table), so an owned
-        // scan never observes the stale entries; but the docstring
-        // promises a return to the owned path, so restore that
-        // invariant here too rather than relying on the caller always
-        // resetting first. Mirrors `reset` / `drain_real_prefix`:
-        // clear the table and re-floor `prefix_start_index` at the
-        // sentinel-0 baseline.
-        self.hash_table.clear();
+        // Detach the window pointer only — do NOT memset the table. The hash
+        // table still holds absolute positions into the now-detached borrowed
+        // buffer, but every frame begins with `reset()` (which memsets the
+        // table for no-dict / copy frames, or epoch-advances the bias for
+        // dict-attach frames) BEFORE any subsequent scan reads it, so an
+        // owned- or borrowed-path scan never observes the stale entries. The
+        // prior unconditional `hash_table.clear()` here was a second
+        // full-table memset per borrowed frame (this runs on the
+        // `ClearBorrowedOnDrop` guard at every frame exit) on top of the next
+        // frame's reset — measured at ~12% of the borrowed-dict encode — with
+        // no correctness role the reset does not already cover. `start_matching`
+        // (the owned path) additionally asserts `borrowed.is_none()`, which the
+        // `self.borrowed = None` above satisfies. Re-floor the sentinel-0
+        // baseline (a single store, not a memset).
         self.prefix_start_index = INITIAL_PREFIX_START_INDEX;
     }
 
@@ -1012,6 +1047,140 @@ impl FastKernelMatcher {
         self.last_borrowed_block = Some((block_start, block_end));
     }
 
+    /// Borrowed in-place scan WITH an attached dictionary (the dict-attach
+    /// counterpart of [`Self::start_matching_borrowed`]). The dictionary
+    /// content sits in `history[0..dict_end]`; the frame input is read in
+    /// place from the borrowed window, never copied after it. Positions live
+    /// in the logical `[dict][input]` window: a dict byte `d` has absolute
+    /// position `d`; an input byte `i` has absolute position `dict_end + i`
+    /// (the dict precedes the input). A match offset is `cur_abs - cand_abs`.
+    ///
+    /// Live (input) candidates read from the borrowed window and count flat;
+    /// dictionary candidates read from `history[0..dict_end]` and extend across
+    /// the dict→input boundary via the 2-segment counter — the 2-segment count
+    /// C performs with `dictBase` / `ZSTD_count_2segments`, which the flat
+    /// single-base path cannot. Dispatches the active `(mls, use_cmov)` pair to
+    /// the monomorphised dual-base kernel
+    /// [`compress_block_fast_dict_borrowed`], which carries the owned dict
+    /// kernel's full machinery (repcode probe, step-ramp two-position
+    /// lookahead, dense fills, backward extension, immediate repcode-2 loop) —
+    /// the prior scalar greedy scan had none of these and was +68% slower.
+    /// Validated by roundtrip + cross-validation + the FFI ratio gate.
+    pub(crate) fn start_matching_borrowed_dict(
+        &mut self,
+        block_start: usize,
+        block_end: usize,
+        mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        use super::fast_kernel::kernel::{PrefixBounds, compress_block_fast_dict_borrowed};
+        let (ptr, total_len) = self
+            .borrowed
+            .expect("start_matching_borrowed_dict requires a registered borrowed window");
+        assert!(
+            block_start <= block_end && block_end <= total_len,
+            "borrowed block bounds out of range: start={block_start} end={block_end} total={total_len}",
+        );
+        self.last_borrowed_block = Some((block_start, block_end));
+
+        let dict_end = self.dict.region_len();
+        // Single checked virtual length of the [dict][input] window. The dual-base
+        // kernel stores VIRTUAL positions `dict_end + input_off` (up to
+        // `virtual_len`) into the main table, so the next frame's epoch advance
+        // must span past it — NOT just `block_end` — or stale entries in
+        // `[block_end, virtual_len)` would survive the bias advance and alias as
+        // bogus low positions. Checked so the `as u32` casts below cannot
+        // truncate (the kernel asserts the same bound).
+        let virtual_len = dict_end
+            .checked_add(block_end)
+            .filter(|&v| v <= u32::MAX as usize)
+            .expect("dict_end + block_end exceeds the u32 FastKernel position space");
+        self.table_pos_high_water = self.table_pos_high_water.max(virtual_len);
+        let advertised_window = 1usize << self.window_log;
+        let mls = self.hash_table.mls();
+        let use_cmov = self.use_cmov;
+        let step_size = self.step_size;
+        let rep_in = self.rep;
+        let kernel = self.kernel;
+
+        // Window bounds in VIRTUAL `[dict][input]` coords, so the kernel's gates
+        // match the owned flat dict kernel: `window_low` is the absolute floor;
+        // `prefix_start_index` the sentinel-aware floor (`>= 1`) for the
+        // hash-slot filter. `virtual_len` was checked above.
+        let window_low = virtual_len.saturating_sub(advertised_window);
+        let prefix_start_index = window_low.max(self.prefix_start_index as usize) as u32;
+        let bounds = PrefixBounds {
+            prefix_start_index,
+            window_low: window_low as u32,
+        };
+
+        // SAFETY: `block_end <= total_len` (asserted) and the borrowed window is
+        // live for the call; `ptr` is `Copy`d out so `inp` holds no `&self`
+        // borrow. The dict slice reborrows `history`'s base through a raw ptr so
+        // it coexists with the `&mut self.hash_table` writes inside the kernel —
+        // disjoint memory (the dict content is committed at `history[0..
+        // dict_end]` and is not mutated during the scan). The dict hash table
+        // likewise reborrows through a raw ptr (immutable, built once in
+        // `prime_dict_table_*`).
+        let inp: &[u8] = unsafe { core::slice::from_raw_parts(ptr, block_end) };
+        debug_assert!(
+            dict_end <= self.history.len(),
+            "dict region_len ({dict_end}) exceeds history.len() ({}) — \
+             dictionary bytes must be committed before borrowed-dict scan",
+            self.history.len(),
+        );
+        let dict: &[u8] = unsafe { core::slice::from_raw_parts(self.history.as_ptr(), dict_end) };
+        let dict_tab_ptr: *const FastHashTable = self
+            .dict
+            .table()
+            .expect("start_matching_borrowed_dict requires an attached dict table");
+        // SAFETY: reborrow the immutable dict table (built once in
+        // `prime_dict_table_*`, not mutated during the scan) detached from
+        // `&self` so it coexists with the `&mut self.hash_table` borrow below.
+        let dict_tab: &FastHashTable = unsafe { &*dict_tab_ptr };
+        let main_table = &mut self.hash_table;
+
+        macro_rules! run {
+            ($mls:literal, $cmov:literal) => {
+                compress_block_fast_dict_borrowed::<$mls, $cmov>(
+                    inp,
+                    dict,
+                    block_start,
+                    block_end,
+                    main_table,
+                    dict_tab,
+                    bounds,
+                    rep_in,
+                    step_size,
+                    &mut handle_sequence,
+                    kernel,
+                )
+            };
+        }
+        let result = match (mls, use_cmov) {
+            (4, false) => run!(4, false),
+            (4, true) => run!(4, true),
+            (5, false) => run!(5, false),
+            (5, true) => run!(5, true),
+            (6, false) => run!(6, false),
+            (6, true) => run!(6, true),
+            (7, false) => run!(7, false),
+            (7, true) => run!(7, true),
+            (8, false) => run!(8, false),
+            (8, true) => run!(8, true),
+            _ => {
+                unreachable!("FastHashTable construction rejects mls outside 4..=8 — got mls={mls}")
+            }
+        };
+        self.rep = result.rep;
+
+        if result.tail_literals_len > 0 {
+            let tail_start = block_end - result.tail_literals_len;
+            handle_sequence(Sequence::Literals {
+                literals: &inp[tail_start..block_end],
+            });
+        }
+    }
+
     /// Make `[block_start, block_end)` the block `last_committed_space`
     /// reports BEFORE the scan runs. The emit pipeline reads
     /// `get_last_space().len()` in `collect_block_parts` *before* calling
@@ -1139,12 +1308,22 @@ impl FastKernelMatcher {
         let (base, _len) = self
             .borrowed
             .expect("prime_hash_table_for_range_borrowed requires a registered borrowed window");
+        // Store primed input positions in VIRTUAL `[dict][input]` coords so they
+        // match what the dual-base dict kernel reads from the main table; 0 when
+        // no dict is attached.
+        let base_offset = self.dict.region_len();
+        debug_assert!(
+            base_offset
+                .checked_add(block_end)
+                .is_some_and(|v| v <= u32::MAX as usize),
+            "virtual position overflow: dict.region_len()={base_offset} + block_end={block_end} exceeds u32",
+        );
         match self.hash_table.mls() {
-            4 => self.prime_hash_table_impl::<4>(base, backfill_start, last_hashable),
-            5 => self.prime_hash_table_impl::<5>(base, backfill_start, last_hashable),
-            6 => self.prime_hash_table_impl::<6>(base, backfill_start, last_hashable),
-            7 => self.prime_hash_table_impl::<7>(base, backfill_start, last_hashable),
-            8 => self.prime_hash_table_impl::<8>(base, backfill_start, last_hashable),
+            4 => self.prime_hash_table_impl::<4>(base, backfill_start, last_hashable, base_offset),
+            5 => self.prime_hash_table_impl::<5>(base, backfill_start, last_hashable, base_offset),
+            6 => self.prime_hash_table_impl::<6>(base, backfill_start, last_hashable, base_offset),
+            7 => self.prime_hash_table_impl::<7>(base, backfill_start, last_hashable, base_offset),
+            8 => self.prime_hash_table_impl::<8>(base, backfill_start, last_hashable, base_offset),
             _ => unreachable!("FastHashTable construction rejects mls outside 4..=8"),
         }
     }
@@ -1230,12 +1409,15 @@ impl FastKernelMatcher {
         }
 
         let base = self.history.as_ptr();
+        // Owned path: history offsets are already the flat `[dict][input]`
+        // coordinate (input is appended after the dict in `history`), so no
+        // virtual rebase is needed.
         match self.hash_table.mls() {
-            4 => self.prime_hash_table_impl::<4>(base, backfill_start, last_hashable),
-            5 => self.prime_hash_table_impl::<5>(base, backfill_start, last_hashable),
-            6 => self.prime_hash_table_impl::<6>(base, backfill_start, last_hashable),
-            7 => self.prime_hash_table_impl::<7>(base, backfill_start, last_hashable),
-            8 => self.prime_hash_table_impl::<8>(base, backfill_start, last_hashable),
+            4 => self.prime_hash_table_impl::<4>(base, backfill_start, last_hashable, 0),
+            5 => self.prime_hash_table_impl::<5>(base, backfill_start, last_hashable, 0),
+            6 => self.prime_hash_table_impl::<6>(base, backfill_start, last_hashable, 0),
+            7 => self.prime_hash_table_impl::<7>(base, backfill_start, last_hashable, 0),
+            8 => self.prime_hash_table_impl::<8>(base, backfill_start, last_hashable, 0),
             _ => unreachable!("FastHashTable construction rejects mls outside 4..=8"),
         }
     }
@@ -1245,11 +1427,20 @@ impl FastKernelMatcher {
     /// [`Self::skip_matching_borrowed`] dict-priming paths. `base` is the
     /// window base pointer (owned `history` or the borrowed input
     /// buffer); positions are absolute window offsets in both.
+    /// `base_offset` is added to every stored position so the main table holds
+    /// the SAME coordinate space the active kernel reads. The owned path passes
+    /// 0 (history offsets are already the flat `[dict][input]` coordinate). The
+    /// borrowed dict path passes `dict_end` so a primed input position `pos` is
+    /// stored as the VIRTUAL `dict_end + pos` the dual-base kernel expects —
+    /// without this, a primed raw offset in `[1, dict_end)` would underflow the
+    /// kernel's `main_idx - dict_end`. No-dict borrowed frames pass 0
+    /// (`region_len() == 0`), so their raw offsets are unchanged.
     fn prime_hash_table_impl<const MLS: u32>(
         &mut self,
         base: *const u8,
         range_start: usize,
         last_hashable: usize,
+        base_offset: usize,
     ) {
         for pos in range_start..=last_hashable {
             // SAFETY: pos < history_len (by loop bound), and the load
@@ -1261,7 +1452,7 @@ impl FastKernelMatcher {
             // constant-folded per MLS.
             let ptr = unsafe { base.add(pos) };
             let hash = unsafe { self.hash_table.hash_ptr::<MLS>(ptr) };
-            unsafe { self.hash_table.put(hash, pos as u32) };
+            unsafe { self.hash_table.put(hash, (base_offset + pos) as u32) };
         }
     }
 

@@ -975,11 +975,29 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
     /// The owned/evicting path keeps the scanned window bounded (positions
     /// stay small), so >4 GiB inputs fall back to it.
     fn borrowed_eligible(&self, input_len: usize, prep: &FramePrep) -> bool {
-        if prep.use_dictionary_state
-            || matches!(self.compression_level, CompressionLevel::Uncompressed)
+        if matches!(self.compression_level, CompressionLevel::Uncompressed)
             || input_len > u32::MAX as usize
         {
             return false;
+        }
+        if prep.use_dictionary_state {
+            // The borrowed dict scan runs in VIRTUAL `[dict][input]` coordinates,
+            // so the position space is `dict_content.len() + input_len`, not just
+            // `input_len`. A large attached dictionary plus an otherwise-allowed
+            // input can exceed the `u32` floor the kernel asserts — fall back to
+            // the owned (copy) path in that case.
+            let fits_u32 = self
+                .dictionary
+                .as_ref()
+                .and_then(|dict| dict.inner.dict_content.len().checked_add(input_len))
+                .is_some_and(|virtual_len| virtual_len <= u32::MAX as usize);
+            if !fits_u32 {
+                return false;
+            }
+            // Dictionary frames: only the Simple (Fast) backend in attach mode
+            // has a borrowed (no input copy) dict scan. Copy-mode dict frames
+            // and the other backends still take the owned path.
+            return self.state.matcher.borrowed_dict_supported();
         }
         // The borrowed (no-copy, in-place over-window) scan exists for the
         // Simple (Fast), Dfast, and Row backends, and for the HashChain
