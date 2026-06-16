@@ -316,6 +316,9 @@ impl HcMatcher {
         //   walks we fall through to the full `common_prefix_len` so
         //   the offset-bits advantage is given a chance to win.
         let history_tail = concat.len();
+        // Raw base pointer for the donor-style `MEM_read32` 4-byte gates below
+        // (single unaligned load each, no per-candidate slice bounds check).
+        let base_ptr = concat.as_ptr();
         while steps < max_chain_steps {
             if cur == HC_EMPTY {
                 break;
@@ -357,12 +360,21 @@ impl HcMatcher {
                     // gate's git history. Briefly: under the monotonicity
                     // precondition above, bounds-fail proves no in-range
                     // candidate at this `current_idx` can outscore `best`.
-                    if i_end > history_tail
-                        || m_end > history_tail
-                        || concat[candidate_idx + tail_off..m_end]
-                            != concat[current_idx + tail_off..i_end]
-                    {
+                    // Raw unaligned `u32` load+compare (donor `MEM_read32`)
+                    // instead of a bounds-checked slice equality — same 4-byte
+                    // tail test, one load each, no `[a..b]` bounds panic path.
+                    if i_end > history_tail || m_end > history_tail {
                         skip = true;
+                    } else {
+                        // SAFETY: both `+ tail_off` reads are `<= history_tail`
+                        // (checked above), so 4 bytes are in range.
+                        let m = unsafe {
+                            MatchTable::read_le_u32_ptr(base_ptr.add(candidate_idx + tail_off))
+                        };
+                        let i = unsafe {
+                            MatchTable::read_le_u32_ptr(base_ptr.add(current_idx + tail_off))
+                        };
+                        skip = m != i;
                     }
                 }
 
@@ -374,13 +386,19 @@ impl HcMatcher {
                 // (random) input, where `best` stays `None` so the speculative
                 // tail gate above never fires, this rejects the bulk of chain
                 // candidates on a scalar compare instead of a full
-                // `common_prefix_len`. Falls through to the full count when
-                // either side lacks a 4-byte lookahead (the count handles short
-                // tails), so the accepted set is byte-identical.
+                // `common_prefix_len`. Raw unaligned `u32` load+compare (donor
+                // `MEM_read32`), not a bounds-checked slice equality. Falls
+                // through to the full count when either side lacks a 4-byte
+                // lookahead (the count handles short tails), so the accepted
+                // set is byte-identical.
                 let four_byte_ok = candidate_idx + 4 > history_tail
                     || current_idx + 4 > history_tail
-                    || concat[candidate_idx..candidate_idx + 4]
-                        == concat[current_idx..current_idx + 4];
+                    || unsafe {
+                        // SAFETY: both `+ 4` reads are `<= history_tail` (checked
+                        // above), so 4 bytes are in range.
+                        MatchTable::read_le_u32_ptr(base_ptr.add(candidate_idx))
+                            == MatchTable::read_le_u32_ptr(base_ptr.add(current_idx))
+                    };
                 if !skip && four_byte_ok {
                     let match_len =
                         common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
