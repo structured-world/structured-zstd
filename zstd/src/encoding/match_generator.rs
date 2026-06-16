@@ -2082,11 +2082,36 @@ impl Matcher for MatchGeneratorDriver {
             // correction the native HC dict-prime path applies above), so a dict
             // much smaller than the window doesn't prime a needlessly sparse
             // table. Row-finder levels are never BinaryTree, so `uses_bt = false`.
+            //
+            // Feed `cdict_table_logs` the UN-hinted base Row width, not the
+            // resolved `row.hash_bits`: the latter is already source-capped on a
+            // hinted reset (the `row_cap = table_log + 1` clamp), so passing it
+            // here would double-cap exactly as the native HC dict path warns
+            // above — a small hinted source with a large dictionary would
+            // collapse the prepared table below what the dict needs.
+            // `cdict_table_logs` only ever downsizes, so deriving the ceiling
+            // from the un-hinted base (plus active public overrides) keeps the
+            // dict-tier geometry intact. No source hint => `row.hash_bits` is
+            // already the level's full width, so reuse it directly.
+            let row_cdict_hash_bits = match dict_hint.filter(|&size| size > 0) {
+                Some(_) => {
+                    let mut base_params = Self::level_params(level, None);
+                    if let Some(ov) = self.param_overrides
+                        && !ov.is_empty()
+                    {
+                        apply_param_overrides(&mut base_params, &ov);
+                    }
+                    base_params
+                        .row
+                        .map_or(row.hash_bits, |base_row| base_row.hash_bits)
+                }
+                None => row.hash_bits,
+            };
             let (mut hash_log, mut chain_log) = match dict_hint.filter(|&size| size > 0) {
                 Some(dict_size) => cdict_table_logs(
                     params.window_log,
-                    row.hash_bits,
-                    row.hash_bits,
+                    row_cdict_hash_bits,
+                    row_cdict_hash_bits,
                     false,
                     dict_size,
                 ),

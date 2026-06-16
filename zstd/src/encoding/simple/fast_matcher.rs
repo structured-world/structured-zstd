@@ -1122,6 +1122,12 @@ impl FastKernelMatcher {
         // likewise reborrows through a raw ptr (immutable, built once in
         // `prime_dict_table_*`).
         let inp: &[u8] = unsafe { core::slice::from_raw_parts(ptr, block_end) };
+        debug_assert!(
+            dict_end <= self.history.len(),
+            "dict region_len ({dict_end}) exceeds history.len() ({}) — \
+             dictionary bytes must be committed before borrowed-dict scan",
+            self.history.len(),
+        );
         let dict: &[u8] = unsafe { core::slice::from_raw_parts(self.history.as_ptr(), dict_end) };
         let dict_tab_ptr: *const FastHashTable = self
             .dict
