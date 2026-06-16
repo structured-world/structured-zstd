@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781603353368,
+  "lastUpdate": 1781637697200,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -68054,6 +68054,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.199,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "0d46f4ed793afe8dc74b302469e91d5e7193f0d6",
+          "message": "perf(hc): lazy-skip + separate dictMatchState beat C on small-window dict compress (#427)\n\n* perf(encode): add SoA node-price array to the optimal parser (infra)\n\nSplit the optimal-parser DP price into a contiguous `node_prices: Box<[u32]>`\ncompanion to `opt_nodes_scratch`, maintained in lockstep with every\n`HcOptimalNode.price` write. The two hot price-set loop reads now read the\ncontiguous array. This is the prerequisite for SIMD-vectorising the inner\nprice-set loop: the 28-byte AoS node stride would otherwise force a strided\ngather for the per-length price compare; a contiguous u32 array allows a\nsingle vector load.\n\nByte-identical (840 tests incl level22 parity + cross_validation). The\nredundant struct `price` field is retained here and removed in a follow-up\nonce all remaining readers route through the array.\n\n* perf(encode): SIMD price-set compare for non-abort optimal modes\n\nVectorise the btultra/btultra2 (OPT_LEVEL >= 2) price-set inner loop: each\nmatch_len writes a distinct node, so iteration is order-independent and the\nimprovement test reduces to next_cost < node_prices[next] (reset already set\nbeyond-frontier cells to u32::MAX, subsuming next > last_pos). Process the\nmatch-length range in 8-lane chunks: scalar next_cost (same add_prices /\nmatch_price_from_parts chain, byte-identical), AVX2 unsigned compare against\nthe contiguous node_prices SoA array (min_epu32-derived since AVX2 has no\ncmplt_epu32), scalar write of the improving lanes. btopt (OPT_LEVEL == 0)\nkeeps the reverse-iterate-then-break scalar form. 840 tests byte-identical.\n\n* perf(encode): gate optimal-parser SIMD price-set to long ranges only\n\nThe standalone vectorised helper penalised the short match-length ranges\n(trip < 8, the majority by count) with fn-call + non-inlined price-lookup\noverhead and zero vectorisation benefit, regressing L18 +3.9%. Keep short\nranges (< 16) on the inline-scalar simplified-compare path; only divert\nlong ranges to the vectorised helper where the chunked compare can amortise.\n\n* perf(encode): macro-expand optimal-parser SIMD price-set per CPU tier\n\nReplace the standalone runtime-dispatched price-set helper with per-tier\nfunctions threaded through the build_optimal_plan macro ($priceset param),\nmatching the existing $collect kernel pattern: the avx2 wrapper passes\npriceset_range_nonabort_avx2 (#[target_feature(avx2)] + #[inline] -> folds\ninto the wrapper's avx2 umbrella: no call ABI, no per-chunk runtime feature\ndetection, cached_match_length_price inlines), other tiers pass the inline\nscalar variant. Eliminates the standalone-fn overhead that regressed the\ngated version. byte-identical 840 tests (scalar path; avx2 path validated\non x86 CI / bench host).\n\n* perf(encode): vector-load cached ml-prices in the optimal-parser price-set\n\nThe price-set inner loop is compute-bound, not write-bound: an improve-ratio\nprobe shows only 1-8% of high-trip comparisons write, so the dominant cost is\nthe per-lane next_cost computation (ml-price cache retrieval), which the\ncompare-only vectorisation left scalar. A hit-ratio probe shows the ml-price\ncache is 91-98% warm. Since cached_match_length_price indexes the cache by\nmatch_len directly, a run of consecutive match lengths maps to contiguous\n[price,generation] cells: vector-load 8 cells, deinterleave + check all gens\n== stamp, and fold the cached prices with one broadcast constant (c_base =\nbase_cost + ll0_price + match_price_from_parts(off,0)); cold chunks fall back\nto the scalar fill. Byte-identical (avx2 path validated on x86).\n\n* perf(encode): cheaper in-lane deinterleave for the price-set vector load\n\nThe cross-lane permutevar8x32 deinterleave was a latency-bound serial chain\nthat lost to pipelined scalar cache loads on high-chunk-count fixtures\n(low-entropy-1m L18 regressed ~27%). Replace with in-128-lane shuffle_epi32 +\nunpack*_epi64 and a single cross-lane permute4x64 for the ordered prices;\ngens stay unordered (only the all-equal stamp test matters). One cross-lane op\ninstead of six.\n\n* perf(encode): generic price-set vector body + NEON tier\n\nReplace the macro-based vector price-set body (macro hygiene couldn't see the\nwrapper's parameters, so only the never-compiled-here avx2 arm \"worked\") with\na generic `priceset_range_vec::<W>` taking the per-tier deinterleave + mask as\nzero-sized impl Fn closures; #[inline(always)] + monomorphisation folds them\ninto each wrapper's target_feature umbrella (intrinsics inline, no call ABI,\nno runtime detection). Wire the NEON tier: vld2q_u32 deinterleaves the 4\n[price,gen] pairs natively (no shuffle chain), vcltq_u32 + lane-weight\nvaddvq packs the 4-lane improve mask. byte-identical 846 tests on aarch64\n(M1 dispatch -> neon path). AVX2 unchanged (now via the generic body).\n\n* perf(encode): wire SSE4.1 price-set tier + per-tier helper correctness test\n\nSSE4.1 4-lane deinterleave (two 128-bit loads + shuffle_epi32 + unpack_epi64)\nand min_epu32-based improve mask, wired to the sse42 DP wrapper via the shared\ngeneric body. Add a direct unit test asserting every compile-available tier's\ndeinterleave + improve-mask helpers (AVX2 + SSE4.1 on x86, NEON on aarch64)\nmatch a scalar reference — the dispatch only fires the best tier per host, so\nthis is the only coverage for the non-selected SIMD tiers.\n\n* perf(encode): wire wasm simd128 price-set tier\n\nAdd the simd128 4-lane deinterleave (u32x4_shuffle selects price/gen lanes\nnatively) + native unsigned u32x4_lt/u32x4_bitmask improve mask, a simd128 DP\nwrapper, and route wasm32+simd128 to it in the dispatch (was scalar). cfg-gate\nthe now-dead scalar range / wrapper / generic body on targets where another\ntier is selected. Both wasm clippy variants (simd128 + scalar) clean under\n-D warnings; the helper correctness test covers the simd128 lane math on a\nwasm host.\n\n* fix(encode): hash the borrowed window in HashChain insert, not the owned mirror\n\nThe greedy/lazy levels (5-12) on small inputs take the borrowed (no-copy)\none-shot path, where the resolved window is <= 14 and the matchfinder falls\nback to HashChain (donor ZSTD_resolveRowMatchFinderMode). In that mode the\nfinder reads the borrowed input via live_history(), but insert_position_no_rebase\nand fill_hash_chain_positions hashed self.history[history_start..] — the owned\nmirror, which is empty under the no-copy path. The insert therefore skipped or\nhashed garbage while the finder hashed the real input, so the chain stayed empty,\nno matches were found, and a trivially-compressible repeated 4 KiB block ballooned\nto 2549 bytes (~16x the donor's 154). Read live_history() in both insert paths so\ninsert and find hash the same bytes (donor uses one buffer for both). Owned mode\nis unchanged: live_history() == history[history_start..] there.\n\nRegression test: small_repetitive_compresses_on_borrowed_hashchain_band covers\nlevels 5/6/7/10/12.\n\n* perf(encode): reuse HC dict tables on snapshot restore instead of realloc\n\nThe greedy/lazy levels (5-12) on small dict frames fall back to HashChain\n(donor matchfinder gate) and restore the primed-dictionary snapshot every\nframe. Only the Fast backend reused its buffers via clone_from; HC/BT took\n`snapshot.clone()` + `ensure_tables()`, a full per-frame allocate+copy+drop\nthat made the profile allocation-bound (malloc/sbrk/page-fault) and ran\n5-7x the C dict compress. Give MatchTable a manual Clone whose clone_from\nreuses the history/hash/chain/hash3/dms buffers, and restore HC lazy/greedy\n(non-BT) snapshots through it — donor reuses the CDict tables in place rather\nthan reallocating. BT (uses_bt) snapshots still drop their live tables, so\nthey keep the realloc path.\n\n* perf(hc): raw u32 MEM_read32 gate in chain walk\n\nReplace the bounds-checked 4-byte slice-equality gates in the\nhash-chain candidate walk (both the speculative tail gate and the\nhead 4-byte gate) with raw unaligned u32 load+compare, matching\nupstream zstd ZSTD_HcFindBestMatch's MEM_read32 gate. One load per\nside, no per-candidate slice bounds-check path. Accepted-candidate set\nis byte-identical (848 tests pass).\n\n* perf(hc): relative-space chain walk, hoist loop invariants\n\nThe dict-primed HC lazy chain walk was the dominant compress-dict cost\n(76% self-time in find_best_match on small-10k-random L7). The per-\ncandidate body did far more than upstream ZSTD_HcFindBestMatch's tight\nloop: an Option-returning absolute-position decode, and a window-floor\nrecompute (.max()/.saturating_sub()) on every step.\n\nTrack candidates in history-relative index space instead. The loop\ninvariants (window floor, position->index bias) are hoisted once before\nthe walk, so each step is a single add + range check + 4-byte gate,\nmirroring the donor's matchIndex>=lowLimit / NEXT_IN_CHAIN body. The\nabsolute position is recovered only on the rare accept path. Accepted-\ncandidate set is byte-identical (848 tests pass).\n\n* perf(hc): lazy skipping over matchless runs (donor parity)\n\nThe lazy parser advanced one byte per no-match position; upstream\nZSTD_compressBlock_lazy_generic (zstd_lazy.c:1614) advances\nstep = ((ip - anchor) >> kSearchStrength) + 1, jumping faster over runs\nwith no match. On compressible input the literal run stays short so the\nstep is 1 (unchanged); on incompressible / dict-over-random input the\nrun grows and the parser searches one position per step instead of every\nbyte.\n\nInstrumented both sides on small-10k-random L7 dict: find_best_match\ncall count was 9136 vs C's 6107 (1.5x too many). With this change ours\nis 6103, matching C. Output follows upstream (ratio-equivalent, not\nbyte-identical); 848 tests pass.\n\n* perf(hc): separate dictMatchState fused into the lazy chain walk\n\nLazy-HC dict frames merged the dictionary into the live hash chain, so\neach input-position walk dragged dict candidates out of the shared\nbuckets. Upstream keeps the dict in a SEPARATE dictMatchState\n(ZSTD_HcFindBestMatch dms HC4 loop). Mirror it: ATTACH mode (small /\nunknown inputs) builds a single-link hash-chain dms over the committed\ndict (prime_dms_hc) and keeps it out of the live chain. The dms walk is\nFUSED into hash_chain_candidate and shares the SAME steps/max_chain_steps\nbudget as the live walk (donor decrements one nbAttempts across both), so\nthe live + dms search is a single bounded operation, not two full-budget\nwalks. Large known inputs keep the COPY (merge) path. Ratio-equivalent\n(not byte-identical); 848 tests pass.\n\n* perf(hc): monomorphise lazy parse over DICT (dms split)\n\nThe fused dms walk lived in hash_chain_candidate behind a runtime guard,\nwhich bloated the no-dict hot path codegen (z000033 L10 no-dict +6%).\nMirror upstream's compile-time dictMode template: make find_best_match /\npick_lazy_match / hash_chain_candidate generic over const DICT, and split\nstart_matching_lazy into a dispatcher that picks the monomorph from\nwhether a dms is primed. The DICT=false instance carries NO dms code, so\nthe no-dict path is byte-for-byte the pre-dms hot loop; the DICT=true\ninstance dual-probes the dms (still sharing the one step budget). The dms\nloop itself stays out-of-line (dms_chain_walk). 848 tests pass.\n\n* perf(hc): inline the dms walk into the DICT=true monomorph\n\nWith the DICT const-generic split the dms_chain_walk is dropped from the\nno-dict monomorph regardless of inlining (compile-time gate), so\n#[inline(never)] only added a per-call hop on the dict hot path. Switch to\n#[inline] so the DICT=true instance inlines the dms walk.\n\n* fix(opt): count node-price buffer in workspace estimate\n\n- estimated_workspace_bytes(): include the retained SoA node-price\n  Box<[u32]> (HC_OPT_NODE_LEN u32s) that was missing, so the steady-state\n  matcher workspace is no longer under-reported\n- document why the lazy-HC dict attach/copy mode is intentionally NOT\n  folded into PrimedKey: both modes share identical window geometry\n  (max_window_size + dict limit set before the mode branch), so a\n  cross-mode restore stays decodable; keying it would force re-primes\n  across the cutoff. Upstream attach/copy likewise keep the caller window\n- add hc_dict_snapshot_reuse_roundtrips: end-to-end regression that a\n  frame compressed after a dict prime-snapshot restore still decodes\n- borrowed-HC regression now decodes the exact frame it asserts the ratio\n  on (was recompressing via roundtrip_at_level)\n- note the affine equivalence that keeps the scalar and SoA-vector\n  price-set paths byte-identical, and why the c_base hoist is kept\n\n* fix(dict): align HC attach cutoff to upstream 32 KiB\n\n- HC_ATTACH_DICT_CUTOFF_LOG was 16 KiB but upstream\n  attachDictSizeCutoffs[ZSTD_lazy/lazy2] is 32 KiB; bump to 2^15 so the\n  lazy hash-chain dict attach/copy boundary matches upstream zstd. Also\n  aligns with the snapshot prefer-copy gate (already 32 KiB for lazy), so\n  the attach band and the no-snapshot band now coincide instead of\n  leaving the 16-32 KiB band attached-without-snapshot\n- correct the constant doc that misstated the upstream value as 16 KiB\n- reword the over-key test comment: Dfast/Row/HC each have their own\n  attach/copy regime, all intentionally kept out of the Fast-only\n  fast_attach key (was inaccurately \"Dfast/Row prime one way\")\n\n* fix(dict): add BT/optimal dict copy path to match upstream shape\n\nThe binary-tree (btlazy2/btopt/btultra/btultra2) dict path always built a\nseparate DUBT dms (attach), with no copy path — diverging from upstream,\nwhich COPIES the dict into the live tree above a per-strategy cutoff\n(ZSTD_resetCCtx_byCopyingCDict). Mirror the upstream shape:\n\n- attach (small/unknown source) builds the DUBT dms, as before\n- copy (large known source) merges the dict into the live binary tree via\n  the normal skip_matching path and drops the dms\n- per-strategy cutoffs match attachDictSizeCutoffs: btlazy2/btopt 32 KiB,\n  btultra/btultra2 8 KiB\n\nUnify the attach/copy decision for both the lazy-HC and BT arms behind one\nhc_dict_attach_mode() helper so skip_matching_for_dictionary_priming and\nprime_with_dictionary stay in lock-step. The snapshot capture now retains\nthe full live tables whenever the dict was copied in (keyed on\ndms.is_primed(), the exact decoupled signal) instead of assuming every BT\nsnapshot is dms-only.\n\nOutput stays a valid frame that upstream decodes (cross-validation tests\ncompress here + decompress via FFI); attach vs copy is a memory/speed\ntrade-off, not a wire change.\n\n* fix(dict): tag dms layout + sync SoA prices in optimal seed\n\nCodeRabbit re-review follow-ups on the dict match-finder:\n\n- dms cache key now carries a layout discriminator (DmsDictLayout::{Hc,Bt}).\n  prime_dms_hc and prime_dms_bt populate hash_table/chain_table with\n  incompatible meanings (HC single-link chain vs BT DUBT, chain_table len\n  region vs 2*region); a reused compressor switching level across the\n  HC<->BT boundary with coincident (region, mls, hash_log) could reuse the\n  wrong layout. Tag each build and require a layout match to reuse.\n- optimal-parser seed keeps the SoA node_prices sidecar in lockstep with\n  nodes[].price: the seed reset loop and the forced-seed write now mirror\n  into node_prices so the price-set paths compare against the live baseline.\n- gate the lazy-HC dms walk on dms.is_primed() (the canonical validity\n  contract) instead of probing table presence.\n- borrowed-HC roundtrip regression covers the full L5..=12 band.\n- refresh stale attach/copy comments: fast_attach is Fast-only; BT\n  decoupling is uses_bt && dms.is_primed(); document why the lazy skip needs\n  no tail clamp (HC_MIN_MATCH_LEN == insert width, no missed anchor).\n\nAdds dms_cache_rebuilds_across_hc_bt_layout_switch (fails without the\ndiscriminator).\n\n* fix(dict): gate lazy dispatcher on dms.is_primed()\n\nThe lazy start_matching dispatcher picked the dict-aware monomorph on\ndms.table().is_some(); its own doc says 'when a separate dms is primed'.\nSwitch to dms.is_primed() so it matches the inner dms-walk guard and the\noptimal dispatcher. Behaviorally equivalent (invalidate() clears both the\ntable and the primed flag together), but the canonical validity contract.\n\n* refactor(opt): make node_prices the single source of truth for price\n\nFinish the AoS->SoA split in the optimal parser: remove the `price` field\nfrom `HcOptimalNode` and keep each position's price ONLY in the parallel\n`node_prices: Box<[u32]>`.\n\nPreviously price was duplicated (in the 28-byte node struct AND the flat\nSoA array the SIMD price-set vector-loads), which required a lockstep\ninvariant and was the source of the desync bug class (forced-seed sidecar\nmiss). With one home for each price there is nothing to keep in sync, so\nthat bug class is gone by construction.\n\n- frontier reads/writes go through node_prices[i] (node struct loses price)\n- transient node copies that carried price (forced_end_state, last_stretch)\n  now track it via parallel locals (forced_end_price / last_stretch_price);\n  prev_match's price reuses the pre-overwrite node_pos_price\n- per node update we now store the price once (was twice), and the AoS\n  struct shrinks 28->24 bytes\n- reset_opt_node only resets litlen; price reset stays in reset_opt_nodes\n\nPure representation change: compressed output is byte-identical (850 tests\nincl. cross-validation FFI round-trip, clippy, fmt green). Upstream zstd\nkeeps one `opt[].price` and has no such invariant; this matches that\nsingle-source property while keeping our SIMD vector price compare.",
+          "timestamp": "2026-06-16T21:35:39+03:00",
+          "tree_id": "c4bbe71c82b97791f1af89c1e4d3a1542c6f72fb",
+          "url": "https://github.com/structured-world/structured-zstd/commit/0d46f4ed793afe8dc74b302469e91d5e7193f0d6"
+        },
+        "date": 1781637684225,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.105,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.113,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 240.434,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 253.087,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.342,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.428,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.107,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.031,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.014,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.978,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.109,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.109,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.011,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 12.387,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 4.952,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.235,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.318,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.897,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.217,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.62,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.104,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.396,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.142,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.12,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.26,
             "unit": "ms"
           }
         ]
