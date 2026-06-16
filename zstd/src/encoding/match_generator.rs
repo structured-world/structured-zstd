@@ -2118,6 +2118,7 @@ impl Matcher for MatchGeneratorDriver {
             // ROW_L* width (>= 19) or a public `hash_log` override, and the
             // override is range-validated to `ZSTD_HASHLOG_MIN = 6` at the
             // parameter API, so the value is always >= 6 here.
+            //
             let row_cdict_chain_bits = row_cdict_hash_bits - 1;
             let (mut hash_log, mut chain_log) = match dict_hint.filter(|&size| size > 0) {
                 Some(dict_size) => cdict_table_logs(
@@ -8391,6 +8392,41 @@ fn driver_huge_source_hint_with_dict_does_not_overflow_hc_reserve() {
     space.truncate(12);
     driver.commit_space(space);
     driver.skip_matching_with_hint(None);
+}
+
+#[test]
+fn driver_chain_log_override_survives_row_to_hc_fallback() {
+    // Regression: when a RowHash level is forced onto the HashChain backend
+    // (resolved window <= 14, upstream `ZSTD_resolveRowMatchFinderMode`), the
+    // synthesised HC chain table must honour an explicit `chain_log` override.
+    // The RowHash override arm drops `chain_log` (Row has no chain table), so
+    // the synthesis previously replaced the caller's `chain_log` with the donor
+    // `hashLog - 1`, silently ignoring it on small-window frames.
+    let chain_log_override = 10u32;
+    let ov = super::parameters::ParamOverrides {
+        chain_log: Some(chain_log_override),
+        ..Default::default()
+    };
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+    // Small source hint pins the window to the hinted floor (16 KiB =
+    // windowLog 14), so the Level 6 Row finder falls back to HashChain.
+    driver.set_source_size_hint(1 << 12);
+    driver.set_param_overrides(Some(ov));
+    driver.reset(CompressionLevel::Level(6));
+    let mut space = driver.get_next_space();
+    space[..12].copy_from_slice(b"abcabcabcabc");
+    space.truncate(12);
+    driver.commit_space(space);
+    driver.skip_matching_with_hint(None);
+    // The override (10) is below the window cap (14), so the resolved HC chain
+    // table must reflect it — NOT the donor `hashLog - 1` (18, clamped to the
+    // window 14). Pre-fix this resolved to 14.
+    assert_eq!(
+        driver.hc_matcher().table.chain_log,
+        chain_log_override as usize,
+        "explicit chain_log override must survive the Row->HC fallback, got {}",
+        driver.hc_matcher().table.chain_log
+    );
 }
 
 #[test]
