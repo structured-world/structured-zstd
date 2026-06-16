@@ -433,6 +433,114 @@ mod tests {
         assert_eq!(decoder.decoder.direct_frames(), 2);
     }
 
+    /// `read_to_end` after a partial `read` must STILL consume the source to
+    /// EOF across concatenated frames, not stop at the current frame's end. The
+    /// partial read forces the mid-frame fallback path; with two concatenated
+    /// frames the fallback must finish frame 1, then advance through frame 2.
+    #[cfg(feature = "std")]
+    #[test]
+    fn read_to_end_after_partial_read_decodes_all_concatenated_frames() {
+        use crate::encoding::{CompressionLevel, compress_slice_to_vec};
+        use alloc::vec;
+        use alloc::vec::Vec;
+
+        let a: Vec<u8> = (0..6000u32).map(|i| (i & 0xFF) as u8).collect();
+        let b: Vec<u8> = (0..4000u32)
+            .map(|i| ((i.wrapping_mul(11)) & 0xFF) as u8)
+            .collect();
+        let mut stream = compress_slice_to_vec(&a, CompressionLevel::Level(3));
+        stream.extend_from_slice(&compress_slice_to_vec(&b, CompressionLevel::Level(3)));
+
+        let mut decoder = StreamingDecoder::new(stream.as_slice()).unwrap();
+        // Partial read of frame 1 → mid-frame, so read_to_end takes the fallback.
+        let mut head = vec![0u8; 2048];
+        let got = decoder.read(&mut head).unwrap();
+        assert!(got > 0 && got <= head.len());
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&head[..got]);
+        decoder.read_to_end(&mut out).unwrap();
+
+        let mut expected = a.clone();
+        expected.extend_from_slice(&b);
+        assert_eq!(
+            out, expected,
+            "fallback path must decode frame 2 too, not stop at frame 1 EOF"
+        );
+    }
+
+    /// `read_to_end` on a stream of concatenated DICTIONARY frames must decode
+    /// every frame WITH the dictionary the decoder was constructed with. The
+    /// fast-path concatenated loop re-initialises following frames, and a plain
+    /// re-init resolves dictionaries by frame id only — losing the forced
+    /// dictionary for frames that omit (or can't resolve) the id.
+    #[cfg(feature = "std")]
+    #[test]
+    fn read_to_end_concatenated_dict_frames_decode_with_dictionary() {
+        use crate::encoding::{CompressionLevel, FrameCompressor};
+        use alloc::vec::Vec;
+
+        let dict_raw = include_bytes!("../../dict_tests/dictionary");
+        let compress_with_dict = |payload: &[u8]| -> Vec<u8> {
+            let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+            compressor
+                .set_dictionary_from_bytes(dict_raw)
+                .expect("dict load");
+            compressor.set_source(payload);
+            let mut compressed = Vec::new();
+            compressor.set_drain(&mut compressed);
+            compressor.compress();
+            compressed
+        };
+
+        let a = b"first dictionary-compressed frame payload".to_vec();
+        let b = b"second dictionary-compressed frame payload".to_vec();
+        let mut stream = compress_with_dict(&a);
+        stream.extend_from_slice(&compress_with_dict(&b));
+
+        let mut decoder =
+            StreamingDecoder::new_with_dictionary_bytes(stream.as_slice(), dict_raw).unwrap();
+        let mut out = Vec::new();
+        decoder
+            .read_to_end(&mut out)
+            .expect("both dict frames must decode with the forced dictionary");
+
+        let mut expected = a.clone();
+        expected.extend_from_slice(&b);
+        assert_eq!(out, expected);
+    }
+
+    /// A direct-path decode error must NOT leave non-decoded bytes in `output`.
+    /// The fast path resizes `output` to the declared content size before
+    /// decoding; if decode fails, the enlarged (zeroed) tail must be truncated
+    /// away so callers never observe bytes that were never decoded.
+    #[cfg(feature = "std")]
+    #[test]
+    fn read_to_end_truncates_output_on_direct_decode_error() {
+        use crate::encoding::{CompressionLevel, FrameCompressor};
+        use alloc::vec::Vec;
+
+        let payload: Vec<u8> = (0..5000u32).map(|i| (i & 0xFF) as u8).collect();
+        let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        compressor.set_source(payload.as_slice());
+        let mut compressed = Vec::new();
+        compressor.set_drain(&mut compressed);
+        compressor.compress();
+        // Truncate the block bytes (the FCS-bearing header at the front stays
+        // intact) so the header parses but the direct-path block decode hits a
+        // premature end → error after `output` was already resized.
+        compressed.truncate(compressed.len() - 40);
+
+        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut out = b"SENTINEL".to_vec();
+        let result = decoder.read_to_end(&mut out);
+        assert!(result.is_err(), "truncated block must fail the decode");
+        assert_eq!(
+            out, b"SENTINEL",
+            "failed direct decode must not append non-decoded bytes to output"
+        );
+    }
+
     /// An empty (`Frame_Content_Size = 0`) frame decodes to nothing through the
     /// `read_to_end` fast path — the declared-size validation accepts the valid
     /// case (produced == 0) instead of erroring.
