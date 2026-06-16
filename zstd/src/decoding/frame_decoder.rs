@@ -2340,27 +2340,53 @@ impl FrameDecoder {
         &mut self,
         mut input: &[u8],
         output: &mut Vec<u8>,
+        dict: Option<&DictionaryHandle>,
     ) -> Result<usize, FrameDecoderError> {
         let start_len = output.len();
         // The current frame is already initialised (its header consumed by the
-        // caller). Decode it, then decode any FOLLOWING concatenated / skippable
-        // frames in `input` so the whole source is consumed to EOF and nothing
-        // is dropped (matching `read_to_end` semantics).
+        // caller, WITH `dict` applied if the decoder was constructed with one).
+        // Decode it, then decode any FOLLOWING concatenated / skippable frames
+        // in `input` so the whole source is consumed to EOF and nothing is
+        // dropped (matching `read_to_end` semantics).
         self.decode_one_frame_to_vec(&mut input, output)?;
+        self.decode_concatenated_frames_to_vec(&mut input, output, dict)?;
+        Ok(output.len() - start_len)
+    }
+
+    /// Initialise and decode every frame remaining in `input` (concatenated /
+    /// skippable), APPENDING to `output`. `input` is advanced as frames are
+    /// consumed; on return it is empty. Re-initialisation honours `dict`: when
+    /// `Some`, each following frame is initialised via
+    /// [`Self::init_with_dict_handle`] so a forced dictionary is preserved even
+    /// for frames that omit the dictionary id (plain [`Self::init`] would
+    /// resolve dictionaries by id only). Backs the `read_to_end` fast path (the
+    /// frames after the current one) and its mid-frame fallback (the frames
+    /// after the partially-read one).
+    pub(crate) fn decode_concatenated_frames_to_vec(
+        &mut self,
+        input: &mut &[u8],
+        output: &mut Vec<u8>,
+        dict: Option<&DictionaryHandle>,
+    ) -> Result<usize, FrameDecoderError> {
+        let start_len = output.len();
         while !input.is_empty() {
-            match self.init(&mut input) {
+            let init_result = match dict {
+                Some(d) => self.init_with_dict_handle(&mut *input, d),
+                None => self.init(&mut *input),
+            };
+            match init_result {
                 Ok(_) => {}
                 Err(FrameDecoderError::ReadFrameHeaderError(
                     crate::decoding::errors::ReadFrameHeaderError::SkipFrame { length, .. },
                 )) => {
-                    input = input
+                    *input = input
                         .get(length as usize..)
                         .ok_or(FrameDecoderError::FailedToSkipFrame)?;
                     continue;
                 }
                 Err(e) => return Err(e),
             }
-            self.decode_one_frame_to_vec(&mut input, output)?;
+            self.decode_one_frame_to_vec(&mut *input, output)?;
         }
         Ok(output.len() - start_len)
     }
@@ -2394,8 +2420,17 @@ impl FrameDecoder {
             // `content_size` bytes (erroring otherwise), so the grown region is
             // fully written.
             output.resize(frame_end, 0);
+            // On error, drop the just-grown (zeroed) tail before propagating so
+            // callers never observe bytes that were never decoded.
             let written =
-                self.run_direct_decode(&mut *input, &mut output[frame_start..], content_size)?;
+                match self.run_direct_decode(&mut *input, &mut output[frame_start..], content_size)
+                {
+                    Ok(n) => n,
+                    Err(e) => {
+                        output.truncate(frame_start);
+                        return Err(e);
+                    }
+                };
             output.truncate(frame_start + written);
             #[cfg(feature = "hash")]
             self.verify_content_checksum()?;

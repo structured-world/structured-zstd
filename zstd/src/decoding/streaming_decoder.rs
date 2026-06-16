@@ -46,6 +46,12 @@ use crate::io::{Error, Read};
 pub struct StreamingDecoder<READ: Read, DEC: BorrowMut<FrameDecoder>> {
     pub decoder: DEC,
     source: READ,
+    /// Dictionary the decoder was constructed with, if any. Retained so the
+    /// `read_to_end` paths can re-initialise FOLLOWING concatenated frames with
+    /// the same forced dictionary (a plain re-init resolves dictionaries by
+    /// frame id only and would lose a forced dict for frames omitting the id).
+    /// Cheap to hold: `DictionaryHandle` is an `Arc`/`Rc` handle.
+    dict: Option<DictionaryHandle>,
 }
 
 impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
@@ -54,7 +60,11 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
         mut decoder: DEC,
     ) -> Result<StreamingDecoder<READ, DEC>, FrameDecoderError> {
         decoder.borrow_mut().init(&mut source)?;
-        Ok(StreamingDecoder { decoder, source })
+        Ok(StreamingDecoder {
+            decoder,
+            source,
+            dict: None,
+        })
     }
 }
 
@@ -64,7 +74,11 @@ impl<READ: Read> StreamingDecoder<READ, FrameDecoder> {
     ) -> Result<StreamingDecoder<READ, FrameDecoder>, FrameDecoderError> {
         let mut decoder = FrameDecoder::new();
         decoder.init(&mut source)?;
-        Ok(StreamingDecoder { decoder, source })
+        Ok(StreamingDecoder {
+            decoder,
+            source,
+            dict: None,
+        })
     }
 
     /// Create a streaming decoder using a pre-parsed dictionary handle.
@@ -82,7 +96,11 @@ impl<READ: Read> StreamingDecoder<READ, FrameDecoder> {
     ) -> Result<StreamingDecoder<READ, FrameDecoder>, FrameDecoderError> {
         let mut decoder = FrameDecoder::new();
         decoder.init_with_dict_handle(&mut source, dict)?;
-        Ok(StreamingDecoder { decoder, source })
+        Ok(StreamingDecoder {
+            decoder,
+            source,
+            dict: Some(dict.clone()),
+        })
     }
 
     /// Create a streaming decoder using a serialized dictionary blob.
@@ -229,24 +247,28 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
     /// recreate-the-decoder pattern instead.
     #[cfg(feature = "std")]
     fn read_to_end(&mut self, output: &mut alloc::vec::Vec<u8>) -> Result<usize, Error> {
+        let start_total = output.len();
         // `new()` already read the frame header, so the fast path applies when
         // the decoder sits at the start of that frame with nothing decoded yet.
         let at_start = {
             let d = self.decoder.borrow_mut();
             d.is_at_frame_start() && d.can_collect() == 0
         };
+        // Clone the (cheap Arc/Rc) dict handle out so the `decoder` borrow below
+        // does not conflict with borrowing `self.dict`.
+        let dict = self.dict.clone();
         if at_start {
             let mut compressed = alloc::vec::Vec::new();
             self.source.read_to_end(&mut compressed)?;
-            let written = self
-                .decoder
+            self.decoder
                 .borrow_mut()
-                .decode_current_frame_to_vec(&compressed, output)
+                .decode_current_frame_to_vec(&compressed, output, dict.as_ref())
                 .map_err(Error::other)?;
-            return Ok(written);
+            return Ok(output.len() - start_total);
         }
-        // Mid-frame fallback: grow `output` and drain through the generic path.
-        let mut total = 0;
+        // Mid-frame fallback: drain the partially-read CURRENT frame through the
+        // generic path, then decode any FOLLOWING concatenated frames so
+        // read_to_end still consumes the source to true EOF.
         loop {
             let start = output.len();
             output.resize(start + MAX_BLOCK_SIZE as usize, 0);
@@ -255,9 +277,18 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
             if n == 0 {
                 break;
             }
-            total += n;
         }
-        Ok(total)
+        // Current frame fully drained; `source` is positioned at the next frame.
+        let mut rest = alloc::vec::Vec::new();
+        self.source.read_to_end(&mut rest)?;
+        if !rest.is_empty() {
+            let mut input = rest.as_slice();
+            self.decoder
+                .borrow_mut()
+                .decode_concatenated_frames_to_vec(&mut input, output, dict.as_ref())
+                .map_err(Error::other)?;
+        }
+        Ok(output.len() - start_total)
     }
 
     /// no_std counterpart of the decode-in-place `read_to_end` fast path above
@@ -268,15 +299,20 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
             let d = self.decoder.borrow_mut();
             d.is_at_frame_start() && d.can_collect() == 0
         };
+        // Cheap Arc/Rc clone so the `decoder` borrow does not conflict with
+        // borrowing `self.dict`.
+        let dict = self.dict.clone();
         if at_start {
             let mut compressed = alloc::vec::Vec::new();
             self.source.read_to_end(&mut compressed)?;
             self.decoder
                 .borrow_mut()
-                .decode_current_frame_to_vec(&compressed, output)
+                .decode_current_frame_to_vec(&compressed, output, dict.as_ref())
                 .map_err(|e| Error::new(ErrorKind::Other, alloc::boxed::Box::new(e)))?;
             return Ok(());
         }
+        // Mid-frame fallback: drain the partial CURRENT frame, then decode the
+        // FOLLOWING concatenated frames so the source is consumed to true EOF.
         loop {
             let start = output.len();
             output.resize(start + MAX_BLOCK_SIZE as usize, 0);
@@ -285,6 +321,15 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
             if n == 0 {
                 break;
             }
+        }
+        let mut rest = alloc::vec::Vec::new();
+        self.source.read_to_end(&mut rest)?;
+        if !rest.is_empty() {
+            let mut input = rest.as_slice();
+            self.decoder
+                .borrow_mut()
+                .decode_concatenated_frames_to_vec(&mut input, output, dict.as_ref())
+                .map_err(|e| Error::new(ErrorKind::Other, alloc::boxed::Box::new(e)))?;
         }
         Ok(())
     }
