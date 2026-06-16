@@ -4540,11 +4540,44 @@ macro_rules! build_optimal_plan_impl_body {
                             break;
                         }
                     }
+                } else if max_match_len + 1 - start_len < 16 {
+                    // btultra / btultra2 SHORT range: stay inline-scalar (forward,
+                    // simplified `next_cost < node_prices[next]` compare — the
+                    // `next > last_pos` term is subsumed because reset set
+                    // beyond-frontier cells to MAX). No fn-call / vectorisation
+                    // overhead on the short loops that dominate by count.
+                    for match_len in start_len..=max_match_len {
+                        let next = pos + match_len;
+                        let ml_price = BtMatcher::cached_match_length_price(
+                            profile,
+                            $stats,
+                            match_len,
+                            &mut ml_cache,
+                            ml_price_stamp,
+                        );
+                        let seq_cost = BtMatcher::add_prices(
+                            ll0_price,
+                            profile.match_price_from_parts(off_price, ml_price, $stats),
+                        );
+                        let next_cost = BtMatcher::add_prices(base_cost, seq_cost);
+                        if next_cost < unsafe { *node_prices.get_unchecked(next) } {
+                            let slot = unsafe { nodes.get_unchecked_mut(next) };
+                            *slot = HcOptimalNode {
+                                price: next_cost,
+                                off: candidate.offset as u32,
+                                mlen: match_len as u32,
+                                litlen: 0,
+                                reps: base_reps,
+                            };
+                            unsafe { *node_prices.get_unchecked_mut(next) = next_cost };
+                            if next > last_pos {
+                                last_pos = next;
+                            }
+                        }
+                    }
                 } else {
-                    // btultra / btultra2 (OPT_LEVEL >= 2): no abort, each
-                    // match_len writes a distinct node => order-independent =>
-                    // SIMD-vectorised price-set (compare against the contiguous
-                    // node_prices SoA array).
+                    // btultra / btultra2 LONG range: SIMD-vectorised price-set
+                    // (compare against the contiguous node_prices SoA array).
                     last_pos = last_pos.max(priceset_range_nonabort(
                         &mut node_prices,
                         &mut nodes,
