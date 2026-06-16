@@ -211,6 +211,76 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
 
         Ok(written)
     }
+
+    /// Decode-in-place fast path for whole-frame consumption. Instead of the
+    /// generic `read` loop (decode block -> `RingBuffer` -> copy into the
+    /// caller buffer), buffer the (compressed, hence small) source and decode
+    /// STRAIGHT into `output`'s spare capacity via the single-copy direct path,
+    /// pre-sized from the frame's declared content size. Only taken when the
+    /// decoder is at a frame boundary (nothing partially decoded / undrained);
+    /// otherwise it falls back to the generic grow-and-`read` loop so a caller
+    /// that mixed `read` with `read_to_end` still gets correct output.
+    #[cfg(feature = "std")]
+    fn read_to_end(&mut self, output: &mut alloc::vec::Vec<u8>) -> Result<usize, Error> {
+        // `new()` already read the frame header, so the fast path applies when
+        // the decoder sits at the start of that frame with nothing decoded yet.
+        let at_start = {
+            let d = self.decoder.borrow_mut();
+            d.is_at_frame_start() && d.can_collect() == 0
+        };
+        if at_start {
+            let mut compressed = alloc::vec::Vec::new();
+            self.source.read_to_end(&mut compressed)?;
+            let written = self
+                .decoder
+                .borrow_mut()
+                .decode_current_frame_to_vec(&compressed, output)
+                .map_err(Error::other)?;
+            return Ok(written);
+        }
+        // Mid-frame fallback: grow `output` and drain through the generic path.
+        let mut total = 0;
+        loop {
+            let start = output.len();
+            output.resize(start + MAX_BLOCK_SIZE as usize, 0);
+            let n = self.read(&mut output[start..])?;
+            output.truncate(start + n);
+            if n == 0 {
+                break;
+            }
+            total += n;
+        }
+        Ok(total)
+    }
+
+    /// no_std counterpart of the decode-in-place `read_to_end` fast path above
+    /// (the no_std `Read::read_to_end` returns `()` instead of the byte count).
+    #[cfg(not(feature = "std"))]
+    fn read_to_end(&mut self, output: &mut alloc::vec::Vec<u8>) -> Result<(), Error> {
+        let at_start = {
+            let d = self.decoder.borrow_mut();
+            d.is_at_frame_start() && d.can_collect() == 0
+        };
+        if at_start {
+            let mut compressed = alloc::vec::Vec::new();
+            self.source.read_to_end(&mut compressed)?;
+            self.decoder
+                .borrow_mut()
+                .decode_current_frame_to_vec(&compressed, output)
+                .map_err(|e| Error::new(ErrorKind::Other, alloc::boxed::Box::new(e)))?;
+            return Ok(());
+        }
+        loop {
+            let start = output.len();
+            output.resize(start + MAX_BLOCK_SIZE as usize, 0);
+            let n = self.read(&mut output[start..])?;
+            output.truncate(start + n);
+            if n == 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -268,5 +338,63 @@ mod tests {
             .read(&mut buf)
             .expect_err("deferred checksum mismatch must surface on the terminating read");
         assert_eq!(err.kind(), ErrorKind::Other);
+    }
+
+    /// A fresh `read_to_end` must take the single-copy decode-in-place path
+    /// (FCS-declared frame decoded straight into the output `Vec`, no ring
+    /// drain) AND reproduce the payload byte-for-byte.
+    #[cfg(feature = "std")]
+    #[test]
+    fn read_to_end_decode_in_place_matches_and_takes_direct_path() {
+        use crate::encoding::{CompressionLevel, FrameCompressor};
+        use alloc::vec::Vec;
+
+        let payload: Vec<u8> = (0..20_000u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+            .collect();
+        let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        compressor.set_source(payload.as_slice());
+        let mut compressed = Vec::new();
+        compressor.set_drain(&mut compressed);
+        compressor.compress();
+
+        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut out = Vec::new();
+        let n = decoder.read_to_end(&mut out).unwrap();
+        assert_eq!(n, payload.len());
+        assert_eq!(out, payload);
+        // FrameCompressor declares FCS, so the fresh fast path used the direct
+        // (decode-in-place) route, not the ring drain.
+        assert_eq!(decoder.decoder.direct_frames(), 1);
+    }
+
+    /// `read_to_end` after a partial `read` must still produce the full
+    /// payload. The decoder is mid-frame, so the fast path is skipped and the
+    /// generic grow-and-drain fallback runs (no direct frame).
+    #[cfg(feature = "std")]
+    #[test]
+    fn read_to_end_after_partial_read_is_complete() {
+        use crate::encoding::{CompressionLevel, FrameCompressor};
+        use alloc::vec;
+        use alloc::vec::Vec;
+
+        let payload: Vec<u8> = (0..20_000u32).map(|i| (i & 0xFF) as u8).collect();
+        let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        compressor.set_source(payload.as_slice());
+        let mut compressed = Vec::new();
+        compressor.set_drain(&mut compressed);
+        compressor.compress();
+
+        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut head = vec![0u8; 4096];
+        let got = decoder.read(&mut head).unwrap();
+        assert!(got > 0 && got <= head.len());
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&head[..got]);
+        decoder.read_to_end(&mut out).unwrap();
+        assert_eq!(out, payload);
+        // Mid-frame entry → fallback path, never the direct route.
+        assert_eq!(decoder.decoder.direct_frames(), 0);
     }
 }

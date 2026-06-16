@@ -1456,6 +1456,14 @@ impl FrameDecoder {
     /// Whether the current frames last block has been decoded yet
     /// If this returns true you can call the drain* functions to get all content
     /// (the read() function will drain automatically if this returns true)
+    /// Test-only: number of frames decoded through the single-copy direct
+    /// path (`run_direct_decode`). Lets cross-module tests assert that a
+    /// given decode took the decode-in-place path rather than the ring drain.
+    #[cfg(test)]
+    pub(crate) fn direct_frames(&self) -> u64 {
+        self.direct_frames
+    }
+
     pub fn is_finished(&self) -> bool {
         let state = match &self.state {
             None => return true,
@@ -2277,6 +2285,100 @@ impl FrameDecoder {
                 None,
             )
         }
+    }
+
+    /// Decode every frame in `input`, APPENDING the decompressed bytes to
+    /// `output` (growing it as needed), and return the number of bytes
+    /// appended.
+    ///
+    /// This is the `Vec`-output sibling of [`Self::decode_all`]. A frame that
+    /// declares its content size decodes DIRECTLY into freshly-reserved
+    /// `output` capacity through the single-copy direct path
+    /// ([`Self::run_direct_decode`]) — bypassing the `Ring`/`FlatBuf` →
+    /// `read()` drain copy that the streaming loop pays. A frame WITHOUT a
+    /// declared size falls back to the window-bounded ring drain (still one
+    /// copy, into `output`). Skippable frames are skipped.
+    ///
+    /// Each frame is (re)initialised via [`Self::init`] (resolving any
+    /// attached dictionary by id), so the decoder must be at a frame boundary
+    /// (no partially-decoded frame in flight) when this is called. It backs
+    /// [`StreamingDecoder`](crate::decoding::StreamingDecoder)'s `read_to_end`
+    /// fast path.
+    ///
+    /// Whether the decoder sits at the very start of an initialised frame:
+    /// the header has been read (state populated) but no block has been
+    /// decoded and the frame is not finished. In this state the wrapped
+    /// source is positioned exactly after the frame header, so
+    /// [`Self::decode_current_frame_to_vec`] can decode the rest of the frame
+    /// straight from the remaining source bytes.
+    pub(crate) fn is_at_frame_start(&self) -> bool {
+        self.state
+            .as_ref()
+            .is_some_and(|s| s.block_counter == 0 && !s.frame_finished)
+    }
+
+    /// Decode the CURRENT (already-initialised) frame, APPENDING the
+    /// decompressed bytes to `output`, and return the number appended.
+    ///
+    /// `input` must be the frame's post-header bytes (the wrapped source after
+    /// `init` consumed the header). Unlike [`Self::decode_all_to_vec`] this
+    /// neither re-reads a header nor requires the caller to pre-reserve
+    /// capacity: a frame that declares its content size decodes DIRECTLY into
+    /// freshly-grown `output` capacity via the single-copy direct path
+    /// ([`Self::run_direct_decode`]) — bypassing the `Ring`/`FlatBuf` →
+    /// `read()` drain copy the streaming loop pays — while an unsized frame
+    /// falls back to the window-bounded ring drain (still one copy, into
+    /// `output`). Backs [`StreamingDecoder`](crate::decoding::StreamingDecoder)'s
+    /// `read_to_end` fast path; the caller must ensure
+    /// [`Self::is_at_frame_start`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`FrameDecoderError`] from block decode, content-size
+    /// mismatch, or (in `Verify` mode) checksum validation.
+    pub(crate) fn decode_current_frame_to_vec(
+        &mut self,
+        mut input: &[u8],
+        output: &mut Vec<u8>,
+    ) -> Result<usize, FrameDecoderError> {
+        let start_len = output.len();
+        let content_size = self
+            .state
+            .as_ref()
+            .expect("caller ensures is_at_frame_start")
+            .frame_header
+            .frame_content_size();
+        if content_size > 0 {
+            // FCS declared and non-empty: reserve exactly the frame's content
+            // and decode straight into it (single copy, no ring). The direct
+            // path writes precisely `content_size` bytes and never reads past
+            // the current write position, so the grown region is fully written.
+            let cs = content_size as usize;
+            output.resize(start_len + cs, 0);
+            let written =
+                self.run_direct_decode(&mut input, &mut output[start_len..], content_size)?;
+            output.truncate(start_len + written);
+            #[cfg(feature = "hash")]
+            self.verify_content_checksum()?;
+            return Ok(written);
+        }
+        // No declared size (or explicit FCS=0): window-bounded ring drain,
+        // appended directly to `output` via `collect_to_writer` (no staging
+        // buffer). Empty FCS=0 frames append nothing.
+        loop {
+            self.decode_blocks(&mut input, BlockDecodingStrategy::UptoBytes(1024 * 1024))?;
+            self.collect_to_writer(&mut *output)
+                .map_err(FrameDecoderError::FailedToDrainDecodebuffer)?;
+            if self.is_finished() {
+                // Final flush of the retained window tail.
+                self.collect_to_writer(&mut *output)
+                    .map_err(FrameDecoderError::FailedToDrainDecodebuffer)?;
+                break;
+            }
+        }
+        #[cfg(feature = "hash")]
+        self.verify_content_checksum()?;
+        Ok(output.len() - start_len)
     }
 
     /// Default-feature decode_all_impl: no visitor parameter so the
