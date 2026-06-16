@@ -220,6 +220,13 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
     /// decoder is at a frame boundary (nothing partially decoded / undrained);
     /// otherwise it falls back to the generic grow-and-`read` loop so a caller
     /// that mixed `read` with `read_to_end` still gets correct output.
+    ///
+    /// Per the `Read::read_to_end` contract this consumes the source to EOF: if
+    /// the stream holds several concatenated frames they are ALL decoded (and
+    /// skippable frames skipped). To recover bytes that follow a single frame,
+    /// use `read` plus the
+    /// [`SkipFrame`](crate::decoding::errors::ReadFrameHeaderError::SkipFrame)
+    /// recreate-the-decoder pattern instead.
     #[cfg(feature = "std")]
     fn read_to_end(&mut self, output: &mut alloc::vec::Vec<u8>) -> Result<usize, Error> {
         // `new()` already read the frame header, so the fast path applies when
@@ -396,5 +403,49 @@ mod tests {
         assert_eq!(out, payload);
         // Mid-frame entry → fallback path, never the direct route.
         assert_eq!(decoder.decoder.direct_frames(), 0);
+    }
+
+    /// `read_to_end` reads the WHOLE source to EOF: a stream of concatenated
+    /// frames must decode every frame, not just the first. (The fast path
+    /// buffers the whole source, so dropping the trailing frame would lose
+    /// data.)
+    #[cfg(feature = "std")]
+    #[test]
+    fn read_to_end_decodes_all_concatenated_frames() {
+        use crate::encoding::{CompressionLevel, compress_slice_to_vec};
+        use alloc::vec::Vec;
+
+        let a: Vec<u8> = (0..5000u32).map(|i| (i & 0xFF) as u8).collect();
+        let b: Vec<u8> = (0..3000u32)
+            .map(|i| ((i.wrapping_mul(7)) & 0xFF) as u8)
+            .collect();
+        let mut stream = compress_slice_to_vec(&a, CompressionLevel::Level(3));
+        stream.extend_from_slice(&compress_slice_to_vec(&b, CompressionLevel::Level(3)));
+
+        let mut decoder = StreamingDecoder::new(stream.as_slice()).unwrap();
+        let mut out = Vec::new();
+        decoder.read_to_end(&mut out).unwrap();
+
+        let mut expected = a.clone();
+        expected.extend_from_slice(&b);
+        assert_eq!(out, expected);
+        // Both FCS-declared frames took the direct path.
+        assert_eq!(decoder.decoder.direct_frames(), 2);
+    }
+
+    /// An empty (`Frame_Content_Size = 0`) frame decodes to nothing through the
+    /// `read_to_end` fast path — the declared-size validation accepts the valid
+    /// case (produced == 0) instead of erroring.
+    #[cfg(feature = "std")]
+    #[test]
+    fn read_to_end_empty_frame_decodes_to_empty() {
+        use crate::encoding::{CompressionLevel, compress_slice_to_vec};
+        use alloc::vec::Vec;
+
+        let compressed = compress_slice_to_vec(&[], CompressionLevel::Level(3));
+        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut out = Vec::new();
+        decoder.read_to_end(&mut out).unwrap();
+        assert!(out.is_empty());
     }
 }

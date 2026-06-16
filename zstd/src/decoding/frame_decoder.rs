@@ -2342,31 +2342,70 @@ impl FrameDecoder {
         output: &mut Vec<u8>,
     ) -> Result<usize, FrameDecoderError> {
         let start_len = output.len();
-        let content_size = self
-            .state
-            .as_ref()
-            .expect("caller ensures is_at_frame_start")
-            .frame_header
-            .frame_content_size();
-        if content_size > 0 {
-            // FCS declared and non-empty: reserve exactly the frame's content
-            // and decode straight into it (single copy, no ring). The direct
-            // path writes precisely `content_size` bytes and never reads past
-            // the current write position, so the grown region is fully written.
-            let cs = content_size as usize;
-            output.resize(start_len + cs, 0);
+        // The current frame is already initialised (its header consumed by the
+        // caller). Decode it, then decode any FOLLOWING concatenated / skippable
+        // frames in `input` so the whole source is consumed to EOF and nothing
+        // is dropped (matching `read_to_end` semantics).
+        self.decode_one_frame_to_vec(&mut input, output)?;
+        while !input.is_empty() {
+            match self.init(&mut input) {
+                Ok(_) => {}
+                Err(FrameDecoderError::ReadFrameHeaderError(
+                    crate::decoding::errors::ReadFrameHeaderError::SkipFrame { length, .. },
+                )) => {
+                    input = input
+                        .get(length as usize..)
+                        .ok_or(FrameDecoderError::FailedToSkipFrame)?;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+            self.decode_one_frame_to_vec(&mut input, output)?;
+        }
+        Ok(output.len() - start_len)
+    }
+
+    /// Decode the single CURRENT (already-initialised) frame, APPENDING to
+    /// `output`. Helper for [`Self::decode_current_frame_to_vec`].
+    fn decode_one_frame_to_vec(
+        &mut self,
+        input: &mut &[u8],
+        output: &mut Vec<u8>,
+    ) -> Result<usize, FrameDecoderError> {
+        let frame_start = output.len();
+        let (content_size, fcs_declared) = {
+            let s = self.state.as_ref().expect("frame is initialised");
+            (
+                s.frame_header.frame_content_size(),
+                s.frame_header.fcs_declared(),
+            )
+        };
+        // Direct path: a declared, non-empty content size that FITS in `usize`
+        // (and whose end offset does not overflow). `usize::try_from` guards the
+        // 32-bit / oversized-FCS truncation; an unrepresentable size falls
+        // through to the window-bounded ring drain rather than allocating a
+        // truncated buffer that would violate `run_direct_decode`'s precondition.
+        if content_size > 0
+            && let Ok(cs) = usize::try_from(content_size)
+            && let Some(frame_end) = frame_start.checked_add(cs)
+        {
+            // Reserve exactly the frame's content and decode straight into it
+            // (single copy, no ring). The direct path writes precisely
+            // `content_size` bytes (erroring otherwise), so the grown region is
+            // fully written.
+            output.resize(frame_end, 0);
             let written =
-                self.run_direct_decode(&mut input, &mut output[start_len..], content_size)?;
-            output.truncate(start_len + written);
+                self.run_direct_decode(&mut *input, &mut output[frame_start..], content_size)?;
+            output.truncate(frame_start + written);
             #[cfg(feature = "hash")]
             self.verify_content_checksum()?;
             return Ok(written);
         }
-        // No declared size (or explicit FCS=0): window-bounded ring drain,
-        // appended directly to `output` via `collect_to_writer` (no staging
-        // buffer). Empty FCS=0 frames append nothing.
+        // No declared size, explicit FCS=0, or an unrepresentable FCS: window-
+        // bounded ring drain, appended directly to `output` via
+        // `collect_to_writer` (no staging buffer).
         loop {
-            self.decode_blocks(&mut input, BlockDecodingStrategy::UptoBytes(1024 * 1024))?;
+            self.decode_blocks(&mut *input, BlockDecodingStrategy::UptoBytes(1024 * 1024))?;
             self.collect_to_writer(&mut *output)
                 .map_err(FrameDecoderError::FailedToDrainDecodebuffer)?;
             if self.is_finished() {
@@ -2376,9 +2415,20 @@ impl FrameDecoder {
                 break;
             }
         }
+        let produced = (output.len() - frame_start) as u64;
+        // A declared content size MUST match what the body produced — otherwise
+        // accept the same corrupt frames `decode_all_impl` rejects (e.g. an
+        // explicit FCS=0 whose body emits bytes). Use `fcs_declared()` so an
+        // on-wire FCS=0 is validated, while an unknown size is not.
+        if fcs_declared && produced != content_size {
+            return Err(FrameDecoderError::FrameContentSizeMismatch {
+                declared: content_size,
+                produced,
+            });
+        }
         #[cfg(feature = "hash")]
         self.verify_content_checksum()?;
-        Ok(output.len() - start_len)
+        Ok(produced as usize)
     }
 
     /// Default-feature decode_all_impl: no visitor parameter so the
