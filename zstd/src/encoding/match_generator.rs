@@ -3828,6 +3828,7 @@ unsafe fn priceset_improved_mask8_avx2(next_cost: &[u32; 8], node_price: &[u32])
 /// for one match length — the exact `add_prices` chain the scalar loop uses,
 /// so the SoA vector path stays byte-identical.
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 fn priceset_next_cost(
     profile: HcOptimalCostProfile,
     stats: &HcOptState,
@@ -3896,13 +3897,53 @@ fn priceset_range_nonabort_scalar(
     new_last
 }
 
-/// AVX2 counterpart of [`priceset_range_nonabort_scalar`]: process the range
-/// in 8-lane chunks (scalar `next_cost`, same byte-identical chain; AVX2
-/// unsigned compare against the contiguous `node_prices` SoA array; scalar
-/// write of the improving lanes), scalar remainder tail. `#[target_feature]`
-/// + `#[inline]` so it folds into the avx2 optimal-parser wrapper's
-/// `target_feature` umbrella — no runtime feature detection, no call ABI,
-/// `cached_match_length_price` inlines.
+/// Vector-load 8 cached ml-prices for the optimal parser's price-set, given a
+/// run of 8 contiguous `[price, generation]` cells. Returns `Some(prices)`
+/// only when ALL eight cells are warm (`generation == stamp`) — the common
+/// (~91-98%) case — so the caller can fold them with one broadcast constant;
+/// any cold cell returns `None` to route the chunk through the scalar fill
+/// (which recomputes + repopulates the misses). Deinterleaves the price (even)
+/// and generation (odd) lanes with two `permutevar8x32` + a `permute2x128`.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn priceset_cached_prices8_avx2(cells: &[[u32; 2]], stamp: u32) -> Option<[u32; 8]> {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::{
+        __m256i, _mm256_castsi256_ps, _mm256_cmpeq_epi32, _mm256_loadu_si256, _mm256_movemask_ps,
+        _mm256_permute2x128_si256, _mm256_permutevar8x32_epi32, _mm256_set1_epi32,
+        _mm256_setr_epi32, _mm256_storeu_si256,
+    };
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::{
+        __m256i, _mm256_castsi256_ps, _mm256_cmpeq_epi32, _mm256_loadu_si256, _mm256_movemask_ps,
+        _mm256_permute2x128_si256, _mm256_permutevar8x32_epi32, _mm256_set1_epi32,
+        _mm256_setr_epi32, _mm256_storeu_si256,
+    };
+    debug_assert!(cells.len() >= 8);
+    let base = cells.as_ptr() as *const __m256i;
+    // v0 = [p0 g0 p1 g1 p2 g2 p3 g3], v1 = [p4 g4 .. p7 g7] (contiguous pairs).
+    let v0 = unsafe { _mm256_loadu_si256(base) };
+    let v1 = unsafe { _mm256_loadu_si256(base.add(1)) };
+    let idx_even = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
+    let idx_odd = _mm256_setr_epi32(1, 3, 5, 7, 1, 3, 5, 7);
+    // Gather the 8 generation stamps (odd lanes) and require an all-hit chunk.
+    let g_lo = _mm256_permutevar8x32_epi32(v0, idx_odd);
+    let g_hi = _mm256_permutevar8x32_epi32(v1, idx_odd);
+    let gens = _mm256_permute2x128_si256(g_lo, g_hi, 0x20);
+    let eq = _mm256_cmpeq_epi32(gens, _mm256_set1_epi32(stamp as i32));
+    if _mm256_movemask_ps(_mm256_castsi256_ps(eq)) as u8 != 0xFF {
+        return None;
+    }
+    // All hit: deinterleave the 8 cached prices (even lanes) in order.
+    let p_lo = _mm256_permutevar8x32_epi32(v0, idx_even);
+    let p_hi = _mm256_permutevar8x32_epi32(v1, idx_even);
+    let prices = _mm256_permute2x128_si256(p_lo, p_hi, 0x20);
+    let mut out = [0u32; 8];
+    unsafe { _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, prices) };
+    Some(out)
+}
+
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 #[inline]
@@ -3926,19 +3967,44 @@ unsafe fn priceset_range_nonabort_avx2(
 ) -> usize {
     let mut new_last = last_pos;
     let mut buf = [0u32; 8];
+    // Loop-invariant constant of the byte-identical next_cost chain:
+    // next_cost = add_prices(base_cost, add_prices(ll0_price,
+    //   match_price_from_parts(off_price, ml_price))) = c_base + ml_price,
+    // with c_base = base_cost + ll0_price + match_price_from_parts(off_price, 0)
+    // (folds the off_price + non-Predefined bias). Lets the all-hit chunk add
+    // the vector-loaded cached prices to one broadcast constant.
+    let c_base = base_cost
+        .wrapping_add(ll0_price)
+        .wrapping_add(profile.match_price_from_parts(off_price, 0, stats));
     let mut ml = start;
     while ml + 8 <= max + 1 {
-        for (k, slot) in buf.iter_mut().enumerate() {
-            *slot = priceset_next_cost(
-                profile,
-                stats,
-                ml_cache,
-                ml_stamp,
-                ml + k,
-                ll0_price,
-                off_price,
-                base_cost,
-            );
+        // Fast path: all 8 ml-price cells are warm (gen == stamp, ~91-98% of
+        // chunks) — vector-load + deinterleave the cached prices and fold the
+        // constant, instead of 8 scalar cache probes. Cold/out-of-cache chunks
+        // fall back to the scalar `next_cost` (which fills the cache).
+        let vectorised = if ml + 8 <= ml_cache.len() {
+            // SAFETY: avx2 umbrella; slice is >= 8 cells.
+            unsafe { priceset_cached_prices8_avx2(&ml_cache[ml..ml + 8], ml_stamp) }
+        } else {
+            None
+        };
+        if let Some(prices) = vectorised {
+            for (k, slot) in buf.iter_mut().enumerate() {
+                *slot = c_base.wrapping_add(prices[k]);
+            }
+        } else {
+            for (k, slot) in buf.iter_mut().enumerate() {
+                *slot = priceset_next_cost(
+                    profile,
+                    stats,
+                    ml_cache,
+                    ml_stamp,
+                    ml + k,
+                    ll0_price,
+                    off_price,
+                    base_cost,
+                );
+            }
         }
         let base_next = pos + ml;
         // SAFETY: caller's `target_feature(avx2)` umbrella covers this; both
