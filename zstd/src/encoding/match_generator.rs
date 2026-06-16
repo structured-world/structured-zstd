@@ -6354,7 +6354,22 @@ impl HcMatchGenerator {
         }
     }
 
+    /// Dispatcher: pick the dict-aware monomorph when a separate dms is primed
+    /// (attach-mode dictionary), else the no-dict monomorph. Mirrors upstream's
+    /// compile-time `dictMode` split — the `DICT = false` body carries no dms
+    /// code at all, so the no-dict hot path is unaffected by the dict search.
     pub(crate) fn start_matching_lazy(
+        &mut self,
+        handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        if self.table.dms.table().is_some() {
+            self.start_matching_lazy_impl::<true>(handle_sequence);
+        } else {
+            self.start_matching_lazy_impl::<false>(handle_sequence);
+        }
+    }
+
+    fn start_matching_lazy_impl<const DICT: bool>(
         &mut self,
         mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
     ) {
@@ -6385,8 +6400,13 @@ impl HcMatchGenerator {
             let abs_pos = current_abs_start + pos;
             let lit_len = pos - literals_start;
 
-            let best = self.hc.find_best_match(&self.table, abs_pos, lit_len);
-            if let Some(candidate) = self.hc.pick_lazy_match(&self.table, abs_pos, lit_len, best) {
+            let best = self
+                .hc
+                .find_best_match::<DICT>(&self.table, abs_pos, lit_len);
+            if let Some(candidate) =
+                self.hc
+                    .pick_lazy_match::<DICT>(&self.table, abs_pos, lit_len, best)
+            {
                 self.table
                     .insert_match_span(abs_pos, candidate.start + candidate.match_len);
                 let start = candidate.start - current_abs_start;
