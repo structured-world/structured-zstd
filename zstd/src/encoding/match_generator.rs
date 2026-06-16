@@ -3796,9 +3796,21 @@ macro_rules! start_matching_btlazy2_body {
 /// `min_epu32`: `nc <= np` iff `min(nc,np) == nc`, then exclude equality.
 /// Returns a bitmask (bit `k` set => lane `k` improves). Scalar fallback
 /// for non-x86 / no-AVX2.
-#[cfg(all(target_arch = "x86_64", feature = "kernel_avx2"))]
+/// 8-lane `next_cost < node_price` mask for the optimal-parser price-set
+/// loop. AVX2 lacks an unsigned `cmplt`, so derive `nc < np` from
+/// `min_epu32`: `nc <= np` iff `min(nc,np) == nc`, then exclude equality.
+/// Returns a bitmask (bit `k` set => lane `k` improves). Compiled on every
+/// x86 target (same as the avx2 collect kernel); the cargo `kernel_avx2`
+/// feature only gates the runtime dispatch, not compilation.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 unsafe fn priceset_improved_mask8_avx2(next_cost: &[u32; 8], node_price: &[u32]) -> u8 {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::{
+        __m256i, _mm256_andnot_si256, _mm256_castsi256_ps, _mm256_cmpeq_epi32, _mm256_loadu_si256,
+        _mm256_min_epu32, _mm256_movemask_ps,
+    };
+    #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::{
         __m256i, _mm256_andnot_si256, _mm256_castsi256_ps, _mm256_cmpeq_epi32, _mm256_loadu_si256,
         _mm256_min_epu32, _mm256_movemask_ps,
@@ -3812,36 +3824,90 @@ unsafe fn priceset_improved_mask8_avx2(next_cost: &[u32; 8], node_price: &[u32])
     _mm256_movemask_ps(_mm256_castsi256_ps(lt)) as u8
 }
 
-#[inline]
-fn priceset_improved_mask8(next_cost: &[u32; 8], node_price: &[u32]) -> u8 {
-    #[cfg(all(target_arch = "x86_64", feature = "kernel_avx2"))]
-    {
-        if std::is_x86_feature_detected!("avx2") {
-            // SAFETY: avx2 confirmed at runtime; both slices are >= 8 u32.
-            return unsafe { priceset_improved_mask8_avx2(next_cost, node_price) };
-        }
-    }
-    let mut mask = 0u8;
-    for k in 0..8 {
-        if next_cost[k] < node_price[k] {
-            mask |= 1 << k;
-        }
-    }
-    mask
+/// Inline `next_cost = base_cost + ll0_price + match_price_from_parts(off,ml)`
+/// for one match length — the exact `add_prices` chain the scalar loop uses,
+/// so the SoA vector path stays byte-identical.
+#[inline(always)]
+fn priceset_next_cost(
+    profile: HcOptimalCostProfile,
+    stats: &HcOptState,
+    ml_cache: &mut [[u32; 2]],
+    ml_stamp: u32,
+    match_len: usize,
+    ll0_price: u32,
+    off_price: u32,
+    base_cost: u32,
+) -> u32 {
+    let ml_price =
+        BtMatcher::cached_match_length_price(profile, stats, match_len, ml_cache, ml_stamp);
+    let seq_cost = BtMatcher::add_prices(
+        ll0_price,
+        profile.match_price_from_parts(off_price, ml_price, stats),
+    );
+    BtMatcher::add_prices(base_cost, seq_cost)
 }
 
-/// Vectorised price-set over the match-length range `[start, max]` for the
-/// NON-abort optimal modes (btultra / btultra2, `OPT_LEVEL >= 2`). Each
-/// `match_len` writes a distinct node `pos + match_len`, so iteration order
-/// is irrelevant and the loop vectorises; the scalar abort path (btopt,
-/// `OPT_LEVEL == 0`) keeps its reverse-iterate-then-break form. `next_cost`
-/// is computed with the same `add_prices` / `match_price_from_parts` chain
-/// as the scalar loop (byte-identical), and the improvement test reduces to
-/// `next_cost < node_prices[next]` because `reset_opt_nodes` set every
-/// beyond-frontier cell to `u32::MAX` (so `next > last_pos` is subsumed).
-/// Returns the highest written `next` (the caller folds it into `last_pos`).
+/// Scalar price-set over the match-length range `[start, max]` for the
+/// NON-abort optimal modes (btultra / btultra2). Each `match_len` writes a
+/// distinct node `pos + match_len`, so order is irrelevant; the improvement
+/// test reduces to `next_cost < node_prices[next]` (`reset_opt_nodes` set
+/// every beyond-frontier cell to `u32::MAX`, subsuming `next > last_pos`).
+/// `#[inline]` so it folds into each per-tier optimal-parser monomorphisation
+/// (no call overhead). Returns the highest written `next`.
+#[inline]
 #[allow(clippy::too_many_arguments)]
-fn priceset_range_nonabort(
+fn priceset_range_nonabort_scalar(
+    node_prices: &mut [u32],
+    nodes: &mut [HcOptimalNode],
+    ml_cache: &mut [[u32; 2]],
+    ml_stamp: u32,
+    profile: HcOptimalCostProfile,
+    stats: &HcOptState,
+    pos: usize,
+    start: usize,
+    max: usize,
+    ll0_price: u32,
+    off_price: u32,
+    base_cost: u32,
+    off: u32,
+    reps: [u32; 3],
+    last_pos: usize,
+) -> usize {
+    let mut new_last = last_pos;
+    for ml in start..=max {
+        let next_cost = priceset_next_cost(
+            profile, stats, ml_cache, ml_stamp, ml, ll0_price, off_price, base_cost,
+        );
+        let next = pos + ml;
+        if next_cost < node_prices[next] {
+            node_prices[next] = next_cost;
+            nodes[next] = HcOptimalNode {
+                price: next_cost,
+                off,
+                mlen: ml as u32,
+                litlen: 0,
+                reps,
+            };
+            if next > new_last {
+                new_last = next;
+            }
+        }
+    }
+    new_last
+}
+
+/// AVX2 counterpart of [`priceset_range_nonabort_scalar`]: process the range
+/// in 8-lane chunks (scalar `next_cost`, same byte-identical chain; AVX2
+/// unsigned compare against the contiguous `node_prices` SoA array; scalar
+/// write of the improving lanes), scalar remainder tail. `#[target_feature]`
+/// + `#[inline]` so it folds into the avx2 optimal-parser wrapper's
+/// `target_feature` umbrella — no runtime feature detection, no call ABI,
+/// `cached_match_length_price` inlines.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn priceset_range_nonabort_avx2(
     node_prices: &mut [u32],
     nodes: &mut [HcOptimalNode],
     ml_cache: &mut [[u32; 2]],
@@ -3863,43 +3929,45 @@ fn priceset_range_nonabort(
     let mut ml = start;
     while ml + 8 <= max + 1 {
         for (k, slot) in buf.iter_mut().enumerate() {
-            let ml_price =
-                BtMatcher::cached_match_length_price(profile, stats, ml + k, ml_cache, ml_stamp);
-            let seq_cost = BtMatcher::add_prices(
+            *slot = priceset_next_cost(
+                profile,
+                stats,
+                ml_cache,
+                ml_stamp,
+                ml + k,
                 ll0_price,
-                profile.match_price_from_parts(off_price, ml_price, stats),
+                off_price,
+                base_cost,
             );
-            *slot = BtMatcher::add_prices(base_cost, seq_cost);
         }
         let base_next = pos + ml;
-        let mask = priceset_improved_mask8(&buf, &node_prices[base_next..base_next + 8]);
-        if mask != 0 {
-            for k in 0..8 {
-                if mask & (1 << k) != 0 {
-                    let next = base_next + k;
-                    node_prices[next] = buf[k];
-                    nodes[next] = HcOptimalNode {
-                        price: buf[k],
-                        off,
-                        mlen: (ml + k) as u32,
-                        litlen: 0,
-                        reps,
-                    };
-                    if next > new_last {
-                        new_last = next;
-                    }
-                }
+        // SAFETY: caller's `target_feature(avx2)` umbrella covers this; both
+        // slices are exactly 8 u32 wide.
+        let mask =
+            unsafe { priceset_improved_mask8_avx2(&buf, &node_prices[base_next..base_next + 8]) };
+        let mut bits = mask;
+        while bits != 0 {
+            let k = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let next = base_next + k;
+            node_prices[next] = buf[k];
+            nodes[next] = HcOptimalNode {
+                price: buf[k],
+                off,
+                mlen: (ml + k) as u32,
+                litlen: 0,
+                reps,
+            };
+            if next > new_last {
+                new_last = next;
             }
         }
         ml += 8;
     }
     while ml <= max {
-        let ml_price = BtMatcher::cached_match_length_price(profile, stats, ml, ml_cache, ml_stamp);
-        let seq_cost = BtMatcher::add_prices(
-            ll0_price,
-            profile.match_price_from_parts(off_price, ml_price, stats),
+        let next_cost = priceset_next_cost(
+            profile, stats, ml_cache, ml_stamp, ml, ll0_price, off_price, base_cost,
         );
-        let next_cost = BtMatcher::add_prices(base_cost, seq_cost);
         let next = pos + ml;
         if next_cost < node_prices[next] {
             node_prices[next] = next_cost;
@@ -3929,7 +3997,8 @@ macro_rules! build_optimal_plan_impl_body {
         $initial_state:ident,
         $stats:ident,
         $out:ident,
-        $collect:ident $(,)?
+        $collect:ident,
+        $priceset:path $(,)?
     ) => {{
         let current_abs_end = $current_abs_start + $current_len;
         let min_match_len = HC_OPT_MIN_MATCH_LEN;
@@ -4540,61 +4609,35 @@ macro_rules! build_optimal_plan_impl_body {
                             break;
                         }
                     }
-                } else if max_match_len + 1 - start_len < 16 {
-                    // btultra / btultra2 SHORT range: stay inline-scalar (forward,
-                    // simplified `next_cost < node_prices[next]` compare — the
-                    // `next > last_pos` term is subsumed because reset set
-                    // beyond-frontier cells to MAX). No fn-call / vectorisation
-                    // overhead on the short loops that dominate by count.
-                    for match_len in start_len..=max_match_len {
-                        let next = pos + match_len;
-                        let ml_price = BtMatcher::cached_match_length_price(
-                            profile,
-                            $stats,
-                            match_len,
-                            &mut ml_cache,
-                            ml_price_stamp,
-                        );
-                        let seq_cost = BtMatcher::add_prices(
-                            ll0_price,
-                            profile.match_price_from_parts(off_price, ml_price, $stats),
-                        );
-                        let next_cost = BtMatcher::add_prices(base_cost, seq_cost);
-                        if next_cost < unsafe { *node_prices.get_unchecked(next) } {
-                            let slot = unsafe { nodes.get_unchecked_mut(next) };
-                            *slot = HcOptimalNode {
-                                price: next_cost,
-                                off: candidate.offset as u32,
-                                mlen: match_len as u32,
-                                litlen: 0,
-                                reps: base_reps,
-                            };
-                            unsafe { *node_prices.get_unchecked_mut(next) = next_cost };
-                            if next > last_pos {
-                                last_pos = next;
-                            }
-                        }
-                    }
                 } else {
-                    // btultra / btultra2 LONG range: SIMD-vectorised price-set
-                    // (compare against the contiguous node_prices SoA array).
-                    last_pos = last_pos.max(priceset_range_nonabort(
-                        &mut node_prices,
-                        &mut nodes,
-                        ml_cache,
-                        ml_price_stamp,
-                        profile,
-                        $stats,
-                        pos,
-                        start_len,
-                        max_match_len,
-                        ll0_price,
-                        off_price,
-                        base_cost,
-                        candidate.offset as u32,
-                        base_reps,
-                        last_pos,
-                    ));
+                    // btultra / btultra2 (OPT_LEVEL >= 2): no abort, each
+                    // match_len writes a distinct node => order-independent.
+                    // Dispatch to the per-tier price-set ($priceset is the
+                    // tier's fn: AVX2 SoA-vector compare for the avx2 wrapper,
+                    // inline scalar otherwise) — it folds into this wrapper's
+                    // monomorphisation, so no call ABI / runtime feature check.
+                    #[allow(unused_unsafe)]
+                    {
+                        last_pos = last_pos.max(unsafe {
+                            $priceset(
+                                &mut node_prices,
+                                &mut nodes,
+                                ml_cache,
+                                ml_price_stamp,
+                                profile,
+                                $stats,
+                                pos,
+                                start_len,
+                                max_match_len,
+                                ll0_price,
+                                off_price,
+                                base_cost,
+                                candidate.offset as u32,
+                                base_reps,
+                                last_pos,
+                            )
+                        });
+                    }
                 }
                 prev_max_len = prev_max_len.max(max_match_len);
             }
@@ -6323,6 +6366,7 @@ impl HcMatchGenerator {
             stats,
             out,
             collect_optimal_candidates_initialized_neon,
+            priceset_range_nonabort_scalar,
         )
     }
 
@@ -6351,6 +6395,7 @@ impl HcMatchGenerator {
             stats,
             out,
             collect_optimal_candidates_initialized_sse42,
+            priceset_range_nonabort_scalar,
         )
     }
 
@@ -6379,6 +6424,7 @@ impl HcMatchGenerator {
             stats,
             out,
             collect_optimal_candidates_initialized_avx2_bmi2,
+            priceset_range_nonabort_avx2,
         )
     }
 
@@ -6410,6 +6456,7 @@ impl HcMatchGenerator {
             stats,
             out,
             collect_optimal_candidates_initialized_scalar,
+            priceset_range_nonabort_scalar,
         )
     }
 
