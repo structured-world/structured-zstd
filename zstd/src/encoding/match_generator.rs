@@ -2383,7 +2383,15 @@ impl Matcher for MatchGeneratorDriver {
                 // allocation. Was the source of L10-lazy peak-alloc ~2.15x the
                 // donor on a 1 MiB input. Only applied when hinted; an
                 // unknown-size stream keeps the full level tables.
-                if hinted {
+                // Skip for dict-bearing frames: their `hc_cfg.{hash,chain}_log`
+                // were already sized to the dictionary content tier via
+                // `cdict_table_logs` (the dict supplies the long-distance
+                // matches, so upstream `ZSTD_createCDict` sizes the prepared
+                // tables to the dict, not the source window). Re-applying the
+                // source-window cap here would collapse those dict-tier logs
+                // back to the small hinted source — the same double-cap the
+                // synthesis sites avoid by using the un-hinted base width.
+                if hinted && !matches!(dict_hint, Some(size) if size > 0) {
                     let wlog = hc_hash_bits_for_window(table_window_size);
                     let uses_bt = matches!(
                         strategy_tag,
