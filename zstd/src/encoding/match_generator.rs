@@ -3903,6 +3903,98 @@ fn priceset_range_nonabort_scalar(
     new_last
 }
 
+/// Per-tier deinterleave + improve-mask correctness vs a scalar reference.
+/// Each tier's dispatch only fires on matching hardware (i9 picks AVX2 over
+/// SSE4.1, M1 picks NEON), so the non-dispatched tiers never run in the
+/// roundtrip suite; this exercises the deinterleave/mask helpers directly on
+/// whatever ISA the test host exposes (AVX2 + SSE4.1 on x86, NEON on aarch64).
+#[cfg(test)]
+#[test]
+fn priceset_tier_helpers_match_scalar() {
+    // Reference: gen-stamped contiguous cells -> ordered prices on all-warm.
+    fn scalar_deint<const W: usize>(cells: &[[u32; 2]], stamp: u32) -> Option<[u32; W]> {
+        let mut out = [0u32; W];
+        for k in 0..W {
+            if cells[k][1] != stamp {
+                return None;
+            }
+            out[k] = cells[k][0];
+        }
+        Some(out)
+    }
+    fn scalar_mask<const W: usize>(nc: &[u32; W], np: &[u32]) -> u8 {
+        let mut m = 0u8;
+        for k in 0..W {
+            if nc[k] < np[k] {
+                m |= 1 << k;
+            }
+        }
+        m
+    }
+    const S: u32 = 0x55;
+    let warm: [[u32; 2]; 4] = [[11, S], [22, S], [33, S], [44, S]];
+    let mut cold = warm;
+    cold[2][1] = S ^ 1; // one stale cell -> must yield None
+    let nc4: [u32; 4] = [10, 99, 30, 41];
+    let np4: [u32; 4] = [20, 21, 30, 99]; // lt: lane0 (10<20), lane3 (41<99)
+
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    unsafe {
+        assert_eq!(
+            priceset_cached_prices4_neon(&warm, S),
+            scalar_deint::<4>(&warm, S)
+        );
+        assert_eq!(priceset_cached_prices4_neon(&cold, S), None);
+        assert_eq!(
+            priceset_improved_mask4_neon(&nc4, &np4),
+            scalar_mask::<4>(&nc4, &np4)
+        );
+    }
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if std::is_x86_feature_detected!("sse4.2") {
+            unsafe {
+                assert_eq!(
+                    priceset_cached_prices4_sse41(&warm, S),
+                    scalar_deint::<4>(&warm, S)
+                );
+                assert_eq!(priceset_cached_prices4_sse41(&cold, S), None);
+                assert_eq!(
+                    priceset_improved_mask4_sse41(&nc4, &np4),
+                    scalar_mask::<4>(&nc4, &np4)
+                );
+            }
+        }
+        if std::is_x86_feature_detected!("avx2") {
+            let warm8: [[u32; 2]; 8] = [
+                [11, S],
+                [22, S],
+                [33, S],
+                [44, S],
+                [55, S],
+                [66, S],
+                [77, S],
+                [88, S],
+            ];
+            let mut cold8 = warm8;
+            cold8[5][1] = S ^ 1;
+            let nc8: [u32; 8] = [10, 99, 30, 41, 99, 60, 99, 80];
+            let np8: [u32; 8] = [20, 21, 30, 99, 50, 99, 70, 99];
+            unsafe {
+                assert_eq!(
+                    priceset_cached_prices8_avx2(&warm8, S),
+                    scalar_deint::<8>(&warm8, S)
+                );
+                assert_eq!(priceset_cached_prices8_avx2(&cold8, S), None);
+                assert_eq!(
+                    priceset_improved_mask8_avx2(&nc8, &np8),
+                    scalar_mask::<8>(&nc8, &np8)
+                );
+            }
+        }
+    }
+}
+
 /// Shared vectorised price-set loop body, generic over the SIMD width `W`.
 /// The per-tier `deint` (vector-load plus deinterleave of `W` cached prices,
 /// returning `Some` only on an all-warm chunk) and `mask` (per-tier
@@ -4185,6 +4277,111 @@ unsafe fn priceset_range_nonabort_neon(
         // SAFETY: both closures run inside this fn's neon target_feature umbrella.
         |cells, stamp| unsafe { priceset_cached_prices4_neon(cells, stamp) },
         |nc, np| unsafe { priceset_improved_mask4_neon(nc, np) },
+    )
+}
+
+/// SSE4.1 4-lane vector-load + deinterleave of cached ml-prices. Two 128-bit
+/// loads of `[price, gen]` pairs, `shuffle_epi32(0xD8)` groups prices then gens
+/// within each, `unpacklo/hi_epi64` separates them. `Some(prices)` only when
+/// all 4 generations equal `stamp`.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "sse4.2")]
+#[inline]
+unsafe fn priceset_cached_prices4_sse41(cells: &[[u32; 2]], stamp: u32) -> Option<[u32; 4]> {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::{
+        __m128i, _mm_castsi128_ps, _mm_cmpeq_epi32, _mm_loadu_si128, _mm_movemask_ps,
+        _mm_set1_epi32, _mm_shuffle_epi32, _mm_storeu_si128, _mm_unpackhi_epi64,
+        _mm_unpacklo_epi64,
+    };
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::{
+        __m128i, _mm_castsi128_ps, _mm_cmpeq_epi32, _mm_loadu_si128, _mm_movemask_ps,
+        _mm_set1_epi32, _mm_shuffle_epi32, _mm_storeu_si128, _mm_unpackhi_epi64,
+        _mm_unpacklo_epi64,
+    };
+    debug_assert!(cells.len() >= 4);
+    let base = cells.as_ptr() as *const __m128i;
+    let v0 = unsafe { _mm_loadu_si128(base) }; // [p0 g0 p1 g1]
+    let v1 = unsafe { _mm_loadu_si128(base.add(1)) }; // [p2 g2 p3 g3]
+    let s0 = _mm_shuffle_epi32(v0, 0xD8); // [p0 p1 g0 g1]
+    let s1 = _mm_shuffle_epi32(v1, 0xD8); // [p2 p3 g2 g3]
+    let gens = _mm_unpackhi_epi64(s0, s1); // [g0 g1 g2 g3]
+    let eq = _mm_cmpeq_epi32(gens, _mm_set1_epi32(stamp as i32));
+    if _mm_movemask_ps(_mm_castsi128_ps(eq)) as u8 & 0x0F != 0x0F {
+        return None;
+    }
+    let prices = _mm_unpacklo_epi64(s0, s1); // [p0 p1 p2 p3]
+    let mut out = [0u32; 4];
+    unsafe { _mm_storeu_si128(out.as_mut_ptr() as *mut __m128i, prices) };
+    Some(out)
+}
+
+/// SSE4.1 4-lane `next_cost < node_price` bitmask (unsigned compare via
+/// `min_epu32`, like the AVX2 path).
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "sse4.2")]
+#[inline]
+unsafe fn priceset_improved_mask4_sse41(next_cost: &[u32; 4], node_price: &[u32]) -> u8 {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::{
+        __m128i, _mm_andnot_si128, _mm_castsi128_ps, _mm_cmpeq_epi32, _mm_loadu_si128,
+        _mm_min_epu32, _mm_movemask_ps,
+    };
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::{
+        __m128i, _mm_andnot_si128, _mm_castsi128_ps, _mm_cmpeq_epi32, _mm_loadu_si128,
+        _mm_min_epu32, _mm_movemask_ps,
+    };
+    let nc = unsafe { _mm_loadu_si128(next_cost.as_ptr() as *const __m128i) };
+    let np = unsafe { _mm_loadu_si128(node_price.as_ptr() as *const __m128i) };
+    let min = _mm_min_epu32(nc, np);
+    let le = _mm_cmpeq_epi32(min, nc);
+    let eq = _mm_cmpeq_epi32(nc, np);
+    let lt = _mm_andnot_si128(eq, le);
+    (_mm_movemask_ps(_mm_castsi128_ps(lt)) as u8) & 0x0F
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "sse4.2")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn priceset_range_nonabort_sse41(
+    node_prices: &mut [u32],
+    nodes: &mut [HcOptimalNode],
+    ml_cache: &mut [[u32; 2]],
+    ml_stamp: u32,
+    profile: HcOptimalCostProfile,
+    stats: &HcOptState,
+    pos: usize,
+    start: usize,
+    max: usize,
+    ll0_price: u32,
+    off_price: u32,
+    base_cost: u32,
+    off: u32,
+    reps: [u32; 3],
+    last_pos: usize,
+) -> usize {
+    priceset_range_vec::<4>(
+        node_prices,
+        nodes,
+        ml_cache,
+        ml_stamp,
+        profile,
+        stats,
+        pos,
+        start,
+        max,
+        ll0_price,
+        off_price,
+        base_cost,
+        off,
+        reps,
+        last_pos,
+        // SAFETY: both closures run inside this fn's sse4.2 target_feature umbrella.
+        |cells, stamp| unsafe { priceset_cached_prices4_sse41(cells, stamp) },
+        |nc, np| unsafe { priceset_improved_mask4_sse41(nc, np) },
     )
 }
 
@@ -6596,7 +6793,7 @@ impl HcMatchGenerator {
             stats,
             out,
             collect_optimal_candidates_initialized_sse42,
-            priceset_range_nonabort_scalar,
+            priceset_range_nonabort_sse41,
         )
     }
 
