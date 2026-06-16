@@ -3857,10 +3857,14 @@ fn priceset_next_cost(
 /// (no call overhead). Returns the highest written `next`.
 #[inline]
 #[allow(clippy::too_many_arguments)]
-// Used by the scalar / sse42 / wasm DP wrappers; on aarch64 the dispatch only
-// reaches the neon wrapper, so this is cfg-dead there.
+// Used by the scalar / sse42 DP wrappers; on aarch64 the dispatch only reaches
+// the neon wrapper and on wasm+simd128 only the simd128 wrapper, so this is
+// cfg-dead on those targets.
 #[cfg_attr(
-    all(target_arch = "aarch64", target_endian = "little"),
+    any(
+        all(target_arch = "aarch64", target_endian = "little"),
+        all(target_arch = "wasm32", target_feature = "simd128")
+    ),
     allow(dead_code)
 )]
 fn priceset_range_nonabort_scalar(
@@ -4008,6 +4012,18 @@ fn priceset_tier_helpers_match_scalar() {
 /// improve-ratio probe). Same signature tail as the scalar variant.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
+// Instantiated only by a vector tier wrapper (avx2/sse4.1 on x86, neon on
+// aarch64, simd128 on wasm+simd128); a target with none of those (e.g.
+// wasm without +simd128) uses only the scalar range, leaving this generic dead.
+#[cfg_attr(
+    not(any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_endian = "little"),
+        all(target_arch = "wasm32", target_feature = "simd128")
+    )),
+    allow(dead_code)
+)]
 fn priceset_range_vec<const W: usize>(
     node_prices: &mut [u32],
     nodes: &mut [HcOptimalNode],
@@ -4382,6 +4398,88 @@ unsafe fn priceset_range_nonabort_sse41(
         // SAFETY: both closures run inside this fn's sse4.2 target_feature umbrella.
         |cells, stamp| unsafe { priceset_cached_prices4_sse41(cells, stamp) },
         |nc, np| unsafe { priceset_improved_mask4_sse41(nc, np) },
+    )
+}
+
+/// wasm `simd128` 4-lane vector-load + deinterleave of cached ml-prices.
+/// `u32x4_shuffle` selects the price (even) and gen (odd) lanes across the two
+/// loaded vectors natively. `Some(prices)` only when all 4 gens equal `stamp`
+/// (`u32x4_all_true` of the equality vector).
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[target_feature(enable = "simd128")]
+#[inline]
+unsafe fn priceset_cached_prices4_simd128(cells: &[[u32; 2]], stamp: u32) -> Option<[u32; 4]> {
+    use core::arch::wasm32::{
+        u32x4_all_true, u32x4_eq, u32x4_shuffle, u32x4_splat, v128, v128_load, v128_store,
+    };
+    debug_assert!(cells.len() >= 4);
+    let base = cells.as_ptr() as *const v128;
+    let v0 = unsafe { v128_load(base) }; // [p0 g0 p1 g1]
+    let v1 = unsafe { v128_load(base.add(1)) }; // [p2 g2 p3 g3]
+    // Lanes 0..3 index v0, 4..7 index v1.
+    let gens = u32x4_shuffle::<1, 3, 5, 7>(v0, v1); // [g0 g1 g2 g3]
+    let eq = u32x4_eq(gens, u32x4_splat(stamp));
+    if !u32x4_all_true(eq) {
+        return None;
+    }
+    let prices = u32x4_shuffle::<0, 2, 4, 6>(v0, v1); // [p0 p1 p2 p3]
+    let mut out = [0u32; 4];
+    unsafe { v128_store(out.as_mut_ptr() as *mut v128, prices) };
+    Some(out)
+}
+
+/// wasm `simd128` 4-lane `next_cost < node_price` bitmask. wasm has a native
+/// unsigned compare (`u32x4_lt`) and `u32x4_bitmask` to pack the lanes.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[target_feature(enable = "simd128")]
+#[inline]
+unsafe fn priceset_improved_mask4_simd128(next_cost: &[u32; 4], node_price: &[u32]) -> u8 {
+    use core::arch::wasm32::{u32x4_bitmask, u32x4_lt, v128, v128_load};
+    let nc = unsafe { v128_load(next_cost.as_ptr() as *const v128) };
+    let np = unsafe { v128_load(node_price.as_ptr() as *const v128) };
+    u32x4_bitmask(u32x4_lt(nc, np))
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[target_feature(enable = "simd128")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn priceset_range_nonabort_simd128(
+    node_prices: &mut [u32],
+    nodes: &mut [HcOptimalNode],
+    ml_cache: &mut [[u32; 2]],
+    ml_stamp: u32,
+    profile: HcOptimalCostProfile,
+    stats: &HcOptState,
+    pos: usize,
+    start: usize,
+    max: usize,
+    ll0_price: u32,
+    off_price: u32,
+    base_cost: u32,
+    off: u32,
+    reps: [u32; 3],
+    last_pos: usize,
+) -> usize {
+    priceset_range_vec::<4>(
+        node_prices,
+        nodes,
+        ml_cache,
+        ml_stamp,
+        profile,
+        stats,
+        pos,
+        start,
+        max,
+        ll0_price,
+        off_price,
+        base_cost,
+        off,
+        reps,
+        last_pos,
+        // SAFETY: both closures run inside this fn's simd128 target_feature umbrella.
+        |cells, stamp| unsafe { priceset_cached_prices4_simd128(cells, stamp) },
+        |nc, np| unsafe { priceset_improved_mask4_simd128(nc, np) },
     )
 }
 
@@ -6719,10 +6817,23 @@ impl HcMatchGenerator {
                     ),
             }
         }
+        // wasm with simd128: route through the simd128 DP body (4-lane price-set).
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        unsafe {
+            self.build_optimal_plan_impl_simd128::<S, ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(
+                current,
+                current_abs_start,
+                current_len,
+                initial_state,
+                stats,
+                out,
+            )
+        }
         #[cfg(not(any(
             all(target_arch = "aarch64", target_endian = "little"),
             target_arch = "x86",
-            target_arch = "x86_64"
+            target_arch = "x86_64",
+            all(target_arch = "wasm32", target_feature = "simd128")
         )))]
         {
             self.build_optimal_plan_impl_scalar::<S, ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(
@@ -6831,6 +6942,13 @@ impl HcMatchGenerator {
     // variants where callees are `unsafe fn`. The scalar wrappers route
     // through safe fns, so those blocks are redundant on this path.
     #[allow(unused_unsafe)]
+    // The dispatch reaches this only on non-SIMD x86 (Scalar tier) and the
+    // portable fallback; on wasm+simd128 the simd128 wrapper is selected, so
+    // this is cfg-dead there.
+    #[cfg_attr(
+        all(target_arch = "wasm32", target_feature = "simd128"),
+        allow(dead_code)
+    )]
     fn build_optimal_plan_impl_scalar<
         S: super::strategy::Strategy,
         const ACCURATE_PRICE: bool,
@@ -6855,6 +6973,41 @@ impl HcMatchGenerator {
             out,
             collect_optimal_candidates_initialized_scalar,
             priceset_range_nonabort_scalar,
+        )
+    }
+
+    /// wasm `simd128`-umbrella DP body: scalar candidate collection (no wasm
+    /// collect kernel) but the simd128 4-lane price-set.
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    #[target_feature(enable = "simd128")]
+    // With `+simd128` in the wasm baseline the shared body macro's `unsafe`
+    // blocks (needed by the safe scalar wrapper) are redundant inside this
+    // target_feature fn.
+    #[allow(unused_unsafe)]
+    unsafe fn build_optimal_plan_impl_simd128<
+        S: super::strategy::Strategy,
+        const ACCURATE_PRICE: bool,
+        const FAVOR_SMALL_OFFSETS: bool,
+    >(
+        &mut self,
+        current: &[u8],
+        current_abs_start: usize,
+        current_len: usize,
+        initial_state: HcOptimalPlanState,
+        stats: &HcOptState,
+        out: &mut Vec<HcOptimalSequence>,
+    ) -> (u32, [u32; 3], usize, usize) {
+        build_optimal_plan_impl_body!(
+            self,
+            S,
+            current,
+            current_abs_start,
+            current_len,
+            initial_state,
+            stats,
+            out,
+            collect_optimal_candidates_initialized_scalar,
+            priceset_range_nonabort_simd128,
         )
     }
 
