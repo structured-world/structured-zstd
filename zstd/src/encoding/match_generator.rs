@@ -3857,6 +3857,12 @@ fn priceset_next_cost(
 /// (no call overhead). Returns the highest written `next`.
 #[inline]
 #[allow(clippy::too_many_arguments)]
+// Used by the scalar / sse42 / wasm DP wrappers; on aarch64 the dispatch only
+// reaches the neon wrapper, so this is cfg-dead there.
+#[cfg_attr(
+    all(target_arch = "aarch64", target_endian = "little"),
+    allow(dead_code)
+)]
 fn priceset_range_nonabort_scalar(
     node_prices: &mut [u32],
     nodes: &mut [HcOptimalNode],
@@ -3893,6 +3899,115 @@ fn priceset_range_nonabort_scalar(
                 new_last = next;
             }
         }
+    }
+    new_last
+}
+
+/// Shared vectorised price-set loop body, generic over the SIMD width `W`.
+/// The per-tier `deint` (vector-load plus deinterleave of `W` cached prices,
+/// returning `Some` only on an all-warm chunk) and `mask` (per-tier
+/// `next_cost` less-than `node_price` bitmask) are passed as zero-sized
+/// `impl Fn`s. `#[inline(always)]` plus monomorphisation folds `deint` and
+/// `mask` directly into each per-tier wrapper's `target_feature` umbrella, so
+/// the intrinsics inline with no call ABI and no runtime feature detection.
+/// Cold or out-of-cache chunks, and the sub-`W` remainder, fall back to the
+/// scalar `priceset_next_cost` (which fills the cache); writes are
+/// scalar-scatter on the improving lanes (1-8% of compares, per the
+/// improve-ratio probe). Same signature tail as the scalar variant.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn priceset_range_vec<const W: usize>(
+    node_prices: &mut [u32],
+    nodes: &mut [HcOptimalNode],
+    ml_cache: &mut [[u32; 2]],
+    ml_stamp: u32,
+    profile: HcOptimalCostProfile,
+    stats: &HcOptState,
+    pos: usize,
+    start: usize,
+    max: usize,
+    ll0_price: u32,
+    off_price: u32,
+    base_cost: u32,
+    off: u32,
+    reps: [u32; 3],
+    last_pos: usize,
+    deint: impl Fn(&[[u32; 2]], u32) -> Option<[u32; W]>,
+    mask: impl Fn(&[u32; W], &[u32]) -> u8,
+) -> usize {
+    let mut new_last = last_pos;
+    let mut buf = [0u32; W];
+    // Loop-invariant constant of the byte-identical next_cost chain:
+    // next_cost = add_prices(base_cost, add_prices(ll0_price,
+    //   match_price_from_parts(off_price, ml_price))) = c_base + ml_price,
+    // c_base = base_cost + ll0_price + match_price_from_parts(off_price, 0).
+    let c_base = base_cost
+        .wrapping_add(ll0_price)
+        .wrapping_add(profile.match_price_from_parts(off_price, 0, stats));
+    let mut ml = start;
+    while ml + W <= max + 1 {
+        let vectorised = if ml + W <= ml_cache.len() {
+            deint(&ml_cache[ml..ml + W], ml_stamp)
+        } else {
+            None
+        };
+        if let Some(prices) = vectorised {
+            for (k, slot) in buf.iter_mut().enumerate() {
+                *slot = c_base.wrapping_add(prices[k]);
+            }
+        } else {
+            for (k, slot) in buf.iter_mut().enumerate() {
+                *slot = priceset_next_cost(
+                    profile,
+                    stats,
+                    ml_cache,
+                    ml_stamp,
+                    ml + k,
+                    ll0_price,
+                    off_price,
+                    base_cost,
+                );
+            }
+        }
+        let base_next = pos + ml;
+        let mut bits = mask(&buf, &node_prices[base_next..base_next + W]);
+        while bits != 0 {
+            let k = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let next = base_next + k;
+            node_prices[next] = buf[k];
+            nodes[next] = HcOptimalNode {
+                price: buf[k],
+                off,
+                mlen: (ml + k) as u32,
+                litlen: 0,
+                reps,
+            };
+            if next > new_last {
+                new_last = next;
+            }
+        }
+        ml += W;
+    }
+    while ml <= max {
+        let next_cost = priceset_next_cost(
+            profile, stats, ml_cache, ml_stamp, ml, ll0_price, off_price, base_cost,
+        );
+        let next = pos + ml;
+        if next_cost < node_prices[next] {
+            node_prices[next] = next_cost;
+            nodes[next] = HcOptimalNode {
+                price: next_cost,
+                off,
+                mlen: ml as u32,
+                litlen: 0,
+                reps,
+            };
+            if next > new_last {
+                new_last = next;
+            }
+        }
+        ml += 1;
     }
     new_last
 }
@@ -3968,92 +4083,109 @@ unsafe fn priceset_range_nonabort_avx2(
     reps: [u32; 3],
     last_pos: usize,
 ) -> usize {
-    let mut new_last = last_pos;
-    let mut buf = [0u32; 8];
-    // Loop-invariant constant of the byte-identical next_cost chain:
-    // next_cost = add_prices(base_cost, add_prices(ll0_price,
-    //   match_price_from_parts(off_price, ml_price))) = c_base + ml_price,
-    // with c_base = base_cost + ll0_price + match_price_from_parts(off_price, 0)
-    // (folds the off_price + non-Predefined bias). Lets the all-hit chunk add
-    // the vector-loaded cached prices to one broadcast constant.
-    let c_base = base_cost
-        .wrapping_add(ll0_price)
-        .wrapping_add(profile.match_price_from_parts(off_price, 0, stats));
-    let mut ml = start;
-    while ml + 8 <= max + 1 {
-        // Fast path: all 8 ml-price cells are warm (gen == stamp, ~91-98% of
-        // chunks) — vector-load + deinterleave the cached prices and fold the
-        // constant, instead of 8 scalar cache probes. Cold/out-of-cache chunks
-        // fall back to the scalar `next_cost` (which fills the cache).
-        let vectorised = if ml + 8 <= ml_cache.len() {
-            // SAFETY: avx2 umbrella; slice is >= 8 cells.
-            unsafe { priceset_cached_prices8_avx2(&ml_cache[ml..ml + 8], ml_stamp) }
-        } else {
-            None
-        };
-        if let Some(prices) = vectorised {
-            for (k, slot) in buf.iter_mut().enumerate() {
-                *slot = c_base.wrapping_add(prices[k]);
-            }
-        } else {
-            for (k, slot) in buf.iter_mut().enumerate() {
-                *slot = priceset_next_cost(
-                    profile,
-                    stats,
-                    ml_cache,
-                    ml_stamp,
-                    ml + k,
-                    ll0_price,
-                    off_price,
-                    base_cost,
-                );
-            }
-        }
-        let base_next = pos + ml;
-        // SAFETY: caller's `target_feature(avx2)` umbrella covers this; both
-        // slices are exactly 8 u32 wide.
-        let mask =
-            unsafe { priceset_improved_mask8_avx2(&buf, &node_prices[base_next..base_next + 8]) };
-        let mut bits = mask;
-        while bits != 0 {
-            let k = bits.trailing_zeros() as usize;
-            bits &= bits - 1;
-            let next = base_next + k;
-            node_prices[next] = buf[k];
-            nodes[next] = HcOptimalNode {
-                price: buf[k],
-                off,
-                mlen: (ml + k) as u32,
-                litlen: 0,
-                reps,
-            };
-            if next > new_last {
-                new_last = next;
-            }
-        }
-        ml += 8;
+    priceset_range_vec::<8>(
+        node_prices,
+        nodes,
+        ml_cache,
+        ml_stamp,
+        profile,
+        stats,
+        pos,
+        start,
+        max,
+        ll0_price,
+        off_price,
+        base_cost,
+        off,
+        reps,
+        last_pos,
+        // SAFETY: both closures run inside this fn's avx2 target_feature umbrella.
+        |cells, stamp| unsafe { priceset_cached_prices8_avx2(cells, stamp) },
+        |nc, np| unsafe { priceset_improved_mask8_avx2(nc, np) },
+    )
+}
+
+/// NEON 4-lane vector-load + deinterleave of cached ml-prices. `vld2q_u32`
+/// deinterleaves the 4 contiguous `[price, generation]` pairs natively into
+/// two registers (prices, gens) — no shuffle chain. `Some(prices)` only when
+/// all 4 generations equal `stamp` (`vminvq` of the equality mask is all-ones).
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn priceset_cached_prices4_neon(cells: &[[u32; 2]], stamp: u32) -> Option<[u32; 4]> {
+    use core::arch::aarch64::{vceqq_u32, vdupq_n_u32, vld2q_u32, vminvq_u32, vst1q_u32};
+    debug_assert!(cells.len() >= 4);
+    // SAFETY: caller's neon umbrella; `cells` is >= 4 pairs = 8 contiguous u32.
+    let pair = unsafe { vld2q_u32(cells.as_ptr() as *const u32) };
+    let eq = vceqq_u32(pair.1, vdupq_n_u32(stamp));
+    if vminvq_u32(eq) != u32::MAX {
+        return None;
     }
-    while ml <= max {
-        let next_cost = priceset_next_cost(
-            profile, stats, ml_cache, ml_stamp, ml, ll0_price, off_price, base_cost,
-        );
-        let next = pos + ml;
-        if next_cost < node_prices[next] {
-            node_prices[next] = next_cost;
-            nodes[next] = HcOptimalNode {
-                price: next_cost,
-                off,
-                mlen: ml as u32,
-                litlen: 0,
-                reps,
-            };
-            if next > new_last {
-                new_last = next;
-            }
-        }
-        ml += 1;
-    }
-    new_last
+    let mut out = [0u32; 4];
+    unsafe { vst1q_u32(out.as_mut_ptr(), pair.0) };
+    Some(out)
+}
+
+/// NEON 4-lane `next_cost < node_price` bitmask. NEON has an unsigned compare
+/// (`vcltq_u32`) but no movemask; AND the all-ones lane mask with lane weights
+/// `[1,2,4,8]` and horizontal-add (`vaddvq_u32`) to pack the 4 bits.
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn priceset_improved_mask4_neon(next_cost: &[u32; 4], node_price: &[u32]) -> u8 {
+    use core::arch::aarch64::{vaddvq_u32, vandq_u32, vcltq_u32, vld1q_u32, vst1q_u32};
+    // SAFETY: neon umbrella; both spans are 4 u32 wide.
+    let nc = unsafe { vld1q_u32(next_cost.as_ptr()) };
+    let np = unsafe { vld1q_u32(node_price.as_ptr()) };
+    let lt = vcltq_u32(nc, np);
+    let weights: [u32; 4] = [1, 2, 4, 8];
+    let w = unsafe { vld1q_u32(weights.as_ptr()) };
+    let bits = vandq_u32(lt, w);
+    let _ = vst1q_u32; // silence unused import on some toolchains
+    vaddvq_u32(bits) as u8
+}
+
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[target_feature(enable = "neon")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn priceset_range_nonabort_neon(
+    node_prices: &mut [u32],
+    nodes: &mut [HcOptimalNode],
+    ml_cache: &mut [[u32; 2]],
+    ml_stamp: u32,
+    profile: HcOptimalCostProfile,
+    stats: &HcOptState,
+    pos: usize,
+    start: usize,
+    max: usize,
+    ll0_price: u32,
+    off_price: u32,
+    base_cost: u32,
+    off: u32,
+    reps: [u32; 3],
+    last_pos: usize,
+) -> usize {
+    priceset_range_vec::<4>(
+        node_prices,
+        nodes,
+        ml_cache,
+        ml_stamp,
+        profile,
+        stats,
+        pos,
+        start,
+        max,
+        ll0_price,
+        off_price,
+        base_cost,
+        off,
+        reps,
+        last_pos,
+        // SAFETY: both closures run inside this fn's neon target_feature umbrella.
+        |cells, stamp| unsafe { priceset_cached_prices4_neon(cells, stamp) },
+        |nc, np| unsafe { priceset_improved_mask4_neon(nc, np) },
+    )
 }
 
 macro_rules! build_optimal_plan_impl_body {
@@ -6435,7 +6567,7 @@ impl HcMatchGenerator {
             stats,
             out,
             collect_optimal_candidates_initialized_neon,
-            priceset_range_nonabort_scalar,
+            priceset_range_nonabort_neon,
         )
     }
 
