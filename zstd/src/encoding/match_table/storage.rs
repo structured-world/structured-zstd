@@ -222,8 +222,27 @@ pub(crate) const HC3_HASH_LOG: usize = 17;
 /// with its OWN compare budget so dictionary candidates are reachable even
 /// when the live tree's budget is spent on recent positions. Slots store
 /// `dict_rel + 1` (dictionary-relative concat index); `0` is empty.
+/// Which matcher built a [`DmsDictTables`]: the hash-chain (`prime_dms_hc`) and
+/// the binary-tree (`prime_dms_bt`) populate `hash_table` / `chain_table` with
+/// incompatible meanings, so a cached dms must only be reused by the SAME
+/// builder. Part of the cache-reuse key alongside `mls` / `hash_log` / region so
+/// a reused compressor that switches level across the HC↔BT boundary (same
+/// `mls` / `hash_log`) rebuilds instead of reinterpreting the other layout.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub(crate) enum DmsDictLayout {
+    /// Unbuilt / invalidated — never matches a reuse probe.
+    #[default]
+    None,
+    /// Hash-chain dms (`prime_dms_hc`): single-link chain for the lazy backend.
+    Hc,
+    /// Binary-tree dms (`prime_dms_bt`): unsorted DUBT for the optimal backend.
+    Bt,
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct DmsDictTables {
+    /// Builder that populated the tables (HC vs BT), part of the reuse key.
+    pub(crate) layout: DmsDictLayout,
     /// Per-hash-bucket binary-tree root (`1 << hash_log` entries), packed
     /// `dict_rel + 1` (`0` = empty).
     pub(crate) hash_table: Vec<u32>,
@@ -244,7 +263,6 @@ pub(crate) struct DmsDictTables {
 /// tables. Methods on this struct contain only logic that's identical
 /// between HC and BT modes — backend-specific table interpretation
 /// lives in the matcher modules.
-#[derive(Clone)]
 pub(crate) struct MatchTable {
     pub(crate) max_window_size: usize,
     /// Per-chunk lengths of the live window, in add order. The bytes
@@ -306,6 +324,79 @@ pub(crate) struct MatchTable {
     /// Active borrowed block range `[start, end)` within `borrowed_input`,
     /// staged before each borrowed scan.
     pub(crate) borrowed_block: Option<(usize, usize)>,
+}
+
+// Manual `Clone` (not derived) so the per-frame dictionary-snapshot restore can
+// `clone_from` the retained `history` / hash / chain / hash3 / dms buffers
+// in place — the derived `clone_from` is `*self = source.clone()`, a full
+// per-frame allocate+copy+drop that dominated small `compress-dict` HC/lazy
+// frames (donor reuses the CDict tables in place). `clone()` is the obvious
+// field-wise copy; `clone_from()` reuses every heap buffer.
+impl Clone for MatchTable {
+    fn clone(&self) -> Self {
+        Self {
+            max_window_size: self.max_window_size,
+            chunk_lens: self.chunk_lens.clone(),
+            window_size: self.window_size,
+            history: self.history.clone(),
+            history_start: self.history_start,
+            history_abs_start: self.history_abs_start,
+            position_base: self.position_base,
+            index_shift: self.index_shift,
+            offset_hist: self.offset_hist,
+            hash_table: self.hash_table.clone(),
+            hash3_table: self.hash3_table.clone(),
+            chain_table: self.chain_table.clone(),
+            hash_log: self.hash_log,
+            chain_log: self.chain_log,
+            hash3_log: self.hash3_log,
+            next_to_update3: self.next_to_update3,
+            skip_insert_until_abs: self.skip_insert_until_abs,
+            dictionary_limit_abs: self.dictionary_limit_abs,
+            dictionary_primed_for_frame: self.dictionary_primed_for_frame,
+            allow_zero_relative_position: self.allow_zero_relative_position,
+            search_depth: self.search_depth,
+            is_btultra2: self.is_btultra2,
+            uses_bt: self.uses_bt,
+            search_mls: self.search_mls,
+            dms: self.dms.clone(),
+            borrowed_input: self.borrowed_input,
+            borrowed_block: self.borrowed_block,
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        // Heap buffers: reuse the existing allocation (Vec/VecDeque/DictAttach
+        // `clone_from` keep capacity and overwrite in place).
+        self.chunk_lens.clone_from(&source.chunk_lens);
+        self.history.clone_from(&source.history);
+        self.hash_table.clone_from(&source.hash_table);
+        self.hash3_table.clone_from(&source.hash3_table);
+        self.chain_table.clone_from(&source.chain_table);
+        self.dms.clone_from(&source.dms);
+        // Scalars / Copy fields.
+        self.max_window_size = source.max_window_size;
+        self.window_size = source.window_size;
+        self.history_start = source.history_start;
+        self.history_abs_start = source.history_abs_start;
+        self.position_base = source.position_base;
+        self.index_shift = source.index_shift;
+        self.offset_hist = source.offset_hist;
+        self.hash_log = source.hash_log;
+        self.chain_log = source.chain_log;
+        self.hash3_log = source.hash3_log;
+        self.next_to_update3 = source.next_to_update3;
+        self.skip_insert_until_abs = source.skip_insert_until_abs;
+        self.dictionary_limit_abs = source.dictionary_limit_abs;
+        self.dictionary_primed_for_frame = source.dictionary_primed_for_frame;
+        self.allow_zero_relative_position = source.allow_zero_relative_position;
+        self.search_depth = source.search_depth;
+        self.is_btultra2 = source.is_btultra2;
+        self.uses_bt = source.uses_bt;
+        self.search_mls = source.search_mls;
+        self.borrowed_input = source.borrowed_input;
+        self.borrowed_block = source.borrowed_block;
+    }
 }
 
 impl MatchTable {
@@ -412,11 +503,21 @@ impl MatchTable {
     #[inline]
     pub(crate) fn insert_position_no_rebase(&mut self, abs_pos: usize) {
         let idx = abs_pos.wrapping_sub(self.history_abs_start);
-        let concat = &self.history[self.history_start..];
-        if idx + 4 > concat.len() {
-            return;
-        }
-        let hash = Self::hash_position_at(concat, idx, self.hash_log, 4);
+        // Borrowed-aware: read the SAME bytes the finder hashes via
+        // `live_history()` (borrowed window in no-copy mode, owned mirror
+        // otherwise). Reading `self.history[history_start..]` directly would
+        // hash the empty owned mirror on the borrowed HC lazy/greedy path
+        // (live=input, mirror=0) — the insert would skip or hash garbage while
+        // the finder hashes the real input, so the chain stays empty and no
+        // matches are ever found. `hash` is the only value needed past this
+        // borrow, so it ends before the table mutation below.
+        let hash = {
+            let concat = self.live_history();
+            if idx + 4 > concat.len() {
+                return;
+            }
+            Self::hash_position_at(concat, idx, self.hash_log, 4)
+        };
         let Some(relative_pos) = self.relative_position(abs_pos) else {
             return;
         };
@@ -616,10 +717,9 @@ impl MatchTable {
         // change lands here with a different shape and rebuilds.
         if self.dms.is_primed()
             && self.dms.region_len() == region
-            && self
-                .dms
-                .table()
-                .is_some_and(|t| t.mls == mls && t.hash_log == dms_hash_log)
+            && self.dms.table().is_some_and(|t| {
+                t.layout == DmsDictLayout::Bt && t.mls == mls && t.hash_log == dms_hash_log
+            })
         {
             return;
         }
@@ -693,6 +793,69 @@ impl MatchTable {
         }
         // `concat`'s borrow of `self` ends above; now mutate `self.dms`.
         let tables = self.dms.table_mut_or_init(DmsDictTables::default);
+        tables.layout = DmsDictLayout::Bt;
+        tables.hash_table = hash_table;
+        tables.chain_table = chain_table;
+        tables.hash_log = dms_hash_log;
+        tables.mls = mls;
+        self.dms.set_region_len(region);
+        self.dms.mark_primed();
+    }
+
+    /// Build a SEPARATE dictionary match state for the lazy hash-chain path
+    /// (upstream `ZSTD_dictMatchState`, the dms HC4 walk in
+    /// `ZSTD_HcFindBestMatch` `zstd_lazy.c:748-770`) over the first `region_len`
+    /// bytes of the live history (the dictionary at the front). Unlike
+    /// [`Self::prime_dms_bt`] this is a single-link hash chain (one `next` entry
+    /// per dict position, like the live HC chain), not a binary tree: the lazy
+    /// parser walks it with a bounded compare budget rather than descending to
+    /// the longest match. `hash_table` holds per-bucket chain heads, packed
+    /// `dict_rel + 1` (`0` = empty); `chain_table[dict_rel]` is the previous
+    /// dict position in the same bucket, same packing. Dict positions are concat
+    /// indices at the front of the shared buffer, so the offset is `idx -
+    /// dict_idx` directly. Hashed at `HC_MIN_MATCH_LEN` (4), matching the live
+    /// chain. Cached across frames via `DictAttach::is_primed`.
+    pub(crate) fn prime_dms_hc(&mut self, region_len: usize) {
+        let mls = HC_MIN_MATCH_LEN;
+        let region = region_len.min(self.live_history().len());
+        if region < mls {
+            self.dms.invalidate();
+            return;
+        }
+        let dms_hash_log =
+            (usize::BITS - (region - 1).leading_zeros()).clamp(10, self.hash_log as u32) as usize;
+        if self.dms.is_primed()
+            && self.dms.region_len() == region
+            && self.dms.table().is_some_and(|t| {
+                t.layout == DmsDictLayout::Hc && t.mls == mls && t.hash_log == dms_hash_log
+            })
+        {
+            return;
+        }
+        let (mut hash_table, mut chain_table) = match self.dms.table_mut() {
+            Some(t) => (
+                core::mem::take(&mut t.hash_table),
+                core::mem::take(&mut t.chain_table),
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
+        hash_table.clear();
+        hash_table.resize(1usize << dms_hash_log, 0u32);
+        // Single `next` link per dict position (HC4 chain, not the BT's 2/pos).
+        chain_table.clear();
+        chain_table.resize(region, 0u32);
+        let concat = self.live_history();
+        let mut current = 0usize;
+        while current + mls <= region {
+            let h = Self::hash_position_at(concat, current, dms_hash_log, mls);
+            // Prepend `current` to its bucket chain (donor
+            // `ZSTD_insertAndFindFirstIndex` head insert).
+            chain_table[current] = hash_table[h];
+            hash_table[h] = (current + 1) as u32;
+            current += 1;
+        }
+        let tables = self.dms.table_mut_or_init(DmsDictTables::default);
+        tables.layout = DmsDictLayout::Hc;
         tables.hash_table = hash_table;
         tables.chain_table = chain_table;
         tables.hash_log = dms_hash_log;
@@ -1719,15 +1882,17 @@ impl MatchTable {
         let index_shift = self.index_shift;
         let hash_log = self.hash_log;
         let chain_mask = (1usize << self.chain_log) - 1;
-        let hist_start = self.history_start;
-        let concat_len = self.history.len() - hist_start;
-        // Raw base pointers hoisted once: the loop reads `history` and
-        // writes `hash_table` / `chain_table`, which are disjoint fields, so
-        // raw pointers let the writes proceed without re-borrowing `self`
-        // each iteration. `ensure_tables` (run before any matching pass)
-        // guarantees `hash_table.len() == 1 << hash_log` and
-        // `chain_table.len() == 1 << chain_log`.
-        let concat_ptr = self.history.as_ptr();
+        // Borrowed-aware source: `live_history()` is the borrowed input window
+        // in no-copy mode (owned mirror empty) and `history[history_start..]`
+        // otherwise. Reading `self.history` directly would hash the empty
+        // mirror on the borrowed HC lazy/greedy path. The raw ptr is copied
+        // out so it holds no borrow across the `hash_table` / `chain_table`
+        // mutations below; the window stays valid for the loop (borrowed input
+        // is live by contract, owned `history` is not realloc'd mid-fill).
+        let (concat_ptr, concat_len) = {
+            let live = self.live_history();
+            (live.as_ptr(), live.len())
+        };
         let hash_ptr = self.hash_table.as_mut_ptr();
         let chain_ptr = self.chain_table.as_mut_ptr();
         debug_assert!(self.hash_table.len() == 1usize << hash_log);
@@ -1743,7 +1908,7 @@ impl MatchTable {
         // Hoist the source pointer and relative index out of the loop and
         // advance both by one per iteration, mirroring the donor's
         // `ip++ / idx++` fill rather than recomputing them from `pos`.
-        let mut src = unsafe { concat_ptr.add(hist_start + (start - history_abs_start)) };
+        let mut src = unsafe { concat_ptr.add(start - history_abs_start) };
         // `rel` cannot reach `u32::MAX` because the caller proved
         // `!needs_rebase(end - 1)`; `wrapping_add` keeps the overflow branch
         // off this per-byte hot loop.
@@ -2160,6 +2325,44 @@ mod storage_tests {
         t.history_abs_start = 100;
         t.set_dictionary_limit_from_primed_bytes(40);
         assert_eq!(t.dictionary_limit_abs, Some(140));
+    }
+
+    #[test]
+    fn dms_cache_rebuilds_across_hc_bt_layout_switch() {
+        // A reused compressor that changes level across the HC↔BT boundary lands
+        // back in prime_dms_* with the SAME (region, mls, hash_log) but the OTHER
+        // builder. Without a layout discriminator in the cache key, the second
+        // prime would reuse the first builder's tables verbatim (HC single-link
+        // chain reinterpreted as a BT DUBT, or vice versa) — a silent corruption.
+        // The cache key must include the layout so the switch forces a rebuild.
+        let mut t = new_table(64);
+        // dms_hash_log clamps to [10, hash_log]; keep hash_log above the floor.
+        t.hash_log = 12;
+        // Match HC's fixed mls (HC_MIN_MATCH_LEN == 4) so the BT prime resolves
+        // the SAME (region, mls, hash_log) as the HC prime — then the LAYOUT field
+        // is the only differing key, which is exactly what this test guards. With
+        // search_mls != 4 the rebuild would happen via the mls mismatch and the
+        // test would pass even without the layout discriminator.
+        t.search_mls = 4;
+        t.push_test_chunk(vec![7u8; 48]);
+        t.ensure_tables();
+        let region = 48;
+
+        t.prime_dms_hc(region);
+        assert_eq!(t.dms.table().unwrap().layout, DmsDictLayout::Hc);
+        // HC chain has one `next` per dict position.
+        assert_eq!(t.dms.table().unwrap().chain_table.len(), region);
+
+        // Same region/mls/hash_log, but the BT builder must NOT reuse the HC
+        // tables: it rebuilds to the BT layout (2 children per dict position).
+        t.prime_dms_bt(region);
+        assert_eq!(t.dms.table().unwrap().layout, DmsDictLayout::Bt);
+        assert_eq!(t.dms.table().unwrap().chain_table.len(), 2 * region);
+
+        // And back to HC rebuilds again.
+        t.prime_dms_hc(region);
+        assert_eq!(t.dms.table().unwrap().layout, DmsDictLayout::Hc);
+        assert_eq!(t.dms.table().unwrap().chain_table.len(), region);
     }
 
     #[test]

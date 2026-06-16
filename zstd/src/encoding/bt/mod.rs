@@ -45,6 +45,13 @@ pub(crate) struct BtMatcher {
     /// boxed slice (no `cap` field, no in-parse `resize`/realloc) sized to
     /// `HC_OPT_NODE_LEN`, mirroring upstream zstd's fixed `opt[ZSTD_OPT_NUM]`.
     pub(crate) opt_nodes_scratch: alloc::boxed::Box<[HcOptimalNode]>,
+    /// SoA companion to `opt_nodes_scratch`: the running DP price for each
+    /// node, split out of `HcOptimalNode` into its own contiguous `u32`
+    /// array so the optimal-parser inner price-set loop can SIMD-compare a
+    /// run of consecutive node prices with a single vector load (the 28-byte
+    /// AoS node stride would otherwise force a strided gather). Same length
+    /// as `opt_nodes_scratch`; index `i` is the price of node `i`.
+    pub(crate) opt_node_prices_scratch: alloc::boxed::Box<[u32]>,
     /// Per-frame scratch for collected match candidates.
     pub(crate) opt_candidates_scratch: Vec<MatchCandidate>,
     /// Per-frame scratch for the final emitted node stream.
@@ -104,7 +111,8 @@ impl BtMatcher {
     /// payload (`HcOptState` cost tables, lit-price arrays) plus the
     /// retained scratch arenas at their growth bounds — node frontier and
     /// emitted store (`HC_OPT_NODE_LEN` nodes each, including the `+2`
-    /// lookahead slack), the consolidated price arena (two frontier-sized
+    /// lookahead slack), the SoA node-price companion (`HC_OPT_NODE_LEN`
+    /// `u32`s), the consolidated price arena (two frontier-sized
     /// `[price, generation]` pair regions, LL and ML), the per-segment plan
     /// buffers, and the candidate ladder (`MAX_HC_SEARCH_DEPTH`). LDM is
     /// opt-in and excluded (`ldm_sequences` stays empty on every level
@@ -116,6 +124,7 @@ impl BtMatcher {
         let frontier = HC_OPT_NUM + 1;
         core::mem::size_of::<Self>()
             + 2 * HC_OPT_NODE_LEN * core::mem::size_of::<HcOptimalNode>()
+            + HC_OPT_NODE_LEN * core::mem::size_of::<u32>()
             + 2 * frontier * core::mem::size_of::<[u32; 2]>()
             + 2 * frontier * core::mem::size_of::<HcOptimalSequence>()
             + MAX_HC_SEARCH_DEPTH * core::mem::size_of::<MatchCandidate>()
@@ -150,6 +159,7 @@ impl BtMatcher {
             // first runs (non-BT strategies never touch these), matching
             // the prior lazy `Vec::new()` + grow behaviour.
             opt_nodes_scratch: alloc::boxed::Box::default(),
+            opt_node_prices_scratch: alloc::boxed::Box::default(),
             opt_candidates_scratch: Vec::new(),
             opt_store_scratch: Vec::new(),
             opt_segment_plan_scratch: Vec::new(),
@@ -171,6 +181,7 @@ impl BtMatcher {
     /// (counted by the owner's `size_of`), so only the `Vec` fields contribute.
     pub(crate) fn heap_size(&self) -> usize {
         let scratch = self.opt_nodes_scratch.len() * core::mem::size_of::<HcOptimalNode>()
+            + self.opt_node_prices_scratch.len() * core::mem::size_of::<u32>()
             + self.opt_candidates_scratch.capacity() * core::mem::size_of::<MatchCandidate>()
             + self.opt_store_scratch.capacity() * core::mem::size_of::<HcOptimalNode>()
             + (self.opt_segment_plan_scratch.capacity() + self.opt_seed_plan_scratch.capacity())
@@ -360,12 +371,14 @@ impl BtMatcher {
     ) -> (u32, [u32; 3], usize, usize) {
         let HcOptimalPlanBuffers {
             nodes,
+            node_prices,
             mut candidates,
             store,
             price_arena,
         } = buffers;
         candidates.clear();
         self.opt_nodes_scratch = nodes;
+        self.opt_node_prices_scratch = node_prices;
         self.opt_candidates_scratch = candidates;
         self.opt_store_scratch = store;
         self.opt_price_arena = price_arena;
@@ -600,17 +613,25 @@ impl BtMatcher {
     }
 
     #[inline(always)]
-    pub(crate) fn reset_opt_nodes(nodes: &mut [HcOptimalNode], start: usize, end: usize) {
+    pub(crate) fn reset_opt_nodes(
+        nodes: &mut [HcOptimalNode],
+        node_prices: &mut [u32],
+        start: usize,
+        end: usize,
+    ) {
         for node in &mut nodes[start..=end] {
             Self::reset_opt_node(node);
+        }
+        for price in &mut node_prices[start..=end] {
+            *price = u32::MAX;
         }
     }
 
     #[inline(always)]
     pub(crate) fn reset_opt_node(node: &mut HcOptimalNode) {
-        node.price = u32::MAX;
-        // Donor only marks the slot as unreachable and not end-of-match here;
-        // stale mlen is ignored while price is MAX and litlen is non-zero.
+        // Price is reset separately via `node_prices` (see `reset_opt_nodes`);
+        // here we only mark the slot not end-of-match. Donor parity: stale mlen
+        // is ignored while the (separately-held) price is MAX and litlen != 0.
         node.litlen = u32::MAX;
     }
 

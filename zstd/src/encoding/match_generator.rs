@@ -685,6 +685,26 @@ const DFAST_ATTACH_DICT_CUTOFF_LOG: u8 = 14;
 /// `row_candidate_rl`), larger known-size inputs dense-COPY into the live rows.
 const ROW_ATTACH_DICT_CUTOFF_LOG: u8 = 15;
 
+/// 32 KiB (`2^15`, upstream zstd `attachDictSizeCutoffs[ZSTD_lazy2]`): small /
+/// unknown-size inputs ATTACH the dict as a separate hash-chain dms (the dual
+/// search in `find_best_match` walks the live input chain + the dms), larger
+/// known-size inputs dense-COPY (merge the dict into the live chain and search
+/// the one combined chain).
+const HC_ATTACH_DICT_CUTOFF_LOG: u8 = 15;
+
+/// BT/optimal attach cutoff for `btlazy2` + `btopt`: 32 KiB (`2^15`, upstream
+/// zstd `attachDictSizeCutoffs[ZSTD_btlazy2]` == `[ZSTD_btopt]`). Small /
+/// unknown-size inputs ATTACH the dict as a separate DUBT dms; larger known-size
+/// inputs COPY the dict into the LIVE binary tree (donor
+/// `ZSTD_resetCCtx_byCopyingCDict`).
+const BT_OPT_ATTACH_DICT_CUTOFF_LOG: u8 = 15;
+
+/// BT/optimal attach cutoff for `btultra` + `btultra2`: 8 KiB (`2^13`, upstream
+/// zstd `attachDictSizeCutoffs[ZSTD_btultra]` == `[ZSTD_btultra2]`). The deepest
+/// parses copy the dict into the live tree past a much smaller source than the
+/// `btopt` tier, matching upstream's per-strategy cutoff table.
+const BT_ULTRA_ATTACH_DICT_CUTOFF_LOG: u8 = 13;
+
 // Source-size cap for the dfast hash bits when a size hint is present: a tiny
 // input needs no larger hash than its window. The donor `cParams.hashLog` /
 // `chainLog` (from `DfastConfig`) caps it from above at the call site.
@@ -1825,6 +1845,35 @@ impl MatchGeneratorDriver {
         }
     }
 
+    /// ATTACH (`true`) vs COPY (`false`) decision for the dms-bearing HashChain
+    /// backend (lazy hash-chain AND binary-tree/optimal levels), mirroring
+    /// upstream `ZSTD_shouldAttachDict` and its per-strategy `attachDictSizeCutoffs`:
+    /// a small / unknown source ATTACHES the dict as a separate dms (hash-chain
+    /// dms for lazy, DUBT dms for BT); a large known source COPIES it into the
+    /// live chain / tree. The cutoff is the lazy/lazy2 value for HC, the
+    /// btlazy2/btopt value for Bt{Opt}, and the smaller btultra/btultra2 value for
+    /// the deepest parses. Both `skip_matching_for_dictionary_priming` (which
+    /// stages the dict) and `prime_with_dictionary` (which builds-or-drops the
+    /// dms) read this so the two stay in lock-step.
+    fn hc_dict_attach_mode(&self) -> bool {
+        // Only the HashChain backend (lazy hash-chain + BT/optimal) routes here;
+        // a non-HashChain storage has no dms decision, so default to attach.
+        let MatcherStorage::HashChain(hc) = &self.storage else {
+            return true;
+        };
+        let cutoff = if hc.table.uses_bt {
+            match hc.strategy_tag {
+                super::strategy::StrategyTag::BtUltra | super::strategy::StrategyTag::BtUltra2 => {
+                    BT_ULTRA_ATTACH_DICT_CUTOFF_LOG
+                }
+                _ => BT_OPT_ATTACH_DICT_CUTOFF_LOG,
+            }
+        } else {
+            HC_ATTACH_DICT_CUTOFF_LOG
+        };
+        self.reset_size_log.is_none_or(|log| log <= cutoff)
+    }
+
     fn skip_matching_for_dictionary_priming(&mut self) {
         match self.active_backend() {
             super::strategy::BackendTag::Simple => {
@@ -1888,13 +1937,18 @@ impl MatchGeneratorDriver {
                 }
             }
             super::strategy::BackendTag::HashChain => {
-                let table = &mut self.hc_matcher_mut().table;
-                if table.uses_bt {
-                    // BT / optimal levels: keep the dict in history for the dms
-                    // but do NOT insert it into the live tree (donor separate
-                    // dictMatchState). Lazy-HC levels still index the dict into
-                    // the live chain (they have no dms).
-                    table.skip_matching_dict_bt();
+                // Lazy-HC AND BT/optimal both follow donor `ZSTD_shouldAttachDict`
+                // per-strategy: ATTACH (a separate dms — hash-chain dms for lazy,
+                // DUBT dms for BT) for small / unknown inputs, COPY (merge the dict
+                // into the live chain/tree) for large known inputs. ATTACH keeps
+                // the dict in history but out of the live structure via
+                // `skip_matching_dict_bt` (the cursor advance is shared by both
+                // arms); COPY routes through the normal `skip_matching` (its
+                // `uses_bt` branch fills the live tree, the lazy branch the live
+                // chain). The dms is built-or-dropped to match in
+                // `prime_with_dictionary`.
+                if self.hc_dict_attach_mode() {
+                    self.hc_matcher_mut().table.skip_matching_dict_bt();
                 } else {
                     self.hc_matcher_mut().skip_matching(Some(false));
                 }
@@ -2492,11 +2546,13 @@ impl Matcher for MatchGeneratorDriver {
         // here (post-resolution, after the test-only param override) so the key
         // reflects exactly the geometry the restored `storage` must match. The
         // Fast attach-vs-copy mode is part of the shape ONLY for the Simple
-        // backend (it decides whether a separate dict table is built); the other
-        // backends prime the dictionary the same way regardless, so including
-        // the bit there would over-key identical resolved shapes. When it
-        // applies it matches the decision `prime_with_dictionary` makes from the
-        // same `reset_size_log`.
+        // backend (it decides the distinct dict-table shape that backend builds).
+        // Dfast/Row/HashChain have their OWN attach/copy regimes, but this bit
+        // models only the Fast table split; those backends are keyed by the
+        // resolved matcher geometry instead, so folding the Fast bit into their
+        // key would over-key identical resolved shapes. When it applies it
+        // matches the decision `prime_with_dictionary` makes from the same
+        // `reset_size_log`.
         let fast_attach = matches!(next_backend, super::strategy::BackendTag::Simple)
             && self
                 .reset_size_log
@@ -2680,13 +2736,54 @@ impl Matcher for MatchGeneratorDriver {
                 .saturating_add(granted_retained_budget);
         }
         if self.active_backend() == super::strategy::BackendTag::HashChain {
+            // Recompute the lazy-HC attach decision made per-chunk in
+            // `skip_matching_for_dictionary_priming` (stable across the prime —
+            // `reset_size_log` does not change here).
+            //
+            // The HC attach/copy mode is deliberately NOT folded into `PrimedKey`
+            // (unlike Fast `fast_attach`). Fast attach builds a separate dict
+            // table whose dimensions differ from the copy-mode live table, so a
+            // cross-mode restore would install mismatched table geometry and the
+            // encoder could search past the frame window (undecodable). The two
+            // HC modes share identical window geometry: `max_window_size` and the
+            // dictionary limit are both set ABOVE this branch (the same value in
+            // either mode), and the live chain table dimensions come from the
+            // resolved `params` the key already pins. The modes differ only in
+            // WHERE the committed dict lives — a single-link `dms` (attach) vs
+            // merged into the live chain (copy) — both producing valid matches at
+            // in-window offsets. Upstream zstd makes the same observation: attach
+            // (`ZSTD_resetCCtx_byAttachingCDict`) and copy
+            // (`ZSTD_resetCCtx_byCopyingCDict`) both keep the caller's
+            // `windowLog`; the choice is a memory/speed trade-off, not a wire
+            // contract. So restoring an attach snapshot where this frame would
+            // have copied (or vice versa) yields a decodable frame that may only
+            // differ in which matches are found (ratio) — algorithmic freedom, not
+            // a defect. Keying on the mode would instead force a re-prime across
+            // the cutoff, re-adding the per-frame cost this snapshot path removes.
+            //
+            // In practice the public reuse path (`compress_independent_frame`)
+            // only ever captures AND restores the COPY-mode snapshot — capture is
+            // gated on the above-cutoff source size, so a restored frame always
+            // matches the captured mode. `hc_dict_snapshot_reuse_roundtrips` pins
+            // that same-mode reuse decodes; the driver-level cross-mode restore is
+            // accepted (not refused) per
+            // `primed_snapshot_fast_attach_does_not_over_key_non_simple_backends`.
+            let attach = self.hc_dict_attach_mode();
             let table = &mut self.hc_matcher_mut().table;
             table.set_dictionary_limit_from_primed_bytes(committed_dict_budget);
-            // Build the dictMatchState chain for BT/optimal levels so the
-            // collect dual-probes the dictionary with its own compare budget
-            // (the dict bytes were just committed to the front of history).
-            if table.uses_bt {
+            // Build the dictMatchState over the committed dict (front of history)
+            // so `find_best_match` dual-probes it with its own compare budget —
+            // but ONLY in ATTACH mode. BT/optimal attach → DUBT dms; lazy-HC
+            // attach → single-link hash-chain dms. COPY mode (large known source,
+            // both BT and lazy-HC) already merged the dict into the live tree /
+            // chain in `skip_matching_for_dictionary_priming`, so it carries no
+            // separate dms — drop any stale one.
+            if !attach {
+                table.dms.invalidate();
+            } else if table.uses_bt {
                 table.prime_dms_bt(committed_dict_budget);
+            } else {
+                table.prime_dms_hc(committed_dict_budget);
             }
         }
         // CDict-equivalent: now that every dict chunk is indexed, mark the
@@ -2739,18 +2836,37 @@ impl Matcher for MatchGeneratorDriver {
             (MatcherStorage::Simple(live), MatcherStorage::Simple(snap)) => {
                 live.clone_from(snap);
             }
+            // Same-variant HC lazy/greedy restore (non-BT): the snapshot keeps
+            // the full primed hash/chain tables (capture's non-BT full clone),
+            // so `clone_from` reuses the live history/hash/chain/dms buffers in
+            // place — donor reuses the CDict tables rather than reallocating
+            // them. This is the per-frame allocate+copy+drop that dominated
+            // small `compress-dict` HC frames (5-7x vs C). BT (`uses_bt`)
+            // snapshots drop their live tables, so they stay on the realloc
+            // path below.
+            (MatcherStorage::HashChain(live), MatcherStorage::HashChain(snap))
+                if !snap.table.uses_bt =>
+            {
+                live.table.clone_from(&snap.table);
+                live.hc.clone_from(&snap.hc);
+                live.strategy_tag = snap.strategy_tag;
+                // backend is `HcBackend::Hc` (zero-sized) for non-BT levels;
+                // the live one is already correct for this resolved key.
+            }
             (live, snapshot_storage) => {
                 let mut storage = snapshot_storage.clone();
-                // A binary-tree snapshot is stored WITHOUT its live hash /
-                // chain / hash3 tables (they hold no dictionary entries — the
-                // dict lives in `dms` + history; see
-                // `capture_primed_dictionary`). Re-allocate them zeroed to the
-                // snapshot's geometry, exactly reproducing the post-prime
-                // state (all `HC_EMPTY`). This is a full storage replace, so
-                // no stale live-table entry from a prior frame can survive —
-                // `ensure_tables` only allocates when the length mismatches,
-                // so a full (HC / non-BT) snapshot whose tables are already
-                // present is left untouched.
+                // This arm handles the binary-tree backend. In ATTACH mode the
+                // snapshot was stored WITHOUT its live hash / chain / hash3
+                // tables (they hold no dictionary entries — the dict lives in
+                // `dms` + history; see `capture_primed_dictionary`), so
+                // `ensure_tables` re-allocates them zeroed to the snapshot's
+                // geometry, exactly reproducing the post-prime state (all
+                // `HC_EMPTY`). In COPY mode the snapshot retained its FULL live
+                // tree (the dict was merged into it, no `dms`), so the tables are
+                // already present at the right length and `ensure_tables` — which
+                // only allocates on a length mismatch — leaves them untouched.
+                // Either way this is a full storage replace, so no stale
+                // live-table entry from a prior frame can survive.
                 if let MatcherStorage::HashChain(hc) = &mut storage {
                     hc.table.ensure_tables();
                 }
@@ -2791,9 +2907,9 @@ impl Matcher for MatchGeneratorDriver {
             fast_attach,
             ldm,
         };
-        // Donor CDict-equivalent retained state. On the binary-tree backend the
-        // dictionary is decoupled into `dms` (the donor `dictMatchState`); the
-        // live hash / chain / hash3 tables carry NO dict entries at capture
+        // CDict-equivalent retained state. A binary-tree level in ATTACH mode
+        // decouples the dictionary into `dms` (the donor `dictMatchState`); its
+        // live hash / chain / hash3 tables carry NO dict entries
         // (`skip_matching_dict_bt` keeps the dict out of the live tree), so they
         // are pure zeros. Storing them in the snapshot wastes the full table
         // footprint (a second window-tier table set resident for the whole
@@ -2801,11 +2917,17 @@ impl Matcher for MatchGeneratorDriver {
         // clone only the dict-state (history + `dms` + window/offset/dict-limit),
         // then move the live tables back — the snapshot keeps just what donor's
         // CDict keeps, and `restore_primed_dictionary` re-allocates the zeroed
-        // live tables. HC / lazy levels keep the dict IN the live chain (no
-        // `dms`), so their snapshot must retain the full tables: full clone.
+        // live tables. Every other case keeps the dict reachable through the live
+        // structure, so the snapshot must retain the full tables (full clone):
+        // lazy-HC attach (it DOES prime a hash-chain `dms`, but the live chain is
+        // still the search structure, so the tables must travel) and COPY mode for
+        // BOTH BT and lazy-HC (`dms` invalidated, dict merged into the live tree /
+        // chain). `uses_bt && dms.is_primed()` is therefore the exact "decoupled"
+        // signal — true only for the BT attach prime; lazy-HC attach primes `dms`
+        // too but is intentionally NOT decoupled.
         let bt_decoupled = matches!(
             &self.storage,
-            MatcherStorage::HashChain(hc) if hc.table.uses_bt
+            MatcherStorage::HashChain(hc) if hc.table.uses_bt && hc.table.dms.is_primed()
         );
         if bt_decoupled {
             let MatcherStorage::HashChain(hc) = &mut self.storage else {
@@ -3791,6 +3913,707 @@ macro_rules! start_matching_btlazy2_body {
     }};
 }
 
+/// 8-lane `next_cost < node_price` mask for the optimal-parser price-set
+/// loop. AVX2 lacks an unsigned `cmplt`, so derive `nc < np` from
+/// `min_epu32`: `nc <= np` iff `min(nc,np) == nc`, then exclude equality.
+/// Returns a bitmask (bit `k` set => lane `k` improves). Scalar fallback
+/// for non-x86 / no-AVX2.
+/// 8-lane `next_cost < node_price` mask for the optimal-parser price-set
+/// loop. AVX2 lacks an unsigned `cmplt`, so derive `nc < np` from
+/// `min_epu32`: `nc <= np` iff `min(nc,np) == nc`, then exclude equality.
+/// Returns a bitmask (bit `k` set => lane `k` improves). Compiled on every
+/// x86 target (same as the avx2 collect kernel); the cargo `kernel_avx2`
+/// feature only gates the runtime dispatch, not compilation.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn priceset_improved_mask8_avx2(next_cost: &[u32; 8], node_price: &[u32]) -> u8 {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::{
+        __m256i, _mm256_andnot_si256, _mm256_castsi256_ps, _mm256_cmpeq_epi32, _mm256_loadu_si256,
+        _mm256_min_epu32, _mm256_movemask_ps,
+    };
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::{
+        __m256i, _mm256_andnot_si256, _mm256_castsi256_ps, _mm256_cmpeq_epi32, _mm256_loadu_si256,
+        _mm256_min_epu32, _mm256_movemask_ps,
+    };
+    let nc = unsafe { _mm256_loadu_si256(next_cost.as_ptr() as *const __m256i) };
+    let np = unsafe { _mm256_loadu_si256(node_price.as_ptr() as *const __m256i) };
+    let min = _mm256_min_epu32(nc, np);
+    let le = _mm256_cmpeq_epi32(min, nc); // nc <= np
+    let eq = _mm256_cmpeq_epi32(nc, np); // nc == np
+    let lt = _mm256_andnot_si256(eq, le); // nc < np
+    _mm256_movemask_ps(_mm256_castsi256_ps(lt)) as u8
+}
+
+/// Inline `next_cost = base_cost + ll0_price + match_price_from_parts(off,ml)`
+/// for one match length — the exact `add_prices` chain the scalar loop uses,
+/// so the SoA vector path stays byte-identical.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn priceset_next_cost(
+    profile: HcOptimalCostProfile,
+    stats: &HcOptState,
+    ml_cache: &mut [[u32; 2]],
+    ml_stamp: u32,
+    match_len: usize,
+    ll0_price: u32,
+    off_price: u32,
+    base_cost: u32,
+) -> u32 {
+    let ml_price =
+        BtMatcher::cached_match_length_price(profile, stats, match_len, ml_cache, ml_stamp);
+    let seq_cost = BtMatcher::add_prices(
+        ll0_price,
+        profile.match_price_from_parts(off_price, ml_price, stats),
+    );
+    BtMatcher::add_prices(base_cost, seq_cost)
+}
+
+/// Scalar price-set over the match-length range `[start, max]` for the
+/// NON-abort optimal modes (btultra / btultra2). Each `match_len` writes a
+/// distinct node `pos + match_len`, so order is irrelevant; the improvement
+/// test reduces to `next_cost < node_prices[next]` (`reset_opt_nodes` set
+/// every beyond-frontier cell to `u32::MAX`, subsuming `next > last_pos`).
+/// `#[inline]` so it folds into each per-tier optimal-parser monomorphisation
+/// (no call overhead). Returns the highest written `next`.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+// Used by the scalar / sse42 DP wrappers; on aarch64 the dispatch only reaches
+// the neon wrapper and on wasm+simd128 only the simd128 wrapper, so this is
+// cfg-dead on those targets.
+#[cfg_attr(
+    any(
+        all(target_arch = "aarch64", target_endian = "little"),
+        all(target_arch = "wasm32", target_feature = "simd128")
+    ),
+    allow(dead_code)
+)]
+fn priceset_range_nonabort_scalar(
+    node_prices: &mut [u32],
+    nodes: &mut [HcOptimalNode],
+    ml_cache: &mut [[u32; 2]],
+    ml_stamp: u32,
+    profile: HcOptimalCostProfile,
+    stats: &HcOptState,
+    pos: usize,
+    start: usize,
+    max: usize,
+    ll0_price: u32,
+    off_price: u32,
+    base_cost: u32,
+    off: u32,
+    reps: [u32; 3],
+    last_pos: usize,
+) -> usize {
+    let mut new_last = last_pos;
+    for ml in start..=max {
+        let next_cost = priceset_next_cost(
+            profile, stats, ml_cache, ml_stamp, ml, ll0_price, off_price, base_cost,
+        );
+        let next = pos + ml;
+        if next_cost < node_prices[next] {
+            node_prices[next] = next_cost;
+            nodes[next] = HcOptimalNode {
+                off,
+                mlen: ml as u32,
+                litlen: 0,
+                reps,
+            };
+            if next > new_last {
+                new_last = next;
+            }
+        }
+    }
+    new_last
+}
+
+/// Per-tier deinterleave + improve-mask correctness vs a scalar reference.
+/// Each tier's dispatch only fires on matching hardware (i9 picks AVX2 over
+/// SSE4.1, M1 picks NEON), so the non-dispatched tiers never run in the
+/// roundtrip suite; this exercises the deinterleave/mask helpers directly on
+/// whatever ISA the test host exposes (AVX2 + SSE4.1 on x86, NEON on aarch64).
+#[cfg(test)]
+#[test]
+fn priceset_tier_helpers_match_scalar() {
+    // Reference: gen-stamped contiguous cells -> ordered prices on all-warm.
+    fn scalar_deint<const W: usize>(cells: &[[u32; 2]], stamp: u32) -> Option<[u32; W]> {
+        let mut out = [0u32; W];
+        for k in 0..W {
+            if cells[k][1] != stamp {
+                return None;
+            }
+            out[k] = cells[k][0];
+        }
+        Some(out)
+    }
+    fn scalar_mask<const W: usize>(nc: &[u32; W], np: &[u32]) -> u8 {
+        let mut m = 0u8;
+        for k in 0..W {
+            if nc[k] < np[k] {
+                m |= 1 << k;
+            }
+        }
+        m
+    }
+    const S: u32 = 0x55;
+    let warm: [[u32; 2]; 4] = [[11, S], [22, S], [33, S], [44, S]];
+    let mut cold = warm;
+    cold[2][1] = S ^ 1; // one stale cell -> must yield None
+    let nc4: [u32; 4] = [10, 99, 30, 41];
+    let np4: [u32; 4] = [20, 21, 30, 99]; // lt: lane0 (10<20), lane3 (41<99)
+
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    unsafe {
+        assert_eq!(
+            priceset_cached_prices4_neon(&warm, S),
+            scalar_deint::<4>(&warm, S)
+        );
+        assert_eq!(priceset_cached_prices4_neon(&cold, S), None);
+        assert_eq!(
+            priceset_improved_mask4_neon(&nc4, &np4),
+            scalar_mask::<4>(&nc4, &np4)
+        );
+    }
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    {
+        if std::is_x86_feature_detected!("sse4.2") {
+            unsafe {
+                assert_eq!(
+                    priceset_cached_prices4_sse41(&warm, S),
+                    scalar_deint::<4>(&warm, S)
+                );
+                assert_eq!(priceset_cached_prices4_sse41(&cold, S), None);
+                assert_eq!(
+                    priceset_improved_mask4_sse41(&nc4, &np4),
+                    scalar_mask::<4>(&nc4, &np4)
+                );
+            }
+        }
+        if std::is_x86_feature_detected!("avx2") {
+            let warm8: [[u32; 2]; 8] = [
+                [11, S],
+                [22, S],
+                [33, S],
+                [44, S],
+                [55, S],
+                [66, S],
+                [77, S],
+                [88, S],
+            ];
+            let mut cold8 = warm8;
+            cold8[5][1] = S ^ 1;
+            let nc8: [u32; 8] = [10, 99, 30, 41, 99, 60, 99, 80];
+            let np8: [u32; 8] = [20, 21, 30, 99, 50, 99, 70, 99];
+            unsafe {
+                assert_eq!(
+                    priceset_cached_prices8_avx2(&warm8, S),
+                    scalar_deint::<8>(&warm8, S)
+                );
+                assert_eq!(priceset_cached_prices8_avx2(&cold8, S), None);
+                assert_eq!(
+                    priceset_improved_mask8_avx2(&nc8, &np8),
+                    scalar_mask::<8>(&nc8, &np8)
+                );
+            }
+        }
+    }
+}
+
+/// Shared vectorised price-set loop body, generic over the SIMD width `W`.
+/// The per-tier `deint` (vector-load plus deinterleave of `W` cached prices,
+/// returning `Some` only on an all-warm chunk) and `mask` (per-tier
+/// `next_cost` less-than `node_price` bitmask) are passed as zero-sized
+/// `impl Fn`s. `#[inline(always)]` plus monomorphisation folds `deint` and
+/// `mask` directly into each per-tier wrapper's `target_feature` umbrella, so
+/// the intrinsics inline with no call ABI and no runtime feature detection.
+/// Cold or out-of-cache chunks, and the sub-`W` remainder, fall back to the
+/// scalar `priceset_next_cost` (which fills the cache); writes are
+/// scalar-scatter on the improving lanes (1-8% of compares, per the
+/// improve-ratio probe). Same signature tail as the scalar variant.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+// Instantiated only by a vector tier wrapper (avx2/sse4.1 on x86, neon on
+// aarch64, simd128 on wasm+simd128); a target with none of those (e.g.
+// wasm without +simd128) uses only the scalar range, leaving this generic dead.
+#[cfg_attr(
+    not(any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_endian = "little"),
+        all(target_arch = "wasm32", target_feature = "simd128")
+    )),
+    allow(dead_code)
+)]
+fn priceset_range_vec<const W: usize>(
+    node_prices: &mut [u32],
+    nodes: &mut [HcOptimalNode],
+    ml_cache: &mut [[u32; 2]],
+    ml_stamp: u32,
+    profile: HcOptimalCostProfile,
+    stats: &HcOptState,
+    pos: usize,
+    start: usize,
+    max: usize,
+    ll0_price: u32,
+    off_price: u32,
+    base_cost: u32,
+    off: u32,
+    reps: [u32; 3],
+    last_pos: usize,
+    deint: impl Fn(&[[u32; 2]], u32) -> Option<[u32; W]>,
+    mask: impl Fn(&[u32; W], &[u32]) -> u8,
+) -> usize {
+    let mut new_last = last_pos;
+    let mut buf = [0u32; W];
+    // Loop-invariant constant of the byte-identical next_cost chain:
+    // next_cost = add_prices(base_cost, add_prices(ll0_price,
+    //   match_price_from_parts(off_price, ml_price))) = c_base + ml_price,
+    // c_base = base_cost + ll0_price + match_price_from_parts(off_price, 0).
+    //
+    // This stays bit-exact with the scalar `priceset_next_cost` because both
+    // helpers are affine in `ml_price`: `BtMatcher::add_prices(a, b) = a + b`
+    // and `match_price_from_parts(off, ml) = off + ml + bias` are plain integer
+    // additions, so `match_price_from_parts(off, ml) = match_price_from_parts(
+    // off, 0) + ml` and the whole chain collapses to `c_base + ml_price`. The
+    // `wrapping_add` here matches the scalar `+` under the cost model's
+    // no-overflow invariant (the `debug_assert`s in both helpers). Factoring the
+    // combine into one helper per the review suggestion would force a per-lane
+    // `match_price_from_parts(off, ml_price)` recompute instead of hoisting the
+    // ml-independent `c_base` once — a regression on this hot DP loop — so the
+    // hoist is kept and the equivalence documented here instead.
+    let c_base = base_cost
+        .wrapping_add(ll0_price)
+        .wrapping_add(profile.match_price_from_parts(off_price, 0, stats));
+    let mut ml = start;
+    while ml + W <= max + 1 {
+        let vectorised = if ml + W <= ml_cache.len() {
+            deint(&ml_cache[ml..ml + W], ml_stamp)
+        } else {
+            None
+        };
+        if let Some(prices) = vectorised {
+            for (k, slot) in buf.iter_mut().enumerate() {
+                *slot = c_base.wrapping_add(prices[k]);
+            }
+        } else {
+            for (k, slot) in buf.iter_mut().enumerate() {
+                *slot = priceset_next_cost(
+                    profile,
+                    stats,
+                    ml_cache,
+                    ml_stamp,
+                    ml + k,
+                    ll0_price,
+                    off_price,
+                    base_cost,
+                );
+            }
+        }
+        let base_next = pos + ml;
+        let mut bits = mask(&buf, &node_prices[base_next..base_next + W]);
+        while bits != 0 {
+            let k = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let next = base_next + k;
+            node_prices[next] = buf[k];
+            nodes[next] = HcOptimalNode {
+                off,
+                mlen: (ml + k) as u32,
+                litlen: 0,
+                reps,
+            };
+            if next > new_last {
+                new_last = next;
+            }
+        }
+        ml += W;
+    }
+    while ml <= max {
+        let next_cost = priceset_next_cost(
+            profile, stats, ml_cache, ml_stamp, ml, ll0_price, off_price, base_cost,
+        );
+        let next = pos + ml;
+        if next_cost < node_prices[next] {
+            node_prices[next] = next_cost;
+            nodes[next] = HcOptimalNode {
+                off,
+                mlen: ml as u32,
+                litlen: 0,
+                reps,
+            };
+            if next > new_last {
+                new_last = next;
+            }
+        }
+        ml += 1;
+    }
+    new_last
+}
+
+/// Vector-load 8 cached ml-prices for the optimal parser's price-set, given a
+/// run of 8 contiguous `[price, generation]` cells. Returns `Some(prices)`
+/// only when ALL eight cells are warm (`generation == stamp`) — the common
+/// (~91-98%) case — so the caller can fold them with one broadcast constant;
+/// any cold cell returns `None` to route the chunk through the scalar fill
+/// (which recomputes + repopulates the misses). Deinterleaves with cheap
+/// in-128-lane ops (`shuffle_epi32` + `unpack*_epi64`) and a single cross-lane
+/// `permute4x64` for the ordered prices — avoiding the latency-bound chain of
+/// cross-lane `permutevar8x32`s that lost to pipelined scalar loads on
+/// high-chunk-count fixtures.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn priceset_cached_prices8_avx2(cells: &[[u32; 2]], stamp: u32) -> Option<[u32; 8]> {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::{
+        __m256i, _mm256_castsi256_ps, _mm256_cmpeq_epi32, _mm256_loadu_si256, _mm256_movemask_ps,
+        _mm256_permute4x64_epi64, _mm256_set1_epi32, _mm256_shuffle_epi32, _mm256_storeu_si256,
+        _mm256_unpackhi_epi64, _mm256_unpacklo_epi64,
+    };
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::{
+        __m256i, _mm256_castsi256_ps, _mm256_cmpeq_epi32, _mm256_loadu_si256, _mm256_movemask_ps,
+        _mm256_permute4x64_epi64, _mm256_set1_epi32, _mm256_shuffle_epi32, _mm256_storeu_si256,
+        _mm256_unpackhi_epi64, _mm256_unpacklo_epi64,
+    };
+    debug_assert!(cells.len() >= 8);
+    let base = cells.as_ptr() as *const __m256i;
+    // v0 = [p0 g0 p1 g1 | p2 g2 p3 g3], v1 = [p4 g4 p5 g5 | p6 g6 p7 g7].
+    let v0 = unsafe { _mm256_loadu_si256(base) };
+    let v1 = unsafe { _mm256_loadu_si256(base.add(1)) };
+    // In-128-lane group prices then gens: [p g p g] -> [p p g g] (control 0xD8).
+    let s0 = _mm256_shuffle_epi32(v0, 0xD8); // [p0 p1 g0 g1 | p2 p3 g2 g3]
+    let s1 = _mm256_shuffle_epi32(v1, 0xD8); // [p4 p5 g4 g5 | p6 p7 g6 g7]
+    // Gens (hi 64 of each 128-lane) — order irrelevant for the all-equal test.
+    let gens = _mm256_unpackhi_epi64(s0, s1);
+    let eq = _mm256_cmpeq_epi32(gens, _mm256_set1_epi32(stamp as i32));
+    if _mm256_movemask_ps(_mm256_castsi256_ps(eq)) as u8 != 0xFF {
+        return None;
+    }
+    // Prices (lo 64 of each 128-lane): [p0 p1 p4 p5 | p2 p3 p6 p7] as 64-bit
+    // chunks [c0 c1 c2 c3] = [p0p1 p4p5 p2p3 p6p7]; reorder to [c0 c2 c1 c3]
+    // (control 0xD8) for in-order [p0..p7].
+    let p_scrambled = _mm256_unpacklo_epi64(s0, s1);
+    let prices = _mm256_permute4x64_epi64(p_scrambled, 0xD8);
+    let mut out = [0u32; 8];
+    unsafe { _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, prices) };
+    Some(out)
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn priceset_range_nonabort_avx2(
+    node_prices: &mut [u32],
+    nodes: &mut [HcOptimalNode],
+    ml_cache: &mut [[u32; 2]],
+    ml_stamp: u32,
+    profile: HcOptimalCostProfile,
+    stats: &HcOptState,
+    pos: usize,
+    start: usize,
+    max: usize,
+    ll0_price: u32,
+    off_price: u32,
+    base_cost: u32,
+    off: u32,
+    reps: [u32; 3],
+    last_pos: usize,
+) -> usize {
+    priceset_range_vec::<8>(
+        node_prices,
+        nodes,
+        ml_cache,
+        ml_stamp,
+        profile,
+        stats,
+        pos,
+        start,
+        max,
+        ll0_price,
+        off_price,
+        base_cost,
+        off,
+        reps,
+        last_pos,
+        // SAFETY: both closures run inside this fn's avx2 target_feature umbrella.
+        |cells, stamp| unsafe { priceset_cached_prices8_avx2(cells, stamp) },
+        |nc, np| unsafe { priceset_improved_mask8_avx2(nc, np) },
+    )
+}
+
+/// NEON 4-lane vector-load + deinterleave of cached ml-prices. `vld2q_u32`
+/// deinterleaves the 4 contiguous `[price, generation]` pairs natively into
+/// two registers (prices, gens) — no shuffle chain. `Some(prices)` only when
+/// all 4 generations equal `stamp` (`vminvq` of the equality mask is all-ones).
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn priceset_cached_prices4_neon(cells: &[[u32; 2]], stamp: u32) -> Option<[u32; 4]> {
+    use core::arch::aarch64::{vceqq_u32, vdupq_n_u32, vld2q_u32, vminvq_u32, vst1q_u32};
+    debug_assert!(cells.len() >= 4);
+    // SAFETY: caller's neon umbrella; `cells` is >= 4 pairs = 8 contiguous u32.
+    let pair = unsafe { vld2q_u32(cells.as_ptr() as *const u32) };
+    let eq = vceqq_u32(pair.1, vdupq_n_u32(stamp));
+    if vminvq_u32(eq) != u32::MAX {
+        return None;
+    }
+    let mut out = [0u32; 4];
+    unsafe { vst1q_u32(out.as_mut_ptr(), pair.0) };
+    Some(out)
+}
+
+/// NEON 4-lane `next_cost < node_price` bitmask. NEON has an unsigned compare
+/// (`vcltq_u32`) but no movemask; AND the all-ones lane mask with lane weights
+/// `[1,2,4,8]` and horizontal-add (`vaddvq_u32`) to pack the 4 bits.
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn priceset_improved_mask4_neon(next_cost: &[u32; 4], node_price: &[u32]) -> u8 {
+    use core::arch::aarch64::{vaddvq_u32, vandq_u32, vcltq_u32, vld1q_u32, vst1q_u32};
+    // SAFETY: neon umbrella; both spans are 4 u32 wide.
+    let nc = unsafe { vld1q_u32(next_cost.as_ptr()) };
+    let np = unsafe { vld1q_u32(node_price.as_ptr()) };
+    let lt = vcltq_u32(nc, np);
+    let weights: [u32; 4] = [1, 2, 4, 8];
+    let w = unsafe { vld1q_u32(weights.as_ptr()) };
+    let bits = vandq_u32(lt, w);
+    let _ = vst1q_u32; // silence unused import on some toolchains
+    vaddvq_u32(bits) as u8
+}
+
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[target_feature(enable = "neon")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn priceset_range_nonabort_neon(
+    node_prices: &mut [u32],
+    nodes: &mut [HcOptimalNode],
+    ml_cache: &mut [[u32; 2]],
+    ml_stamp: u32,
+    profile: HcOptimalCostProfile,
+    stats: &HcOptState,
+    pos: usize,
+    start: usize,
+    max: usize,
+    ll0_price: u32,
+    off_price: u32,
+    base_cost: u32,
+    off: u32,
+    reps: [u32; 3],
+    last_pos: usize,
+) -> usize {
+    priceset_range_vec::<4>(
+        node_prices,
+        nodes,
+        ml_cache,
+        ml_stamp,
+        profile,
+        stats,
+        pos,
+        start,
+        max,
+        ll0_price,
+        off_price,
+        base_cost,
+        off,
+        reps,
+        last_pos,
+        // SAFETY: both closures run inside this fn's neon target_feature umbrella.
+        |cells, stamp| unsafe { priceset_cached_prices4_neon(cells, stamp) },
+        |nc, np| unsafe { priceset_improved_mask4_neon(nc, np) },
+    )
+}
+
+/// SSE4.1 4-lane vector-load + deinterleave of cached ml-prices. Two 128-bit
+/// loads of `[price, gen]` pairs, `shuffle_epi32(0xD8)` groups prices then gens
+/// within each, `unpacklo/hi_epi64` separates them. `Some(prices)` only when
+/// all 4 generations equal `stamp`.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "sse4.2")]
+#[inline]
+unsafe fn priceset_cached_prices4_sse41(cells: &[[u32; 2]], stamp: u32) -> Option<[u32; 4]> {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::{
+        __m128i, _mm_castsi128_ps, _mm_cmpeq_epi32, _mm_loadu_si128, _mm_movemask_ps,
+        _mm_set1_epi32, _mm_shuffle_epi32, _mm_storeu_si128, _mm_unpackhi_epi64,
+        _mm_unpacklo_epi64,
+    };
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::{
+        __m128i, _mm_castsi128_ps, _mm_cmpeq_epi32, _mm_loadu_si128, _mm_movemask_ps,
+        _mm_set1_epi32, _mm_shuffle_epi32, _mm_storeu_si128, _mm_unpackhi_epi64,
+        _mm_unpacklo_epi64,
+    };
+    debug_assert!(cells.len() >= 4);
+    let base = cells.as_ptr() as *const __m128i;
+    let v0 = unsafe { _mm_loadu_si128(base) }; // [p0 g0 p1 g1]
+    let v1 = unsafe { _mm_loadu_si128(base.add(1)) }; // [p2 g2 p3 g3]
+    let s0 = _mm_shuffle_epi32(v0, 0xD8); // [p0 p1 g0 g1]
+    let s1 = _mm_shuffle_epi32(v1, 0xD8); // [p2 p3 g2 g3]
+    let gens = _mm_unpackhi_epi64(s0, s1); // [g0 g1 g2 g3]
+    let eq = _mm_cmpeq_epi32(gens, _mm_set1_epi32(stamp as i32));
+    if _mm_movemask_ps(_mm_castsi128_ps(eq)) as u8 & 0x0F != 0x0F {
+        return None;
+    }
+    let prices = _mm_unpacklo_epi64(s0, s1); // [p0 p1 p2 p3]
+    let mut out = [0u32; 4];
+    unsafe { _mm_storeu_si128(out.as_mut_ptr() as *mut __m128i, prices) };
+    Some(out)
+}
+
+/// SSE4.1 4-lane `next_cost < node_price` bitmask (unsigned compare via
+/// `min_epu32`, like the AVX2 path).
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "sse4.2")]
+#[inline]
+unsafe fn priceset_improved_mask4_sse41(next_cost: &[u32; 4], node_price: &[u32]) -> u8 {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::{
+        __m128i, _mm_andnot_si128, _mm_castsi128_ps, _mm_cmpeq_epi32, _mm_loadu_si128,
+        _mm_min_epu32, _mm_movemask_ps,
+    };
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::{
+        __m128i, _mm_andnot_si128, _mm_castsi128_ps, _mm_cmpeq_epi32, _mm_loadu_si128,
+        _mm_min_epu32, _mm_movemask_ps,
+    };
+    let nc = unsafe { _mm_loadu_si128(next_cost.as_ptr() as *const __m128i) };
+    let np = unsafe { _mm_loadu_si128(node_price.as_ptr() as *const __m128i) };
+    let min = _mm_min_epu32(nc, np);
+    let le = _mm_cmpeq_epi32(min, nc);
+    let eq = _mm_cmpeq_epi32(nc, np);
+    let lt = _mm_andnot_si128(eq, le);
+    (_mm_movemask_ps(_mm_castsi128_ps(lt)) as u8) & 0x0F
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "sse4.2")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn priceset_range_nonabort_sse41(
+    node_prices: &mut [u32],
+    nodes: &mut [HcOptimalNode],
+    ml_cache: &mut [[u32; 2]],
+    ml_stamp: u32,
+    profile: HcOptimalCostProfile,
+    stats: &HcOptState,
+    pos: usize,
+    start: usize,
+    max: usize,
+    ll0_price: u32,
+    off_price: u32,
+    base_cost: u32,
+    off: u32,
+    reps: [u32; 3],
+    last_pos: usize,
+) -> usize {
+    priceset_range_vec::<4>(
+        node_prices,
+        nodes,
+        ml_cache,
+        ml_stamp,
+        profile,
+        stats,
+        pos,
+        start,
+        max,
+        ll0_price,
+        off_price,
+        base_cost,
+        off,
+        reps,
+        last_pos,
+        // SAFETY: both closures run inside this fn's sse4.2 target_feature umbrella.
+        |cells, stamp| unsafe { priceset_cached_prices4_sse41(cells, stamp) },
+        |nc, np| unsafe { priceset_improved_mask4_sse41(nc, np) },
+    )
+}
+
+/// wasm `simd128` 4-lane vector-load + deinterleave of cached ml-prices.
+/// `u32x4_shuffle` selects the price (even) and gen (odd) lanes across the two
+/// loaded vectors natively. `Some(prices)` only when all 4 gens equal `stamp`
+/// (`u32x4_all_true` of the equality vector).
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[target_feature(enable = "simd128")]
+#[inline]
+unsafe fn priceset_cached_prices4_simd128(cells: &[[u32; 2]], stamp: u32) -> Option<[u32; 4]> {
+    use core::arch::wasm32::{
+        u32x4_all_true, u32x4_eq, u32x4_shuffle, u32x4_splat, v128, v128_load, v128_store,
+    };
+    debug_assert!(cells.len() >= 4);
+    let base = cells.as_ptr() as *const v128;
+    let v0 = unsafe { v128_load(base) }; // [p0 g0 p1 g1]
+    let v1 = unsafe { v128_load(base.add(1)) }; // [p2 g2 p3 g3]
+    // Lanes 0..3 index v0, 4..7 index v1.
+    let gens = u32x4_shuffle::<1, 3, 5, 7>(v0, v1); // [g0 g1 g2 g3]
+    let eq = u32x4_eq(gens, u32x4_splat(stamp));
+    if !u32x4_all_true(eq) {
+        return None;
+    }
+    let prices = u32x4_shuffle::<0, 2, 4, 6>(v0, v1); // [p0 p1 p2 p3]
+    let mut out = [0u32; 4];
+    unsafe { v128_store(out.as_mut_ptr() as *mut v128, prices) };
+    Some(out)
+}
+
+/// wasm `simd128` 4-lane `next_cost < node_price` bitmask. wasm has a native
+/// unsigned compare (`u32x4_lt`) and `u32x4_bitmask` to pack the lanes.
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[target_feature(enable = "simd128")]
+#[inline]
+unsafe fn priceset_improved_mask4_simd128(next_cost: &[u32; 4], node_price: &[u32]) -> u8 {
+    use core::arch::wasm32::{u32x4_bitmask, u32x4_lt, v128, v128_load};
+    let nc = unsafe { v128_load(next_cost.as_ptr() as *const v128) };
+    let np = unsafe { v128_load(node_price.as_ptr() as *const v128) };
+    u32x4_bitmask(u32x4_lt(nc, np))
+}
+
+#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[target_feature(enable = "simd128")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+unsafe fn priceset_range_nonabort_simd128(
+    node_prices: &mut [u32],
+    nodes: &mut [HcOptimalNode],
+    ml_cache: &mut [[u32; 2]],
+    ml_stamp: u32,
+    profile: HcOptimalCostProfile,
+    stats: &HcOptState,
+    pos: usize,
+    start: usize,
+    max: usize,
+    ll0_price: u32,
+    off_price: u32,
+    base_cost: u32,
+    off: u32,
+    reps: [u32; 3],
+    last_pos: usize,
+) -> usize {
+    priceset_range_vec::<4>(
+        node_prices,
+        nodes,
+        ml_cache,
+        ml_stamp,
+        profile,
+        stats,
+        pos,
+        start,
+        max,
+        ll0_price,
+        off_price,
+        base_cost,
+        off,
+        reps,
+        last_pos,
+        // SAFETY: both closures run inside this fn's simd128 target_feature umbrella.
+        |cells, stamp| unsafe { priceset_cached_prices4_simd128(cells, stamp) },
+        |nc, np| unsafe { priceset_improved_mask4_simd128(nc, np) },
+    )
+}
+
 macro_rules! build_optimal_plan_impl_body {
     (
         $self:expr,
@@ -3801,7 +4624,8 @@ macro_rules! build_optimal_plan_impl_body {
         $initial_state:ident,
         $stats:ident,
         $out:ident,
-        $collect:ident $(,)?
+        $collect:ident,
+        $priceset:path $(,)?
     ) => {{
         let current_abs_end = $current_abs_start + $current_len;
         let min_match_len = HC_OPT_MIN_MATCH_LEN;
@@ -3831,6 +4655,7 @@ macro_rules! build_optimal_plan_impl_body {
             <$strategy_ty as super::strategy::Strategy>::OPT_LEVEL == 0;
         let opt_level: bool = <$strategy_ty as super::strategy::Strategy>::OPT_LEVEL >= 2;
         let mut nodes = core::mem::take(&mut $self.backend.bt_mut().opt_nodes_scratch);
+        let mut node_prices = core::mem::take(&mut $self.backend.bt_mut().opt_node_prices_scratch);
         // `frontier_limit + 2 <= HC_OPT_NODE_LEN` — bounded by const.
         let frontier_buffer_size = frontier_limit + 2;
         if nodes.len() < HC_OPT_NODE_LEN {
@@ -3838,6 +4663,13 @@ macro_rules! build_optimal_plan_impl_body {
             // buffer: allocate the fixed upstream-zstd-sized frontier once. The DP
             // overwrites the active prefix before reading it.
             nodes = alloc::vec![HcOptimalNode::default(); HC_OPT_NODE_LEN].into_boxed_slice();
+        }
+        // The DP price array, same fixed length as `nodes`. This is the SOLE
+        // home of each position's price (the node struct carries no price), so
+        // the SIMD price-set vector-loads it directly. Initialised to u32::MAX
+        // so unwritten frontier cells compare as "unreachable".
+        if node_prices.len() < HC_OPT_NODE_LEN {
+            node_prices = alloc::vec![u32::MAX; HC_OPT_NODE_LEN].into_boxed_slice();
         }
         let mut candidates = core::mem::take(&mut $self.backend.bt_mut().opt_candidates_scratch);
         candidates.clear();
@@ -3892,18 +4724,19 @@ macro_rules! build_optimal_plan_impl_body {
             .wrapping_add(1)
             .max(1);
         let ml_price_stamp = $self.backend.bt_mut().opt_ml_price_stamp;
+        let node0_price = BtMatcher::cached_lit_length_price(
+            profile,
+            $stats,
+            initial_litlen,
+            &mut ll_cache,
+            ll_price_stamp,
+        );
         nodes[0] = HcOptimalNode {
-            price: BtMatcher::cached_lit_length_price(
-                profile,
-                $stats,
-                initial_litlen,
-                &mut ll_cache,
-                ll_price_stamp,
-            ),
             litlen: initial_litlen as u32,
             reps: initial_reps,
             ..HcOptimalNode::default()
         };
+        node_prices[0] = node0_price;
         let sufficient_len = profile.sufficient_match_len;
         let ll0_price = BtMatcher::cached_lit_length_price(
             profile,
@@ -3923,6 +4756,9 @@ macro_rules! build_optimal_plan_impl_body {
         let mut last_pos = 0usize;
         let mut forced_end: Option<usize> = None;
         let mut forced_end_state: Option<HcOptimalNode> = None;
+        // Price companion of `forced_end_state` (price no longer lives in the
+        // node struct; tracked alongside the forced-seed node).
+        let mut forced_end_price: Option<u32> = None;
         let mut seed_forced_shortest_path = false;
         let mut opt_ldm = HcOptLdmState {
             seq_store: HcRawSeqStore {
@@ -3992,6 +4828,8 @@ macro_rules! build_optimal_plan_impl_body {
                 last_pos = (min_match_len - 1).min(frontier_limit);
                 for p in 1..min_match_len.min(frontier_buffer_size) {
                     BtMatcher::reset_opt_node(&mut nodes[p]);
+                    // Reset the price (sole home; the node carries none).
+                    node_prices[p] = u32::MAX;
                     // `initial_litlen` is the litlen carried from prior
                     // optimal-plan segments — its real bound is the
                     // current block length (the frame compressor caps
@@ -4030,19 +4868,20 @@ macro_rules! build_optimal_plan_impl_body {
                         ll0_price,
                         profile.match_price_from_parts(off_price, ml_price, $stats),
                     );
-                    let forced_price = BtMatcher::add_prices(nodes[0].price, seq_cost);
+                    let forced_price = BtMatcher::add_prices(node_prices[0], seq_cost);
                     let forced_state = HcOptimalNode {
-                        price: forced_price,
                         off: candidate.offset as u32,
                         mlen: longest_len as u32,
                         litlen: 0,
                         reps: initial_reps,
                     };
-                    if longest_len < frontier_buffer_size && forced_price < nodes[longest_len].price {
+                    if longest_len < frontier_buffer_size && forced_price < node_prices[longest_len] {
                         nodes[longest_len] = forced_state;
+                        node_prices[longest_len] = forced_price;
                     }
                     forced_end = Some(longest_len);
                     forced_end_state = Some(forced_state);
+                    forced_end_price = Some(forced_price);
                     seed_forced_shortest_path = true;
                 }
             }
@@ -4059,7 +4898,12 @@ macro_rules! build_optimal_plan_impl_body {
                         continue;
                     }
                     if max_match_len > last_pos {
-                        BtMatcher::reset_opt_nodes(&mut nodes, last_pos + 1, max_match_len);
+                        BtMatcher::reset_opt_nodes(
+                            &mut nodes,
+                            &mut node_prices,
+                            last_pos + 1,
+                            max_match_len,
+                        );
                     }
                     let off_base = BtMatcher::encode_offset_base_with_reps(
                         candidate.offset as u32,
@@ -4069,7 +4913,7 @@ macro_rules! build_optimal_plan_impl_body {
                     let off_price = profile
                         .offset_price_for::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>($stats, off_base);
                     debug_assert!(max_match_len < frontier_buffer_size);
-                    let nodes0_price = nodes[0].price;
+                    let nodes0_price = node_prices[0];
                     for match_len in (start_len..=max_match_len).rev() {
                         let ml_price = BtMatcher::cached_match_length_price(
                             profile,
@@ -4083,16 +4927,16 @@ macro_rules! build_optimal_plan_impl_body {
                             profile.match_price_from_parts(off_price, ml_price, $stats),
                         );
                         let next_cost = BtMatcher::add_prices(nodes0_price, seq_cost);
-                        let node_price = unsafe { nodes.get_unchecked(match_len).price };
+                        let node_price = unsafe { *node_prices.get_unchecked(match_len) };
                         if match_len > last_pos || next_cost < node_price {
                             let slot = unsafe { nodes.get_unchecked_mut(match_len) };
                             *slot = HcOptimalNode {
-                                price: next_cost,
                                 off: candidate.offset as u32,
                                 mlen: match_len as u32,
                                 litlen: 0,
                                 reps: initial_reps,
                             };
+                            unsafe { *node_prices.get_unchecked_mut(match_len) = next_cost };
                             if match_len > last_pos {
                                 last_pos = match_len;
                             }
@@ -4103,14 +4947,15 @@ macro_rules! build_optimal_plan_impl_body {
                     prev_max_len = prev_max_len.max(max_match_len);
                 }
                 if last_pos + 1 < frontier_buffer_size {
-                    nodes[last_pos + 1].price = u32::MAX;
+                    node_prices[last_pos + 1] = u32::MAX;
                 }
             }
         }
         while !seed_forced_shortest_path && pos <= last_pos && pos <= frontier_limit {
             debug_assert!(pos + 1 < frontier_buffer_size);
             let prev_node = unsafe { *nodes.get_unchecked(pos - 1) };
-            if prev_node.price != u32::MAX {
+            let prev_node_price = unsafe { *node_prices.get_unchecked(pos - 1) };
+            if prev_node_price != u32::MAX {
                 let lit_len = prev_node.litlen as usize + 1;
                 let lit_price = {
                     let bt = $self.backend.bt_mut();
@@ -4130,14 +4975,16 @@ macro_rules! build_optimal_plan_impl_body {
                     &mut ll_cache,
                     ll_price_stamp,
                 );
-                let lit_cost = BtMatcher::add_price_delta(prev_node.price, lit_price, ll_delta);
-                let node_pos_price = unsafe { nodes.get_unchecked(pos).price };
+                let lit_cost = BtMatcher::add_price_delta(prev_node_price, lit_price, ll_delta);
+                // `node_pos_price` is the OLD price at `pos` (before the write
+                // below) — also the price of `prev_match`, the pre-overwrite copy.
+                let node_pos_price = unsafe { *node_prices.get_unchecked(pos) };
                 if lit_cost <= node_pos_price {
                     let prev_match = unsafe { *nodes.get_unchecked(pos) };
                     let slot = unsafe { nodes.get_unchecked_mut(pos) };
                     *slot = prev_node;
                     slot.litlen = lit_len as u32;
-                    slot.price = lit_cost;
+                    node_prices[pos] = lit_cost;
                     #[allow(clippy::collapsible_if)]
                     if opt_level
                         && prev_match.mlen > 0
@@ -4157,7 +5004,7 @@ macro_rules! build_optimal_plan_impl_body {
                                 )
                             };
                             let with1literal = BtMatcher::add_price_delta(
-                                prev_match.price,
+                                node_pos_price,
                                 next_lit_price,
                                 ll1_price as i32 - ll0_price as i32,
                             );
@@ -4171,7 +5018,7 @@ macro_rules! build_optimal_plan_impl_body {
                             let with_more_literals =
                                 BtMatcher::add_price_delta(lit_cost, next_lit_price, ll_delta_next);
                             let next = pos + 1;
-                            let next_price = unsafe { nodes.get_unchecked(next).price };
+                            let next_price = unsafe { *node_prices.get_unchecked(next) };
                             if with1literal < with_more_literals && with1literal < next_price {
                                 // Donor parity (zstd_opt.c:1232): `cur >= prevMatch.mlen`.
                                 debug_assert!(pos >= prev_match.mlen as usize);
@@ -4187,7 +5034,7 @@ macro_rules! build_optimal_plan_impl_body {
                                     *slot = prev_match;
                                     slot.reps = reps_after_match;
                                     slot.litlen = 1;
-                                    slot.price = with1literal;
+                                    node_prices[next] = with1literal;
                                     if next > last_pos {
                                         last_pos = next;
                                     }
@@ -4205,7 +5052,7 @@ macro_rules! build_optimal_plan_impl_body {
             // reading the fields fresh on each side keeps them out of the
             // cross-call live set. `nodes[pos]` is stable across `$collect`
             // (it only fills `candidates`), so post-call reads are identical.
-            let base_cost = unsafe { nodes.get_unchecked(pos).price };
+            let base_cost = unsafe { *node_prices.get_unchecked(pos) };
             if base_cost == u32::MAX {
                 pos += 1;
                 continue;
@@ -4235,7 +5082,7 @@ macro_rules! build_optimal_plan_impl_body {
                 break;
             }
 
-            let next_price = unsafe { nodes.get_unchecked(pos + 1).price };
+            let next_price = unsafe { *node_prices.get_unchecked(pos + 1) };
             // `saturating_add` is REQUIRED here, not a masked bug: `base_cost`
             // is a node price that can be the `u32::MAX` "unreachable" sentinel,
             // and saturating keeps `base_cost + margin` pinned at MAX so the
@@ -4311,12 +5158,12 @@ macro_rules! build_optimal_plan_impl_body {
                     let end_pos = (pos + longest_len).min($current_len);
                     forced_end = Some(end_pos);
                     forced_end_state = Some(HcOptimalNode {
-                        price: forced_price,
                         off: candidate.offset as u32,
                         mlen: longest_len as u32,
                         litlen: 0,
                         reps: base_reps,
                     });
+                    forced_end_price = Some(forced_price);
                     break;
                 }
             }
@@ -4341,7 +5188,12 @@ macro_rules! build_optimal_plan_impl_body {
                 }
                 let max_next = pos + max_match_len;
                 if max_next > last_pos {
-                    BtMatcher::reset_opt_nodes(&mut nodes, last_pos + 1, max_next);
+                    BtMatcher::reset_opt_nodes(
+                        &mut nodes,
+                        &mut node_prices,
+                        last_pos + 1,
+                        max_next,
+                    );
                 }
                 let lit_len = base_litlen;
                 let off_base = BtMatcher::encode_offset_base_with_reps(
@@ -4352,36 +5204,69 @@ macro_rules! build_optimal_plan_impl_body {
                 let off_price = profile
                     .offset_price_for::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>($stats, off_base);
                 debug_assert!(pos + max_match_len < frontier_buffer_size);
-                for match_len in (start_len..=max_match_len).rev() {
-                    let next = pos + match_len;
-                    let ml_price = BtMatcher::cached_match_length_price(
-                        profile,
-                        $stats,
-                        match_len,
-                        &mut ml_cache,
-                        ml_price_stamp,
-                    );
-                    let seq_cost = BtMatcher::add_prices(
-                        ll0_price,
-                        profile.match_price_from_parts(off_price, ml_price, $stats),
-                    );
-                    let next_cost = BtMatcher::add_prices(base_cost, seq_cost);
-                    let node_next_price = unsafe { nodes.get_unchecked(next).price };
-                    let improved = next > last_pos || next_cost < node_next_price;
-                    if improved {
-                        let slot = unsafe { nodes.get_unchecked_mut(next) };
-                        *slot = HcOptimalNode {
-                            price: next_cost,
-                            off: candidate.offset as u32,
-                            mlen: match_len as u32,
-                            litlen: 0,
-                            reps: base_reps,
-                        };
-                        if next > last_pos {
-                            last_pos = next;
+                if abort_on_worse_match {
+                    // btopt (OPT_LEVEL == 0): reverse-iterate with early break —
+                    // once a longer match stops improving, shorter ones are
+                    // skipped. Order-dependent, stays scalar.
+                    for match_len in (start_len..=max_match_len).rev() {
+                        let next = pos + match_len;
+                        let ml_price = BtMatcher::cached_match_length_price(
+                            profile,
+                            $stats,
+                            match_len,
+                            &mut ml_cache,
+                            ml_price_stamp,
+                        );
+                        let seq_cost = BtMatcher::add_prices(
+                            ll0_price,
+                            profile.match_price_from_parts(off_price, ml_price, $stats),
+                        );
+                        let next_cost = BtMatcher::add_prices(base_cost, seq_cost);
+                        let node_next_price = unsafe { *node_prices.get_unchecked(next) };
+                        if next > last_pos || next_cost < node_next_price {
+                            let slot = unsafe { nodes.get_unchecked_mut(next) };
+                            *slot = HcOptimalNode {
+                                off: candidate.offset as u32,
+                                mlen: match_len as u32,
+                                litlen: 0,
+                                reps: base_reps,
+                            };
+                            unsafe { *node_prices.get_unchecked_mut(next) = next_cost };
+                            if next > last_pos {
+                                last_pos = next;
+                            }
+                        } else {
+                            break;
                         }
-                    } else if abort_on_worse_match {
-                        break;
+                    }
+                } else {
+                    // btultra / btultra2 (OPT_LEVEL >= 2): no abort, each
+                    // match_len writes a distinct node => order-independent.
+                    // Dispatch to the per-tier price-set ($priceset is the
+                    // tier's fn: AVX2 SoA-vector compare for the avx2 wrapper,
+                    // inline scalar otherwise) — it folds into this wrapper's
+                    // monomorphisation, so no call ABI / runtime feature check.
+                    #[allow(unused_unsafe)]
+                    {
+                        last_pos = last_pos.max(unsafe {
+                            $priceset(
+                                &mut node_prices,
+                                &mut nodes,
+                                ml_cache,
+                                ml_price_stamp,
+                                profile,
+                                $stats,
+                                pos,
+                                start_len,
+                                max_match_len,
+                                ll0_price,
+                                off_price,
+                                base_cost,
+                                candidate.offset as u32,
+                                base_reps,
+                                last_pos,
+                            )
+                        });
                     }
                 }
                 prev_max_len = prev_max_len.max(max_match_len);
@@ -4389,7 +5274,7 @@ macro_rules! build_optimal_plan_impl_body {
 
             if last_pos + 1 < frontier_buffer_size {
                 unsafe {
-                    nodes.get_unchecked_mut(last_pos + 1).price = u32::MAX;
+                    *node_prices.get_unchecked_mut(last_pos + 1) = u32::MAX;
                 }
             }
             pos += 1;
@@ -4397,10 +5282,11 @@ macro_rules! build_optimal_plan_impl_body {
 
         if last_pos == 0 {
             if $current_len == 0 {
-                let price = nodes[0].price;
+                let price = node_prices[0];
                 return $self.backend.bt_mut().finish_optimal_plan(
                     HcOptimalPlanBuffers {
                         nodes,
+                        node_prices,
                         candidates,
                         store,
                         price_arena,
@@ -4435,10 +5321,11 @@ macro_rules! build_optimal_plan_impl_body {
                 &mut ll_cache,
                 ll_price_stamp,
             );
-            let price = BtMatcher::add_price_delta(nodes[0].price, lit_price, ll_delta);
+            let price = BtMatcher::add_price_delta(node_prices[0], lit_price, ll_delta);
             return $self.backend.bt_mut().finish_optimal_plan(
                 HcOptimalPlanBuffers {
                     nodes,
+                    node_prices,
                     candidates,
                     store,
                     price_arena,
@@ -4448,15 +5335,19 @@ macro_rules! build_optimal_plan_impl_body {
         }
 
         let target_pos = forced_end.unwrap_or(last_pos.min(frontier_limit));
-        let last_stretch = if let Some(forced_state) = forced_end_state {
-            forced_state
+        // Price lives in `node_prices`, not the node struct, so carry the
+        // final-stretch price alongside its node (forced-seed companion or the
+        // frontier price at `target_pos`).
+        let (last_stretch, last_stretch_price) = if let Some(forced_state) = forced_end_state {
+            (forced_state, forced_end_price.expect("forced state has a price"))
         } else {
-            nodes[target_pos]
+            (nodes[target_pos], node_prices[target_pos])
         };
-        if last_stretch.price == u32::MAX {
+        if last_stretch_price == u32::MAX {
             return $self.backend.bt_mut().finish_optimal_plan(
                 HcOptimalPlanBuffers {
                     nodes,
+                    node_prices,
                     candidates,
                     store,
                     price_arena,
@@ -4469,12 +5360,13 @@ macro_rules! build_optimal_plan_impl_body {
             return $self.backend.bt_mut().finish_optimal_plan(
                 HcOptimalPlanBuffers {
                     nodes,
+                    node_prices,
                     candidates,
                     store,
                     price_arena,
                 },
                 (
-                    last_stretch.price,
+                    last_stretch_price,
                     last_stretch.reps,
                     last_stretch.litlen as usize,
                     target_pos.min($current_len),
@@ -4497,12 +5389,13 @@ macro_rules! build_optimal_plan_impl_body {
                 return $self.backend.bt_mut().finish_optimal_plan(
                     HcOptimalPlanBuffers {
                         nodes,
+                        node_prices,
                         candidates,
                         store,
                         price_arena,
                     },
                     (
-                        last_stretch.price,
+                        last_stretch_price,
                         last_stretch.reps,
                         tail_literals,
                         target_pos.min($current_len),
@@ -4578,7 +5471,7 @@ macro_rules! build_optimal_plan_impl_body {
             store_pos += 1;
         }
         let result = (
-            last_stretch.price,
+            last_stretch_price,
             end_reps,
             if last_stretch.litlen > 0 {
                 last_stretch.litlen as usize
@@ -4590,6 +5483,7 @@ macro_rules! build_optimal_plan_impl_body {
         $self.backend.bt_mut().finish_optimal_plan(
             HcOptimalPlanBuffers {
                 nodes,
+                node_prices,
                 candidates,
                 store,
                 price_arena,
@@ -5547,7 +6441,22 @@ impl HcMatchGenerator {
         }
     }
 
+    /// Dispatcher: pick the dict-aware monomorph when a separate dms is primed
+    /// (attach-mode dictionary), else the no-dict monomorph. Mirrors upstream's
+    /// compile-time `dictMode` split — the `DICT = false` body carries no dms
+    /// code at all, so the no-dict hot path is unaffected by the dict search.
     pub(crate) fn start_matching_lazy(
+        &mut self,
+        handle_sequence: impl for<'a> FnMut(Sequence<'a>),
+    ) {
+        if self.table.dms.is_primed() {
+            self.start_matching_lazy_impl::<true>(handle_sequence);
+        } else {
+            self.start_matching_lazy_impl::<false>(handle_sequence);
+        }
+    }
+
+    fn start_matching_lazy_impl<const DICT: bool>(
         &mut self,
         mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
     ) {
@@ -5578,8 +6487,13 @@ impl HcMatchGenerator {
             let abs_pos = current_abs_start + pos;
             let lit_len = pos - literals_start;
 
-            let best = self.hc.find_best_match(&self.table, abs_pos, lit_len);
-            if let Some(candidate) = self.hc.pick_lazy_match(&self.table, abs_pos, lit_len, best) {
+            let best = self
+                .hc
+                .find_best_match::<DICT>(&self.table, abs_pos, lit_len);
+            if let Some(candidate) =
+                self.hc
+                    .pick_lazy_match::<DICT>(&self.table, abs_pos, lit_len, best)
+            {
                 self.table
                     .insert_match_span(abs_pos, candidate.start + candidate.match_len);
                 let start = candidate.start - current_abs_start;
@@ -5598,7 +6512,26 @@ impl HcMatchGenerator {
                 literals_start = pos;
             } else {
                 self.table.insert_position(abs_pos);
-                pos += 1;
+                // Lazy skipping (upstream zstd `ZSTD_compressBlock_lazy_generic`,
+                // zstd_lazy.c:1614): advance faster over runs with no match.
+                // `step = ((ip - anchor) >> kSearchStrength) + 1` with
+                // kSearchStrength = 8, where `ip - anchor` is the current
+                // literal-run length. On compressible input the run stays short
+                // (step == 1, identical to a 1-byte advance); on incompressible
+                // / dict-over-random input the run grows so the parser skips
+                // ahead (one search per `step` positions) instead of searching
+                // every byte. Skipped positions are not inserted, mirroring
+                // upstream (it inserts only searched positions during a no-match
+                // run). Ratio follows upstream (not byte-identical).
+                let step = ((pos - literals_start) >> 8) + 1;
+                pos += step;
+                // No clamp needed before the tail loop: the search bound and the
+                // hashable bound are both `pos + HC_MIN_MATCH_LEN <= current_len`
+                // (HC_MIN_MATCH_LEN == 4 == the insert width), so there is no
+                // non-searchable-but-hashable anchor to miss. Positions the skip
+                // jumps over inside the searchable region are intentionally not
+                // inserted — same as upstream zstd, which advances past them via
+                // the identical `ip += step` and never hashes them either.
             }
         }
 
@@ -6059,10 +6992,23 @@ impl HcMatchGenerator {
                     ),
             }
         }
+        // wasm with simd128: route through the simd128 DP body (4-lane price-set).
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        unsafe {
+            self.build_optimal_plan_impl_simd128::<S, ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(
+                current,
+                current_abs_start,
+                current_len,
+                initial_state,
+                stats,
+                out,
+            )
+        }
         #[cfg(not(any(
             all(target_arch = "aarch64", target_endian = "little"),
             target_arch = "x86",
-            target_arch = "x86_64"
+            target_arch = "x86_64",
+            all(target_arch = "wasm32", target_feature = "simd128")
         )))]
         {
             self.build_optimal_plan_impl_scalar::<S, ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(
@@ -6104,6 +7050,7 @@ impl HcMatchGenerator {
             stats,
             out,
             collect_optimal_candidates_initialized_neon,
+            priceset_range_nonabort_neon,
         )
     }
 
@@ -6132,6 +7079,7 @@ impl HcMatchGenerator {
             stats,
             out,
             collect_optimal_candidates_initialized_sse42,
+            priceset_range_nonabort_sse41,
         )
     }
 
@@ -6160,6 +7108,7 @@ impl HcMatchGenerator {
             stats,
             out,
             collect_optimal_candidates_initialized_avx2_bmi2,
+            priceset_range_nonabort_avx2,
         )
     }
 
@@ -6168,6 +7117,13 @@ impl HcMatchGenerator {
     // variants where callees are `unsafe fn`. The scalar wrappers route
     // through safe fns, so those blocks are redundant on this path.
     #[allow(unused_unsafe)]
+    // The dispatch reaches this only on non-SIMD x86 (Scalar tier) and the
+    // portable fallback; on wasm+simd128 the simd128 wrapper is selected, so
+    // this is cfg-dead there.
+    #[cfg_attr(
+        all(target_arch = "wasm32", target_feature = "simd128"),
+        allow(dead_code)
+    )]
     fn build_optimal_plan_impl_scalar<
         S: super::strategy::Strategy,
         const ACCURATE_PRICE: bool,
@@ -6191,6 +7147,42 @@ impl HcMatchGenerator {
             stats,
             out,
             collect_optimal_candidates_initialized_scalar,
+            priceset_range_nonabort_scalar,
+        )
+    }
+
+    /// wasm `simd128`-umbrella DP body: scalar candidate collection (no wasm
+    /// collect kernel) but the simd128 4-lane price-set.
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    #[target_feature(enable = "simd128")]
+    // With `+simd128` in the wasm baseline the shared body macro's `unsafe`
+    // blocks (needed by the safe scalar wrapper) are redundant inside this
+    // target_feature fn.
+    #[allow(unused_unsafe)]
+    unsafe fn build_optimal_plan_impl_simd128<
+        S: super::strategy::Strategy,
+        const ACCURATE_PRICE: bool,
+        const FAVOR_SMALL_OFFSETS: bool,
+    >(
+        &mut self,
+        current: &[u8],
+        current_abs_start: usize,
+        current_len: usize,
+        initial_state: HcOptimalPlanState,
+        stats: &HcOptState,
+        out: &mut Vec<HcOptimalSequence>,
+    ) -> (u32, [u32; 3], usize, usize) {
+        build_optimal_plan_impl_body!(
+            self,
+            S,
+            current,
+            current_abs_start,
+            current_len,
+            initial_state,
+            stats,
+            out,
+            collect_optimal_candidates_initialized_scalar,
+            priceset_range_nonabort_simd128,
         )
     }
 
@@ -9276,11 +10268,17 @@ fn primed_snapshot_not_restored_across_fast_attach_copy_boundary() {
 #[test]
 fn primed_snapshot_fast_attach_does_not_over_key_non_simple_backends() {
     // `fast_attach` is a Simple/Fast-backend concept (the 8 KiB attach-vs-copy
-    // table split). On the HashChain/Dfast/Row backends the dictionary is
-    // always primed the same way, so the bit must NOT enter their snapshot key
-    // — otherwise an unhinted capture (which would record `fast_attach = true`)
-    // and a hinted reset that resolves to the IDENTICAL `LevelParams` would key
-    // differently and force a needless re-prime. `Best` is a Row-backend lazy
+    // table split). Dfast/Row/HashChain each have their OWN attach/copy regime
+    // (`DFAST_ATTACH_DICT_CUTOFF_LOG`, `ROW_ATTACH_DICT_CUTOFF_LOG`,
+    // `HC_ATTACH_DICT_CUTOFF_LOG`) but those are deliberately kept OUT of the
+    // `fast_attach` key, which only models the Fast table split. Their snapshots
+    // are keyed by the resolved matcher geometry instead, and the HC modes share
+    // one window geometry so an HC cross-mode restore stays decodable (see
+    // `prime_with_dictionary`). Either way the `fast_attach`
+    // bit must NOT enter a non-Simple snapshot key — otherwise an unhinted
+    // capture (which would record `fast_attach = true`) and a hinted reset that
+    // resolves to the IDENTICAL `LevelParams` would key differently and force a
+    // needless re-prime. `Best` is a Row-backend lazy
     // level; this also pins the Row arm recording its RESOLVED hash width on
     // the unhinted path (a 0 default there keyed unhinted-vs-hinted apart).
     // An explicit Row-backend level: `Best` now sits on level 13 (Btlazy2),
