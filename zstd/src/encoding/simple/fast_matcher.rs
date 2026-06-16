@@ -1306,6 +1306,12 @@ impl FastKernelMatcher {
         // match what the dual-base dict kernel reads from the main table; 0 when
         // no dict is attached.
         let base_offset = self.dict.region_len();
+        debug_assert!(
+            base_offset
+                .checked_add(block_end)
+                .is_some_and(|v| v <= u32::MAX as usize),
+            "virtual position overflow: dict.region_len()={base_offset} + block_end={block_end} exceeds u32",
+        );
         match self.hash_table.mls() {
             4 => self.prime_hash_table_impl::<4>(base, backfill_start, last_hashable, base_offset),
             5 => self.prime_hash_table_impl::<5>(base, backfill_start, last_hashable, base_offset),
