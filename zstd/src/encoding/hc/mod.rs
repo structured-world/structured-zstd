@@ -470,7 +470,13 @@ impl HcMatcher {
     /// search is one bounded operation. The dict sits at the front of `concat`
     /// (`[0, region)`); a dms candidate is a concat index `< current_idx`, so
     /// the offset / extension logic matches the live walk.
-    #[inline(never)]
+    ///
+    /// `#[inline]`: with the `DICT` split the `DICT = false` monomorph never
+    /// references this (the `if DICT &&` gate is a compile-time false), so it is
+    /// dropped from the no-dict path entirely; the `DICT = true` monomorph
+    /// inlines it into the dict hot path.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
     fn dms_chain_walk(
         &self,
         table: &MatchTable,
