@@ -439,6 +439,85 @@ impl HcMatcher {
             }
             cur = next;
         }
+
+        // Separate dictionary match state (upstream `ZSTD_dictMatchState` HC4
+        // loop, `zstd_lazy.c:748-770`). FUSED into this function and sharing the
+        // SAME `steps` / `max_chain_steps` budget as the live walk above — donor
+        // decrements ONE `nbAttempts` across the live chain then the dms chain,
+        // so the two together are a single bounded operation, not two
+        // full-budget walks. The dict sits at the front of the concat buffer
+        // (`[0, region)`); a dms candidate is a concat index < `current_idx`, so
+        // the offset / extension logic matches the live walk. Inert when no dms
+        // is primed (no-dict frames, or copy-mode where the dict was merged into
+        // the live chain above).
+        if let Some(dms) = table.dms.table()
+            && !dms.hash_table.is_empty()
+        {
+            let dms_hash = MatchTable::hash_position_at(concat, current_idx, dms.hash_log, dms.mls);
+            let mut dcur = dms.hash_table[dms_hash];
+            while steps < max_chain_steps {
+                if dcur == 0 {
+                    break;
+                }
+                // Dict position is a concat index in `[0, region)`; the dict is
+                // at the front so `dict_idx < current_idx` always.
+                let dict_idx = (dcur - 1) as usize;
+                let dnext = dms.chain_table[dict_idx];
+                steps += 1;
+                let new_offset = current_idx - dict_idx;
+                // Out-of-window dict positions are unreachable to the decoder.
+                if new_offset <= table.max_window_size {
+                    let mut skip = false;
+                    if let Some(best_ref) = best
+                        && new_offset >= best_ref.offset
+                        && let Some(tail_off) = best_ref.match_len.checked_sub(lit_len + 3)
+                    {
+                        let m_end = dict_idx + tail_off + 4;
+                        let i_end = current_idx + tail_off + 4;
+                        if i_end > history_tail || m_end > history_tail {
+                            skip = true;
+                        } else {
+                            let m = unsafe {
+                                MatchTable::read_le_u32_ptr(base_ptr.add(dict_idx + tail_off))
+                            };
+                            let i = unsafe {
+                                MatchTable::read_le_u32_ptr(base_ptr.add(current_idx + tail_off))
+                            };
+                            skip = m != i;
+                        }
+                    }
+                    let four_byte_ok = dict_idx + 4 > history_tail
+                        || current_idx + 4 > history_tail
+                        || unsafe {
+                            MatchTable::read_le_u32_ptr(base_ptr.add(dict_idx))
+                                == MatchTable::read_le_u32_ptr(base_ptr.add(current_idx))
+                        };
+                    if !skip && four_byte_ok {
+                        let match_len =
+                            common_prefix_len(&concat[dict_idx..], &concat[current_idx..]);
+                        if match_len >= HC_MIN_MATCH_LEN {
+                            let candidate = Self::extend_backwards(
+                                table,
+                                dict_idx + history_abs_start,
+                                abs_pos,
+                                match_len,
+                                lit_len,
+                            );
+                            best = Self::better_candidate(best, Some(candidate));
+                            if best.is_some_and(|b| b.match_len >= self.target_len) {
+                                return best;
+                            }
+                        }
+                    }
+                }
+                // Chain links are strictly decreasing (head insert); `dnext == 0`
+                // ends the walk at the loop top.
+                if dnext == dcur {
+                    break;
+                }
+                dcur = dnext;
+            }
+        }
         best
     }
 

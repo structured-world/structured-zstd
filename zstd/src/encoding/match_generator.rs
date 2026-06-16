@@ -685,6 +685,13 @@ const DFAST_ATTACH_DICT_CUTOFF_LOG: u8 = 14;
 /// `row_candidate_rl`), larger known-size inputs dense-COPY into the live rows.
 const ROW_ATTACH_DICT_CUTOFF_LOG: u8 = 15;
 
+/// 16 KiB (`2^14`, donor `attachDictSizeCutoffs[ZSTD_lazy2]`): small /
+/// unknown-size inputs ATTACH the dict as a separate hash-chain dms (the dual
+/// search in `find_best_match` walks the live input chain + the dms), larger
+/// known-size inputs dense-COPY (merge the dict into the live chain and search
+/// the one combined chain).
+const HC_ATTACH_DICT_CUTOFF_LOG: u8 = 14;
+
 // Source-size cap for the dfast hash bits when a size hint is present: a tiny
 // input needs no larger hash than its window. The donor `cParams.hashLog` /
 // `chainLog` (from `DfastConfig`) caps it from above at the call site.
@@ -1892,11 +1899,24 @@ impl MatchGeneratorDriver {
                 if table.uses_bt {
                     // BT / optimal levels: keep the dict in history for the dms
                     // but do NOT insert it into the live tree (donor separate
-                    // dictMatchState). Lazy-HC levels still index the dict into
-                    // the live chain (they have no dms).
+                    // dictMatchState). The dms-BT is built in
+                    // `prime_with_dictionary`.
                     table.skip_matching_dict_bt();
                 } else {
-                    self.hc_matcher_mut().skip_matching(Some(false));
+                    // Lazy-HC: ATTACH (separate dms hash-chain) for small /
+                    // unknown inputs like the Fast/Dfast/Row backends; COPY
+                    // (merge into the live chain) for large known inputs. Attach
+                    // keeps the dict in history but out of the live chain (same
+                    // insert-cursor advance as the BT arm); the dms hash-chain is
+                    // built in `prime_with_dictionary`.
+                    let attach = self
+                        .reset_size_log
+                        .is_none_or(|log| log <= HC_ATTACH_DICT_CUTOFF_LOG);
+                    if attach {
+                        self.hc_matcher_mut().table.skip_matching_dict_bt();
+                    } else {
+                        self.hc_matcher_mut().skip_matching(Some(false));
+                    }
                 }
             }
         }
@@ -2680,13 +2700,25 @@ impl Matcher for MatchGeneratorDriver {
                 .saturating_add(granted_retained_budget);
         }
         if self.active_backend() == super::strategy::BackendTag::HashChain {
+            // Recompute the lazy-HC attach decision made per-chunk in
+            // `skip_matching_for_dictionary_priming` (stable across the prime —
+            // `reset_size_log` does not change here).
+            let hc_attach = self
+                .reset_size_log
+                .is_none_or(|log| log <= HC_ATTACH_DICT_CUTOFF_LOG);
             let table = &mut self.hc_matcher_mut().table;
             table.set_dictionary_limit_from_primed_bytes(committed_dict_budget);
-            // Build the dictMatchState chain for BT/optimal levels so the
-            // collect dual-probes the dictionary with its own compare budget
-            // (the dict bytes were just committed to the front of history).
+            // Build the dictMatchState over the committed dict (front of
+            // history) so `find_best_match` dual-probes it with its own compare
+            // budget. BT/optimal → DUBT dms; lazy-HC attach → single-link
+            // hash-chain dms. Copy-mode lazy-HC merged the dict into the live
+            // chain instead, so drop any stale dms.
             if table.uses_bt {
                 table.prime_dms_bt(committed_dict_budget);
+            } else if hc_attach {
+                table.prime_dms_hc(committed_dict_budget);
+            } else {
+                table.dms.invalidate();
             }
         }
         // CDict-equivalent: now that every dict chunk is indexed, mark the

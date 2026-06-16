@@ -783,6 +783,68 @@ impl MatchTable {
         self.dms.mark_primed();
     }
 
+    /// Build a SEPARATE dictionary match state for the lazy hash-chain path
+    /// (upstream `ZSTD_dictMatchState`, the dms HC4 walk in
+    /// `ZSTD_HcFindBestMatch` `zstd_lazy.c:748-770`) over the first `region_len`
+    /// bytes of the live history (the dictionary at the front). Unlike
+    /// [`Self::prime_dms_bt`] this is a single-link hash chain (one `next` entry
+    /// per dict position, like the live HC chain), not a binary tree: the lazy
+    /// parser walks it with a bounded compare budget rather than descending to
+    /// the longest match. `hash_table` holds per-bucket chain heads, packed
+    /// `dict_rel + 1` (`0` = empty); `chain_table[dict_rel]` is the previous
+    /// dict position in the same bucket, same packing. Dict positions are concat
+    /// indices at the front of the shared buffer, so the offset is `idx -
+    /// dict_idx` directly. Hashed at `HC_MIN_MATCH_LEN` (4), matching the live
+    /// chain. Cached across frames via `DictAttach::is_primed`.
+    pub(crate) fn prime_dms_hc(&mut self, region_len: usize) {
+        let mls = HC_MIN_MATCH_LEN;
+        let region = region_len.min(self.live_history().len());
+        if region < mls {
+            self.dms.invalidate();
+            return;
+        }
+        let dms_hash_log =
+            (usize::BITS - (region - 1).leading_zeros()).clamp(10, self.hash_log as u32) as usize;
+        if self.dms.is_primed()
+            && self.dms.region_len() == region
+            && self
+                .dms
+                .table()
+                .is_some_and(|t| t.mls == mls && t.hash_log == dms_hash_log)
+        {
+            return;
+        }
+        let (mut hash_table, mut chain_table) = match self.dms.table_mut() {
+            Some(t) => (
+                core::mem::take(&mut t.hash_table),
+                core::mem::take(&mut t.chain_table),
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
+        hash_table.clear();
+        hash_table.resize(1usize << dms_hash_log, 0u32);
+        // Single `next` link per dict position (HC4 chain, not the BT's 2/pos).
+        chain_table.clear();
+        chain_table.resize(region, 0u32);
+        let concat = self.live_history();
+        let mut current = 0usize;
+        while current + mls <= region {
+            let h = Self::hash_position_at(concat, current, dms_hash_log, mls);
+            // Prepend `current` to its bucket chain (donor
+            // `ZSTD_insertAndFindFirstIndex` head insert).
+            chain_table[current] = hash_table[h];
+            hash_table[h] = (current + 1) as u32;
+            current += 1;
+        }
+        let tables = self.dms.table_mut_or_init(DmsDictTables::default);
+        tables.hash_table = hash_table;
+        tables.chain_table = chain_table;
+        tables.hash_log = dms_hash_log;
+        tables.mls = mls;
+        self.dms.set_region_len(region);
+        self.dms.mark_primed();
+    }
+
     /// Append a freshly committed buffer to the rolling window. Drops
     /// chunk-length entries for the oldest slices until the new total
     /// fits inside `max_window_size`, extends the contiguous `history`
