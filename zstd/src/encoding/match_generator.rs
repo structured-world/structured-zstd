@@ -6373,7 +6373,19 @@ impl HcMatchGenerator {
                 literals_start = pos;
             } else {
                 self.table.insert_position(abs_pos);
-                pos += 1;
+                // Lazy skipping (upstream zstd `ZSTD_compressBlock_lazy_generic`,
+                // zstd_lazy.c:1614): advance faster over runs with no match.
+                // `step = ((ip - anchor) >> kSearchStrength) + 1` with
+                // kSearchStrength = 8, where `ip - anchor` is the current
+                // literal-run length. On compressible input the run stays short
+                // (step == 1, identical to a 1-byte advance); on incompressible
+                // / dict-over-random input the run grows so the parser skips
+                // ahead (one search per `step` positions) instead of searching
+                // every byte. Skipped positions are not inserted, mirroring
+                // upstream (it inserts only searched positions during a no-match
+                // run). Ratio follows upstream (not byte-identical).
+                let step = ((pos - literals_start) >> 8) + 1;
+                pos += step;
             }
         }
 
