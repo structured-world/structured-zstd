@@ -318,7 +318,7 @@ fn small_repetitive_compresses_on_borrowed_hashchain_band() {
         let take = line.len().min(4096 - data.len());
         data.extend_from_slice(&line[..take]);
     }
-    for level in [5i32, 6, 7, 10, 12] {
+    for level in 5i32..=12 {
         // Compress via the one-shot slice entry (the borrowed in-place scan this
         // regression guards), then decode THIS exact frame — not a separately
         // recompressed one — so the round-trip validates the same bytes the ratio

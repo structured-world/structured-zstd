@@ -2546,11 +2546,13 @@ impl Matcher for MatchGeneratorDriver {
         // here (post-resolution, after the test-only param override) so the key
         // reflects exactly the geometry the restored `storage` must match. The
         // Fast attach-vs-copy mode is part of the shape ONLY for the Simple
-        // backend (it decides whether a separate dict table is built); the other
-        // backends prime the dictionary the same way regardless, so including
-        // the bit there would over-key identical resolved shapes. When it
-        // applies it matches the decision `prime_with_dictionary` makes from the
-        // same `reset_size_log`.
+        // backend (it decides the distinct dict-table shape that backend builds).
+        // Dfast/Row/HashChain have their OWN attach/copy regimes, but this bit
+        // models only the Fast table split; those backends are keyed by the
+        // resolved matcher geometry instead, so folding the Fast bit into their
+        // key would over-key identical resolved shapes. When it applies it
+        // matches the decision `prime_with_dictionary` makes from the same
+        // `reset_size_log`.
         let fast_attach = matches!(next_backend, super::strategy::BackendTag::Simple)
             && self
                 .reset_size_log
@@ -2915,13 +2917,14 @@ impl Matcher for MatchGeneratorDriver {
         // clone only the dict-state (history + `dms` + window/offset/dict-limit),
         // then move the live tables back — the snapshot keeps just what donor's
         // CDict keeps, and `restore_primed_dictionary` re-allocates the zeroed
-        // live tables. Every other case keeps the dict IN the live structure and
-        // carries no usable `dms`, so the snapshot must retain the full tables
-        // (full clone): lazy-HC (attach hash-chain dms aside, the live chain is
-        // still the search structure) and COPY mode for BOTH BT and lazy-HC
-        // (`dms` invalidated, dict merged into the live tree / chain). `dms`
-        // being primed is the exact "decoupled" signal — it is set only by the BT
-        // attach prime and dropped in copy mode.
+        // live tables. Every other case keeps the dict reachable through the live
+        // structure, so the snapshot must retain the full tables (full clone):
+        // lazy-HC attach (it DOES prime a hash-chain `dms`, but the live chain is
+        // still the search structure, so the tables must travel) and COPY mode for
+        // BOTH BT and lazy-HC (`dms` invalidated, dict merged into the live tree /
+        // chain). `uses_bt && dms.is_primed()` is therefore the exact "decoupled"
+        // signal — true only for the BT attach prime; lazy-HC attach primes `dms`
+        // too but is intentionally NOT decoupled.
         let bt_decoupled = matches!(
             &self.storage,
             MatcherStorage::HashChain(hc) if hc.table.uses_bt && hc.table.dms.is_primed()
@@ -4826,6 +4829,9 @@ macro_rules! build_optimal_plan_impl_body {
                 last_pos = (min_match_len - 1).min(frontier_limit);
                 for p in 1..min_match_len.min(frontier_buffer_size) {
                     BtMatcher::reset_opt_node(&mut nodes[p]);
+                    // Keep the SoA `node_prices` sidecar in lockstep with the AoS
+                    // `nodes[p].price` the price-set paths compare against.
+                    node_prices[p] = u32::MAX;
                     // `initial_litlen` is the litlen carried from prior
                     // optimal-plan segments — its real bound is the
                     // current block length (the frame compressor caps
@@ -4874,6 +4880,9 @@ macro_rules! build_optimal_plan_impl_body {
                     };
                     if longest_len < frontier_buffer_size && forced_price < nodes[longest_len].price {
                         nodes[longest_len] = forced_state;
+                        // Mirror into the SoA sidecar so the price-set loop sees
+                        // the forced seed as the baseline (lockstep invariant).
+                        node_prices[longest_len] = forced_price;
                     }
                     forced_end = Some(longest_len);
                     forced_end_state = Some(forced_state);
@@ -6520,6 +6529,13 @@ impl HcMatchGenerator {
                 // run). Ratio follows upstream (not byte-identical).
                 let step = ((pos - literals_start) >> 8) + 1;
                 pos += step;
+                // No clamp needed before the tail loop: the search bound and the
+                // hashable bound are both `pos + HC_MIN_MATCH_LEN <= current_len`
+                // (HC_MIN_MATCH_LEN == 4 == the insert width), so there is no
+                // non-searchable-but-hashable anchor to miss. Positions the skip
+                // jumps over inside the searchable region are intentionally not
+                // inserted — same as upstream zstd, which advances past them via
+                // the identical `ip += step` and never hashes them either.
             }
         }
 

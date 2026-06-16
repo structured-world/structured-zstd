@@ -222,8 +222,27 @@ pub(crate) const HC3_HASH_LOG: usize = 17;
 /// with its OWN compare budget so dictionary candidates are reachable even
 /// when the live tree's budget is spent on recent positions. Slots store
 /// `dict_rel + 1` (dictionary-relative concat index); `0` is empty.
+/// Which matcher built a [`DmsDictTables`]: the hash-chain (`prime_dms_hc`) and
+/// the binary-tree (`prime_dms_bt`) populate `hash_table` / `chain_table` with
+/// incompatible meanings, so a cached dms must only be reused by the SAME
+/// builder. Part of the cache-reuse key alongside `mls` / `hash_log` / region so
+/// a reused compressor that switches level across the HC↔BT boundary (same
+/// `mls` / `hash_log`) rebuilds instead of reinterpreting the other layout.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub(crate) enum DmsDictLayout {
+    /// Unbuilt / invalidated — never matches a reuse probe.
+    #[default]
+    None,
+    /// Hash-chain dms (`prime_dms_hc`): single-link chain for the lazy backend.
+    Hc,
+    /// Binary-tree dms (`prime_dms_bt`): unsorted DUBT for the optimal backend.
+    Bt,
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct DmsDictTables {
+    /// Builder that populated the tables (HC vs BT), part of the reuse key.
+    pub(crate) layout: DmsDictLayout,
     /// Per-hash-bucket binary-tree root (`1 << hash_log` entries), packed
     /// `dict_rel + 1` (`0` = empty).
     pub(crate) hash_table: Vec<u32>,
@@ -698,10 +717,9 @@ impl MatchTable {
         // change lands here with a different shape and rebuilds.
         if self.dms.is_primed()
             && self.dms.region_len() == region
-            && self
-                .dms
-                .table()
-                .is_some_and(|t| t.mls == mls && t.hash_log == dms_hash_log)
+            && self.dms.table().is_some_and(|t| {
+                t.layout == DmsDictLayout::Bt && t.mls == mls && t.hash_log == dms_hash_log
+            })
         {
             return;
         }
@@ -775,6 +793,7 @@ impl MatchTable {
         }
         // `concat`'s borrow of `self` ends above; now mutate `self.dms`.
         let tables = self.dms.table_mut_or_init(DmsDictTables::default);
+        tables.layout = DmsDictLayout::Bt;
         tables.hash_table = hash_table;
         tables.chain_table = chain_table;
         tables.hash_log = dms_hash_log;
@@ -807,10 +826,9 @@ impl MatchTable {
             (usize::BITS - (region - 1).leading_zeros()).clamp(10, self.hash_log as u32) as usize;
         if self.dms.is_primed()
             && self.dms.region_len() == region
-            && self
-                .dms
-                .table()
-                .is_some_and(|t| t.mls == mls && t.hash_log == dms_hash_log)
+            && self.dms.table().is_some_and(|t| {
+                t.layout == DmsDictLayout::Hc && t.mls == mls && t.hash_log == dms_hash_log
+            })
         {
             return;
         }
@@ -837,6 +855,7 @@ impl MatchTable {
             current += 1;
         }
         let tables = self.dms.table_mut_or_init(DmsDictTables::default);
+        tables.layout = DmsDictLayout::Hc;
         tables.hash_table = hash_table;
         tables.chain_table = chain_table;
         tables.hash_log = dms_hash_log;
@@ -2306,6 +2325,44 @@ mod storage_tests {
         t.history_abs_start = 100;
         t.set_dictionary_limit_from_primed_bytes(40);
         assert_eq!(t.dictionary_limit_abs, Some(140));
+    }
+
+    #[test]
+    fn dms_cache_rebuilds_across_hc_bt_layout_switch() {
+        // A reused compressor that changes level across the HC↔BT boundary lands
+        // back in prime_dms_* with the SAME (region, mls, hash_log) but the OTHER
+        // builder. Without a layout discriminator in the cache key, the second
+        // prime would reuse the first builder's tables verbatim (HC single-link
+        // chain reinterpreted as a BT DUBT, or vice versa) — a silent corruption.
+        // The cache key must include the layout so the switch forces a rebuild.
+        let mut t = new_table(64);
+        // dms_hash_log clamps to [10, hash_log]; keep hash_log above the floor.
+        t.hash_log = 12;
+        // Match HC's fixed mls (HC_MIN_MATCH_LEN == 4) so the BT prime resolves
+        // the SAME (region, mls, hash_log) as the HC prime — then the LAYOUT field
+        // is the only differing key, which is exactly what this test guards. With
+        // search_mls != 4 the rebuild would happen via the mls mismatch and the
+        // test would pass even without the layout discriminator.
+        t.search_mls = 4;
+        t.push_test_chunk(vec![7u8; 48]);
+        t.ensure_tables();
+        let region = 48;
+
+        t.prime_dms_hc(region);
+        assert_eq!(t.dms.table().unwrap().layout, DmsDictLayout::Hc);
+        // HC chain has one `next` per dict position.
+        assert_eq!(t.dms.table().unwrap().chain_table.len(), region);
+
+        // Same region/mls/hash_log, but the BT builder must NOT reuse the HC
+        // tables: it rebuilds to the BT layout (2 children per dict position).
+        t.prime_dms_bt(region);
+        assert_eq!(t.dms.table().unwrap().layout, DmsDictLayout::Bt);
+        assert_eq!(t.dms.table().unwrap().chain_table.len(), 2 * region);
+
+        // And back to HC rebuilds again.
+        t.prime_dms_hc(region);
+        assert_eq!(t.dms.table().unwrap().layout, DmsDictLayout::Hc);
+        assert_eq!(t.dms.table().unwrap().chain_table.len(), region);
     }
 
     #[test]

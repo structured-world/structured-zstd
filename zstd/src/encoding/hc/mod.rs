@@ -446,7 +446,7 @@ impl HcMatcher {
         // the `is_some` guard is a single not-taken branch. `dms_chain_walk`
         // continues the SAME `steps` budget, so live + dms stay one bounded
         // operation (donor's single `nbAttempts`).
-        if DICT && table.dms.table().is_some_and(|d| !d.hash_table.is_empty()) {
+        if DICT && table.dms.is_primed() {
             best = self.dms_chain_walk(
                 table,
                 concat,
