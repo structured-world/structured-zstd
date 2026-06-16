@@ -3831,6 +3831,7 @@ macro_rules! build_optimal_plan_impl_body {
             <$strategy_ty as super::strategy::Strategy>::OPT_LEVEL == 0;
         let opt_level: bool = <$strategy_ty as super::strategy::Strategy>::OPT_LEVEL >= 2;
         let mut nodes = core::mem::take(&mut $self.backend.bt_mut().opt_nodes_scratch);
+        let mut node_prices = core::mem::take(&mut $self.backend.bt_mut().opt_node_prices_scratch);
         // `frontier_limit + 2 <= HC_OPT_NODE_LEN` — bounded by const.
         let frontier_buffer_size = frontier_limit + 2;
         if nodes.len() < HC_OPT_NODE_LEN {
@@ -3838,6 +3839,13 @@ macro_rules! build_optimal_plan_impl_body {
             // buffer: allocate the fixed upstream-zstd-sized frontier once. The DP
             // overwrites the active prefix before reading it.
             nodes = alloc::vec![HcOptimalNode::default(); HC_OPT_NODE_LEN].into_boxed_slice();
+        }
+        // SoA price companion, same fixed length as `nodes`. Initialised to
+        // u32::MAX so unwritten frontier cells compare as "unreachable",
+        // mirroring `HcOptimalNode::default().price`. Kept in lockstep with
+        // every `nodes[i].price` write below.
+        if node_prices.len() < HC_OPT_NODE_LEN {
+            node_prices = alloc::vec![u32::MAX; HC_OPT_NODE_LEN].into_boxed_slice();
         }
         let mut candidates = core::mem::take(&mut $self.backend.bt_mut().opt_candidates_scratch);
         candidates.clear();
@@ -3892,18 +3900,20 @@ macro_rules! build_optimal_plan_impl_body {
             .wrapping_add(1)
             .max(1);
         let ml_price_stamp = $self.backend.bt_mut().opt_ml_price_stamp;
+        let node0_price = BtMatcher::cached_lit_length_price(
+            profile,
+            $stats,
+            initial_litlen,
+            &mut ll_cache,
+            ll_price_stamp,
+        );
         nodes[0] = HcOptimalNode {
-            price: BtMatcher::cached_lit_length_price(
-                profile,
-                $stats,
-                initial_litlen,
-                &mut ll_cache,
-                ll_price_stamp,
-            ),
+            price: node0_price,
             litlen: initial_litlen as u32,
             reps: initial_reps,
             ..HcOptimalNode::default()
         };
+        node_prices[0] = node0_price;
         let sufficient_len = profile.sufficient_match_len;
         let ll0_price = BtMatcher::cached_lit_length_price(
             profile,
@@ -4059,7 +4069,12 @@ macro_rules! build_optimal_plan_impl_body {
                         continue;
                     }
                     if max_match_len > last_pos {
-                        BtMatcher::reset_opt_nodes(&mut nodes, last_pos + 1, max_match_len);
+                        BtMatcher::reset_opt_nodes(
+                            &mut nodes,
+                            &mut node_prices,
+                            last_pos + 1,
+                            max_match_len,
+                        );
                     }
                     let off_base = BtMatcher::encode_offset_base_with_reps(
                         candidate.offset as u32,
@@ -4083,7 +4098,7 @@ macro_rules! build_optimal_plan_impl_body {
                             profile.match_price_from_parts(off_price, ml_price, $stats),
                         );
                         let next_cost = BtMatcher::add_prices(nodes0_price, seq_cost);
-                        let node_price = unsafe { nodes.get_unchecked(match_len).price };
+                        let node_price = unsafe { *node_prices.get_unchecked(match_len) };
                         if match_len > last_pos || next_cost < node_price {
                             let slot = unsafe { nodes.get_unchecked_mut(match_len) };
                             *slot = HcOptimalNode {
@@ -4093,6 +4108,7 @@ macro_rules! build_optimal_plan_impl_body {
                                 litlen: 0,
                                 reps: initial_reps,
                             };
+                            unsafe { *node_prices.get_unchecked_mut(match_len) = next_cost };
                             if match_len > last_pos {
                                 last_pos = match_len;
                             }
@@ -4104,6 +4120,7 @@ macro_rules! build_optimal_plan_impl_body {
                 }
                 if last_pos + 1 < frontier_buffer_size {
                     nodes[last_pos + 1].price = u32::MAX;
+                    node_prices[last_pos + 1] = u32::MAX;
                 }
             }
         }
@@ -4138,6 +4155,7 @@ macro_rules! build_optimal_plan_impl_body {
                     *slot = prev_node;
                     slot.litlen = lit_len as u32;
                     slot.price = lit_cost;
+                    node_prices[pos] = lit_cost;
                     #[allow(clippy::collapsible_if)]
                     if opt_level
                         && prev_match.mlen > 0
@@ -4188,6 +4206,7 @@ macro_rules! build_optimal_plan_impl_body {
                                     slot.reps = reps_after_match;
                                     slot.litlen = 1;
                                     slot.price = with1literal;
+                                    node_prices[next] = with1literal;
                                     if next > last_pos {
                                         last_pos = next;
                                     }
@@ -4341,7 +4360,12 @@ macro_rules! build_optimal_plan_impl_body {
                 }
                 let max_next = pos + max_match_len;
                 if max_next > last_pos {
-                    BtMatcher::reset_opt_nodes(&mut nodes, last_pos + 1, max_next);
+                    BtMatcher::reset_opt_nodes(
+                        &mut nodes,
+                        &mut node_prices,
+                        last_pos + 1,
+                        max_next,
+                    );
                 }
                 let lit_len = base_litlen;
                 let off_base = BtMatcher::encode_offset_base_with_reps(
@@ -4366,7 +4390,7 @@ macro_rules! build_optimal_plan_impl_body {
                         profile.match_price_from_parts(off_price, ml_price, $stats),
                     );
                     let next_cost = BtMatcher::add_prices(base_cost, seq_cost);
-                    let node_next_price = unsafe { nodes.get_unchecked(next).price };
+                    let node_next_price = unsafe { *node_prices.get_unchecked(next) };
                     let improved = next > last_pos || next_cost < node_next_price;
                     if improved {
                         let slot = unsafe { nodes.get_unchecked_mut(next) };
@@ -4377,6 +4401,7 @@ macro_rules! build_optimal_plan_impl_body {
                             litlen: 0,
                             reps: base_reps,
                         };
+                        unsafe { *node_prices.get_unchecked_mut(next) = next_cost };
                         if next > last_pos {
                             last_pos = next;
                         }
@@ -4390,6 +4415,7 @@ macro_rules! build_optimal_plan_impl_body {
             if last_pos + 1 < frontier_buffer_size {
                 unsafe {
                     nodes.get_unchecked_mut(last_pos + 1).price = u32::MAX;
+                    *node_prices.get_unchecked_mut(last_pos + 1) = u32::MAX;
                 }
             }
             pos += 1;
@@ -4401,6 +4427,7 @@ macro_rules! build_optimal_plan_impl_body {
                 return $self.backend.bt_mut().finish_optimal_plan(
                     HcOptimalPlanBuffers {
                         nodes,
+                        node_prices,
                         candidates,
                         store,
                         price_arena,
@@ -4439,6 +4466,7 @@ macro_rules! build_optimal_plan_impl_body {
             return $self.backend.bt_mut().finish_optimal_plan(
                 HcOptimalPlanBuffers {
                     nodes,
+                    node_prices,
                     candidates,
                     store,
                     price_arena,
@@ -4457,6 +4485,7 @@ macro_rules! build_optimal_plan_impl_body {
             return $self.backend.bt_mut().finish_optimal_plan(
                 HcOptimalPlanBuffers {
                     nodes,
+                    node_prices,
                     candidates,
                     store,
                     price_arena,
@@ -4469,6 +4498,7 @@ macro_rules! build_optimal_plan_impl_body {
             return $self.backend.bt_mut().finish_optimal_plan(
                 HcOptimalPlanBuffers {
                     nodes,
+                    node_prices,
                     candidates,
                     store,
                     price_arena,
@@ -4497,6 +4527,7 @@ macro_rules! build_optimal_plan_impl_body {
                 return $self.backend.bt_mut().finish_optimal_plan(
                     HcOptimalPlanBuffers {
                         nodes,
+                        node_prices,
                         candidates,
                         store,
                         price_arena,
@@ -4590,6 +4621,7 @@ macro_rules! build_optimal_plan_impl_body {
         $self.backend.bt_mut().finish_optimal_plan(
             HcOptimalPlanBuffers {
                 nodes,
+                node_prices,
                 candidates,
                 store,
                 price_arena,

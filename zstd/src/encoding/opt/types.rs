@@ -90,6 +90,10 @@ pub(crate) struct HcOptimalPlanState {
 /// scaffolding.
 pub(crate) struct HcOptimalPlanBuffers {
     pub(crate) nodes: alloc::boxed::Box<[HcOptimalNode]>,
+    /// SoA price companion to `nodes` (see `BtMatcher::opt_node_prices_scratch`):
+    /// `node_prices[i]` mirrors node `i`'s running DP price as a contiguous
+    /// `u32` so the inner price-set loop can SIMD-compare a run of node prices.
+    pub(crate) node_prices: alloc::boxed::Box<[u32]>,
     pub(crate) candidates: Vec<MatchCandidate>,
     pub(crate) store: Vec<HcOptimalNode>,
     /// Single backing allocation for the LL/ML price caches as `[price,
