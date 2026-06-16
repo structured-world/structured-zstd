@@ -2119,7 +2119,19 @@ impl Matcher for MatchGeneratorDriver {
             // override is range-validated to `ZSTD_HASHLOG_MIN = 6` at the
             // parameter API, so the value is always >= 6 here.
             //
-            let row_cdict_chain_bits = row_cdict_hash_bits - 1;
+            // A public `chain_log` override (#27) is dropped by the RowHash
+            // override arm (Row has no chain table), but once this frame falls
+            // back to HC the chain table is live and must honour it — mirror
+            // the native HC dict path, which feeds the override-applied
+            // `base_hc.chain_log` into `cdict_table_logs`. Use the explicit
+            // override (also API-validated to ZSTD_CHAINLOG_MIN = 6) when set,
+            // else the donor `hashLog - 1` relationship.
+            let explicit_chain_log = self
+                .param_overrides
+                .filter(|ov| !ov.is_empty())
+                .and_then(|ov| ov.chain_log)
+                .map(|chain_log| chain_log as usize);
+            let row_cdict_chain_bits = explicit_chain_log.unwrap_or(row_cdict_hash_bits - 1);
             let (mut hash_log, mut chain_log) = match dict_hint.filter(|&size| size > 0) {
                 Some(dict_size) => cdict_table_logs(
                     params.window_log,
@@ -2128,7 +2140,10 @@ impl Matcher for MatchGeneratorDriver {
                     false,
                     dict_size,
                 ),
-                None => (row.hash_bits, row.hash_bits - 1),
+                None => (
+                    row.hash_bits,
+                    explicit_chain_log.unwrap_or(row.hash_bits - 1),
+                ),
             };
             // No-dict path: the HashChain reset arm only clamps the logs to the
             // window when `hinted`, but a public `window_log` override can lower
