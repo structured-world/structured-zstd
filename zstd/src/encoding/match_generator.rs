@@ -3791,6 +3791,134 @@ macro_rules! start_matching_btlazy2_body {
     }};
 }
 
+/// 8-lane `next_cost < node_price` mask for the optimal-parser price-set
+/// loop. AVX2 lacks an unsigned `cmplt`, so derive `nc < np` from
+/// `min_epu32`: `nc <= np` iff `min(nc,np) == nc`, then exclude equality.
+/// Returns a bitmask (bit `k` set => lane `k` improves). Scalar fallback
+/// for non-x86 / no-AVX2.
+#[cfg(all(target_arch = "x86_64", feature = "kernel_avx2"))]
+#[target_feature(enable = "avx2")]
+unsafe fn priceset_improved_mask8_avx2(next_cost: &[u32; 8], node_price: &[u32]) -> u8 {
+    use core::arch::x86_64::{
+        __m256i, _mm256_andnot_si256, _mm256_castsi256_ps, _mm256_cmpeq_epi32, _mm256_loadu_si256,
+        _mm256_min_epu32, _mm256_movemask_ps,
+    };
+    let nc = unsafe { _mm256_loadu_si256(next_cost.as_ptr() as *const __m256i) };
+    let np = unsafe { _mm256_loadu_si256(node_price.as_ptr() as *const __m256i) };
+    let min = _mm256_min_epu32(nc, np);
+    let le = _mm256_cmpeq_epi32(min, nc); // nc <= np
+    let eq = _mm256_cmpeq_epi32(nc, np); // nc == np
+    let lt = _mm256_andnot_si256(eq, le); // nc < np
+    _mm256_movemask_ps(_mm256_castsi256_ps(lt)) as u8
+}
+
+#[inline]
+fn priceset_improved_mask8(next_cost: &[u32; 8], node_price: &[u32]) -> u8 {
+    #[cfg(all(target_arch = "x86_64", feature = "kernel_avx2"))]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: avx2 confirmed at runtime; both slices are >= 8 u32.
+            return unsafe { priceset_improved_mask8_avx2(next_cost, node_price) };
+        }
+    }
+    let mut mask = 0u8;
+    for k in 0..8 {
+        if next_cost[k] < node_price[k] {
+            mask |= 1 << k;
+        }
+    }
+    mask
+}
+
+/// Vectorised price-set over the match-length range `[start, max]` for the
+/// NON-abort optimal modes (btultra / btultra2, `OPT_LEVEL >= 2`). Each
+/// `match_len` writes a distinct node `pos + match_len`, so iteration order
+/// is irrelevant and the loop vectorises; the scalar abort path (btopt,
+/// `OPT_LEVEL == 0`) keeps its reverse-iterate-then-break form. `next_cost`
+/// is computed with the same `add_prices` / `match_price_from_parts` chain
+/// as the scalar loop (byte-identical), and the improvement test reduces to
+/// `next_cost < node_prices[next]` because `reset_opt_nodes` set every
+/// beyond-frontier cell to `u32::MAX` (so `next > last_pos` is subsumed).
+/// Returns the highest written `next` (the caller folds it into `last_pos`).
+#[allow(clippy::too_many_arguments)]
+fn priceset_range_nonabort(
+    node_prices: &mut [u32],
+    nodes: &mut [HcOptimalNode],
+    ml_cache: &mut [[u32; 2]],
+    ml_stamp: u32,
+    profile: HcOptimalCostProfile,
+    stats: &HcOptState,
+    pos: usize,
+    start: usize,
+    max: usize,
+    ll0_price: u32,
+    off_price: u32,
+    base_cost: u32,
+    off: u32,
+    reps: [u32; 3],
+    last_pos: usize,
+) -> usize {
+    let mut new_last = last_pos;
+    let mut buf = [0u32; 8];
+    let mut ml = start;
+    while ml + 8 <= max + 1 {
+        for (k, slot) in buf.iter_mut().enumerate() {
+            let ml_price =
+                BtMatcher::cached_match_length_price(profile, stats, ml + k, ml_cache, ml_stamp);
+            let seq_cost = BtMatcher::add_prices(
+                ll0_price,
+                profile.match_price_from_parts(off_price, ml_price, stats),
+            );
+            *slot = BtMatcher::add_prices(base_cost, seq_cost);
+        }
+        let base_next = pos + ml;
+        let mask = priceset_improved_mask8(&buf, &node_prices[base_next..base_next + 8]);
+        if mask != 0 {
+            for k in 0..8 {
+                if mask & (1 << k) != 0 {
+                    let next = base_next + k;
+                    node_prices[next] = buf[k];
+                    nodes[next] = HcOptimalNode {
+                        price: buf[k],
+                        off,
+                        mlen: (ml + k) as u32,
+                        litlen: 0,
+                        reps,
+                    };
+                    if next > new_last {
+                        new_last = next;
+                    }
+                }
+            }
+        }
+        ml += 8;
+    }
+    while ml <= max {
+        let ml_price = BtMatcher::cached_match_length_price(profile, stats, ml, ml_cache, ml_stamp);
+        let seq_cost = BtMatcher::add_prices(
+            ll0_price,
+            profile.match_price_from_parts(off_price, ml_price, stats),
+        );
+        let next_cost = BtMatcher::add_prices(base_cost, seq_cost);
+        let next = pos + ml;
+        if next_cost < node_prices[next] {
+            node_prices[next] = next_cost;
+            nodes[next] = HcOptimalNode {
+                price: next_cost,
+                off,
+                mlen: ml as u32,
+                litlen: 0,
+                reps,
+            };
+            if next > new_last {
+                new_last = next;
+            }
+        }
+        ml += 1;
+    }
+    new_last
+}
+
 macro_rules! build_optimal_plan_impl_body {
     (
         $self:expr,
@@ -4376,38 +4504,64 @@ macro_rules! build_optimal_plan_impl_body {
                 let off_price = profile
                     .offset_price_for::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>($stats, off_base);
                 debug_assert!(pos + max_match_len < frontier_buffer_size);
-                for match_len in (start_len..=max_match_len).rev() {
-                    let next = pos + match_len;
-                    let ml_price = BtMatcher::cached_match_length_price(
+                if abort_on_worse_match {
+                    // btopt (OPT_LEVEL == 0): reverse-iterate with early break —
+                    // once a longer match stops improving, shorter ones are
+                    // skipped. Order-dependent, stays scalar.
+                    for match_len in (start_len..=max_match_len).rev() {
+                        let next = pos + match_len;
+                        let ml_price = BtMatcher::cached_match_length_price(
+                            profile,
+                            $stats,
+                            match_len,
+                            &mut ml_cache,
+                            ml_price_stamp,
+                        );
+                        let seq_cost = BtMatcher::add_prices(
+                            ll0_price,
+                            profile.match_price_from_parts(off_price, ml_price, $stats),
+                        );
+                        let next_cost = BtMatcher::add_prices(base_cost, seq_cost);
+                        let node_next_price = unsafe { *node_prices.get_unchecked(next) };
+                        if next > last_pos || next_cost < node_next_price {
+                            let slot = unsafe { nodes.get_unchecked_mut(next) };
+                            *slot = HcOptimalNode {
+                                price: next_cost,
+                                off: candidate.offset as u32,
+                                mlen: match_len as u32,
+                                litlen: 0,
+                                reps: base_reps,
+                            };
+                            unsafe { *node_prices.get_unchecked_mut(next) = next_cost };
+                            if next > last_pos {
+                                last_pos = next;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                } else {
+                    // btultra / btultra2 (OPT_LEVEL >= 2): no abort, each
+                    // match_len writes a distinct node => order-independent =>
+                    // SIMD-vectorised price-set (compare against the contiguous
+                    // node_prices SoA array).
+                    last_pos = last_pos.max(priceset_range_nonabort(
+                        &mut node_prices,
+                        &mut nodes,
+                        ml_cache,
+                        ml_price_stamp,
                         profile,
                         $stats,
-                        match_len,
-                        &mut ml_cache,
-                        ml_price_stamp,
-                    );
-                    let seq_cost = BtMatcher::add_prices(
+                        pos,
+                        start_len,
+                        max_match_len,
                         ll0_price,
-                        profile.match_price_from_parts(off_price, ml_price, $stats),
-                    );
-                    let next_cost = BtMatcher::add_prices(base_cost, seq_cost);
-                    let node_next_price = unsafe { *node_prices.get_unchecked(next) };
-                    let improved = next > last_pos || next_cost < node_next_price;
-                    if improved {
-                        let slot = unsafe { nodes.get_unchecked_mut(next) };
-                        *slot = HcOptimalNode {
-                            price: next_cost,
-                            off: candidate.offset as u32,
-                            mlen: match_len as u32,
-                            litlen: 0,
-                            reps: base_reps,
-                        };
-                        unsafe { *node_prices.get_unchecked_mut(next) = next_cost };
-                        if next > last_pos {
-                            last_pos = next;
-                        }
-                    } else if abort_on_worse_match {
-                        break;
-                    }
+                        off_price,
+                        base_cost,
+                        candidate.offset as u32,
+                        base_reps,
+                        last_pos,
+                    ));
                 }
                 prev_max_len = prev_max_len.max(max_match_len);
             }
