@@ -2739,6 +2739,23 @@ impl Matcher for MatchGeneratorDriver {
             (MatcherStorage::Simple(live), MatcherStorage::Simple(snap)) => {
                 live.clone_from(snap);
             }
+            // Same-variant HC lazy/greedy restore (non-BT): the snapshot keeps
+            // the full primed hash/chain tables (capture's non-BT full clone),
+            // so `clone_from` reuses the live history/hash/chain/dms buffers in
+            // place — donor reuses the CDict tables rather than reallocating
+            // them. This is the per-frame allocate+copy+drop that dominated
+            // small `compress-dict` HC frames (5-7x vs C). BT (`uses_bt`)
+            // snapshots drop their live tables, so they stay on the realloc
+            // path below.
+            (MatcherStorage::HashChain(live), MatcherStorage::HashChain(snap))
+                if !snap.table.uses_bt =>
+            {
+                live.table.clone_from(&snap.table);
+                live.hc.clone_from(&snap.hc);
+                live.strategy_tag = snap.strategy_tag;
+                // backend is `HcBackend::Hc` (zero-sized) for non-BT levels;
+                // the live one is already correct for this resolved key.
+            }
             (live, snapshot_storage) => {
                 let mut storage = snapshot_storage.clone();
                 // A binary-tree snapshot is stored WITHOUT its live hash /

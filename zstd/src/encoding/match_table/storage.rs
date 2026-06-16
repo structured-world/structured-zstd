@@ -244,7 +244,6 @@ pub(crate) struct DmsDictTables {
 /// tables. Methods on this struct contain only logic that's identical
 /// between HC and BT modes — backend-specific table interpretation
 /// lives in the matcher modules.
-#[derive(Clone)]
 pub(crate) struct MatchTable {
     pub(crate) max_window_size: usize,
     /// Per-chunk lengths of the live window, in add order. The bytes
@@ -306,6 +305,79 @@ pub(crate) struct MatchTable {
     /// Active borrowed block range `[start, end)` within `borrowed_input`,
     /// staged before each borrowed scan.
     pub(crate) borrowed_block: Option<(usize, usize)>,
+}
+
+// Manual `Clone` (not derived) so the per-frame dictionary-snapshot restore can
+// `clone_from` the retained `history` / hash / chain / hash3 / dms buffers
+// in place — the derived `clone_from` is `*self = source.clone()`, a full
+// per-frame allocate+copy+drop that dominated small `compress-dict` HC/lazy
+// frames (donor reuses the CDict tables in place). `clone()` is the obvious
+// field-wise copy; `clone_from()` reuses every heap buffer.
+impl Clone for MatchTable {
+    fn clone(&self) -> Self {
+        Self {
+            max_window_size: self.max_window_size,
+            chunk_lens: self.chunk_lens.clone(),
+            window_size: self.window_size,
+            history: self.history.clone(),
+            history_start: self.history_start,
+            history_abs_start: self.history_abs_start,
+            position_base: self.position_base,
+            index_shift: self.index_shift,
+            offset_hist: self.offset_hist,
+            hash_table: self.hash_table.clone(),
+            hash3_table: self.hash3_table.clone(),
+            chain_table: self.chain_table.clone(),
+            hash_log: self.hash_log,
+            chain_log: self.chain_log,
+            hash3_log: self.hash3_log,
+            next_to_update3: self.next_to_update3,
+            skip_insert_until_abs: self.skip_insert_until_abs,
+            dictionary_limit_abs: self.dictionary_limit_abs,
+            dictionary_primed_for_frame: self.dictionary_primed_for_frame,
+            allow_zero_relative_position: self.allow_zero_relative_position,
+            search_depth: self.search_depth,
+            is_btultra2: self.is_btultra2,
+            uses_bt: self.uses_bt,
+            search_mls: self.search_mls,
+            dms: self.dms.clone(),
+            borrowed_input: self.borrowed_input,
+            borrowed_block: self.borrowed_block,
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        // Heap buffers: reuse the existing allocation (Vec/VecDeque/DictAttach
+        // `clone_from` keep capacity and overwrite in place).
+        self.chunk_lens.clone_from(&source.chunk_lens);
+        self.history.clone_from(&source.history);
+        self.hash_table.clone_from(&source.hash_table);
+        self.hash3_table.clone_from(&source.hash3_table);
+        self.chain_table.clone_from(&source.chain_table);
+        self.dms.clone_from(&source.dms);
+        // Scalars / Copy fields.
+        self.max_window_size = source.max_window_size;
+        self.window_size = source.window_size;
+        self.history_start = source.history_start;
+        self.history_abs_start = source.history_abs_start;
+        self.position_base = source.position_base;
+        self.index_shift = source.index_shift;
+        self.offset_hist = source.offset_hist;
+        self.hash_log = source.hash_log;
+        self.chain_log = source.chain_log;
+        self.hash3_log = source.hash3_log;
+        self.next_to_update3 = source.next_to_update3;
+        self.skip_insert_until_abs = source.skip_insert_until_abs;
+        self.dictionary_limit_abs = source.dictionary_limit_abs;
+        self.dictionary_primed_for_frame = source.dictionary_primed_for_frame;
+        self.allow_zero_relative_position = source.allow_zero_relative_position;
+        self.search_depth = source.search_depth;
+        self.is_btultra2 = source.is_btultra2;
+        self.uses_bt = source.uses_bt;
+        self.search_mls = source.search_mls;
+        self.borrowed_input = source.borrowed_input;
+        self.borrowed_block = source.borrowed_block;
+    }
 }
 
 impl MatchTable {
