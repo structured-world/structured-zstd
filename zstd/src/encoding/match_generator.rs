@@ -692,6 +692,19 @@ const ROW_ATTACH_DICT_CUTOFF_LOG: u8 = 15;
 /// the one combined chain).
 const HC_ATTACH_DICT_CUTOFF_LOG: u8 = 15;
 
+/// BT/optimal attach cutoff for `btlazy2` + `btopt`: 32 KiB (`2^15`, upstream
+/// zstd `attachDictSizeCutoffs[ZSTD_btlazy2]` == `[ZSTD_btopt]`). Small /
+/// unknown-size inputs ATTACH the dict as a separate DUBT dms; larger known-size
+/// inputs COPY the dict into the LIVE binary tree (donor
+/// `ZSTD_resetCCtx_byCopyingCDict`).
+const BT_OPT_ATTACH_DICT_CUTOFF_LOG: u8 = 15;
+
+/// BT/optimal attach cutoff for `btultra` + `btultra2`: 8 KiB (`2^13`, upstream
+/// zstd `attachDictSizeCutoffs[ZSTD_btultra]` == `[ZSTD_btultra2]`). The deepest
+/// parses copy the dict into the live tree past a much smaller source than the
+/// `btopt` tier, matching upstream's per-strategy cutoff table.
+const BT_ULTRA_ATTACH_DICT_CUTOFF_LOG: u8 = 13;
+
 // Source-size cap for the dfast hash bits when a size hint is present: a tiny
 // input needs no larger hash than its window. The donor `cParams.hashLog` /
 // `chainLog` (from `DfastConfig`) caps it from above at the call site.
@@ -1832,6 +1845,35 @@ impl MatchGeneratorDriver {
         }
     }
 
+    /// ATTACH (`true`) vs COPY (`false`) decision for the dms-bearing HashChain
+    /// backend (lazy hash-chain AND binary-tree/optimal levels), mirroring
+    /// upstream `ZSTD_shouldAttachDict` and its per-strategy `attachDictSizeCutoffs`:
+    /// a small / unknown source ATTACHES the dict as a separate dms (hash-chain
+    /// dms for lazy, DUBT dms for BT); a large known source COPIES it into the
+    /// live chain / tree. The cutoff is the lazy/lazy2 value for HC, the
+    /// btlazy2/btopt value for Bt{Opt}, and the smaller btultra/btultra2 value for
+    /// the deepest parses. Both `skip_matching_for_dictionary_priming` (which
+    /// stages the dict) and `prime_with_dictionary` (which builds-or-drops the
+    /// dms) read this so the two stay in lock-step.
+    fn hc_dict_attach_mode(&self) -> bool {
+        // Only the HashChain backend (lazy hash-chain + BT/optimal) routes here;
+        // a non-HashChain storage has no dms decision, so default to attach.
+        let MatcherStorage::HashChain(hc) = &self.storage else {
+            return true;
+        };
+        let cutoff = if hc.table.uses_bt {
+            match hc.strategy_tag {
+                super::strategy::StrategyTag::BtUltra | super::strategy::StrategyTag::BtUltra2 => {
+                    BT_ULTRA_ATTACH_DICT_CUTOFF_LOG
+                }
+                _ => BT_OPT_ATTACH_DICT_CUTOFF_LOG,
+            }
+        } else {
+            HC_ATTACH_DICT_CUTOFF_LOG
+        };
+        self.reset_size_log.is_none_or(|log| log <= cutoff)
+    }
+
     fn skip_matching_for_dictionary_priming(&mut self) {
         match self.active_backend() {
             super::strategy::BackendTag::Simple => {
@@ -1895,28 +1937,20 @@ impl MatchGeneratorDriver {
                 }
             }
             super::strategy::BackendTag::HashChain => {
-                let table = &mut self.hc_matcher_mut().table;
-                if table.uses_bt {
-                    // BT / optimal levels: keep the dict in history for the dms
-                    // but do NOT insert it into the live tree (donor separate
-                    // dictMatchState). The dms-BT is built in
-                    // `prime_with_dictionary`.
-                    table.skip_matching_dict_bt();
+                // Lazy-HC AND BT/optimal both follow donor `ZSTD_shouldAttachDict`
+                // per-strategy: ATTACH (a separate dms — hash-chain dms for lazy,
+                // DUBT dms for BT) for small / unknown inputs, COPY (merge the dict
+                // into the live chain/tree) for large known inputs. ATTACH keeps
+                // the dict in history but out of the live structure via
+                // `skip_matching_dict_bt` (the cursor advance is shared by both
+                // arms); COPY routes through the normal `skip_matching` (its
+                // `uses_bt` branch fills the live tree, the lazy branch the live
+                // chain). The dms is built-or-dropped to match in
+                // `prime_with_dictionary`.
+                if self.hc_dict_attach_mode() {
+                    self.hc_matcher_mut().table.skip_matching_dict_bt();
                 } else {
-                    // Lazy-HC: ATTACH (separate dms hash-chain) for small /
-                    // unknown inputs like the Fast/Dfast/Row backends; COPY
-                    // (merge into the live chain) for large known inputs. Attach
-                    // keeps the dict in history but out of the live chain (same
-                    // insert-cursor advance as the BT arm); the dms hash-chain is
-                    // built in `prime_with_dictionary`.
-                    let attach = self
-                        .reset_size_log
-                        .is_none_or(|log| log <= HC_ATTACH_DICT_CUTOFF_LOG);
-                    if attach {
-                        self.hc_matcher_mut().table.skip_matching_dict_bt();
-                    } else {
-                        self.hc_matcher_mut().skip_matching(Some(false));
-                    }
+                    self.hc_matcher_mut().skip_matching(Some(false));
                 }
             }
         }
@@ -2732,22 +2766,22 @@ impl Matcher for MatchGeneratorDriver {
             // that same-mode reuse decodes; the driver-level cross-mode restore is
             // accepted (not refused) per
             // `primed_snapshot_fast_attach_does_not_over_key_non_simple_backends`.
-            let hc_attach = self
-                .reset_size_log
-                .is_none_or(|log| log <= HC_ATTACH_DICT_CUTOFF_LOG);
+            let attach = self.hc_dict_attach_mode();
             let table = &mut self.hc_matcher_mut().table;
             table.set_dictionary_limit_from_primed_bytes(committed_dict_budget);
-            // Build the dictMatchState over the committed dict (front of
-            // history) so `find_best_match` dual-probes it with its own compare
-            // budget. BT/optimal → DUBT dms; lazy-HC attach → single-link
-            // hash-chain dms. Copy-mode lazy-HC merged the dict into the live
-            // chain instead, so drop any stale dms.
-            if table.uses_bt {
-                table.prime_dms_bt(committed_dict_budget);
-            } else if hc_attach {
-                table.prime_dms_hc(committed_dict_budget);
-            } else {
+            // Build the dictMatchState over the committed dict (front of history)
+            // so `find_best_match` dual-probes it with its own compare budget —
+            // but ONLY in ATTACH mode. BT/optimal attach → DUBT dms; lazy-HC
+            // attach → single-link hash-chain dms. COPY mode (large known source,
+            // both BT and lazy-HC) already merged the dict into the live tree /
+            // chain in `skip_matching_for_dictionary_priming`, so it carries no
+            // separate dms — drop any stale one.
+            if !attach {
                 table.dms.invalidate();
+            } else if table.uses_bt {
+                table.prime_dms_bt(committed_dict_budget);
+            } else {
+                table.prime_dms_hc(committed_dict_budget);
             }
         }
         // CDict-equivalent: now that every dict chunk is indexed, mark the
@@ -2819,16 +2853,18 @@ impl Matcher for MatchGeneratorDriver {
             }
             (live, snapshot_storage) => {
                 let mut storage = snapshot_storage.clone();
-                // A binary-tree snapshot is stored WITHOUT its live hash /
-                // chain / hash3 tables (they hold no dictionary entries — the
-                // dict lives in `dms` + history; see
-                // `capture_primed_dictionary`). Re-allocate them zeroed to the
-                // snapshot's geometry, exactly reproducing the post-prime
-                // state (all `HC_EMPTY`). This is a full storage replace, so
-                // no stale live-table entry from a prior frame can survive —
-                // `ensure_tables` only allocates when the length mismatches,
-                // so a full (HC / non-BT) snapshot whose tables are already
-                // present is left untouched.
+                // This arm handles the binary-tree backend. In ATTACH mode the
+                // snapshot was stored WITHOUT its live hash / chain / hash3
+                // tables (they hold no dictionary entries — the dict lives in
+                // `dms` + history; see `capture_primed_dictionary`), so
+                // `ensure_tables` re-allocates them zeroed to the snapshot's
+                // geometry, exactly reproducing the post-prime state (all
+                // `HC_EMPTY`). In COPY mode the snapshot retained its FULL live
+                // tree (the dict was merged into it, no `dms`), so the tables are
+                // already present at the right length and `ensure_tables` — which
+                // only allocates on a length mismatch — leaves them untouched.
+                // Either way this is a full storage replace, so no stale
+                // live-table entry from a prior frame can survive.
                 if let MatcherStorage::HashChain(hc) = &mut storage {
                     hc.table.ensure_tables();
                 }
@@ -2869,9 +2905,9 @@ impl Matcher for MatchGeneratorDriver {
             fast_attach,
             ldm,
         };
-        // Donor CDict-equivalent retained state. On the binary-tree backend the
-        // dictionary is decoupled into `dms` (the donor `dictMatchState`); the
-        // live hash / chain / hash3 tables carry NO dict entries at capture
+        // CDict-equivalent retained state. A binary-tree level in ATTACH mode
+        // decouples the dictionary into `dms` (the donor `dictMatchState`); its
+        // live hash / chain / hash3 tables carry NO dict entries
         // (`skip_matching_dict_bt` keeps the dict out of the live tree), so they
         // are pure zeros. Storing them in the snapshot wastes the full table
         // footprint (a second window-tier table set resident for the whole
@@ -2879,11 +2915,16 @@ impl Matcher for MatchGeneratorDriver {
         // clone only the dict-state (history + `dms` + window/offset/dict-limit),
         // then move the live tables back — the snapshot keeps just what donor's
         // CDict keeps, and `restore_primed_dictionary` re-allocates the zeroed
-        // live tables. HC / lazy levels keep the dict IN the live chain (no
-        // `dms`), so their snapshot must retain the full tables: full clone.
+        // live tables. Every other case keeps the dict IN the live structure and
+        // carries no usable `dms`, so the snapshot must retain the full tables
+        // (full clone): lazy-HC (attach hash-chain dms aside, the live chain is
+        // still the search structure) and COPY mode for BOTH BT and lazy-HC
+        // (`dms` invalidated, dict merged into the live tree / chain). `dms`
+        // being primed is the exact "decoupled" signal — it is set only by the BT
+        // attach prime and dropped in copy mode.
         let bt_decoupled = matches!(
             &self.storage,
-            MatcherStorage::HashChain(hc) if hc.table.uses_bt
+            MatcherStorage::HashChain(hc) if hc.table.uses_bt && hc.table.dms.is_primed()
         );
         if bt_decoupled {
             let MatcherStorage::HashChain(hc) = &mut self.storage else {
