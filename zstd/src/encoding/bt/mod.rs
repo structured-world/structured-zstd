@@ -629,9 +629,9 @@ impl BtMatcher {
 
     #[inline(always)]
     pub(crate) fn reset_opt_node(node: &mut HcOptimalNode) {
-        node.price = u32::MAX;
-        // Donor only marks the slot as unreachable and not end-of-match here;
-        // stale mlen is ignored while price is MAX and litlen is non-zero.
+        // Price is reset separately via `node_prices` (see `reset_opt_nodes`);
+        // here we only mark the slot not end-of-match. Donor parity: stale mlen
+        // is ignored while the (separately-held) price is MAX and litlen != 0.
         node.litlen = u32::MAX;
     }
 

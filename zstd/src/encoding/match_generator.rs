@@ -4015,7 +4015,6 @@ fn priceset_range_nonabort_scalar(
         if next_cost < node_prices[next] {
             node_prices[next] = next_cost;
             nodes[next] = HcOptimalNode {
-                price: next_cost,
                 off,
                 mlen: ml as u32,
                 litlen: 0,
@@ -4219,7 +4218,6 @@ fn priceset_range_vec<const W: usize>(
             let next = base_next + k;
             node_prices[next] = buf[k];
             nodes[next] = HcOptimalNode {
-                price: buf[k],
                 off,
                 mlen: (ml + k) as u32,
                 litlen: 0,
@@ -4239,7 +4237,6 @@ fn priceset_range_vec<const W: usize>(
         if next_cost < node_prices[next] {
             node_prices[next] = next_cost;
             nodes[next] = HcOptimalNode {
-                price: next_cost,
                 off,
                 mlen: ml as u32,
                 litlen: 0,
@@ -4667,10 +4664,10 @@ macro_rules! build_optimal_plan_impl_body {
             // overwrites the active prefix before reading it.
             nodes = alloc::vec![HcOptimalNode::default(); HC_OPT_NODE_LEN].into_boxed_slice();
         }
-        // SoA price companion, same fixed length as `nodes`. Initialised to
-        // u32::MAX so unwritten frontier cells compare as "unreachable",
-        // mirroring `HcOptimalNode::default().price`. Kept in lockstep with
-        // every `nodes[i].price` write below.
+        // The DP price array, same fixed length as `nodes`. This is the SOLE
+        // home of each position's price (the node struct carries no price), so
+        // the SIMD price-set vector-loads it directly. Initialised to u32::MAX
+        // so unwritten frontier cells compare as "unreachable".
         if node_prices.len() < HC_OPT_NODE_LEN {
             node_prices = alloc::vec![u32::MAX; HC_OPT_NODE_LEN].into_boxed_slice();
         }
@@ -4735,7 +4732,6 @@ macro_rules! build_optimal_plan_impl_body {
             ll_price_stamp,
         );
         nodes[0] = HcOptimalNode {
-            price: node0_price,
             litlen: initial_litlen as u32,
             reps: initial_reps,
             ..HcOptimalNode::default()
@@ -4760,6 +4756,9 @@ macro_rules! build_optimal_plan_impl_body {
         let mut last_pos = 0usize;
         let mut forced_end: Option<usize> = None;
         let mut forced_end_state: Option<HcOptimalNode> = None;
+        // Price companion of `forced_end_state` (price no longer lives in the
+        // node struct; tracked alongside the forced-seed node).
+        let mut forced_end_price: Option<u32> = None;
         let mut seed_forced_shortest_path = false;
         let mut opt_ldm = HcOptLdmState {
             seq_store: HcRawSeqStore {
@@ -4829,8 +4828,7 @@ macro_rules! build_optimal_plan_impl_body {
                 last_pos = (min_match_len - 1).min(frontier_limit);
                 for p in 1..min_match_len.min(frontier_buffer_size) {
                     BtMatcher::reset_opt_node(&mut nodes[p]);
-                    // Keep the SoA `node_prices` sidecar in lockstep with the AoS
-                    // `nodes[p].price` the price-set paths compare against.
+                    // Reset the price (sole home; the node carries none).
                     node_prices[p] = u32::MAX;
                     // `initial_litlen` is the litlen carried from prior
                     // optimal-plan segments — its real bound is the
@@ -4870,22 +4868,20 @@ macro_rules! build_optimal_plan_impl_body {
                         ll0_price,
                         profile.match_price_from_parts(off_price, ml_price, $stats),
                     );
-                    let forced_price = BtMatcher::add_prices(nodes[0].price, seq_cost);
+                    let forced_price = BtMatcher::add_prices(node_prices[0], seq_cost);
                     let forced_state = HcOptimalNode {
-                        price: forced_price,
                         off: candidate.offset as u32,
                         mlen: longest_len as u32,
                         litlen: 0,
                         reps: initial_reps,
                     };
-                    if longest_len < frontier_buffer_size && forced_price < nodes[longest_len].price {
+                    if longest_len < frontier_buffer_size && forced_price < node_prices[longest_len] {
                         nodes[longest_len] = forced_state;
-                        // Mirror into the SoA sidecar so the price-set loop sees
-                        // the forced seed as the baseline (lockstep invariant).
                         node_prices[longest_len] = forced_price;
                     }
                     forced_end = Some(longest_len);
                     forced_end_state = Some(forced_state);
+                    forced_end_price = Some(forced_price);
                     seed_forced_shortest_path = true;
                 }
             }
@@ -4917,7 +4913,7 @@ macro_rules! build_optimal_plan_impl_body {
                     let off_price = profile
                         .offset_price_for::<ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>($stats, off_base);
                     debug_assert!(max_match_len < frontier_buffer_size);
-                    let nodes0_price = nodes[0].price;
+                    let nodes0_price = node_prices[0];
                     for match_len in (start_len..=max_match_len).rev() {
                         let ml_price = BtMatcher::cached_match_length_price(
                             profile,
@@ -4935,7 +4931,6 @@ macro_rules! build_optimal_plan_impl_body {
                         if match_len > last_pos || next_cost < node_price {
                             let slot = unsafe { nodes.get_unchecked_mut(match_len) };
                             *slot = HcOptimalNode {
-                                price: next_cost,
                                 off: candidate.offset as u32,
                                 mlen: match_len as u32,
                                 litlen: 0,
@@ -4952,7 +4947,6 @@ macro_rules! build_optimal_plan_impl_body {
                     prev_max_len = prev_max_len.max(max_match_len);
                 }
                 if last_pos + 1 < frontier_buffer_size {
-                    nodes[last_pos + 1].price = u32::MAX;
                     node_prices[last_pos + 1] = u32::MAX;
                 }
             }
@@ -4960,7 +4954,8 @@ macro_rules! build_optimal_plan_impl_body {
         while !seed_forced_shortest_path && pos <= last_pos && pos <= frontier_limit {
             debug_assert!(pos + 1 < frontier_buffer_size);
             let prev_node = unsafe { *nodes.get_unchecked(pos - 1) };
-            if prev_node.price != u32::MAX {
+            let prev_node_price = unsafe { *node_prices.get_unchecked(pos - 1) };
+            if prev_node_price != u32::MAX {
                 let lit_len = prev_node.litlen as usize + 1;
                 let lit_price = {
                     let bt = $self.backend.bt_mut();
@@ -4980,14 +4975,15 @@ macro_rules! build_optimal_plan_impl_body {
                     &mut ll_cache,
                     ll_price_stamp,
                 );
-                let lit_cost = BtMatcher::add_price_delta(prev_node.price, lit_price, ll_delta);
-                let node_pos_price = unsafe { nodes.get_unchecked(pos).price };
+                let lit_cost = BtMatcher::add_price_delta(prev_node_price, lit_price, ll_delta);
+                // `node_pos_price` is the OLD price at `pos` (before the write
+                // below) — also the price of `prev_match`, the pre-overwrite copy.
+                let node_pos_price = unsafe { *node_prices.get_unchecked(pos) };
                 if lit_cost <= node_pos_price {
                     let prev_match = unsafe { *nodes.get_unchecked(pos) };
                     let slot = unsafe { nodes.get_unchecked_mut(pos) };
                     *slot = prev_node;
                     slot.litlen = lit_len as u32;
-                    slot.price = lit_cost;
                     node_prices[pos] = lit_cost;
                     #[allow(clippy::collapsible_if)]
                     if opt_level
@@ -5008,7 +5004,7 @@ macro_rules! build_optimal_plan_impl_body {
                                 )
                             };
                             let with1literal = BtMatcher::add_price_delta(
-                                prev_match.price,
+                                node_pos_price,
                                 next_lit_price,
                                 ll1_price as i32 - ll0_price as i32,
                             );
@@ -5022,7 +5018,7 @@ macro_rules! build_optimal_plan_impl_body {
                             let with_more_literals =
                                 BtMatcher::add_price_delta(lit_cost, next_lit_price, ll_delta_next);
                             let next = pos + 1;
-                            let next_price = unsafe { nodes.get_unchecked(next).price };
+                            let next_price = unsafe { *node_prices.get_unchecked(next) };
                             if with1literal < with_more_literals && with1literal < next_price {
                                 // Donor parity (zstd_opt.c:1232): `cur >= prevMatch.mlen`.
                                 debug_assert!(pos >= prev_match.mlen as usize);
@@ -5038,7 +5034,6 @@ macro_rules! build_optimal_plan_impl_body {
                                     *slot = prev_match;
                                     slot.reps = reps_after_match;
                                     slot.litlen = 1;
-                                    slot.price = with1literal;
                                     node_prices[next] = with1literal;
                                     if next > last_pos {
                                         last_pos = next;
@@ -5057,7 +5052,7 @@ macro_rules! build_optimal_plan_impl_body {
             // reading the fields fresh on each side keeps them out of the
             // cross-call live set. `nodes[pos]` is stable across `$collect`
             // (it only fills `candidates`), so post-call reads are identical.
-            let base_cost = unsafe { nodes.get_unchecked(pos).price };
+            let base_cost = unsafe { *node_prices.get_unchecked(pos) };
             if base_cost == u32::MAX {
                 pos += 1;
                 continue;
@@ -5087,7 +5082,7 @@ macro_rules! build_optimal_plan_impl_body {
                 break;
             }
 
-            let next_price = unsafe { nodes.get_unchecked(pos + 1).price };
+            let next_price = unsafe { *node_prices.get_unchecked(pos + 1) };
             // `saturating_add` is REQUIRED here, not a masked bug: `base_cost`
             // is a node price that can be the `u32::MAX` "unreachable" sentinel,
             // and saturating keeps `base_cost + margin` pinned at MAX so the
@@ -5163,12 +5158,12 @@ macro_rules! build_optimal_plan_impl_body {
                     let end_pos = (pos + longest_len).min($current_len);
                     forced_end = Some(end_pos);
                     forced_end_state = Some(HcOptimalNode {
-                        price: forced_price,
                         off: candidate.offset as u32,
                         mlen: longest_len as u32,
                         litlen: 0,
                         reps: base_reps,
                     });
+                    forced_end_price = Some(forced_price);
                     break;
                 }
             }
@@ -5231,7 +5226,6 @@ macro_rules! build_optimal_plan_impl_body {
                         if next > last_pos || next_cost < node_next_price {
                             let slot = unsafe { nodes.get_unchecked_mut(next) };
                             *slot = HcOptimalNode {
-                                price: next_cost,
                                 off: candidate.offset as u32,
                                 mlen: match_len as u32,
                                 litlen: 0,
@@ -5280,7 +5274,6 @@ macro_rules! build_optimal_plan_impl_body {
 
             if last_pos + 1 < frontier_buffer_size {
                 unsafe {
-                    nodes.get_unchecked_mut(last_pos + 1).price = u32::MAX;
                     *node_prices.get_unchecked_mut(last_pos + 1) = u32::MAX;
                 }
             }
@@ -5289,7 +5282,7 @@ macro_rules! build_optimal_plan_impl_body {
 
         if last_pos == 0 {
             if $current_len == 0 {
-                let price = nodes[0].price;
+                let price = node_prices[0];
                 return $self.backend.bt_mut().finish_optimal_plan(
                     HcOptimalPlanBuffers {
                         nodes,
@@ -5328,7 +5321,7 @@ macro_rules! build_optimal_plan_impl_body {
                 &mut ll_cache,
                 ll_price_stamp,
             );
-            let price = BtMatcher::add_price_delta(nodes[0].price, lit_price, ll_delta);
+            let price = BtMatcher::add_price_delta(node_prices[0], lit_price, ll_delta);
             return $self.backend.bt_mut().finish_optimal_plan(
                 HcOptimalPlanBuffers {
                     nodes,
@@ -5342,12 +5335,15 @@ macro_rules! build_optimal_plan_impl_body {
         }
 
         let target_pos = forced_end.unwrap_or(last_pos.min(frontier_limit));
-        let last_stretch = if let Some(forced_state) = forced_end_state {
-            forced_state
+        // Price lives in `node_prices`, not the node struct, so carry the
+        // final-stretch price alongside its node (forced-seed companion or the
+        // frontier price at `target_pos`).
+        let (last_stretch, last_stretch_price) = if let Some(forced_state) = forced_end_state {
+            (forced_state, forced_end_price.expect("forced state has a price"))
         } else {
-            nodes[target_pos]
+            (nodes[target_pos], node_prices[target_pos])
         };
-        if last_stretch.price == u32::MAX {
+        if last_stretch_price == u32::MAX {
             return $self.backend.bt_mut().finish_optimal_plan(
                 HcOptimalPlanBuffers {
                     nodes,
@@ -5370,7 +5366,7 @@ macro_rules! build_optimal_plan_impl_body {
                     price_arena,
                 },
                 (
-                    last_stretch.price,
+                    last_stretch_price,
                     last_stretch.reps,
                     last_stretch.litlen as usize,
                     target_pos.min($current_len),
@@ -5399,7 +5395,7 @@ macro_rules! build_optimal_plan_impl_body {
                         price_arena,
                     },
                     (
-                        last_stretch.price,
+                        last_stretch_price,
                         last_stretch.reps,
                         tail_literals,
                         target_pos.min($current_len),
@@ -5475,7 +5471,7 @@ macro_rules! build_optimal_plan_impl_body {
             store_pos += 1;
         }
         let result = (
-            last_stretch.price,
+            last_stretch_price,
             end_reps,
             if last_stretch.litlen > 0 {
                 last_stretch.litlen as usize
