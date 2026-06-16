@@ -2703,6 +2703,35 @@ impl Matcher for MatchGeneratorDriver {
             // Recompute the lazy-HC attach decision made per-chunk in
             // `skip_matching_for_dictionary_priming` (stable across the prime —
             // `reset_size_log` does not change here).
+            //
+            // The HC attach/copy mode is deliberately NOT folded into `PrimedKey`
+            // (unlike Fast `fast_attach`). Fast attach builds a separate dict
+            // table whose dimensions differ from the copy-mode live table, so a
+            // cross-mode restore would install mismatched table geometry and the
+            // encoder could search past the frame window (undecodable). The two
+            // HC modes share identical window geometry: `max_window_size` and the
+            // dictionary limit are both set ABOVE this branch (the same value in
+            // either mode), and the live chain table dimensions come from the
+            // resolved `params` the key already pins. The modes differ only in
+            // WHERE the committed dict lives — a single-link `dms` (attach) vs
+            // merged into the live chain (copy) — both producing valid matches at
+            // in-window offsets. Upstream zstd makes the same observation: attach
+            // (`ZSTD_resetCCtx_byAttachingCDict`) and copy
+            // (`ZSTD_resetCCtx_byCopyingCDict`) both keep the caller's
+            // `windowLog`; the choice is a memory/speed trade-off, not a wire
+            // contract. So restoring an attach snapshot where this frame would
+            // have copied (or vice versa) yields a decodable frame that may only
+            // differ in which matches are found (ratio) — algorithmic freedom, not
+            // a defect. Keying on the mode would instead force a re-prime across
+            // the cutoff, re-adding the per-frame cost this snapshot path removes.
+            //
+            // In practice the public reuse path (`compress_independent_frame`)
+            // only ever captures AND restores the COPY-mode snapshot — capture is
+            // gated on the above-cutoff source size, so a restored frame always
+            // matches the captured mode. `hc_dict_snapshot_reuse_roundtrips` pins
+            // that same-mode reuse decodes; the driver-level cross-mode restore is
+            // accepted (not refused) per
+            // `primed_snapshot_fast_attach_does_not_over_key_non_simple_backends`.
             let hc_attach = self
                 .reset_size_log
                 .is_none_or(|log| log <= HC_ATTACH_DICT_CUTOFF_LOG);
@@ -4098,6 +4127,18 @@ fn priceset_range_vec<const W: usize>(
     // next_cost = add_prices(base_cost, add_prices(ll0_price,
     //   match_price_from_parts(off_price, ml_price))) = c_base + ml_price,
     // c_base = base_cost + ll0_price + match_price_from_parts(off_price, 0).
+    //
+    // This stays bit-exact with the scalar `priceset_next_cost` because both
+    // helpers are affine in `ml_price`: `BtMatcher::add_prices(a, b) = a + b`
+    // and `match_price_from_parts(off, ml) = off + ml + bias` are plain integer
+    // additions, so `match_price_from_parts(off, ml) = match_price_from_parts(
+    // off, 0) + ml` and the whole chain collapses to `c_base + ml_price`. The
+    // `wrapping_add` here matches the scalar `+` under the cost model's
+    // no-overflow invariant (the `debug_assert`s in both helpers). Factoring the
+    // combine into one helper per the review suggestion would force a per-lane
+    // `match_price_from_parts(off, ml_price)` recompute instead of hoisting the
+    // ml-independent `c_base` once — a regression on this hot DP loop — so the
+    // hoist is kept and the equivalence documented here instead.
     let c_base = base_cost
         .wrapping_add(ll0_price)
         .wrapping_add(profile.match_price_from_parts(off_price, 0, stats));
@@ -10174,11 +10215,15 @@ fn primed_snapshot_not_restored_across_fast_attach_copy_boundary() {
 #[test]
 fn primed_snapshot_fast_attach_does_not_over_key_non_simple_backends() {
     // `fast_attach` is a Simple/Fast-backend concept (the 8 KiB attach-vs-copy
-    // table split). On the HashChain/Dfast/Row backends the dictionary is
-    // always primed the same way, so the bit must NOT enter their snapshot key
-    // — otherwise an unhinted capture (which would record `fast_attach = true`)
-    // and a hinted reset that resolves to the IDENTICAL `LevelParams` would key
-    // differently and force a needless re-prime. `Best` is a Row-backend lazy
+    // table split). Dfast/Row prime the dictionary one way; HashChain has its
+    // OWN attach/copy split (`HC_ATTACH_DICT_CUTOFF_LOG`) but deliberately keeps
+    // it OUT of the snapshot key — both HC modes share the same window geometry,
+    // so a cross-mode restore is decodable (see `prime_with_dictionary` and
+    // `primed_snapshot_hc_cross_mode_roundtrips`). Either way the `fast_attach`
+    // bit must NOT enter a non-Simple snapshot key — otherwise an unhinted
+    // capture (which would record `fast_attach = true`) and a hinted reset that
+    // resolves to the IDENTICAL `LevelParams` would key differently and force a
+    // needless re-prime. `Best` is a Row-backend lazy
     // level; this also pins the Row arm recording its RESOLVED hash width on
     // the unhinted path (a 0 default there keyed unhinted-vs-hinted apart).
     // An explicit Row-backend level: `Best` now sits on level 13 (Btlazy2),

@@ -111,7 +111,8 @@ impl BtMatcher {
     /// payload (`HcOptState` cost tables, lit-price arrays) plus the
     /// retained scratch arenas at their growth bounds — node frontier and
     /// emitted store (`HC_OPT_NODE_LEN` nodes each, including the `+2`
-    /// lookahead slack), the consolidated price arena (two frontier-sized
+    /// lookahead slack), the SoA node-price companion (`HC_OPT_NODE_LEN`
+    /// `u32`s), the consolidated price arena (two frontier-sized
     /// `[price, generation]` pair regions, LL and ML), the per-segment plan
     /// buffers, and the candidate ladder (`MAX_HC_SEARCH_DEPTH`). LDM is
     /// opt-in and excluded (`ldm_sequences` stays empty on every level
@@ -123,6 +124,7 @@ impl BtMatcher {
         let frontier = HC_OPT_NUM + 1;
         core::mem::size_of::<Self>()
             + 2 * HC_OPT_NODE_LEN * core::mem::size_of::<HcOptimalNode>()
+            + HC_OPT_NODE_LEN * core::mem::size_of::<u32>()
             + 2 * frontier * core::mem::size_of::<[u32; 2]>()
             + 2 * frontier * core::mem::size_of::<HcOptimalSequence>()
             + MAX_HC_SEARCH_DEPTH * core::mem::size_of::<MatchCandidate>()

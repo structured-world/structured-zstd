@@ -91,6 +91,68 @@ fn test_dictionary_handle_from_dictionary_roundtrips() {
 }
 
 #[test]
+fn hc_dict_snapshot_reuse_roundtrips() {
+    // The lazy hash-chain dict path captures a CDict-equivalent prime snapshot on
+    // the first above-cutoff frame and restores it (a table copy) on later frames
+    // instead of re-hashing the dictionary. This pins that a frame compressed
+    // AFTER a snapshot restore still decodes against the dictionary — the reuse
+    // must reproduce the post-prime matcher exactly, not a stale or wrong-mode
+    // shape. Both frames are > 32 KiB so the lazy attach cutoff routes them
+    // through capture (frame 1) + restore (frame 2) on the same compressor.
+    use crate::decoding::FrameDecoder;
+    use crate::decoding::dictionary::{Dictionary, DictionaryHandle};
+    use crate::encoding::{CompressionLevel, FrameCompressor};
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    // Deterministic ~2 KiB dictionary content (LCG, so the test is hermetic).
+    let dict_id = 0x5A5A_1234u32;
+    let mut dict_content = Vec::with_capacity(2048);
+    let mut s = 0x1234_5678u32;
+    while dict_content.len() < 2048 {
+        s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        dict_content.push((s >> 24) as u8);
+    }
+
+    let enc_dict = Dictionary::from_raw_content(dict_id, dict_content.clone())
+        .expect("encoder dict should build");
+    let dec_handle = DictionaryHandle::from_dictionary(
+        Dictionary::from_raw_content(dict_id, dict_content.clone())
+            .expect("decoder dict should build"),
+    );
+
+    // Two distinct > 32 KiB inputs that embed the dictionary content, so dict
+    // matches actually fire through the restored tables on the second frame.
+    let make_input = |salt: u8| {
+        let mut data = Vec::with_capacity(48 * 1024);
+        while data.len() < 48 * 1024 {
+            data.extend_from_slice(&dict_content);
+            data.push(salt);
+        }
+        data
+    };
+    let input_a = make_input(0xAA);
+    let input_b = make_input(0xBB);
+
+    let mut cctx: FrameCompressor = FrameCompressor::new(CompressionLevel::Level(12));
+    cctx.set_dictionary(enc_dict).expect("attach dict");
+
+    // Frame 1 primes + captures the copy-mode snapshot; frame 2 restores it.
+    let frame_a = cctx.compress_independent_frame(&input_a);
+    let frame_b = cctx.compress_independent_frame(&input_b);
+
+    for (frame, original) in [(&frame_a, &input_a), (&frame_b, &input_b)] {
+        let mut output = vec![0u8; original.len()];
+        let mut decoder = FrameDecoder::new();
+        let written = decoder
+            .decode_all_with_dict_handle(frame.as_slice(), &mut output, &dec_handle)
+            .expect("decode with dict should succeed");
+        assert_eq!(written, original.len());
+        assert_eq!(&output, original, "snapshot-reuse frame must round-trip");
+    }
+}
+
+#[test]
 fn test_dict_decoding() {
     extern crate std;
     use crate::decoding::BlockDecodingStrategy;

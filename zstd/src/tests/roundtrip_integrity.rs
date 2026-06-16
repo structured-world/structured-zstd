@@ -319,8 +319,15 @@ fn small_repetitive_compresses_on_borrowed_hashchain_band() {
         data.extend_from_slice(&line[..take]);
     }
     for level in [5i32, 6, 7, 10, 12] {
-        let compressed = compress_to_vec(&data[..], CompressionLevel::Level(level));
-        let roundtrip = roundtrip_at_level(&data, CompressionLevel::Level(level));
+        // Compress via the one-shot slice entry (the borrowed in-place scan this
+        // regression guards), then decode THIS exact frame — not a separately
+        // recompressed one — so the round-trip validates the same bytes the ratio
+        // assertion below measures, and keeps guarding the borrowed-HC path even
+        // if wrapper routing changes.
+        let compressed = compress_slice_to_vec(&data[..], CompressionLevel::Level(level));
+        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        let mut roundtrip = Vec::new();
+        decoder.read_to_end(&mut roundtrip).unwrap();
         assert_eq!(data, roundtrip, "L{level} borrowed-HC roundtrip mismatch");
         // The repeats are found: output is a small fraction of the input, not
         // the near-incompressible ~62% the empty-mirror bug produced.
