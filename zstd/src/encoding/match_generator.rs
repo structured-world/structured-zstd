@@ -3902,8 +3902,11 @@ fn priceset_range_nonabort_scalar(
 /// only when ALL eight cells are warm (`generation == stamp`) — the common
 /// (~91-98%) case — so the caller can fold them with one broadcast constant;
 /// any cold cell returns `None` to route the chunk through the scalar fill
-/// (which recomputes + repopulates the misses). Deinterleaves the price (even)
-/// and generation (odd) lanes with two `permutevar8x32` + a `permute2x128`.
+/// (which recomputes + repopulates the misses). Deinterleaves with cheap
+/// in-128-lane ops (`shuffle_epi32` + `unpack*_epi64`) and a single cross-lane
+/// `permute4x64` for the ordered prices — avoiding the latency-bound chain of
+/// cross-lane `permutevar8x32`s that lost to pipelined scalar loads on
+/// high-chunk-count fixtures.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
 #[inline]
@@ -3911,34 +3914,34 @@ unsafe fn priceset_cached_prices8_avx2(cells: &[[u32; 2]], stamp: u32) -> Option
     #[cfg(target_arch = "x86")]
     use core::arch::x86::{
         __m256i, _mm256_castsi256_ps, _mm256_cmpeq_epi32, _mm256_loadu_si256, _mm256_movemask_ps,
-        _mm256_permute2x128_si256, _mm256_permutevar8x32_epi32, _mm256_set1_epi32,
-        _mm256_setr_epi32, _mm256_storeu_si256,
+        _mm256_permute4x64_epi64, _mm256_set1_epi32, _mm256_shuffle_epi32, _mm256_storeu_si256,
+        _mm256_unpackhi_epi64, _mm256_unpacklo_epi64,
     };
     #[cfg(target_arch = "x86_64")]
     use core::arch::x86_64::{
         __m256i, _mm256_castsi256_ps, _mm256_cmpeq_epi32, _mm256_loadu_si256, _mm256_movemask_ps,
-        _mm256_permute2x128_si256, _mm256_permutevar8x32_epi32, _mm256_set1_epi32,
-        _mm256_setr_epi32, _mm256_storeu_si256,
+        _mm256_permute4x64_epi64, _mm256_set1_epi32, _mm256_shuffle_epi32, _mm256_storeu_si256,
+        _mm256_unpackhi_epi64, _mm256_unpacklo_epi64,
     };
     debug_assert!(cells.len() >= 8);
     let base = cells.as_ptr() as *const __m256i;
-    // v0 = [p0 g0 p1 g1 p2 g2 p3 g3], v1 = [p4 g4 .. p7 g7] (contiguous pairs).
+    // v0 = [p0 g0 p1 g1 | p2 g2 p3 g3], v1 = [p4 g4 p5 g5 | p6 g6 p7 g7].
     let v0 = unsafe { _mm256_loadu_si256(base) };
     let v1 = unsafe { _mm256_loadu_si256(base.add(1)) };
-    let idx_even = _mm256_setr_epi32(0, 2, 4, 6, 0, 2, 4, 6);
-    let idx_odd = _mm256_setr_epi32(1, 3, 5, 7, 1, 3, 5, 7);
-    // Gather the 8 generation stamps (odd lanes) and require an all-hit chunk.
-    let g_lo = _mm256_permutevar8x32_epi32(v0, idx_odd);
-    let g_hi = _mm256_permutevar8x32_epi32(v1, idx_odd);
-    let gens = _mm256_permute2x128_si256(g_lo, g_hi, 0x20);
+    // In-128-lane group prices then gens: [p g p g] -> [p p g g] (control 0xD8).
+    let s0 = _mm256_shuffle_epi32(v0, 0xD8); // [p0 p1 g0 g1 | p2 p3 g2 g3]
+    let s1 = _mm256_shuffle_epi32(v1, 0xD8); // [p4 p5 g4 g5 | p6 p7 g6 g7]
+    // Gens (hi 64 of each 128-lane) — order irrelevant for the all-equal test.
+    let gens = _mm256_unpackhi_epi64(s0, s1);
     let eq = _mm256_cmpeq_epi32(gens, _mm256_set1_epi32(stamp as i32));
     if _mm256_movemask_ps(_mm256_castsi256_ps(eq)) as u8 != 0xFF {
         return None;
     }
-    // All hit: deinterleave the 8 cached prices (even lanes) in order.
-    let p_lo = _mm256_permutevar8x32_epi32(v0, idx_even);
-    let p_hi = _mm256_permutevar8x32_epi32(v1, idx_even);
-    let prices = _mm256_permute2x128_si256(p_lo, p_hi, 0x20);
+    // Prices (lo 64 of each 128-lane): [p0 p1 p4 p5 | p2 p3 p6 p7] as 64-bit
+    // chunks [c0 c1 c2 c3] = [p0p1 p4p5 p2p3 p6p7]; reorder to [c0 c2 c1 c3]
+    // (control 0xD8) for in-order [p0..p7].
+    let p_scrambled = _mm256_unpacklo_epi64(s0, s1);
+    let prices = _mm256_permute4x64_epi64(p_scrambled, 0xD8);
     let mut out = [0u32; 8];
     unsafe { _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, prices) };
     Some(out)
