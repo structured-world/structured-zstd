@@ -2107,15 +2107,27 @@ impl Matcher for MatchGeneratorDriver {
                 }
                 None => row.hash_bits,
             };
+            // Row-backed levels carry only `hash_bits`; the HC chain table they
+            // fall back to follows the donor cParams relationship `chainLog =
+            // hashLog - 1` for every Row level (L6 c18 h19 .. L12 c22 h23, see
+            // the ROW_L* tables). Synthesise the chain width as `hash_bits - 1`
+            // so the dict path doesn't leave the chain table one bit too wide
+            // (cdict_table_logs only downsizes, so passing the full hash width
+            // for both would keep a 2x-too-large chain table on dict frames).
+            // Raw `- 1` is underflow-safe: `hash_bits` is either a predefined
+            // ROW_L* width (>= 19) or a public `hash_log` override, and the
+            // override is range-validated to `ZSTD_HASHLOG_MIN = 6` at the
+            // parameter API, so the value is always >= 6 here.
+            let row_cdict_chain_bits = row_cdict_hash_bits - 1;
             let (mut hash_log, mut chain_log) = match dict_hint.filter(|&size| size > 0) {
                 Some(dict_size) => cdict_table_logs(
                     params.window_log,
                     row_cdict_hash_bits,
-                    row_cdict_hash_bits,
+                    row_cdict_chain_bits,
                     false,
                     dict_size,
                 ),
-                None => (row.hash_bits, row.hash_bits),
+                None => (row.hash_bits, row.hash_bits - 1),
             };
             // No-dict path: the HashChain reset arm only clamps the logs to the
             // window when `hinted`, but a public `window_log` override can lower
