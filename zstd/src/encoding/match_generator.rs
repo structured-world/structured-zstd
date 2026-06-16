@@ -6453,7 +6453,7 @@ impl HcMatchGenerator {
         &mut self,
         handle_sequence: impl for<'a> FnMut(Sequence<'a>),
     ) {
-        if self.table.dms.table().is_some() {
+        if self.table.dms.is_primed() {
             self.start_matching_lazy_impl::<true>(handle_sequence);
         } else {
             self.start_matching_lazy_impl::<false>(handle_sequence);
