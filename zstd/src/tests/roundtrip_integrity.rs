@@ -301,6 +301,39 @@ fn repetitive_data_compresses_better_than_random() {
     );
 }
 
+/// Regression: small repetitive inputs at the greedy/lazy levels (5-12) take
+/// the borrowed (no-copy) one-shot path, where the resolved window is <= 14 and
+/// the matchfinder falls back to HashChain (donor `ZSTD_resolveRowMatchFinderMode`).
+/// The HC `insert_position` must hash the borrowed input window, not the empty
+/// owned history mirror — otherwise the chain stays empty, no matches are found,
+/// and a trivially-compressible repeated block balloons (was 4 KiB -> 2549 B,
+/// ~16x the donor's 154 B). Assert the borrowed-HC band still finds the repeats.
+#[test]
+fn small_repetitive_compresses_on_borrowed_hashchain_band() {
+    // ~96-byte repeating record, 4 KiB total: the exact small-log-lines shape
+    // that resolves to windowLog 14 -> HashChain on the borrowed path.
+    let line = b"ts=2026-03-26T21:39:28Z level=INFO msg=\"flush memtable\" tenant=demo table=orders region=eu-west\n";
+    let mut data = Vec::with_capacity(4096);
+    while data.len() < 4096 {
+        let take = line.len().min(4096 - data.len());
+        data.extend_from_slice(&line[..take]);
+    }
+    for level in [5i32, 6, 7, 10, 12] {
+        let compressed = compress_to_vec(&data[..], CompressionLevel::Level(level));
+        let roundtrip = roundtrip_at_level(&data, CompressionLevel::Level(level));
+        assert_eq!(data, roundtrip, "L{level} borrowed-HC roundtrip mismatch");
+        // The repeats are found: output is a small fraction of the input, not
+        // the near-incompressible ~62% the empty-mirror bug produced.
+        assert!(
+            compressed.len() < data.len() / 4,
+            "L{level} small repetitive input must compress well on the borrowed \
+             HashChain band (matches found), got {} bytes for {} input",
+            compressed.len(),
+            data.len()
+        );
+    }
+}
+
 /// Multi-block data exercises FSE table reuse across blocks and offset history
 /// persistence across block boundaries.
 #[test]

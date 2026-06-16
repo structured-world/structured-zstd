@@ -412,11 +412,21 @@ impl MatchTable {
     #[inline]
     pub(crate) fn insert_position_no_rebase(&mut self, abs_pos: usize) {
         let idx = abs_pos.wrapping_sub(self.history_abs_start);
-        let concat = &self.history[self.history_start..];
-        if idx + 4 > concat.len() {
-            return;
-        }
-        let hash = Self::hash_position_at(concat, idx, self.hash_log, 4);
+        // Borrowed-aware: read the SAME bytes the finder hashes via
+        // `live_history()` (borrowed window in no-copy mode, owned mirror
+        // otherwise). Reading `self.history[history_start..]` directly would
+        // hash the empty owned mirror on the borrowed HC lazy/greedy path
+        // (live=input, mirror=0) — the insert would skip or hash garbage while
+        // the finder hashes the real input, so the chain stays empty and no
+        // matches are ever found. `hash` is the only value needed past this
+        // borrow, so it ends before the table mutation below.
+        let hash = {
+            let concat = self.live_history();
+            if idx + 4 > concat.len() {
+                return;
+            }
+            Self::hash_position_at(concat, idx, self.hash_log, 4)
+        };
         let Some(relative_pos) = self.relative_position(abs_pos) else {
             return;
         };
@@ -1719,15 +1729,17 @@ impl MatchTable {
         let index_shift = self.index_shift;
         let hash_log = self.hash_log;
         let chain_mask = (1usize << self.chain_log) - 1;
-        let hist_start = self.history_start;
-        let concat_len = self.history.len() - hist_start;
-        // Raw base pointers hoisted once: the loop reads `history` and
-        // writes `hash_table` / `chain_table`, which are disjoint fields, so
-        // raw pointers let the writes proceed without re-borrowing `self`
-        // each iteration. `ensure_tables` (run before any matching pass)
-        // guarantees `hash_table.len() == 1 << hash_log` and
-        // `chain_table.len() == 1 << chain_log`.
-        let concat_ptr = self.history.as_ptr();
+        // Borrowed-aware source: `live_history()` is the borrowed input window
+        // in no-copy mode (owned mirror empty) and `history[history_start..]`
+        // otherwise. Reading `self.history` directly would hash the empty
+        // mirror on the borrowed HC lazy/greedy path. The raw ptr is copied
+        // out so it holds no borrow across the `hash_table` / `chain_table`
+        // mutations below; the window stays valid for the loop (borrowed input
+        // is live by contract, owned `history` is not realloc'd mid-fill).
+        let (concat_ptr, concat_len) = {
+            let live = self.live_history();
+            (live.as_ptr(), live.len())
+        };
         let hash_ptr = self.hash_table.as_mut_ptr();
         let chain_ptr = self.chain_table.as_mut_ptr();
         debug_assert!(self.hash_table.len() == 1usize << hash_log);
@@ -1743,7 +1755,7 @@ impl MatchTable {
         // Hoist the source pointer and relative index out of the loop and
         // advance both by one per iteration, mirroring the donor's
         // `ip++ / idx++` fill rather than recomputing them from `pos`.
-        let mut src = unsafe { concat_ptr.add(hist_start + (start - history_abs_start)) };
+        let mut src = unsafe { concat_ptr.add(start - history_abs_start) };
         // `rel` cannot reach `u32::MAX` because the caller proved
         // `!needs_rebase(end - 1)`; `wrapping_add` keeps the overflow branch
         // off this per-byte hot loop.
