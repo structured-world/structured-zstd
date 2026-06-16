@@ -319,33 +319,44 @@ impl HcMatcher {
         // Raw base pointer for the donor-style `MEM_read32` 4-byte gates below
         // (single unaligned load each, no per-candidate slice bounds check).
         let base_ptr = concat.as_ptr();
+        // Loop-invariant precompute, hoisted out of the chain walk (donor:
+        // `lowLimit` + base pointers are set once before the loop). Candidates
+        // are tracked in history-RELATIVE index space so each step is a single
+        // `add` + range check + 4-byte gate, mirroring `ZSTD_HcFindBestMatch`'s
+        // tight body (`matchIndex >= lowLimit`; `NEXT_IN_CHAIN`) instead of an
+        // `Option`-returning absolute-position decode plus a per-candidate
+        // `.max()/.saturating_sub()` window-floor recompute.
+        let floor_idx = current_idx.saturating_sub(table.max_window_size);
+        // `candidate_idx = position_base + (cur-1) - index_shift -
+        // history_abs_start`, folded into one wrapping bias so the per-step cost
+        // is `cur + idx_bias`. Stale / sub-floor chain entries wrap to a huge
+        // index and are rejected by the `< current_idx` upper bound — the
+        // accepted set is identical to the `stored_abs_position_fast` decode
+        // (which returned `None` for the same sub-floor entries).
+        let idx_bias = table
+            .position_base
+            .wrapping_sub(1)
+            .wrapping_sub(table.index_shift)
+            .wrapping_sub(history_abs_start);
         while steps < max_chain_steps {
             if cur == HC_EMPTY {
                 break;
             }
             let candidate_rel = cur.wrapping_sub(1) as usize;
-            let candidate_abs_opt =
-                super::match_table::storage::MatchTable::stored_abs_position_fast(
-                    cur,
-                    table.position_base,
-                    table.index_shift,
-                );
             let next = table.chain_table[candidate_rel & chain_mask];
             steps += 1;
             // Self-loop: two positions share `candidate_rel & chain_mask`;
             // stop after processing this slot.
             let self_loop = next == cur;
 
-            // Only process candidates in the live window [history_abs_start, abs_pos).
-            if let Some(candidate_abs) = candidate_abs_opt
-                && candidate_abs
-                    >= history_abs_start.max(abs_pos.saturating_sub(table.max_window_size))
-                && candidate_abs < abs_pos
-            {
-                let candidate_idx = candidate_abs - history_abs_start;
-                // `abs_pos > candidate_abs` is invariant under the bounds check
-                // above, so the subtraction never underflows.
-                let new_offset = abs_pos - candidate_abs;
+            // Only process candidates in the live window, in relative space:
+            // `floor_idx <= candidate_idx < current_idx`.
+            let candidate_idx = (cur as usize).wrapping_add(idx_bias);
+            if candidate_idx >= floor_idx && candidate_idx < current_idx {
+                // `candidate_idx < current_idx` (checked above), so the
+                // subtraction never underflows. `new_offset == abs_pos -
+                // candidate_abs`.
+                let new_offset = current_idx - candidate_idx;
                 // Speculative tail gate — full rationale (backward-extension
                 // bound + walk-order/offset-monotonicity precondition) is in
                 // the comment block right above this loop.
@@ -403,6 +414,11 @@ impl HcMatcher {
                     let match_len =
                         common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
                     if match_len >= HC_MIN_MATCH_LEN {
+                        // Rare accept path: recover the absolute position only
+                        // here (the hot per-candidate body stays in relative
+                        // space). `candidate_abs == candidate_idx +
+                        // history_abs_start`.
+                        let candidate_abs = candidate_idx + history_abs_start;
                         let candidate = Self::extend_backwards(
                             table,
                             candidate_abs,
