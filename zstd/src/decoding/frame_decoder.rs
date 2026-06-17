@@ -2393,8 +2393,23 @@ impl FrameDecoder {
         // 32-bit / oversized-FCS truncation; an unrepresentable size falls
         // through to the window-bounded ring drain rather than allocating a
         // truncated buffer that would violate `run_direct_decode`'s precondition.
+        //
+        // Plausibility gate: the direct path `resize`s `output` to the declared
+        // size up front, so a tiny/truncated frame declaring a huge (but
+        // representable) FCS would allocate + zero that whole size before the
+        // body is validated. zstd's per-block ceiling is MAX_BLOCK_SIZE from as
+        // little as ~4 input bytes, so the declared size cannot legitimately
+        // exceed `input.len() * (MAX_BLOCK_SIZE / 4)`. Anything larger falls
+        // through to the ring drain, which grows only as real bytes are produced
+        // and errors out cheaply on truncated input. `input` spans the remaining
+        // source (this frame plus any following ones), so the bound only ever
+        // over-permits — a legitimate frame is never forced off the direct path.
+        // saturating_mul is intentional: an overflow means the available input
+        // is so large that any representable FCS is plausible (cap = "no limit").
+        const MAX_DECOMPRESSION_RATIO: usize = (crate::common::MAX_BLOCK_SIZE / 4) as usize;
         if content_size > 0
             && let Ok(cs) = usize::try_from(content_size)
+            && cs <= input.len().saturating_mul(MAX_DECOMPRESSION_RATIO)
             && let Some(frame_end) = frame_start.checked_add(cs)
         {
             // Reserve exactly the frame's content and decode straight into it
