@@ -1453,6 +1453,14 @@ impl FrameDecoder {
         state.bytes_read_counter
     }
 
+    /// Test-only: number of frames decoded through the single-copy direct
+    /// path (`run_direct_decode`). Lets cross-module tests assert that a
+    /// given decode took the decode-in-place path rather than the ring drain.
+    #[cfg(test)]
+    pub(crate) fn direct_frames(&self) -> u64 {
+        self.direct_frames
+    }
+
     /// Whether the current frames last block has been decoded yet
     /// If this returns true you can call the drain* functions to get all content
     /// (the read() function will drain automatically if this returns true)
@@ -2277,6 +2285,202 @@ impl FrameDecoder {
                 None,
             )
         }
+    }
+
+    /// Whether the decoder sits at the very start of an initialised frame:
+    /// the header has been read (state populated) but no block has been
+    /// decoded and the frame is not finished. In this state the wrapped
+    /// source is positioned exactly after the frame header, so
+    /// [`Self::decode_current_frame_to_vec`] can decode the rest of the frame
+    /// straight from the remaining source bytes.
+    pub(crate) fn is_at_frame_start(&self) -> bool {
+        self.state
+            .as_ref()
+            .is_some_and(|s| s.block_counter == 0 && !s.frame_finished)
+    }
+
+    /// Decode the CURRENT (already-initialised) frame, APPENDING the
+    /// decompressed bytes to `output`, and return the number appended.
+    ///
+    /// `input` must be the frame's post-header bytes (the wrapped source after
+    /// `init` consumed the header). Unlike [`Self::decode_all_to_vec`] this
+    /// neither re-reads a header nor requires the caller to pre-reserve
+    /// capacity: a frame that declares its content size decodes DIRECTLY into
+    /// freshly-grown `output` capacity via the single-copy direct path
+    /// ([`Self::run_direct_decode`]) — bypassing the `Ring`/`FlatBuf` →
+    /// `read()` drain copy the streaming loop pays — while an unsized frame
+    /// falls back to the window-bounded ring drain (still one copy, into
+    /// `output`). Backs [`StreamingDecoder`](crate::decoding::StreamingDecoder)'s
+    /// `read_to_end` fast path; the caller must ensure
+    /// [`Self::is_at_frame_start`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`FrameDecoderError`] from block decode, content-size
+    /// mismatch, or (in `Verify` mode) checksum validation.
+    pub(crate) fn decode_current_frame_to_vec(
+        &mut self,
+        mut input: &[u8],
+        output: &mut Vec<u8>,
+        dict: Option<&DictionaryHandle>,
+    ) -> Result<usize, FrameDecoderError> {
+        let start_len = output.len();
+        // The current frame is already initialised (its header consumed by the
+        // caller, WITH `dict` applied if the decoder was constructed with one).
+        // Decode it, then decode any FOLLOWING concatenated / skippable frames
+        // in `input` so the whole source is consumed to EOF and nothing is
+        // dropped (matching `read_to_end` semantics).
+        self.decode_one_frame_to_vec(&mut input, output)?;
+        self.decode_concatenated_frames_to_vec(&mut input, output, dict)?;
+        Ok(output.len() - start_len)
+    }
+
+    /// Initialise and decode every frame remaining in `input` (concatenated /
+    /// skippable), APPENDING to `output`. `input` is advanced as frames are
+    /// consumed; on return it is empty. Re-initialisation honours `dict`: when
+    /// `Some`, each following frame is initialised via
+    /// [`Self::init_with_dict_handle`] so a forced dictionary is preserved even
+    /// for frames that omit the dictionary id (plain [`Self::init`] would
+    /// resolve dictionaries by id only). Backs the `read_to_end` fast path (the
+    /// frames after the current one) and its mid-frame fallback (the frames
+    /// after the partially-read one).
+    pub(crate) fn decode_concatenated_frames_to_vec(
+        &mut self,
+        input: &mut &[u8],
+        output: &mut Vec<u8>,
+        dict: Option<&DictionaryHandle>,
+    ) -> Result<usize, FrameDecoderError> {
+        let start_len = output.len();
+        while !input.is_empty() {
+            let init_result = match dict {
+                Some(d) => self.init_with_dict_handle(&mut *input, d),
+                None => self.init(&mut *input),
+            };
+            match init_result {
+                Ok(_) => {}
+                Err(FrameDecoderError::ReadFrameHeaderError(
+                    crate::decoding::errors::ReadFrameHeaderError::SkipFrame { length, .. },
+                )) => {
+                    *input = input
+                        .get(length as usize..)
+                        .ok_or(FrameDecoderError::FailedToSkipFrame)?;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+            self.decode_one_frame_to_vec(&mut *input, output)?;
+        }
+        Ok(output.len() - start_len)
+    }
+
+    /// Decode the single CURRENT (already-initialised) frame, APPENDING to
+    /// `output`. Helper for [`Self::decode_current_frame_to_vec`].
+    fn decode_one_frame_to_vec(
+        &mut self,
+        input: &mut &[u8],
+        output: &mut Vec<u8>,
+    ) -> Result<usize, FrameDecoderError> {
+        let frame_start = output.len();
+        let (content_size, fcs_declared) = {
+            let s = self.state.as_ref().expect("frame is initialised");
+            (
+                s.frame_header.frame_content_size(),
+                s.frame_header.fcs_declared(),
+            )
+        };
+        // Direct path: a declared, non-empty content size that FITS in `usize`
+        // (and whose end offset does not overflow). `usize::try_from` guards the
+        // 32-bit / oversized-FCS truncation; an unrepresentable size falls
+        // through to the window-bounded ring drain rather than allocating a
+        // truncated buffer that would violate `run_direct_decode`'s precondition.
+        //
+        // Plausibility gate: the direct path `resize`s `output` to the declared
+        // size up front, so a tiny/truncated frame declaring a huge (but
+        // representable) FCS would allocate + zero that whole size before the
+        // body is validated. zstd's per-block ceiling is MAX_BLOCK_SIZE from as
+        // little as ~4 input bytes, so the declared size cannot legitimately
+        // exceed `input.len() * (MAX_BLOCK_SIZE / 4)`. Anything larger falls
+        // through to the ring drain, which grows only as real bytes are produced
+        // and errors out cheaply on truncated input. `input` spans the remaining
+        // source (this frame plus any following ones), so the bound only ever
+        // over-permits — a legitimate frame is never forced off the direct path.
+        // saturating_mul is intentional: an overflow means the available input
+        // is so large that any representable FCS is plausible (cap = "no limit").
+        const MAX_DECOMPRESSION_RATIO: usize = (crate::common::MAX_BLOCK_SIZE / 4) as usize;
+        if content_size > 0
+            && let Ok(cs) = usize::try_from(content_size)
+            && cs <= input.len().saturating_mul(MAX_DECOMPRESSION_RATIO)
+            && let Some(frame_end) = frame_start.checked_add(cs)
+        {
+            // Reserve exactly the frame's content and decode straight into it
+            // (single copy, no ring). The direct path writes precisely
+            // `content_size` bytes (erroring otherwise), so the grown region is
+            // fully written.
+            output.resize(frame_end, 0);
+            // On error, drop the just-grown (zeroed) tail before propagating so
+            // callers never observe bytes that were never decoded.
+            let written =
+                match self.run_direct_decode(&mut *input, &mut output[frame_start..], content_size)
+                {
+                    Ok(n) => n,
+                    Err(e) => {
+                        output.truncate(frame_start);
+                        return Err(e);
+                    }
+                };
+            output.truncate(frame_start + written);
+            #[cfg(feature = "hash")]
+            self.verify_content_checksum()?;
+            return Ok(written);
+        }
+        // The ring-drain fallback below pre-reserves `useful_window_size()`
+        // (= `window.min(FCS)`), which for a single-segment frame is the
+        // declared FCS itself — so a truncated single-segment frame lying about
+        // its size would still allocate the pledged window before the body
+        // errors, sidestepping the direct-path gate above. Reject such a frame
+        // up front when its declared (FCS-bearing) window exceeds what the
+        // available input could plausibly produce. Frames without a declared
+        // size keep their window-descriptor reservation (already capped at
+        // `MAXIMUM_ALLOWED_WINDOW_SIZE` at init); a small-window multi-segment
+        // frame still falls through to the ring drain, which errors cheaply on
+        // the truncated body.
+        if fcs_declared
+            && let Some(state) = self.state.as_ref()
+            && state.useful_window_size() > input.len().saturating_mul(MAX_DECOMPRESSION_RATIO)
+        {
+            return Err(FrameDecoderError::FrameContentSizeMismatch {
+                declared: content_size,
+                produced: 0,
+            });
+        }
+        // No declared size, explicit FCS=0, or an unrepresentable FCS: window-
+        // bounded ring drain, appended directly to `output` via
+        // `collect_to_writer` (no staging buffer).
+        loop {
+            self.decode_blocks(&mut *input, BlockDecodingStrategy::UptoBytes(1024 * 1024))?;
+            self.collect_to_writer(&mut *output)
+                .map_err(FrameDecoderError::FailedToDrainDecodebuffer)?;
+            if self.is_finished() {
+                // Final flush of the retained window tail.
+                self.collect_to_writer(&mut *output)
+                    .map_err(FrameDecoderError::FailedToDrainDecodebuffer)?;
+                break;
+            }
+        }
+        let produced = (output.len() - frame_start) as u64;
+        // A declared content size MUST match what the body produced — otherwise
+        // accept the same corrupt frames `decode_all_impl` rejects (e.g. an
+        // explicit FCS=0 whose body emits bytes). Use `fcs_declared()` so an
+        // on-wire FCS=0 is validated, while an unknown size is not.
+        if fcs_declared && produced != content_size {
+            return Err(FrameDecoderError::FrameContentSizeMismatch {
+                declared: content_size,
+                produced,
+            });
+        }
+        #[cfg(feature = "hash")]
+        self.verify_content_checksum()?;
+        Ok(produced as usize)
     }
 
     /// Default-feature decode_all_impl: no visitor parameter so the
@@ -3814,6 +4018,79 @@ mod tests {
         assert_eq!(
             decoder.direct_frames, 1,
             "dict frame must take the direct path, not the buffered fallback"
+        );
+    }
+
+    #[test]
+    fn implausible_content_size_skips_eager_alloc_direct_path() {
+        // Adversarial frame: a 1 KiB window (small ring) but a declared
+        // content size of 4 MiB, followed by a truncated raw block. The
+        // direct path would `resize` the caller's Vec to the pledged 4 MiB
+        // (allocating + zeroing it) BEFORE the truncated body is validated.
+        // The gate must reject the implausible size (4 MiB cannot come from
+        // 3 compressed bytes) and fall through to the window-bounded ring
+        // drain, which errors without ever allocating the pledged size.
+        //
+        // Hand-built so the declared size is fully decoupled from the real
+        // (tiny) input — the encoder always writes a truthful FCS.
+        let frame: &[u8] = &[
+            0x28, 0xB5, 0x2F, 0xFD, // magic
+            0x80, // FHD: multi-segment, 4-byte FCS field, no dict
+            0x00, // window descriptor -> 1 KiB window
+            0x00, 0x00, 0x40, 0x00, // FCS = 4 MiB
+            0x21, 0x03, 0x00, // raw block header: last, size 100, no body
+        ];
+
+        let mut dec = FrameDecoder::new();
+        let mut src = frame;
+        dec.init(&mut src).expect("header must parse");
+        // `src` now points past the header at the truncated 3-byte block.
+        let mut out = Vec::new();
+        let err = dec.decode_current_frame_to_vec(src, &mut out, None);
+        assert!(
+            err.is_err(),
+            "truncated body must fail regardless of decode path"
+        );
+        assert_eq!(
+            dec.direct_frames, 0,
+            "implausible FCS must NOT take the eager-alloc direct path"
+        );
+    }
+
+    #[test]
+    fn implausible_single_segment_fcs_rejected_before_window_reservation() {
+        // Single-segment adversarial frame: the window equals the declared
+        // content size (4 MiB) by definition, so the fallback ring drain would
+        // pre-reserve that whole window via `useful_window_size()` before the
+        // truncated body errors — the multi-segment gate test does not cover
+        // this. The implausible size (4 MiB cannot come from 3 compressed
+        // bytes) must be rejected up front with a content-size error, NOT a
+        // block-body error after the reservation.
+        let frame: &[u8] = &[
+            0x28, 0xB5, 0x2F, 0xFD, // magic
+            0xA0, // FHD: single-segment, 4-byte FCS field
+            0x00, 0x00, 0x40, 0x00, // FCS = 4 MiB (== window for single-segment)
+            0x21, 0x03, 0x00, // raw block header: last, size 100, no body
+        ];
+
+        let mut dec = FrameDecoder::new();
+        let mut src = frame;
+        dec.init(&mut src).expect("header must parse");
+        let mut out = Vec::new();
+        let err = dec
+            .decode_current_frame_to_vec(src, &mut out, None)
+            .expect_err("implausible single-segment FCS must be rejected");
+        match err {
+            super::FrameDecoderError::FrameContentSizeMismatch { declared, .. } => {
+                assert_eq!(declared, 4 * 1024 * 1024);
+            }
+            other => panic!(
+                "expected early FrameContentSizeMismatch (no window reservation), got {other:?}"
+            ),
+        }
+        assert_eq!(
+            dec.direct_frames, 0,
+            "implausible FCS must not take the eager-alloc direct path"
         );
     }
 
