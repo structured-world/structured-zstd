@@ -47,6 +47,20 @@ name = "structured-zstd-c"
 release = false
 git_tag_name = "structured-zstd-c-v{{ version }}"
 
+# Non-published bench/test crate: holds the libzstd-linking comparison benches,
+# FFI parity tests, and diagnostic examples (`publish = false` in
+# ffi-bench/Cargo.toml). It never releases anywhere. Same baseline-diff trap as
+# the wasm and c-api crates above: added after the last shared `v*` tag, so
+# resolving its "last release" against the shared `v{{ version }}` pattern
+# checks out an old worktree where this package does not exist and crashes
+# `release-pr` with "Failed to find package ffi-bench". A private tag namespace
+# with no matching tag makes release-plz treat it as unreleased and skip the
+# broken baseline diff.
+[[package]]
+name = "ffi-bench"
+release = false
+git_tag_name = "ffi-bench-v{{ version }}"
+
 [changelog]
 commit_parsers = [
     { message = "^chore", skip = true },
