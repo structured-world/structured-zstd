@@ -1453,9 +1453,6 @@ impl FrameDecoder {
         state.bytes_read_counter
     }
 
-    /// Whether the current frames last block has been decoded yet
-    /// If this returns true you can call the drain* functions to get all content
-    /// (the read() function will drain automatically if this returns true)
     /// Test-only: number of frames decoded through the single-copy direct
     /// path (`run_direct_decode`). Lets cross-module tests assert that a
     /// given decode took the decode-in-place path rather than the ring drain.
@@ -1464,6 +1461,9 @@ impl FrameDecoder {
         self.direct_frames
     }
 
+    /// Whether the current frames last block has been decoded yet
+    /// If this returns true you can call the drain* functions to get all content
+    /// (the read() function will drain automatically if this returns true)
     pub fn is_finished(&self) -> bool {
         let state = match &self.state {
             None => return true,
@@ -2287,24 +2287,6 @@ impl FrameDecoder {
         }
     }
 
-    /// Decode every frame in `input`, APPENDING the decompressed bytes to
-    /// `output` (growing it as needed), and return the number of bytes
-    /// appended.
-    ///
-    /// This is the `Vec`-output sibling of [`Self::decode_all`]. A frame that
-    /// declares its content size decodes DIRECTLY into freshly-reserved
-    /// `output` capacity through the single-copy direct path
-    /// ([`Self::run_direct_decode`]) — bypassing the `Ring`/`FlatBuf` →
-    /// `read()` drain copy that the streaming loop pays. A frame WITHOUT a
-    /// declared size falls back to the window-bounded ring drain (still one
-    /// copy, into `output`). Skippable frames are skipped.
-    ///
-    /// Each frame is (re)initialised via [`Self::init`] (resolving any
-    /// attached dictionary by id), so the decoder must be at a frame boundary
-    /// (no partially-decoded frame in flight) when this is called. It backs
-    /// [`StreamingDecoder`](crate::decoding::StreamingDecoder)'s `read_to_end`
-    /// fast path.
-    ///
     /// Whether the decoder sits at the very start of an initialised frame:
     /// the header has been read (state populated) but no block has been
     /// decoded and the frame is not finished. In this state the wrapped
