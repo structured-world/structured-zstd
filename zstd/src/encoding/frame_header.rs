@@ -32,7 +32,7 @@ pub struct FrameHeader {
     /// If true, the 4-byte magic number prefix is omitted from the
     /// serialized output. The caller MUST know out-of-band that the
     /// stream is magicless and use a magicless-aware decoder.
-    /// Donor parity: `ZSTD_f_zstd1_magicless` (see `ZSTD_d_format`).
+    /// Upstream zstd parity: `ZSTD_f_zstd1_magicless` (see `ZSTD_d_format`).
     pub magicless: bool,
 }
 

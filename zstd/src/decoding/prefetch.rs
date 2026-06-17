@@ -28,7 +28,7 @@ pub(crate) fn prefetch_slice_t1(slice: &[u8]) {
 }
 
 /// Issue one L1 prefetch hint at `ptr`. The encoder match-finder uses this
-/// to warm the input lines a few positions ahead (donor `PREFETCH_L1(ip +
+/// to warm the input lines a few positions ahead (upstream zstd `PREFETCH_L1(ip +
 /// 256)` in `ZSTD_compressBlock_doubleFast`). `ptr` need not be in bounds —
 /// prefetching an invalid address is a no-op by the ISA spec, not UB — so the
 /// caller may aim slightly past the buffer end without a bounds check.

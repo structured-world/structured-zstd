@@ -74,7 +74,7 @@ impl FlatBuf {
 }
 
 impl BufferBackend for FlatBuf {
-    /// FlatBuf opts into the donor-shape inline `exec_sequence_inline`
+    /// FlatBuf opts into the upstream zstd-shape inline `exec_sequence_inline`
     /// path on every target: x86_64 via the SSE2
     /// `exec_sequence_inline::x86` module, all other ISAs via the
     /// architecture-agnostic `portable` module (the `cfg(not(x86_64))`
@@ -134,7 +134,7 @@ impl BufferBackend for FlatBuf {
         unsafe {
             let base_mut = self.buf.as_mut_ptr();
 
-            // Literal copy: donor `ZSTD_copy16` + optional wildcopy tail.
+            // Literal copy: upstream zstd `ZSTD_copy16` + optional wildcopy tail.
             let op_lit = base_mut.add(buf_len);
             copy16(op_lit, lit_src);
             if lit_length > 16 {
@@ -160,7 +160,7 @@ impl BufferBackend for FlatBuf {
         Ok(())
     }
 
-    /// Non-x86 port of [`Self::exec_sequence_inline`] — identical donor
+    /// Non-x86 port of [`Self::exec_sequence_inline`] — identical upstream zstd
     /// `ZSTD_execSequence` shape, but the wildcopy helpers come from the
     /// portable module (16-byte `u128` / 8-byte `u64` unaligned moves,
     /// lowered to NEON `ldr q`/`str q` on aarch64 and the widest store

@@ -1,4 +1,4 @@
-//! Donor-shape Fast strategy block compressor — flat hash-table +
+//! Upstream zstd-shape Fast strategy block compressor — flat hash-table +
 //! tight per-block loop, ported from `lib/compress/zstd_fast.c`. See
 //! [`kernel::compress_block_fast`] for the entry point.
 //!

@@ -14,7 +14,7 @@ use alloc::vec::Vec;
 use super::super::cost_model::HcOptimalCostProfile;
 
 /// One candidate match produced by a match-finder probe. Carries the
-/// absolute starting position and the donor-style offset/length pair.
+/// absolute starting position and the upstream zstd-style offset/length pair.
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct MatchCandidate {
     pub(crate) start: usize,
@@ -43,7 +43,7 @@ impl Default for HcOptimalNode {
         Self {
             off: 0,
             mlen: 0,
-            // Donor parity: uninitialized DP slots use litlen != 0
+            // Upstream zstd parity: uninitialized DP slots use litlen != 0
             // (C code uses !0) so they are never treated as end-of-match.
             litlen: u32::MAX,
             reps: [1, 4, 8],

@@ -10,7 +10,7 @@
 //! `FrameCompressor` field that stores this info, the methods that
 //! return it, and these public types only exist when the feature is
 //! enabled. Without `lsm` the C FFI surface stays strict drop-in for
-//! donor `libzstd` v1.5.7.
+//! upstream zstd `libzstd` v1.5.7.
 //!
 //! [`FrameCompressor::last_frame_emit_info`]: super::FrameCompressor::last_frame_emit_info
 

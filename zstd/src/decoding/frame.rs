@@ -16,7 +16,7 @@ pub(crate) fn read_frame_header(r: impl Read) -> Result<(FrameHeader, u8), ReadF
 /// Read a single serialized frame header. When `magicless` is
 /// `true`, the 4-byte magic prefix is NOT consumed and skippable-
 /// frame detection is bypassed — the caller MUST know out-of-band
-/// that the stream is magicless. Donor parity:
+/// that the stream is magicless. Upstream zstd parity:
 /// `ZSTD_f_zstd1_magicless` via `ZSTD_d_format`.
 pub fn read_frame_header_with_format(
     mut r: impl Read,

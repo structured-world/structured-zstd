@@ -15,7 +15,7 @@
 //! caller without the same feature set must call the function non-inline. In
 //! C, the equivalent intrinsics inline via macros without restriction. That ABI
 //! barrier is the dominant structural reason our encoder cannot match the
-//! C zstd donor on per-block latency — every hot-path SIMD call becomes a
+//! C zstd upstream zstd on per-block latency — every hot-path SIMD call becomes a
 //! function call (~100 cycles overhead per BT walk iter, ~32-512 iters per
 //! position, thousands of positions per block).
 //!
@@ -137,7 +137,7 @@ pub(crate) fn select_kernel() -> FastpathKernel {
 )]
 fn detect_kernel_uncached() -> FastpathKernel {
     // Each kernel's `hash_mix_u64` uses a hardware CRC instruction
-    // (`_mm_crc32_u64` on x86, `__crc32d` on AArch64) for the donor-style
+    // (`_mm_crc32_u64` on x86, `__crc32d` on AArch64) for the upstream zstd-style
     // mix. The CRC ISA extension is NOT implied by the SIMD umbrella that
     // names the kernel:
     //   * `_mm_crc32_u64` is SSE4.2, NOT AVX2 — older Intel CPUs can ship

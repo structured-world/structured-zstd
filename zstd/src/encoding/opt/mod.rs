@@ -1,10 +1,10 @@
 //! Optimal-parser DP used by `BtOpt` / `BtUltra` / `BtUltra2`.
 //!
 //! Will host:
-//! - Forward DP loop (`build_optimal_plan_impl`, donor
+//! - Forward DP loop (`build_optimal_plan_impl`, upstream zstd
 //!   `ZSTD_compressBlock_opt_generic`)
 //! - Reverse traceback + sequence emit
-//! - `init_stats_ultra` BtUltra2 first-pass (donor
+//! - `init_stats_ultra` BtUltra2 first-pass (upstream zstd
 //!   `ZSTD_initStats_ultra`)
 //! - LDM integration (`optLdm_processMatchCandidate` parity hooks);
 //!   the actual LDM matcher (gear hash + bucket table) lands as a

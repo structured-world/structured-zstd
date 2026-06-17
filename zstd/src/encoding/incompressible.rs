@@ -126,7 +126,7 @@ fn scan_sample_region(
         // Top `INCOMPRESSIBLE_REPEAT_TABLE_BITS` bits of the 32-bit hash give
         // the slot directly: the `as usize` value is `< 2^32`, so the shift
         // by `32 - BITS` already yields an index in `0..TABLE_LEN`. No mask
-        // needed (donor `ZSTD_hashPtr` shape).
+        // needed (upstream zstd `ZSTD_hashPtr` shape).
         let slot = (quad.wrapping_mul(INCOMPRESSIBLE_REPEAT_HASH_MULT) as usize)
             >> (32 - INCOMPRESSIBLE_REPEAT_TABLE_BITS);
         let word = slot / 64;

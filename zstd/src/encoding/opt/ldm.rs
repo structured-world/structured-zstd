@@ -1,6 +1,6 @@
 //! Long-distance-match (LDM) integration types for the optimal parser.
 //!
-//! Donor parity: mirrors `optLdm_t` and `rawSeq` from `zstd_opt.c`.
+//! Upstream zstd parity: mirrors `optLdm_t` and `rawSeq` from `zstd_opt.c`.
 //! The optimal parser consumes pre-computed LDM sequences (one per long
 //! match window) and weaves them into candidate selection via
 //! `ldm_process_match_candidate`.
@@ -31,7 +31,7 @@ pub(crate) struct HcRawSeqStore {
     pub(crate) size: usize,
 }
 
-/// Donor `optLdm_t` parity: the active LDM window relative to the
+/// Upstream zstd `optLdm_t` parity: the active LDM window relative to the
 /// current block. `(start_pos_in_block, end_pos_in_block)` mark the
 /// reachable slice; `UINT_MAX` (here `usize::MAX`) signals "no LDM
 /// candidate currently in flight" so the default-constructed state never
