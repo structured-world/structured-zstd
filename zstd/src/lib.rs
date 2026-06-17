@@ -153,17 +153,17 @@ pub mod testing {
 
     /// Maximum block size per RFC 8878 §3.1.1.2.3 (128 KiB).
     /// Exposed for parity tests that feed exactly-one-block chunks
-    /// into the donor splitter comparator.
+    /// into the block-splitter comparator.
     pub const MAX_BLOCK_SIZE: u32 = crate::common::MAX_BLOCK_SIZE;
 
-    /// Run our donor-port block splitter on a 128 KB chunk.
+    /// Run our block splitter on a 128 KB chunk.
     ///
-    /// `split_level` mirrors donor `ZSTD_splitBlock(level)`: `0` selects
+    /// `split_level` mirrors upstream zstd `ZSTD_splitBlock(level)`: `0` selects
     /// the borders heuristic (`ZSTD_splitBlock_fromBorders`), `1..=4`
     /// select `ZSTD_splitBlock_byChunks` at the corresponding sampling
     /// level. Returns the split position (or `block.len()` if no split).
     ///
-    /// Crate-internal facade for the donor-parity comparator test —
+    /// Crate-internal facade for the block-splitter parity comparator test —
     /// the underlying functions stay `fn` so they don't widen the
     /// stable API surface.
     pub fn block_splitter_decision(block: &[u8], split_level: usize) -> usize {
@@ -175,7 +175,7 @@ pub mod testing {
 /// (currently **32 bytes**). Sized so the AVX2 chunked kernel in
 /// `simd_copy::copy_bytes_overshooting` (32-byte stride on x86-64) can
 /// fire on tail copies near the end of a fixed-capacity output buffer.
-/// Donor zstd's `WILDCOPY_OVERLENGTH` is also 32 bytes today; this
+/// Upstream zstd's `WILDCOPY_OVERLENGTH` is also 32 bytes today; this
 /// matches that contract.
 ///
 /// Public so callers sizing an output slice for

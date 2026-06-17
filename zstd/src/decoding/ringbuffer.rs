@@ -11,7 +11,7 @@ use super::simd_copy;
 // assumption that wildcopy SIMD overshoot stores/loads near the
 // buffer boundary do not need a "min_buffer_size < copy_multiple"
 // fallback. See [`super::buffer_backend::WILDCOPY_OVERLENGTH`] for
-// the donor-parity rationale.
+// the upstream-zstd parity rationale.
 
 pub struct RingBuffer {
     // Safety invariants:
@@ -917,7 +917,7 @@ impl super::buffer_backend::BufferBackend for RingBuffer {
 
     #[inline(always)]
     fn inline_exec_ok(&self, lit_length: usize, match_length: usize, offset: usize) -> bool {
-        // The inline donor wildcopy addresses the ring linearly from `tail`
+        // The inline wildcopy addresses the ring linearly from `tail`
         // (literals at `[tail, tail+lit)`, match at `[tail+lit, tail+lit+ml)`,
         // match source at `tail + lit - offset`) with up to 31 bytes of AVX2
         // wildcopy overshoot. It is sound whenever that whole span is one
@@ -932,7 +932,7 @@ impl super::buffer_backend::BufferBackend for RingBuffer {
         //
         // * **Wrapped** (`head > tail`): the free region is the gap
         //   `[tail, head)` and live data is split (`[head, cap)` + `[0, tail)`).
-        //   The donor body can still run linearly from `tail` when (a) the write
+        //   The upstream body can still run linearly from `tail` when (a) the write
         //   + overshoot ends strictly before `head` (so it neither wraps nor
         //   clobbers the upper live segment) and (b) the match source does not
         //   underflow into that upper segment: `offset <= tail + lit` keeps
@@ -940,7 +940,7 @@ impl super::buffer_backend::BufferBackend for RingBuffer {
         //   lower live segment `[0, tail)`. Sequences violating either bound
         //   (a far-back match across the wrap, or a write that reaches `head`)
         //   fall back to the wrap-correct `push` / `repeat` path. This is the
-        //   subset the donor handles with its fast `ZSTD_execSequence` body;
+        //   subset upstream zstd handles with its fast `ZSTD_execSequence` body;
         //   only its `execSequenceEnd` near the buffer boundary is the
         //   equivalent of our fallback.
         const INLINE_EXEC_MAX_OVERSHOOT: usize = 31;
@@ -992,7 +992,7 @@ impl super::buffer_backend::BufferBackend for RingBuffer {
         }
     }
 
-    /// Donor `ZSTD_execSequence` on the contiguous sub-window. Gated by
+    /// Inline `ZSTD_execSequence` fast path on the contiguous sub-window. Gated by
     /// [`Self::inline_exec_ok`]: `head <= tail` and the write + 15-byte
     /// overshoot stay below `cap`, so the linear addressing the FlatBuf body
     /// uses is valid for the ring too. Mirrors `FlatBuf::exec_sequence_inline`
@@ -1595,7 +1595,7 @@ mod tests {
 
     #[test]
     fn inline_exec_ok_admits_contiguous_wrapped_sequence() {
-        // After the ring wraps (`head > tail`), the inline donor path stays
+        // After the ring wraps (`head > tail`), the inline path stays
         // eligible for a sequence whose linear write fits in the free gap
         // before `head` AND whose match source is the contiguous lower live
         // segment (`offset <= tail + lit`). A far-back match (source across the

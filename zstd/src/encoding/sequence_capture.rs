@@ -224,8 +224,8 @@ impl Matcher for CapturingMatcher {
 ///
 /// The compressed output is discarded — only matcher metadata is
 /// returned. Use this from a benchmark or audit tool to diff the
-/// Rust-emitted sequence stream against a donor FFI side
-/// (`ZSTD_generateSequences`) for the same `(input, level)` pair.
+/// Rust-emitted sequence stream against libzstd's
+/// `ZSTD_generateSequences` for the same `(input, level)` pair.
 ///
 /// Trailing-literal lengths are captured per block via the matcher's
 /// terminal `Sequence::Literals` event (or the entire committed space
@@ -274,7 +274,7 @@ pub fn compress_and_collect_sequences_with_raw_content(
 /// offset-history seed + entropy-table seed) exactly as the production
 /// dict-compress path would. Used by the dict-ratio audit to diff the Fast
 /// backend's dict-primed sequence stream against the dfast backend's (which
-/// reaches donor parity) on the same `(input, dict)` pair.
+/// matches libzstd's stream) on the same `(input, dict)` pair.
 pub fn compress_and_collect_sequences_with_dict(
     input: &[u8],
     level: CompressionLevel,
@@ -391,7 +391,7 @@ fn compress_and_collect_sequences_impl(
     // Hint the exact input size so the matcher picks the same
     // hash-table / window class the production one-shot path uses
     // (`compress_to_vec` does the same). Without the hint, the matcher
-    // assumes streaming sizing, which would diverge from the donor's
+    // assumes streaming sizing, which would diverge from libzstd's
     // `ZSTD_generateSequences` (which receives `srcSize` directly).
     compressor.set_source_size_hint(input.len() as u64);
     compressor.compress();
@@ -806,7 +806,7 @@ mod tests {
     /// `pre_split_level` matches the EXACT enum variants
     /// (`Level(11..=15)` / `Level(16..=22)`) — the `Best` arm
     /// falls through to `None`, so the named preset does NOT
-    /// trigger the donor block-splitter. The guard above
+    /// trigger the block-splitter. The guard above
     /// intentionally allows `Best` through; this test pins the
     /// matcher path stays alignment-correct for it. Without it, a
     /// future tightening of the guard to also reject `Best` would

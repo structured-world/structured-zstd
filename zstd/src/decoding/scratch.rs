@@ -182,7 +182,7 @@ impl<B: BufferBackend> DecoderScratch<B> {
         // `extend_from_slice` / `resize` does not pay anonymous-page
         // first-touch faults inside the decode hot path. `clear()`
         // keeps `capacity()`, so subsequent frames with the same
-        // (or smaller) window also avoid realloc. Matches donor's
+        // (or smaller) window also avoid realloc. Matches upstream zstd's
         // upfront sizing strategy where `dctx->litExtraBuffer` and
         // the dst layout are sized to `blockSizeMax` at frame init.
         // Measured at ~18% of decode-time page-fault cost on
@@ -204,7 +204,7 @@ impl<B: BufferBackend> DecoderScratch<B> {
         // the very first reset (or after a grow to larger
         // window_size).
         //
-        // This matches donor's `dctx->litExtraBuffer` /
+        // This matches upstream zstd's `dctx->litExtraBuffer` /
         // `dctx->workspace` lifecycle — touched once at decoder
         // construction, warm across all subsequent frames.
         if self.literals_buffer.capacity() < block_cap {
@@ -261,7 +261,7 @@ impl<B: BufferBackend> DecoderScratch<B> {
         // bump) instead of copying it into a per-frame buffer; the decoder
         // reads match bytes straight out of the shared content.
         self.buffer.set_dict(dict.clone());
-        // Donor parity: `ZSTD_decompressBegin_usingDDict` sets
+        // Upstream zstd parity: `ZSTD_decompressBegin_usingDDict` sets
         // `dctx->ddictIsCold = 1` so the first block of the frame
         // engages the prefetch decoder regardless of long-offset
         // share. We do the same here; the first
@@ -371,7 +371,7 @@ pub struct FSEScratch {
     pub literal_lengths: AlignedFSETable,
     pub match_lengths: AlignedFSETable,
     /// Cached "share of offset codes strictly > LONG_OFFSET_CODE_THRESHOLD
-    /// (i.e. codes ≥ 23 when the threshold is 22)" scaled to donor's
+    /// (i.e. codes ≥ 23 when the threshold is 22)" scaled to upstream zstd's
     /// `OffFSELog = 8` (256-entry reference).
     /// Updated by [`crate::decoding::sequence_section_decoder`] when
     /// the offsets FSE table is rebuilt (FSE / Predefined modes);
@@ -380,7 +380,7 @@ pub struct FSEScratch {
     /// The sequence-section pipeline gate reads this directly instead
     /// of re-walking `offsets.decode` per block.
     pub offsets_long_share: u32,
-    /// Mirrors donor `ZSTD_DCtx::ddictIsCold`. Set to `true` when a
+    /// Mirrors upstream zstd `ZSTD_DCtx::ddictIsCold`. Set to `true` when a
     /// dictionary is freshly attached (its FSE / HUF tables are not
     /// yet in cache); the first sequence-section decode of the
     /// resulting frame engages the pipelined prefetch decoder
@@ -391,11 +391,11 @@ pub struct FSEScratch {
     /// the short-block fallback in both the cold-dict and warm cases.
     /// Without a dictionary the flag stays `false` (cache state of the
     /// predefined and repeat tables is not considered "cold" in the
-    /// donor model).
+    /// upstream zstd model).
     pub ddict_is_cold: bool,
     /// Copy-on-write source for each sequence FSE table axis. After
     /// [`DecoderScratch::init_from_dict`] all three point at the shared
-    /// dictionary (`Dict`) with **no table bytes copied** (the donor's
+    /// dictionary (`Dict`) with **no table bytes copied** (the upstream zstd's
     /// eager `ZSTD_copyDDictParameters` memcpy is elided); a block that
     /// rebuilds an axis (FSE_Compressed / RLE / Predefined mode) writes
     /// the local `AlignedFSETable` and flips that axis to `Local`.
@@ -573,7 +573,7 @@ mod tests {
 
     #[test]
     fn init_from_dict_marks_fse_ddict_is_cold() {
-        // Donor parity: `ZSTD_decompressBegin_usingDDict` sets
+        // Upstream zstd parity: `ZSTD_decompressBegin_usingDDict` sets
         // `dctx->ddictIsCold = 1`. Mirror: `init_from_dict` must
         // leave `fse.ddict_is_cold = true` so the first
         // sequence-section decode of the frame engages the prefetch

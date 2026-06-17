@@ -27,7 +27,7 @@ pub struct DecodeBuffer<B: BufferBackend = RingBuffer> {
     buffer: B,
     /// Active dictionary, held by shared handle (`Arc`/`Rc`) rather than a
     /// per-frame owned copy. `repeat_from_dict` reads match bytes straight
-    /// out of the handle's content (donor `ZSTD_refDDict` semantics): one
+    /// out of the handle's content (libzstd `ZSTD_refDDict` semantics): one
     /// dictionary copy is shared across every frame AND across decoder
     /// instances on other threads (`Arc<Dictionary>` is `Send + Sync`), so
     /// reusing a dictionary costs a refcount bump, never a content memcpy.
@@ -718,7 +718,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     /// computed `match_start - offset` with an offset larger than
     /// match_start (e.g. a stale or malformed sequence), and
     /// dictionary-sourced matches whose logical position predates
-    /// the buffer's current frame. The donor (`PREFETCH_L1` in
+    /// the buffer's current frame. Upstream zstd (`PREFETCH_L1` in
     /// `ZSTD_prefetchMatch` — we mirror that with `prefetch_slice`
     /// → `_MM_HINT_T0` / `pldl1keep`, see the body comment) tolerates
     /// invalid addresses by spec, but in
@@ -729,12 +729,12 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         if start_idx >= self.buffer.len() {
             return;
         }
-        // Donor's `ZSTD_prefetchMatch` issues two `PREFETCH_L1` hints
+        // Upstream zstd's `ZSTD_prefetchMatch` issues two `PREFETCH_L1` hints
         // per match — one at `match`, one at `match + CACHELINE_SIZE`.
         // We mirror that intent via `prefetch_slice` (`_MM_HINT_T0` on
         // x86 / `pldl1keep` on aarch64 → L1 destination) with extent
         // capped at 2 × 64 B = 128 B. In the contiguous case the helper
-        // emits at most two prefetch instructions, matching donor
+        // emits at most two prefetch instructions, matching upstream zstd
         // exactly. In the wrap-boundary case the same 128 B budget is
         // split across `s1_tail` and `s2[0..]`, which can emit up to
         // four cache-line prefetches total (two per slice when each
@@ -764,7 +764,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             // Wrap continuation: when the match source straddles the
             // s1/s2 boundary and the s1 tail is shorter than the
             // PREFETCH_EXTENT we asked for, top up the rest from
-            // s2[0..]. Without this the donor's "up to two cache
+            // s2[0..]. Without this the upstream "up to two cache
             // lines" intent silently collapses to one (or zero if
             // s1_tail is the last sub-line of s1).
             if s1_bound < PREFETCH_EXTENT {
