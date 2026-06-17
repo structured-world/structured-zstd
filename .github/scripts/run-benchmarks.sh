@@ -37,7 +37,7 @@ if [ -n "${STRUCTURED_ZSTD_BENCH_BIN:-}" ]; then
   echo "Running pre-built bench binary: $STRUCTURED_ZSTD_BENCH_BIN" >&2
   "$STRUCTURED_ZSTD_BENCH_BIN" --bench --output-format bencher | tee "$BENCH_RAW_FILE"
 else
-  BENCH_CMD=(cargo bench --bench compare_ffi -p structured-zstd --features dict_builder)
+  BENCH_CMD=(cargo bench --bench compare_ffi -p ffi-bench)
   if [ -n "$BENCH_TARGET_TRIPLE" ]; then
     BENCH_CMD+=(--target "$BENCH_TARGET_TRIPLE")
   fi
@@ -62,7 +62,7 @@ elif [ -z "${STRUCTURED_ZSTD_BENCH_BIN:-}" ]; then
   # Local dev path: when no prebuilt binary env was set above, the
   # cargo invocation already covered compare_ffi. Run the memory bench
   # the same way so REPORT_MEM lines land in the raw file.
-  MEM_CMD=(cargo bench --bench compare_ffi_memory -p structured-zstd --features dict_builder)
+  MEM_CMD=(cargo bench --bench compare_ffi_memory -p ffi-bench)
   if [ -n "$BENCH_TARGET_TRIPLE" ]; then
     MEM_CMD+=(--target "$BENCH_TARGET_TRIPLE")
   fi
