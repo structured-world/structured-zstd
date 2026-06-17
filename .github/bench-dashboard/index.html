@@ -2394,7 +2394,7 @@
         wasmRenderPlainOptions(wasmState.selectors.level, levels, null);
 
         // Default to a meaningful starting view: plain kind, all scenarios,
-        // the donor default level (3) if present.
+        // the upstream zstd default level (3) if present.
         if (kinds.includes("plain")) wasmState.selectors.kind.value = "plain";
         wasmState.selectors.scenario.value = ALWAYS;
         if (levels.map(String).includes("3")) wasmState.selectors.level.value = "3";

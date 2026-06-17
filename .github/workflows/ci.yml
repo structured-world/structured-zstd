@@ -727,7 +727,7 @@ jobs:
       - id: set
         env:
           # Drives the shard plan below. On a `pull_request` we run
-          # only the two canonical levels (`level_3_dfast` = donor
+          # only the two canonical levels (`level_3_dfast` = upstream zstd
           # default, `level_22_btultra2` = max compression) bundled
           # into a single shard per target — three shards total, cheap
           # PR feedback. On a `push: main` (post-merge), one shard per
@@ -856,13 +856,13 @@ jobs:
       - name: Build compare_ffi + compare_ffi_memory bench binaries
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
-          # The donor zstd-sys C library uses runtime feature detection
+          # The upstream zstd zstd-sys C library uses runtime feature detection
           # (is_x86_feature_detected!-equivalent) so it transparently
           # picks up BMI2/AVX2/etc. on the runner. Pure-Rust hot paths
           # gate intrinsics on COMPILE-time cfg!(target_feature = ...)
           # and the default rustc x86_64 target ships with SSE2 only.
           # Without explicit target selection the bench compares
-          # "donor with full ISA" vs "us with SSE2 baseline" — not
+          # "upstream zstd with full ISA" vs "us with SSE2 baseline" — not
           # apples-to-apples.
           #
           # Use a DETERMINISTIC baseline (x86-64-v3 = BMI2 + AVX2 +
