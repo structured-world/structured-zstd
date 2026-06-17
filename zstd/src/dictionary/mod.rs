@@ -670,13 +670,12 @@ mod tests {
         compressor.set_drain(&mut compressed);
         compressor.compress();
 
-        let handle = crate::decoding::DictionaryHandle::decode_dict(finalized.as_slice())
-            .expect("decoder should accept finalized dictionary");
-        let mut decoder = crate::decoding::FrameDecoder::new();
-        let mut decoded = alloc::vec![0u8; payload.len()];
-        let written = decoder
-            .decode_all_with_dict_handle(compressed.as_slice(), &mut decoded, &handle)
-            .expect("decoder should decode payload");
+        let mut ffi_decoder = zstd::bulk::Decompressor::with_dictionary(finalized.as_slice())
+            .expect("ffi decoder should accept finalized dictionary");
+        let mut decoded = Vec::with_capacity(payload.len());
+        let written = ffi_decoder
+            .decompress_to_buffer(compressed.as_slice(), &mut decoded)
+            .expect("ffi decoder should decode payload");
         assert_eq!(written, payload.len());
         assert_eq!(decoded, payload);
     }
