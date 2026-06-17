@@ -3986,6 +3986,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn implausible_content_size_skips_eager_alloc_direct_path() {
+        // Adversarial frame: a 1 KiB window (small ring) but a declared
+        // content size of 4 MiB, followed by a truncated raw block. The
+        // direct path would `resize` the caller's Vec to the pledged 4 MiB
+        // (allocating + zeroing it) BEFORE the truncated body is validated.
+        // The gate must reject the implausible size (4 MiB cannot come from
+        // 3 compressed bytes) and fall through to the window-bounded ring
+        // drain, which errors without ever allocating the pledged size.
+        //
+        // Hand-built so the declared size is fully decoupled from the real
+        // (tiny) input — the encoder always writes a truthful FCS.
+        let frame: &[u8] = &[
+            0x28, 0xB5, 0x2F, 0xFD, // magic
+            0x80, // FHD: multi-segment, 4-byte FCS field, no dict
+            0x00, // window descriptor -> 1 KiB window
+            0x00, 0x00, 0x40, 0x00, // FCS = 4 MiB
+            0x21, 0x03, 0x00, // raw block header: last, size 100, no body
+        ];
+
+        let mut dec = FrameDecoder::new();
+        let mut src = frame;
+        dec.init(&mut src).expect("header must parse");
+        // `src` now points past the header at the truncated 3-byte block.
+        let mut out = Vec::new();
+        let err = dec.decode_current_frame_to_vec(src, &mut out, None);
+        assert!(
+            err.is_err(),
+            "truncated body must fail regardless of decode path"
+        );
+        assert_eq!(
+            dec.direct_frames, 0,
+            "implausible FCS must NOT take the eager-alloc direct path"
+        );
+    }
+
     #[cfg(feature = "lsm")]
     mod expect_validation {
         use super::*;
