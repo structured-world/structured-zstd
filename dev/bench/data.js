@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781685337151,
+  "lastUpdate": 1781711243375,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -68462,6 +68462,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.27,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "32b1dc82587c351fc61492b720d28a4ebfedba7d",
+          "message": "refactor: purge reference-impl terminology + isolate C bindings in ffi-bench (#430)\n\n* refactor(terminology): drop legacy reference-impl term in decode/io comments\n\nRename comments and identifiers that referenced the reference implementation\nby name to describe behaviour directly (inline-sequence path, expected-skippable\noracle) or cite it neutrally as upstream zstd. First batch: errors, ringbuffer,\ndecode_buffer, scratch, sequence_capture, skippable, lib.\n\n* refactor(terminology): drop legacy reference-impl term in matcher/codec comments\n\nComment-only files: fast kernel, row, hc, bt, dfast, cost model, ldm search,\nhuf cstream, fse/sequence/literals decoders, huff0 decoder, buffer backend,\nexec-sequence-inline. Source citations now read upstream zstd; no behaviour change.\n\n* refactor(terminology): drop legacy reference-impl term in dict/encoder comments\n\nComment-only files: fastcover, fast-kernel count, match-table helpers,\nstreaming encoder, simple backend, encoding mod, fuzz regressions, histogram,\ncpu kernel, frame decoder.\n\n* refactor(terminology): drop legacy reference-impl term in remaining comment-only files\n\n* refactor(terminology): rename reference-named identifiers + sweep matcher/ldm comments\n\nTest names and the opt-start-cursor helper renamed to describe their contract\n(matches_expected_value, opt_start_cursor_and_litlen, applies_gate, etc.);\nLDM, fast-matcher, strategy, storage, hash-table, blocks comments cite upstream\nzstd. No behaviour change.\n\n* refactor(terminology): rename FSE encoder helpers + sweep user-slice/fse comments\n\n* refactor(terminology): clear remaining one-off comment references\n\n* test(cparams): convert level/cparams conformance to in-tree pure-Rust asserts\n\nReplace the libzstd ZSTD_getCParams comparisons with assertions against the\nconstant clevels table[0]/table[3] values transcribed inline. Removes the\nFFI dependency from these match-generator unit tests; coverage unchanged.\n\n* refactor(terminology): rename reference-named files + sweep README/Cargo\n\nRename the four files whose names embedded the legacy term to describe their\nrole (block_splitter_parity, cparams_check, cparams_range, ffi_compress_*);\nupdate the test name entry and README prose to cite upstream zstd.\n\n* refactor(terminology): sweep benches/examples/cross-validation; rename example identifiers\n\n* refactor(terminology): rename match-generator identifiers + sweep comments\n\nTest/helper names describe their contract (matches_default_table,\nuses_btultra2_tiers, merge_block_delimiters, level22_block_ranges, reference_*);\ncomparison variables named reference; comments cite upstream zstd.\n\n* refactor(terminology): remove legacy reference-impl term repo-wide\n\nSweep the last C-binding test files (huff0, frame_compressor, block_splitter\nparity) plus CI/dashboard/docs prose. Identifiers describe their contract\n(reference_decision, build_limited_weights, encode4x_reference); prose cites\nupstream zstd. A repo-wide search for the term is now empty (CHANGELOG\nintentionally untouched).\n\n* test(decode): verify dict roundtrips through our own decoder, drop FFI re-check\n\nThe dictionary and frame-compressor unit tests now decode their own\ncompressed output with FrameDecoder instead of libzstd's bulk decoder.\nCross-implementation interop stays covered by tests/cross_validation.rs.\nRemoves the zstd dev-dep import from these two source files.\n\n* test: remove C-binding tests from the library crate src\n\nThe lib crate no longer imports zstd_sys. Two white-box conformance clusters\n(level-22 sequence parity vs ZSTD_generateSequences in match_generator; HUF\nreader acceptance in huff0_encoder) are removed from src; their coverage stays\nin the separate surfaces where C bindings belong: tests/cross_validation.rs\nroundtrips and the compare_ffi / compare_ffi_sequences benches. zstd remains a\ndev-dependency used only by those benches and integration test crates.\n\n* Revert \"test: remove C-binding tests from the library crate src\"\n\nThis reverts commit a77075c4f659fbd1f15931648e54e3cde959324b.\n\n* Revert \"test(decode): verify dict roundtrips through our own decoder, drop FFI re-check\"\n\nThis reverts commit 8d00b54ba98b654d184a2d799c6eeaaea2ee0c0a.\n\n* build: move benches + integration tests + FFI examples to ffi-bench crate\n\nNew non-published workspace member ffi-bench depends on structured-zstd plus\nthe C zstd bindings; it owns every target that links libzstd (the compare_ffi*\nbenches, the cross-validation / splitter-parity integration tests, and the FFI\ndiagnostic examples), referencing the in-tree source files via path so their\nfixtures and the shared benches/support module resolve unchanged. structured-zstd\ndisables auto-discovery for those and drops criterion/dhat. A few white-box unit\ntests still cross-check against libzstd, so zstd stays a structured-zstd dev-dep\nuntil those move to ffi-bench too.\n\n* test: move C-binding unit tests to ffi-bench, drop zstd dev-dependency\n\nThe library crate now links zero C bindings. Every test that cross-checks\nour output against libzstd lives in the sibling ffi-bench crate:\n\n- frame compressor FFI roundtrips (+ fuzz-artifact interop replay)\n- streaming encoder FFI roundtrips\n- huff0 weight-description / 4-stream / level-22 literal-section conformance\n- match-generator level-22 sequence-stream conformance\n- dictionary roundtrip through the C decoder\n- corpus roundtrip through the C decoder\n\nWhite-box cases keep their pure-Rust capture in the library behind a\ntesting facade (bench_internals) and feed only the result to the C side\nin ffi-bench. The our-decoder corpus roundtrips stay in the library.\nRemoved the zstd dev-dependency from the library crate; fixed the moved\nintegration tests to resolve the corpus fixture from either crate root.\n\n* ci: build parity benches + FFI tests from ffi-bench, keep comparison fair\n\nThe libzstd-linking benches and tests now live in ffi-bench, so the CI\nreferences had to follow them. The rust-vs-C parity benches must not link\nbench_internals (it widens the API surface and biases the comparison).\n\n- ffi-bench: drop bench_internals / hash / copy_shape_stats from default\n  and from the base structured-zstd dependency; gate each target that needs\n  them via required-features. compare_ffi / compare_ffi_memory carry none,\n  so building them in isolation links structured-zstd in its plain\n  consumer configuration (dict_builder only).\n- bench-build: build compare_ffi / compare_ffi_memory from ffi-bench.\n- lint: clippy the testing facade on structured-zstd and clippy the\n  ffi-bench targets; the parity gate now reads ffi-bench/Cargo.toml and\n  also rejects bench_internals on the dependency and on default features.\n- test: run the ffi-bench parity / cross-validation / corpus suite (these\n  moved out of the library crate and would otherwise drop out of CI).\n- run-benchmarks.sh: point the local fallback at ffi-bench.\n\n* build(c-api): drop rlib crate-type to end the libstructured_zstd.rlib collision\n\nThe C ABI crate names its lib target `structured_zstd` so the cdylib becomes\n`libstructured_zstd.so` (SONAME rewritten to `libzstd.so.1`). Its crate-type\nalso carried `lib`, emitting `libstructured_zstd.rlib` — the same filename the\n`structured-zstd` library crate produces, so a full workspace build warned on\nthe output-filename collision (cargo #6313).\n\nNothing depends on this crate from Rust and its 57 unit tests compile from\nsource via `--test` (no library artifact needed); there are no doctests. Drop\n`lib`, keeping only cdylib + staticlib. One rlib remains, owned unambiguously\nby the library crate, and the collision warning is gone.\n\n* fix(encode): compact small-frame headers and store non-shrinking blocks raw\n\nTwo coupled encoder fixes so small inputs are never larger than the C\nreference (they were by up to 4 bytes on sub-256-byte payloads):\n\n- Frame header: drop the 512-byte floor on single-segment selection. A\n  known-size payload that fits the window is now single-segment regardless\n  of size, matching upstream `ZSTD_writeFrameHeader`. A windowed frame\n  cannot encode a content size below 256 in fewer than 4 FCS bytes (the\n  1-byte FCS class is single-segment-only), so sub-256 inputs paid a 4-byte\n  FCS plus a window descriptor; single-segment stores the size in one byte\n  and omits the descriptor.\n\n- Block emit: fall back to a raw block whenever the compressed payload is\n  not smaller than the source (`payload >= block_size`), for every block\n  rather than only dictionary-primed ones. A non-shrinking compressed block\n  wastes bytes and, critically, can reference past a single-segment frame's\n  window (which equals the content size), failing to decode in a strict\n  decoder. The pre-compression raw-fast-path only catches blocks that\n  already look incompressible, so small inputs that slip past it but fail to\n  shrink still need this post-hoc store-raw. Applied on both the owned and\n  borrowed one-shot block loops.\n\nRegression tests assert our one-shot frame is never larger than C across\nsmall sizes / content shapes and round-trips through the C decoder, and that\nsub-512 known-size frames are single-segment.\n\n* fix: corpus file filter, HUF size mask, error wording, std cfg gate\n\n- encode_corpus_ffi: skip non-file directory entries before fs::read, and\n  assert the corpus fixture is present (was a bare unwrap).\n- huff0_ffi: mask the lhl_code=2 compressed-size field to 14 bits, matching\n  the regenerated-size field and the lhl_code=1 arm.\n- errors.rs: reword OutputBufferOverflow (doc + Display) backend-agnostically;\n  the flat buffer raises it too, not only the user slice.\n- match_generator: gate the x86 feature-detection test block on\n  feature = \"std\" (the macro needs std), matching the rest of the codebase.\n\n* docs(examples): point run commands at ffi-bench, document tests location\n\n- The FFI / diagnostic examples are built from the `ffi-bench` crate now, so\n  their header build/run commands use `-p ffi-bench --example` instead of the\n  stale `-p structured-zstd` form.\n- Document in zstd/Cargo.toml that with `autotests = false` a pure-Rust\n  integration test in `zstd/tests/` would not run under\n  `cargo test -p structured-zstd`: add such tests as `src/` unit tests or an\n  explicit `[[test]]` entry; C-binding tests go to `ffi-bench`.\n\n* docs(encode): clarify literals-RLE vs block-level RLE and small-frame framing\n\nThe literals-section RLE shortcut only runs inside a compressed block that\nalready carries sequences; a fully all-identical block takes the block-level\nRLE path instead, and the small-input framing economy lives in the frame\nheader / block-type selection. Cross-reference both so the size math here is\nnot mistaken for the whole small-input story.",
+          "timestamp": "2026-06-17T18:04:57+03:00",
+          "tree_id": "6625fb77564de9a86ad86eb2046c290d3631b9ce",
+          "url": "https://github.com/structured-world/structured-zstd/commit/32b1dc82587c351fc61492b720d28a4ebfedba7d"
+        },
+        "date": 1781711224420,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.102,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.087,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 246.034,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 208.401,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.262,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.386,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.251,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.97,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.144,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.921,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.028,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.174,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.028,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.174,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.01,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 12.266,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.248,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.142,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.263,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.794,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.115,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.532,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.004,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.304,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.05,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.027,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.167,
             "unit": "ms"
           }
         ]
