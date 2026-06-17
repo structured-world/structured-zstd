@@ -4,7 +4,7 @@
 //! both `FFI_TRACE_FAST=1` set and stderr redirected to a file to
 //! capture the C encoder's actual cursor trace.
 //!
-//! Build: cargo build --release -p structured-zstd --example ffi_compress_z000033
+//! Build: cargo build --release -p ffi-bench --example ffi_compress_z000033
 //! Run:   FFI_TRACE_FAST=1 ./target/release/examples/ffi_compress_z000033 \
 //!          > /dev/null 2> /tmp/ffi_trace.log
 

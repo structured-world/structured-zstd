@@ -21,6 +21,13 @@ categories = ["compression"]
 # `zstd` bindings. Auto-discovery is disabled because those source files still
 # physically live under `benches/`, `tests/`, and `examples/` here and are
 # compiled as targets of `ffi-bench` via explicit `path` entries.
+#
+# Consequence for new tests: `tests/` auto-discovery is OFF, so a pure-Rust
+# integration test dropped into `zstd/tests/` would NOT run under
+# `cargo test -p structured-zstd`. Add pure-Rust tests as unit tests under
+# `src/` (the `#[cfg(test)] mod tests` tree, which always runs) or, if a
+# `tests/`-style integration file is required, register it with an explicit
+# `[[test]]` entry here. C-binding tests always go to `ffi-bench`.
 autobenches = false
 autotests = false
 autoexamples = false
