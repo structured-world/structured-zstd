@@ -4075,7 +4075,7 @@ fn priceset_tier_helpers_match_scalar() {
             scalar_mask::<4>(&nc4, &np4)
         );
     }
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
     {
         if std::is_x86_feature_detected!("sse4.2") {
             unsafe {

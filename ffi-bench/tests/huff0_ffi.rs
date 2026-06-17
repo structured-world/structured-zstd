@@ -198,7 +198,9 @@ fn level22_emitted_literal_sections_are_accepted_by_reference_huf_reader() {
                             false,
                             4,
                             ((header >> 4) & 0x3fff) as usize,
-                            (header >> 18) as usize,
+                            // 14-bit compressed-size field (mask matches the
+                            // regenerated-size field above and the lhl_code=1 arm).
+                            ((header >> 18) & 0x3fff) as usize,
                         ),
                         3 => (
                             false,

@@ -15,14 +15,24 @@ const CORPUS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../zstd/decodecor
 const LOCAL_CORPUS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../zstd/local_corpus_files");
 
 fn corpus_files() -> Vec<PathBuf> {
-    let mut files: Vec<PathBuf> = fs::read_dir(CORPUS_DIR)
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .collect();
-    if let Ok(local) = fs::read_dir(LOCAL_CORPUS_DIR) {
-        files.extend(local.map(|e| e.unwrap().path()));
+    // Only regular files: a stray subdirectory or symlink in the corpus dir
+    // would otherwise reach `fs::read` below and panic.
+    fn regular_files(dir: &str) -> impl Iterator<Item = PathBuf> {
+        fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+            .map(|e| e.path())
     }
+    let mut files: Vec<PathBuf> = regular_files(CORPUS_DIR).collect();
+    files.extend(regular_files(LOCAL_CORPUS_DIR));
     files.sort();
+    assert!(
+        !files.is_empty(),
+        "no corpus files found at {CORPUS_DIR} — the decodecorpus_files/ fixture \
+         from the repository checkout is required for this test"
+    );
     files
 }
 
