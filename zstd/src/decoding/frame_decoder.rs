@@ -4037,6 +4037,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn implausible_single_segment_fcs_rejected_before_window_reservation() {
+        // Single-segment adversarial frame: the window equals the declared
+        // content size (4 MiB) by definition, so the fallback ring drain would
+        // pre-reserve that whole window via `useful_window_size()` before the
+        // truncated body errors — the multi-segment gate test does not cover
+        // this. The implausible size (4 MiB cannot come from 3 compressed
+        // bytes) must be rejected up front with a content-size error, NOT a
+        // block-body error after the reservation.
+        let frame: &[u8] = &[
+            0x28, 0xB5, 0x2F, 0xFD, // magic
+            0xA0, // FHD: single-segment, 4-byte FCS field
+            0x00, 0x00, 0x40, 0x00, // FCS = 4 MiB (== window for single-segment)
+            0x21, 0x03, 0x00, // raw block header: last, size 100, no body
+        ];
+
+        let mut dec = FrameDecoder::new();
+        let mut src = frame;
+        dec.init(&mut src).expect("header must parse");
+        let mut out = Vec::new();
+        let err = dec
+            .decode_current_frame_to_vec(src, &mut out, None)
+            .expect_err("implausible single-segment FCS must be rejected");
+        match err {
+            super::FrameDecoderError::FrameContentSizeMismatch { declared, .. } => {
+                assert_eq!(declared, 4 * 1024 * 1024);
+            }
+            other => panic!(
+                "expected early FrameContentSizeMismatch (no window reservation), got {other:?}"
+            ),
+        }
+        assert_eq!(
+            dec.direct_frames, 0,
+            "implausible FCS must not take the eager-alloc direct path"
+        );
+    }
+
     #[cfg(feature = "lsm")]
     mod expect_validation {
         use super::*;
