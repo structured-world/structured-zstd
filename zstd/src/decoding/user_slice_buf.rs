@@ -110,7 +110,7 @@ use super::buffer_backend::{BufferBackend, WILDCOPY_OVERLENGTH};
 /// block whose payload expands past the declared
 /// `frame_content_size` is caught per-write as
 /// `ExecuteSequencesError::OutputBufferOverflow` (literal-push /
-/// donor-inline path) or `DecodeBufferError::OutputBufferOverflow`
+/// upstream zstd-inline path) or `DecodeBufferError::OutputBufferOverflow`
 /// (match-repeat path); `FrameDecoder::run_direct_decode` folds both
 /// into a structured `FrameDecoderError::FrameContentSizeMismatch` —
 /// the SAME error a Raw / RLE overshoot produces — instead of
@@ -186,7 +186,7 @@ impl<'a> UserSliceBackend<'a> {
     /// - `self.tail + lit_length + match_length <= self.slice.len()`
     ///   (caller asserts exact fit before dispatching here).
     /// - `offset >= 1` and `offset <= (self.tail - self.head) +
-    ///   lit_length` (donor's `oLitEnd - offset` precondition), so the
+    ///   lit_length` (upstream zstd's `oLitEnd - offset` precondition), so the
     ///   match source stays inside the already-written window.
     /// - `lit_src` is valid for `lit_length` bytes (this path reads
     ///   exactly `lit_length`, no 16-byte overshoot, so the parent
@@ -218,7 +218,7 @@ impl<'a> UserSliceBackend<'a> {
 }
 
 impl<'a> BufferBackend for UserSliceBackend<'a> {
-    /// Donor-shape inline `ZSTD_execSequence` on every target: x86_64
+    /// Upstream zstd-shape inline `ZSTD_execSequence` on every target: x86_64
     /// via the SSE2 [`super::exec_sequence_inline::x86`] module
     /// (`_mm_loadu_si128` / `_mm_storeu_si128`, SSE2 is the x86_64
     /// baseline so no `#[target_feature]` gate), all other ISAs via the
@@ -236,7 +236,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
     /// path). See the trait const's doc.
     const INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER: bool = false;
 
-    /// Donor `ZSTD_execSequence` body — see trait doc for
+    /// Upstream zstd `ZSTD_execSequence` body — see trait doc for
     /// preconditions / contract.
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
@@ -326,7 +326,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
             let base_mut = self.slice.as_mut_ptr();
 
             // ── Literal copy ──
-            // Donor: ZSTD_copy16(op, *litPtr); if (litLength > 16)
+            // Upstream zstd: ZSTD_copy16(op, *litPtr); if (litLength > 16)
             //         wildcopy(op+16, *litPtr+16, litLength-16, no_overlap)
             //
             // The unconditional first copy16 may overshoot up to 15
@@ -340,7 +340,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
             }
 
             // ── Match copy ──
-            // Donor uses `oLitEnd = op + litLength` as the match
+            // Upstream zstd uses `oLitEnd = op + litLength` as the match
             // destination; the match source is `oLitEnd - offset`.
             let op_match = base_mut.add(self.tail + lit_length);
             let match_src = base_mut.cast_const().add(self.tail + lit_length - offset);
@@ -359,7 +359,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
         Ok(())
     }
 
-    /// Non-x86 port of [`Self::exec_sequence_inline`] — identical donor
+    /// Non-x86 port of [`Self::exec_sequence_inline`] — identical upstream zstd
     /// `ZSTD_execSequence` shape through the portable wildcopy helpers
     /// (unaligned u128/u64 moves; NEON `ldr q`/`str q` on aarch64).
     /// Mirrors the x86 arm's capacity / offset safety checks exactly.
@@ -521,7 +521,7 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
             let base_mut = self.slice.as_mut_ptr();
 
             // Literal copy — UNCHANGED from SSE2 default. 16-byte
-            // copy16 + optional 16-byte-stride wildcopy. Donor's
+            // copy16 + optional 16-byte-stride wildcopy. Upstream zstd's
             // literal copy is the smaller portion (~24 bytes typical);
             // the AVX2 win lives entirely in the match copy below.
             let op_lit = base_mut.add(self.tail);
@@ -548,21 +548,21 @@ impl<'a> BufferBackend for UserSliceBackend<'a> {
                 // the destination region BEFORE the first store has
                 // written them. That reads uninitialised destination
                 // bytes (or the previous block's tail) and silently
-                // corrupts the output. The donor SSE2 16-byte wildcopy
+                // corrupts the output. The upstream zstd SSE2 16-byte wildcopy
                 // is safe at `offset == 16` because the load reads
                 // exactly through `dst - 1`; the AVX2 ymm stride needs
                 // an extra 16-byte margin to maintain the same property.
                 wildcopy_no_overlap_avx2(op_match, match_src, match_length);
             } else if offset >= 16 {
                 // Mid-offset range (16..=31): too small for safe AVX2
-                // 32-byte stride (see above), large enough for donor's
+                // 32-byte stride (see above), large enough for upstream zstd's
                 // SSE2 16-byte no-overlap wildcopy. Keep the
                 // SSE2 path for these offsets.
                 wildcopy_no_overlap(op_match, match_src, match_length);
             } else {
                 // Short-offset path unchanged: overlap_copy8 +
                 // 8-byte stride wildcopy. 32-byte SIMD doesn't fit
-                // the donor's overlap_src_before_dst semantics
+                // the upstream zstd's overlap_src_before_dst semantics
                 // because the 8-byte spread step needs the source
                 // to lag the destination by less than the stride
                 // width.
@@ -1252,7 +1252,7 @@ mod tests {
     /// 8-byte stride), long-offset match (wildcopy_no_overlap).
     #[test]
     fn exec_sequence_inline_overflow_returns_output_buffer_overflow() {
-        // #246: the donor-inline sequence executor must return
+        // #246: the upstream zstd-inline sequence executor must return
         // `ExecuteSequencesError::OutputBufferOverflow` (NOT panic, NOT
         // an out-of-bounds unsafe write) when a sequence's literal+match
         // copy plus wildcopy overshoot would land past the fixed slice.
@@ -1272,7 +1272,7 @@ mod tests {
         let mut b = UserSliceBackend::from_slice(&mut buf);
         b.tail = 8;
         let lits = [0xAAu8; 16];
-        // SAFETY: `lits` is a 16-byte parent buffer (donor 16-byte read
+        // SAFETY: `lits` is a 16-byte parent buffer (upstream zstd 16-byte read
         // slack satisfied); the call must return Err before any write
         // past the slice end.
         let err = unsafe { b.exec_sequence_inline(lits.as_ptr(), 8, 4, 8) }
@@ -1289,7 +1289,7 @@ mod tests {
     fn exec_sequence_inline_short_literal_plus_long_offset_match() {
         // Layout: pre-fill `tail = 8` with a "history" region so
         // a match copy at offset 16 reaches inside the slice. Then
-        // bump tail past that history and exercise donor_exec.
+        // bump tail past that history and exercise upstream zstd_exec.
         // Buffer sized with WILDCOPY_OVERLENGTH slack at the end.
         const WILDCOPY: usize = super::super::buffer_backend::WILDCOPY_OVERLENGTH;
         let mut buf = vec![0u8; 256 + WILDCOPY];
@@ -1301,7 +1301,7 @@ mod tests {
         let mut b = UserSliceBackend::from_slice(&mut buf);
         b.tail = 32; // Pretend 32 history bytes are already written.
 
-        // 8-byte literals to write (donor's litLength <= 16 fast
+        // 8-byte literals to write (upstream zstd's litLength <= 16 fast
         // path — no wildcopy tail). Match length 8 at offset 16.
         let lits: [u8; 16] = [
             0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x11, 0x22, 0xA1, 0xB1, 0xC1, 0xD1, 0xE1, 0xF1,
@@ -1357,14 +1357,14 @@ mod tests {
         //   3. The FIRST 4 match-output bytes match seed[4..8] —
         //      that prefix of the match copy reads source bytes
         //      that the literal `copy16` overshoot did NOT
-        //      overwrite (the donor `copy16` writes 16 bytes at
+        //      overwrite (the upstream zstd `copy16` writes 16 bytes at
         //      `tail`, so source bytes BEFORE `tail` survive).
         //
         // We do NOT cross-validate against the legacy `extend` +
         // `repeat_in_chunks` chain: those paths don't perform the
         // 16-byte literal overshoot, so they produce a different
         // output for the same logical sequence (different bytes in
-        // positions where the donor's overshoot is consumed by the
+        // positions where the upstream zstd's overshoot is consumed by the
         // match copy). End-to-end parity is covered by the higher
         // level `roundtrip_integrity::*` tests in lib.rs which
         // decode whole frames and compare to the encoder input.
@@ -1394,7 +1394,7 @@ mod tests {
         // The remaining 8 match bytes (40..48) get fed by the
         // 8-byte-stride wildcopy reading from positions inside the
         // match-destination region, which the literal copy16 already
-        // overwrote with 0xFF. That's the donor invariant — the
+        // overwrote with 0xFF. That's the upstream zstd invariant — the
         // overshoot is consumed correctly. We don't pin the exact
         // bytes (they're a function of overlap_copy8's spread
         // tables) but the output length must be right.
