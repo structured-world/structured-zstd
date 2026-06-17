@@ -6749,9 +6749,8 @@ impl HcMatchGenerator {
         let mut best_plan = core::mem::take(&mut self.backend.bt_mut().opt_segment_plan_scratch);
         best_plan.clear();
         let mut plan_reps = self.table.offset_hist;
-        let (mut cursor, mut plan_litlen) = self
-            .table
-            .donor_opt_start_cursor_and_litlen(current_abs_start);
+        let (mut cursor, mut plan_litlen) =
+            self.table.opt_start_cursor_and_litlen(current_abs_start);
         let mut plan_literals_cursor = 0usize;
         let match_loop_limit = current_len.saturating_sub(8);
         while cursor < match_loop_limit {
@@ -6808,9 +6807,8 @@ impl HcMatchGenerator {
             core::mem::replace(&mut self.backend.bt_mut().opt_state, HcOptState::new());
         opt_state.rescale_freqs(current, seed_profile);
         let mut seed_reps = self.table.offset_hist;
-        let (mut cursor, mut seed_litlen) = self
-            .table
-            .donor_opt_start_cursor_and_litlen(current_abs_start);
+        let (mut cursor, mut seed_litlen) =
+            self.table.opt_start_cursor_and_litlen(current_abs_start);
         let mut seed_literals_cursor = 0usize;
         let mut seed_plan = core::mem::take(&mut self.backend.bt_mut().opt_seed_plan_scratch);
         seed_plan.clear();

@@ -19,8 +19,8 @@ pub use fse_decoder::*;
 pub mod fse_encoder;
 
 #[test]
-fn decoder_entry_layout_12_bytes_donor_seqsymbol_shape() {
-    // Donor `ZSTD_seqSymbol` shape: 4-byte header (new_state /
+fn decoder_entry_layout_12_bytes_seqsymbol_shape() {
+    // Upstream zstd `ZSTD_seqSymbol` shape: 4-byte header (new_state /
     // symbol / num_bits), 4-byte `base_value`, 1-byte
     // `num_additional_bits` + 3-byte tail padding for natural u32
     // alignment. Total 12 bytes. Grown from the classical 4-byte
@@ -77,7 +77,7 @@ fn tables_equal() {
 #[cfg(any(test, feature = "fuzz_exports"))]
 fn check_tables(dec_table: &fse_decoder::FSETable, enc_table: &fse_encoder::FSETable) {
     // Per-symbol `Vec<State>` storage was dropped in #110 — the encoder now
-    // holds only `nextStateTable` (donor parity) and per-symbol
+    // holds only `nextStateTable` (upstream zstd parity) and per-symbol
     // `symbolTT`. Verify decoder/encoder parity by enumerating every
     // valid `(symbol, input_state)` transition and asserting that:
     //   (a) `next.index` lands on a decoder slot owned by `symbol`

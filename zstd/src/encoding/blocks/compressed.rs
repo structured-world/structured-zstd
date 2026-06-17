@@ -13,23 +13,23 @@ use crate::{
 const MIN_SEQUENCES_BLOCK_SPLITTING: usize = 300;
 const MAX_NB_BLOCK_SPLITS: usize = 196;
 
-/// Donor `ZSTD_minLiteralsToCompress` (`zstd_compress_literals.c:114-127`):
+/// Upstream zstd `ZSTD_minLiteralsToCompress` (`zstd_compress_literals.c:114-127`):
 /// strategy-aware floor below which `compress_literals` does not even
 /// attempt huf compression and falls back to raw.
 ///
-/// Formula: `shift = MIN(9 - donor_strategy, 3); mintc = (huf_repeat ==
+/// Formula: `shift = MIN(9 - strategy, 3); mintc = (huf_repeat ==
 /// valid) ? 6 : (8 << shift)`. With huf reuse available, the per-block huf
 /// header overhead is gone, so the cheap floor is 6 bytes. Without it, the
 /// huf tree-description must be serialized per block — alphabet size and
 /// max symbol determine its exact byte cost, but on payloads near the
 /// per-strategy floor that overhead dominates and the compressed section
-/// loses to raw. Donor's shift table picks the floor per strategy:
+/// loses to raw. Upstream zstd's shift table picks the floor per strategy:
 /// strategy 1..6 → 64 bytes, strategy 7 (btopt) → 32, strategy 8 (btultra)
 /// → 16, strategy 9 (btultra2) → 8.
 ///
-/// Our `StrategyTag` enum has eight variants: `Lazy` covers donor strategies
-/// 4..5 (greedy/lazy/lazy2) and `Btlazy2` is the separate donor strategy 6.
-/// Within the fast..btlazy2 band donor's shift table is flat: strategies 1..6
+/// Our `StrategyTag` enum has eight variants: `Lazy` covers upstream zstd strategies
+/// 4..5 (greedy/lazy/lazy2) and `Btlazy2` is the separate upstream zstd strategy 6.
+/// Within the fast..btlazy2 band upstream zstd's shift table is flat: strategies 1..6
 /// all pin `shift = MIN(9 - strat, 3) = 3`, so both `Lazy` and `Btlazy2` land
 /// on the 64-byte floor. No aggressiveness gradient within this band to
 /// preserve (the gradient only starts at btopt).
@@ -55,8 +55,8 @@ fn min_literals_to_compress(
     8usize << shift
 }
 
-/// Donor `ZSTD_minGain` (`zstd_compress_internal.h:677-684`):
-/// strategy-aware minimum-compression margin. In donor it gates both
+/// Upstream zstd `ZSTD_minGain` (`zstd_compress_internal.h:677-684`):
+/// strategy-aware minimum-compression margin. In upstream zstd it gates both
 /// the block-level "compressed block must beat raw + minGain" decision
 /// and the literal-section `cLitSize >= srcSize - minGain` fallback.
 ///
@@ -86,7 +86,7 @@ fn min_gain(src_size: usize, strategy: crate::encoding::strategy::StrategyTag) -
     (src_size >> minlog) + 2
 }
 
-/// Donor `compress_literals` raw-fallback gate
+/// Upstream zstd `compress_literals` raw-fallback gate
 /// (`zstd_compress_literals.c:187-188`): emit raw when
 /// `cLitSize >= srcSize - minGain`, where `cLitSize` is the HUF payload
 /// plus tree description (the bytes `HUF_compress*` writes — excluding
@@ -108,7 +108,7 @@ fn use_raw_literal_fallback(
     huf_section_size >= literals_len.saturating_sub(min_gain(literals_len, strategy))
 }
 
-/// Donor `kInverseProbabilityLog256`: floor(-log2(x / 256) * 256).
+/// Upstream zstd `kInverseProbabilityLog256`: floor(-log2(x / 256) * 256).
 const INVERSE_PROBABILITY_LOG_256: [usize; 256] = [
     0, 2048, 1792, 1642, 1536, 1453, 1386, 1329, 1280, 1236, 1197, 1162, 1130, 1100, 1073, 1047,
     1024, 1001, 980, 960, 941, 923, 906, 889, 874, 859, 844, 830, 817, 804, 791, 779, 768, 756,
@@ -429,7 +429,7 @@ const LITERAL_INLINE_COPY_MAX: usize = 2048;
 /// - `32 < len < 2048`: `simd_copy::copy_exact_medium` — the widest
 ///   available SIMD tier (AVX2 32B / SSE2 16B / NEON / scalar) doing an
 ///   EXACT copy (floor bulk + overlapping tier-width tail), the safe
-///   donor-wildcopy analog: matches glibc's store width but drops the
+///   upstream zstd-wildcopy analog: matches glibc's store width but drops the
 ///   libc call, and never overshoots reads (borrowed-input safe).
 /// - `len ≥ 2048`: `extend_from_slice` — bandwidth-bound, ERMS wins.
 #[inline]
@@ -519,7 +519,7 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
     // literals section
 
     let mut writer = BitWriter::from(output);
-    // Donor `compress_literals` (`zstd_compress_literals.c:153-160`):
+    // Upstream zstd `compress_literals` (`zstd_compress_literals.c:153-160`):
     // `srcSize < ZSTD_minLiteralsToCompress(strategy, prevHuf->repeatMode)`
     // → `ZSTD_noCompressLiterals` (raw). The threshold is strategy-aware
     // (see `min_literals_to_compress`). With huf reuse available the
@@ -527,10 +527,10 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
     let strategy = state.strategy_tag;
     let has_huf_table = state.last_huff_table.is_some();
     let min_lits = min_literals_to_compress(strategy, has_huf_table);
-    // RLE pre-check: donor `compress_literals` reaches RLE only through
+    // RLE pre-check: upstream zstd `compress_literals` reaches RLE only through
     // the `cLitSize == 1` branch (`zstd_compress_literals.c:192-201`)
     // after passing the `min_lits` gate and running a full HUF compress —
-    // so donor emits raw for any all-identical section under `min_lits`
+    // so upstream zstd emits raw for any all-identical section under `min_lits`
     // (e.g. 8..63 bytes at fast/dfast/greedy/lazy without HUF reuse).
     // RLE and raw share the same lhSize for a given `len`
     // (both use `uncompressed_literals_header_bytes`), so RLE = lhSize + 1
@@ -538,9 +538,9 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
     // and smaller by exactly `len - 1` bytes for `len >= 2`, regardless of
     // the lhSize tier (1 / 2 / 3 / 5 bytes). Our pre-check fires for ANY
     // all-identical literal slice regardless of strategy/min_lits.
-    // This produces strictly smaller output than donor on the small
-    // all-identical edges while still matching donor on `>= min_lits`
-    // inputs (where donor's compress+`cLitSize==1` path reaches the same
+    // This produces strictly smaller output than upstream zstd on the small
+    // all-identical edges while still matching upstream zstd on `>= min_lits`
+    // inputs (where upstream zstd's compress+`cLitSize==1` path reaches the same
     // RLE block).
     // Note the order — RLE pre-check runs BEFORE `min_lits`;
     // `estimate_literals_section_bytes` mirrors this exactly so probe
@@ -728,8 +728,8 @@ fn estimate_literals_section_bytes(
         return uncompressed_literals_header_bytes(literals.len()) + literals.len();
     }
 
-    // Donor preferRepeat fast-path: skip the histogram +
-    // `build_from_counts` cost. Mirrors donor's
+    // Upstream zstd preferRepeat fast-path: skip the histogram +
+    // `build_from_counts` cost. Mirrors upstream zstd's
     // `huf_compress.c:1360-1364` policy — when the prior table
     // is valid for the input, REUSE unconditionally regardless
     // of whether a freshly-built table would compress better.
@@ -758,7 +758,7 @@ fn estimate_literals_section_bytes(
     }
 
     let (max_sym, largest_count) = crate::histogram::count_bytes(literals, counts);
-    // Mirror `compress_literals`' donor pre-build incompressibility gate
+    // Mirror `compress_literals`' upstream zstd pre-build incompressibility gate
     // byte-for-byte (flat histogram → raw section, no tree build) so
     // splitter probe costs match what the emitter writes.
     if largest_count <= (literals.len() >> 7) + 4 {
@@ -771,7 +771,7 @@ fn estimate_literals_section_bytes(
         *last_huff = None;
         return uncompressed_literals_header_bytes(literals.len()) + literals.len();
     };
-    // For lit_size ≥ 256, donor `compress_literals` calls `encoder.encode4x`
+    // For lit_size ≥ 256, upstream zstd `compress_literals` calls `encoder.encode4x`
     // which splits the data in 4 streams with a 6-byte jumptable and per-stream
     // byte-aligned padding. Bare `estimate_compressed_size_from_counts` would
     // model a single stream and undercount by ~6–10 bytes per section, biasing
@@ -812,19 +812,19 @@ fn estimate_literals_section_bytes(
     let compressed_header = compressed_literals_header_bytes(literals.len());
     let total = compressed_header + tree_desc + payload;
 
-    // Donor `compress_literals` raw-fallback gate
+    // Upstream zstd `compress_literals` raw-fallback gate
     // (`zstd_compress_literals.c:187-188`):
     //   `cLitSize >= srcSize - minGain`
     // where `cLitSize` is the encoded literals payload + tree description
     // (output of `HUF_compress*`, excluding the surrounding lhSize bytes)
     // and `srcSize` is the literal-payload length. In our terms:
-    //   - donor `cLitSize` ≡ `total - compressed_header` (tree_desc + payload)
-    //   - donor `srcSize`  ≡ `literals.len()`
+    //   - upstream zstd `cLitSize` ≡ `total - compressed_header` (tree_desc + payload)
+    //   - upstream zstd `srcSize`  ≡ `literals.len()`
     // Using the on-wire `total >= raw_section_bytes - mg` form (which
     // includes the compressed header on the LHS and the raw header on
     // the RHS) skews the threshold by `compressed_header - raw_header`
-    // bytes and rejects compressed sections that donor would keep,
-    // losing ratio. Mirror donor's payload-vs-srcSize form here.
+    // bytes and rejects compressed sections that upstream zstd would keep,
+    // losing ratio. Mirror upstream zstd's payload-vs-srcSize form here.
     let raw_section_bytes = uncompressed_literals_header_bytes(literals.len()) + literals.len();
     let huf_section_size = total - compressed_header; // tree_desc + payload, no lhSize
     if use_raw_literal_fallback(huf_section_size, literals.len(), strategy) {
@@ -857,7 +857,7 @@ fn estimate_sequences_section_bytes(
         ll_counts[ll as usize] += 1;
         ml_counts[ml as usize] += 1;
         of_counts[of as usize] += 1;
-        // Donor: OF code's value equals its additional-bits width.
+        // Upstream zstd: OF code's value equals its additional-bits width.
         extra_bits += ll_bits + ml_bits + of as usize;
     }
 
@@ -896,7 +896,7 @@ fn estimate_sequences_section_bytes(
     let ml_table_desc_bytes = mode_table_description_bytes(&ml_mode);
     let of_table_desc_bytes = mode_table_description_bytes(&of_mode);
 
-    // nbSeq varint header (donor RFC 8878 §3.1.1.3.2.1): 1–3 bytes.
+    // nbSeq varint header (upstream zstd RFC 8878 §3.1.1.3.2.1): 1–3 bytes.
     let nb_seq_header = match sequences.len() {
         0..=127 => 1,
         128..=0x7FFF => 2,
@@ -981,23 +981,23 @@ fn mode_table_description_bytes(mode: &FseTableMode<'_>) -> usize {
 /// (`estimate_literals_section_bytes`). Returns `true` when a fresh table
 /// should be emitted, `false` when the prior table can be reused.
 ///
-/// Decision logic is byte-for-byte the donor's: the old-table cost is the
+/// Decision logic is byte-for-byte the upstream zstd's: the old-table cost is the
 /// single-stream `estimate_compressed_size` (returns `None` when the prior
 /// table lacks codes for a symbol present in the current literals — in which
 /// case we must emit a new table). The new-table cost is its description
 /// size plus the single-stream payload estimate. A small-input guard
 /// (`new_desc + 12 >= literals.len()`) keeps the reuse path for tiny blocks
 /// where the description alone would exceed the literals.
-/// Donor `HUF_flags_preferRepeat` gate (`zstd_compress_literals.c:165`):
+/// Upstream zstd `HUF_flags_preferRepeat` gate (`zstd_compress_literals.c:165`):
 /// fast-band strategies (`strategy < ZSTD_lazy` → Fast / Dfast /
 /// Greedy in our enum) with short literal sections (≤ 1024 bytes)
 /// prefer reusing the previous tree over rebuilding it. Inside
-/// donor's HUF_compress (`huf_compress.c:1360-1364, 1396-1400`),
+/// upstream zstd's HUF_compress (`huf_compress.c:1360-1364, 1396-1400`),
 /// the flag short-circuits the rebuild path when the prior table
 /// is valid; we mirror it at our caller layer so the wasted
 /// `HuffmanTable::build_from_data` work is also skipped on the
 /// fast-band reuse path. Note this is an UNCONDITIONAL reuse
-/// override — donor intentionally picks reuse even when a fresh
+/// override — upstream zstd intentionally picks reuse even when a fresh
 /// table would compress better, trading a small ratio loss on
 /// tiny sections for the CPU saved on the tree build. The
 /// `decide_huff_reuse_like_encoder` helper then implements a
@@ -1098,7 +1098,7 @@ fn estimate_huff_payload_bytes_checked(
     }
 }
 
-/// Donor RFC 8878 §3.1.1.3.1.2 raw/RLE literals header size (bytes).
+/// Upstream zstd RFC 8878 §3.1.1.3.1.2 raw/RLE literals header size (bytes).
 fn uncompressed_literals_header_bytes(lit_size: usize) -> usize {
     match lit_size {
         0..=31 => 1,
@@ -1107,7 +1107,7 @@ fn uncompressed_literals_header_bytes(lit_size: usize) -> usize {
     }
 }
 
-/// Donor RFC 8878 §3.1.1.3.1.1 compressed literals section header size (bytes,
+/// Upstream zstd RFC 8878 §3.1.1.3.1.1 compressed literals section header size (bytes,
 /// excluding the Huffman tree description itself).
 fn compressed_literals_header_bytes(lit_size: usize) -> usize {
     match lit_size {
@@ -1320,7 +1320,7 @@ impl SplitEstimator<'_> {
         }
         let entry = self.block_entry.clone();
         let (full, full_raw_fallback, _) = self.estimate_subblock_size(start_idx, end_idx, &entry);
-        // G3 — whole-block bail-out before partition split. Donor
+        // G3 — whole-block bail-out before partition split. Upstream zstd
         // `ZSTD_compressSubBlock_multi` (`zstd_compress_superblock.c:530-532`)
         // bails when `estBlockSize > srcSize` (strict). Our trigger is
         // the `raw_fallback` flag from `estimate_subblock_size`, which
@@ -1328,7 +1328,7 @@ impl SplitEstimator<'_> {
         // min_gain` condition (where `min_gain = (source_len >> 8) + 2`,
         // ≈0.4% margin — see the `min_gain` computation inside
         // `estimate_subblock_size` above). So we bail in a narrow band
-        // `[source_len - min_gain, source_len + 3]` where donor would
+        // `[source_len - min_gain, source_len + 3]` where upstream zstd would
         // still recurse and *might* find a compressible split.
         //
         // Why this is safe ratio-wise:
@@ -1348,7 +1348,7 @@ impl SplitEstimator<'_> {
         //   outcome. For such a missed split-win to matter, both
         //   sub-blocks would need to compress strictly AND
         //   `cost(first) + cost(second) < source_len + 3`. The wider
-        //   donor band gives at most `min_gain` bytes of theoretical
+        //   upstream zstd band gives at most `min_gain` bytes of theoretical
         //   recoverable ratio per block.
         // - Empirically validated: `compare_ffi --list` REPORT lines
         //   show **zero rust_bytes delta** vs main on every
@@ -1371,7 +1371,7 @@ impl SplitEstimator<'_> {
     /// Returns the post-emit state at `end_idx` produced by whichever
     /// partitioning the recursion settles on (single emit OR multiple
     /// nested splits). Callers thread this into the sibling probe so the
-    /// right-hand recursion sees the actual donor-parity state the real
+    /// right-hand recursion sees the actual upstream zstd-parity state the real
     /// emit would land in, not just the "left as one big partition" state.
     fn derive_block_splits_with_full(
         &mut self,
@@ -1392,7 +1392,7 @@ impl SplitEstimator<'_> {
         }
         let mid_idx = (start_idx + end_idx) / 2;
         let (first, _, first_post) = self.estimate_subblock_size(start_idx, mid_idx, &entry);
-        // Donor parity: score the right half from the left's post-state,
+        // Upstream zstd parity: score the right half from the left's post-state,
         // not from the parent's block-entry state. Without this propagation
         // `second` is evaluated as a fresh-block start, biasing the
         // `first + second < full` decision toward overly optimistic splits.
@@ -1401,7 +1401,7 @@ impl SplitEstimator<'_> {
             // If the left side gets further split, the true state at
             // `mid_idx` is the left subtree's exit state, not `first_post`.
             // Thread the returned state into the right recursion so the
-            // right subtree probes against actual donor-parity state.
+            // right subtree probes against actual upstream zstd-parity state.
             let left_post =
                 self.derive_block_splits_with_full(start_idx, mid_idx, first, entry, partitions);
             if partitions.len() >= MAX_NB_BLOCK_SPLITS {
@@ -1571,7 +1571,7 @@ fn choose_table_from_counts<'a>(
         return FseTableMode::Rle(symbol);
     }
 
-    // Fast-band preferRepeat (donor `ZSTD_selectEncodingType`,
+    // Fast-band preferRepeat (upstream zstd `ZSTD_selectEncodingType`,
     // `zstd_compress_sequences.c:179-204`): for fast/dfast/greedy with a
     // valid previous table and `< 1000` sequences, reuse it without building
     // a new one. Trades a negligible ratio loss for skipping the per-block
@@ -1594,7 +1594,7 @@ fn choose_table_from_counts<'a>(
 
     let use_low_prob_count = total >= 2048;
 
-    // Mirror donor `ZSTD_selectEncodingType()`: compare default
+    // Mirror upstream zstd `ZSTD_selectEncodingType()`: compare default
     // cross-entropy, repeat-table FSE bit cost, and the custom compressed
     // table (header + entropy-bound payload). The custom table's header is
     // priced from its normalized counts via `fse_header_bits_for_counts`
@@ -1757,7 +1757,7 @@ fn encode_sequences(
     writer.write_bits(ml_add_bits, ml_num_bits);
     writer.write_bits(of_add_bits, of_num_bits);
 
-    // Donor-faithful sequence loop: write state diffs + extras via
+    // Upstream zstd-faithful sequence loop: write state diffs + extras via
     // unchecked fast-path adds with explicit `flush_bulk` calls at
     // safe burst boundaries. Per-sequence bit budget:
     //   state diffs: of (<=8) + ml (<=9) + ll (<=9) = 26 bits → one
@@ -1766,7 +1766,7 @@ fn encode_sequences(
     //                one burst between flushes.
     //
     // Total per sequence: 82 bits ⇒ at least 2 flushes (one per burst).
-    // Mirrors donor `ZSTD_encodeSequences_body`
+    // Mirrors upstream zstd `ZSTD_encodeSequences_body`
     // (`zstd_compress_sequences.c:303-360`) which uses BIT_addBitsFast
     // + BIT_flushBitsFast at the same burst boundaries.
     //
@@ -1838,11 +1838,11 @@ fn encode_sequences(
             // Extras burst: ll (≤16) + ml (≤16) + of (≤ window_log,
             // up to 30 for our max window_log). With ≤ 7 leftover from
             // the prior flush_bulk, total ll+ml+of+partial can exceed
-            // 64 once of_num_bits > 25. Donor handles this via
+            // 64 once of_num_bits > 25. Upstream zstd handles this via
             // `longOffsets` mode that splits high offsets across two
             // BIT_addBits calls; we instead drain the partial after ml
             // and write of into a fresh container. The branch matches
-            // donor's `MEM_32bits()` flush-between-each-component
+            // upstream zstd's `MEM_32bits()` flush-between-each-component
             // shape on the 32-bit build (which has the same 64-bit
             // container constraint).
             //
@@ -2086,7 +2086,7 @@ fn rle_literals(literals: &[u8], writer: &mut BitWriter<&mut Vec<u8>>) {
 /// the huf payload is emitted), and the huf-encoded payload using
 /// `last_table` (no tree description, since the decoder reuses the
 /// previously-emitted one). Used by `compress_literals` when the
-/// donor preferRepeat gate short-circuits the rebuild path.
+/// upstream zstd preferRepeat gate short-circuits the rebuild path.
 /// Mirrors the post-decide reuse branch at the bottom of
 /// `compress_literals` byte-for-byte (same size_format ladder, same
 /// min_gain raw-fallback gate) so the wire output is identical to
@@ -2143,11 +2143,11 @@ fn compress_literals(
 ) -> HuffmanTableUpdate {
     let reset_idx = writer.index();
 
-    // Donor preferRepeat fast-path: when Fast/Dfast/Greedy on
+    // Upstream zstd preferRepeat fast-path: when Fast/Dfast/Greedy on
     // <=1024-byte literals AND the prior table can encode this
     // input (`estimate_compressed_size` returns Some), skip the
     // expensive `HuffmanTable::build_from_data` and route the
-    // emit straight through the reuse path. Mirrors donor's
+    // emit straight through the reuse path. Mirrors upstream zstd's
     // HUF_compress shape: `huf_compress.c:1360-1364` checks the
     // flag BEFORE the histogram + tree-build, so the rebuild cost
     // is avoided on fast-band tiny sections. Without this gate,
@@ -2162,7 +2162,7 @@ fn compress_literals(
 
     let mut counts = [0usize; 256];
     let (max_symbol, largest_count) = crate::histogram::count_bytes(literals, &mut counts);
-    // Donor pre-build incompressibility gate (`huf_compress.c`,
+    // Upstream zstd pre-build incompressibility gate (`huf_compress.c`,
     // `HUF_compress_internal`): a histogram this flat
     // (`largest <= (srcSize >> 7) + 4`) is heuristically not worth
     // compressing — bail to raw BEFORE the tree build and the full
@@ -2239,21 +2239,21 @@ fn compress_literals(
     writer.change_bits(size_index, encoded_len as u64, size_bits);
     let total_len = (writer.index() - reset_idx) / 8;
 
-    // Donor `compress_literals` raw-fallback gate
+    // Upstream zstd `compress_literals` raw-fallback gate
     // (`zstd_compress_literals.c:187-188`):
     //   `cLitSize >= srcSize - minGain`
-    // where donor's `cLitSize` is the encoded literals payload plus the
+    // where upstream zstd's `cLitSize` is the encoded literals payload plus the
     // tree description (output of `HUF_compress*`, excluding the
     // surrounding `lhSize` literals header), and `srcSize` is the
     // literal-payload length. In our terms:
-    //   - donor `cLitSize` ≡ `total_len - compressed_literals_header_bytes`
+    //   - upstream zstd `cLitSize` ≡ `total_len - compressed_literals_header_bytes`
     //     (i.e. tree_desc + huf_payload, no lhSize)
-    //   - donor `srcSize`  ≡ `literals.len()`
+    //   - upstream zstd `srcSize`  ≡ `literals.len()`
     // Comparing `total_len >= raw_section_bytes - minGain` (with the
     // compressed-section lhSize on the LHS and raw-section header on
     // the RHS) skews the threshold by `compressed_header - raw_header`
-    // bytes and rejects compressed sections that donor would keep —
-    // direct ratio loss. Mirror donor's payload-vs-srcSize form here.
+    // bytes and rejects compressed sections that upstream zstd would keep —
+    // direct ratio loss. Mirror upstream zstd's payload-vs-srcSize form here.
     // `minGain` is strategy-aware (`min_gain` helper above; ~1.56% for
     // fast..btopt, ~0.78% for btultra, ~0.39% for btultra2). Saturating
     // subtraction covers tiny inputs where `literals.len() < minGain`.
@@ -2363,7 +2363,7 @@ mod tests {
     #[test]
     fn use_raw_literal_fallback_uses_payload_vs_srcsize_threshold() {
         use super::{compressed_literals_header_bytes, use_raw_literal_fallback};
-        // Donor formula: `huf_section_size >= literals_len - min_gain`,
+        // Upstream zstd formula: `huf_section_size >= literals_len - min_gain`,
         // payload-vs-srcSize (no headers on either side). Verify the
         // gate is symmetric in header overhead by hitting the boundary
         // where the old on-wire `total >= raw_section - mg` form would
@@ -2401,11 +2401,11 @@ mod tests {
     }
 
     #[test]
-    fn prefer_repeat_eligible_matches_donor_gate() {
+    fn prefer_repeat_eligible_applies_gate() {
         use super::prefer_repeat_eligible;
-        // Donor `zstd_compress_literals.c:165`:
+        // Upstream zstd `zstd_compress_literals.c:165`:
         //   strategy < ZSTD_lazy && srcSize <= 1024 -> HUF_flags_preferRepeat
-        // ZSTD_lazy == 4 in donor enum; our `< Lazy` set is
+        // ZSTD_lazy == 4 in upstream zstd enum; our `< Lazy` set is
         // {Fast, Dfast, Greedy}. Verify the gate fires for each
         // and stays off for the rest.
         for lit_len in [0usize, 1, 64, 256, 1024] {
@@ -2443,7 +2443,7 @@ mod tests {
             );
         }
         // Above the 1024-byte size threshold the gate stays off
-        // for ALL strategies (donor `srcSize <= 1024` is the
+        // for ALL strategies (upstream zstd `srcSize <= 1024` is the
         // closed upper bound).
         for lit_len in [1025usize, 2048, 16384] {
             assert!(!prefer_repeat_eligible(StrategyTag::Fast, lit_len));
@@ -2543,7 +2543,7 @@ mod tests {
         // `min_lits` band (8/16/32/64), (b) seeded HUF-reuse state at
         // the lowered floor of 6 — under the prior hardcoded `len >= 8`
         // gate 6/7-byte all-identical sections went raw, now they pass
-        // `min_lits == 6` and the donor-parity HUF+`cLitSize==1` path
+        // `min_lits == 6` and the upstream zstd-parity HUF+`cLitSize==1` path
         // would route them to RLE; the pre-check shortcuts that path,
         // (c) sub-`min_lits` all-identical sections that take the
         // RLE pre-check regardless of strategy.
@@ -2577,7 +2577,7 @@ mod tests {
             // hardcoded `len >= 8` gate 6/7-byte sections went raw;
             // post-fix, all-identical 6/7-byte sections take the RLE
             // pre-check and stay byte-equivalent estimator-vs-emit
-            // (donor parity would route them HUF→cLitSize==1→RLE).
+            // (upstream zstd parity would route them HUF→cLitSize==1→RLE).
             // Also exercise non-identical 6-byte raw fallback and
             // 16-byte HUF reuse path.
             (
@@ -2766,7 +2766,7 @@ mod tests {
     }
 
     /// Fast-band strategies (fast/dfast/greedy) reuse a covering previous FSE
-    /// table without building a new one (donor `preferRepeat`), even on a
+    /// table without building a new one (upstream zstd `preferRepeat`), even on a
     /// fresh distribution where the cost-based path could pick a new table.
     /// A non-fast-band strategy on an identical distribution takes the
     /// cost-based path instead.

@@ -1,39 +1,39 @@
-//! LDM tuning parameters and donor-parity defaults.
+//! LDM tuning parameters and upstream zstd-parity defaults.
 //!
 //! Direct port of `ldmParams_t` (`zstd_compress_internal.h`) and the
 //! `ZSTD_ldm_adjustParameters` derivation logic (`zstd_ldm.c:135`),
 //! v1.5.7.
 //!
-//! Donor flow:
+//! Upstream zstd flow:
 //!
 //! 1. Caller starts with a zeroed `ldmParams_t` (all auto-derive).
 //! 2. [`LdmParams::adjust_for`] fills the zero-valued knobs from
 //!    `windowLog` / `strategy` using the same `BOUNDED` clamps as
-//!    donor.
+//!    upstream zstd.
 //! 3. The returned struct then feeds [`super::gear_hash::GearHashState::new`]
 //!    and the bucket hash table.
 
 use super::gear_hash::{LDM_BUCKET_SIZE_LOG, LDM_HASH_RLOG, LDM_MIN_MATCH_LENGTH};
 
-/// Donor `ZSTD_HASHLOG_MIN` (`zstd.h:1268`).
+/// Upstream zstd `ZSTD_HASHLOG_MIN` (`zstd.h:1268`).
 pub(crate) const LDM_HASHLOG_MIN: u32 = 6;
-/// Donor `ZSTD_HASHLOG_MAX` (`zstd.h:1267`). Donor caps at
-/// `min(WINDOWLOG_MAX, 30)`; both Rust and donor share the `30` cap
+/// Upstream zstd `ZSTD_HASHLOG_MAX` (`zstd.h:1267`). Upstream zstd caps at
+/// `min(WINDOWLOG_MAX, 30)`; both Rust and upstream zstd share the `30` cap
 /// because no platform we target exceeds it.
 pub(crate) const LDM_HASHLOG_MAX: u32 = 30;
-/// Donor `ZSTD_LDM_BUCKETSIZELOG_MAX` (`zstd.h:1300`).
+/// Upstream zstd `ZSTD_LDM_BUCKETSIZELOG_MAX` (`zstd.h:1300`).
 pub(crate) const LDM_BUCKETSIZELOG_MAX: u32 = 8;
 
-/// Donor strategy ordinal for `ZSTD_btultra`. Triggers the
-/// `minMatchLength /= 2` step in `adjust_for`. Donor `zstd.h`
+/// Upstream zstd strategy ordinal for `ZSTD_btultra`. Triggers the
+/// `minMatchLength /= 2` step in `adjust_for`. Upstream zstd `zstd.h`
 /// enumerates strategies as 1..=9 in order:
 /// fast, dfast, greedy, lazy, lazy2, btlazy2, btopt, btultra, btultra2.
 pub(crate) const STRATEGY_BTULTRA: u32 = 8;
 
 /// LDM parameter set fed to both the gear-hash producer and the
-/// bucket hash table. Field semantics mirror donor `ldmParams_t`.
+/// bucket hash table. Field semantics mirror upstream zstd `ldmParams_t`.
 ///
-/// All-zero `LdmParams::default()` is the donor sentinel for
+/// All-zero `LdmParams::default()` is the upstream zstd sentinel for
 /// "auto-derive every knob"; [`Self::adjust_for`] performs that
 /// derivation.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
@@ -41,18 +41,18 @@ pub(crate) struct LdmParams {
     /// Compression `windowLog` (mirrors `cParams->windowLog`). The
     /// LDM window size in bytes is `1 << window_log`.
     pub(crate) window_log: u32,
-    /// `log2` of the LDM hash-table size (in entries). Donor name:
+    /// `log2` of the LDM hash-table size (in entries). Upstream zstd name:
     /// `hashLog`. Clamped to `[LDM_HASHLOG_MIN, LDM_HASHLOG_MAX]`.
     pub(crate) hash_log: u32,
     /// `log2` of bytes between successive split-point checks (on
-    /// average). Donor name: `hashRateLog`. Defaults derived from
+    /// average). Upstream zstd name: `hashRateLog`. Defaults derived from
     /// strategy.
     pub(crate) hash_rate_log: u32,
-    /// Minimum accepted LDM match length in bytes. Donor name:
+    /// Minimum accepted LDM match length in bytes. Upstream zstd name:
     /// `minMatchLength`. Defaults to [`LDM_MIN_MATCH_LENGTH`], halved
     /// for `>= btultra`.
     pub(crate) min_match_length: u32,
-    /// `log2` of the per-bucket entry count. Donor name:
+    /// `log2` of the per-bucket entry count. Upstream zstd name:
     /// `bucketSizeLog`. Clamped to
     /// `[LDM_BUCKET_SIZE_LOG, LDM_BUCKETSIZELOG_MAX]`.
     pub(crate) bucket_size_log: u32,
@@ -60,8 +60,8 @@ pub(crate) struct LdmParams {
 
 impl LdmParams {
     /// Derive a complete parameter set from caller-supplied
-    /// `window_log` + `strategy` using donor `ZSTD_ldm_adjustParameters`
-    /// (`zstd_ldm.c:135`). Strategy is the donor 1..=9 enum ordinal
+    /// `window_log` + `strategy` using upstream zstd `ZSTD_ldm_adjustParameters`
+    /// (`zstd_ldm.c:135`). Strategy is the upstream zstd 1..=9 enum ordinal
     /// (fast=1 .. btultra2=9).
     ///
     /// Returns a fully-initialised `LdmParams` with no zero fields.
@@ -73,13 +73,13 @@ impl LdmParams {
         .derive(strategy)
     }
 
-    /// Donor `ZSTD_ldm_adjustParameters` derivation over a (possibly
+    /// Upstream zstd `ZSTD_ldm_adjustParameters` derivation over a (possibly
     /// caller-seeded) parameter set: fill every zero-valued knob from
     /// `window_log` / `strategy`, leaving non-zero fields untouched.
     ///
     /// This is the path the public-parameter LDM overrides (#27) use:
     /// the caller seeds the knobs it wants to pin (the rest stay zero),
-    /// and `derive` completes the set with donor cross-field
+    /// and `derive` completes the set with upstream zstd cross-field
     /// consistency (e.g. `hash_rate_log = window_log - hash_log` when a
     /// caller pins `hash_log`). Calling `adjust_for` and then clobbering
     /// fields afterwards would break that consistency.
@@ -88,33 +88,33 @@ impl LdmParams {
         // raw `LDM_HASH_RLOG - (strategy / 3)`, which underflows
         // `u32` for `strategy >= 24` (`7 - 8 = u32::MAX`) and
         // yields nonsensical `hash_rate_log` in release builds.
-        // Donor enforces the same precondition as a hard
+        // Upstream zstd enforces the same precondition as a hard
         // `assert(1 <= strategy && strategy <= 9)` at
         // `zstd_ldm.c:149` / `zstd_ldm.c:167`; we mirror that
         // hardness in our `pub(crate)` surface. The check runs
         // once per frame so the cost is negligible.
         assert!(
             (1..=9).contains(&strategy),
-            "strategy must be a donor 1..=9 ordinal (donor asserts at \
+            "strategy must be a upstream zstd 1..=9 ordinal (upstream zstd asserts at \
              zstd_ldm.c:149 + zstd_ldm.c:167)"
         );
 
         let mut params = self;
 
-        // hash_rate_log: donor `zstd_ldm.c:141-153`. With `hash_log`
-        // still zero (the only path we expose), donor falls into the
+        // hash_rate_log: upstream zstd `zstd_ldm.c:141-153`. With `hash_log`
+        // still zero (the only path we expose), upstream zstd falls into the
         // `7 - strategy/3` branch.
         if params.hash_rate_log == 0 {
             if params.hash_log > 0 && params.window_log > params.hash_log {
                 params.hash_rate_log = params.window_log - params.hash_log;
             } else {
                 // Map [fast=1, rate 7] .. [btultra2=9, rate 4].
-                // Donor `zstd_ldm.c:151`.
+                // Upstream zstd `zstd_ldm.c:151`.
                 params.hash_rate_log = LDM_HASH_RLOG - (strategy / 3);
             }
         }
 
-        // hash_log: donor `zstd_ldm.c:154-160`.
+        // hash_log: upstream zstd `zstd_ldm.c:154-160`.
         if params.hash_log == 0 {
             params.hash_log = if params.window_log <= params.hash_rate_log {
                 LDM_HASHLOG_MIN
@@ -127,7 +127,7 @@ impl LdmParams {
             };
         }
 
-        // min_match_length: donor `zstd_ldm.c:161-165`.
+        // min_match_length: upstream zstd `zstd_ldm.c:161-165`.
         if params.min_match_length == 0 {
             let mut mml = LDM_MIN_MATCH_LENGTH as u32;
             if strategy >= STRATEGY_BTULTRA {
@@ -136,7 +136,7 @@ impl LdmParams {
             params.min_match_length = mml;
         }
 
-        // bucket_size_log: donor `zstd_ldm.c:166-169`.
+        // bucket_size_log: upstream zstd `zstd_ldm.c:166-169`.
         if params.bucket_size_log == 0 {
             params.bucket_size_log = bounded(LDM_BUCKET_SIZE_LOG, strategy, LDM_BUCKETSIZELOG_MAX);
         }
@@ -155,9 +155,9 @@ impl LdmParams {
     }
 }
 
-/// Donor `BOUNDED(lo, val, hi)` macro: clamp `val` into `[lo, hi]`.
+/// Upstream zstd `BOUNDED(lo, val, hi)` macro: clamp `val` into `[lo, hi]`.
 /// Equivalent to `val.clamp(lo, hi)` but kept as a free function so
-/// the donor-line citations read naturally.
+/// the upstream zstd-line citations read naturally.
 #[inline]
 const fn bounded(lo: u32, val: u32, hi: u32) -> u32 {
     if val < lo {
@@ -173,7 +173,7 @@ const fn bounded(lo: u32, val: u32, hi: u32) -> u32 {
 mod tests {
     use super::*;
 
-    /// Spot-check donor strategy → hash_rate_log mapping
+    /// Spot-check upstream zstd strategy → hash_rate_log mapping
     /// (`zstd_ldm.c:151`): `7 - strategy/3`.
     ///
     ///   strategy 1 (fast)     → 7
@@ -181,19 +181,19 @@ mod tests {
     ///   strategy 6 (btlazy2)  → 5
     ///   strategy 9 (btultra2) → 4
     /// `adjust_for` must panic in BOTH debug and release builds
-    /// when handed an out-of-range strategy (donor 1..=9). The
+    /// when handed an out-of-range strategy (upstream zstd 1..=9). The
     /// inner `LDM_HASH_RLOG - (strategy / 3)` would otherwise
     /// underflow `u32` for `strategy >= 24` and produce
     /// nonsensical params. Regression for PR #139 round-10
     /// review (Copilot).
     #[test]
-    #[should_panic(expected = "strategy must be a donor 1..=9 ordinal")]
+    #[should_panic(expected = "strategy must be a upstream zstd 1..=9 ordinal")]
     fn adjust_for_panics_on_out_of_range_strategy() {
         let _ = LdmParams::adjust_for(27, 24);
     }
 
     #[test]
-    fn adjust_strategy_to_hash_rate_log_matches_donor_table() {
+    fn adjust_strategy_to_hash_rate_log_matches_table() {
         assert_eq!(LdmParams::adjust_for(27, 1).hash_rate_log, 7);
         assert_eq!(LdmParams::adjust_for(27, 3).hash_rate_log, 6);
         assert_eq!(LdmParams::adjust_for(27, 6).hash_rate_log, 5);
@@ -209,14 +209,14 @@ mod tests {
     ///   window_log = 7,  strategy = 1 → hash_rate_log = 7
     ///     → window_log <= hash_rate_log → degenerate → hash_log = 6
     #[test]
-    fn adjust_hash_log_clamps_within_donor_bounds() {
+    fn adjust_hash_log_clamps_within_bounds() {
         assert_eq!(LdmParams::adjust_for(27, 1).hash_log, 20);
         assert_eq!(LdmParams::adjust_for(10, 1).hash_log, LDM_HASHLOG_MIN);
         assert_eq!(LdmParams::adjust_for(7, 1).hash_log, LDM_HASHLOG_MIN);
     }
 
     /// `min_match_length` halving at btultra (strategy ≥ 8).
-    /// Donor `zstd_ldm.c:163-164`.
+    /// Upstream zstd `zstd_ldm.c:163-164`.
     #[test]
     fn adjust_min_match_halved_for_btultra_and_above() {
         assert_eq!(
@@ -234,10 +234,10 @@ mod tests {
     }
 
     /// `bucket_size_log = BOUNDED(LDM_BUCKET_SIZE_LOG, strategy,
-    /// LDM_BUCKETSIZELOG_MAX)` — donor `zstd_ldm.c:168`.
+    /// LDM_BUCKETSIZELOG_MAX)` — upstream zstd `zstd_ldm.c:168`.
     /// `LDM_BUCKET_SIZE_LOG = 4`, `LDM_BUCKETSIZELOG_MAX = 8`.
     #[test]
-    fn adjust_bucket_size_log_clamps_strategy_to_donor_bounds() {
+    fn adjust_bucket_size_log_clamps_strategy_to_bounds() {
         // strategy 1 < lower bound 4 → clamps up
         assert_eq!(LdmParams::adjust_for(27, 1).bucket_size_log, 4);
         // strategy 4 == lower bound → identity

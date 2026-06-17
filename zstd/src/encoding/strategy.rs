@@ -28,13 +28,13 @@
 //!                                      └─ S::USE_HASH3 → hash3 lookup (const-gated)
 //! ```
 //!
-//! Donor parity reference: `ZSTD_compressionParameters` in
+//! Upstream zstd parity reference: `ZSTD_compressionParameters` in
 //! `lib/compress/zstd_compress_internal.h` and the per-level table in
 //! `lib/compress/clevels.h`.
 
 #![allow(dead_code)]
 
-/// Donor `ZSTD_compressionParameters.strategy` equivalent — names the
+/// Upstream zstd `ZSTD_compressionParameters.strategy` equivalent — names the
 /// concrete match-finder backend a [`Strategy`] runs on top of. The
 /// runtime [`StrategyTag`] dispatcher and the [`Strategy::BACKEND`]
 /// associated const both produce values of this type, so the
@@ -54,17 +54,17 @@ pub(crate) enum BackendTag {
 
 /// Parse strategy — what the outer match loop does with the candidates
 /// a search method produces. Orthogonal to [`SearchMethod`]: the same
-/// parse can run on top of any search backend (donor decouples these as
+/// parse can run on top of any search backend (upstream zstd decouples these as
 /// `cParams.strategy`'s parse half vs the `useRowMatchFinder` switch).
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ParseMode {
-    /// Commit the first acceptable match (donor `ZSTD_greedy`, depth 0).
+    /// Commit the first acceptable match (upstream zstd `ZSTD_greedy`, depth 0).
     Greedy,
-    /// One-position lazy lookahead (donor `ZSTD_lazy`, depth 1).
+    /// One-position lazy lookahead (upstream zstd `ZSTD_lazy`, depth 1).
     Lazy,
-    /// Two-position lazy lookahead (donor `ZSTD_lazy2`, depth 2).
+    /// Two-position lazy lookahead (upstream zstd `ZSTD_lazy2`, depth 2).
     Lazy2,
-    /// Optimal cost-model parse (donor `ZSTD_btopt`/`btultra`/`btultra2`).
+    /// Optimal cost-model parse (upstream zstd `ZSTD_btopt`/`btultra`/`btultra2`).
     Optimal,
 }
 
@@ -93,20 +93,20 @@ impl ParseMode {
 }
 
 /// Search method — how match candidates are produced for a position.
-/// Orthogonal to [`ParseMode`] (donor `cParams.strategy` search half plus
+/// Orthogonal to [`ParseMode`] (upstream zstd `cParams.strategy` search half plus
 /// the `useRowMatchFinder` cParam that swaps `HashChain` for `RowHash` in
 /// the greedy/lazy band).
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SearchMethod {
-    /// Single-table fast finder (donor `ZSTD_fast`).
+    /// Single-table fast finder (upstream zstd `ZSTD_fast`).
     Fast,
-    /// Two parallel hash tables (donor `ZSTD_dfast`).
+    /// Two parallel hash tables (upstream zstd `ZSTD_dfast`).
     DoubleFast,
-    /// Row-hash SIMD-tag finder (donor row matchfinder).
+    /// Row-hash SIMD-tag finder (upstream zstd row matchfinder).
     RowHash,
-    /// Hash-chain finder (donor `ZSTD_HcFindBestMatch`).
+    /// Hash-chain finder (upstream zstd `ZSTD_HcFindBestMatch`).
     HashChain,
-    /// Binary-tree finder for the optimal parser (donor `ZSTD_BtGetAllMatches`).
+    /// Binary-tree finder for the optimal parser (upstream zstd `ZSTD_BtGetAllMatches`).
     BinaryTree,
 }
 
@@ -126,7 +126,7 @@ impl SearchMethod {
 
 /// Compile-time encoder strategy. Each concrete implementor is a ZST
 /// whose associated `const`s tell the optimal parser / match finder
-/// which donor-equivalent path to execute. Hot entry points are
+/// which upstream zstd-equivalent path to execute. Hot entry points are
 /// generic over `S: Strategy`, so monomorphisation strips every
 /// dead `if S::FOO` arm at codegen time.
 pub(crate) trait Strategy: Copy + 'static {
@@ -143,11 +143,11 @@ pub(crate) trait Strategy: Copy + 'static {
     const MIN_MATCH: usize;
 
     /// `accurate` flag for [`crate::encoding::cost_model::HcOptimalCostProfile`]
-    /// — enables refined statistics weighting (donor `ZSTD_btultra` and
+    /// — enables refined statistics weighting (upstream zstd `ZSTD_btultra` and
     /// above).
     const ACCURATE_PRICE: bool;
 
-    /// Donor "small offset bonus" toggle. Enabled for Lazy2 / BtOpt to
+    /// Upstream zstd "small offset bonus" toggle. Enabled for Lazy2 / BtOpt to
     /// favour decompression speed; disabled for BtUltra / BtUltra2.
     const FAVOR_SMALL_OFFSETS: bool;
 
@@ -167,22 +167,22 @@ pub(crate) trait Strategy: Copy + 'static {
     /// `true` for BtOpt / BtUltra / BtUltra2.
     const USE_BT: bool;
 
-    /// Donor `optLevel` (0 = btopt, 2 = btultra / btultra2). Drives the
+    /// Upstream zstd `optLevel` (0 = btopt, 2 = btultra / btultra2). Drives the
     /// `opt_level >= 2` price-table refinement in
     /// `build_optimal_plan_impl_body!`.
     const OPT_LEVEL: u8;
 
-    /// Donor `max_chain_depth` for the optimal-parser cost profile.
+    /// Upstream zstd `max_chain_depth` for the optimal-parser cost profile.
     /// Used by `HcOptimalCostProfile::const_for_strategy::<S>()`.
     const MAX_CHAIN_DEPTH: usize;
 
-    /// Donor `sufficient_match_len` — the BT walker bails out as soon
+    /// Upstream zstd `sufficient_match_len` — the BT walker bails out as soon
     /// as a candidate at or above this length is seen. `usize::MAX`
     /// means "never bail early".
     const SUFFICIENT_MATCH_LEN: usize;
 }
 
-/// Level 1 — donor `ZSTD_fast`. Single-table Simple matcher.
+/// Level 1 — upstream zstd `ZSTD_fast`. Single-table Simple matcher.
 #[derive(Copy, Clone, Debug, Default)]
 pub(crate) struct Fast;
 
@@ -209,7 +209,7 @@ impl Strategy for Fast {
     const SUFFICIENT_MATCH_LEN: usize = 32;
 }
 
-/// Levels 2-3 — donor `ZSTD_dfast`. Two parallel hash chains.
+/// Levels 2-3 — upstream zstd `ZSTD_dfast`. Two parallel hash chains.
 #[derive(Copy, Clone, Debug, Default)]
 pub(crate) struct Dfast;
 
@@ -227,7 +227,7 @@ impl Strategy for Dfast {
     const SUFFICIENT_MATCH_LEN: usize = 32;
 }
 
-/// Level 4 — donor `ZSTD_greedy` with row hashing.
+/// Level 4 — upstream zstd `ZSTD_greedy` with row hashing.
 #[derive(Copy, Clone, Debug, Default)]
 pub(crate) struct Greedy;
 
@@ -245,8 +245,8 @@ impl Strategy for Greedy {
     const SUFFICIENT_MATCH_LEN: usize = 32;
 }
 
-/// Levels 6-12 — donor `ZSTD_lazy`/`ZSTD_lazy2` on the row finder
-/// (donor row mode is the greedy..lazy2 default). Levels inside the
+/// Levels 6-12 — upstream zstd `ZSTD_lazy`/`ZSTD_lazy2` on the row finder
+/// (upstream zstd row mode is the greedy..lazy2 default). Levels inside the
 /// band differ only by runtime `RowConfig` fields (`search_depth`,
 /// `hash_bits`, `row_log`, `target_len`, `lazy_depth`), not by
 /// compile-time `Strategy` consts, so they share a single type.
@@ -263,7 +263,7 @@ impl Strategy for Lazy {
     const OPT_LEVEL: u8 = 0;
     // Lazy runs on the Row backend with `USE_BT == false`, so the
     // optimal parser entry point is unreachable for this strategy.
-    // These values mirror the donor `lazy2` cost profile (would be
+    // These values mirror the upstream zstd `lazy2` cost profile (would be
     // the right defaults if a future caller did build a profile for
     // the lazy path), but with no current reader the same
     // unreachable-by-design contract from `Fast` applies.
@@ -271,11 +271,11 @@ impl Strategy for Lazy {
     const SUFFICIENT_MATCH_LEN: usize = 32;
 }
 
-/// Levels 13-15 — donor `ZSTD_btlazy2`. Binary-tree match finder driving
+/// Levels 13-15 — upstream zstd `ZSTD_btlazy2`. Binary-tree match finder driving
 /// a greedy/lazy parse (NOT the optimal DP). Reuses the BT candidate
 /// collector to surface the longest match per position, then commits it
 /// greedily. minMatch = 5 (`search_mls`); the BT find runs to full depth
-/// (no `sufficient_match_len` early bail — donor `ZSTD_BtFindBestMatch`
+/// (no `sufficient_match_len` early bail — upstream zstd `ZSTD_BtFindBestMatch`
 /// does not cap by `targetLength`), so `MAX_CHAIN_DEPTH` must be large
 /// enough that the runtime `HcConfig::search_depth` (16/32/64 for
 /// L13/14/15) governs the BT walk, not this const.
@@ -294,11 +294,11 @@ impl Strategy for Btlazy2 {
     // `max_chain_depth.min(search_depth)` lets the level's search_depth
     // govern (BtOpt's 32 would silently halve L15's BT walk).
     const MAX_CHAIN_DEPTH: usize = 64;
-    // Full BT find, no early bail (donor `ZSTD_BtFindBestMatch`).
+    // Full BT find, no early bail (upstream zstd `ZSTD_BtFindBestMatch`).
     const SUFFICIENT_MATCH_LEN: usize = usize::MAX;
 }
 
-/// Levels 16-17 — donor `ZSTD_btopt`. BT + opt without the ultra
+/// Levels 16-17 — upstream zstd `ZSTD_btopt`. BT + opt without the ultra
 /// price-table refinements.
 #[derive(Copy, Clone, Debug, Default)]
 pub(crate) struct BtOpt;
@@ -368,7 +368,7 @@ pub(crate) enum StrategyTag {
     Dfast,
     Greedy,
     Lazy,
-    /// Donor `ZSTD_btlazy2` (levels 13-15): binary-tree match finder with a
+    /// Upstream zstd `ZSTD_btlazy2` (levels 13-15): binary-tree match finder with a
     /// lazy parse (not the optimal DP). Shares the BT table layout / finder
     /// with the opt strategies (`uses_bt`) but selects greedily/lazily.
     Btlazy2,
@@ -380,18 +380,18 @@ pub(crate) enum StrategyTag {
 impl StrategyTag {
     /// Map a compression level (1..=22) to its [`StrategyTag`].
     ///
-    /// Matches `LEVEL_TABLE` in `match_generator.rs` and the donor
+    /// Matches `LEVEL_TABLE` in `match_generator.rs` and the upstream zstd
     /// `clevels.h` table:
-    /// Mirrors donor `ZSTD_defaultCParameters[0]` (srcSize > 256 KiB
+    /// Mirrors upstream zstd `ZSTD_defaultCParameters[0]` (srcSize > 256 KiB
     /// tier) strategy column at `zstd/lib/compress/clevels.h:25-50`:
     ///
     /// * 1-2 → `Fast`
     /// * 3-4 → `Dfast`
     /// * 5 → `Greedy`
-    /// * 6-12 → `Lazy` (donor 6/7=lazy, 8-12=lazy2; we collapse lazy and
+    /// * 6-12 → `Lazy` (upstream zstd 6/7=lazy, 8-12=lazy2; we collapse lazy and
     ///   lazy2 onto our `Lazy` tag and carry the lazy/lazy2 split via
     ///   `LevelParams.lazy_depth` — 1 for lazy, 2 for lazy2)
-    /// * 13-15 → `Btlazy2` (donor btlazy2: BinaryTree finder + lazy parse)
+    /// * 13-15 → `Btlazy2` (upstream zstd btlazy2: BinaryTree finder + lazy parse)
     /// * 16-17 → `BtOpt`
     /// * 18 → `BtUltra`
     /// * 19-22 → `BtUltra2`
@@ -442,7 +442,7 @@ impl StrategyTag {
     }
 
     /// Bridge to [`BackendTag`] for the dispatcher entry point.
-    /// Greedy AND lazy run on the Row finder (donor
+    /// Greedy AND lazy run on the Row finder (upstream zstd
     /// `ZSTD_resolveRowMatchFinderMode`: row mode is the default for
     /// greedy..lazy2); the BT strategies keep the HashChain storage
     /// (their tree scratch lives inside it).
@@ -477,7 +477,7 @@ impl StrategyTag {
         match self {
             Self::Fast | Self::Dfast | Self::Greedy => ParseMode::Greedy,
             Self::Lazy => ParseMode::Lazy,
-            // Donor btlazy2 = BinaryTree finder + depth-2 lazy parse
+            // Upstream zstd btlazy2 = BinaryTree finder + depth-2 lazy parse
             // (`Strategy::lazy_depth()` reports 2 for it as well).
             Self::Btlazy2 => ParseMode::Lazy2,
             Self::BtOpt | Self::BtUltra | Self::BtUltra2 => ParseMode::Optimal,
@@ -506,7 +506,7 @@ mod tests {
     }
 
     /// Pin the `Btlazy2` tag's full bridge: it runs the BinaryTree finder on
-    /// the HashChain backend with a Lazy parse (donor `ZSTD_btlazy2`).
+    /// the HashChain backend with a Lazy parse (upstream zstd `ZSTD_btlazy2`).
     #[test]
     fn btlazy2_tag_bridge_contract() {
         assert_eq!(StrategyTag::Btlazy2.backend(), BackendTag::HashChain);
@@ -548,7 +548,7 @@ mod tests {
     }
 
     #[test]
-    fn level_to_tag_matches_donor_table() {
+    fn level_to_tag_matches_default_table() {
         // Spot-check every band boundary and one mid-band level.
         assert_eq!(StrategyTag::for_level(1), StrategyTag::Fast);
         assert_eq!(StrategyTag::for_level(2), StrategyTag::Fast);
@@ -557,14 +557,14 @@ mod tests {
         assert_eq!(StrategyTag::for_level(5), StrategyTag::Greedy);
         assert_eq!(StrategyTag::for_level(9), StrategyTag::Lazy);
         assert_eq!(StrategyTag::for_level(12), StrategyTag::Lazy);
-        // Donor `clevels.h` 13-15 are `ZSTD_btlazy2` — distinct from the
+        // Upstream zstd `clevels.h` 13-15 are `ZSTD_btlazy2` — distinct from the
         // Row-backed `Lazy` band.
         assert_eq!(StrategyTag::for_level(13), StrategyTag::Btlazy2);
         assert_eq!(StrategyTag::for_level(15), StrategyTag::Btlazy2);
         assert_eq!(StrategyTag::for_level(16), StrategyTag::BtOpt);
         assert_eq!(StrategyTag::for_level(17), StrategyTag::BtOpt);
         assert_eq!(StrategyTag::for_level(18), StrategyTag::BtUltra);
-        // Donor `clevels.h` level 19 uses `ZSTD_btultra2` (searchLog 7,
+        // Upstream zstd `clevels.h` level 19 uses `ZSTD_btultra2` (searchLog 7,
         // two-pass dynamic stats + hash3), not plain btultra.
         assert_eq!(StrategyTag::for_level(19), StrategyTag::BtUltra2);
         assert_eq!(StrategyTag::for_level(20), StrategyTag::BtUltra2);

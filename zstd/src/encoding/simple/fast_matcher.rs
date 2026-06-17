@@ -1,4 +1,4 @@
-//! Donor-shape Fast strategy matcher backend — selected for every
+//! Upstream zstd-shape Fast strategy matcher backend — selected for every
 //! Fast-strategy level (Uncompressed, Fastest, Level(1), and the
 //! negative Level(-7..=-1) variants). Per-level dispatch on
 //! `(fast_hash_log, fast_mls, fast_step_size)` is wired through
@@ -6,18 +6,18 @@
 //! the construction/reset signature, not a separate setter).
 //! Level(1) uses `(hash_log=14, mls=7, step_size=2)`; Fastest /
 //! Uncompressed / Level(-1..=-7) use `(hash_log=14, mls=6)` with
-//! `step_size` 2..8 driving donor's acceleration gradient on
+//! `step_size` 2..8 driving upstream zstd's acceleration gradient on
 //! negative levels.
 //!
 //! `use_cmov` is derived directly from `window_log` inside the
-//! matcher (donor heuristic `windowLog < 19`) — NOT a
+//! matcher (upstream zstd heuristic `windowLog < 19`) — NOT a
 //! `LevelParams` field.
 //!
 //! Wraps the kernel from
 //! [`super::fast_kernel::kernel::compress_block_fast`] and presents the
 //! `Matcher` API expected by [`crate::encoding::match_generator::MatchGeneratorDriver`].
 //! Replaces the SuffixStore-based `MatchGenerator` for the Fast strategy
-//! path with a donor-parity hash table and tight per-block loop.
+//! path with a upstream zstd-parity hash table and tight per-block loop.
 //!
 //! Wired into production: [`crate::encoding::match_generator::MatcherStorage::Simple`]
 //! holds `FastKernelMatcher` directly; the driver's Matcher trait
@@ -30,7 +30,7 @@
 //! - `prefix_start_index >= INITIAL_PREFIX_START_INDEX = 1` at all
 //!   times. `history` holds real input bytes from position 0
 //!   onward (no dummy region — M8 dropped the seeded sentinel byte
-//!   for donor byte-range parity). Sentinel-0 protection comes from
+//!   for upstream zstd byte-range parity). Sentinel-0 protection comes from
 //!   the kernel's `match_idx >= prefix_start_index` filter rejecting
 //!   the hash table's empty-slot value `0`. After eviction / drain
 //!   the buffer is rebased to position 0 and `prefix_start_index`
@@ -60,7 +60,7 @@ use crate::encoding::dict_attach::DictAttach;
 use super::fast_kernel::hash_table::FastHashTable;
 use super::fast_kernel::kernel::compress_block_fast;
 
-/// Donor `ZSTD_defaultCParameters[level=1][srcSize > 256 KiB][Fast]`
+/// Upstream zstd `ZSTD_defaultCParameters[level=1][srcSize > 256 KiB][Fast]`
 /// constants. Kept for `MatchGeneratorDriver::new`'s initial-state
 /// matcher (which runs BEFORE any `reset` from a resolved
 /// `LevelParams`). Production calls thread per-level values
@@ -68,7 +68,7 @@ use super::fast_kernel::kernel::compress_block_fast;
 /// `LevelParams` instead.
 pub(crate) const FAST_LEVEL_1_HASH_LOG: u32 = 14;
 pub(crate) const FAST_LEVEL_1_MLS: u32 = 7;
-/// Donor level-1 Fast `window_log`. Production code reads
+/// Upstream zstd level-1 Fast `window_log`. Production code reads
 /// `window_log` from the resolved [`crate::encoding::match_generator`]
 /// `LevelParams` directly; this const exists only for the
 /// [`FastKernelMatcher::new`] test-helper constructor and the
@@ -76,20 +76,20 @@ pub(crate) const FAST_LEVEL_1_MLS: u32 = 7;
 #[cfg(test)]
 pub(crate) const FAST_LEVEL_1_WINDOW_LOG: u8 = 19;
 
-/// Donor's initial repcode state — `(rep_offset1 = 1, rep_offset2 = 4)`
+/// Upstream zstd's initial repcode state — `(rep_offset1 = 1, rep_offset2 = 4)`
 /// matches `ZSTD_initCCtx`'s reset of `rep` at the start of every
 /// frame. Used both as a struct-init constant and as a recovery point
 /// in `reset`.
 pub(crate) const FAST_INITIAL_REP: [u32; 2] = [1, 4];
 
 /// Initial offset-history seed for the encoder's repcode-coded
-/// offsets — matches donor's `repToConfirm[] = { 1, 4, 8 }` at frame
+/// offsets — matches upstream zstd's `repToConfirm[] = { 1, 4, 8 }` at frame
 /// start and mirrors the value the old [`super::MatchGenerator`] used.
 pub(crate) const FAST_INITIAL_OFFSET_HIST: [u32; 3] = [1, 4, 8];
 
 /// Drain start offset used by eviction / drain paths. Set to 0:
 /// `history` holds real input bytes from position 0 onward,
-/// donor-parity layout, no dummy region. Sentinel-0 protection
+/// upstream zstd-parity layout, no dummy region. Sentinel-0 protection
 /// (hash table's empty-slot value `0` would otherwise be
 /// indistinguishable from a real match at position 0) is provided
 /// by [`INITIAL_PREFIX_START_INDEX`] = 1 via the kernel's
@@ -99,14 +99,14 @@ pub(crate) const FAST_INITIAL_OFFSET_HIST: [u32; 3] = [1, 4, 8];
 /// against future changes.
 pub(crate) const HISTORY_DRAIN_BASE: usize = 0;
 
-/// Donor's `prefixStartIndex` floor on fresh frames. Set to 1 (not 0)
+/// Upstream zstd's `prefixStartIndex` floor on fresh frames. Set to 1 (not 0)
 /// so the kernel's `match_idx >= prefix_start_index` filter rejects
 /// stale empty-slot lookups (value 0 in FastHashTable's all-zero
-/// initial state). Donor relies on its `ip0 += (ip0 == prefixStart)`
+/// initial state). Upstream zstd relies on its `ip0 += (ip0 == prefixStart)`
 /// bump to skip position 0 instead — both approaches match the same
 /// 0..N-1 byte ranges for the hash table.
 ///
-/// Tradeoff: this rejects legitimate position-0 matches donor would
+/// Tradeoff: this rejects legitimate position-0 matches upstream zstd would
 /// emit (rare — requires `read32(ip0)` to coincidentally equal
 /// `read32(base)`), but cross-block isolation under
 /// `skip_matching_with_hint(None)` depends on the sentinel — the
@@ -115,16 +115,16 @@ pub(crate) const HISTORY_DRAIN_BASE: usize = 0;
 /// position-0 emit rate is too small to be worth that breakage.
 const INITIAL_PREFIX_START_INDEX: u32 = 1;
 
-/// Donor-shape Fast-strategy matcher state.
+/// Upstream zstd-shape Fast-strategy matcher state.
 ///
-/// State layout mirrors the donor's `ZSTD_compressBlock_fast_*` entry
+/// State layout mirrors the upstream zstd's `ZSTD_compressBlock_fast_*` entry
 /// frame:
 ///
 /// - `history` holds the flat byte buffer that the kernel reads from.
 ///   Both already-matched prior-block bytes (the prefix) and the
 ///   current block live in this single contiguous buffer; the kernel's
 ///   `block_start` parameter separates the two.
-/// - `prefix_start_index` is donor's `prefixStartIndex` — the lowest
+/// - `prefix_start_index` is upstream zstd's `prefixStartIndex` — the lowest
 ///   position any match may reference. Pinned to
 ///   `INITIAL_PREFIX_START_INDEX` (= 1) at construction and after every
 ///   drain (drain re-indexes the retained tail; the `1` floor rejects
@@ -134,7 +134,7 @@ const INITIAL_PREFIX_START_INDEX: u32 = 1;
 /// - `offset_hist` is the encoder-side 3-deep offset history used by
 ///   the wire encoder's repcode coding (separate from `rep`, which is
 ///   the matcher's own two-deep stack for the kernel).
-/// - `hash_table` is the donor's flat `u32` hash table, persistent
+/// - `hash_table` is the upstream zstd's flat `u32` hash table, persistent
 ///   across blocks (cleared only on full `reset`).
 /// - `pending` holds the most recently `commit_space`'d block before
 ///   `start_matching` appends it onto `history` and runs the kernel.
@@ -142,10 +142,10 @@ pub(crate) struct FastKernelMatcher {
     /// Concatenated input history: prior-block bytes followed by the
     /// most-recently-committed (still pending-matching) tail.
     history: Vec<u8>,
-    /// Donor `prefixStartIndex` — earliest position any match may
+    /// Upstream zstd `prefixStartIndex` — earliest position any match may
     /// reference.
     prefix_start_index: u32,
-    /// Donor `rep_offset1, rep_offset2`. Threaded into the kernel as
+    /// Upstream zstd `rep_offset1, rep_offset2`. Threaded into the kernel as
     /// the `rep` array and updated from the kernel's `FastBlockResult`
     /// after every block.
     rep: [u32; 2],
@@ -155,7 +155,7 @@ pub(crate) struct FastKernelMatcher {
     /// matches the legacy `MatchGenerator` field-visibility pattern
     /// the driver was written against.
     pub(crate) offset_hist: [u32; 3],
-    /// Flat hash table indexed by donor `hash_ptr<MLS>`. Persistent
+    /// Flat hash table indexed by upstream zstd `hash_ptr<MLS>`. Persistent
     /// across blocks; only `reset` (or a `(hash_log, mls)` parameter
     /// change) reallocates it.
     hash_table: FastHashTable,
@@ -169,7 +169,7 @@ pub(crate) struct FastKernelMatcher {
     /// Decoder-side window size (in `log` bits). Reported to the
     /// frame header via the `Matcher::window_size` trait method.
     window_log: u8,
-    /// Donor heuristic: prefer cmov match-found when
+    /// Upstream zstd heuristic: prefer cmov match-found when
     /// `windowLog < 19` (`ZSTD_compressBlock_fast` line 449). Small-
     /// window encoders have less predictable in-range filtering, so
     /// the branchless variant beats the branchful one on those
@@ -177,7 +177,7 @@ pub(crate) struct FastKernelMatcher {
     /// Reachable in production via source-size hints (when the
     /// caller passes a small `source_size` to a streaming encoder,
     /// `adjust_params_for_source_size` clamps `window_log` below
-    /// the donor default of 19, flipping `use_cmov` on).
+    /// the upstream zstd default of 19, flipping `use_cmov` on).
     use_cmov: bool,
     /// Cached per-tier SIMD kernel selection (resolved once via
     /// [`crate::encoding::fastpath::select_kernel`] at construction / reset),
@@ -188,9 +188,9 @@ pub(crate) struct FastKernelMatcher {
     /// word-at-a-time `count_forward`.
     kernel: crate::encoding::fastpath::FastpathKernel,
     /// Initial step the kernel uses for the 4-cursor body's skip
-    /// schedule. Donor `stepSize = targetLength + !(targetLength) +
+    /// schedule. Upstream zstd `stepSize = targetLength + !(targetLength) +
     /// 1` (min 2). Negative-level frames set this to 2..8 to
-    /// recreate donor's acceleration gradient; Level(1) and other
+    /// recreate upstream zstd's acceleration gradient; Level(1) and other
     /// Fast levels keep step_size=2.
     step_size: usize,
     /// Holds a `commit_space`'d block until `start_matching` consumes
@@ -201,7 +201,7 @@ pub(crate) struct FastKernelMatcher {
     /// Absolute history position where the MOST RECENTLY appended
     /// block starts — `extend_history_with_pending` updates this so
     /// [`Self::last_committed_space`] can return that block's bytes
-    /// AFTER processing (donor / legacy MatchGenerator parity: the
+    /// AFTER processing (upstream zstd / legacy MatchGenerator parity: the
     /// driver's frame compressor reads `get_last_space` after
     /// `start_matching` to fetch the raw bytes for raw-block
     /// emission). Initialised to 0 — overwritten by every
@@ -240,7 +240,7 @@ pub(crate) struct FastKernelMatcher {
     /// (`borrowed[start..end]`, zero-copy) for the emit path — the
     /// borrowed analogue of `last_block_start` on the owned path.
     last_borrowed_block: Option<(usize, usize)>,
-    /// Immutable dictionary hash table (donor `dictMatchState` Fast path) plus
+    /// Immutable dictionary hash table (upstream zstd `dictMatchState` Fast path) plus
     /// its CDict cache lifecycle, via the shared [`DictAttach`] level-1
     /// scaffolding. The table is built once during `prime_with_dictionary` over
     /// the dictionary region at the front of `history` (positions
@@ -288,7 +288,7 @@ impl Clone for FastKernelMatcher {
     // The per-frame dictionary snapshot restore `clone_from`s this whole
     // matcher; reusing the retained `history` / hash-table / dict-table
     // buffers turns that restore into pure copies (no allocations), which
-    // is what the donor's CDict table-copy regime pays.
+    // is what the upstream zstd's CDict table-copy regime pays.
     fn clone_from(&mut self, source: &Self) {
         self.history.clone_from(&source.history);
         self.prefix_start_index = source.prefix_start_index;
@@ -311,10 +311,10 @@ impl Clone for FastKernelMatcher {
 }
 
 impl FastKernelMatcher {
-    /// Test-only zero-arg constructor that bakes in the donor's
+    /// Test-only zero-arg constructor that bakes in the upstream zstd's
     /// level-1 defaults. Production code goes through
     /// [`Self::with_params`] directly from the driver, threading the
-    /// resolved LevelParams `window_log` (and the donor `hash_log =
+    /// resolved LevelParams `window_log` (and the upstream zstd `hash_log =
     /// 14`, `mls = 7` constants) explicitly — no defaults applied.
     #[cfg(test)]
     pub(crate) fn new() -> Self {
@@ -365,11 +365,11 @@ impl FastKernelMatcher {
             "FastKernelMatcher requires step_size >= 2 (got {step_size})"
         );
         // Kernel indices are `u32`. `accept_data` lets history grow
-        // up to `2 * max_window_size` before draining (donor parity
+        // up to `2 * max_window_size` before draining (upstream zstd parity
         // for the eager-eviction band), so `max_window_size` is
         // capped at 2^30 to keep that band ≤ 2^31 < `u32::MAX` and
         // prevent any `history.len()` from tripping the kernel's
-        // `data.len() > u32::MAX` panic. Donor's
+        // `data.len() > u32::MAX` panic. Upstream zstd's
         // `ZSTD_WINDOWLOG_MAX_64` is 30 for the same reason — we
         // mirror it.
         assert!(
@@ -418,7 +418,7 @@ impl FastKernelMatcher {
     /// `dict_attach_epoch`: the upcoming frame re-primes the SAME
     /// dictionary in attach mode (separate cached dict table, dual-probe
     /// kernel). When the cached dict table is still primed, the main
-    /// table is then invalidated via an epoch advance (donor
+    /// table is then invalidated via an epoch advance (upstream zstd
     /// `ZSTD_continueCCtx` cadence — stale entries filtered by the bias,
     /// no full-table memset); every other shape keeps the historical
     /// `clear()` so the raw-slice no-dict kernels always see a bias-0
@@ -464,7 +464,7 @@ impl FastKernelMatcher {
         } else if dict_attach_epoch && self.dict.is_primed() {
             // Dict-attach frame over the same primed dictionary: advance
             // the epoch bias past every position the previous frames could
-            // have stored instead of memsetting the whole table (donor
+            // have stored instead of memsetting the whole table (upstream zstd
             // `ZSTD_continueCCtx`). The dual-probe dict kernel reads the
             // main table only through `FastHashTable::get`, which maps
             // pre-advance entries to the empty sentinel. The cached dict
@@ -597,7 +597,7 @@ impl FastKernelMatcher {
         // `compress_oneshot_borrowed`) ALWAYS runs immediately before this
         // call — `reset` either memsets the table (no-dict / copy frames) or
         // epoch-advances the bias past every prior position (dict-attach
-        // frames, donor `ZSTD_continueCCtx`). Re-clearing here would memset the
+        // frames, upstream zstd `ZSTD_continueCCtx`). Re-clearing here would memset the
         // whole table a SECOND time per frame and, on the dict-attach path,
         // throw away the epoch advance the reset just performed (measured: the
         // redundant clear was ~12% of the borrowed-dict encode). The
@@ -629,7 +629,7 @@ impl FastKernelMatcher {
         self.prefix_start_index = INITIAL_PREFIX_START_INDEX;
     }
 
-    /// Read-only view of the most recently committed block — donor /
+    /// Read-only view of the most recently committed block — upstream zstd /
     /// legacy MatchGenerator's `window.last().data` equivalent.
     ///
     /// Three states:
@@ -654,7 +654,7 @@ impl FastKernelMatcher {
 
     /// Accept a freshly-committed block from the driver.
     ///
-    /// Donor's `ZSTD_window_update`: the new bytes are stashed for
+    /// Upstream zstd's `ZSTD_window_update`: the new bytes are stashed for
     /// the next [`Self::start_matching`] / [`Self::skip_matching`]
     /// call but NOT yet appended to `history` — that delay lets the
     /// driver-side `get_last_space` peek at the still-pending buffer
@@ -678,7 +678,7 @@ impl FastKernelMatcher {
         );
 
         // Eager window eviction: drop oldest history bytes NOW if
-        // accepting this block would push the total past donor's
+        // accepting this block would push the total past upstream zstd's
         // `2 × max_window_size` soft cap. This fires at commit time
         // (not at append time inside `extend_history_with_pending`)
         // so the driver's `commit_space` can observe the byte delta
@@ -786,16 +786,16 @@ impl FastKernelMatcher {
 
     /// Internal: drain `self.pending` into `self.history`, applying
     /// the window-budget eviction first. Returns the absolute position
-    /// at which the newly-appended block starts (donor's
+    /// at which the newly-appended block starts (upstream zstd's
     /// `currentBlockStart` — what the kernel receives as
     /// `block_start`).
     ///
-    /// Eviction rule mirrors donor's `ZSTD_window_correctOverflow`:
+    /// Eviction rule mirrors upstream zstd's `ZSTD_window_correctOverflow`:
     /// when total retained bytes would exceed `2 × max_window_size`,
     /// drop the oldest bytes back down to a `max_window_size` tail
     /// and clear the hash table. The clear is forced because absolute
     /// positions stored in the table would otherwise reference
-    /// evicted bytes; donor avoids the clear via a base-pointer trick
+    /// evicted bytes; upstream zstd avoids the clear via a base-pointer trick
     /// (`base += correction`) that the flat-`Vec<u8>` history can't
     /// reuse, but pays for it with a one-time eviction every
     /// `max_window_size` worth of input — amortised constant.
@@ -844,7 +844,7 @@ impl FastKernelMatcher {
         self.recycled_space.take()
     }
 
-    /// Process the pending block with the donor-shape kernel,
+    /// Process the pending block with the upstream zstd-shape kernel,
     /// streaming `Sequence::Triple` emissions to `handle_sequence`
     /// and emitting a terminal `Sequence::Literals` if any tail
     /// remained after the last match.
@@ -882,16 +882,16 @@ impl FastKernelMatcher {
         // reports `1 << window_log`, so any emitted offset older
         // than `history.len() - (1 << window_log)` would exceed
         // the decoder's reserved window and produce a format-
-        // invalid sequence. Donor's
+        // invalid sequence. Upstream zstd's
         // `ZSTD_getLowestPrefixIndex(ms, endIndex, windowLog)`
         // uses `windowLog` for the same reason.
         let advertised_window = 1usize << self.window_log;
-        // Donor's `windowLow` analogue: the absolute floor of in-window
+        // Upstream zstd's `windowLow` analogue: the absolute floor of in-window
         // positions. Equals 0 at block 0 (no prior input retained) and
         // advances as the window slides. Drives the prologue's
         // `max_rep = ip0 - window_low` computation AND the backward-
         // extension `match_pos > window_low` bound — both paths that
-        // donor expresses against `prefixStart` directly (NOT against
+        // upstream zstd expresses against `prefixStart` directly (NOT against
         // a sentinel-1 floor).
         let window_low = self.history_bytes().len().saturating_sub(advertised_window) as u32;
         // Sentinel-aware prefix for the hash-table filter — match_idx
@@ -900,11 +900,11 @@ impl FastKernelMatcher {
         // = 1` when window_low is 0 (block 0 / pre-eviction blocks).
         // For later blocks (window_low >= 1) the two values coincide.
         //
-        // This SPLIT is the donor-parity fix for issue #220: using
+        // This SPLIT is the upstream zstd-parity fix for issue #220: using
         // `prefix_start_index = 1` for the prologue's max_rep gave
-        // `max_rep = 0` at ip0=1, zeroing donor's default
+        // `max_rep = 0` at ip0=1, zeroing upstream zstd's default
         // `rep_offset1 = 1` and disabling rep-at-ip2 for the entire
-        // first block. With `window_low = 0` we match donor exactly
+        // first block. With `window_low = 0` we match upstream zstd exactly
         // (`max_rep = 1`, rep_offset1 survives).
         let prefix_start_index = window_low.max(self.prefix_start_index);
         let rep_in = self.rep;
@@ -912,7 +912,7 @@ impl FastKernelMatcher {
         let step_size = self.step_size;
         let use_cmov = self.use_cmov;
 
-        // Donor `dictMatchState` Fast path, active whenever a dictionary is
+        // Upstream zstd `dictMatchState` Fast path, active whenever a dictionary is
         // primed (and not yet evicted — `drain_real_prefix` drops the table).
         // The 4-cursor search and its `prefix_start_index` / `window_low`
         // bounds are shared with the no-dict kernel (main matches are input
@@ -1206,18 +1206,18 @@ impl FastKernelMatcher {
         self.last_borrowed_block = Some((block_start, block_end));
     }
 
-    /// Donor's `skipMatching` equivalent: append the pending block to
+    /// Upstream zstd's `skipMatching` equivalent: append the pending block to
     /// history without running the kernel.
     ///
     /// The block's bytes are NOT hashed into the table, so block N+1's
     /// matcher cannot find matches against the skipped region. This
     /// trades compression on the skipped bytes for CPU — the driver
     /// calls this when an upstream incompressibility hint marks the
-    /// block as not worth scanning. Donor's
+    /// block as not worth scanning. Upstream zstd's
     /// `ZSTD_compressBlock_targetCBlockSize_body` makes the same
     /// trade.
     ///
-    /// The `incompressible_hint` parameter accepts the donor's
+    /// The `incompressible_hint` parameter accepts the upstream zstd's
     /// `Matcher::skip_matching_with_hint` semantics:
     ///
     /// - `Some(true)` or `None` — incompressible / no opinion: append
@@ -1329,7 +1329,7 @@ impl FastKernelMatcher {
     }
 
     /// Seed both the wire encoder's offset history AND the kernel's
-    /// repcode state from a primed dictionary load. Donor's
+    /// repcode state from a primed dictionary load. Upstream zstd's
     /// `ZSTD_dictAndWindowLoad` restores `rep[0..2]` to the
     /// dictionary's stored `repToConfirm[0..2]`; the wire encoder
     /// uses the same triple as its 3-deep offset history. Setting
@@ -1390,7 +1390,7 @@ impl FastKernelMatcher {
     fn prime_hash_table_for_range(&mut self, range_start: usize) {
         let history_len = self.history.len();
         // HASH_READ_SIZE = 8 is the kernel's load-width invariant
-        // (donor `MEM_readST` cadence). Hashing a position with fewer
+        // (upstream zstd `MEM_readST` cadence). Hashing a position with fewer
         // forward bytes would compute a hash over uninitialised /
         // out-of-range memory.
         const HASH_READ_SIZE: usize = 8;
@@ -1456,12 +1456,12 @@ impl FastKernelMatcher {
         }
     }
 
-    /// Dictionary-priming entry for the donor `dictMatchState` Fast path.
+    /// Dictionary-priming entry for the upstream zstd `dictMatchState` Fast path.
     /// Appends the pending dict slice to `history` and indexes its positions
     /// into the SEPARATE immutable [`Self::dict_table`] — NOT the main hash
     /// table. Keeping dict positions out of the main table is what lets the
     /// dual-probe kernel prefer recent-input matches (main) over dictionary
-    /// matches (dict fallback), matching the donor's `prefixStart`/dict split.
+    /// matches (dict fallback), matching the upstream zstd's `prefixStart`/dict split.
     /// Replaces the [`Self::skip_matching_with_hint`]`(Some(false))` call the
     /// driver used to make for Fast-backend priming.
     pub(crate) fn skip_matching_for_dict_prime(&mut self) {
@@ -1765,7 +1765,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn new_uses_donor_level_1_defaults() {
+    fn new_uses_level_1_defaults() {
         let m = FastKernelMatcher::new();
         assert_eq!(m.window_log, FAST_LEVEL_1_WINDOW_LOG);
         assert_eq!(m.hash_table.hash_log(), FAST_LEVEL_1_HASH_LOG);
@@ -1918,7 +1918,7 @@ mod tests {
     #[test]
     fn with_params_threads_through_each_field() {
         // Pick a non-default triple to prove no silent override by
-        // donor-default constants.
+        // upstream zstd-default constants.
         let m = FastKernelMatcher::with_params(16, 12, 5, 2);
         assert_eq!(m.window_log, 16);
         assert_eq!(m.hash_table.hash_log(), 12);
@@ -2095,7 +2095,7 @@ mod tests {
         // no dummy carried since construction — M8).
         assert_eq!(m.history.len(), data.len() + HISTORY_DRAIN_BASE);
         // `last_committed_space` post-processing reads from
-        // history[last_block_start..] (donor / legacy MatchGenerator
+        // history[last_block_start..] (upstream zstd / legacy MatchGenerator
         // parity for the frame compressor's raw-block emission
         // path) — for a single-block-then-process flow it equals
         // the input data verbatim.
@@ -2137,7 +2137,7 @@ mod tests {
     /// reason for keeping the hash table persistent across blocks).
     ///
     /// Sizing rationale: the kernel's main loop only scans up to
-    /// `ilimit = data.len() - HASH_READ_SIZE` (donor parity). Block
+    /// `ilimit = data.len() - HASH_READ_SIZE` (upstream zstd parity). Block
     /// 2 must therefore carry enough trailing bytes past the
     /// crossblock-match start for `ip0` to actually reach the copy.
     /// We use a 128-byte block 1 and a 64-byte block 2 with the
@@ -2677,11 +2677,11 @@ mod tests {
     #[test]
     fn prime_offset_history_keeps_rep_and_offset_hist_in_lockstep() {
         let mut m = FastKernelMatcher::with_params(12, 8, 4, 2);
-        // Pre-prime: matcher carries the donor's initial state.
+        // Pre-prime: matcher carries the upstream zstd's initial state.
         assert_eq!(m.rep, FAST_INITIAL_REP);
         assert_eq!(m.offset_hist, FAST_INITIAL_OFFSET_HIST);
 
-        // Prime with non-default history (donor's dictionary load
+        // Prime with non-default history (upstream zstd's dictionary load
         // restores explicit rep1/rep2/rep3 values).
         let primed = [9u32, 4, 8];
         m.prime_offset_history(primed);
@@ -2850,7 +2850,7 @@ mod tests {
         // budget (mirrors MatchGeneratorDriver::prime_with_dictionary
         // for the Simple backend).
         //
-        // Pattern period 4 (`(i % 4)`) — dense enough that the donor-
+        // Pattern period 4 (`(i % 4)`) — dense enough that the upstream zstd-
         // parity `kSearchStrength = 8` (K_STEP_INCR = 128) step
         // doubling, which skips positions under step=3 in dict scan,
         // still leaves matches hittable from block2: every position
@@ -2906,7 +2906,7 @@ mod tests {
     }
 
     /// Regression: at block 0 the kernel's prologue must NOT zero
-    /// `rep_offset1 = 1` (donor's default initial rep state). Donor
+    /// `rep_offset1 = 1` (upstream zstd's default initial rep state). Upstream zstd
     /// computes `max_rep = ip0 - windowLow` where `windowLow = 0` at
     /// block 0, giving `max_rep = 1` at ip0=1 → `rep_offset1 = 1`
     /// survives (`1 > 1` is false).
@@ -2917,9 +2917,9 @@ mod tests {
     /// 0` → stashed → rep-at-ip2 probe disabled for the ENTIRE first
     /// block.
     ///
-    /// Symptom assertion: on a `[0x01, 0x42 × 199]` fixture, donor's
+    /// Symptom assertion: on a `[0x01, 0x42 × 199]` fixture, upstream zstd's
     /// rep-at-ip2 fires at iter 1 (ip2=3, both `read32` reads see
-    /// `[42,42,42,42]`). The donor emit sequence is:
+    /// `[42,42,42,42]`). The upstream zstd emit sequence is:
     /// `new_ip = ip2 = 3`, `match0 = ip2 - rep_offset1 = 2`, then the
     /// one-byte backward extension absorbs `data[2] == data[1]`
     /// (both `0x42`), giving `new_ip = 2, match_len ≈ 198`. Literal
@@ -2973,7 +2973,7 @@ mod tests {
         assert_eq!(
             first_offset,
             Some(1),
-            "first emit must reference offset=1 — donor's default \
+            "first emit must reference offset=1 — upstream zstd's default \
              rep_offset1=1 fires on rep-at-ip2 at iter 1, and the \
              prologue MUST NOT zero it (max_rep computed against \
              window_low=0 at block 0, NOT against the sentinel \

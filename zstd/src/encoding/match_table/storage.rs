@@ -173,22 +173,22 @@ mod stream_abs_headroom_tests {
     }
 }
 
-/// Knuth-style 3-byte hash multiplier. Donor parity:
+/// Knuth-style 3-byte hash multiplier. Upstream zstd parity:
 /// `ZSTD_HASH3PRIME` in `lib/compress/zstd_compress_internal.h`. Used
 /// by the HC3 short-match side table and by the 3-byte branch of the
 /// generic `hash_value_with_mls`.
 pub(crate) const HC_PRIME3BYTES: u32 = 506_832_829;
-/// Knuth-style 4-byte hash multiplier. Donor parity: `ZSTD_HASHPRIME`.
+/// Knuth-style 4-byte hash multiplier. Upstream zstd parity: `ZSTD_HASHPRIME`.
 pub(crate) const HC_PRIME4BYTES: u32 = 2_654_435_761;
-/// 5-byte hash multiplier. Donor parity: `prime5bytes` in
+/// 5-byte hash multiplier. Upstream zstd parity: `prime5bytes` in
 /// `lib/compress/zstd_compress_internal.h`.
 pub(crate) const HC_PRIME5BYTES: u64 = 889_523_592_379;
-/// 6-byte hash multiplier. Donor parity: `prime6bytes`.
+/// 6-byte hash multiplier. Upstream zstd parity: `prime6bytes`.
 pub(crate) const HC_PRIME6BYTES: u64 = 227_718_039_650_203;
 
 /// Hash / chain / hash3 sentinel marking an empty slot.
 ///
-/// The donor uses position `0` as the sentinel because absolute
+/// The upstream zstd uses position `0` as the sentinel because absolute
 /// positions are stored as `relative_position + 1`, so a stored zero
 /// never collides with a real position. Kept here so storage helpers
 /// don't have to pull it from the matcher modules.
@@ -216,7 +216,7 @@ pub(crate) const HC_CHAIN_LOG: usize = 19;
 pub(crate) const HC3_HASH_LOG: usize = 17;
 
 /// Shared storage backing every match finder. Holds the contiguous
-/// Immutable dictionary match structure (donor `ZSTD_dictMatchState`) for
+/// Immutable dictionary match structure (upstream zstd `ZSTD_dictMatchState`) for
 /// the binary-tree / optimal path. A hash + single-link chain over the
 /// dictionary content concat range, searched in addition to the live BT
 /// with its OWN compare budget so dictionary candidates are reachable even
@@ -248,13 +248,13 @@ pub(crate) struct DmsDictTables {
     pub(crate) hash_table: Vec<u32>,
     /// Binary-tree children, 2 per dict position (`2 * region_len` entries):
     /// `[2*p] = smaller child, [2*p+1] = larger child` of dict position `p`,
-    /// packed `dict_rel + 1` (`0` = empty). An unsorted-DUBT (donor dms-BT).
+    /// packed `dict_rel + 1` (`0` = empty). An unsorted-DUBT (upstream zstd dms-BT).
     pub(crate) chain_table: Vec<u32>,
     /// Hash width (bits) the dict chain was built at, so probe hashing
     /// reproduces the same buckets.
     pub(crate) hash_log: usize,
     /// Match-length search width (`mls`) the dict chain was built/probed at —
-    /// the live cParams `minMatch` (donor `ZSTD_dictMatchState` uses the same
+    /// the live cParams `minMatch` (upstream zstd `ZSTD_dictMatchState` uses the same
     /// `mls` as the live search), so probe hashing matches the build.
     pub(crate) mls: usize,
 }
@@ -303,7 +303,7 @@ pub(crate) struct MatchTable {
     /// `btultra`, `btultra2`). Mirrored from the active strategy for
     /// the same reason as `is_btultra2`.
     pub(crate) uses_bt: bool,
-    /// Binary-tree finder hash width (`mls`), donor `ZSTD_hashPtr` mls =
+    /// Binary-tree finder hash width (`mls`), upstream zstd `ZSTD_hashPtr` mls =
     /// `BOUNDED(4, cParams.minMatch, 6)`. clevels.h gives the btlazy2 / btopt
     /// band (levels 13-16) `minMatch = 5` → a 5-byte (8-byte read) hash that
     /// shortens the chains the BT walks (speed), so it is set per level in
@@ -311,7 +311,7 @@ pub(crate) struct MatchTable {
     /// guarantee 8 readable bytes); the HC `hash_position` stays 4-byte.
     /// Defaults to `4`.
     pub(crate) search_mls: usize,
-    /// Immutable dictionary match chain (donor `ZSTD_dictMatchState`),
+    /// Immutable dictionary match chain (upstream zstd `ZSTD_dictMatchState`),
     /// searched by the BT/optimal collect alongside the live tree. `Some`
     /// once primed from a non-empty dictionary on a BT level.
     pub(crate) dms: DictAttach<DmsDictTables>,
@@ -330,7 +330,7 @@ pub(crate) struct MatchTable {
 // `clone_from` the retained `history` / hash / chain / hash3 / dms buffers
 // in place — the derived `clone_from` is `*self = source.clone()`, a full
 // per-frame allocate+copy+drop that dominated small `compress-dict` HC/lazy
-// frames (donor reuses the CDict tables in place). `clone()` is the obvious
+// frames (upstream zstd reuses the CDict tables in place). `clone()` is the obvious
 // field-wise copy; `clone_from()` reuses every heap buffer.
 impl Clone for MatchTable {
     fn clone(&self) -> Self {
@@ -437,7 +437,7 @@ impl MatchTable {
     /// involved position is already trivially representable as a
     /// `(rel + 1)` u32? The `is_btultra2` flag tweaks the boundary
     /// rule: BtUltra2 allows `abs_pos == history_abs_start` even when
-    /// `allow_zero_relative_position` is `false`, matching the donor
+    /// `allow_zero_relative_position` is `false`, matching the upstream zstd
     /// btultra2 seed-pass behaviour.
     #[inline(always)]
     pub(crate) fn can_skip_rebase_check_at(
@@ -477,7 +477,7 @@ impl MatchTable {
     /// Insert a position into the HC3 short-match side table without
     /// running the rebase check. Caller is responsible for ensuring
     /// the position is already representable (or that the rebase
-    /// guard upstream already cleared it). Donor parity: the inner
+    /// guard upstream already cleared it). Upstream zstd parity: the inner
     /// `ZSTD_insertAndFindFirstIndexHash3` body.
     pub(crate) fn insert_hash3_only_no_rebase(&mut self, abs_pos: usize) {
         if self.hash3_log == 0 {
@@ -499,7 +499,7 @@ impl MatchTable {
     /// running the rebase check. Caller pre-validates that the
     /// position is representable as a `(rel + 1)` u32, either via
     /// `maybe_rebase_positions` (HC) or `bt_update_tree_until` (BT).
-    /// Donor parity: `ZSTD_insertAndFindFirstIndex` inner body.
+    /// Upstream zstd parity: `ZSTD_insertAndFindFirstIndex` inner body.
     #[inline]
     pub(crate) fn insert_position_no_rebase(&mut self, abs_pos: usize) {
         let idx = abs_pos.wrapping_sub(self.history_abs_start);
@@ -567,7 +567,7 @@ impl MatchTable {
     }
 
     /// Unaligned little-endian `u32` load. Hot helper for every
-    /// `hash_position*` site. Donor parity: `MEM_readLE32`.
+    /// `hash_position*` site. Upstream zstd parity: `MEM_readLE32`.
     #[inline(always)]
     pub(crate) fn read_le_u32(data: &[u8]) -> u32 {
         debug_assert!(data.len() >= 4);
@@ -584,7 +584,7 @@ impl MatchTable {
         unsafe { u32::from_le(core::ptr::read_unaligned(ptr as *const u32)) }
     }
 
-    /// 8-byte little-endian read for the `mls` 5/6 hash. Donor parity:
+    /// 8-byte little-endian read for the `mls` 5/6 hash. Upstream zstd parity:
     /// `MEM_readLE64`.
     ///
     /// # Safety
@@ -596,7 +596,7 @@ impl MatchTable {
     }
 
     /// MLS-parameterised hash of a 32-bit value into a `hash_log`-bit
-    /// index. Donor parity: the `mls`-switch in `ZSTD_hashPtr`.
+    /// index. Upstream zstd parity: the `mls`-switch in `ZSTD_hashPtr`.
     #[inline(always)]
     pub(crate) fn hash_value_with_mls(value: u32, hash_log: usize, mls: usize) -> usize {
         match mls {
@@ -606,7 +606,7 @@ impl MatchTable {
     }
 
     /// 8-byte (`mls` 5/6) hash of a 64-bit value into a `hash_log`-bit index.
-    /// Donor parity: `ZSTD_hash5` / `ZSTD_hash6` in
+    /// Upstream zstd parity: `ZSTD_hash5` / `ZSTD_hash6` in
     /// `lib/compress/zstd_compress_internal.h` (`(readLE64 << (64 - 8*mls)) *
     /// primeNbytes >> (64 - hBits)`). Used by the `minMatch = 5` lazy / BT
     /// band (clevels.h levels 6-16).
@@ -678,22 +678,22 @@ impl MatchTable {
         };
     }
 
-    /// Build the immutable dictionary match **binary tree** (donor
+    /// Build the immutable dictionary match **binary tree** (upstream zstd
     /// `ZSTD_dictMatchState`, the dms-BT walked in `ZSTD_insertBtAndGetAllMatches`
     /// `zstd_opt.c:777-813`) over the first `region_len` bytes of the live
     /// history (the dictionary content at the front). A hash-chain dms surfaces
     /// only the few candidates that share a hash bucket; a DUBT descends to the
-    /// LONGEST dict match efficiently, which is where the donor extracts the
+    /// LONGEST dict match efficiently, which is where the upstream zstd extracts the
     /// bulk of its dict-match value at btlazy2 / btopt (a chain there left
     /// 80-90% of the dict savings on the table). Hashed at the BT `search_mls`
     /// width into a dict-sized hash log; `chain_table` holds 2 entries per dict
     /// position (`[smaller_child, larger_child]`), `hash_table` the per-bucket
     /// tree roots. `dict_rel + 1` packing, `0` sentinel. Dict positions are
     /// concat indices at the front of the shared buffer, so the walk's offset is
-    /// `idx - dict_idx` directly (no donor `dmsIndexDelta`). Called on BT levels
+    /// `idx - dict_idx` directly (no upstream zstd `dmsIndexDelta`). Called on BT levels
     /// (`uses_bt`); cached across frames via `DictAttach::is_primed`.
     pub(crate) fn prime_dms_bt(&mut self, region_len: usize) {
-        // Donor `ZSTD_dictMatchState` searches the dict at the live cParams
+        // Upstream zstd `ZSTD_dictMatchState` searches the dict at the live cParams
         // `minMatch` (= our `search_mls`), NOT a fixed 3 — a fixed 3 surfaces
         // huge-offset ml=3 dict matches that the greedy btlazy2 parser commits
         // at a loss. The dms's value is being a SEPARATE structure (the dict is
@@ -725,7 +725,7 @@ impl MatchTable {
         }
         // Build-pass compare budget: the dict is bounded (<= window), so a
         // generous fixed depth keeps the tree well-ordered without the live
-        // searchLog cap. Mirrors donor `ZSTD_insertBt1` nbCompares.
+        // searchLog cap. Mirrors upstream zstd `ZSTD_insertBt1` nbCompares.
         const DMS_BUILD_DEPTH: usize = 1 << 9;
         // Reuse the previous tables' capacity on a genuine rebuild (shape
         // change): move the Vecs out before `live_history` re-borrows `self`.
@@ -746,7 +746,7 @@ impl MatchTable {
         while current + read <= region {
             let h = Self::hash_position_at(concat, current, dms_hash_log, mls);
             // Insert `current` as the new root; splay the old tree into
-            // `current`'s smaller/larger subtrees (donor `ZSTD_insertBt1`).
+            // `current`'s smaller/larger subtrees (upstream zstd `ZSTD_insertBt1`).
             let mut match_packed = hash_table[h];
             hash_table[h] = (current + 1) as u32;
             let mut smaller_slot = 2 * current;
@@ -770,7 +770,7 @@ impl MatchTable {
                     ml += 1;
                 }
                 if current + ml >= region {
-                    // Reached the dict end: can't order this pair, stop (donor
+                    // Reached the dict end: can't order this pair, stop (upstream zstd
                     // `ip+matchLength == iend` break).
                     break;
                 }
@@ -848,7 +848,7 @@ impl MatchTable {
         let mut current = 0usize;
         while current + mls <= region {
             let h = Self::hash_position_at(concat, current, dms_hash_log, mls);
-            // Prepend `current` to its bucket chain (donor
+            // Prepend `current` to its bucket chain (upstream zstd
             // `ZSTD_insertAndFindFirstIndex` head insert).
             chain_table[current] = hash_table[h];
             hash_table[h] = (current + 1) as u32;
@@ -875,7 +875,7 @@ impl MatchTable {
     /// Pre-size the contiguous `history` mirror to `expected_bytes` (capped to
     /// the window eviction bound) so the per-block `add_data`
     /// `extend_from_slice` growth does not overshoot through `Vec` capacity
-    /// doubling. Donor allocates its window buffer at `windowSize + blockSize`
+    /// doubling. Upstream zstd allocates its window buffer at `windowSize + blockSize`
     /// exactly; left to `Vec` doubling, a ~1 MiB history lands in a 2 MiB
     /// allocation — wasted peak that dominates once the match-finder tables are
     /// dictionary-tier-small. Correctness-neutral: the mirror still grows on
@@ -1085,13 +1085,13 @@ impl MatchTable {
 
     /// Convert an absolute position into the (relative_pos + 1) form
     /// stored in the hash / chain tables. Returns `None` for positions
-    /// outside the current window's representable range. Donor parity:
+    /// outside the current window's representable range. Upstream zstd parity:
     /// matches the `relIdx` arithmetic in `ZSTD_HcFindBestMatch`.
     pub(crate) fn relative_position(&self, abs_pos: usize) -> Option<u32> {
         let shifted_abs = abs_pos.checked_add(self.index_shift)?;
         let rel = shifted_abs.checked_sub(self.position_base)?;
         let rel_u32 = u32::try_from(rel).ok()?;
-        // Donor parity: raw BT/HC tables use 0 as the empty sentinel, so
+        // Upstream zstd parity: raw BT/HC tables use 0 as the empty sentinel, so
         // the very first absolute position in the first block
         // (curr == 0) is not a representable candidate index.
         if !self.allow_zero_relative_position && self.position_base == 0 && rel_u32 == 0 {
@@ -1104,7 +1104,7 @@ impl MatchTable {
     }
 
     /// Lower bound (in absolute positions) of the window that's still
-    /// reachable from `target_abs`. Donor parity: `windowLow` in
+    /// reachable from `target_abs`. Upstream zstd parity: `windowLow` in
     /// `ZSTD_compressBlock_*`.
     pub(crate) fn window_low_abs_for_target(&self, target_abs: usize) -> usize {
         let history_low = self.history_abs_start;
@@ -1119,7 +1119,7 @@ impl MatchTable {
         self.chain_log.saturating_sub(1)
     }
 
-    /// BT pointer-pair address mask. Donor parity: `(1 << btLog) - 1`.
+    /// BT pointer-pair address mask. Upstream zstd parity: `(1 << btLog) - 1`.
     #[inline(always)]
     pub(crate) fn bt_mask(&self) -> usize {
         (1usize << self.bt_log()) - 1
@@ -1127,7 +1127,7 @@ impl MatchTable {
 
     /// Convert an absolute position into a BT pair index in
     /// `chain_table`. Each node occupies two consecutive slots
-    /// (smaller, larger) so the result is doubled. Donor parity:
+    /// (smaller, larger) so the result is doubled. Upstream zstd parity:
     /// `2 * (curr & btMask)` from `ZSTD_insertBt1`.
     #[inline(always)]
     pub(crate) fn bt_pair_index_for_abs(&self, abs_pos: usize) -> usize {
@@ -1238,16 +1238,13 @@ impl MatchTable {
         }
     }
 
-    /// Donor parity: `ZSTD_compressBlock_btopt_generic` starts its main
+    /// Upstream zstd parity: `ZSTD_compressBlock_btopt_generic` starts its main
     /// match loop at cursor `1` (not `0`) whenever the current block sits
     /// at the absolute history origin — the byte at offset `0` is
     /// reserved for the seed literal so the parser never reports a
     /// zero-offset match. The same flag governs the initial `litlen`
     /// because the seed literal counts as one pending literal byte.
-    pub(crate) fn donor_opt_start_cursor_and_litlen(
-        &self,
-        current_abs_start: usize,
-    ) -> (usize, usize) {
+    pub(crate) fn opt_start_cursor_and_litlen(&self, current_abs_start: usize) -> (usize, usize) {
         let start_cursor = usize::from(current_abs_start == self.history_abs_start);
         (start_cursor, start_cursor)
     }
@@ -1815,7 +1812,7 @@ impl MatchTable {
     /// `u32::MAX`, or at the reserved stream-origin `rel == 0`), so when
     /// neither end needs a rebase no interior position can either, and the
     /// fill runs as a tight loop with raw `(pos - position_base)` index
-    /// arithmetic and hoisted base pointers. This mirrors the donor's
+    /// arithmetic and hoisted base pointers. This mirrors the upstream zstd's
     /// once-per-block `ZSTD_window_correctOverflow` followed by an
     /// unchecked fill, and matters on highly repetitive inputs where a
     /// single long match makes this loop fill the entire block. When a
@@ -1838,13 +1835,13 @@ impl MatchTable {
         self.next_to_update3 = self.next_to_update3.max(end);
     }
 
-    /// Index a just-emitted match span with the donor skip-threshold cap
+    /// Index a just-emitted match span with the upstream zstd skip-threshold cap
     /// (`ZSTD_row_update_internal`, `zstd_lazy.c:922-940`): when the span
     /// exceeds `SKIP_THRESHOLD` positions only the first `MAX_START` and last
     /// `MAX_END` are chained, the interior is skipped. Indexing every interior
     /// byte of a long match is O(matchlen) and dominates HashChain (lazy)
     /// encode time on periodic inputs where one match can span a whole block;
-    /// donor's hash-chain finder chains nothing in the interior at all, so the
+    /// upstream zstd's hash-chain finder chains nothing in the interior at all, so the
     /// 96 + 32 cap is a conservative (ratio-preserving) mirror that still keeps
     /// boundary anchors for the following search.
     pub(crate) fn insert_match_span(&mut self, start: usize, end: usize) {
@@ -1873,7 +1870,7 @@ impl MatchTable {
     /// [`Self::insert_position_no_rebase`], but with the table base pointers
     /// and config hoisted out of the loop and the relative position derived
     /// by a raw subtraction instead of the checked `relative_position`
-    /// arithmetic. Donor parity: the unchecked `ZSTD_insertAndFindFirstIndex`
+    /// arithmetic. Upstream zstd parity: the unchecked `ZSTD_insertAndFindFirstIndex`
     /// fill body.
     #[inline]
     fn fill_hash_chain_positions(&mut self, start: usize, end: usize) {
@@ -1906,7 +1903,7 @@ impl MatchTable {
             return;
         }
         // Hoist the source pointer and relative index out of the loop and
-        // advance both by one per iteration, mirroring the donor's
+        // advance both by one per iteration, mirroring the upstream zstd's
         // `ip++ / idx++` fill rather than recomputing them from `pos`.
         let mut src = unsafe { concat_ptr.add(start - history_abs_start) };
         // `rel` cannot reach `u32::MAX` because the caller proved
@@ -1933,7 +1930,7 @@ impl MatchTable {
 
     /// Insert every `step`-th position in `[start, end)` — the sparse
     /// counterpart to [`Self::insert_positions`]. Skipped positions are
-    /// *not* advanced through `next_to_update3` (the donor's behaviour
+    /// *not* advanced through `next_to_update3` (the upstream zstd's behaviour
     /// for the "incompressible block" skip path).
     pub(crate) fn insert_positions_with_step(&mut self, start: usize, end: usize, step: usize) {
         if step == 0 {
@@ -2026,10 +2023,10 @@ impl MatchTable {
     /// `skip_matching` body — backfill the slice boundary and then walk
     /// the current slice in either dense or sparse mode (driven by the
     /// `incompressible_hint`). BT and HC modes branch via `uses_bt`.
-    /// Dict-priming for BT / optimal levels (donor `ZSTD_dictMatchState`):
+    /// Dict-priming for BT / optimal levels (upstream zstd `ZSTD_dictMatchState`):
     /// the dictionary content stays in `history` (so the dms chain can read it
     /// and offsets are computed across the dict→input boundary) but is NOT
-    /// inserted into the LIVE binary tree — the donor keeps the dictionary in a
+    /// inserted into the LIVE binary tree — the upstream zstd keeps the dictionary in a
     /// SEPARATE matchState, so the live tree searches only the input. Advancing
     /// the BT (`skip_insert_until_abs`) and hash3 cursors past the committed
     /// dict block makes the first input block's tree update start after it,
@@ -2222,9 +2219,9 @@ impl MatchTable {
         }
     }
 
-    /// Donor parity: replay an optimal-parser plan into the consumer's
+    /// Upstream zstd parity: replay an optimal-parser plan into the consumer's
     /// sequence sink. Reads the current input frame off `window` and
-    /// advances `offset_hist` exactly like the donor block-store walker.
+    /// advances `offset_hist` exactly like the upstream zstd block-store walker.
     pub(crate) fn emit_optimal_plan(
         &mut self,
         current_len: usize,
