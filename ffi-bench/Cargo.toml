@@ -83,6 +83,34 @@ path = "../zstd/benches/wildcopy_candidates.rs"
 harness = false
 
 [[test]]
+name = "frame_compressor_ffi"
+path = "tests/frame_compressor_ffi.rs"
+
+[[test]]
+name = "fuzz_interop"
+path = "tests/fuzz_interop.rs"
+
+[[test]]
+name = "match_generator_ffi"
+path = "tests/match_generator_ffi.rs"
+
+[[test]]
+name = "streaming_encoder_ffi"
+path = "tests/streaming_encoder_ffi.rs"
+
+[[test]]
+name = "huff0_ffi"
+path = "tests/huff0_ffi.rs"
+
+[[test]]
+name = "dictionary_ffi"
+path = "tests/dictionary_ffi.rs"
+
+[[test]]
+name = "encode_corpus_ffi"
+path = "tests/encode_corpus_ffi.rs"
+
+[[test]]
 name = "block_splitter_parity"
 path = "../zstd/tests/block_splitter_parity.rs"
 

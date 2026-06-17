@@ -10913,19 +10913,19 @@ fn deterministic_high_entropy_bytes(seed: u64, len: usize) -> Vec<u8> {
     out
 }
 
-#[cfg(test)]
-fn level22_block_ranges(data: &[u8]) -> Vec<(usize, usize)> {
+#[cfg(feature = "bench_internals")]
+pub(crate) fn level22_block_ranges(data: &[u8]) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     let mut cursor = 0usize;
     let mut savings = 0i64;
     while cursor < data.len() {
         let remaining = data.len() - cursor;
-        let candidate_len = remaining.min(HC_BLOCKSIZE_MAX);
+        let candidate_len = remaining.min(super::cost_model::HC_BLOCKSIZE_MAX);
         let block_len = crate::encoding::frame_compressor::optimal_block_size(
             CompressionLevel::Level(22),
             &data[cursor..cursor + candidate_len],
             remaining,
-            HC_BLOCKSIZE_MAX,
+            super::cost_model::HC_BLOCKSIZE_MAX,
             savings,
         )
         .min(candidate_len)
@@ -10935,14 +10935,14 @@ fn level22_block_ranges(data: &[u8]) -> Vec<(usize, usize)> {
         // The exact upstream zstd gate uses compressed-size savings. For this corpus
         // parity harness, after the first full block has compressed, savings is
         // sufficient to authorize the same pre-block splitter path.
-        if cursor >= HC_BLOCKSIZE_MAX {
+        if cursor >= super::cost_model::HC_BLOCKSIZE_MAX {
             savings = 3;
         }
     }
     ranges
 }
 
-#[cfg(test)]
+#[cfg(feature = "bench_internals")]
 fn merge_block_delimiters(sequences: Vec<(usize, usize, usize)>) -> Vec<(usize, usize, usize)> {
     let mut out = Vec::with_capacity(sequences.len());
     let mut pending_lits = 0usize;
@@ -10960,17 +10960,22 @@ fn merge_block_delimiters(sequences: Vec<(usize, usize, usize)>) -> Vec<(usize, 
     out
 }
 
-#[cfg(test)]
-fn collect_level22_sequences(data: &[u8]) -> Vec<(usize, usize, usize)> {
+/// White-box capture of the level-22 sequence stream (literal-length,
+/// offset, match-length triples) the match generator emits for `data`,
+/// with block-delimiter pseudo-sequences merged into the following
+/// triple's literal run. Pure Rust; the C-conformance comparison that
+/// consumes it lives in the `ffi-bench` crate.
+#[cfg(feature = "bench_internals")]
+pub(crate) fn collect_level22_sequences(data: &[u8]) -> Vec<(usize, usize, usize)> {
     merge_block_delimiters(collect_level22_sequences_with_delimiters(data))
         .into_iter()
         .filter(|(_, offset, match_len)| *offset != 0 || *match_len != 0)
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(feature = "bench_internals")]
 fn collect_level22_sequences_with_delimiters(data: &[u8]) -> Vec<(usize, usize, usize)> {
-    let mut driver = MatchGeneratorDriver::new(HC_BLOCKSIZE_MAX, 1);
+    let mut driver = MatchGeneratorDriver::new(super::cost_model::HC_BLOCKSIZE_MAX, 1);
     driver.set_source_size_hint(data.len() as u64);
     driver.reset(CompressionLevel::Level(22));
 
@@ -10994,134 +10999,6 @@ fn collect_level22_sequences_with_delimiters(data: &[u8]) -> Vec<(usize, usize, 
         });
     }
     sequences
-}
-
-#[cfg(test)]
-fn reference_level22_sequences(data: &[u8]) -> Vec<(usize, usize, usize)> {
-    merge_block_delimiters(reference_level22_sequences_with_delimiters(data))
-        .into_iter()
-        .filter(|(_, offset, match_len)| *offset != 0 || *match_len != 0)
-        .collect()
-}
-
-#[cfg(test)]
-fn reference_level22_sequences_with_delimiters(data: &[u8]) -> Vec<(usize, usize, usize)> {
-    use zstd::zstd_safe;
-    use zstd::zstd_safe::zstd_sys;
-
-    fn assert_zstd_ok(code: usize, context: &str) {
-        assert_eq!(
-            unsafe { zstd_sys::ZSTD_isError(code) },
-            0,
-            "{context} failed: {}",
-            zstd_safe::get_error_name(code)
-        );
-    }
-
-    unsafe {
-        let cctx = zstd_sys::ZSTD_createCCtx();
-        assert!(!cctx.is_null(), "ZSTD_createCCtx returned null");
-
-        assert_zstd_ok(
-            zstd_sys::ZSTD_CCtx_setParameter(
-                cctx,
-                zstd_sys::ZSTD_cParameter::ZSTD_c_compressionLevel,
-                22,
-            ),
-            "ZSTD_c_compressionLevel",
-        );
-
-        let seq_capacity = zstd_safe::sequence_bound(data.len());
-        let mut seqs = alloc::vec![
-            zstd_sys::ZSTD_Sequence {
-                offset: 0,
-                litLength: 0,
-                matchLength: 0,
-                rep: 0,
-            };
-            seq_capacity
-        ];
-
-        let seq_count = zstd_sys::ZSTD_generateSequences(
-            cctx,
-            seqs.as_mut_ptr(),
-            seqs.len(),
-            data.as_ptr().cast(),
-            data.len(),
-        );
-        assert_zstd_ok(seq_count, "ZSTD_generateSequences");
-        let rc = zstd_sys::ZSTD_freeCCtx(cctx);
-        assert_eq!(rc, 0, "ZSTD_freeCCtx failed");
-
-        seqs.truncate(seq_count);
-        seqs.into_iter()
-            .map(|seq| {
-                (
-                    seq.litLength as usize,
-                    seq.offset as usize,
-                    seq.matchLength as usize,
-                )
-            })
-            .collect()
-    }
-}
-
-#[test]
-fn level22_sequences_match_reference_on_corpus_proxy() {
-    let data = include_bytes!("../../decodecorpus_files/z000033");
-    assert_level22_sequences_match_reference(data);
-}
-
-#[test]
-fn level22_sequences_match_reference_on_small_corpus_proxy() {
-    let data = include_bytes!("../../decodecorpus_files/z000030");
-    assert_level22_sequences_match_reference(data);
-}
-
-#[cfg(test)]
-fn assert_level22_sequences_match_reference(data: &[u8]) {
-    let rust = collect_level22_sequences(data);
-    let reference = reference_level22_sequences(data);
-
-    if rust != reference {
-        let first_diff = rust
-            .iter()
-            .zip(reference.iter())
-            .position(|(lhs, rhs)| lhs != rhs)
-            .unwrap_or_else(|| rust.len().min(reference.len()));
-        let rust_pos = rust
-            .iter()
-            .take(first_diff)
-            .fold(0usize, |acc, seq| acc + seq.0 + seq.2);
-        let ref_pos = reference
-            .iter()
-            .take(first_diff)
-            .fold(0usize, |acc, seq| acc + seq.0 + seq.2);
-        let start = first_diff.saturating_sub(4);
-        let rust_window = &rust[start..rust.len().min(first_diff + 4)];
-        let ref_window = &reference[start..reference.len().min(first_diff + 4)];
-        let mut reps = [1u32, 4, 8];
-        for (lit_len, offset, _) in rust.iter().take(first_diff) {
-            let _ = encode_offset_with_history(*offset as u32, *lit_len as u32, &mut reps);
-        }
-        panic!(
-            "level22 sequence path diverged at idx {}: rust={:?} reference={:?} (rust_len={} ref_len={} rust_pos={} ref_pos={} reps_before={:?} rust_window={:?} ref_window={:?} block_ranges={:?})",
-            first_diff,
-            rust.get(first_diff),
-            reference.get(first_diff),
-            rust.len(),
-            reference.len(),
-            rust_pos,
-            ref_pos,
-            reps,
-            rust_window,
-            ref_window,
-            level22_block_ranges(data)
-                .into_iter()
-                .filter(|(start, len)| *start <= rust_pos && rust_pos < start + len)
-                .collect::<Vec<_>>(),
-        );
-    }
 }
 
 #[test]

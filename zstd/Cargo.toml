@@ -63,12 +63,11 @@ core = { version = "1.0.0", optional = true, package = "rustc-std-workspace-core
 alloc = { version = "1.0.0", optional = true, package = "rustc-std-workspace-alloc" }
 
 [dev-dependencies]
-# `criterion` and `dhat` moved to the `ffi-bench` crate with the benches and
-# FFI examples. `zstd` (the C bindings) is still needed by a few white-box
-# unit tests that cross-check our output against libzstd; migrating those to
-# `ffi-bench` (so this library imports zero C bindings) is the remaining step.
+# This library imports zero C bindings. The `zstd` (libzstd) cross-checks,
+# the criterion benches, the `dhat` profiling examples, and the FFI parity
+# tests all live in the sibling `ffi-bench` crate, which depends on both this
+# crate and `zstd`. Only the pure-Rust unit/integration tests run here.
 rand = "0.10"
-zstd = { version = "0.13.3", features = ["zdict_builder", "experimental"] }
 
 [features]
 default = [

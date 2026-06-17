@@ -1758,23 +1758,13 @@ fn write_table_raw_path_initializes_none_cache() {
     ));
 }
 
-#[test]
-fn encoded_weight_description_is_accepted_by_reference_huf_reader() {
-    use zstd::zstd_safe::zstd_sys;
-
-    unsafe extern "C" {
-        fn HUF_readStats(
-            huff_weight: *mut u8,
-            hw_size: usize,
-            rank_stats: *mut u32,
-            nb_symbols_ptr: *mut u32,
-            table_log_ptr: *mut u32,
-            src: *const core::ffi::c_void,
-            src_size: usize,
-        ) -> usize;
-    }
-
-    let data = &include_bytes!("../../decodecorpus_files/z000033")[..16 * 1024];
+/// White-box capture of the FSE-coded Huffman weight description our encoder
+/// emits for `data` (a length byte followed by the FSE payload), plus the raw
+/// per-symbol weights. Returns `(description, weights)`. The C-conformance
+/// check that feeds this through `HUF_readStats` lives in the `ffi-bench`
+/// crate; this side stays pure Rust.
+#[cfg(feature = "bench_internals")]
+pub(crate) fn huf_weight_description_for_test(data: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let table = HuffmanTable::build_from_data(data);
     let mut weights = {
         let mut out = Vec::new();
@@ -1788,50 +1778,15 @@ fn encoded_weight_description_is_accepted_by_reference_huf_reader() {
     let mut description = Vec::with_capacity(encoded.len() + 1);
     description.push(encoded.len() as u8);
     description.extend_from_slice(&encoded);
-
-    let mut huff_weight = [0u8; 256];
-    let mut rank_stats = [0u32; 13];
-    let mut nb_symbols = 0u32;
-    let mut table_log = 0u32;
-    let read = unsafe {
-        HUF_readStats(
-            huff_weight.as_mut_ptr(),
-            huff_weight.len(),
-            rank_stats.as_mut_ptr(),
-            &mut nb_symbols,
-            &mut table_log,
-            description.as_ptr().cast(),
-            description.len(),
-        )
-    };
-    assert_eq!(
-        unsafe { zstd_sys::ZSTD_isError(read) },
-        0,
-        "HUF_readStats rejected weight description: {}",
-        zstd::zstd_safe::get_error_name(read)
-    );
-    assert_eq!(read, description.len());
-    assert_eq!(&huff_weight[..weights.len()], weights.as_slice());
+    (description, weights)
 }
 
-#[test]
-fn encoded_huffman_payload_is_accepted_by_reference_huf_reader() {
-    use zstd::zstd_safe::zstd_sys;
-
-    unsafe extern "C" {
-        fn HUF_decompress4X_hufOnly_wksp(
-            dctx: *mut u32,
-            dst: *mut core::ffi::c_void,
-            dst_size: usize,
-            c_src: *const core::ffi::c_void,
-            c_src_size: usize,
-            work_space: *mut core::ffi::c_void,
-            wksp_size: usize,
-            flags: i32,
-        ) -> usize;
-    }
-
-    let data = &include_bytes!("../../decodecorpus_files/z000033")[..16 * 1024];
+/// White-box capture of the 4-stream Huffman payload (table description
+/// followed by the coded streams) our encoder emits for `data`. The
+/// C-conformance check that decodes it via `HUF_decompress4X_hufOnly_wksp`
+/// lives in the `ffi-bench` crate.
+#[cfg(feature = "bench_internals")]
+pub(crate) fn huf_encode4x_for_test(data: &[u8]) -> Vec<u8> {
     let table = HuffmanTable::build_from_data(data);
     let mut encoded = Vec::new();
     {
@@ -1840,224 +1795,5 @@ fn encoded_huffman_payload_is_accepted_by_reference_huf_reader() {
         encoder.encode4x(data, true);
         writer.flush();
     }
-
-    let mut decoded = alloc::vec![0u8; data.len()];
-    let mut dtable = alloc::vec![0u32; 1 + (1 << 12)];
-    dtable[0] = 12 * 0x01010101;
-    let mut workspace = alloc::vec![0u64; 1 << 15];
-    let read = unsafe {
-        HUF_decompress4X_hufOnly_wksp(
-            dtable.as_mut_ptr(),
-            decoded.as_mut_ptr().cast(),
-            decoded.len(),
-            encoded.as_ptr().cast(),
-            encoded.len(),
-            workspace.as_mut_ptr().cast(),
-            workspace.len() * core::mem::size_of::<u64>(),
-            0,
-        )
-    };
-    assert_eq!(
-        unsafe { zstd_sys::ZSTD_isError(read) },
-        0,
-        "HUF_decompress4X_hufOnly_wksp rejected payload: {}",
-        zstd::zstd_safe::get_error_name(read)
-    );
-    assert_eq!(read, data.len());
-    assert_eq!(decoded.as_slice(), data);
-}
-
-#[test]
-fn level22_emitted_literal_sections_are_accepted_by_reference_huf_reader() {
-    use crate::encoding::{CompressionLevel, compress_to_vec};
-    use zstd::zstd_safe::zstd_sys;
-
-    unsafe extern "C" {
-        fn HUF_decompress1X1_DCtx_wksp(
-            dctx: *mut u32,
-            dst: *mut core::ffi::c_void,
-            dst_size: usize,
-            c_src: *const core::ffi::c_void,
-            c_src_size: usize,
-            work_space: *mut core::ffi::c_void,
-            wksp_size: usize,
-            flags: i32,
-        ) -> usize;
-        fn HUF_decompress4X_hufOnly_wksp(
-            dctx: *mut u32,
-            dst: *mut core::ffi::c_void,
-            dst_size: usize,
-            c_src: *const core::ffi::c_void,
-            c_src_size: usize,
-            work_space: *mut core::ffi::c_void,
-            wksp_size: usize,
-            flags: i32,
-        ) -> usize;
-        fn HUF_decompress1X_usingDTable(
-            dst: *mut core::ffi::c_void,
-            dst_size: usize,
-            c_src: *const core::ffi::c_void,
-            c_src_size: usize,
-            dtable: *const u32,
-            flags: i32,
-        ) -> usize;
-        fn HUF_decompress4X_usingDTable(
-            dst: *mut core::ffi::c_void,
-            dst_size: usize,
-            c_src: *const core::ffi::c_void,
-            c_src_size: usize,
-            dtable: *const u32,
-            flags: i32,
-        ) -> usize;
-    }
-
-    fn frame_blocks_offset(frame: &[u8]) -> usize {
-        assert_eq!(&frame[..4], &[0x28, 0xb5, 0x2f, 0xfd]);
-        let descriptor = frame[4];
-        let fcs_flag = descriptor >> 6;
-        let single_segment = descriptor & (1 << 5) != 0;
-        let dict_id_flag = descriptor & 0b11;
-        let mut pos = 5usize;
-        if !single_segment {
-            pos += 1;
-        }
-        pos += match dict_id_flag {
-            0 => 0,
-            1 => 1,
-            2 => 2,
-            3 => 4,
-            _ => unreachable!(),
-        };
-        pos += match (single_segment, fcs_flag) {
-            (true, 0) => 1,
-            (_, 0) => 0,
-            (_, 1) => 2,
-            (_, 2) => 4,
-            (_, 3) => 8,
-            _ => unreachable!(),
-        };
-        pos
-    }
-
-    let data = include_bytes!("../../decodecorpus_files/z000033");
-    let frame = compress_to_vec(data.as_slice(), CompressionLevel::Level(22));
-    let mut pos = frame_blocks_offset(&frame);
-    let mut dtable = alloc::vec![0u32; 1 + (1 << 12)];
-    dtable[0] = 12 * 0x01010101;
-    let mut workspace = alloc::vec![0u64; 1 << 15];
-    let mut huf_valid = false;
-    let mut block_idx = 0usize;
-    loop {
-        let header = u32::from(frame[pos])
-            | (u32::from(frame[pos + 1]) << 8)
-            | (u32::from(frame[pos + 2]) << 16);
-        pos += 3;
-        let last = header & 1 != 0;
-        let block_type = (header >> 1) & 0b11;
-        let block_size = (header >> 3) as usize;
-        let block = &frame[pos..pos + block_size];
-        pos += block_size;
-        if block_type == 2 {
-            let lit_type = block[0] & 0b11;
-            match lit_type {
-                0 | 1 => huf_valid = false,
-                2 | 3 => {
-                    if lit_type == 3 {
-                        assert!(
-                            huf_valid,
-                            "repeat HUF without live table at block {block_idx}"
-                        );
-                    }
-                    let header = u64::from(block[0])
-                        | (u64::from(block[1]) << 8)
-                        | (u64::from(block[2]) << 16)
-                        | (u64::from(*block.get(3).unwrap_or(&0)) << 24);
-                    let lhl_code = (block[0] >> 2) & 0b11;
-                    let (single_stream, lh_size, lit_size, lit_c_size) = match lhl_code {
-                        0 | 1 => {
-                            let single = lhl_code == 0;
-                            (
-                                single,
-                                3,
-                                ((header >> 4) & 0x3ff) as usize,
-                                ((header >> 14) & 0x3ff) as usize,
-                            )
-                        }
-                        2 => (
-                            false,
-                            4,
-                            ((header >> 4) & 0x3fff) as usize,
-                            (header >> 18) as usize,
-                        ),
-                        3 => (
-                            false,
-                            5,
-                            ((header >> 4) & 0x3ffff) as usize,
-                            (((header >> 22) & 0x3ff) as usize) + ((block[4] as usize) << 10),
-                        ),
-                        _ => unreachable!(),
-                    };
-                    let csrc = &block[lh_size..lh_size + lit_c_size];
-                    let mut decoded = alloc::vec![0u8; lit_size];
-                    let code = unsafe {
-                        match (lit_type, single_stream) {
-                            (2, true) => HUF_decompress1X1_DCtx_wksp(
-                                dtable.as_mut_ptr(),
-                                decoded.as_mut_ptr().cast(),
-                                decoded.len(),
-                                csrc.as_ptr().cast(),
-                                csrc.len(),
-                                workspace.as_mut_ptr().cast(),
-                                workspace.len() * core::mem::size_of::<u64>(),
-                                0,
-                            ),
-                            (2, false) => HUF_decompress4X_hufOnly_wksp(
-                                dtable.as_mut_ptr(),
-                                decoded.as_mut_ptr().cast(),
-                                decoded.len(),
-                                csrc.as_ptr().cast(),
-                                csrc.len(),
-                                workspace.as_mut_ptr().cast(),
-                                workspace.len() * core::mem::size_of::<u64>(),
-                                0,
-                            ),
-                            (3, true) => HUF_decompress1X_usingDTable(
-                                decoded.as_mut_ptr().cast(),
-                                decoded.len(),
-                                csrc.as_ptr().cast(),
-                                csrc.len(),
-                                dtable.as_ptr(),
-                                0,
-                            ),
-                            (3, false) => HUF_decompress4X_usingDTable(
-                                decoded.as_mut_ptr().cast(),
-                                decoded.len(),
-                                csrc.as_ptr().cast(),
-                                csrc.len(),
-                                dtable.as_ptr(),
-                                0,
-                            ),
-                            _ => unreachable!(),
-                        }
-                    };
-                    assert_eq!(
-                        unsafe { zstd_sys::ZSTD_isError(code) },
-                        0,
-                        "upstream zstd HUF rejected block {block_idx} lit_type={lit_type} single={single_stream} lit_size={lit_size} lit_c_size={lit_c_size}: {}",
-                        zstd::zstd_safe::get_error_name(code)
-                    );
-                    assert_eq!(
-                        code, lit_size,
-                        "upstream zstd HUF decoded short block {block_idx}"
-                    );
-                    huf_valid = true;
-                }
-                _ => unreachable!(),
-            }
-        }
-        if last {
-            break;
-        }
-        block_idx += 1;
-    }
+    encoded
 }

@@ -1385,21 +1385,6 @@ mod tests {
         assert_eq!(decoded, b"custom-matcher");
     }
 
-    #[cfg(feature = "std")]
-    #[test]
-    fn streaming_encoder_output_decompresses_with_c_zstd() {
-        let payload = b"tenant=demo op=put key=streaming value=abcdef\n".repeat(4096);
-        let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Fastest);
-        for chunk in payload.chunks(1024) {
-            encoder.write_all(chunk).unwrap();
-        }
-        let compressed = encoder.finish().unwrap();
-
-        let mut decoded = Vec::with_capacity(payload.len());
-        zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
-        assert_eq!(decoded, payload);
-    }
-
     #[test]
     fn pledged_content_size_written_in_header() {
         let payload = b"hello world, pledged size test";
@@ -1526,31 +1511,6 @@ mod tests {
         let mut decoder = StreamingDecoder::new(with_hint_frame.as_slice()).unwrap();
         let mut decoded = Vec::new();
         decoder.read_to_end(&mut decoded).unwrap();
-        assert_eq!(decoded, payload);
-    }
-
-    #[cfg(feature = "std")]
-    #[test]
-    fn pledged_content_size_c_zstd_compatible() {
-        let payload = b"tenant=demo op=put key=streaming value=abcdef\n".repeat(4096);
-        let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Fastest);
-        encoder
-            .set_pledged_content_size(payload.len() as u64)
-            .unwrap();
-        for chunk in payload.chunks(1024) {
-            encoder.write_all(chunk).unwrap();
-        }
-        let compressed = encoder.finish().unwrap();
-
-        // FCS should be written
-        let header = crate::decoding::frame::read_frame_header(compressed.as_slice())
-            .unwrap()
-            .0;
-        assert_eq!(header.frame_content_size(), payload.len() as u64);
-
-        // C zstd should decompress successfully
-        let mut decoded = Vec::new();
-        zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
         assert_eq!(decoded, payload);
     }
 

@@ -64,7 +64,14 @@ unsafe extern "C" {
 /// runners (nextest, IDE test runners, in-tree `cargo test`,
 /// out-of-tree invocations) when the fixture is present.
 fn corpus_dir() -> PathBuf {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("decodecorpus_files");
+    // This source is built from the sibling `ffi-bench` crate (so the library
+    // crate links no C bindings), so `CARGO_MANIFEST_DIR` may point at either
+    // crate. Resolve the fixture next to the manifest first, then under the
+    // sibling `zstd` crate.
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let here = manifest.join("decodecorpus_files");
+    let sibling = manifest.join("../zstd/decodecorpus_files");
+    let path = if here.is_dir() { here } else { sibling };
     assert!(
         path.is_dir(),
         "expected corpus directory at {} — this test needs the \
