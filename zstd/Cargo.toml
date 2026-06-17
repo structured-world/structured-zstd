@@ -206,5 +206,5 @@ harness = false
 required-features = ["bench_internals"]
 
 [[test]]
-name = "block_splitter_donor_parity"
+name = "block_splitter_parity"
 required-features = ["bench_internals"]

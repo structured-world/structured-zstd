@@ -88,7 +88,7 @@ Behind the `dict_builder` feature flag, the `dictionary` module can:
 | 18          | `BtUltra`  | `HashChain` candidates + `btultra` price parser |
 | 19-22       | `BtUltra2` | `HashChain` candidates + `btultra2` dual-profile parse |
 
-The level → strategy column matches donor `ZSTD_defaultCParameters[0]` at `zstd/lib/compress/clevels.h:25-50` (srcSize > 256 KiB tier). Donor routes `greedy`/`lazy`/`lazy2` through its row-based matchfinder when `windowLog > 14`; we route `Greedy` through the row matcher (matches donor) but `Lazy`/`Lazy2` through the hash-chain matcher — an intentional architectural difference, not an oversight.
+The level → strategy column matches upstream zstd `ZSTD_defaultCParameters[0]` at `zstd/lib/compress/clevels.h:25-50` (srcSize > 256 KiB tier). Upstream routes `greedy`/`lazy`/`lazy2` through its row-based matchfinder when `windowLog > 14`; we route `Greedy` through the row matcher (matching upstream) but `Lazy`/`Lazy2` through the hash-chain matcher — an intentional architectural difference, not an oversight.
 
 </details>
 
