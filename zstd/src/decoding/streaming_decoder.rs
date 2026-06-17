@@ -181,7 +181,7 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
         // ever-larger buffers; decoding `buf.len()` worth into the ring up
         // front grew it far past the window (repeated `reserve_amortized`
         // alloc+copy). Decode at most one block worth per step, then drain
-        // what is now collectable into `buf`, mirroring the donor's
+        // what is now collectable into `buf`, mirroring upstream zstd's
         // window-bounded flush loop.
         let mut written = 0;
         while written < buf.len() {
