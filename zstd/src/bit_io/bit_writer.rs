@@ -116,7 +116,7 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
     }
 
     /// Pre-reserve additional capacity in the output buffer so the
-    /// donor-faithful FSE fast path can do `flush_bulk` writes without
+    /// upstream zstd-faithful FSE fast path can do `flush_bulk` writes without
     /// triggering `Vec::extend_from_slice`'s grow-on-realloc branch.
     /// `additional` is the number of bytes the upcoming bursts will
     /// emit (caller's bit budget / 8, rounded up).
@@ -125,7 +125,7 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
         self.output.as_mut().reserve(additional);
     }
 
-    /// Donor `BIT_addBitsFast` (`bitstream.h:193-200`): always accumulate
+    /// Upstream zstd `BIT_addBitsFast` (`bitstream.h:193-200`): always accumulate
     /// `bits` into the bottom of `partial`, no overflow check.
     ///
     /// # Safety
@@ -150,14 +150,14 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
     /// output stream that decoders cannot recover — equivalent in
     /// blast radius to undefined behaviour for the consumer.
     ///
-    /// Used by the donor-faithful FSE sequence encoder which knows its
+    /// Used by the upstream zstd-faithful FSE sequence encoder which knows its
     /// per-sequence bit budget at compile time and inserts explicit
     /// [`Self::flush_bulk`] calls between bursts — saving the
     /// per-call branch + spill that `write_bits_64`'s overflow check
     /// pays.
     #[inline(always)]
     pub unsafe fn write_bits_64_no_check(&mut self, bits: u64, num_bits: usize) {
-        // num_bits == 0 short-circuit: matches donor `BIT_addBits` no-op
+        // num_bits == 0 short-circuit: matches upstream zstd `BIT_addBits` no-op
         // semantics AND guards the `bits << self.bits_in_partial` below
         // from a `<< 64` undefined-behaviour evaluation when the
         // accumulator is already full (`bits_in_partial == 64`). Callers
@@ -185,7 +185,7 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
         self.bits_in_partial += num_bits;
     }
 
-    /// Donor `BIT_flushBitsFast` (`bitstream.h:202-214`): write the
+    /// Upstream zstd `BIT_flushBitsFast` (`bitstream.h:202-214`): write the
     /// full 8 bytes of `partial` directly to the output buffer via a
     /// single `MEM_writeLEST` (unaligned 8-byte LE store), then
     /// advance the Vec's `len` by only `nb_bytes` so the scratch
@@ -197,7 +197,7 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
     /// hot — its per-call capacity check + memcpy dispatch cost
     /// dwarfs the actual byte write at FSE flush cadence (~54K
     /// flushes per compress on the L1 fast path). The direct
-    /// unaligned store path matches donor's hot loop cycle-for-cycle.
+    /// unaligned store path matches upstream zstd's hot loop cycle-for-cycle.
     ///
     /// # Safety
     ///
@@ -231,7 +231,7 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
         }
         // `nb_bytes == 8` means the accumulator was full (64 bits). A
         // raw `partial >>= 64` is UB on `u64`, so we zero explicitly.
-        // Donor's `BIT_flushBitsFast` writes a fresh 8 bytes the next
+        // Upstream zstd's `BIT_flushBitsFast` writes a fresh 8 bytes the next
         // round so the post-flush state must be clean either way.
         if nb_bytes == 8 {
             self.partial = 0;
@@ -242,7 +242,7 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
         self.bit_idx += nb_bytes * 8;
     }
 
-    /// Bridge for the donor-faithful Huffman encoder (`HufCStream`) so
+    /// Bridge for the upstream zstd-faithful Huffman encoder (`HufCStream`) so
     /// it can write bytes directly into our backing `Vec<u8>` without
     /// going through the `BitWriter`'s partial-bit accumulator. The
     /// closure receives full mutable access to the underlying `Vec`;

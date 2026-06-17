@@ -44,7 +44,7 @@ macro_rules! decode_one_body {
 }
 
 /// Scalar-tier execute body. Routes through the shared
-/// `execute_one_sequence_pipelined`, which uses the donor inline
+/// `execute_one_sequence_pipelined`, which uses the upstream zstd inline
 /// literal+match wildcopy on backends that opt into
 /// `SUPPORTS_INLINE_SEQUENCE_EXEC` (FlatBuf / UserSliceBackend, on every
 /// target) and falls back to `try_push` + `repeat_lookahead_prefetched`

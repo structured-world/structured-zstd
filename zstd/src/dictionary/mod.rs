@@ -604,11 +604,80 @@ pub fn create_fastcover_dict_from_source<R: io::Read, W: io::Write>(
     Ok(tuned)
 }
 
+/// Build a finalized FastCOVER dictionary, attach it to a fastest-level
+/// frame compressor, and compress a fresh payload. Returns
+/// `(finalized_dictionary, compressed_frame, original_payload)` so a
+/// roundtrip check can decode `compressed_frame` against
+/// `finalized_dictionary` and compare to `original_payload`. The
+/// C-decoder roundtrip that consumes this lives in the `ffi-bench` crate;
+/// this side stays pure Rust.
+#[cfg(feature = "bench_internals")]
+pub(crate) fn dict_roundtrip_fixture() -> (
+    alloc::vec::Vec<u8>,
+    alloc::vec::Vec<u8>,
+    alloc::vec::Vec<u8>,
+) {
+    use crate::decoding::Dictionary;
+    use crate::encoding::{CompressionLevel, FrameCompressor};
+
+    let mut sample = alloc::vec::Vec::new();
+    for i in 0..512u32 {
+        sample.extend_from_slice(
+            alloc::format!(
+                "tenant=demo table=orders key={i} region=eu payload=aaaaabbbbbcccccdddddeeeee\n"
+            )
+            .as_bytes(),
+        );
+    }
+
+    let dict_size = 4096usize;
+    let content_budget = finalized_content_budget(sample.as_slice(), sample.as_slice(), dict_size)
+        .expect("content budget should be computable");
+    let raw = fastcover::train_fastcover_raw(
+        sample.as_slice(),
+        content_budget,
+        fastcover::FastCoverParams {
+            k: 256,
+            d: 8,
+            f: 20,
+            accel: 1,
+        },
+    );
+    let finalized = finalize_raw_dict(
+        raw.as_slice(),
+        sample.as_slice(),
+        dict_size,
+        FinalizeOptions::default(),
+    )
+    .expect("finalization should succeed");
+    let parsed =
+        Dictionary::decode_dict(finalized.as_slice()).expect("finalized dictionary should parse");
+    assert!(!parsed.dict_content.is_empty());
+
+    let mut payload = alloc::vec::Vec::new();
+    for idx in 0..96u32 {
+        payload.extend_from_slice(
+            alloc::format!("tenant=demo op=put key={idx} value=aaaaabbbbbcccccdddddeeeee\n")
+                .as_bytes(),
+        );
+    }
+
+    let mut compressed = alloc::vec::Vec::new();
+    let mut compressor = FrameCompressor::new(CompressionLevel::Fastest);
+    compressor
+        .set_dictionary(parsed)
+        .expect("dictionary should attach");
+    compressor.set_source(payload.as_slice());
+    compressor.set_drain(&mut compressed);
+    compressor.compress();
+
+    (finalized, compressed, payload)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::decoding::Dictionary;
-    use crate::encoding::{CompressionLevel, FrameCompressor};
     use std::io::Cursor;
     use std::string::ToString;
 
@@ -623,61 +692,6 @@ mod tests {
             );
         }
         data
-    }
-
-    #[test]
-    fn finalize_raw_dict_roundtrips_with_ffi_decoder() {
-        let sample = training_data();
-        let dict_size = 4096usize;
-        let content_budget =
-            finalized_content_budget(sample.as_slice(), sample.as_slice(), dict_size)
-                .expect("content budget should be computable");
-        let raw = fastcover::train_fastcover_raw(
-            sample.as_slice(),
-            content_budget,
-            FastCoverParams {
-                k: 256,
-                d: 8,
-                f: 20,
-                accel: 1,
-            },
-        );
-        let finalized = finalize_raw_dict(
-            raw.as_slice(),
-            sample.as_slice(),
-            dict_size,
-            FinalizeOptions::default(),
-        )
-        .expect("finalization should succeed");
-        let parsed = Dictionary::decode_dict(finalized.as_slice())
-            .expect("finalized dictionary should parse");
-        assert!(!parsed.dict_content.is_empty());
-
-        let mut payload = Vec::new();
-        for idx in 0..96u32 {
-            payload.extend_from_slice(
-                format!("tenant=demo op=put key={idx} value=aaaaabbbbbcccccdddddeeeee\n")
-                    .as_bytes(),
-            );
-        }
-
-        let mut compressed = Vec::new();
-        let mut compressor = FrameCompressor::new(CompressionLevel::Fastest);
-        compressor
-            .set_dictionary(parsed)
-            .expect("dictionary should attach");
-        compressor.set_source(payload.as_slice());
-        compressor.set_drain(&mut compressed);
-        compressor.compress();
-
-        let mut ffi_decoder = zstd::bulk::Decompressor::with_dictionary(finalized.as_slice())
-            .expect("ffi decoder should accept finalized dictionary");
-        let mut decoded = Vec::with_capacity(payload.len());
-        let written = ffi_decoder
-            .decompress_to_buffer(compressed.as_slice(), &mut decoded)
-            .expect("ffi decoder should decode payload");
-        assert_eq!(written, payload.len());
-        assert_eq!(decoded, payload);
     }
 
     #[test]

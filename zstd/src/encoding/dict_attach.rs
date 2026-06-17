@@ -2,7 +2,7 @@
 //! matcher's immutable dictionary table type `T`.
 //!
 //! This is the level-1 scaffolding common to every match-finder backend that
-//! supports donor `ZSTD_dictMatchState` attach-by-reference: instead of
+//! supports upstream zstd `ZSTD_dictMatchState` attach-by-reference: instead of
 //! re-priming the whole dictionary into the live hash table(s) on every frame
 //! (O(dict) per frame, the dominant cost on small-payload `compress-dict`), the
 //! dictionary is hashed ONCE into a SEPARATE immutable table `T` held here, and

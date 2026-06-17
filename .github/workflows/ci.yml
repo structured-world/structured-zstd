@@ -85,36 +85,49 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy -p structured-zstd --features hash,std,dict_builder -- -D warnings
-      - name: Clippy (bench_internals)
-        run: cargo clippy -p structured-zstd --features hash,std,dict_builder,bench_internals --benches -- -D warnings
+      - name: Clippy (testing facade)
+        run: cargo clippy -p structured-zstd --features hash,std,dict_builder,bench_internals -- -D warnings
+      - name: Clippy (ffi-bench targets)
+        # The libzstd-linking benches/tests/examples live in `ffi-bench`.
+        # Lint them with the features their `required-features` gate on so the
+        # whole surface compiles clean.
+        run: cargo clippy -p ffi-bench --all-targets --features bench_internals,hash,copy_shape_stats -- -D warnings
       - name: Gate — compare_ffi/memory must not pull bench_internals
         # Rationale: both `compare_ffi` (timing) and `compare_ffi_memory`
         # (peak alloc) benchmark structured-zstd against libzstd. If
         # `bench_internals` widens our crate's public API surface
         # (visibility changes for `BitReaderReversed` etc.), the Rust
         # side ships compiled differently than what a real downstream
-        # consumer uses — biasing every cross-side comparison. Keep
-        # bench_internals strictly out of both benches' feature sets.
+        # consumer uses — biasing every cross-side comparison. These benches
+        # live in `ffi-bench`; keep bench_internals off the crate's default
+        # features, off its structured-zstd dependency, and off both benches'
+        # required-features so a `cargo bench --bench compare_ffi` (the CI
+        # bench-build) never links it.
         #
         # tomllib (Python 3.11+ stdlib) handles both single-line and
-        # multi-line TOML arrays, so a future `required-features` array
-        # reformat can't sneak `bench_internals` past the gate.
+        # multi-line TOML arrays, so a future array reformat can't sneak
+        # bench_internals past the gate.
         run: |
           python3 - <<'PY'
           import sys, tomllib
-          with open("zstd/Cargo.toml", "rb") as f:
+          with open("ffi-bench/Cargo.toml", "rb") as f:
               cargo = tomllib.load(f)
+          errors = []
+          dep = cargo.get("dependencies", {}).get("structured-zstd", {})
+          if "bench_internals" in dep.get("features", []):
+              errors.append("structured-zstd dependency must NOT enable bench_internals")
+          if "bench_internals" in cargo.get("features", {}).get("default", []):
+              errors.append("ffi-bench default features must NOT include bench_internals")
           benches = {
               bench.get("name"): bench.get("required-features", [])
               for bench in cargo.get("bench", [])
           }
-          violators = [
-              name for name in ("compare_ffi", "compare_ffi_memory")
-              if "bench_internals" in benches.get(name, [])
-          ]
-          if violators:
-              for name in violators:
-                  print(f"::error::{name} must NOT require bench_internals — would bias Rust-vs-FFI parity")
+          for name in ("compare_ffi", "compare_ffi_memory"):
+              if "bench_internals" in benches.get(name, []):
+                  errors.append(f"{name} must NOT require bench_internals — would bias Rust-vs-FFI parity")
+          if errors:
+              for e in errors:
+                  print(f"::error::{e}")
               sys.exit(1)
           PY
       - name: Gate — bench instrumentation must not leak into zstd/src/
@@ -321,6 +334,12 @@ jobs:
         run: cargo nextest run --profile ci -p structured-zstd --features hash,std,dict_builder
       - name: Doc tests
         run: cargo test --doc -p structured-zstd --features hash,std,dict_builder
+      - name: FFI parity + cross-validation tests
+        # The libzstd-linking parity / cross-validation / corpus tests live in
+        # `ffi-bench`; `bench_internals` activates the white-box-facade targets
+        # gated behind it. Corpus fixtures resolve from the manifest dir, so no
+        # working-directory is needed.
+        run: cargo nextest run --profile ci -p ffi-bench --features bench_internals
 
   cross-i686:
     needs: lint
@@ -727,7 +746,7 @@ jobs:
       - id: set
         env:
           # Drives the shard plan below. On a `pull_request` we run
-          # only the two canonical levels (`level_3_dfast` = donor
+          # only the two canonical levels (`level_3_dfast` = upstream zstd
           # default, `level_22_btultra2` = max compression) bundled
           # into a single shard per target — three shards total, cheap
           # PR feedback. On a `push: main` (post-merge), one shard per
@@ -856,13 +875,13 @@ jobs:
       - name: Build compare_ffi + compare_ffi_memory bench binaries
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
-          # The donor zstd-sys C library uses runtime feature detection
+          # The upstream zstd zstd-sys C library uses runtime feature detection
           # (is_x86_feature_detected!-equivalent) so it transparently
           # picks up BMI2/AVX2/etc. on the runner. Pure-Rust hot paths
           # gate intrinsics on COMPILE-time cfg!(target_feature = ...)
           # and the default rustc x86_64 target ships with SSE2 only.
           # Without explicit target selection the bench compares
-          # "donor with full ISA" vs "us with SSE2 baseline" — not
+          # "upstream zstd with full ISA" vs "us with SSE2 baseline" — not
           # apples-to-apples.
           #
           # Use a DETERMINISTIC baseline (x86-64-v3 = BMI2 + AVX2 +
@@ -887,8 +906,14 @@ jobs:
           # can ship just the executable to shards. Building BOTH
           # bench binaries in one cargo invocation reuses dependency
           # compilation between them (zstd-sys, criterion, etc.).
+          # Built from the `ffi-bench` crate (holds the libzstd-linking
+          # targets). Selecting ONLY these two benches activates no
+          # `required-features`, so structured-zstd compiles WITHOUT
+          # `bench_internals` / instrumentation — the parity benches see the
+          # same Rust build a real consumer gets. `dict_builder` is on via the
+          # crate's base dependency on structured-zstd.
           cargo bench --bench compare_ffi --bench compare_ffi_memory \
-            -p structured-zstd --features dict_builder \
+            -p ffi-bench \
             --target ${{ matrix.bench.target_triple }} --no-run \
             --message-format=json > build.log
           mkdir -p bench-binary

@@ -1,8 +1,8 @@
-//! Donor-shape Fast strategy block compressor — flat hash-table +
+//! Upstream zstd-shape Fast strategy block compressor — flat hash-table +
 //! tight per-block loop, ported from `lib/compress/zstd_fast.c`. See
 //! [`kernel::compress_block_fast`] for the entry point.
 //!
-//! This module is the first commit of the donor-port branch: the
+//! This module isolates the Fast-strategy kernel: the
 //! kernel is implemented and unit-tested in isolation but not yet
 //! wired into [`super::MatchGenerator`] / `MatcherStorage`. The
 //! follow-up commit on the same branch replaces the `SuffixStore`-

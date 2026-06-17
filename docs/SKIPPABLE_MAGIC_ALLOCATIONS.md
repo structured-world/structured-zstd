@@ -14,7 +14,7 @@ and parsing these but **does not allocate any variant**.
 > structured-zstd = { version = "0", features = ["lsm"] }
 > ```
 >
-> The C FFI `cdylib` build remains strict drop-in for donor `libzstd`
+> The C FFI `cdylib` build remains strict drop-in for upstream `libzstd`
 > v1.5.7 regardless of which Rust features are enabled — magic-variant
 > allocations affect only Rust-side typed wrappers, not the cdylib
 > symbol surface.

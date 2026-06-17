@@ -4,14 +4,14 @@
 //! `ZSTD_ldm_getBucket` / `ZSTD_ldm_insertEntry` helpers from
 //! `lib/compress/zstd_ldm.c` v1.5.7.
 //!
-//! Layout (donor `zstd_ldm.c:188-207`):
+//! Layout (upstream zstd `zstd_ldm.c:188-207`):
 //!
 //! ```text
 //! entries: [LdmEntry; 1 << hash_log]
 //!   = bucket_count buckets of `1 << bucket_size_log` slots each
 //!
 //! bucket_offsets: [u8; bucket_count]
-//!   = round-robin write cursor per bucket (donor uses one BYTE)
+//!   = round-robin write cursor per bucket (upstream zstd uses one BYTE)
 //!
 //! bucket_count = 1 << (hash_log - bucket_size_log)
 //! ```
@@ -19,11 +19,11 @@
 //! Lookup is a bare slice into `entries`; insertion is a single
 //! 64-bit write plus a one-byte modular cursor bump. There is no
 //! eviction policy beyond the round-robin overwrite, which mirrors
-//! donor's behaviour and is correct because LDM tolerates dropped
+//! upstream zstd's behaviour and is correct because LDM tolerates dropped
 //! candidates (the verify step rejects stale entries via the
 //! checksum + window-distance check).
 //!
-//! Donor `bucket_size_log` is silently clamped to `hash_log`
+//! Upstream zstd `bucket_size_log` is silently clamped to `hash_log`
 //! (`zstd_ldm.c:176`); the same clamp lives in [`LdmHashTable::new`].
 //!
 //! See [`super::params::LdmParams`] for how the logs are derived.
@@ -34,7 +34,7 @@ use alloc::vec::Vec;
 /// One hash-table entry — `(offset_relative_to_position_base,
 /// checksum)`.
 ///
-/// Mirrors donor `ldmEntry_t` from `zstd_compress_internal.h`.
+/// Mirrors upstream zstd `ldmEntry_t` from `zstd_compress_internal.h`.
 ///
 /// **Offset semantics:** `offset` is **NOT an absolute stream
 /// position**. It is stored relative to the owning
@@ -43,7 +43,7 @@ use alloc::vec::Vec;
 /// table calls [`LdmHashTable::resolve`] to translate
 /// `entry.offset` to an absolute position when the producer or
 /// search path needs it, and periodically rebases via
-/// [`LdmHashTable::reduce`] (donor `ZSTD_ldm_reduceTable`,
+/// [`LdmHashTable::reduce`] (upstream zstd `ZSTD_ldm_reduceTable`,
 /// `zstd_ldm.c:520`) to keep `position - position_base ≤
 /// u32::MAX`. Same scheme `MatchTable` uses for the BT/HC chain
 /// table.
@@ -66,14 +66,14 @@ pub(crate) struct LdmEntry {
     /// inverse translation.
     pub(crate) offset: u32,
     /// High 32 bits of the XXH64 over the `min_match_length`-byte
-    /// window — donor `entry.checksum`. Used to filter
+    /// window — upstream zstd `entry.checksum`. Used to filter
     /// false-positive bucket collisions before invoking the
     /// byte-level verify.
     pub(crate) checksum: u32,
 }
 
 /// Margin reserved above the high-water mark before triggering a
-/// rebase. Donor `ZSTD_ldm_reduceTable` is called at a coarser
+/// rebase. Upstream zstd `ZSTD_ldm_reduceTable` is called at a coarser
 /// granularity (per-frame `ZSTD_window_update`); ours kicks in
 /// per-insert via [`LdmHashTable::ensure_room_for`] but uses a
 /// generous safety band so the rebase is amortised across many
@@ -95,7 +95,7 @@ const REBASE_GUARD_BAND: u32 = 1u32 << 30;
 pub(crate) struct LdmHashTable {
     entries: Vec<LdmEntry>,
     bucket_offsets: Vec<u8>,
-    /// Effective bucket-size log after the donor's
+    /// Effective bucket-size log after the upstream zstd's
     /// `MIN(bucketSizeLog, hashLog)` clamp (`zstd_ldm.c:176`).
     effective_bucket_log: u32,
     /// Hash-id mask: `bucket_count - 1`. The caller must hand in
@@ -105,7 +105,7 @@ pub(crate) struct LdmHashTable {
     /// Absolute stream position that corresponds to a stored
     /// `entry.offset == 1` (offset 0 is the empty-slot sentinel).
     /// Advanced by [`Self::reduce`] when the producer is about to
-    /// store a position beyond the `u32` window — donor
+    /// store a position beyond the `u32` window — upstream zstd
     /// `ZSTD_ldm_reduceTable` (`zstd_ldm.c:520`).
     position_base: usize,
 }
@@ -113,41 +113,41 @@ pub(crate) struct LdmHashTable {
 impl LdmHashTable {
     /// Allocate a fresh table for the given parameters.
     ///
-    /// Donor parity: matches `ZSTD_ldm_getTableSize` (`zstd_ldm.c:175-180`)
+    /// Upstream zstd parity: matches `ZSTD_ldm_getTableSize` (`zstd_ldm.c:175-180`)
     /// in shape — `hashTable + bucketOffsets`. `bucket_size_log` is
-    /// clamped to `hash_log` to mirror the donor's silent floor on
+    /// clamped to `hash_log` to mirror the upstream zstd's silent floor on
     /// the per-bucket slot count.
     ///
     /// # Panics
     ///
     /// Panics if `hash_log == 0` (no buckets) or `hash_log > 30`
-    /// (would allocate > 8 GiB of entries — far beyond donor's
-    /// `ZSTD_LDM_HASHLOG_MAX = 30`). Both bounds match donor.
+    /// (would allocate > 8 GiB of entries — far beyond upstream zstd's
+    /// `ZSTD_LDM_HASHLOG_MAX = 30`). Both bounds match upstream zstd.
     pub(crate) fn new(hash_log: u32, bucket_size_log: u32) -> Self {
         assert!(hash_log > 0, "hash_log must be > 0");
         assert!(
             hash_log <= 30,
-            "hash_log {hash_log} exceeds donor ZSTD_LDM_HASHLOG_MAX (30)"
+            "hash_log {hash_log} exceeds upstream zstd ZSTD_LDM_HASHLOG_MAX (30)"
         );
-        // Donor `zstd_ldm.c:176`: effective bucket_size_log is the
+        // Upstream zstd `zstd_ldm.c:176`: effective bucket_size_log is the
         // min of caller's request and hash_log. Without the clamp a
         // bucket would span the whole table and bucket_count would
         // be zero — undefined behaviour upstream and a div-by-zero
         // here.
         let effective_bucket_log = bucket_size_log.min(hash_log);
-        // Donor cap `ZSTD_LDM_BUCKETSIZELOG_MAX = 8` (`zstd.h:1300`).
+        // Upstream zstd cap `ZSTD_LDM_BUCKETSIZELOG_MAX = 8` (`zstd.h:1300`).
         // We store the per-bucket round-robin cursor in a `u8`
-        // (mirrors donor `BYTE bucketOffsets[]` in `zstd_ldm.c:202`),
+        // (mirrors upstream zstd `BYTE bucketOffsets[]` in `zstd_ldm.c:202`),
         // which silently truncates at 256 slots — i.e. above this
         // cap the cursor would only cycle through the first 256
         // entries of a larger bucket, dropping new inserts on the
-        // floor. The assertion enforces the donor pre-condition so
+        // floor. The assertion enforces the upstream zstd pre-condition so
         // callers that bypass `LdmParams::adjust_for` (which already
         // clamps to `LDM_BUCKETSIZELOG_MAX`) still get a clear
         // failure instead of silent data loss.
         assert!(
             effective_bucket_log <= 8,
-            "effective bucket_size_log {effective_bucket_log} exceeds donor \
+            "effective bucket_size_log {effective_bucket_log} exceeds upstream zstd \
              ZSTD_LDM_BUCKETSIZELOG_MAX (8); a u8 cursor would silently \
              truncate at 256 slots — widen the cursor or clamp the request"
         );
@@ -172,7 +172,7 @@ impl LdmHashTable {
     /// rewind the rebase base so a fresh frame can start its
     /// absolute positions from any value (including 0) without
     /// tripping the `abs_pos >= position_base` assertion in
-    /// [`Self::insert_absolute`]. Donor equivalent is the
+    /// [`Self::insert_absolute`]. Upstream zstd equivalent is the
     /// `ZSTD_cwksp` clear of the LDM region at frame boundaries.
     /// `LdmEntry` is `Copy` so the slice `fill` compiles down to
     /// a bulk memset — meaningful when `hash_log` is large and
@@ -199,7 +199,7 @@ impl LdmHashTable {
     ///
     /// `hash_id` MUST be in `[0, bucket_count())`. The caller is
     /// responsible for masking via [`Self::bucket_mask`] before
-    /// calling — donor `ZSTD_ldm_getBucket` performs no clamping
+    /// calling — upstream zstd `ZSTD_ldm_getBucket` performs no clamping
     /// either, leaving the responsibility to the producer.
     pub(crate) fn bucket(&self, hash_id: u32) -> &[LdmEntry] {
         let start = (hash_id as usize) << self.effective_bucket_log;
@@ -210,7 +210,7 @@ impl LdmHashTable {
     /// Insert `entry` into the bucket for `hash_id` at the bucket's
     /// next round-robin slot.
     ///
-    /// Donor `ZSTD_ldm_insertEntry` (`zstd_ldm.c:198-207`): the
+    /// Upstream zstd `ZSTD_ldm_insertEntry` (`zstd_ldm.c:198-207`): the
     /// per-bucket `bucket_offsets[hash_id]` byte is the next write
     /// position, post-bump it modulo `1 << bucket_size_log`. The
     /// modulo is implemented by masking with `slots - 1`.
@@ -250,7 +250,7 @@ impl LdmHashTable {
         let bucket_start = (hash_id as usize) << self.effective_bucket_log;
         let offset = self.bucket_offsets[hash_id as usize] as usize;
         self.entries[bucket_start + offset] = entry;
-        // Post-increment modulo bucket size. Donor stores the result
+        // Post-increment modulo bucket size. Upstream zstd stores the result
         // in a BYTE (so the mask is implicit at bucket_size_log <= 8);
         // we mirror the explicit mask so values above 8 (clamped by
         // params, but defensive here) still wrap correctly.
@@ -343,7 +343,7 @@ impl LdmHashTable {
     /// past 4 GiB rebase transparently. Caller positions remain
     /// absolute on both sides of the rebase — `Self::resolve` /
     /// `Self::insert_absolute` handle the relative-coordinate
-    /// translation internally. Donor: `ZSTD_ldm_reduceTable`
+    /// translation internally. Upstream zstd: `ZSTD_ldm_reduceTable`
     /// (`zstd_ldm.c:520`), invoked from `ZSTD_window_update`.
     pub(crate) fn ensure_room_for(&mut self, abs_pos: usize) {
         if abs_pos < self.position_base {
@@ -365,13 +365,13 @@ impl LdmHashTable {
         let max_rel = u32::MAX as usize - REBASE_GUARD_BAND as usize;
         while abs_pos - self.position_base > max_rel {
             // Shift the base forward by `REBASE_GUARD_BAND` —
-            // matches donor's "subtract the reducer value, clamp
+            // matches upstream zstd's "subtract the reducer value, clamp
             // anything below to 0" semantics.
             self.reduce(REBASE_GUARD_BAND);
         }
     }
 
-    /// Donor `ZSTD_ldm_reduceTable` (`zstd_ldm.c:520`): subtract
+    /// Upstream zstd `ZSTD_ldm_reduceTable` (`zstd_ldm.c:520`): subtract
     /// `reducer` from every entry's relative offset, saturating
     /// anything below at 0 (which becomes the empty-slot
     /// sentinel); advance `position_base` by `reducer` so future
@@ -393,9 +393,9 @@ mod tests {
     use super::*;
 
     /// `hash_log = 8`, `bucket_size_log = 4` → 16 buckets ×
-    /// 16 slots = 256 entries, matches donor sizing math.
+    /// 16 slots = 256 entries, matches upstream zstd sizing math.
     #[test]
-    fn new_table_sizes_match_donor_formulae() {
+    fn new_table_sizes_match_size_formulae() {
         let t = LdmHashTable::new(8, 4);
         assert_eq!(t.bucket_count(), 16);
         assert_eq!(t.bucket_slots(), 16);
@@ -404,7 +404,7 @@ mod tests {
         assert_eq!(t.bucket_mask(), 15);
     }
 
-    /// Donor `MIN(bucketSizeLog, hashLog)` clamp must apply: when
+    /// Upstream zstd `MIN(bucketSizeLog, hashLog)` clamp must apply: when
     /// caller requests `bucket_size_log > hash_log` the bucket
     /// collapses to a single bucket covering all entries.
     #[test]
@@ -519,9 +519,9 @@ mod tests {
     /// Boundary-arithmetic smoke test: a moderately large `hash_log`
     /// must allocate without panic and produce a sane bucket count.
     /// Doubles as a guard that the assertions don't accidentally
-    /// reject the donor-supported range.
+    /// reject the upstream zstd-supported range.
     ///
-    /// We deliberately do NOT use `hash_log = 30` (donor's max)
+    /// We deliberately do NOT use `hash_log = 30` (upstream zstd's max)
     /// because that would allocate 8 GiB of entries; the bucket
     /// arithmetic is the same at every log so 18 is sufficient.
     /// Gated to 64-bit pointer widths to avoid the 32-bit CI shards
@@ -532,7 +532,7 @@ mod tests {
     #[cfg(target_pointer_width = "64")]
     fn new_accepts_large_hash_log_smoke() {
         // Use a small bucket_size_log so the entry count is bounded
-        // and we don't actually allocate 8 GiB. Donor itself never
+        // and we don't actually allocate 8 GiB. Upstream zstd itself never
         // allocates the max at runtime either (window_log caps
         // hash_log to 27 or so in practice). Test just the boundary
         // arithmetic — request hash_log = 18 with bucket_size_log =
@@ -543,13 +543,13 @@ mod tests {
         assert_eq!(t.bucket_slots(), 1usize << 4);
     }
 
-    /// `effective_bucket_log > 8` (donor `LDM_BUCKETSIZELOG_MAX`)
+    /// `effective_bucket_log > 8` (upstream zstd `LDM_BUCKETSIZELOG_MAX`)
     /// must panic, not silently truncate the `u8` round-robin
-    /// cursor at 256 slots. Donor pre-condition mirrored from
+    /// cursor at 256 slots. Upstream zstd pre-condition mirrored from
     /// `zstd_ldm.c:202` where `bucketOffsets` is a `BYTE`.
     #[test]
     #[should_panic(expected = "ZSTD_LDM_BUCKETSIZELOG_MAX")]
-    fn new_rejects_bucket_size_log_above_donor_cap() {
+    fn new_rejects_bucket_size_log_above_cap() {
         // hash_log = 12, bucket_size_log = 9 → effective = 9 > 8
         // → assertion fires.
         let _ = LdmHashTable::new(12, 9);
@@ -584,7 +584,7 @@ mod tests {
     /// `reduce` subtracts the reducer from every entry's relative
     /// offset (saturating at 0 = empty sentinel) and advances
     /// `position_base` so future `resolve` calls translate back
-    /// to the same absolute positions. Donor
+    /// to the same absolute positions. Upstream zstd
     /// `ZSTD_ldm_reduceTable` (`zstd_ldm.c:520`).
     #[test]
     fn reduce_preserves_resolved_absolute_positions() {

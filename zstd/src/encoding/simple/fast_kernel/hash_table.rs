@@ -1,4 +1,4 @@
-//! Flat `Vec<u32>` hash table used by the donor-shape Fast strategy
+//! Flat `Vec<u32>` hash table used by the upstream zstd-shape Fast strategy
 //! match-finder. Direct port of `ZSTD_hash4`/`ZSTD_hash5`/`ZSTD_hash6`/
 //! `ZSTD_hash7`/`ZSTD_hash8` from
 //! `lib/compress/zstd_compress_internal.h` — multiply-shift on the first
@@ -8,10 +8,10 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-/// Donor `ZSTD_HASHLOG_MAX` (`lib/zstd.h`). The cap applies uniformly
+/// Upstream zstd `ZSTD_HASHLOG_MAX` (`lib/zstd.h`). The cap applies uniformly
 /// across all five `mls` instantiations (`mls ∈ {4, 5, 6, 7, 8}`): even
 /// though `mls >= 5` widens the hash to a `u64` reduction, the Fast
-/// strategy's per-level `hashLog` is sourced from the donor's
+/// strategy's per-level `hashLog` is sourced from the upstream zstd's
 /// `ZSTD_defaultCParameters` table where the maximum is `14` (level 1,
 /// `srcSize > 256 KB`), and the user-tunable upper bound is `30`.
 /// Enforcing this in the constructor catches misuse before the first
@@ -19,7 +19,7 @@ use alloc::vec::Vec;
 /// `(64 - hash_log)` shift.
 const ZSTD_HASHLOG_MAX: u32 = 30;
 
-/// Donor multiplicative hash constants — exact bit-for-bit match with
+/// Upstream zstd multiplicative hash constants — exact bit-for-bit match with
 /// `lib/compress/zstd_compress_internal.h` so the table-keying behaviour
 /// stays identical to the reference encoder.
 /// Non-allocating parameter validation shared by [`FastHashTable::new`] and
@@ -31,8 +31,8 @@ const ZSTD_HASHLOG_MAX: u32 = 30;
 fn validate_params(hash_log: u32, mls: u32) {
     assert!(
         (1..=ZSTD_HASHLOG_MAX).contains(&hash_log),
-        "hash_log must be in 1..={ZSTD_HASHLOG_MAX} for donor-compatible Fast hashing (got {hash_log}); \
-         the lower bound prevents a full-word-width shift in hash_ptr, the upper bound is donor's ZSTD_HASHLOG_MAX",
+        "hash_log must be in 1..={ZSTD_HASHLOG_MAX} for upstream zstd-compatible Fast hashing (got {hash_log}); \
+         the lower bound prevents a full-word-width shift in hash_ptr, the upper bound is upstream zstd's ZSTD_HASHLOG_MAX",
     );
     assert!(
         (4..=8).contains(&mls),
@@ -48,20 +48,20 @@ const PRIME_8_BYTES: u64 = 0xCF1BBCDCB7A56463;
 
 /// Flat hash table indexed by `hash_ptr(ptr, hash_log, mls)`. Entries
 /// store absolute positions into the encoder's flat history buffer
-/// (matches donor's `U32* hashTable` with `base + matchIdx` lookup).
+/// (matches upstream zstd's `U32* hashTable` with `base + matchIdx` lookup).
 /// Sentinel `0` is fine because position `0` either belongs to the
 /// initial prefix (where the `+= (ip0 == prefixStart)` adjustment at
 /// loop entry skips it) or is below `prefixStartIndex` and filtered by
 /// the in-range check.
 pub(crate) struct FastHashTable {
     table: Vec<u32>,
-    /// Donor `hash_log` — number of bits the hash output is reduced to.
+    /// Upstream zstd `hash_log` — number of bits the hash output is reduced to.
     hash_log: u32,
-    /// Donor `mls` — minimum match length used as the hash input width.
+    /// Upstream zstd `mls` — minimum match length used as the hash input width.
     /// Valid range `4..=8`; the kernel monomorphises over this so it
     /// compiles to a constant inside each instantiation.
     mls: u32,
-    /// Epoch bias for continue-mode frame resets (donor `ZSTD_continueCCtx`
+    /// Epoch bias for continue-mode frame resets (upstream zstd `ZSTD_continueCCtx`
     /// cadence): stored values are `position + bias`, and [`Self::get`]
     /// reads any entry below the current bias as the empty sentinel `0`.
     /// Advancing the bias past every previously-stored value
@@ -100,17 +100,17 @@ impl FastHashTable {
     /// Allocate the table at `1 << hash_log` entries, all initialised
     /// to the sentinel `0` position. The encoder is expected to bump
     /// the first real input position to at least `1` so the sentinel
-    /// can never be confused with a valid match (the donor achieves
+    /// can never be confused with a valid match (the upstream zstd achieves
     /// this via `ip0 += (ip0 == prefixStart)`).
     ///
     /// # Panics
     ///
     /// Parameter-range failures:
-    /// - `hash_log` outside `1..=ZSTD_HASHLOG_MAX` (donor's cap,
+    /// - `hash_log` outside `1..=ZSTD_HASHLOG_MAX` (upstream zstd's cap,
     ///   currently `30`). The lower bound exists because `0` would
     ///   make `hash_ptr` shift by the full word width (`32` for
     ///   mls=4, `64` for mls≥5) — UB / panic in Rust. The upper
-    ///   bound is the donor's documented maximum; importantly,
+    ///   bound is the upstream zstd's documented maximum; importantly,
     ///   even on 64-bit targets a `usize::BITS - 1` cap would still
     ///   admit `hash_log ∈ 33..=63` which is invalid for the
     ///   `mls=4` path that shifts by `32 - hash_log` (panics for
@@ -123,7 +123,7 @@ impl FastHashTable {
     /// - `1usize << hash_log` overflowing `usize`. Only reachable on
     ///   32-bit hosts at `hash_log >= 32` — but `validate_params`
     ///   already pins `hash_log <= ZSTD_HASHLOG_MAX = 30`, so this
-    ///   path is unreachable today for the donor-compatible band.
+    ///   path is unreachable today for the upstream zstd-compatible band.
     ///   Kept here as a tripwire if `ZSTD_HASHLOG_MAX` is ever
     ///   raised past `31`.
     /// - `entries * size_of::<u32>()` overflowing `usize`. This is
@@ -205,7 +205,7 @@ impl FastHashTable {
         self.bias = 0;
     }
 
-    /// Continue-mode frame reset (donor `ZSTD_continueCCtx` cadence): keep
+    /// Continue-mode frame reset (upstream zstd `ZSTD_continueCCtx` cadence): keep
     /// the table contents and advance the epoch bias past every entry the
     /// previous frame stored, so all of them read back as the empty
     /// sentinel via [`Self::get`]'s epoch filter — no full-table memset.
@@ -226,7 +226,7 @@ impl FastHashTable {
         }
     }
 
-    /// Donor-parity `ZSTD_hashPtr` — multiply-shift hash over the first
+    /// Upstream zstd-parity `ZSTD_hashPtr` — multiply-shift hash over the first
     /// `mls` bytes at `ptr`, output reduced to `hash_log` bits.
     ///
     /// # Safety
@@ -243,7 +243,7 @@ impl FastHashTable {
     ///
     /// The kernel satisfies the readable-bytes promise uniformly
     /// via the `ilimit = iend - HASH_READ_SIZE` cap
-    /// (`HASH_READ_SIZE = 8`), mirroring donor's same invariant.
+    /// (`HASH_READ_SIZE = 8`), mirroring upstream zstd's same invariant.
     ///
     /// **`MLS` const-generic contract:**
     /// - `MLS` MUST equal `self.mls()`.
@@ -376,23 +376,26 @@ pub(crate) unsafe fn hash_ptr_raw<const MLS: u32>(ptr: *const u8, hash_log: u32)
 mod tests {
     use super::*;
 
-    /// Donor parity: `ZSTD_hash4` on `[0x01, 0x02, 0x03, 0x04]` with
+    /// Upstream zstd parity: `ZSTD_hash4` on `[0x01, 0x02, 0x03, 0x04]` with
     /// hash_log=12 produces a specific bit pattern. Captured here as a
     /// regression tripwire so any future refactor of the multiply
     /// constants surfaces immediately.
     #[test]
-    fn hash4_matches_donor_formula_on_known_input() {
+    fn hash4_matches_expected_value_on_known_input() {
         let table = FastHashTable::new(12, 4);
         let data = [0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
         // SAFETY: data has 8 ≥ 4 readable bytes.
         let h = unsafe { table.hash_ptr::<4>(data.as_ptr()) };
-        // Manual donor calc: u32::from_le_bytes(0x04030201) * 0x9E3779B1 >> 20.
+        // Manual upstream zstd calc: u32::from_le_bytes(0x04030201) * 0x9E3779B1 >> 20.
         let expected = 0x04030201u32.wrapping_mul(0x9E3779B1) >> 20;
-        assert_eq!(h, expected, "hash4 must match donor multiply-shift formula");
+        assert_eq!(
+            h, expected,
+            "hash4 must match upstream zstd multiply-shift formula"
+        );
     }
 
     #[test]
-    fn hash5_matches_donor_formula_on_known_input() {
+    fn hash5_matches_expected_value_on_known_input() {
         let table = FastHashTable::new(13, 5);
         let data = [0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
         // SAFETY: data has 8 ≥ 5 readable bytes.
@@ -432,10 +435,10 @@ mod tests {
         assert_eq!(read_back, 0, "clear must zero every entry");
     }
 
-    /// Donor parity for mls=6: `ZSTD_hash6` uses
+    /// Upstream zstd parity for mls=6: `ZSTD_hash6` uses
     /// `(u << (64-48)).wrapping_mul(PRIME_6_BYTES) >> (64 - hash_log)`.
     #[test]
-    fn hash6_matches_donor_formula_on_known_input() {
+    fn hash6_matches_expected_value_on_known_input() {
         let table = FastHashTable::new(14, 6);
         let data = [0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
         // SAFETY: data has 8 ≥ 6 readable bytes (the implementation
@@ -444,13 +447,16 @@ mod tests {
         let u = u64::from_le_bytes(data);
         let expected =
             (((u << (64 - 48)).wrapping_mul(227_718_039_650_203u64)) >> (64 - 14)) as u32;
-        assert_eq!(h, expected, "hash6 must match donor multiply-shift formula");
+        assert_eq!(
+            h, expected,
+            "hash6 must match upstream zstd multiply-shift formula"
+        );
     }
 
-    /// Donor parity for mls=7: `ZSTD_hash7` shifts by `(64-56)` and
+    /// Upstream zstd parity for mls=7: `ZSTD_hash7` shifts by `(64-56)` and
     /// multiplies by `PRIME_7_BYTES`.
     #[test]
-    fn hash7_matches_donor_formula_on_known_input() {
+    fn hash7_matches_expected_value_on_known_input() {
         let table = FastHashTable::new(15, 7);
         let data = [0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
         // SAFETY: data has 8 ≥ 7 readable bytes.
@@ -458,21 +464,27 @@ mod tests {
         let u = u64::from_le_bytes(data);
         let expected =
             (((u << (64 - 56)).wrapping_mul(58_295_818_150_454_627u64)) >> (64 - 15)) as u32;
-        assert_eq!(h, expected, "hash7 must match donor multiply-shift formula");
+        assert_eq!(
+            h, expected,
+            "hash7 must match upstream zstd multiply-shift formula"
+        );
     }
 
-    /// Donor parity for mls=8: `ZSTD_hash8` does NOT shift the input
-    /// (full u64), then multiplies by `PRIME_8_BYTES` (donor's
+    /// Upstream zstd parity for mls=8: `ZSTD_hash8` does NOT shift the input
+    /// (full u64), then multiplies by `PRIME_8_BYTES` (upstream zstd's
     /// `prime8bytes = 0xCF1BBCDCB7A56463ULL`).
     #[test]
-    fn hash8_matches_donor_formula_on_known_input() {
+    fn hash8_matches_expected_value_on_known_input() {
         let table = FastHashTable::new(16, 8);
         let data = [0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
         // SAFETY: data has 8 readable bytes.
         let h = unsafe { table.hash_ptr::<8>(data.as_ptr()) };
         let u = u64::from_le_bytes(data);
         let expected = (u.wrapping_mul(0xCF1BBCDCB7A56463u64) >> (64 - 16)) as u32;
-        assert_eq!(h, expected, "hash8 must match donor multiply-shift formula");
+        assert_eq!(
+            h, expected,
+            "hash8 must match upstream zstd multiply-shift formula"
+        );
     }
 
     /// Boundary: `hash_log = 1` is the smallest accepted value

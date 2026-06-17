@@ -3,7 +3,7 @@
 //! Direct port of `ZSTD_ldm_gear_*` from `lib/compress/zstd_ldm.c`
 //! v1.5.7. The 256-entry permutation table [`GEAR_TAB`] is reproduced
 //! verbatim from `lib/compress/zstd_ldm_geartab.h` so split points
-//! computed from any byte stream match the donor bit-for-bit — a
+//! computed from any byte stream match the upstream zstd bit-for-bit — a
 //! prerequisite for the ratio-parity goal of #111 Phase 5.
 //!
 //! # Algorithm
@@ -19,14 +19,14 @@
 //! position, bit `n` of `hash` after `k` updates depends on the last
 //! `min(n, k)` bytes — a content-defined window without any explicit
 //! ring buffer. A "split point" is signalled whenever
-//! `(hash & stop_mask) == 0`. Donor [`init`] derives `stop_mask` so
+//! `(hash & stop_mask) == 0`. Upstream zstd [`init`] derives `stop_mask` so
 //! that on average one split occurs every `2 ^ hash_rate_log` bytes,
 //! and the active bits sit at the high end of the rolling window
 //! (`min(min_match_length, 64)` bits) — biasing splits toward
 //! content-defined boundaries of at least `min_match_length` bytes
 //! whenever the parameter ranges allow it.
 //!
-//! # Donor anchors
+//! # Upstream zstd anchors
 //!
 //! * `ZSTD_ldm_gear_init`  → [`GearHashState::new`]
 //! * `ZSTD_ldm_gear_reset` → [`reset`]
@@ -34,25 +34,25 @@
 //!
 //! # Constants
 //!
-//! * [`LDM_BUCKET_SIZE_LOG`] — donor `#define` (= 4, the default /
+//! * [`LDM_BUCKET_SIZE_LOG`] — upstream zstd `#define` (= 4, the default /
 //!   lower bound used by `LdmParams::adjust_for`'s `BOUNDED`
-//!   clamp; the donor upper bound is the separate
+//!   clamp; the upstream zstd upper bound is the separate
 //!   `ZSTD_LDM_BUCKETSIZELOG_MAX = 8` constant, exposed as
 //!   `params::LDM_BUCKETSIZELOG_MAX`).
-//! * [`LDM_MIN_MATCH_LENGTH`] — donor `#define`.
-//! * [`LDM_HASH_RLOG`] — donor `#define` (default hash-rate log).
-//! * [`LDM_BATCH_SIZE`] — donor `#define` from
+//! * [`LDM_MIN_MATCH_LENGTH`] — upstream zstd `#define`.
+//! * [`LDM_HASH_RLOG`] — upstream zstd `#define` (default hash-rate log).
+//! * [`LDM_BATCH_SIZE`] — upstream zstd `#define` from
 //!   `zstd_compress_internal.h`. Caps the per-call split count so the
 //!   caller's `splits` buffer never overflows.
 
 /// Bucket size log for the LDM hash table.
 ///
-/// Donor: `lib/compress/zstd_ldm.c:19` (`#define LDM_BUCKET_SIZE_LOG 4`).
+/// Upstream zstd: `lib/compress/zstd_ldm.c:19` (`#define LDM_BUCKET_SIZE_LOG 4`).
 pub(crate) const LDM_BUCKET_SIZE_LOG: u32 = 4;
 
 /// Default minimum LDM match length in bytes.
 ///
-/// Donor: `lib/compress/zstd_ldm.c:20`
+/// Upstream zstd: `lib/compress/zstd_ldm.c:20`
 /// (`#define LDM_MIN_MATCH_LENGTH 64`). Defines both the gear-hash
 /// window depth (and therefore the maximum bit weight used for the
 /// `stop_mask` placement) and the floor on accepted match lengths.
@@ -61,25 +61,25 @@ pub(crate) const LDM_MIN_MATCH_LENGTH: usize = 64;
 /// Default hash-rate log (one split every `2 ^ LDM_HASH_RLOG` bytes
 /// on average).
 ///
-/// Donor: `lib/compress/zstd_ldm.c:21` (`#define LDM_HASH_RLOG 7`).
+/// Upstream zstd: `lib/compress/zstd_ldm.c:21` (`#define LDM_HASH_RLOG 7`).
 pub(crate) const LDM_HASH_RLOG: u32 = 7;
 
-/// Maximum number of splits the donor `gear_feed` produces per call.
+/// Maximum number of splits the upstream zstd `gear_feed` produces per call.
 ///
-/// Donor: `lib/compress/zstd_compress_internal.h:335`
+/// Upstream zstd: `lib/compress/zstd_compress_internal.h:335`
 /// (`#define LDM_BATCH_SIZE 64`). The caller-owned `splits` array
 /// must hold at least this many entries.
 pub(crate) const LDM_BATCH_SIZE: usize = 64;
 
-/// Initial rolling-hash value used by donor `ZSTD_ldm_gear_init`:
+/// Initial rolling-hash value used by upstream zstd `ZSTD_ldm_gear_init`:
 /// `state->rolling = ~(U32)0;` — the low 32 bits set, high 32 bits
 /// zero. Splitting this out so callers can re-seed mid-stream
-/// (mirroring donor's behaviour at frame / block boundaries).
+/// (mirroring upstream zstd's behaviour at frame / block boundaries).
 pub(crate) const GEAR_HASH_INIT: u64 = 0xFFFF_FFFF;
 
 /// Gear rolling-hash state — `(rolling, stop_mask)`.
 ///
-/// Mirrors donor `ldmRollingHashState_t` from
+/// Mirrors upstream zstd `ldmRollingHashState_t` from
 /// `lib/compress/zstd_ldm.c:23-26`. Kept `Copy` so the per-block
 /// state can be cheaply snapshotted before a speculative scan.
 #[derive(Copy, Clone, Debug)]
@@ -87,7 +87,7 @@ pub(crate) struct GearHashState {
     /// 64-bit rolling accumulator. Updated as `hash = (hash << 1) +
     /// GEAR_TAB[byte]` for every input byte.
     pub(crate) rolling: u64,
-    /// Donor `stopMask`. A split is registered when
+    /// Upstream zstd `stopMask`. A split is registered when
     /// `(rolling & stop_mask) == 0`.
     pub(crate) stop_mask: u64,
 }
@@ -95,8 +95,8 @@ pub(crate) struct GearHashState {
 impl GearHashState {
     /// Build a fresh state for the requested LDM parameters.
     ///
-    /// Donor: `ZSTD_ldm_gear_init` (`zstd_ldm.c:32`). `min_match_length`
-    /// is clamped to `64` (the donor uses
+    /// Upstream zstd: `ZSTD_ldm_gear_init` (`zstd_ldm.c:32`). `min_match_length`
+    /// is clamped to `64` (the upstream zstd uses
     /// `MIN(params->minMatchLength, 64)` because the hash window can
     /// expose at most 64 useful bits) and the resulting mask sits at
     /// the high end of that window when `hash_rate_log` fits — see
@@ -107,7 +107,7 @@ impl GearHashState {
         // `1u64 << hash_rate_log` would panic at 64. Every
         // production caller routes through `LdmParams::adjust_for`
         // (`hash_rate_log = LDM_HASH_RLOG - strategy/3` → 4..7) or
-        // `window_log - hash_log` (donor-bounded to 0..27), so the
+        // `window_log - hash_log` (upstream zstd-bounded to 0..27), so the
         // clamp is unreachable today; it guards against future
         // callers / param-API misuse picking up the function
         // directly.
@@ -117,7 +117,7 @@ impl GearHashState {
         } else {
             // Degenerate path: simply honour the requested hash rate
             // without trying to bias toward `min_match_length` bits.
-            // Donor `zstd_ldm.c:56`.
+            // Upstream zstd `zstd_ldm.c:56`.
             (1u64 << hash_rate_log) - 1
         };
         Self {
@@ -130,19 +130,19 @@ impl GearHashState {
 /// Feed `min_match_length` bytes through the rolling hash WITHOUT
 /// emitting any splits.
 ///
-/// Donor: `ZSTD_ldm_gear_reset` (`zstd_ldm.c:65`). Used at block
+/// Upstream zstd: `ZSTD_ldm_gear_reset` (`zstd_ldm.c:65`). Used at block
 /// boundaries and after a skip so the rolling window is primed
 /// against the new context before split detection resumes.
 ///
 /// `min_match_length` is named after the parameter that controls it
-/// in the donor — the actual length consumed is `data.len()` capped
-/// implicitly by the caller's bounds (donor requires
+/// in the upstream zstd — the actual length consumed is `data.len()` capped
+/// implicitly by the caller's bounds (upstream zstd requires
 /// `data.len() >= min_match_length`; this Rust port lets the caller
 /// pass an arbitrary slice for unit testing and skip flexibility).
 pub(crate) fn reset(state: &mut GearHashState, data: &[u8]) {
     let mut hash = state.rolling;
     let mut n = 0;
-    // Donor unrolls the inner loop four-wide; we keep the same shape
+    // Upstream zstd unrolls the inner loop four-wide; we keep the same shape
     // so the bounds check fires identically and the per-iteration
     // arithmetic monomorphises to the same instruction sequence on
     // every backend.
@@ -165,18 +165,18 @@ pub(crate) fn reset(state: &mut GearHashState, data: &[u8]) {
 /// data is exhausted or `splits.len()` reaches [`LDM_BATCH_SIZE`].
 ///
 /// Each entry written to `splits` is a 1-based offset *into `data`*
-/// (the byte index just past the split), matching the donor's
+/// (the byte index just past the split), matching the upstream zstd's
 /// `splits[*numSplits] = n` semantics where `n` is the post-increment
 /// byte count.
 ///
 /// Returns `(bytes_consumed, splits_written)`. The caller is expected
 /// to advance its input cursor by `bytes_consumed` and re-call when
-/// the previous batch has been drained — exactly the donor's outer
+/// the previous batch has been drained — exactly the upstream zstd's outer
 /// loop in `ZSTD_ldm_generateSequences_internal`.
 ///
 /// # Panics
 ///
-/// Panics if `splits` is shorter than [`LDM_BATCH_SIZE`] — the donor
+/// Panics if `splits` is shorter than [`LDM_BATCH_SIZE`] — the upstream zstd
 /// pre-condition is that the array has at least `LDM_BATCH_SIZE` slots
 /// reserved, and feeding into a shorter buffer would silently drop
 /// splits.
@@ -184,17 +184,17 @@ pub(crate) fn feed(state: &mut GearHashState, data: &[u8], splits: &mut [usize])
     assert!(
         splits.len() >= LDM_BATCH_SIZE,
         "splits buffer must hold at least LDM_BATCH_SIZE entries \
-         (donor pre-condition: zstd_ldm.c:96)"
+         (upstream zstd pre-condition: zstd_ldm.c:96)"
     );
     let mut hash = state.rolling;
     let mask = state.stop_mask;
     let mut n: usize = 0;
     let mut num_splits: usize = 0;
 
-    // 4-wide unrolled head. Donor `zstd_ldm.c:118-123`. Each iteration
+    // 4-wide unrolled head. Upstream zstd `zstd_ldm.c:118-123`. Each iteration
     // increments `n` first, then tests the post-update hash so the
     // split index points to the byte AFTER the matched window — this
-    // matches `splits[*numSplits] = n` in donor (n already
+    // matches `splits[*numSplits] = n` in upstream zstd (n already
     // incremented).
     while n + 3 < data.len() {
         hash = (hash << 1).wrapping_add(GEAR_TAB[data[n] as usize]);
@@ -238,7 +238,7 @@ pub(crate) fn feed(state: &mut GearHashState, data: &[u8], splits: &mut [usize])
             }
         }
     }
-    // Tail loop for the remaining 0..3 bytes. Donor `zstd_ldm.c:124-126`.
+    // Tail loop for the remaining 0..3 bytes. Upstream zstd `zstd_ldm.c:124-126`.
     while n < data.len() {
         hash = (hash << 1).wrapping_add(GEAR_TAB[data[n] as usize]);
         n += 1;
@@ -255,10 +255,10 @@ pub(crate) fn feed(state: &mut GearHashState, data: &[u8], splits: &mut [usize])
     (n, num_splits)
 }
 
-/// 256-entry random-permutation table from donor
+/// 256-entry random-permutation table from upstream zstd
 /// `lib/compress/zstd_ldm_geartab.h`. Reproduced verbatim — DO NOT
 /// REGENERATE: byte-parity of split points (and therefore LDM ratio
-/// parity vs upstream) depends on every entry matching the donor
+/// parity vs upstream) depends on every entry matching the upstream zstd
 /// value exactly.
 #[rustfmt::skip]
 pub(crate) const GEAR_TAB: [u64; 256] = [
@@ -359,42 +359,42 @@ mod tests {
     /// anchors regress every downstream LDM split point drifts
     /// relative to upstream output.
     ///
-    /// Indices were cross-verified by parsing donor
+    /// Indices were cross-verified by parsing upstream zstd
     /// `lib/compress/zstd_ldm_geartab.h` and computing each entry's
-    /// positional index (donor layout: 3 entries per source line
+    /// positional index (upstream zstd layout: 3 entries per source line
     /// starting at line 18, except the final line which holds the
     /// 256th element). The full 256-entry table was also
-    /// byte-compared against the parsed donor at build time during
+    /// byte-compared against the parsed upstream zstd at build time during
     /// the port (zero mismatches).
     #[test]
-    fn gear_tab_anchor_entries_match_donor_geartab_header() {
-        // First entry (donor zstd_ldm_geartab.h:18).
+    fn gear_tab_anchor_entries_match_known_geartab_header() {
+        // First entry (upstream zstd zstd_ldm_geartab.h:18).
         assert_eq!(GEAR_TAB[0], 0xf5b8f72c5f77775c, "GEAR_TAB[0]");
-        // Mid-table anchor (donor row 14 col 0 → index 42).
+        // Mid-table anchor (upstream zstd row 14 col 0 → index 42).
         assert_eq!(GEAR_TAB[42], 0x869cb54a8749c161, "GEAR_TAB[42]");
-        // Three-quarter anchor (donor row 26 col 2 → index 80).
+        // Three-quarter anchor (upstream zstd row 26 col 2 → index 80).
         assert_eq!(GEAR_TAB[80], 0x3bed519cbcb4e1e1, "GEAR_TAB[80]");
-        // Last entry: index 255 (donor zstd_ldm_geartab.h:103).
+        // Last entry: index 255 (upstream zstd zstd_ldm_geartab.h:103).
         assert_eq!(GEAR_TAB[255], 0x2b4da14f2613d8f4, "GEAR_TAB[255]");
     }
 
     /// `stop_mask` derivation under the *common* parameter set
-    /// (`min_match_length = 64`, `hash_rate_log = 7`): donor
+    /// (`min_match_length = 64`, `hash_rate_log = 7`): upstream zstd
     /// `zstd_ldm.c:52-53` produces
     /// `(((1 << 7) - 1)) << (64 - 7) = 0x7F << 57 = 0xFE00_0000_0000_0000`.
     #[test]
-    fn stop_mask_default_params_matches_donor_high_bit_window() {
+    fn stop_mask_default_params_use_high_bit_window() {
         let state = GearHashState::new(LDM_MIN_MATCH_LENGTH, LDM_HASH_RLOG);
         assert_eq!(
             state.stop_mask, 0xFE00_0000_0000_0000,
             "default stop_mask must put the 7 active bits at the \
-             top of the 64-bit window (donor zstd_ldm.c:52-53)"
+             top of the 64-bit window (upstream zstd zstd_ldm.c:52-53)"
         );
         assert_eq!(state.rolling, GEAR_HASH_INIT);
     }
 
     /// Degenerate path: when `hash_rate_log > min_match_length`
-    /// donor `zstd_ldm.c:55-56` falls back to the low-bit mask
+    /// upstream zstd `zstd_ldm.c:55-56` falls back to the low-bit mask
     /// `(1 << hash_rate_log) - 1` without trying to bias the bits
     /// upward. Guards against silent drift if the params clamp ever
     /// gets reworked.
@@ -405,13 +405,13 @@ mod tests {
             state.stop_mask,
             (1u64 << 8) - 1,
             "fallback mask must equal (1 << hash_rate_log) - 1 \
-             (donor zstd_ldm.c:56)"
+             (upstream zstd zstd_ldm.c:56)"
         );
     }
 
     /// `hash_rate_log == 0` also lands on the degenerate branch
     /// (`> 0` precondition fails) → mask becomes `0`. Every byte
-    /// then qualifies as a split point. Matches donor behaviour.
+    /// then qualifies as a split point. Matches upstream zstd behaviour.
     #[test]
     fn stop_mask_hash_rate_log_zero_disables_filter() {
         let state = GearHashState::new(LDM_MIN_MATCH_LENGTH, 0);
@@ -419,7 +419,7 @@ mod tests {
     }
 
     /// Verify the rolling update against a hand-traced two-byte
-    /// stream. Donor recurrence is `hash = (hash << 1) +
+    /// stream. Upstream zstd recurrence is `hash = (hash << 1) +
     /// GEAR_TAB[byte]`. Starting from `GEAR_HASH_INIT = 0xFFFF_FFFF`:
     ///
     ///   after byte 0x00:
@@ -472,7 +472,7 @@ mod tests {
     /// `feed` with a zero mask flags every byte as a split. The
     /// number of recorded splits is therefore `min(data.len(),
     /// LDM_BATCH_SIZE)`, the consumed-byte count matches, and each
-    /// `splits[i]` is `i + 1` (donor stores the 1-based post-byte
+    /// `splits[i]` is `i + 1` (upstream zstd stores the 1-based post-byte
     /// offset).
     #[test]
     fn feed_zero_mask_records_split_per_byte_up_to_batch_cap() {
@@ -493,7 +493,7 @@ mod tests {
             assert_eq!(
                 s,
                 i + 1,
-                "donor records 1-based post-byte indices \
+                "upstream zstd records 1-based post-byte indices \
                  (zstd_ldm.c:111); splits[{i}] should be {}",
                 i + 1
             );
@@ -502,7 +502,7 @@ mod tests {
 
     /// Feeding in two consecutive chunks must produce the same
     /// rolling state as feeding the concatenation. Guards against
-    /// state corruption between calls (the donor allows the caller
+    /// state corruption between calls (the upstream zstd allows the caller
     /// to drain its `splits` buffer and resume mid-stream).
     #[test]
     fn feed_concatenation_invariant() {
@@ -528,7 +528,7 @@ mod tests {
         );
     }
 
-    /// `splits` buffer too small must panic — donor pre-condition
+    /// `splits` buffer too small must panic — upstream zstd pre-condition
     /// enforced. Without this assertion a short buffer would
     /// silently truncate at runtime once the inner branches start
     /// indexing past the end.

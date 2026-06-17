@@ -177,7 +177,7 @@ pub struct BitReaderReversed<'s, K: CpuKernel = ScalarKernel> {
     /// position 63 of `bit_container`, before any consumption).
     ///
     /// `pub(crate)` so the HUF 4-stream burst hot loop in
-    /// `decoding::literals_section_decoder` can run donor's
+    /// `decoding::literals_section_decoder` can run upstream zstd's
     /// `ip[s] -= nb_bytes; bits[s] = MEM_read64(ip[s]) | 1` reload
     /// pattern directly against the byte stream — see
     /// [`Self::bits_consumed`] for the broader rationale.
@@ -187,7 +187,7 @@ pub struct BitReaderReversed<'s, K: CpuKernel = ScalarKernel> {
     ///
     /// `pub(crate)` so the HUF 4-stream hot loop in
     /// `decoding::literals_section_decoder` can lift the reader state
-    /// into a local `bits[4]` register layout (donor parity with
+    /// into a local `bits[4]` register layout (upstream zstd parity with
     /// `huf_decompress.c:HUF_decompress4X1_usingDTable_internal_fast_c_loop`):
     /// inside the burst, all symbol-decode work happens against a
     /// `bits[s]` u64 that fuses the decoder state with pending input
@@ -203,7 +203,7 @@ pub struct BitReaderReversed<'s, K: CpuKernel = ScalarKernel> {
     ///
     /// `pub(crate)` — paired with [`Self::index`], the HUF 4-stream
     /// burst hot loop needs direct slice access for the per-iter
-    /// donor-pattern reload (`MEM_read64(source[ip..ip+8])`).
+    /// upstream zstd-pattern reload (`MEM_read64(source[ip..ip+8])`).
     pub(crate) source: &'s [u8],
 
     /// The reader doesn't read directly from the source, it reads bits from here, and the container

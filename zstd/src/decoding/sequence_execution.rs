@@ -3,7 +3,7 @@
 /// before you get a functional number.
 pub(crate) fn do_offset_history(offset_value: u32, lit_len: u32, scratch: &mut [u32; 3]) -> u32 {
     // Fast path: offset_value >= 4 means a fresh (non-repcode) offset, which
-    // is the dominant case for non-trivial corpora. Donor (zstd_decompress_block.c
+    // is the dominant case for non-trivial corpora. Upstream zstd (zstd_decompress_block.c
     // ZSTD_updateRep) special-cases this with a straight shift: rotate the
     // history down and store `offset_value - 3` at slot 0. No rule table, no
     // branchless masks. The slow path below handles repcode 1..=3 with the

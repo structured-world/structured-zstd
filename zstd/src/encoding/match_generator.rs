@@ -25,7 +25,7 @@ use super::cost_model::{HC_BLOCKSIZE_MAX, HC_MAX_LL, HC_MAX_ML, HC_MAX_OFF, HcOp
 use super::dfast::DfastMatchGenerator;
 // FAST_HASH_FILL_STEP test-only re-export was tied to the legacy
 // SuffixStore MatchGenerator's interleaved hash-fill stride. The
-// donor-shape Fast kernel walks ip0 with kSearchStrength step-skip
+// upstream zstd-shape Fast kernel walks ip0 with kSearchStrength step-skip
 // acceleration instead, so the constant has no consumer in the
 // remaining live test set today.
 #[cfg(test)]
@@ -53,16 +53,16 @@ use std::arch::is_aarch64_feature_detected;
 use std::arch::is_x86_feature_detected;
 
 pub(crate) const DFAST_MIN_MATCH_LEN: usize = 5;
-// Bytes the dfast short hash reads (donor `mls = 5`). Seeding / lookahead
+// Bytes the dfast short hash reads (upstream zstd `mls = 5`). Seeding / lookahead
 // guards use it so a position is only short-hashed once its full 5-byte key
 // is in range.
 pub(crate) const DFAST_SHORT_HASH_LOOKAHEAD: usize = 5;
 pub(crate) const ROW_MIN_MATCH_LEN: usize = 5;
-// Donor `clevels.h:31` at level 3 large-input bucket sets
+// Upstream zstd `clevels.h:31` at level 3 large-input bucket sets
 // `hashLog = 17` (the long-hash table) and `chainLog = 16` (the
-// short-hash table — donor names this `chainTable` even though for
+// short-hash table — upstream zstd names this `chainTable` even though for
 // dfast it's used as a plain single-slot hash). Each table holds one
-// `U32` per slot; the donor overwrites on collision and recovers
+// `U32` per slot; the upstream zstd overwrites on collision and recovers
 // compression quality via the inline `_search_next_long` retry
 // (after a short-hash hit, probes `hashLong[hl1]` at `ip + 1` and
 // keeps the longer match).
@@ -74,7 +74,7 @@ pub(crate) const ROW_MIN_MATCH_LEN: usize = 5;
 // exact upstream parity. The `_search_next_long` retry lives in
 // `DfastMatchGenerator::hash_candidate` (called via
 // `best_match`). Earlier revisions kept a
-// 4-slot bucket per hash position; that paid 4× the donor memory
+// 4-slot bucket per hash position; that paid 4× the upstream zstd memory
 // without measurable ratio gain once the retry was in place.
 //
 // `dfast_hash_bits_for_window` still clamps the runtime long-hash
@@ -82,10 +82,10 @@ pub(crate) const ROW_MIN_MATCH_LEN: usize = 5;
 // upper bound rather than a fixed default.
 pub(crate) const DFAST_HASH_BITS: usize = 17;
 /// Difference between `long_hash_bits` and `short_hash_bits` —
-/// donor `hashLog - chainLog` is 1 at every dfast level (`clevels.h`
+/// upstream zstd `hashLog - chainLog` is 1 at every dfast level (`clevels.h`
 /// level 2: 16-15=1; level 3: 17-16=1). The short hash is one bit
 /// smaller than the long hash so the per-bucket footprint matches
-/// donor sizing exactly.
+/// upstream zstd sizing exactly.
 pub(crate) const DFAST_SHORT_HASH_BITS_DELTA: usize = 1;
 /// Sentinel value for an empty slot in the dfast hash tables. Real
 /// positions are stored as `(abs_pos - position_base + 1) as u32`, so
@@ -160,7 +160,7 @@ struct HcConfig {
     chain_log: usize,
     search_depth: usize,
     target_len: usize,
-    /// Binary-tree finder hash width (donor `mls = BOUNDED(4, minMatch, 6)`),
+    /// Binary-tree finder hash width (upstream zstd `mls = BOUNDED(4, minMatch, 6)`),
     /// carried explicitly per level so it is NOT inferred from `target_len`
     /// (a `target_length` override must not silently flip the finder between
     /// 5- and 4-byte hashing). Only the BT body reads it; HC/lazy levels keep
@@ -175,7 +175,7 @@ pub(crate) struct RowConfig {
     pub(crate) row_log: usize,
     pub(crate) search_depth: usize,
     pub(crate) target_len: usize,
-    /// Donor `cParams.minMatch` for the row matcher: the regular-search
+    /// Upstream zstd `cParams.minMatch` for the row matcher: the regular-search
     /// acceptance floor (a row candidate must extend to >= `mls` bytes).
     /// The C-like advanced API surfaces this as the row min-match knob.
     /// `ROW_MIN_MATCH_LEN` (5) is the default; the row hash key width stays
@@ -261,7 +261,7 @@ const ROW_CONFIG: RowConfig = RowConfig {
 
 // Level-5 greedy is the ONLY strategy routed to the Row backend
 // (`StrategyTag::backend`: greedy -> Row; lazy / btopt / btultra* ->
-// HashChain), so it is the only level whose `row:` field is read. The donor
+// HashChain), so it is the only level whose `row:` field is read. The upstream zstd
 // `clevels.h` default row (srcSize > 256 KB) for level 5 is searchLog=3,
 // targetLength=2, from which the row matcher derives:
 //   rowLog       = clamp(searchLog, 4, 6) = 4
@@ -272,7 +272,7 @@ const ROW_CONFIG: RowConfig = RowConfig {
 // 48-byte match. That exhaustive walk was the dominant cost in greedy L5's
 // encode-speed regression vs FFI. `hash_bits` matches upstream zstd's
 // `ZSTD_getCParams(5, .., 0).hashLog` = 19 (verified via
-// `donor_cparams_check 5`), so the row table is the same width as upstream's
+// `cparams_check 5`), so the row table is the same width as upstream's
 // (2^19 slots); the previous `ROW_HASH_BITS` (20) doubled both row tables vs
 // upstream, the dominant peak-memory excess on the greedy band.
 const ROW_L5: RowConfig = RowConfig {
@@ -283,7 +283,7 @@ const ROW_L5: RowConfig = RowConfig {
     mls: ROW_MIN_MATCH_LEN,
 };
 
-// Donor `clevels.h` unbounded defaults for the lazy band, verified via
+// Upstream zstd `clevels.h` unbounded defaults for the lazy band, verified via
 // `ZSTD_getCParams(level, 0, 0)`:
 //   L6  { w21 c18 h19 s3 mml5 t4  lazy  } → rowLog 4, depth 1<<3 = 8
 //   L7  { w21 c19 h20 s4 mml5 t8  lazy  } → rowLog 4, depth 16
@@ -293,9 +293,9 @@ const ROW_L5: RowConfig = RowConfig {
 //   L11 { w22 c21 h22 s6 mml5 t16 lazy2 } → rowLog 6, depth 64
 //   L12 { w22 c22 h23 s6 mml5 t32 lazy2 } → rowLog 6, depth 64
 // `rowLog = clamp(searchLog, 4, 6)`, `depth = 1 << min(searchLog, rowLog)`
-// (same derivation as `ROW_L5` above). `hash_bits` carries the donor
+// (same derivation as `ROW_L5` above). `hash_bits` carries the upstream zstd
 // `hashLog`; the hinted-source clamp in `configure` caps it by the window
-// exactly like the donor `ZSTD_adjustCParams` path.
+// exactly like the upstream zstd `ZSTD_adjustCParams` path.
 const ROW_L6: RowConfig = RowConfig {
     hash_bits: 19,
     row_log: 4,
@@ -346,12 +346,12 @@ const ROW_L12: RowConfig = RowConfig {
     mls: ROW_MIN_MATCH_LEN,
 };
 
-/// Per-level Double-Fast hash sizing, mirroring the donor `clevels.h` columns
+/// Per-level Double-Fast hash sizing, mirroring the upstream zstd `clevels.h` columns
 /// (config-driven, not a hardcoded constant): `long_hash_log` =
 /// `cParams.hashLog` (the long 8-byte hash table), `short_hash_log` =
 /// `cParams.chainLog` (the short hash table dfast repurposes as its
 /// secondary index). Only the Dfast backend reads it, so non-dfast level
-/// rows carry `dfast: None`. `minMatch` stays the donor-fixed `5`
+/// rows carry `dfast: None`. `minMatch` stays the upstream zstd-fixed `5`
 /// (`DFAST_MIN_MATCH_LEN`, used in const contexts).
 #[derive(Copy, Clone, PartialEq, Eq)]
 struct DfastConfig {
@@ -359,7 +359,7 @@ struct DfastConfig {
     short_hash_log: u8,
 }
 
-// Donor clevels.h default row (srcSize > 256 KB): L3 {hashLog 17, chainLog 16},
+// Upstream zstd clevels.h default row (srcSize > 256 KB): L3 {hashLog 17, chainLog 16},
 // L4 {hashLog 18, chainLog 18}.
 const DFAST_L3: DfastConfig = DfastConfig {
     long_hash_log: 17,
@@ -371,8 +371,8 @@ const DFAST_L4: DfastConfig = DfastConfig {
 };
 
 /// Per-level Fast-strategy tuning, only consumed by the `FastKernelMatcher`
-/// (Simple backend): `hash_log` = donor `cParams.hashLog`, `mls` = donor
-/// `cParams.minMatch` (4..=8), `step_size` = donor `stepSize`. Carried as
+/// (Simple backend): `hash_log` = upstream zstd `cParams.hashLog`, `mls` = upstream zstd
+/// `cParams.minMatch` (4..=8), `step_size` = upstream zstd `stepSize`. Carried as
 /// `LevelParams.fast` (`Some` only on Fast level rows; `None` elsewhere).
 #[derive(Copy, Clone, PartialEq, Eq)]
 struct FastConfig {
@@ -442,13 +442,13 @@ impl LevelParams {
     }
 
     /// Cheap fingerprint pre-splitter level, the C-like `blockSplitterLevel`
-    /// knob. Mirrors the donor `splitLevels[]` table indexed by strategy in
+    /// knob. Mirrors the upstream zstd `splitLevels[]` table indexed by strategy in
     /// `ZSTD_optimalBlockSize` (`{0,0,1,2,2,3,3,4,4,4}` over fast..btultra2):
     /// fast=0, dfast=1, greedy=2, lazy=2, lazy2=3, btlazy2=3,
-    /// btopt/btultra/btultra2=4. We collapse the donor `lazy2` and `btlazy2`
+    /// btopt/btultra/btultra2=4. We collapse the upstream zstd `lazy2` and `btlazy2`
     /// strategies into the hash-chain `Lazy` tag, distinguished here by
     /// `lazy_depth` (the level table runs both at depth 2), so depth 2 routes
-    /// to split level 3 to match the donor. `split_level == 0` routes to the
+    /// to split level 3 to match the upstream zstd. `split_level == 0` routes to the
     /// cheap from-borders heuristic; `1..=4` to byChunks with internal
     /// sampling level `split_level - 1`. The `savings >= 3` gate in
     /// `optimal_block_size` keeps incompressible data and the first full block
@@ -522,7 +522,7 @@ fn apply_param_overrides(params: &mut LevelParams, ov: &super::parameters::Param
         }
         SearchMethod::HashChain | SearchMethod::BinaryTree => {
             // A `Btlazy2` strategy override moved off a non-HC row needs the
-            // BT 5-byte finder hash (donor minMatch 5); other synthesized HC
+            // BT 5-byte finder hash (upstream zstd minMatch 5); other synthesized HC
             // rows keep the 4-byte default. An explicit `min_match` override
             // below refines this further.
             params.hc.get_or_insert(HcConfig {
@@ -543,7 +543,7 @@ fn apply_param_overrides(params: &mut LevelParams, ov: &super::parameters::Param
     }
 
     // 4. Per-backend numeric knobs map into the active config, mirroring
-    //    the donor `cParams` -> matcher translation documented on each
+    //    the upstream zstd `cParams` -> matcher translation documented on each
     //    config struct.
     match params.search {
         SearchMethod::Fast => {
@@ -579,7 +579,7 @@ fn apply_param_overrides(params: &mut LevelParams, ov: &super::parameters::Param
                     row.hash_bits = hash_log as usize;
                 }
                 if let Some(search_log) = ov.search_log {
-                    // Donor: rowLog = clamp(searchLog, 4, 6);
+                    // Upstream zstd: rowLog = clamp(searchLog, 4, 6);
                     //        nbAttempts = 1 << min(searchLog, rowLog).
                     let row_log = (search_log as usize).clamp(4, 6);
                     row.row_log = row_log;
@@ -608,7 +608,7 @@ fn apply_param_overrides(params: &mut LevelParams, ov: &super::parameters::Param
                     hc.target_len = target_length as usize;
                 }
                 if let Some(min_match) = ov.min_match {
-                    // Donor `mls = BOUNDED(4, cParams.minMatch, 6)`: a BT
+                    // Upstream zstd `mls = BOUNDED(4, cParams.minMatch, 6)`: a BT
                     // min_match override maps into the finder hash width. Only
                     // the BT body reads `search_mls`; HC/lazy keep 4-byte
                     // hashing regardless, so this is a no-op for them.
@@ -619,7 +619,7 @@ fn apply_param_overrides(params: &mut LevelParams, ov: &super::parameters::Param
     }
 }
 
-/// Map the resolved runtime strategy to the donor LDM strategy ordinal
+/// Map the resolved runtime strategy to the upstream zstd LDM strategy ordinal
 /// (1..=9) that [`super::ldm::params::LdmParams::adjust_for`] expects.
 /// The collapsed `Lazy` tag splits on `lazy_depth` (lazy = 4, lazy2 = 5).
 #[cfg(feature = "hash")]
@@ -636,7 +636,7 @@ fn ldm_strategy_ordinal(tag: super::strategy::StrategyTag, lazy_depth: u8) -> u3
                 4
             }
         }
-        // Donor `ZSTD_btlazy2` ordinal.
+        // Upstream zstd `ZSTD_btlazy2` ordinal.
         StrategyTag::Btlazy2 => 6,
         StrategyTag::BtOpt => 7,
         StrategyTag::BtUltra => 8,
@@ -661,7 +661,7 @@ pub(crate) fn source_size_ceil_log(size: u64) -> u8 {
     }
 }
 
-/// Donor `ZSTD_shouldAttachDict` cutoff for the Fast strategy, as a ceil-log
+/// Upstream zstd `ZSTD_shouldAttachDict` cutoff for the Fast strategy, as a ceil-log
 /// bucket: 8 KiB = `2^13`, and `bucket <= 13` is exactly `hint <= 8192` because
 /// the bucket is monotone in the hint. A hint at or below this (or unknown,
 /// `None`) ATTACHES the dictionary (a separate immutable table); a larger hint
@@ -669,7 +669,7 @@ pub(crate) fn source_size_ceil_log(size: u64) -> u8 {
 /// the primed-snapshot key) and `prime_with_dictionary` (which acts on it).
 const FAST_ATTACH_DICT_CUTOFF_LOG: u8 = 13;
 
-/// Dfast counterpart of [`FAST_ATTACH_DICT_CUTOFF_LOG`]: donor
+/// Dfast counterpart of [`FAST_ATTACH_DICT_CUTOFF_LOG`]: upstream zstd
 /// `ZSTD_dictMatchState` attach cutoff for the double-fast strategy is 16 KiB
 /// (`2^14`), so small / unknown-size inputs ATTACH (separate immutable dict
 /// long+short tables + dual-probe in `start_matching_fast_loop`) and larger
@@ -680,7 +680,7 @@ const FAST_ATTACH_DICT_CUTOFF_LOG: u8 = 13;
 const DFAST_ATTACH_DICT_CUTOFF_LOG: u8 = 14;
 
 /// `ZSTD_dictMatchState` attach cutoff for the Row (greedy/lazy) strategy is
-/// 32 KiB (`2^15`, donor `attachDictSizeCutoffs`): small / unknown-size inputs
+/// 32 KiB (`2^15`, upstream zstd `attachDictSizeCutoffs`): small / unknown-size inputs
 /// ATTACH the dict into the separate immutable row index (bounded dual-probe in
 /// `row_candidate_rl`), larger known-size inputs dense-COPY into the live rows.
 const ROW_ATTACH_DICT_CUTOFF_LOG: u8 = 15;
@@ -695,7 +695,7 @@ const HC_ATTACH_DICT_CUTOFF_LOG: u8 = 15;
 /// BT/optimal attach cutoff for `btlazy2` + `btopt`: 32 KiB (`2^15`, upstream
 /// zstd `attachDictSizeCutoffs[ZSTD_btlazy2]` == `[ZSTD_btopt]`). Small /
 /// unknown-size inputs ATTACH the dict as a separate DUBT dms; larger known-size
-/// inputs COPY the dict into the LIVE binary tree (donor
+/// inputs COPY the dict into the LIVE binary tree (upstream zstd
 /// `ZSTD_resetCCtx_byCopyingCDict`).
 const BT_OPT_ATTACH_DICT_CUTOFF_LOG: u8 = 15;
 
@@ -706,7 +706,7 @@ const BT_OPT_ATTACH_DICT_CUTOFF_LOG: u8 = 15;
 const BT_ULTRA_ATTACH_DICT_CUTOFF_LOG: u8 = 13;
 
 // Source-size cap for the dfast hash bits when a size hint is present: a tiny
-// input needs no larger hash than its window. The donor `cParams.hashLog` /
+// input needs no larger hash than its window. The upstream zstd `cParams.hashLog` /
 // `chainLog` (from `DfastConfig`) caps it from above at the call site.
 fn dfast_hash_bits_for_window(max_window_size: usize) -> usize {
     let window_log = (usize::BITS - 1 - max_window_size.leading_zeros()) as usize;
@@ -714,19 +714,19 @@ fn dfast_hash_bits_for_window(max_window_size: usize) -> usize {
 }
 
 fn row_hash_bits_for_window(max_window_size: usize) -> usize {
-    // Donor `ZSTD_adjustCParams_internal` cap: `hashLog <= windowLog + 1`.
-    // The `+ 1` is load-bearing for L12, whose donor hashLog (23) exceeds
+    // Upstream zstd `ZSTD_adjustCParams_internal` cap: `hashLog <= windowLog + 1`.
+    // The `+ 1` is load-bearing for L12, whose upstream zstd hashLog (23) exceeds
     // its windowLog (22) — a plain `windowLog` cap would shrink the L12
     // table on EVERY hinted reset and split primed snapshots between
     // hinted and unhinted frames that resolve to the identical geometry.
     // No constant upper clamp: the old `ROW_HASH_BITS` (20) ceiling
-    // predates the lazy band moving onto Row (L9-12 carry donor hashLog
+    // predates the lazy band moving onto Row (L9-12 carry upstream zstd hashLog
     // 21-23).
     let window_log = (usize::BITS - 1 - max_window_size.leading_zeros()) as usize;
     (window_log + 1).max(MIN_WINDOW_LOG as usize)
 }
 
-/// `floor(log2(window))` for the HashChain table-log cap (donor
+/// `floor(log2(window))` for the HashChain table-log cap (upstream zstd
 /// `ZSTD_adjustCParams_internal`). The caller clamps the level's `hash_log` /
 /// `chain_log` from above with this so a small hinted input doesn't allocate the
 /// full level's tables.
@@ -739,7 +739,7 @@ fn hc_hash_bits_for_window(max_window_size: usize) -> usize {
 ///
 /// Each entry maps a zstd compression level to the best-available matcher
 /// backend and tuning knobs. High levels map to dedicated parse modes:
-/// btopt (16-17), btultra (18), btultra2 (19-22) — matching donor
+/// btopt (16-17), btultra (18), btultra2 (19-22) — matching upstream zstd
 /// `clevels.h` (level 19 is `ZSTD_btultra2`, not plain btultra).
 ///
 /// Index 0 = level 1, index 21 = level 22.
@@ -753,21 +753,21 @@ const LEVEL_TABLE: [LevelParams; 22] = [
     /* 2 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Fast, search: super::strategy::SearchMethod::Fast, window_log: 20, lazy_depth: 0, fast: Some(FAST_L2), dfast: None, hc: None, row: None },
     /* 3 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Dfast, search: super::strategy::SearchMethod::DoubleFast, window_log: 21, lazy_depth: 1, fast: None, dfast: Some(DFAST_L3), hc: None, row: None },
     /* 4 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Dfast, search: super::strategy::SearchMethod::DoubleFast, window_log: 21, lazy_depth: 1, fast: None, dfast: Some(DFAST_L4), hc: None, row: None },
-    // target_len column for L5..=L15 matches donor cParams.targetLength
-    // from clevels.h table[0] (default — srcSize > 256 KB). Donor uses
+    // target_len column for L5..=L15 matches upstream zstd cParams.targetLength
+    // from clevels.h table[0] (default — srcSize > 256 KB). Upstream zstd uses
     // it as the lazy outer loop's `sufficient_len` (nice-match) threshold.
-    // Inflating it above donor forces the chain walk to complete
+    // Inflating it above upstream zstd forces the chain walk to complete
     // search_depth iterations instead of breaking on the first
     // long-enough match — the dominant cost in the L5..=L15 speed
-    // regression vs FFI (see lazy_band_target_len_matches_donor_default_table).
+    // regression vs FFI (see lazy_band_target_len_matches_default_table).
     /* 5 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Greedy, search: super::strategy::SearchMethod::RowHash, window_log: 21, lazy_depth: 0, fast: None, dfast: None, hc: None, row: Some(ROW_L5) },
-    // L6-12: the donor runs the lazy/lazy2 strategies on the ROW-based
+    // L6-12: the upstream zstd runs the lazy/lazy2 strategies on the ROW-based
     // match finder by default (`ZSTD_resolveRowMatchFinderMode`: row mode
     // is on for greedy..lazy2 whenever SIMD is available) — a bounded
     // SIMD tag scan per row instead of a pointer-chasing hash-chain walk.
     // Our HashChain walk on these levels was ~75% of L10 wall time on the
     // 1 MiB corpus (dependent chain-table loads). Same `RowConfig`
-    // derivation as `ROW_L5` above, donor values per level in the
+    // derivation as `ROW_L5` above, upstream zstd values per level in the
     // `ROW_L6..ROW_L12` comment block.
     /* 6 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::RowHash, window_log: 21, lazy_depth: 1, fast: None, dfast: None, hc: None, row: Some(ROW_L6) },
     /* 7 */ LevelParams { strategy_tag: super::strategy::StrategyTag::Lazy, search: super::strategy::SearchMethod::RowHash, window_log: 21, lazy_depth: 1, fast: None, dfast: None, hc: None, row: Some(ROW_L7) },
@@ -796,13 +796,13 @@ const LEVEL_TABLE: [LevelParams; 22] = [
     /*22 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, search: super::strategy::SearchMethod::BinaryTree, window_log: 27, lazy_depth: 2, fast: None, dfast: None, hc: Some(BTULTRA2_HC_CONFIG_L22), row: None },
 ];
 
-/// Donor `minSrcSize` assumption when building a dictionary's prepared cParams
+/// Upstream zstd `minSrcSize` assumption when building a dictionary's prepared cParams
 /// with an unknown source (`zstd_compress.c` `ZSTD_adjustCParams_internal`,
 /// `ZSTD_cpm_createCDict`: `if (dictSize && srcSize == UNKNOWN) srcSize =
 /// minSrcSize` where `minSrcSize = (1<<9) + 1`). Used by [`cdict_table_logs`].
 const DICT_MIN_SRC_SIZE: u64 = 513;
 
-/// Donor `ZSTD_dictAndWindowLog` (`zstd_compress.c`): the window log large
+/// Upstream zstd `ZSTD_dictAndWindowLog` (`zstd_compress.c`): the window log large
 /// enough to address both the source and the dictionary, used when downsizing
 /// the hash / chain logs for a dictionary-bearing compress. `window_log` is the
 /// (already source-clamped) compress window; `src_size` / `dict_size` are the
@@ -825,10 +825,10 @@ fn dict_and_window_log(window_log: u8, src_size: u64, dict_size: u64) -> u32 {
     }
 }
 
-/// Donor `ZSTD_createCDict` table geometry: the `(hash_log, chain_log)` a
+/// Upstream zstd `ZSTD_createCDict` table geometry: the `(hash_log, chain_log)` a
 /// dictionary's prepared match-finder tables get, mirroring
 /// `ZSTD_adjustCParams_internal` under `ZSTD_cpm_createCDict`. A dictionary
-/// supplies the long matches, so donor downsizes the table widths toward the
+/// supplies the long matches, so upstream zstd downsizes the table widths toward the
 /// dict-and-window log (assuming a `minSrcSize` source) while the live window
 /// stays source-sized. `window_log` is the resolved compress window; `hash_log`
 /// / `chain_log` are the level's own widths; `uses_bt` selects the binary-tree
@@ -843,7 +843,7 @@ fn cdict_table_logs(
     let dict_size = dict_size as u64;
     // createCDict assumes a minSrcSize source when the real size is unknown.
     let src_size = DICT_MIN_SRC_SIZE;
-    // Source-size window resize (donor caps windowLog by ceil_log2(src+dict)).
+    // Source-size window resize (upstream zstd caps windowLog by ceil_log2(src+dict)).
     // Plain `+`: src_size is the tiny DICT_MIN_SRC_SIZE constant and dict_size
     // is a real dictionary length, so the u64 sum cannot overflow.
     let tsize = src_size + dict_size;
@@ -908,7 +908,7 @@ fn adjust_params_for_source_size(mut params: LevelParams, src_size: u64) -> Leve
     // level table uses, so the load factor (and match quality) is unchanged.
     // The Dfast backend derives its table widths from the source in `reset`
     // (`set_hash_bits` recomputes there), so it is not adjusted here. The Row
-    // backend's width IS capped here, mirroring the donor (see the Row branch).
+    // backend's width IS capped here, mirroring the upstream zstd (see the Row branch).
     let table_log = raw_src_log.max(MIN_WINDOW_LOG);
     let backend = params.backend();
     if backend == super::strategy::BackendTag::HashChain {
@@ -1071,8 +1071,8 @@ fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> Le
             // decoder-side buffer reservation. Stay at 17 (128 KiB).
             window_log: 17,
             lazy_depth: 0,
-            // Beyond-donor: hash_log=14 (vs donor's 13) for 2× fewer
-            // collisions on structured corpora. Donor's "base for negative"
+            // Beyond-upstream zstd: hash_log=14 (vs upstream zstd's 13) for 2× fewer
+            // collisions on structured corpora. Upstream zstd's "base for negative"
             // row has targetLength=1 → step_size = 1 + 0 + 1 = 2.
             fast: Some(FastConfig {
                 hash_log: 14,
@@ -1114,25 +1114,25 @@ fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> Le
                 // Level 0 = default, matching C zstd semantics.
                 LEVEL_TABLE[CompressionLevel::DEFAULT_LEVEL as usize - 1]
             } else {
-                // Negative levels — donor sets
+                // Negative levels — upstream zstd sets
                 // targetLength = -level (clampedCompressionLevel),
                 // yielding step_size = (-level) + 1 since
                 // !(targetLength) = 0 when targetLength > 0.
                 // So L-1..L-7 get step_size 2..8. Acceleration
                 // gradient comes from larger step skipping more
                 // positions per iter (faster, worse ratio).
-                // Clamp to donor's MIN_LEVEL before negating so
+                // Clamp to upstream zstd's MIN_LEVEL before negating so
                 // i32::MIN can't overflow on `-n`.
                 let clamped = n.max(CompressionLevel::MIN_LEVEL);
                 let target_length = (-clamped) as usize;
                 let step_size = target_length + 1;
-                // Donor row-0 ("base for negative", clevels.h srcSize>256KB):
+                // Upstream zstd row-0 ("base for negative", clevels.h srcSize>256KB):
                 // hashLog=13, minMatch=7. The 32 KiB hash table (2^13 * 4B)
                 // is L1d-resident on contemporary cores, so every probe is an
                 // L1 hit; hashLog=14 (64 KiB) overflows a 32 KiB L1d and turns
                 // each probe into an L2 access. minMatch=7 (vs 6) skips
                 // short-distance 6-byte matches: fewer sequences, less
-                // extension/emit work, and parity with the donor's negative
+                // extension/emit work, and parity with the upstream zstd's negative
                 // ladder on both ratio and throughput.
                 LevelParams {
                     strategy_tag: super::strategy::StrategyTag::Fast,
@@ -1196,23 +1196,23 @@ pub(crate) fn level_pre_split(level: CompressionLevel) -> Option<usize> {
 /// changes.
 #[derive(Clone)]
 enum MatcherStorage {
-    /// Donor `ZSTD_fast` family. Constructed by
+    /// Upstream zstd `ZSTD_fast` family. Constructed by
     /// [`MatchGeneratorDriver::new`] as the initial variant and
     /// re-selected by [`Matcher::reset`] for any [`CompressionLevel`]
     /// that `resolve_level_params` maps to [`StrategyTag::Fast`]
     /// (`Uncompressed`, `Fastest`, `Level(1)`, and any non-positive
     /// `Level(n)` not equal to `0`).
     Simple(FastKernelMatcher),
-    /// Donor `ZSTD_dfast` family — two-table hash chain. Selected for
+    /// Upstream zstd `ZSTD_dfast` family — two-table hash chain. Selected for
     /// any level that resolves to [`StrategyTag::Dfast`] in
     /// `resolve_level_params` (`Default`, `Level(0)`, `Level(2)`,
     /// `Level(3)`).
     Dfast(DfastMatchGenerator),
-    /// Donor `ZSTD_greedy` family with row hashing. Selected for any
+    /// Upstream zstd `ZSTD_greedy` family with row hashing. Selected for any
     /// level that resolves to [`StrategyTag::Greedy`] (currently
     /// `Level(4)` only).
     Row(RowMatchGenerator),
-    /// Donor `ZSTD_lazy2` and the BT-based optimal modes
+    /// Upstream zstd `ZSTD_lazy2` and the BT-based optimal modes
     /// (`btopt` / `btultra` / `btultra2`). Selected for any level that
     /// resolves to [`StrategyTag::Lazy`], [`StrategyTag::BtOpt`],
     /// [`StrategyTag::BtUltra`], or [`StrategyTag::BtUltra2`]
@@ -1303,15 +1303,15 @@ pub struct MatchGeneratorDriver {
     source_size_hint: Option<u64>,
     // Dictionary content size for the next frame (set via set_dictionary_size_hint,
     // consumed on reset). When present on a binary-tree / hash-chain backend, the
-    // match-finder hash/chain tables are sized from the DICTIONARY (donor CDict
+    // match-finder hash/chain tables are sized from the DICTIONARY (upstream zstd CDict
     // economics: a loaded dictionary supplies the long matches, so the live tables
     // can shrink to the dict's size tier) while the eviction window stays
-    // source-sized. Mirrors donor `ZSTD_getCParamRowSize`, which picks the cParams
+    // source-sized. Mirrors upstream zstd `ZSTD_getCParamRowSize`, which picks the cParams
     // table column from `dictSize` for a dictionary-bearing compress.
     dictionary_size_hint: Option<usize>,
     // Normalized `ceil_log2` bucket of the frame's source-size hint, captured at
     // `reset` (where `source_size_hint` is consumed) via [`source_size_ceil_log`].
-    // `None` means the frame was unhinted. Drives `prime_with_dictionary`'s donor
+    // `None` means the frame was unhinted. Drives `prime_with_dictionary`'s upstream zstd
     // `ZSTD_shouldAttachDict` mode for the Simple/Fast backend: `None` (unknown)
     // or `<= FAST_ATTACH_DICT_CUTOFF_LOG` → attach (separate dict table, 2-cursor
     // `compress_block_fast_dict`); larger → copy (dictionary primed into the live
@@ -1343,7 +1343,7 @@ pub struct MatchGeneratorDriver {
     /// the driver-level `dictionary_retained_budget`, the only two pieces
     /// `prime_with_dictionary` writes. Subsequent frames restore this
     /// (a table memcpy) instead of re-hashing every dictionary position,
-    /// mirroring donor `ZSTD_compressBegin_usingCDict` copying the
+    /// mirroring upstream zstd `ZSTD_compressBegin_usingCDict` copying the
     /// precomputed `cdict->matchState`. Invalidated when the dictionary
     /// changes; keyed by the [`PrimedKey`] resolved matcher shape so a snapshot
     /// is only restored into a reset that produces the same matcher — see
@@ -1360,7 +1360,7 @@ pub struct MatchGeneratorDriver {
 /// table-width derived from the hint's ceil-log bucket. The mapping from hint
 /// to resolved shape is many-to-one: the source-size adjustment is monotone in
 /// `ceil_log2(hint)`, and Level 22 additionally collapses several buckets onto
-/// one donor tier (its `<= 16/128/256 KiB` thresholds). Keying on the raw hint
+/// one upstream zstd tier (its `<= 16/128/256 KiB` thresholds). Keying on the raw hint
 /// (or even its ceil-log bucket) therefore over-keys — two hints that resolve
 /// to the identical matcher would each force a full re-prime. Keying on the
 /// resolved (`params`, `table_bits`) pair restores across them.
@@ -1466,7 +1466,7 @@ impl MatchGeneratorDriver {
                 window_log_init,
                 FAST_LEVEL_1_HASH_LOG,
                 FAST_LEVEL_1_MLS,
-                2, // donor default step_size (targetLength=0 → step=2)
+                2, // upstream zstd default step_size (targetLength=0 → step=2)
             )),
             strategy_tag: super::strategy::StrategyTag::Fast,
             search: super::strategy::SearchMethod::Fast,
@@ -1778,7 +1778,7 @@ impl MatchGeneratorDriver {
             match self.active_backend() {
                 super::strategy::BackendTag::Simple => {
                     // FastKernelMatcher owns its history as a single
-                    // flat `Vec<u8>` (donor's flat-buffer layout)
+                    // flat `Vec<u8>` (upstream zstd's flat-buffer layout)
                     // rather than the legacy per-block `WindowEntry`
                     // stack. There are no per-block Vec allocations
                     // to recycle into `vec_pool` — `trim_to_window`
@@ -1877,7 +1877,7 @@ impl MatchGeneratorDriver {
     fn skip_matching_for_dictionary_priming(&mut self) {
         match self.active_backend() {
             super::strategy::BackendTag::Simple => {
-                // Donor `ZSTD_shouldAttachDict` mode selection for the Fast
+                // Upstream zstd `ZSTD_shouldAttachDict` mode selection for the Fast
                 // strategy (cutoff 8 KB): small / unknown-size inputs ATTACH
                 // (index dict positions into a SEPARATE immutable table; the
                 // dual-probe 2-cursor `compress_block_fast_dict` then prefers
@@ -1885,7 +1885,7 @@ impl MatchGeneratorDriver {
                 // that wins small/unknown). Large known-size inputs COPY (prime
                 // dict into the live table; the 4-cursor `compress_block_fast`
                 // matches against it as window history — the path that already
-                // matches/beats the donor on large corpora). The dispatch in
+                // matches/beats the upstream zstd on large corpora). The dispatch in
                 // `start_matching` keys off `dict_table.is_some()`, which only
                 // the attach path populates. See [`FAST_ATTACH_DICT_CUTOFF_LOG`].
                 let attach = self
@@ -1899,7 +1899,7 @@ impl MatchGeneratorDriver {
                 self.recycle_simple_space();
             }
             super::strategy::BackendTag::Dfast => {
-                // Donor `ZSTD_dictMatchState` mode selection for dfast (cutoff
+                // Upstream zstd `ZSTD_dictMatchState` mode selection for dfast (cutoff
                 // 16 KiB): small / unknown-size inputs ATTACH (build the
                 // separate immutable dict long+short tables; the dual-probe
                 // `start_matching_fast_loop` searches live + dict, the path that
@@ -1920,7 +1920,7 @@ impl MatchGeneratorDriver {
                 }
             }
             super::strategy::BackendTag::Row => {
-                // Donor `ZSTD_RowFindBestMatch` `dictMatchState`: small /
+                // Upstream zstd `ZSTD_RowFindBestMatch` `dictMatchState`: small /
                 // unknown-size inputs ATTACH (build the separate immutable dict
                 // row index; the bounded dual-probe in `row_candidate_rl`
                 // searches live + dict, avoiding the per-frame dict re-index),
@@ -1937,7 +1937,7 @@ impl MatchGeneratorDriver {
                 }
             }
             super::strategy::BackendTag::HashChain => {
-                // Lazy-HC AND BT/optimal both follow donor `ZSTD_shouldAttachDict`
+                // Lazy-HC AND BT/optimal both follow upstream zstd `ZSTD_shouldAttachDict`
                 // per-strategy: ATTACH (a separate dms — hash-chain dms for lazy,
                 // DUBT dms for BT) for small / unknown inputs, COPY (merge the dict
                 // into the live chain/tree) for large known inputs. ATTACH keeps
@@ -2056,10 +2056,10 @@ impl Matcher for MatchGeneratorDriver {
                 }
             }
         }
-        // Dictionary-driven table sizing — parity with donor `ZSTD_createCDict`
+        // Dictionary-driven table sizing — parity with upstream zstd `ZSTD_createCDict`
         // (`ZSTD_getCParams_internal(level, UNKNOWN, dictSize, ZSTD_cpm_createCDict)`
         // → `ZSTD_adjustCParams_internal`). A loaded dictionary supplies the
-        // long-distance matches, so donor sizes the prepared match-finder tables
+        // long-distance matches, so upstream zstd sizes the prepared match-finder tables
         // to the DICTIONARY (assuming a `minSrcSize` source), not the live
         // window: it downsizes `hashLog`/`chainLog` toward the dict-and-window
         // log while leaving the frame's eviction `window_log` source-derived so
@@ -2071,7 +2071,7 @@ impl Matcher for MatchGeneratorDriver {
         // widths from the source window in their `reset` arms.
         // A zero-length dictionary is "no dictionary": running the CDict sizing
         // path for `Some(0)` is not a no-op — `cdict_table_logs(.., 0)` still
-        // collapses the HC/BT tables toward the 513-byte donor tier via
+        // collapses the HC/BT tables toward the 513-byte upstream zstd tier via
         // `DICT_MIN_SRC_SIZE`, tanking ratio/perf on the next frame. Priming
         // already treats empty content as empty, so skip the downsizing here too.
         if let Some(dict_size) = dict_hint.filter(|&size| size > 0) {
@@ -2162,7 +2162,7 @@ impl Matcher for MatchGeneratorDriver {
                 None => row.hash_bits,
             };
             // Row-backed levels carry only `hash_bits`; the HC chain table they
-            // fall back to follows the donor cParams relationship `chainLog =
+            // fall back to follows the upstream zstd cParams relationship `chainLog =
             // hashLog - 1` for every Row level (L6 c18 h19 .. L12 c22 h23, see
             // the ROW_L* tables). Synthesise the chain width as `hash_bits - 1`
             // so the dict path doesn't leave the chain table one bit too wide
@@ -2179,7 +2179,7 @@ impl Matcher for MatchGeneratorDriver {
             // the native HC dict path, which feeds the override-applied
             // `base_hc.chain_log` into `cdict_table_logs`. Use the explicit
             // override (also API-validated to ZSTD_CHAINLOG_MIN = 6) when set,
-            // else the donor `hashLog - 1` relationship.
+            // else the upstream zstd `hashLog - 1` relationship.
             let explicit_chain_log = self
                 .param_overrides
                 .filter(|ov| !ov.is_empty())
@@ -2202,7 +2202,7 @@ impl Matcher for MatchGeneratorDriver {
             // No-dict path: the HashChain reset arm only clamps the logs to the
             // window when `hinted`, but a public `window_log` override can lower
             // this level to <= 14 with no source hint — clamp the level's full
-            // Row `hash_bits` to the window here too (donor `ZSTD_adjustCParams`:
+            // Row `hash_bits` to the window here too (upstream zstd `ZSTD_adjustCParams`:
             // hashLog <= windowLog + 1, chainLog <= windowLog) so a 16 KiB window
             // doesn't allocate Row-sized HC tables.
             if dict_hint.filter(|&size| size > 0).is_none() {
@@ -2287,7 +2287,7 @@ impl Matcher for MatchGeneratorDriver {
                 super::strategy::BackendTag::Simple => {
                     // Per-level Fast cParams from resolve_level_params:
                     // Level(1) gets (hash_log=14, mls=7); Level(-7..=-1)
-                    // get donor row-0 (hash_log=13, mls=7); Fastest /
+                    // get upstream zstd row-0 (hash_log=13, mls=7); Fastest /
                     // Uncompressed keep (hash_log=14, mls=6). See
                     // resolve_level_params for rationale.
                     let fast = params.fast.expect("Fast level row carries a FastConfig");
@@ -2400,7 +2400,7 @@ impl Matcher for MatchGeneratorDriver {
                 let dcfg = params
                     .dfast
                     .expect("Dfast level row must carry a DfastConfig");
-                // Donor `cParams.hashLog`/`chainLog`, capped by the
+                // Upstream zstd `cParams.hashLog`/`chainLog`, capped by the
                 // source-size window when hinted so tiny inputs don't
                 // over-allocate.
                 let long_bits = if hinted {
@@ -2426,7 +2426,7 @@ impl Matcher for MatchGeneratorDriver {
                 let mut row_cfg = params.row.expect("Row level row carries a RowConfig");
                 if hinted {
                     // Clamp the configured hash width by the hinted window
-                    // (donor `ZSTD_adjustCParams` caps hashLog by windowLog) —
+                    // (upstream zstd `ZSTD_adjustCParams` caps hashLog by windowLog) —
                     // `min`, not replace, so an explicit `hash_log` param
                     // override (`row_cfg.hash_bits`) survives the hinted path
                     // instead of being overwritten by the window value.
@@ -2455,7 +2455,7 @@ impl Matcher for MatchGeneratorDriver {
                 hc.hc.lazy_depth = params.lazy_depth;
                 let mut hc_cfg = params.hc.expect("HashChain level row carries an HcConfig");
                 // Cap the hash / chain table logs by the hinted window so a small
-                // input doesn't allocate the full level's tables (the donor
+                // input doesn't allocate the full level's tables (the upstream zstd
                 // `ZSTD_adjustCParams_internal` clamp: `hashLog <= windowLog + 1`,
                 // and `cycleLog <= windowLog` — `cycleLog == chainLog` for the HC
                 // finder, `chainLog - 1` for the BT pair table, so `chainLog <=
@@ -2463,7 +2463,7 @@ impl Matcher for MatchGeneratorDriver {
                 // `2^wlog` bytes holds at most `2^wlog` positions, so the slots
                 // beyond that are never populated — capping only sheds unused
                 // allocation. Was the source of L10-lazy peak-alloc ~2.15x the
-                // donor on a 1 MiB input. Only applied when hinted; an
+                // upstream zstd on a 1 MiB input. Only applied when hinted; an
                 // unknown-size stream keeps the full level tables.
                 // Skip for dict-bearing frames: their `hc_cfg.{hash,chain}_log`
                 // were already sized to the dictionary content tier via
@@ -2493,7 +2493,7 @@ impl Matcher for MatchGeneratorDriver {
                 });
                 // When the source size is known, pre-size the history mirror to
                 // the expected total (dictionary + payload) so per-block growth
-                // does not overshoot via Vec capacity doubling (donor sizes its
+                // does not overshoot via Vec capacity doubling (upstream zstd sizes its
                 // window buffer exactly). Dominates peak once the match-finder
                 // tables are dictionary-tier-small. Unhinted streams skip this
                 // and keep doubling growth.
@@ -2525,7 +2525,7 @@ impl Matcher for MatchGeneratorDriver {
                 .and_then(|ov| ov.ldm)
                 .map(|ldm_ov| {
                     let strategy_ord = ldm_strategy_ordinal(params.strategy_tag, params.lazy_depth);
-                    // Seed the caller-pinned knobs, then run the donor
+                    // Seed the caller-pinned knobs, then run the upstream zstd
                     // derivation over the seed so the remaining (zero)
                     // fields are filled with cross-field consistency
                     // (e.g. `hash_rate_log = window_log - hash_log`).
@@ -2830,7 +2830,7 @@ impl Matcher for MatchGeneratorDriver {
         match (&mut self.storage, snapshot) {
             // Same-variant Fast restore: copy the snapshot into the retained
             // live storage. `clone_from` reuses the history / hash-table /
-            // dict-table buffers, so this is the donor CDict table-copy
+            // dict-table buffers, so this is the upstream zstd CDict table-copy
             // regime's cost (pure copies) instead of a full per-frame
             // allocation + copy + drop cycle.
             (MatcherStorage::Simple(live), MatcherStorage::Simple(snap)) => {
@@ -2839,7 +2839,7 @@ impl Matcher for MatchGeneratorDriver {
             // Same-variant HC lazy/greedy restore (non-BT): the snapshot keeps
             // the full primed hash/chain tables (capture's non-BT full clone),
             // so `clone_from` reuses the live history/hash/chain/dms buffers in
-            // place — donor reuses the CDict tables rather than reallocating
+            // place — upstream zstd reuses the CDict tables rather than reallocating
             // them. This is the per-frame allocate+copy+drop that dominated
             // small `compress-dict` HC frames (5-7x vs C). BT (`uses_bt`)
             // snapshots drop their live tables, so they stay on the realloc
@@ -2908,14 +2908,14 @@ impl Matcher for MatchGeneratorDriver {
             ldm,
         };
         // CDict-equivalent retained state. A binary-tree level in ATTACH mode
-        // decouples the dictionary into `dms` (the donor `dictMatchState`); its
+        // decouples the dictionary into `dms` (the upstream zstd `dictMatchState`); its
         // live hash / chain / hash3 tables carry NO dict entries
         // (`skip_matching_dict_bt` keeps the dict out of the live tree), so they
         // are pure zeros. Storing them in the snapshot wastes the full table
         // footprint (a second window-tier table set resident for the whole
         // compress). Instead, move the live tables OUT of the working storage,
         // clone only the dict-state (history + `dms` + window/offset/dict-limit),
-        // then move the live tables back — the snapshot keeps just what donor's
+        // then move the live tables back — the snapshot keeps just what upstream zstd's
         // CDict keeps, and `restore_primed_dictionary` re-allocates the zeroed
         // live tables. Every other case keeps the dict reachable through the live
         // structure, so the snapshot must retain the full tables (full clone):
@@ -3249,11 +3249,11 @@ impl Matcher for MatchGeneratorDriver {
                     .start_matching(&mut handle_sequence);
             }
             SearchMethod::RowHash => {
-                // Greedy parse (depth 0) = donor-greedy entry (default
+                // Greedy parse (depth 0) = upstream zstd-greedy entry (default
                 // `ip + 1` start, greedy repcode commit); lazy / lazy2 use
                 // the `pick_lazy_match` lookahead entry (reads `lazy_depth`).
                 // Both bare entries dispatch on `row_log` internally into the
-                // const-`ROW_LOG` hot loop (donor per-rowLog variant table).
+                // const-`ROW_LOG` hot loop (upstream zstd per-rowLog variant table).
                 let greedy = self.parse == super::strategy::ParseMode::Greedy;
                 let row = self.row_matcher_mut();
                 if greedy {
@@ -3534,7 +3534,7 @@ macro_rules! bt_insert_step_no_rebase_body {
         let bt_low = $abs_pos.saturating_sub(bt_mask);
         // Hoist the BT pointer-pair base out of `self` once — see the
         // collect-matches body for the full rationale (per-step Vec reload +
-        // bounds check through `&mut self` vs the donor's raw `U32*` walk).
+        // bounds check through `&mut self` vs the upstream zstd's raw `U32*` walk).
         let chain_ptr = $table.chain_table.as_mut_ptr();
         debug_assert_eq!($table.chain_table.len(), 2 << $table.bt_log());
         let window_low = $table.window_low_abs_for_target($target_abs);
@@ -3687,7 +3687,7 @@ pub(crate) use bt_insert_step_no_rebase_body;
 /// (`ACCURATE_PRICE`, `FAVOR_SMALL_OFFSETS`) come from the wrapper's
 /// generic parameter list and are referenced as bare identifiers; macro
 /// hygiene resolves them at the expansion site.
-/// Donor `offBase` for the btlazy2 lazy gain heuristic: a match whose offset
+/// Upstream zstd `offBase` for the btlazy2 lazy gain heuristic: a match whose offset
 /// equals one of the three active repeat offsets prices as the cheap repcode
 /// code (1/2/3); any other offset prices as `offset + 3`. So an equal-length
 /// repeat-offset match always out-gains an explicit-offset one
@@ -3695,7 +3695,7 @@ pub(crate) use bt_insert_step_no_rebase_body;
 #[inline]
 fn btlazy2_offbase(offset: usize, reps: [u32; 3], ll0: bool) -> u32 {
     let o = offset as u32;
-    // Donor repcode mapping shifts by `ll0` (zero-literal position): the cheap
+    // Upstream zstd repcode mapping shifts by `ll0` (zero-literal position): the cheap
     // codes become rep1 / rep2 / (rep0 - 1) instead of rep0 / rep1 / rep2,
     // because at ll0 an offset equal to rep0 is the special rep0-1 case, not
     // repcode 1. Scoring offsets against the wrong code at ll0 over-rewards a
@@ -3723,7 +3723,7 @@ fn btlazy2_offbase(offset: usize, reps: [u32; 3], ll0: bool) -> u32 {
     }
 }
 
-/// Donor lazy match gain (`matchLength * 4 - ZSTD_highbit32(offBase)`): the
+/// Upstream zstd lazy match gain (`matchLength * 4 - ZSTD_highbit32(offBase)`): the
 /// selection metric that lets a shorter repeat-offset match beat a longer
 /// explicit-offset one. `offBase >= 1`, so `highbit` is well-defined.
 #[inline]
@@ -3778,7 +3778,7 @@ macro_rules! start_matching_btlazy2_body {
         let mut pos = 0usize;
         let mut literals_start = 0usize;
 
-        // Collect + select the highest-GAIN match at a position (donor
+        // Collect + select the highest-GAIN match at a position (upstream zstd
         // `ZSTD_searchMax` plus the explicit offset_1 repcode check): scan the
         // length-sorted BT/dms ladder by gain, then probe rep0 directly since
         // the ladder's strictly-increasing-length filter drops short cheap
@@ -3786,7 +3786,7 @@ macro_rules! start_matching_btlazy2_body {
         macro_rules! bt_select {
             ($p:expr) => {{
                 let sel_pos: usize = $p;
-                // `ll0` (donor): zero literals pending before this position, so
+                // `ll0` (upstream zstd): zero literals pending before this position, so
                 // the repcode set is shifted (see `btlazy2_offbase`).
                 let ll0 = sel_pos == literals_start;
                 let sel_abs = current_abs_start + sel_pos;
@@ -3794,7 +3794,7 @@ macro_rules! start_matching_btlazy2_body {
                 let query = HcCandidateQuery {
                     reps: $self.table.offset_hist,
                     lit_len: sel_pos - literals_start,
-                    // No LDM seed: L13-15 run at windowLog 22, below donor's
+                    // No LDM seed: L13-15 run at windowLog 22, below upstream zstd's
                     // LDM auto-enable threshold (windowLog >= 27).
                     ldm_candidate: None,
                 };
@@ -3826,7 +3826,7 @@ macro_rules! start_matching_btlazy2_body {
                     }
                 }
                 let sel_idx = sel_abs - history_abs_start;
-                // Donor probes `rep[0 + ll0]` directly (the length-sorted ladder
+                // Upstream zstd probes `rep[0 + ll0]` directly (the length-sorted ladder
                 // drops short cheap reps): rep0 normally, rep1 at a zero-literal
                 // position where rep0 is not the cheapest code.
                 let probe_rep = if ll0 {
@@ -3858,8 +3858,8 @@ macro_rules! start_matching_btlazy2_body {
                 pos += 1;
                 continue;
             }
-            // Lazy lookahead (donor depth 1/2): advance one byte and accept the
-            // later match only if it out-gains the current one by the donor
+            // Lazy lookahead (upstream zstd depth 1/2): advance one byte and accept the
+            // later match only if it out-gains the current one by the upstream zstd
             // margin (deferring costs an extra literal — `+4` at depth 1, `+7`
             // at depth 2). `start` tracks where the chosen match begins.
             let mut start = pos;
@@ -4075,7 +4075,7 @@ fn priceset_tier_helpers_match_scalar() {
             scalar_mask::<4>(&nc4, &np4)
         );
     }
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
     {
         if std::is_x86_feature_detected!("sse4.2") {
             unsafe {
@@ -4637,7 +4637,7 @@ macro_rules! build_optimal_plan_impl_body {
         let mut profile = $initial_state.profile;
         profile.sufficient_match_len = $self.hc.sufficient_match_len_for_pass(profile);
         // Const-fold from the strategy's associated `OPT_LEVEL`
-        // (donor `optLevel`): BtOpt = 0, BtUltra / BtUltra2 = 2.
+        // (upstream zstd `optLevel`): BtOpt = 0, BtUltra / BtUltra2 = 2.
         // The two flags below are the only places the inner DP loop
         // used to consult `parse_mode`; lifting them into const
         // expressions drops one indirect read + one branch on every
@@ -4793,7 +4793,7 @@ macro_rules! build_optimal_plan_impl_body {
                 .ldm_get_next_match_and_update_seq_store(&mut opt_ldm, 0, $current_len);
         }
 
-        // Donor-like seed at rPos=0: initialize frontier with matches starting
+        // Upstream zstd-like seed at rPos=0: initialize frontier with matches starting
         // at current position before entering the generic forward DP loop.
         if $current_len >= min_match_len {
             let seed_ldm = if has_ldm {
@@ -5020,7 +5020,7 @@ macro_rules! build_optimal_plan_impl_body {
                             let next = pos + 1;
                             let next_price = unsafe { *node_prices.get_unchecked(next) };
                             if with1literal < with_more_literals && with1literal < next_price {
-                                // Donor parity (zstd_opt.c:1232): `cur >= prevMatch.mlen`.
+                                // Upstream zstd parity (zstd_opt.c:1232): `cur >= prevMatch.mlen`.
                                 debug_assert!(pos >= prev_match.mlen as usize);
                                 let prev_pos = pos - prev_match.mlen as usize;
                                 {
@@ -5045,7 +5045,7 @@ macro_rules! build_optimal_plan_impl_body {
                 }
             }
 
-            // Memory-resident DP (donor parity): read opt[cur] fields on
+            // Memory-resident DP (upstream zstd parity): read opt[cur] fields on
             // demand instead of holding a 28-byte node copy live across the
             // per-position `$collect` call below. The held copy forced LLVM
             // to spill reps[3] + litlen around the (non-inlinable) call;
@@ -5060,7 +5060,7 @@ macro_rules! build_optimal_plan_impl_body {
             {
                 let base_node = unsafe { *nodes.get_unchecked(pos) };
                 if base_node.mlen > 0 && base_node.litlen == 0 {
-                    // Donor parity (zstd_opt.c:1255): `cur >= opt[cur].mlen`.
+                    // Upstream zstd parity (zstd_opt.c:1255): `cur >= opt[cur].mlen`.
                     debug_assert!(pos >= base_node.mlen as usize);
                     let prev_pos = pos - base_node.mlen as usize;
                     let prev_state = unsafe { *nodes.get_unchecked(prev_pos) };
@@ -5831,7 +5831,7 @@ macro_rules! for_each_repcode_candidate_body {
                 continue;
             }
             let candidate_idx = candidate_pos - $table.history_abs_start;
-            // Donor `ZSTD_readMINMATCH` gate (zstd_opt.c:657-674): a
+            // Upstream zstd `ZSTD_readMINMATCH` gate (zstd_opt.c:657-674): a
             // 4-byte (3-byte when min_match_len == 3) equality probe
             // before the full prefix scan. Equivalent filtering — a
             // mismatch here means `match_len < min_match_len`, which
@@ -5971,7 +5971,7 @@ macro_rules! bt_insert_and_collect_matches_body {
         // access below is `chain_table[computed_index]` through `&mut self`,
         // which the optimizer cannot prove loop-invariant, so it reloads the
         // Vec's (ptr,len) from the struct AND bounds-checks on every tree
-        // step (the donor walks a raw `U32* btable`, zstd_opt.c). The raw
+        // step (the upstream zstd walks a raw `U32* btable`, zstd_opt.c). The raw
         // base carries no borrow, so the `&self` helper calls in the loop
         // (`bt_pair_index_for_abs`, `window_low_abs_for_target`,
         // `relative_position`) coexist — they read other fields, never
@@ -5984,7 +5984,7 @@ macro_rules! bt_insert_and_collect_matches_body {
         // first BT walk of a fresh frame where `abs_pos < bt_mask`.
         let bt_low = $abs_pos.saturating_sub(bt_mask);
         let window_low = $table.window_low_abs_for_target($abs_pos);
-        // Donor-style window bound in stored space so the BT-walk loop
+        // Upstream zstd-style window bound in stored space so the BT-walk loop
         // condition rejects out-of-window / HC_EMPTY candidates WITHOUT
         // decoding them (mirrors upstream `while ... matchIndex >= matchLow`):
         // one range check on `match_stored` instead of decode-then-break,
@@ -6012,7 +6012,7 @@ macro_rules! bt_insert_and_collect_matches_body {
         let mut larger_slot = pair_idx + 1;
         let mut match_stored = $table.hash_table[hash];
         $table.hash_table[hash] = stored;
-        // Donor semantics: `bestLength` starts at `lengthToBeat - 1`; rep/hash3
+        // Upstream zstd semantics: `bestLength` starts at `lengthToBeat - 1`; rep/hash3
         // probing may raise it; BT then only reports strictly longer matches.
         // `min_match_len >= HC_FORMAT_MINMATCH (3)` by configure invariant,
         // so `min_match_len - 1 >= 2` cannot underflow.
@@ -6022,7 +6022,7 @@ macro_rules! bt_insert_and_collect_matches_body {
         );
         let mut best_len = (*$best_len_for_skip).max($min_match_len - 1);
 
-        // Donor-form loop condition: the stored-space window range check
+        // Upstream zstd-form loop condition: the stored-space window range check
         // (`s.wrapping_add(win_off) < win_range`) rejects out-of-window and
         // HC_EMPTY candidates here, so the terminating step never enters the
         // body — no wasted candidate_abs decode, matching upstream's
@@ -6129,7 +6129,7 @@ macro_rules! bt_insert_and_collect_matches_body {
             };
         }
 
-        // Dict dual-probe (donor `ZSTD_dictMatchState`, zstd_opt.c:777-813):
+        // Dict dual-probe (upstream zstd `ZSTD_dictMatchState`, zstd_opt.c:777-813):
         // after the live tree, descend the immutable dictionary BINARY TREE
         // (built in `prime_dms_bt`) with its OWN compare budget and push any
         // dict match longer than the live best into the ladder. The DUBT
@@ -6138,7 +6138,7 @@ macro_rules! bt_insert_and_collect_matches_body {
         // dict savings unrealised at btlazy2 / btopt). Dict positions are
         // dictionary-relative concat indices in `[0, region)`, pinned at the
         // front of history, so a dict candidate at `dict_idx` sits at offset
-        // `idx - dict_idx` (no donor `dmsIndexDelta`). The optimal parser
+        // `idx - dict_idx` (no upstream zstd `dmsIndexDelta`). The optimal parser
         // prices these (its DP lookahead values the repcode chain a dict match
         // seeds); the greedy/lazy parser commits the longest.
         if let Some(dms) = $table.dms.table() {
@@ -6151,7 +6151,7 @@ macro_rules! bt_insert_and_collect_matches_body {
             );
             let mut dcur = dms.hash_table[dh];
             // DUBT seed lengths: bytes already known common on each side, so
-            // `$cmf` resumes from there (donor commonLengthSmaller/Larger).
+            // `$cmf` resumes from there (upstream zstd commonLengthSmaller/Larger).
             let mut common_smaller = 0usize;
             let mut common_larger = 0usize;
             let mut dms_compares = $profile.max_chain_depth.min($search_depth);
@@ -6191,13 +6191,13 @@ macro_rules! bt_insert_and_collect_matches_body {
                         }
                     }
                 }
-                // Match reached the block tail: can't order the pair (donor
+                // Match reached the block tail: can't order the pair (upstream zstd
                 // `ip+matchLength == iLimit`), and indexing `concat[idx +
                 // match_len]` below would step past the searchable region.
                 if match_len >= tail_limit {
                     break;
                 }
-                // Descend the DUBT (donor zstd_opt.c:806-811): dict candidate
+                // Descend the DUBT (upstream zstd zstd_opt.c:806-811): dict candidate
                 // smaller than input → its larger child is closer to `idx`.
                 if concat[dict_idx + match_len] < concat[idx + match_len] {
                     common_smaller = match_len;
@@ -6307,7 +6307,7 @@ impl HcMatchGenerator {
         self.table.search_depth = self.hc.search_depth;
         self.table.is_btultra2 = is_btultra2;
         self.table.uses_bt = uses_bt;
-        // BT finder hash width, donor `mls = BOUNDED(4, cParams.minMatch, 6)`,
+        // BT finder hash width, upstream zstd `mls = BOUNDED(4, cParams.minMatch, 6)`,
         // carried explicitly in the level config so a `target_length` override
         // cannot silently flip the finder between 5- and 4-byte hashing. Only
         // the BT body reads it; HC/lazy levels leave it at 4. clevels.h
@@ -6588,7 +6588,7 @@ impl HcMatchGenerator {
         self.table.skip_matching(incompressible_hint);
     }
 
-    /// Donor `ZSTD_btlazy2` (levels 13-15): binary-tree match finder with a
+    /// Upstream zstd `ZSTD_btlazy2` (levels 13-15): binary-tree match finder with a
     /// greedy/lazy parse. Bare dispatcher — resolves the runtime tier ONCE
     /// per block via `select_kernel()` and calls the matching
     /// `start_matching_btlazy2_<kernel>` wrapper, so the per-position BT
@@ -6719,7 +6719,7 @@ impl HcMatchGenerator {
         //
         // The producer operates in absolute stream coordinates
         // throughout; `live_history[0]` corresponds to absolute
-        // `history_abs_start` (donor `base + dictLimit`), and the
+        // `history_abs_start` (upstream zstd `base + dictLimit`), and the
         // abs→slice translation happens inside the producer at
         // each `live_history[..]` access. Passing the full
         // `history` Vec would index into the dead prefix (the
@@ -6749,9 +6749,8 @@ impl HcMatchGenerator {
         let mut best_plan = core::mem::take(&mut self.backend.bt_mut().opt_segment_plan_scratch);
         best_plan.clear();
         let mut plan_reps = self.table.offset_hist;
-        let (mut cursor, mut plan_litlen) = self
-            .table
-            .donor_opt_start_cursor_and_litlen(current_abs_start);
+        let (mut cursor, mut plan_litlen) =
+            self.table.opt_start_cursor_and_litlen(current_abs_start);
         let mut plan_literals_cursor = 0usize;
         let match_loop_limit = current_len.saturating_sub(8);
         while cursor < match_loop_limit {
@@ -6808,9 +6807,8 @@ impl HcMatchGenerator {
             core::mem::replace(&mut self.backend.bt_mut().opt_state, HcOptState::new());
         opt_state.rescale_freqs(current, seed_profile);
         let mut seed_reps = self.table.offset_hist;
-        let (mut cursor, mut seed_litlen) = self
-            .table
-            .donor_opt_start_cursor_and_litlen(current_abs_start);
+        let (mut cursor, mut seed_litlen) =
+            self.table.opt_start_cursor_and_litlen(current_abs_start);
         let mut seed_literals_cursor = 0usize;
         let mut seed_plan = core::mem::take(&mut self.backend.bt_mut().opt_seed_plan_scratch);
         seed_plan.clear();
@@ -6850,13 +6848,13 @@ impl HcMatchGenerator {
         self.backend.bt_mut().opt_seed_plan_scratch = seed_plan;
         self.backend.bt_mut().opt_state = opt_state;
 
-        // Donor initStats_ultra keeps the collected entropy statistics but
+        // Upstream zstd initStats_ultra keeps the collected entropy statistics but
         // invalidates the first-pass matchfinder history before the real pass.
         self.table.position_base = self.table.history_abs_start;
         self.table.index_shift = current_len;
         self.table.next_to_update3 = current_abs_start;
         self.table.skip_insert_until_abs = current_abs_start;
-        // Donor `ZSTD_initStats_ultra()` invalidates the first scan by moving
+        // Upstream zstd `ZSTD_initStats_ultra()` invalidates the first scan by moving
         // `window.base` back by `srcSize`, making the real pass start at
         // `curr == srcSize` instead of 0. Position 0 is therefore a valid
         // table entry in the second pass even though raw C tables reserve
@@ -7632,7 +7630,7 @@ fn dfast_accepts_exact_five_byte_match() {
     // Layout the input so that:
     //   byte  0      = 'Z'            (lead byte — keeps the match SOURCE off
     //                                  position 0, which the greedy loop never
-    //                                  inserts: like the donor it starts the
+    //                                  inserts: like the upstream zstd it starts the
     //                                  cursor at ip+1 and hashes only visited
     //                                  positions)
     //   bytes 1..6   = "ABCDE"        (the match source — position 1 IS visited)
@@ -7649,9 +7647,9 @@ fn dfast_accepts_exact_five_byte_match() {
     data.extend_from_slice(b"ABCDE"); // 29..34
     data.push(b'F'); // 34: forces forward extension to stop at length 5
     // Trailing filler so the match site (29) sits at least HASH_READ_SIZE (8)
-    // bytes before the block end. The greedy double-fast — like the donor —
+    // bytes before the block end. The greedy double-fast — like the upstream zstd —
     // stops probing at `ilimit = iend - HASH_READ_SIZE`, so a match in the
-    // final 8 bytes is never searched (donor parity, not a regression).
+    // final 8 bytes is never searched (upstream zstd parity, not a regression).
     data.extend_from_slice(b"GHIJKLMNOPQRSTUVWXYZ"); // 35..55
     assert_eq!(data.len(), 55);
 
@@ -7749,7 +7747,7 @@ fn driver_level5_selects_row_backend() {
     );
 }
 
-/// Level 4 maps to `StrategyTag::Dfast` (the greedy double-fast, donor
+/// Level 4 maps to `StrategyTag::Dfast` (the greedy double-fast, upstream zstd
 /// `ZSTD_dfast` — "greedy" is the parse discipline, not the Row/Greedy
 /// strategy at Level 5). Round-trip alone doesn't pin match quality (a lazy
 /// parser would also reconstruct the input correctly), so this test guards the
@@ -8075,7 +8073,7 @@ fn config_override_is_consumed_by_reset() {
 }
 
 // Level 4 maps to the greedy Dfast (double-fast) backend — "greedy" here is the
-// parse discipline (no lazy lookahead, donor `ZSTD_dfast`), NOT the Row/Greedy
+// parse discipline (no lazy lookahead, upstream zstd `ZSTD_dfast`), NOT the Row/Greedy
 // strategy (which is Level 5). This roundtrip is intentional Dfast L4 coverage;
 // the Row backend is exercised by the `Level(5)` fixtures elsewhere in this file.
 #[cfg(test)]
@@ -8365,7 +8363,7 @@ fn level_16_17_map_to_btopt_strategy() {
 #[test]
 fn level_18_maps_to_btultra_level_19_to_btultra2_strategy() {
     use super::strategy::{BackendTag, StrategyTag};
-    // Donor `clevels.h` (srcSize > 256 KiB tier): level 18 = `ZSTD_btultra`,
+    // Upstream zstd `clevels.h` (srcSize > 256 KiB tier): level 18 = `ZSTD_btultra`,
     // level 19 = `ZSTD_btultra2`. Level 19 was previously mapped to plain
     // btultra, which under-searched (searchLog 6 vs 7) and lost ~3.7% ratio
     // on the repo corpus.
@@ -8388,7 +8386,7 @@ fn level_20_22_map_to_btultra2_strategy() {
 }
 
 #[test]
-fn level22_uses_donor_target_length_and_large_input_tables() {
+fn level22_uses_target_length_and_large_input_tables() {
     let params = resolve_level_params(CompressionLevel::Level(22), None);
     assert_eq!(params.window_log, 27);
     let hc = params.hc.unwrap();
@@ -8427,7 +8425,7 @@ fn bt_levels_16_to_21_pin_clevels_params() {
 }
 
 #[test]
-fn level22_source_size_hint_uses_donor_btultra2_tiers() {
+fn level22_source_size_hint_uses_btultra2_tiers() {
     let p16k = resolve_level_params(CompressionLevel::Level(22), Some(16 * 1024));
     assert_eq!(p16k.window_log, 14);
     let hc16k = p16k.hc.unwrap();
@@ -8454,20 +8452,20 @@ fn level22_source_size_hint_uses_donor_btultra2_tiers() {
 }
 
 #[test]
-fn level22_small_source_size_hint_matches_donor_cparams() {
-    use zstd::zstd_safe::zstd_sys;
-
+fn level22_non_power_of_two_small_source_uses_tier3_params() {
+    // srcSize 15 027 (<= 16 KB) selects the table[3] btultra2 row; the
+    // source-size clamp gives windowLog 14 (ceil log2 15027). Pure-Rust
+    // assertion against the constant tier-3 geometry (no FFI).
     let source_size = 15_027u64;
-    let donor = unsafe { zstd_sys::ZSTD_getCParams(22, source_size, 0) };
     let params = resolve_level_params(CompressionLevel::Level(22), Some(source_size));
 
     let hc = params.hc.unwrap();
-    assert_eq!(params.window_log as u32, donor.windowLog);
-    assert_eq!(hc.chain_log as u32, donor.chainLog);
-    assert_eq!(hc.hash_log as u32, donor.hashLog);
-    assert_eq!(hc.search_depth as u32, 1u32 << donor.searchLog);
-    assert_eq!(HC_OPT_MIN_MATCH_LEN as u32, donor.minMatch);
-    assert_eq!(hc.target_len as u32, donor.targetLength);
+    assert_eq!(params.window_log, 14);
+    assert_eq!(hc.chain_log, 15);
+    assert_eq!(hc.hash_log, 15);
+    assert_eq!(hc.search_depth, 1 << 10);
+    assert_eq!(HC_OPT_MIN_MATCH_LEN, 3);
+    assert_eq!(hc.target_len, 999);
 }
 
 #[test]
@@ -8514,21 +8512,21 @@ fn btultra2_profile_disables_small_offset_handicap() {
     // Pre-Phase-3 this test duplicated the profile build with
     // `pass2=false` and `pass2=true` since `for_mode` differentiated
     // them. With `const_for_strategy::<BtUltra2>()` there is only one
-    // profile — the donor `opt2` pricing — so a single binding
+    // profile — the upstream zstd `opt2` pricing — so a single binding
     // captures the invariant the test is asserting.
     let profile = HcOptimalCostProfile::const_for_strategy::<super::strategy::BtUltra2>();
     assert!(
         !profile.favor_small_offsets,
-        "btultra2 should match donor opt2 offset pricing"
+        "btultra2 should match upstream zstd opt2 offset pricing"
     );
     assert!(
         profile.accurate,
-        "btultra2 should use donor opt2 accurate pricing"
+        "btultra2 should use upstream zstd opt2 accurate pricing"
     );
 }
 
 #[test]
-fn btultra_profile_keeps_donor_search_depth_budget() {
+fn btultra_profile_keeps_search_depth_budget() {
     let p = HcOptimalCostProfile::const_for_strategy::<super::strategy::BtUltra>();
     assert_eq!(
         p.max_chain_depth, 64,
@@ -8537,11 +8535,11 @@ fn btultra_profile_keeps_donor_search_depth_budget() {
 }
 
 #[test]
-fn btopt_profile_keeps_donor_search_depth_budget() {
+fn btopt_profile_keeps_search_depth_budget() {
     let p = HcOptimalCostProfile::const_for_strategy::<super::strategy::BtOpt>();
     assert_eq!(
         p.max_chain_depth, 32,
-        "btopt should not cap chain depth below donor btopt search budget"
+        "btopt should not cap chain depth below upstream zstd btopt search budget"
     );
 }
 
@@ -9112,7 +9110,7 @@ fn hc_collect_optimal_candidates_chain_fast_skip_uses_match_end_minus_8() {
     );
     assert!(
         hc.table.skip_insert_until_abs <= best_match_end.saturating_sub(8),
-        "chain fast-skip must not exceed donor-style matchEndIdx - 8 bound"
+        "chain fast-skip must not exceed upstream zstd-style matchEndIdx - 8 bound"
     );
 }
 
@@ -9151,7 +9149,7 @@ fn hc_collect_optimal_candidates_advances_skip_window_on_plain_bt_path() {
     assert_eq!(
         hc.table.skip_insert_until_abs,
         abs_pos.saturating_add(1),
-        "plain BT path should advance skip window by 1 via donor matchEndIdx baseline"
+        "plain BT path should advance skip window by 1 via upstream zstd matchEndIdx baseline"
     );
 }
 
@@ -9165,7 +9163,7 @@ fn hc_collect_optimal_candidates_advances_skip_window_on_plain_bt_path() {
 // `self.strategy_tag`, there is no production-shaped configuration
 // that reproduces what those tests asserted. The corresponding hash3
 // invariants are exercised end-to-end by the existing level22 roundtrip
-// + donor-parity ratio gate.
+// + upstream zstd-parity ratio gate.
 
 #[test]
 fn hc_ldm_candidates_are_merged_into_optimal_candidates() {
@@ -9273,7 +9271,7 @@ fn btultra_and_btultra2_both_keep_dictionary_candidates() {
     );
     assert!(
         out.iter().any(|candidate| candidate.offset >= 32),
-        "btultra2 should retain dictionary candidates on donor-parity path"
+        "btultra2 should retain dictionary candidates on upstream zstd-parity path"
     );
 
     let mut hc = HcMatchGenerator::new(256);
@@ -9306,7 +9304,7 @@ fn driver_small_source_hint_shrinks_dfast_hash_tables() {
     space.truncate(12);
     driver.commit_space(space);
     driver.skip_matching_with_hint(None);
-    // Donor-parity split sizes: long-hash = DFAST_HASH_BITS,
+    // Upstream zstd-parity split sizes: long-hash = DFAST_HASH_BITS,
     // short-hash = DFAST_HASH_BITS - DFAST_SHORT_HASH_BITS_DELTA.
     let full_long = driver.dfast_matcher().long_hash.len();
     let full_short = driver.dfast_matcher().short_hash.len();
@@ -9407,7 +9405,7 @@ fn driver_chain_log_override_survives_row_to_hc_fallback() {
     // (resolved window <= 14, upstream `ZSTD_resolveRowMatchFinderMode`), the
     // synthesised HC chain table must honour an explicit `chain_log` override.
     // The RowHash override arm drops `chain_log` (Row has no chain table), so
-    // the synthesis previously replaced the caller's `chain_log` with the donor
+    // the synthesis previously replaced the caller's `chain_log` with the upstream zstd
     // `hashLog - 1`, silently ignoring it on small-window frames.
     let chain_log_override = 10u32;
     let ov = super::parameters::ParamOverrides {
@@ -9426,7 +9424,7 @@ fn driver_chain_log_override_survives_row_to_hc_fallback() {
     driver.commit_space(space);
     driver.skip_matching_with_hint(None);
     // The override (10) is below the window cap (14), so the resolved HC chain
-    // table must reflect it — NOT the donor `hashLog - 1` (18, clamped to the
+    // table must reflect it — NOT the upstream zstd `hashLog - 1` (18, clamped to the
     // window 14). Pre-fix this resolved to 14.
     assert_eq!(
         driver.hc_matcher().table.chain_log,
@@ -9484,7 +9482,7 @@ fn driver_small_source_hint_shrinks_row_hash_tables() {
     assert_eq!(
         driver.active_backend(),
         super::strategy::BackendTag::HashChain,
-        "windowLog <= 14 must fall back to the donor hash-chain matchfinder",
+        "windowLog <= 14 must fall back to the upstream zstd hash-chain matchfinder",
     );
 }
 
@@ -9678,7 +9676,7 @@ fn row_skip_matching_with_incompressible_hint_uses_sparse_prefix() {
 
 /// Regression for the `None` arm of `skip_matching_with_hint`: the
 /// row table must NOT receive dense inserts across the skipped range.
-/// Donor parity (`ZSTD_row_fillHashCache` only pre-fills the next-scan
+/// Upstream zstd parity (`ZSTD_row_fillHashCache` only pre-fills the next-scan
 /// cache, not the skipped block's interior) trades cross-block
 /// matches into the skipped interior for the per-block O(block_size)
 /// insert cost.
@@ -9722,7 +9720,7 @@ fn row_skip_matching_with_none_hint_leaves_interior_empty() {
     assert_eq!(
         none_slots, 0,
         "None hint at block_start=0 must leave row table fully empty \
-         (donor parity — interior NOT inserted, no pre-block backfill possible)",
+         (upstream zstd parity — interior NOT inserted, no pre-block backfill possible)",
     );
     assert!(
         dense_slots > 0,
@@ -9742,8 +9740,8 @@ fn driver_unhinted_level2_keeps_default_dfast_hash_table_size() {
     driver.commit_space(space);
     driver.skip_matching_with_hint(None);
 
-    // Donor-parity split: long-hash at DFAST_HASH_BITS, short-hash one
-    // bit smaller (DFAST_SHORT_HASH_BITS_DELTA = 1, matching donor
+    // Upstream zstd-parity split: long-hash at DFAST_HASH_BITS, short-hash one
+    // bit smaller (DFAST_SHORT_HASH_BITS_DELTA = 1, matching upstream zstd
     // `chainLog = hashLog - 1` for dfast levels).
     let long_len = driver.dfast_matcher().long_hash.len();
     let short_len = driver.dfast_matcher().short_hash.len();
@@ -9906,7 +9904,7 @@ fn driver_better_to_best_resizes_hc_tables() {
 }
 
 #[cfg(any())]
-// disabled: tests legacy SuffixStore behavior incompatible with donor-shape kernel's HASH_READ_SIZE geometry
+// disabled: tests legacy SuffixStore behavior incompatible with upstream zstd-shape kernel's HASH_READ_SIZE geometry
 #[test]
 fn prime_with_dictionary_preserves_history_for_first_full_block() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
@@ -9941,7 +9939,7 @@ fn prime_with_dictionary_preserves_history_for_first_full_block() {
 }
 
 #[cfg(any())]
-// disabled: tests legacy SuffixStore behavior incompatible with donor-shape kernel's HASH_READ_SIZE geometry
+// disabled: tests legacy SuffixStore behavior incompatible with upstream zstd-shape kernel's HASH_READ_SIZE geometry
 #[test]
 fn prime_with_large_dictionary_preserves_early_history_until_first_block() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
@@ -10068,7 +10066,7 @@ fn hc_prime_with_dictionary_disables_btultra2_seed_pass() {
 #[test]
 fn dfast_prime_with_dictionary_preserves_history_for_first_full_block() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
-    // Level(4) is Dfast with the greedy double-fast loop (donor parity:
+    // Level(4) is Dfast with the greedy double-fast loop (upstream zstd parity:
     // clevels.h L3/L4 are both `ZSTD_dfast`, which has no lazy lookahead).
     // The fast loop needs at least `HASH_READ_SIZE` (8) bytes ahead of the
     // probe cursor, so this exercises a 16-byte dict + 16-byte block (the
@@ -10197,8 +10195,8 @@ fn primed_snapshot_restored_for_hints_in_same_window_bucket() {
 }
 
 #[test]
-fn primed_snapshot_restored_across_level22_donor_tier_hints() {
-    // Level 22 collapses several ceil-log buckets onto one donor source-size
+fn primed_snapshot_restored_across_level22_tier_hints() {
+    // Level 22 collapses several ceil-log buckets onto one upstream zstd source-size
     // tier: `resolve_level_params(Level(22), ..)` selects the HC config and
     // window_log by raw `<= 16 KiB / 128 KiB / 256 KiB` thresholds, so a 20 KiB
     // and a 100 KiB hint (ceil-log buckets 15 and 17) both land in the
@@ -10220,7 +10218,7 @@ fn primed_snapshot_restored_across_level22_donor_tier_hints() {
     let window_b = driver.window_size();
     assert_eq!(
         window_a, window_b,
-        "precondition: both hints must land in the same Level 22 donor tier \
+        "precondition: both hints must land in the same Level 22 upstream zstd tier \
          (a={window_a}, b={window_b})"
     );
 
@@ -10228,7 +10226,7 @@ fn primed_snapshot_restored_across_level22_donor_tier_hints() {
     assert!(
         restored,
         "Level 22 snapshot captured at a 20 KiB hint must be restored into a \
-         100 KiB hint that resolves to the same donor tier (different ceil-log \
+         100 KiB hint that resolves to the same upstream zstd tier (different ceil-log \
          buckets, identical matcher shape)"
     );
 }
@@ -10773,7 +10771,7 @@ fn hash_mix_crc_path_is_available_and_matches_accelerated_impl_when_supported() 
 }
 
 #[test]
-fn hc_hash3_position_matches_donor_formula() {
+fn hc_hash3_position_matches_hash3_formula() {
     let bytes = [b'a', b'b', b'c', b'd'];
     let read32 = u32::from_le_bytes(bytes);
     let expected = (((read32 << 8).wrapping_mul(HC_PRIME3BYTES)) >> (32 - HC3_HASH_LOG)) as usize;
@@ -10784,7 +10782,7 @@ fn hc_hash3_position_matches_donor_formula() {
 }
 
 #[test]
-fn hc_hash_position_matches_donor_hash4_formula() {
+fn hc_hash_position_matches_hash4_formula() {
     let mut hc = HcMatchGenerator::new(1 << 20);
     hc.configure(HC_CONFIG, super::strategy::StrategyTag::Lazy, 22);
     let bytes = [b'a', b'b', b'c', b'd'];
@@ -10794,7 +10792,7 @@ fn hc_hash_position_matches_donor_hash4_formula() {
 }
 
 #[test]
-fn btultra2_main_hash_uses_donor_hash4_formula() {
+fn btultra2_main_hash_uses_hash4_formula() {
     let mut hc = HcMatchGenerator::new(1 << 20);
     hc.configure(
         BTULTRA2_HC_CONFIG_L22,
@@ -10915,39 +10913,37 @@ fn deterministic_high_entropy_bytes(seed: u64, len: usize) -> Vec<u8> {
     out
 }
 
-#[cfg(test)]
-fn level22_donor_block_ranges(data: &[u8]) -> Vec<(usize, usize)> {
+#[cfg(feature = "bench_internals")]
+pub(crate) fn level22_block_ranges(data: &[u8]) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     let mut cursor = 0usize;
     let mut savings = 0i64;
     while cursor < data.len() {
         let remaining = data.len() - cursor;
-        let candidate_len = remaining.min(HC_BLOCKSIZE_MAX);
+        let candidate_len = remaining.min(super::cost_model::HC_BLOCKSIZE_MAX);
         let block_len = crate::encoding::frame_compressor::optimal_block_size(
             CompressionLevel::Level(22),
             &data[cursor..cursor + candidate_len],
             remaining,
-            HC_BLOCKSIZE_MAX,
+            super::cost_model::HC_BLOCKSIZE_MAX,
             savings,
         )
         .min(candidate_len)
         .max(1);
         ranges.push((cursor, block_len));
         cursor += block_len;
-        // The exact donor gate uses compressed-size savings. For this corpus
+        // The exact upstream zstd gate uses compressed-size savings. For this corpus
         // parity harness, after the first full block has compressed, savings is
         // sufficient to authorize the same pre-block splitter path.
-        if cursor >= HC_BLOCKSIZE_MAX {
+        if cursor >= super::cost_model::HC_BLOCKSIZE_MAX {
             savings = 3;
         }
     }
     ranges
 }
 
-#[cfg(test)]
-fn merge_block_delimiters_like_donor(
-    sequences: Vec<(usize, usize, usize)>,
-) -> Vec<(usize, usize, usize)> {
+#[cfg(feature = "bench_internals")]
+fn merge_block_delimiters(sequences: Vec<(usize, usize, usize)>) -> Vec<(usize, usize, usize)> {
     let mut out = Vec::with_capacity(sequences.len());
     let mut pending_lits = 0usize;
     for (lit_len, offset, match_len) in sequences {
@@ -10964,22 +10960,27 @@ fn merge_block_delimiters_like_donor(
     out
 }
 
-#[cfg(test)]
-fn collect_level22_sequences(data: &[u8]) -> Vec<(usize, usize, usize)> {
-    merge_block_delimiters_like_donor(collect_level22_sequences_with_delimiters(data))
+/// White-box capture of the level-22 sequence stream (literal-length,
+/// offset, match-length triples) the match generator emits for `data`,
+/// with block-delimiter pseudo-sequences merged into the following
+/// triple's literal run. Pure Rust; the C-conformance comparison that
+/// consumes it lives in the `ffi-bench` crate.
+#[cfg(feature = "bench_internals")]
+pub(crate) fn collect_level22_sequences(data: &[u8]) -> Vec<(usize, usize, usize)> {
+    merge_block_delimiters(collect_level22_sequences_with_delimiters(data))
         .into_iter()
         .filter(|(_, offset, match_len)| *offset != 0 || *match_len != 0)
         .collect()
 }
 
-#[cfg(test)]
+#[cfg(feature = "bench_internals")]
 fn collect_level22_sequences_with_delimiters(data: &[u8]) -> Vec<(usize, usize, usize)> {
-    let mut driver = MatchGeneratorDriver::new(HC_BLOCKSIZE_MAX, 1);
+    let mut driver = MatchGeneratorDriver::new(super::cost_model::HC_BLOCKSIZE_MAX, 1);
     driver.set_source_size_hint(data.len() as u64);
     driver.reset(CompressionLevel::Level(22));
 
     let mut sequences = Vec::new();
-    for (chunk_start, chunk_len) in level22_donor_block_ranges(data) {
+    for (chunk_start, chunk_len) in level22_block_ranges(data) {
         let chunk = &data[chunk_start..chunk_start + chunk_len];
         let mut space = driver.get_next_space();
         space[..chunk.len()].copy_from_slice(chunk);
@@ -10998,134 +10999,6 @@ fn collect_level22_sequences_with_delimiters(data: &[u8]) -> Vec<(usize, usize, 
         });
     }
     sequences
-}
-
-#[cfg(test)]
-fn donor_level22_sequences(data: &[u8]) -> Vec<(usize, usize, usize)> {
-    merge_block_delimiters_like_donor(donor_level22_sequences_with_delimiters(data))
-        .into_iter()
-        .filter(|(_, offset, match_len)| *offset != 0 || *match_len != 0)
-        .collect()
-}
-
-#[cfg(test)]
-fn donor_level22_sequences_with_delimiters(data: &[u8]) -> Vec<(usize, usize, usize)> {
-    use zstd::zstd_safe;
-    use zstd::zstd_safe::zstd_sys;
-
-    fn assert_zstd_ok(code: usize, context: &str) {
-        assert_eq!(
-            unsafe { zstd_sys::ZSTD_isError(code) },
-            0,
-            "{context} failed: {}",
-            zstd_safe::get_error_name(code)
-        );
-    }
-
-    unsafe {
-        let cctx = zstd_sys::ZSTD_createCCtx();
-        assert!(!cctx.is_null(), "ZSTD_createCCtx returned null");
-
-        assert_zstd_ok(
-            zstd_sys::ZSTD_CCtx_setParameter(
-                cctx,
-                zstd_sys::ZSTD_cParameter::ZSTD_c_compressionLevel,
-                22,
-            ),
-            "ZSTD_c_compressionLevel",
-        );
-
-        let seq_capacity = zstd_safe::sequence_bound(data.len());
-        let mut seqs = alloc::vec![
-            zstd_sys::ZSTD_Sequence {
-                offset: 0,
-                litLength: 0,
-                matchLength: 0,
-                rep: 0,
-            };
-            seq_capacity
-        ];
-
-        let seq_count = zstd_sys::ZSTD_generateSequences(
-            cctx,
-            seqs.as_mut_ptr(),
-            seqs.len(),
-            data.as_ptr().cast(),
-            data.len(),
-        );
-        assert_zstd_ok(seq_count, "ZSTD_generateSequences");
-        let rc = zstd_sys::ZSTD_freeCCtx(cctx);
-        assert_eq!(rc, 0, "ZSTD_freeCCtx failed");
-
-        seqs.truncate(seq_count);
-        seqs.into_iter()
-            .map(|seq| {
-                (
-                    seq.litLength as usize,
-                    seq.offset as usize,
-                    seq.matchLength as usize,
-                )
-            })
-            .collect()
-    }
-}
-
-#[test]
-fn level22_sequences_match_donor_on_corpus_proxy() {
-    let data = include_bytes!("../../decodecorpus_files/z000033");
-    assert_level22_sequences_match_donor(data);
-}
-
-#[test]
-fn level22_sequences_match_donor_on_small_corpus_proxy() {
-    let data = include_bytes!("../../decodecorpus_files/z000030");
-    assert_level22_sequences_match_donor(data);
-}
-
-#[cfg(test)]
-fn assert_level22_sequences_match_donor(data: &[u8]) {
-    let rust = collect_level22_sequences(data);
-    let donor = donor_level22_sequences(data);
-
-    if rust != donor {
-        let first_diff = rust
-            .iter()
-            .zip(donor.iter())
-            .position(|(lhs, rhs)| lhs != rhs)
-            .unwrap_or_else(|| rust.len().min(donor.len()));
-        let rust_pos = rust
-            .iter()
-            .take(first_diff)
-            .fold(0usize, |acc, seq| acc + seq.0 + seq.2);
-        let donor_pos = donor
-            .iter()
-            .take(first_diff)
-            .fold(0usize, |acc, seq| acc + seq.0 + seq.2);
-        let start = first_diff.saturating_sub(4);
-        let rust_window = &rust[start..rust.len().min(first_diff + 4)];
-        let donor_window = &donor[start..donor.len().min(first_diff + 4)];
-        let mut reps = [1u32, 4, 8];
-        for (lit_len, offset, _) in rust.iter().take(first_diff) {
-            let _ = encode_offset_with_history(*offset as u32, *lit_len as u32, &mut reps);
-        }
-        panic!(
-            "level22 sequence path diverged at idx {}: rust={:?} donor={:?} (rust_len={} donor_len={} rust_pos={} donor_pos={} reps_before={:?} rust_window={:?} donor_window={:?} block_ranges={:?})",
-            first_diff,
-            rust.get(first_diff),
-            donor.get(first_diff),
-            rust.len(),
-            donor.len(),
-            rust_pos,
-            donor_pos,
-            reps,
-            rust_window,
-            donor_window,
-            level22_donor_block_ranges(data)
-                .into_iter()
-                .filter(|(start, len)| *start <= rust_pos && rust_pos < start + len)
-                .collect::<Vec<_>>(),
-        );
-    }
 }
 
 #[test]
@@ -11321,7 +11194,7 @@ fn hc_insert_positions_with_step_keeps_next_to_update3_cursor_for_sparse_ranges(
 }
 
 #[cfg(any())]
-// disabled: tests legacy SuffixStore behavior incompatible with donor-shape kernel's HASH_READ_SIZE geometry
+// disabled: tests legacy SuffixStore behavior incompatible with upstream zstd-shape kernel's HASH_READ_SIZE geometry
 #[test]
 fn prime_with_dictionary_budget_shrinks_after_simple_eviction() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
@@ -12373,7 +12246,7 @@ fn dfast_skip_matching_dense_backfills_newly_hashable_long_tail_positions() {
     );
     let long_hash = matcher.long_hash_index(&live[target_rel..]);
     let target_slot = matcher.pack_slot(target_abs_pos);
-    // Single-slot tables (donor parity): the bucket holds at most one
+    // Single-slot tables (upstream zstd parity): the bucket holds at most one
     // u32; the assertion below is a direct equality (no `.contains`).
     assert_ne!(
         target_slot, DFAST_EMPTY_SLOT,
@@ -12496,7 +12369,7 @@ fn dfast_ensure_room_for_rebases_above_guard_band() {
     // The early entry at abs=1024 had packed slot 1025; the rebase
     // subtracts `DFAST_REBASE_GUARD_BAND` (= 2^30) from every slot.
     // 1025 <= 2^30 so the slot drops to the empty sentinel —
-    // donor parity for `ZSTD_window_reduce`'s clamp-at-zero rule.
+    // upstream zstd parity for `ZSTD_window_reduce`'s clamp-at-zero rule.
     // Verify BOTH tables — `reduce()` walks them in sequence.
     assert_eq!(
         dfast.short_hash[0], DFAST_EMPTY_SLOT,
@@ -12630,10 +12503,10 @@ fn fastest_hint_iteration_23_sequences_reconstruct_source() {
     });
 
     // Whether THIS specific iteration produces a Triple depends on
-    // the matcher's step-skip schedule (donor-shape kernel walks ip0
+    // the matcher's step-skip schedule (upstream zstd-shape kernel walks ip0
     // with kSearchStrength-driven stride growth) — the legacy
     // SuffixStore-based matcher iterated every position and always
-    // hit short repeats, but the donor-shape kernel may skip over
+    // hit short repeats, but the upstream zstd-shape kernel may skip over
     // them when the step has grown large by the time it reaches the
     // repeat region. The substance of this test is the
     // reconstruction assertion below; `saw_triple` was a legacy
@@ -12644,7 +12517,7 @@ fn fastest_hint_iteration_23_sequences_reconstruct_source() {
 
 #[test]
 fn fast_levels_dispatch_per_level_hash_log_and_mls() {
-    // Level 1 — donor `{ 19, 13, 14, 1, 7, 0, ZSTD_fast }` row:
+    // Level 1 — upstream zstd `{ 19, 13, 14, 1, 7, 0, ZSTD_fast }` row:
     // window_log=19, hash_log=14, mls=7.
     let f1 = resolve_level_params(CompressionLevel::Level(1), None)
         .fast
@@ -12653,12 +12526,12 @@ fn fast_levels_dispatch_per_level_hash_log_and_mls() {
     assert_eq!(f1.mls, 7);
     assert_eq!(f1.step_size, 2);
 
-    // Negative levels — donor row-0 ("base for negative"):
+    // Negative levels — upstream zstd row-0 ("base for negative"):
     // hash_log=13, mls=7. The 32 KiB table is L1d-resident (every
     // probe an L1 hit, vs an L2 access for a 64 KiB hash_log=14
     // table), and minMatch=7 drops short-distance 6-byte matches —
-    // donor parity on both ratio and throughput.
-    // step_size follows donor's formula: targetLength = -level,
+    // upstream zstd parity on both ratio and throughput.
+    // step_size follows upstream zstd's formula: targetLength = -level,
     // step_size = (-level) + 1, giving 2..8 for L-1..L-7.
     for n in -7..=-1 {
         let f = resolve_level_params(CompressionLevel::Level(n), None)
@@ -12671,7 +12544,7 @@ fn fast_levels_dispatch_per_level_hash_log_and_mls() {
     }
 
     // Fastest + Uncompressed keep hash_log=14 / mls=6 (their own
-    // tuning; not part of the negative-level donor ladder).
+    // tuning; not part of the negative-level upstream zstd ladder).
     let pf = resolve_level_params(CompressionLevel::Fastest, None);
     let ff = pf.fast.unwrap();
     assert_eq!(
@@ -12768,29 +12641,34 @@ fn fast_levels_driver_wiring_threads_cparams_into_inner_matcher() {
 /// parser here, but the reference `targetLength` (32) is the same nice-match
 /// threshold for both finders, so we mirror it directly.
 ///
-/// Test queries the reference via `ZSTD_getCParams(level, 0, 0)` so any
-/// future table tweak upstream is reflected automatically.
+/// Asserts against the constant `clevels.h` table[0] `targetLength` column
+/// (transcribed inline) — a pure-Rust in-tree test, no FFI dependency.
 #[test]
-fn lazy_band_target_len_matches_donor_default_table() {
-    use zstd::zstd_safe::zstd_sys;
-
-    for level in 5..=15i32 {
-        // SAFETY: `ZSTD_getCParams` reads from a static table; safe to
-        // call with any (level, srcSize, dictSize) combination.
-        let reference = unsafe { zstd_sys::ZSTD_getCParams(level, 0, 0) };
+fn lazy_band_target_len_matches_default_table() {
+    // table[0] (srcSize > 256 KB) targetLength, levels 5..=15: the lazy
+    // outer loop's nice-match (`sufficient_len`) threshold.
+    let expected: [(i32, usize); 11] = [
+        (5, 2),
+        (6, 4),
+        (7, 8),
+        (8, 16),
+        (9, 16),
+        (10, 16),
+        (11, 16),
+        (12, 32),
+        (13, 32),
+        (14, 32),
+        (15, 32),
+    ];
+    for (level, want) in expected {
         let params = resolve_level_params(CompressionLevel::Level(level), None);
         // L5 = greedy (Row backend → `row`); L6-15 = lazy (HashChain → `hc`).
-        // Both surface the donor `targetLength` as their nice-match threshold.
         let target_len = params
             .hc
             .map(|hc| hc.target_len)
             .or_else(|| params.row.map(|row| row.target_len))
             .expect("lazy/greedy level carries hc or row config");
-        assert_eq!(
-            target_len as u32, reference.targetLength,
-            "L{level}: target_len ({target_len}) must match reference cParams.targetLength ({})",
-            reference.targetLength
-        );
+        assert_eq!(target_len, want, "L{level}: target_len must match table[0]");
     }
 }
 
@@ -12803,36 +12681,20 @@ fn lazy_band_target_len_matches_donor_default_table() {
 /// asserting the full row (not just `search_depth`) keeps the whole budget
 /// aligned and guards every field against silent drift.
 #[test]
-fn upper_lazy_band_params_match_donor_default_table() {
-    use zstd::zstd_safe::zstd_sys;
-
-    for level in 13..=15i32 {
-        // SAFETY: `ZSTD_getCParams` reads from a static table; safe to
-        // call with any (level, srcSize, dictSize) combination.
-        let reference = unsafe { zstd_sys::ZSTD_getCParams(level, 0, 0) };
+fn upper_lazy_band_params_match_default_table() {
+    // table[0] (srcSize > 256 KB), levels 13..=15 (btlazy2 budget):
+    // (level, windowLog, hashLog, chainLog, search_depth = 1 << searchLog).
+    let expected: [(i32, u8, usize, usize, usize); 3] = [
+        (13, 22, 22, 22, 1 << 4),
+        (14, 22, 23, 22, 1 << 5),
+        (15, 22, 23, 23, 1 << 6),
+    ];
+    for (level, wlog, hlog, clog, sd) in expected {
         let params = resolve_level_params(CompressionLevel::Level(level), None);
         let hc = params.hc.unwrap();
-        assert_eq!(
-            hc.search_depth as u32,
-            1u32 << reference.searchLog,
-            "L{level}: hc.search_depth ({}) must equal 1<<cParams.searchLog ({})",
-            hc.search_depth,
-            1u32 << reference.searchLog
-        );
-        assert_eq!(
-            params.window_log as u32, reference.windowLog,
-            "L{level}: window_log ({}) must equal cParams.windowLog ({})",
-            params.window_log, reference.windowLog
-        );
-        assert_eq!(
-            hc.hash_log as u32, reference.hashLog,
-            "L{level}: hc.hash_log ({}) must equal cParams.hashLog ({})",
-            hc.hash_log, reference.hashLog
-        );
-        assert_eq!(
-            hc.chain_log as u32, reference.chainLog,
-            "L{level}: hc.chain_log ({}) must equal cParams.chainLog ({})",
-            hc.chain_log, reference.chainLog
-        );
+        assert_eq!(hc.search_depth, sd, "L{level}: search_depth");
+        assert_eq!(params.window_log, wlog, "L{level}: window_log");
+        assert_eq!(hc.hash_log, hlog, "L{level}: hash_log");
+        assert_eq!(hc.chain_log, clog, "L{level}: chain_log");
     }
 }

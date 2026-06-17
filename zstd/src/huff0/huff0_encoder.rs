@@ -48,14 +48,14 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
 
     /// Encodes the data using the provided table in 4 concatenated streams.
     ///
-    /// Donor-faithful port of `HUF_compress4X_usingCTable_internal_body`
+    /// Upstream zstd-faithful port of `HUF_compress4X_usingCTable_internal_body`
     /// (`huf_compress.c:1169-1216`): emits the table description (if
     /// requested), a 6-byte jump-table placeholder, then four
     /// independent 1X Huffman bitstreams via the unrolled
     /// dual-container loop in [`Self::encode_one_stream`]. Stream
     /// sizes are patched back into the jump table after encoding.
     ///
-    /// Donor's `HUF_compress1X_usingCTable_internal_body_loop` (lines
+    /// Upstream zstd's `HUF_compress1X_usingCTable_internal_body_loop` (lines
     /// 991-1043) extracts ILP by encoding `kUnroll` symbols into
     /// `bitContainer[0]` and another `kUnroll` symbols into
     /// `bitContainer[1]` in parallel, then merging — breaking the
@@ -63,21 +63,21 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
     /// mirror that here via `HufCStream::add_bits<FAST=true>` +
     /// `zero_index1` / `merge_index1`.
     ///
-    /// `kUnroll` choice mirrors donor's `tableLog`-driven dispatch
+    /// `kUnroll` choice mirrors upstream zstd's `tableLog`-driven dispatch
     /// (`huf_compress.c:1077-1108`) so each instantiation keeps the
-    /// container's per-symbol nb_bits sum below 64 - 4 (the donor "≥
+    /// container's per-symbol nb_bits sum below 64 - 4 (the upstream zstd "≥
     /// 4 free bits" precondition for `kFast=1`).
     pub fn encode4x(&mut self, data: &[u8], with_table: bool) {
         assert!(
             data.len() >= 12,
-            "donor HUF_compress4X requires srcSize >= 12"
+            "upstream zstd HUF_compress4X requires srcSize >= 12"
         );
 
         if with_table {
             self.write_table();
         }
 
-        // Donor's jump table: 3 × u16 LE sizes (size1, size2, size3);
+        // Upstream zstd's jump table: 3 × u16 LE sizes (size1, size2, size3);
         // size4 is implicit from total - sum. Reserve 6 bytes here,
         // patch in after each stream finishes.
         let jt_bit_idx = self.writer.index();
@@ -85,7 +85,7 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         self.writer.write_bits(0u16, 16);
         self.writer.write_bits(0u16, 16);
 
-        // Donor: `segmentSize = (srcSize + 3) / 4` for the first 3
+        // Upstream zstd: `segmentSize = (srcSize + 3) / 4` for the first 3
         // segments; last segment takes whatever remains.
         let segment_size = data.len().div_ceil(4);
         let segments = [
@@ -118,10 +118,10 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
                 Self::encode_one_stream(packed_codes, &mut bit_c, segment, table_log);
                 bit_c.close()
             });
-            // Donor `HUF_CStream_close` returns 0 on overflow (the
+            // Upstream zstd `HUF_CStream_close` returns 0 on overflow (the
             // dst_capacity was exhausted before close completed) and
             // truncates the output back to the segment start. Our
-            // `huf_tight_compress_bound` is sized exactly per donor's
+            // `huf_tight_compress_bound` is sized exactly per upstream zstd's
             // spec, so this branch is unreachable under a correctly
             // sized buffer — but if a future change ever mis-sizes
             // the bound, silently emitting a 0-length stream would
@@ -148,7 +148,7 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
             .change_bits(jt_bit_idx + 32, stream_sizes[2], 16);
     }
 
-    /// Donor `HUF_tightCompressBound(srcSize, tableLog)` from
+    /// Upstream zstd `HUF_tightCompressBound(srcSize, tableLog)` from
     /// `huf_compress.c:1050-1053`: an upper bound on encoded bytes
     /// that lets the hot path skip per-symbol bounds checks. We add
     /// 16 extra slack for the trailing end-mark byte + close-flush
@@ -159,7 +159,7 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
     }
 
     /// Dispatch on table_log to pick `kUnroll`, `kFastFlush`,
-    /// `kLastFast` matching donor's 64-bit branch in
+    /// `kLastFast` matching upstream zstd's 64-bit branch in
     /// `huf_compress.c:1092-1110`.
     fn encode_one_stream(
         table: &[u64],
@@ -167,7 +167,7 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         data: &[u8],
         table_log: u32,
     ) {
-        // Donor's fallback for tableLog > 11 OR insufficient dst
+        // Upstream zstd's fallback for tableLog > 11 OR insufficient dst
         // capacity: kUnroll=4 (on 64-bit), kFast=0, kLastFast=0.
         // We always reserve `huf_tight_compress_bound` worth of dst,
         // so the dst-capacity branch never fires; only tableLog > 11
@@ -179,13 +179,13 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
             9 => Self::encode_one_stream_unrolled::<6, true, false>(table, bit_c, data),
             8 => Self::encode_one_stream_unrolled::<7, true, false>(table, bit_c, data),
             7 => Self::encode_one_stream_unrolled::<8, true, false>(table, bit_c, data),
-            // tableLog ∈ {1..=6, 12} — donor's "default" branch falls
+            // tableLog ∈ {1..=6, 12} — upstream zstd's "default" branch falls
             // here too. kUnroll=4 keeps per-flush bit budget safe.
             _ => Self::encode_one_stream_unrolled::<4, false, false>(table, bit_c, data),
         }
     }
 
-    /// Donor `HUF_compress1X_usingCTable_internal_body_loop`
+    /// Upstream zstd `HUF_compress1X_usingCTable_internal_body_loop`
     /// (`huf_compress.c:991-1043`). Three phases:
     ///
     /// 1. Encode `n % K_UNROLL` symbols (slow / `FAST=false`) to
@@ -200,9 +200,9 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
     ///    sub-streams breaking the dependency chain.
     ///
     /// Symbols are consumed in REVERSE (`data[n-1]` then `data[n-2]`
-    /// …) matching donor's `ip[--n]` cadence — the resulting
+    /// …) matching upstream zstd's `ip[--n]` cadence — the resulting
     /// bitstream is decoded forward, but encoding right-to-left lets
-    /// donor pack high-frequency low-bit codes against the top of
+    /// upstream zstd pack high-frequency low-bit codes against the top of
     /// the container.
     ///
     /// `K_FAST_FLUSH`: skip the post-write overflow clamp in
@@ -222,7 +222,7 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
     ) {
         // Delegate to the hoisted-locals encode loop on `HufCStream`,
         // which keeps the bit containers / positions / cursor
-        // register-resident (donor's `HUF_CStream_t` shape) instead of
+        // register-resident (upstream zstd's `HUF_CStream_t` shape) instead of
         // reloading them from `*bit_c` per symbol. Byte-identical output.
         bit_c.encode_unrolled::<K_UNROLL, K_FAST_FLUSH, K_LAST_FAST>(table, data);
     }
@@ -348,7 +348,7 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
                 return None;
             }
             // Trust the FSE encoding and emit it directly, matching upstream
-            // zstd's HUF_writeCTable (no decode round-trip). The donor
+            // zstd's HUF_writeCTable (no decode round-trip). The upstream zstd
             // early-outs above guarantee FSE is only attempted on streams it
             // can represent, so the emitted description always decodes back —
             // verified exhaustively by `fse_weight_descriptions_roundtrip` over
@@ -389,16 +389,16 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
 pub struct HuffmanTable {
     /// Index is the symbol, values are the bitstring in the lower bits of the u32 and the amount of bits in the u8
     codes: Vec<(u32, u8)>,
-    /// Donor-format packed Huffman codes (`HUF_CElt`): one `u64` per
+    /// Upstream zstd-format packed Huffman codes (`HUF_CElt`): one `u64` per
     /// symbol where the bottom 8 bits hold `nb_bits` and the top
     /// `(64 - nb_bits)` bits hold `value` left-shifted to the high
-    /// end. Built in lockstep with `codes` so the donor-style
+    /// end. Built in lockstep with `codes` so the upstream zstd-style
     /// dual-container [`super::huf_cstream::HufCStream`] can index
     /// symbols with a single u64 load (no per-symbol shift+combine).
-    /// See `huf_compress.c:208-221` for the donor format.
+    /// See `huf_compress.c:208-221` for the upstream zstd format.
     packed_codes: Vec<u64>,
     /// Active Huffman table-log (1..=12). Stored explicitly so
-    /// `encode4x_donor` can dispatch to the correct `kUnroll`
+    /// `encode4x_reference` can dispatch to the correct `kUnroll`
     /// template instantiation without re-scanning `codes`.
     table_log: u32,
     /// Lazy cache of the FSE-encoded weight description. Avoids re-running
@@ -459,7 +459,7 @@ impl HuffmanTable {
         assert!(counts.len() <= 256);
         let symbol_cardinality = counts.iter().filter(|&&count| count > 0).count();
         if symbol_cardinality <= 1 {
-            return Self::build_from_weights(&build_donor_limited_weights(counts, 11));
+            return Self::build_from_weights(&build_limited_weights(counts, 11));
         }
 
         let min_table_log = symbol_cardinality.ilog2() as usize + 1;
@@ -468,7 +468,7 @@ impl HuffmanTable {
 
         // Outer-loop scoring uses [`cheap_desc_size_proxy`] — an integer
         // entropy estimate of the weight description, no FSE encode.
-        // Donor `HUF_writeCTable_wksp` picks the smaller of FSE / raw
+        // Upstream zstd `HUF_writeCTable_wksp` picks the smaller of FSE / raw
         // serializations; the proxy mirrors that decision analytically.
         // Empirically (#167 validation sweep across the compare_ffi
         // matrix) the proxy preserves the `(table_log → total_size)`
@@ -481,7 +481,7 @@ impl HuffmanTable {
         // conversion that the proxy wants. Avoids the per-candidate
         // `table.weights()` allocation (~256 B Vec) and lets the
         // table-log search loop stay allocation-free past the
-        // mandatory `build_donor_limited_weights` Vec.
+        // mandatory `build_limited_weights` Vec.
         let mut weights_u8 = [0u8; 256];
         // The Huffman tree shape (and thus the per-leaf natural depths) does
         // not depend on `table_log`; only the height limiting does. Build the
@@ -525,7 +525,7 @@ impl HuffmanTable {
             if max_bits < table_log && table_log > min_table_log {
                 break;
             }
-            // Donor `HUF_writeCTable` serializes `weights[..len-1]` — the
+            // Upstream zstd `HUF_writeCTable` serializes `weights[..len-1]` — the
             // decoder reconstructs the final weight from the Kraft-
             // equality (sum of `2^(weight-1)` is a power of two). Pass
             // the same trimmed slice to the proxy so it scores the
@@ -569,7 +569,7 @@ impl HuffmanTable {
 
         best_weights
             .map(|w| Self::build_from_weights(&w))
-            .unwrap_or_else(|| Self::build_from_weights(&build_donor_limited_weights(counts, 11)))
+            .unwrap_or_else(|| Self::build_from_weights(&build_limited_weights(counts, 11)))
     }
 
     /// Estimates encoded payload size in bytes for `data` using this table.
@@ -709,7 +709,7 @@ impl HuffmanTable {
         table
     }
 
-    /// Donor-format packed code table for the hot encode loop.
+    /// Upstream zstd-format packed code table for the hot encode loop.
     /// One `HUF_CElt` (`u64`) per symbol — see
     /// `huf_compress.c:208-221` for the layout.
     #[inline(always)]
@@ -718,7 +718,7 @@ impl HuffmanTable {
     }
 
     /// Active Huffman table-log (1..=12) — drives the `kUnroll`
-    /// dispatch in `encode4x_donor`.
+    /// dispatch in `encode4x_reference`.
     #[inline(always)]
     pub(crate) fn table_log(&self) -> u32 {
         self.table_log
@@ -755,7 +755,7 @@ impl HuffmanTable {
 /// table just to count bytes. For a 7-iteration `min_table_log..=11`
 /// search that is 7× FSE encode + 7× FSE table build per block — ~31 %
 /// inclusive on the 4 KiB profile (#167). This proxy reproduces the
-/// donor `HUF_writeCTable_wksp` decision (FSE vs raw nibble) without
+/// upstream zstd `HUF_writeCTable_wksp` decision (FSE vs raw nibble) without
 /// touching the FSE encoder.
 ///
 /// Algorithm — both representations mirror the writer code in this file
@@ -783,7 +783,7 @@ impl HuffmanTable {
 /// the contract symmetric ("not representable" = "skip this
 /// candidate") without an empty-slice special case.
 ///
-/// Donor picks the smaller of FSE / raw when both are representable.
+/// Upstream zstd picks the smaller of FSE / raw when both are representable.
 ///
 /// **Tolerance note:** the FSE entropy bound is generous — it never
 /// undershoots a perfectly-tuned FSE encoder. In practice that means
@@ -806,7 +806,7 @@ fn cheap_desc_size_proxy(weights: &[u8]) -> Option<usize> {
     for &w in weights {
         debug_assert!(
             (w as usize) < hist.len(),
-            "huffman weights are bounded to 0..12 by `build_donor_limited_weights`"
+            "huffman weights are bounded to 0..12 by `build_limited_weights`"
         );
         hist[w as usize] += 1;
     }
@@ -840,7 +840,7 @@ fn cheap_desc_size_proxy(weights: &[u8]) -> Option<usize> {
     // empirically-derived upper bound for our `acc_log = 6` weight tables.
     const FSE_HEADER_OVERHEAD_BYTES: usize = 8;
     let fse_size = fse_payload_bytes + FSE_HEADER_OVERHEAD_BYTES;
-    // Donor `encode_weight_description` rejects only `encoded.len() >= 128`,
+    // Upstream zstd `encode_weight_description` rejects only `encoded.len() >= 128`,
     // so `encoded.len() == 127` is the largest accepted FSE-encoded payload
     // and the total serialized description (`encoded.len() + 1` length-byte
     // prefix) is exactly 128 B in that boundary case. `fse_size` here is
@@ -1026,7 +1026,7 @@ fn limited_weights_from_leaves(
     Some(weights)
 }
 
-fn build_donor_limited_weights(counts: &[usize], max_nb_bits: usize) -> Vec<usize> {
+fn build_limited_weights(counts: &[usize], max_nb_bits: usize) -> Vec<usize> {
     let leaves = build_huffman_leaf_depths(counts);
     limited_weights_from_leaves(&leaves, counts.len(), max_nb_bits)
         .unwrap_or_else(|| legacy_distributed_weights(counts))
@@ -1758,23 +1758,13 @@ fn write_table_raw_path_initializes_none_cache() {
     ));
 }
 
-#[test]
-fn encoded_weight_description_is_accepted_by_donor_huf_reader() {
-    use zstd::zstd_safe::zstd_sys;
-
-    unsafe extern "C" {
-        fn HUF_readStats(
-            huff_weight: *mut u8,
-            hw_size: usize,
-            rank_stats: *mut u32,
-            nb_symbols_ptr: *mut u32,
-            table_log_ptr: *mut u32,
-            src: *const core::ffi::c_void,
-            src_size: usize,
-        ) -> usize;
-    }
-
-    let data = &include_bytes!("../../decodecorpus_files/z000033")[..16 * 1024];
+/// White-box capture of the FSE-coded Huffman weight description our encoder
+/// emits for `data` (a length byte followed by the FSE payload), plus the raw
+/// per-symbol weights. Returns `(description, weights)`. The C-conformance
+/// check that feeds this through `HUF_readStats` lives in the `ffi-bench`
+/// crate; this side stays pure Rust.
+#[cfg(feature = "bench_internals")]
+pub(crate) fn huf_weight_description_for_test(data: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let table = HuffmanTable::build_from_data(data);
     let mut weights = {
         let mut out = Vec::new();
@@ -1788,50 +1778,15 @@ fn encoded_weight_description_is_accepted_by_donor_huf_reader() {
     let mut description = Vec::with_capacity(encoded.len() + 1);
     description.push(encoded.len() as u8);
     description.extend_from_slice(&encoded);
-
-    let mut huff_weight = [0u8; 256];
-    let mut rank_stats = [0u32; 13];
-    let mut nb_symbols = 0u32;
-    let mut table_log = 0u32;
-    let read = unsafe {
-        HUF_readStats(
-            huff_weight.as_mut_ptr(),
-            huff_weight.len(),
-            rank_stats.as_mut_ptr(),
-            &mut nb_symbols,
-            &mut table_log,
-            description.as_ptr().cast(),
-            description.len(),
-        )
-    };
-    assert_eq!(
-        unsafe { zstd_sys::ZSTD_isError(read) },
-        0,
-        "HUF_readStats rejected weight description: {}",
-        zstd::zstd_safe::get_error_name(read)
-    );
-    assert_eq!(read, description.len());
-    assert_eq!(&huff_weight[..weights.len()], weights.as_slice());
+    (description, weights)
 }
 
-#[test]
-fn encoded_huffman_payload_is_accepted_by_donor_huf_reader() {
-    use zstd::zstd_safe::zstd_sys;
-
-    unsafe extern "C" {
-        fn HUF_decompress4X_hufOnly_wksp(
-            dctx: *mut u32,
-            dst: *mut core::ffi::c_void,
-            dst_size: usize,
-            c_src: *const core::ffi::c_void,
-            c_src_size: usize,
-            work_space: *mut core::ffi::c_void,
-            wksp_size: usize,
-            flags: i32,
-        ) -> usize;
-    }
-
-    let data = &include_bytes!("../../decodecorpus_files/z000033")[..16 * 1024];
+/// White-box capture of the 4-stream Huffman payload (table description
+/// followed by the coded streams) our encoder emits for `data`. The
+/// C-conformance check that decodes it via `HUF_decompress4X_hufOnly_wksp`
+/// lives in the `ffi-bench` crate.
+#[cfg(feature = "bench_internals")]
+pub(crate) fn huf_encode4x_for_test(data: &[u8]) -> Vec<u8> {
     let table = HuffmanTable::build_from_data(data);
     let mut encoded = Vec::new();
     {
@@ -1840,221 +1795,5 @@ fn encoded_huffman_payload_is_accepted_by_donor_huf_reader() {
         encoder.encode4x(data, true);
         writer.flush();
     }
-
-    let mut decoded = alloc::vec![0u8; data.len()];
-    let mut dtable = alloc::vec![0u32; 1 + (1 << 12)];
-    dtable[0] = 12 * 0x01010101;
-    let mut workspace = alloc::vec![0u64; 1 << 15];
-    let read = unsafe {
-        HUF_decompress4X_hufOnly_wksp(
-            dtable.as_mut_ptr(),
-            decoded.as_mut_ptr().cast(),
-            decoded.len(),
-            encoded.as_ptr().cast(),
-            encoded.len(),
-            workspace.as_mut_ptr().cast(),
-            workspace.len() * core::mem::size_of::<u64>(),
-            0,
-        )
-    };
-    assert_eq!(
-        unsafe { zstd_sys::ZSTD_isError(read) },
-        0,
-        "HUF_decompress4X_hufOnly_wksp rejected payload: {}",
-        zstd::zstd_safe::get_error_name(read)
-    );
-    assert_eq!(read, data.len());
-    assert_eq!(decoded.as_slice(), data);
-}
-
-#[test]
-fn level22_emitted_literal_sections_are_accepted_by_donor_huf_reader() {
-    use crate::encoding::{CompressionLevel, compress_to_vec};
-    use zstd::zstd_safe::zstd_sys;
-
-    unsafe extern "C" {
-        fn HUF_decompress1X1_DCtx_wksp(
-            dctx: *mut u32,
-            dst: *mut core::ffi::c_void,
-            dst_size: usize,
-            c_src: *const core::ffi::c_void,
-            c_src_size: usize,
-            work_space: *mut core::ffi::c_void,
-            wksp_size: usize,
-            flags: i32,
-        ) -> usize;
-        fn HUF_decompress4X_hufOnly_wksp(
-            dctx: *mut u32,
-            dst: *mut core::ffi::c_void,
-            dst_size: usize,
-            c_src: *const core::ffi::c_void,
-            c_src_size: usize,
-            work_space: *mut core::ffi::c_void,
-            wksp_size: usize,
-            flags: i32,
-        ) -> usize;
-        fn HUF_decompress1X_usingDTable(
-            dst: *mut core::ffi::c_void,
-            dst_size: usize,
-            c_src: *const core::ffi::c_void,
-            c_src_size: usize,
-            dtable: *const u32,
-            flags: i32,
-        ) -> usize;
-        fn HUF_decompress4X_usingDTable(
-            dst: *mut core::ffi::c_void,
-            dst_size: usize,
-            c_src: *const core::ffi::c_void,
-            c_src_size: usize,
-            dtable: *const u32,
-            flags: i32,
-        ) -> usize;
-    }
-
-    fn frame_blocks_offset(frame: &[u8]) -> usize {
-        assert_eq!(&frame[..4], &[0x28, 0xb5, 0x2f, 0xfd]);
-        let descriptor = frame[4];
-        let fcs_flag = descriptor >> 6;
-        let single_segment = descriptor & (1 << 5) != 0;
-        let dict_id_flag = descriptor & 0b11;
-        let mut pos = 5usize;
-        if !single_segment {
-            pos += 1;
-        }
-        pos += match dict_id_flag {
-            0 => 0,
-            1 => 1,
-            2 => 2,
-            3 => 4,
-            _ => unreachable!(),
-        };
-        pos += match (single_segment, fcs_flag) {
-            (true, 0) => 1,
-            (_, 0) => 0,
-            (_, 1) => 2,
-            (_, 2) => 4,
-            (_, 3) => 8,
-            _ => unreachable!(),
-        };
-        pos
-    }
-
-    let data = include_bytes!("../../decodecorpus_files/z000033");
-    let frame = compress_to_vec(data.as_slice(), CompressionLevel::Level(22));
-    let mut pos = frame_blocks_offset(&frame);
-    let mut dtable = alloc::vec![0u32; 1 + (1 << 12)];
-    dtable[0] = 12 * 0x01010101;
-    let mut workspace = alloc::vec![0u64; 1 << 15];
-    let mut huf_valid = false;
-    let mut block_idx = 0usize;
-    loop {
-        let header = u32::from(frame[pos])
-            | (u32::from(frame[pos + 1]) << 8)
-            | (u32::from(frame[pos + 2]) << 16);
-        pos += 3;
-        let last = header & 1 != 0;
-        let block_type = (header >> 1) & 0b11;
-        let block_size = (header >> 3) as usize;
-        let block = &frame[pos..pos + block_size];
-        pos += block_size;
-        if block_type == 2 {
-            let lit_type = block[0] & 0b11;
-            match lit_type {
-                0 | 1 => huf_valid = false,
-                2 | 3 => {
-                    if lit_type == 3 {
-                        assert!(
-                            huf_valid,
-                            "repeat HUF without live table at block {block_idx}"
-                        );
-                    }
-                    let header = u64::from(block[0])
-                        | (u64::from(block[1]) << 8)
-                        | (u64::from(block[2]) << 16)
-                        | (u64::from(*block.get(3).unwrap_or(&0)) << 24);
-                    let lhl_code = (block[0] >> 2) & 0b11;
-                    let (single_stream, lh_size, lit_size, lit_c_size) = match lhl_code {
-                        0 | 1 => {
-                            let single = lhl_code == 0;
-                            (
-                                single,
-                                3,
-                                ((header >> 4) & 0x3ff) as usize,
-                                ((header >> 14) & 0x3ff) as usize,
-                            )
-                        }
-                        2 => (
-                            false,
-                            4,
-                            ((header >> 4) & 0x3fff) as usize,
-                            (header >> 18) as usize,
-                        ),
-                        3 => (
-                            false,
-                            5,
-                            ((header >> 4) & 0x3ffff) as usize,
-                            (((header >> 22) & 0x3ff) as usize) + ((block[4] as usize) << 10),
-                        ),
-                        _ => unreachable!(),
-                    };
-                    let csrc = &block[lh_size..lh_size + lit_c_size];
-                    let mut decoded = alloc::vec![0u8; lit_size];
-                    let code = unsafe {
-                        match (lit_type, single_stream) {
-                            (2, true) => HUF_decompress1X1_DCtx_wksp(
-                                dtable.as_mut_ptr(),
-                                decoded.as_mut_ptr().cast(),
-                                decoded.len(),
-                                csrc.as_ptr().cast(),
-                                csrc.len(),
-                                workspace.as_mut_ptr().cast(),
-                                workspace.len() * core::mem::size_of::<u64>(),
-                                0,
-                            ),
-                            (2, false) => HUF_decompress4X_hufOnly_wksp(
-                                dtable.as_mut_ptr(),
-                                decoded.as_mut_ptr().cast(),
-                                decoded.len(),
-                                csrc.as_ptr().cast(),
-                                csrc.len(),
-                                workspace.as_mut_ptr().cast(),
-                                workspace.len() * core::mem::size_of::<u64>(),
-                                0,
-                            ),
-                            (3, true) => HUF_decompress1X_usingDTable(
-                                decoded.as_mut_ptr().cast(),
-                                decoded.len(),
-                                csrc.as_ptr().cast(),
-                                csrc.len(),
-                                dtable.as_ptr(),
-                                0,
-                            ),
-                            (3, false) => HUF_decompress4X_usingDTable(
-                                decoded.as_mut_ptr().cast(),
-                                decoded.len(),
-                                csrc.as_ptr().cast(),
-                                csrc.len(),
-                                dtable.as_ptr(),
-                                0,
-                            ),
-                            _ => unreachable!(),
-                        }
-                    };
-                    assert_eq!(
-                        unsafe { zstd_sys::ZSTD_isError(code) },
-                        0,
-                        "donor HUF rejected block {block_idx} lit_type={lit_type} single={single_stream} lit_size={lit_size} lit_c_size={lit_c_size}: {}",
-                        zstd::zstd_safe::get_error_name(code)
-                    );
-                    assert_eq!(code, lit_size, "donor HUF decoded short block {block_idx}");
-                    huf_valid = true;
-                }
-                _ => unreachable!(),
-            }
-        }
-        if last {
-            break;
-        }
-        block_idx += 1;
-    }
+    encoded
 }

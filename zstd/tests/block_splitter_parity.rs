@@ -1,20 +1,20 @@
-//! Donor-parity verification for the block splitter port.
+//! Upstream zstd-parity verification for the block splitter port.
 //!
 //! Our `split_block_from_borders` and `split_block_by_chunks`
-//! ports must produce byte-identical decisions to upstream donor
+//! ports must produce byte-identical decisions to upstream upstream zstd
 //! `ZSTD_splitBlock` for every (block, split_level) input in the
 //! decode corpus. This test invokes both implementations on the same
 //! 128 KB chunks and asserts equality.
 //!
-//! Donor reference: `lib/compress/zstd_preSplit.h` —
+//! Upstream zstd reference: `lib/compress/zstd_preSplit.h` —
 //! `ZSTD_splitBlock(blockStart, blockSize == 128 KB, level ∈ 0..=4,
 //! workspace, wkspSize >= ZSTD_SLIPBLOCK_WORKSPACESIZE = 8208)`.
 //! `ZSTD_splitBlock` is NOT in the public `zstd.h` API; we declare
 //! the extern manually since `zstd-sys` does not bind it.
 //!
-//! Implements #206 (block splitter donor-parity check). Per the
+//! Implements #206 (block splitter upstream zstd-parity check). Per the
 //! issue acceptance criteria, divergences correlating with ratio
-//! losses would justify porting more donor split logic; divergences
+//! losses would justify porting more upstream zstd split logic; divergences
 //! that are size-neutral represent algorithmic freedom. Today we
 //! assert STRICT equality because `split_block_from_borders`
 //! and `split_block_by_chunks` are direct ports; any
@@ -29,16 +29,16 @@ use structured_zstd::testing::{MAX_BLOCK_SIZE, block_splitter_decision};
 // the manually-declared `ZSTD_splitBlock` symbol below.
 use zstd::zstd_safe::zstd_sys as _;
 
-/// Donor preSplit workspace size constant from `zstd_preSplit.h`.
+/// Upstream zstd preSplit workspace size constant from `zstd_preSplit.h`.
 const ZSTD_SLIPBLOCK_WORKSPACESIZE: usize = 8208;
 
-// `non_snake_case` is allowed on the extern block so the donor symbol
+// `non_snake_case` is allowed on the extern block so the upstream zstd symbol
 // keeps its exact upstream spelling — the linker resolves by name, and
 // renaming would force a `#[link_name = ...]` shim with no readability
 // gain.
 #[allow(non_snake_case)]
 unsafe extern "C" {
-    /// Donor `ZSTD_splitBlock` (internal, not in `zstd.h` public API
+    /// Upstream zstd `ZSTD_splitBlock` (internal, not in `zstd.h` public API
     /// but exported by libzstd). Returns the split position within
     /// `[0, blockSize)` or `blockSize` if no split is chosen.
     ///
@@ -64,7 +64,14 @@ unsafe extern "C" {
 /// runners (nextest, IDE test runners, in-tree `cargo test`,
 /// out-of-tree invocations) when the fixture is present.
 fn corpus_dir() -> PathBuf {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("decodecorpus_files");
+    // This source is built from the sibling `ffi-bench` crate (so the library
+    // crate links no C bindings), so `CARGO_MANIFEST_DIR` may point at either
+    // crate. Resolve the fixture next to the manifest first, then under the
+    // sibling `zstd` crate.
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let here = manifest.join("decodecorpus_files");
+    let sibling = manifest.join("../zstd/decodecorpus_files");
+    let path = if here.is_dir() { here } else { sibling };
     assert!(
         path.is_dir(),
         "expected corpus directory at {} — this test needs the \
@@ -99,7 +106,7 @@ fn load_corpus_chunks() -> Vec<(String, Vec<u8>)> {
             continue;
         }
         let bytes = fs::read(&path).expect("read corpus file");
-        // Donor's `ZSTD_splitBlock` only accepts exactly 128 KB.
+        // Upstream zstd's `ZSTD_splitBlock` only accepts exactly 128 KB.
         // Stride through the corpus file in 128 KB chunks; skip the
         // tail if it's not exactly one block.
         let block_size = MAX_BLOCK_SIZE as usize;
@@ -130,7 +137,7 @@ fn synthetic_transition_chunk(transition_at: usize) -> Vec<u8> {
     let block_size = MAX_BLOCK_SIZE as usize;
     let mut block = Vec::with_capacity(block_size);
     // Two distinct xorshift seeds so the byte distributions differ
-    // enough for the donor histogram to register a split.
+    // enough for the upstream zstd histogram to register a split.
     let mut s1: u64 = 0xDEAD_BEEF_CAFE_F00D;
     let mut s2: u64 = 0x0123_4567_89AB_CDEF;
     for i in 0..block_size {
@@ -150,17 +157,17 @@ fn synthetic_transition_chunk(transition_at: usize) -> Vec<u8> {
     block
 }
 
-/// Call donor `ZSTD_splitBlock` with a fresh stack-aligned workspace.
-fn donor_decision(block: &[u8], level: i32) -> usize {
+/// Call upstream zstd `ZSTD_splitBlock` with a fresh stack-aligned workspace.
+fn reference_decision(block: &[u8], level: i32) -> usize {
     assert_eq!(block.len(), MAX_BLOCK_SIZE as usize);
     // `ZSTD_SLIPBLOCK_WORKSPACESIZE` is in bytes; we allocate `u64`
     // slots so the buffer is naturally 8-byte aligned (satisfies the
-    // donor's `size_t` alignment requirement on all supported targets,
+    // upstream zstd's `size_t` alignment requirement on all supported targets,
     // where `size_t` is at most 8 bytes). Slot count is the ceiling
     // of `ZSTD_SLIPBLOCK_WORKSPACESIZE / size_of::<u64>()` so the
-    // byte budget never under-shoots the donor minimum even if the
+    // byte budget never under-shoots the upstream zstd minimum even if the
     // constant is later raised to a non-multiple of 8. The actual
-    // byte count passed to donor below is `workspace.len() * size_of::<u64>()`.
+    // byte count passed to upstream zstd below is `workspace.len() * size_of::<u64>()`.
     const U64_SIZE: usize = core::mem::size_of::<u64>();
     let workspace_slots = ZSTD_SLIPBLOCK_WORKSPACESIZE.div_ceil(U64_SIZE);
     let mut workspace = vec![0u64; workspace_slots];
@@ -181,19 +188,19 @@ fn donor_decision(block: &[u8], level: i32) -> usize {
 
 fn assert_parity(label: &str, block: &[u8], split_level: usize) {
     let ours = block_splitter_decision(block, split_level);
-    let donor = donor_decision(block, split_level as i32);
+    let reference = reference_decision(block, split_level as i32);
     assert_eq!(
         ours,
-        donor,
+        reference,
         "{label} @ split_level={split_level}: \
-         our port = {ours}, donor = {donor} \
+         our port = {ours}, reference = {reference} \
          (block first 16 bytes = {:02X?})",
         &block[..16]
     );
 }
 
 #[test]
-fn corpus_borders_heuristic_matches_donor() {
+fn corpus_borders_heuristic_matches_reference() {
     let chunks = load_corpus_chunks();
     assert!(
         !chunks.is_empty(),
@@ -205,7 +212,7 @@ fn corpus_borders_heuristic_matches_donor() {
 }
 
 #[test]
-fn corpus_by_chunks_matches_donor_at_each_sampling_level() {
+fn corpus_by_chunks_matches_reference_at_each_sampling_level() {
     let chunks = load_corpus_chunks();
     assert!(
         !chunks.is_empty(),
@@ -238,13 +245,16 @@ fn synthetic_transition_at_96k_borders_heuristic() {
 
 #[test]
 fn synthetic_no_transition_borders_heuristic() {
-    // No transition — single-stream chunk; donor + ours should both
+    // No transition — single-stream chunk; upstream zstd + ours should both
     // return block.len() (no split).
     let block = synthetic_transition_chunk(MAX_BLOCK_SIZE as usize);
     let split_level = 0;
     let ours = block_splitter_decision(&block, split_level);
-    let donor = donor_decision(&block, split_level as i32);
-    assert_eq!(ours, donor, "no-transition: ours={ours} donor={donor}");
+    let reference = reference_decision(&block, split_level as i32);
+    assert_eq!(
+        ours, reference,
+        "no-transition: ours={ours} reference={reference}"
+    );
     assert_eq!(
         ours,
         block.len(),

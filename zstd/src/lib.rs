@@ -153,21 +153,84 @@ pub mod testing {
 
     /// Maximum block size per RFC 8878 §3.1.1.2.3 (128 KiB).
     /// Exposed for parity tests that feed exactly-one-block chunks
-    /// into the donor splitter comparator.
+    /// into the block-splitter comparator.
     pub const MAX_BLOCK_SIZE: u32 = crate::common::MAX_BLOCK_SIZE;
 
-    /// Run our donor-port block splitter on a 128 KB chunk.
+    /// Run our block splitter on a 128 KB chunk.
     ///
-    /// `split_level` mirrors donor `ZSTD_splitBlock(level)`: `0` selects
+    /// `split_level` mirrors upstream zstd `ZSTD_splitBlock(level)`: `0` selects
     /// the borders heuristic (`ZSTD_splitBlock_fromBorders`), `1..=4`
     /// select `ZSTD_splitBlock_byChunks` at the corresponding sampling
     /// level. Returns the split position (or `block.len()` if no split).
     ///
-    /// Crate-internal facade for the donor-parity comparator test —
+    /// Crate-internal facade for the block-splitter parity comparator test —
     /// the underlying functions stay `fn` so they don't widen the
     /// stable API surface.
     pub fn block_splitter_decision(block: &[u8], split_level: usize) -> usize {
         crate::encoding::frame_compressor::block_splitter_decision_for_bench(block, split_level)
+    }
+
+    /// White-box capture of our Huffman weight description for `data`:
+    /// `(description, weights)` where `description` is the length-prefixed
+    /// FSE payload and `weights` the raw per-symbol weights. Facade for the
+    /// `ffi-bench` conformance test that feeds it through the C `HUF_readStats`.
+    pub fn huf_weight_description(data: &[u8]) -> (alloc::vec::Vec<u8>, alloc::vec::Vec<u8>) {
+        crate::huff0::huff0_encoder::huf_weight_description_for_test(data)
+    }
+
+    /// White-box capture of our 4-stream Huffman payload for `data`. Facade for
+    /// the `ffi-bench` conformance test that decodes it through the C HUF reader.
+    pub fn huf_encode4x(data: &[u8]) -> alloc::vec::Vec<u8> {
+        crate::huff0::huff0_encoder::huf_encode4x_for_test(data)
+    }
+
+    /// White-box capture of the level-22 sequence stream (literal-length,
+    /// offset, match-length triples) our match generator emits for `data`.
+    /// Facade for the sequence-conformance test in `ffi-bench`, which
+    /// compares this stream against the C reference's `ZSTD_generateSequences`
+    /// output. Pure Rust; the C side stays out of this crate.
+    pub fn collect_level22_sequences(data: &[u8]) -> alloc::vec::Vec<(usize, usize, usize)> {
+        crate::encoding::match_generator::collect_level22_sequences(data)
+    }
+
+    /// FastCOVER dictionary roundtrip fixture: `(finalized_dictionary,
+    /// compressed_frame, original_payload)`. Facade for the `ffi-bench`
+    /// conformance test that decodes `compressed_frame` against the dictionary
+    /// through the C decoder and compares to `original_payload`.
+    #[cfg(feature = "dict_builder")]
+    pub fn dict_roundtrip_fixture() -> (
+        alloc::vec::Vec<u8>,
+        alloc::vec::Vec<u8>,
+        alloc::vec::Vec<u8>,
+    ) {
+        crate::dictionary::dict_roundtrip_fixture()
+    }
+
+    pub use crate::blocks::block::BlockType;
+
+    /// First block's type (raw / rle / compressed) in a frame. Facade over the
+    /// internal block decoder for the FFI parity tests in `ffi-bench`.
+    pub fn first_block_type(frame: &[u8]) -> BlockType {
+        let (_, header_size) = crate::decoding::frame::read_frame_header_with_format(frame, false)
+            .expect("frame header should parse");
+        let mut decoder = crate::decoding::block_decoder::new();
+        let (header, _) = decoder
+            .read_block_header(&frame[header_size as usize..])
+            .expect("block header should parse");
+        header.block_type
+    }
+
+    /// `(single_segment_flag, frame_content_size, fcs_field_size_bytes)` parsed
+    /// from a frame header. Facade for the FFI parity tests in `ffi-bench` so
+    /// they need not reach into the internal `FrameHeader` type.
+    pub fn frame_header_info(frame: &[u8]) -> (bool, u64, u8) {
+        let (h, _) = crate::decoding::frame::read_frame_header_with_format(frame, false)
+            .expect("frame header should parse");
+        (
+            h.descriptor.single_segment_flag(),
+            h.frame_content_size(),
+            h.descriptor.frame_content_size_bytes().unwrap_or(0),
+        )
     }
 }
 
@@ -175,7 +238,7 @@ pub mod testing {
 /// (currently **32 bytes**). Sized so the AVX2 chunked kernel in
 /// `simd_copy::copy_bytes_overshooting` (32-byte stride on x86-64) can
 /// fire on tail copies near the end of a fixed-capacity output buffer.
-/// Donor zstd's `WILDCOPY_OVERLENGTH` is also 32 bytes today; this
+/// Upstream zstd's `WILDCOPY_OVERLENGTH` is also 32 bytes today; this
 /// matches that contract.
 ///
 /// Public so callers sizing an output slice for

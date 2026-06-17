@@ -49,7 +49,7 @@ impl<'t, E: FseEntry, const CAP: usize> FSEDecoderImpl<'t, E, CAP> {
     ) -> Result<(), FSEDecoderError> {
         // Uninitialised = no decode entries. (Previously this checked
         // `accuracy_log == 0`, but a valid RLE table has accuracy_log 0
-        // with a single entry — donor's RLE DTable. An empty `decode`
+        // with a single entry — upstream zstd's RLE DTable. An empty `decode`
         // vec is the real "never built" signal; the `InvalidTableShape`
         // check below still enforces `decode.len() == 1 << accuracy_log`,
         // which holds for the 1-entry RLE table since `1 << 0 == 1`.)
@@ -239,7 +239,7 @@ pub struct FSETableImpl<E: FseEntry, const CAP: usize> {
     /// strategy — HUF weights `CAP=64`, sequence LL/ML/OF `CAP=512`). Only
     /// `decode[..decode_len]` is live; the rest is unused capacity. Storing it
     /// inline (vs a `Vec`) lets `reinit_from` copy the whole table in one
-    /// contiguous `memcpy` (array assignment) — mirroring the donor's
+    /// contiguous `memcpy` (array assignment) — mirroring the upstream zstd's
     /// fixed-array `ZSTD_entropyDTables_t` copied by `ZSTD_copyDDictParameters`
     /// — instead of a heap copy through a separate allocation.
     decode: [E; CAP],
@@ -271,7 +271,7 @@ pub struct FSETableImpl<E: FseEntry, const CAP: usize> {
 pub type FSETable = FSETableImpl<Entry, 64>;
 
 /// Compact sequence-section variant. Backed by 8-byte [`SeqSymbol`]
-/// entries instead of the 12-byte HUF [`Entry`] — matches donor
+/// entries instead of the 12-byte HUF [`Entry`] — matches upstream zstd
 /// `ZSTD_seqSymbol`. The per-entry `symbol` byte is dropped. Build
 /// flow: [`FseEntry::from_raw`] zero-inits `base_value` /
 /// `num_additional_bits` on insert; the LL / ML / OF enrich passes
@@ -340,10 +340,10 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         // the decode Vector"): the decode hot path and Repeat-mode reuse read
         // only `decode` + `accuracy_log`, and any block that rebuilds the
         // table (`build_decoder`) repopulates the scratch itself. Skipping
-        // them mirrors the donor copying just the FSE decode table per frame
+        // them mirrors the upstream zstd copying just the FSE decode table per frame
         // instead of the full build workspace.
         // ONE contiguous memcpy of the whole fixed-size decode array (the
-        // monomorphized-per-shape table), mirroring the donor's single
+        // monomorphized-per-shape table), mirroring the upstream zstd's single
         // `ZSTD_copyDDictParameters` memcpy — instead of a heap `Vec` copy
         // through a separate allocation. `decode_len` carries the live span.
         self.decode = other.decode;
@@ -511,7 +511,7 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
     }
 
     /// Build the actual decoding table after probabilities have been
-    /// read. Donor-shape single-pass build: spread symbols into the
+    /// read. Upstream zstd-shape single-pass build: spread symbols into the
     /// scratch buffer, then write `decode` entries in one linear pass
     /// — no intermediate zero-init Vec::resize, no per-call heap
     /// allocation for the symbol counter (stack-allocated since the
@@ -567,8 +567,8 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         spread.clear();
         spread.resize(table_size, 0);
 
-        // Donor `ZSTD_buildFSETable_body`-shape per-symbol counter
-        // (donor `symbolNext[]`). Indexed by symbol byte; initialised
+        // Upstream zstd `ZSTD_buildFSETable_body`-shape per-symbol counter
+        // (upstream zstd `symbolNext[]`). Indexed by symbol byte; initialised
         // to `prob` for positive-probability symbols, `1` for `-1`
         // (low-probability) symbols. The build loop below reads then
         // increments `symbol_next[symbol]` per state placed, and
@@ -583,7 +583,7 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         let mut symbol_next = [0u32; 256];
 
         // Pass 1: place -1 probability symbols at the top of the
-        // table AND initialise `symbol_next` for them. Donor:
+        // table AND initialise `symbol_next` for them. Upstream zstd:
         // `tableDecode[highThreshold--].baseValue = s; symbolNext[s]
         // = 1;`.
         //
@@ -603,10 +603,10 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         }
 
         // Pass 2: distribute positive-probability symbols across the
-        // [0, negative_idx) range using the donor's `next_position`
+        // [0, negative_idx) range using the upstream zstd's `next_position`
         // walker, and initialise `symbol_next[s] = prob` so the
         // build loop's counter reaches `2*prob - 1` over `prob`
-        // iterations (matching donor `symbolNext[s]++` semantics).
+        // iterations (matching upstream zstd `symbolNext[s]++` semantics).
         let mut position = 0usize;
         for symbol in 0..nb_symbols {
             let prob = probs[symbol];
@@ -624,8 +624,8 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
             }
         }
 
-        // === Build step (donor formula) ===
-        // For each state u in 0..tableSize, donor `ZSTD_buildFSETable_body`:
+        // === Build step (upstream zstd formula) ===
+        // For each state u in 0..tableSize, upstream zstd `ZSTD_buildFSETable_body`:
         //   nextState = symbolNext[symbol]++
         //   nbBits    = tableLog - ZSTD_highbit32(nextState)
         //   newState  = (nextState << nbBits) - tableSize
@@ -693,7 +693,7 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
             // FSE invariant gate: keep the explicit `nb > accuracy_log`
             // guard for `build_from_probabilities` (public surface) so
             // a crafted probability vector can't silently violate
-            // `new_state + (1 << nb) - 1 < table_size`. With the donor
+            // `new_state + (1 << nb) - 1 < table_size`. With the upstream zstd
             // formula `nb` derives from `high_bit` which is itself
             // bounded by the table-size invariant, but a malformed
             // probability accumulating beyond `table_size` could push
@@ -757,7 +757,7 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
     fn read_probabilities(&mut self, source: &[u8], max_log: u8) -> Result<usize, FSETableError> {
         self.symbol_probabilities.clear(); //just clear, we will fill a probability for each entry anyways. No need to force new allocs here
 
-        // Donor `FSE_readNCount` cursor shape: a flat little-endian bit
+        // Upstream zstd `FSE_readNCount` cursor shape: a flat little-endian bit
         // position over `source`, extracting each field with one whole-word
         // load. The generic `BitReader::get_bits` assembled fields
         // byte-by-byte with per-call divisions — measured ~6% of decode
@@ -883,7 +883,7 @@ impl FSETableImpl<SeqSymbol, 512> {
     /// from a packed LL / ML meta table. [`SeqSymbol`] has no
     /// per-state byte; the source symbol for slot `i` is read from
     /// the persisted `symbol_spread_buffer` (still in place after
-    /// `build_decoding_table` finishes). Mirrors donor
+    /// `build_decoding_table` finishes). Mirrors upstream zstd
     /// `ZSTD_buildSeqTable` post-build enrich for LL / ML.
     pub(crate) fn enrich_with_packed_seq_meta(&mut self, packed: &[u32]) {
         debug_assert_eq!(self.decode_len, self.symbol_spread_buffer.len());
@@ -919,7 +919,7 @@ impl FSETableImpl<SeqSymbol, 512> {
 
     /// Build a degenerate single-state RLE table for a sequence axis
     /// whose Compression_Mode is RLE: exactly one symbol, decoded every
-    /// sequence with no FSE state-transition bits. Mirrors the donor
+    /// sequence with no FSE state-transition bits. Mirrors the upstream zstd
     /// RLE DTable (`accuracy_log = 0`, one entry, `new_state = 0`,
     /// `num_bits = 0`). The caller runs the usual `enrich_with_packed_seq_meta`
     /// (LL/ML) or `enrich_for_offsets` (OF) pass afterward to fill
@@ -936,7 +936,7 @@ impl FSETableImpl<SeqSymbol, 512> {
         // `max_symbol` at the axis maximum, which is correct here.
         // Spread buffer drives the enrich pass (symbol per slot); one slot.
         self.symbol_spread_buffer.push(symbol);
-        // Single RLE entry at slot 0 (donor RLE DTable: one state).
+        // Single RLE entry at slot 0 (upstream zstd RLE DTable: one state).
         self.decode[0] = SeqSymbol {
             new_state: 0,
             num_bits: 0,
@@ -944,7 +944,7 @@ impl FSETableImpl<SeqSymbol, 512> {
             base_value: 0,
         };
         self.decode_len = 1;
-        // accuracy_log stays 0 (donor RLE DTable tableLog); init_state
+        // accuracy_log stays 0 (upstream zstd RLE DTable tableLog); init_state
         // reads 0 state bits and update_state keeps the single state.
     }
 }
@@ -955,11 +955,11 @@ pub type SeqFSEDecoder<'t> = FSEDecoderImpl<'t, SeqSymbol, 512>;
 /// A single entry in an FSE table.
 ///
 /// The first four bytes (`new_state`, `symbol`, `num_bits`) mirror the
-/// classical donor `FSE_decode_t` layout used by every FSE-backed
+/// classical upstream zstd `FSE_decode_t` layout used by every FSE-backed
 /// decoder in the crate (sequence-section LL/ML/OF, HUF-weight
 /// stream). The trailing `base_value` + `num_additional_bits`
 /// fields are populated only by the LL / ML / OF tables in the
-/// sequence-section decoder (donor `ZSTD_seqSymbol` shape) so the
+/// sequence-section decoder (upstream zstd `ZSTD_seqSymbol` shape) so the
 /// per-sequence hot path can read them directly off the active
 /// entry instead of issuing a second lookup into a separate
 /// metadata table. HUF tables leave these two fields at their
@@ -977,14 +977,14 @@ pub struct Entry {
     /// How many bits should be read from the stream when decoding this entry.
     pub num_bits: u8,
     /// For LL / ML / OF tables: pre-computed code baseline.
-    /// `actual_value = base_value + extra_bits_read`. Donor
+    /// `actual_value = base_value + extra_bits_read`. Upstream zstd
     /// `ZSTD_seqSymbol::baseValue`. Populated by the per-table
     /// `enrich_for_*` post-build pass; stays 0 for FSE tables that
     /// don't need it (HUF-weight stream).
     pub base_value: u32,
     /// For LL / ML / OF tables: number of bits to read from the
     /// bitstream after the symbol has been decoded, to obtain the
-    /// additional value to add to `base_value`. Donor
+    /// additional value to add to `base_value`. Upstream zstd
     /// `ZSTD_seqSymbol::nbAdditionalBits`. Populated alongside
     /// `base_value`; stays 0 for FSE tables that don't need it.
     pub num_additional_bits: u8,
@@ -1005,11 +1005,11 @@ const _: [(); 8] = [(); core::mem::offset_of!(Entry, num_additional_bits)];
 #[cfg(target_endian = "little")]
 const _: [(); 12] = [(); core::mem::size_of::<Entry>()];
 
-/// Compact sequence-section FSE entry, mirroring donor's
+/// Compact sequence-section FSE entry, mirroring upstream zstd's
 /// `ZSTD_seqSymbol` exactly: no `symbol` field (the sequence-section
 /// decoder reads `base_value` / `num_additional_bits` directly off
 /// the active state and never needs the source byte). 8 bytes vs
-/// the 12-byte HUF-grade `Entry`. Field order matches donor so the
+/// the 12-byte HUF-grade `Entry`. Field order matches upstream zstd so the
 /// init-state path can issue a single aligned 8-byte load.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
@@ -1022,10 +1022,10 @@ pub struct SeqSymbol {
     /// state.
     pub num_bits: u8,
     /// Bits to read after the symbol decodes, to add to `base_value`.
-    /// Donor `ZSTD_seqSymbol::nbAdditionalBits`.
+    /// Upstream zstd `ZSTD_seqSymbol::nbAdditionalBits`.
     pub num_additional_bits: u8,
     /// Pre-computed code baseline. `actual_value = base_value +
-    /// extra_bits_read`. Donor `ZSTD_seqSymbol::baseValue`.
+    /// extra_bits_read`. Upstream zstd `ZSTD_seqSymbol::baseValue`.
     pub base_value: u32,
 }
 
@@ -1052,7 +1052,7 @@ const _: [(); 8] = [(); core::mem::size_of::<SeqSymbol>()];
 /// `num_additional_bits` from caller-provided meta and discards
 /// `symbol`.
 #[doc(hidden)]
-/// Sequence-axis meta source fused into the table-build loop. The donor
+/// Sequence-axis meta source fused into the table-build loop. The upstream zstd
 /// fills `baseValue` / `nbAdditionalBits` during table construction
 /// (`ZSTD_buildSeqTable`); building first and enriching in a second
 /// full-table pass doubles the entry traffic on table-dense frames.
@@ -1083,7 +1083,7 @@ pub trait FseEntry: Copy + Default {
 
     /// Build-time constructor from the raw (new_state, symbol, num_bits)
     /// triple produced by `build_decoding_table`. Implementations may
-    /// drop `symbol` (e.g. [`SeqSymbol`] mirrors donor `ZSTD_seqSymbol`
+    /// drop `symbol` (e.g. [`SeqSymbol`] mirrors upstream zstd `ZSTD_seqSymbol`
     /// which has no per-state byte) — the sequence-section decoder
     /// fills `base_value` / `num_additional_bits` via a separate enrich
     /// pass.
@@ -1129,7 +1129,7 @@ impl FseEntry for SeqSymbol {
     }
     #[inline(always)]
     fn from_raw(new_state: u16, _symbol: u8, num_bits: u8) -> Self {
-        // `symbol` is intentionally dropped: the donor `ZSTD_seqSymbol`
+        // `symbol` is intentionally dropped: the upstream zstd `ZSTD_seqSymbol`
         // layout has no per-state byte. LL / ML / OF tables fill the
         // `base_value` / `num_additional_bits` fields via the enrich
         // post-pass that follows `build_decoder`.

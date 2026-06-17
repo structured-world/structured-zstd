@@ -1,6 +1,6 @@
 //! Long-distance-match (LDM) producer.
 //!
-//! Implements the donor's `lib/compress/zstd_ldm.c` pipeline:
+//! Implements the upstream zstd's `lib/compress/zstd_ldm.c` pipeline:
 //!
 //! 1. [`gear_hash`] — gear rolling hash over a 256-entry random
 //!    permutation table picks content-defined split points
@@ -38,11 +38,11 @@
 //!   wires `ZSTD_c_enableLongDistanceMatching` through the same
 //!   surface.
 //!
-//! Therefore the `level22_sequences_match_donor_on_corpus_proxy`
+//! Therefore the `level22_sequences_match_upstream zstd_on_corpus_proxy`
 //! ratio gate continues to compare two LDM-OFF outputs (ours vs
 //! upstream `ZSTD_compress(..., 22)`) — byte-parity invariant.
 //!
-//! Donor parity anchors:
+//! Upstream zstd parity anchors:
 //! * `lib/compress/zstd_ldm.c` v1.5.7
 //! * `lib/compress/zstd_ldm.h`
 //! * `lib/compress/zstd_ldm_geartab.h` — the 256 × `u64` permutation
@@ -80,7 +80,7 @@ use params::LdmParams;
 use search::{FindBestMatchInputs, find_best_match};
 use table::LdmHashTable;
 
-/// Donor `XXH64` seed for the per-window LDM hash
+/// Upstream zstd `XXH64` seed for the per-window LDM hash
 /// (`zstd_ldm.c:315`: `XXH64(split, minMatchLength, 0)`).
 const LDM_XXH64_SEED: u64 = 0;
 
@@ -94,7 +94,7 @@ const LDM_XXH64_SEED: u64 = 0;
 /// Designed to be re-used across blocks within a frame — call
 /// [`Self::clear`] only when starting a new frame (so the
 /// long-range history accumulated across blocks is preserved
-/// within a frame, mirroring donor's `ldmState_t` lifecycle).
+/// within a frame, mirroring upstream zstd's `ldmState_t` lifecycle).
 #[derive(Clone)]
 pub(crate) struct LdmProducer {
     /// Parameter set this producer was built with. Used by the
@@ -107,7 +107,7 @@ pub(crate) struct LdmProducer {
     /// XXH64. See [`table`] for layout details.
     hash_table: LdmHashTable,
     /// Scratch buffer for `gear_hash::feed` (`LDM_BATCH_SIZE`
-    /// entries per donor pre-condition). Kept in the producer so
+    /// entries per upstream zstd pre-condition). Kept in the producer so
     /// hot calls don't re-allocate.
     splits_scratch: Vec<usize>,
 }
@@ -120,7 +120,7 @@ impl LdmProducer {
     /// `params.min_match_length` / `params.hash_rate_log`. The
     /// `splits_scratch` buffer is sized to [`LDM_BATCH_SIZE`] so
     /// every subsequent `gear_hash::feed` call sees a buffer
-    /// satisfying the donor pre-condition without re-allocation.
+    /// satisfying the upstream zstd pre-condition without re-allocation.
     pub(crate) fn new(params: LdmParams) -> Self {
         let hash_state = GearHashState::new(params.min_match_length as usize, params.hash_rate_log);
         let hash_table = LdmHashTable::new(params.hash_log, params.bucket_size_log);
@@ -175,29 +175,29 @@ impl LdmProducer {
     /// [`find_best_match`] (entries at exactly
     /// `lowest_index_abs == history_abs_start` survive).
     ///
-    /// Implements the donor pipeline from
+    /// Implements the upstream zstd pipeline from
     /// `ZSTD_ldm_generateSequences_internal`
     /// (`zstd_ldm.c:346-515`) in three phases:
     ///
     /// 1. **Init** — re-seed the rolling hash and prime it with
     ///    the first `min_match_length` bytes of the block
-    ///    (donor `zstd_ldm.c:381-383`). Donor resets the hash
+    ///    (upstream zstd `zstd_ldm.c:381-383`). Upstream zstd resets the hash
     ///    state at every `generateSequences_internal` call; the
     ///    bucket table is preserved across blocks within a frame
     ///    so long-range candidates accumulated by earlier blocks
     ///    remain reachable.
     /// 2. **Feed batch** — call [`gear_hash::feed`] to fill the
     ///    `splits_scratch` buffer with up to [`LDM_BATCH_SIZE`]
-    ///    split positions (donor `zstd_ldm.c:390-391`).
+    ///    split positions (upstream zstd `zstd_ldm.c:390-391`).
     /// 3. **Per-split verify + emit** — for every split, hash the
-    ///    preceding `min_match_length`-byte window (donor seed
+    ///    preceding `min_match_length`-byte window (upstream zstd seed
     ///    0, XXH64), look up the bucket, run [`find_best_match`]
     ///    to score every entry by forward + backward match
     ///    length, and either emit an [`HcRawSeq`] + insert the
-    ///    new entry (match found) or insert-only (donor
+    ///    new entry (match found) or insert-only (upstream zstd
     ///    `zstd_ldm.c:393-510`). When a match overlaps the
-    ///    already-hashed range donor re-resets the rolling hash
-    ///    and re-enters the outer loop from `anchor` (donor
+    ///    already-hashed range upstream zstd re-resets the rolling hash
+    ///    and re-enters the outer loop from `anchor` (upstream zstd
     ///    `zstd_ldm.c:497-508` — the "all-zeros repetition speed
     ///    boost").
     ///
@@ -217,13 +217,13 @@ impl LdmProducer {
         debug_assert!(block_end_abs <= history_abs_start + live_history.len());
 
         let min_match = self.params.min_match_length as usize;
-        // Donor `zstd_ldm.c:377-378`: nothing to do if the block
+        // Upstream zstd `zstd_ldm.c:377-378`: nothing to do if the block
         // can't fit a single LDM window.
         if block_end_abs.saturating_sub(block_start_abs) < min_match {
             return;
         }
 
-        // hBits = hashLog - bucketSizeLog (donor `zstd_ldm.c:354`).
+        // hBits = hashLog - bucketSizeLog (upstream zstd `zstd_ldm.c:354`).
         // Pull the mask from the table rather than re-deriving from
         // `params.hash_log / params.bucket_size_log`: the table
         // applies a `min(bucket_size_log, hash_log)` clamp
@@ -238,7 +238,7 @@ impl LdmProducer {
         let to_idx = |abs: usize| abs - history_abs_start;
 
         // Re-init + reset against the first min_match bytes —
-        // donor `zstd_ldm.c:381-383`. The table itself is
+        // upstream zstd `zstd_ldm.c:381-383`. The table itself is
         // preserved across blocks; only the rolling hash is
         // wound back.
         self.hash_state = GearHashState::new(min_match, self.params.hash_rate_log);
@@ -249,15 +249,15 @@ impl LdmProducer {
         );
 
         // Anchor: leftmost byte the producer can still emit as
-        // literal. Donor `BYTE const* anchor = istart;` — kept in
+        // literal. Upstream zstd `BYTE const* anchor = istart;` — kept in
         // absolute coordinates so emitted seq positions stay
         // consistent across blocks within a frame.
         let mut anchor_abs = block_start_abs;
         // `ip` (current input cursor): we start AFTER the reset
-        // window. Donor `ip += minMatchLength;`.
+        // window. Upstream zstd `ip += minMatchLength;`.
         let mut ip_abs = block_start_abs + min_match;
-        // Donor caps the outer walk at `iend - HASH_READ_SIZE`
-        // (`zstd_ldm.c:366`). HASH_READ_SIZE = 8 in donor.
+        // Upstream zstd caps the outer walk at `iend - HASH_READ_SIZE`
+        // (`zstd_ldm.c:366`). HASH_READ_SIZE = 8 in upstream zstd.
         const HASH_READ_SIZE: usize = 8;
         let ilimit_abs = block_end_abs.saturating_sub(HASH_READ_SIZE);
 
@@ -268,8 +268,8 @@ impl LdmProducer {
             let (hashed, num_splits) =
                 gear_hash::feed(&mut self.hash_state, chunk, &mut self.splits_scratch);
 
-            // Two-pass over the batch like donor. The first pass
-            // prepares (hash, checksum) for every split (donor
+            // Two-pass over the batch like upstream zstd. The first pass
+            // prepares (hash, checksum) for every split (upstream zstd
             // does it for PREFETCH_L1; we leave the entries in
             // `splits_scratch` and recompute the per-split state
             // in pass two — Rust's optimiser folds the duplicated
@@ -278,7 +278,7 @@ impl LdmProducer {
             while split_n < num_splits {
                 let s = self.splits_scratch[split_n];
                 split_n += 1;
-                // Donor `zstd_ldm.c:313`:
+                // Upstream zstd `zstd_ldm.c:313`:
                 //   if (ip + splits[n] >= istart + minMatchLength)
                 // Since `ip_abs - block_start_abs >= min_match`
                 // after the reset, the window-start subtraction
@@ -302,13 +302,13 @@ impl LdmProducer {
                 let checksum = (xxhash >> 32) as u32;
 
                 // The table stores positions as `u32` offsets
-                // relative to its internal `position_base` (donor
+                // relative to its internal `position_base` (upstream zstd
                 // rebase scheme — see `table.rs`); ensure room
                 // before every insert so streams beyond
                 // `u32::MAX` rebase transparently.
                 self.hash_table.ensure_room_for(split_abs);
 
-                // Donor `zstd_ldm.c:420-426`: if this split would
+                // Upstream zstd `zstd_ldm.c:420-426`: if this split would
                 // emit a sequence overlapping the previous one,
                 // just record it and move on.
                 if split_abs < anchor_abs {
@@ -338,7 +338,7 @@ impl LdmProducer {
                         anchor_abs,
                         lowest_index_abs: history_abs_start,
                         // Cap the forward search at the current
-                        // block's end — donor `iend`. Without
+                        // block's end — upstream zstd `iend`. Without
                         // this bound a match could extend past
                         // `block_end_abs` into bytes the
                         // producer hasn't scanned yet, breaking
@@ -350,14 +350,14 @@ impl LdmProducer {
                 );
 
                 let Some(best) = best else {
-                    // Donor `zstd_ldm.c:468-473`: no match → just
+                    // Upstream zstd `zstd_ldm.c:468-473`: no match → just
                     // insert the new entry and continue.
                     self.hash_table
                         .insert_absolute(hash_id, split_abs, checksum);
                     continue;
                 };
 
-                // Match found. Donor `zstd_ldm.c:475-488`.
+                // Match found. Upstream zstd `zstd_ldm.c:475-488`.
                 // `best.match_pos` is absolute; `split_abs` is
                 // absolute; their difference is a true
                 // back-reference distance immune to window
@@ -373,16 +373,16 @@ impl LdmProducer {
                 });
 
                 // Insert AFTER finding the match so the lookup
-                // doesn't clobber `bestEntry` (donor `zstd_ldm.c:
+                // doesn't clobber `bestEntry` (upstream zstd `zstd_ldm.c:
                 // 490-492`).
                 self.hash_table
                     .insert_absolute(hash_id, split_abs, checksum);
 
-                // Advance anchor past the matched bytes (donor
+                // Advance anchor past the matched bytes (upstream zstd
                 // `zstd_ldm.c:494`).
                 anchor_abs = split_abs + best.forward_len;
 
-                // Donor `zstd_ldm.c:496-508`: when the emitted
+                // Upstream zstd `zstd_ldm.c:496-508`: when the emitted
                 // match extends past the already-hashed window,
                 // skip ahead by re-resetting the rolling hash on
                 // the bytes preceding the new anchor.
@@ -398,7 +398,7 @@ impl LdmProducer {
                             &live_history[reset_idx..reset_idx + min_match],
                         );
                         // Continue the outer `while (ip < ilimit)`
-                        // loop at `anchor`. Donor: `ip = anchor -
+                        // loop at `anchor`. Upstream zstd: `ip = anchor -
                         // hashed;` so the upcoming `ip += hashed`
                         // lands exactly at `anchor`.
                         ip_abs = anchor_abs.saturating_sub(hashed).max(history_abs_start);
@@ -429,7 +429,7 @@ impl LdmProducer {
             ip_abs += hashed.max(1);
         }
 
-        // Donor returns `iend - anchor` (the "leftover" tail),
+        // Upstream zstd returns `iend - anchor` (the "leftover" tail),
         // which our caller doesn't currently need; the optimal
         // parser drains `out` based on the sequences alone.
     }
@@ -440,7 +440,7 @@ mod tests {
     use super::*;
 
     /// `LdmParams::adjust_for` must derive a representative
-    /// donor-btultra2 parameter set at window_log=27. Checked via
+    /// upstream zstd-btultra2 parameter set at window_log=27. Checked via
     /// the parameter struct alone — instantiating the producer
     /// at these knobs would allocate `1 << 23 = 8M` table entries
     /// (~64 MiB), which slows nextest under parallelism and risks
@@ -448,9 +448,9 @@ mod tests {
     /// path is exercised by every other test in this module with
     /// a smaller hand-tuned `LdmParams`.
     #[test]
-    fn producer_constructs_with_donor_default_params() {
+    fn producer_constructs_with_default_params() {
         let p = LdmParams::adjust_for(27, 9);
-        // Donor defaults at btultra2: minMatch halved, hash_rate_log
+        // Upstream zstd defaults at btultra2: minMatch halved, hash_rate_log
         // = 4, bucket_size_log clamps to 8. See params::tests for
         // the per-knob derivations.
         assert_eq!(p.window_log, 27);
@@ -461,8 +461,8 @@ mod tests {
 
     /// Compact `LdmParams` for unit-test producer construction —
     /// keeps the table allocation at ~8 KiB instead of the
-    /// donor-btultra2 64 MiB so parallel nextest stays stable.
-    /// `min_match_length = 32` (half of donor floor) matches the
+    /// upstream zstd-btultra2 64 MiB so parallel nextest stays stable.
+    /// `min_match_length = 32` (half of upstream zstd floor) matches the
     /// btultra2 derivation so engineered fixtures still trigger
     /// long-range matches at 32-byte windows.
     fn test_params() -> LdmParams {
@@ -504,7 +504,7 @@ mod tests {
     /// 64 KiB of unique filler) must emit at least one
     /// [`HcRawSeq`] whose `offset` equals the distance between
     /// the copies and whose `match_length` reaches at least the
-    /// donor `min_match_length` floor. Validates that
+    /// upstream zstd `min_match_length` floor. Validates that
     /// gear-hash → bucket-insert → checksum-filter → forward /
     /// backward extend → emit all hold together.
     #[test]
@@ -551,7 +551,7 @@ mod tests {
             !out.is_empty(),
             "long-range repetition must produce at least one LDM sequence"
         );
-        // Every emitted sequence must satisfy the donor floor.
+        // Every emitted sequence must satisfy the upstream zstd floor.
         for seq in &out {
             assert!(
                 seq.match_length >= p.min_match_length as usize,

@@ -26,7 +26,7 @@ pub(crate) const fn mismatch_byte_index(diff: usize) -> usize {
 }
 
 /// Multiplicative hash constant (Knuth golden ratio for 64-bit). Shared across
-/// every variant — donor parity matches the C zstd value.
+/// every variant — upstream zstd parity matches the C zstd value.
 pub(crate) const HASH_MIX_PRIME: u64 = 0x9E37_79B1_85EB_CA87;
 
 /// Pure scalar `hash_mix_u64` — single multiplication. Used by

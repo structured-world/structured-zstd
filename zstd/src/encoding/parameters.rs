@@ -263,7 +263,7 @@ impl core::fmt::Display for ParameterError {
 impl std::error::Error for ParameterError {}
 
 /// LDM tuning overrides — every knob is `Option`, falling back to the
-/// strategy-derived donor default (`LdmParams::adjust_for`) when unset.
+/// strategy-derived upstream zstd default (`LdmParams::adjust_for`) when unset.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct LdmOverride {
     pub(crate) hash_log: Option<u32>,

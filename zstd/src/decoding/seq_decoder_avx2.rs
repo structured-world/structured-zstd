@@ -125,7 +125,7 @@ macro_rules! execute_one_body {
                 break 'exec_inner Err(ExecuteSequencesError::ZeroOffset.into());
             }
 
-            // Donor inline-eligibility gates. `inline_exec_ok` lets a wrapping
+            // Upstream zstd inline-eligibility gates. `inline_exec_ok` lets a wrapping
             // backend (RingBuffer) veto the inline path when the live region is
             // not contiguous at `tail`; linear backends fold it to `true`.
             let inline_path_safe = B::SUPPORTS_INLINE_SEQUENCE_EXEC

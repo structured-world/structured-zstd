@@ -19,7 +19,7 @@ use super::scalar;
 
 pub(crate) const KERNEL_TAG: &str = "sse42";
 
-/// SSE4.2 `_mm_crc32_u64`-accelerated `hash_mix_u64`. Mirror of the donor
+/// SSE4.2 `_mm_crc32_u64`-accelerated `hash_mix_u64`. Mirror of the upstream zstd
 /// CRC-folded hash mix used by Dfast/Row hash compute. `_mm_crc32_u64` is
 /// only available in 64-bit mode.
 #[cfg(target_arch = "x86_64")]

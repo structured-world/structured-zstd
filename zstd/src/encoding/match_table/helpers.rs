@@ -18,12 +18,12 @@ use super::super::opt::types::MatchCandidate;
 use crate::encoding::fastpath::FastpathKernel;
 
 /// Minimum match length emitted by the Simple / level-1 matcher (and the
-/// donor `ZSTD_fast.c` baseline). Lives here so every matcher and the
+/// upstream zstd `ZSTD_fast.c` baseline). Lives here so every matcher and the
 /// `match_generator` driver can reference the shared minimum without
 /// importing one matcher module from another.
 pub(crate) const MIN_MATCH_LEN: usize = 5;
 /// Hash-fill stride used by the Simple / level-1 fast pass when
-/// backfilling the suffix store. Donor parity: matches
+/// backfilling the suffix store. Upstream zstd parity: matches
 /// `ZSTD_FAST_HASH_FILL_STEP` in `zstd_fast.c`.
 pub(crate) const FAST_HASH_FILL_STEP: usize = 3;
 /// Sparse step used when a block was determined to be incompressible —
@@ -87,7 +87,7 @@ pub(crate) fn best_len_offset_candidate(
 
 /// Walk a candidate match backwards over the literal run so the matcher
 /// can absorb literal bytes that happen to match the byte preceding the
-/// candidate. Donor parity: equivalent to the back-extend done inside
+/// candidate. Upstream zstd parity: equivalent to the back-extend done inside
 /// every match finder before committing a sequence.
 #[inline]
 pub(crate) fn extend_backwards_shared(
@@ -126,7 +126,7 @@ pub(crate) fn extend_backwards_shared(
     }
 }
 
-/// Probe the 3 rep-code offsets (with the donor `ll0` ↦ `rep[0] - 1`
+/// Probe the 3 rep-code offsets (with the upstream zstd `ll0` ↦ `rep[0] - 1`
 /// fallback) and return the best match found, if any. Hot path:
 /// invoked once per encoded byte on lazy / Dfast / Row matchers
 /// (~10% exclusive on the default-level profile).
@@ -176,7 +176,7 @@ pub(crate) fn repcode_candidate_shared(
             let rep = $rep;
             if rep != 0 && rep <= abs_pos {
                 let candidate_pos = abs_pos - rep;
-                // Donor `MEM_read32` rep gate (`zstd_lazy.c` lazy loop): a
+                // Upstream zstd `MEM_read32` rep gate (`zstd_lazy.c` lazy loop): a
                 // first-4-byte mismatch can never reach the
                 // `>= min_match_len` floor (asserted >= 4 above), so reject
                 // on one scalar compare instead of paying the SIMD count
@@ -185,7 +185,7 @@ pub(crate) fn repcode_candidate_shared(
                 // `candidate_idx < current_idx`.
                 if candidate_pos >= history_abs_start {
                     let candidate_idx = candidate_pos - history_abs_start;
-                    // Donor `MEM_read32` gate: one unaligned u32 compare. The
+                    // Upstream zstd `MEM_read32` gate: one unaligned u32 compare. The
                     // slice-range form paid two bounds checks per rep probe
                     // (per input byte on the greedy/lazy levels).
                     // SAFETY: the entry guard established `current_idx +
@@ -229,7 +229,7 @@ pub(crate) fn repcode_candidate_shared(
 }
 
 /// Configuration knobs that the lazy decision shares across matchers.
-/// `target_len` is the donor "sufficient_len" — once a match crosses
+/// `target_len` is the upstream zstd "sufficient_len" — once a match crosses
 /// it we stop the lookahead. `history_abs_end` is the absolute end of
 /// the currently-live history slice, used to guard the lookahead probe
 /// from running past it.
@@ -241,7 +241,7 @@ pub(crate) struct LazyMatchConfig {
     pub(crate) history_abs_end: usize,
 }
 
-/// Donor `lazy` / `lazy2` evaluation: look 1 (and optionally 2) bytes
+/// Upstream zstd `lazy` / `lazy2` evaluation: look 1 (and optionally 2) bytes
 /// ahead to see whether deferring the current match yields a strictly
 /// better one. Returns `Some(best)` if the current match wins,
 /// `None` if the caller should defer to a future position.

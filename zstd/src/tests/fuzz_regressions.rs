@@ -19,7 +19,7 @@ fn test_all_artifacts() {
     // regression contract (no panic on the literal crash inputs
     // pinned in the other `#[test]` below, e.g.
     // `interop_7_byte_input_does_not_oob_in_dfast_fast_loop`) still
-    // holds for the corpus inputs that DO exist in the donor crate.
+    // holds for the corpus inputs that DO exist in the upstream zstd crate.
     let entries = match fs::read_dir("./fuzz/artifacts/decode") {
         Ok(e) => e,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
@@ -53,7 +53,7 @@ fn test_all_artifacts() {
 /// the underlying `Vec`'s spare capacity covers the bytes.
 ///
 /// The fix tightens every fast-loop guard to `+ HASH_READ_SIZE = 8` so
-/// the load is always in-bounds for the live history, matching donor
+/// the load is always in-bounds for the live history, matching upstream zstd
 /// `ilimit = iend - HASH_READ_SIZE` in `zstd_double_fast.c`.
 ///
 /// Artifact: `zstd/fuzz/artifacts/interop/crash-01be...0dc7`. Base64
@@ -94,7 +94,7 @@ fn interop_7_byte_input_does_not_oob_in_dfast_fast_loop() {
 
     // Roundtrip through the in-tree decoder — matches the convention
     // used by `test_all_artifacts` above and avoids coupling this
-    // regression to the donor `zstd` crate. The OOB load shows up as
+    // regression to the upstream zstd `zstd` crate. The OOB load shows up as
     // a panic / decode error before this point under ASan; if we get
     // here with a parseable frame the bytes must match the input.
     let mut frame_dec = FrameDecoder::new();

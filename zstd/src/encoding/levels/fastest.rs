@@ -173,18 +173,17 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         let payload_off = output.len();
         compress_block(state, output);
         let payload_len = output.len() - payload_off;
-        // If the compressed data is larger than the maximum allowable
-        // block size, store uncompressed. When a dictionary is active we
-        // ALSO fall back to raw whenever compression did not actually
-        // shrink the block (`payload >= block_size`): the raw-fast-path
-        // was bypassed to give dictionary matching a chance, so a block
-        // that turns out incompressible-even-with-the-dict must still be
-        // emitted raw instead of as a (larger) compressed block. Mirrors
-        // the reference's post-hoc raw fallback; gated on `dict_active` so
-        // the non-dictionary wire output is byte-identical to before.
-        if payload_len >= MAX_BLOCK_SIZE as usize
-            || (dict_active && payload_len >= block_size as usize)
-        {
+        // Fall back to a raw block when the compressed payload is not
+        // smaller than the source (`payload >= block_size`) or exceeds the
+        // maximum block size. A compressed block that did not shrink is never
+        // the right choice: it wastes bytes and, in a single-segment frame
+        // (window == content size), can reference past the declared window
+        // and fail to decode in a strict decoder. This mirrors the upstream
+        // post-hoc raw fallback and applies to every block, dictionary-primed
+        // or not — the pre-compression raw-fast-path only catches blocks that
+        // already look incompressible, so small inputs that slip past it but
+        // fail to shrink still need this post-hoc store-raw.
+        if payload_len >= MAX_BLOCK_SIZE as usize || payload_len >= block_size as usize {
             // Roll back the payload + reserved header and the entropy state.
             output.truncate(hdr_off);
             state.offset_hist = saved_offset_hist;
@@ -336,9 +335,13 @@ pub(crate) fn compress_block_encoded_borrowed(
         let payload_off = output.len();
         compress_block(state, output);
         let payload_len = output.len() - payload_off;
-        if payload_len >= MAX_BLOCK_SIZE as usize {
-            // Incompressible: roll back the payload + reserved header and the
-            // entropy state, then emit a stored Raw block.
+        if payload_len >= MAX_BLOCK_SIZE as usize || payload_len >= block_size as usize {
+            // Incompressible (compressed payload not smaller than the source,
+            // or over the max block size): roll back the payload + reserved
+            // header and the entropy state, then emit a stored Raw block. A
+            // non-shrinking compressed block wastes bytes and can reference
+            // past a single-segment frame's window (== content size); storing
+            // raw matches the upstream post-hoc fallback.
             output.truncate(hdr_off);
             state.offset_hist = saved_offset_hist;
             // Swap (not move) so the slot keeps owning a reusable table

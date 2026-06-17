@@ -59,7 +59,7 @@ pub struct StreamingEncoder<W: Write, M: Matcher = MatchGeneratorDriver> {
     /// the `hash` feature, so without `hash` no checksum is emitted
     /// regardless. See [`Self::set_content_checksum`].
     content_checksum: bool,
-    /// Dictionary applied to the frame (donor `ZSTD_CCtx_loadDictionary` on a
+    /// Dictionary applied to the frame (upstream zstd `ZSTD_CCtx_loadDictionary` on a
     /// streaming context). `None` = no dictionary. Set before the first write.
     dictionary: Option<EncoderDictionary>,
     /// Whether the frame header records the attached dictionary's ID
@@ -279,7 +279,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         Ok(())
     }
 
-    /// Attach a serialized dictionary blob to the frame (donor
+    /// Attach a serialized dictionary blob to the frame (upstream zstd
     /// `ZSTD_CCtx_loadDictionary` on a streaming context). The dictionary primes
     /// the match-finder and seeds the first block's entropy tables + repeat
     /// offsets, and its ID is written into the frame header. Must be called
@@ -487,7 +487,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                 .set_dictionary_size_hint(dict.inner.dict_content.len());
         }
         self.state.matcher.reset(self.compression_level);
-        // Seed the repeat-offset history from the dictionary (donor
+        // Seed the repeat-offset history from the dictionary (upstream zstd
         // `ZSTD_compress_insertDictionary`), or the default rep codes otherwise.
         self.state.offset_hist = if use_dictionary_state {
             self.dictionary
@@ -508,7 +508,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                 .prime_with_dictionary(dict.inner.dict_content.as_slice(), offset_hist);
         }
         // Seed the first block's entropy from the dictionary's cached encoder
-        // tables (donor `cdict->cBlockState`), or clear to defaults.
+        // tables (upstream zstd `cdict->cBlockState`), or clear to defaults.
         if use_dictionary_state && let Some(cache) = self.dictionary_entropy_cache.as_ref() {
             self.state.last_huff_table.clone_from(&cache.huff);
             self.state
@@ -1385,21 +1385,6 @@ mod tests {
         assert_eq!(decoded, b"custom-matcher");
     }
 
-    #[cfg(feature = "std")]
-    #[test]
-    fn streaming_encoder_output_decompresses_with_c_zstd() {
-        let payload = b"tenant=demo op=put key=streaming value=abcdef\n".repeat(4096);
-        let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Fastest);
-        for chunk in payload.chunks(1024) {
-            encoder.write_all(chunk).unwrap();
-        }
-        let compressed = encoder.finish().unwrap();
-
-        let mut decoded = Vec::with_capacity(payload.len());
-        zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
-        assert_eq!(decoded, payload);
-    }
-
     #[test]
     fn pledged_content_size_written_in_header() {
         let payload = b"hello world, pledged size test";
@@ -1526,31 +1511,6 @@ mod tests {
         let mut decoder = StreamingDecoder::new(with_hint_frame.as_slice()).unwrap();
         let mut decoded = Vec::new();
         decoder.read_to_end(&mut decoded).unwrap();
-        assert_eq!(decoded, payload);
-    }
-
-    #[cfg(feature = "std")]
-    #[test]
-    fn pledged_content_size_c_zstd_compatible() {
-        let payload = b"tenant=demo op=put key=streaming value=abcdef\n".repeat(4096);
-        let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Fastest);
-        encoder
-            .set_pledged_content_size(payload.len() as u64)
-            .unwrap();
-        for chunk in payload.chunks(1024) {
-            encoder.write_all(chunk).unwrap();
-        }
-        let compressed = encoder.finish().unwrap();
-
-        // FCS should be written
-        let header = crate::decoding::frame::read_frame_header(compressed.as_slice())
-            .unwrap()
-            .0;
-        assert_eq!(header.frame_content_size(), payload.len() as u64);
-
-        // C zstd should decompress successfully
-        let mut decoded = Vec::new();
-        zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
         assert_eq!(decoded, payload);
     }
 

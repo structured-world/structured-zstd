@@ -221,7 +221,7 @@ pub(crate) unsafe fn copy_bytes_overshooting(
     // with offset 8..15 funnel into repeat_in_chunks → here as 8..15-byte
     // calls, and the previous chunk-loop dispatcher paid a function-call +
     // loop-setup cost on every one of them. The single-op path collapses
-    // that to one load + one store, which is the donor wildcopy pattern.
+    // that to one load + one store, which is the upstream zstd wildcopy pattern.
     if copy_at_least <= 16 && min_buffer_size >= 16 {
         unsafe { single_op_copy_16(src.0, dst.0, copy_at_least) };
         debug_assert_eq_copy(src, dst, copy_at_least);
@@ -1098,7 +1098,7 @@ unsafe fn copy_exact_inline_neon(src: *const u8, dst: *mut u8, len: usize) {
 }
 
 /// Exact medium-size copy (`33 <= len < `[`BULK_MEMCPY_THRESHOLD`]) for encoder
-/// literal runs — the safe analog of donor `ZSTD_wildcopy`. The kernel is
+/// literal runs — the safe analog of upstream zstd `ZSTD_wildcopy`. The kernel is
 /// fixed at **compile time** (the build's `target_feature`), so the chosen
 /// SIMD body inlines directly into the caller with NO runtime detect and NO
 /// `#[target_feature]` ABI boundary:

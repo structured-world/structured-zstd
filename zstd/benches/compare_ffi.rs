@@ -881,7 +881,7 @@ fn bench_dictionary(c: &mut Criterion) {
             // outside the timing sample catches a desynced
             // (rust_dict_handle, with_dict_bytes) pairing before it would
             // silently inflate or deflate throughput numbers. FFI side
-            // gets the same treatment for parity. Matches the donor shape
+            // gets the same treatment for parity. Matches the upstream zstd shape
             // used by `bench_decompress_source` →
             // `assert_decompress_matches_reference`.
             {

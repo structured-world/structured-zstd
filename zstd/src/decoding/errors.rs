@@ -1010,14 +1010,15 @@ pub enum ExecuteSequencesError {
         have: usize,
     },
     ZeroOffset,
-    /// A donor-shape inline sequence (`BufferBackend::exec_sequence_inline`)
-    /// would have written past the writable tail of a fixed-size backend
-    /// (`UserSliceBackend`). Indicates the frame is corrupt — its sequences
-    /// expand past the declared `frame_content_size` plus the caller-supplied
-    /// `WILDCOPY_OVERLENGTH` slack. The fast-path check is per-sequence; the
-    /// post-block FCS overflow check would also catch the same shape, but the
-    /// per-sequence guard is what keeps the unsafe write surface inside the
-    /// user-provided slice on the way to the post-block check.
+    /// An inline sequence (`exec_sequence_inline`) would have written past
+    /// the writable tail of the output buffer. Raised by every capacity-bounded
+    /// backend that runs the inline executor (the fixed-capacity user slice and
+    /// the pre-reserved flat buffer alike). Indicates the frame is corrupt: its
+    /// sequences expand past the declared `frame_content_size` plus the
+    /// caller-supplied `WILDCOPY_OVERLENGTH` slack. The fast-path check is
+    /// per-sequence; the post-block FCS overflow check would also catch the
+    /// same shape, but the per-sequence guard is what keeps the unsafe write
+    /// surface inside the buffer on the way to the post-block check.
     OutputBufferOverflow {
         tail: usize,
         requested: usize,
@@ -1047,7 +1048,7 @@ impl core::fmt::Display for ExecuteSequencesError {
             } => {
                 write!(
                     f,
-                    "Donor-path sequence would write past fixed-size buffer: tail={tail}, requested={requested}, capacity={capacity}"
+                    "Inline sequence would write past the output buffer: tail={tail}, requested={requested}, capacity={capacity}"
                 )
             }
         }
@@ -1083,7 +1084,7 @@ impl From<crate::decoding::buffer_backend::BackendOverflow> for ExecuteSequences
 impl ExecuteSequencesError {
     /// `Some(requested)` when this error is a fixed-capacity output-buffer
     /// overshoot from the Compressed-block sequence executor — either the
-    /// donor-inline path ([`Self::OutputBufferOverflow`]) or the
+    /// inline-sequence path ([`Self::OutputBufferOverflow`]) or the
     /// match-repeat fallback ([`DecodeBufferError::OutputBufferOverflow`]
     /// wrapped in [`Self::DecodebufferError`]). `requested` is the byte
     /// count the failing write tried to append past the slice end.
@@ -1641,7 +1642,7 @@ mod tests {
         // #246: `run_direct_decode` folds a Compressed-block overshoot into
         // `FrameContentSizeMismatch` by reading `requested` from whichever
         // overflow shape the executor produced. Cover all three arms:
-        //   1. donor-inline path -> `OutputBufferOverflow` directly,
+        //   1. inline-sequence path -> `OutputBufferOverflow` directly,
         //   2. match-repeat path -> `DecodebufferError(OutputBufferOverflow)`,
         //   3. any other variant -> None (no fold).
         let inline = ExecuteSequencesError::OutputBufferOverflow {

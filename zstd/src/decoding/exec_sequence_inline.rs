@@ -1,11 +1,11 @@
-//! Verbatim port of donor zstd's `ZSTD_execSequence` body
+//! Verbatim port of upstream zstd zstd's `ZSTD_execSequence` body
 //! (lib/decompress/zstd_decompress_block.c:1008-1105) for the inline
 //! direct-write decode path (`UserSliceBackend` and `FlatBuf`). Bypasses
 //! the `DecodeBuffer::push` + `repeat` abstraction chain in favour of
-//! donor's straight-line shape:
+//! upstream zstd's straight-line shape:
 //!
 //! 1. Literal copy: unconditional 16-byte SIMD store + wildcopy tail
-//!    if `litLength > 16`. Mirrors donor's "split out litLength <= 16
+//!    if `litLength > 16`. Mirrors upstream zstd's "split out litLength <= 16
 //!    since it is nearly always true" comment.
 //! 2. Match copy fast path: `offset >= 16` → single wildcopy
 //!    (`no_overlap` semantics, 16-byte SIMD loop).
@@ -59,7 +59,7 @@ pub(crate) unsafe fn exec_sequence_bounded_copy(
             core::ptr::copy_nonoverlapping(match_src, op_match, match_length);
         } else {
             // Overlapping LZ copy: forward byte-by-byte replicates the
-            // `offset`-periodic pattern (donor `ZSTD_overlapCopy`, scalar form).
+            // `offset`-periodic pattern (upstream zstd `ZSTD_overlapCopy`, scalar form).
             let mut i = 0usize;
             while i < match_length {
                 *op_match.add(i) = *match_src.add(i);
@@ -299,7 +299,7 @@ pub(crate) mod x86 {
         }
     }
 
-    /// Donor's `ZSTD_copy16`: one unaligned 16-byte SIMD store.
+    /// Upstream zstd's `ZSTD_copy16`: one unaligned 16-byte SIMD store.
     /// SSE2 is the x86_64 baseline (and on x86 we gate via the
     /// module's `cfg(target_arch)`), so the intrinsics are always
     /// available without a per-call CPU feature check.
@@ -311,7 +311,7 @@ pub(crate) mod x86 {
         }
     }
 
-    /// Donor's `ZSTD_wildcopy(..., ZSTD_no_overlap)`: 16-byte SIMD
+    /// Upstream zstd's `ZSTD_wildcopy(..., ZSTD_no_overlap)`: 16-byte SIMD
     /// loop until at least `length` bytes are written. May overshoot
     /// up to 15 bytes past `dst + length`; caller's
     /// `WILDCOPY_OVERLENGTH` slack accommodates.
@@ -330,7 +330,7 @@ pub(crate) mod x86 {
         }
     }
 
-    /// Donor's `ZSTD_wildcopy(..., ZSTD_overlap_src_before_dst)` for
+    /// Upstream zstd's `ZSTD_wildcopy(..., ZSTD_overlap_src_before_dst)` for
     /// the `diff < WILDCOPY_VECLEN` (= < 16) arm: 8-byte unaligned
     /// loop. Each iter reads `src + off` (8 bytes) which may be in
     /// the just-written destination region — correct for RLE
@@ -355,7 +355,7 @@ pub(crate) mod x86 {
         }
     }
 
-    /// Donor's `ZSTD_overlapCopy8`
+    /// Upstream zstd's `ZSTD_overlapCopy8`
     /// (zstd_decompress_block.c:799-826). Copies 8 bytes from `src`
     /// to `dst` and, when `offset < 8`, "spreads" the source/dest
     /// distance so the following wildcopy can use the safe ≥ 8
@@ -369,14 +369,14 @@ pub(crate) mod x86 {
         src: *const u8,
         offset: usize,
     ) -> (*mut u8, *const u8) {
-        // dec32table / dec64table — donor's two precomputed lookup
+        // dec32table / dec64table — upstream zstd's two precomputed lookup
         // tables for the offset < 8 spread step.
         const DEC32_TABLE: [u32; 8] = [0, 1, 2, 1, 4, 4, 4, 4];
         const DEC64_TABLE: [i32; 8] = [8, 8, 8, 7, 8, 9, 10, 11];
         unsafe {
             if offset < 8 {
                 // Read 4 bytes, advance src by dec32, read 4 more bytes,
-                // then back-advance by dec64 — see donor source.
+                // then back-advance by dec64 — see upstream zstd source.
                 let sub2 = DEC64_TABLE[offset];
                 dst.add(0).write(src.add(0).read());
                 dst.add(1).write(src.add(1).read());
@@ -388,10 +388,10 @@ pub(crate) mod x86 {
                 // Post-call src position is `src + (dec32 - sub2 + 8)`.
                 // Computing this as
                 // `src.add(dec32).offset(-(sub2 as isize)).add(8)`
-                // (donor's literal C transcription) produces an
+                // (upstream zstd's literal C transcription) produces an
                 // intermediate pointer below the allocation base
                 // when `dec32 < sub2` — true for every offset ∈ 1..=7
-                // in donor's tables — which is UB under Rust's
+                // in upstream zstd's tables — which is UB under Rust's
                 // `.offset()` provenance rules even when the final
                 // pointer lands back in-bounds. Apply the net signed
                 // offset once so no intermediate underflows.
@@ -418,7 +418,7 @@ pub(crate) mod x86 {
 /// load/store to a single NEON `ldr q`/`str q`; elsewhere it picks the
 /// widest available move. The `cfg(not(x86_64))` arms of
 /// `FlatBuf`/`UserSliceBackend::exec_sequence_inline` use these to get
-/// the donor `ZSTD_execSequence` shape the x86 path already has, instead
+/// the upstream zstd `ZSTD_execSequence` shape the x86 path already has, instead
 /// of the slow `try_push` + `repeat` chain.
 ///
 /// How the inline path is reached per target:
@@ -440,7 +440,7 @@ pub(crate) mod x86 {
 /// shard.
 #[cfg(any(not(target_arch = "x86_64"), test))]
 pub(crate) mod portable {
-    /// Donor `ZSTD_copy16`: one unaligned 16-byte move.
+    /// Upstream zstd `ZSTD_copy16`: one unaligned 16-byte move.
     ///
     /// # Safety
     /// `dst` / `src` valid for 16 bytes; regions non-overlapping.
@@ -452,13 +452,13 @@ pub(crate) mod portable {
         }
     }
 
-    /// Donor `ZSTD_wildcopy(..., ZSTD_no_overlap)`: 16-byte loop until at
+    /// Upstream zstd `ZSTD_wildcopy(..., ZSTD_no_overlap)`: 16-byte loop until at
     /// least `length` bytes written. May overshoot up to 15 bytes past
     /// `dst + length`; caller's `WILDCOPY_OVERLENGTH` slack accommodates.
     ///
     /// # Safety
     /// `dst` writable for `length + 15`; `src` readable for `length + 15`;
-    /// no-overlap (`dst` and `src` regions disjoint, donor semantics).
+    /// no-overlap (`dst` and `src` regions disjoint, upstream zstd semantics).
     #[inline(always)]
     pub(crate) unsafe fn wildcopy_no_overlap(dst: *mut u8, src: *const u8, length: usize) {
         debug_assert!(length > 0);
@@ -474,7 +474,7 @@ pub(crate) mod portable {
         }
     }
 
-    /// Donor `ZSTD_wildcopy(..., ZSTD_overlap_src_before_dst)` 8-byte arm:
+    /// Upstream zstd `ZSTD_wildcopy(..., ZSTD_overlap_src_before_dst)` 8-byte arm:
     /// each iter reads `src + off` (may lie in the just-written
     /// destination), correct once the src/dst gap is ≥ 8.
     ///
@@ -502,7 +502,7 @@ pub(crate) mod portable {
         }
     }
 
-    /// Donor `ZSTD_overlapCopy8`: copies 8 bytes and, for `offset < 8`,
+    /// Upstream zstd `ZSTD_overlapCopy8`: copies 8 bytes and, for `offset < 8`,
     /// spreads the src/dst distance so the following wildcopy can use the
     /// safe ≥ 8 stride. Returns the updated `(dst, src)` pair. Byte-exact
     /// port of [`super::x86::overlap_copy8`] (same dec32/dec64 tables and
@@ -565,7 +565,7 @@ mod inline_helper_tests {
     fn wildcopy_no_overlap_short_length_overshoots() {
         // Length 1 still triggers the unconditional first 16-byte
         // store — the wildcopy overshoots up to 15 bytes past the
-        // declared end, which is the donor contract.
+        // declared end, which is the upstream zstd contract.
         let src: [u8; 32] = core::array::from_fn(|i| (i + 1) as u8);
         let mut dst = [0u8; 32];
         unsafe { wildcopy_no_overlap(dst.as_mut_ptr(), src.as_ptr(), 1) };
@@ -629,7 +629,7 @@ mod inline_helper_tests {
         assert_eq!(op2, unsafe { buf.as_mut_ptr().add(11) });
         // First 8 bytes of the destination region are the 3-byte
         // seed expanded — verify they're non-zero (exact spread
-        // pattern depends on the lookup tables; donor parity is the
+        // pattern depends on the lookup tables; upstream zstd parity is the
         // contract).
         assert!(buf[3..11].iter().any(|&b| b != 0));
     }
@@ -665,7 +665,7 @@ mod portable_helper_tests {
     fn wildcopy_no_overlap_short_length_overshoots() {
         // Length 1 still triggers the unconditional first 16-byte store
         // — the wildcopy overshoots up to 15 bytes past the declared
-        // end, the donor contract.
+        // end, the upstream zstd contract.
         let src: [u8; 32] = core::array::from_fn(|i| (i + 1) as u8);
         let mut dst = [0u8; 32];
         unsafe { wildcopy_no_overlap(dst.as_mut_ptr(), src.as_ptr(), 1) };

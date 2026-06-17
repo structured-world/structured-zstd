@@ -1,0 +1,220 @@
+# Non-published crate holding every target that links the C `zstd` bindings:
+# the rust-vs-C comparison benches, the cross-validation / parity integration
+# tests, and the FFI diagnostic examples. It depends on `structured-zstd` (the
+# pure-Rust library, which itself never imports the C bindings) plus `zstd`
+# (zstd-sys). Targets reference the source files in `../zstd` directly via
+# `path` so fixtures (`../zstd/decodecorpus_files`) and the shared
+# `benches/support` module resolve unchanged.
+[package]
+name = "ffi-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+autobenches = false
+autotests = false
+autoexamples = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Base features only — `dict_builder` is the one runtime feature the
+# `compare_ffi` / `compare_ffi_memory` parity benches build against (matching
+# what those benches measured when they lived in the library crate). The
+# API-widening `bench_internals` and the instrumentation features
+# (`hash`, `copy_shape_stats`) are NOT here: pulling them unconditionally
+# would compile the Rust side differently than a real downstream consumer and
+# bias every Rust-vs-libzstd comparison. Targets that genuinely need them opt
+# in per-target via `required-features` below, so a bench built in isolation
+# (`cargo bench --bench compare_ffi`) never links them.
+structured-zstd = { path = "../zstd", features = ["dict_builder"] }
+zstd = { version = "0.13.3", features = ["zdict_builder", "experimental"] }
+criterion = "0.8"
+rand = "0.10"
+dhat = "0.3"
+
+[features]
+# Forward the structured-zstd features the bench/test/example sources gate on
+# via `#[cfg(feature = ...)]`. None are in `default`: each target that needs
+# one lists it in `required-features`, which both activates the feature when
+# that target is built and keeps it OFF the parity benches.
+default = []
+hash = ["structured-zstd/hash"]
+dict_builder = ["structured-zstd/dict_builder"]
+bench_internals = ["structured-zstd/bench_internals"]
+copy_shape_stats = ["structured-zstd/copy_shape_stats"]
+# The `dhat-heap` example swaps in the dhat global allocator; keep it opt-in so
+# the timing benches do not pick up the profiling allocator.
+dhat-heap = ["structured-zstd/dhat-heap"]
+
+[[bench]]
+name = "decode_all"
+path = "../zstd/benches/decode_all.rs"
+harness = false
+
+[[bench]]
+name = "huf_decode_kernels"
+path = "../zstd/benches/huf_decode_kernels.rs"
+harness = false
+
+[[bench]]
+name = "compare_ffi"
+path = "../zstd/benches/compare_ffi.rs"
+harness = false
+
+[[bench]]
+name = "compare_ffi_memory"
+path = "../zstd/benches/compare_ffi_memory.rs"
+harness = false
+
+[[bench]]
+name = "compare_ffi_sequences"
+path = "../zstd/benches/compare_ffi_sequences.rs"
+harness = false
+required-features = ["bench_internals"]
+
+[[bench]]
+name = "bitstream"
+path = "../zstd/benches/bitstream.rs"
+harness = false
+required-features = ["bench_internals"]
+
+[[bench]]
+name = "dict_builder_fastcover"
+path = "../zstd/benches/dict_builder_fastcover.rs"
+harness = false
+
+[[bench]]
+name = "decode_dict_handle"
+path = "../zstd/benches/decode_dict_handle.rs"
+harness = false
+
+[[bench]]
+name = "wildcopy_candidates"
+path = "../zstd/benches/wildcopy_candidates.rs"
+harness = false
+required-features = ["bench_internals"]
+
+[[test]]
+name = "frame_compressor_ffi"
+path = "tests/frame_compressor_ffi.rs"
+required-features = ["bench_internals"]
+
+[[test]]
+name = "fuzz_interop"
+path = "tests/fuzz_interop.rs"
+
+[[test]]
+name = "match_generator_ffi"
+path = "tests/match_generator_ffi.rs"
+required-features = ["bench_internals"]
+
+[[test]]
+name = "streaming_encoder_ffi"
+path = "tests/streaming_encoder_ffi.rs"
+required-features = ["bench_internals"]
+
+[[test]]
+name = "huff0_ffi"
+path = "tests/huff0_ffi.rs"
+required-features = ["bench_internals"]
+
+[[test]]
+name = "dictionary_ffi"
+path = "tests/dictionary_ffi.rs"
+required-features = ["bench_internals"]
+
+[[test]]
+name = "encode_corpus_ffi"
+path = "tests/encode_corpus_ffi.rs"
+
+[[test]]
+name = "block_splitter_parity"
+path = "../zstd/tests/block_splitter_parity.rs"
+required-features = ["bench_internals"]
+
+[[test]]
+name = "corpus_level22_gap"
+path = "../zstd/tests/corpus_level22_gap.rs"
+
+[[test]]
+name = "cross_validation"
+path = "../zstd/tests/cross_validation.rs"
+
+[[test]]
+name = "he_level22_ratio"
+path = "../zstd/tests/he_level22_ratio.rs"
+
+[[test]]
+name = "incompressibility_falsepos"
+path = "../zstd/tests/incompressibility_falsepos.rs"
+
+[[example]]
+name = "alloc_audit_decode"
+path = "../zstd/examples/alloc_audit_decode.rs"
+required-features = ["dhat-heap"]
+
+[[example]]
+name = "c_decode_loop_z000033"
+path = "../zstd/examples/c_decode_loop_z000033.rs"
+
+[[example]]
+name = "copy_shape"
+path = "../zstd/examples/copy_shape.rs"
+required-features = ["copy_shape_stats"]
+
+[[example]]
+name = "cparams_check"
+path = "../zstd/examples/cparams_check.rs"
+
+[[example]]
+name = "cparams_range"
+path = "../zstd/examples/cparams_range.rs"
+
+[[example]]
+name = "decode_loop_dict"
+path = "../zstd/examples/decode_loop_dict.rs"
+
+[[example]]
+name = "decode_loop_z000033"
+path = "../zstd/examples/decode_loop_z000033.rs"
+
+[[example]]
+name = "encode_l4"
+path = "../zstd/examples/encode_l4.rs"
+
+[[example]]
+name = "encode_loop_dict"
+path = "../zstd/examples/encode_loop_dict.rs"
+
+[[example]]
+name = "encode_loop_reuse_z000033"
+path = "../zstd/examples/encode_loop_reuse_z000033.rs"
+
+[[example]]
+name = "encode_loop_z000033"
+path = "../zstd/examples/encode_loop_z000033.rs"
+
+[[example]]
+name = "ffi_compress_z000033"
+path = "../zstd/examples/ffi_compress_z000033.rs"
+
+[[example]]
+name = "ffi_loop_dict"
+path = "../zstd/examples/ffi_loop_dict.rs"
+
+[[example]]
+name = "profile_decode"
+path = "../zstd/examples/profile_decode.rs"
+
+[[example]]
+name = "profile_decode_direct"
+path = "../zstd/examples/profile_decode_direct.rs"
+
+[[example]]
+name = "section_split"
+path = "../zstd/examples/section_split.rs"
+
+[[example]]
+name = "trace_fast_kernel"
+path = "../zstd/examples/trace_fast_kernel.rs"

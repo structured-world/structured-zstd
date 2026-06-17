@@ -3,8 +3,8 @@
 //! for checking our per-level table widths (windowLog / hashLog / chainLog)
 //! against upstream's source-size-adjusted values.
 //!
-//! Build: cargo build --release -p structured-zstd --example donor_cparams_check
-//! Run:   ./target/release/examples/donor_cparams_check [level] [src_size]
+//! Build: cargo build --release -p ffi-bench --example cparams_check
+//! Run:   ./target/release/examples/cparams_check [level] [src_size]
 //!        level    compression level (default 1)
 //!        src_size source size in bytes for the size hint (default 1022035,
 //!                 the decodecorpus-z000033 fixture; 0 = unknown/unbounded)

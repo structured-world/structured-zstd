@@ -1,10 +1,10 @@
-//! Donor-shape Fast strategy block compressor — port of
+//! Upstream zstd-shape Fast strategy block compressor — port of
 //! `ZSTD_compressBlock_fast_noDict_generic` from
 //! `lib/compress/zstd_fast.c`. Includes the 4-cursor
 //! (`ip0/ip1/ip2/ip3`) lookahead pipeline with `kSearchStrength`
 //! step-doubling, repcode-at-ip2 probe, two explicit-match probes
 //! per do-while iter, immediate-rep2 inner loop after match emit,
-//! and both donor variants of the match-found check
+//! and both upstream zstd variants of the match-found check
 //! (`ZSTD_match4Found_branch` + `ZSTD_match4Found_cmov`) selected
 //! per-call via the `USE_CMOV` const generic.
 
@@ -21,7 +21,7 @@ use crate::encoding::Sequence;
 /// `if std::env::var(..)` check.
 ///
 /// Used by `examples/trace_fast_kernel.rs` to diff our kernel's
-/// state against donor `zstd_fast.c:266-348` reasoning at every iter
+/// state against upstream zstd `zstd_fast.c:266-348` reasoning at every iter
 /// in the first block of decodecorpus-z000033 (issue #220 ratio gap).
 #[cfg(feature = "kernel_trace")]
 macro_rules! ktrace {
@@ -53,7 +53,7 @@ pub(crate) fn kernel_trace_enabled() -> bool {
     }
 }
 
-/// Donor `kSearchStrength` — defined in `zstd_compress_internal.h:32`
+/// Upstream zstd `kSearchStrength` — defined in `zstd_compress_internal.h:32`
 /// as `#define kSearchStrength 8`. The step-skip accelerator advances
 /// the per-iteration step every `1 << (kSearchStrength - 1) = 128`
 /// bytes when no matches are found, so incompressible regions skip
@@ -61,19 +61,19 @@ pub(crate) fn kernel_trace_enabled() -> bool {
 ///
 /// Issue #220 fix: previously had `SEARCH_STRENGTH = 6` (`K_STEP_INCR
 /// = 32`), causing our step doubling to fire 4× more frequently than
-/// donor — by ip0=1280 our step was ~40 while donor's was 12. This
+/// upstream zstd — by ip0=1280 our step was ~40 while upstream zstd's was 12. This
 /// drove the +7.43% ratio gap on decodecorpus-z000033 at Level(1)
-/// Fast: cursor skipped too many positions, missing matches donor
+/// Fast: cursor skipped too many positions, missing matches upstream zstd
 /// found via finer-grained probing.
 const SEARCH_STRENGTH: usize = 8;
 
-/// Donor `kStepIncr = 1 << (kSearchStrength - 1) = 128` — every this-
+/// Upstream zstd `kStepIncr = 1 << (kSearchStrength - 1) = 128` — every this-
 /// many bytes of no-match scanning, the per-iteration `step` is
-/// bumped by 1 (donor's `step++` at `zstd_fast.c:343`). Drives the
+/// bumped by 1 (upstream zstd's `step++` at `zstd_fast.c:343`). Drives the
 /// incompressible-region step acceleration.
 const K_STEP_INCR: usize = 1 << (SEARCH_STRENGTH - 1);
 
-/// Donor `HASH_READ_SIZE`. The forward-progress invariant is that the
+/// Upstream zstd `HASH_READ_SIZE`. The forward-progress invariant is that the
 /// hash read at `ip0` MUST stay inside `[base, iend)`, so the
 /// `ilimit = iend - HASH_READ_SIZE` cap is applied to the loop
 /// boundary check.
@@ -89,13 +89,13 @@ const HASH_READ_SIZE: usize = 8;
 /// minimum.
 const MIN_DICT_MATCH_LEN: usize = 8;
 
-/// Donor's `MEM_read32(ptr)` — unaligned native-endian 4-byte load,
+/// Upstream zstd's `MEM_read32(ptr)` — unaligned native-endian 4-byte load,
 /// used by the raw match probe on the hot path. The result is only
 /// ever compared for equality against another `read32` of the same
 /// width on the same host, so the byte ordering does not matter — both
 /// sides experience the same endianness, and `a == b` holds iff the
 /// underlying byte sequences match. No `.to_le()` conversion is needed
-/// (donor's C `MEM_read32` is also implemented as a native-endian
+/// (upstream zstd's C `MEM_read32` is also implemented as a native-endian
 /// `memcpy` for the same reason).
 ///
 /// # Safety
@@ -107,7 +107,7 @@ unsafe fn read32(ptr: *const u8) -> u32 {
     unsafe { core::ptr::read_unaligned(ptr.cast::<u32>()) }
 }
 
-/// Donor `ZSTD_match4Found_cmov`'s dummy buffer — 4 random-ish bytes
+/// Upstream zstd `ZSTD_match4Found_cmov`'s dummy buffer — 4 random-ish bytes
 /// to compare against when `match_idx < prefix_start_index`. Chosen
 /// so the read32 result is very unlikely to coincide with any real
 /// 4-byte window from the input. Used by the cmov branchless variant
@@ -115,7 +115,7 @@ unsafe fn read32(ptr: *const u8) -> u32 {
 /// branch.
 const CMOV_DUMMY: [u8; 4] = [0x12, 0x34, 0x56, 0x78];
 
-/// Donor `ZSTD_match4Found_branch` / `ZSTD_match4Found_cmov`
+/// Upstream zstd `ZSTD_match4Found_branch` / `ZSTD_match4Found_cmov`
 /// branchless dispatch via const generic.
 ///
 /// # Safety
@@ -138,7 +138,7 @@ unsafe fn match_found<const USE_CMOV: bool>(
     match_idx: u32,
     prefix_start_index: u32,
 ) -> bool {
-    // Donor-parity hot-path: the ONLY filter on the branch variant is
+    // Upstream zstd-parity hot-path: the ONLY filter on the branch variant is
     // `match_idx < prefix_start_index` (rejects stale entries below
     // the current window). Two safety invariants make additional
     // bounds checks redundant:
@@ -152,12 +152,12 @@ unsafe fn match_found<const USE_CMOV: bool>(
     //    = 1` rule at the matcher boundary rejects the stale-zero
     //    initial entry that would otherwise alias to position 0.
     //
-    // 2. `match_pos < ip_pos`: hash writes precede probes in donor's
+    // 2. `match_pos < ip_pos`: hash writes precede probes in upstream zstd's
     //    flow (writeback `hashTable[hash0] = current0` happens before
     //    `matchFound(...)` reads matchIdx). Since `current0 < ip0` at
     //    every shift step, `matchIdx <= current0_prev < ip0_now`.
     //
-    // Donor `ZSTD_match4Found_branch` (`zstd_fast.c:128-141`) takes
+    // Upstream zstd `ZSTD_match4Found_branch` (`zstd_fast.c:128-141`) takes
     // the same invariants and emits exactly one prefix filter + one
     // 4-byte equality compare. The previous defensive bounds checks
     // we carried here added two extra branches per match probe —
@@ -167,7 +167,7 @@ unsafe fn match_found<const USE_CMOV: bool>(
     let match_pos = match_idx as usize;
 
     if USE_CMOV {
-        // Donor cmov variant (`ZSTD_match4Found_cmov`): pick either
+        // Upstream zstd cmov variant (`ZSTD_match4Found_cmov`): pick either
         // `base + match_pos` or `CMOV_DUMMY` based on the prefix
         // filter, then AND with an explicit `in_range` predicate.
         // The compiler typically lowers the if-expression to a
@@ -178,7 +178,7 @@ unsafe fn match_found<const USE_CMOV: bool>(
         // `CMOV_DUMMY` (rare but reachable), the out-of-window
         // match would otherwise slip through.
         //
-        // Donor (`ZSTD_match4Found_cmov` lines 119-124) inserts an
+        // Upstream zstd (`ZSTD_match4Found_cmov` lines 119-124) inserts an
         // `__asm__("")` compiler barrier between the two checks to
         // pin codegen order. We don't replicate that — Rust offers
         // `core::sync::atomic::compiler_fence` if needed, but
@@ -197,14 +197,14 @@ unsafe fn match_found<const USE_CMOV: bool>(
         let bytes_match = unsafe { read32(ip) == read32(mval_addr) };
         // Bitwise AND (not `&&`) is INTENTIONAL — short-circuit
         // would re-introduce a branch on `bytes_match`, defeating
-        // the cmov-branchless path. Donor enforces the same
+        // the cmov-branchless path. Upstream zstd enforces the same
         // ordering with `__asm__("")` between its two checks
         // (`ZSTD_match4Found_cmov` lines 119-124).
         #[allow(clippy::needless_bitwise_bool)]
         let r = bytes_match & in_range;
         r
     } else {
-        // Donor branch variant (`ZSTD_match4Found_branch`): explicit
+        // Upstream zstd branch variant (`ZSTD_match4Found_branch`): explicit
         // branch on the prefix filter. Faster when the branch is
         // strongly predictable — that's the typical Fast strategy
         // case where almost all hash table entries are within the
@@ -225,7 +225,7 @@ pub(crate) struct FastBlockResult {
     pub(crate) tail_literals_len: usize,
 }
 
-/// Donor-parity Fast block compressor, monomorphised over `MLS` (4..=8).
+/// Upstream zstd-parity Fast block compressor, monomorphised over `MLS` (4..=8).
 /// Each call processes one full block; produced sequences are emitted
 /// via `handle_sequence` in order. The caller is responsible for
 /// flushing the trailing literals (returned in `tail_literals_len`)
@@ -234,28 +234,28 @@ pub(crate) struct FastBlockResult {
 /// # Arguments
 ///
 /// - `data`: the full prefix history followed by the current block,
-///   laid out as a single flat buffer (matches donor's `base`).
+///   laid out as a single flat buffer (matches upstream zstd's `base`).
 /// - `block_start`: byte offset of the current block's first byte
 ///   within `data`. The kernel hashes/searches only positions in
 ///   `[block_start, data.len())`, but matches may reach back into the
 ///   prefix all the way to `bounds.prefix_start_index`.
-/// - `bounds: PrefixBounds`: bundle of two donor-derived absolute
+/// - `bounds: PrefixBounds`: bundle of two upstream zstd-derived absolute
 ///   floors (kept together so the kernel signature stays inside the
 ///   clippy 7-argument cap). See [`PrefixBounds`] field docs for the
 ///   exact semantics:
 ///   - `prefix_start_index`: sentinel-aware match-table filter (rejects
 ///     the all-zero empty-slot value at position 0).
-///   - `window_low`: donor `windowLow`-equivalent absolute floor used
+///   - `window_low`: upstream zstd `windowLow`-equivalent absolute floor used
 ///     by the prologue's `max_rep` computation and the backward-extension
 ///     `match_pos > window_low` bound.
 /// - `hash_table`: the encoder's `FastHashTable`. Mutated in place;
 ///   entries are absolute indices into `data`.
 /// - `rep`: incoming `[rep_offset1, rep_offset2]` from the previous
 ///   block. Returned updated in `FastBlockResult.rep`.
-/// - `step_size`: donor `stepSize = targetLength + !(targetLength) + 1`
+/// - `step_size`: upstream zstd `stepSize = targetLength + !(targetLength) + 1`
 ///   (min 2). Drives the initial step in the 4-cursor skip schedule.
 /// - `handle_sequence`: closure that the kernel invokes once per
-///   emitted `Sequence` — equivalent to donor's `ZSTD_storeSeq`.
+///   emitted `Sequence` — equivalent to upstream zstd's `ZSTD_storeSeq`.
 ///
 /// # Preconditions / algorithm invariants
 ///
@@ -263,7 +263,7 @@ pub(crate) struct FastBlockResult {
 /// every input that doesn't trigger one of the entry-time
 /// `assert!`s (see the **Panics** section below for that list). The
 /// contract below is about algorithmic correctness (correct output
-/// sequences, donor-parity match coverage), not Rust memory safety.
+/// sequences, upstream zstd-parity match coverage), not Rust memory safety.
 /// Passing a smaller `data` is well-defined but the kernel falls
 /// into the short-input early-return branch and emits no sequences,
 /// which may not be what the caller wanted.
@@ -283,7 +283,7 @@ pub(crate) struct FastBlockResult {
 /// - `data.len() > u32::MAX as usize` — the kernel stores
 ///   absolute positions into a u32 hash table and computes offsets
 ///   as u32, so larger inputs would silently truncate match indices.
-/// - `MLS` outside `4..=8` — the donor's Fast strategy supports
+/// - `MLS` outside `4..=8` — the upstream zstd's Fast strategy supports
 ///   only mls 4..=8; out-of-range MLS would route to a
 ///   non-existent hash formula.
 /// - `MLS` != `hash_table.mls()` — a mismatched table layout would
@@ -326,7 +326,7 @@ pub(crate) struct FastBlockResult {
 /// wrapping the kernel's output would have to special-case "did
 /// the kernel already emit the tail" per branch, which is exactly
 /// the inconsistency this contract removes.
-/// Donor `prefixStartIndex` + `windowLow` bundled into a single
+/// Upstream zstd `prefixStartIndex` + `windowLow` bundled into a single
 /// argument so the kernel signature stays within the 7-arg clippy
 /// budget. Both fields are u32 absolute positions in the flat
 /// history buffer; see [`compress_block_fast`] doc for which path
@@ -339,11 +339,11 @@ pub(crate) struct PrefixBounds {
     /// `prefix_start_index >= 1` so the all-zero empty-slot value
     /// can't be confused with a valid match at position 0.
     pub prefix_start_index: u32,
-    /// Donor `windowLow` analogue — the absolute floor of in-window
+    /// Upstream zstd `windowLow` analogue — the absolute floor of in-window
     /// positions, equals 0 at block 0 / pre-eviction blocks and
     /// advances as the window slides. Drives the prologue's
     /// `max_rep = ip0 - window_low` computation AND the backward-
-    /// extension `match_pos > window_low` bound (both paths donor
+    /// extension `match_pos > window_low` bound (both paths upstream zstd
     /// expresses against `prefixStart` directly, NOT against a
     /// sentinel-1 floor).
     pub window_low: u32,
@@ -361,7 +361,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
 ) -> FastBlockResult {
     let prefix_start_index = bounds.prefix_start_index;
     let window_low = bounds.window_low;
-    // Donor's `stepSize = targetLength + !(targetLength) + 1`
+    // Upstream zstd's `stepSize = targetLength + !(targetLength) + 1`
     // (min 2). Callers must pass >= 2; values larger than 2 drive
     // the kernel's acceleration gradient on negative levels.
     // Validated in release builds too: `compress_block_fast` is a
@@ -373,7 +373,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
     assert!(
         step_size >= 2,
         "Fast kernel requires step_size >= 2 (got {step_size}); \
-         the donor formula clamps to a min of 2",
+         the upstream zstd formula clamps to a min of 2",
     );
     // Real runtime check (not debug_assert) — MLS is a const-generic
     // so the wrong value would compile, and a mismatched table at the
@@ -432,7 +432,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
     );
 
     // Block too short to do any matching — report the whole block
-    // as trailing literals without emitting anything. Donor mirrors
+    // as trailing literals without emitting anything. Upstream zstd mirrors
     // the same shape via the `_cleanup` path (`anchor = istart`,
     // returns `iend - anchor`). The caller emits the
     // `Sequence::Literals` wrapper per the contract above; we don't
@@ -450,7 +450,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
 
     let mut anchor: usize = block_start;
     let mut ip0: usize = block_start;
-    // Donor: `ip0 += (ip0 == prefixStart);`. Equivalent in flat-buffer
+    // Upstream zstd: `ip0 += (ip0 == prefixStart);`. Equivalent in flat-buffer
     // terms is to ensure ip0 isn't at the absolute zero position
     // (where the sentinel could be confused with a valid match).
     if ip0 == 0 {
@@ -459,16 +459,16 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
 
     let mut rep_offset1: u32 = rep[0];
     let mut rep_offset2: u32 = rep[1];
-    // Donor stashes the repcodes when they're out of range for the
+    // Upstream zstd stashes the repcodes when they're out of range for the
     // current block and restores them at `_cleanup`. For phase 1 we
     // mirror the same save/restore so cross-block repcode history
     // stays correct.
     let mut offset_saved1: u32 = 0;
     let mut offset_saved2: u32 = 0;
     {
-        // Donor (`zstd_fast.c:240-244`): `maxRep = curr - windowLow`.
+        // Upstream zstd (`zstd_fast.c:240-244`): `maxRep = curr - windowLow`.
         // `windowLow` is the absolute floor of in-window positions
-        // (= 0 at block 0). It is NOT `prefixStartIndex` — donor's
+        // (= 0 at block 0). It is NOT `prefixStartIndex` — upstream zstd's
         // `prefixStartIndex == windowLow` in the canonical fast path,
         // but our `prefix_start_index` carries the sentinel-1 floor
         // for hash-filter purposes. Using `prefix_start_index` here
@@ -487,15 +487,15 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
         }
     }
 
-    // Step-skip state: donor's `step = stepSize` (`targetLength + 1`
+    // Step-skip state: upstream zstd's `step = stepSize` (`targetLength + 1`
     // = 2 for Fast strategy with `targetLength == 0`). The 4-cursor
     // loop walks ip0/ip1 = ip0 + 1 adjacent + ip2/ip3 at `step` gap.
     // `next_step` is the absolute position where step doubles next;
-    // donor increments by `kStepIncr = 1 << (kSearchStrength - 1)`.
+    // upstream zstd increments by `kStepIncr = 1 << (kSearchStrength - 1)`.
     let mut step: usize = step_size;
     let mut next_step: usize = ip0.saturating_add(K_STEP_INCR);
 
-    // 4-cursor donor port. Outer `'restart` loop matches donor's
+    // 4-cursor upstream zstd port. Outer `'restart` loop matches upstream zstd's
     // `_start:` reentry: every emitted match `goto _start`s back
     // here for a fresh setup. The inner `do-while` walks ip0..ip3
     // with hash precomputation, repcode-at-ip2 probe, two explicit-
@@ -539,7 +539,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
             break;
         }
 
-        // Hash precomputation for ip0 + ip1 (donor lines 261-262).
+        // Hash precomputation for ip0 + ip1 (upstream zstd lines 261-262).
         // SAFETY: ip0, ip1 < ilimit = iend - 8, so ≥ 8 readable
         // bytes at each `base + ip*`. MLS ≤ 8 matches hash_ptr's
         // contract.
@@ -568,12 +568,12 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
                 new_ip: usize,
                 match0: usize,
                 m_len: usize,
-                // Donor's `current0` — position of the LAST hash
+                // Upstream zstd's `current0` — position of the LAST hash
                 // writeback before the rep was found. For the
                 // rep-at-ip2 path that's the iter-start ip0 (the
                 // writeback at the top of the do-while body).
                 // Used post-emit to insert hash at `current0 + 2`
-                // (donor zstd_fast.c:407). Captured BEFORE the
+                // (upstream zstd zstd_fast.c:407). Captured BEFORE the
                 // backward-extension decrement so it doesn't
                 // collapse onto new_ip for rep matches.
                 current0: usize,
@@ -591,8 +591,8 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
             },
         }
         let found: Option<MatchFound> = loop {
-            // Repcode probe at ip2 (donor line 268). Unconditional
-            // load — donor `MEM_read32(ip2 - rep_offset1)` always
+            // Repcode probe at ip2 (upstream zstd line 268). Unconditional
+            // load — upstream zstd `MEM_read32(ip2 - rep_offset1)` always
             // reads, no `rep_offset1 > 0` short-circuit. Safe even
             // when rep_offset1 == 0 because `ip2 - 0 = ip2`, which
             // reads the same 4 bytes as the equality target below
@@ -605,7 +605,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
             // backward read stays in-bounds.
             let rval = unsafe { read32(base.add(ip2 - rep_offset1 as usize)) };
 
-            // Writeback hash for ip0 (donor line 272). Donor writes
+            // Writeback hash for ip0 (upstream zstd line 272). Upstream zstd writes
             // BEFORE the rep probe so the hash table reflects ip0
             // even if the iteration's match comes from rep at ip2.
             // SAFETY: hash0 from hash_ptr ⇒ in-bounds; ip0 ≤ u32::MAX
@@ -621,20 +621,20 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
             // `ip2 + 4 < iend`) and `rval` is already loaded above, so
             // dropping the branch on `rep_offset1 > 0` lets the optimizer
             // fold the combined predicate into a branchless compare (the
-            // donor/reference shape) instead of a short-circuit branch
+            // upstream zstd/reference shape) instead of a short-circuit branch
             // before the load.
             if (rep_offset1 > 0) & (unsafe { read32(base.add(ip2)) } == rval) {
                 // Repcode match. ip0 fast-forwards to ip2; backward-
                 // extend by 1 if the byte before ip2 also matches.
-                // Donor's `mLength = ip0[-1] == match0[-1]` is a
+                // Upstream zstd's `mLength = ip0[-1] == match0[-1]` is a
                 // single-byte extension with implicit `new_ip >
                 // anchor` AND `match > prefix` checks via the
                 // prologue's save/restore on rep_offset1.
                 let mut new_ip = ip2;
                 let mut match0 = new_ip - rep_offset1 as usize;
                 let mut m_len: usize = 4;
-                // Donor bound: `match0 > prefixStart` ≡
-                // `match_pos > windowLow` (donor's prefixStart and
+                // Upstream zstd bound: `match0 > prefixStart` ≡
+                // `match_pos > windowLow` (upstream zstd's prefixStart and
                 // windowLow are the same pointer in the no-dict
                 // fast path). We use `window_low` here rather than
                 // the sentinel-aware `prefix_start_index` so the
@@ -656,7 +656,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
                 }
                 // Safe writeback for hash1 — ip1 is BEFORE ip2 (the
                 // match site), so its position won't conflict with
-                // the match's forward extension. Donor lines 286-287.
+                // the match's forward extension. Upstream zstd lines 286-287.
                 ktrace!("PUT hash1={} pos={} (rep-emit post)", hash1, ip1);
                 unsafe { *table.get_unchecked_mut(hash1 as usize) = ip1 as u32 };
                 ktrace!(
@@ -671,18 +671,18 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
                     match0,
                     m_len,
                     // Iter-start ip0 (the writeback at line 426
-                    // above) — donor's `current0` for this path.
+                    // above) — upstream zstd's `current0` for this path.
                     current0: ip0,
                 });
             }
 
-            // First explicit-match probe at ip0 (donor line 292).
+            // First explicit-match probe at ip0 (upstream zstd line 292).
             ktrace!("PROBE1 ip0={} match_idx={}", ip0, match_idx);
             if unsafe {
                 match_found::<USE_CMOV>(base.add(ip0), base, match_idx, prefix_start_index)
             } {
                 // Safe writeback for hash1 (ip1 = ip0 + 1, before
-                // search resumption). Donor line 296.
+                // search resumption). Upstream zstd line 296.
                 ktrace!("PUT hash1={} pos={} (explicit1 post)", hash1, ip1);
                 unsafe { *table.get_unchecked_mut(hash1 as usize) = ip1 as u32 };
                 ktrace!(
@@ -710,18 +710,18 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
             ip1 = ip2;
             ip2 = ip3;
 
-            // Writeback for new ip0. Donor lines 314-315.
+            // Writeback for new ip0. Upstream zstd lines 314-315.
             ktrace!("PUT hash0={} pos={} (post-shift1)", hash0, ip0);
             unsafe { *table.get_unchecked_mut(hash0 as usize) = ip0 as u32 };
 
             // Second explicit-match probe at the shifted ip0
-            // (donor line 317).
+            // (upstream zstd line 317).
             ktrace!("PROBE2 ip0={} match_idx={}", ip0, match_idx);
             if unsafe {
                 match_found::<USE_CMOV>(base.add(ip0), base, match_idx, prefix_start_index)
             } {
                 // Conditional writeback: only safe if `step <= 4`
-                // (donor lines 319-324) — otherwise ip1 might fall
+                // (upstream zstd lines 319-324) — otherwise ip1 might fall
                 // past the match start when we resume scanning.
                 if step <= 4 {
                     ktrace!("PUT hash1={} pos={} (explicit2 post, step<=4)", hash1, ip1);
@@ -743,7 +743,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
             // Shift again with the larger `step` gap. The second
             // shift is the one that advances ip2/ip3 by `step`
             // rather than by 1; this is where the step-skip kicks
-            // in. Donor lines 329-339.
+            // in. Upstream zstd lines 329-339.
             match_idx = unsafe { *table.get_unchecked(hash1 as usize) };
             hash0 = hash1;
             hash1 = unsafe { hash_ptr_raw::<MLS>(base.add(ip2), hlog) };
@@ -764,7 +764,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
             ip2 = new_ip2;
             ip3 = new_ip3;
 
-            // Step-doubling: donor lines 342-347. Drives the
+            // Step-doubling: upstream zstd lines 342-347. Drives the
             // kSearchStrength-based acceleration on incompressible
             // regions.
             if ip2 >= next_step {
@@ -784,11 +784,11 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
         };
 
         // _offset / _match — backward + forward extension + emit.
-        // Donor's `current0` = position of the LAST hash writeback
+        // Upstream zstd's `current0` = position of the LAST hash writeback
         // before the match was found. Captured at break-time on
         // each MatchFound variant so the Rep path's backward
         // extension doesn't collapse `current0` onto the post-
-        // backward `new_ip` (donor zstd_fast.c:407 uses the
+        // backward `new_ip` (upstream zstd zstd_fast.c:407 uses the
         // pre-backward iter-start position).
         let current0 = match found {
             MatchFound::Rep { current0, .. } => current0,
@@ -807,13 +807,13 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
                 current0: _,
             } => {
                 let match_pos = match_idx as usize;
-                // Donor invariant: hash table writes for ip_pos
+                // Upstream zstd invariant: hash table writes for ip_pos
                 // happen BEFORE the probe reads `match_idx` (see the
                 // writeback at the top of the do-while body), so the
                 // returned `match_idx` is always strictly less than
                 // `new_ip` (it was a hash slot occupant from a prior
                 // shift step where `current0_prev < ip0_now`).
-                // Donor `ZSTD_match4Found_branch` relies on the same
+                // Upstream zstd `ZSTD_match4Found_branch` relies on the same
                 // invariant — neither side adds a release-time check.
                 debug_assert!(
                     match_pos < new_ip,
@@ -822,7 +822,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
                 );
                 let offset = new_ip - match_pos;
                 // Rotate the rep stack ahead of backward extension
-                // — donor stores the offset BEFORE the backward
+                // — upstream zstd stores the offset BEFORE the backward
                 // walk (lines 381-383). This way the explicit-match
                 // path's backward extension is bounded by the
                 // anchor + prefix_start_index pair; subsequent
@@ -834,7 +834,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
         };
 
         // Backward extension — only for explicit matches; rep path
-        // already handled the 1-byte backward step above. Donor's
+        // already handled the 1-byte backward step above. Upstream zstd's
         // bound is `match0 > prefixStart` ≡ `match_pos > windowLow`;
         // we mirror it via `window_low` (NOT `prefix_start_index`,
         // which is sentinel-floored at 1 for hash-filter purposes
@@ -885,18 +885,18 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
         ip0 = match_ip + m_len;
         anchor = ip0;
 
-        // Immediate-rep2 inner loop (donor lines 404-420). After a
-        // match emit, donor (a) refills the hash for `ip0 - 2` to
+        // Immediate-rep2 inner loop (upstream zstd lines 404-420). After a
+        // match emit, upstream zstd (a) refills the hash for `ip0 - 2` to
         // give the next scan a head start, (b) probes for repcode-2
         // matches at the new ip0 — if found, emit them as lit_len=0
         // rep1 sequences (with rep stack swap) until exhausted.
         if ip0 <= ilimit {
-            // Donor inserts TWO hashes after a match emit
+            // Upstream zstd inserts TWO hashes after a match emit
             // (zstd_fast.c:407-408): one at `current0 + 2` (2 bytes
             // past the trigger-ip position, filling a slot inside
             // the now-consumed match), one at `ip0 - 2` (2 bytes
             // before the next scan start). Both are vital — missing
-            // either makes the hash table sparser than donor's and
+            // either makes the hash table sparser than upstream zstd's and
             // costs subsequent matches.
             //
             // SAFETY: each `base.add(N - 2)` covers ≥ 8 readable
@@ -926,7 +926,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
                 unsafe { *table.get_unchecked_mut(h_back as usize) = (ip0 - 2) as u32 };
             }
 
-            // Repcode-2 inner loop. Donor swaps rep1 / rep2 on each
+            // Repcode-2 inner loop. Upstream zstd swaps rep1 / rep2 on each
             // hit so the just-found offset becomes the new rep1.
             while rep_offset2 > 0
                 && ip0 <= ilimit
@@ -946,10 +946,10 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
                 };
                 let r_len = 4 + r_extra;
 
-                // Swap rep1 / rep2 (donor line 414).
+                // Swap rep1 / rep2 (upstream zstd line 414).
                 core::mem::swap(&mut rep_offset1, &mut rep_offset2);
 
-                // Hash refill at ip0 (donor line 415).
+                // Hash refill at ip0 (upstream zstd line 415).
                 let h_at = unsafe { hash_ptr_raw::<MLS>(base.add(ip0), hlog) };
                 unsafe { *table.get_unchecked_mut(h_at as usize) = ip0 as u32 };
 
@@ -983,7 +983,7 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
 
     // Repcode save/restore: if `rep_offset1` came in invalid
     // (offset_saved1 != 0) and finished valid (rep_offset1 != 0),
-    // then the donor-saved offset becomes the new rep[1]. Mirrors
+    // then the upstream zstd-saved offset becomes the new rep[1]. Mirrors
     // `offsetSaved2 = ((offsetSaved1 != 0) && (rep_offset1 != 0)) ?
     // offsetSaved1 : offsetSaved2;`.
     if offset_saved1 != 0 && rep_offset1 != 0 {
@@ -1009,23 +1009,23 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
     }
 }
 
-/// Attach-mode dict Fast kernel — flat-buffer port of donor
+/// Attach-mode dict Fast kernel — flat-buffer port of upstream zstd
 /// `ZSTD_compressBlock_fast_dictMatchState_generic` (`zstd_fast.c:483-678`),
 /// the 2-cursor dict-aware search C uses for small / unknown-size inputs
 /// (`ZSTD_shouldAttachDict`: `pledgedSrcSize <= 8 KB` for the Fast strategy, or
 /// size unknown). The caller routes large known-size inputs through the plain
 /// 4-cursor [`compress_block_fast`] with the dictionary copied into the window
-/// instead (donor's "copy" mode) — that path already matches/beats the donor on
+/// instead (upstream zstd's "copy" mode) — that path already matches/beats the upstream zstd on
 /// large corpora, so this attach path exists ONLY to win the small/unknown case
 /// the 4-cursor parse-order misses.
 ///
-/// Flat-model adaptations vs the donor: the dictionary occupies `data[1..
+/// Flat-model adaptations vs the upstream zstd: the dictionary occupies `data[1..
 /// dict_end]` immediately before the frame input (mirroring the decoder's
 /// `[dict][output]` window), so a dict-match offset is `ip - dict_pos` like any
 /// in-window match and match counts cross the dict→input boundary freely (no
 /// `ZSTD_count_2segments`, no `dictBase`/`dictIndexDelta`). `dict_table` stores
-/// plain positions (no donor short-cache tags); `main_table` holds ONLY frame-
-/// input positions. Search order mirrors the donor: rep@ip0+1 → dict (only when
+/// plain positions (no upstream zstd short-cache tags); `main_table` holds ONLY frame-
+/// input positions. Search order mirrors the upstream zstd: rep@ip0+1 → dict (only when
 /// the main candidate is invalid) → main. Correctness is independent of table
 /// contents (every match byte-verified + bounds-guarded); `MIN_DICT_MATCH_LEN`
 /// gates short far dict matches that would fragment the offset-FSE alphabet.
@@ -1081,7 +1081,7 @@ pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
     let mut offset_2: u32 = rep[1];
 
     // Inner-loop result: literals end (where the match copy begins), the raw
-    // match offset, the match length, and the donor `curr` (probe position,
+    // match offset, the match length, and the upstream zstd `curr` (probe position,
     // for the post-match `curr + 2` fill). `None` → drain to cleanup.
     struct DictMatch {
         lit_end: usize,
@@ -1100,10 +1100,10 @@ pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
         let found: Option<DictMatch> = loop {
             // SAFETY: ip1 <= ilimit ⇒ ≥ 8 readable bytes at ip1.
             let hash1 = unsafe { main_table.hash_ptr::<MLS>(base.add(ip1)) };
-            // Insert current position into the MAIN table (donor line 565).
+            // Insert current position into the MAIN table (upstream zstd line 565).
             unsafe { main_table.put(hash0, curr as u32) };
 
-            // Repcode probe for a match starting at ip0 + 1 (donor 559-574).
+            // Repcode probe for a match starting at ip0 + 1 (upstream zstd 559-574).
             if offset_1 > 0 && curr + 1 >= offset_1 as usize + window_low {
                 let rep_index = curr + 1 - offset_1 as usize;
                 // SAFETY: ip0+1+4 <= ilimit+5 < iend; rep_index < ip0+1 so
@@ -1131,7 +1131,7 @@ pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
             // aligned case `main_idx == prefix_start_index` is a VALID recent
             // candidate, so it must fall through to the main-match probe below
             // rather than the dict path — keeping "recent input wins, dict is
-            // the fallback". (Donor's `matchIndex <= prefixStartIndex` gate is
+            // the fallback". (Upstream zstd's `matchIndex <= prefixStartIndex` gate is
             // an if/else-if with no main fallthrough; our two-`if` structure
             // needs `<` here to stay consistent with `match_found`'s floor.)
             if main_idx < prefix_start_index {
@@ -1146,7 +1146,7 @@ pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
                     let mut m_len = 4 + unsafe {
                         count_forward(base.add(ip0 + 4), base.add(dpos + 4), base.add(iend_addr))
                     };
-                    // Catch-up backward extension into the dict (donor 586-591).
+                    // Catch-up backward extension into the dict (upstream zstd 586-591).
                     while match_ip > anchor
                         && match_pos > window_low
                         && unsafe { *base.add(match_ip - 1) == *base.add(match_pos - 1) }
@@ -1169,7 +1169,7 @@ pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
                 }
             }
 
-            // Main match (recent input) — donor line 600.
+            // Main match (recent input) — upstream zstd line 600.
             if unsafe { match_found::<USE_CMOV>(base.add(ip0), base, main_idx, prefix_start_index) }
             {
                 let mut match_ip = ip0;
@@ -1200,7 +1200,7 @@ pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
                 });
             }
 
-            // Prepare next iteration (donor 616-630).
+            // Prepare next iteration (upstream zstd 616-630).
             dict_idx = unsafe { dict_table.get(hash1) };
             main_idx = unsafe { main_table.get(hash1) };
             ip0 = ip1;
@@ -1225,7 +1225,7 @@ pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
         anchor = ip0;
 
         if ip0 <= ilimit {
-            // Post-match dense fills (donor 641-642).
+            // Post-match dense fills (upstream zstd 641-642).
             if m.curr + 2 + HASH_READ_SIZE <= iend_addr {
                 let h = unsafe { main_table.hash_ptr::<MLS>(base.add(m.curr + 2)) };
                 unsafe { main_table.put(h, (m.curr + 2) as u32) };
@@ -1234,7 +1234,7 @@ pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
                 let h = unsafe { main_table.hash_ptr::<MLS>(base.add(ip0 - 2)) };
                 unsafe { main_table.put(h, (ip0 - 2) as u32) };
             }
-            // Immediate repcode-2 loop (donor 644-663).
+            // Immediate repcode-2 loop (upstream zstd 644-663).
             while ip0 <= ilimit
                 && offset_2 > 0
                 && ip0 >= offset_2 as usize + window_low
@@ -1419,7 +1419,7 @@ fn compress_block_fast_dict_borrowed_impl<
     let mut offset_2: u32 = rep[1];
 
     // Inner-loop result: literals end (input offset), raw match offset, match
-    // length, and the donor `curr` probe offset for the post-match `curr + 2`
+    // length, and the upstream zstd `curr` probe offset for the post-match `curr + 2`
     // fill. `None` → drain to cleanup.
     struct DictMatch {
         lit_end: usize,
@@ -2214,7 +2214,7 @@ mod tests {
     /// reference.
     ///
     /// Stale hash entries below `prefix_start_index` must be rejected
-    /// by the donor-parity prefix filter in `match_found`. Engineered
+    /// by the upstream zstd-parity prefix filter in `match_found`. Engineered
     /// scenario: pre-populate the hash slot for ip0 with a low stale
     /// index (5) that points into the supposedly-out-of-window region;
     /// run with `prefix_start_index = 50` so the kernel must skip
@@ -2244,7 +2244,7 @@ mod tests {
             Sequence::Literals { literals } => tuples.push((literals.to_vec(), 0, 0)),
         };
         // prefix_start_index = 50 — match_idx=5 is below the floor and
-        // must be rejected by the donor-parity prefix filter in
+        // must be rejected by the upstream zstd-parity prefix filter in
         // `match_found`.
         let _ = compress_block_fast::<4, false>(
             &data,
@@ -2355,7 +2355,7 @@ mod tests {
             "out-of-range rep_offset1 must be restored verbatim across the block",
         );
         // rep_offset2 was also out of range (max_rep ≈ 0..63, 7 > 1).
-        // Donor restores it through offset_saved2; the in-range
+        // Upstream zstd restores it through offset_saved2; the in-range
         // restoration path is the second witness.
         assert_eq!(result.rep[1], 7, "rep_offset2 (also stashed) must restore");
     }

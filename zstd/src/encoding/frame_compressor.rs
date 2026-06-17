@@ -191,7 +191,7 @@ impl CachedDictionaryEntropy {
     }
 
     /// Derive the encoder-side entropy tables a dictionary seeds for the first
-    /// block of each frame (the donor `cdict->cBlockState`): the literals
+    /// block of each frame (the upstream zstd `cdict->cBlockState`): the literals
     /// Huffman table plus the literal-length / match-length / offset FSE
     /// "previous" tables. Shared by [`FrameCompressor`] and
     /// [`crate::encoding::StreamingEncoder`] so both seed identically.
@@ -222,7 +222,7 @@ impl CachedDictionaryEntropy {
 /// builds compiling, single-thread there anyway), mirroring
 /// `decoding::dictionary::SharedDictionary`. Cloning the cached
 /// dictionary entropy into the per-frame state is then a refcount bump,
-/// not a full `FSETable` copy — the donor references `cdict->cBlockState`
+/// not a full `FSETable` copy — the upstream zstd references `cdict->cBlockState`
 /// instead of rebuilding it per frame.
 #[cfg(target_has_atomic = "ptr")]
 pub(crate) type SharedFseTable = alloc::sync::Arc<FSETable>;
@@ -319,7 +319,7 @@ const PRESPLIT_CHUNK_SIZE: usize = 8 << 10;
 const PRESPLIT_HASH_LOG_MAX: usize = 10;
 const PRESPLIT_HASH_TABLE_SIZE: usize = 1 << PRESPLIT_HASH_LOG_MAX;
 const PRESPLIT_KNUTH: u32 = 0x9E37_79B9;
-/// Donor `SEGMENT_SIZE` in `ZSTD_splitBlock_fromBorders` (`zstd_preSplit.c:201`).
+/// Upstream zstd `SEGMENT_SIZE` in `ZSTD_splitBlock_fromBorders` (`zstd_preSplit.c:201`).
 /// Two `SEGMENT_SIZE`-byte fingerprints — one from the start, one from the end —
 /// drive the cheap border heuristic; a third one from the middle disambiguates
 /// where in the block the transition sits.
@@ -419,12 +419,12 @@ fn presplit_record_fingerprint(
         fp.events[presplit_hash2(&src[n..], hash_log)] += 1;
         n += sampling_rate;
     }
-    // Donor parity: zstd_preSplit.c records the integer division, not the
+    // Upstream zstd parity: zstd_preSplit.c records the integer division, not the
     // rounded-up number of sampled events from the loop above.
     fp.nb_events += limit / sampling_rate;
 }
 
-/// Single-byte histogram pass — matches donor `HIST_add` over a small
+/// Single-byte histogram pass — matches upstream zstd `HIST_add` over a small
 /// segment with `hashLog == 8` (the `hash2` shortcut at
 /// `zstd_preSplit.c:36` returns the raw byte). The byChunks path uses
 /// 2-byte hashing for `hashLog >= 9`; this helper exists so the borders
@@ -434,7 +434,7 @@ fn presplit_record_byte_histogram(fp: &mut PreSplitFingerprint, src: &[u8]) {
     for &b in src {
         fp.events[b as usize] += 1;
     }
-    // Donor `HIST_add` returns the maximum symbol; the caller then sets
+    // Upstream zstd `HIST_add` returns the maximum symbol; the caller then sets
     // `nbEvents = SEGMENT_SIZE` explicitly (see `zstd_preSplit.c:213`).
     fp.nb_events = src.len();
 }
@@ -519,7 +519,7 @@ fn split_block_by_chunks(block: &[u8], level: usize) -> usize {
     block.len()
 }
 
-/// Donor port of `ZSTD_splitBlock_fromBorders` (`zstd_preSplit.c:198`).
+/// Upstream zstd port of `ZSTD_splitBlock_fromBorders` (`zstd_preSplit.c:198`).
 /// Records two 512-byte byte-histograms — one from each end of a 128 KB
 /// block — and a third from the middle as a tie-breaker; returns either
 /// a quantised split point (32 KB / 64 KB / 96 KB) or the full block
@@ -533,7 +533,7 @@ fn split_block_from_borders(block: &[u8]) -> usize {
     let mut new_fp = PreSplitFingerprint::default();
     presplit_record_byte_histogram(&mut past, &block[..PRESPLIT_BORDERS_SEGMENT]);
     presplit_record_byte_histogram(&mut new_fp, &block[block_size - PRESPLIT_BORDERS_SEGMENT..]);
-    // Donor uses `penalty = 0, hash_log = 8` — i.e. raw byte histogram
+    // Upstream zstd uses `penalty = 0, hash_log = 8` — i.e. raw byte histogram
     // distance with no threshold padding (`zstd_preSplit.c:214`).
     if !presplit_fingerprints_differ(&past, &new_fp, 0, 8) {
         return block_size;
@@ -548,7 +548,7 @@ fn split_block_from_borders(block: &[u8]) -> usize {
 
     let dist_from_begin = presplit_distance(&past, &middle, 8);
     let dist_from_end = presplit_distance(&new_fp, &middle, 8);
-    // Donor `SEGMENT_SIZE * SEGMENT_SIZE / 3` (`zstd_preSplit.c:221`):
+    // Upstream zstd `SEGMENT_SIZE * SEGMENT_SIZE / 3` (`zstd_preSplit.c:221`):
     // if the middle is roughly equidistant from both ends, the change
     // sits near the centre — split at the midpoint.
     let min_distance = (PRESPLIT_BORDERS_SEGMENT as u64) * (PRESPLIT_BORDERS_SEGMENT as u64) / 3;
@@ -584,12 +584,12 @@ pub(crate) fn xxh64_block_low32(data: &[u8]) -> u32 {
     h.finish() as u32
 }
 
-/// Bench-only entry point for the donor-parity comparator test in
-/// `tests/block_splitter_donor_parity.rs`. Dispatches to the same
+/// Bench-only entry point for the upstream zstd-parity comparator test in
+/// `tests/block_splitter_parity.rs`. Dispatches to the same
 /// `_from_borders` (split_level == 0) / `_by_chunks` (split_level ∈
 /// 1..=4) ports that `optimal_block_size` itself routes
 /// through. Caller is responsible for passing exactly
-/// `MAX_BLOCK_SIZE` bytes (per donor `ZSTD_splitBlock` contract —
+/// `MAX_BLOCK_SIZE` bytes (per upstream zstd `ZSTD_splitBlock` contract —
 /// "@blockSize must be == 128 KB" in `zstd_preSplit.h`).
 #[cfg(feature = "bench_internals")]
 pub(crate) fn block_splitter_decision_for_bench(block: &[u8], split_level: usize) -> usize {
@@ -654,7 +654,7 @@ pub(crate) fn optimal_block_size(
     if block.len() < MAX_BLOCK_SIZE as usize {
         return remaining_src_size.min(block_size_max);
     }
-    // Donor `ZSTD_splitBlock` dispatch (`zstd_preSplit.c:234`):
+    // Upstream zstd `ZSTD_splitBlock` dispatch (`zstd_preSplit.c:234`):
     // `split_level == 0` → cheap borders heuristic;
     // `split_level == 1..=4` → byChunks with internal sampling level
     // `split_level - 1`.
@@ -685,7 +685,7 @@ pub(crate) struct CompressState<M: Matcher> {
     /// Strategy tag resolved from the current `CompressionLevel` at every
     /// `matcher.reset()` call. Used by the literal-compression gates
     /// (`min_literals_to_compress`, `min_gain`) in
-    /// `encoding::blocks::compressed` to mirror donor's strategy-aware
+    /// `encoding::blocks::compressed` to mirror upstream zstd's strategy-aware
     /// thresholds (`zstd_compress_literals.c:114-127, 187-188`).
     ///
     /// **Invariant (required of every construction site):** must be
@@ -736,12 +736,12 @@ struct FramePrep {
 /// Initial capacity for the `all_blocks` accumulator, by source-size hint.
 /// The frame header is written only after all input is read (so
 /// Frame_Content_Size is known), so compressed blocks accumulate in memory
-/// first. Seed-size tiers (mirrors donor `ZSTD_CStreamOutSize` naming):
+/// first. Seed-size tiers (mirrors upstream zstd `ZSTD_CStreamOutSize` naming):
 /// - tiny (`<= 4 KiB` hint): payload-bound seed, `>=` anything a tiny input's
 ///   compressed output could need.
 /// - small (`<= 64 KiB` hint): absorbs one or two `Vec::extend` doublings
 ///   without over-allocating.
-/// - default (one donor block, `130 KiB`): the value the rest of the encoder
+/// - default (one upstream zstd block, `130 KiB`): the value the rest of the encoder
 ///   is sized around; larger inputs amortise the first doublings cheaply and
 ///   the residue is dominated by internal `compress_block_encoded` buffers.
 ///
@@ -751,7 +751,7 @@ struct FramePrep {
 /// `block_capacity` (the active `targetCBlockSize` cap, or the 128 KiB
 /// format ceiling) bounds every tier: with a small target the first
 /// allocation tracks one capped block + header/checksum slack instead of
-/// keeping the donor-sized floor that only later growth respects.
+/// keeping the upstream zstd-sized floor that only later growth respects.
 fn initial_all_blocks_cap(initial_size_hint: Option<u64>, block_capacity: usize) -> usize {
     const TINY_THRESHOLD: u64 = 4 * 1024;
     const SMALL_THRESHOLD: u64 = 64 * 1024;
@@ -1143,7 +1143,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         // first, since the content size is known up front, and the loop
         // emits blocks straight after it — no separate `all_blocks` Vec and
         // no header+blocks copy). Output-size reads below are taken RELATIVE
-        // to `blocks_start` so a header prefix never skews the donor split
+        // to `blocks_start` so a header prefix never skews the upstream zstd split
         // `savings` gate (which would change block boundaries / wire output).
         let blocks_start = out.len();
         let total_uncompressed = input.len() as u64;
@@ -1197,10 +1197,10 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 input.len() - start,
                 block_capacity,
             );
-            // Donor `ZSTD_compress_frameChunk`: size each block via the cheap
+            // Upstream zstd `ZSTD_compress_frameChunk`: size each block via the cheap
             // fingerprint pre-splitter so a full 128 KiB block is cut at a
             // statistical boundary when it pays. `savings = consumed -
-            // produced` mirrors the donor gate (the first block and
+            // produced` mirrors the upstream zstd gate (the first block and
             // incompressible input keep the full 128 KiB). The borrowed window
             // already spans the whole input, so a smaller block is just a
             // narrower `(block_start, block_end)` range into it.
@@ -1509,7 +1509,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             self.state.matcher.set_source_size_hint(size_hint);
         }
         // Hand the matcher the dictionary's content size so its binary-tree /
-        // hash-chain tables shrink to the dictionary's cParams tier (donor CDict
+        // hash-chain tables shrink to the dictionary's cParams tier (upstream zstd CDict
         // economics: the dictionary supplies long matches, so a source-sized live
         // table is wasted peak memory). The eviction window stays source-sized so
         // the dictionary bytes remain referenceable. Set before `reset` (which
@@ -1543,18 +1543,18 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             // This state drives sequence encoding, while matcher priming below updates
             // the match generator's internal repeat-offset history for match finding.
             self.state.offset_hist = dict.inner.offset_hist;
-            // Donor `ZSTD_shouldAttachDict` (`zstd_compress.c`): a
+            // Upstream zstd `ZSTD_shouldAttachDict` (`zstd_compress.c`): a
             // precomputed-dictionary table is COPIED into the working context
             // only when the source is larger than a per-strategy cutoff; at or
-            // below it (and for unknown size) the donor ATTACHES the dictionary
+            // below it (and for unknown size) the upstream zstd ATTACHES the dictionary
             // tables by reference (no per-frame table touch at all). We don't
             // have an attach-by-reference path yet, so:
             //   - large source (> cutoff): reuse the captured prime snapshot
             //     (a table copy) instead of re-hashing the dictionary — the
-            //     donor COPY regime, where the copy is cheaper than re-priming;
+            //     upstream zstd COPY regime, where the copy is cheaper than re-priming;
             //   - small / unknown source: re-prime (the snapshot copy of the
             //     whole table would cost MORE than the sparse re-prime here,
-            //     which is exactly why the donor attaches by reference instead).
+            //     which is exactly why the upstream zstd attaches by reference instead).
             // `attachDictSizeCutoffs` per strategy: fast 8K, dfast 16K,
             // greedy/lazy/btopt 32K, btultra/btultra2 8K. Expressed as the
             // ceil-log bucket (8K = 2^13, 16K = 2^14, 32K = 2^15) so the
@@ -1698,7 +1698,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // streaming drain path passes a fresh buffer (the frame header is
         // written to the drain afterward, since Frame_Content_Size is only
         // known once the reader hits EOF); the one-shot compress-into-Vec
-        // path passes `out` already holding the header. The donor split
+        // path passes `out` already holding the header. The upstream zstd split
         // `savings` gate below accumulates block-relative (`before_len`)
         // output deltas, so a header prefix never skews it.
         let blocks_start = out.len();
@@ -1708,7 +1708,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         let mut savings = 0i64;
         // Compress block by block
         loop {
-            // Read up to one donor block. When the pre-block splitter keeps a
+            // Read up to one upstream zstd block. When the pre-block splitter keeps a
             // suffix, top it back up before compressing the next block, matching
             // ZSTD_compress_frameChunk() over a contiguous input buffer.
             let block_capacity = self.block_capacity();
@@ -1890,19 +1890,26 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// Appends rather than returns so the one-shot path serializes straight
     /// into the reused output buffer with no per-frame header `Vec`.
     fn append_frame_header(&self, total_uncompressed: u64, prep: &FramePrep, out: &mut Vec<u8>) {
-        // Match the donor framing policy for pledged one-shot inputs: use a
-        // single-segment frame whenever the source fits the active window.
-        // A single-segment frame REQUIRES an FCS field, so suppressing the
-        // content size (`content_size_flag` off) also forces the windowed
-        // layout, mirroring upstream. Dictionary frames qualify (the
-        // reference emits single-segment + dictionary-ID headers): the
-        // dictionary is decoder setup state, not part of the regenerated
-        // segment, so the frame keeps single-segment wire layout and
-        // decoders keep their single-allocation paths (our own decoder
-        // already caps reservation to min(window, FCS) either way).
+        // Match the upstream zstd framing policy (`ZSTD_writeFrameHeader`):
+        // single-segment whenever the content size is known and the whole
+        // source fits the active window (`contentSizeFlag && windowSize >=
+        // srcSize`). A single-segment frame REQUIRES an FCS field, so
+        // suppressing the content size (`content_size_flag` off) forces the
+        // windowed layout. There is no lower size bound: small payloads
+        // benefit most, since a windowed frame cannot encode a content size
+        // below 256 in fewer than 4 FCS bytes (the 1-byte FCS class is
+        // single-segment-only, see `find_fcs_field_size`), whereas a
+        // single-segment frame stores it in one byte and omits the window
+        // descriptor. The single-segment window equals the FCS, so a block
+        // must never reference past the content: the post-hoc raw fallback in
+        // the block emitters guarantees any non-shrinking block is stored raw,
+        // and genuine matches stay within the already-emitted output.
+        // Dictionary frames qualify too (the dictionary is decoder setup
+        // state, not part of the regenerated segment), keeping the decoder's
+        // single-allocation path (our decoder caps reservation to
+        // min(window, FCS) either way).
         let single_segment = self.content_size_flag
             && prep.source_size_hint_known
-            && total_uncompressed >= 512
             && total_uncompressed <= prep.window_size;
         let header = FrameHeader {
             frame_content_size: self.content_size_flag.then_some(total_uncompressed),
@@ -2312,9 +2319,8 @@ mod tests {
     use alloc::vec;
 
     use super::FrameCompressor;
-    use crate::blocks::block::BlockType;
     use crate::common::{MAGIC_NUM, MAX_BLOCK_SIZE};
-    use crate::decoding::{FrameDecoder, block_decoder, frame::read_frame_header};
+    use crate::decoding::FrameDecoder;
     use crate::encoding::{Matcher, Sequence};
     use alloc::vec::Vec;
 
@@ -2330,461 +2336,9 @@ mod tests {
         data
     }
 
-    fn first_block_type(frame: &[u8]) -> BlockType {
-        let (_, header_size) = read_frame_header(frame).expect("frame header should parse");
-        let mut decoder = block_decoder::new();
-        let (header, _) = decoder
-            .read_block_header(&frame[header_size as usize..])
-            .expect("block header should parse");
-        header.block_type
-    }
-
-    /// Frame content size is written correctly and C zstd can decompress the output.
-    #[cfg(feature = "std")]
-    #[test]
-    fn fcs_header_written_and_c_zstd_compatible() {
-        let levels = [
-            crate::encoding::CompressionLevel::Uncompressed,
-            crate::encoding::CompressionLevel::Fastest,
-            crate::encoding::CompressionLevel::Default,
-            crate::encoding::CompressionLevel::Better,
-            crate::encoding::CompressionLevel::Best,
-        ];
-        let fcs_2byte = vec![0xCDu8; 300]; // 300 bytes → 2-byte FCS (256..=65791 range)
-        let large = vec![0xABu8; 100_000];
-        let inputs: [&[u8]; 5] = [
-            &[],
-            &[0x00],
-            b"abcdefghijklmnopqrstuvwxy\n",
-            &fcs_2byte,
-            &large,
-        ];
-        for level in levels {
-            for data in &inputs {
-                let compressed = crate::encoding::compress_to_vec(*data, level);
-                // Verify FCS is present and correct
-                let header = crate::decoding::frame::read_frame_header(compressed.as_slice())
-                    .unwrap()
-                    .0;
-                assert_eq!(
-                    header.frame_content_size(),
-                    data.len() as u64,
-                    "FCS mismatch for len={} level={:?}",
-                    data.len(),
-                    level,
-                );
-                // Confirm the FCS field is actually present in the header
-                // (not just the decoder returning 0 for absent FCS).
-                assert_ne!(
-                    header.descriptor.frame_content_size_bytes().unwrap(),
-                    0,
-                    "FCS field must be present for len={} level={:?}",
-                    data.len(),
-                    level,
-                );
-                // Verify C zstd can decompress
-                let mut decoded = Vec::new();
-                zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap_or_else(
-                    |e| {
-                        panic!(
-                            "C zstd decode failed for len={} level={level:?}: {e}",
-                            data.len()
-                        )
-                    },
-                );
-                assert_eq!(
-                    decoded.as_slice(),
-                    *data,
-                    "C zstd roundtrip failed for len={}",
-                    data.len()
-                );
-            }
-        }
-    }
-
-    #[cfg(feature = "std")]
-    #[test]
-    fn source_size_hint_fastest_remains_ffi_compatible_small_input() {
-        let data = vec![0xAB; 2047];
-        let compressed = {
-            let mut compressor = FrameCompressor::new(super::CompressionLevel::Fastest);
-            compressor.set_source_size_hint(data.len() as u64);
-            compressor.set_source(data.as_slice());
-            let mut out = Vec::new();
-            compressor.set_drain(&mut out);
-            compressor.compress();
-            out
-        };
-
-        let mut decoded = Vec::new();
-        zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
-        assert_eq!(decoded, data);
-    }
-
-    #[cfg(feature = "std")]
-    #[test]
-    fn small_hinted_default_frame_uses_single_segment_header() {
-        let data = generate_data(0xD15E_A5ED, 1024);
-        let compressed = {
-            let mut compressor = FrameCompressor::new(super::CompressionLevel::Default);
-            compressor.set_source_size_hint(data.len() as u64);
-            compressor.set_source(data.as_slice());
-            let mut out = Vec::new();
-            compressor.set_drain(&mut out);
-            compressor.compress();
-            out
-        };
-
-        let (frame_header, _) = read_frame_header(compressed.as_slice()).unwrap();
-        assert!(
-            frame_header.descriptor.single_segment_flag(),
-            "small hinted default frames should use single-segment header for Rust/FFI parity"
-        );
-        assert_eq!(frame_header.frame_content_size(), data.len() as u64);
-        let mut decoded = Vec::new();
-        zstd::stream::copy_decode(compressed.as_slice(), &mut decoded)
-            .expect("ffi decoder must accept single-segment small hinted default frame");
-        assert_eq!(decoded, data);
-    }
-
-    #[cfg(feature = "std")]
-    #[test]
-    fn small_hinted_numeric_default_levels_use_single_segment_header() {
-        let data = generate_data(0xA11C_E003, 1024);
-        for level in [
-            super::CompressionLevel::Level(0),
-            super::CompressionLevel::Level(3),
-        ] {
-            let compressed = {
-                let mut compressor = FrameCompressor::new(level);
-                compressor.set_source_size_hint(data.len() as u64);
-                compressor.set_source(data.as_slice());
-                let mut out = Vec::new();
-                compressor.set_drain(&mut out);
-                compressor.compress();
-                out
-            };
-
-            let (frame_header, _) = read_frame_header(compressed.as_slice()).unwrap();
-            assert!(
-                frame_header.descriptor.single_segment_flag(),
-                "small hinted numeric default level frames should use single-segment header (level={level:?})"
-            );
-            assert_eq!(frame_header.frame_content_size(), data.len() as u64);
-            let mut decoded = Vec::new();
-            zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap_or_else(|e| {
-                panic!(
-                    "ffi decoder must accept single-segment small hinted numeric default level frame (level={level:?}): {e}"
-                )
-            });
-            assert_eq!(decoded, data);
-        }
-    }
-
-    #[cfg(feature = "std")]
-    #[test]
-    fn source_size_hint_levels_remain_ffi_compatible_small_inputs_matrix() {
-        let levels = [
-            super::CompressionLevel::Fastest,
-            super::CompressionLevel::Default,
-            super::CompressionLevel::Better,
-            super::CompressionLevel::Best,
-            super::CompressionLevel::Level(-1),
-            super::CompressionLevel::Level(2),
-            super::CompressionLevel::Level(3),
-            super::CompressionLevel::Level(4),
-            super::CompressionLevel::Level(11),
-        ];
-        let sizes = [
-            511usize, 512, 513, 1023, 1024, 1536, 2047, 2048, 4095, 4096, 8191, 16_384, 16_385,
-        ];
-
-        for (seed_idx, seed) in [11u64, 23, 41].into_iter().enumerate() {
-            for &size in &sizes {
-                let data = generate_data(seed + seed_idx as u64, size);
-                for &level in &levels {
-                    let compressed = {
-                        let mut compressor = FrameCompressor::new(level);
-                        compressor.set_source_size_hint(data.len() as u64);
-                        compressor.set_source(data.as_slice());
-                        let mut out = Vec::new();
-                        compressor.set_drain(&mut out);
-                        compressor.compress();
-                        out
-                    };
-                    if matches!(size, 511 | 512) {
-                        let (frame_header, _) = read_frame_header(compressed.as_slice()).unwrap();
-                        assert_eq!(
-                            frame_header.descriptor.single_segment_flag(),
-                            size == 512,
-                            "single_segment 511/512 boundary mismatch: level={level:?} size={size}"
-                        );
-                    }
-
-                    let mut decoded = Vec::new();
-                    zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap_or_else(
-                        |e| {
-                            panic!(
-                                "ffi decode failed with source-size hint: level={level:?} size={size} seed={} err={e}",
-                                seed + seed_idx as u64
-                            )
-                        },
-                    );
-                    assert_eq!(
-                        decoded,
-                        data,
-                        "hinted ffi roundtrip mismatch: level={level:?} size={size} seed={}",
-                        seed + seed_idx as u64
-                    );
-                }
-            }
-        }
-    }
-
-    #[cfg(feature = "std")]
-    #[test]
-    fn hinted_levels_use_single_segment_header_symmetrically() {
-        let levels = [
-            super::CompressionLevel::Fastest,
-            super::CompressionLevel::Default,
-            super::CompressionLevel::Better,
-            super::CompressionLevel::Best,
-            super::CompressionLevel::Level(0),
-            super::CompressionLevel::Level(2),
-            super::CompressionLevel::Level(3),
-            super::CompressionLevel::Level(4),
-            super::CompressionLevel::Level(11),
-        ];
-        for (seed_idx, seed) in [7u64, 23, 41].into_iter().enumerate() {
-            let size = 1024 + seed_idx * 97;
-            let data = generate_data(seed, size);
-            for &level in &levels {
-                let compressed = {
-                    let mut compressor = FrameCompressor::new(level);
-                    compressor.set_source_size_hint(data.len() as u64);
-                    compressor.set_source(data.as_slice());
-                    let mut out = Vec::new();
-                    compressor.set_drain(&mut out);
-                    compressor.compress();
-                    out
-                };
-                let (frame_header, _) = read_frame_header(compressed.as_slice()).unwrap();
-                assert!(
-                    frame_header.descriptor.single_segment_flag(),
-                    "hinted frame should be single-segment for level={level:?} size={}",
-                    data.len()
-                );
-                assert_eq!(frame_header.frame_content_size(), data.len() as u64);
-                let mut decoded = Vec::new();
-                zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap_or_else(|e| {
-                    panic!(
-                        "ffi decode failed for hinted single-segment parity: level={level:?} size={} err={e}",
-                        data.len()
-                    )
-                });
-                assert_eq!(decoded, data);
-            }
-        }
-    }
-
-    #[cfg(feature = "std")]
-    #[test]
-    fn hinted_levels_pin_511_512_single_segment_boundary() {
-        let levels = [
-            super::CompressionLevel::Fastest,
-            super::CompressionLevel::Default,
-            super::CompressionLevel::Better,
-            super::CompressionLevel::Best,
-            super::CompressionLevel::Level(0),
-            super::CompressionLevel::Level(2),
-            super::CompressionLevel::Level(3),
-            super::CompressionLevel::Level(4),
-            super::CompressionLevel::Level(11),
-        ];
-        for (seed_idx, seed) in [7u64, 23, 41].into_iter().enumerate() {
-            for &size in &[511usize, 512] {
-                let data = generate_data(seed + seed_idx as u64, size);
-                for &level in &levels {
-                    let compressed = {
-                        let mut compressor = FrameCompressor::new(level);
-                        compressor.set_source_size_hint(data.len() as u64);
-                        compressor.set_source(data.as_slice());
-                        let mut out = Vec::new();
-                        compressor.set_drain(&mut out);
-                        compressor.compress();
-                        out
-                    };
-                    let (frame_header, _) = read_frame_header(compressed.as_slice()).unwrap();
-                    assert_eq!(
-                        frame_header.descriptor.single_segment_flag(),
-                        size == 512,
-                        "single_segment 511/512 boundary mismatch: level={level:?} size={size}"
-                    );
-                    let mut decoded = Vec::new();
-                    zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap_or_else(
-                        |e| {
-                            panic!(
-                                "ffi decode failed at single-segment boundary: level={level:?} size={size} seed={} err={e}",
-                                seed + seed_idx as u64
-                            )
-                        },
-                    );
-                    assert_eq!(decoded, data);
-                }
-            }
-        }
-    }
-
-    #[cfg(feature = "std")]
-    #[test]
-    fn fastest_random_block_uses_raw_fast_path() {
-        let data = generate_data(0xC0FF_EE11, 10 * 1024);
-        let compressed =
-            crate::encoding::compress_to_vec(data.as_slice(), super::CompressionLevel::Fastest);
-
-        assert_eq!(first_block_type(&compressed), BlockType::Raw);
-
-        let mut decoded = Vec::new();
-        zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
-        assert_eq!(decoded, data);
-    }
-
-    #[cfg(feature = "std")]
-    #[test]
-    fn default_random_block_uses_raw_fast_path() {
-        let data = generate_data(0xD15E_A5ED, 10 * 1024);
-        let compressed =
-            crate::encoding::compress_to_vec(data.as_slice(), super::CompressionLevel::Default);
-
-        assert_eq!(first_block_type(&compressed), BlockType::Raw);
-
-        let mut decoded = Vec::new();
-        zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
-        assert_eq!(decoded, data);
-    }
-
-    #[cfg(feature = "std")]
-    #[test]
-    fn best_random_block_uses_raw_fast_path() {
-        let data = generate_data(0xB35C_AFE1, 10 * 1024);
-        let compressed =
-            crate::encoding::compress_to_vec(data.as_slice(), super::CompressionLevel::Best);
-
-        assert_eq!(first_block_type(&compressed), BlockType::Raw);
-
-        let mut decoded = Vec::new();
-        zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
-        assert_eq!(decoded, data);
-    }
-
-    #[cfg(feature = "std")]
-    #[test]
-    fn level2_random_block_uses_raw_fast_path() {
-        let data = generate_data(0xA11C_E222, 10 * 1024);
-        let compressed =
-            crate::encoding::compress_to_vec(data.as_slice(), super::CompressionLevel::Level(2));
-
-        assert_eq!(first_block_type(&compressed), BlockType::Raw);
-
-        let mut decoded = Vec::new();
-        zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
-        assert_eq!(decoded, data);
-    }
-
-    #[cfg(feature = "std")]
-    #[test]
-    fn better_random_block_uses_raw_fast_path() {
-        let data = generate_data(0xBE77_E111, 10 * 1024);
-        let compressed =
-            crate::encoding::compress_to_vec(data.as_slice(), super::CompressionLevel::Better);
-
-        assert_eq!(first_block_type(&compressed), BlockType::Raw);
-
-        let mut decoded = Vec::new();
-        zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
-        assert_eq!(decoded, data);
-    }
-
-    #[cfg(feature = "std")]
-    #[test]
-    fn compressible_logs_do_not_fall_back_to_raw_fast_path() {
-        let mut data = Vec::with_capacity(16 * 1024);
-        const LINE: &[u8] =
-            b"ts=2026-04-10T00:00:00Z level=INFO tenant=demo op=flush table=orders\n";
-        while data.len() < 16 * 1024 {
-            let remaining = 16 * 1024 - data.len();
-            data.extend_from_slice(&LINE[..LINE.len().min(remaining)]);
-        }
-
-        fn assert_not_raw_for_level(data: &[u8], level: super::CompressionLevel) {
-            let compressed = crate::encoding::compress_to_vec(data, level);
-            assert_ne!(first_block_type(&compressed), BlockType::Raw);
-            assert!(
-                compressed.len() < data.len(),
-                "compressible input should remain compressible for level={level:?}"
-            );
-            let mut decoded = Vec::new();
-            zstd::stream::copy_decode(compressed.as_slice(), &mut decoded).unwrap();
-            assert_eq!(decoded, data);
-        }
-
-        assert_not_raw_for_level(data.as_slice(), super::CompressionLevel::Fastest);
-        assert_not_raw_for_level(data.as_slice(), super::CompressionLevel::Default);
-        assert_not_raw_for_level(data.as_slice(), super::CompressionLevel::Level(3));
-        assert_not_raw_for_level(data.as_slice(), super::CompressionLevel::Better);
-        assert_not_raw_for_level(data.as_slice(), super::CompressionLevel::Best);
-    }
-
-    #[cfg(feature = "std")]
-    #[test]
-    fn hinted_small_compressible_frames_use_single_segment_across_levels() {
-        let mut data = Vec::with_capacity(4 * 1024);
-        const LINE: &[u8] =
-            b"ts=2026-04-10T00:00:00Z level=INFO tenant=demo op=flush table=orders\n";
-        while data.len() < 4 * 1024 {
-            let remaining = 4 * 1024 - data.len();
-            data.extend_from_slice(&LINE[..LINE.len().min(remaining)]);
-        }
-
-        for level in [
-            super::CompressionLevel::Fastest,
-            super::CompressionLevel::Default,
-            super::CompressionLevel::Better,
-            super::CompressionLevel::Best,
-            super::CompressionLevel::Level(0),
-            super::CompressionLevel::Level(3),
-            super::CompressionLevel::Level(4),
-            super::CompressionLevel::Level(11),
-        ] {
-            let compressed = {
-                let mut compressor = FrameCompressor::new(level);
-                compressor.set_source_size_hint(data.len() as u64);
-                compressor.set_source(data.as_slice());
-                let mut out = Vec::new();
-                compressor.set_drain(&mut out);
-                compressor.compress();
-                out
-            };
-            let (frame_header, _) = read_frame_header(compressed.as_slice()).unwrap();
-            assert!(
-                frame_header.descriptor.single_segment_flag(),
-                "hinted small compressible frame should use single-segment (level={level:?})"
-            );
-            assert_ne!(
-                first_block_type(&compressed),
-                BlockType::Raw,
-                "compressible hinted frame should stay off raw fast path (level={level:?})"
-            );
-            assert!(
-                compressed.len() < data.len(),
-                "compressible hinted frame should still shrink (level={level:?})"
-            );
-            let mut decoded = Vec::new();
-            zstd::stream::copy_decode(compressed.as_slice(), &mut decoded)
-                .unwrap_or_else(|e| panic!("ffi decode failed (level={level:?}): {e}"));
-            assert_eq!(decoded, data);
-        }
-    }
+    // Cross-implementation parity tests (compress here, decode through the C
+    // bindings) moved to `ffi-bench/tests/frame_compressor_ffi.rs` so the
+    // library crate never links libzstd.
 
     struct NoDictionaryMatcher {
         last_space: Vec<u8>,
@@ -2871,10 +2425,6 @@ mod tests {
         let mut decoded = Vec::with_capacity(mock_data.len());
         decoder.decode_all_to_vec(&output, &mut decoded).unwrap();
         assert_eq!(mock_data, decoded);
-
-        let mut decoded = Vec::new();
-        zstd::stream::copy_decode(output.as_slice(), &mut decoded).unwrap();
-        assert_eq!(mock_data, decoded);
     }
 
     #[test]
@@ -2906,10 +2456,6 @@ mod tests {
         let mut decoder = FrameDecoder::new();
         let mut decoded = Vec::with_capacity(mock_data.len());
         decoder.decode_all_to_vec(&output, &mut decoded).unwrap();
-        assert_eq!(mock_data, decoded);
-
-        let mut decoded = Vec::new();
-        zstd::stream::copy_decode(output.as_slice(), &mut decoded).unwrap();
         assert_eq!(mock_data, decoded);
     }
 
@@ -2967,14 +2513,6 @@ mod tests {
         let mut decoded = Vec::with_capacity(data.len());
         decoder.decode_all_to_vec(&with_dict, &mut decoded).unwrap();
         assert_eq!(decoded, data);
-
-        let mut ffi_decoder = zstd::bulk::Decompressor::with_dictionary(dict_raw).unwrap();
-        let mut ffi_decoded = Vec::with_capacity(data.len());
-        let ffi_written = ffi_decoder
-            .decompress_to_buffer(with_dict.as_slice(), &mut ffi_decoded)
-            .unwrap();
-        assert_eq!(ffi_written, data.len());
-        assert_eq!(ffi_decoded, data);
     }
 
     #[cfg(all(feature = "dict_builder", feature = "std"))]
@@ -3245,16 +2783,6 @@ mod tests {
             .decode_all_to_vec(&frame, &mut decoded)
             .expect("single-segment dict frame must decode");
         assert_eq!(decoded, payload);
-
-        // Reference-decoder cross-check: our serializer and parser could
-        // share a bug and still self-roundtrip, so the on-wire
-        // single-segment + dictionary-ID layout must also decode through
-        // the C implementation.
-        let ffi_decoded = zstd::bulk::Decompressor::with_dictionary(dict_raw)
-            .expect("reference decompressor must accept the dictionary")
-            .decompress(&frame, payload.len() + 64)
-            .expect("reference zstd must accept the single-segment dict frame");
-        assert_eq!(ffi_decoded, payload);
     }
 
     // Regression test: `heap_size()` must count the retained Huffman tables
@@ -3360,7 +2888,7 @@ mod tests {
         let dict_raw = include_bytes!("../../dict_tests/dictionary");
         // Source must exceed the Fast strategy's 8 KiB attach cutoff so the
         // copy-snapshot (restore) path is taken on frame 2 — at or below the
-        // cutoff the donor attaches by reference and we fall back to re-prime,
+        // cutoff the upstream zstd attaches by reference and we fall back to re-prime,
         // which would not exercise restore.
         let mut payload = Vec::new();
         while payload.len() < 16 * 1024 {
@@ -4116,7 +3644,7 @@ mod tests {
                 .expect("raw dictionary should be valid");
 
         // Payload must exceed the encoder's advertised window (512 KiB
-        // for Fastest after `window_log = 19` alignment with donor's
+        // for Fastest after `window_log = 19` alignment with upstream zstd's
         // L1 fast row in `clevels.h`) so the test actually exercises
         // cross-window-boundary behavior.
         let payload = b"abcdefgh".repeat(512 * 1024 / 8 + 64);
@@ -4681,101 +4209,9 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "std")]
-    #[test]
-    fn fuzz_targets() {
-        use std::io::Read;
-        fn decode_szstd(data: &mut dyn std::io::Read) -> Vec<u8> {
-            let mut decoder = crate::decoding::StreamingDecoder::new(data).unwrap();
-            let mut result: Vec<u8> = Vec::new();
-            decoder.read_to_end(&mut result).expect("Decoding failed");
-            result
-        }
-
-        fn decode_szstd_writer(mut data: impl Read) -> Vec<u8> {
-            let mut decoder = crate::decoding::FrameDecoder::new();
-            decoder.reset(&mut data).unwrap();
-            let mut result = vec![];
-            while !decoder.is_finished() || decoder.can_collect() > 0 {
-                decoder
-                    .decode_blocks(
-                        &mut data,
-                        crate::decoding::BlockDecodingStrategy::UptoBytes(1024 * 1024),
-                    )
-                    .unwrap();
-                decoder.collect_to_writer(&mut result).unwrap();
-            }
-            result
-        }
-
-        fn encode_zstd(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
-            zstd::stream::encode_all(std::io::Cursor::new(data), 3)
-        }
-
-        fn encode_szstd_uncompressed(data: &mut dyn std::io::Read) -> Vec<u8> {
-            let mut input = Vec::new();
-            data.read_to_end(&mut input).unwrap();
-
-            crate::encoding::compress_to_vec(
-                input.as_slice(),
-                crate::encoding::CompressionLevel::Uncompressed,
-            )
-        }
-
-        fn encode_szstd_compressed(data: &mut dyn std::io::Read) -> Vec<u8> {
-            let mut input = Vec::new();
-            data.read_to_end(&mut input).unwrap();
-
-            crate::encoding::compress_to_vec(
-                input.as_slice(),
-                crate::encoding::CompressionLevel::Fastest,
-            )
-        }
-
-        fn decode_zstd(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
-            let mut output = Vec::new();
-            zstd::stream::copy_decode(data, &mut output)?;
-            Ok(output)
-        }
-        if std::fs::exists("fuzz/artifacts/interop").unwrap_or(false) {
-            for file in std::fs::read_dir("fuzz/artifacts/interop").unwrap() {
-                if file.as_ref().unwrap().file_type().unwrap().is_file() {
-                    let data = std::fs::read(file.unwrap().path()).unwrap();
-                    let data = data.as_slice();
-                    // Decoding
-                    let compressed = encode_zstd(data).unwrap();
-                    let decoded = decode_szstd(&mut compressed.as_slice());
-                    let decoded2 = decode_szstd_writer(&mut compressed.as_slice());
-                    assert!(
-                        decoded == data,
-                        "Decoded data did not match the original input during decompression"
-                    );
-                    assert_eq!(
-                        decoded2, data,
-                        "Decoded data did not match the original input during decompression"
-                    );
-
-                    // Encoding
-                    // Uncompressed encoding
-                    let mut input = data;
-                    let compressed = encode_szstd_uncompressed(&mut input);
-                    let decoded = decode_zstd(&compressed).unwrap();
-                    assert_eq!(
-                        decoded, data,
-                        "Decoded data did not match the original input during compression"
-                    );
-                    // Compressed encoding
-                    let mut input = data;
-                    let compressed = encode_szstd_compressed(&mut input);
-                    let decoded = decode_zstd(&compressed).unwrap();
-                    assert_eq!(
-                        decoded, data,
-                        "Decoded data did not match the original input during compression"
-                    );
-                }
-            }
-        }
-    }
+    // The fuzz-artifact interop replay (C-compress -> our-decode and
+    // our-compress -> C-decode) moved to `ffi-bench/tests/fuzz_interop.rs` so
+    // the library crate never links libzstd.
 
     /// Homogeneous input — every byte the same — must NOT be split:
     /// both border histograms are identical (all 512 hits on a single
@@ -4822,7 +4258,7 @@ mod tests {
     }
 
     /// `level_pre_split` resolves the per-level split knob through the
-    /// `LevelParams` table, mirroring the donor `splitLevels[]` by strategy
+    /// `LevelParams` table, mirroring the upstream zstd `splitLevels[]` by strategy
     /// (`ZSTD_optimalBlockSize`): fast → 0 (from-borders), dfast → 1,
     /// greedy/lazy → 2, lazy2/btlazy2 (Lazy tag at depth 2) → 3,
     /// btopt/btultra/btultra2 → 4. `Uncompressed` has no numeric level so it
@@ -4882,7 +4318,7 @@ mod tests {
             "ts=2026-03-26T21:39:30Z level=INFO msg=\"compact level\" tenant=demo table=orders region=eu-west\n",
             "ts=2026-03-26T21:39:31Z level=INFO msg=\"write block\" tenant=demo table=orders region=eu-west\n",
         ];
-        // 512 KB = 4 donor blocks, enough for the cascade to manifest.
+        // 512 KB = 4 upstream zstd blocks, enough for the cascade to manifest.
         let target = 512 * 1024usize;
         let mut data = Vec::with_capacity(target);
         let mut i = 0;
@@ -4917,12 +4353,12 @@ mod tests {
         }
     }
 
-    /// End-to-end: a 256 KB payload whose SECOND 128 KB donor block carries
+    /// End-to-end: a 256 KB payload whose SECOND 128 KB upstream zstd block carries
     /// an intra-block fingerprint transition, compressed at Level(5)
     /// (greedy, the pre-split path this revision routes through the cheap
     /// chunk splitter), round-trips through the crate's own decoder.
     ///
-    /// The transition lives in the second block on purpose: the donor
+    /// The transition lives in the second block on purpose: the upstream zstd
     /// `savings < 3` gate skips splitting the first block (savings start at
     /// 0), so the first block is a homogeneous compressible run that banks
     /// savings, and the second block is the one whose intra-block transition
@@ -4936,7 +4372,7 @@ mod tests {
         use crate::encoding::CompressionLevel;
         let mut data = vec![0u8; 256 * 1024];
         // First 128 KB: homogeneous low-entropy run (compressible, banks
-        // the savings the donor gate needs). Second 128 KB: low-entropy run
+        // the savings the upstream zstd gate needs). Second 128 KB: low-entropy run
         // for its first half, then a counter sequence: a clear intra-block
         // fingerprint transition at the 192 KB midpoint for the chunk
         // splitter to find.
@@ -4961,7 +4397,7 @@ mod tests {
         );
         assert!(
             split < MAX_BLOCK_SIZE as usize,
-            "second donor block must chunk-split at its intra-block transition, got {split}",
+            "second upstream zstd block must chunk-split at its intra-block transition, got {split}",
         );
 
         let mut compressed = Vec::new();
@@ -5008,7 +4444,7 @@ mod tests {
         }
 
         // Pin the splitter decision for the Fast path directly (mirrors the
-        // greedy test): the second donor block must resolve to a sub-block
+        // greedy test): the second upstream zstd block must resolve to a sub-block
         // boundary, so the >= 3 block count below cannot pass vacuously.
         let second_block = &data[128 * 1024..];
         assert!(
@@ -5019,7 +4455,7 @@ mod tests {
                 MAX_BLOCK_SIZE as usize,
                 100,
             ) < MAX_BLOCK_SIZE as usize,
-            "fixture must resolve to a sub-block split in the second donor block",
+            "fixture must resolve to a sub-block split in the second upstream zstd block",
         );
 
         // Drive the borrowed one-shot route explicitly (Fast level ->
@@ -5042,7 +4478,7 @@ mod tests {
         assert_eq!(decoded, data, "roundtrip must reproduce the input verbatim");
         assert!(
             decoder.blocks_decoded() >= 3,
-            "fast one-shot borrowed path must split the second donor block \
+            "fast one-shot borrowed path must split the second upstream zstd block \
              (256 KiB unsplit = 2 blocks), got {} blocks",
             decoder.blocks_decoded(),
         );

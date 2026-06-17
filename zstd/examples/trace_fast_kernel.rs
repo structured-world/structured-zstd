@@ -8,7 +8,7 @@
 //! Run:   `STRUCTURED_ZSTD_KERNEL_TRACE=1 ./target/release/examples/trace_fast_kernel > /dev/null 2> trace.log`
 //!
 //! The trace records every outer-iter state, every hash-table put, and
-//! every match-found event. Diff vs donor's expected sequence (manually
+//! every match-found event. Diff vs upstream zstd's expected sequence (manually
 //! computed from `zstd_fast.c:266-348`) to pinpoint the first
 //! divergence in block 0.
 //!
@@ -41,7 +41,7 @@ fn main() {
     // compression level 1") but `Fastest` overrides `LEVEL_TABLE[0]`'s
     // `fast_mls = 7` to `fast_mls = 6` for an even-faster preset. The
     // canonical L1 Fast strategy (which `compare_ffi` benches and the
-    // donor `ZSTD_compress_usingCDict(level=1)` both use) is mls=7 via
+    // upstream zstd `ZSTD_compress_usingCDict(level=1)` both use) is mls=7 via
     // `LEVEL_TABLE[0]` unchanged → reach it via `Level(1)`.
     let compressed = compress_to_vec(&bytes[..], CompressionLevel::Level(1));
 

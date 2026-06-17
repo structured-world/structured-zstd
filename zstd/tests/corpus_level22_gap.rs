@@ -7,7 +7,15 @@ mod common;
 #[test]
 #[ignore = "manual probe — run with --ignored"]
 fn corpus_z000033_level22_ratio_breakdown() {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("decodecorpus_files/z000033");
+    // Built from the sibling `ffi-bench` crate, so resolve the fixture next to
+    // the manifest first, then under the sibling `zstd` crate.
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let here = manifest.join("decodecorpus_files/z000033");
+    let path = if here.is_file() {
+        here
+    } else {
+        manifest.join("../zstd/decodecorpus_files/z000033")
+    };
     let data = fs::read(&path).expect("z000033 corpus file present");
     println!("Corpus z000033 size: {} bytes", data.len());
 

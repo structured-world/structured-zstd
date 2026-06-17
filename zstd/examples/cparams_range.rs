@@ -1,7 +1,7 @@
-//! Print donor cParams for levels 1..=22 at a given source size.
-//! Companion to `donor_cparams_check` for sweeping a whole level band.
+//! Print upstream zstd cParams for levels 1..=22 at a given source size.
+//! Companion to `cparams_check` for sweeping a whole level band.
 //!
-//! Run: `cargo run --release -p structured-zstd --example donor_cparams_range
+//! Run: `cargo run --release -p ffi-bench --example cparams_range
 //!       --features dict_builder -- [src_size]` (0 / omitted = unbounded).
 use zstd::zstd_safe::zstd_sys;
 

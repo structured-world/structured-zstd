@@ -6,7 +6,7 @@
 //! `offset_price_for`, `match_length_price`) consumed by the optimal
 //! parser DP body in [`crate::encoding::opt`].
 //!
-//! Donor parity: mirrors `zstd_opt.c` price functions and stat
+//! Upstream zstd parity: mirrors `zstd_opt.c` price functions and stat
 //! handling. The per-DP-iteration hot path (`bit_weight` /
 //! `frac_weight`, `*_price` helpers, `update_stats`, `set_base_prices`,
 //! `downscale_stats`, `scale_stats`) already runs on raw `+`/`-`/`*`
@@ -107,14 +107,14 @@ impl HcOptState {
     }
 
     pub(crate) fn bit_weight(stat: u32) -> u32 {
-        // Donor parity: stat+1 ≥ 1 ⇒ leading_zeros ≤ 31 ⇒ 31-lz ≥ 0.
+        // Upstream zstd parity: stat+1 ≥ 1 ⇒ leading_zeros ≤ 31 ⇒ 31-lz ≥ 0.
         // hb ≤ 31, MULTIPLIER = 256 ⇒ product ≤ 7936, no overflow.
         let hb = 31 - (stat + 1).leading_zeros();
         hb * HC_BITCOST_MULTIPLIER
     }
 
     pub(crate) fn frac_weight(raw_stat: u32) -> u32 {
-        // Donor parity (ZSTD_fracWeight). All operands bounded: stat fits u32,
+        // Upstream zstd parity (ZSTD_fracWeight). All operands bounded: stat fits u32,
         // hb ∈ 0..=31, BWeight ≤ 7936, FWeight ≤ 65535 ⇒ sum no overflow.
         let stat = raw_stat + 1;
         let hb = 31 - stat.leading_zeros();
@@ -132,7 +132,7 @@ impl HcOptState {
     }
 
     pub(crate) fn downscale_stats(table: &mut [u32], shift: u32, base1: bool) -> u32 {
-        // Donor parity: table sums bounded by block size (≤ 256K) ⇒ no overflow.
+        // Upstream zstd parity: table sums bounded by block size (≤ 256K) ⇒ no overflow.
         let mut sum = 0u32;
         for stat in table {
             let base = if base1 { 1 } else { u32::from(*stat > 0) };
@@ -241,7 +241,7 @@ impl HcOptState {
 
     #[inline(always)]
     pub(crate) fn lit_code_and_bits(lit_len: usize) -> (usize, u32) {
-        // Donor parity (`ZSTD_LLcode` + `LL_bits`, zstd_compress_internal.h):
+        // Upstream zstd parity (`ZSTD_LLcode` + `LL_bits`, zstd_compress_internal.h):
         // a direct table lookup for ll < 64 and `highbit32(ll) + delta` above,
         // replacing the former 20-arm range cascade (a `jae` comparison ladder
         // that was ~8% of L16-btopt-dict). Same (code, nbBits) values — only
@@ -270,7 +270,7 @@ impl HcOptState {
 
     #[inline(always)]
     pub(crate) fn ml_code_and_bits(match_len: usize) -> (usize, u32) {
-        // Donor parity (`ZSTD_MLcode` + `ML_bits`, zstd_compress_internal.h):
+        // Upstream zstd parity (`ZSTD_MLcode` + `ML_bits`, zstd_compress_internal.h):
         // direct table lookup on `mlBase = ml - MINMATCH` for mlBase < 128 and
         // `highbit32(mlBase) + 36` above — same (code, nbBits) values as the
         // former 22-arm range cascade, replacing its jae ladder. Cold on
@@ -414,7 +414,7 @@ impl HcOptState {
         off_base: u32,
         match_len: usize,
     ) {
-        // Donor parity (ZSTD_updateStats). All freq sums bounded by
+        // Upstream zstd parity (ZSTD_updateStats). All freq sums bounded by
         // block_size * LITFREQ_ADD ≤ 256K * 2 = 512K ≪ u32::MAX.
         if self.literals_compressed() {
             for &byte in literals.iter().take(lit_len) {
@@ -482,7 +482,7 @@ impl HcOptimalCostProfile {
         if matches!(stats.price_type, HcOptPriceType::Predefined) {
             return 6 * HC_BITCOST_MULTIPLIER;
         }
-        // Donor parity: ZSTD_rawLiteralsCost asserts lit_sum_base_price ≥
+        // Upstream zstd parity: ZSTD_rawLiteralsCost asserts lit_sum_base_price ≥
         // BITCOST_MULTIPLIER, then clamps lit_weight to that range, so the
         // final subtract never underflows.
         debug_assert!(stats.lit_sum_base_price >= HC_BITCOST_MULTIPLIER);
@@ -496,7 +496,7 @@ impl HcOptimalCostProfile {
 
     pub(crate) fn lit_length_price(&self, stats: &HcOptState, lit_len: usize) -> u32 {
         if lit_len == HC_BLOCKSIZE_MAX {
-            // Donor parity: ZSTD_litLengthPrice() handles the non-representable
+            // Upstream zstd parity: ZSTD_litLengthPrice() handles the non-representable
             // BLOCKSIZE_MAX literal-length by charging one extra bit over the
             // largest encodable litLength symbol.
             return HC_BITCOST_MULTIPLIER
@@ -517,7 +517,7 @@ impl HcOptimalCostProfile {
         stats: &HcOptState,
         off_base: u32,
     ) -> u32 {
-        // Donor parity (ZSTD_getMatchPrice). off_base ≥ 1 ⇒ leading_zeros ≤ 31.
+        // Upstream zstd parity (ZSTD_getMatchPrice). off_base ≥ 1 ⇒ leading_zeros ≤ 31.
         // off_code ≤ 31, (16 + off_code) * 256 ≤ 12032, sums no overflow.
         let off_code = 31 - off_base.max(1).leading_zeros();
         if matches!(stats.price_type, HcOptPriceType::Predefined) {
@@ -534,7 +534,7 @@ impl HcOptimalCostProfile {
 
     #[inline(always)]
     pub(crate) fn match_length_price(&self, stats: &HcOptState, match_len: usize) -> u32 {
-        // Donor parity: mlBase = match_len - MINMATCH; callers guarantee
+        // Upstream zstd parity: mlBase = match_len - MINMATCH; callers guarantee
         // match_len ≥ HC_FORMAT_MINMATCH. ml_bits ≤ 16, * 256 ≤ 4096.
         debug_assert!(match_len >= HC_FORMAT_MINMATCH);
         let ml_base = match_len - HC_FORMAT_MINMATCH;

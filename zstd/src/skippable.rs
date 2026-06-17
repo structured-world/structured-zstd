@@ -1,7 +1,7 @@
 //! Typed Rust API for zstd skippable frames (RFC 8878 §3.1).
 //!
 //! Skippable frames carry an arbitrary application payload alongside
-//! a zstd data stream. Spec layout, byte-compatible with donor
+//! a zstd data stream. Spec layout, byte-compatible with upstream zstd
 //! `ZSTD_writeSkippableFrame`
 //! (`lib/compress/zstd_compress.c:4751-4763` in zstd v1.5.7):
 //!
@@ -245,7 +245,7 @@ impl SkippableFrame {
 
 /// Free function for callers that want to write a skippable frame
 /// directly into a sink without constructing a temporary
-/// [`SkippableFrame`]. Shape mirrors donor
+/// [`SkippableFrame`]. Shape mirrors upstream zstd
 /// `ZSTD_writeSkippableFrame(dst, dstCapacity, src, srcSize,
 /// magicVariant)` — same validation, same byte-level output.
 ///
@@ -430,11 +430,11 @@ impl std::error::Error for DecodeSkippableFrameError {
 mod tests {
     use super::*;
 
-    fn build_donor_skippable(magic_variant: u8, payload: &[u8]) -> Vec<u8> {
-        // Donor `ZSTD_writeSkippableFrame` (zstd v1.5.7
+    fn build_expected_skippable(magic_variant: u8, payload: &[u8]) -> Vec<u8> {
+        // Upstream zstd `ZSTD_writeSkippableFrame` (zstd v1.5.7
         // `lib/compress/zstd_compress.c:4751-4763`) emits exactly
         // `4-byte LE magic || 4-byte LE size || payload`. Mirror that
-        // here as the byte-parity oracle. Re-implementing the donor
+        // here as the byte-parity oracle. Re-implementing the upstream zstd
         // layout in the test (rather than calling out to zstd-sys)
         // keeps this test independent of the dev-dep wiring and
         // makes the parity expectation visible inline.
@@ -535,15 +535,15 @@ mod tests {
     }
 
     #[test]
-    fn byte_parity_with_donor_layout() {
+    fn byte_parity_with_spec_layout() {
         // For every variant + a handful of payload sizes, our output
-        // bytes must equal the donor's `ZSTD_writeSkippableFrame`
+        // bytes must equal the upstream zstd's `ZSTD_writeSkippableFrame`
         // layout byte-for-byte. This locks the wire-format contract
         // against future drift.
         for &payload_len in &[0usize, 1, 8, 256, 4096] {
             let payload: Vec<u8> = (0..payload_len).map(|i| (i % 251) as u8).collect();
             for variant in 0u8..=15 {
-                let expected = build_donor_skippable(variant, &payload);
+                let expected = build_expected_skippable(variant, &payload);
 
                 let mut via_struct = Vec::new();
                 SkippableFrame::new(variant, payload.clone())

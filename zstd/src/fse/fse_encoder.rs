@@ -122,13 +122,13 @@ impl<V: AsMut<Vec<u8>>> FSEEncoder<'_, V> {
     }
 }
 
-/// Donor-parity per-symbol coding transform, mirroring upstream
+/// Upstream zstd-parity per-symbol coding transform, mirroring upstream
 /// `FSE_symbolCompressionTransform` in `lib/compress/fse_compress.c`.
 /// Together with [`FSETable::state_table_flat`] this gives an O(1)
 /// next-state lookup in [`FSETable::next_state`], replacing the prior
 /// linear scan over `SymbolStates::states`.
 ///
-/// Donor formulas (`FSE_encodeSymbol`, `fse_compress.c`):
+/// Upstream zstd formulas (`FSE_encodeSymbol`, `fse_compress.c`):
 ///
 /// ```text
 /// value       = (1 << acc_log) + current_state.index
@@ -145,11 +145,11 @@ impl<V: AsMut<Vec<u8>>> FSEEncoder<'_, V> {
 /// negative offset, because of how delta_find_state is derived).
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct SymbolTT {
-    /// Donor 16.16 fixed-point value. **`u32`, not `usize`** — on 16-bit
+    /// Upstream zstd 16.16 fixed-point value. **`u32`, not `usize`** — on 16-bit
     /// targets (AVR / MSP430 / Cortex-M0 in the no-atomic profile this
     /// crate documents) `usize` is 16 bits, and `<<16` / `>>16` on a
     /// `usize` would silently overflow to zero, breaking the
-    /// fixed-point math. Donor `fse_compress.c` uses `U32` throughout
+    /// fixed-point math. Upstream zstd `fse_compress.c` uses `U32` throughout
     /// the same arithmetic for the same reason.
     pub(crate) delta_nb_bits: u32,
     pub(crate) delta_find_state: isize,
@@ -161,13 +161,13 @@ pub struct FSETable {
     pub(super) states: [SymbolStates; 256],
     /// Sum of all states.states.len()
     pub(crate) table_size: usize,
-    /// Donor-parity flat next-state table — `state_table_flat[i]` is the
+    /// Upstream zstd-parity flat next-state table — `state_table_flat[i]` is the
     /// FSE state index that the encoder transitions TO when the
     /// transition arithmetic resolves to slot `i`. Length is exactly
     /// `table_size` (= `1 << acc_log`). Mirror of upstream
     /// `nextStateTable` (`fse_compress.c`).
     pub(super) state_table_flat: alloc::boxed::Box<[u16]>,
-    /// Per-symbol donor-parity coding transform — see [`SymbolTT`].
+    /// Per-symbol upstream zstd-parity coding transform — see [`SymbolTT`].
     pub(super) symbol_tt: [SymbolTT; 256],
 }
 
@@ -181,14 +181,14 @@ impl FSETable {
 
     /// O(1) next-state lookup mirroring upstream `FSE_encodeSymbol`
     /// (`lib/compress/fse_compress.c`). Was a linear scan over a
-    /// `Vec<State>` per symbol; the flat tables that drive the donor
+    /// `Vec<State>` per symbol; the flat tables that drive the upstream zstd
     /// arithmetic were already built during table construction and
     /// previously discarded — now they live on the FSETable
     /// ([`SymbolTT`] + [`Self::state_table_flat`]) and `next_state` is
     /// pure arithmetic + one array load. See #164.
     #[inline]
     pub(crate) fn next_state(&self, symbol: u8, idx: usize) -> State {
-        // Donor formulas, transliterated:
+        // Upstream zstd formulas, transliterated:
         //   value       = (1 << acc_log) + idx
         //   nb_bits     = (value + delta_nb_bits) >> 16
         //   baseline    = idx & !((1 << nb_bits) - 1)
@@ -199,7 +199,7 @@ impl FSETable {
         // `(value >> nb_bits)` is always large enough to keep the final
         // index non-negative; this is a construction invariant from
         // `build_table_from_probabilities`.
-        // Fixed-point arithmetic uses `u32` (donor parity, 16-bit-target
+        // Fixed-point arithmetic uses `u32` (upstream zstd parity, 16-bit-target
         // safe — see `SymbolTT::delta_nb_bits` doc). `table_size` is
         // `1 << acc_log` with `acc_log <= 12`, so `value <= 4096 + 4095`
         // fits comfortably; the `<<16` half of the math lives entirely
@@ -225,7 +225,7 @@ impl FSETable {
     /// First-state lookup for the encode-init of a new FSE stream.
     /// Stays on the `Vec<State>` storage because (a) it is called once
     /// per stream (not on the hot per-sequence path), and (b) the
-    /// donor flat-table arithmetic for the start state would require
+    /// upstream zstd flat-table arithmetic for the start state would require
     /// an extra special-case for the `1 << acc_log` "virtual" current
     /// state. Returning by value matches the new [`Self::next_state`]
     /// return shape so callers can store `State` directly without
@@ -235,7 +235,7 @@ impl FSETable {
             .start_state
             .expect("symbol must be present in the FSE table");
         // Callers consume only `index` (audited across the encoder + sequence
-        // emit paths). Donor `FSE_initCState2` likewise stores just the
+        // emit paths). Upstream zstd `FSE_initCState2` likewise stores just the
         // start state value; `num_bits` / `baseline` are properties of
         // transitions, not of the initial state, so they have no
         // meaningful values here and are zeroed.
@@ -336,7 +336,7 @@ impl FSETable {
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct SymbolStates {
-    /// Donor-encoder start-state slot (`FSE_initCState2` result, in
+    /// Upstream zstd-encoder start-state slot (`FSE_initCState2` result, in
     /// `0..table_size`). `None` when `probability == 0`. Callers
     /// consume only the `index` field of the [`State`] returned from
     /// [`FSETable::start_state`] (see line-by-line audit on the
@@ -348,21 +348,21 @@ pub(super) struct SymbolStates {
     pub(super) probability: i32,
     /// Max `num_bits` emitted by [`FSETable::next_state`] across all input
     /// states for this symbol. `None` when `probability == 0`. Computed via
-    /// donor arithmetic at build time (`(2*table_size-1 + delta_nb_bits) >> 16`)
+    /// upstream zstd arithmetic at build time (`(2*table_size-1 + delta_nb_bits) >> 16`)
     /// so [`FSETable::max_num_bits_for_symbol`] is a single array load
     /// instead of a `Vec<State>` scan.
     pub(super) max_num_bits: Option<u8>,
 }
 
 // SymbolStates::get (the old linear-scan next-state lookup) was
-// replaced by [`FSETable::next_state`]'s O(1) donor arithmetic in
+// replaced by [`FSETable::next_state`]'s O(1) upstream zstd arithmetic in
 // #164. The legacy per-symbol `Vec<State>` storage was dropped in
-// #110: production no longer materializes any per-state vector; donor
+// #110: production no longer materializes any per-state vector; upstream zstd
 // `FSE_buildCTable_wksp` only ever stores `nextStateTable` (here
 // [`FSETable::state_table_flat`]) + `symbolTT` (here
 // [`FSETable::symbol_tt`]). Everything else — start state,
 // max-nb-bits, probability — is precomputed once per symbol via the
-// donor arithmetic and held in [`SymbolStates`].
+// upstream zstd arithmetic and held in [`SymbolStates`].
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct State {
@@ -425,9 +425,9 @@ fn build_table_from_counts(counts: &[usize], max_log: u8, avoid_0_numbit: bool) 
         .iter()
         .rposition(|&count| count > 0)
         .unwrap_or_default();
-    let table_log = donor_optimal_table_log(max_log, total, max_symbol);
+    let table_log = optimal_table_log(max_log, total, max_symbol);
     let mut probs = [0i32; 256];
-    donor_normalize_counts(
+    normalize_counts(
         &mut probs[..counts.len()],
         table_log,
         counts,
@@ -518,9 +518,9 @@ pub(crate) fn fse_header_bits_for_counts(
         .iter()
         .rposition(|&count| count > 0)
         .unwrap_or_default();
-    let table_log = donor_optimal_table_log(max_log, total, max_symbol);
+    let table_log = optimal_table_log(max_log, total, max_symbol);
     let mut probs = [0i32; 256];
-    donor_normalize_counts(
+    normalize_counts(
         &mut probs[..counts.len()],
         table_log,
         counts,
@@ -531,7 +531,7 @@ pub(crate) fn fse_header_bits_for_counts(
     ncount_header_bits(&probs[..counts.len()], table_log)
 }
 
-fn donor_min_table_log(total: usize, max_symbol: usize) -> u8 {
+fn min_table_log(total: usize, max_symbol: usize) -> u8 {
     let min_bits_src = total.ilog2() + 1;
     let min_bits_symbols = if max_symbol == 0 {
         2
@@ -541,9 +541,9 @@ fn donor_min_table_log(total: usize, max_symbol: usize) -> u8 {
     min_bits_src.min(min_bits_symbols) as u8
 }
 
-fn donor_optimal_table_log(max_table_log: u8, total: usize, max_symbol: usize) -> u8 {
+fn optimal_table_log(max_table_log: u8, total: usize, max_symbol: usize) -> u8 {
     let max_bits_src = (total - 1).ilog2().saturating_sub(2) as u8;
-    let min_bits = donor_min_table_log(total, max_symbol);
+    let min_bits = min_table_log(total, max_symbol);
     let mut table_log = max_table_log;
     if max_bits_src < table_log {
         table_log = max_bits_src;
@@ -554,7 +554,7 @@ fn donor_optimal_table_log(max_table_log: u8, total: usize, max_symbol: usize) -
     table_log.clamp(5, 12)
 }
 
-fn donor_normalize_counts(
+fn normalize_counts(
     normalized: &mut [i32],
     table_log: u8,
     counts: &[usize],
@@ -599,7 +599,7 @@ fn donor_normalize_counts(
     }
 
     if -still_to_distribute >= normalized[largest] >> 1 {
-        donor_normalize_m2(
+        normalize_m2(
             normalized,
             table_log,
             counts,
@@ -621,7 +621,7 @@ fn donor_normalize_counts(
     );
 }
 
-fn donor_normalize_m2(
+fn normalize_m2(
     normalized: &mut [i32],
     table_log: u8,
     counts: &[usize],
@@ -703,7 +703,10 @@ fn donor_normalize_m2(
             let start_bucket = tmp_total >> v_step_log;
             let end_bucket = end >> v_step_log;
             let weight = end_bucket - start_bucket;
-            assert!(weight >= 1, "donor FSE normalization produced zero weight");
+            assert!(
+                weight >= 1,
+                "upstream zstd FSE normalization produced zero weight"
+            );
             normalized[symbol] = weight as i32;
             tmp_total = end;
         }
@@ -714,12 +717,12 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
     let table_size: usize = 1 << acc_log;
     let mut symbol_states: [SymbolStates; 256] = core::array::from_fn(|_| SymbolStates::default());
 
-    // Donor `FSE_buildCTable_wksp` (lib/compress/fse_compress.c) — build
+    // Upstream zstd `FSE_buildCTable_wksp` (lib/compress/fse_compress.c) — build
     // `nextStateTable` (== `state_table_flat`) once via cumul + spread +
     // sorted-by-symbol sweep, without ever materializing per-symbol
     // `Vec<State>`. Previous implementation paid an O(num_symbols ×
     // table_size) enumeration with a BTreeSet dedup per symbol —
-    // ~18% self time on small-input encode profiles. Drop it; donor
+    // ~18% self time on small-input encode profiles. Drop it; upstream zstd
     // only ever needs symbolTT + nextStateTable, and we precompute
     // `start_state` / `max_num_bits` for callers via the same
     // arithmetic [`FSETable::next_state`] uses on the hot path.
@@ -754,7 +757,7 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
     }
 
     // Phase 2 — spread positive-probability symbols across the
-    // remaining slots, donor `step`-walk with low-prob area skip.
+    // remaining slots, upstream zstd `step`-walk with low-prob area skip.
     let step = (table_size >> 1) + (table_size >> 3) + 3;
     let table_mask = table_size - 1;
     let mut position: usize = 0;
@@ -775,11 +778,11 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
         "FSE spread must cycle exactly once through tableSize positions"
     );
 
-    // Phase 3 — emit `state_table_flat` (donor `nextStateTable`)
+    // Phase 3 — emit `state_table_flat` (upstream zstd `nextStateTable`)
     // ordered by `(symbol, slot)`. Walk every table slot `u`, look up
     // its owning symbol via `table_symbol[u]`, and write the raw slot
     // `u` into that symbol's running cumul cursor. The Rust convention
-    // stores raw slots (`0..table_size`); donor stores `table_size + u`
+    // stores raw slots (`0..table_size`); upstream zstd stores `table_size + u`
     // pre-shifted and recovers `u` on read by subtracting `table_size`.
     // Both representations encode the same `(symbol → next_slot)`
     // mapping; [`FSETable::next_state`] is written against the raw-slot
@@ -789,7 +792,7 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
     for (u, &symbol_at_slot) in table_symbol.iter().enumerate() {
         let s = symbol_at_slot as usize;
         // The Rust convention here keeps `state_table_flat[i]` as the
-        // raw slot (`0..table_size`); donor stores `table_size + u`
+        // raw slot (`0..table_size`); upstream zstd stores `table_size + u`
         // and subtracts on read. `next_state` arithmetic ([`FSETable::next_state`])
         // matches the Rust convention — store the slot directly.
         state_table_flat[cursor[s] as usize] = u as u16;
@@ -799,13 +802,13 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
 
     // Phase 4 — `symbolTT[]` (delta_nb_bits, delta_find_state) plus
     // precomputed `start_state` and `max_num_bits` per symbol. All via
-    // donor 16.16 fixed-point arithmetic; no per-state enumeration.
+    // upstream zstd 16.16 fixed-point arithmetic; no per-state enumeration.
     let mut symbol_tt = [SymbolTT::default(); 256];
     let mut total: usize = 0;
     for (symbol, &prob) in probs.iter().enumerate() {
         symbol_states[symbol].probability = prob;
         if prob == 0 {
-            // Donor fills `symbolTT` for prob==0 too, so `FSE_getMaxNbBits`
+            // Upstream zstd fills `symbolTT` for prob==0 too, so `FSE_getMaxNbBits`
             // still works (returns `acc_log + 1` for absent symbols).
             // We don't expose that path, but mirror the value for parity.
             symbol_tt[symbol] = SymbolTT {
@@ -836,17 +839,17 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
         };
         total += prob.unsigned_abs() as usize;
 
-        // Donor `FSE_initCState2`: start_state =
+        // Upstream zstd `FSE_initCState2`: start_state =
         //   stateTable[(((nbBitsOut<<16) - deltaNbBits) >> nbBitsOut) + deltaFindState]
         // where `nbBitsOut = (deltaNbBits + (1<<15)) >> 16`.
         let init_nb_bits_out = (delta_nb_bits + (1 << 15)) >> 16;
         let init_value = (init_nb_bits_out << 16).saturating_sub(delta_nb_bits);
         let state_table_index = (init_value >> init_nb_bits_out) as isize + delta_find_state;
-        // Donor `FSE_initCState2` guarantees this index is in
+        // Upstream zstd `FSE_initCState2` guarantees this index is in
         // `0..table_size` by construction (`delta_find_state` is bounded
         // by `total - probability`, and `(value >> nb_bits_out)` is
         // bounded by `2 * probability - 1`). The `debug_assert` makes
-        // the invariant explicit so a future regression in the donor
+        // the invariant explicit so a future regression in the upstream zstd
         // arithmetic surfaces in dev builds before the silent
         // `as usize` wraparound.
         debug_assert!(
@@ -855,7 +858,7 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
         );
         let start_index = state_table_flat[state_table_index as usize] as usize;
 
-        // Max nb_bits across all input states `0..table_size`. Donor
+        // Max nb_bits across all input states `0..table_size`. Upstream zstd
         // `next_state` arithmetic: `nb_bits = (value + delta_nb_bits) >> 16`
         // with `value = table_size + idx`, `idx ∈ 0..table_size`. The
         // maximum is at `idx = table_size - 1`. Single op vs the prior
