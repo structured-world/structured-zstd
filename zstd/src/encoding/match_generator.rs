@@ -8452,20 +8452,20 @@ fn level22_source_size_hint_uses_donor_btultra2_tiers() {
 }
 
 #[test]
-fn level22_small_source_size_hint_matches_donor_cparams() {
-    use zstd::zstd_safe::zstd_sys;
-
+fn level22_non_power_of_two_small_source_uses_tier3_params() {
+    // srcSize 15 027 (<= 16 KB) selects the table[3] btultra2 row; the
+    // source-size clamp gives windowLog 14 (ceil log2 15027). Pure-Rust
+    // assertion against the constant tier-3 geometry (no FFI).
     let source_size = 15_027u64;
-    let donor = unsafe { zstd_sys::ZSTD_getCParams(22, source_size, 0) };
     let params = resolve_level_params(CompressionLevel::Level(22), Some(source_size));
 
     let hc = params.hc.unwrap();
-    assert_eq!(params.window_log as u32, donor.windowLog);
-    assert_eq!(hc.chain_log as u32, donor.chainLog);
-    assert_eq!(hc.hash_log as u32, donor.hashLog);
-    assert_eq!(hc.search_depth as u32, 1u32 << donor.searchLog);
-    assert_eq!(HC_OPT_MIN_MATCH_LEN as u32, donor.minMatch);
-    assert_eq!(hc.target_len as u32, donor.targetLength);
+    assert_eq!(params.window_log, 14);
+    assert_eq!(hc.chain_log, 15);
+    assert_eq!(hc.hash_log, 15);
+    assert_eq!(hc.search_depth, 1 << 10);
+    assert_eq!(HC_OPT_MIN_MATCH_LEN, 3);
+    assert_eq!(hc.target_len, 999);
 }
 
 #[test]
@@ -12766,29 +12766,34 @@ fn fast_levels_driver_wiring_threads_cparams_into_inner_matcher() {
 /// parser here, but the reference `targetLength` (32) is the same nice-match
 /// threshold for both finders, so we mirror it directly.
 ///
-/// Test queries the reference via `ZSTD_getCParams(level, 0, 0)` so any
-/// future table tweak upstream is reflected automatically.
+/// Asserts against the constant `clevels.h` table[0] `targetLength` column
+/// (transcribed inline) — a pure-Rust in-tree test, no FFI dependency.
 #[test]
-fn lazy_band_target_len_matches_donor_default_table() {
-    use zstd::zstd_safe::zstd_sys;
-
-    for level in 5..=15i32 {
-        // SAFETY: `ZSTD_getCParams` reads from a static table; safe to
-        // call with any (level, srcSize, dictSize) combination.
-        let reference = unsafe { zstd_sys::ZSTD_getCParams(level, 0, 0) };
+fn lazy_band_target_len_matches_default_table() {
+    // table[0] (srcSize > 256 KB) targetLength, levels 5..=15: the lazy
+    // outer loop's nice-match (`sufficient_len`) threshold.
+    let expected: [(i32, usize); 11] = [
+        (5, 2),
+        (6, 4),
+        (7, 8),
+        (8, 16),
+        (9, 16),
+        (10, 16),
+        (11, 16),
+        (12, 32),
+        (13, 32),
+        (14, 32),
+        (15, 32),
+    ];
+    for (level, want) in expected {
         let params = resolve_level_params(CompressionLevel::Level(level), None);
         // L5 = greedy (Row backend → `row`); L6-15 = lazy (HashChain → `hc`).
-        // Both surface the donor `targetLength` as their nice-match threshold.
         let target_len = params
             .hc
             .map(|hc| hc.target_len)
             .or_else(|| params.row.map(|row| row.target_len))
             .expect("lazy/greedy level carries hc or row config");
-        assert_eq!(
-            target_len as u32, reference.targetLength,
-            "L{level}: target_len ({target_len}) must match reference cParams.targetLength ({})",
-            reference.targetLength
-        );
+        assert_eq!(target_len, want, "L{level}: target_len must match table[0]");
     }
 }
 
@@ -12801,36 +12806,20 @@ fn lazy_band_target_len_matches_donor_default_table() {
 /// asserting the full row (not just `search_depth`) keeps the whole budget
 /// aligned and guards every field against silent drift.
 #[test]
-fn upper_lazy_band_params_match_donor_default_table() {
-    use zstd::zstd_safe::zstd_sys;
-
-    for level in 13..=15i32 {
-        // SAFETY: `ZSTD_getCParams` reads from a static table; safe to
-        // call with any (level, srcSize, dictSize) combination.
-        let reference = unsafe { zstd_sys::ZSTD_getCParams(level, 0, 0) };
+fn upper_lazy_band_params_match_default_table() {
+    // table[0] (srcSize > 256 KB), levels 13..=15 (btlazy2 budget):
+    // (level, windowLog, hashLog, chainLog, search_depth = 1 << searchLog).
+    let expected: [(i32, u8, usize, usize, usize); 3] = [
+        (13, 22, 22, 22, 1 << 4),
+        (14, 22, 23, 22, 1 << 5),
+        (15, 22, 23, 23, 1 << 6),
+    ];
+    for (level, wlog, hlog, clog, sd) in expected {
         let params = resolve_level_params(CompressionLevel::Level(level), None);
         let hc = params.hc.unwrap();
-        assert_eq!(
-            hc.search_depth as u32,
-            1u32 << reference.searchLog,
-            "L{level}: hc.search_depth ({}) must equal 1<<cParams.searchLog ({})",
-            hc.search_depth,
-            1u32 << reference.searchLog
-        );
-        assert_eq!(
-            params.window_log as u32, reference.windowLog,
-            "L{level}: window_log ({}) must equal cParams.windowLog ({})",
-            params.window_log, reference.windowLog
-        );
-        assert_eq!(
-            hc.hash_log as u32, reference.hashLog,
-            "L{level}: hc.hash_log ({}) must equal cParams.hashLog ({})",
-            hc.hash_log, reference.hashLog
-        );
-        assert_eq!(
-            hc.chain_log as u32, reference.chainLog,
-            "L{level}: hc.chain_log ({}) must equal cParams.chainLog ({})",
-            hc.chain_log, reference.chainLog
-        );
+        assert_eq!(hc.search_depth, sd, "L{level}: search_depth");
+        assert_eq!(params.window_log, wlog, "L{level}: window_log");
+        assert_eq!(hc.hash_log, hlog, "L{level}: hash_log");
+        assert_eq!(hc.chain_log, clog, "L{level}: chain_log");
     }
 }
