@@ -545,6 +545,14 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
     // Note the order — RLE pre-check runs BEFORE `min_lits`;
     // `estimate_literals_section_bytes` mirrors this exactly so probe
     // costs match emit byte-for-byte.
+    //
+    // This is the LITERALS-section RLE inside a compressed block, reached only
+    // when the block already carries sequences. A block whose ENTIRE content
+    // is one repeated byte never gets here: `compress_block_encoded` emits a
+    // block-level RLE block (Block_Type 1) for it first. The remaining
+    // small-input framing economy (single-segment header, store-raw fallback
+    // for non-shrinking blocks) lives in `append_frame_header` /
+    // `compress_block_encoded`, not in this literals path.
     if !literals_vec.is_empty() && all_bytes_identical(literals_vec) {
         rle_literals(literals_vec, &mut writer);
         state.clear_huff_table();
