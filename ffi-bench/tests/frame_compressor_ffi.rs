@@ -135,14 +135,13 @@ fn source_size_hint_levels_remain_ffi_compatible_small_inputs_matrix() {
             let data = generate_data(seed + seed_idx as u64, size);
             for &level in &levels {
                 let compressed = compress_hinted(&data, level);
-                if matches!(size, 511 | 512) {
-                    let (single_segment, _, _) = frame_header_info(&compressed);
-                    assert_eq!(
-                        single_segment,
-                        size == 512,
-                        "single_segment 511/512 boundary level={level:?} size={size}"
-                    );
-                }
+                // Known-size payloads that fit the window are single-segment
+                // regardless of size (upstream policy: no lower size floor).
+                let (single_segment, _, _) = frame_header_info(&compressed);
+                assert!(
+                    single_segment,
+                    "hinted small frame should be single-segment level={level:?} size={size}"
+                );
                 assert_eq!(
                     c_decode(&compressed),
                     data,
@@ -184,7 +183,11 @@ fn hinted_levels_use_single_segment_header_symmetrically() {
 }
 
 #[test]
-fn hinted_levels_pin_511_512_single_segment_boundary() {
+fn small_hinted_frames_are_single_segment_below_512() {
+    // Regression for the dropped 512-byte single-segment floor: a known-size
+    // payload that fits the window is single-segment at any size (matching
+    // upstream `ZSTD_writeFrameHeader`). The old floor forced a windowed
+    // header with a 4-byte FCS on sub-512 inputs.
     let levels = [
         CompressionLevel::Fastest,
         CompressionLevel::Default,
@@ -197,18 +200,46 @@ fn hinted_levels_pin_511_512_single_segment_boundary() {
         CompressionLevel::Level(11),
     ];
     for (seed_idx, seed) in [7u64, 23, 41].into_iter().enumerate() {
-        for &size in &[511usize, 512] {
+        for &size in &[1usize, 100, 255, 256, 511, 512] {
             let data = generate_data(seed + seed_idx as u64, size);
             for &level in &levels {
                 let compressed = compress_hinted(&data, level);
-                let (single_segment, _, _) = frame_header_info(&compressed);
-                assert_eq!(
+                let (single_segment, fcs, _) = frame_header_info(&compressed);
+                assert!(
                     single_segment,
-                    size == 512,
-                    "single_segment 511/512 boundary level={level:?} size={size}"
+                    "small hinted frame should be single-segment level={level:?} size={size}"
                 );
+                assert_eq!(fcs, size as u64, "FCS must equal len size={size}");
                 assert_eq!(c_decode(&compressed), data);
             }
+        }
+    }
+}
+
+#[test]
+fn small_frames_are_not_larger_than_c() {
+    // The dropped 512 floor plus the post-hoc store-raw fallback together fix
+    // a small-input ratio regression: sub-256 inputs paid a 4-byte FCS +
+    // window descriptor that upstream avoids with a single-segment 1-byte FCS,
+    // and incompressible small blocks were emitted as oversized compressed
+    // blocks instead of raw. Guard that our one-shot frame is never larger
+    // than the C reference across small sizes and content shapes, and that it
+    // round-trips through the C decoder (a single-segment window equals the
+    // content size, so a non-shrinking compressed block would fail to decode).
+    for size in 1..=64usize {
+        let varied = generate_data(0xBADC0FFE, size);
+        let ramp: Vec<u8> = (0..size).map(|i| i as u8).collect();
+        let all_same = vec![0x5Au8; size];
+        for (label, input) in [("varied", &varied), ("ramp", &ramp), ("rle", &all_same)] {
+            let ours = compress_to_vec(input.as_slice(), CompressionLevel::Fastest);
+            let c = zstd::bulk::compress(input.as_slice(), 1).expect("C compress");
+            assert!(
+                ours.len() <= c.len(),
+                "ours {} > C {} ({label}) size={size}",
+                ours.len(),
+                c.len()
+            );
+            assert_eq!(c_decode(&ours), *input, "roundtrip ({label}) size={size}");
         }
     }
 }

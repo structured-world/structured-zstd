@@ -1890,19 +1890,26 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// Appends rather than returns so the one-shot path serializes straight
     /// into the reused output buffer with no per-frame header `Vec`.
     fn append_frame_header(&self, total_uncompressed: u64, prep: &FramePrep, out: &mut Vec<u8>) {
-        // Match the upstream zstd framing policy for pledged one-shot inputs: use a
-        // single-segment frame whenever the source fits the active window.
-        // A single-segment frame REQUIRES an FCS field, so suppressing the
-        // content size (`content_size_flag` off) also forces the windowed
-        // layout, mirroring upstream. Dictionary frames qualify (the
-        // reference emits single-segment + dictionary-ID headers): the
-        // dictionary is decoder setup state, not part of the regenerated
-        // segment, so the frame keeps single-segment wire layout and
-        // decoders keep their single-allocation paths (our own decoder
-        // already caps reservation to min(window, FCS) either way).
+        // Match the upstream zstd framing policy (`ZSTD_writeFrameHeader`):
+        // single-segment whenever the content size is known and the whole
+        // source fits the active window (`contentSizeFlag && windowSize >=
+        // srcSize`). A single-segment frame REQUIRES an FCS field, so
+        // suppressing the content size (`content_size_flag` off) forces the
+        // windowed layout. There is no lower size bound: small payloads
+        // benefit most, since a windowed frame cannot encode a content size
+        // below 256 in fewer than 4 FCS bytes (the 1-byte FCS class is
+        // single-segment-only, see `find_fcs_field_size`), whereas a
+        // single-segment frame stores it in one byte and omits the window
+        // descriptor. The single-segment window equals the FCS, so a block
+        // must never reference past the content: the post-hoc raw fallback in
+        // the block emitters guarantees any non-shrinking block is stored raw,
+        // and genuine matches stay within the already-emitted output.
+        // Dictionary frames qualify too (the dictionary is decoder setup
+        // state, not part of the regenerated segment), keeping the decoder's
+        // single-allocation path (our decoder caps reservation to
+        // min(window, FCS) either way).
         let single_segment = self.content_size_flag
             && prep.source_size_hint_known
-            && total_uncompressed >= 512
             && total_uncompressed <= prep.window_size;
         let header = FrameHeader {
             frame_content_size: self.content_size_flag.then_some(total_uncompressed),
