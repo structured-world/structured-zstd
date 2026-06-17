@@ -2433,6 +2433,26 @@ impl FrameDecoder {
             self.verify_content_checksum()?;
             return Ok(written);
         }
+        // The ring-drain fallback below pre-reserves `useful_window_size()`
+        // (= `window.min(FCS)`), which for a single-segment frame is the
+        // declared FCS itself — so a truncated single-segment frame lying about
+        // its size would still allocate the pledged window before the body
+        // errors, sidestepping the direct-path gate above. Reject such a frame
+        // up front when its declared (FCS-bearing) window exceeds what the
+        // available input could plausibly produce. Frames without a declared
+        // size keep their window-descriptor reservation (already capped at
+        // `MAXIMUM_ALLOWED_WINDOW_SIZE` at init); a small-window multi-segment
+        // frame still falls through to the ring drain, which errors cheaply on
+        // the truncated body.
+        if fcs_declared
+            && let Some(state) = self.state.as_ref()
+            && state.useful_window_size() > input.len().saturating_mul(MAX_DECOMPRESSION_RATIO)
+        {
+            return Err(FrameDecoderError::FrameContentSizeMismatch {
+                declared: content_size,
+                produced: 0,
+            });
+        }
         // No declared size, explicit FCS=0, or an unrepresentable FCS: window-
         // bounded ring drain, appended directly to `output` via
         // `collect_to_writer` (no staging buffer).
