@@ -17,9 +17,13 @@ publish = false
 # rewritten to `libzstd.so.1` by build.rs so a consumer linked against
 # upstream libzstd resolves against this build with no rebuild.
 name = "structured_zstd"
-# `lib` (rlib) is added alongside the C artifacts so the crate's own test
-# harness can link the wrappers; the shipped artifacts are the cdylib + staticlib.
-crate-type = ["lib", "cdylib", "staticlib"]
+# Only the C artifacts are emitted: a cdylib (`libstructured_zstd.so`, SONAME
+# rewritten to `libzstd.so.1`) and a staticlib (`.a`). No `rlib` — nothing
+# depends on this crate from Rust, and the unit tests compile straight from
+# source via `--test` (they don't link the library artifact). Emitting an
+# `rlib` here would name it `libstructured_zstd.rlib`, colliding with the
+# `structured-zstd` library crate's own rlib of the same name.
+crate-type = ["cdylib", "staticlib"]
 
 # No `[features]` / `std` contract by design: this is a host-only cdylib/
 # staticlib whose `extern "C"` wrappers guard the boundary with
