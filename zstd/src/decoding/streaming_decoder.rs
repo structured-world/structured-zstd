@@ -272,7 +272,15 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
         loop {
             let start = output.len();
             output.resize(start + MAX_BLOCK_SIZE as usize, 0);
-            let n = self.read(&mut output[start..])?;
+            // On error, drop the just-grown (zeroed) tail before propagating so
+            // the caller never observes bytes that were never decoded.
+            let n = match self.read(&mut output[start..]) {
+                Ok(n) => n,
+                Err(e) => {
+                    output.truncate(start);
+                    return Err(e);
+                }
+            };
             output.truncate(start + n);
             if n == 0 {
                 break;
@@ -316,7 +324,15 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> Read for StreamingDecoder<READ, D
         loop {
             let start = output.len();
             output.resize(start + MAX_BLOCK_SIZE as usize, 0);
-            let n = self.read(&mut output[start..])?;
+            // On error, drop the just-grown (zeroed) tail before propagating so
+            // the caller never observes bytes that were never decoded.
+            let n = match self.read(&mut output[start..]) {
+                Ok(n) => n,
+                Err(e) => {
+                    output.truncate(start);
+                    return Err(e);
+                }
+            };
             output.truncate(start + n);
             if n == 0 {
                 break;
