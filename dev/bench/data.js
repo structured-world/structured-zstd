@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781637697200,
+  "lastUpdate": 1781685337151,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -68258,6 +68258,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.26,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "e0ca9c902f9bb0c195e98b12e6633e50c9f38ee6",
+          "message": "perf(decode): decode StreamingDecoder read_to_end in place (#429)\n\n* perf(decode): decode StreamingDecoder read_to_end in place\n\n`StreamingDecoder::read_to_end` ran the generic `read` loop: decode a\nblock into the internal `RingBuffer`, then COPY the collectable bytes into\nthe caller's buffer — a double copy (decode -> ring -> user) plus\n`read_to_end`'s power-of-two regrow churn. The single-copy direct path\n(`run_direct_decode`, decode straight into a user slice) already existed\nbut only `decode_all` (in-memory input + pre-sized output) used it.\n\nSpecialize `read_to_end`: when the decoder sits at the start of its\n(already header-read) frame, buffer the compressed source and decode the\nframe STRAIGHT into the output `Vec`'s grown capacity via the direct path,\npre-sized from the frame's declared content size. Eliminates the ring\ndrain copy and the regrow churn. Falls back to the generic grow-and-drain\nloop when the caller already consumed part of the frame (mixed read +\nread_to_end), and to a window-bounded ring drain for frames without a\ndeclared content size.\n\n- new `FrameDecoder::decode_current_frame_to_vec` + `is_at_frame_start`\n- read_to_end override is cfg-split (std returns the byte count, no_std\n  returns `()`), no_std build verified\n- regression tests: fast path fires (direct_frames == 1) and matches\n  byte-for-byte; mixed read+read_to_end stays correct via the fallback\n\nDecode output is unchanged (852 tests incl. cross-validation FFI\nround-trip, verify-mode checksum, dict, streaming; clippy, fmt clean).\n\n* fix(decode): multi-frame read_to_end, FCS-0 validation, checked sizing\n\nReview fixes for the decode-in-place read_to_end fast path:\n\n- read_to_end now decodes ALL frames in the source (concatenated +\n  skippable), not just the current one. The fast path buffers the whole\n  source per the Read::read_to_end \"read to EOF\" contract, so decoding\n  only the first frame silently dropped trailing frames. decode_current_\n  frame_to_vec loops: decode the already-init'd frame, then init+decode the\n  rest. Regression test feeds two concatenated frames (fails pre-fix:\n  only the first decoded).\n- declared content size is validated against produced bytes in the ring\n  branch (fcs_declared && produced != content_size -> FrameContentSizeMismatch),\n  matching decode_all_impl. A frame with an explicit Frame_Content_Size=0\n  whose body emits bytes is now rejected instead of accepted.\n- direct-path sizing goes through usize::try_from + checked_add instead of\n  `as usize`, so a 32-bit / oversized declared FCS falls back to the\n  window-bounded ring drain rather than allocating a truncated buffer that\n  would violate run_direct_decode's precondition. (32-bit-only path; not\n  reachable by a 64-bit test.)\n\n854 tests pass (incl. new multi-frame + empty-FCS-0 streaming tests),\nclippy + fmt clean, no_std builds.\n\n* test(decode): regression tests for read_to_end concatenated/dict/error paths\n\nThree failing tests pinning bugs in the read_to_end fast path:\n- concatenated dictionary frames lose the forced dictionary on re-init\n  (frame 2 fails with DictNotProvided)\n- read_to_end after a partial read stops at the current frame's EOF\n  instead of consuming concatenated frames to true EOF\n- a direct-path decode error leaves the resized (zeroed) output tail in\n  place, exposing non-decoded bytes to callers\n\n* fix(decode): preserve dictionary + consume to EOF in read_to_end\n\nThree correctness fixes in the read_to_end decode-in-place paths:\n\n- Concatenated frames now re-initialise via init_with_dict_handle when the\n  StreamingDecoder was built with a dictionary, so a forced dict is preserved\n  for following frames (plain init resolves dicts by frame id only, losing the\n  dict for frames that omit the id). StreamingDecoder retains the (cheap Arc/Rc)\n  dict handle for this; the shared init+decode loop is factored into\n  FrameDecoder::decode_concatenated_frames_to_vec.\n- The mid-frame fallback (mixed read + read_to_end) now drains the partial\n  current frame and then decodes the remaining concatenated frames to true EOF,\n  matching the fast path and the Read::read_to_end contract.\n- A direct-path decode error truncates the just-grown output tail before\n  propagating, so callers never observe zeroed non-decoded bytes.\n\n* docs(decode): fix misattributed doc blocks on frame decoder\n\n- Split is_finished() doc from direct_frames(): the three drain-related\n  /// lines were attached to the test-only direct_frames() accessor,\n  leaving is_finished() undocumented. Move direct_frames() doc above it,\n  restore is_finished()'s own block.\n- Remove duplicated frame-decode prose wrongly prefixed onto\n  is_at_frame_start(); that behaviour is already documented on\n  decode_current_frame_to_vec / decode_concatenated_frames_to_vec.\n\n* test(decode): regression for eager FCS allocation on untrusted frame\n\nA frame declaring a large content size with a tiny truncated body must\nnot drive the direct path's output.resize() before the body is\nvalidated. Asserts decode_current_frame_to_vec falls to the ring drain\n(direct_frames stays 0) for an implausible declared size. Fails on\ncurrent code (direct_frames == 1).\n\n* fix(decode): gate direct-path pre-sizing on plausible content size\n\nThe decode-in-place path resized the output Vec to the frame's declared\ncontent size before decoding/validating the body, so a tiny or truncated\nframe declaring a huge (usize-representable) FCS allocated and zeroed\nthat whole size up front. Bound the eager resize to what the available\ncompressed input could plausibly produce (input.len() * MAX_BLOCK_SIZE/4,\nzstd's per-block ceiling); larger declarations fall through to the\nwindow-bounded ring drain, which grows only as real bytes are produced\nand errors cheaply on truncated input.\n\n* test(decode): regression for zero-filled tail on fallback read error\n\nread_to_end's mid-frame fallback grows output by MAX_BLOCK_SIZE before\neach self.read; a read error must not leave that zeroed tail in the\ncaller's Vec. Forces a sub-input window so a partial read leaves the\nframe mid-decode with a truncated block ahead, then asserts the decoded\nprefix matches the payload (no appended non-decoded bytes). Fails on\ncurrent code (zero tail mismatches the incompressible payload).\n\n* fix(decode): truncate output on read error in read_to_end fallback\n\nThe mid-frame fallback grew output by MAX_BLOCK_SIZE before each\nself.read, but the `?` early-return on a read error left that zeroed\ntail in the caller's Vec. Restore the length to the pre-grow point\nbefore propagating the error, in both the std and no_std paths.\n\n* docs(decode): clarify StreamingDecoder read vs read_to_end semantics\n\nThe module caveat predated the read_to_end specialization: it claimed\nthe decoder handles only a single frame and that no_std lacks\nread_to_end. Distinguish plain read / read_exact (single frame) from\nread_to_end (consumes concatenated + skippable frames to EOF), and drop\nthe stale no_std note (read_to_end is implemented there too; only File\nin the example is std-only).\n\n* test(decode): regression for single-segment implausible FCS reservation\n\nThe direct-path gate routes an implausible declared size to the ring\ndrain, but decode_blocks pre-reserves useful_window_size(), which for a\nsingle-segment frame equals the declared FCS. A truncated single-segment\nframe declaring a huge content size still allocates that window before\nthe body errors. Asserts the implausible size is rejected up front with\na content-size error rather than a post-reservation block-body error.\nFails on current code (returns FailedToReadBlockBody after reserving).\n\n* fix(decode): reject implausible single-segment FCS before window reserve\n\nThe direct-path plausibility gate routed an implausibly-large declared\nsize to the ring drain, but decode_blocks pre-reserves\nuseful_window_size() (= window.min(FCS)), which for a single-segment\nframe is the declared FCS itself. A truncated single-segment frame lying\nabout its size therefore still allocated the pledged window before the\nbody errored. Reject such an FCS-bearing frame up front when its useful\nwindow exceeds the input's plausible output (input.len() * per-block\nceiling); small-window multi-segment frames still fall through to the\nring drain and error cheaply on the truncated body.",
+          "timestamp": "2026-06-17T10:45:34+03:00",
+          "tree_id": "e0eb5838b6a780012a9fe726484758d44756316d",
+          "url": "https://github.com/structured-world/structured-zstd/commit/e0ca9c902f9bb0c195e98b12e6633e50c9f38ee6"
+        },
+        "date": 1781685323957,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.104,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.111,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 241.84,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 273.312,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.402,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.607,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.115,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.029,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 3.022,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.971,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.109,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.109,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.238,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.01,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 12.032,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.791,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.224,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.297,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.003,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.79,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.258,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.577,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.123,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.387,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.138,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.108,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.27,
             "unit": "ms"
           }
         ]
