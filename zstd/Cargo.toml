@@ -16,6 +16,14 @@ exclude = ["fuzz_decodecorpus/*", "decodecorpus_files/*", "dict_tests/files/**"]
 readme = "README.md"
 keywords = ["zstd", "zstandard", "decompression", "compression", "pure-rust"]
 categories = ["compression"]
+# The C-binding benches, conformance tests, and FFI diagnostic examples live in
+# the non-published `ffi-bench` crate so this library never depends on the C
+# `zstd` bindings. Auto-discovery is disabled because those source files still
+# physically live under `benches/`, `tests/`, and `examples/` here and are
+# compiled as targets of `ffi-bench` via explicit `path` entries.
+autobenches = false
+autotests = false
+autoexamples = false
 
 # docs.rs builds the crate with the public feature set so feature-gated
 # items (e.g. the `dictionary` module behind `dict_builder`) appear in the
@@ -55,13 +63,12 @@ core = { version = "1.0.0", optional = true, package = "rustc-std-workspace-core
 alloc = { version = "1.0.0", optional = true, package = "rustc-std-workspace-alloc" }
 
 [dev-dependencies]
-criterion = "0.8"
+# `criterion` and `dhat` moved to the `ffi-bench` crate with the benches and
+# FFI examples. `zstd` (the C bindings) is still needed by a few white-box
+# unit tests that cross-check our output against libzstd; migrating those to
+# `ffi-bench` (so this library imports zero C bindings) is the remaining step.
 rand = "0.10"
 zstd = { version = "0.13.3", features = ["zdict_builder", "experimental"] }
-# Heap profiler for per-allocation-site attribution (the `dhat-heap`
-# feature swaps it in as the global allocator in the reuse profiling
-# example). Dev-only; never linked into the library.
-dhat = "0.3"
 
 [features]
 default = [
@@ -156,55 +163,7 @@ lsm = []
 # stable interface of this crate.
 rustc-dep-of-std = ["dep:compiler_builtins", "dep:core", "dep:alloc"]
 
-# Diagnostic example: only buildable with the copy-shape counters compiled
-# in, so `--all-targets` on the default feature set skips it (the
-# `shape_stats` re-export is feature-gated).
-[[example]]
-name = "copy_shape"
-required-features = ["copy_shape_stats", "dict_builder"]
-
-[[bench]]
-name = "decode_all"
-harness = false
-
-[[bench]]
-name = "huf_decode_kernels"
-harness = false
-
-[[bench]]
-name = "compare_ffi"
-harness = false
-required-features = ["dict_builder"]
-
-[[bench]]
-name = "compare_ffi_memory"
-harness = false
-required-features = ["dict_builder"]
-
-[[bench]]
-name = "compare_ffi_sequences"
-harness = false
-required-features = ["dict_builder", "bench_internals"]
-
-[[bench]]
-name = "bitstream"
-harness = false
-required-features = ["bench_internals"]
-
-[[bench]]
-name = "dict_builder_fastcover"
-harness = false
-required-features = ["dict_builder"]
-
-[[bench]]
-name = "decode_dict_handle"
-harness = false
-
-[[bench]]
-name = "wildcopy_candidates"
-harness = false
-required-features = ["bench_internals"]
-
-[[test]]
-name = "block_splitter_parity"
-required-features = ["bench_internals"]
+# All benches, integration tests, and FFI diagnostic examples are targets of
+# the non-published `ffi-bench` crate (they link the C `zstd` bindings); their
+# source files remain under `benches/`, `tests/`, and `examples/` here and are
+# referenced from `../ffi-bench/Cargo.toml` via `path`.
