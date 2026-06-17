@@ -2,8 +2,8 @@
 //! ENCODER hot path. Reads a raw corpus, then loops a `FrameCompressor`
 //! over a contiguous `&[u8]` source at the given level for N iters. No
 //! criterion, no FFI side — the perf samples land purely in our encoder
-//! (the `compare_ffi` compress bench runs the donor in the same process,
-//! so its flamegraph mixes `ZSTD_*` donor symbols with ours; this binary
+//! (the `compare_ffi` compress bench runs the upstream zstd in the same process,
+//! so its flamegraph mixes `ZSTD_*` upstream zstd symbols with ours; this binary
 //! does not).
 //!
 //! The output buffer is allocated ONCE and `clear()`-reused every

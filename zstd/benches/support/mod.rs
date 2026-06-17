@@ -189,28 +189,28 @@ pub(crate) fn supported_levels_filtered() -> Vec<LevelConfig> {
 /// `level 22 :: BtUltra2`, etc. without re-deriving the strategy from
 /// the numeric level on the consumer side.
 ///
-/// Negative levels share the `fast` ultra-fast strategy (donor maps
+/// Negative levels share the `fast` ultra-fast strategy (upstream zstd maps
 /// any `cParams.cLevel <= 1` to `ZSTD_fast`). The 1..=22 split mirrors
 /// `clevels.h` and `StrategyTag::for_level` exactly.
 fn strategy_suffix(level: i32) -> &'static str {
     match level {
         // Negative levels uniformly map to the ultra-fast `Fast`
-        // strategy (donor `cParams.strategy = ZSTD_fast` for any
+        // strategy (upstream zstd `cParams.strategy = ZSTD_fast` for any
         // `cLevel <= 1`). Level 0 is intentionally NOT classified
-        // here — donor treats it as a sentinel for "use default"
+        // here — upstream zstd treats it as a sentinel for "use default"
         // (= 3, `Dfast`), and `supported_levels()` omits it to keep
         // bench labels unambiguous. A future caller that does pass
         // `0` should pre-resolve it to `3` before reaching this
         // helper rather than have it silently aliased to `fast`.
         i32::MIN..=-1 => "fast",
         0 => unreachable!(
-            "strategy_suffix(0) called; level 0 is the donor sentinel for \
+            "strategy_suffix(0) called; level 0 is the upstream zstd sentinel for \
              'use default' (= 3). `supported_levels()` skips it so it never \
              reaches this helper. Resolve to the canonical numeric level \
              before calling."
         ),
         // Names mirror the encoder's actual per-level strategy
-        // (`StrategyTag::for_level`, itself a port of donor `clevels.h`
+        // (`StrategyTag::for_level`, itself a port of upstream zstd `clevels.h`
         // for the srcSize > 256 KiB tier): 1-2 fast, 3-4 dfast, 5 greedy,
         // 6-15 lazy, 16-17 btopt, 18 btultra, 19-22 btultra2.
         1 | 2 => "fast",
@@ -224,8 +224,8 @@ fn strategy_suffix(level: i32) -> &'static str {
 }
 
 /// Canonical bench level inventory: `-7..=-1` (ultra-fast) plus
-/// `1..=22` (the donor advertised range). Level 0 is omitted because
-/// the donor treats it as a sentinel for "use default" (= 3) — a
+/// `1..=22` (the upstream zstd advertised range). Level 0 is omitted because
+/// the upstream zstd treats it as a sentinel for "use default" (= 3) — a
 /// distinct bench entry would just duplicate level 3's numbers.
 ///
 /// Each entry's `name` field is the canonical `level_<N>_<strategy>`
@@ -252,7 +252,7 @@ pub(crate) fn supported_levels() -> Vec<LevelConfig> {
 
 fn build_supported_levels() -> Vec<LevelConfig> {
     let mut levels = Vec::with_capacity(33);
-    // Ultra-fast tier: `-7..=-1`. Donor strategy = Fast.
+    // Ultra-fast tier: `-7..=-1`. Upstream zstd strategy = Fast.
     for n in -7..=-1i32 {
         levels.push(LevelConfig {
             name: leak_owned(format!("level_{n}_{}", strategy_suffix(n))),

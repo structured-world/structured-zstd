@@ -1,12 +1,12 @@
 //! One-shot diagnostic: invoke FFI `ZSTD_compress` on z000033 at level 1.
-//! Donor's `zstd_fast.c` has been patched with `fprintf(stderr, "D_...")`
-//! traces gated by `DONOR_TRACE_FAST=1` env var. Run this binary with
-//! both `DONOR_TRACE_FAST=1` set and stderr redirected to a file to
-//! capture donor's actual cursor trace.
+//! A patched upstream `zstd_fast.c` (with `fprintf(stderr, "D_...")`
+//! traces) is gated by the `FFI_TRACE_FAST=1` env var. Run this binary with
+//! both `FFI_TRACE_FAST=1` set and stderr redirected to a file to
+//! capture the C encoder's actual cursor trace.
 //!
-//! Build: cargo build --release -p structured-zstd --example donor_compress_z000033
-//! Run:   DONOR_TRACE_FAST=1 ./target/release/examples/donor_compress_z000033 \
-//!          > /dev/null 2> /tmp/donor_trace.log
+//! Build: cargo build --release -p structured-zstd --example ffi_compress_z000033
+//! Run:   FFI_TRACE_FAST=1 ./target/release/examples/ffi_compress_z000033 \
+//!          > /dev/null 2> /tmp/ffi_trace.log
 
 use std::env;
 use std::fs;
@@ -19,7 +19,7 @@ fn main() {
         .unwrap_or_else(|| "zstd/decodecorpus_files/z000033".to_string());
     let bytes = fs::read(&corpus_path).expect("read corpus");
     eprintln!(
-        "DONOR_TRACE_START corpus={} size={} level=1",
+        "FFI_TRACE_START corpus={} size={} level=1",
         corpus_path,
         bytes.len()
     );
@@ -42,9 +42,5 @@ fn main() {
         "ZSTD_compress failed"
     );
 
-    eprintln!(
-        "DONOR_TRACE_END ffi_bytes={} input_bytes={}",
-        rc,
-        bytes.len()
-    );
+    eprintln!("FFI_TRACE_END ffi_bytes={} input_bytes={}", rc, bytes.len());
 }

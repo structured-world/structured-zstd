@@ -427,7 +427,7 @@ fn level22_stays_within_ffi_level22_on_corpus_proxy() {
     let level22 = compress_to_vec(data.as_slice(), CompressionLevel::Level(22));
     assert!(
         level22.len() <= ffi_level22.len(),
-        "Rust Level(22) should not be worse than donor level 22 on corpus proxy. rust_level22={} ffi_level22={}",
+        "Rust Level(22) should not be worse than upstream zstd level 22 on corpus proxy. rust_level22={} ffi_level22={}",
         level22.len(),
         ffi_level22.len()
     );

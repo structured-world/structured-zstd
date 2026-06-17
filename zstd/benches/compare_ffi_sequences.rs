@@ -5,10 +5,10 @@
 //! triples. The tool emits raw diff verdicts —
 //! `Equal` / `Differ` / `RustOnly` / `FfiOnly` — over which a human
 //! triages residual compression-ratio gaps into interpretation classes
-//! ("algorithmic win" where Rust ships a sequence donor missed,
+//! ("algorithmic win" where Rust ships a sequence upstream zstd missed,
 //! "cost source" where both sides emit at the same position but Rust
 //! chose a worse offset/length, "missed match upstream skipped" where
-//! donor emits a sequence Rust didn't). The classification labels are
+//! upstream zstd emits a sequence Rust didn't). The classification labels are
 //! HUMAN-APPLIED reasoning on top of the raw verdicts, not tool output.
 //!
 //! Pipeline:
@@ -20,7 +20,7 @@
 //!    holds the trailing-literal byte count for block `i` (the bytes
 //!    between the last triple and the block end).
 //! 2. FFI side — `ZSTD_generateSequences` against the same `level`. The
-//!    donor emits a per-block stream where every block ends with a
+//!    upstream zstd emits a per-block stream where every block ends with a
 //!    dummy delimiter `(of=0, ml=0, ll=trailing_literals)`. The
 //!    delimiter's `ll` is captured as the FFI-side trailing-literal
 //!    length; remaining sequences are tagged with their block index.
@@ -91,7 +91,7 @@ const MAX_SUPPORTED_LEVEL: i32 = 15;
 /// lines only — so the output stays scannable across all levels.
 const DEFAULT_MAX_DIVERGENCE_ROWS: usize = 30;
 
-/// One sequence captured from the donor (`ZSTD_generateSequences`).
+/// One sequence captured from the upstream zstd (`ZSTD_generateSequences`).
 /// Block delimiters (`of=0 ml=0`) are filtered out before construction.
 #[derive(Clone, Copy, Debug)]
 struct FfiSeq {
@@ -381,7 +381,7 @@ fn run_one(_name: &str, input: &[u8], level: i32, max_rows: usize, dict: Option<
     }
     let total = rows.len().max(1);
     // Wording note: `Differ/RustOnly/FfiOnly` are RAW classifications,
-    // not value judgments. Divergence from the donor is not a bug —
+    // not value judgments. Divergence from the upstream zstd is not a bug —
     // structured-zstd is allowed (and expected) to make different
     // and sometimes better choices. The tool surfaces "where do we
     // pick a different path"; whether each path is a win or
@@ -623,7 +623,7 @@ fn align_and_diff(
 /// non-delimiter sequences tagged with their block index, plus a
 /// parallel vec of trailing-literal lengths indexed by block.
 ///
-/// Donor semantics (from `zstd-sys` bindgen doc): every block ends
+/// Upstream zstd semantics (from `zstd-sys` bindgen doc): every block ends
 /// with a dummy entry `(of=0, ml=0, ll=trailing_literals)`. The
 /// dummy's `litLength` is the bytes between the last real triple of
 /// the block and the block end — needed by the comparator's
@@ -664,7 +664,7 @@ fn ffi_generate_sequences(
         );
         assert_zstd_ok(rc, "ZSTD_CCtx_setParameter(ZSTD_c_compressionLevel)");
         // Mirror the small-input windowLog=14 override used by
-        // `compare_ffi.rs` so the donor parser sees the same window
+        // `compare_ffi.rs` so the upstream zstd parser sees the same window
         // the Rust encoder applies when the source size is hinted
         // down to a 16 KiB frame. Without this, tiny fixtures
         // (e.g. the 16 KiB synthetic log) get parsed against a
@@ -679,7 +679,7 @@ fn ffi_generate_sequences(
             );
             assert_zstd_ok(rc, "ZSTD_CCtx_setParameter(ZSTD_c_windowLog=14)");
         }
-        // Attach the dictionary so the donor parser sees the same primed
+        // Attach the dictionary so the upstream zstd parser sees the same primed
         // state the Rust `set_dictionary_from_bytes` path applies.
         // `ZSTD_CCtx_loadDictionary` auto-detects a serialized dict
         // (magic) vs raw content and seeds the matcher tables, offset
