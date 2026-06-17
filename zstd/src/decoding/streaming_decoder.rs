@@ -20,16 +20,18 @@ use crate::io::{Error, Read};
 /// [FrameDecoder::decode_blocks] repeatedly to decode the entire frame.
 ///
 /// ## Caveat
-/// [StreamingDecoder] expects the underlying stream to only contain a single frame,
-/// yet the specification states that a single archive may contain multiple frames.
+/// Plain `read` / `read_exact` operate on the single frame this decoder was
+/// initialised with: they do not advance into following frames. `read_to_end`,
+/// by contrast, is specialised to consume a finite source to EOF, decoding
+/// concatenated frames and skipping skippable frames along the way.
 ///
-/// To decode all the frames in a finite stream, the calling code needs to recreate
-/// the instance of the decoder and handle
+/// To recover the bytes that follow one frame WITHOUT consuming the rest of the
+/// source, recreate the decoder manually and handle
 /// [crate::decoding::errors::ReadFrameHeaderError::SkipFrame]
 /// errors by skipping forward the `length` amount of bytes, see <https://github.com/KillingSpark/zstd-rs/issues/57>
 ///
 /// ```no_run
-/// // `read_to_end` is not implemented by the no_std implementation.
+/// // `File` is std-only; `read_to_end` itself is available under no_std too.
 /// #[cfg(feature = "std")]
 /// {
 ///     use std::fs::File;
