@@ -586,6 +586,67 @@ mod tests {
         );
     }
 
+    /// The mid-frame fallback grows `output` by `MAX_BLOCK_SIZE` before each
+    /// `self.read`. When that read errors (truncated current frame), the grown
+    /// zero-filled tail must be truncated away before the error propagates, so
+    /// the caller never observes `MAX_BLOCK_SIZE` worth of bytes that were never
+    /// decoded.
+    #[cfg(feature = "std")]
+    #[test]
+    fn read_to_end_truncates_output_on_midframe_fallback_error() {
+        use crate::encoding::{CompressionLevel, CompressionParameters, FrameCompressor};
+        use alloc::vec;
+        use alloc::vec::Vec;
+
+        // Incompressible payload with a window (128 KiB) SMALLER than the input,
+        // so the frame holds several blocks and bytes become collectable while
+        // the frame is still mid-decode. Without a sub-input window the decoder
+        // retains the whole input until the frame finishes, and a partial read
+        // could only ever finish or error, never leave a truncated remainder for
+        // the fallback to trip on.
+        let payload: Vec<u8> = (0..320_000u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+            .collect();
+        let params = CompressionParameters::builder(CompressionLevel::Default)
+            .window_log(17)
+            .build()
+            .expect("window_log within bounds");
+        let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+        compressor.set_parameters(&params);
+        compressor.set_source(payload.as_slice());
+        let mut compressed = Vec::new();
+        compressor.set_drain(&mut compressed);
+        compressor.compress();
+        // Truncate the tail so the final block decode fails partway through.
+        compressed.truncate(compressed.len() - 40);
+
+        let mut decoder = StreamingDecoder::new(compressed.as_slice()).unwrap();
+        // A partial `read` first: leaves the decoder mid-frame so `read_to_end`
+        // takes the grow-and-drain fallback (not the decode-in-place fast path).
+        let mut head = vec![0u8; 4096];
+        let got = decoder.read(&mut head).unwrap();
+        assert!(got > 0);
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&head[..got]);
+        let result = decoder.read_to_end(&mut out);
+        assert!(
+            result.is_err(),
+            "truncated current frame must fail the decode"
+        );
+        assert!(
+            out.len() <= payload.len(),
+            "failed fallback read must not leave a zero-filled tail (len {} > payload {})",
+            out.len(),
+            payload.len()
+        );
+        assert_eq!(
+            out.as_slice(),
+            &payload[..out.len()],
+            "decoded prefix must match the payload, with no appended non-decoded bytes"
+        );
+    }
+
     /// An empty (`Frame_Content_Size = 0`) frame decodes to nothing through the
     /// `read_to_end` fast path — the declared-size validation accepts the valid
     /// case (produced == 0) instead of erroring.
