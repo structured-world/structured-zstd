@@ -1,6 +1,6 @@
 //! Row-based match finder (level 4 default backend).
 //!
-//! Donor parity: mirrors the `ZSTD_row_*` family in `zstd_lazy.c`. The
+//! Upstream zstd parity: mirrors the `ZSTD_row_*` family in `zstd_lazy.c`. The
 //! row hash splits each bucket into `1 << row_log` slots (16 / 32 / 64),
 //! each tagged with a 1-byte hash so the search can skip most slots
 //! without touching the position table.
@@ -23,7 +23,7 @@ use super::match_generator::{
     ROW_TAG_BITS, ROW_TARGET_LEN, RowConfig,
 };
 
-/// Immutable row-hash dictionary index (donor `ZSTD_RowFindBestMatch`'s
+/// Immutable row-hash dictionary index (upstream zstd `ZSTD_RowFindBestMatch`'s
 /// `dictMatchState` probe). Built once over the dictionary region and probed as
 /// ONE fixed-width row (`<= row_entries` tag-matched candidates) AFTER the live
 /// row, so the dict search is bounded (unlike a hash-chain walk) and never
@@ -226,11 +226,11 @@ macro_rules! dispatch_tag_kernel {
 /// Per-tier `#[target_feature]` umbrella over the greedy row kernel: with
 /// the umbrella's features a superset of the tier probe's, the
 /// `#[inline(always)]` loop body AND the tier's `row_probe_*` merge into ONE
-/// compiled function (donor `ZSTD_compressBlock_greedy_row` shape) instead
+/// compiled function (upstream zstd `ZSTD_compressBlock_greedy_row` shape) instead
 /// of paying a non-inlinable `#[target_feature]` call per position.
 /// The greedy row parse BODY as a macro: expanded per tier with the tier's
 /// own SIMD pairing (`$maskmac` tag-match + `$cpl` prefix kernel), with the
-/// probe body expanded inline at the search site — the full donor
+/// probe body expanded inline at the search site — the full upstream zstd
 /// `ZSTD_compressBlock_greedy_row` monolith, one compiled function per tier.
 macro_rules! greedy_parse_body {
     ($m:expr, $handle:expr, $rl:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
@@ -248,12 +248,12 @@ macro_rules! greedy_parse_body {
                 $m.insert_positions::<$rl>(backfill_start, current_abs_start);
             }
 
-            // Donor mls for repcode probes is 4 (`MEM_read32` compare on
+            // Upstream zstd mls for repcode probes is 4 (`MEM_read32` compare on
             // `ip+1` against `ip+1-offset_1`, length extended by
             // `ZSTD_count + 4`). The row matcher's `ROW_MIN_MATCH_LEN = 5`
             // gates the *regular* search via the row-table layout; rep
             // probes are independent of the row table and benefit from
-            // the lower donor threshold (a 4-byte rep is cheap to
+            // the lower upstream zstd threshold (a 4-byte rep is cheap to
             // encode and frequently outperforms emitting the bytes as
             // literals).
             const REP_MIN_MATCH_LEN: usize = 4;
@@ -271,7 +271,7 @@ macro_rules! greedy_parse_body {
             // prefetched, so the probe's row loads (the hottest instructions of
             // this loop — a hash-dependent cache miss per position) overlap the
             // current iteration's tail instead of stalling the next probe.
-            // Donor `ZSTD_RowFindBestMatch` gets the same overlap from its
+            // Upstream zstd `ZSTD_RowFindBestMatch` gets the same overlap from its
             // hash-cache + `ZSTD_row_prefetch` pipeline.
             let mut carried: Option<(usize, (usize, u8))> = None;
 
@@ -281,13 +281,13 @@ macro_rules! greedy_parse_body {
 
                 // (1) Default start = abs_pos + 1: probe the repcode bank
                 //     at the next byte, treating one byte as already
-                //     committed to the literal run. Donor probes only
+                //     committed to the literal run. Upstream zstd probes only
                 //     rep1 here; `repcode_candidate_shared` probes all three
-                //     plus the `ll0` fallback because the donor "ll0" trick
+                //     plus the `ll0` fallback because the upstream zstd "ll0" trick
                 //     is already baked into our shared helper. The extra
                 //     probes only add candidates that have repcode encoding
                 //     costs (cheap), so the ratio direction is positive vs
-                //     donor while still landing in the "greedy via repcode"
+                //     upstream zstd while still landing in the "greedy via repcode"
                 //     algorithmic shape.
                 let rep_probe_pos = abs_pos + 1;
                 let rep_probe_lit_len = lit_len + 1;
@@ -335,7 +335,7 @@ macro_rules! greedy_parse_body {
                 };
 
                 let Some(candidate) = chosen else {
-                    // Donor `kSearchStrength = 8` shifts hard on miss
+                    // Upstream zstd `kSearchStrength = 8` shifts hard on miss
                     // (step grows by `lit_len >> 8`). Empirically on our
                     // corpus that recovers ~30% speed but costs ratio by
                     // dropping hash inserts on long literal runs that
@@ -343,7 +343,7 @@ macro_rules! greedy_parse_body {
                     // `SKIP_STRENGTH = 10` instead — same shape, ~4×
                     // rarer growth, so the step stays at 1 byte until the
                     // literal run hits ~1 KiB and only then begins
-                    // skipping. Lets us keep most of donor's speed
+                    // skipping. Lets us keep most of upstream zstd's speed
                     // characteristic without re-introducing the ratio
                     // drain.
                     const SKIP_STRENGTH: u32 = 10;
@@ -418,7 +418,7 @@ macro_rules! greedy_parse_body {
                     }
                 }
 
-                // Donor's `lazy_generic` has an immediate-repcode loop here
+                // Upstream zstd's `lazy_generic` has an immediate-repcode loop here
                 // (probing `offset_2` after each main emit and swapping
                 // `offset_1 ↔ offset_2` on hit). It was implemented and
                 // shipped in earlier iterations of this method but never
@@ -428,7 +428,7 @@ macro_rules! greedy_parse_body {
                 // rep3 + the `ll0` fallback), and the immediate-rep slot
                 // (`offset_hist[1]` at `lit_len = 0`) is subsumed by the
                 // next main-loop iteration's rep probe of the same slot.
-                // Donor's version is single-rep, so the inner loop catches
+                // Upstream zstd's version is single-rep, so the inner loop catches
                 // hits its main-loop probe wouldn't; ours is three-rep, so
                 // the inner loop is dead by construction. Removed to free
                 // the per-iteration check and keep the parser body lean.
@@ -714,7 +714,7 @@ macro_rules! gen_greedy_monolith {
 }
 
 /// Bind the runtime `row_log` (clamped 4..=6) to the const `ROW_LOG` of a
-/// `*_rl::<K, ROW_LOG>` hot loop. Mirrors the donor's per-rowLog variant
+/// `*_rl::<K, ROW_LOG>` hot loop. Mirrors the upstream zstd's per-rowLog variant
 /// table; the branch is cold (once per block / call).
 macro_rules! dispatch_row_log {
     ($self:ident . $rl_method:ident :: <$k:ty> ( $($arg:expr),* )) => {
@@ -727,7 +727,7 @@ macro_rules! dispatch_row_log {
     };
 }
 
-/// Row tag-match mask kernels as `macro_rules!` bodies (donor
+/// Row tag-match mask kernels as `macro_rules!` bodies (upstream zstd
 /// `ZSTD_row_getMatchMask`). Per the SW-Rust SIMD rule, the SIMD body is a macro
 /// expanded at the call site inside each per-kernel `#[target_feature]` probe so
 /// the vector compare + movemask inline straight-line — `#[inline(always)]` +
@@ -955,15 +955,15 @@ macro_rules! row_probe_body {
             // permanent lhs, exactly as the former trailing
             // `best_len_offset_candidate(rep, row)` merge made it.
             let mut best: Option<MatchCandidate> = $seed;
-            // Donor `ZSTD_RowFindBestMatch` mask iteration: rotate the tag
+            // Upstream zstd `ZSTD_RowFindBestMatch` mask iteration: rotate the tag
             // mask into head (newest-first) order once, then visit ONLY the
             // set bits via tzcnt + clear-lowest. The former per-slot loop
             // burned slot arithmetic + a bit test on EVERY entry (rows are
             // 16-64 wide, typical tag hits 0-2) — ~14% of L10 wall time.
-            // `max_walk` bounds ATTEMPTED candidates (donor `nbAttempts`
+            // `max_walk` bounds ATTEMPTED candidates (upstream zstd `nbAttempts`
             // decrements per mask hit, not per scanned slot), so a depth
             // below the row width searches up to `depth` hits across the
-            // WHOLE row — donor semantics on both the SIMD and scalar tiers
+            // WHOLE row — upstream zstd semantics on both the SIMD and scalar tiers
             // (the scalar arm advances to the next on-the-fly tag hit so
             // its visit order and attempt accounting stay bit-identical to
             // the mask tiers).
@@ -1078,7 +1078,7 @@ macro_rules! row_probe_body {
                 }
             }
 
-            // Dict dual-probe (donor `ZSTD_RowFindBestMatch` `dictMatchState`):
+            // Dict dual-probe (upstream zstd `ZSTD_RowFindBestMatch` `dictMatchState`):
             // one bounded immutable dict row (concat-indexed positions).
             // The candidate budget is SHARED with the live row (upstream
             // zstd decrements one `nbAttempts` across both rows,
@@ -1096,7 +1096,7 @@ macro_rules! row_probe_body {
                 } else {
                     0
                 };
-                // Same donor mask iteration as the live row above.
+                // Same upstream zstd mask iteration as the live row above.
                 #[allow(unused_mut)]
                 let mut dpending: u64 = if $use_mask {
                     let m = dtag_match & entries_bits;
@@ -1277,7 +1277,7 @@ pub(crate) struct RowMatchGenerator {
     pub(crate) row_log: usize,
     pub(crate) search_depth: usize,
     pub(crate) target_len: usize,
-    /// Regular-search min-match floor (donor `cParams.minMatch`). A row
+    /// Regular-search min-match floor (upstream zstd `cParams.minMatch`). A row
     /// candidate must extend to >= `mls` bytes to be accepted. Hoisted to
     /// a local in the parse loops so the per-position compare reads a
     /// register, not this field. Default `ROW_MIN_MATCH_LEN` (5).
@@ -1288,7 +1288,7 @@ pub(crate) struct RowMatchGenerator {
     pub(crate) row_heads: Vec<u8>,
     // Absolute match positions, one per row slot. Stored as `u32` (not
     // `usize`): this is the largest match-finder array, and `u32` halves its
-    // footprint vs the donor-parity `U32` layout. `ROW_EMPTY_SLOT == u32::MAX`
+    // footprint vs the upstream zstd-parity `U32` layout. `ROW_EMPTY_SLOT == u32::MAX`
     // is the empty sentinel, so every stored position must stay strictly below
     // it. On a long stream the cumulative absolute cursor would cross `u32::MAX`
     // even while the live window is bounded; `add_data` rebases the coordinate
@@ -1310,7 +1310,7 @@ pub(crate) struct RowMatchGenerator {
         allow(dead_code)
     )]
     tag_kernel: FastpathKernel,
-    /// Attached immutable dictionary row index (donor `dictMatchState`). `Some`
+    /// Attached immutable dictionary row index (upstream zstd `dictMatchState`). `Some`
     /// activates the bounded dict probe in `row_candidate_rl`; built once and
     /// cached across frames via `DictAttach`, invalidated on eviction / resize.
     pub(crate) dict: DictAttach<RowDictTables>,
@@ -1378,11 +1378,11 @@ impl RowMatchGenerator {
     }
 
     pub(crate) fn set_hash_bits(&mut self, bits: usize) {
-        // Deliberate deviation from donor hashLog 21-23 on L9-12: the
+        // Deliberate deviation from upstream zstd hashLog 21-23 on L9-12: the
         // 20-bit cap keeps the row table L2/L3-resident. Measured on the
         // 1 MiB corpus at L10 (tight pair, flat control): the honest
         // 21-bit table cost +26.8% wall for a 19-byte output delta — our
-        // lazy-band ratio already beats the donor with the capped width.
+        // lazy-band ratio already beats the upstream zstd with the capped width.
         let clamped = bits.clamp(self.row_log + 1, ROW_HASH_BITS);
         let row_hash_log = clamped.saturating_sub(self.row_log);
         if self.row_hash_log != row_hash_log {
@@ -1420,9 +1420,9 @@ impl RowMatchGenerator {
         // coordinate floor past everything ever inserted. Stale entries all
         // hold positions below the new floor, so the probes' existing
         // `candidate_pos < self.history_abs_start` window check rejects them
-        // without any clearing — the donor's persistent-index design. Stale
+        // without any clearing — the upstream zstd's persistent-index design. Stale
         // TAGS can still produce the occasional false mask hit whose
-        // candidate then fails the window check; the donor's tag table
+        // candidate then fails the window check; the upstream zstd's tag table
         // persists across frames with the same behaviour.
         let next_floor = self.history_abs_start + (self.history.len() - self.history_start);
         self.window_size = 0;
@@ -1600,7 +1600,7 @@ impl RowMatchGenerator {
                 // Dense seeding requested by the caller: the entire
                 // skipped range must remain queryable so subsequent
                 // blocks can match into it. Currently only used by the
-                // dictionary-priming path (donor's
+                // dictionary-priming path (upstream zstd's
                 // `ZSTD_loadDictionaryContent` does the same dense fill
                 // via `ZSTD_row_update_internalImpl` over every dict
                 // byte), but the semantic is "dense fill on demand" and
@@ -1610,8 +1610,8 @@ impl RowMatchGenerator {
                 self.insert_positions::<ROW_LOG>(current_abs_start, current_abs_end);
             }
             None => {
-                // Donor parity: a plain `skip_matching` (no hint) leaves
-                // the row table untouched for the skipped range. Donor's
+                // Upstream zstd parity: a plain `skip_matching` (no hint) leaves
+                // the row table untouched for the skipped range. Upstream zstd's
                 // `ZSTD_row_fillHashCache` only pre-fills the next-scan
                 // cache (8 positions of lookahead for SIMD prefetch); it
                 // does NOT retroactively insert every byte of a skipped
@@ -1628,7 +1628,7 @@ impl RowMatchGenerator {
                 // that call's `current_abs_start` lands at
                 // `current_abs_end`. So a parse of block N+1 sees
                 // block N's tail in the row table but not its
-                // interior, matching donor.
+                // interior, matching upstream zstd.
                 //
                 // Trade: cross-block matches into a skipped block's
                 // interior are lost (rare in practice — `skip_matching`
@@ -1641,7 +1641,7 @@ impl RowMatchGenerator {
             }
         }
     }
-    /// Donor-parity greedy parse for `lazy_depth == 0` (level 5).
+    /// Upstream zstd-parity greedy parse for `lazy_depth == 0` (level 5).
     ///
     /// Mirrors `ZSTD_compressBlock_lazy_generic` (`zstd_lazy.c:1560`) with
     /// `depth == 0`, `dictMode == ZSTD_noDict`. The structural features
@@ -1650,7 +1650,7 @@ impl RowMatchGenerator {
     ///
     /// 1. **Default `start = pos + 1`**: each iteration first probes the
     ///    repcode bank at `abs_pos + 1` (treating one literal byte as
-    ///    already committed). Donor's `start = ip + 1; matchLength = 0;
+    ///    already committed). Upstream zstd's `start = ip + 1; matchLength = 0;
     ///    offBase = REPCODE1_TO_OFFBASE;` at the top of the loop body.
     ///    Only if a regular match at `abs_pos` is strictly longer does
     ///    `start` slide back to `abs_pos`. This trades one literal byte
@@ -1660,37 +1660,37 @@ impl RowMatchGenerator {
     ///    regular match (9-13 bits) whenever the rep hit is close to
     ///    matching the regular match's length.
     ///
-    /// 2. **Hybrid commit, not donor's pure `goto _storeSequence`**:
-    ///    donor's depth-0 path jumps to `_storeSequence` on the first
+    /// 2. **Hybrid commit, not upstream zstd's pure `goto _storeSequence`**:
+    ///    upstream zstd's depth-0 path jumps to `_storeSequence` on the first
     ///    repcode hit and skips the regular search at `abs_pos`. We
     ///    deviate here — both the rep probe at `abs_pos + 1` *and* the
     ///    regular `row_candidate(abs_pos, ..)` are evaluated each
     ///    iteration, and the longer match wins (ties go to rep for
-    ///    cheaper encoding via [`best_len_offset_candidate`]). Donor
+    ///    cheaper encoding via [`best_len_offset_candidate`]). Upstream zstd
     ///    can afford pure commit-on-first-rep because it recovers any
     ///    ratio loss via superblock-level entropy sharing, which we
     ///    don't replicate yet, so the hybrid form avoids a measured
     ///    ratio cliff on decodecorpus. (The row accept floor itself now
-    ///    matches donor's `minMatch = 5` via `ROW_MIN_MATCH_LEN`; the
+    ///    matches upstream zstd's `minMatch = 5` via `ROW_MIN_MATCH_LEN`; the
     ///    remaining un-replicated piece is the cross-block entropy
     ///    sharing, not the match-length threshold.) The hybrid form
-    ///    still skips the donor `lazy_depth == 1` lookahead probe
+    ///    still skips the upstream zstd `lazy_depth == 1` lookahead probe
     ///    that [`start_matching`] above runs unconditionally — the
-    ///    speed shape stays donor-like.
+    ///    speed shape stays upstream zstd-like.
     ///
-    /// 3. **Skip-step grows with literal-run length**: on a miss donor
+    /// 3. **Skip-step grows with literal-run length**: on a miss upstream zstd
     ///    advances `ip += ((ip - anchor) >> kSearchStrength) + 1` with
     ///    `kSearchStrength = 8`. The plain matcher steps by 1 — denser
-    ///    hash inserts (mild ratio benefit), but the donor parity skip
+    ///    hash inserts (mild ratio benefit), but the upstream zstd parity skip
     ///    halves the per-byte work on incompressible runs (the
-    ///    `lazySkipping` mode in donor is an extension of the same idea).
+    ///    `lazySkipping` mode in upstream zstd is an extension of the same idea).
     ///
-    /// Donor has an immediate-rep loop after store that probes
+    /// Upstream zstd has an immediate-rep loop after store that probes
     /// `offset_2` for back-to-back hits. It is omitted here: the
     /// main-loop rep probe at `abs_pos + 1` already evaluates all
-    /// three rep slots (rep1, rep2, rep3 + the donor `ll0` fallback)
+    /// three rep slots (rep1, rep2, rep3 + the upstream zstd `ll0` fallback)
     /// via [`repcode_candidate_shared`], so the inner-loop slot
-    /// donor's single-rep design would catch is already covered by
+    /// upstream zstd's single-rep design would catch is already covered by
     /// the next main-loop iteration. Confirmed dead-on-arrival via a
     /// `panic!` probe across the full 528-test suite + benchmark
     /// matrix (never fires).
@@ -1819,7 +1819,7 @@ impl RowMatchGenerator {
         }
     }
 
-    /// Row hash key at `idx`: `key_len` bytes (donor `mls`, 5-6 on the row
+    /// Row hash key at `idx`: `key_len` bytes (upstream zstd `mls`, 5-6 on the row
     /// levels) via one masked 8-byte read, degrading to the 4-byte key in
     /// the last <8 bytes of the window. Shared by the live hash and the
     /// dictionary row-index build — the two MUST bucket identically or
@@ -1831,7 +1831,7 @@ impl RowMatchGenerator {
     /// case — the bytes following them exist only at probe time, so no
     /// fixed build-time key (4-byte, zero-padded, or otherwise) can match
     /// the probe's real-byte key there. Those few dict-tail entries stay
-    /// unreachable, mirroring the donor, whose dictionary load also stops
+    /// unreachable, mirroring the upstream zstd, whose dictionary load also stops
     /// hashing short of the dictionary end.
     #[inline(always)]
     fn row_key_value(concat: &[u8], idx: usize, key_len: usize) -> u64 {
@@ -1850,7 +1850,7 @@ impl RowMatchGenerator {
         if idx + ROW_HASH_KEY_LEN > concat.len() {
             return None;
         }
-        // Donor `ZSTD_hashPtrSalted` hashes `mls` bytes (5-6 on the row
+        // Upstream zstd `ZSTD_hashPtrSalted` hashes `mls` bytes (5-6 on the row
         // levels), not 4: a wider key cuts the false tag hits whose
         // candidates then cost a data load + reject in the probe. Read 8
         // bytes and mask to the key width when the tail allows; the last
@@ -2275,7 +2275,7 @@ impl RowMatchGenerator {
         }
     }
 
-    /// Index a just-emitted match span, mirroring the donor
+    /// Index a just-emitted match span, mirroring the upstream zstd
     /// `ZSTD_row_update_internal` skip-threshold (`zstd_lazy.c:922-940`):
     /// when the span exceeds `SKIP_THRESHOLD` positions, only the first
     /// `MAX_START` and last `MAX_END` are indexed and the interior is
@@ -2283,7 +2283,7 @@ impl RowMatchGenerator {
     /// O(matchlen) and dominates encode time on periodic inputs (e.g.
     /// repeated log lines), where a single greedy/lazy match can span an
     /// entire block: that O(matchlen) fill, not the search, is what left
-    /// the row backend ~11x slower than FFI on those streams. The donor
+    /// the row backend ~11x slower than FFI on those streams. The upstream zstd
     /// caps the fill at 96 + 32 positions regardless of match length.
     fn insert_match_span<const ROW_LOG: usize>(&mut self, start: usize, end: usize) {
         const SKIP_THRESHOLD: usize = 384;
@@ -2397,7 +2397,7 @@ impl RowMatchGenerator {
         self.dict.invalidate();
     }
 
-    /// Donor `ZSTD_RowFindBestMatch` `dictMatchState` attach: index the
+    /// Upstream zstd `ZSTD_RowFindBestMatch` `dictMatchState` attach: index the
     /// just-committed dictionary block (current `chunk_lens` tail) into the
     /// SEPARATE immutable dict row tables instead of the live ones, so the live
     /// rows carry only input and the dict is never re-indexed per frame. The

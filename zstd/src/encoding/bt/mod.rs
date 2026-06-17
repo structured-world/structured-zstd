@@ -1,6 +1,6 @@
 //! Binary-tree match finder used by `BtOpt` / `BtUltra` / `BtUltra2`.
 //!
-//! Hosts the BT-side per-frame state: the donor `optStatePtr_t` cost
+//! Hosts the BT-side per-frame state: the upstream zstd `optStatePtr_t` cost
 //! model (`opt_state`), the optimal-parser scratch buffers
 //! (`opt_*_scratch` / `opt_*_generation` / `opt_*_stamp`), and the
 //! LDM long-distance match buffer (`ldm_sequences`). Method bodies
@@ -12,7 +12,7 @@
 //! ownership boundary mirror to Stage 1 (`MatchTable`) and Stage 2
 //! (`HcMatcher`).
 //!
-//! Donor parity reference: `lib/compress/zstd_opt.c`,
+//! Upstream zstd parity reference: `lib/compress/zstd_opt.c`,
 //! `ZSTD_compressBlock_opt_generic` and friends.
 
 #![allow(dead_code)]
@@ -25,7 +25,7 @@ use super::ldm::LdmProducer;
 use super::opt::ldm::{HcOptLdmState, HcRawSeq, HcRawSeqStore};
 use super::opt::types::{HcOptimalNode, HcOptimalPlanBuffers, HcOptimalSequence, MatchCandidate};
 
-/// Maximum offset reachable by the HC3 short-match probe. Donor
+/// Maximum offset reachable by the HC3 short-match probe. Upstream zstd
 /// parity: keeps the 3-byte side table from emitting offsets that
 /// the main BT/HC paths would address more efficiently. Used inside
 /// the `hash3_candidate_body!` macro that the kernel-specific
@@ -38,7 +38,7 @@ pub(crate) const HC3_MAX_OFFSET: usize = 1 << 18;
 /// shared [`super::match_table::storage::MatchTable`].
 #[derive(Clone)]
 pub(crate) struct BtMatcher {
-    /// Donor `optStatePtr_t` — Huffman / FSE-derived literal and
+    /// Upstream zstd `optStatePtr_t` — Huffman / FSE-derived literal and
     /// sequence-symbol cost tables that drive the optimal parser.
     pub(crate) opt_state: HcOptState,
     /// Per-frame scratch for the optimal-parse node stream. Fixed-size
@@ -99,7 +99,7 @@ pub(crate) struct BtMatcher {
 }
 
 impl BtMatcher {
-    /// BT/HC hash MLS (minimum-length-segment) parameter. Donor
+    /// BT/HC hash MLS (minimum-length-segment) parameter. Upstream zstd
     /// parity: even when `minMatch == 3` (btultra2), the main BT/HC
     /// hash still goes through `ZSTD_hashPtr(…, mls)` which falls
     /// back to the default `case 4` in
@@ -224,7 +224,7 @@ impl BtMatcher {
         }
     }
 
-    /// Donor parity: `ZSTD_optLdm_skipRawSeqStoreBytes`. Fast-forward the
+    /// Upstream zstd parity: `ZSTD_optLdm_skipRawSeqStoreBytes`. Fast-forward the
     /// raw LDM seq store cursor by `nb_bytes`, consuming whole stored
     /// sequences and leaving a partial-sequence offset in `pos_in_sequence`.
     pub(crate) fn ldm_skip_raw_seq_store_bytes(
@@ -249,7 +249,7 @@ impl BtMatcher {
         }
     }
 
-    /// Donor parity: `ZSTD_optLdm_maybeAddMatch` / its preamble in
+    /// Upstream zstd parity: `ZSTD_optLdm_maybeAddMatch` / its preamble in
     /// `ZSTD_optLdm_getNextMatch`. Advance the per-block LDM window
     /// markers to the next raw LDM sequence and skip its literals.
     pub(crate) fn ldm_get_next_match_and_update_seq_store(
@@ -303,7 +303,7 @@ impl BtMatcher {
         }
     }
 
-    /// Donor parity: `ZSTD_optLdm_maybeAddMatch`. Convert the active LDM
+    /// Upstream zstd parity: `ZSTD_optLdm_maybeAddMatch`. Convert the active LDM
     /// window (open/close cursors set by
     /// [`ldm_get_next_match_and_update_seq_store`]) into a usable
     /// `MatchCandidate` when the current position falls inside it.
@@ -332,7 +332,7 @@ impl BtMatcher {
         })
     }
 
-    /// Donor parity: `ZSTD_optLdm_processMatchCandidate`. Wraps
+    /// Upstream zstd parity: `ZSTD_optLdm_processMatchCandidate`. Wraps
     /// [`ldm_maybe_add_match`] with a re-seed step when the parser has
     /// stepped past the current LDM window.
     pub(crate) fn ldm_process_match_candidate(
@@ -359,7 +359,7 @@ impl BtMatcher {
         self.ldm_maybe_add_match(opt_ldm, curr_pos_in_block, min_match)
     }
 
-    /// Donor parity: restore the seven per-frame scratch buffers that
+    /// Upstream zstd parity: restore the seven per-frame scratch buffers that
     /// `build_optimal_plan_impl!` borrowed via `core::mem::take`. The
     /// passed `result` tuple is the parser's `(offset, reps, litlen,
     /// match_len)` return value — kept untouched and returned so the
@@ -385,7 +385,7 @@ impl BtMatcher {
         result
     }
 
-    /// Donor parity: `ZSTD_ldm_blockCompress` seeds external
+    /// Upstream zstd parity: `ZSTD_ldm_blockCompress` seeds external
     /// long-distance match candidates here when `enableLdm ==
     /// ZSTD_ps_enable`. The default Rust encoder still keeps LDM
     /// disabled (`ldm_producer = None`); when an external caller
@@ -475,8 +475,8 @@ impl BtMatcher {
         }
     }
 
-    /// Donor parity: `ZSTD_storeSeq` — encode `actual_offset` into the
-    /// donor's compact offset base (1/2/3 for rep slots, otherwise
+    /// Upstream zstd parity: `ZSTD_storeSeq` — encode `actual_offset` into the
+    /// upstream zstd's compact offset base (1/2/3 for rep slots, otherwise
     /// `actual_offset + 3`) and update the rolling `reps` window in
     /// lock-step. Returns `(off_base, next_reps)`. The non-rep branch
     /// uses `saturating_add` so a `u32` near `u32::MAX` (only possible
@@ -569,7 +569,7 @@ impl BtMatcher {
         }
     }
 
-    /// Donor parity: replay an already-emitted plan segment through the
+    /// Upstream zstd parity: replay an already-emitted plan segment through the
     /// `optStatePtr_t` stats updater so the next parse pass sees frozen
     /// counts. Pure static helper — only mutates the caller-owned
     /// `opt_state` / `reps` / `literals_start`.
@@ -630,7 +630,7 @@ impl BtMatcher {
     #[inline(always)]
     pub(crate) fn reset_opt_node(node: &mut HcOptimalNode) {
         // Price is reset separately via `node_prices` (see `reset_opt_nodes`);
-        // here we only mark the slot not end-of-match. Donor parity: stale mlen
+        // here we only mark the slot not end-of-match. Upstream zstd parity: stale mlen
         // is ignored while the (separately-held) price is MAX and litlen != 0.
         node.litlen = u32::MAX;
     }
@@ -811,7 +811,7 @@ mod ldm_helper_tests {
 
         let mut bt = BtMatcher::new();
         // Activate the producer with hand-tuned small params —
-        // the donor btultra2 defaults (`with_window_and_strategy(27, 9)`)
+        // the upstream zstd btultra2 defaults (`with_window_and_strategy(27, 9)`)
         // would allocate `1 << 23 = 8M` entries × 8 bytes = 64 MiB
         // for a table this test never actually populates beyond a
         // handful of entries. Build a 10-bit hash log instead so
@@ -826,7 +826,7 @@ mod ldm_helper_tests {
         }));
 
         // 256 bytes of arbitrary content — enough for the gear
-        // hash to make progress against the donor btultra2
+        // hash to make progress against the upstream zstd btultra2
         // `min_match_length = 32`.
         let history: alloc::vec::Vec<u8> = (0u8..=255).collect();
 

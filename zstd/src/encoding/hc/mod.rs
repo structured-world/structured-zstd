@@ -10,7 +10,7 @@
 //! ownership boundary so the BT-side extraction in Stage 3 has a
 //! clean counterpart type to mirror.
 //!
-//! Donor parity reference: `lib/compress/zstd_lazy.c`,
+//! Upstream zstd parity reference: `lib/compress/zstd_lazy.c`,
 //! `ZSTD_HcFindBestMatch` / `ZSTD_compressBlock_lazy2_generic`.
 
 #![allow(dead_code)]
@@ -21,7 +21,7 @@ use super::match_table::storage::{HC_EMPTY, MatchTable};
 use super::opt::types::MatchCandidate;
 
 /// Minimum match length emitted by the lazy / lazy2 chain walker.
-/// Donor parity: `MIN_MATCH` in `lib/compress/zstd_lazy.c`.
+/// Upstream zstd parity: `MIN_MATCH` in `lib/compress/zstd_lazy.c`.
 pub(crate) const HC_MIN_MATCH_LEN: usize = 4;
 
 /// Hard cap on chain-walk depth. Used to size the fixed-length
@@ -37,18 +37,18 @@ pub(crate) const MAX_HC_SEARCH_DEPTH: usize = 512;
 /// borrows when it runs.
 #[derive(Clone)]
 pub(crate) struct HcMatcher {
-    /// Lookahead depth (1 = lazy, 2 = lazy2). Donor parity:
+    /// Lookahead depth (1 = lazy, 2 = lazy2). Upstream zstd parity:
     /// `params->cParams.strategy >= ZSTD_lazy2`.
     pub(crate) lazy_depth: u8,
     /// Maximum number of chain entries inspected per `find_best_match`
-    /// call. Donor parity: `params->cParams.searchLog` (clamped to
+    /// call. Upstream zstd parity: `params->cParams.searchLog` (clamped to
     /// [`MAX_HC_SEARCH_DEPTH`](super::match_generator::MAX_HC_SEARCH_DEPTH)
     /// for HC mode; BT modes use the unclamped value as their walk
     /// budget).
     pub(crate) search_depth: usize,
     /// "Sufficient" match length — once a candidate reaches this
     /// length, the lazy decision short-circuits without checking the
-    /// next position. Donor parity:
+    /// next position. Upstream zstd parity:
     /// `params->cParams.targetLength`.
     pub(crate) target_len: usize,
 }
@@ -62,7 +62,7 @@ impl HcMatcher {
         }
     }
 
-    /// Donor "match gain" heuristic: `match_len * 4 - offset_bits`.
+    /// Upstream zstd "match gain" heuristic: `match_len * 4 - offset_bits`.
     /// The lazy lookahead uses this to compare a candidate at the
     /// current position against one a byte (or two) ahead. Pure
     /// associated function — kept off `&self` so it can be called
@@ -122,7 +122,7 @@ impl HcMatcher {
         let mut steps = 0;
         // Cap both the loop bound and the result-fill bound at
         // MAX_HC_SEARCH_DEPTH so a misconfigured `search_depth >
-        // MAX_HC_SEARCH_DEPTH` (BT modes set it from the donor config,
+        // MAX_HC_SEARCH_DEPTH` (BT modes set it from the upstream zstd config,
         // which can exceed 64) cannot index past `buf`'s fixed size.
         let max_chain_steps = self.search_depth.min(MAX_HC_SEARCH_DEPTH);
         while filled < max_chain_steps && steps < max_chain_steps {
@@ -172,7 +172,7 @@ impl HcMatcher {
         buf
     }
 
-    /// Probe the 3 rep-code offsets (with the donor `ll0 ↦ rep[0] − 1`
+    /// Probe the 3 rep-code offsets (with the upstream zstd `ll0 ↦ rep[0] − 1`
     /// fallback) and return the best in-range match. Pure helper —
     /// only reads from `MatchTable`, no HcMatcher state needed.
     pub(crate) fn repcode_candidate(
@@ -246,7 +246,7 @@ impl HcMatcher {
         // memcpy on return). At lazy_depth=2 (L7+) `pick_lazy_match`
         // triggers up to three chain walks per committed position, so
         // the array form costs ~12 KiB of stack traffic per accepted
-        // match. Donor (`zstd_lazy.c` `ZSTD_HcFindBestMatch`) runs a
+        // match. Upstream zstd (`zstd_lazy.c` `ZSTD_HcFindBestMatch`) runs a
         // single fused loop with no intermediate buffer; mirror that.
         //
         // `chain_candidates` itself is still alive — the chain-walk
@@ -261,13 +261,13 @@ impl HcMatcher {
         let mut cur = table.hash_table[hash];
         // Cap loop at MAX_HC_SEARCH_DEPTH so a misconfigured
         // `search_depth > MAX_HC_SEARCH_DEPTH` (BT modes set it from the
-        // donor config, which can exceed our cap) cannot run forever.
+        // upstream zstd config, which can exceed our cap) cannot run forever.
         let max_chain_steps = self.search_depth.min(MAX_HC_SEARCH_DEPTH);
         let mut steps = 0usize;
         let history_abs_start = table.history_abs_start;
 
         let mut best: Option<MatchCandidate> = None;
-        // Donor speculative tail check (`zstd_lazy.c:714`,
+        // Upstream zstd speculative tail check (`zstd_lazy.c:714`,
         // `ZSTD_HcFindBestMatch`): once `best` is set, gate the
         // expensive `common_prefix_len` walk on a 4-byte tail compare
         // proving the new candidate can possibly reach the *forward*
@@ -316,10 +316,10 @@ impl HcMatcher {
         //   walks we fall through to the full `common_prefix_len` so
         //   the offset-bits advantage is given a chance to win.
         let history_tail = concat.len();
-        // Raw base pointer for the donor-style `MEM_read32` 4-byte gates below
+        // Raw base pointer for the upstream zstd-style `MEM_read32` 4-byte gates below
         // (single unaligned load each, no per-candidate slice bounds check).
         let base_ptr = concat.as_ptr();
-        // Loop-invariant precompute, hoisted out of the chain walk (donor:
+        // Loop-invariant precompute, hoisted out of the chain walk (upstream zstd:
         // `lowLimit` + base pointers are set once before the loop). Candidates
         // are tracked in history-RELATIVE index space so each step is a single
         // `add` + range check + 4-byte gate, mirroring `ZSTD_HcFindBestMatch`'s
@@ -371,7 +371,7 @@ impl HcMatcher {
                     // gate's git history. Briefly: under the monotonicity
                     // precondition above, bounds-fail proves no in-range
                     // candidate at this `current_idx` can outscore `best`.
-                    // Raw unaligned `u32` load+compare (donor `MEM_read32`)
+                    // Raw unaligned `u32` load+compare (upstream zstd `MEM_read32`)
                     // instead of a bounds-checked slice equality — same 4-byte
                     // tail test, one load each, no `[a..b]` bounds panic path.
                     if i_end > history_tail || m_end > history_tail {
@@ -390,14 +390,14 @@ impl HcMatcher {
                 }
 
                 // Cheap 4-byte equality gate before the wider SIMD count
-                // (donor `MEM_read32` gate in `ZSTD_HcFindBestMatch`).
+                // (upstream zstd `MEM_read32` gate in `ZSTD_HcFindBestMatch`).
                 // `HC_MIN_MATCH_LEN == 4`, so a first-4-byte mismatch can never
                 // reach the match floor — reject without the vector
                 // load+count+tzcnt. On dict-primed chains over low-match
                 // (random) input, where `best` stays `None` so the speculative
                 // tail gate above never fires, this rejects the bulk of chain
                 // candidates on a scalar compare instead of a full
-                // `common_prefix_len`. Raw unaligned `u32` load+compare (donor
+                // `common_prefix_len`. Raw unaligned `u32` load+compare (upstream zstd
                 // `MEM_read32`), not a bounds-checked slice equality. Falls
                 // through to the full count when either side lacks a 4-byte
                 // lookahead (the count handles short tails), so the accepted
@@ -445,7 +445,7 @@ impl HcMatcher {
         // dict-only code never bloats this hot function on no-dict frames, where
         // the `is_some` guard is a single not-taken branch. `dms_chain_walk`
         // continues the SAME `steps` budget, so live + dms stay one bounded
-        // operation (donor's single `nbAttempts`).
+        // operation (upstream zstd's single `nbAttempts`).
         if DICT && table.dms.is_primed() {
             best = self.dms_chain_walk(
                 table,
@@ -579,7 +579,7 @@ impl HcMatcher {
         Self::better_candidate(rep, hash)
     }
 
-    /// Donor `lazy` / `lazy2` lookahead: evaluate the match a byte
+    /// Upstream zstd `lazy` / `lazy2` lookahead: evaluate the match a byte
     /// (and optionally two) ahead before committing the current one.
     /// Returns `Some(best)` if the current match wins, `None` if the
     /// caller should defer.
@@ -833,7 +833,7 @@ impl HcMatcher {
 
     /// Walk a candidate match backwards over the literal run so the
     /// matcher can absorb literal bytes that happen to match the byte
-    /// preceding the candidate. Donor parity: equivalent to the back
+    /// preceding the candidate. Upstream zstd parity: equivalent to the back
     /// extend inside `ZSTD_HcFindBestMatch` before committing a
     /// sequence.
     ///
@@ -866,9 +866,9 @@ impl HcMatcher {
         }
     }
 
-    /// Donor parity: per-pass clamp of the "good enough — stop probing"
+    /// Upstream zstd parity: per-pass clamp of the "good enough — stop probing"
     /// threshold that the optimal parser passes to the BT/HC walkers.
-    /// Reflects donor `ZSTD_compressBlock_opt_generic` which caps the
+    /// Reflects upstream zstd `ZSTD_compressBlock_opt_generic` which caps the
     /// profile's `sufficient_match_len` by the user-configured
     /// `targetLength` and the `HC_OPT_NUM` ceiling.
     pub(crate) fn sufficient_match_len_for_pass(&self, profile: HcOptimalCostProfile) -> usize {

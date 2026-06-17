@@ -85,17 +85,17 @@ pub(crate) fn sequence_output_fits(
 /// impl is the no-wrap shape of the same contract.
 pub(crate) trait BufferBackend: Sized {
     /// `true` when the backend can execute a single sequence via the
-    /// donor-shape inline `exec_sequence_inline` path (literal
+    /// upstream zstd-shape inline `exec_sequence_inline` path (literal
     /// copy + match copy in one straight-line body, no per-call
     /// dispatch through `extend` / `repeat`). Defaults to `false`;
     /// `UserSliceBackend` overrides to `true` on `x86_64` only —
-    /// 32-bit `x86` is excluded because the donor helpers emit SSE2
+    /// 32-bit `x86` is excluded because the upstream zstd helpers emit SSE2
     /// intrinsics without a `#[target_feature]` gate, and pre-SSE2
     /// i386 / i486 / i586 baselines would SIGILL.
     ///
     /// Reads of this const at the dispatch site fold to a compile-time
     /// branch the optimiser dead-eliminates — the unused arm
-    /// (donor body on `FlatBuf` / `RingBuffer`, existing
+    /// (upstream zstd body on `FlatBuf` / `RingBuffer`, existing
     /// `push`/`repeat` body on `UserSliceBackend`) carries no runtime
     /// cost.
     const SUPPORTS_INLINE_SEQUENCE_EXEC: bool = false;
@@ -113,10 +113,10 @@ pub(crate) trait BufferBackend: Sized {
     /// const: the dispatch-site branch folds away per backend.
     const INLINE_EXEC_MAINTAINS_OUTPUT_COUNTER: bool = true;
 
-    /// Donor's `ZSTD_execSequence` body
+    /// Upstream zstd's `ZSTD_execSequence` body
     /// (zstd_decompress_block.c:1008-1105). Writes `lit_length` bytes
     /// from `lit_src` at the current tail, then writes `match_length`
-    /// bytes via the donor offset-dispatch (offset ≥ 16 → wildcopy
+    /// bytes via the upstream zstd offset-dispatch (offset ≥ 16 → wildcopy
     /// no-overlap; offset 1..=15 → overlapCopy8 + wildcopy
     /// overlap-src-before-dst).
     ///
@@ -128,7 +128,7 @@ pub(crate) trait BufferBackend: Sized {
     ///
     /// # Safety
     /// - `lit_src` MUST be derived from the FULL parent literals
-    ///   buffer's `as_ptr()` (not a sub-slice). The donor body issues
+    ///   buffer's `as_ptr()` (not a sub-slice). The upstream zstd body issues
     ///   an unconditional 16-byte `_mm_loadu_si128` regardless of
     ///   `lit_length`; reads through `lit_src` must stay within the
     ///   parent buffer's allocated provenance even when
@@ -141,9 +141,9 @@ pub(crate) trait BufferBackend: Sized {
     ///   the regular case; for direct decode the slice's
     ///   `WILDCOPY_OVERLENGTH` slack covers the wildcopy overshoot).
     /// - `offset >= 1` and `offset <= self.len() + lit_length`
-    ///   (donor's `oLitEnd - offset` precondition).
+    ///   (upstream zstd's `oLitEnd - offset` precondition).
     /// - `match_length >= 1`.
-    /// - **Read-side slack on the parent literals buffer**: the donor
+    /// - **Read-side slack on the parent literals buffer**: the upstream zstd
     ///   literal-copy path issues an unconditional `copy16` from
     ///   `lit_src` and, when `lit_length > 16`, a 16-byte-stride
     ///   wildcopy whose final iteration's last byte read is at
@@ -233,7 +233,7 @@ pub(crate) trait BufferBackend: Sized {
     /// caller MUST be in `#[target_feature(enable = "avx2,bmi2")]`
     /// scope (the only call site is the AVX2-tier execute path which
     /// satisfies this), and the destination slack at the writable
-    /// tail MUST be ≥ 31 bytes past `tail + total` (donor's 16-byte
+    /// tail MUST be ≥ 31 bytes past `tail + total` (upstream zstd's 16-byte
     /// SIMD-copy overshoot bound doubles for 32-byte ymm stride).
     #[allow(unused_variables, unused_mut, dead_code)]
     #[inline(always)]
@@ -596,7 +596,7 @@ pub(crate) trait BufferBackend: Sized {
 /// diagnostic context. The decoder converts this into one of two
 /// structured variants on the way out of `FrameDecoder`:
 /// `ExecuteSequencesError::OutputBufferOverflow` (literal-push and
-/// donor-inline paths inside the sequence executor) or
+/// upstream zstd-inline paths inside the sequence executor) or
 /// `DecodeBufferError::OutputBufferOverflow` (the match-repeat
 /// `try_reserve` pre-check inside `DecodeBuffer::repeat_inner`).
 /// On the direct-decode path both are folded by

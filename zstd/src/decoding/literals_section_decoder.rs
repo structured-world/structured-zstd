@@ -70,7 +70,7 @@ pub struct LiteralsView<'a> {
 /// through `target` because they have to produce new bytes (RLE: N
 /// copies of one byte; HUF: indexed burst writes).
 ///
-/// Donor parity: `dctx->litPtr` is set to either `src` (Raw) or
+/// Upstream zstd parity: `dctx->litPtr` is set to either `src` (Raw) or
 /// `dctx->litBuffer` (HUF); the seq executor reads from
 /// `dctx->litPtr` uniformly.
 pub fn decode_literals_zerocopy<'a>(
@@ -84,7 +84,7 @@ pub fn decode_literals_zerocopy<'a>(
     // pre-existing tail the caller forgot to `clear()`. The current
     // in-tree callers clear before this call, but anchoring the
     // view at `base..` makes the API robust against future
-    // misuse and matches donor's `dctx->litPtr` semantics (always
+    // misuse and matches upstream zstd's `dctx->litPtr` semantics (always
     // points at the current frame's literals, never carries
     // history from earlier blocks' Vecs).
     let base = target.len();
@@ -340,13 +340,13 @@ fn decompress_literals_impl<K: CpuKernel>(
         let ends: [usize; 4] = [starts[1], starts[2], starts[3], limit];
         let mut cursors = starts;
 
-        // Donor-parity 4-stream HUF decode. `bits[s]` is the fused
+        // Upstream zstd-parity 4-stream HUF decode. `bits[s]` is the fused
         // state+stream+sentinel u64 register (see `run_4stream_burst_loop`).
         // Each iter decodes `symbols_per_burst` symbols × 4 streams,
         // then reloads all 4 stream registers via `ip[s] -= nb_bytes;
         // MEM_read64(ip[s]) | 1`.
         let max_num_bits = table.max_num_bits;
-        // Safety constraint per donor `HUF_decompress4X1_usingDTable_internal_fast_c_loop`:
+        // Safety constraint per upstream zstd `HUF_decompress4X1_usingDTable_internal_fast_c_loop`:
         // before each `bits[s] >> table_shift` read, the sentinel-bit position
         // must be strictly below bit `64 - max_num_bits` (i.e. outside the top
         // `max_num_bits` read region). After `s` shifts the sentinel is at bit
@@ -359,7 +359,7 @@ fn decompress_literals_impl<K: CpuKernel>(
         //   N <= (63 - 8) / max_num_bits = 55 / max_num_bits
         // (Letter `s` is used here for shift-count to avoid colliding with
         // the surrounding generic parameter `K: CpuKernel`.)
-        // For max=11: 5 symbols (donor parity — was 4 with the old off-by-one
+        // For max=11: 5 symbols (upstream zstd parity — was 4 with the old off-by-one
         // formula). For max=8: 6 symbols. For max=4: 13.
         let symbols_per_burst: usize = (63 - 8) / max_num_bits as usize;
         let burst_bits = (symbols_per_burst * max_num_bits as usize) as u8;
@@ -370,7 +370,7 @@ fn decompress_literals_impl<K: CpuKernel>(
         // cursors by `symbols_per_burst` in step, so `cursors[0]`
         // tracks progress for all four streams. `cursor_exit_olimit
         // = starts[0] + min(seg_len[i])` is the cursor value at which
-        // the lagging segment runs out — donor parity with
+        // the lagging segment runs out — upstream zstd parity with
         // `huf_decompress.c` `olimit`-style single-pointer bound.
         let min_seg_len = (ends[0] - starts[0])
             .min(ends[1] - starts[1])
@@ -402,7 +402,7 @@ fn decompress_literals_impl<K: CpuKernel>(
             alloc_upper_bound: base + regen,
         };
 
-        // Burst is identical across all kernels (donor parity: reads
+        // Burst is identical across all kernels (upstream zstd parity: reads
         // `packed[idx]` u16 directly + `MEM_read64` reload pattern,
         // no SIMD intrinsics needed). Single un-genericised call.
         //
@@ -539,7 +539,7 @@ struct LoopBounds {
 
 /// One burst iteration's inner symbol loop, monomorphised on the
 /// compile-time symbol count `SPB` so LLVM fully unrolls the
-/// `SPB × 4` decode steps into straight-line code — matching donor's
+/// `SPB × 4` decode steps into straight-line code — matching upstream zstd's
 /// `for symbol in 0..5` hardcoded unroll in
 /// `HUF_decompress4X1_usingDTable_internal_fast_c_loop`. A runtime
 /// `for _ in 0..symbols_per_burst` bound leaves an induction variable
@@ -588,7 +588,7 @@ unsafe fn burst_decode_symbols<const SPB: usize>(
     }
 }
 
-/// Donor-parity 4-stream HUF decode burst loop. Single code path —
+/// Upstream zstd-parity 4-stream HUF decode burst loop. Single code path —
 /// no kernel dispatch, no SIMD-fallback hybrid. Mirrors
 /// `huf_decompress.c:HUF_decompress4X1_usingDTable_internal_fast_c_loop`:
 /// each outer iter decodes `symbols_per_burst` symbols × 4 streams,
@@ -665,7 +665,7 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel>(
          cursors stay within bounds across a full burst",
     );
 
-    // Donor-parity burst loop. `bits[s]` is the unified u64 register
+    // Upstream zstd-parity burst loop. `bits[s]` is the unified u64 register
     // that fuses state + unconsumed stream + sentinel:
     //   bits 63..(64-max_num_bits): current state (next index into `packed`)
     //   below:                       upcoming stream bits, top-aligned
@@ -679,12 +679,12 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel>(
     // is reconstructed via `bits[s] >> table_shift` at the burst exit
     // and written back to `decoders[s].state` for the drain phase.
     //
-    // Composition matches donor `HUF_DecompressFastArgs_init` and
+    // Composition matches upstream zstd `HUF_DecompressFastArgs_init` and
     // `HUF_4X1_RELOAD_STREAM` (huf_decompress.c:795-804): each iter
     // reloads `bits[s] = MEM_read64(ip[s]) | 1; bits[s] <<= nb_bits`
     // after advancing `ip[s] -= nb_bytes` (where nb_bytes/nb_bits
     // come from `ctz(bits[s])` at the end of the previous iter).
-    // Initial composition exactly mirrors donor `HUF_DecompressFastArgs_init`:
+    // Initial composition exactly mirrors upstream zstd `HUF_DecompressFastArgs_init`:
     // `bits[s] = (MEM_read64(ip) | 1) << padding_skip`. Top `max_num_bits`
     // of the result is the state value implicitly (HUF stream encoding
     // ensures the top max bits of unconsumed stream at any consumption
@@ -694,14 +694,14 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel>(
     //
     // `padding_skip = brs[s].bits_consumed - max_num_bits`: `init_state`
     // pre-consumed `max_num_bits` for `decoders[s].state`, so
-    // `brs[s].bits_consumed = padding_skip + max_num_bits`. Donor leaves
+    // `brs[s].bits_consumed = padding_skip + max_num_bits`. Upstream zstd leaves
     // state implicit; we reverse our pre-consumption by shifting only
     // by `padding_skip` (not by `bits_consumed`) so the top max bits
     // come from the unshifted stream-position-of-state.
     //
     // Sentinel ends up at bit `padding_skip` after the shift, so
     // `ctz(initial bits[s]) = padding_skip` and the first reload's
-    // `nb_bytes = (padding_skip + K) / 8` matches donor's byte-cursor
+    // `nb_bytes = (padding_skip + K) / 8` matches upstream zstd's byte-cursor
     // advance from absolute stream position 0.
     let mut bits: [u64; 4] = [
         (brs[0].bit_container | 1) << (brs[0].bits_consumed - max_num_bits),
@@ -715,7 +715,7 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel>(
     // state: drain compatibility wants `bits_consumed = nb_bits + max_num_bits`,
     // so `nb_bits_last[s] = brs[s].bits_consumed - max_num_bits` for the
     // pre-reload writeback path (no burst iter ran). After the first
-    // reload `nb_bits_last[s] = ctz & 7` (sub-byte phase of donor's
+    // reload `nb_bits_last[s] = ctz & 7` (sub-byte phase of upstream zstd's
     // `MEM_read64 + shift`).
     let mut nb_bits_last: [u8; 4] = [
         brs[0].bits_consumed - max_num_bits,
@@ -724,7 +724,7 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel>(
         brs[3].bits_consumed - max_num_bits,
     ];
 
-    // Donor `iiters` safety budget. Worst-case `nb_bytes` per iter is
+    // Upstream zstd `iiters` safety budget. Worst-case `nb_bytes` per iter is
     // `floor(ctz_max / 8)` where `ctz_max = pad_max + burst_bits`,
     // since at the first iter the sentinel starts at `padding_skip
     // ∈ [1, 8]` and on subsequent iters at `nb_bits ∈ [0, 7]` set by
@@ -773,7 +773,7 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel>(
         //   uninitialised tail before its byte is written.
         //
         // Dispatch the inner loop on the compile-time symbol count so
-        // the dominant cases get a fully-unrolled body (donor's
+        // the dominant cases get a fully-unrolled body (upstream zstd's
         // hardcoded `for symbol in 0..5`). `symbols_per_burst` is
         // loop-invariant, so the match is hoisted out of the `while`
         // by loop-unswitching; each arm monomorphises
@@ -839,7 +839,7 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel>(
             }
         }
 
-        // Reload all 4 streams (donor `HUF_4X1_RELOAD_STREAM`).
+        // Reload all 4 streams (upstream zstd `HUF_4X1_RELOAD_STREAM`).
         //
         // SAFETY:
         //   * `ip[s] - nb_bytes >= 0`: the `min_ip >= bytes_per_iter_upper`
@@ -875,7 +875,7 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel>(
                     .try_into()
                     .unwrap_unchecked()
             });
-            // Donor `HUF_4X1_RELOAD_STREAM` order: `(MEM_read64 | 1) << nb_bits`,
+            // Upstream zstd `HUF_4X1_RELOAD_STREAM` order: `(MEM_read64 | 1) << nb_bits`,
             // NOT `(MEM_read64 << nb_bits) | 1`. The two are NOT equivalent —
             // the former puts the sentinel at bit `nb_bits` (so `ctz` of the
             // post-reload register accumulates the sub-byte phase into the

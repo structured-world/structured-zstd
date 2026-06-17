@@ -1,4 +1,4 @@
-//! Donor-faithful port of `HUF_CStream_t` from `lib/compress/huf_compress.c`.
+//! Upstream zstd-faithful port of `HUF_CStream_t` from `lib/compress/huf_compress.c`.
 //!
 //! Three differences vs the generic `BitWriter`:
 //!
@@ -6,11 +6,11 @@
 //!    hold `nb_bits` and the top `(64 - nb_bits)` bits hold the value
 //!    left-shifted to the high end of the word. Allows a single
 //!    `shr + or + add` per symbol on x86_64 BMI2.
-//! 2. The bit container is filled from the TOP DOWN (donor convention).
+//! 2. The bit container is filled from the TOP DOWN (upstream zstd convention).
 //!    To add an N-bit value: `container >>= N; container |= value`.
 //! 3. Two indexed containers (`bit_container[0]` and `bit_container[1]`).
 //!    Caller can encode into both in parallel (breaking data dependencies)
-//!    then merge before flushing — the trick donor uses in the unrolled
+//!    then merge before flushing — the trick upstream zstd uses in the unrolled
 //!    `HUF_compress1X_usingCTable_internal_body_loop` to extract
 //!    instruction-level parallelism.
 //!
@@ -21,12 +21,12 @@
 //! at least `HUF_TABLELOG_ABSOLUTEMAX = 12` free bits before the add
 //! and that the output buffer has 8 bytes of slack before the flush.
 //!
-//! Donor reference: `lib/compress/huf_compress.c:824-983`.
+//! Upstream zstd reference: `lib/compress/huf_compress.c:824-983`.
 
 use alloc::vec::Vec;
 
-/// Donor `HUF_BITS_IN_CONTAINER = sizeof(size_t) * 8`. We hard-code 64
-/// regardless of target pointer width. Donor's `MEM_32bits()` branch
+/// Upstream zstd `HUF_BITS_IN_CONTAINER = sizeof(size_t) * 8`. We hard-code 64
+/// regardless of target pointer width. Upstream zstd's `MEM_32bits()` branch
 /// switches the container to `u32` on 32-bit hosts; this crate's CI
 /// includes i686, but a 32-bit `usize` host can still operate a 64-bit
 /// arithmetic accumulator — the container is just `u64`, not
@@ -35,15 +35,15 @@ use alloc::vec::Vec;
 /// the 64-bit hot path on all supported architectures.
 pub(crate) const HUF_BITS_IN_CONTAINER: usize = 64;
 
-/// Donor `HUF_TABLELOG_ABSOLUTEMAX = 12` (defined in `common/huf.h`).
+/// Upstream zstd `HUF_TABLELOG_ABSOLUTEMAX = 12` (defined in `common/huf.h`).
 pub(crate) const HUF_TABLELOG_ABSOLUTEMAX: usize = 12;
 
-/// Packed Huffman code element matching donor `HUF_CElt`:
+/// Packed Huffman code element matching upstream zstd `HUF_CElt`:
 /// - Bits [0, 8)            = `nb_bits`
 /// - Bits [8, 64 - nb_bits) = 0
 /// - Bits [64 - nb_bits, 64) = `value`
 ///
-/// Donor `HUF_setNbBits` / `HUF_setValue` in `huf_compress.c:208-221`.
+/// Upstream zstd `HUF_setNbBits` / `HUF_setValue` in `huf_compress.c:208-221`.
 #[inline(always)]
 pub(crate) fn pack_huf_celt(value: u32, nb_bits: u8) -> u64 {
     debug_assert!((nb_bits as usize) <= HUF_TABLELOG_ABSOLUTEMAX);
@@ -55,7 +55,7 @@ pub(crate) fn pack_huf_celt(value: u32, nb_bits: u8) -> u64 {
     nb | ((value as u64) << (HUF_BITS_IN_CONTAINER as u64 - nb))
 }
 
-/// Dual-container bit packer matching donor `HUF_CStream_t`.
+/// Dual-container bit packer matching upstream zstd `HUF_CStream_t`.
 ///
 /// Operates directly on a borrowed `Vec<u8>` — the caller pre-reserves
 /// enough capacity so the hot path can do unchecked 8-byte writes via
@@ -75,7 +75,7 @@ pub(crate) struct HufCStream<'a> {
     /// `nb_bits` before each `add` to make room at the top.
     bit_container: [u64; 2],
     /// Bit-count counters. ONLY the low 8 bits are real; upper bits
-    /// carry "dirty" noise from donor's `nbBitsFast` trick and must
+    /// carry "dirty" noise from upstream zstd's `nbBitsFast` trick and must
     /// be masked with `0xFF` on read.
     bit_pos: [u64; 2],
     /// Output buffer. `cursor` indexes into this Vec; `Vec::len()`
@@ -99,11 +99,11 @@ pub(crate) struct HufCStream<'a> {
     /// `cursor` must never reach this value — beyond it the 8-byte
     /// flush write would overrun the reserved capacity. `FAST=true`
     /// flushes skip the check; `FAST=false` clamps `cursor = end_ptr`
-    /// on overflow (donor's `if (!kFast && ptr > endPtr) ptr = endPtr`).
+    /// on overflow (upstream zstd's `if (!kFast && ptr > endPtr) ptr = endPtr`).
     end_ptr: usize,
     /// Set to `true` by `flush_bits::<false>` when the clamp at
     /// `cursor > end_ptr` actually fires. `close()` uses this flag to
-    /// emit donor's overflow result (return 0). Without it, the clamp
+    /// emit upstream zstd's overflow result (return 0). Without it, the clamp
     /// would mask overflow: post-clamp `cursor == end_ptr`, so a
     /// `cursor >= end_ptr + 8` post-flush check could never fire, and
     /// an undersized `dst_capacity` would silently succeed with a
@@ -112,12 +112,12 @@ pub(crate) struct HufCStream<'a> {
 }
 
 impl<'a> HufCStream<'a> {
-    /// Donor `HUF_initCStream`. Requires `output.capacity() >=
+    /// Upstream zstd `HUF_initCStream`. Requires `output.capacity() >=
     /// output.len() + dst_capacity` AND `dst_capacity > 8` (else
-    /// returns `None`, mirroring donor's `ERROR(dstSize_tooSmall)`).
+    /// returns `None`, mirroring upstream zstd's `ERROR(dstSize_tooSmall)`).
     ///
     /// `dst_capacity` is the upper bound on bytes this stream may write;
-    /// donor uses `HUF_tightCompressBound(srcSize, tableLog) + 8` slack.
+    /// upstream zstd uses `HUF_tightCompressBound(srcSize, tableLog) + 8` slack.
     pub(crate) fn new(output: &'a mut Vec<u8>, dst_capacity: usize) -> Option<Self> {
         if dst_capacity <= 8 {
             return None;
@@ -142,12 +142,12 @@ impl<'a> HufCStream<'a> {
         })
     }
 
-    /// Donor `HUF_addBits`: insert `elt`'s value into the top `nb_bits`
+    /// Upstream zstd `HUF_addBits`: insert `elt`'s value into the top `nb_bits`
     /// of `bit_container[idx]`.
     ///
-    /// `FAST=true` matches donor's `kFast=1`: caller guarantees ≥ 4
+    /// `FAST=true` matches upstream zstd's `kFast=1`: caller guarantees ≥ 4
     /// free bits remain in the container post-add, so we can skip the
-    /// `& !0xFF` value mask. Donor uses `HUF_getValueFast` here which
+    /// `& !0xFF` value mask. Upstream zstd uses `HUF_getValueFast` here which
     /// is just `elt` (dirty bottom 8 bits get shifted out by the next
     /// container shr anyway).
     #[inline(always)]
@@ -161,17 +161,17 @@ impl<'a> HufCStream<'a> {
         // OR in the value. In FAST mode the bottom 8 bits of `elt`
         // (which hold nb_bits) are "dirty" but they land in the
         // already-occupied lower portion that the next shr will
-        // overwrite — donor's `HUF_getValueFast` exploits this.
+        // overwrite — upstream zstd's `HUF_getValueFast` exploits this.
         let value = if FAST { elt } else { elt & !0xFFu64 };
         self.bit_container[idx] |= value;
-        // Donor `HUF_getNbBitsFast(elt) = elt` — we accumulate the
+        // Upstream zstd `HUF_getNbBitsFast(elt) = elt` — we accumulate the
         // whole word; only the low 8 bits of `bit_pos` are real on
         // any subsequent read (always masked with `0xFF`).
         let nb_add = if FAST { elt } else { nb_bits };
         self.bit_pos[idx] = self.bit_pos[idx].wrapping_add(nb_add);
     }
 
-    /// Donor `HUF_flushBits`: write the top `nb_bytes` of
+    /// Upstream zstd `HUF_flushBits`: write the top `nb_bytes` of
     /// `bit_container[0]` to `output[cursor..cursor+8]`, advance
     /// `cursor` by `nb_bytes`, keep the trailing `< 8` bits in the
     /// container for the next flush.
@@ -183,7 +183,7 @@ impl<'a> HufCStream<'a> {
         let nb_bits = (self.bit_pos[0] & 0xFF) as usize;
         let nb_bytes = nb_bits >> 3;
         // Top `nb_bits` of the container become the next bytes.
-        // Donor uses `bitContainer >> (HUF_BITS_IN_CONTAINER - nb_bits)`.
+        // Upstream zstd uses `bitContainer >> (HUF_BITS_IN_CONTAINER - nb_bits)`.
         // Guard the shift: `nb_bits == 0` would shift by 64 (UB in Rust).
         let bit_container = if nb_bits == 0 {
             0
@@ -211,7 +211,7 @@ impl<'a> HufCStream<'a> {
         }
     }
 
-    /// Donor `HUF_compress1X_usingCTable_internal_body_loop`
+    /// Upstream zstd `HUF_compress1X_usingCTable_internal_body_loop`
     /// (`huf_compress.c:991-1043`) with all mutable bit state hoisted
     /// into locals so the two containers, their bit positions, and the
     /// write cursor stay register-resident across the whole encode loop.
@@ -221,8 +221,8 @@ impl<'a> HufCStream<'a> {
     /// `&mut self` every symbol; the optimizer could not prove the
     /// output-buffer raw writes in `flush_bits` don't alias those struct
     /// fields, so it conservatively reloaded the containers from memory
-    /// per symbol (donor keeps them in `HUF_CStream_t` locals). Hoisting
-    /// to locals here matches donor's register-resident shape. The
+    /// per symbol (upstream zstd keeps them in `HUF_CStream_t` locals). Hoisting
+    /// to locals here matches upstream zstd's register-resident shape. The
     /// arithmetic mirrors those four methods byte for byte, so the
     /// emitted bitstream is identical; only the codegen changes.
     ///
@@ -355,25 +355,25 @@ impl<'a> HufCStream<'a> {
     }
 
     /// Number of bits currently buffered in `bit_container[0]`.
-    /// Useful for the close-stream finalization (donor writes a final
+    /// Useful for the close-stream finalization (upstream zstd writes a final
     /// partial byte if bits remain).
     #[inline(always)]
     pub(crate) fn pending_bits(&self) -> usize {
         (self.bit_pos[0] & 0xFF) as usize
     }
 
-    /// Donor `HUF_closeCStream`: append the 1-bit end marker (value=1,
+    /// Upstream zstd `HUF_closeCStream`: append the 1-bit end marker (value=1,
     /// nb_bits=1), final flush, return total bytes written. Returns 0
-    /// on overflow (donor convention).
+    /// on overflow (upstream zstd convention).
     pub(crate) fn close(mut self) -> usize {
-        // Donor `HUF_endMark()` returns a HUF_CElt with nbBits=1, value=1.
+        // Upstream zstd `HUF_endMark()` returns a HUF_CElt with nbBits=1, value=1.
         // Packed: low byte = 1 (nb_bits), top bit of u64 = 1 (value).
         let end_mark: u64 = 1u64 | (1u64 << (HUF_BITS_IN_CONTAINER as u64 - 1));
         self.add_bits::<false>(end_mark, 0);
         self.flush_bits::<false>();
         let nb_bits = self.pending_bits();
         if self.overflow {
-            // Overflow — donor returns 0. The clamp in
+            // Overflow — upstream zstd returns 0. The clamp in
             // `flush_bits::<false>` already capped `cursor` at
             // `end_ptr`, so a post-flush `cursor >= end_ptr + 8`
             // check would never fire — we rely on the explicit
@@ -414,7 +414,7 @@ mod tests {
         let n = s.close();
         assert!(n > 0);
         assert_eq!(out.len(), 1);
-        // Donor `HUF_addBits` + `HUF_flushBits` layout (top-down
+        // Upstream zstd `HUF_addBits` + `HUF_flushBits` layout (top-down
         // packing in the 64-bit container, then `flushBits` shifts
         // the buffered bits down to the bottom of a 0-padded word
         // and `MEM_writeLE` stores 8 bytes little-endian — emitted
@@ -429,7 +429,7 @@ mod tests {
         // = 27 = 0x1B, which lands in `out[0]`.
         assert_eq!(
             out[0], 0x1B,
-            "first emitted byte must mirror donor's HUF_addBits + \
+            "first emitted byte must mirror upstream zstd's HUF_addBits + \
              HUF_endMark packing collapsed to a 5-bit prefix 0b11011",
         );
     }

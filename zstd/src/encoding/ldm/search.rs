@@ -1,17 +1,17 @@
 //! Bucket lookup + forward / backward extension for the LDM
 //! producer.
 //!
-//! Implements the per-split candidate selection from donor
+//! Implements the per-split candidate selection from upstream zstd
 //! `ZSTD_ldm_generateSequences_internal` (`zstd_ldm.c:405-466`)
 //! v1.5.7, **prefix-only path**. The two-segment `extDict`
-//! variant (donor `ZSTD_count_2segments` +
+//! variant (upstream zstd `ZSTD_count_2segments` +
 //! `ZSTD_ldm_countBackwardsMatch_2segments`) is deferred — the
 //! current Rust encoder does not surface a separate `extDict`
 //! buffer, so every byte the producer can reach lives in a
 //! single contiguous `history` slice and the prefix-only path
-//! is bit-for-bit equivalent to donor on those inputs.
+//! is bit-for-bit equivalent to upstream zstd on those inputs.
 //!
-//! Donor parity anchors:
+//! Upstream zstd parity anchors:
 //! * `ZSTD_count`                        → [`super::super::match_table::helpers::common_prefix_len`]
 //! * `ZSTD_ldm_countBackwardsMatch`      → [`count_backwards_match`]
 //! * Per-bucket best-match selection     → [`find_best_match`]
@@ -28,7 +28,7 @@ use super::table::LdmHashTable;
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct LdmMatch {
     /// **Absolute** byte position of the matching window's start
-    /// in the back reference (donor `bestEntry->offset`). Stored
+    /// in the back reference (upstream zstd `bestEntry->offset`). Stored
     /// as `usize` so streams larger than `u32::MAX` (4 GiB) stay
     /// representable end-to-end; the table rebases its internal
     /// `u32` storage transparently via
@@ -42,7 +42,7 @@ pub(crate) struct LdmMatch {
 }
 
 impl LdmMatch {
-    /// Total match length emitted on the wire. Donor
+    /// Total match length emitted on the wire. Upstream zstd
     /// `mLength = forwardMatchLength + backwardMatchLength`
     /// (`zstd_ldm.c:477`).
     pub(crate) const fn total_len(&self) -> usize {
@@ -50,7 +50,7 @@ impl LdmMatch {
     }
 }
 
-/// Donor `ZSTD_ldm_countBackwardsMatch` (`zstd_ldm.c:214-225`):
+/// Upstream zstd `ZSTD_ldm_countBackwardsMatch` (`zstd_ldm.c:214-225`):
 /// walk left from `(p_in, p_match)` while bytes still match and
 /// both pointers stay above their respective lower bounds.
 ///
@@ -92,7 +92,7 @@ pub(crate) fn count_backwards_match(
 /// Per-call inputs to [`find_best_match`]. Bundled into a struct
 /// so the public function avoids the `clippy::too_many_arguments`
 /// trip-wire while keeping each input clearly named (every field
-/// has a distinct semantic role; merging would obscure the donor
+/// has a distinct semantic role; merging would obscure the upstream zstd
 /// citations).
 ///
 /// All positional fields are **absolute stream coordinates** —
@@ -103,7 +103,7 @@ pub(crate) fn count_backwards_match(
 /// the bucket entries (which `LdmProducer` stores in absolute
 /// coordinates by design) remain valid after a window slide.
 pub(crate) struct FindBestMatchInputs<'a> {
-    /// Live history slice (donor: `base + dictLimit .. iend`).
+    /// Live history slice (upstream zstd: `base + dictLimit .. iend`).
     /// `live_history[0]` is the byte at absolute position
     /// `history_abs_start`.
     pub(crate) live_history: &'a [u8],
@@ -112,12 +112,12 @@ pub(crate) struct FindBestMatchInputs<'a> {
     /// slice.
     pub(crate) history_abs_start: usize,
     /// Absolute stream position of the candidate window's start.
-    /// Donor `split` (as an absolute index relative to `base`).
+    /// Upstream zstd `split` (as an absolute index relative to `base`).
     pub(crate) split_abs: usize,
     /// Absolute stream position of the leftmost byte the producer
     /// is still allowed to emit as literal — the previous emitted
     /// match's post-match boundary or the block start at frame
-    /// entry. Donor `anchor`.
+    /// entry. Upstream zstd `anchor`.
     pub(crate) anchor_abs: usize,
     /// **Inclusive** lower bound: entries with absolute `offset <
     /// lowest_index_abs` are stale and rejected, entries with
@@ -129,18 +129,18 @@ pub(crate) struct FindBestMatchInputs<'a> {
     /// so the comparison stays valid above the `u32` boundary
     /// (the table itself rebases internally).
     ///
-    /// Semantic deviation from donor `zstd_ldm.c:431` — donor's
+    /// Semantic deviation from upstream zstd `zstd_ldm.c:431` — upstream zstd's
     /// `cur->offset <= lowestIndex` is an exclusive lower bound
     /// where `lowestIndex` itself is rejected. We use the inclusive
     /// form because our internal coordinate space (absolute
     /// stream position, +1-biased relative offset in the
-    /// rebase-aware table) already differs from donor; flipping
+    /// rebase-aware table) already differs from upstream zstd; flipping
     /// the comparison removes the need for a
     /// `history_abs_start.saturating_sub(1)` adjustment at every
     /// callsite.
     pub(crate) lowest_index_abs: usize,
     /// Absolute stream position one past the last byte the
-    /// forward match is allowed to reach. Donor `iend` (the
+    /// forward match is allowed to reach. Upstream zstd `iend` (the
     /// caller-supplied `block_end_abs`); the forward count is
     /// clamped to `iend_abs - split_abs` bytes so a match cannot
     /// extend past the current block's scan boundary even if
@@ -148,14 +148,14 @@ pub(crate) struct FindBestMatchInputs<'a> {
     /// it. Must satisfy `iend_abs >= split_abs` and
     /// `iend_abs <= history_abs_start + live_history.len()`.
     pub(crate) iend_abs: usize,
-    /// Donor `params->minMatchLength` — forward matches shorter
+    /// Upstream zstd `params->minMatchLength` — forward matches shorter
     /// than this floor are filtered out.
     pub(crate) min_match_length: usize,
 }
 
 /// Walk every slot of the bucket associated with `hash_id`, scoring
 /// each entry by `forward + backward` match length, and return the
-/// best candidate strictly above the donor's
+/// best candidate strictly above the upstream zstd's
 /// `forward >= min_match_length` floor. Returns `None` when no
 /// bucket entry survives the filter.
 ///
@@ -194,13 +194,13 @@ pub(crate) fn find_best_match(
     // once; every forward comparison reuses them. `split_idx_end`
     // caps the forward slice so a match cannot extend past the
     // current block's scan boundary even if matching bytes happen
-    // to live beyond it — donor `ZSTD_count(split, pMatch, iend)`
+    // to live beyond it — upstream zstd `ZSTD_count(split, pMatch, iend)`
     // is bounded by `iend`.
     let split_idx = split_abs - history_abs_start;
     let split_idx_end = iend_abs - history_abs_start;
 
     for entry in bucket {
-        // Donor `zstd_ldm.c:431`: skip stale or wrong-checksum
+        // Upstream zstd `zstd_ldm.c:431`: skip stale or wrong-checksum
         // entries. `table.resolve` filters the empty-slot
         // sentinel (`entry.offset == 0`) and translates the
         // stored relative offset back to an absolute stream
@@ -245,11 +245,11 @@ pub(crate) fn find_best_match(
         let match_idx = match_abs - history_abs_start;
 
         // Forward match: bytes that compare equal starting from
-        // `split` vs `match_pos`. Donor `ZSTD_count(split, pMatch,
+        // `split` vs `match_pos`. Upstream zstd `ZSTD_count(split, pMatch,
         // iend)` — bounded by `iend`, so we cap the `split` slice
         // at `split_idx_end`. The match slice is bounded only by
         // `live_history.len()` because back-references into the
-        // history before the current block are legitimate (donor
+        // history before the current block are legitimate (upstream zstd
         // `pMatch < iend` is automatically true when the entry's
         // absolute offset is below `iend_abs`).
         let forward_len = common_prefix_len(
@@ -262,7 +262,7 @@ pub(crate) fn find_best_match(
 
         // Backward match: walk left as far as both `anchor`-bound
         // and `low_prefix`-bound (the absolute start of the live
-        // history) permit. Donor `zstd_ldm.c:455-456`.
+        // history) permit. Upstream zstd `zstd_ldm.c:455-456`.
         let backward_len = count_backwards_match(
             live_history,
             split_idx,
@@ -385,7 +385,7 @@ mod tests {
 
     /// `find_best_match` returns the longest combined
     /// forward+backward match across the bucket. Engineered
-    /// fixture: a 4-byte preamble (so the donor `offset > 0`
+    /// fixture: a 4-byte preamble (so the upstream zstd `offset > 0`
     /// staleness floor is satisfied — entry.offset == 0 is the
     /// reserved "empty slot" sentinel) followed by two
     /// repetitions of "abcdefgh". The single candidate at
@@ -453,7 +453,7 @@ mod tests {
 
     /// When the bucket holds multiple valid candidates the longer
     /// combined match wins, regardless of slot order. Preamble
-    /// bytes shift both candidate offsets above the donor `offset
+    /// bytes shift both candidate offsets above the upstream zstd `offset
     /// > 0` floor.
     #[test]
     fn find_best_match_prefers_longer_total_across_slots() {
@@ -572,7 +572,7 @@ mod tests {
     }
 
     /// Forward match below `min_match_length` is rejected even
-    /// when the checksum agrees (donor `zstd_ldm.c:444/452`).
+    /// when the checksum agrees (upstream zstd `zstd_ldm.c:444/452`).
     #[test]
     fn find_best_match_filters_short_forward_matches() {
         let mut table = fresh_table();

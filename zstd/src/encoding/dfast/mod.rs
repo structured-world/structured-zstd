@@ -1,4 +1,4 @@
-//! Double-fast match finder (default-level backend, donor parity for
+//! Double-fast match finder (default-level backend, upstream zstd parity for
 //! `ZSTD_dfast.c`). Two parallel hash chains — a 4-byte short hash and
 //! an 8-byte long hash — feed an adaptive sparse search that bails out
 //! when consecutive misses suggest an incompressible region.
@@ -28,10 +28,10 @@ use super::match_table::helpers::{common_prefix_len_with_kernel, extend_backward
 use super::match_table::storage::{REBASE_RESET_FLOOR_CEILING, check_stream_abs_headroom};
 use super::opt::types::MatchCandidate;
 
-/// Donor `HASH_READ_SIZE` (`zstd_compress_internal.h`): the largest probe
+/// Upstream zstd `HASH_READ_SIZE` (`zstd_compress_internal.h`): the largest probe
 /// width any hash / equality check in the dfast hot path reads at once.
 /// Loop guards must stop scanning when fewer than `HASH_READ_SIZE` bytes
-/// remain ahead of the probe cursor, matching donor `ilimit = iend -
+/// remain ahead of the probe cursor, matching upstream zstd `ilimit = iend -
 /// HASH_READ_SIZE`. The `DFAST_MIN_MATCH_LEN = 5` floor is the match
 /// acceptance threshold, NOT a safe loop bound — using it as the loop
 /// guard reads up to 3 bytes past the live history end and is UB on a
@@ -56,7 +56,7 @@ pub(crate) struct DfastMatchGenerator {
     /// Per-block length queue. Previously held the raw input
     /// `VecDeque<Vec<u8>>` for each appended block — that duplicated
     /// every byte in `history`, doubling the input footprint relative
-    /// to donor on the hot path. Now stores only the lengths so the
+    /// to upstream zstd on the hot path. Now stores only the lengths so the
     /// matcher can still pop blocks block-by-block on eviction
     /// (advancing `history_start` by each pop) while the actual byte
     /// storage lives once, in `history`.
@@ -68,15 +68,15 @@ pub(crate) struct DfastMatchGenerator {
     pub(crate) history_start: usize,
     pub(crate) history_abs_start: usize,
     pub(crate) offset_hist: [u32; 3],
-    // Storage: single `u32` per bucket — donor-parity overwrite-on-
+    // Storage: single `u32` per bucket — upstream zstd-parity overwrite-on-
     // collision. Each slot holds a +1-biased relative position
     // (`(abs_pos - position_base + 1) as u32`); `DFAST_EMPTY_SLOT = 0`
     // is therefore never a real value. The two tables are sized
     // independently: `long_hash` (8-byte hash) uses `long_hash_bits`
-    // (donor `hashTable`); `short_hash` (4-byte hash) uses
-    // `short_hash_bits` = `long - 1` (donor `chainTable` for dfast).
-    // Donor parity at Level 3: `2^17 × 4 + 2^16 × 4 = 768 KiB`. The
-    // ratio loss from single-slot is compensated by donor's
+    // (upstream zstd `hashTable`); `short_hash` (4-byte hash) uses
+    // `short_hash_bits` = `long - 1` (upstream zstd `chainTable` for dfast).
+    // Upstream zstd parity at Level 3: `2^17 × 4 + 2^16 × 4 = 768 KiB`. The
+    // ratio loss from single-slot is compensated by upstream zstd's
     // `_search_next_long` retry — after a short-hash hit, the search
     // probes long_hash at `ip + 1` and picks the longer of the two
     // (see `hash_candidate`, invoked via `best_match`, for the retry).
@@ -89,23 +89,23 @@ pub(crate) struct DfastMatchGenerator {
     /// `history_abs_start` against `usize::MAX`, so a rebase trigger
     /// here only fires on encoder sessions that span more than
     /// `u32::MAX - DFAST_REBASE_GUARD_BAND ≈ 3 GiB` of input through
-    /// a single matcher instance. Donor parity: `ZSTD_window_reduce`
+    /// a single matcher instance. Upstream zstd parity: `ZSTD_window_reduce`
     /// (`zstd_compress_internal.h`).
     pub(crate) position_base: usize,
     /// Long-hash table bit-width — `long_hash.len() == 1 <<
-    /// long_hash_bits`. Donor parity with `cParams.hashLog` (17 for
+    /// long_hash_bits`. Upstream zstd parity with `cParams.hashLog` (17 for
     /// Level 3 large input, 16 for Level 2; see `clevels.h`).
     pub(crate) long_hash_bits: usize,
     /// Short-hash table bit-width — `short_hash.len() == 1 <<
     /// short_hash_bits`. Default is `long_hash_bits -
-    /// DFAST_SHORT_HASH_BITS_DELTA`, donor parity with
+    /// DFAST_SHORT_HASH_BITS_DELTA`, upstream zstd parity with
     /// `cParams.chainLog` for dfast levels (one bit smaller than the
     /// long hash). Halves the short-table footprint without losing
     /// measurable ratio — the 4-byte short hash overwrites less
     /// frequently than the 8-byte long hash on average, so the
-    /// smaller bucket count is the donor-correct sizing.
+    /// smaller bucket count is the upstream zstd-correct sizing.
     pub(crate) short_hash_bits: usize,
-    /// Immutable dictionary long+short hash tables (donor `dictMatchState`)
+    /// Immutable dictionary long+short hash tables (upstream zstd `dictMatchState`)
     /// plus the CDict cache lifecycle, via the shared [`DictAttach`] level-1
     /// scaffolding. Built once over the dictionary region at the front of the
     /// contiguous history (flat `[dict][input]` model like the Fast backend:
@@ -182,7 +182,7 @@ impl DfastMatchGenerator {
     }
 
     /// Set both hash table sizes from the per-level [`DfastConfig`]:
-    /// `long_bits` = donor `cParams.hashLog`, `short_bits` = donor
+    /// `long_bits` = upstream zstd `cParams.hashLog`, `short_bits` = upstream zstd
     /// `cParams.chainLog`. Both clamps stay above `MIN_WINDOW_LOG` so very
     /// small windows don't underflow. The caller already caps `long_bits` by
     /// the source-size window when hinted, so no upper clamp is applied here.
@@ -243,7 +243,7 @@ impl DfastMatchGenerator {
     /// by `DFAST_REBASE_GUARD_BAND` (in a loop, in case the caller
     /// jumped past multiple guard bands at once) and shift every
     /// stored slot down by the same amount. Mirrors
-    /// `LdmHashTable::ensure_room_for` and the donor's
+    /// `LdmHashTable::ensure_room_for` and the upstream zstd's
     /// `ZSTD_window_reduce` semantics.
     pub(crate) fn ensure_room_for(&mut self, abs_pos: usize) {
         if abs_pos < self.position_base {
@@ -585,7 +585,7 @@ impl DfastMatchGenerator {
         self.insert_positions(current_abs_start, current_abs_end);
     }
 
-    /// Donor `ZSTD_dictMatchState` attach (dfast): hash the dictionary block at
+    /// Upstream zstd `ZSTD_dictMatchState` attach (dfast): hash the dictionary block at
     /// the front of history into the SEPARATE immutable [`Self::dict`] tables
     /// (long+short), once, instead of re-priming the live tables every frame
     /// (`skip_matching_dense`). The dual-probe kernel then searches live + dict
@@ -638,7 +638,7 @@ impl DfastMatchGenerator {
         let long_bits = self.long_hash_bits;
         let short_bits = self.short_hash_bits;
         // Lookahead-safe cutoffs within the concat: long needs 8 readable
-        // bytes, short needs 5 (donor `mls = 5` for the short hash).
+        // bytes, short needs 5 (upstream zstd `mls = 5` for the short hash).
         let long_safe_end = concat_len.saturating_sub(7).min(end_concat);
         let short_safe_end = concat_len.saturating_sub(4).min(end_concat);
         // The seam window `[backfill_floor, start_concat)` holds positions that
@@ -661,7 +661,7 @@ impl DfastMatchGenerator {
         let short_ptr = dict.short.as_mut_ptr();
         // SAFETY: `base.add(history_start + pos)` is in-bounds for
         // `pos + 8 <= concat_len` (long) / `pos + 5 <= concat_len` (short, the
-        // donor 5-byte key), enforced by the `*_safe_end` cutoffs (the short
+        // upstream zstd 5-byte key), enforced by the `*_safe_end` cutoffs (the short
         // loop reads a 4-byte word + 1 byte, never past `concat_len`).
         // `*_idx = mixed >> (64 - bits)`
         // has at most `bits` bits set, in-bounds for the `1 << bits` tables.
@@ -683,7 +683,7 @@ impl DfastMatchGenerator {
             unsafe {
                 let load_ptr = base.add(history_start + pos);
                 let v8 = (load_ptr as *const u64).read_unaligned();
-                // Donor 5-byte short hash (ZSTD_hash5 shape): low 5 bytes in
+                // Upstream zstd 5-byte short hash (ZSTD_hash5 shape): low 5 bytes in
                 // the high 40 bits (`v8 << 24`), matching `short_hash_index`.
                 let short_idx = ((v8 << 24).wrapping_mul(PRIME) >> short_shift) as usize;
                 let long_idx = (v8.wrapping_mul(PRIME) >> long_shift) as usize;
@@ -696,7 +696,7 @@ impl DfastMatchGenerator {
         while pos < short_safe_end {
             unsafe {
                 let load_ptr = base.add(history_start + pos);
-                // 5-byte short key (donor `mls = 5`), assembled from a 4-byte
+                // 5-byte short key (upstream zstd `mls = 5`), assembled from a 4-byte
                 // load + 1 byte so it never over-reads the <8-byte tail; the
                 // low 5 bytes land in bits 24..63, matching `v8 << 24`.
                 let lo4 = (load_ptr as *const u32).read_unaligned() as u64;
@@ -718,7 +718,7 @@ impl DfastMatchGenerator {
         }
 
         let current_abs_start = self.history_abs_start + self.window_size - current_len;
-        // Re-seed the previous block's seam. With the donor 5-byte short hash,
+        // Re-seed the previous block's seam. With the upstream zstd 5-byte short hash,
         // a position within `mls - 1` bytes of the prior block end could not
         // form its full key when that block was processed (the trailing bytes
         // arrived with THIS block); re-hash that tail now that history spans
@@ -730,14 +730,14 @@ impl DfastMatchGenerator {
         if backfill_start < current_abs_start {
             self.insert_positions(backfill_start, current_abs_start);
         }
-        // dfast is the donor's greedy double-fast at every level (no lazy
+        // dfast is the upstream zstd's greedy double-fast at every level (no lazy
         // variant exists — lazy parsing is the separate `ZSTD_lazy`/`lazy2`
         // strategy), so there is a single match path.
         self.start_matching_fast_loop(current_abs_start, current_len, &mut handle_sequence);
     }
 
     /// Register the caller's in-place input buffer for the borrowed one-shot
-    /// path (donor `ZSTD_CCtx` in-place input). The dfast analog of
+    /// path (upstream zstd `ZSTD_CCtx` in-place input). The dfast analog of
     /// [`super::simple::fast_matcher::FastKernelMatcher::set_borrowed_window`]:
     /// subsequent blocks scan ranges of `buffer` directly instead of copying
     /// each into the owned `history` concat.
@@ -1016,23 +1016,23 @@ impl DfastMatchGenerator {
         None
     }
 
-    /// Donor `zstd_double_fast.c` post-match rep-0 extension. After the
-    /// primary match has been emitted and `pos` advanced past it, donor
+    /// Upstream zstd `zstd_double_fast.c` post-match rep-0 extension. After the
+    /// primary match has been emitted and `pos` advanced past it, upstream zstd
     /// opportunistically chains additional `rep_2`-coded matches at the
     /// new cursor as long as 4 bytes at `ip` keep matching the bytes at
-    /// `ip - offset_2` (in donor naming; in Rust offset terms this is
+    /// `ip - offset_2` (in upstream zstd naming; in Rust offset terms this is
     /// `offset_hist[1]` once `lit_len == 0` after the just-emitted
     /// primary). Each iteration:
     ///
     ///   * emits one zero-literal sequence with the old `offset_hist[1]`,
     ///   * swaps `offset_hist[0]` ↔ `offset_hist[1]` via
-    ///     [`encode_offset_with_history`] (the donor `offset_2 = offset_1;
+    ///     [`encode_offset_with_history`] (the upstream zstd `offset_2 = offset_1;
     ///     offset_1 = old_offset_2;` swap),
     ///   * skips the hash-table probe entirely on every extra match.
     ///
-    /// Critically uses donor's `MINMATCH = 4` here rather than the
+    /// Critically uses upstream zstd's `MINMATCH = 4` here rather than the
     /// `DFAST_MIN_MATCH_LEN = 5` enforced on the main search
-    /// loop. The donor accepts any 4-byte rep extension; we mirror that
+    /// loop. The upstream zstd accepts any 4-byte rep extension; we mirror that
     /// because the rep emission carries no offset cost — even a 4-byte
     /// rep is a net win over re-running the full hash search. Returns
     /// the new value of `pos` and updates `literals_start` in place to
@@ -1051,7 +1051,7 @@ impl DfastMatchGenerator {
                 break;
             }
             // After a primary emit `literals_start == pos`, so `lit_len`
-            // on the next sequence is zero — donor's rep probe uses
+            // on the next sequence is zero — upstream zstd's rep probe uses
             // `offset_2` (== `offset_hist[1]` under our encoding).
             let rep = self.offset_hist[1] as usize;
             if rep == 0 {
@@ -1071,7 +1071,7 @@ impl DfastMatchGenerator {
             // the addressable history range). A previous draft also
             // gated on `rep > pos`, which over-rejected valid offsets
             // that point into retained history near block boundaries —
-            // exactly the donor-style chain win this helper is meant to
+            // exactly the upstream zstd-style chain win this helper is meant to
             // recover.
             let cand_idx = match cur_idx.checked_sub(rep) {
                 Some(idx) => idx,
@@ -1109,7 +1109,7 @@ impl DfastMatchGenerator {
             // positions, not the whole match range. The previous
             // `insert_positions(abs_pos, abs_pos + match_len)` made
             // sense only under the 4-slot bucket; with single-slot
-            // donor parity it would just overwrite every bucket along
+            // upstream zstd parity it would just overwrite every bucket along
             // the match span and discard whichever positions the
             // producer was about to re-probe.
             //
@@ -1220,7 +1220,7 @@ impl DfastMatchGenerator {
     /// owned rebase coordinates (`start_offset`, `abs_start`, `position_base`)
     /// are constant `0` and the hot loop supplies them as literals — folding
     /// every per-position `abs - abs_start` / `>= abs_start` term to the bare
-    /// absolute position (donor `base + index` shape). Split out from
+    /// absolute position (upstream zstd `base + index` shape). Split out from
     /// [`Self::scan_source`] so the `BORROWED` const kernel never materialises
     /// the owned-path arithmetic.
     #[inline(always)]
@@ -1286,12 +1286,12 @@ impl DfastMatchGenerator {
         candidate: MatchCandidate,
         handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
     ) -> usize {
-        // Donor `zstd_double_fast.c` parity: the inner search loop already
+        // Upstream zstd `zstd_double_fast.c` parity: the inner search loop already
         // inserts every position it VISITS (step-accelerated), so the literal
-        // run is hashed exactly as densely as the donor's cursor swept it —
+        // run is hashed exactly as densely as the upstream zstd's cursor swept it —
         // stepped-over and block-anchor (position 0) positions are NOT
-        // re-inserted here (the donor skips them too via `ip += (ip ==
-        // prefixStart)` + the growing `step`). Match interior: donor fills only
+        // re-inserted here (the upstream zstd skips them too via `ip += (ip ==
+        // prefixStart)` + the growing `step`). Match interior: upstream zstd fills only
         // the sparse 3-target set (`curr+2`, `ip-2`, `ip-1`), each clamped to
         // the open match interval.
         let match_start = candidate.start;
@@ -1359,7 +1359,7 @@ impl DfastMatchGenerator {
     }
 
     pub(crate) fn ensure_hash_tables(&mut self) {
-        // Independent sizing per donor `clevels.h`: long-hash =
+        // Independent sizing per upstream zstd `clevels.h`: long-hash =
         // `hashLog`, short-hash = `chainLog`. Lazy allocation so
         // Fastest/Uncompressed never pay the dfast-level memory cost.
         let long_len = 1usize << self.long_hash_bits;
@@ -1442,7 +1442,7 @@ impl DfastMatchGenerator {
         //   remain, so only the short hash gets inserted (4-byte
         //   load).
         // Past `short_safe_end` neither hash has enough lookahead and
-        // donor parity is "no insert" — skip entirely.
+        // upstream zstd parity is "no insert" — skip entirely.
         let abs_concat_end = history_abs_start + concat_len;
         let long_safe_end = abs_concat_end.saturating_sub(7).min(end);
         let short_safe_end = abs_concat_end.saturating_sub(4).min(end);
@@ -1463,11 +1463,11 @@ impl DfastMatchGenerator {
                 let packed = ((pos - position_base) as u32) + 1;
                 let load_ptr = history_base_ptr.add(history_start + idx);
                 let v8 = (load_ptr as *const u64).read_unaligned();
-                // Donor parity (`zstd_compress_internal.h:923-924`):
+                // Upstream zstd parity (`zstd_compress_internal.h:923-924`):
                 // scalar `* prime8bytes` then shift to high bits. Drops
                 // the CRC32d-based kernel dispatch (3-4 instructions) for
                 // a single mul on the per-byte insert path. Short hash keys
-                // on the donor 5-byte window (`v8 << 24`, ZSTD_hash5 shape).
+                // on the upstream zstd 5-byte window (`v8 << 24`, ZSTD_hash5 shape).
                 let mixed_short = (v8 << 24).wrapping_mul(0xCF1BBCDCB7A56463_u64);
                 let mixed_long = v8.wrapping_mul(0xCF1BBCDCB7A56463_u64);
                 let short_idx = (mixed_short >> short_shift) as usize;
@@ -1482,7 +1482,7 @@ impl DfastMatchGenerator {
                 let idx = pos - history_abs_start;
                 let packed = ((pos - position_base) as u32) + 1;
                 let load_ptr = history_base_ptr.add(history_start + idx);
-                // 5-byte short key (donor `mls = 5`): 4-byte load + 1 byte so
+                // 5-byte short key (upstream zstd `mls = 5`): 4-byte load + 1 byte so
                 // the <8-byte tail is never over-read; low 5 bytes in bits
                 // 24..63 to match `v8 << 24`.
                 let lo4 = (load_ptr as *const u32).read_unaligned() as u64;
@@ -1563,7 +1563,7 @@ impl DfastMatchGenerator {
         // `ZSTD_compressBlock_doubleFast_*` writes a single `U32` per hash
         // position and relies on the dense `_search_next_long` retry in
         // `hash_candidate` (via `best_match`) to preserve compression ratio.
-        // Short key needs 5 readable bytes (donor `mls = 5`). A position
+        // Short key needs 5 readable bytes (upstream zstd `mls = 5`). A position
         // within 4 bytes of the source end is not inserted here; the
         // `start_matching` seam re-seed picks it up once the next block
         // extends the source far enough to form its full 5-byte key.
@@ -1581,12 +1581,12 @@ impl DfastMatchGenerator {
         }
     }
 
-    /// 5-byte short-hash index (donor `ZSTD_hashPtr(ip, hBitsS, mls=5)`). A
+    /// 5-byte short-hash index (upstream zstd `ZSTD_hashPtr(ip, hBitsS, mls=5)`). A
     /// 4-byte key collides more on repetitive / log-stream data, so the
-    /// single-slot table overwrites useful positions the donor's 5-byte key
+    /// single-slot table overwrites useful positions the upstream zstd's 5-byte key
     /// keeps. `data` MUST hold at least 5 bytes — every call site gates on a
     /// 5-byte lookahead, so no zero-padded synthetic key is ever formed (a
-    /// padded short key would populate buckets for starts the donor skips).
+    /// padded short key would populate buckets for starts the upstream zstd skips).
     #[inline(always)]
     pub(crate) fn short_hash_index(&self, data: &[u8]) -> usize {
         debug_assert!(data.len() >= 5, "short hash needs a full 5-byte key");
@@ -1620,10 +1620,10 @@ impl DfastMatchGenerator {
 
     #[inline(always)]
     fn hash_index_with_bits(&self, value: u64, bits: usize) -> usize {
-        // Donor parity (`zstd_compress_internal.h:923-924`, `ZSTD_hash8`):
+        // Upstream zstd parity (`zstd_compress_internal.h:923-924`, `ZSTD_hash8`):
         // a single 64-bit multiply by `prime8bytes` followed by a high-bits
         // shift. Drops the CRC32d + rotate + mul kernel dispatch the rest
-        // of the crate uses — for dfast the donor's scalar hash is
+        // of the crate uses — for dfast the upstream zstd's scalar hash is
         // distribution-equivalent and one instruction shorter on the hot
         // path.
         let mixed = value.wrapping_mul(0xCF1BBCDCB7A56463_u64);
@@ -1643,15 +1643,15 @@ macro_rules! start_matching_fast_loop_body {
         // early-skip path (the `block_looks_incompressible_strict` short
         // circuit + `miss_run` / `DFAST_LOCAL_SKIP_TRIGGER` thresholding).
         // The step ramp is now driven purely by distance traveled
-        // (`DFAST_SKIP_STEP_GROWTH_INTERVAL = 64`, donor parity except
-        // donor uses 256 — see "Donor-deviation audit" in the PR body),
+        // (`DFAST_SKIP_STEP_GROWTH_INTERVAL = 64`, upstream zstd parity except
+        // upstream zstd uses 256 — see "Upstream zstd-deviation audit" in the PR body),
         // so blocks the strict gate used to bail out of early now scan
         // through the standard ramp. `block_looks_incompressible_strict`
         // is still used by `levels/fastest.rs` for the Fastest preset
         // and by `incompressible.rs` unit tests, so the helper itself
         // stays.
         //
-        // Donor outer/inner structure (`zstd_double_fast.c:167-322`):
+        // Upstream zstd outer/inner structure (`zstd_double_fast.c:167-322`):
         //   * outer `while(1)` runs once per match-found-and-stored;
         //   * inner `do { ... } while (ip1 <= ilimit)` carries `hl0`,
         //     `idxl0` between iterations, and precomputes `hl1` so the
@@ -1737,7 +1737,7 @@ macro_rules! start_matching_fast_loop_body {
         let mut pos = 1usize;
         let mut literals_start = 0usize;
 
-        // Dict dual-probe (donor `ZSTD_dictMatchState`): snapshot the immutable
+        // Dict dual-probe (upstream zstd `ZSTD_dictMatchState`): snapshot the immutable
         // dict tables ONCE. Unlike the live tables (which `emit_candidate` may
         // grow / rebase), the dict tables are never mutated during matching, so
         // one snapshot before the outer loop stays valid every iteration. The
@@ -1759,7 +1759,7 @@ macro_rules! start_matching_fast_loop_body {
         // (`$use_dict == false`, a compile-time const) in which this block and
         // every `if $use_dict` probe below const-fold away — so the hot no-dict
         // loop carries zero dict code and zero per-position dict check, instead
-        // of branching on a loop-invariant flag every position (donor keeps the
+        // of branching on a loop-invariant flag every position (upstream zstd keeps the
         // no-dict and dictMatchState loops as separate functions for the same
         // reason). `$use_dict == true` is dispatched only when the table is
         // present, so the `expect` never fires.
@@ -1862,7 +1862,7 @@ macro_rules! start_matching_fast_loop_body {
             // kernel `history_start_offset / history_abs_start / position_base`
             // are LITERAL `0`, collapsing every per-position `abs - abs_start`
             // term and the always-true `cand_pos >= abs_start` lower-bound
-            // check to the bare absolute position (donor `base + index` shape).
+            // check to the bare absolute position (upstream zstd `base + index` shape).
             let (history_base_ptr, history_start_offset, history_abs_start, position_base, concat_len) =
                 if $borrowed {
                     let (ptr, block_end) = $self.borrowed_scan_descriptor();
@@ -1967,17 +1967,17 @@ macro_rules! start_matching_fast_loop_body {
                         .read_unaligned()
                 };
                 // `v4_0` (low 4 bytes) is the cheap 4-byte equality-gate key
-                // below; the short HASH keys on the donor 5-byte window
+                // below; the short HASH keys on the upstream zstd 5-byte window
                 // (`v8_0 << 24`, ZSTD_hash5 shape) to match `short_hash_index`.
                 let v4_0 = v8_0 & 0xFFFF_FFFF;
                 let hs0_idx = ((v8_0 << 24).wrapping_mul(PRIME) >> short_shift) as usize;
                 let idxs0 = unsafe { *short_hash_ptr.add(hs0_idx) };
 
-                // Donor parity (`zstd_double_fast.c:187`): update BOTH
+                // Upstream zstd parity (`zstd_double_fast.c:187`): update BOTH
                 // tables at curr BEFORE checking matches. The benefit is
                 // for hash-table consumers, NOT the rep peek (rep at ip+1
                 // reads `offset_hist[0]`, never the hash tables). The
-                // donor rationale is the long-hash retry path: the next
+                // upstream zstd rationale is the long-hash retry path: the next
                 // inner iter's `idxl1` lookup (`hashLong[hl1_idx]`) can
                 // collide with this iter's `hl0_idx`, and writing curr
                 // first means a $self-collision still resolves to a real
@@ -1990,11 +1990,11 @@ macro_rules! start_matching_fast_loop_body {
                     *short_hash_ptr.add(hs0_idx) = packed_curr;
                 }
 
-                // Donor parity (`zstd_double_fast.c:190`): inline rep1
-                // peek at ip+1, 4-byte gate. Donor's hot path checks ONLY
+                // Upstream zstd parity (`zstd_double_fast.c:190`): inline rep1
+                // peek at ip+1, 4-byte gate. Upstream zstd's hot path checks ONLY
                 // `offset_1` here (full 3-rep walk lives in lazy/btopt).
                 // Since the peek is at `ip+1` with `pos >= literals_start`,
-                // `lit_len_ip1 >= 1`, so `offset_hist[0]` is the donor's
+                // `lit_len_ip1 >= 1`, so `offset_hist[0]` is the upstream zstd's
                 // `offset_1`. The `repcode_candidate_shared` helper we used
                 // before walked all three offsets + did a full SIMD
                 // `common_prefix_len` per probe, paying ~3× the work for
@@ -2066,7 +2066,7 @@ macro_rules! start_matching_fast_loop_body {
                     }
                 }
 
-                // Precompute hl1 (donor `_search_next_long` carry, line 197).
+                // Precompute hl1 (upstream zstd `_search_next_long` carry, line 197).
                 let v8_1 = unsafe {
                     (history_base_ptr.add(history_start_offset + concat_idx1) as *const u64)
                         .read_unaligned()
@@ -2082,7 +2082,7 @@ macro_rules! start_matching_fast_loop_body {
                 // ~100 instructions below (the `_search_next_long` retry at
                 // `ip1`); the next inner iteration's short-hash slot is keyed on
                 // these same `v8_1` bytes (this `ip1` becomes the next `ip0`).
-                // Unlike the donor's input `PREFETCH_L1(ip + 256)` — which only
+                // Unlike the upstream zstd's input `PREFETCH_L1(ip + 256)` — which only
                 // warms the sequential input the HW prefetcher already covers —
                 // these target the loads that actually stall.
                 unsafe {
@@ -2158,7 +2158,7 @@ macro_rules! start_matching_fast_loop_body {
                     }
                 }
 
-                // Dict long fallback (donor `dictMatchState`): the live long
+                // Dict long fallback (upstream zstd `dictMatchState`): the live long
                 // missed (empty / out-of-window / 8-byte mismatch). Probe the
                 // immutable dict long table at the SAME `hl0_idx`. Flat model:
                 // the dict sits in the contiguous history before the input, so
@@ -2230,7 +2230,7 @@ macro_rules! start_matching_fast_loop_body {
                 let idxl1 = unsafe { *long_hash_ptr.add(hl1_idx) };
 
                 // Short match check at ip0 with idxs0 — 4-byte gate
-                // ONLY (donor `zstd_double_fast.c:220`). Forward count
+                // ONLY (upstream zstd `zstd_double_fast.c:220`). Forward count
                 // and `_search_next_long` retry happen ONLY on hit.
                 // Branchy validity, same shape as the ip1 long retry below:
                 // the slot-populated / in-window / before-cursor checks are
@@ -2295,7 +2295,7 @@ macro_rules! start_matching_fast_loop_body {
                             // floor, comfortably above `DFAST_MIN_MATCH_LEN`).
                             let short_hit_valid = short_cand.match_len >= DFAST_MIN_MATCH_LEN;
 
-                            // Donor `_search_next_long` retry (line 260):
+                            // Upstream zstd `_search_next_long` retry (line 260):
                             // try long match at ip1 with precomputed idxl1.
                             // If it produces a strictly longer match, use it.
                             let mut chosen = short_cand;
@@ -2358,9 +2358,9 @@ macro_rules! start_matching_fast_loop_body {
                                     }
                                 }
                             }
-                            // Dict long match at ip1 (donor `_search_next_long`
+                            // Dict long match at ip1 (upstream zstd `_search_next_long`
                             // dict arm, zstd_double_fast.c:472-483): probed ONLY
-                            // when the live long+1 missed, mirroring donor's
+                            // when the live long+1 missed, mirroring upstream zstd's
                             // `else if dictTagsMatchL3`. Attach-mode keeps the
                             // dict in a SEPARATE table, so the live long+1 probe
                             // above never sees dict positions; without this the
@@ -2448,7 +2448,7 @@ macro_rules! start_matching_fast_loop_body {
                     }
                 }
 
-                // Dict short fallback (donor `dictMatchState`): the live short
+                // Dict short fallback (upstream zstd `dictMatchState`): the live short
                 // missed / was below floor. Probe the immutable dict short
                 // table at the SAME `hs0_idx`, 4-byte gate, forward count, then
                 // enforce the same `DFAST_MIN_MATCH_LEN` floor the live short
@@ -2515,7 +2515,7 @@ macro_rules! start_matching_fast_loop_body {
                     }
                 }
 
-                // Step bump on distance (donor `zstd_double_fast.c:224-228`).
+                // Step bump on distance (upstream zstd `zstd_double_fast.c:224-228`).
                 if ip1 >= next_step_pos {
                     step = (step + 1).min(DFAST_MAX_SKIP_STEP);
                     next_step_pos += DFAST_SKIP_STEP_GROWTH_INTERVAL;
@@ -2585,16 +2585,16 @@ impl DfastMatchGenerator {
         // const-monomorphised kernel (`USE_DICT` true/false) so the per-position
         // dict probe is compiled in or out at the call shape — never a
         // loop-invariant runtime check inside the scan. The no-dict kernel
-        // carries zero dict code (donor keeps the noDict / dictMatchState loops
+        // carries zero dict code (upstream zstd keeps the noDict / dictMatchState loops
         // as separate functions for exactly this reason).
         // Two orthogonal axes resolved ONCE here, off the hot path, into a
         // const-monomorphised kernel:
-        //   * `USE_DICT` — dict probe compiled in or out (donor keeps noDict /
+        //   * `USE_DICT` — dict probe compiled in or out (upstream zstd keeps noDict /
         //     dictMatchState as separate functions for the same reason).
         //   * `BORROWED` — borrowed-window scan vs owned history concat. The
         //     borrowed kernel folds the rebase coordinates to literal `0`,
         //     erasing the per-position abstraction arithmetic the owned path
-        //     needs (donor `base + index` shape).
+        //     needs (upstream zstd `base + index` shape).
         // A borrowed block never carries a dict (`borrowed_eligible` rejects
         // `use_dictionary_state`), so only three of the four combinations are
         // ever instantiated; the `<true, true>` arm is unreachable.
@@ -2832,7 +2832,7 @@ mod extend_with_repcode_tests {
         let mut dfast = build_dfast_with(&data);
 
         // Post-primary-match state: pretend a previous sequence emitted
-        // with offset = 4 (`offset_hist[0]`). Under the donor swap the
+        // with offset = 4 (`offset_hist[0]`). Under the upstream zstd swap the
         // post-match rep probe consults `offset_hist[1]`, here set to
         // 1 so every subsequent byte (constant 'A') matches its
         // predecessor.
@@ -2949,7 +2949,7 @@ mod extend_with_repcode_tests {
         }
     }
 
-    /// The helper accepts 4-byte rep extensions (donor `MINMATCH = 4`),
+    /// The helper accepts 4-byte rep extensions (upstream zstd `MINMATCH = 4`),
     /// not the main-loop `DFAST_MIN_MATCH_LEN = 5` floor. A regression
     /// back above 4 would still pass the constant-run / cross-block tests
     /// above (their rep matches extend much further), so this fixture
@@ -3016,7 +3016,7 @@ mod extend_with_repcode_tests {
                 assert_eq!(*offset, 8, "rep emit must use offset 8 (offset_hist[1])");
                 assert_eq!(
                     *match_len, 4,
-                    "rep emit must be exactly 4 bytes (donor MINMATCH floor). \
+                    "rep emit must be exactly 4 bytes (upstream zstd MINMATCH floor). \
                      A regression back to DFAST_MIN_MATCH_LEN > 4 would skip \
                      this emission entirely and the test would fail with 0 seqs."
                 );

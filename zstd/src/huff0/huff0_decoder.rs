@@ -303,12 +303,12 @@ pub struct HuffmanTable {
     /// `pub(crate)` because the HUF 4-stream burst hot path in
     /// `literals_section_decoder::decode_literals` indexes it directly
     /// (`packed_decode[idx]`) for a single-load table lookup matching
-    /// donor `huf_decompress.c:dtable[index]`. This is the primary
+    /// upstream zstd `huf_decompress.c:dtable[index]`. This is the primary
     /// (and only) 4-stream decode lookup table since the previous
-    /// SIMD-fallback dispatch was removed in favour of donor's
+    /// SIMD-fallback dispatch was removed in favour of upstream zstd's
     /// always-firing burst.
     ///
-    /// **`u16` (matches donor `HUF_DEltX1` layout exactly).** Donor's
+    /// **`u16` (matches upstream zstd `HUF_DEltX1` layout exactly).** Upstream zstd's
     /// `dtable[index]` returns a 2-byte entry — low byte is `symbol`,
     /// high byte is `nbBits`. We mirror that representation so the
     /// table size is `2 × (1 << max_num_bits)` bytes instead of `4 ×`.
@@ -333,11 +333,11 @@ pub struct HuffmanTable {
     bits: Vec<u8>,
     bit_ranks: Vec<u32>,
     /// Running `sum(1 << (w - 1))` accumulated WHILE weights decode
-    /// (donor `HUF_readStats` keeps the same running stats), replacing a
+    /// (upstream zstd `HUF_readStats` keeps the same running stats), replacing a
     /// separate post-decode pass over `weights`.
     weight_sum: u32,
     /// Per-weight occurrence counts accumulated during weight decode
-    /// (donor `rankStats`); `bit_ranks` derives from this without
+    /// (upstream zstd `rankStats`); `bit_ranks` derives from this without
     /// re-walking the code-length array.
     weight_rank_count: [u32; (MAX_MAX_NUM_BITS as usize) + 1],
     /// Inferred last weight, stashed by `compute_huffman_bits` for the
@@ -383,7 +383,7 @@ impl HuffmanTable {
         // `rank scratch and the weight-decoding `fse_table` are build-time
         // scratch (repopulated when a block carries a new HUF table); the
         // literal-decode hot path reads only `packed_decode` + `max_num_bits`
-        // + `state_mask`. Skipping the rest mirrors the donor copying just the
+        // + `state_mask`. Skipping the rest mirrors the upstream zstd copying just the
         // HUF decode table per frame, not the full build workspace.
         self.packed_decode.extend_from_slice(&other.packed_decode);
         self.max_num_bits = other.max_num_bits;
@@ -538,7 +538,7 @@ impl HuffmanTable {
 
                 // Disjoint-field borrow: `dec1`/`dec2` hold `&self.fse_table`,
                 // so the weight sink is taken as a field borrow. The running
-                // stats (donor `HUF_readStats` shape) accumulate in locals
+                // stats (upstream zstd `HUF_readStats` shape) accumulate in locals
                 // and commit to `self` after the loop, replacing the
                 // separate weight-sum and rank-count passes.
                 let weights = &mut self.weights;
@@ -574,7 +574,7 @@ impl HuffmanTable {
                 // update reads at most 6 bits. Refilling once per loop step
                 // (two interleaved updates = up to 12 bits) lets both updates
                 // use the unchecked fast advance instead of a per-symbol refill
-                // branch, mirroring the donor's single reload per decode step.
+                // branch, mirroring the upstream zstd's single reload per decode step.
                 // `bits_remaining()` still tracks end-of-stream via `extra_bits`
                 // (maintained by `refill_slow`), so the termination checks below
                 // fire identically.
@@ -635,7 +635,7 @@ impl HuffmanTable {
                 // Unpack both nibbles per source byte in one iteration —
                 // the per-index parity branch defeated unrolling and read
                 // every byte twice. The running stats accumulate alongside
-                // (donor `HUF_readStats` shape).
+                // (upstream zstd `HUF_readStats` shape).
                 let mut push_weight = |w: u8, weights: &mut Vec<u8>| -> Result<(), err> {
                     if w > MAX_MAX_NUM_BITS {
                         return Err(err::WeightBiggerThanMaxNumBits { got: w });
@@ -753,7 +753,7 @@ impl HuffmanTable {
 
         // The rank walk partitions [0, table_size) into one contiguous run
         // per code length (no gaps, no overlap), so the fill loop below
-        // initialises every slot — the donor likewise skips the table
+        // initialises every slot — the upstream zstd likewise skips the table
         // pre-zero (`ZSTD_memset ... is not necessary`). Assert the total
         // span equals `table_size` before trusting the unchecked `set_len`.
         assert!(
@@ -774,7 +774,7 @@ impl HuffmanTable {
             .as_mut_ptr()
             .cast::<u16>();
 
-        // Per-symbol run fill, donor `HUF_DEltX1` shape: every live symbol
+        // Per-symbol run fill, upstream zstd `HUF_DEltX1` shape: every live symbol
         // claims a contiguous run inside its code-length rank, and the
         // 16-bit entry broadcasts four-at-a-time through a 64-bit store
         // (LLVM lowered the per-slot `MaybeUninit::write` loop to scalar
@@ -857,7 +857,7 @@ mod tests {
     use alloc::vec;
 
     fn test_table() -> HuffmanTable {
-        // Packed `symbol | (num_bits << 8)` per state index (donor `HUF_DEltX1`).
+        // Packed `symbol | (num_bits << 8)` per state index (upstream zstd `HUF_DEltX1`).
         let packed_decode = vec![
             u16::from(b'A') | (1u16 << 8),
             u16::from(b'B') | (2u16 << 8),

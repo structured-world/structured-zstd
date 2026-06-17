@@ -13,7 +13,7 @@ use crate::fse::SeqFSEDecoder;
 #[cfg(test)]
 use alloc::vec::Vec;
 
-// 8-slot software pipeline mirroring donor
+// 8-slot software pipeline mirroring upstream zstd
 // `ZSTD_decompressSequencesLong_body`'s `STORED_SEQS = 8`. The
 // 8-deep lookahead lets the prefetch issued at iteration `i`
 // resolve through L1/L2 by the time iteration `i + 8` consumes it,
@@ -28,14 +28,14 @@ const _: () = assert!(
     "ADVANCE must be a power of two; ring indexing uses `i & (ADVANCE - 1)` as `i % ADVANCE`"
 );
 
-/// Donor `ZSTD_decompressBlock_internal` long-pipeline gate. Engages
+/// Upstream zstd `ZSTD_decompressBlock_internal` long-pipeline gate. Engages
 /// the 8-deep lookahead-ring decoder when (a) the block has enough
 /// sequences to amortise prefill+drain (`num_sequences >= ADVANCE * 2`)
 /// AND (b) either the dict is cold (first block after attach) OR total
 /// history exceeds 16 MB AND the FSE offset distribution carries
 /// enough long-distance codes to make prefetch worthwhile.
 ///
-/// `MIN_LONG_OFFSET_SHARE`: donor `minShare = MEM_64bits() ? 7 : 20` —
+/// `MIN_LONG_OFFSET_SHARE`: upstream zstd `minShare = MEM_64bits() ? 7 : 20` —
 /// the 32-bit threshold is higher because the prefetch pipeline needs
 /// a stronger long-offset signal to outpace the narrower load window
 /// on those targets. `HISTORY_THRESHOLD_FOR_PREFETCH = 1 << 24` (16 MB):
@@ -104,7 +104,7 @@ where
 {
     // Consume the one-shot `ddict_is_cold` flag BEFORE any early return
     // (padding validation) so a later block's gate can't mis-apply a
-    // cold-dict signal that no longer holds. Donor
+    // cold-dict signal that no longer holds. Upstream zstd
     // `ZSTD_decompressBlock_internal` clears `dctx->ddictIsCold = 0`
     // unconditionally after the sequence-section dispatch decision.
     let ddict_is_cold = fse.ddict_is_cold;
@@ -204,7 +204,7 @@ where
 /// bitstream and immediately executes it (literal copy + match copy)
 /// without materialising the intermediate `Vec<Sequence>` round-trip.
 ///
-/// Donor parity: zstd's `ZSTD_decompressSequences_body` interleaves
+/// Upstream zstd parity: zstd's `ZSTD_decompressSequences_body` interleaves
 /// `ZSTD_decodeSequence` and `ZSTD_execSequence` in one loop, keeping
 /// the `seq_t` in registers. We were paying ~24 B/seq × 2 (write + read)
 /// of L1↔L2 traffic on the dropped Vec<Sequence> roundtrip plus the
@@ -379,7 +379,7 @@ pub(crate) fn decode_and_execute_sequences_impl<
 ) -> Result<(), DecompressBlockError> {
     // Consume the one-shot `ddict_is_cold` flag at function entry,
     // BEFORE any early returns (padding-bit validation).
-    // Donor `ZSTD_decompressBlock_internal` clears
+    // Upstream zstd `ZSTD_decompressBlock_internal` clears
     // `dctx->ddictIsCold = 0` unconditionally after the
     // sequence-section dispatch decision; if the early-return paths
     // left the flag set, a later block's gate would mis-apply the
@@ -426,7 +426,7 @@ pub(crate) fn decode_and_execute_sequences_impl<
     // bitstream-tail validation fails, covering the edge case where
     // every sequence succeeds but the bitstream has leftover bits.
 
-    // 8-slot software pipeline mirroring donor
+    // 8-slot software pipeline mirroring upstream zstd
     // `ZSTD_decompressSequencesLong_body`. Pre-decode `ADVANCE`
     // sequences ahead, prefetch each match source as we go, then
     // execute the oldest in-flight sequence per iteration while
@@ -436,7 +436,7 @@ pub(crate) fn decode_and_execute_sequences_impl<
     // line(s) into L1/L2 — hiding DRAM latency for long-distance
     // matches whose source is beyond cache residency.
     //
-    // Donor parity: `STORED_SEQS = 8`. 8-deep lookahead lets the
+    // Upstream zstd parity: `STORED_SEQS = 8`. 8-deep lookahead lets the
     // prefetch issued at iteration `i` resolve through L1/L2 by the
     // time iteration `i + 8` consumes it, whereas 4-deep often
     // wasn't enough gap on the long-distance workloads we target.
@@ -447,7 +447,7 @@ pub(crate) fn decode_and_execute_sequences_impl<
     // ADVANCE / ADVANCE_MASK hoisted to module scope so the extracted
     // `run_pipelined_sequence_loop` can reach them.
 
-    // The format-level `isLongOffset` shortcut from donor is
+    // The format-level `isLongOffset` shortcut from upstream zstd is
     // irrelevant on our u32-indexed decoder, so on top of the
     // long-offset share the cold-dict signal is the only other gate.
 
@@ -505,7 +505,7 @@ pub(crate) fn decode_and_execute_sequences_impl<
         //
         // Routes through `execute_one_sequence_pipelined` (resolving
         // the actual offset against a `shadow_hist` upfront) so the
-        // inline donor-shape writer fires on backends that opt in
+        // inline upstream zstd-shape writer fires on backends that opt in
         // (`UserSliceBackend::SUPPORTS_INLINE_SEQUENCE_EXEC = true`).
         // The legacy `execute_one_sequence` path went through
         // `DecodeBuffer::repeat_inner` which incremented
@@ -665,7 +665,7 @@ fn run_pipelined_sequence_loop<
     max_update_bits: u8,
     seq_sum: &mut u32,
 ) -> Result<(), DecompressBlockError> {
-    // Donor `ZSTD_decompressSequencesLong_body` shape: 8-deep
+    // Upstream zstd `ZSTD_decompressSequencesLong_body` shape: 8-deep
     // lookahead ring with `prefetch_lookahead_match_source` per
     // decoded seq, executing the OLDEST resolved sequence per
     // iteration. Used ONLY when caller selected the long-pipeline
@@ -990,30 +990,30 @@ pub(crate) fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBac
         return Err(ExecuteSequencesError::ZeroOffset.into());
     }
 
-    // Donor-shape inline dispatch — when the backend opts in
+    // Upstream zstd-shape inline dispatch — when the backend opts in
     // (`UserSliceBackend` on x86_64 today, per its
     // `SUPPORTS_INLINE_SEQUENCE_EXEC = true` const) we collapse the
     // literal copy + match copy into a single straight-line body
-    // that mirrors donor `ZSTD_execSequence`
+    // that mirrors upstream zstd `ZSTD_execSequence`
     // (zstd_decompress_block.c:1008-1105). The const branch is
     // compile-time per backend monomorphisation, so the dead arm
     // carries no runtime cost on either side.
     //
-    // **Literal-source slack guard** (the read-side donor-port
-    // safety contract): donor's `ZSTD_copy16` reads 16 bytes
+    // **Literal-source slack guard** (the read-side upstream zstd-port
+    // safety contract): upstream zstd's `ZSTD_copy16` reads 16 bytes
     // unconditionally regardless of `litLength`; on truncated
     // literals (the closing sequences of a block) that would read
     // past the end of the literals buffer slice — UB even when the
     // bytes happen to be valid memory inside the backing `Vec`.
-    // Donor guards with `iLitEnd > litLimit` → slow path. We mirror
-    // the same gate. The donor inline path issues two distinct reads
+    // Upstream zstd guards with `iLitEnd > litLimit` → slow path. We mirror
+    // the same gate. The upstream zstd inline path issues two distinct reads
     // past the declared literal end:
     //   (1) Unconditional first `ZSTD_copy16` from `lit_cur_before`
     //       — needs `lit_cur_before + 16 <= lit_len`. THIS GATE
     //       MATTERS EVEN WHEN `seq.ll == 0`: the copy still happens,
     //       overwriting the dst region the match copy will rewrite.
     //   (2) Tail wildcopy's final 16-byte chunk — ONLY when
-    //       `lit_length > 16` (the donor inline path gates the
+    //       `lit_length > 16` (the upstream zstd inline path gates the
     //       wildcopy call on that same threshold). Reads up to
     //       `lit_cur_before + lit_length + 15`, i.e. `high + 15`.
     // For `lit_length ∈ 0..=16` only (1) fires; gate (2) would
@@ -1026,7 +1026,7 @@ pub(crate) fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBac
     // reads through `lit_cur_before + seq.ll.next_multiple_of(16)
     // - 1`. Use that exact bound rather than `high + 15`, which
     // over-counts by `15 - ((seq.ll - 1) % 16)` whenever `seq.ll %
-    // 16 != 1` — keeping the donor inline path active on more
+    // 16 != 1` — keeping the upstream zstd inline path active on more
     // sequences near the end of the literals buffer.
     let inline_path_safe = B::SUPPORTS_INLINE_SEQUENCE_EXEC
         && buffer.buffer_mut().inline_exec_ok(
@@ -1042,7 +1042,7 @@ pub(crate) fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBac
     if inline_path_safe {
         // Validate match-copy offset against the live region
         // (matches `repeat()`'s `offset > buffer.len()` → dict path
-        // gate). Donor inline path stays on the prefix-resident
+        // gate). Upstream zstd inline path stays on the prefix-resident
         // case; offsets that step into dict / extDict territory fall
         // back to the layered path below.
         let buf_len = buffer.len();
@@ -1051,12 +1051,12 @@ pub(crate) fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBac
         // lits.len()` would wrap `usize`, treat the offset as
         // out-of-range and fall back to the layered path. Without
         // the check, wrapping addition could classify a wildly
-        // out-of-range `offset` as in-range and feed the donor
+        // out-of-range `offset` as in-range and feed the upstream zstd
         // inline path an OOB match-source pointer.
         let prefix_end = buf_len.checked_add(lits.len()).filter(|end| offset <= *end);
         if prefix_end.is_none() {
             // Match source reaches outside what's been written in this
-            // frame — donor's `extDict` arm. Punt back to the slow
+            // frame — upstream zstd's `extDict` arm. Punt back to the slow
             // `repeat()` path; that path already routes through
             // `repeat_from_dict` for these offsets.
             buffer.try_push(lits).map_err(ExecuteSequencesError::from)?;
@@ -1070,7 +1070,7 @@ pub(crate) fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBac
         // - `lits` is a non-aliased slice of the literals block.
         // - Source-side slack: `lit_cur_before + 16 <= lit_len`
         //   (gated above), so `lits.as_ptr().add(16)` reads stay
-        //   inside the literals buffer. Donor unconditional
+        //   inside the literals buffer. Upstream zstd unconditional
         //   `ZSTD_copy16` over-read of up to 16 bytes past
         //   `lits.len()` is bounded by the slack we just asserted.
         // - Offset is within the live region (prefix-resident,
@@ -1089,7 +1089,7 @@ pub(crate) fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBac
         // SAFETY: `literals.as_ptr().add(lit_cur_before)` has the
         // provenance of the FULL `literals` slice (not `lits`, the
         // sub-slice). The 16-byte unconditional `copy16` inside the
-        // donor body reads up to `lit_cur_before + 16` bytes from
+        // upstream zstd body reads up to `lit_cur_before + 16` bytes from
         // the parent buffer, which the `inline_path_safe` gate above
         // bounded by `lit_cur_before + 16 <= lit_len`. Passing
         // `lits.as_ptr()` directly would be UB when `lits.len() <
@@ -1248,7 +1248,7 @@ fn decode_one_sequence_inline<K: crate::cpu_kernel::CpuKernel>(
     // matches the prior `1u32 << of_code` shift form (both share the
     // already-touched bit-count cache line) and the uniform read
     // shape unblocks dropping `state.symbol` from the hot path so
-    // the 12-byte Entry can shrink to donor's 8-byte ZSTD_seqSymbol
+    // the 12-byte Entry can shrink to upstream zstd's 8-byte ZSTD_seqSymbol
     // in a follow-up tightening of the FSE table cache footprint.
     let ll_state = ll_dec.state;
     let ml_state = ml_dec.state;
@@ -1258,14 +1258,14 @@ fn decode_one_sequence_inline<K: crate::cpu_kernel::CpuKernel>(
     let ll_num_bits = ll_state.num_additional_bits;
     let ml_value = ml_state.base_value;
     let ml_num_bits = ml_state.num_additional_bits;
-    // Donor-shape uniform read: OF uses `base_value` + `num_additional_bits`
+    // Upstream zstd-shape uniform read: OF uses `base_value` + `num_additional_bits`
     // like LL/ML, dropping the `entry.symbol → 1 << symbol` shift. Both
     // fields are already populated by `enrich_for_offsets` (`base_value
     // = 1 << code`, `num_additional_bits = code`). On x86_64 the memory
     // load is wash vs the shift since both fields share the same Entry
     // cache line that was already touched for the bit-count read; the
     // win is that the hot path no longer reads `state.symbol`, which
-    // unblocks dropping the field from `Entry` (donor's ZSTD_seqSymbol
+    // unblocks dropping the field from `Entry` (upstream zstd's ZSTD_seqSymbol
     // is 8 bytes vs our 12 — that would tighten the FSE table cache
     // footprint by 4 bytes / entry).
     let of_num_bits = of_state.num_additional_bits;
@@ -1286,7 +1286,7 @@ fn decode_one_sequence_inline<K: crate::cpu_kernel::CpuKernel>(
 }
 
 /// Packed (baseline, extra_bits) pairs for literal-length codes.
-/// Donor parity: `LL_base` + `LL_bits` from the zstd reference
+/// Upstream zstd parity: `LL_base` + `LL_bits` from the zstd reference
 /// (`zstd_compress_internal.h`). Per Zstandard format §3.1.1.3.2.1.1.1,
 /// valid codes are 0..=35; the FSE decoder guarantees codes never
 /// exceed 35 (table built with `max_symbol = MAX_LITERAL_LENGTH_CODE`
@@ -1315,7 +1315,7 @@ pub(crate) const LL_META: [u32; 36] = pack_code_meta(
 );
 
 /// Packed (baseline, extra_bits) pairs for match-length codes.
-/// Donor parity: `ML_base` + `ML_bits`. Codes 0..=52 per Zstandard
+/// Upstream zstd parity: `ML_base` + `ML_bits`. Codes 0..=52 per Zstandard
 /// format §3.1.1.3.2.1.1.2. Same packed layout as [`LL_META`].
 pub(crate) const ML_META: [u32; 53] = pack_code_meta(
     &[
@@ -1357,10 +1357,10 @@ pub const ML_MAX_LOG: u8 = 9;
 /// "The maximum accuracy log for the offset table is 8."
 pub const OF_MAX_LOG: u8 = 8;
 
-/// Walk the offsets FSE decode table and return the donor-shaped
+/// Walk the offsets FSE decode table and return the upstream zstd-shaped
 /// "share of long offsets" signal: count entries whose symbol (offset
 /// code) is > 22 (raw offset ≥ 2²³ = 8 MiB), then scale up to the
-/// donor `OffFSELog = 8` reference so a fine-grained table still
+/// upstream zstd `OffFSELog = 8` reference so a fine-grained table still
 /// registers comparable share. Output compares directly against
 /// `MIN_LONG_OFFSET_SHARE` (7 on 64-bit, 20 on 32-bit) in the
 /// pipeline-gate decision.
@@ -1698,7 +1698,7 @@ const OFFSET_DEFAULT_DISTRIBUTION: [i32; 29] = [
 /// `accuracy_log`, different `offsets_long_share` for OF) the
 /// dispatch in `maybe_update_fse_tables` would silently decode
 /// against a stale table — the bench delta would still look fine
-/// but cross-validation against the donor would diverge on the
+/// but cross-validation against the upstream zstd would diverge on the
 /// next ratio gate.
 #[cfg(feature = "std")]
 #[test]
@@ -1862,7 +1862,7 @@ mod offsets_long_share_tests {
     #[test]
     fn zero_long_codes_returns_zero_share() {
         // A table with only short offset codes (all symbols <= 22).
-        // Donor parity: share is the count of symbols > 22, scaled to
+        // Upstream zstd parity: share is the count of symbols > 22, scaled to
         // OffFSELog = 8 — with zero such symbols, share is 0
         // regardless of accuracy_log.
         for log in [3u8, 5, 6, 8] {
@@ -1880,7 +1880,7 @@ mod offsets_long_share_tests {
     #[test]
     fn long_codes_scale_to_offset_fse_log_reference() {
         // accuracy_log = 5 → 32-entry table. One symbol at code 23
-        // (just above the threshold of 22), the rest at 0. Donor
+        // (just above the threshold of 22), the rest at 0. Upstream zstd
         // scales the raw count by `OffFSELog - accuracy_log` =
         // `8 - 5 = 3`, so 1 << 3 = 8 should land at the 64-bit
         // `MIN_LONG_OFFSET_SHARE = 7` threshold (just over).
@@ -1906,7 +1906,7 @@ mod offsets_long_share_tests {
     #[test]
     fn threshold_is_strict_greater_than() {
         // Symbol == LONG_OFFSET_CODE_THRESHOLD (22) does NOT count —
-        // matches donor `> 22` strict-greater predicate. Only
+        // matches upstream zstd `> 22` strict-greater predicate. Only
         // symbols 23..MAX raise the share.
         let mut symbols = [0u8; 256];
         for sym in symbols.iter_mut().take(50) {
