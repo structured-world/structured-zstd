@@ -1,6 +1,6 @@
 //! Shared byte-histogram helpers used by entropy-table builders.
 //!
-//! Follows the donor strategy from `zstd/lib/compress/hist.c`:
+//! Follows the upstream zstd strategy from `zstd/lib/compress/hist.c`:
 //! a scalar path for small inputs and a striped counting path for larger inputs.
 
 const PARALLEL_COUNT_THRESHOLD: usize = 1500;
@@ -44,7 +44,7 @@ fn count_bytes_parallel(data: &[u8], counts: &mut [usize; 256]) -> (usize, usize
         let end = data.len() - 16;
         while index <= end {
             // SAFETY: loop condition guarantees we can read 16 bytes starting at
-            // `index`; read_unaligned matches donor-style lane loads.
+            // `index`; read_unaligned matches upstream zstd-style lane loads.
             let ptr = unsafe { data.as_ptr().add(index) };
             let lane0 = u32::from_le(unsafe { core::ptr::read_unaligned(ptr.cast::<u32>()) });
             let lane1 =

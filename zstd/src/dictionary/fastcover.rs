@@ -23,7 +23,7 @@ pub const DEFAULT_K_CANDIDATES: &[usize] = &[64, 128, 256, 512, 1024, 2048];
 pub const DEFAULT_D_CANDIDATES: &[usize] = &[6, 8, 12, 16];
 pub const DEFAULT_F_CANDIDATES: &[u32] = &[16, 18, 20];
 
-// Donor multiplicative hash primes (`ZSTD_hashXPtr` family,
+// Upstream zstd multiplicative hash primes (`ZSTD_hashXPtr` family,
 // `zstd/lib/common/zstd_internal.h`): one unaligned read + one multiply per
 // dmer instead of a per-byte FNV loop.
 const PRIME_4_BYTES: u32 = 2_654_435_761;
@@ -33,14 +33,14 @@ const PRIME_7_BYTES: u64 = 58_295_818_150_454_627;
 const PRIME_8_BYTES: u64 = 0xCF1B_BCDC_B7A5_6463;
 
 /// Bytes a dmer hash reads at a position: the hash covers the first
-/// `min(d, 8)` bytes but the wide read is always 8 (donor
+/// `min(d, 8)` bytes but the wide read is always 8 (upstream zstd
 /// `readLength = MAX(d, 8)`), except the pure 4-byte hash.
 #[inline]
 fn dmer_read_len(d: usize) -> usize {
     d.max(8)
 }
 
-/// Donor `FASTCOVER_hashPtrToIndex`: hash the first `min(d, 8)` bytes of the
+/// Upstream zstd `FASTCOVER_hashPtrToIndex`: hash the first `min(d, 8)` bytes of the
 /// dmer at `pos` into an `f`-bit table index. Caller guarantees
 /// `pos + dmer_read_len(d) <= sample.len()`.
 #[inline]
@@ -74,7 +74,7 @@ pub(crate) fn normalize_fastcover_params(mut params: FastCoverParams) -> FastCov
 fn build_frequency_table(sample: &[u8], d: usize, f: u32, accel: usize) -> Vec<u32> {
     let bits = clamp_table_bits(f);
     let size = 1usize << bits;
-    // Donor accel table: `skip = accel - 1` dmers between counted dmers
+    // Upstream zstd accel table: `skip = accel - 1` dmers between counted dmers
     // (`FASTCOVER_defaultAccelParameters`), i.e. a stride of `accel`.
     let step = accel.max(1);
     let mut table = vec![0u32; size];
@@ -110,7 +110,7 @@ fn build_raw_dict(sample: &[u8], dict_size: usize, params: FastCoverParams) -> V
         return Vec::new();
     }
 
-    // Donor `FASTCOVER_buildDictionary` epoch model: split the corpus into
+    // Upstream zstd `FASTCOVER_buildDictionary` epoch model: split the corpus into
     // epochs of dmers and round-robin them, taking the best k-byte segment
     // per visit. A segment's score is the sum of frequencies of its DISTINCT
     // dmers, maintained incrementally while the candidate window slides
@@ -125,7 +125,7 @@ fn build_raw_dict(sample: &[u8], dict_size: usize, params: FastCoverParams) -> V
     let mut freqs = build_frequency_table(sample, d, f, params.accel);
     let dmers_in_k = k - d + 1; // `normalize` guarantees k >= d
 
-    // Donor `COVER_computeEpochs` (passes = 1): target one selection per
+    // Upstream zstd `COVER_computeEpochs` (passes = 1): target one selection per
     // epoch, with a floor so epochs stay large enough to contain useful
     // segments.
     let min_epoch_size = k * 10;
@@ -136,10 +136,10 @@ fn build_raw_dict(sample: &[u8], dict_size: usize, params: FastCoverParams) -> V
         epoch_count = (nb_dmers / epoch_size).max(1);
     }
 
-    // Per-window dmer occurrence counts (donor `segmentFreqs`, u16: a window
+    // Per-window dmer occurrence counts (upstream zstd `segmentFreqs`, u16: a window
     // holds at most `dmers_in_k` <= k occurrences of one index).
     let mut segment_freqs = vec![0u16; 1usize << f];
-    // Fill from the back (donor layout) so the best segments sit at the end
+    // Fill from the back (upstream zstd layout) so the best segments sit at the end
     // of the dictionary and get referenced with the smallest offsets.
     let mut out = vec![0u8; dict_size];
     let mut tail = dict_size;
@@ -153,7 +153,7 @@ fn build_raw_dict(sample: &[u8], dict_size: usize, params: FastCoverParams) -> V
         epoch = (epoch + 1) % epoch_count;
 
         // Slide the candidate window across the epoch, tracking the best
-        // segment (donor `FASTCOVER_selectSegment`).
+        // segment (upstream zstd `FASTCOVER_selectSegment`).
         let mut best_begin = 0usize;
         let mut best_end = 0usize;
         let mut best_score = 0u64;
@@ -194,7 +194,7 @@ fn build_raw_dict(sample: &[u8], dict_size: usize, params: FastCoverParams) -> V
 
         if best_score == 0 {
             // This epoch has no uncovered content left; other epochs may.
-            // Give up after a run of empty epochs (donor `maxZeroScoreRun`).
+            // Give up after a run of empty epochs (upstream zstd `maxZeroScoreRun`).
             zero_score_run += 1;
             if zero_score_run >= MAX_ZERO_SCORE_RUN {
                 break;

@@ -23,7 +23,7 @@ use crate::common::MAXIMUM_ALLOWED_WINDOW_SIZE;
 /// Build the block-header decode error. With the `lsm` feature it captures
 /// the failing block's index and frame offset (block-precise recovery);
 /// without it, the legacy positionless variant — so the default build's
-/// error surface stays byte-identical to the donor.
+/// error surface stays byte-identical to the upstream zstd.
 #[cfg(feature = "lsm")]
 fn block_header_decode_error(
     source: crate::decoding::errors::BlockHeaderReadError,
@@ -156,7 +156,7 @@ pub struct FrameDecoder {
     direct_frames: u64,
     // Registered dictionaries are stored by shared handle (Arc/Rc) so a
     // single content copy is referenced by every frame the decoder decodes
-    // (donor `ZSTD_refDDict`), rather than re-copied into the decode buffer
+    // (upstream zstd `ZSTD_refDDict`), rather than re-copied into the decode buffer
     // per frame. `add_dict` wraps an owned `Dictionary` into a handle.
     owned_dicts: BTreeMap<u32, DictionaryHandle>,
     #[cfg(target_has_atomic = "ptr")]
@@ -829,7 +829,7 @@ impl FrameDecoderState {
 
     /// Construct a new frame decoder state, reading the frame header
     /// from `source`. When `magicless` is `true`, the 4-byte magic
-    /// number prefix is NOT consumed (donor `ZSTD_f_zstd1_magicless`).
+    /// number prefix is NOT consumed (upstream zstd `ZSTD_f_zstd1_magicless`).
     /// Crate-internal — reached only via `FrameDecoder::init` /
     /// `FrameDecoder::init_with_dict_handle`. The decode buffer is
     /// allocated lazily on BOTH backends (`new_ring` and `new_flat`):
@@ -869,7 +869,7 @@ impl FrameDecoderState {
     /// Reset this state for a new frame read from `source`, reusing
     /// existing allocations. When `magicless` is `true`, the frame
     /// header is read WITHOUT expecting a magic-number prefix
-    /// (donor `ZSTD_f_zstd1_magicless`). Crate-internal — reached
+    /// (upstream zstd `ZSTD_f_zstd1_magicless`). Crate-internal — reached
     /// only via `FrameDecoder::reset`.
     ///
     /// `DecodeBuffer::reset` no longer reserves window_size for either
@@ -1018,7 +1018,7 @@ impl FrameDecoder {
     /// attacks).
     ///
     /// NOT a replacement for AEAD authentication. NOT the same
-    /// semantic as donor `ZSTD_d_windowLogMax` (which is a
+    /// semantic as upstream zstd `ZSTD_d_windowLogMax` (which is a
     /// ceiling-style limit, separate concern).
     #[cfg(feature = "lsm")]
     #[cfg_attr(docsrs, doc(cfg(feature = "lsm")))]
@@ -1043,7 +1043,7 @@ impl FrameDecoder {
     ///
     /// `None` (default) disables the check.
     ///
-    /// Byte-exact equality, NOT a ceiling. Donor
+    /// Byte-exact equality, NOT a ceiling. Upstream zstd
     /// `ZSTD_d_windowLogMax` is a separate ceiling-style limit
     /// available through the C FFI surface; this method is for
     /// strict equality validation against a pinned expectation
@@ -2998,7 +2998,7 @@ impl FrameDecoder {
                     });
                 }
                 // Compressed-block in-block overshoot: the sequence
-                // executor (donor-inline path) or the match-repeat
+                // executor (upstream zstd-inline path) or the match-repeat
                 // fallback tripped the fixed-capacity backend's per-write
                 // check. Unlike Raw/RLE, a Compressed block carries no
                 // header-declared output size, so `produced` is computed

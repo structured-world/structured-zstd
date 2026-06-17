@@ -94,7 +94,7 @@ impl CpuKernel for ScalarKernel {
 /// when the CPU has BMI2 but not the AVX2 SIMD width to upgrade to
 /// the Avx2 kernel. Treated as a stepping stone between Sse2 and
 /// Avx2 on hardware that has BMI2 but not AVX2 (rare in practice but
-/// matches donor's gating).
+/// matches upstream zstd's gating).
 #[cfg(all(target_arch = "x86_64", feature = "kernel_bmi2"))]
 #[derive(Copy, Clone, Default)]
 pub(crate) struct Bmi2Kernel;

@@ -66,7 +66,7 @@ pub(crate) mod cost_model;
 pub(crate) mod dfast;
 pub(crate) mod hc;
 // LDM uses `twox_hash::XxHash64` (per-window XXH64 over the
-// `min_match_length` byte slice, donor `zstd_ldm.c:315`). The
+// `min_match_length` byte slice, upstream zstd `zstd_ldm.c:315`). The
 // `twox-hash` dependency is gated behind the `hash` feature so
 // `default-features = false` builds (no_std, embedded) don't pull
 // it in. `BtMatcher::ldm_producer` and the `cfg(feature = "hash")`
@@ -187,7 +187,7 @@ pub fn compress_to_vec<R: Read>(source: R, level: CompressionLevel) -> Vec<u8> {
 /// Panics on encoder error (matches the failure surface of
 /// [`compress_to_vec`], which this function backs). Out-of-memory during
 /// the output / per-block scratch allocations is handled by the global
-/// allocator's abort policy. The slice/Vec entry points mirror the donor
+/// allocator's abort policy. The slice/Vec entry points mirror the upstream zstd
 /// `ZSTD_compress` shape (no error return on the bulk path).
 ///
 /// ```rust
@@ -404,7 +404,7 @@ pub trait Matcher {
     /// Hint the byte size of the dictionary that will be primed into the next
     /// frame. The built-in runtime matcher uses it to size the binary-tree /
     /// hash-chain match-finder tables from the dictionary's cParams tier rather
-    /// than the source window (donor CDict economics), while keeping the
+    /// than the source window (upstream zstd CDict economics), while keeping the
     /// eviction window source-sized. Default no-op for custom matchers and test
     /// stubs; consumed at the next [`reset`](Self::reset).
     fn set_dictionary_size_hint(&mut self, _size: usize) {}

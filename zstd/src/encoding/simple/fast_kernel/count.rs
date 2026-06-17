@@ -1,13 +1,13 @@
-//! Forward match-length counter — direct port of donor's `ZSTD_count`
+//! Forward match-length counter — direct port of upstream zstd's `ZSTD_count`
 //! from `lib/compress/zstd_compress_internal.h`. Compares `pIn` against
 //! `pMatch` in `usize`-sized chunks via XOR, falls back to a u32 / u16
 //! / u8 tail. The first mismatching byte is located via
 //! `trailing_zeros()/8` (little-endian) or `leading_zeros()/8`
-//! (big-endian) on the XOR difference, matching donor's
+//! (big-endian) on the XOR difference, matching upstream zstd's
 //! `ZSTD_NbCommonBytes`.
 //!
 //! The chunk type is `usize` — `u64` on 64-bit hosts, `u32` on 32-bit —
-//! to match donor's `MEM_readST` (`size_t`) loads. On 32-bit targets a
+//! to match upstream zstd's `MEM_readST` (`size_t`) loads. On 32-bit targets a
 //! u64 chunk would compile to two adjacent 32-bit loads + a 64-bit
 //! XOR; using native pointer width keeps the inner loop a single load
 //! per pointer per iteration.
@@ -35,9 +35,9 @@
 ///   concurrent write — the kernel runs single-threaded over a
 ///   block-local input slice so this holds by construction.
 ///
-/// # Equivalence to donor
+/// # Equivalence to upstream zstd
 ///
-/// Donor (`ZSTD_count` in `zstd_compress_internal.h`):
+/// Upstream zstd (`ZSTD_count` in `zstd_compress_internal.h`):
 /// ```c
 /// const BYTE* const pStart = pIn;
 /// const BYTE* const pInLoopLimit = pInLimit - (sizeof(size_t)-1);
@@ -61,7 +61,7 @@ pub(crate) unsafe fn count_forward(ip: *const u8, match_ptr: *const u8, iend: *c
     let mut ip = ip;
     let mut m = match_ptr;
 
-    // `usize`-sized chunk loop matching donor's `MEM_readST` cadence.
+    // `usize`-sized chunk loop matching upstream zstd's `MEM_readST` cadence.
     // CHUNK_SIZE = 8 on 64-bit targets, 4 on 32-bit. The bound check
     // `(ip as usize) + CHUNK_SIZE <= (iend as usize)` ensures every
     // chunked read stays inside the caller's `[ip, iend)` source range.
@@ -74,7 +74,7 @@ pub(crate) unsafe fn count_forward(ip: *const u8, match_ptr: *const u8, iend: *c
         let b = unsafe { core::ptr::read_unaligned(m.cast::<usize>()) };
         let diff = a ^ b;
         if diff != 0 {
-            // Donor's `ZSTD_NbCommonBytes` picks `__builtin_ctzll`
+            // Upstream zstd's `ZSTD_NbCommonBytes` picks `__builtin_ctzll`
             // (or `ctzl` on 32-bit) on little-endian and `clzll`/`clzl`
             // on big-endian. Native-endian XOR loads place the first
             // byte of the input in the LOW byte of the chunk on LE
@@ -116,7 +116,7 @@ pub(crate) unsafe fn count_forward(ip: *const u8, match_ptr: *const u8, iend: *c
     // operates in 4-byte strides, so the chunk's bounds invariant
     // (`+ CHUNK_SIZE <= iend` failed → at most 3 bytes left) makes
     // this branch's `+ 4 <= iend` always false — guarding the block
-    // with `cfg(target_pointer_width = "64")` mirrors donor's
+    // with `cfg(target_pointer_width = "64")` mirrors upstream zstd's
     // `MEM_64bits()` gate and lets the optimiser drop the dead check
     // on 32-bit builds.
     //
@@ -317,7 +317,7 @@ mod tests {
     fn diff_in_u32_tail() {
         // 12 bytes: 1×8-chunk match, then 4-byte tail diverges at
         // BYTE INDEX 9 (`99` vs `10`). After the 8-chunk advances
-        // ip/m by 8, the donor's u32 tail check compares
+        // ip/m by 8, the upstream zstd's u32 tail check compares
         // a[8..12]=[9,99,11,12] vs b[8..12]=[9,10,11,12] → unequal,
         // so the u32 advance is skipped. Same for u16
         // (a[8..10]=[9,99] vs b[8..10]=[9,10] → unequal). The single
