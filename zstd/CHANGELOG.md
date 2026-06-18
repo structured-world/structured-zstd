@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.41](https://github.com/structured-world/structured-zstd/compare/v0.0.40...v0.0.41) - 2026-06-17
+
+### Performance
+
+- *(decode)* decode StreamingDecoder read_to_end in place ([#429](https://github.com/structured-world/structured-zstd/pull/429))
+- *(hc)* lazy-skip + separate dictMatchState beat C on small-window dict compress ([#427](https://github.com/structured-world/structured-zstd/pull/427))
+- *(encode)* close small-window dict compress gap (hash-chain matchfinder + borrowed dict kernel) ([#426](https://github.com/structured-world/structured-zstd/pull/426))
+- *(huff0)* skip FSE weight description for streams it cannot encode ([#424](https://github.com/structured-world/structured-zstd/pull/424))
+
+### Refactored
+
+- purge reference-impl terminology + isolate C bindings in ffi-bench ([#430](https://github.com/structured-world/structured-zstd/pull/430))
+
 ## [0.0.40](https://github.com/structured-world/structured-zstd/compare/v0.0.39...v0.0.40) - 2026-06-15
 
 ### Performance
