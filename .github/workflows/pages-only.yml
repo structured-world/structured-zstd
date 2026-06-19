@@ -28,7 +28,7 @@ jobs:
     timeout-minutes: 5
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Generate bot token
         id: bot-token
@@ -38,7 +38,7 @@ jobs:
           private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
 
       - name: Checkout gh-pages
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: gh-pages
           token: ${{ steps.bot-token.outputs.token }}

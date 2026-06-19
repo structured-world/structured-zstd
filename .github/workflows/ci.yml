@@ -53,7 +53,7 @@ jobs:
     outputs:
       rust_core: ${{ steps.filter.outputs.rust_core }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dorny/paths-filter@v4
         id: filter
         with:
@@ -76,7 +76,7 @@ jobs:
     timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -164,7 +164,7 @@ jobs:
     env:
       UPSTREAM_TAG: v1.5.7
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # Build + test + header-diff job (no push); don't leave the token
           # in the checkout's git config.
@@ -312,7 +312,7 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Prepend toolchain bin to PATH (macos shim workaround)
         if: runner.os == 'macOS'
@@ -346,7 +346,7 @@ jobs:
     timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@nextest
       - name: Install i686 target
@@ -365,7 +365,7 @@ jobs:
     timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.92.0"
@@ -391,7 +391,7 @@ jobs:
     timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -425,7 +425,7 @@ jobs:
     timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # This job builds + tests only (no push); don't leave the token in
           # the checkout's git config.
@@ -497,7 +497,7 @@ jobs:
     timeout-minutes: 30
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -574,7 +574,7 @@ jobs:
           private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
 
       - name: Checkout gh-pages with push token
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: gh-pages
           token: ${{ steps.bot-token.outputs.token }}
@@ -616,7 +616,7 @@ jobs:
     timeout-minutes: 15
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: llvm-tools-preview
@@ -664,7 +664,7 @@ jobs:
       # corpus replay step and the fresh-fuzz step iterate over this.
       FUZZ_TARGETS: "decode encode interop huff0 fse"
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
         with:
@@ -862,7 +862,7 @@ jobs:
         bench: ${{ fromJSON(needs.bench-matrix.outputs.targets) }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - name: Install benchmark target
         run: rustup target add ${{ matrix.bench.target_triple }}
@@ -960,7 +960,7 @@ jobs:
         shard: ${{ fromJSON(needs.bench-matrix.outputs.shards) }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         # Needed for: corpus files referenced via `env!("CARGO_MANIFEST_DIR")`
         # inside the bench binary, the run-benchmarks.sh script, and
         # the python post-processor.
@@ -1039,7 +1039,7 @@ jobs:
     timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Generate bot token
         id: bot-token
@@ -1110,7 +1110,7 @@ jobs:
     timeout-minutes: 20
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Generate bot token
         id: bot-token
@@ -1122,7 +1122,7 @@ jobs:
 
       - name: Checkout gh-pages with push token
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: gh-pages
           token: ${{ steps.bot-token.outputs.token }}
