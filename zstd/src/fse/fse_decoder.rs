@@ -364,6 +364,18 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         if self.accuracy_log == 0 || self.symbol_probabilities.is_empty() {
             return None;
         }
+        // The encoder table builder indexes a fixed `1 << 9 = 512`-entry stack
+        // scratch, so it can only represent `accuracy_log <= 9` (the sequence
+        // FSE wire cap). The decoder accepts tables up to
+        // `ENTRY_MAX_ACCURACY_LOG = 16` (a non-sequence table reached through a
+        // dictionary can carry one), and slicing the scratch with `1 <<
+        // accuracy_log > 512` would panic in release too. Such a table cannot be
+        // reused as a sequence encoder table — return None so the caller builds
+        // a fresh one instead of indexing past the scratch.
+        const MAX_ENCODER_ACCURACY_LOG: u8 = 9;
+        if self.accuracy_log > MAX_ENCODER_ACCURACY_LOG {
+            return None;
+        }
 
         Some(crate::fse::fse_encoder::build_table_from_probabilities(
             &self.symbol_probabilities,
@@ -1251,5 +1263,24 @@ mod tests {
         let probs: [i32; 4] = [4, 4, 4, 4];
         let result = t.build_from_probabilities(4, &probs);
         assert!(result.is_ok(), "expected Ok for exact sum, got {result:?}");
+    }
+
+    /// The decoder accepts tables with `accuracy_log` up to
+    /// `ENTRY_MAX_ACCURACY_LOG = 16`, but the encoder table builder indexes a
+    /// fixed 512-entry (`1 << 9`) scratch. A decoder table with `accuracy_log >
+    /// 9` reached through `to_encoder_table` (e.g. a non-sequence table carried
+    /// by a dictionary) must return None rather than slice past the scratch and
+    /// panic.
+    #[test]
+    fn to_encoder_table_rejects_accuracy_log_above_nine() {
+        let mut t = FSETable::new(8);
+        // A table with accuracy_log 10 (1 << 10 = 1024 entries) and a plausible
+        // probability distribution summing to 1024.
+        t.accuracy_log = 10;
+        t.symbol_probabilities = alloc::vec![512, 512];
+        assert!(
+            t.to_encoder_table().is_none(),
+            "accuracy_log > 9 must not be reusable as an encoder table"
+        );
     }
 }

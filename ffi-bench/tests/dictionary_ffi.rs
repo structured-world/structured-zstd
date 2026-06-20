@@ -6,6 +6,27 @@
 
 use structured_zstd::testing::dict_roundtrip_fixture;
 
+/// Repeated log-line fixture shared by the dictionary cross-decode tests: a
+/// dict built from this structure matches an input drawn from it heavily, so the
+/// encoder emits dict-reaching offsets the C decoder must accept.
+fn repeated_log_lines(len: usize) -> Vec<u8> {
+    const LINES: &[&str] = &[
+        "ts=2026-03-26T21:39:28Z level=INFO msg=\"flush memtable\" tenant=demo table=orders\n",
+        "ts=2026-03-26T21:39:29Z level=INFO msg=\"rotate segment\" tenant=demo table=orders\n",
+        "ts=2026-03-26T21:39:30Z level=INFO msg=\"compact level\" tenant=demo table=orders\n",
+        "ts=2026-03-26T21:39:31Z level=INFO msg=\"write block\" tenant=demo table=orders\n",
+    ];
+    let mut out = Vec::with_capacity(len);
+    let mut i = 0usize;
+    while out.len() < len {
+        let line = LINES[i % LINES.len()].as_bytes();
+        let take = line.len().min(len - out.len());
+        out.extend_from_slice(&line[..take]);
+        i += 1;
+    }
+    out
+}
+
 #[test]
 fn finalize_raw_dict_roundtrips_with_c_decoder() {
     let (finalized, compressed, payload) = dict_roundtrip_fixture();
@@ -31,26 +52,6 @@ fn finalize_raw_dict_roundtrips_with_c_decoder() {
 fn copy_mode_fast_dict_frame_decodes_with_c() {
     use structured_zstd::decoding::Dictionary;
     use structured_zstd::encoding::{CompressionLevel, FrameCompressor};
-
-    // The same repeated-log-line structure the dict shares, so a >8 KiB input
-    // matches the dict heavily and the copy path emits dict-reaching offsets.
-    fn repeated_log_lines(len: usize) -> Vec<u8> {
-        const LINES: &[&str] = &[
-            "ts=2026-03-26T21:39:28Z level=INFO msg=\"flush memtable\" tenant=demo table=orders\n",
-            "ts=2026-03-26T21:39:29Z level=INFO msg=\"rotate segment\" tenant=demo table=orders\n",
-            "ts=2026-03-26T21:39:30Z level=INFO msg=\"compact level\" tenant=demo table=orders\n",
-            "ts=2026-03-26T21:39:31Z level=INFO msg=\"write block\" tenant=demo table=orders\n",
-        ];
-        let mut out = Vec::with_capacity(len);
-        let mut i = 0usize;
-        while out.len() < len {
-            let line = LINES[i % LINES.len()].as_bytes();
-            let take = line.len().min(len - out.len());
-            out.extend_from_slice(&line[..take]);
-            i += 1;
-        }
-        out
-    }
 
     let dict = repeated_log_lines(8 * 1024);
     let payload = repeated_log_lines(16 * 1024); // > 8 KiB → Fast copy mode.
@@ -84,24 +85,6 @@ fn copy_mode_fast_dict_frame_decodes_with_c() {
 fn dict_frames_decode_with_c_across_levels_and_reuse() {
     use structured_zstd::decoding::Dictionary;
     use structured_zstd::encoding::{CompressionLevel, FrameCompressor};
-
-    fn repeated_log_lines(len: usize) -> Vec<u8> {
-        const LINES: &[&str] = &[
-            "ts=2026-03-26T21:39:28Z level=INFO msg=\"flush memtable\" tenant=demo table=orders\n",
-            "ts=2026-03-26T21:39:29Z level=INFO msg=\"rotate segment\" tenant=demo table=orders\n",
-            "ts=2026-03-26T21:39:30Z level=INFO msg=\"compact level\" tenant=demo table=orders\n",
-            "ts=2026-03-26T21:39:31Z level=INFO msg=\"write block\" tenant=demo table=orders\n",
-        ];
-        let mut out = Vec::with_capacity(len);
-        let mut i = 0usize;
-        while out.len() < len {
-            let line = LINES[i % LINES.len()].as_bytes();
-            let take = line.len().min(len - out.len());
-            out.extend_from_slice(&line[..take]);
-            i += 1;
-        }
-        out
-    }
 
     let dict = repeated_log_lines(8 * 1024);
     // Levels spanning every backend: 1 (Fast), 3 (dfast), 6 (Row/lazy),

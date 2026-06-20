@@ -6417,6 +6417,17 @@ impl HcMatchGenerator {
         // (srcSize > 256 KiB tier): btlazy2 L13-15 + btopt L16 are minMatch=5,
         // btopt L17 is minMatch=4, btultra/btultra2 are minMatch=3 (4-byte main
         // hash + the hash3 short-match probe).
+        // A `search_mls` change (e.g. btlazy2 -> lazy across a reused-compressor
+        // level switch) invalidates the cached dms: it was hashed at the old
+        // mls, but the reborrow fast path in `MatchTable::reset` reuses it on
+        // `dms.is_primed()` ALONE, without re-checking the (region, layout, mls,
+        // hash_log) key that `build_dms!` validates on the normal prime path.
+        // Drop the stale-mls dms here (configure runs before reset) so the next
+        // dict frame re-primes at the new mls instead of probing a mismatched
+        // dms and silently degrading match quality.
+        if self.table.search_mls != config.search_mls {
+            self.table.dms.invalidate();
+        }
         self.table.search_mls = config.search_mls;
         // Stage D: promote the backend discriminator. HC modes drop the
         // BT scratch buffers entirely; switching back into a BT mode

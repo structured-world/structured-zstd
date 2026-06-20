@@ -1726,6 +1726,22 @@ impl FastKernelMatcher {
         // stored tag does not match the query, so colliding dict positions with
         // different tags do not alias — matching upstream's `ZSTD_SHORT_CACHE`.
         let dict_hash_log = dict_table.hash_log();
+        // Always-on (not debug_assert): every slot stores `(pos << DICT_TAG_BITS)
+        // | tag`, so a filled position must fit the `32 - DICT_TAG_BITS`-bit
+        // position field (16 MiB with an 8-bit tag). `last_hashable` bounds every
+        // position the loop writes (both the stride `pos` and the in-between
+        // `ipp <= last_hashable`), so checking it once here covers the whole fill
+        // without a per-position branch. A dict region past this limit would
+        // truncate the high position bits and alias dict matches to wrong
+        // offsets; reject it loudly instead of silently corrupting the stream in
+        // release builds (the per-position `debug_assert` below is debug-only and
+        // never sees `ipp`).
+        assert!(
+            last_hashable >> (32 - DICT_TAG_BITS) == 0,
+            "dict region too large for the tagged fast-table position field \
+             (last_hashable={last_hashable}, max={})",
+            (1usize << (32 - DICT_TAG_BITS)) - 1,
+        );
         const FILL_STEP: usize = 3;
         let mut pos = range_start;
         // Upstream bound `ip + step < iend + 2` with `iend` = end-of-input minus
