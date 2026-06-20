@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781805699390,
+  "lastUpdate": 1781986452313,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -68870,6 +68870,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.188,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "f78f01a63b3b0e19bb51a81462d502e0e1539acb",
+          "message": "perf(encode): Fast dictionary compression — reuse-safe attach + in-place scan (#433)\n\n* perf(encode): reuse-safe dictionary reuse + source-size encoder tiering\n\nDictionary reuse (the reused per-label-dictionary path):\n- Re-borrow a resident attach-mode dictionary across reused frames on the\n  Fast, HC and dfast backends: keep the dict bytes + cached index in place\n  instead of re-committing the dictionary into history every frame. That\n  per-frame re-commit was the dominant cost on small dict frames (~37-39% in\n  __memmove on a profile); removing it cuts ~22% off small Fast/dfast dict\n  frames and brings large dict frames to C parity. The frame compressor skips\n  prime_with_dictionary when the matcher reports the dictionary resident and\n  only reapplies the offset history.\n- Fix the reused-dictionary decay: a reused compressor silently stopped\n  applying the dictionary after a few frames (output ballooned to the no-dict\n  size) because the match base climbed off the freshly-primed dict region.\n  The base now rewinds per dictionary frame; regression test added.\n- Fix the Fast HUF size gate reading the source-size hint after it was taken.\n\nSource-size tiering (upstream ZSTD_getCParams shape):\n- Tier Fast/Dfast cParams (hashLog / chainLog / minMatch) by source size,\n  fixing the medium-input Level 2/3 pathology where a tier-0-sized table was\n  zeroed every fresh frame.\n- Gate the #167 HUF table-log search by source size for the Fast strategy:\n  search only where its cost is negligible (large frames); the Fast matcher\n  ties the reference on the cheap build, so small frames take it.\n\nAllocation / scratch:\n- Single-allocation dfast hash tables; deferred Fast hash-table alloc to first\n  reset; Fast hash_log capped to window_log+1 on small no-dict frames; reused\n  huff0 build workspace + pre-sized entropy-build scratch; bucketed Huffman\n  leaf sort; stack-allocated FSE / HUF table-build scratch.\n\nRefactor: fold the two dms builders into a build_dms! macro.\nBench: dict / HUF perf+ratio matrix harnesses.\n\nWire-format compatible and byte-identical on the reuse paths; full suite plus\ncross-validation / dictionary_ffi / encode_corpus all green.\n\n* refactor(encode): single-source the cParams table + CreateCDict sizing\n\nThe encoder duplicated upstream's compression-parameter data and adjust\nlogic across three hand-rolled spots in match_generator.rs (the\n`apply_cparams_tier` tier arrays, a copy of `ZSTD_dictAndWindowLog`, and a\ncopy of the createCDict table-log adjust) while `cparams.rs` held a faithful\n`ZSTD_getCParams` port that nothing consumed. Collapse to one source:\n\n- `apply_cparams_tier` now reads `cparams::default_cparams(tier, level)`\n  (the verbatim `ZSTD_defaultCParameters` rows) instead of re-typing the\n  tier values. Byte-identical: the arrays already matched the table.\n- The dictionary table geometry goes through `cparams::create_cdict_table_logs`\n  -> the shared `adjust_cparams` (createCDict path), replacing the duplicate\n  `dict_and_window_log` + hand-rolled `cdict_table_logs` body. This applies\n  the faithful `ZSTD_adjustCParams_internal` down-sizing (including the\n  `dictAndWindowLog + 1` hashLog cap and the WINDOWLOG_MAX clamp the old copy\n  lacked), so prepared-dictionary table widths for the HC / Row / BT backends\n  now match the reference exactly. Output for dictionary frames changes\n  accordingly (measured separately).\n- `cparams::adjust_cparams` takes a `create_cdict: bool` (the two live modes)\n  instead of a four-variant `CParamMode` enum whose attach / noAttach arms had\n  no caller; the public `get_cparams` reference path (validated against C by\n  `zz_cparams`) and its level-selection constants are gated to `bench_internals`.\n\nAlso fixes two unrelated `-D warnings` lint failures surfaced by the lint job:\nunused `with_params_table` params and a no-op `range_start.max(0)`.\n\n* fix(encode): apply source-size cParams tiering to Default/Level(0)\n\n`CompressionLevel::Default` and `Level(0)` both resolve to the default\nlevel's table row but skipped `apply_cparams_tier`, so hinted default\ncompression kept the tier-0 (> 256 KiB) Fast/Dfast table widths on small\nand medium frames while an explicit `Level(3)` shrank them. Tier both\naliases the same way so default compression matches `Level(DEFAULT_LEVEL)`.\n\n* test(encode): add regression for copy-mode Fast dict prefix floor\n\nA >8 KiB input over an 8 KiB dict routes through the Fast copy path; the\nblock prefix floor was computed window-clamped from the history end, which\nrejected every dict position for the whole block. The dictionary was\nignored and the frame fell back to the no-dict ratio (with_dict==no_dict).\n\nTest fails on current code (with_dict=8218 vs no_dict=16394).\n\n* fix(encode): floor copy-mode Fast dict prefix at the dict start\n\nA Fast (level 1/2) input over the 8 KiB attach cutoff routes through the\ncopy path: the dict is committed to the front of history and primed into\nthe live hash table as window prefix. The block prefix floor was computed\nwindow-clamped from the history END (history.len() - window), so once the\ninput filled the window the floor landed at the dict/input boundary and the\nhash filter rejected every dict position for the whole block. The dictionary\nwas ignored and a 16 KiB input over an 8 KiB dict fell back to the no-dict\nratio (logs-16k L1 emitted 154 B vs the C reference 28 B).\n\nMirror upstream zstd ZSTD_getLowestPrefixIndex with isDictionary: track the\ncopy-mode dict end (loaded_dict_end) and, while the dict is still within\nmaxDist of the block end, floor the prefix at the dict start instead. The\ndict stays reachable for the whole block; offsets reaching into it (bounded\nby window + dict size) decode against the same dictionary. The floor reverts\nto the windowed value once the dict slides out of the window (eviction\nclears loaded_dict_end). No-dict frames are unchanged (loaded_dict_end == 0).\n\nlogs-16k L1/L2 now emit 27 B (one below the C reference's 28). Verified the\nframe round-trips through both our decoder and the C reference decoder.\n\n* fix(encode): restore retained-dict budget on resident dict re-borrow\n\nA reused-dict frame that re-borrows the resident dictionary (skipping the\nre-prime) left the driver-level dictionary_retained_budget at 0: the\nper-frame reset clears it, the matcher's reset re-inflates max_window_size\nby the dict region, but the resident path (reapply_resident_dictionary)\nonly restored the offset history, never the budget. With budget 0,\nretire_dictionary_budget never shrinks the inflated window as input evicts\nthe resident dict. For the HashChain backend, whose window_low is measured\nagainst max_window_size, that lets a post-eviction match exceed the frame\nheader's base window and emit an over-window offset the dictionary no\nlonger covers.\n\nRestore the budget to the actual window inflation (max_window_size - base)\non the resident path, matching prime_with_dictionary's bookkeeping, so the\nretire path shrinks the window back to base as the dict evicts. Fast and\nDfast bound offsets by the advertised window directly, so they were already\nsafe; the fix makes the budget bookkeeping uniform across backends.\n\nThe MatchTable re-borrow rationale now states that the driver re-establishes\nmax_window_size = base before every reset (bump yields base+region each\nframe, no accumulation) and that underflow-safety holds via the\nMAX_PRIMED_WINDOW_SIZE invariant.\n\nWhite-box regression added; it fails without the budget restore.\n\n* fix(encode): harden dict kernels, streaming hint, and reuse test\n\n- fast_kernel: enforce dict hash_log + DICT_TAG_BITS <= 32 with a release\n  assert hoisted once per block, before the unchecked tagged-table reads in\n  both dict kernels (debug_assert alone left release builds able to compute\n  an out-of-range slot).\n- streaming_encoder: route set_source_size_hint into the Fast HUF fast-path\n  gate via pledged_content_size.or(source_size_hint), so an advisory size\n  also lifts Fast streams off the optimal-HUF search (previously only a\n  pledged size did).\n- dict_matrix example: assert the C handles are non-null before use.\n- frame_compressor reuse test: assert full byte-identity (not just length)\n  and add a no-dict baseline so the dictionary is proven load-bearing.\n\n* perf(encode): pass tracked max_symbol to FSE table selection\n\nchoose_table_from_counts derived the highest non-zero symbol code with a\nreverse scan over the full 256-wide counts array, per stream, per block.\nThe sequence-code alphabets are tiny (LL <= 35, ML <= 52, OF <= 31), so\nthat scan walked ~200 permanently-zero high slots three times per block --\nthe dominant cost on small frames (profiled ~35% of a 1 KiB dict-frame\nencode on aarch64).\n\nThe histogram loop already visits every code once, so it now carries the\nrunning max per stream and passes it in; the distinctness probe is bounded\nto the live alphabet. max_symbol equals the old rposition result (a counted\ncode always sets its slot), so table selection stays byte-identical -- all\nroundtrip + cross-validation tests unchanged.\n\nSmall-frame dict encode on aarch64 (M1, ours vs libzstd): logs-1k L1\n1.79x -> 1.23x, logs-1k L2 1.92x -> 1.07x, logs-4k L1 1.65x -> 1.12x.\nHelps every arch (the scan was architecture-independent).\n\n* test(encode): cross-level dict C-decode + raw-content encode harness\n\n- dictionary_ffi: add a matrix test that compresses with a dictionary across\n  every strategy backend (Fast/dfast/Row/HashChain/BT), at attach (< cutoff)\n  and copy (> cutoff) sizes, over reused compressors (exercising the resident\n  re-borrow + retained-budget path), and decodes each frame through the C\n  reference decoder. Guards the dict prefix-floor and resident-budget changes\n  against any over-window offset.\n- encode_loop_dict: accept a raw-content dict blob (id flag off) when the file\n  is not a magic-prefixed finalized dictionary, so the profiling harness can\n  load the bench's raw dict directly.\n\n* fix(encode): guard dict entropy/tagged-fill bounds + stale-mls dms reuse\n\n- fse_decoder: to_encoder_table rejects accuracy_log > 9 (returns None). The\n  encoder table builder indexes a fixed 1<<9 stack scratch, but the decoder\n  accepts tables up to accuracy_log 16; a dictionary-carried non-sequence\n  table at >9 would slice past the scratch and panic in release. Regression\n  test added.\n- fast_matcher: always-on assert that the tagged dict-table fill region fits\n  the 32 - DICT_TAG_BITS-bit position field (16 MiB). The prior debug_assert\n  was debug-only and never covered the in-between ipp positions; a larger\n  dict region would truncate the high bits and alias matches to wrong offsets.\n- match_generator: invalidate the cached dms when search_mls changes in\n  configure (e.g. btlazy2 -> lazy on a reused compressor). The reborrow fast\n  path reuses the dms on is_primed() alone, bypassing the (region, layout,\n  mls, hash_log) key check, so a stale-mls dms would silently degrade matches.\n- dictionary_ffi: hoist the duplicated repeated_log_lines helper to module\n  level.\n\n* fix(encode): keep resident dict block in dfast window ledger on reborrow\n\nThe dfast reborrow reset pushed the resident dict's [region] entry onto\nwindow_blocks, but an unconditional window_blocks.clear() after the\nbranch dropped it again. After a resident reset window_size and history\nstill counted the dictionary while window_blocks was empty, so the next\neviction popped the wrong block (or panicked on pop_front of an empty\ndeque). Clear window_blocks only in the non-reborrow branch; the reborrow\nbranch keeps its single dict-block entry.\n\n* fix(encode): keep Fast dict matches near to restore dict ratio\n\nA trained-dictionary Fast frame had regressed to LARGER than its no-dict\ncounterpart (the dictionary made compression worse). Two things stacked\nup on the attach-mode dict path:\n\n- The dict hash table used a strided fill (overwrite on stride positions,\n  fill-if-empty between). For repetitive dictionary content one hash maps\n  to many positions, and the stride alignment frequently kept a FAR\n  occurrence, so the emitted match offset was large (1679 instead of 42)\n  and cost many offset-code bits. Restore the every-position last-wins\n  fill, which keeps the nearest occurrence per hash and the smallest\n  reachable offset.\n- The dictionary-match length floor was lowered to 4. A short dict match\n  is inherently far, so committing it inflates the offset-code FSE\n  alphabet for almost no literal saving. Restore the 8-byte floor so the\n  parse skips a short dict match and finds a near (small-offset / repcode)\n  match instead.\n\nDrop the short-cache tag from the dict slots: with the nearest-wins fill\nthe lookup needs only the plain position (the kernel already byte-checks\nevery candidate with MEM_read32), and the tag selected a different, worse\ncandidate on collisions here. Removes the now-unused tag bounds guards.\n\nOn the trained-dict Fast fixture the dict frame is now smaller than the\nno-dict frame (233 vs 234 bytes), matching the C reference's direction\n(its dict frame is 213 vs 222 no-dict). Full suite, dict cross-decode,\nand cross-validation all green.\n\n* perf(encode): bias-aware ptr-hoist in Fast dict kernels\n\nHoist the main hash table backing slice + hash_log + epoch bias into loop\nlocals in both dict-attach Fast kernels (owned + borrowed), applying the\nbias inline (saturating_sub on read, plus bias on write) instead of going\nthrough get/put/hash_ptr on the and-mut FastHashTable each access. Removes\nthe per-access Vec-header / hash_log / bias reload (the chases-the-Vec\npattern) that the no-dict kernel already avoids via hot_state. Adds\nFastHashTable::hot_state_biased.\n\nByte-identical: 206 dict/borrowed/seam/roundtrip tests pass, including the\nepoch-reset and primed-cache-reuse byte-identity tests.\n\nExperiment result pending i9 cycles measurement.\n\n* perf(encode): tagged short-cache on Fast dict lookup over full fill\n\nRe-add the ZSTD_SHORT_CACHE tag to the dict-attach Fast path: pack each\ndict slot as (position << 8) | tag and reject a colliding position on tag\nmismatch without the candidate load + MEM_read32 the untagged lookup pays\nevery collision. Keeps the every-position last-wins fill (nearest\noccurrence per hash = small offset, the ratio fix) AND MIN_DICT_MATCH_LEN\n= 8, so the tag only adds the collision-reject — byte-identical output.\n\n825 lib tests pass incl. the dict_builder ratio test (dict frame 233 <\nno-dict 234) and the epoch/reuse byte-identity tests.\n\nExperiment result pending i9 cycles measurement on the dict band.\n\n* perf(encode): scan Fast dict frames in place instead of copying input\n\nEvery Fast (level 1) dictionary frame now ATTACHES the dictionary and\nscans the caller's input in place via the borrowed dual-base kernel,\ninstead of the copy-mode owned path that memmoved the whole input into\nhistory every frame (profiled at 30% __memmove + 14% __memset on a reused\n1 MiB dict encode, vs 0.69% on the no-dict in-place path). Measured i9:\na 1 MiB dict frame drops 167 us -> 52 us, a 10 KiB frame 20.4 us -> 4.4 us.\n\nRaising the attach cutoff exposed three correctness gaps in the borrowed\ndict path, fixed here:\n\n- Floor the borrowed dict scan at the dict start while the dict is within\n  window + dict_end of the block end (upstream zstd ZSTD_getLowestPrefixIndex\n  with isDictionary). Without it an over-cutoff block window-clamps the\n  whole dictionary out and ignores it.\n- Gate the raw-fast-path on the dictionary. The owned path skipped the scan\n  for an incompressible-looking block, but with a dictionary attached such a\n  block can still compress against it; the borrowed path had no dict guard\n  at all. The dict path now uses a stricter full-block incompressibility\n  sample (catches long-range internal repeats the 4 KiB cap misses) AND a\n  cheap dict-relevance probe (samples ~32 block positions for an extendable\n  dict match) before skipping to raw. Non-Fast backends keep the\n  conservative scan-with-dict behaviour. The no-dict path is byte-identical.\n- Keep the snapshot-cutoff and the attach decision in sync so Fast never\n  prepares a copy-mode snapshot it can no longer use.\n\nAdds FastHashTable::hot_state_biased and Matcher::block_samples_match_dict.\n825 lib tests, ffi dictionary cross-decode, and cross_validation green;\nratio preserved or better (rust_bytes <= ffi_bytes on the dict bands).\n\n* docs(encode): mark attach-mode dict table as short-cache tagged\n\nThe compress_block_fast_dict docstring still said the dict table stores\nplain positions; it stores tagged (position << DICT_TAG_BITS) | tag slots.\nMIN_DICT_MATCH_LEN stays the short-far-match gate (8-byte floor), not a\n4-byte commit floor.\n\n* fix(encode): always-on FSE encoder scratch bound + dms mls-reuse note\n\n- Promote the FSE encoder table-size guard from debug_assert to a runtime\n  assert so a >512-byte (accuracy_log > 9) table can never reach the\n  build_table_from_probabilities stack scratch in release through any\n  pub(crate) caller, not just the to_encoder_table path that already gates it.\n- Document at the dict re-borrow site why a primed dms is always built with\n  the current search_mls (configure() invalidates it on an mls change), so\n  the reborrow cannot reuse stale-mls dict tables.\n\n* test(encode): cover dict-probe, Matcher default, and CDict cparams downsize\n\n- block_samples_match_dict: a long verbatim dict run trips the probe, a\n  sub-16-byte match and a non-dict block do not, and a sub-8-byte block and\n  the no-dict matcher both return false.\n- The Matcher::block_samples_match_dict trait default returns false for a\n  backend without a dict-table probe.\n- create_cdict_table_logs down-sizes the prepared table logs for an\n  unknown-size source with a dictionary, and leaves them untouched with no\n  dictionary.\n\n* fix(encode): harden dict attach floor, dms shape reuse, and tagged lookup bounds\n\n- Apply the dictionary prefix floor to OWNED attach-mode scans too: the\n  floor only consulted loaded_dict_end (set for COPY-mode dicts), so an\n  owned attach-mode frame whose input filled the advertised window clamped\n  the whole attached dict out of reach. Fall back to dict.region_len() when\n  attached, mirroring the borrowed dict floor.\n- Invalidate the cached dms on ANY shape change, not just search_mls: a\n  reused-compressor level switch can change hash_log / chain_log / hash3\n  (the resize signal) independently of mls, and either leaves the dms\n  hashed for a different geometry while the reborrow fast path reuses it on\n  is_primed() alone.\n- Guard the tagged Fast dict lookup width in both safe kernels: dict_lookup\n  hashes to dict_hash_log + DICT_TAG_BITS bits, well-defined only while that\n  fits 32 bits, so a hash_log > 24 dict table is now rejected loudly in\n  release instead of reaching an out-of-range slot.\n- Use checked_sub for the dict reborrow region: compact_history can reset\n  history_start to 0 while history_abs_start is past dictionary_limit_abs,\n  underflowing the plain subtraction before the filter rejects it.\n- Cap the always-attach contract at 2 GiB (source ceil-log <= 31): the\n  borrowed kernel stores virtual positions as u32, so a larger bucket would\n  wrap. Document the bound and pin it with a regression test.\n- Note that block_looks_incompressible_dict covers internal repeats only;\n  external dict matches are caught by the block_samples_match_dict layer at\n  the call site, not inside the heuristic.\n\n* fix(encode): gate Fast dict attach on dict size, dms layout, lookup width\n\n- Route dictionaries larger than the tagged attach position field (16 MiB,\n  the 32 minus DICT_TAG_BITS-bit packed position) to COPY mode instead of the\n  tagged attach fill, which would overflow the position and panic. The\n  decision is keyed on the load-set size hint (equal to the actual dict\n  length) so the prime, the attach-epoch reset, and the primed-snapshot\n  fast_attach bit all agree; copy mode stores full u32 positions and handles\n  large dicts.\n- Add the always-on hash-width guard to the tagged dict-table fill too\n  (dict_hash_log plus DICT_TAG_BITS less-or-equal 32), matching the\n  kernel-side guards, so an oversized hash_log is rejected before the unsafe\n  tagged fill, not only at lookup.\n- Include the HC/BT layout flip in the dms invalidation: uses_bt is part of\n  the cached dms shape but was overwritten before the check, so a pure layout\n  flip with unchanged logs/mls could reuse a dms built for the old layout.\n- Keep the non-Simple block_samples_match_dict fallback at true: it is\n  load-bearing for dictionary_segment_in_incompressible_input_is_matched\n  (Dfast/Row/BT match an embedded dict segment in high-entropy filler only by\n  staying on the scan; a false there emits the block raw and drops the match).\n\n* docs(encode): clarify trait-default vs driver dict-probe fallback\n\nThe custom_matcher_dict_probe_defaults_to_false doc conflated the trait\ndefault (false) with the driver wrapper, which overrides it to true for\nnon-Simple backends. Cross-reference the wrapper-behaviour test. Also\nrustfmt-wrap the cparams CDict test call sites.\n\n* test(encode): reword Fast dict attach guard to reflect cutoff bounds\n\nThe guard implied every Fast dict frame attaches, but the path now falls back\nto copy mode above FAST_ATTACH_DICT_CUTOFF_LOG (source) and\nMAX_FAST_ATTACH_DICT_REGION (dict size). Rename to _within_cutoff_bounds and\ncross-reference the two out-of-bounds tests.",
+          "timestamp": "2026-06-20T22:31:03+03:00",
+          "tree_id": "b9d72df49c65b87ca29f7d8c9b4fd2bed97652bb",
+          "url": "https://github.com/structured-world/structured-zstd/commit/f78f01a63b3b0e19bb51a81462d502e0e1539acb"
+        },
+        "date": 1781986441250,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.1,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.111,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 227.27,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 223.416,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.238,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.3,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 3.022,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.933,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.918,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.879,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.027,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.027,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.008,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.008,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 11.657,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.023,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.138,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.223,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.792,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.111,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.522,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.303,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.05,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.027,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.167,
             "unit": "ms"
           }
         ]
