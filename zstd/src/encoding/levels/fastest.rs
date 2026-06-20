@@ -442,6 +442,7 @@ mod tests {
             block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
             offset_hist: [1, 4, 8],
             strategy_tag: crate::encoding::strategy::StrategyTag::Fast,
+            huf_optimal_search: true,
         };
         let mut output = Vec::new();
 
@@ -476,6 +477,7 @@ mod tests {
             block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
             offset_hist: [1, 4, 8],
             strategy_tag: crate::encoding::strategy::StrategyTag::Fast,
+            huf_optimal_search: true,
         };
         let mut output = Vec::new();
 

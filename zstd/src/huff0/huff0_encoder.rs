@@ -328,7 +328,13 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
             return None;
         }
 
-        let mut encoded = Vec::new();
+        // Pre-size to the weight count: the FSE-encoded description is rejected
+        // above `weights.len() / 2` (the raw nibble fallback wins) and at 128
+        // bytes outright, so `weights.len()` is a generous one-shot capacity
+        // that keeps the BitWriter's backing buffer from reallocating as the
+        // interleaved stream is written. Transient scratch (discarded or
+        // returned, never the frame output), so no peak-memory trade-off.
+        let mut encoded = Vec::with_capacity(weights.len());
         {
             let mut writer = BitWriter::from(&mut encoded);
             let mut encoder = FSEEncoder::new(
@@ -439,6 +445,20 @@ impl Clone for HuffmanTable {
     }
 }
 
+/// Measurement-only toggle (gated behind `bench_internals`): when set, every
+/// [`HuffmanTable::build_from_counts`] takes the cheap single-build path
+/// instead of the #167 table-log search, so a bench harness can A/B the search
+/// on/off from a single build. Never set in shipping code.
+#[cfg(feature = "bench_internals")]
+pub static FORCE_CHEAP_HUF: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Set the [`FORCE_CHEAP_HUF`] measurement toggle.
+#[cfg(feature = "bench_internals")]
+pub fn set_force_cheap_huf(on: bool) {
+    FORCE_CHEAP_HUF.store(on, core::sync::atomic::Ordering::Relaxed);
+}
+
 impl HuffmanTable {
     /// Heap bytes this table holds: the per-symbol code table and the packed
     /// dual-container codes. The lazily-built weight-description cache is a
@@ -455,16 +475,50 @@ impl HuffmanTable {
         Self::build_from_counts(&counts[..=max_symbol])
     }
 
+    /// Build the literals Huffman table, running the #167 table-log search
+    /// only when `use_search` is set; otherwise take the cheap single-build
+    /// (the upstream non-optimalDepth path). The caller gates `use_search` by
+    /// strategy and source size (see `CompressState::huf_optimal_search`).
+    pub fn build_from_counts_gated(counts: &[usize], use_search: bool) -> Self {
+        if use_search {
+            Self::build_from_counts(counts)
+        } else {
+            Self::build_from_weights(&build_limited_weights(counts, 11))
+        }
+    }
+
     pub fn build_from_counts(counts: &[usize]) -> Self {
         assert!(counts.len() <= 256);
         let symbol_cardinality = counts.iter().filter(|&&count| count > 0).count();
         if symbol_cardinality <= 1 {
             return Self::build_from_weights(&build_limited_weights(counts, 11));
         }
+        // Measurement-only: force the cheap single-build path (the upstream
+        // non-optimalDepth path) so a bench harness can compare #167 on/off
+        // ratio and speed across levels from one build. Off in every shipping
+        // build (gated behind `bench_internals`).
+        #[cfg(feature = "bench_internals")]
+        if FORCE_CHEAP_HUF.load(core::sync::atomic::Ordering::Relaxed) {
+            return Self::build_from_weights(&build_limited_weights(counts, 11));
+        }
 
         let min_table_log = symbol_cardinality.ilog2() as usize + 1;
         let mut best_size = usize::MAX - 1;
-        let mut best_weights: Option<alloc::vec::Vec<usize>> = None;
+        // Reused across every `table_log` candidate so the search allocates
+        // nothing per iteration: `work` is the height-limit scratch, `cand`
+        // holds the current candidate's weights, `best` retains the winning
+        // weights — swapped in on a new best, so the loser's buffer recycles
+        // back into `cand` for the next iteration. On a small alphabet
+        // `min_table_log` is low, so the candidate count (and the old
+        // per-candidate `leaves.to_vec()` + weight-`Vec` allocations) was the
+        // dominant small-frame entropy-build cost.
+        // Pre-size the reused scratch to its proven bound (alphabet <= 256, tree
+        // <= 2*256-1 nodes) so the first candidate's resize/extend allocates once
+        // and never reallocates across the table-log search.
+        let mut work: Vec<HuffNode> = Vec::with_capacity(2 * counts.len());
+        let mut cand: Vec<usize> = Vec::with_capacity(counts.len());
+        let mut best: Vec<usize> = Vec::with_capacity(counts.len());
+        let mut best_found = false;
 
         // Outer-loop scoring uses [`cheap_desc_size_proxy`] — an integer
         // entropy estimate of the weight description, no FSE encode.
@@ -478,10 +532,7 @@ impl HuffmanTable {
         //
         // Stack-allocated `weights_u8` buffer (256 B — counts.len() max
         // = 256) absorbs the per-candidate `Vec<usize> → &[u8]`
-        // conversion that the proxy wants. Avoids the per-candidate
-        // `table.weights()` allocation (~256 B Vec) and lets the
-        // table-log search loop stay allocation-free past the
-        // mandatory `build_limited_weights` Vec.
+        // conversion that the proxy wants.
         let mut weights_u8 = [0u8; 256];
         // The Huffman tree shape (and thus the per-leaf natural depths) does
         // not depend on `table_log`; only the height limiting does. Build the
@@ -489,9 +540,11 @@ impl HuffmanTable {
         // instead of rebuilding the whole tree per iteration.
         let leaves = build_huffman_leaf_depths(counts);
         for table_log in min_table_log..=11 {
-            let weights = limited_weights_from_leaves(&leaves, counts.len(), table_log)
-                .unwrap_or_else(|| legacy_distributed_weights(counts));
-            if !huffman_weight_sum_is_power_of_two(&weights) {
+            if !limited_weights_into(&leaves, counts.len(), table_log, &mut work, &mut cand) {
+                cand = legacy_distributed_weights(counts);
+            }
+            let weights = &cand;
+            if !huffman_weight_sum_is_power_of_two(weights) {
                 continue;
             }
             // Per-symbol code length is `wtable_log + 1 - weight` (weight > 0) —
@@ -561,15 +614,19 @@ impl HuffmanTable {
             }
             if new_size < best_size {
                 best_size = new_size;
-                // Move the owned weights in (no clone); the next iteration
-                // allocates fresh weights and the previous best is freed.
-                best_weights = Some(weights);
+                // Keep the winning weights without a clone: swap them into
+                // `best`; the previous best's buffer lands in `cand` and is
+                // recycled (cleared + refilled) by the next candidate.
+                core::mem::swap(&mut best, &mut cand);
+                best_found = true;
             }
         }
 
-        best_weights
-            .map(|w| Self::build_from_weights(&w))
-            .unwrap_or_else(|| Self::build_from_weights(&build_limited_weights(counts, 11)))
+        if best_found {
+            Self::build_from_weights(&best)
+        } else {
+            Self::build_from_weights(&build_limited_weights(counts, 11))
+        }
     }
 
     /// Estimates encoded payload size in bytes for `data` using this table.
@@ -882,30 +939,96 @@ struct HuffNode {
 /// symbol the (0 or 1) leaves are returned with `nb_bits == 0` and the caller
 /// assigns the trivial weight.
 fn build_huffman_leaf_depths(counts: &[usize]) -> Vec<HuffNode> {
-    let mut leaves = counts
-        .iter()
-        .copied()
-        .enumerate()
-        .filter(|&(_, count)| count > 0)
-        .map(|(symbol, count)| HuffNode {
+    let leaf_count = counts.iter().filter(|&&count| count > 0).count();
+    // Pre-size to the final node count (`2 * leaf_count - 1`) so the tree
+    // build's resize never reallocates.
+    let mut nodes: Vec<HuffNode> = Vec::with_capacity((2 * leaf_count).max(1));
+
+    if leaf_count == 0 {
+        return nodes;
+    }
+    if leaf_count == 1 {
+        let (symbol, &count) = counts.iter().enumerate().find(|&(_, &c)| c > 0).unwrap();
+        nodes.push(HuffNode {
             count,
             symbol,
             parent: None,
             nb_bits: 0,
-        })
-        .collect::<Vec<_>>();
-
-    if leaves.len() <= 1 {
-        return leaves;
+        });
+        return nodes;
     }
 
-    leaves.sort_by(|left, right| match right.count.cmp(&left.count) {
-        Ordering::Equal => left.symbol.cmp(&right.symbol),
-        other => other,
-    });
+    // Bucketed sort (upstream zstd `HUF_sort`, huf_compress.c): an O(n)
+    // counting pass bucketed by the count magnitude. Counts below
+    // `DISTINCT_CUTOFF` each get a dedicated bucket, so they land strictly
+    // count-descending / symbol-ascending with no per-bucket sort; counts at
+    // or above it share log2 buckets that ARE sorted. Sorting those log2
+    // buckets by `(count desc, symbol asc)` reproduces the previous
+    // comparison-sort order byte-for-byte while replacing the O(n log n) sort
+    // with the bucket pass plus a handful of tiny bucket sorts — the Huffman
+    // leaf sort was a measured ~7% of the per-frame entropy-build time.
+    const BUCKETS: usize = 192;
+    const LOG_BUCKETS_BEGIN: usize = 158; // (BUCKETS - 1) - 32 - 1
+    const DISTINCT_CUTOFF: usize = 165; // LOG_BUCKETS_BEGIN + highbit32(158)
+    let bucket_of = |count: usize| -> usize {
+        if count < DISTINCT_CUTOFF {
+            count
+        } else {
+            // `highest_bit_set(count) - 1` == upstream `ZSTD_highbit32`.
+            (highest_bit_set(count) - 1) + LOG_BUCKETS_BEGIN
+        }
+    };
+    let mut bucket_size = [0u32; BUCKETS];
+    for &count in counts {
+        if count > 0 {
+            bucket_size[bucket_of(count)] += 1;
+        }
+    }
+    // Output start index per bucket: higher buckets (higher counts) come
+    // first, so the leaves end up count-descending.
+    let mut start = [0u32; BUCKETS];
+    let mut acc = 0u32;
+    for bucket in (0..BUCKETS).rev() {
+        start[bucket] = acc;
+        acc += bucket_size[bucket];
+    }
+    let mut cursor = start;
+    nodes.resize(
+        leaf_count,
+        HuffNode {
+            count: 0,
+            symbol: 0,
+            parent: None,
+            nb_bits: 0,
+        },
+    );
+    for (symbol, &count) in counts.iter().enumerate() {
+        if count == 0 {
+            continue;
+        }
+        let bucket = bucket_of(count);
+        let pos = cursor[bucket] as usize;
+        cursor[bucket] += 1;
+        nodes[pos] = HuffNode {
+            count,
+            symbol,
+            parent: None,
+            nb_bits: 0,
+        };
+    }
+    // Only the log2 buckets mix distinct counts; sort them stably by
+    // `(count desc, symbol asc)` so the order matches the old full sort.
+    for bucket in DISTINCT_CUTOFF..BUCKETS {
+        let lo = start[bucket] as usize;
+        let hi = cursor[bucket] as usize;
+        if hi - lo > 1 {
+            nodes[lo..hi].sort_by(|left, right| match right.count.cmp(&left.count) {
+                Ordering::Equal => left.symbol.cmp(&right.symbol),
+                other => other,
+            });
+        }
+    }
 
-    let leaf_count = leaves.len();
-    let mut nodes = leaves;
     nodes.resize(
         2 * leaf_count - 1,
         HuffNode {
@@ -999,37 +1122,51 @@ fn build_huffman_leaf_depths(counts: &[usize]) -> Vec<HuffNode> {
 /// height limiting cannot reach `max_nb_bits` (the caller then falls back to
 /// the distributed-weight construction). `leaves` must be sorted by count
 /// descending, which `enforce_max_height` relies on.
-fn limited_weights_from_leaves(
+/// Height-limit `leaves` to `max_nb_bits` and project onto a per-symbol weight
+/// table, writing into `out` (cleared + sized to `counts_len`). `work` is a
+/// caller-owned scratch buffer for the height-limiting pass; both buffers are
+/// reused across the table-log candidate search so the per-candidate
+/// `leaves.to_vec()` + fresh weight `Vec` allocations are gone. Returns `false`
+/// when the height limiting cannot reach `max_nb_bits` (caller falls back).
+fn limited_weights_into(
     leaves: &[HuffNode],
     counts_len: usize,
     max_nb_bits: usize,
-) -> Option<Vec<usize>> {
+    work: &mut Vec<HuffNode>,
+    out: &mut Vec<usize>,
+) -> bool {
+    out.clear();
+    out.resize(counts_len, 0);
     if leaves.len() <= 1 {
-        let mut weights = alloc::vec![0; counts_len];
         if let Some(leaf) = leaves.first() {
-            weights[leaf.symbol] = 1;
+            out[leaf.symbol] = 1;
         }
-        return Some(weights);
+        return true;
     }
 
-    let mut sorted_leaves = leaves.to_vec();
-    enforce_max_height(&mut sorted_leaves, max_nb_bits);
-    repair_limited_lengths(&mut sorted_leaves, max_nb_bits);
-    if sorted_leaves.iter().any(|leaf| leaf.nb_bits > max_nb_bits) {
-        return None;
+    work.clear();
+    work.extend_from_slice(leaves);
+    enforce_max_height(work, max_nb_bits);
+    repair_limited_lengths(work, max_nb_bits);
+    if work.iter().any(|leaf| leaf.nb_bits > max_nb_bits) {
+        return false;
     }
 
-    let mut weights = alloc::vec![0; counts_len];
-    for leaf in sorted_leaves {
-        weights[leaf.symbol] = max_nb_bits - leaf.nb_bits + 1;
+    for leaf in work.iter() {
+        out[leaf.symbol] = max_nb_bits - leaf.nb_bits + 1;
     }
-    Some(weights)
+    true
 }
 
 fn build_limited_weights(counts: &[usize], max_nb_bits: usize) -> Vec<usize> {
     let leaves = build_huffman_leaf_depths(counts);
-    limited_weights_from_leaves(&leaves, counts.len(), max_nb_bits)
-        .unwrap_or_else(|| legacy_distributed_weights(counts))
+    let mut work = Vec::new();
+    let mut out = Vec::new();
+    if limited_weights_into(&leaves, counts.len(), max_nb_bits, &mut work, &mut out) {
+        out
+    } else {
+        legacy_distributed_weights(counts)
+    }
 }
 
 fn repair_limited_lengths(nodes: &mut [HuffNode], target_nb_bits: usize) {
@@ -1120,7 +1257,15 @@ fn enforce_max_height(nodes: &mut [HuffNode], target_nb_bits: usize) {
     total_cost >>= largest_bits - target_nb_bits;
 
     const NO_SYMBOL: usize = usize::MAX;
-    let mut rank_last = alloc::vec![NO_SYMBOL; target_nb_bits + 2];
+    // `rank_last` is indexed `0..=target_nb_bits + 1`. `target_nb_bits` is the
+    // Huffman table log, capped at upstream zstd's `HUF_TABLELOG_MAX` (12), so a
+    // fixed 14-slot stack array covers every valid call and avoids the
+    // per-frame heap allocation this build performed for a ≤14-element scratch.
+    debug_assert!(
+        target_nb_bits + 2 <= 14,
+        "target_nb_bits {target_nb_bits} exceeds HUF_TABLELOG_MAX scratch bound"
+    );
+    let mut rank_last = [NO_SYMBOL; 14];
     let mut current_nb_bits = target_nb_bits;
     for pos in (0..=n).rev() {
         if nodes[pos].nb_bits >= current_nb_bits {

@@ -155,6 +155,15 @@ path = "../zstd/examples/alloc_audit_decode.rs"
 required-features = ["dhat-heap"]
 
 [[example]]
+name = "alloc_audit_fresh"
+path = "../zstd/examples/alloc_audit_fresh.rs"
+
+[[example]]
+name = "huf_matrix"
+path = "../zstd/examples/huf_matrix.rs"
+required-features = ["bench_internals"]
+
+[[example]]
 name = "c_decode_loop_z000033"
 path = "../zstd/examples/c_decode_loop_z000033.rs"
 
@@ -218,3 +227,13 @@ path = "../zstd/examples/section_split.rs"
 [[example]]
 name = "trace_fast_kernel"
 path = "../zstd/examples/trace_fast_kernel.rs"
+
+[[test]]
+name = "zz_cparams"
+path = "tests/zz_cparams.rs"
+required-features = ["bench_internals"]
+
+[[example]]
+name = "dict_matrix"
+path = "../zstd/examples/dict_matrix.rs"
+required-features = ["dict_builder"]

@@ -57,8 +57,9 @@ use alloc::vec::Vec;
 use crate::encoding::Sequence;
 use crate::encoding::dict_attach::DictAttach;
 
-use super::fast_kernel::hash_table::FastHashTable;
+use super::fast_kernel::hash_table::{FastHashTable, hash_ptr_raw};
 use super::fast_kernel::kernel::compress_block_fast;
+use super::fast_kernel::kernel::{DICT_TAG_BITS, DICT_TAG_MASK};
 
 /// Upstream zstd `ZSTD_defaultCParameters[level=1][srcSize > 256 KiB][Fast]`
 /// constants. Kept for `MatchGeneratorDriver::new`'s initial-state
@@ -260,6 +261,11 @@ pub(crate) struct FastKernelMatcher {
     /// [`FastHashTable::advance_epoch`] as the span that makes every
     /// previously-stored entry stale, then rearms it at 0.
     table_pos_high_water: usize,
+    /// Set by [`Self::reset`] when it re-borrowed a resident attach-mode
+    /// dictionary (kept the dict bytes at the front of history + the cached
+    /// dict table in place instead of clearing + re-committing them). Signals
+    /// the frame compressor to SKIP `prime_with_dictionary` this frame.
+    dict_resident: bool,
 }
 
 impl Clone for FastKernelMatcher {
@@ -282,6 +288,7 @@ impl Clone for FastKernelMatcher {
             last_borrowed_block: self.last_borrowed_block,
             dict: self.dict.clone(),
             table_pos_high_water: self.table_pos_high_water,
+            dict_resident: self.dict_resident,
         }
     }
 
@@ -307,6 +314,7 @@ impl Clone for FastKernelMatcher {
         self.last_borrowed_block = source.last_borrowed_block;
         self.dict.clone_from(&source.dict);
         self.table_pos_high_water = source.table_pos_high_water;
+        self.dict_resident = source.dict_resident;
     }
 }
 
@@ -359,7 +367,46 @@ impl FastKernelMatcher {
     /// hash_log, mls, step_size)` tuple (typically because a small
     /// source-size hint clamped the window). Tests can also call this
     /// directly.
+    /// Construct with the hash table allocated up front at `hash_log`.
     pub(crate) fn with_params(window_log: u8, hash_log: u32, mls: u32, step_size: usize) -> Self {
+        Self::with_params_table(
+            window_log,
+            hash_log,
+            mls,
+            step_size,
+            FastHashTable::new(hash_log, mls),
+        )
+    }
+
+    /// Construct with the hash table allocation deferred to the first
+    /// [`Self::reset`]. Used by `MatchGeneratorDriver::new`, which runs before
+    /// any source size is known and would otherwise allocate the table at the
+    /// level-default `hash_log` only to realloc it the moment the first frame
+    /// clamps the window to a smaller input — a wasted malloc + zero-fill on
+    /// every fresh compressor (the `compare_ffi` bench shape). The reset path
+    /// allocates the table once at the resolved size before the kernel runs.
+    pub(crate) fn with_params_deferred(
+        window_log: u8,
+        hash_log: u32,
+        mls: u32,
+        step_size: usize,
+    ) -> Self {
+        Self::with_params_table(
+            window_log,
+            hash_log,
+            mls,
+            step_size,
+            FastHashTable::new_deferred(hash_log, mls),
+        )
+    }
+
+    fn with_params_table(
+        window_log: u8,
+        hash_log: u32,
+        mls: u32,
+        step_size: usize,
+        hash_table: FastHashTable,
+    ) -> Self {
         assert!(
             step_size >= 2,
             "FastKernelMatcher requires step_size >= 2 (got {step_size})"
@@ -394,7 +441,7 @@ impl FastKernelMatcher {
             prefix_start_index: INITIAL_PREFIX_START_INDEX,
             rep: FAST_INITIAL_REP,
             offset_hist: FAST_INITIAL_OFFSET_HIST,
-            hash_table: FastHashTable::new(hash_log, mls),
+            hash_table,
             max_window_size: 1usize << window_log,
             window_log,
             use_cmov: window_log < 19,
@@ -405,6 +452,7 @@ impl FastKernelMatcher {
             last_borrowed_block: None,
             dict: DictAttach::new(),
             table_pos_high_water: 0,
+            dict_resident: false,
         }
     }
 
@@ -447,7 +495,17 @@ impl FastKernelMatcher {
             window_log <= 30,
             "FastKernelMatcher requires window_log <= 30 (got {window_log})"
         );
-        if table_overwritten_by_restore
+        // Re-borrow detection: set to the resident dict region when the
+        // epoch-reuse branch below keeps the dict bytes in place (see there).
+        let mut reborrow_region: Option<usize> = None;
+        if !self.hash_table.is_allocated() {
+            // Deferred table from `with_params`: this first reset is where the
+            // source-size-clamped (hash_log, mls) is finally known, so allocate
+            // once at the resolved size. Subsequent frames take the
+            // same-shape `clear()` / epoch branches below.
+            self.hash_table = FastHashTable::new(hash_log, mls);
+            self.dict.invalidate();
+        } else if table_overwritten_by_restore
             && self.hash_table.hash_log() == hash_log
             && self.hash_table.mls() == mls
         {
@@ -474,6 +532,17 @@ impl FastKernelMatcher {
             // (CDict-equivalent).
             let span = u32::try_from(self.table_pos_high_water).unwrap_or(u32::MAX);
             self.hash_table.advance_epoch(span);
+            // Re-borrow: the dictionary bytes from the previous frame are still
+            // resident at the front of history (`[0, region)`), so keep them in
+            // place instead of clearing + re-committing — the per-frame dict
+            // memmove was the dominant Fast-dict cost (~39% on a profiled small
+            // frame). The cached dict table already covers them; the frame
+            // compressor skips `prime_with_dictionary`. Gated on the dict still
+            // being fully resident (no eviction drained it off the front).
+            let region = self.dict.region_len();
+            if region > 0 && self.history.len() >= region {
+                reborrow_region = Some(region);
+            }
         } else {
             // Same shape — keep the allocation, zero the entries via
             // `memset` (ZSTD_window_clear cadence). A primed dict table
@@ -482,11 +551,20 @@ impl FastKernelMatcher {
             self.hash_table.clear();
         }
         self.table_pos_high_water = 0;
-        // M8: history starts empty (HISTORY_DRAIN_BASE = 0).
-        self.history.clear();
-        self.history.resize(HISTORY_DRAIN_BASE, 0);
+        if let Some(region) = reborrow_region {
+            // Keep `[0, region)` (the resident dict); drop the previous input.
+            self.history.truncate(region);
+            self.dict_resident = true;
+        } else {
+            // M8: history starts empty (HISTORY_DRAIN_BASE = 0).
+            self.history.clear();
+            self.history.resize(HISTORY_DRAIN_BASE, 0);
+            self.dict_resident = false;
+        }
         // Sentinel-0 protection via prefix_start_index >= 1 filter
-        // — see `with_params` for the full rationale.
+        // — see `with_params` for the full rationale. Unchanged for re-borrow:
+        // the dict sits at `[0, region)`, position 0 is the sentinel, so the
+        // dict's `[1, region)` stay reachable to the kernel and the decoder.
         self.prefix_start_index = INITIAL_PREFIX_START_INDEX;
         self.rep = FAST_INITIAL_REP;
         self.offset_hist = FAST_INITIAL_OFFSET_HIST;
@@ -494,8 +572,21 @@ impl FastKernelMatcher {
         self.use_cmov = window_log < 19;
         self.step_size = step_size;
         self.max_window_size = 1usize << window_log;
+        if let Some(region) = reborrow_region {
+            // Bump the eviction window by the dict size (exactly as
+            // `prime_with_dictionary`, clamped to MAX_PRIMED_WINDOW_SIZE) so the
+            // resident dict + the next input both stay in the window. Base is
+            // `1 << window_log` (<= 2^30 < MAX_PRIMED_WINDOW_SIZE), so headroom
+            // cannot underflow and the sum cannot overflow — no `saturating_*`.
+            let headroom = crate::encoding::match_table::storage::MAX_PRIMED_WINDOW_SIZE
+                - self.max_window_size;
+            self.max_window_size += region.min(headroom);
+        }
         self.pending = None;
-        self.last_block_start = HISTORY_DRAIN_BASE;
+        // Input starts after the resident dict on a re-borrow frame; otherwise
+        // at the drain base. (The first `extend_history` re-derives this, but
+        // keep it consistent for any pre-append reads.)
+        self.last_block_start = reborrow_region.unwrap_or(HISTORY_DRAIN_BASE);
         self.recycled_space = None;
         // Drop any borrowed window: the next frame's input buffer is a
         // different allocation, so a stale (ptr, len) would dangle.
@@ -1479,6 +1570,13 @@ impl FastKernelMatcher {
         self.dict.mark_primed();
     }
 
+    /// Whether the last [`Self::reset`] re-borrowed a resident dictionary (kept
+    /// the dict bytes + cached dict table in place). The driver reports this up
+    /// so the frame compressor skips `prime_with_dictionary` for the frame.
+    pub(crate) fn dict_resident(&self) -> bool {
+        self.dict_resident
+    }
+
     /// Drop the cached dict table and its primed flag. Called by the driver
     /// when the next frame carries no dictionary, so the kernel never probes
     /// a stale dict region whose bytes are no longer re-committed.
@@ -1506,12 +1604,23 @@ impl FastKernelMatcher {
             return;
         }
         let last_hashable = history_len - HASH_READ_SIZE;
-        // Backfill the (HASH_READ_SIZE - 1) seam positions below
-        // `range_start` (see `prime_hash_table_for_range`): a dictionary
-        // fed in slice_size chunks otherwise drops every match that
-        // straddles a chunk boundary.
-        let backfill_start = range_start.saturating_sub(HASH_READ_SIZE - 1);
-        if backfill_start > last_hashable {
+        // The strided dict fill resumes at the carried-forward fill origin
+        // (`next_to_update`), NOT this slice's `range_start`. The stride phase
+        // stays anchored at the dictionary content start (upstream zstd
+        // `ms->nextToUpdate = ip - base`) across every `accept_data` slice, so
+        // a position whose wide hash read straddles a slice seam — unreachable
+        // by the prior slice (its `last_hashable` stopped `HASH_READ_SIZE - 1`
+        // bytes short) and below this slice's `range_start` — is still hashed
+        // here. Restarting at `range_start` instead would drop those seam
+        // positions and fragment a long cross-seam dict match. `next_to_update`
+        // starts at the content start (`HISTORY_DRAIN_BASE == 0`, the default).
+        debug_assert!(
+            self.dict.next_to_update() <= range_start.max(HISTORY_DRAIN_BASE),
+            "dict fill origin {} ran ahead of slice start {range_start}",
+            self.dict.next_to_update(),
+        );
+        let stride_start = self.dict.next_to_update();
+        if stride_start > last_hashable {
             return;
         }
         let hash_log = self.hash_table.hash_log();
@@ -1519,36 +1628,94 @@ impl FastKernelMatcher {
         self.dict
             .table_mut_or_init(|| FastHashTable::new(hash_log, mls));
         let base = self.history.as_ptr();
-        match self.hash_table.mls() {
-            4 => self.prime_dict_table_impl::<4>(base, backfill_start, last_hashable),
-            5 => self.prime_dict_table_impl::<5>(base, backfill_start, last_hashable),
-            6 => self.prime_dict_table_impl::<6>(base, backfill_start, last_hashable),
-            7 => self.prime_dict_table_impl::<7>(base, backfill_start, last_hashable),
-            8 => self.prime_dict_table_impl::<8>(base, backfill_start, last_hashable),
+        let next = match self.hash_table.mls() {
+            4 => self.prime_dict_table_impl::<4>(base, stride_start, last_hashable),
+            5 => self.prime_dict_table_impl::<5>(base, stride_start, last_hashable),
+            6 => self.prime_dict_table_impl::<6>(base, stride_start, last_hashable),
+            7 => self.prime_dict_table_impl::<7>(base, stride_start, last_hashable),
+            8 => self.prime_dict_table_impl::<8>(base, stride_start, last_hashable),
             _ => unreachable!("FastHashTable construction rejects mls outside 4..=8"),
-        }
+        };
+        self.dict.set_next_to_update(next);
     }
 
     /// Monomorphised per-MLS dict-table fill. `base` is a raw pointer into
     /// `self.history` (no borrow held), so mutating `self.dict_table` in the
     /// loop is sound — the loop never touches `history`, which stays put.
+    /// Returns the carried-forward fill origin (the first stride position not
+    /// yet processed), stored as [`DictAttach::next_to_update`] so the next
+    /// `accept_data` slice resumes the stride here without dropping the seam.
     fn prime_dict_table_impl<const MLS: u32>(
         &mut self,
         base: *const u8,
         range_start: usize,
         last_hashable: usize,
-    ) {
+    ) -> usize {
         let dict_table = self
             .dict
             .table_mut()
             .expect("prime_dict_table_for_range creates the table before this call");
-        for pos in range_start..=last_hashable {
-            // SAFETY: pos <= last_hashable = history_len - 8, so `base.add(pos)`
+        // Mirror upstream `ZSTD_fillHashTableForCDict` (zstd_fast.c:16-49): a
+        // strided fill, NOT every-position. The stride origin is the dictionary
+        // content start (upstream `ms->nextToUpdate = ip - base`), so the fill
+        // PHASE matches upstream — an every-position last-wins fill (or a stride
+        // started at the seam-backfill position) resolves the same hash to a
+        // different dict position and surfaces a worse match (the dict-primed
+        // Fast path then fragments a long dict match into short local ones).
+        // Stride-aligned positions always overwrite (last stride wins); the
+        // `FILL_STEP - 1` positions between them are written only into an empty
+        // slot (first-fill wins). `0` is the empty sentinel — the dict occupies
+        // positions `1..dict_end` and the kernel rejects `dict_idx < 1`, so a
+        // never-filled slot reads back as `0`.
+        // Each slot stores `(position << DICT_TAG_BITS) | tag`, where `tag` is
+        // the low `DICT_TAG_BITS` of a `hash_log + DICT_TAG_BITS`-wide hash and
+        // the slot index is that hash `>> DICT_TAG_BITS` (== the plain
+        // `hash_log` hash). The kernel's tagged lookup rejects a slot whose
+        // stored tag does not match the query, so colliding dict positions with
+        // different tags do not alias — matching upstream's `ZSTD_SHORT_CACHE`.
+        let dict_hash_log = dict_table.hash_log();
+        const FILL_STEP: usize = 3;
+        let mut pos = range_start;
+        // Upstream bound `ip + step < iend + 2` with `iend` = end-of-input minus
+        // HASH_READ_SIZE; `last_hashable` plays the role of `iend` here.
+        while pos + FILL_STEP < last_hashable + 2 {
+            // SAFETY: pos < last_hashable < history_len - 8, so `base.add(pos)`
             // covers >= 8 readable bytes; MLS matches the table's mls.
-            let ptr = unsafe { base.add(pos) };
-            let hash = unsafe { dict_table.hash_ptr::<MLS>(ptr) };
-            unsafe { dict_table.put(hash, pos as u32) };
+            debug_assert!(
+                pos >> (32 - DICT_TAG_BITS) == 0,
+                "dict position overflows tagged index"
+            );
+            let hat = unsafe { hash_ptr_raw::<MLS>(base.add(pos), dict_hash_log + DICT_TAG_BITS) };
+            unsafe {
+                dict_table.put(
+                    hat >> DICT_TAG_BITS,
+                    ((pos as u32) << DICT_TAG_BITS) | (hat & DICT_TAG_MASK),
+                )
+            };
+            // In-between positions: fill only an empty slot (first-fill wins),
+            // matching `ZSTD_fillHashTableForCDict` (dtlm_full).
+            for p in 1..FILL_STEP {
+                let ipp = pos + p;
+                if ipp > last_hashable {
+                    break;
+                }
+                let hat2 =
+                    unsafe { hash_ptr_raw::<MLS>(base.add(ipp), dict_hash_log + DICT_TAG_BITS) };
+                let slot2 = hat2 >> DICT_TAG_BITS;
+                if unsafe { dict_table.get(slot2) } == 0 {
+                    unsafe {
+                        dict_table.put(
+                            slot2,
+                            ((ipp as u32) << DICT_TAG_BITS) | (hat2 & DICT_TAG_MASK),
+                        )
+                    };
+                }
+            }
+            pos += FILL_STEP;
         }
+        // `pos` is now the first stride position past the loop bound — the
+        // resume point for the next slice's fill.
+        pos
     }
 }
 
@@ -2410,10 +2577,20 @@ mod tests {
         // seam: its 8-byte hash read straddles the chunk boundary.
         let p = seam - 4;
         let dt = m.dict.table().expect("dict table primed");
-        let h = unsafe { dt.hash_ptr::<4>(m.history.as_ptr().add(p)) };
+        // Read the dict table exactly as the kernel does: a tagged lookup that
+        // decodes the packed `(position << DICT_TAG_BITS) | tag` slot and
+        // verifies the tag (a bare `get` would compare the packed value to the
+        // plain position and never match). Returns the stored position, or 0
+        // if the slot is empty / the tag mismatches.
+        let found = unsafe {
+            crate::encoding::simple::fast_kernel::kernel::dict_tagged_lookup::<4>(
+                dt,
+                m.history.as_ptr().add(p),
+                dt.hash_log(),
+            )
+        };
         assert_eq!(
-            unsafe { dt.get(h) },
-            p as u32,
+            found, p as u32,
             "seam-spanning position {p} must be indexed in the dict table",
         );
     }

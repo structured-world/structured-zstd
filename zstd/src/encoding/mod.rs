@@ -44,6 +44,7 @@
 
 pub(crate) mod block_header;
 pub(crate) mod blocks;
+pub(crate) mod cparams;
 pub(crate) mod dict_attach;
 pub(crate) mod fastpath;
 pub(crate) mod frame_header;
@@ -418,6 +419,16 @@ pub trait Matcher {
     /// Prime matcher state with dictionary history before compressing the next frame.
     /// Default implementation is a no-op for custom matchers that do not support this.
     fn prime_with_dictionary(&mut self, _dict_content: &[u8], _offset_hist: [u32; 3]) {}
+    /// Whether the most recent [`reset`](Self::reset) re-borrowed a resident
+    /// attach-mode dictionary (kept the dict bytes + cached index in place).
+    /// When `true` the caller MUST skip [`Self::prime_with_dictionary`] and only
+    /// reapply the offset history via [`Self::reapply_resident_dictionary`].
+    fn dictionary_is_resident(&self) -> bool {
+        false
+    }
+    /// Reapply the dictionary's offset history to a re-borrowed frame — the cheap
+    /// tail of priming, without the dict commit / re-index. Default no-op.
+    fn reapply_resident_dictionary(&mut self, _offset_hist: [u32; 3]) {}
     /// CDict-equivalent fast path for repeated frames sharing one dictionary.
     /// Restore the matcher state captured by [`Self::capture_primed_dictionary`]
     /// at the SAME level (a table copy) instead of re-running

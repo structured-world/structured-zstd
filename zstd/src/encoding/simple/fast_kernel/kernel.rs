@@ -80,14 +80,53 @@ const K_STEP_INCR: usize = 1 << (SEARCH_STRENGTH - 1);
 const HASH_READ_SIZE: usize = 8;
 
 /// Minimum length a DICTIONARY match must reach to be committed by the
-/// dict-aware (attach-mode) Fast kernel [`compress_block_fast_dict`]. Dict
-/// matches are inherently far (they reach back across the whole input into the
-/// dictionary region), so a short one inflates the offset-FSE alphabet for
-/// little payload gain; below this floor the kernel skips the dict match and
-/// lets the parse find a near (small-offset / repcode) match instead. Only
-/// applies to dict matches — main-table and repcode matches keep the 4-byte
-/// minimum.
-const MIN_DICT_MATCH_LEN: usize = 8;
+/// dict-aware (attach-mode) Fast kernel [`compress_block_fast_dict`]. Matches
+/// upstream zstd, which commits any dict match that passes the 4-byte
+/// `MEM_read32` check (`ZSTD_compressBlock_fast_dictMatchState_generic`,
+/// zstd_fast.c:580-581) with no extra length floor — a higher floor drops
+/// short dict matches the reference keeps, fragmenting them into literals and
+/// losing ratio on dictionary-primed Fast frames.
+const MIN_DICT_MATCH_LEN: usize = 4;
+
+/// Short-cache tag width for the dictionary hash table (upstream zstd
+/// `ZSTD_SHORT_CACHE_TAG_BITS`). Each dict slot packs `(position << TAG_BITS) |
+/// tag`, where `tag` is the low `TAG_BITS` of a `hashLog + TAG_BITS`-wide hash.
+/// On lookup the stored tag must equal the query tag, so two dict positions
+/// that collide into the same slot but carry different tags do NOT alias — the
+/// untagged variant would return whichever position happened to land in the
+/// slot and pick a different (worse) candidate than the reference.
+pub(crate) const DICT_TAG_BITS: u32 = 8;
+pub(crate) const DICT_TAG_MASK: u32 = (1 << DICT_TAG_BITS) - 1;
+
+/// Tagged dictionary-table lookup (upstream zstd
+/// `ZSTD_compressBlock_fast_dictMatchState_generic`, zstd_fast.c:546-548).
+/// Computes the `hashLog + DICT_TAG_BITS`-wide hash of `ptr`, indexes the slot
+/// (`hash >> DICT_TAG_BITS`, identical to the plain `hashLog` hash), and returns
+/// the stored dict position ONLY if the packed tag matches; otherwise `0` (the
+/// empty sentinel, which the caller's `dict_idx >= 1` gate rejects). `0` is also
+/// the never-filled sentinel because dict positions start at `1`.
+///
+/// # Safety
+/// `ptr` must have the readable-bytes context `hash_ptr_raw::<MLS>` requires.
+#[inline(always)]
+pub(crate) unsafe fn dict_tagged_lookup<const MLS: u32>(
+    dict_table: &FastHashTable,
+    ptr: *const u8,
+    dict_hash_log: u32,
+) -> u32 {
+    debug_assert!(
+        dict_hash_log + DICT_TAG_BITS <= 32,
+        "tagged dict hash overflows 32 bits"
+    );
+    let hash_and_tag = unsafe { hash_ptr_raw::<MLS>(ptr, dict_hash_log + DICT_TAG_BITS) };
+    // SAFETY: `hash_and_tag >> DICT_TAG_BITS` < `1 << dict_hash_log` = table len.
+    let stored = unsafe { dict_table.get(hash_and_tag >> DICT_TAG_BITS) };
+    if stored & DICT_TAG_MASK == hash_and_tag & DICT_TAG_MASK {
+        stored >> DICT_TAG_BITS
+    } else {
+        0
+    }
+}
 
 /// Upstream zstd's `MEM_read32(ptr)` — unaligned native-endian 4-byte load,
 /// used by the raw match probe on the hot path. The result is only
@@ -1080,6 +1119,10 @@ pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
     let mut offset_1: u32 = rep[0];
     let mut offset_2: u32 = rep[1];
 
+    // Width of the dict table's slot index; the tagged lookup hashes to
+    // `dict_hash_log + DICT_TAG_BITS` bits and reads slot `hash >> DICT_TAG_BITS`.
+    let dict_hash_log = dict_table.hash_log();
+
     // Inner-loop result: literals end (where the match copy begins), the raw
     // match offset, the match length, and the upstream zstd `curr` (probe position,
     // for the post-match `curr + 2` fill). `None` → drain to cleanup.
@@ -1094,7 +1137,9 @@ pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
         // SAFETY: ip0 < ip1 <= ilimit = iend - 8 ⇒ ≥ 8 readable bytes at ip0.
         let mut hash0 = unsafe { main_table.hash_ptr::<MLS>(base.add(ip0)) };
         let mut main_idx = unsafe { main_table.get(hash0) };
-        let mut dict_idx = unsafe { dict_table.get(hash0) };
+        // Tagged dict lookup (slot == plain `hash0`, tag from the wider hash).
+        let mut dict_idx =
+            unsafe { dict_tagged_lookup::<MLS>(dict_table, base.add(ip0), dict_hash_log) };
         let mut curr = ip0;
 
         let found: Option<DictMatch> = loop {
@@ -1201,7 +1246,8 @@ pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
             }
 
             // Prepare next iteration (upstream zstd 616-630).
-            dict_idx = unsafe { dict_table.get(hash1) };
+            dict_idx =
+                unsafe { dict_tagged_lookup::<MLS>(dict_table, base.add(ip1), dict_hash_log) };
             main_idx = unsafe { main_table.get(hash1) };
             ip0 = ip1;
             ip1 += step_size;
@@ -1418,6 +1464,8 @@ fn compress_block_fast_dict_borrowed_impl<
     let mut offset_1: u32 = rep[0];
     let mut offset_2: u32 = rep[1];
 
+    let dict_hash_log = dict_table.hash_log();
+
     // Inner-loop result: literals end (input offset), raw match offset, match
     // length, and the upstream zstd `curr` probe offset for the post-match `curr + 2`
     // fill. `None` → drain to cleanup.
@@ -1432,7 +1480,8 @@ fn compress_block_fast_dict_borrowed_impl<
         // SAFETY: ip0 < ip1 <= ilimit = block_end - 8 ⇒ ≥ 8 readable bytes at ip0.
         let mut hash0 = unsafe { main_table.hash_ptr::<MLS>(inp_base.add(ip0)) };
         let mut main_idx = unsafe { main_table.get(hash0) };
-        let mut dict_idx = unsafe { dict_table.get(hash0) };
+        let mut dict_idx =
+            unsafe { dict_tagged_lookup::<MLS>(dict_table, inp_base.add(ip0), dict_hash_log) };
         let mut curr = ip0;
 
         let found: Option<DictMatch> = loop {
@@ -1572,7 +1621,8 @@ fn compress_block_fast_dict_borrowed_impl<
             }
 
             // Prepare next iteration.
-            dict_idx = unsafe { dict_table.get(hash1) };
+            dict_idx =
+                unsafe { dict_tagged_lookup::<MLS>(dict_table, inp_base.add(ip1), dict_hash_log) };
             main_idx = unsafe { main_table.get(hash1) };
             ip0 = ip1;
             ip1 += step_size;
@@ -2504,9 +2554,16 @@ mod tests {
         let mut main_table = FastHashTable::new(hash_log, MLS);
         let mut dict_table = FastHashTable::new(hash_log, MLS);
         for pos in 0..=dict.len() - HASH_READ_SIZE {
-            // SAFETY: pos + 8 <= dict.len(); MLS matches the table.
-            let h = unsafe { dict_table.hash_ptr::<MLS>(dict.as_ptr().add(pos)) };
-            unsafe { dict_table.put(h, pos as u32) };
+            // SAFETY: pos + 8 <= dict.len(); MLS matches the table. Tagged
+            // entry format (slot + tag), matching the kernel's tagged lookup.
+            let hat =
+                unsafe { hash_ptr_raw::<MLS>(dict.as_ptr().add(pos), hash_log + DICT_TAG_BITS) };
+            unsafe {
+                dict_table.put(
+                    hat >> DICT_TAG_BITS,
+                    ((pos as u32) << DICT_TAG_BITS) | (hat & DICT_TAG_MASK),
+                )
+            };
         }
 
         let mut tuples: Vec<(Vec<u8>, usize, usize)> = Vec::new();

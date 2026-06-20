@@ -383,6 +383,12 @@ struct FastConfig {
 
 const FAST_L1: FastConfig = FastConfig {
     hash_log: 14,
+    // Tier-0 (srcSize > 256 KiB) `cParams.minMatch`. Upstream zstd selects the
+    // Level-1 row from a 4-way srcSize-tiered table (`ZSTD_getCParams_internal`
+    // → `ZSTD_defaultCParameters[tableID][1]`), and minMatch shrinks for
+    // smaller inputs: 7 (>256 KiB) / 6 (16..256 KiB) / 5 (<=16 KiB). The base
+    // here is the tier-0 value; `fast_l1_mls_for_source_size` lowers it per the
+    // tier in `adjust_params_for_source_size`.
     mls: 7,
     step_size: 2,
 };
@@ -884,6 +890,56 @@ const MIN_HINTED_WINDOW_LOG: u8 = 14;
 /// encoder's baseline minimum supported window.
 /// For the HC backend, `hash_log` and `chain_log` are reduced
 /// proportionally.
+/// Source-size tier index, matching upstream `ZSTD_getCParams_internal`'s
+/// `tableID = (rSize<=256K)+(rSize<=128K)+(rSize<=16K)`: 0 = > 256 KiB or
+/// unknown, 1 = 128..256 KiB, 2 = 16..128 KiB, 3 = <= 16 KiB.
+fn cparams_tier(source_size: Option<u64>) -> usize {
+    match source_size {
+        Some(size) if size <= 16 * 1024 => 3,
+        Some(size) if size <= 128 * 1024 => 2,
+        Some(size) if size <= 256 * 1024 => 1,
+        _ => 0,
+    }
+}
+
+/// Override a Fast (L1/L2) or Dfast (L3) level row's table-shaping cParams
+/// (hashLog / chainLog / minMatch) by source-size tier, matching the
+/// reference `ZSTD_defaultCParameters[tableID][level]`. L1 keeps its base
+/// hashLog (the source-size window clamp in `adjust_params_for_source_size`
+/// already lands on the reference value) and only tiers minMatch; L2 also
+/// tiers hashLog (the tier-0 value 16 oversized the table on medium inputs,
+/// the page-fault pathology); L3 tiers both dfast hash widths. Strategy
+/// switches (L2 tier 1, L4) are intentionally not applied here.
+fn apply_cparams_tier(level: i32, source_size: Option<u64>, p: &mut LevelParams) {
+    let tier = cparams_tier(source_size);
+    match level {
+        // Fast, all tiers — minMatch only (hashLog handled by the window clamp).
+        1 => {
+            if let Some(f) = p.fast.as_mut() {
+                f.mls = [7, 6, 6, 5][tier];
+            }
+        }
+        // Fast (base strategy; tier 1 is dfast upstream — not switched here).
+        // (hashLog, minMatch) per tier from `clevels.h` level-2 rows.
+        2 => {
+            if let Some(f) = p.fast.as_mut() {
+                let (h, m) = [(16u32, 6u32), (14, 5), (15, 5), (15, 4)][tier];
+                f.hash_log = h;
+                f.mls = m;
+            }
+        }
+        // Dfast, all tiers — (long hashLog, short chainLog) per tier.
+        3 => {
+            if let Some(d) = p.dfast.as_mut() {
+                let (l, s) = [(17u8, 16u8), (16, 16), (16, 15), (15, 14)][tier];
+                d.long_hash_log = l;
+                d.short_hash_log = s;
+            }
+        }
+        _ => {}
+    }
+}
+
 fn adjust_params_for_source_size(mut params: LevelParams, src_size: u64) -> LevelParams {
     // Derive a source-size-based cap from ceil(log2(src_size)), then
     // clamp first to MIN_WINDOW_LOG (baseline encoder minimum) and then to
@@ -1109,7 +1165,22 @@ fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> Le
         CompressionLevel::Level(n) => {
             if n > 0 {
                 let idx = (n as usize).min(CompressionLevel::MAX_LEVEL as usize) - 1;
-                LEVEL_TABLE[idx]
+                let mut p = LEVEL_TABLE[idx];
+                // Upstream zstd selects the cParams row from a 4-way
+                // source-size-tiered table (`ZSTD_getCParams_internal` →
+                // `ZSTD_defaultCParameters[tableID][level]`), and the Fast /
+                // Dfast hashLog, chainLog and minMatch shrink for smaller
+                // inputs. The `LEVEL_TABLE` base is the tier-0 (> 256 KiB) row;
+                // override the table-shaping params per tier here so small and
+                // medium frames use the reference's table widths (the oversized
+                // tier-0 widths were a per-frame alloc / page-fault pathology on
+                // medium inputs) and minMatch (short matches the wide hash
+                // skips). NOTE: the reference also switches STRATEGY in some
+                // tiers (L2 → dfast at 128..256 KiB, L4 → greedy at <= 16 KiB
+                // and 128..256 KiB); those backend switches are not yet tiered,
+                // so those tiers keep the base strategy.
+                apply_cparams_tier(n, source_size, &mut p);
+                p
             } else if n == 0 {
                 // Level 0 = default, matching C zstd semantics.
                 LEVEL_TABLE[CompressionLevel::DEFAULT_LEVEL as usize - 1]
@@ -1462,7 +1533,12 @@ impl MatchGeneratorDriver {
         let window_log_init = next_pow2.trailing_zeros() as u8;
         Self {
             vec_pool: Vec::new(),
-            storage: MatcherStorage::Simple(FastKernelMatcher::with_params(
+            // Deferred table: `new` runs before any source size or resolved
+            // LevelParams exist, so allocating at the level-default hash_log
+            // here would be thrown away by the first frame's reset (which
+            // clamps the window to the input and reallocs at the resolved
+            // size). The deferral lets that first reset allocate exactly once.
+            storage: MatcherStorage::Simple(FastKernelMatcher::with_params_deferred(
                 window_log_init,
                 FAST_LEVEL_1_HASH_LOG,
                 FAST_LEVEL_1_MLS,
@@ -2247,14 +2323,13 @@ impl Matcher for MatchGeneratorDriver {
                     // tables with `DFAST_EMPTY_SLOT` sentinels — wasted
                     // work given the next assignment to `self.storage`
                     // is about to drop `m` entirely. `reset` itself
-                    // short-circuits on `if !self.short_hash.is_empty()`,
-                    // so handing it an empty `Vec` skips the fill loop.
+                    // short-circuits on `if !self.tables.is_empty()`, so
+                    // handing it an empty `Vec` skips the fill loop.
                     // Mirrors the pre-drain pattern in the HashChain
                     // arm below (and serves the same peak-memory
                     // purpose: release the table-allocation footprint
                     // before constructing the replacement variant).
-                    m.short_hash = Vec::new();
-                    m.long_hash = Vec::new();
+                    m.tables = Vec::new();
                     m.reset();
                 }
                 MatcherStorage::Row(m) => {
@@ -2386,9 +2461,24 @@ impl Matcher for MatchGeneratorDriver {
                                 ldm: None,
                             }
                     });
+                // Cap `hash_log <= window_log + 1` (upstream zstd
+                // `ZSTD_adjustCParams_internal`): once `window_log` is resized
+                // down for a small source, a level-default `1 << hash_log`
+                // table is mostly wasted address space whose per-frame memset
+                // dominates the compress cost on tiny frames (a 4 KB frame at
+                // window_log 12 still zero-fills the 64 KiB hash_log-14 table).
+                // Gated to no-dict frames: the dict-attach path shares one
+                // hash_log between the main and dict tables (so one hash keys
+                // both), and shrinking only the main table would break that
+                // invariant and the small-frame dict ratio.
+                let hash_log = if dict_hint.is_some_and(|s| s > 0) {
+                    fast.hash_log
+                } else {
+                    fast.hash_log.min(params.window_log as u32 + 1)
+                };
                 m.reset(
                     params.window_log,
-                    fast.hash_log,
+                    hash_log,
                     fast.mls,
                     fast.step_size,
                     dict_attach_epoch,
@@ -2573,6 +2663,34 @@ impl Matcher for MatchGeneratorDriver {
         self.reset_shape = Some((params, resolved_table_bits, fast_attach, active_ldm));
     }
 
+    fn dictionary_is_resident(&self) -> bool {
+        match &self.storage {
+            MatcherStorage::HashChain(hc) => hc.table.dict_resident,
+            MatcherStorage::Simple(s) => s.dict_resident(),
+            MatcherStorage::Dfast(d) => d.dict_resident(),
+            _ => false,
+        }
+    }
+
+    fn reapply_resident_dictionary(&mut self, offset_hist: [u32; 3]) {
+        // Same offset-history head as `prime_with_dictionary`, without the dict
+        // commit / re-index (resident dict bytes + cached dms already in place).
+        match self.active_backend() {
+            super::strategy::BackendTag::Simple => {
+                self.simple_mut().prime_offset_history(offset_hist)
+            }
+            super::strategy::BackendTag::Dfast => {
+                self.dfast_matcher_mut().offset_hist = offset_hist
+            }
+            super::strategy::BackendTag::Row => self.row_matcher_mut().offset_hist = offset_hist,
+            super::strategy::BackendTag::HashChain => {
+                let matcher = self.hc_matcher_mut();
+                matcher.table.offset_hist = offset_hist;
+                matcher.table.mark_dictionary_primed();
+            }
+        }
+    }
+
     fn prime_with_dictionary(&mut self, dict_content: &[u8], offset_hist: [u32; 3]) {
         match self.active_backend() {
             super::strategy::BackendTag::Simple => {
@@ -2615,8 +2733,7 @@ impl Matcher for MatchGeneratorDriver {
         // re-introduce the same overflow the `window_log` cap was
         // designed to prevent. Clamp the post-priming size so the
         // doubled-band-plus-block invariant survives.
-        const MAX_PRIMED_WINDOW_SIZE: usize =
-            (u32::MAX as usize - crate::common::MAX_BLOCK_SIZE as usize) / 2;
+        use super::match_table::storage::MAX_PRIMED_WINDOW_SIZE;
 
         // `requested_dict_budget` is what the caller asked for;
         // `base_max_window_size` snapshots the pre-priming cap so we
@@ -9306,8 +9423,8 @@ fn driver_small_source_hint_shrinks_dfast_hash_tables() {
     driver.skip_matching_with_hint(None);
     // Upstream zstd-parity split sizes: long-hash = DFAST_HASH_BITS,
     // short-hash = DFAST_HASH_BITS - DFAST_SHORT_HASH_BITS_DELTA.
-    let full_long = driver.dfast_matcher().long_hash.len();
-    let full_short = driver.dfast_matcher().short_hash.len();
+    let full_long = driver.dfast_matcher().long_len();
+    let full_short = driver.dfast_matcher().short_len();
     assert_eq!(full_long, 1 << DFAST_HASH_BITS);
     assert_eq!(
         full_short,
@@ -9321,8 +9438,8 @@ fn driver_small_source_hint_shrinks_dfast_hash_tables() {
     space.truncate(12);
     driver.commit_space(space);
     driver.skip_matching_with_hint(None);
-    let hinted_long = driver.dfast_matcher().long_hash.len();
-    let hinted_short = driver.dfast_matcher().short_hash.len();
+    let hinted_long = driver.dfast_matcher().long_len();
+    let hinted_short = driver.dfast_matcher().short_len();
 
     // The wire `window_log` stays at its floor (decoder-interop), but the
     // internal dfast tables are sized from the RAW 1 KiB source, not the
@@ -9358,7 +9475,7 @@ fn driver_huge_source_hint_does_not_overflow_table_window_shift() {
     driver.skip_matching_with_hint(None);
 
     assert!(
-        driver.dfast_matcher().long_hash.len() >= 1 << MIN_WINDOW_LOG,
+        driver.dfast_matcher().long_len() >= 1 << MIN_WINDOW_LOG,
         "huge hint must size the dfast table from the real window, not wrap to zero"
     );
 }
@@ -9743,8 +9860,8 @@ fn driver_unhinted_level2_keeps_default_dfast_hash_table_size() {
     // Upstream zstd-parity split: long-hash at DFAST_HASH_BITS, short-hash one
     // bit smaller (DFAST_SHORT_HASH_BITS_DELTA = 1, matching upstream zstd
     // `chainLog = hashLog - 1` for dfast levels).
-    let long_len = driver.dfast_matcher().long_hash.len();
-    let short_len = driver.dfast_matcher().short_hash.len();
+    let long_len = driver.dfast_matcher().long_len();
+    let short_len = driver.dfast_matcher().short_len();
     assert_eq!(
         long_len,
         1 << DFAST_HASH_BITS,
@@ -12253,7 +12370,7 @@ fn dfast_skip_matching_dense_backfills_newly_hashable_long_tail_positions() {
         "pack_slot must never return the empty-slot sentinel for a real position"
     );
     assert_eq!(
-        matcher.long_hash[long_hash], target_slot,
+        matcher.tables[long_hash], target_slot,
         "dense skip must seed long-hash entry for newly hashable boundary start"
     );
 }
@@ -12284,7 +12401,8 @@ fn dfast_seed_remaining_hashable_starts_seeds_last_short_hash_positions() {
         "pack_slot must never return the empty-slot sentinel for a real position"
     );
     assert_eq!(
-        matcher.short_hash[short_hash], target_slot,
+        matcher.tables[matcher.long_len() + short_hash],
+        target_slot,
         "tail seeding must include the last 5-byte-hashable start"
     );
 }
@@ -12314,7 +12432,8 @@ fn dfast_seed_remaining_hashable_starts_handles_pos_at_block_end() {
         "pack_slot must never return the empty-slot sentinel for a real position"
     );
     assert_eq!(
-        matcher.short_hash[short_hash], target_slot,
+        matcher.tables[matcher.long_len() + short_hash],
+        target_slot,
         "tail seeding must still include the last 5-byte-hashable start when pos is at block end"
     );
 }
@@ -12350,8 +12469,9 @@ fn dfast_ensure_room_for_rebases_above_guard_band() {
     let early_abs = 1024usize;
     let early_packed = dfast.pack_slot(early_abs);
     assert_ne!(early_packed, DFAST_EMPTY_SLOT);
-    dfast.short_hash[0] = early_packed;
-    dfast.long_hash[0] = early_packed;
+    let short0 = dfast.long_len();
+    dfast.tables[short0] = early_packed;
+    dfast.tables[0] = early_packed;
 
     // Pick a trigger position that forces the first rebase. With
     // `position_base = 0`, the smallest `abs_pos` that fails the
@@ -12372,11 +12492,12 @@ fn dfast_ensure_room_for_rebases_above_guard_band() {
     // upstream zstd parity for `ZSTD_window_reduce`'s clamp-at-zero rule.
     // Verify BOTH tables — `reduce()` walks them in sequence.
     assert_eq!(
-        dfast.short_hash[0], DFAST_EMPTY_SLOT,
+        dfast.tables[dfast.long_len()],
+        DFAST_EMPTY_SLOT,
         "pre-rebase short-hash entries below the reducer must become empty"
     );
     assert_eq!(
-        dfast.long_hash[0], DFAST_EMPTY_SLOT,
+        dfast.tables[0], DFAST_EMPTY_SLOT,
         "pre-rebase long-hash entries below the reducer must become empty"
     );
 

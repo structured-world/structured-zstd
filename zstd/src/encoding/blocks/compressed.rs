@@ -344,6 +344,7 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
             block_scratch: inner_scratch,
             offset_hist: state.offset_hist,
             strategy_tag: state.strategy_tag,
+            huf_optimal_search: state.huf_optimal_search,
         },
         workspace,
     };
@@ -562,6 +563,7 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
             state.last_huff_table.as_ref(),
             &mut writer,
             strategy,
+            state.huf_optimal_search,
         ) {
             HuffmanTableUpdate::New(table) => {
                 state.replace_huff_table(table);
@@ -693,6 +695,7 @@ fn estimate_block_parts_size<M: Matcher>(
         &mut state.last_huff_table,
         &mut workspace.lit_counts,
         state.strategy_tag,
+        state.huf_optimal_search,
     );
 
     let seq_bytes = if workspace.sequences.is_empty() {
@@ -716,6 +719,7 @@ fn estimate_literals_section_bytes(
     last_huff: &mut Option<huff0_encoder::HuffmanTable>,
     counts: &mut [usize; 256],
     strategy: crate::encoding::strategy::StrategyTag,
+    huf_search: bool,
 ) -> usize {
     // Mirror `encode_block_parts_with_sequence_scratch` literal-mode branches
     // **in the same order**. The emitter pre-checks `all_identical`
@@ -773,7 +777,8 @@ fn estimate_literals_section_bytes(
         *last_huff = None;
         return uncompressed_literals_header_bytes(literals.len()) + literals.len();
     }
-    let new_table = huff0_encoder::HuffmanTable::build_from_counts(&counts[..=max_sym]);
+    let new_table =
+        huff0_encoder::HuffmanTable::build_from_counts_gated(&counts[..=max_sym], huf_search);
 
     let Some(new_desc) = new_table.writeable_table_description_size() else {
         *last_huff = None;
@@ -2148,6 +2153,7 @@ fn compress_literals(
     last_table: Option<&huff0_encoder::HuffmanTable>,
     writer: &mut BitWriter<&mut Vec<u8>>,
     strategy: crate::encoding::strategy::StrategyTag,
+    huf_search: bool,
 ) -> HuffmanTableUpdate {
     let reset_idx = writer.index();
 
@@ -2185,7 +2191,8 @@ fn compress_literals(
         return HuffmanTableUpdate::Cleared;
     }
 
-    let new_encoder_table = huff0_encoder::HuffmanTable::build_from_counts(&counts[..=max_symbol]);
+    let new_encoder_table =
+        huff0_encoder::HuffmanTable::build_from_counts_gated(&counts[..=max_symbol], huf_search);
 
     let Some(new_table_description_size) = new_encoder_table.writeable_table_description_size()
     else {
@@ -2625,6 +2632,7 @@ mod tests {
                     block_scratch: CompressedBlockScratch::new(),
                     offset_hist: [1, 4, 8],
                     strategy_tag: *strat,
+                    huf_optimal_search: true,
                 };
                 let mut emit_state = CompressState::<EntropyOnlyMatcher> {
                     matcher: EntropyOnlyMatcher,
@@ -2634,6 +2642,7 @@ mod tests {
                     block_scratch: CompressedBlockScratch::new(),
                     offset_hist: [1, 4, 8],
                     strategy_tag: *strat,
+                    huf_optimal_search: true,
                 };
                 let mut workspace = EstimatorWorkspace::default();
                 let est = estimate_block_parts_size(&mut est_state, &literals, &[], &mut workspace);
@@ -2678,6 +2687,7 @@ mod tests {
             block_scratch: super::CompressedBlockScratch::new(),
             offset_hist: [10, 20, 30],
             strategy_tag: crate::encoding::strategy::StrategyTag::Fast,
+            huf_optimal_search: true,
         };
         let source = [0xA5; 8];
         let sequences = [RawSequence {

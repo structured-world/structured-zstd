@@ -114,6 +114,10 @@ impl<W: Write> StreamingEncoder<W, MatchGeneratorDriver> {
         self.state.strategy_tag = self.strategy_override.unwrap_or_else(|| {
             crate::encoding::strategy::StrategyTag::for_compression_level(self.compression_level)
         });
+        self.state.huf_optimal_search = crate::encoding::frame_compressor::fast_huf_search_enabled(
+            self.state.strategy_tag,
+            self.pledged_content_size,
+        );
         self.state.matcher.set_param_overrides(Some(overrides));
         Ok(())
     }
@@ -138,6 +142,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                 strategy_tag: crate::encoding::strategy::StrategyTag::for_compression_level(
                     compression_level,
                 ),
+                huf_optimal_search: true,
             },
             pending: Vec::new(),
             encoded_scratch: Vec::new(),
@@ -557,6 +562,10 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         self.state.strategy_tag = self.strategy_override.unwrap_or_else(|| {
             crate::encoding::strategy::StrategyTag::for_compression_level(self.compression_level)
         });
+        self.state.huf_optimal_search = crate::encoding::frame_compressor::fast_huf_search_enabled(
+            self.state.strategy_tag,
+            self.pledged_content_size,
+        );
         #[cfg(feature = "hash")]
         {
             self.hasher = XxHash64::with_seed(0);
