@@ -740,3 +740,91 @@ fn load_sample_dict_frame(expected_dict_id: u32) -> (alloc::vec::Vec<u8>, alloc:
 
     (compressed, original)
 }
+
+/// Regression: a copy-mode Fast (level 1) dictionary must stay reachable for a
+/// whole >8 KiB block. The attach/copy split routes inputs larger than the Fast
+/// 8 KiB cutoff through the copy path, which commits the dict to the front of
+/// history and primes the live hash table over it. The block's prefix floor must
+/// then mirror upstream zstd `ZSTD_getLowestPrefixIndex`: while the dictionary is
+/// still within `maxDist + loadedDictEnd` of the block end, the floor is the dict
+/// start, NOT the window-clamped `blockEnd - window`. A block-constant
+/// window-clamped floor (computed from the history END) rejected every dict
+/// position for the whole block, so a 16 KiB input over an 8 KiB dict ignored the
+/// dictionary entirely and fell back to the no-dict ratio.
+#[test]
+fn fast_copy_mode_dict_reachable_for_full_block() {
+    use crate::decoding::FrameDecoder;
+    use crate::decoding::dictionary::{Dictionary, DictionaryHandle};
+    use crate::encoding::{CompressionLevel, FrameCompressor};
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    // 128 distinct pseudo-random 64-byte lines (LCG, hermetic). Distinct content
+    // means the input has no cheap internal matches on first occurrence — the
+    // only way to compress the first pass is to match the dictionary.
+    const LINE: usize = 64;
+    const N_LINES: usize = 128;
+    let mut lines: Vec<Vec<u8>> = Vec::with_capacity(N_LINES);
+    let mut s: u32 = 0x1234_5678;
+    for _ in 0..N_LINES {
+        let mut line = Vec::with_capacity(LINE);
+        while line.len() < LINE {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            line.push((s >> 24) as u8);
+        }
+        lines.push(line);
+    }
+
+    // Dict = all 128 lines (8192 bytes). Input = the same 128 lines twice
+    // (16384 bytes) — over the Fast 8 KiB copy cutoff, single block.
+    let mut dict_content = Vec::with_capacity(N_LINES * LINE);
+    for line in &lines {
+        dict_content.extend_from_slice(line);
+    }
+    assert_eq!(dict_content.len(), 8192, "dict must be exactly 8 KiB");
+
+    let mut input = Vec::with_capacity(2 * N_LINES * LINE);
+    for _ in 0..2 {
+        for line in &lines {
+            input.extend_from_slice(line);
+        }
+    }
+    assert_eq!(input.len(), 16384, "input must be 16 KiB (> 8 KiB cutoff)");
+
+    let dict_id = 0x00AB_CDEFu32;
+    let enc_dict = Dictionary::from_raw_content(dict_id, dict_content.clone())
+        .expect("encoder dict should build");
+
+    // With dictionary.
+    let mut cctx: FrameCompressor = FrameCompressor::new(CompressionLevel::Level(1));
+    cctx.set_dictionary(enc_dict).expect("attach dict");
+    let with_dict = cctx.compress_independent_frame(&input);
+
+    // Without dictionary, same level — the baseline the bug regressed to.
+    let mut cctx_nodict: FrameCompressor = FrameCompressor::new(CompressionLevel::Level(1));
+    let no_dict = cctx_nodict.compress_independent_frame(&input);
+
+    // The dictionary covers every line of the first pass, so a working copy-mode
+    // dict path must compress dramatically better than the no-dict baseline (C
+    // reaches a tiny frame here). The bug made the two equal.
+    assert!(
+        with_dict.len() * 2 < no_dict.len(),
+        "copy-mode Fast dict must beat the no-dict baseline by >2x; \
+         got with_dict={} vs no_dict={}",
+        with_dict.len(),
+        no_dict.len(),
+    );
+
+    // And the frame must still round-trip against the dictionary.
+    let dec_handle = DictionaryHandle::from_dictionary(
+        Dictionary::from_raw_content(dict_id, dict_content)
+            .expect("decoder dict should build"),
+    );
+    let mut output = vec![0u8; input.len()];
+    let mut decoder = FrameDecoder::new();
+    let written = decoder
+        .decode_all_with_dict_handle(with_dict.as_slice(), &mut output, &dec_handle)
+        .expect("decode with dict should succeed");
+    assert_eq!(written, input.len());
+    assert_eq!(&output, &input, "copy-mode dict frame must round-trip");
+}
