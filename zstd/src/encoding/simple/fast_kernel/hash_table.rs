@@ -311,6 +311,18 @@ impl FastHashTable {
         (self.table.as_mut_slice(), self.hash_log)
     }
 
+    /// Like [`hot_state`] but also exposes the epoch `bias`, so a hot loop on a
+    /// POSSIBLY-biased table (the dict-attach kernels) can hoist the backing
+    /// slice + `hash_log` and apply the bias inline — `slot.saturating_sub(bias)`
+    /// on read, `pos + bias` on write — exactly as [`get`]/[`put`] do, without
+    /// re-reading the `Vec` header / `hash_log` / `bias` through `&mut self` on
+    /// every access. On a bias-0 table this is identical to `hot_state` + raw
+    /// access (`saturating_sub(0)` / `+ 0` fold away).
+    #[inline(always)]
+    pub(crate) fn hot_state_biased(&mut self) -> (&mut [u32], u32, u32) {
+        (self.table.as_mut_slice(), self.hash_log, self.bias)
+    }
+
     /// Direct table access — `table[hash]`. Bounds-check at index time
     /// is provably redundant because `hash >> (64 - hash_log)` produces
     /// a value `< 1 << hash_log == table.len()`; LLVM cannot infer
