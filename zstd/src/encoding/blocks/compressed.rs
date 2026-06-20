@@ -593,10 +593,22 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
         let mut ll_counts = [0usize; 256];
         let mut ml_counts = [0usize; 256];
         let mut of_counts = [0usize; 256];
+        // Track the highest code per stream while histogramming so the table
+        // selector skips the full-256 reverse scan for `max_symbol` (the small
+        // sequence-code alphabets leave ~200 high slots permanently zero).
+        let mut ll_max = 0usize;
+        let mut ml_max = 0usize;
+        let mut of_max = 0usize;
         for seq in sequences.iter() {
-            ll_counts[encode_literal_length(seq.ll).0 as usize] += 1;
-            ml_counts[encode_match_len(seq.ml).0 as usize] += 1;
-            of_counts[encode_offset(seq.of).0 as usize] += 1;
+            let ll_code = encode_literal_length(seq.ll).0 as usize;
+            let ml_code = encode_match_len(seq.ml).0 as usize;
+            let of_code = encode_offset(seq.of).0 as usize;
+            ll_counts[ll_code] += 1;
+            ml_counts[ml_code] += 1;
+            of_counts[of_code] += 1;
+            ll_max = ll_max.max(ll_code);
+            ml_max = ml_max.max(ml_code);
+            of_max = of_max.max(of_code);
         }
         let total = sequences.len();
 
@@ -605,6 +617,7 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
             state.fse_tables.ll_default_ref(),
             &ll_counts,
             total,
+            ll_max,
             9,
             state.strategy_tag,
         );
@@ -613,6 +626,7 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
             state.fse_tables.ml_default_ref(),
             &ml_counts,
             total,
+            ml_max,
             9,
             state.strategy_tag,
         );
@@ -621,6 +635,7 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
             state.fse_tables.of_default_ref(),
             &of_counts,
             total,
+            of_max,
             8,
             state.strategy_tag,
         );
@@ -1536,14 +1551,26 @@ fn choose_table<'a>(
     max_log: u8,
     strategy: crate::encoding::strategy::StrategyTag,
 ) -> FseTableMode<'a> {
-    // Collect symbol distribution
+    // Collect symbol distribution, tracking the highest code so the selector
+    // skips the full-256 reverse scan (see `choose_table_from_counts`).
     let mut counts = [0usize; 256];
     let mut total = 0usize;
+    let mut max_symbol = 0usize;
     for symbol in data {
-        counts[symbol as usize] += 1;
+        let symbol = symbol as usize;
+        counts[symbol] += 1;
         total += 1;
+        max_symbol = max_symbol.max(symbol);
     }
-    choose_table_from_counts(previous, default_table, &counts, total, max_log, strategy)
+    choose_table_from_counts(
+        previous,
+        default_table,
+        &counts,
+        total,
+        max_symbol,
+        max_log,
+        strategy,
+    )
 }
 
 /// Same decision logic as [`choose_table`] but takes pre-computed
@@ -1558,6 +1585,16 @@ fn choose_table_from_counts<'a>(
     default_table: &'a FSETable,
     counts: &[usize; 256],
     total: usize,
+    // The highest symbol code with a non-zero count, tracked by the caller as it
+    // builds `counts`. The sequence-code alphabets are tiny (LL <= 35, ML <= 52,
+    // OF <= 31) while `counts` is a fixed 256-wide array, so deriving this here
+    // via `counts.iter().rposition(..)` would scan ~200 always-zero high slots
+    // per stream per block — the dominant cost on small frames (profiled ~35% of
+    // a 1 KiB dict-frame encode). The caller already visits every code once, so
+    // it carries the running max for free. Equal to the old `rposition` result
+    // (every counted code increments its slot, so the max code IS the highest
+    // non-zero index), keeping the table selection byte-identical.
+    max_symbol: usize,
     max_log: u8,
     strategy: crate::encoding::strategy::StrategyTag,
 ) -> FseTableMode<'a> {
@@ -1565,12 +1602,14 @@ fn choose_table_from_counts<'a>(
         return FseTableMode::Predefined(default_table);
     }
 
-    // Build a new table from the actual data distribution
-    let max_symbol = counts
+    // Distinctness over the live alphabet only (`..=max_symbol`); slots above
+    // `max_symbol` are zero by construction, so bounding the scan there matches
+    // the full-array result without touching the always-zero tail.
+    let distinct_symbols = counts[..=max_symbol]
         .iter()
-        .rposition(|&count| count > 0)
-        .unwrap_or_default();
-    let distinct_symbols = counts.iter().filter(|&&count| count > 0).take(2).count();
+        .filter(|&&count| count > 0)
+        .take(2)
+        .count();
     if distinct_symbols == 1 {
         let symbol = max_symbol as u8;
         if let Some(PreviousFseTable::Rle(prev_symbol)) = previous
@@ -2810,6 +2849,7 @@ mod tests {
                 fse_tables.ll_default_ref(),
                 &counts,
                 total,
+                1, // highest non-zero code in {0,1}
                 9,
                 strategy,
             );
