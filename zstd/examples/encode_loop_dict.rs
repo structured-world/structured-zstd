@@ -91,8 +91,16 @@ fn main() {
     let mut cctx: FrameCompressor = FrameCompressor::new(CompressionLevel::from_level(level));
     if let Some(path) = dict_path {
         let dict = std::fs::read(path).expect("read dict file");
-        cctx.set_dictionary_from_bytes(&dict)
-            .expect("dictionary should attach");
+        // A finalized dict carries the zstd magic; a non-magic blob is raw
+        // content (the `ZSTD_createCDict`-on-raw-bytes path the dict_matrix
+        // bench uses), attached with the id flag off so the frame omits a id.
+        if cctx.set_dictionary_from_bytes(&dict).is_err() {
+            let dict_obj = structured_zstd::decoding::Dictionary::from_raw_content(1, dict)
+                .expect("raw-content dictionary should build");
+            cctx.set_dictionary_id_flag(false);
+            cctx.set_dictionary(dict_obj)
+                .expect("raw-content dictionary should attach");
+        }
     }
 
     // Output buffer reused across iterations (allocated once, replaced in
