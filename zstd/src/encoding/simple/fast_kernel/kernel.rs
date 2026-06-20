@@ -1071,11 +1071,13 @@ pub(crate) fn compress_block_fast<const MLS: u32, const USE_CMOV: bool>(
 /// `[dict][output]` window), so a dict-match offset is `ip - dict_pos` like any
 /// in-window match and match counts cross the dict→input boundary freely (no
 /// `ZSTD_count_2segments`, no `dictBase`/`dictIndexDelta`). `dict_table` stores
-/// plain positions (no upstream zstd short-cache tags); `main_table` holds ONLY frame-
-/// input positions. Search order mirrors the upstream zstd: rep@ip0+1 → dict (only when
-/// the main candidate is invalid) → main. Correctness is independent of table
-/// contents (every match byte-verified + bounds-guarded); `MIN_DICT_MATCH_LEN`
-/// gates short far dict matches that would fragment the offset-FSE alphabet.
+/// short-cache tagged positions (`(position << DICT_TAG_BITS) | tag`, upstream
+/// zstd `ZSTD_SHORT_CACHE` — the tag rejects a colliding slot without a wasted
+/// candidate load); `main_table` holds ONLY frame-input positions. Search order
+/// mirrors the upstream zstd: rep@ip0+1 → dict (only when the main candidate is
+/// invalid) → main. Correctness is independent of table contents (every match
+/// byte-verified + bounds-guarded); `MIN_DICT_MATCH_LEN` gates short far dict
+/// matches that would fragment the offset-FSE alphabet.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
     data: &[u8],
