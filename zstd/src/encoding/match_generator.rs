@@ -383,6 +383,12 @@ struct FastConfig {
 
 const FAST_L1: FastConfig = FastConfig {
     hash_log: 14,
+    // Tier-0 (srcSize > 256 KiB) `cParams.minMatch`. Upstream zstd selects the
+    // Level-1 row from a 4-way srcSize-tiered table (`ZSTD_getCParams_internal`
+    // → `ZSTD_defaultCParameters[tableID][1]`), and minMatch shrinks for
+    // smaller inputs: 7 (>256 KiB) / 6 (16..256 KiB) / 5 (<=16 KiB). The base
+    // here is the tier-0 value; `fast_l1_mls_for_source_size` lowers it per the
+    // tier in `adjust_params_for_source_size`.
     mls: 7,
     step_size: 2,
 };
@@ -661,13 +667,41 @@ pub(crate) fn source_size_ceil_log(size: u64) -> u8 {
     }
 }
 
-/// Upstream zstd `ZSTD_shouldAttachDict` cutoff for the Fast strategy, as a ceil-log
-/// bucket: 8 KiB = `2^13`, and `bucket <= 13` is exactly `hint <= 8192` because
-/// the bucket is monotone in the hint. A hint at or below this (or unknown,
-/// `None`) ATTACHES the dictionary (a separate immutable table); a larger hint
-/// COPIES it into the live table. Shared by `reset` (which records the mode in
-/// the primed-snapshot key) and `prime_with_dictionary` (which acts on it).
-const FAST_ATTACH_DICT_CUTOFF_LOG: u8 = 13;
+/// Attach-vs-copy cutoff for the Fast strategy, as a ceil-log bucket: a hint at
+/// or below `2^this` (or unknown, `None`) ATTACHES the dictionary (a separate
+/// immutable table scanned in place via the borrowed dual-base kernel); a larger
+/// hint would COPY it into the live table.
+///
+/// We set this to `31` so every dictionary source up to 2 GiB attaches,
+/// diverging from upstream zstd's 8 KiB `ZSTD_shouldAttachDict` cutoff ON
+/// PURPOSE: upstream copy mode copies the small CDict TABLES into the cctx and
+/// still scans the input in place, but our flat-history copy path memmoves the
+/// whole INPUT into history every frame (profiled at 30% `__memmove` + 14%
+/// `__memset` on a reused 1 MiB dict encode). Attach mode scans the caller's
+/// input in place with the dict as a separate prefix base, so it is strictly
+/// faster for every frame size here (measured: 1 MiB dict frame 167 us -> 52 us,
+/// 0.42x of C; 10 KiB 20.4 us -> 4.4 us, 0.17x of C). The dual-base kernel
+/// carries `window_low`, so over-window inputs stay in-window and C-decodable.
+///
+/// `31` is also the largest bucket the borrowed kernel can attach: it stores
+/// virtual positions as `u32` (`cur_abs as u32`), so the maximum attached source
+/// `1 << 31` (plus the dict prefix) stays below `u32::MAX`; the next bucket `32`
+/// (4 GiB) would wrap that arithmetic. Sources past 2 GiB therefore fall back to
+/// copy mode — rare in practice, and the relative copy cost shrinks as the
+/// source grows. Per the drop-in-not-binary-parity contract, we make this match
+/// decision ourselves.
+/// Shared by `reset` (records the mode in the primed-snapshot key) and
+/// `prime_with_dictionary` (acts on it).
+pub(crate) const FAST_ATTACH_DICT_CUTOFF_LOG: u8 = 31;
+
+/// Largest dictionary region (bytes) the Fast attach path can index. The tagged
+/// dict table packs each position into `32 - DICT_TAG_BITS` (= 24) bits, so a
+/// region past `2^24` (16 MiB) would overflow the packed position. Dictionaries
+/// this large fall back to COPY mode, whose live table stores full `u32`
+/// positions and handles them. The size hint set on dict load equals the actual
+/// dict content length, so the attach-vs-copy decision (and the matching
+/// snapshot-key / epoch bits) can gate on it consistently at reset time.
+pub(crate) const MAX_FAST_ATTACH_DICT_REGION: usize = 1 << 24;
 
 /// Dfast counterpart of [`FAST_ATTACH_DICT_CUTOFF_LOG`]: upstream zstd
 /// `ZSTD_dictMatchState` attach cutoff for the double-fast strategy is 16 KiB
@@ -796,43 +830,12 @@ const LEVEL_TABLE: [LevelParams; 22] = [
     /*22 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, search: super::strategy::SearchMethod::BinaryTree, window_log: 27, lazy_depth: 2, fast: None, dfast: None, hc: Some(BTULTRA2_HC_CONFIG_L22), row: None },
 ];
 
-/// Upstream zstd `minSrcSize` assumption when building a dictionary's prepared cParams
-/// with an unknown source (`zstd_compress.c` `ZSTD_adjustCParams_internal`,
-/// `ZSTD_cpm_createCDict`: `if (dictSize && srcSize == UNKNOWN) srcSize =
-/// minSrcSize` where `minSrcSize = (1<<9) + 1`). Used by [`cdict_table_logs`].
-const DICT_MIN_SRC_SIZE: u64 = 513;
-
-/// Upstream zstd `ZSTD_dictAndWindowLog` (`zstd_compress.c`): the window log large
-/// enough to address both the source and the dictionary, used when downsizing
-/// the hash / chain logs for a dictionary-bearing compress. `window_log` is the
-/// (already source-clamped) compress window; `src_size` / `dict_size` are the
-/// assumed source and the dictionary length.
-fn dict_and_window_log(window_log: u8, src_size: u64, dict_size: u64) -> u32 {
-    if dict_size == 0 {
-        return window_log as u32;
-    }
-    let window_size: u64 = 1u64 << window_log;
-    // Plain `+` (matches upstream zstd `ZSTD_dictAndWindowLog`): `window_size` is
-    // `1 << window_log` (window_log <= 31) and dict/src are real data sizes
-    // (<= isize::MAX), so these u64 sums cannot overflow in practice.
-    let dict_and_window = dict_size + window_size;
-    if window_size >= dict_size + src_size {
-        // Window already covers source + dictionary.
-        window_log as u32
-    } else {
-        // ceil(log2(dictAndWindowSize)) = highbit32(x - 1) + 1.
-        source_size_ceil_log(dict_and_window) as u32
-    }
-}
-
-/// Upstream zstd `ZSTD_createCDict` table geometry: the `(hash_log, chain_log)` a
-/// dictionary's prepared match-finder tables get, mirroring
-/// `ZSTD_adjustCParams_internal` under `ZSTD_cpm_createCDict`. A dictionary
-/// supplies the long matches, so upstream zstd downsizes the table widths toward the
-/// dict-and-window log (assuming a `minSrcSize` source) while the live window
-/// stays source-sized. `window_log` is the resolved compress window; `hash_log`
-/// / `chain_log` are the level's own widths; `uses_bt` selects the binary-tree
-/// `cycleLog` (`chainLog - 1`) vs the hash-chain one (`chainLog`).
+/// Upstream `ZSTD_createCDict` table geometry: the `(hash_log, chain_log)` a
+/// dictionary's prepared match-finder tables get. Thin adapter over the single
+/// cParams source [`super::cparams::create_cdict_table_logs`], which mirrors
+/// `ZSTD_adjustCParams_internal` under `ZSTD_cpm_createCDict`. `window_log` is
+/// the resolved compress window; `hash_log` / `chain_log` are the level's own
+/// widths; `uses_bt` selects the binary-tree `cycleLog` (`chainLog - 1`).
 fn cdict_table_logs(
     window_log: u8,
     hash_log: usize,
@@ -840,30 +843,14 @@ fn cdict_table_logs(
     uses_bt: bool,
     dict_size: usize,
 ) -> (usize, usize) {
-    let dict_size = dict_size as u64;
-    // createCDict assumes a minSrcSize source when the real size is unknown.
-    let src_size = DICT_MIN_SRC_SIZE;
-    // Source-size window resize (upstream zstd caps windowLog by ceil_log2(src+dict)).
-    // Plain `+`: src_size is the tiny DICT_MIN_SRC_SIZE constant and dict_size
-    // is a real dictionary length, so the u64 sum cannot overflow.
-    let tsize = src_size + dict_size;
-    let resized_window_log = (window_log as u32)
-        .min(source_size_ceil_log(tsize) as u32)
-        .max(1);
-    let daw = dict_and_window_log(resized_window_log as u8, src_size, dict_size);
-    // `ZSTD_cycleLog(chainLog, strategy)`: chainLog - 1 for binary-tree finders.
-    let cycle_log = (chain_log as u32).saturating_sub(uses_bt as u32);
-    let new_hash_log = if hash_log as u32 > daw + 1 {
-        (daw + 1) as usize
-    } else {
-        hash_log
-    };
-    let new_chain_log = if cycle_log > daw {
-        chain_log.saturating_sub((cycle_log - daw) as usize)
-    } else {
-        chain_log
-    };
-    (new_hash_log, new_chain_log)
+    let (h, c) = super::cparams::create_cdict_table_logs(
+        window_log,
+        hash_log as u32,
+        chain_log as u32,
+        uses_bt,
+        dict_size,
+    );
+    (h as usize, c as usize)
 }
 
 /// Smallest window_log the encoder will use regardless of source size.
@@ -884,6 +871,59 @@ const MIN_HINTED_WINDOW_LOG: u8 = 14;
 /// encoder's baseline minimum supported window.
 /// For the HC backend, `hash_log` and `chain_log` are reduced
 /// proportionally.
+/// Source-size tier index, matching upstream `ZSTD_getCParams_internal`'s
+/// `tableID = (rSize<=256K)+(rSize<=128K)+(rSize<=16K)`: 0 = > 256 KiB or
+/// unknown, 1 = 128..256 KiB, 2 = 16..128 KiB, 3 = <= 16 KiB.
+fn cparams_tier(source_size: Option<u64>) -> usize {
+    match source_size {
+        Some(size) if size <= 16 * 1024 => 3,
+        Some(size) if size <= 128 * 1024 => 2,
+        Some(size) if size <= 256 * 1024 => 1,
+        _ => 0,
+    }
+}
+
+/// Override a Fast (L1/L2) or Dfast (L3) level row's table-shaping cParams
+/// (hashLog / chainLog / minMatch) by source-size tier, matching the
+/// reference `ZSTD_defaultCParameters[tableID][level]`. L1 keeps its base
+/// hashLog (the source-size window clamp in `adjust_params_for_source_size`
+/// already lands on the reference value) and only tiers minMatch; L2 also
+/// tiers hashLog (the tier-0 value 16 oversized the table on medium inputs,
+/// the page-fault pathology); L3 tiers both dfast hash widths. Strategy
+/// switches (L2 tier 1, L4) are intentionally not applied here.
+fn apply_cparams_tier(level: i32, source_size: Option<u64>, p: &mut LevelParams) {
+    let tier = cparams_tier(source_size);
+    // Single source for the table data: the verbatim upstream
+    // `ZSTD_defaultCParameters[tier][level]` row (`cparams::default_cparams`).
+    // The encoder consumes only the table-shaping widths here; the window /
+    // `table_log` clamp lives in `adjust_params_for_source_size`.
+    match level {
+        // Fast, all tiers — minMatch only (hashLog handled by the window clamp).
+        1 => {
+            if let Some(f) = p.fast.as_mut() {
+                f.mls = super::cparams::default_cparams(tier, 1).min_match;
+            }
+        }
+        // Fast (base strategy; tier 1 is dfast upstream — not switched here).
+        2 => {
+            if let Some(f) = p.fast.as_mut() {
+                let cp = super::cparams::default_cparams(tier, 2);
+                f.hash_log = cp.hash_log;
+                f.mls = cp.min_match;
+            }
+        }
+        // Dfast, all tiers — long hashLog (`hash_log`) + short chainLog (`chain_log`).
+        3 => {
+            if let Some(d) = p.dfast.as_mut() {
+                let cp = super::cparams::default_cparams(tier, 3);
+                d.long_hash_log = cp.hash_log as u8;
+                d.short_hash_log = cp.chain_log as u8;
+            }
+        }
+        _ => {}
+    }
+}
+
 fn adjust_params_for_source_size(mut params: LevelParams, src_size: u64) -> LevelParams {
     // Derive a source-size-based cap from ceil(log2(src_size)), then
     // clamp first to MIN_WINDOW_LOG (baseline encoder minimum) and then to
@@ -1098,7 +1138,15 @@ fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> Le
             });
             p
         }
-        CompressionLevel::Default => LEVEL_TABLE[2],
+        CompressionLevel::Default => {
+            // Default == Level(DEFAULT_LEVEL); tier it the same way an explicit
+            // positive level is, so hinted default compression shrinks its
+            // table widths on small / medium frames instead of keeping the
+            // tier-0 row (the oversized-table page-fault pathology).
+            let mut p = LEVEL_TABLE[CompressionLevel::DEFAULT_LEVEL as usize - 1];
+            apply_cparams_tier(CompressionLevel::DEFAULT_LEVEL, source_size, &mut p);
+            p
+        }
         CompressionLevel::Better => LEVEL_TABLE[6],
         // Level 13: the first dominant point of the deep-lazy band. The
         // mls-wide row key lifted the shallow band's ratio enough that
@@ -1109,10 +1157,28 @@ fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> Le
         CompressionLevel::Level(n) => {
             if n > 0 {
                 let idx = (n as usize).min(CompressionLevel::MAX_LEVEL as usize) - 1;
-                LEVEL_TABLE[idx]
+                let mut p = LEVEL_TABLE[idx];
+                // Upstream zstd selects the cParams row from a 4-way
+                // source-size-tiered table (`ZSTD_getCParams_internal` →
+                // `ZSTD_defaultCParameters[tableID][level]`), and the Fast /
+                // Dfast hashLog, chainLog and minMatch shrink for smaller
+                // inputs. The `LEVEL_TABLE` base is the tier-0 (> 256 KiB) row;
+                // override the table-shaping params per tier here so small and
+                // medium frames use the reference's table widths (the oversized
+                // tier-0 widths were a per-frame alloc / page-fault pathology on
+                // medium inputs) and minMatch (short matches the wide hash
+                // skips). NOTE: the reference also switches STRATEGY in some
+                // tiers (L2 → dfast at 128..256 KiB, L4 → greedy at <= 16 KiB
+                // and 128..256 KiB); those backend switches are not yet tiered,
+                // so those tiers keep the base strategy.
+                apply_cparams_tier(n, source_size, &mut p);
+                p
             } else if n == 0 {
-                // Level 0 = default, matching C zstd semantics.
-                LEVEL_TABLE[CompressionLevel::DEFAULT_LEVEL as usize - 1]
+                // Level 0 = default, matching C zstd semantics. Tier it like the
+                // `Default` alias so `Level(0)` and `Default` stay identical.
+                let mut p = LEVEL_TABLE[CompressionLevel::DEFAULT_LEVEL as usize - 1];
+                apply_cparams_tier(CompressionLevel::DEFAULT_LEVEL, source_size, &mut p);
+                p
             } else {
                 // Negative levels — upstream zstd sets
                 // targetLength = -level (clampedCompressionLevel),
@@ -1318,6 +1384,14 @@ pub struct MatchGeneratorDriver {
     // table, 4-cursor `compress_block_fast`). The primed-snapshot key is the
     // resolved shape ([`reset_shape`](Self::reset_shape)), not this bucket.
     reset_size_log: Option<u8>,
+    // Whether the loaded dictionary fits the Fast attach path's tagged position
+    // field (`<= MAX_FAST_ATTACH_DICT_REGION`). Captured at `reset` from the
+    // dict-size hint (which equals the actual dict length on load) so the Fast
+    // attach decision, the attach-epoch reset bit, and the primed-snapshot
+    // `fast_attach` bit all gate on it consistently. `true` when there is no
+    // dictionary (the attach path is then unused). A dict too large to tag falls
+    // back to copy mode instead of overflowing the packed position.
+    reset_dict_attach_ok: bool,
     // Hint-resolved matcher shape from the last `reset`: the [`LevelParams`], the
     // active backend's applied Dfast/Row hash-table width (`0` for HC/Fast), the
     // Fast attach-vs-copy mode, and the active LDM override (#27). Combined with
@@ -1462,7 +1536,12 @@ impl MatchGeneratorDriver {
         let window_log_init = next_pow2.trailing_zeros() as u8;
         Self {
             vec_pool: Vec::new(),
-            storage: MatcherStorage::Simple(FastKernelMatcher::with_params(
+            // Deferred table: `new` runs before any source size or resolved
+            // LevelParams exist, so allocating at the level-default hash_log
+            // here would be thrown away by the first frame's reset (which
+            // clamps the window to the input and reallocs at the resolved
+            // size). The deferral lets that first reset allocate exactly once.
+            storage: MatcherStorage::Simple(FastKernelMatcher::with_params_deferred(
                 window_log_init,
                 FAST_LEVEL_1_HASH_LOG,
                 FAST_LEVEL_1_MLS,
@@ -1486,6 +1565,7 @@ impl MatchGeneratorDriver {
             // resolved LevelParams.
             reported_window_size: next_pow2,
             reset_size_log: None,
+            reset_dict_attach_ok: true,
             reset_shape: None,
             dictionary_retained_budget: 0,
             source_size_hint: None,
@@ -1888,9 +1968,10 @@ impl MatchGeneratorDriver {
                 // matches/beats the upstream zstd on large corpora). The dispatch in
                 // `start_matching` keys off `dict_table.is_some()`, which only
                 // the attach path populates. See [`FAST_ATTACH_DICT_CUTOFF_LOG`].
-                let attach = self
-                    .reset_size_log
-                    .is_none_or(|log| log <= FAST_ATTACH_DICT_CUTOFF_LOG);
+                let attach = self.reset_dict_attach_ok
+                    && self
+                        .reset_size_log
+                        .is_none_or(|log| log <= FAST_ATTACH_DICT_CUTOFF_LOG);
                 if attach {
                     self.simple_mut().skip_matching_for_dict_prime();
                 } else {
@@ -1970,6 +2051,27 @@ impl Matcher for MatchGeneratorDriver {
         self.dictionary_size_hint = Some(size);
     }
 
+    /// Dict-relevance gate for the raw-fast-path. Reached only when a dictionary
+    /// is active (the caller short-circuits on `dict_active`), so this answers
+    /// "could the dict compress this otherwise-incompressible-looking block?".
+    /// The Simple (Fast) backend samples its dict table precisely
+    /// ([`FastKernelMatcher::block_samples_match_dict`]); the other backends
+    /// (Dfast / Row / HashChain / BT) have their own dict structures and no cheap
+    /// probe here, so they answer CONSERVATIVELY `true`: without a probe they
+    /// cannot tell whether the dict compresses an incompressible-LOOKING block,
+    /// and answering `false` would let the raw-fast-path emit such a block raw
+    /// and miss an embedded dict segment. `dictionary_segment_in_incompressible_input_is_matched`
+    /// pins this for Dfast/Row/BT — the 512-byte dict run inside high-entropy
+    /// filler is matched only because these backends stay on the scan. So they
+    /// keep the blanket scan the old `!dict_active` gate gave them; only the
+    /// Simple/Fast backend trades it for the precise probe.
+    fn block_samples_match_dict(&self, block: &[u8]) -> bool {
+        match &self.storage {
+            MatcherStorage::Simple(m) => m.block_samples_match_dict(block),
+            _ => true,
+        }
+    }
+
     /// Heap bytes this driver owns: the active backend's tables/history, the
     /// recycled input-buffer pool, and the primed-dictionary snapshot (a cloned
     /// backend kept for CDict-equivalent reuse). The inline struct itself is
@@ -1997,6 +2099,11 @@ impl Matcher for MatchGeneratorDriver {
         // bucket rather than the raw bytes means two hints that resolve to the
         // same matcher shape share one snapshot instead of each re-priming.
         self.reset_size_log = hint.map(source_size_ceil_log);
+        // A dictionary too large for the tagged attach position field falls back
+        // to copy mode. Captured here (from the load-set size hint = actual dict
+        // length) so the prime decision and the snapshot-key / epoch bits agree.
+        self.reset_dict_attach_ok =
+            dict_hint.is_none_or(|size| size <= MAX_FAST_ATTACH_DICT_REGION);
         let hinted = hint.is_some();
         #[cfg_attr(not(test), allow(unused_mut))]
         let mut params = Self::level_params(level, hint);
@@ -2247,14 +2354,13 @@ impl Matcher for MatchGeneratorDriver {
                     // tables with `DFAST_EMPTY_SLOT` sentinels — wasted
                     // work given the next assignment to `self.storage`
                     // is about to drop `m` entirely. `reset` itself
-                    // short-circuits on `if !self.short_hash.is_empty()`,
-                    // so handing it an empty `Vec` skips the fill loop.
+                    // short-circuits on `if !self.tables.is_empty()`, so
+                    // handing it an empty `Vec` skips the fill loop.
                     // Mirrors the pre-drain pattern in the HashChain
                     // arm below (and serves the same peak-memory
                     // purpose: release the table-allocation footprint
                     // before constructing the replacement variant).
-                    m.short_hash = Vec::new();
-                    m.long_hash = Vec::new();
+                    m.tables = Vec::new();
                     m.reset();
                 }
                 MatcherStorage::Row(m) => {
@@ -2361,6 +2467,7 @@ impl Matcher for MatchGeneratorDriver {
                 // an epoch-advance reset would preserve stale attach state
                 // instead of clearing it.
                 let dict_attach_epoch = matches!(dict_hint, Some(size) if size > 0)
+                    && self.reset_dict_attach_ok
                     && self
                         .reset_size_log
                         .is_none_or(|log| log <= FAST_ATTACH_DICT_CUTOFF_LOG);
@@ -2386,9 +2493,24 @@ impl Matcher for MatchGeneratorDriver {
                                 ldm: None,
                             }
                     });
+                // Cap `hash_log <= window_log + 1` (upstream zstd
+                // `ZSTD_adjustCParams_internal`): once `window_log` is resized
+                // down for a small source, a level-default `1 << hash_log`
+                // table is mostly wasted address space whose per-frame memset
+                // dominates the compress cost on tiny frames (a 4 KB frame at
+                // window_log 12 still zero-fills the 64 KiB hash_log-14 table).
+                // Gated to no-dict frames: the dict-attach path shares one
+                // hash_log between the main and dict tables (so one hash keys
+                // both), and shrinking only the main table would break that
+                // invariant and the small-frame dict ratio.
+                let hash_log = if dict_hint.is_some_and(|s| s > 0) {
+                    fast.hash_log
+                } else {
+                    fast.hash_log.min(params.window_log as u32 + 1)
+                };
                 m.reset(
                     params.window_log,
-                    fast.hash_log,
+                    hash_log,
                     fast.mls,
                     fast.step_size,
                     dict_attach_epoch,
@@ -2554,6 +2676,7 @@ impl Matcher for MatchGeneratorDriver {
         // matches the decision `prime_with_dictionary` makes from the same
         // `reset_size_log`.
         let fast_attach = matches!(next_backend, super::strategy::BackendTag::Simple)
+            && self.reset_dict_attach_ok
             && self
                 .reset_size_log
                 .is_none_or(|log| log <= FAST_ATTACH_DICT_CUTOFF_LOG);
@@ -2571,6 +2694,53 @@ impl Matcher for MatchGeneratorDriver {
             None
         };
         self.reset_shape = Some((params, resolved_table_bits, fast_attach, active_ldm));
+    }
+
+    fn dictionary_is_resident(&self) -> bool {
+        match &self.storage {
+            MatcherStorage::HashChain(hc) => hc.table.dict_resident,
+            MatcherStorage::Simple(s) => s.dict_resident(),
+            MatcherStorage::Dfast(d) => d.dict_resident(),
+            _ => false,
+        }
+    }
+
+    fn reapply_resident_dictionary(&mut self, offset_hist: [u32; 3]) {
+        // Same offset-history head as `prime_with_dictionary`, without the dict
+        // commit / re-index (resident dict bytes + cached dms already in place).
+        match self.active_backend() {
+            super::strategy::BackendTag::Simple => {
+                self.simple_mut().prime_offset_history(offset_hist)
+            }
+            super::strategy::BackendTag::Dfast => {
+                self.dfast_matcher_mut().offset_hist = offset_hist
+            }
+            super::strategy::BackendTag::Row => self.row_matcher_mut().offset_hist = offset_hist,
+            super::strategy::BackendTag::HashChain => {
+                let matcher = self.hc_matcher_mut();
+                matcher.table.offset_hist = offset_hist;
+                matcher.table.mark_dictionary_primed();
+            }
+        }
+        // Restore the retained-dictionary budget the per-frame `reset` cleared.
+        // The matcher's `reset` re-inflated `max_window_size` by the resident
+        // dict region (so the dict + next input both stay in the eviction band),
+        // exactly as `prime_with_dictionary` does — but the resident path skips
+        // that prime, so without this the driver-level budget stays 0 and
+        // `retire_dictionary_budget` never shrinks the inflated window as input
+        // evicts the dict. For HashChain (whose `window_low` is measured against
+        // `max_window_size`), a stuck-inflated window would let a post-eviction
+        // match exceed the frame header's base window and emit an over-window
+        // offset. The inflation equals `max_window_size - base`, and
+        // `reported_window_size` is the base `1 << window_log` set by `reset`.
+        let base = self.reported_window_size;
+        let inflated = match self.active_backend() {
+            super::strategy::BackendTag::Simple => self.simple_mut().max_window_size,
+            super::strategy::BackendTag::Dfast => self.dfast_matcher_mut().max_window_size,
+            super::strategy::BackendTag::Row => self.row_matcher_mut().max_window_size,
+            super::strategy::BackendTag::HashChain => self.hc_matcher_mut().table.max_window_size,
+        };
+        self.dictionary_retained_budget = inflated.saturating_sub(base);
     }
 
     fn prime_with_dictionary(&mut self, dict_content: &[u8], offset_hist: [u32; 3]) {
@@ -2615,8 +2785,7 @@ impl Matcher for MatchGeneratorDriver {
         // re-introduce the same overflow the `window_log` cap was
         // designed to prevent. Clamp the post-priming size so the
         // doubled-band-plus-block invariant survives.
-        const MAX_PRIMED_WINDOW_SIZE: usize =
-            (u32::MAX as usize - crate::common::MAX_BLOCK_SIZE as usize) / 2;
+        use super::match_table::storage::MAX_PRIMED_WINDOW_SIZE;
 
         // `requested_dict_budget` is what the caller asked for;
         // `base_max_window_size` snapshots the pre-priming cap so we
@@ -6292,6 +6461,9 @@ impl HcMatchGenerator {
         let resize = self.table.hash_log != config.hash_log
             || self.table.chain_log != config.chain_log
             || self.table.hash3_log != next_hash3_log;
+        // Capture the layout flip BEFORE `uses_bt` is overwritten below — it
+        // feeds the dms invalidation (the dms is keyed by layout too).
+        let uses_bt_changed = self.table.uses_bt != uses_bt;
         self.table.hash_log = config.hash_log;
         self.table.chain_log = config.chain_log;
         self.table.hash3_log = next_hash3_log;
@@ -6314,6 +6486,21 @@ impl HcMatchGenerator {
         // (srcSize > 256 KiB tier): btlazy2 L13-15 + btopt L16 are minMatch=5,
         // btopt L17 is minMatch=4, btultra/btultra2 are minMatch=3 (4-byte main
         // hash + the hash3 short-match probe).
+        // The cached dms is keyed by the full (region, layout, mls, hash_log)
+        // shape that `build_dms!` validates on the normal prime path, but the
+        // reborrow fast path in `MatchTable::reset` reuses it on `dms.is_primed()`
+        // ALONE. A reused-compressor level switch can change the search mls (e.g.
+        // btlazy2 -> lazy), the table geometry (hash_log / chain_log / hash3,
+        // captured in `resize`), OR the HC<->BT layout (`uses_bt_changed`)
+        // independently of each other, and any of them leaves the dms hashed for
+        // a different shape. Invalidate on ANY so the next dict frame re-primes at
+        // the new shape (configure runs before reset) instead of probing a
+        // mismatched dms and silently degrading match quality. Over-invalidation
+        // only costs a re-prime, which a real shape change needs anyway.
+        let mls_changed = self.table.search_mls != config.search_mls;
+        if resize || mls_changed || uses_bt_changed {
+            self.table.dms.invalidate();
+        }
         self.table.search_mls = config.search_mls;
         // Stage D: promote the backend discriminator. HC modes drop the
         // BT scratch buffers entirely; switching back into a BT mode
@@ -9306,8 +9493,8 @@ fn driver_small_source_hint_shrinks_dfast_hash_tables() {
     driver.skip_matching_with_hint(None);
     // Upstream zstd-parity split sizes: long-hash = DFAST_HASH_BITS,
     // short-hash = DFAST_HASH_BITS - DFAST_SHORT_HASH_BITS_DELTA.
-    let full_long = driver.dfast_matcher().long_hash.len();
-    let full_short = driver.dfast_matcher().short_hash.len();
+    let full_long = driver.dfast_matcher().long_len();
+    let full_short = driver.dfast_matcher().short_len();
     assert_eq!(full_long, 1 << DFAST_HASH_BITS);
     assert_eq!(
         full_short,
@@ -9321,8 +9508,8 @@ fn driver_small_source_hint_shrinks_dfast_hash_tables() {
     space.truncate(12);
     driver.commit_space(space);
     driver.skip_matching_with_hint(None);
-    let hinted_long = driver.dfast_matcher().long_hash.len();
-    let hinted_short = driver.dfast_matcher().short_hash.len();
+    let hinted_long = driver.dfast_matcher().long_len();
+    let hinted_short = driver.dfast_matcher().short_len();
 
     // The wire `window_log` stays at its floor (decoder-interop), but the
     // internal dfast tables are sized from the RAW 1 KiB source, not the
@@ -9358,7 +9545,7 @@ fn driver_huge_source_hint_does_not_overflow_table_window_shift() {
     driver.skip_matching_with_hint(None);
 
     assert!(
-        driver.dfast_matcher().long_hash.len() >= 1 << MIN_WINDOW_LOG,
+        driver.dfast_matcher().long_len() >= 1 << MIN_WINDOW_LOG,
         "huge hint must size the dfast table from the real window, not wrap to zero"
     );
 }
@@ -9743,8 +9930,8 @@ fn driver_unhinted_level2_keeps_default_dfast_hash_table_size() {
     // Upstream zstd-parity split: long-hash at DFAST_HASH_BITS, short-hash one
     // bit smaller (DFAST_SHORT_HASH_BITS_DELTA = 1, matching upstream zstd
     // `chainLog = hashLog - 1` for dfast levels).
-    let long_len = driver.dfast_matcher().long_hash.len();
-    let short_len = driver.dfast_matcher().short_hash.len();
+    let long_len = driver.dfast_matcher().long_len();
+    let short_len = driver.dfast_matcher().short_len();
     assert_eq!(
         long_len,
         1 << DFAST_HASH_BITS,
@@ -10232,34 +10419,95 @@ fn primed_snapshot_restored_across_level22_tier_hints() {
 }
 
 #[test]
-fn primed_snapshot_not_restored_across_fast_attach_copy_boundary() {
-    // The Fast attach-vs-copy cutoff (8 KiB) falls INSIDE a single resolved
-    // matcher shape: a 8192-byte and a 8193-byte hint both clamp Level 1 to
-    // window_log 14 and the same Fast table widths, so `LevelParams` +
-    // `table_bits` are identical, yet 8192 attaches (separate dict table) while
-    // 8193 copies (dict primed into the live table). The snapshot key must
-    // therefore carry the attach/copy mode itself; without it the two resets
-    // would share a key and a copy-mode snapshot could be restored into an
-    // attach-mode reset (a different `storage` shape). Restore must REFUSE
-    // across the boundary.
-    let mut driver = MatchGeneratorDriver::new(8, 1);
+fn fast_dict_attaches_within_cutoff_bounds() {
+    // Within the attach bounds, every Fast dict frame attaches (the copy-mode
+    // owned path memmoved the whole input into history each frame; attach scans
+    // the input in place via the borrowed dual-base kernel). All hints here sit
+    // far below `FAST_ATTACH_DICT_CUTOFF_LOG` (2 GiB source) and the dict is far
+    // below `MAX_FAST_ATTACH_DICT_REGION` (16 MiB), so a hint that used to cross
+    // the old 8 KiB cutoff (8193 B) and a small one (8192 B) BOTH resolve to
+    // attach, and the Simple backend reports a borrowed (in-place) dict scan for
+    // both. This guards `FAST_ATTACH_DICT_CUTOFF_LOG` staying high enough that no
+    // in-bounds Fast hint falls back to the input-copy path; the OUT-of-bounds
+    // fallbacks are covered by `fast_attach_cutoff_keeps_virtual_positions_within_u32`
+    // (source) and `oversized_dict_hint_routes_fast_to_copy_mode` (dict size).
     let level = CompressionLevel::Level(1);
+    for hint in [8192u64, 8193, 1 << 20] {
+        let mut driver = MatchGeneratorDriver::new(8, 1);
+        driver.set_source_size_hint(hint);
+        driver.reset(level);
+        driver.prime_with_dictionary(b"abcdefghABCDEFGHijklmnop", [1, 4, 8]);
+        assert!(
+            driver.borrowed_dict_supported(),
+            "Fast dict frame with hint {hint} must attach (borrowed in-place \
+             dict scan), never fall back to the copy-mode input-copy path"
+        );
+    }
+}
 
-    // Copy side (hint > 8 KiB): prime + capture.
-    driver.set_source_size_hint(8193);
-    driver.reset(level);
-    driver.prime_with_dictionary(b"abcdefghABCDEFGHijklmnop", [1, 4, 8]);
-    driver.capture_primed_dictionary(level);
-
-    // Attach side (hint <= 8 KiB), same resolved window/table shape.
-    driver.set_source_size_hint(8192);
-    driver.reset(level);
-    let restored = driver.restore_primed_dictionary(level);
+#[test]
+fn fast_attach_cutoff_keeps_virtual_positions_within_u32() {
+    // The cutoff is 31, NOT the full u64 source-size range, because the borrowed
+    // dict kernel stores virtual positions as u32 (`cur_abs as u32`). The largest
+    // attached source `1 << CUTOFF` (plus the dict prefix) must stay below
+    // u32::MAX or that arithmetic wraps; the next bucket (4 GiB) would. This pins
+    // the bound so a future "just raise it to attach everything" change cannot
+    // silently reintroduce the overflow — raising the cutoff requires widening
+    // the kernel's position type first.
+    let max_attached: u64 = 1u64 << FAST_ATTACH_DICT_CUTOFF_LOG;
     assert!(
-        !restored,
-        "a copy-mode snapshot (8193 B hint) must NOT be restored into an \
-         attach-mode reset (8192 B hint) that resolves to the same params but a \
-         different dict-table shape"
+        max_attached <= u32::MAX as u64,
+        "the largest attached source 2^{FAST_ATTACH_DICT_CUTOFF_LOG} must fit u32 \
+         virtual positions",
+    );
+    assert!(
+        (1u64 << (FAST_ATTACH_DICT_CUTOFF_LOG + 1)) > u32::MAX as u64,
+        "the next bucket 2^{} would overflow u32 virtual positions",
+        FAST_ATTACH_DICT_CUTOFF_LOG + 1,
+    );
+}
+
+#[test]
+fn oversized_dict_hint_routes_fast_to_copy_mode() {
+    // A dict whose region exceeds the tagged attach position field
+    // (`MAX_FAST_ATTACH_DICT_REGION`, 16 MiB) must route the Fast prime to COPY
+    // mode instead of the tagged attach fill, which would overflow the packed
+    // position. The decision is keyed on the load-set size hint, so a hint past
+    // the limit suffices to exercise it without allocating a real 16 MiB dict.
+    // Copy mode leaves the borrowed in-place dict scan (attach-only) unavailable.
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    driver.set_dictionary_size_hint(MAX_FAST_ATTACH_DICT_REGION + 1);
+    driver.reset(CompressionLevel::Level(1));
+    driver.prime_with_dictionary(b"small dict content with some padding here", [1, 4, 8]);
+    assert!(
+        !driver.borrowed_dict_supported(),
+        "an oversized dict must use copy mode, not the tagged attach fill"
+    );
+}
+
+#[test]
+fn block_samples_match_dict_is_true_for_non_simple_backend() {
+    // Production fallback: a non-Simple backend (here Row, Level 6) has no dict
+    // probe, so the driver wrapper answers CONSERVATIVELY `true` for ANY block —
+    // keeping the dict frame on the scan rather than letting the raw-fast-path
+    // emit a block raw and miss an embedded dict segment (see
+    // `dictionary_segment_in_incompressible_input_is_matched`). Only the
+    // Simple/Fast backend trades the blanket scan for a precise probe.
+    let dict = b"the quick brown fox jumps over the lazy dog 0123456789abcdef";
+    let mut row = MatchGeneratorDriver::new(8, 6);
+    row.set_dictionary_size_hint(dict.len());
+    row.reset(CompressionLevel::Level(6));
+    row.prime_with_dictionary(dict, [1, 4, 8]);
+    assert!(
+        row.block_samples_match_dict(&dict[..32]),
+        "non-Simple backend must stay on the scan (true) for a dict frame"
+    );
+    let random: alloc::vec::Vec<u8> = (0..64u8)
+        .map(|i| i.wrapping_mul(37).wrapping_add(13))
+        .collect();
+    assert!(
+        row.block_samples_match_dict(&random),
+        "non-Simple backend reports true regardless of block content"
     );
 }
 
@@ -11328,6 +11576,54 @@ fn prime_with_dictionary_budget_shrinks_after_hc_eviction() {
 }
 
 #[test]
+fn resident_reapply_restores_retained_dictionary_budget() {
+    // A reused-dict frame that re-borrows the resident dictionary (skips the
+    // re-prime) must restore the retained-dict budget the per-frame `reset`
+    // cleared. The matcher's `reset` re-inflates `max_window_size` by the dict
+    // region; without the restore the driver-level budget stays 0 and
+    // `retire_dictionary_budget` never shrinks that inflated window as the dict
+    // evicts. For the HashChain backend (whose `window_low` is measured against
+    // `max_window_size`) that lets a post-eviction match exceed the frame
+    // header's base window and emit an over-window offset.
+    let mut driver = MatchGeneratorDriver::new(1 << 16, 1);
+    let dict = b"abcdefghABCDEFGHijklmnopqrstuvwxyz0123456789";
+    driver.set_dictionary_size_hint(dict.len());
+    driver.reset_on_hc_lazy(CompressionLevel::Better);
+    driver.prime_with_dictionary(dict, [1, 4, 8]);
+    let base = driver.reported_window_size;
+    assert!(
+        driver.dictionary_retained_budget > 0,
+        "the priming frame must retain a non-zero dict budget"
+    );
+
+    // Second frame: the reset detects the resident dict and re-borrows it.
+    driver.set_dictionary_size_hint(dict.len());
+    driver.reset_on_hc_lazy(CompressionLevel::Better);
+    assert!(
+        driver.dictionary_is_resident(),
+        "the second frame must re-borrow the resident dictionary"
+    );
+    assert_eq!(
+        driver.dictionary_retained_budget, 0,
+        "reset clears the retained-dict budget"
+    );
+    let inflated = driver.hc_matcher().table.max_window_size;
+    assert!(
+        inflated > base,
+        "reset re-inflates the window by the resident dict region \
+         (inflated={inflated}, base={base})"
+    );
+
+    driver.reapply_resident_dictionary([1, 4, 8]);
+    assert_eq!(
+        driver.dictionary_retained_budget,
+        inflated - base,
+        "resident reapply must restore the retained-dict budget (= window \
+         inflation) so the retire path can shrink the window as the dict evicts"
+    );
+}
+
+#[test]
 fn hc_commit_without_eviction_retires_no_dictionary_budget() {
     // Regression: after the window<->history dedup, MatchTable::add_data
     // invokes its reuse_space callback for the *input* buffer (recycle),
@@ -12253,7 +12549,7 @@ fn dfast_skip_matching_dense_backfills_newly_hashable_long_tail_positions() {
         "pack_slot must never return the empty-slot sentinel for a real position"
     );
     assert_eq!(
-        matcher.long_hash[long_hash], target_slot,
+        matcher.tables[long_hash], target_slot,
         "dense skip must seed long-hash entry for newly hashable boundary start"
     );
 }
@@ -12284,7 +12580,8 @@ fn dfast_seed_remaining_hashable_starts_seeds_last_short_hash_positions() {
         "pack_slot must never return the empty-slot sentinel for a real position"
     );
     assert_eq!(
-        matcher.short_hash[short_hash], target_slot,
+        matcher.tables[matcher.long_len() + short_hash],
+        target_slot,
         "tail seeding must include the last 5-byte-hashable start"
     );
 }
@@ -12314,7 +12611,8 @@ fn dfast_seed_remaining_hashable_starts_handles_pos_at_block_end() {
         "pack_slot must never return the empty-slot sentinel for a real position"
     );
     assert_eq!(
-        matcher.short_hash[short_hash], target_slot,
+        matcher.tables[matcher.long_len() + short_hash],
+        target_slot,
         "tail seeding must still include the last 5-byte-hashable start when pos is at block end"
     );
 }
@@ -12350,8 +12648,9 @@ fn dfast_ensure_room_for_rebases_above_guard_band() {
     let early_abs = 1024usize;
     let early_packed = dfast.pack_slot(early_abs);
     assert_ne!(early_packed, DFAST_EMPTY_SLOT);
-    dfast.short_hash[0] = early_packed;
-    dfast.long_hash[0] = early_packed;
+    let short0 = dfast.long_len();
+    dfast.tables[short0] = early_packed;
+    dfast.tables[0] = early_packed;
 
     // Pick a trigger position that forces the first rebase. With
     // `position_base = 0`, the smallest `abs_pos` that fails the
@@ -12372,11 +12671,12 @@ fn dfast_ensure_room_for_rebases_above_guard_band() {
     // upstream zstd parity for `ZSTD_window_reduce`'s clamp-at-zero rule.
     // Verify BOTH tables — `reduce()` walks them in sequence.
     assert_eq!(
-        dfast.short_hash[0], DFAST_EMPTY_SLOT,
+        dfast.tables[dfast.long_len()],
+        DFAST_EMPTY_SLOT,
         "pre-rebase short-hash entries below the reducer must become empty"
     );
     assert_eq!(
-        dfast.long_hash[0], DFAST_EMPTY_SLOT,
+        dfast.tables[0], DFAST_EMPTY_SLOT,
         "pre-rebase long-hash entries below the reducer must become empty"
     );
 

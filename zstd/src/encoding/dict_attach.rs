@@ -34,6 +34,16 @@ pub(crate) struct DictAttach<T> {
     /// per-frame `reset` and skips the re-hash. Cleared on parameter change,
     /// history eviction, or dictionary attach/clear via [`Self::invalidate`].
     primed: bool,
+    /// Next history position a multi-slice dict fill should process (upstream
+    /// zstd `ms->nextToUpdate`). A dictionary loaded across several
+    /// `accept_data` slices is hashed incrementally; without a persistent
+    /// high-water the second slice's fill would restart at its own slice
+    /// origin and drop the `HASH_READ_SIZE - 1` seam positions just below it
+    /// (their wide hash read straddles the slice boundary, so the prior slice
+    /// could not reach them). Carrying the fill origin forward keeps the
+    /// stride phase continuous and closes the seam gap. `0` until the first
+    /// fill; reset by [`Self::invalidate`].
+    next_to_update: usize,
 }
 
 impl<T: Clone> Clone for DictAttach<T> {
@@ -42,6 +52,7 @@ impl<T: Clone> Clone for DictAttach<T> {
             table: self.table.clone(),
             region_len: self.region_len,
             primed: self.primed,
+            next_to_update: self.next_to_update,
         }
     }
 
@@ -51,6 +62,7 @@ impl<T: Clone> Clone for DictAttach<T> {
         self.table.clone_from(&source.table);
         self.region_len = source.region_len;
         self.primed = source.primed;
+        self.next_to_update = source.next_to_update;
     }
 }
 
@@ -60,7 +72,24 @@ impl<T> DictAttach<T> {
             table: None,
             region_len: 0,
             primed: false,
+            next_to_update: 0,
         }
+    }
+
+    /// Next history position a multi-slice dict fill should process (upstream
+    /// zstd `ms->nextToUpdate`). Backends carry the fill origin forward across
+    /// slices via this so the cross-slice seam positions are not dropped.
+    #[inline]
+    pub(crate) fn next_to_update(&self) -> usize {
+        self.next_to_update
+    }
+
+    /// Record how far the dict fill has advanced (the first position not yet
+    /// hashed). The next slice's fill resumes here, keeping the stride phase
+    /// continuous across the slice seam.
+    #[inline]
+    pub(crate) fn set_next_to_update(&mut self, pos: usize) {
+        self.next_to_update = pos;
     }
 
     /// Whether a dict table is attached (drives the dual-probe dispatch).
@@ -128,6 +157,7 @@ impl<T> DictAttach<T> {
         self.table = None;
         self.region_len = 0;
         self.primed = false;
+        self.next_to_update = 0;
     }
 }
 

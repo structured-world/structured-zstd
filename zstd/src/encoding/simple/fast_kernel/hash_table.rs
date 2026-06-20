@@ -180,6 +180,32 @@ impl FastHashTable {
         }
     }
 
+    /// Construct without allocating the entry storage. Records the requested
+    /// `(hash_log, mls)` and validates them (so the deferred allocation is
+    /// feasible), but leaves `table` empty. The first per-frame reset sees the
+    /// source-size-clamped params and allocates once at the final size via
+    /// [`Self::new`] — avoiding the construct-at-level-default-then-realloc
+    /// churn (upstream zstd allocates its cwksp lazily at the resolved
+    /// `hashLog` for the same reason). [`Self::is_allocated`] reports whether
+    /// the storage exists yet; the matcher's reset path always allocates
+    /// before the kernel runs, so the hot path never observes the empty state.
+    pub(crate) fn new_deferred(hash_log: u32, mls: u32) -> Self {
+        validate_params(hash_log, mls);
+        Self {
+            table: Vec::new(),
+            hash_log,
+            mls,
+            bias: 0,
+        }
+    }
+
+    /// Whether the entry storage has been allocated. `false` only for a
+    /// [`Self::new_deferred`] table that has not yet been allocated by a reset.
+    #[inline(always)]
+    pub(crate) fn is_allocated(&self) -> bool {
+        !self.table.is_empty()
+    }
+
     #[inline(always)]
     pub(crate) fn hash_log(&self) -> u32 {
         self.hash_log
@@ -283,6 +309,18 @@ impl FastHashTable {
         // frame is not a dict-attach frame).
         debug_assert_eq!(self.bias, 0, "hot_state requires an unbiased table");
         (self.table.as_mut_slice(), self.hash_log)
+    }
+
+    /// Like [`hot_state`] but also exposes the epoch `bias`, so a hot loop on a
+    /// POSSIBLY-biased table (the dict-attach kernels) can hoist the backing
+    /// slice + `hash_log` and apply the bias inline — `slot.saturating_sub(bias)`
+    /// on read, `pos + bias` on write — exactly as [`get`]/[`put`] do, without
+    /// re-reading the `Vec` header / `hash_log` / `bias` through `&mut self` on
+    /// every access. On a bias-0 table this is identical to `hot_state` + raw
+    /// access (`saturating_sub(0)` / `+ 0` fold away).
+    #[inline(always)]
+    pub(crate) fn hot_state_biased(&mut self) -> (&mut [u32], u32, u32) {
+        (self.table.as_mut_slice(), self.hash_log, self.bias)
     }
 
     /// Direct table access — `table[hash]`. Bounds-check at index time

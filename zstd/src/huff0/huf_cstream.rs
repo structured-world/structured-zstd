@@ -111,6 +111,140 @@ pub(crate) struct HufCStream<'a> {
     overflow: bool,
 }
 
+/// Whether to run the BMI2-targeted burst-encode kernel. BMI2 lets the codegen
+/// use `shrx`/`shlx` for the bit-container's variable shifts (no CL dependency,
+/// no flag stall) instead of `shr`/`shl`; the emitted instruction stream differs
+/// but the logic — and therefore the compressed output — is identical. Detected
+/// at the per-stream entry, never inside the symbol loop.
+#[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+#[inline]
+fn huf_encode_use_bmi2() -> bool {
+    std::arch::is_x86_feature_detected!("bmi2")
+}
+#[cfg(all(not(feature = "std"), any(target_arch = "x86", target_arch = "x86_64")))]
+#[inline]
+fn huf_encode_use_bmi2() -> bool {
+    cfg!(target_feature = "bmi2")
+}
+
+/// One symbol into bit container `$bc` / bit position `$bp`. Mirrors
+/// `add_bits`; `$fast` (a `const`-valued bool) const-folds. Module-level so the
+/// burst-loop body macro can expand it inside both the scalar and the
+/// `#[target_feature]` kernel without an `#[inline(always)]` + `target_feature`
+/// clash (rust-lang/rust#145574).
+macro_rules! huf_add {
+    ($bc:ident, $bp:ident, $elt:expr, $fast:expr) => {{
+        let elt = $elt;
+        let nb_bits = elt & 0xFF;
+        $bc >>= nb_bits;
+        $bc |= if $fast { elt } else { elt & !0xFFu64 };
+        $bp = $bp.wrapping_add(if $fast { elt } else { nb_bits });
+    }};
+}
+
+/// Flush whole bytes out of container `$bc` to `$out_base[$cursor..]`. Mirrors
+/// `flush_bits`. SAFETY of the 8-byte store: the caller reserved `dst_capacity`
+/// and never reallocates `output`, so `$cursor + 8 <= capacity`.
+macro_rules! huf_flush {
+    ($bc:ident, $bp:ident, $cursor:ident, $overflow:ident, $out_base:ident, $end_ptr:ident, $fast:expr) => {{
+        let nb_bits = ($bp & 0xFF) as usize;
+        let nb_bytes = nb_bits >> 3;
+        let chunk = if nb_bits == 0 {
+            0
+        } else {
+            $bc >> (HUF_BITS_IN_CONTAINER - nb_bits)
+        };
+        $bp &= 7;
+        let bytes = chunk.to_le_bytes();
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), $out_base.add($cursor), 8);
+        }
+        $cursor += nb_bytes;
+        if !$fast && $cursor > $end_ptr {
+            $cursor = $end_ptr;
+            $overflow = true;
+        }
+    }};
+}
+
+/// The full reverse-order burst-encode loop, hoisting the stream state into
+/// locals. `self`/`table`/`data` and the three `const` generics are passed in
+/// (`self` resolves at the expansion site; the rest cross the macro hygiene
+/// barrier as arguments) so the identical body can be expanded into the scalar
+/// and BMI2 kernels below.
+macro_rules! encode_unrolled_body {
+    ($self:expr, $table:expr, $data:expr, $ku:expr, $kff:expr, $klf:expr) => {{
+        let mut bc0 = $self.bit_container[0];
+        let mut bc1 = $self.bit_container[1];
+        let mut bp0 = $self.bit_pos[0];
+        let mut bp1 = $self.bit_pos[1];
+        let mut cursor = $self.cursor;
+        let mut overflow = $self.overflow;
+        let end_ptr = $self.end_ptr;
+        // Stable raw base: `new()` reserved `dst_capacity` and this method
+        // never pushes to `output`, so no realloc can move the buffer and
+        // every `cursor + 8 <= capacity` write targets spare capacity.
+        let out_base = $self.output.as_mut_ptr();
+
+        let mut n = $data.len();
+        let rem = n % $ku;
+
+        // Phase 1: tail symbols (< K_UNROLL) on the SLOW path.
+        if rem > 0 {
+            for _ in 0..rem {
+                n -= 1;
+                huf_add!(bc0, bp0, $table[$data[n] as usize], false);
+            }
+            huf_flush!(bc0, bp0, cursor, overflow, out_base, end_ptr, $kff);
+        }
+        debug_assert!(n.is_multiple_of($ku));
+
+        // Phase 2: bring n down to a multiple of 2 * K_UNROLL.
+        if !n.is_multiple_of(2 * $ku) {
+            for u in 1..$ku {
+                huf_add!(bc0, bp0, $table[$data[n - u] as usize], true);
+            }
+            huf_add!(bc0, bp0, $table[$data[n - $ku] as usize], $klf);
+            huf_flush!(bc0, bp0, cursor, overflow, out_base, end_ptr, $kff);
+            n -= $ku;
+        }
+        debug_assert!(n.is_multiple_of(2 * $ku));
+
+        // Phase 3: dual-container main loop.
+        while n > 0 {
+            for u in 1..$ku {
+                huf_add!(bc0, bp0, $table[$data[n - u] as usize], true);
+            }
+            huf_add!(bc0, bp0, $table[$data[n - $ku] as usize], $klf);
+            huf_flush!(bc0, bp0, cursor, overflow, out_base, end_ptr, $kff);
+
+            bc1 = 0;
+            bp1 = 0;
+            for u in 1..$ku {
+                huf_add!(bc1, bp1, $table[$data[n - $ku - u] as usize], true);
+            }
+            huf_add!(bc1, bp1, $table[$data[n - $ku - $ku] as usize], $klf);
+            // merge_index1: fold container 1 into container 0.
+            let nb_bits_1 = bp1 & 0xFF;
+            bc0 >>= nb_bits_1;
+            bc0 |= bc1;
+            bp0 = bp0.wrapping_add(bp1);
+            huf_flush!(bc0, bp0, cursor, overflow, out_base, end_ptr, $kff);
+
+            n -= 2 * $ku;
+        }
+        debug_assert_eq!(n, 0);
+
+        // Write the hoisted state back so `close()` sees the final values.
+        $self.bit_container[0] = bc0;
+        $self.bit_container[1] = bc1;
+        $self.bit_pos[0] = bp0;
+        $self.bit_pos[1] = bp1;
+        $self.cursor = cursor;
+        $self.overflow = overflow;
+    }};
+}
+
 impl<'a> HufCStream<'a> {
     /// Upstream zstd `HUF_initCStream`. Requires `output.capacity() >=
     /// output.len() + dst_capacity` AND `dst_capacity > 8` (else
@@ -241,117 +375,54 @@ impl<'a> HufCStream<'a> {
         table: &[u64],
         data: &[u8],
     ) {
-        let mut bc0 = self.bit_container[0];
-        let mut bc1 = self.bit_container[1];
-        let mut bp0 = self.bit_pos[0];
-        let mut bp1 = self.bit_pos[1];
-        let mut cursor = self.cursor;
-        let mut overflow = self.overflow;
-        let end_ptr = self.end_ptr;
-        // Stable raw base: `new()` reserved `dst_capacity` and this method
-        // never pushes to `output`, so no realloc can move the buffer and
-        // every `cursor + 8 <= capacity` write targets spare capacity.
-        let out_base = self.output.as_mut_ptr();
-
-        // Mirror `add_bits`: `$fast` (a `const`-valued bool) const-folds.
-        macro_rules! add0 {
-            ($elt:expr, $fast:expr) => {{
-                let elt = $elt;
-                let nb_bits = elt & 0xFF;
-                bc0 >>= nb_bits;
-                bc0 |= if $fast { elt } else { elt & !0xFFu64 };
-                bp0 = bp0.wrapping_add(if $fast { elt } else { nb_bits });
-            }};
-        }
-        macro_rules! add1 {
-            ($elt:expr, $fast:expr) => {{
-                let elt = $elt;
-                let nb_bits = elt & 0xFF;
-                bc1 >>= nb_bits;
-                bc1 |= if $fast { elt } else { elt & !0xFFu64 };
-                bp1 = bp1.wrapping_add(if $fast { elt } else { nb_bits });
-            }};
-        }
-        // Mirror `flush_bits` on `bc0`/`bp0`/`cursor`.
-        macro_rules! flush0 {
-            ($fast:expr) => {{
-                let nb_bits = (bp0 & 0xFF) as usize;
-                let nb_bytes = nb_bits >> 3;
-                let chunk = if nb_bits == 0 {
-                    0
-                } else {
-                    bc0 >> (HUF_BITS_IN_CONTAINER - nb_bits)
-                };
-                bp0 &= 7;
-                let bytes = chunk.to_le_bytes();
-                // SAFETY: see `out_base` above; `cursor + 8 <= capacity`.
+        // Pick the burst kernel ONCE per stream, never inside the symbol loop.
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            if huf_encode_use_bmi2() {
+                // SAFETY: `huf_encode_use_bmi2()` returned true, so the running
+                // CPU has BMI2; the body adds no unsafe beyond the 8-byte store
+                // already justified in `huf_flush!`.
                 unsafe {
-                    core::ptr::copy_nonoverlapping(bytes.as_ptr(), out_base.add(cursor), 8);
+                    self.encode_unrolled_bmi2::<K_UNROLL, K_FAST_FLUSH, K_LAST_FAST>(table, data);
                 }
-                cursor += nb_bytes;
-                if !$fast && cursor > end_ptr {
-                    cursor = end_ptr;
-                    overflow = true;
-                }
-            }};
-        }
-
-        let mut n = data.len();
-        let rem = n % K_UNROLL;
-
-        // Phase 1: tail symbols (< K_UNROLL) on the SLOW path.
-        if rem > 0 {
-            for _ in 0..rem {
-                n -= 1;
-                add0!(table[data[n] as usize], false);
+                return;
             }
-            flush0!(K_FAST_FLUSH);
         }
-        debug_assert!(n.is_multiple_of(K_UNROLL));
+        self.encode_unrolled_scalar::<K_UNROLL, K_FAST_FLUSH, K_LAST_FAST>(table, data);
+    }
 
-        // Phase 2: bring n down to a multiple of 2 * K_UNROLL.
-        if !n.is_multiple_of(2 * K_UNROLL) {
-            for u in 1..K_UNROLL {
-                add0!(table[data[n - u] as usize], true);
-            }
-            add0!(table[data[n - K_UNROLL] as usize], K_LAST_FAST);
-            flush0!(K_FAST_FLUSH);
-            n -= K_UNROLL;
-        }
-        debug_assert!(n.is_multiple_of(2 * K_UNROLL));
+    /// Portable burst-encode kernel (no target feature). Bit-identical output to
+    /// the BMI2 kernel — only the emitted shift instructions differ.
+    #[inline]
+    fn encode_unrolled_scalar<
+        const K_UNROLL: usize,
+        const K_FAST_FLUSH: bool,
+        const K_LAST_FAST: bool,
+    >(
+        &mut self,
+        table: &[u64],
+        data: &[u8],
+    ) {
+        encode_unrolled_body!(self, table, data, K_UNROLL, K_FAST_FLUSH, K_LAST_FAST);
+    }
 
-        // Phase 3: dual-container main loop.
-        while n > 0 {
-            for u in 1..K_UNROLL {
-                add0!(table[data[n - u] as usize], true);
-            }
-            add0!(table[data[n - K_UNROLL] as usize], K_LAST_FAST);
-            flush0!(K_FAST_FLUSH);
-
-            bc1 = 0;
-            bp1 = 0;
-            for u in 1..K_UNROLL {
-                add1!(table[data[n - K_UNROLL - u] as usize], true);
-            }
-            add1!(table[data[n - K_UNROLL - K_UNROLL] as usize], K_LAST_FAST);
-            // merge_index1: fold container 1 into container 0.
-            let nb_bits_1 = bp1 & 0xFF;
-            bc0 >>= nb_bits_1;
-            bc0 |= bc1;
-            bp0 = bp0.wrapping_add(bp1);
-            flush0!(K_FAST_FLUSH);
-
-            n -= 2 * K_UNROLL;
-        }
-        debug_assert_eq!(n, 0);
-
-        // Write the hoisted state back so `close()` sees the final values.
-        self.bit_container[0] = bc0;
-        self.bit_container[1] = bc1;
-        self.bit_pos[0] = bp0;
-        self.bit_pos[1] = bp1;
-        self.cursor = cursor;
-        self.overflow = overflow;
+    /// BMI2-targeted burst-encode kernel: identical body, compiled with BMI2 so
+    /// the container's variable shifts lower to `shrx`/`shlx`.
+    ///
+    /// # Safety
+    /// The caller must have verified BMI2 is available (`huf_encode_use_bmi2()`).
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[target_feature(enable = "bmi2")]
+    unsafe fn encode_unrolled_bmi2<
+        const K_UNROLL: usize,
+        const K_FAST_FLUSH: bool,
+        const K_LAST_FAST: bool,
+    >(
+        &mut self,
+        table: &[u64],
+        data: &[u8],
+    ) {
+        encode_unrolled_body!(self, table, data, K_UNROLL, K_FAST_FLUSH, K_LAST_FAST);
     }
 
     /// Number of bits currently buffered in `bit_container[0]`.

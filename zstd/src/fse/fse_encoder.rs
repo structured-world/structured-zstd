@@ -731,7 +731,25 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
     // of the table; bump the high-threshold cursor down. Build the
     // `cumul` prefix-sum table that maps each symbol to its first
     // `nextStateTable` slot in sorted-by-symbol layout.
-    let mut table_symbol = alloc::vec![0u8; table_size];
+    // `table_symbol` is a local scratch (consumed to fill `state_table_flat`,
+    // never returned), bounded by the FSE sequence/weight table-log cap
+    // (`table_size = 1 << table_log <= 1 << 9 = 512`). Use a stack buffer so the
+    // per-build heap alloc + zero is gone. `[..table_size]` keeps the live region
+    // exactly as the old `vec![0u8; table_size]`.
+    const MAX_FSE_TABLE_SIZE: usize = 1 << 9;
+    // Always-on (not debug_assert): the stack scratch is fixed at 512 bytes
+    // (accuracy_log <= 9). `to_encoder_table` already rejects acc_log > 9, but
+    // this function is `pub(crate)` — guard the scratch bound here too so a
+    // future caller can never index the buffer past its length (the `[..
+    // table_size]` slice would panic on the bound; this fires first with a clear
+    // message instead of an opaque slice-index panic).
+    assert!(
+        table_size <= MAX_FSE_TABLE_SIZE,
+        "FSE table_size {table_size} exceeds the {MAX_FSE_TABLE_SIZE}-byte encoder \
+         scratch (accuracy_log must be <= 9)"
+    );
+    let mut table_symbol_buf = [0u8; MAX_FSE_TABLE_SIZE];
+    let table_symbol = &mut table_symbol_buf[..table_size];
     let mut high_threshold = (table_size - 1) as isize;
     // `cumul` / running prefix-sum holds slot counts up to `table_size`.
     // Decoder accepts `accuracy_log` up to `ENTRY_MAX_ACCURACY_LOG = 16`

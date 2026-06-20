@@ -52,6 +52,14 @@ pub(crate) const STREAM_ABS_HEADROOM: usize = HC_OPT_NUM + 16;
 /// cumulative input on a 32-bit build and is astronomically far on 64-bit.
 pub(crate) const REBASE_RESET_FLOOR_CEILING: usize = usize::MAX >> 1;
 
+/// Ceiling for `max_window_size` after a dictionary bump: the eviction band is
+/// `2 * max_window_size` and the kernel asserts `data.len() <= u32::MAX`, so a
+/// large dictionary must not push the doubled band (plus one pending block)
+/// past `u32::MAX`. Both `prime_with_dictionary` and the re-borrow reset clamp
+/// to this so the doubled-band-plus-block invariant survives.
+pub(crate) const MAX_PRIMED_WINDOW_SIZE: usize =
+    (u32::MAX as usize - crate::common::MAX_BLOCK_SIZE as usize) / 2;
+
 /// Frame-level overflow gate shared by `MatchTable`,
 /// `DfastMatchGenerator`, and `RowMatchGenerator`.
 ///
@@ -288,6 +296,20 @@ pub(crate) struct MatchTable {
     pub(crate) skip_insert_until_abs: usize,
     pub(crate) dictionary_limit_abs: Option<usize>,
     pub(crate) dictionary_primed_for_frame: bool,
+    /// Sticky across resets: set once a dictionary is primed into this table
+    /// (`set_dictionary_limit_from_primed_bytes` with a non-zero length),
+    /// cleared when the dictionary is detached. While set, `reset` takes the
+    /// full-reset path (rewind `history_abs_start` to 0 + clear the tables)
+    /// instead of the floor-advance fast path: a reused dictionary frame
+    /// re-primes the dict at the live `history_abs_start`, and letting that
+    /// floor climb frame-over-frame eventually pushes the freshly-primed dict
+    /// region below `window_low`, silently dropping every dict match (the
+    /// reused-CDict path then degrades to no-dict output after a few frames).
+    pub(crate) dictionary_active: bool,
+    /// Set by `reset` when it re-borrows a resident attach-mode dictionary
+    /// (kept the dict bytes + cached dms in place instead of clear + re-prime).
+    /// Signals the frame compressor to SKIP `prime_with_dictionary` this frame.
+    pub(crate) dict_resident: bool,
     pub(crate) allow_zero_relative_position: bool,
     /// HC chain-walk depth, mirrored from `HcMatcher::search_depth` during
     /// `configure()`. Stage D moves the BT walker onto this struct, and the
@@ -354,6 +376,8 @@ impl Clone for MatchTable {
             skip_insert_until_abs: self.skip_insert_until_abs,
             dictionary_limit_abs: self.dictionary_limit_abs,
             dictionary_primed_for_frame: self.dictionary_primed_for_frame,
+            dictionary_active: self.dictionary_active,
+            dict_resident: self.dict_resident,
             allow_zero_relative_position: self.allow_zero_relative_position,
             search_depth: self.search_depth,
             is_btultra2: self.is_btultra2,
@@ -389,6 +413,8 @@ impl Clone for MatchTable {
         self.skip_insert_until_abs = source.skip_insert_until_abs;
         self.dictionary_limit_abs = source.dictionary_limit_abs;
         self.dictionary_primed_for_frame = source.dictionary_primed_for_frame;
+        self.dictionary_active = source.dictionary_active;
+        self.dict_resident = source.dict_resident;
         self.allow_zero_relative_position = source.allow_zero_relative_position;
         self.search_depth = source.search_depth;
         self.is_btultra2 = source.is_btultra2;
@@ -397,6 +423,78 @@ impl Clone for MatchTable {
         self.borrowed_input = source.borrowed_input;
         self.borrowed_block = source.borrowed_block;
     }
+}
+
+/// Shared scaffold for the two `prime_dms_*` dictionary-match-state builders.
+///
+/// Both resolve the dict `region` (capped to the live history), bail on an
+/// undersized dict, derive the dict-sized hash log, short-circuit when a
+/// same-shape table is already primed, recycle the prior tables' capacity, run
+/// the layout-specific `$build` over the dict bytes at the front of the live
+/// history, then publish the tables and mark the cache primed. Only the build
+/// pass (HC single-link chain vs BT binary tree), the minimum readable region,
+/// and the chain entries per dict position differ — those are the macro
+/// parameters. `$build` sees `concat` (the dict bytes), `&mut` `hash_table` /
+/// `chain_table`, `dms_hash_log`, and `region` in scope; `mls` and any
+/// build-only widths come from the caller's surrounding locals.
+macro_rules! build_dms {
+    (
+        $self:ident, $region_len:expr, $layout:expr, $mls:expr, $min_region:expr, $per_pos:expr,
+        |$concat:ident, $ht:ident, $ct:ident, $hlog:ident, $region:ident| $build:block
+    ) => {{
+        let region = $region_len.min($self.live_history().len());
+        if region < $min_region {
+            $self.dms.invalidate();
+            return;
+        }
+        // Dict-sized hash log: ceil-log2(region) clamped to [10, hash_log].
+        let dms_hash_log =
+            (usize::BITS - (region - 1).leading_zeros()).clamp(10, $self.hash_log as u32) as usize;
+        // CDict cache: the tables depend only on the dict bytes (re-committed
+        // identically to the front of history every frame) and the
+        // (region, mls, hash_log) shape, so a primed same-shape table is valid
+        // as-is. A dictionary swap drops the cache via the invalidate path; a
+        // level change lands here with a different shape and rebuilds.
+        if $self.dms.is_primed()
+            && $self.dms.region_len() == region
+            && $self
+                .dms
+                .table()
+                .is_some_and(|t| t.layout == $layout && t.mls == $mls && t.hash_log == dms_hash_log)
+        {
+            return;
+        }
+        // Reuse the previous tables' capacity on a genuine rebuild (shape
+        // change): move the Vecs out before `live_history` re-borrows `self`.
+        let (mut hash_table, mut chain_table) = match $self.dms.table_mut() {
+            Some(t) => (
+                core::mem::take(&mut t.hash_table),
+                core::mem::take(&mut t.chain_table),
+            ),
+            None => (alloc::vec::Vec::new(), alloc::vec::Vec::new()),
+        };
+        hash_table.clear();
+        hash_table.resize(1usize << dms_hash_log, 0u32);
+        chain_table.clear();
+        chain_table.resize($per_pos * region, 0u32);
+        {
+            let $concat = $self.live_history();
+            let $ht = &mut hash_table;
+            let $ct = &mut chain_table;
+            let $hlog = dms_hash_log;
+            let $region = region;
+            $build
+        }
+        // `concat`'s borrow of `self` ends above; now mutate `self.dms`.
+        let tables = $self.dms.table_mut_or_init(DmsDictTables::default);
+        tables.layout = $layout;
+        tables.hash_table = hash_table;
+        tables.chain_table = chain_table;
+        tables.hash_log = dms_hash_log;
+        tables.mls = $mls;
+        $self.dms.set_region_len(region);
+        $self.dms.mark_primed();
+    }};
 }
 
 impl MatchTable {
@@ -421,6 +519,8 @@ impl MatchTable {
             skip_insert_until_abs: 0,
             dictionary_limit_abs: None,
             dictionary_primed_for_frame: false,
+            dictionary_active: false,
+            dict_resident: false,
             allow_zero_relative_position: false,
             search_depth: 0,
             is_btultra2: false,
@@ -676,6 +776,9 @@ impl MatchTable {
         } else {
             Some(self.history_abs_start.saturating_add(primed_len))
         };
+        // Sticky: once primed, every following reset must rewind to a clean
+        // base so the re-prime lands at a stable low `history_abs_start`.
+        self.dictionary_active = primed_len != 0;
     }
 
     /// Build the immutable dictionary match **binary tree** (upstream zstd
@@ -700,106 +803,70 @@ impl MatchTable {
         // not in the live tree), not a lower minMatch.
         let mls = self.search_mls;
         let read = if mls >= 5 { 8 } else { 4 };
-        let region = region_len.min(self.live_history().len());
-        if region < read {
-            self.dms.invalidate();
-            return;
-        }
-        // Dict-sized hash log: ceil-log2(region) clamped to [10, hash_log].
-        let dms_hash_log =
-            (usize::BITS - (region - 1).leading_zeros()).clamp(10, self.hash_log as u32) as usize;
-        // CDict cache: the tree depends only on the dict bytes (re-committed
-        // identically to the front of history every frame) and the
-        // (region, mls, hash_log) shape, so a primed same-shape table is
-        // valid as-is. Rebuilding per frame paid two table allocations AND a
-        // full tree-build pass per frame in a reused compressor. A dictionary
-        // swap drops the cache via `invalidate_primed_dictionary`; a level
-        // change lands here with a different shape and rebuilds.
-        if self.dms.is_primed()
-            && self.dms.region_len() == region
-            && self.dms.table().is_some_and(|t| {
-                t.layout == DmsDictLayout::Bt && t.mls == mls && t.hash_log == dms_hash_log
-            })
-        {
-            return;
-        }
         // Build-pass compare budget: the dict is bounded (<= window), so a
         // generous fixed depth keeps the tree well-ordered without the live
         // searchLog cap. Mirrors upstream zstd `ZSTD_insertBt1` nbCompares.
         const DMS_BUILD_DEPTH: usize = 1 << 9;
-        // Reuse the previous tables' capacity on a genuine rebuild (shape
-        // change): move the Vecs out before `live_history` re-borrows `self`.
-        let (mut hash_table, mut chain_table) = match self.dms.table_mut() {
-            Some(t) => (
-                core::mem::take(&mut t.hash_table),
-                core::mem::take(&mut t.chain_table),
-            ),
-            None => (Vec::new(), Vec::new()),
-        };
-        hash_table.clear();
-        hash_table.resize(1usize << dms_hash_log, 0u32);
         // 2 children per dict position: [smaller, larger].
-        chain_table.clear();
-        chain_table.resize(2 * region, 0u32);
-        let concat = self.live_history();
-        let mut current = 0usize;
-        while current + read <= region {
-            let h = Self::hash_position_at(concat, current, dms_hash_log, mls);
-            // Insert `current` as the new root; splay the old tree into
-            // `current`'s smaller/larger subtrees (upstream zstd `ZSTD_insertBt1`).
-            let mut match_packed = hash_table[h];
-            hash_table[h] = (current + 1) as u32;
-            let mut smaller_slot = 2 * current;
-            let mut larger_slot = 2 * current + 1;
-            let mut common_smaller = 0usize;
-            let mut common_larger = 0usize;
-            let mut compares = DMS_BUILD_DEPTH;
-            while compares > 0 && match_packed != 0 {
-                let cand = (match_packed - 1) as usize;
-                // Tree holds only earlier positions; `cand < current` always.
-                if cand >= current {
-                    break;
-                }
-                compares -= 1;
-                let next_pair = 2 * cand;
-                let mut ml = common_smaller.min(common_larger);
-                // Common prefix bounded by the dict tail from `current`
-                // (`cand < current`, so `current` is the binding limit).
-                let limit = region - current;
-                while ml < limit && concat[cand + ml] == concat[current + ml] {
-                    ml += 1;
-                }
-                if current + ml >= region {
-                    // Reached the dict end: can't order this pair, stop (upstream zstd
-                    // `ip+matchLength == iend` break).
-                    break;
-                }
-                if concat[cand + ml] < concat[current + ml] {
-                    // `cand` (and its smaller subtree) sorts below `current`.
-                    chain_table[smaller_slot] = match_packed;
-                    common_smaller = ml;
-                    smaller_slot = next_pair + 1;
-                    match_packed = chain_table[next_pair + 1];
-                } else {
-                    chain_table[larger_slot] = match_packed;
-                    common_larger = ml;
-                    larger_slot = next_pair;
-                    match_packed = chain_table[next_pair];
+        build_dms!(
+            self,
+            region_len,
+            DmsDictLayout::Bt,
+            mls,
+            read,
+            2,
+            |concat, hash_table, chain_table, dms_hash_log, region| {
+                let mut current = 0usize;
+                while current + read <= region {
+                    let h = Self::hash_position_at(concat, current, dms_hash_log, mls);
+                    // Insert `current` as the new root; splay the old tree into
+                    // `current`'s smaller/larger subtrees (upstream zstd `ZSTD_insertBt1`).
+                    let mut match_packed = hash_table[h];
+                    hash_table[h] = (current + 1) as u32;
+                    let mut smaller_slot = 2 * current;
+                    let mut larger_slot = 2 * current + 1;
+                    let mut common_smaller = 0usize;
+                    let mut common_larger = 0usize;
+                    let mut compares = DMS_BUILD_DEPTH;
+                    while compares > 0 && match_packed != 0 {
+                        let cand = (match_packed - 1) as usize;
+                        // Tree holds only earlier positions; `cand < current` always.
+                        if cand >= current {
+                            break;
+                        }
+                        compares -= 1;
+                        let next_pair = 2 * cand;
+                        let mut ml = common_smaller.min(common_larger);
+                        // Common prefix bounded by the dict tail from `current`
+                        // (`cand < current`, so `current` is the binding limit).
+                        let limit = region - current;
+                        while ml < limit && concat[cand + ml] == concat[current + ml] {
+                            ml += 1;
+                        }
+                        if current + ml >= region {
+                            // Reached the dict end: can't order this pair, stop
+                            // (upstream zstd `ip+matchLength == iend` break).
+                            break;
+                        }
+                        if concat[cand + ml] < concat[current + ml] {
+                            // `cand` (and its smaller subtree) sorts below `current`.
+                            chain_table[smaller_slot] = match_packed;
+                            common_smaller = ml;
+                            smaller_slot = next_pair + 1;
+                            match_packed = chain_table[next_pair + 1];
+                        } else {
+                            chain_table[larger_slot] = match_packed;
+                            common_larger = ml;
+                            larger_slot = next_pair;
+                            match_packed = chain_table[next_pair];
+                        }
+                    }
+                    chain_table[smaller_slot] = 0;
+                    chain_table[larger_slot] = 0;
+                    current += 1;
                 }
             }
-            chain_table[smaller_slot] = 0;
-            chain_table[larger_slot] = 0;
-            current += 1;
-        }
-        // `concat`'s borrow of `self` ends above; now mutate `self.dms`.
-        let tables = self.dms.table_mut_or_init(DmsDictTables::default);
-        tables.layout = DmsDictLayout::Bt;
-        tables.hash_table = hash_table;
-        tables.chain_table = chain_table;
-        tables.hash_log = dms_hash_log;
-        tables.mls = mls;
-        self.dms.set_region_len(region);
-        self.dms.mark_primed();
+        );
     }
 
     /// Build a SEPARATE dictionary match state for the lazy hash-chain path
@@ -817,51 +884,26 @@ impl MatchTable {
     /// chain. Cached across frames via `DictAttach::is_primed`.
     pub(crate) fn prime_dms_hc(&mut self, region_len: usize) {
         let mls = HC_MIN_MATCH_LEN;
-        let region = region_len.min(self.live_history().len());
-        if region < mls {
-            self.dms.invalidate();
-            return;
-        }
-        let dms_hash_log =
-            (usize::BITS - (region - 1).leading_zeros()).clamp(10, self.hash_log as u32) as usize;
-        if self.dms.is_primed()
-            && self.dms.region_len() == region
-            && self.dms.table().is_some_and(|t| {
-                t.layout == DmsDictLayout::Hc && t.mls == mls && t.hash_log == dms_hash_log
-            })
-        {
-            return;
-        }
-        let (mut hash_table, mut chain_table) = match self.dms.table_mut() {
-            Some(t) => (
-                core::mem::take(&mut t.hash_table),
-                core::mem::take(&mut t.chain_table),
-            ),
-            None => (Vec::new(), Vec::new()),
-        };
-        hash_table.clear();
-        hash_table.resize(1usize << dms_hash_log, 0u32);
         // Single `next` link per dict position (HC4 chain, not the BT's 2/pos).
-        chain_table.clear();
-        chain_table.resize(region, 0u32);
-        let concat = self.live_history();
-        let mut current = 0usize;
-        while current + mls <= region {
-            let h = Self::hash_position_at(concat, current, dms_hash_log, mls);
-            // Prepend `current` to its bucket chain (upstream zstd
-            // `ZSTD_insertAndFindFirstIndex` head insert).
-            chain_table[current] = hash_table[h];
-            hash_table[h] = (current + 1) as u32;
-            current += 1;
-        }
-        let tables = self.dms.table_mut_or_init(DmsDictTables::default);
-        tables.layout = DmsDictLayout::Hc;
-        tables.hash_table = hash_table;
-        tables.chain_table = chain_table;
-        tables.hash_log = dms_hash_log;
-        tables.mls = mls;
-        self.dms.set_region_len(region);
-        self.dms.mark_primed();
+        build_dms!(
+            self,
+            region_len,
+            DmsDictLayout::Hc,
+            mls,
+            mls,
+            1,
+            |concat, hash_table, chain_table, dms_hash_log, region| {
+                let mut current = 0usize;
+                while current + mls <= region {
+                    let h = Self::hash_position_at(concat, current, dms_hash_log, mls);
+                    // Prepend `current` to its bucket chain (upstream zstd
+                    // `ZSTD_insertAndFindFirstIndex` head insert).
+                    chain_table[current] = hash_table[h];
+                    hash_table[h] = (current + 1) as u32;
+                    current += 1;
+                }
+            }
+        );
     }
 
     /// Append a freshly committed buffer to the rolling window. Drops
@@ -1199,20 +1241,107 @@ impl MatchTable {
         // position before clearing the history that `history_abs_end`
         // reads. Every stale table entry points strictly below this.
         let next_floor = self.history_abs_end();
+        // Re-borrow: an ATTACH-mode reused dict frame keeps the dict in the
+        // separate cached dms (not the live tables), so the resident dict bytes
+        // at the front of history + the cached dms can stay in place — the frame
+        // compressor then SKIPs `prime_with_dictionary`. Only when the dict is
+        // fully resident at concat `[0, region)` with no drain (`history_start
+        // == 0`). Pinned at abs `[0, region)` (concat-keyed dms is abs-invariant).
+        //
+        // mls consistency: `dms.is_primed()` here is sufficient because the dms is
+        // keyed by `(region, layout, mls, hash_log)` and `configure()` invalidates
+        // it whenever `search_mls` changes (a level switch). So a primed dms is
+        // always one built with the CURRENT `search_mls`; the reborrow can never
+        // reuse a dms whose tables were built under a stale mls.
+        let reborrow_region =
+            if self.dictionary_active && self.dms.is_primed() && self.history_start == 0 {
+                // `checked_sub`, not `-`: after the dict chunk is evicted,
+                // `compact_history` can reset `history_start` to 0 while
+                // `history_abs_start` has already advanced PAST
+                // `dictionary_limit_abs`. The plain subtraction would underflow
+                // (panic under overflow checks) before the `r > 0` filter rejects
+                // the stale region; `checked_sub` -> `None` lets the filter run.
+                self.dictionary_limit_abs
+                    .and_then(|limit| limit.checked_sub(self.history_abs_start))
+                    .filter(|&r| r > 0 && r <= self.history.len())
+            } else {
+                None
+            };
         self.window_size = 0;
-        self.chunk_lens.clear();
-        self.history.clear();
-        self.history_start = 0;
         self.offset_hist = [1, 4, 8];
         self.skip_insert_until_abs = 0;
         // Clear borrowed-window state so a following OWNED frame reads the
         // owned mirror; a borrowed frame re-arms via `set_borrowed_window`.
         self.borrowed_input = None;
         self.borrowed_block = None;
-        self.dictionary_limit_abs = None;
         self.dictionary_primed_for_frame = false;
         self.allow_zero_relative_position = false;
-        if next_floor <= REBASE_RESET_FLOOR_CEILING {
+        if let Some(region) = reborrow_region {
+            // Keep `[0, region)` (the dict); drop the previous frame's input.
+            self.history.truncate(region);
+            self.chunk_lens.clear();
+            self.chunk_lens.push_back(region);
+            self.window_size = region;
+            // Bump the eviction window by the dict size exactly as
+            // `prime_with_dictionary` does (clamped to MAX_PRIMED_WINDOW_SIZE so
+            // the doubled-band invariant survives), so the resident dict + the
+            // next frame's input both stay in the window — otherwise adding the
+            // input drains the dict prefix and `history_abs_start` climbs off
+            // it, turning every dms candidate into an out-of-range underflow.
+            //
+            // The driver re-establishes `self.max_window_size = 1 << window_log`
+            // (the un-bumped base) on EVERY reset, before this `reset` runs (see
+            // `MatchGeneratorDriver::reset`'s HashChain arm), so this `+=` yields
+            // `base + region` each frame, never an accumulating `base + N*region`.
+            // The driver also restores `dictionary_retained_budget = region` on
+            // the resident path (`reapply_resident_dictionary`) so the retire
+            // path shrinks this back to base as the dict evicts. The headroom
+            // subtraction is underflow-safe regardless of the pre-bump value: the
+            // `MAX_PRIMED_WINDOW_SIZE >= max_window_size` invariant always holds
+            // (every bump clamps to it), so `headroom >= 0` — no `saturating_*`.
+            let headroom = MAX_PRIMED_WINDOW_SIZE - self.max_window_size;
+            self.max_window_size += region.min(headroom);
+            self.history_abs_start = 0;
+            self.position_base = 0;
+            self.index_shift = 0;
+            // Dict is in the dms; the live tables carry only input — memset them,
+            // keep the dms. Cursors reproduce `skip_matching_dict_bt`'s post-prime
+            // state (skip re-inserting the resident dict region).
+            self.hash_table.fill(HC_EMPTY);
+            self.hash3_table.fill(HC_EMPTY);
+            self.chain_table.fill(HC_EMPTY);
+            self.skip_insert_until_abs = region;
+            self.next_to_update3 = region;
+            self.dictionary_limit_abs = Some(region);
+            self.dict_resident = true;
+            return;
+        }
+        self.chunk_lens.clear();
+        self.history.clear();
+        self.history_start = 0;
+        self.dictionary_limit_abs = None;
+        self.dict_resident = false;
+        if self.dictionary_active {
+            // A reused dictionary frame re-primes the dict at the live
+            // `history_abs_start` every frame. The floor-advance fast path lets
+            // that base climb frame-over-frame, and once it climbs past the
+            // window the freshly-primed dict region falls below `window_low`
+            // and every dict match is silently dropped (reused-CDict output
+            // degrades to no-dict after a few frames). Rewind to the origin and
+            // clear the tables so the next prime lands at a stable low base.
+            // The memset is load-bearing: the stored positions are relative to
+            // `position_base` / `index_shift`, so rewinding those without
+            // zeroing the slots leaves stale entries that decode as in-range
+            // matches and corrupt the parse (verified: skipping the fills
+            // reproduces the decay).
+            self.history_abs_start = 0;
+            self.position_base = 0;
+            self.index_shift = 0;
+            self.next_to_update3 = 0;
+            self.hash_table.fill(HC_EMPTY);
+            self.hash3_table.fill(HC_EMPTY);
+            self.chain_table.fill(HC_EMPTY);
+        } else if next_floor <= REBASE_RESET_FLOOR_CEILING {
             // Fast path: advance the floor so the previous frame's
             // entries fall below `window_low` and are rejected on read.
             // The tables keep their contents (and their sizing — a later

@@ -57,8 +57,9 @@ use alloc::vec::Vec;
 use crate::encoding::Sequence;
 use crate::encoding::dict_attach::DictAttach;
 
-use super::fast_kernel::hash_table::FastHashTable;
+use super::fast_kernel::hash_table::{FastHashTable, hash_ptr_raw};
 use super::fast_kernel::kernel::compress_block_fast;
+use super::fast_kernel::kernel::{DICT_TAG_BITS, DICT_TAG_MASK};
 
 /// Upstream zstd `ZSTD_defaultCParameters[level=1][srcSize > 256 KiB][Fast]`
 /// constants. Kept for `MatchGeneratorDriver::new`'s initial-state
@@ -260,6 +261,23 @@ pub(crate) struct FastKernelMatcher {
     /// [`FastHashTable::advance_epoch`] as the span that makes every
     /// previously-stored entry stale, then rearms it at 0.
     table_pos_high_water: usize,
+    /// Set by [`Self::reset`] when it re-borrowed a resident attach-mode
+    /// dictionary (kept the dict bytes at the front of history + the cached
+    /// dict table in place instead of clearing + re-committing them). Signals
+    /// the frame compressor to SKIP `prime_with_dictionary` this frame.
+    dict_resident: bool,
+    /// Upstream zstd `ms->loadedDictEnd` for the COPY-mode dict path (inputs
+    /// over the Fast attach cutoff): the history position one past the last
+    /// dictionary byte committed at the front of `history`. The copy path
+    /// primes the dict into the live hash table as window prefix; this records
+    /// the dict/input boundary so `start_matching` can floor the block prefix
+    /// at the dict start (upstream zstd `ZSTD_getLowestPrefixIndex` with
+    /// `isDictionary`), keeping the whole dict reachable while it is still
+    /// within `maxDist` of the block end. `0` when no copy-mode dict is
+    /// resident (attach mode tracks its own boundary via `dict.region_len()`,
+    /// and a plain frame has none). Cleared on reset / eviction (the dict has
+    /// slid out of the window, so the windowed floor takes over).
+    loaded_dict_end: usize,
 }
 
 impl Clone for FastKernelMatcher {
@@ -282,6 +300,8 @@ impl Clone for FastKernelMatcher {
             last_borrowed_block: self.last_borrowed_block,
             dict: self.dict.clone(),
             table_pos_high_water: self.table_pos_high_water,
+            dict_resident: self.dict_resident,
+            loaded_dict_end: self.loaded_dict_end,
         }
     }
 
@@ -307,6 +327,8 @@ impl Clone for FastKernelMatcher {
         self.last_borrowed_block = source.last_borrowed_block;
         self.dict.clone_from(&source.dict);
         self.table_pos_high_water = source.table_pos_high_water;
+        self.dict_resident = source.dict_resident;
+        self.loaded_dict_end = source.loaded_dict_end;
     }
 }
 
@@ -347,6 +369,77 @@ impl FastKernelMatcher {
         self.dict.is_attached()
     }
 
+    /// Cheap dict-relevance probe for the raw-fast-path. A high-entropy-LOOKING
+    /// block can still compress against an EXTERNAL dictionary: the block's own
+    /// content gives no hint (no internal repeat), so only probing the dict
+    /// table reveals it. Sample ~32 evenly-spread positions of `block`, hash
+    /// each into the attached dict table, and return `true` on the first 4-byte
+    /// dict match. The raw-fast-path uses this to keep a dict-matchable block off
+    /// the scan-skip (which would ignore the dictionary). Returns `false` when no
+    /// dict is attached or `block` is too short to hash — the no-dict path never
+    /// calls this, so its incompressibility verdict is unaffected.
+    pub(crate) fn block_samples_match_dict(&self, block: &[u8]) -> bool {
+        use super::fast_kernel::kernel::dict_lookup;
+        const HASH_READ_SIZE: usize = 8;
+        if !self.dict.is_attached() || block.len() < HASH_READ_SIZE {
+            return false;
+        }
+        let Some(dict_tab) = self.dict.table() else {
+            return false;
+        };
+        let dict_end = self.dict.region_len();
+        if dict_end > self.history.len() || dict_end < HASH_READ_SIZE {
+            return false;
+        }
+        let dict_bytes = &self.history[..dict_end];
+        let dhl = dict_tab.hash_log();
+        let mls = self.hash_table.mls();
+        let last = block.len() - HASH_READ_SIZE;
+        // ~32 evenly-spread probes (every position for tiny blocks); a dict that
+        // covers any sampled record trips on the first hit.
+        let step = (block.len() / 32).max(1);
+        let base = block.as_ptr();
+        let mut pos = 0;
+        while pos <= last {
+            // SAFETY: pos <= block.len() - 8 ⇒ `base.add(pos)` has ≥ 8 readable
+            // bytes, the context `dict_lookup`/`hash_ptr_raw` require.
+            let dpos = unsafe {
+                match mls {
+                    4 => dict_lookup::<4>(dict_tab, base.add(pos), dhl),
+                    5 => dict_lookup::<5>(dict_tab, base.add(pos), dhl),
+                    6 => dict_lookup::<6>(dict_tab, base.add(pos), dhl),
+                    7 => dict_lookup::<7>(dict_tab, base.add(pos), dhl),
+                    _ => dict_lookup::<8>(dict_tab, base.add(pos), dhl),
+                }
+            } as usize;
+            // `dpos >= 1` rejects the empty sentinel; verify a real 4-byte match
+            // before declaring the dict relevant, and EXTEND it: only a match
+            // long enough to be worth committing signals a dict that helps. A
+            // short (4-byte) coincidental hit — common when the dict was trained
+            // on data statistically like this block, yet contributes no net
+            // compression — must NOT force a scan, or an incompressible block
+            // with a self-trained dict pays a full wasted scan instead of the
+            // fast raw path. `USEFUL_DICT_MATCH` mirrors the magnitude at which a
+            // dict match starts paying for its (far) offset coding.
+            const USEFUL_DICT_MATCH: usize = 16;
+            if dpos >= 1
+                && dpos + 4 <= dict_end
+                && block[pos..pos + 4] == dict_bytes[dpos..dpos + 4]
+            {
+                let cap = (block.len() - pos).min(dict_end - dpos);
+                let mut len = 4;
+                while len < cap && block[pos + len] == dict_bytes[dpos + len] {
+                    len += 1;
+                }
+                if len >= USEFUL_DICT_MATCH {
+                    return true;
+                }
+            }
+            pos += step;
+        }
+        false
+    }
+
     /// Hash table `mls` (delegates to the inner table). Test-only
     /// crate helper for verifying driver wiring.
     #[cfg(test)]
@@ -359,7 +452,48 @@ impl FastKernelMatcher {
     /// hash_log, mls, step_size)` tuple (typically because a small
     /// source-size hint clamped the window). Tests can also call this
     /// directly.
+    /// Construct with the hash table allocated up front at `hash_log`.
     pub(crate) fn with_params(window_log: u8, hash_log: u32, mls: u32, step_size: usize) -> Self {
+        Self::with_params_table(
+            window_log,
+            hash_log,
+            mls,
+            step_size,
+            FastHashTable::new(hash_log, mls),
+        )
+    }
+
+    /// Construct with the hash table allocation deferred to the first
+    /// [`Self::reset`]. Used by `MatchGeneratorDriver::new`, which runs before
+    /// any source size is known and would otherwise allocate the table at the
+    /// level-default `hash_log` only to realloc it the moment the first frame
+    /// clamps the window to a smaller input — a wasted malloc + zero-fill on
+    /// every fresh compressor (the `compare_ffi` bench shape). The reset path
+    /// allocates the table once at the resolved size before the kernel runs.
+    pub(crate) fn with_params_deferred(
+        window_log: u8,
+        hash_log: u32,
+        mls: u32,
+        step_size: usize,
+    ) -> Self {
+        Self::with_params_table(
+            window_log,
+            hash_log,
+            mls,
+            step_size,
+            FastHashTable::new_deferred(hash_log, mls),
+        )
+    }
+
+    fn with_params_table(
+        window_log: u8,
+        // Redundant here (`hash_table` is already built at this shape), kept in
+        // the signature to mirror `with_params`'s call shape at both sites.
+        _hash_log: u32,
+        _mls: u32,
+        step_size: usize,
+        hash_table: FastHashTable,
+    ) -> Self {
         assert!(
             step_size >= 2,
             "FastKernelMatcher requires step_size >= 2 (got {step_size})"
@@ -394,7 +528,7 @@ impl FastKernelMatcher {
             prefix_start_index: INITIAL_PREFIX_START_INDEX,
             rep: FAST_INITIAL_REP,
             offset_hist: FAST_INITIAL_OFFSET_HIST,
-            hash_table: FastHashTable::new(hash_log, mls),
+            hash_table,
             max_window_size: 1usize << window_log,
             window_log,
             use_cmov: window_log < 19,
@@ -405,6 +539,8 @@ impl FastKernelMatcher {
             last_borrowed_block: None,
             dict: DictAttach::new(),
             table_pos_high_water: 0,
+            dict_resident: false,
+            loaded_dict_end: 0,
         }
     }
 
@@ -447,7 +583,17 @@ impl FastKernelMatcher {
             window_log <= 30,
             "FastKernelMatcher requires window_log <= 30 (got {window_log})"
         );
-        if table_overwritten_by_restore
+        // Re-borrow detection: set to the resident dict region when the
+        // epoch-reuse branch below keeps the dict bytes in place (see there).
+        let mut reborrow_region: Option<usize> = None;
+        if !self.hash_table.is_allocated() {
+            // Deferred table from `with_params`: this first reset is where the
+            // source-size-clamped (hash_log, mls) is finally known, so allocate
+            // once at the resolved size. Subsequent frames take the
+            // same-shape `clear()` / epoch branches below.
+            self.hash_table = FastHashTable::new(hash_log, mls);
+            self.dict.invalidate();
+        } else if table_overwritten_by_restore
             && self.hash_table.hash_log() == hash_log
             && self.hash_table.mls() == mls
         {
@@ -474,6 +620,17 @@ impl FastKernelMatcher {
             // (CDict-equivalent).
             let span = u32::try_from(self.table_pos_high_water).unwrap_or(u32::MAX);
             self.hash_table.advance_epoch(span);
+            // Re-borrow: the dictionary bytes from the previous frame are still
+            // resident at the front of history (`[0, region)`), so keep them in
+            // place instead of clearing + re-committing — the per-frame dict
+            // memmove was the dominant Fast-dict cost (~39% on a profiled small
+            // frame). The cached dict table already covers them; the frame
+            // compressor skips `prime_with_dictionary`. Gated on the dict still
+            // being fully resident (no eviction drained it off the front).
+            let region = self.dict.region_len();
+            if region > 0 && self.history.len() >= region {
+                reborrow_region = Some(region);
+            }
         } else {
             // Same shape — keep the allocation, zero the entries via
             // `memset` (ZSTD_window_clear cadence). A primed dict table
@@ -482,11 +639,24 @@ impl FastKernelMatcher {
             self.hash_table.clear();
         }
         self.table_pos_high_water = 0;
-        // M8: history starts empty (HISTORY_DRAIN_BASE = 0).
-        self.history.clear();
-        self.history.resize(HISTORY_DRAIN_BASE, 0);
+        // No copy-mode dict is resident across a reset: attach mode re-borrows
+        // its separate dict table (handled above), and the copy path re-primes
+        // (and re-records `loaded_dict_end`) during this frame's dict prime.
+        self.loaded_dict_end = 0;
+        if let Some(region) = reborrow_region {
+            // Keep `[0, region)` (the resident dict); drop the previous input.
+            self.history.truncate(region);
+            self.dict_resident = true;
+        } else {
+            // M8: history starts empty (HISTORY_DRAIN_BASE = 0).
+            self.history.clear();
+            self.history.resize(HISTORY_DRAIN_BASE, 0);
+            self.dict_resident = false;
+        }
         // Sentinel-0 protection via prefix_start_index >= 1 filter
-        // — see `with_params` for the full rationale.
+        // — see `with_params` for the full rationale. Unchanged for re-borrow:
+        // the dict sits at `[0, region)`, position 0 is the sentinel, so the
+        // dict's `[1, region)` stay reachable to the kernel and the decoder.
         self.prefix_start_index = INITIAL_PREFIX_START_INDEX;
         self.rep = FAST_INITIAL_REP;
         self.offset_hist = FAST_INITIAL_OFFSET_HIST;
@@ -494,8 +664,21 @@ impl FastKernelMatcher {
         self.use_cmov = window_log < 19;
         self.step_size = step_size;
         self.max_window_size = 1usize << window_log;
+        if let Some(region) = reborrow_region {
+            // Bump the eviction window by the dict size (exactly as
+            // `prime_with_dictionary`, clamped to MAX_PRIMED_WINDOW_SIZE) so the
+            // resident dict + the next input both stay in the window. Base is
+            // `1 << window_log` (<= 2^30 < MAX_PRIMED_WINDOW_SIZE), so headroom
+            // cannot underflow and the sum cannot overflow — no `saturating_*`.
+            let headroom = crate::encoding::match_table::storage::MAX_PRIMED_WINDOW_SIZE
+                - self.max_window_size;
+            self.max_window_size += region.min(headroom);
+        }
         self.pending = None;
-        self.last_block_start = HISTORY_DRAIN_BASE;
+        // Input starts after the resident dict on a re-borrow frame; otherwise
+        // at the drain base. (The first `extend_history` re-derives this, but
+        // keep it consistent for any pre-append reads.)
+        self.last_block_start = reborrow_region.unwrap_or(HISTORY_DRAIN_BASE);
         self.recycled_space = None;
         // Drop any borrowed window: the next frame's input buffer is a
         // different allocation, so a stale (ptr, len) would dangle.
@@ -776,6 +959,12 @@ impl FastKernelMatcher {
         // the dictionary, which is exactly when the dict is no longer
         // reachable anyway.
         self.dict.invalidate();
+        // Same reasoning for the COPY-mode dict boundary: the rebased tail
+        // moves the dict positions, and the drain only fires when history
+        // outgrew the window, i.e. the dict has slid out. Clear it so the
+        // prefix floor reverts to the windowed value (upstream zstd
+        // `ZSTD_window_enforceMaxDist` zeroing `loadedDictEnd`).
+        self.loaded_dict_end = 0;
         self.hash_table.clear();
         self.last_block_start = self.last_block_start.saturating_sub(drop_n);
         // Skip position 0 — `prefix_start_index = 1` means the kernel
@@ -893,7 +1082,37 @@ impl FastKernelMatcher {
         // extension `match_pos > window_low` bound — both paths that
         // upstream zstd expresses against `prefixStart` directly (NOT against
         // a sentinel-1 floor).
-        let window_low = self.history_bytes().len().saturating_sub(advertised_window) as u32;
+        let block_end = self.history_bytes().len();
+        let windowed_low = block_end.saturating_sub(advertised_window) as u32;
+        // Upstream zstd `ZSTD_getLowestPrefixIndex` with `isDictionary`: when a
+        // COPY-mode dict is resident at the front of history AND still within
+        // `maxDist` of the block end (`block_end <= advertised_window +
+        // loadedDictEnd`), the prefix floor is the DICT START, not the
+        // window-clamped floor — so the whole dict stays reachable for the
+        // block. A window-clamped floor computed from the history END would
+        // reject every dict position once the input fills the window, ignoring
+        // the dictionary entirely. Once the block end passes `maxDist +
+        // loadedDictEnd` the dict has slid out of the window and the windowed
+        // floor takes over (eviction also clears `loaded_dict_end`). Offsets
+        // reaching the dict (bounded by `advertised_window + loaded_dict_end`)
+        // stay decodable because the decoder loads the same dictionary.
+        // `loaded_dict_end` is set only for COPY-mode dicts; an ATTACHED
+        // (in-place) dict tracks its boundary via `dict.region_len()` instead. Use
+        // whichever mode is active so an owned attach-mode scan keeps the WHOLE
+        // dict reachable once the input fills the advertised window — mirrors the
+        // borrowed dict floor. Without it the `dpos >= window_low` gate rejects
+        // every attached-dict slot past `advertised_window`, silently dropping the
+        // dictionary for over-window owned frames.
+        let effective_dict_end = if self.loaded_dict_end != 0 {
+            self.loaded_dict_end
+        } else if self.dict.is_attached() {
+            self.dict.region_len()
+        } else {
+            0
+        };
+        let dict_in_window =
+            effective_dict_end != 0 && block_end <= advertised_window + effective_dict_end;
+        let window_low = if dict_in_window { 0 } else { windowed_low };
         // Sentinel-aware prefix for the hash-table filter — match_idx
         // == 0 (an uninitialized FastHashTable slot) must be rejected
         // by `match_found`, so we floor at `INITIAL_PREFIX_START_INDEX
@@ -1106,7 +1325,21 @@ impl FastKernelMatcher {
         // match the owned flat dict kernel: `window_low` is the absolute floor;
         // `prefix_start_index` the sentinel-aware floor (`>= 1`) for the
         // hash-slot filter. `virtual_len` was checked above.
-        let window_low = virtual_len.saturating_sub(advertised_window);
+        let windowed_low = virtual_len.saturating_sub(advertised_window);
+        // Upstream zstd `ZSTD_getLowestPrefixIndex` with `isDictionary`: while the
+        // dict (committed at virtual `[0, dict_end)`) is still within
+        // `maxDist + loadedDictEnd` of the block end, the floor is the DICT START
+        // (0), NOT the window-clamped `virtual_len - window`. `dict_end` is the
+        // loaded-dict-end here. Without this, a block over the Fast attach cutoff
+        // (now every Fast dict frame) computes `window_low = virtual_len - window`
+        // which lands at or above `dict_end`, so the kernel's `dpos >= window_low`
+        // gate rejects EVERY dict position and the dictionary is ignored for the
+        // whole block (the same prefix-floor bug the owned copy path fixed). Once
+        // the block grows past `window + dict_end` the dict has slid out of the
+        // window and the windowed floor takes over; offsets reaching the dict stay
+        // bounded by `window + dict_end`, so they remain decodable.
+        let dict_in_window = dict_end != 0 && virtual_len <= advertised_window + dict_end;
+        let window_low = if dict_in_window { 0 } else { windowed_low };
         let prefix_start_index = window_low.max(self.prefix_start_index as usize) as u32;
         let bounds = PrefixBounds {
             prefix_start_index,
@@ -1249,6 +1482,15 @@ impl FastKernelMatcher {
         // very small).
         if incompressible_hint == Some(false) {
             self.prime_hash_table_for_range(block_start);
+            // Copy-mode dict prime: the dict now occupies `[0, history.len())`
+            // at the front of history (this is the only caller of the
+            // `Some(false)` hint — see the doc above). Record the dict/input
+            // boundary so `start_matching` floors the block prefix at the dict
+            // start while the dict stays within the window (upstream zstd
+            // `ms->loadedDictEnd`). A multi-slice dict advances this to the
+            // running end on each slice; the final slice leaves the full
+            // dict size.
+            self.loaded_dict_end = self.history.len();
         }
     }
 
@@ -1479,6 +1721,13 @@ impl FastKernelMatcher {
         self.dict.mark_primed();
     }
 
+    /// Whether the last [`Self::reset`] re-borrowed a resident dictionary (kept
+    /// the dict bytes + cached dict table in place). The driver reports this up
+    /// so the frame compressor skips `prime_with_dictionary` for the frame.
+    pub(crate) fn dict_resident(&self) -> bool {
+        self.dict_resident
+    }
+
     /// Drop the cached dict table and its primed flag. Called by the driver
     /// when the next frame carries no dictionary, so the kernel never probes
     /// a stale dict region whose bytes are no longer re-committed.
@@ -1506,12 +1755,21 @@ impl FastKernelMatcher {
             return;
         }
         let last_hashable = history_len - HASH_READ_SIZE;
-        // Backfill the (HASH_READ_SIZE - 1) seam positions below
-        // `range_start` (see `prime_hash_table_for_range`): a dictionary
-        // fed in slice_size chunks otherwise drops every match that
-        // straddles a chunk boundary.
-        let backfill_start = range_start.saturating_sub(HASH_READ_SIZE - 1);
-        if backfill_start > last_hashable {
+        // The dict fill resumes at the carried-forward fill origin
+        // (`next_to_update`), NOT this slice's `range_start`: a position whose
+        // wide hash read straddles a slice seam is unreachable by the prior
+        // slice (its `last_hashable` stopped `HASH_READ_SIZE - 1` bytes short)
+        // and sits below this slice's `range_start`, yet must still be hashed
+        // here. Restarting at `range_start` instead would drop those seam
+        // positions and fragment a long cross-seam dict match. `next_to_update`
+        // starts at the content start (`HISTORY_DRAIN_BASE == 0`, the default).
+        debug_assert!(
+            self.dict.next_to_update() <= range_start,
+            "dict fill origin {} ran ahead of slice start {range_start}",
+            self.dict.next_to_update(),
+        );
+        let fill_start = self.dict.next_to_update();
+        if fill_start > last_hashable {
             return;
         }
         let hash_log = self.hash_table.hash_log();
@@ -1519,36 +1777,90 @@ impl FastKernelMatcher {
         self.dict
             .table_mut_or_init(|| FastHashTable::new(hash_log, mls));
         let base = self.history.as_ptr();
-        match self.hash_table.mls() {
-            4 => self.prime_dict_table_impl::<4>(base, backfill_start, last_hashable),
-            5 => self.prime_dict_table_impl::<5>(base, backfill_start, last_hashable),
-            6 => self.prime_dict_table_impl::<6>(base, backfill_start, last_hashable),
-            7 => self.prime_dict_table_impl::<7>(base, backfill_start, last_hashable),
-            8 => self.prime_dict_table_impl::<8>(base, backfill_start, last_hashable),
+        let next = match self.hash_table.mls() {
+            4 => self.prime_dict_table_impl::<4>(base, fill_start, last_hashable),
+            5 => self.prime_dict_table_impl::<5>(base, fill_start, last_hashable),
+            6 => self.prime_dict_table_impl::<6>(base, fill_start, last_hashable),
+            7 => self.prime_dict_table_impl::<7>(base, fill_start, last_hashable),
+            8 => self.prime_dict_table_impl::<8>(base, fill_start, last_hashable),
             _ => unreachable!("FastHashTable construction rejects mls outside 4..=8"),
-        }
+        };
+        self.dict.set_next_to_update(next);
     }
 
     /// Monomorphised per-MLS dict-table fill. `base` is a raw pointer into
     /// `self.history` (no borrow held), so mutating `self.dict_table` in the
     /// loop is sound — the loop never touches `history`, which stays put.
+    /// Returns the carried-forward fill origin (one past the last position
+    /// hashed), stored as [`DictAttach::next_to_update`] so the next
+    /// `accept_data` slice resumes here without dropping the seam.
     fn prime_dict_table_impl<const MLS: u32>(
         &mut self,
         base: *const u8,
         range_start: usize,
         last_hashable: usize,
-    ) {
+    ) -> usize {
         let dict_table = self
             .dict
             .table_mut()
             .expect("prime_dict_table_for_range creates the table before this call");
+        // Every-position last-wins fill. For repetitive dictionary content one
+        // hash maps to many candidate positions, and the kernel emits the match
+        // offset as `ip - position`. Walking every position in increasing order
+        // with last-wins keeps the HIGHEST (nearest-to-the-input) occurrence per
+        // hash, so the emitted offset is the smallest reachable — and small
+        // offsets cost far fewer bits in the offset-code FSE stream than far
+        // ones. A strided fill (stride-overwrite plus in-between fill-if-empty)
+        // instead keeps whichever occurrence the stride alignment happened to
+        // land on; for variable-length records that is frequently a far one,
+        // inflating the offset and erasing the dictionary's ratio benefit (the
+        // dict frame ends up larger than the no-dict frame).
+        //
+        // Each slot stores `(position << DICT_TAG_BITS) | tag` (upstream zstd
+        // `ZSTD_SHORT_CACHE`): the slot index is the plain `dict_hash_log` hash,
+        // the tag is the low `DICT_TAG_BITS` of the wider hash. `0` is the empty
+        // sentinel — the dict occupies positions `1..dict_end` and the kernel
+        // rejects `dict_idx < 1`. The tag lets the kernel reject a colliding
+        // position without the candidate load + `MEM_read32`; tagging does NOT
+        // change the slot, so the last-wins nearest-occurrence guarantee holds.
+        let dict_hash_log = dict_table.hash_log();
+        // The tagged hash is `hash_ptr_raw(.., dict_hash_log + DICT_TAG_BITS)`,
+        // well-defined only while that width fits 32 bits. Guard it here (always-on)
+        // before the unsafe fill, matching the kernel-side guards — a `hash_log > 24`
+        // dict table would otherwise hash past 32 bits and write a bogus slot.
+        assert!(
+            dict_hash_log + DICT_TAG_BITS <= 32,
+            "tagged Fast dict fill requires dict hash_log <= {} (got {dict_hash_log})",
+            32 - DICT_TAG_BITS,
+        );
+        // Every slot packs the position into the `32 - DICT_TAG_BITS`-bit field
+        // (16 MiB with an 8-bit tag). `last_hashable` bounds every position the
+        // loop writes, so one check here covers the whole fill; a larger dict
+        // region would truncate the high position bits and alias offsets. The
+        // driver routes dicts past `MAX_FAST_ATTACH_DICT_REGION` to copy mode, so
+        // in production this is a backstop the attach gate already upholds.
+        assert!(
+            last_hashable >> (32 - DICT_TAG_BITS) == 0,
+            "dict region too large for the tagged fast-table position field \
+             (last_hashable={last_hashable}, max={})",
+            (1usize << (32 - DICT_TAG_BITS)) - 1,
+        );
         for pos in range_start..=last_hashable {
             // SAFETY: pos <= last_hashable = history_len - 8, so `base.add(pos)`
             // covers >= 8 readable bytes; MLS matches the table's mls.
-            let ptr = unsafe { base.add(pos) };
-            let hash = unsafe { dict_table.hash_ptr::<MLS>(ptr) };
-            unsafe { dict_table.put(hash, pos as u32) };
+            let hat = unsafe { hash_ptr_raw::<MLS>(base.add(pos), dict_hash_log + DICT_TAG_BITS) };
+            unsafe {
+                dict_table.put(
+                    hat >> DICT_TAG_BITS,
+                    ((pos as u32) << DICT_TAG_BITS) | (hat & DICT_TAG_MASK),
+                )
+            };
         }
+        // Every position up to `last_hashable` is hashed; the next `accept_data`
+        // slice resumes one past it, picking up the seam positions whose 8-byte
+        // hash read straddled this slice's tail (unreachable until more bytes
+        // landed).
+        last_hashable + 1
     }
 }
 
@@ -2410,12 +2722,77 @@ mod tests {
         // seam: its 8-byte hash read straddles the chunk boundary.
         let p = seam - 4;
         let dt = m.dict.table().expect("dict table primed");
-        let h = unsafe { dt.hash_ptr::<4>(m.history.as_ptr().add(p)) };
+        // Read the dict table exactly as the kernel does: hash the position and
+        // return the stored dict position for that slot (0 if empty).
+        let found = unsafe {
+            crate::encoding::simple::fast_kernel::kernel::dict_lookup::<4>(
+                dt,
+                m.history.as_ptr().add(p),
+                dt.hash_log(),
+            )
+        };
         assert_eq!(
-            unsafe { dt.get(h) },
-            p as u32,
+            found, p as u32,
             "seam-spanning position {p} must be indexed in the dict table",
         );
+    }
+
+    #[test]
+    fn block_samples_match_dict_fires_only_on_extendable_dict_match() {
+        // Distinct dict bytes so the 4-byte hashes are collision-free at
+        // hash_log=20 and a verbatim run is the only way to hit the table.
+        let dict: alloc::vec::Vec<u8> = (0..200u8)
+            .map(|i| i.wrapping_mul(37).wrapping_add(13))
+            .collect();
+        let mut m = FastKernelMatcher::with_params(20, 20, 4, 2);
+        m.accept_data(dict.clone());
+        m.skip_matching_for_dict_prime();
+        assert!(m.dict_is_attached(), "dict must be attached after prime");
+
+        // A 32-byte verbatim dict run extends well past the 16-byte useful-match
+        // floor → the probe fires.
+        let hit = dict[8..40].to_vec();
+        assert!(
+            m.block_samples_match_dict(&hit),
+            "a long verbatim dict run must trip the dict probe",
+        );
+
+        // An 8-byte dict prefix followed by non-dict bytes stays BELOW the
+        // 16-byte floor → the probe must NOT fire (a short coincidental match
+        // does not signal a dict that compresses the block).
+        let mut short = dict[8..16].to_vec();
+        short.extend((0..56u8).map(|i| i.wrapping_mul(53).wrapping_add(201)));
+        assert!(
+            !m.block_samples_match_dict(&short),
+            "a sub-16-byte dict match must not trip the probe",
+        );
+
+        // A high-entropy block sharing no extendable run with the dict → no hit.
+        let miss: alloc::vec::Vec<u8> = (0..64u8)
+            .map(|i| i.wrapping_mul(91).wrapping_add(7) ^ 0xA5)
+            .collect();
+        assert!(
+            !m.block_samples_match_dict(&miss),
+            "a non-dict block must not trip the probe",
+        );
+
+        // A block too short to hash (< HASH_READ_SIZE) → false, no panic.
+        assert!(
+            !m.block_samples_match_dict(&dict[..4]),
+            "a sub-8-byte block cannot be probed",
+        );
+    }
+
+    #[test]
+    fn block_samples_match_dict_is_false_without_a_dictionary() {
+        // No dict primed → the probe short-circuits to false (the no-dict path
+        // never reaches it, but the guard must hold).
+        let m = FastKernelMatcher::with_params(20, 20, 4, 2);
+        let block: alloc::vec::Vec<u8> = (0..64u8)
+            .map(|i| i.wrapping_mul(37).wrapping_add(13))
+            .collect();
+        assert!(!m.dict_is_attached());
+        assert!(!m.block_samples_match_dict(&block));
     }
 
     /// Regression: same seam-gap defect for the MAIN hash table, primed

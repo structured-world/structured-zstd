@@ -700,6 +700,37 @@ pub(crate) struct CompressState<M: Matcher> {
     /// encoder constructor) plumb this explicitly. Tests that build
     /// `CompressState` by hand must also supply a value.
     pub(crate) strategy_tag: crate::encoding::strategy::StrategyTag,
+    /// Whether the HUF literal table build runs the #167 table-log search
+    /// (`true`) or the cheap single-build (`false`). For the Fast strategy the
+    /// search is a clean ratio win over upstream zstd but costs ~1.5 us per
+    /// literal section — negligible on large inputs, ~20% on small ones — and
+    /// the Fast matcher is byte-faithful to upstream zstd (so the cheap path
+    /// ties it). So it is gated ON only for large Fast frames; non-Fast
+    /// strategies always keep it (their matchers diverge, making the search
+    /// load-bearing for ratio — gating those is deferred). Set per frame
+    /// alongside `strategy_tag` via [`fast_huf_search_enabled`].
+    pub(crate) huf_optimal_search: bool,
+}
+
+/// Whether the Fast-strategy HUF literal build should run the #167 table-log
+/// search for a frame of `source_size` bytes (see
+/// [`CompressState::huf_optimal_search`]). Non-Fast strategies always search.
+/// For Fast, enable the search only above 128 KiB (one full block) — below
+/// that the per-frame setup dominates and the search's ~1.5 us is a large
+/// relative cost for a ratio gain the cheap path forgoes while still tying
+/// upstream zstd. Unknown size (streaming) keeps the search for conservative
+/// ratio.
+pub(crate) fn fast_huf_search_enabled(
+    strategy: crate::encoding::strategy::StrategyTag,
+    source_size: Option<u64>,
+) -> bool {
+    if strategy != crate::encoding::strategy::StrategyTag::Fast {
+        return true;
+    }
+    match source_size {
+        Some(size) => size > 128 * 1024,
+        None => true,
+    }
 }
 
 impl<M: Matcher> CompressState<M> {
@@ -893,6 +924,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 strategy_tag: crate::encoding::strategy::StrategyTag::for_compression_level(
                     compression_level,
                 ),
+                huf_optimal_search: true,
             },
             magicless: false,
             content_checksum: false,
@@ -945,6 +977,8 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         self.state.strategy_tag = self.strategy_override.unwrap_or_else(|| {
             crate::encoding::strategy::StrategyTag::for_compression_level(self.compression_level)
         });
+        self.state.huf_optimal_search =
+            fast_huf_search_enabled(self.state.strategy_tag, self.source_size_hint);
         self.state.matcher.set_param_overrides(Some(overrides));
     }
 
@@ -1235,6 +1269,8 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             if self.content_checksum {
                 self.hasher.write(block);
             }
+            let dict_active =
+                self.dictionary.is_some() && self.state.matcher.supports_dictionary_priming();
             crate::encoding::levels::compress_block_encoded_borrowed(
                 &mut self.state,
                 self.compression_level,
@@ -1242,6 +1278,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 block,
                 start,
                 end,
+                dict_active,
                 out,
                 #[cfg(feature = "lsm")]
                 Some(&mut self.block_decompressed_sizes),
@@ -1274,6 +1311,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 strategy_tag: crate::encoding::strategy::StrategyTag::for_compression_level(
                     compression_level,
                 ),
+                huf_optimal_search: true,
             },
             compression_level,
             magicless: false,
@@ -1534,6 +1572,10 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         self.state.strategy_tag = self.strategy_override.unwrap_or_else(|| {
             crate::encoding::strategy::StrategyTag::for_compression_level(self.compression_level)
         });
+        // `initial_size_hint` (captured before the `.take()` above) — by here
+        // `self.source_size_hint` is None.
+        self.state.huf_optimal_search =
+            fast_huf_search_enabled(self.state.strategy_tag, initial_size_hint);
         let cached_entropy = if use_dictionary_state {
             self.dictionary_entropy_cache.as_ref()
         } else {
@@ -1566,8 +1608,14 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             // `hint > 2^k`, so this is identical to the raw `hint > cutoff` on
             // 64-bit.
             let cutoff_log = match self.state.strategy_tag {
-                crate::encoding::strategy::StrategyTag::Fast
-                | crate::encoding::strategy::StrategyTag::BtUltra
+                // Fast always attaches now (the copy-mode owned path memmoved the
+                // whole input into history every frame); keep the copy-snapshot
+                // gate in sync with the matcher's attach cutoff so Fast never
+                // captures/restores a copy snapshot it can no longer use.
+                crate::encoding::strategy::StrategyTag::Fast => {
+                    crate::encoding::match_generator::FAST_ATTACH_DICT_CUTOFF_LOG
+                }
+                crate::encoding::strategy::StrategyTag::BtUltra
                 | crate::encoding::strategy::StrategyTag::BtUltra2 => 13,
                 crate::encoding::strategy::StrategyTag::Dfast => 14,
                 crate::encoding::strategy::StrategyTag::Greedy
@@ -1575,23 +1623,32 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 | crate::encoding::strategy::StrategyTag::Btlazy2
                 | crate::encoding::strategy::StrategyTag::BtOpt => 15,
             };
-            let prefer_copy_snapshot = initial_size_hint.is_some_and(|s| {
-                crate::encoding::match_generator::source_size_ceil_log(s) > cutoff_log
-            });
-            let restored = prefer_copy_snapshot
-                && self
-                    .state
+            if self.state.matcher.dictionary_is_resident() {
+                // Re-borrow fast path: the previous frame's reset kept this
+                // dict's bytes + cached index resident, so skip the re-commit /
+                // re-index and only reapply the offset history.
+                self.state
                     .matcher
-                    .restore_primed_dictionary(self.compression_level);
-            if !restored {
-                self.state.matcher.prime_with_dictionary(
-                    dict.inner.dict_content.as_slice(),
-                    dict.inner.offset_hist,
-                );
-                if prefer_copy_snapshot {
-                    self.state
+                    .reapply_resident_dictionary(dict.inner.offset_hist);
+            } else {
+                let prefer_copy_snapshot = initial_size_hint.is_some_and(|s| {
+                    crate::encoding::match_generator::source_size_ceil_log(s) > cutoff_log
+                });
+                let restored = prefer_copy_snapshot
+                    && self
+                        .state
                         .matcher
-                        .capture_primed_dictionary(self.compression_level);
+                        .restore_primed_dictionary(self.compression_level);
+                if !restored {
+                    self.state.matcher.prime_with_dictionary(
+                        dict.inner.dict_content.as_slice(),
+                        dict.inner.offset_hist,
+                    );
+                    if prefer_copy_snapshot {
+                        self.state
+                            .matcher
+                            .capture_primed_dictionary(self.compression_level);
+                    }
                 }
             }
         }
@@ -2989,6 +3046,79 @@ mod tests {
             let mut decoded = Vec::with_capacity(payload.len());
             decoder.decode_all_to_vec(frame, &mut decoded).unwrap();
             assert_eq!(decoded.as_slice(), payload.as_slice());
+        }
+    }
+
+    #[test]
+    fn dict_reused_across_many_lazy_frames_stays_applied() {
+        // Regression: a reused HashChain-backed dictionary frame (lazy levels)
+        // re-primes the dict at the live `history_abs_start` every frame. The
+        // floor-advance reset let that base climb frame-over-frame until the
+        // freshly-primed dict region dropped below `window_low`, after which
+        // every dict match was silently lost and the output ballooned to the
+        // no-dict size (observed at frame 3-4 of a reused compressor). Drive
+        // many frames and require every one to stay byte-identical to the
+        // first — the dict must keep applying, not decay after a few frames.
+        // Multiple distinct lines so the dictionary is load-bearing: without it
+        // frame 0 must emit each distinct line as literals; with it those lines
+        // match the primed dict immediately. A single repeated line matches
+        // in-frame regardless and would hide the regression.
+        let lines: &[&[u8]] = &[
+            b"ts=2026 level=INFO msg=\"flush memtable\" tenant=demo table=orders\n",
+            b"ts=2026 level=INFO msg=\"rotate segment\" tenant=demo table=orders\n",
+            b"ts=2026 level=INFO msg=\"compact level\" tenant=demo table=orders\n",
+            b"ts=2026 level=INFO msg=\"write block\" tenant=demo table=orders\n",
+        ];
+        let fill = |n: usize| -> Vec<u8> {
+            let mut b = Vec::with_capacity(n);
+            while b.len() < n {
+                for l in lines {
+                    if b.len() >= n {
+                        break;
+                    }
+                    let take = (n - b.len()).min(l.len());
+                    b.extend_from_slice(&l[..take]);
+                }
+            }
+            b
+        };
+        let dict = fill(8 * 1024);
+        let payload = fill(16 * 1024);
+        let dict_obj =
+            crate::decoding::Dictionary::from_raw_content(1, dict).expect("raw dict should build");
+
+        let mut compressor: FrameCompressor =
+            FrameCompressor::new(super::CompressionLevel::Level(6));
+        compressor.set_dictionary_id_flag(false);
+        compressor
+            .set_dictionary(dict_obj)
+            .expect("dict should attach");
+
+        let first = compressor.compress_independent_frame(payload.as_slice());
+
+        // No-dict baseline at the same level: the dictionary must be
+        // load-bearing, so the dict-applied frame has to beat it. Without this
+        // anchor the equal-length loop below would also pass if EVERY frame
+        // decayed to the no-dict size in lockstep.
+        let mut nodict: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(6));
+        let no_dict_frame = nodict.compress_independent_frame(payload.as_slice());
+        assert!(
+            first.len() < no_dict_frame.len(),
+            "dict must be load-bearing: dict frame {} should beat the no-dict baseline {}",
+            first.len(),
+            no_dict_frame.len(),
+        );
+
+        for i in 1..16 {
+            let frame = compressor.compress_independent_frame(payload.as_slice());
+            // Byte-identity, not just equal length: a same-size divergence (e.g.
+            // a different match decision once the resident dict bookkeeping
+            // drifts) would slip past a length-only check.
+            assert_eq!(
+                frame, first,
+                "frame {i} of a reused dict compressor must stay byte-identical to \
+                 the first (dict still applied, no decay or bookkeeping drift)"
+            );
         }
     }
 

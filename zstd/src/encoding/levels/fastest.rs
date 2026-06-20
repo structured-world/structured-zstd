@@ -7,8 +7,8 @@ use crate::{
         blocks::{compress_block, compress_block_with_post_split},
         frame_compressor::CompressState,
         incompressible::{
-            block_looks_incompressible, block_looks_incompressible_strict,
-            compression_level_allows_raw_fast_path,
+            block_looks_incompressible, block_looks_incompressible_dict,
+            block_looks_incompressible_strict, compression_level_allows_raw_fast_path,
         },
         match_generator::MatchGeneratorDriver,
     },
@@ -81,12 +81,12 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         header.serialize(output);
         output.push(rle_byte);
         BlockType::RLE
-    } else if !dict_active
-        && should_emit_raw_fast_path(
-            compression_level,
-            state.matcher.window_size(),
-            &uncompressed_data,
-        )
+    } else if should_emit_raw_fast_path(
+        compression_level,
+        state.matcher.window_size(),
+        &uncompressed_data,
+        dict_active,
+    ) && !(dict_active && state.matcher.block_samples_match_dict(&uncompressed_data))
     {
         #[cfg(feature = "lsm")]
         if let Some(sink) = block_decompressed_sizes {
@@ -240,6 +240,7 @@ pub(crate) fn compress_block_encoded_borrowed(
     block: &[u8],
     block_start: usize,
     block_end: usize,
+    dict_active: bool,
     output: &mut Vec<u8>,
     #[cfg(feature = "lsm")] block_decompressed_sizes: Option<&mut Vec<u32>>,
     #[cfg(all(feature = "lsm", feature = "hash"))] block_checksums: Option<&mut Vec<u32>>,
@@ -277,7 +278,13 @@ pub(crate) fn compress_block_encoded_borrowed(
         header.serialize(output);
         output.push(rle_byte);
         BlockType::RLE
-    } else if should_emit_raw_fast_path(compression_level, state.matcher.window_size(), block) {
+    } else if should_emit_raw_fast_path(
+        compression_level,
+        state.matcher.window_size(),
+        block,
+        dict_active,
+    ) && !(dict_active && state.matcher.block_samples_match_dict(block))
+    {
         #[cfg(feature = "lsm")]
         if let Some(sink) = block_decompressed_sizes {
             sink.push(block_size);
@@ -375,9 +382,26 @@ pub(crate) fn compress_block_encoded_borrowed(
 }
 
 #[inline]
-fn should_emit_raw_fast_path(level: CompressionLevel, window_size: u64, block: &[u8]) -> bool {
+fn should_emit_raw_fast_path(
+    level: CompressionLevel,
+    window_size: u64,
+    block: &[u8],
+    has_dict: bool,
+) -> bool {
     if !compression_level_allows_raw_fast_path(level, window_size) {
         return false;
+    }
+    // With a dictionary attached, a high-entropy-looking block is NOT
+    // necessarily incompressible: the dict can supply matches the block's own
+    // content gives no hint of (e.g. structured records drawn from the trained
+    // dict). So raise the bar to the STRICT head/mid/tail probe before skipping
+    // the scan — the same conservative check `Best` uses. The plain no-dict
+    // heuristic stays for the no-dict path, where it classifies incompressible
+    // blocks very well. Without this, an over-cutoff dict frame whose first
+    // block matches the dict gets emitted raw and ignores the dictionary
+    // entirely.
+    if has_dict {
+        return block_looks_incompressible_dict(block);
     }
     if matches!(level, CompressionLevel::Best) {
         return block_looks_incompressible_strict(block);
@@ -433,6 +457,19 @@ mod tests {
     }
 
     #[test]
+    fn custom_matcher_dict_probe_defaults_to_false() {
+        // `Matcher::block_samples_match_dict` defaults to `false`: a CUSTOM matcher
+        // with no dict-table probe leaves the raw-fast-path on its content-only
+        // verdict. NOTE this is the TRAIT DEFAULT, not the production wrapper: the
+        // `MatchGeneratorDriver` overrides it to `true` for non-Simple backends so
+        // a dict frame stays on the scan (covered by
+        // `block_samples_match_dict_is_true_for_non_simple_backend`). Only the
+        // Simple/Fast backend with an attached dictionary runs the precise probe.
+        let m = HintProbeMatcher::default();
+        assert!(!m.block_samples_match_dict(b"arbitrary block content, no dict probe"));
+    }
+
+    #[test]
     fn rle_branch_passes_compressible_hint_to_skip_matching() {
         let mut state = CompressState {
             matcher: HintProbeMatcher::default(),
@@ -442,6 +479,7 @@ mod tests {
             block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
             offset_hist: [1, 4, 8],
             strategy_tag: crate::encoding::strategy::StrategyTag::Fast,
+            huf_optimal_search: true,
         };
         let mut output = Vec::new();
 
@@ -476,6 +514,7 @@ mod tests {
             block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
             offset_hist: [1, 4, 8],
             strategy_tag: crate::encoding::strategy::StrategyTag::Fast,
+            huf_optimal_search: true,
         };
         let mut output = Vec::new();
 
@@ -530,7 +569,7 @@ mod tests {
             "fixture must look incompressible to exercise Best window guard"
         );
         assert!(
-            !should_emit_raw_fast_path(CompressionLevel::Best, 16 * 1024 * 1024, &block),
+            !should_emit_raw_fast_path(CompressionLevel::Best, 16 * 1024 * 1024, &block, false),
             "Best should keep compressed path when large window can unlock long-distance matches"
         );
     }

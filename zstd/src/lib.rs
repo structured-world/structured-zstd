@@ -129,6 +129,34 @@ mod tests;
 #[cfg(feature = "bench_internals")]
 #[doc(hidden)]
 pub mod testing {
+    /// Compression parameters selected for `(level, srcSize, dictSize)` →
+    /// `(windowLog, chainLog, hashLog, searchLog, minMatch, targetLength,
+    /// strategy)`. Facade for the `ffi-bench` parity test that diffs the
+    /// selection against the reference `ZSTD_getCParams`.
+    pub fn compression_params(
+        level: i32,
+        src: u64,
+        dict: usize,
+    ) -> (u32, u32, u32, u32, u32, u32, u32) {
+        let cp = crate::encoding::cparams::get_cparams_public(level, src, dict);
+        (
+            cp.window_log,
+            cp.chain_log,
+            cp.hash_log,
+            cp.search_log,
+            cp.min_match,
+            cp.target_length,
+            cp.strategy,
+        )
+    }
+
+    /// Force every HUF table build onto the cheap single-build path (skip the
+    /// #167 table-log search) so a bench harness can A/B the search across
+    /// levels. Measurement-only.
+    pub fn set_force_cheap_huf(on: bool) {
+        crate::huff0::huff0_encoder::set_force_cheap_huf(on);
+    }
+
     pub use crate::bit_io::BitReaderReversed;
     // `BitReaderReversed` is generic over `K: CpuKernel = ScalarKernel`,
     // so both the trait bound and the default need a `pub` path to

@@ -80,8 +80,13 @@ pub(crate) struct DfastMatchGenerator {
     // `_search_next_long` retry — after a short-hash hit, the search
     // probes long_hash at `ip + 1` and picks the longer of the two
     // (see `hash_candidate`, invoked via `best_match`, for the retry).
-    pub(crate) short_hash: Vec<u32>,
-    pub(crate) long_hash: Vec<u32>,
+    /// Single backing allocation for both hash tables (cwksp analog): the long
+    /// table occupies `[0, long_len)` and the short table `[long_len,
+    /// long_len + short_len)`. One allocation instead of two halves the
+    /// per-fresh-frame large-table allocator churn (the page-fault / calloc
+    /// storm that dominated dfast on medium inputs). Access through the
+    /// `long_*` / `short_*` helpers, which apply the short-region offset.
+    pub(crate) tables: Vec<u32>,
     /// Absolute position whose `(abs_pos - position_base + 1)` slot
     /// encoding evaluates to `1`. Advances only via [`Self::reduce`]
     /// when an insert is about to overflow the u32 window — the
@@ -137,6 +142,11 @@ pub(crate) struct DfastMatchGenerator {
     /// owned evicting path) and `get_last_space` reports the borrowed block
     /// to the emit pipeline. Only meaningful while `borrowed_input` is `Some`.
     pub(crate) borrowed_block: Option<(usize, usize)>,
+    /// Set by [`Self::reset`] when it re-borrowed a resident attach-mode
+    /// dictionary (kept the dict bytes at the front of history + the cached dict
+    /// tables in place instead of clearing + re-committing them). Signals the
+    /// frame compressor to SKIP `prime_with_dictionary` this frame.
+    pub(crate) dict_resident: bool,
 }
 
 /// The dfast backend's immutable dictionary tables — a long+short pair mirroring
@@ -169,8 +179,7 @@ impl DfastMatchGenerator {
             history_start: 0,
             history_abs_start: 0,
             offset_hist: [1, 4, 8],
-            short_hash: Vec::new(),
-            long_hash: Vec::new(),
+            tables: Vec::new(),
             position_base: 0,
             long_hash_bits: DFAST_HASH_BITS,
             short_hash_bits: DFAST_HASH_BITS - DFAST_SHORT_HASH_BITS_DELTA,
@@ -178,7 +187,55 @@ impl DfastMatchGenerator {
             kernel: select_kernel(),
             borrowed_input: None,
             borrowed_block: None,
+            dict_resident: false,
         }
+    }
+
+    /// Whether the last [`Self::reset`] re-borrowed a resident dictionary (kept
+    /// the dict bytes + cached dict tables in place). The driver reports this up
+    /// so the frame compressor skips `prime_with_dictionary` for the frame.
+    pub(crate) fn dict_resident(&self) -> bool {
+        self.dict_resident
+    }
+
+    /// Number of slots in the long hash table (`[0, long_len)` of `tables`).
+    #[inline(always)]
+    pub(crate) fn long_len(&self) -> usize {
+        1usize << self.long_hash_bits
+    }
+
+    /// Number of slots in the short hash table (`[long_len, +short_len)`).
+    #[inline(always)]
+    pub(crate) fn short_len(&self) -> usize {
+        1usize << self.short_hash_bits
+    }
+
+    /// Base const-pointer to the long table region.
+    #[inline(always)]
+    fn long_ptr(&self) -> *const u32 {
+        self.tables.as_ptr()
+    }
+
+    /// Base const-pointer to the short table region (offset past the long).
+    #[inline(always)]
+    fn short_ptr(&self) -> *const u32 {
+        // SAFETY: `tables.len() == long_len + short_len`, so `long_len` is in
+        // bounds (one past the long region = start of the short region).
+        unsafe { self.tables.as_ptr().add(self.long_len()) }
+    }
+
+    /// Base mut-pointer to the long table region.
+    #[inline(always)]
+    fn long_mut_ptr(&mut self) -> *mut u32 {
+        self.tables.as_mut_ptr()
+    }
+
+    /// Base mut-pointer to the short table region (offset past the long).
+    #[inline(always)]
+    fn short_mut_ptr(&mut self) -> *mut u32 {
+        let off = self.long_len();
+        // SAFETY: as `short_ptr`; `off == long_len` is in bounds.
+        unsafe { self.tables.as_mut_ptr().add(off) }
     }
 
     /// Set both hash table sizes from the per-level [`DfastConfig`]:
@@ -191,13 +248,12 @@ impl DfastMatchGenerator {
         let long_clamped = long_bits.max(min_bits);
         let short_clamped = short_bits.max(min_bits);
         let resized = self.long_hash_bits != long_clamped || self.short_hash_bits != short_clamped;
-        if self.long_hash_bits != long_clamped {
+        if resized {
             self.long_hash_bits = long_clamped;
-            self.long_hash = Vec::new();
-        }
-        if self.short_hash_bits != short_clamped {
             self.short_hash_bits = short_clamped;
-            self.short_hash = Vec::new();
+            // Drop the combined backing so `ensure_hash_tables` reallocates at
+            // the new (long_len + short_len).
+            self.tables = Vec::new();
         }
         if resized {
             // A table-size change makes the cached dict tables (sized to the old
@@ -270,8 +326,10 @@ impl DfastMatchGenerator {
                 };
             }
         };
-        shift_slots(&mut self.short_hash);
-        shift_slots(&mut self.long_hash);
+        let long_len = self.long_len();
+        let (long, short) = self.tables.split_at_mut(long_len);
+        shift_slots(long);
+        shift_slots(short);
         self.position_base += reducer as usize;
     }
 
@@ -281,7 +339,7 @@ impl DfastMatchGenerator {
         let u32_sz = core::mem::size_of::<u32>();
         self.window_blocks.capacity() * core::mem::size_of::<usize>()
             + self.history.capacity()
-            + (self.short_hash.capacity() + self.long_hash.capacity()) * u32_sz
+            + self.tables.capacity() * u32_sz
             + self
                 .dict
                 .table()
@@ -303,26 +361,65 @@ impl DfastMatchGenerator {
         // their (now sub-floor) absolute positions; `ensure_room_for` /
         // `reduce` keep the `u32` packing bounded as the cursor climbs.
         let next_floor = self.history_abs_start + (self.history.len() - self.history_start);
-        self.window_size = 0;
-        self.history.clear();
-        self.history_start = 0;
         self.offset_hist = [1, 4, 8];
-        if next_floor <= REBASE_RESET_FLOOR_CEILING {
-            // Fast path: advance the floor; tables keep their contents (a
-            // later `ensure_tables`/level change still reallocs them clean
-            // if the dimensions changed). The dict tables key off stable
-            // concat indices and are untouched here.
-            self.history_abs_start = next_floor;
+        // Re-borrow: an attach-mode reused dict frame keeps its bytes resident at
+        // the front of history (`[0, region)`) + the cached concat-keyed dict
+        // tables, so the per-frame dict re-commit (the dominant ~37% memmove on
+        // a profiled small dfast frame) is skipped — the frame compressor then
+        // skips `prime_with_dictionary`. The floor-advance still rejects the
+        // previous frame's INPUT (its abs falls below `next_floor`); the dict
+        // matches come from the separate dict tables, which bypass the floor.
+        // Gated on the dict being fully resident at `history_start == 0` and the
+        // floor-advance staying bounded.
+        let reborrow_region = if self.dict.is_primed()
+            && self.history_start == 0
+            && next_floor <= REBASE_RESET_FLOOR_CEILING
+        {
+            let r = self.dict.region_len();
+            (r > 0 && self.history.len() >= r).then_some(r)
         } else {
-            // Bounded fallback: rewind the cursor and zero the tables so
-            // `history_abs_start` cannot climb toward `usize::MAX` (keeps
-            // `check_stream_abs_headroom` satisfiable on 32-bit targets;
-            // fires ~once per 2 GiB cumulative input there).
-            self.history_abs_start = 0;
-            self.position_base = 0;
-            if !self.short_hash.is_empty() {
-                self.short_hash.fill(DFAST_EMPTY_SLOT);
-                self.long_hash.fill(DFAST_EMPTY_SLOT);
+            None
+        };
+        if let Some(region) = reborrow_region {
+            // Keep `[0, region)` (the dict); drop the previous frame's input.
+            self.history.truncate(region);
+            self.window_size = region;
+            self.window_blocks.clear();
+            self.window_blocks.push_back(region);
+            // Bump the eviction window by the dict size (clamped to
+            // MAX_PRIMED_WINDOW_SIZE) so the resident dict + the next input both
+            // stay — base is `1 << window_log` (<= 2^30 < the ceiling), so the
+            // headroom subtraction can't underflow and the sum can't overflow.
+            let headroom = crate::encoding::match_table::storage::MAX_PRIMED_WINDOW_SIZE
+                - self.max_window_size;
+            self.max_window_size += region.min(headroom);
+            self.history_abs_start = next_floor;
+            self.dict_resident = true;
+        } else {
+            self.window_size = 0;
+            self.history.clear();
+            self.history_start = 0;
+            // Non-reborrow reset starts with an empty window; clear the block
+            // ledger to match. (The reborrow branch above intentionally keeps a
+            // single `[region]` entry for the resident dict — see below.)
+            self.window_blocks.clear();
+            self.dict_resident = false;
+            if next_floor <= REBASE_RESET_FLOOR_CEILING {
+                // Fast path: advance the floor; tables keep their contents (a
+                // later `ensure_tables`/level change still reallocs them clean
+                // if the dimensions changed). The dict tables key off stable
+                // concat indices and are untouched here.
+                self.history_abs_start = next_floor;
+            } else {
+                // Bounded fallback: rewind the cursor and zero the tables so
+                // `history_abs_start` cannot climb toward `usize::MAX` (keeps
+                // `check_stream_abs_headroom` satisfiable on 32-bit targets;
+                // fires ~once per 2 GiB cumulative input there).
+                self.history_abs_start = 0;
+                self.position_base = 0;
+                if !self.tables.is_empty() {
+                    self.tables.fill(DFAST_EMPTY_SLOT);
+                }
             }
         }
         // No Vec<u8> blocks to recycle: `add_data` returns each input
@@ -332,7 +429,11 @@ impl DfastMatchGenerator {
         // signature does not take one (HC / Row do because they hold
         // per-block input Vecs internally; the dispatcher in
         // `match_generator.rs` resolves the per-backend shape).
-        self.window_blocks.clear();
+        // NOTE: `window_blocks` is cleared per-branch above (the reborrow branch
+        // keeps its `[region]` dict entry; the non-reborrow branch clears). It
+        // must NOT be cleared unconditionally here — doing so dropped the
+        // resident dict block while `window_size`/`history` still counted it,
+        // desyncing the ledger so the next eviction popped the wrong block.
         // Drop any borrowed window: the input slice it pointed at does not
         // outlive the frame, and the next frame re-stages its own (or runs
         // the owned path). A stale pointer must never survive a reset.
@@ -918,8 +1019,8 @@ impl DfastMatchGenerator {
         // Skipping the writes also removes a small amount of cache
         // dirtying on the tail boundary and keeps `probe_tail_ip0_only`
         // strictly cheaper than a full inner-loop iter.
-        let idxl0 = unsafe { *self.long_hash.as_ptr().add(hl0_idx) };
-        let idxs0 = unsafe { *self.short_hash.as_ptr().add(hs0_idx) };
+        let idxl0 = unsafe { *self.long_ptr().add(hl0_idx) };
+        let idxs0 = unsafe { *self.short_ptr().add(hs0_idx) };
 
         // Live tables only — no attached-dict probe here, by design. This
         // helper runs for exactly ONE position per block (the last hashable
@@ -1362,13 +1463,12 @@ impl DfastMatchGenerator {
         // Independent sizing per upstream zstd `clevels.h`: long-hash =
         // `hashLog`, short-hash = `chainLog`. Lazy allocation so
         // Fastest/Uncompressed never pay the dfast-level memory cost.
-        let long_len = 1usize << self.long_hash_bits;
-        let short_len = 1usize << self.short_hash_bits;
-        if self.long_hash.len() != long_len {
-            self.long_hash = alloc::vec![DFAST_EMPTY_SLOT; long_len];
-        }
-        if self.short_hash.len() != short_len {
-            self.short_hash = alloc::vec![DFAST_EMPTY_SLOT; short_len];
+        let total = self.long_len() + self.short_len();
+        if self.tables.len() != total {
+            // Single zeroed allocation for both regions (`vec![0; n]` lowers to
+            // `alloc_zeroed`). One buffer instead of two cuts the large-table
+            // allocator churn on fresh-per-frame compressors.
+            self.tables = alloc::vec![DFAST_EMPTY_SLOT; total];
         }
     }
 
@@ -1429,8 +1529,8 @@ impl DfastMatchGenerator {
         // stays valid across `ensure_room_for` (it never reallocs `history`).
         let short_hash_bits = self.short_hash_bits;
         let long_hash_bits = self.long_hash_bits;
-        let short_hash_ptr = self.short_hash.as_mut_ptr();
-        let long_hash_ptr = self.long_hash.as_mut_ptr();
+        let short_hash_ptr = self.short_mut_ptr();
+        let long_hash_ptr = self.long_mut_ptr();
         let short_shift = 64 - short_hash_bits;
         let long_shift = 64 - long_hash_bits;
 
@@ -1570,14 +1670,16 @@ impl DfastMatchGenerator {
         let concat = unsafe { core::slice::from_raw_parts(base_ptr.add(start_offset), concat_len) };
         if idx + 5 <= concat_len {
             let short = self.short_hash_index(&concat[idx..]);
-            debug_assert!(short < self.short_hash.len());
-            unsafe { *self.short_hash.get_unchecked_mut(short) = packed };
+            debug_assert!(short < self.short_len());
+            // Short region starts at `long_len`.
+            let slot = self.long_len() + short;
+            unsafe { *self.tables.get_unchecked_mut(slot) = packed };
         }
 
         if idx + 8 <= concat_len {
             let long = self.long_hash_index(&concat[idx..]);
-            debug_assert!(long < self.long_hash.len());
-            unsafe { *self.long_hash.get_unchecked_mut(long) = packed };
+            debug_assert!(long < self.long_len());
+            unsafe { *self.tables.get_unchecked_mut(long) = packed };
         }
     }
 
@@ -1870,8 +1972,8 @@ macro_rules! start_matching_fast_loop_body {
                 } else {
                     $self.owned_scan_descriptor()
                 };
-            let short_hash_ptr = $self.short_hash.as_mut_ptr();
-            let long_hash_ptr = $self.long_hash.as_mut_ptr();
+            let short_hash_ptr = $self.short_mut_ptr();
+            let long_hash_ptr = $self.long_mut_ptr();
 
             // Pre-compute long hash at ip0 ONCE per outer iter.
             // `concat_idx = ($current_abs_start + ip0) - history_abs_start`

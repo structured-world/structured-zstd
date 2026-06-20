@@ -37,6 +37,12 @@ pub struct StreamingEncoder<W: Write, M: Matcher = MatchGeneratorDriver> {
     /// the format's 128 KiB ceiling.
     target_block_size: Option<u32>,
     pledged_content_size: Option<u64>,
+    /// Advisory source-size hint from [`set_source_size_hint`](Self::set_source_size_hint).
+    /// Unlike `pledged_content_size` it carries no end-of-frame enforcement, but
+    /// it still feeds the small-input gates (matcher sizing AND the Fast HUF
+    /// fast-path gate) so `set_source_size_hint(small)` reduces work the same way
+    /// a pledge does. The HUF gate reads `pledged_content_size.or(source_size_hint)`.
+    source_size_hint: Option<u64>,
     /// Whether a pledged size is written into the header's
     /// `Frame_Content_Size` field (upstream `ZSTD_c_contentSizeFlag`).
     /// Pledge *enforcement* is independent of this flag — upstream
@@ -114,6 +120,10 @@ impl<W: Write> StreamingEncoder<W, MatchGeneratorDriver> {
         self.state.strategy_tag = self.strategy_override.unwrap_or_else(|| {
             crate::encoding::strategy::StrategyTag::for_compression_level(self.compression_level)
         });
+        self.state.huf_optimal_search = crate::encoding::frame_compressor::fast_huf_search_enabled(
+            self.state.strategy_tag,
+            self.pledged_content_size.or(self.source_size_hint),
+        );
         self.state.matcher.set_param_overrides(Some(overrides));
         Ok(())
     }
@@ -138,6 +148,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                 strategy_tag: crate::encoding::strategy::StrategyTag::for_compression_level(
                     compression_level,
                 ),
+                huf_optimal_search: true,
             },
             pending: Vec::new(),
             encoded_scratch: Vec::new(),
@@ -147,6 +158,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             frame_started: false,
             target_block_size: None,
             pledged_content_size: None,
+            source_size_hint: None,
             content_size_flag: true,
             bytes_consumed: 0,
             strategy_override: None,
@@ -276,6 +288,11 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             ));
         }
         self.state.matcher.set_source_size_hint(size);
+        // Feed the same hint to the Fast HUF fast-path gate (resolved in
+        // `set_parameters` / `ensure_frame_started` via
+        // `pledged_content_size.or(source_size_hint)`), so a small advisory size
+        // also lifts Fast streams off the expensive optimal-HUF search.
+        self.source_size_hint = Some(size);
         Ok(())
     }
 
@@ -557,6 +574,10 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         self.state.strategy_tag = self.strategy_override.unwrap_or_else(|| {
             crate::encoding::strategy::StrategyTag::for_compression_level(self.compression_level)
         });
+        self.state.huf_optimal_search = crate::encoding::frame_compressor::fast_huf_search_enabled(
+            self.state.strategy_tag,
+            self.pledged_content_size.or(self.source_size_hint),
+        );
         #[cfg(feature = "hash")]
         {
             self.hasher = XxHash64::with_seed(0);
