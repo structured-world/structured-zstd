@@ -1110,7 +1110,15 @@ fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> Le
             });
             p
         }
-        CompressionLevel::Default => LEVEL_TABLE[2],
+        CompressionLevel::Default => {
+            // Default == Level(DEFAULT_LEVEL); tier it the same way an explicit
+            // positive level is, so hinted default compression shrinks its
+            // table widths on small / medium frames instead of keeping the
+            // tier-0 row (the oversized-table page-fault pathology).
+            let mut p = LEVEL_TABLE[CompressionLevel::DEFAULT_LEVEL as usize - 1];
+            apply_cparams_tier(CompressionLevel::DEFAULT_LEVEL, source_size, &mut p);
+            p
+        }
         CompressionLevel::Better => LEVEL_TABLE[6],
         // Level 13: the first dominant point of the deep-lazy band. The
         // mls-wide row key lifted the shallow band's ratio enough that
@@ -1138,8 +1146,11 @@ fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> Le
                 apply_cparams_tier(n, source_size, &mut p);
                 p
             } else if n == 0 {
-                // Level 0 = default, matching C zstd semantics.
-                LEVEL_TABLE[CompressionLevel::DEFAULT_LEVEL as usize - 1]
+                // Level 0 = default, matching C zstd semantics. Tier it like the
+                // `Default` alias so `Level(0)` and `Default` stay identical.
+                let mut p = LEVEL_TABLE[CompressionLevel::DEFAULT_LEVEL as usize - 1];
+                apply_cparams_tier(CompressionLevel::DEFAULT_LEVEL, source_size, &mut p);
+                p
             } else {
                 // Negative levels — upstream zstd sets
                 // targetLength = -level (clampedCompressionLevel),
