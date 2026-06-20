@@ -737,9 +737,16 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
     // per-build heap alloc + zero is gone. `[..table_size]` keeps the live region
     // exactly as the old `vec![0u8; table_size]`.
     const MAX_FSE_TABLE_SIZE: usize = 1 << 9;
-    debug_assert!(
+    // Always-on (not debug_assert): the stack scratch is fixed at 512 bytes
+    // (accuracy_log <= 9). `to_encoder_table` already rejects acc_log > 9, but
+    // this function is `pub(crate)` — guard the scratch bound here too so a
+    // future caller can never index the buffer past its length (the `[..
+    // table_size]` slice would panic on the bound; this fires first with a clear
+    // message instead of an opaque slice-index panic).
+    assert!(
         table_size <= MAX_FSE_TABLE_SIZE,
-        "table_size {table_size} exceeds MAX_FSE_TABLE_SIZE"
+        "FSE table_size {table_size} exceeds the {MAX_FSE_TABLE_SIZE}-byte encoder \
+         scratch (accuracy_log must be <= 9)"
     );
     let mut table_symbol_buf = [0u8; MAX_FSE_TABLE_SIZE];
     let table_symbol = &mut table_symbol_buf[..table_size];

@@ -1247,6 +1247,12 @@ impl MatchTable {
         // compressor then SKIPs `prime_with_dictionary`. Only when the dict is
         // fully resident at concat `[0, region)` with no drain (`history_start
         // == 0`). Pinned at abs `[0, region)` (concat-keyed dms is abs-invariant).
+        //
+        // mls consistency: `dms.is_primed()` here is sufficient because the dms is
+        // keyed by `(region, layout, mls, hash_log)` and `configure()` invalidates
+        // it whenever `search_mls` changes (a level switch). So a primed dms is
+        // always one built with the CURRENT `search_mls`; the reborrow can never
+        // reuse a dms whose tables were built under a stale mls.
         let reborrow_region =
             if self.dictionary_active && self.dms.is_primed() && self.history_start == 0 {
                 self.dictionary_limit_abs
