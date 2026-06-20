@@ -672,17 +672,24 @@ pub(crate) fn source_size_ceil_log(size: u64) -> u8 {
 /// immutable table scanned in place via the borrowed dual-base kernel); a larger
 /// hint would COPY it into the live table.
 ///
-/// We set this to `31` (effectively "always attach"), diverging from upstream
-/// zstd's 8 KiB `ZSTD_shouldAttachDict` cutoff ON PURPOSE: upstream copy mode
-/// copies the small CDict TABLES into the cctx and still scans the input in
-/// place, but our flat-history copy path memmoves the whole INPUT into history
-/// every frame (profiled at 30% `__memmove` + 14% `__memset` on a reused 1 MiB
-/// dict encode). Attach mode scans the caller's input in place with the dict as
-/// a separate prefix base, so it is strictly faster for every frame size here
-/// (measured: 1 MiB dict frame 167 us -> 52 us, 0.42x of C; 10 KiB 20.4 us ->
-/// 4.4 us, 0.17x of C). The dual-base kernel carries `window_low`, so
-/// over-window inputs stay in-window and C-decodable. Per the
-/// drop-in-not-binary-parity contract, we make this match decision ourselves.
+/// We set this to `31` so every dictionary source up to 2 GiB attaches,
+/// diverging from upstream zstd's 8 KiB `ZSTD_shouldAttachDict` cutoff ON
+/// PURPOSE: upstream copy mode copies the small CDict TABLES into the cctx and
+/// still scans the input in place, but our flat-history copy path memmoves the
+/// whole INPUT into history every frame (profiled at 30% `__memmove` + 14%
+/// `__memset` on a reused 1 MiB dict encode). Attach mode scans the caller's
+/// input in place with the dict as a separate prefix base, so it is strictly
+/// faster for every frame size here (measured: 1 MiB dict frame 167 us -> 52 us,
+/// 0.42x of C; 10 KiB 20.4 us -> 4.4 us, 0.17x of C). The dual-base kernel
+/// carries `window_low`, so over-window inputs stay in-window and C-decodable.
+///
+/// `31` is also the largest bucket the borrowed kernel can attach: it stores
+/// virtual positions as `u32` (`cur_abs as u32`), so the maximum attached source
+/// `1 << 31` (plus the dict prefix) stays below `u32::MAX`; the next bucket `32`
+/// (4 GiB) would wrap that arithmetic. Sources past 2 GiB therefore fall back to
+/// copy mode — rare in practice, and the relative copy cost shrinks as the
+/// source grows. Per the drop-in-not-binary-parity contract, we make this match
+/// decision ourselves.
 /// Shared by `reset` (records the mode in the primed-snapshot key) and
 /// `prime_with_dictionary` (acts on it).
 pub(crate) const FAST_ATTACH_DICT_CUTOFF_LOG: u8 = 31;
@@ -6445,15 +6452,19 @@ impl HcMatchGenerator {
         // (srcSize > 256 KiB tier): btlazy2 L13-15 + btopt L16 are minMatch=5,
         // btopt L17 is minMatch=4, btultra/btultra2 are minMatch=3 (4-byte main
         // hash + the hash3 short-match probe).
-        // A `search_mls` change (e.g. btlazy2 -> lazy across a reused-compressor
-        // level switch) invalidates the cached dms: it was hashed at the old
-        // mls, but the reborrow fast path in `MatchTable::reset` reuses it on
-        // `dms.is_primed()` ALONE, without re-checking the (region, layout, mls,
-        // hash_log) key that `build_dms!` validates on the normal prime path.
-        // Drop the stale-mls dms here (configure runs before reset) so the next
-        // dict frame re-primes at the new mls instead of probing a mismatched
-        // dms and silently degrading match quality.
-        if self.table.search_mls != config.search_mls {
+        // The cached dms is keyed by the full (region, layout, mls, hash_log)
+        // shape that `build_dms!` validates on the normal prime path, but the
+        // reborrow fast path in `MatchTable::reset` reuses it on `dms.is_primed()`
+        // ALONE. A reused-compressor level switch can change the search mls (e.g.
+        // btlazy2 -> lazy) OR the table geometry (hash_log / chain_log / hash3,
+        // captured in `resize` above) independently of each other, and either
+        // leaves the dms hashed for a different shape. Invalidate on EITHER so the
+        // next dict frame re-primes at the new shape (configure runs before reset)
+        // instead of probing a mismatched dms and silently degrading match
+        // quality. Over-invalidation only costs a re-prime, which a real shape
+        // change needs anyway.
+        let mls_changed = self.table.search_mls != config.search_mls;
+        if resize || mls_changed {
             self.table.dms.invalidate();
         }
         self.table.search_mls = config.search_mls;
@@ -10395,6 +10406,28 @@ fn fast_dict_always_attaches_regardless_of_source_size_hint() {
              dict scan), never fall back to the copy-mode input-copy path"
         );
     }
+}
+
+#[test]
+fn fast_attach_cutoff_keeps_virtual_positions_within_u32() {
+    // The cutoff is 31, NOT the full u64 source-size range, because the borrowed
+    // dict kernel stores virtual positions as u32 (`cur_abs as u32`). The largest
+    // attached source `1 << CUTOFF` (plus the dict prefix) must stay below
+    // u32::MAX or that arithmetic wraps; the next bucket (4 GiB) would. This pins
+    // the bound so a future "just raise it to attach everything" change cannot
+    // silently reintroduce the overflow — raising the cutoff requires widening
+    // the kernel's position type first.
+    let max_attached: u64 = 1u64 << FAST_ATTACH_DICT_CUTOFF_LOG;
+    assert!(
+        max_attached <= u32::MAX as u64,
+        "the largest attached source 2^{FAST_ATTACH_DICT_CUTOFF_LOG} must fit u32 \
+         virtual positions",
+    );
+    assert!(
+        (1u64 << (FAST_ATTACH_DICT_CUTOFF_LOG + 1)) > u32::MAX as u64,
+        "the next bucket 2^{} would overflow u32 virtual positions",
+        FAST_ATTACH_DICT_CUTOFF_LOG + 1,
+    );
 }
 
 #[test]

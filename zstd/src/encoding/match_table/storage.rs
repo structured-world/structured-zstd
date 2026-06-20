@@ -1255,8 +1255,14 @@ impl MatchTable {
         // reuse a dms whose tables were built under a stale mls.
         let reborrow_region =
             if self.dictionary_active && self.dms.is_primed() && self.history_start == 0 {
+                // `checked_sub`, not `-`: after the dict chunk is evicted,
+                // `compact_history` can reset `history_start` to 0 while
+                // `history_abs_start` has already advanced PAST
+                // `dictionary_limit_abs`. The plain subtraction would underflow
+                // (panic under overflow checks) before the `r > 0` filter rejects
+                // the stale region; `checked_sub` -> `None` lets the filter run.
                 self.dictionary_limit_abs
-                    .map(|limit| limit - self.history_abs_start)
+                    .and_then(|limit| limit.checked_sub(self.history_abs_start))
                     .filter(|&r| r > 0 && r <= self.history.len())
             } else {
                 None

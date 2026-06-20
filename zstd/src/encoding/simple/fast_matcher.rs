@@ -1096,8 +1096,22 @@ impl FastKernelMatcher {
         // floor takes over (eviction also clears `loaded_dict_end`). Offsets
         // reaching the dict (bounded by `advertised_window + loaded_dict_end`)
         // stay decodable because the decoder loads the same dictionary.
+        // `loaded_dict_end` is set only for COPY-mode dicts; an ATTACHED
+        // (in-place) dict tracks its boundary via `dict.region_len()` instead. Use
+        // whichever mode is active so an owned attach-mode scan keeps the WHOLE
+        // dict reachable once the input fills the advertised window — mirrors the
+        // borrowed dict floor. Without it the `dpos >= window_low` gate rejects
+        // every attached-dict slot past `advertised_window`, silently dropping the
+        // dictionary for over-window owned frames.
+        let effective_dict_end = if self.loaded_dict_end != 0 {
+            self.loaded_dict_end
+        } else if self.dict.is_attached() {
+            self.dict.region_len()
+        } else {
+            0
+        };
         let dict_in_window =
-            self.loaded_dict_end != 0 && block_end <= advertised_window + self.loaded_dict_end;
+            effective_dict_end != 0 && block_end <= advertised_window + effective_dict_end;
         let window_low = if dict_in_window { 0 } else { windowed_low };
         // Sentinel-aware prefix for the hash-table filter — match_idx
         // == 0 (an uninitialized FastHashTable slot) must be rejected

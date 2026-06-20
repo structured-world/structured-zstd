@@ -1130,9 +1130,18 @@ pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
     let mut offset_2: u32 = rep[1];
 
     // Slot width for the dict table: `dict_lookup` hashes `ptr` to
-    // `dict_hash_log` bits and reads that slot, always in bounds (the table
-    // length is `1 << dict_hash_log`).
+    // `dict_hash_log + DICT_TAG_BITS` bits — the high `dict_hash_log` select the
+    // slot (table length `1 << dict_hash_log`), the low `DICT_TAG_BITS` are the
+    // collision tag. That hash is only well-defined while the total width fits 32
+    // bits, so guard it here (always-on, not debug_assert): these safe kernels
+    // accept any `FastHashTable::new` shape, and a `hash_log > 24` dict table
+    // would otherwise reach an out-of-range slot in release.
     let dict_hash_log = dict_table.hash_log();
+    assert!(
+        dict_hash_log + DICT_TAG_BITS <= 32,
+        "tagged Fast dict lookup requires dict hash_log <= {} (got {dict_hash_log})",
+        32 - DICT_TAG_BITS,
+    );
     // Hoist the main table's backing slice + hash_log + epoch bias into locals
     // so the hot loop's hash/get/put avoid re-reading the `Vec` header / the
     // `hash_log` / `bias` field through `&mut FastHashTable` on every access (the
@@ -1483,7 +1492,16 @@ fn compress_block_fast_dict_borrowed_impl<
     let mut offset_1: u32 = rep[0];
     let mut offset_2: u32 = rep[1];
 
+    // Same tagged-lookup width guard as the owned kernel: `dict_lookup` hashes to
+    // `dict_hash_log + DICT_TAG_BITS` bits, well-defined only while that fits 32
+    // bits. Always-on (not debug_assert) — a `hash_log > 24` dict table would
+    // reach an out-of-range slot in release otherwise.
     let dict_hash_log = dict_table.hash_log();
+    assert!(
+        dict_hash_log + DICT_TAG_BITS <= 32,
+        "tagged Fast dict lookup requires dict hash_log <= {} (got {dict_hash_log})",
+        32 - DICT_TAG_BITS,
+    );
     // Hoist the main table's backing slice + hash_log + epoch bias into locals so
     // the hot loop avoids re-reading the `Vec` header / `hash_log` / `bias`
     // through `&mut FastHashTable` on every access; bias is applied inline exactly
