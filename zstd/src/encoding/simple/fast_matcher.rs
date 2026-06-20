@@ -1824,10 +1824,21 @@ impl FastKernelMatcher {
         // position without the candidate load + `MEM_read32`; tagging does NOT
         // change the slot, so the last-wins nearest-occurrence guarantee holds.
         let dict_hash_log = dict_table.hash_log();
+        // The tagged hash is `hash_ptr_raw(.., dict_hash_log + DICT_TAG_BITS)`,
+        // well-defined only while that width fits 32 bits. Guard it here (always-on)
+        // before the unsafe fill, matching the kernel-side guards — a `hash_log > 24`
+        // dict table would otherwise hash past 32 bits and write a bogus slot.
+        assert!(
+            dict_hash_log + DICT_TAG_BITS <= 32,
+            "tagged Fast dict fill requires dict hash_log <= {} (got {dict_hash_log})",
+            32 - DICT_TAG_BITS,
+        );
         // Every slot packs the position into the `32 - DICT_TAG_BITS`-bit field
         // (16 MiB with an 8-bit tag). `last_hashable` bounds every position the
         // loop writes, so one check here covers the whole fill; a larger dict
-        // region would truncate the high position bits and alias offsets.
+        // region would truncate the high position bits and alias offsets. The
+        // driver routes dicts past `MAX_FAST_ATTACH_DICT_REGION` to copy mode, so
+        // in production this is a backstop the attach gate already upholds.
         assert!(
             last_hashable >> (32 - DICT_TAG_BITS) == 0,
             "dict region too large for the tagged fast-table position field \

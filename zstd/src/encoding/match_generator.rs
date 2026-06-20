@@ -694,6 +694,15 @@ pub(crate) fn source_size_ceil_log(size: u64) -> u8 {
 /// `prime_with_dictionary` (acts on it).
 pub(crate) const FAST_ATTACH_DICT_CUTOFF_LOG: u8 = 31;
 
+/// Largest dictionary region (bytes) the Fast attach path can index. The tagged
+/// dict table packs each position into `32 - DICT_TAG_BITS` (= 24) bits, so a
+/// region past `2^24` (16 MiB) would overflow the packed position. Dictionaries
+/// this large fall back to COPY mode, whose live table stores full `u32`
+/// positions and handles them. The size hint set on dict load equals the actual
+/// dict content length, so the attach-vs-copy decision (and the matching
+/// snapshot-key / epoch bits) can gate on it consistently at reset time.
+pub(crate) const MAX_FAST_ATTACH_DICT_REGION: usize = 1 << 24;
+
 /// Dfast counterpart of [`FAST_ATTACH_DICT_CUTOFF_LOG`]: upstream zstd
 /// `ZSTD_dictMatchState` attach cutoff for the double-fast strategy is 16 KiB
 /// (`2^14`), so small / unknown-size inputs ATTACH (separate immutable dict
@@ -1375,6 +1384,14 @@ pub struct MatchGeneratorDriver {
     // table, 4-cursor `compress_block_fast`). The primed-snapshot key is the
     // resolved shape ([`reset_shape`](Self::reset_shape)), not this bucket.
     reset_size_log: Option<u8>,
+    // Whether the loaded dictionary fits the Fast attach path's tagged position
+    // field (`<= MAX_FAST_ATTACH_DICT_REGION`). Captured at `reset` from the
+    // dict-size hint (which equals the actual dict length on load) so the Fast
+    // attach decision, the attach-epoch reset bit, and the primed-snapshot
+    // `fast_attach` bit all gate on it consistently. `true` when there is no
+    // dictionary (the attach path is then unused). A dict too large to tag falls
+    // back to copy mode instead of overflowing the packed position.
+    reset_dict_attach_ok: bool,
     // Hint-resolved matcher shape from the last `reset`: the [`LevelParams`], the
     // active backend's applied Dfast/Row hash-table width (`0` for HC/Fast), the
     // Fast attach-vs-copy mode, and the active LDM override (#27). Combined with
@@ -1548,6 +1565,7 @@ impl MatchGeneratorDriver {
             // resolved LevelParams.
             reported_window_size: next_pow2,
             reset_size_log: None,
+            reset_dict_attach_ok: true,
             reset_shape: None,
             dictionary_retained_budget: 0,
             source_size_hint: None,
@@ -1950,9 +1968,10 @@ impl MatchGeneratorDriver {
                 // matches/beats the upstream zstd on large corpora). The dispatch in
                 // `start_matching` keys off `dict_table.is_some()`, which only
                 // the attach path populates. See [`FAST_ATTACH_DICT_CUTOFF_LOG`].
-                let attach = self
-                    .reset_size_log
-                    .is_none_or(|log| log <= FAST_ATTACH_DICT_CUTOFF_LOG);
+                let attach = self.reset_dict_attach_ok
+                    && self
+                        .reset_size_log
+                        .is_none_or(|log| log <= FAST_ATTACH_DICT_CUTOFF_LOG);
                 if attach {
                     self.simple_mut().skip_matching_for_dict_prime();
                 } else {
@@ -2038,9 +2057,14 @@ impl Matcher for MatchGeneratorDriver {
     /// The Simple (Fast) backend samples its dict table precisely
     /// ([`FastKernelMatcher::block_samples_match_dict`]); the other backends
     /// (Dfast / Row / HashChain / BT) have their own dict structures and no cheap
-    /// probe here, so they answer CONSERVATIVELY `true` — keep the dict frame on
-    /// the scan, exactly the behaviour the old `!dict_active` full-disable gave
-    /// them. Only Fast trades that blanket scan for the precise probe.
+    /// probe here, so they answer CONSERVATIVELY `true`: without a probe they
+    /// cannot tell whether the dict compresses an incompressible-LOOKING block,
+    /// and answering `false` would let the raw-fast-path emit such a block raw
+    /// and miss an embedded dict segment. `dictionary_segment_in_incompressible_input_is_matched`
+    /// pins this for Dfast/Row/BT — the 512-byte dict run inside high-entropy
+    /// filler is matched only because these backends stay on the scan. So they
+    /// keep the blanket scan the old `!dict_active` gate gave them; only the
+    /// Simple/Fast backend trades it for the precise probe.
     fn block_samples_match_dict(&self, block: &[u8]) -> bool {
         match &self.storage {
             MatcherStorage::Simple(m) => m.block_samples_match_dict(block),
@@ -2075,6 +2099,11 @@ impl Matcher for MatchGeneratorDriver {
         // bucket rather than the raw bytes means two hints that resolve to the
         // same matcher shape share one snapshot instead of each re-priming.
         self.reset_size_log = hint.map(source_size_ceil_log);
+        // A dictionary too large for the tagged attach position field falls back
+        // to copy mode. Captured here (from the load-set size hint = actual dict
+        // length) so the prime decision and the snapshot-key / epoch bits agree.
+        self.reset_dict_attach_ok =
+            dict_hint.is_none_or(|size| size <= MAX_FAST_ATTACH_DICT_REGION);
         let hinted = hint.is_some();
         #[cfg_attr(not(test), allow(unused_mut))]
         let mut params = Self::level_params(level, hint);
@@ -2438,6 +2467,7 @@ impl Matcher for MatchGeneratorDriver {
                 // an epoch-advance reset would preserve stale attach state
                 // instead of clearing it.
                 let dict_attach_epoch = matches!(dict_hint, Some(size) if size > 0)
+                    && self.reset_dict_attach_ok
                     && self
                         .reset_size_log
                         .is_none_or(|log| log <= FAST_ATTACH_DICT_CUTOFF_LOG);
@@ -2646,6 +2676,7 @@ impl Matcher for MatchGeneratorDriver {
         // matches the decision `prime_with_dictionary` makes from the same
         // `reset_size_log`.
         let fast_attach = matches!(next_backend, super::strategy::BackendTag::Simple)
+            && self.reset_dict_attach_ok
             && self
                 .reset_size_log
                 .is_none_or(|log| log <= FAST_ATTACH_DICT_CUTOFF_LOG);
@@ -6430,6 +6461,9 @@ impl HcMatchGenerator {
         let resize = self.table.hash_log != config.hash_log
             || self.table.chain_log != config.chain_log
             || self.table.hash3_log != next_hash3_log;
+        // Capture the layout flip BEFORE `uses_bt` is overwritten below — it
+        // feeds the dms invalidation (the dms is keyed by layout too).
+        let uses_bt_changed = self.table.uses_bt != uses_bt;
         self.table.hash_log = config.hash_log;
         self.table.chain_log = config.chain_log;
         self.table.hash3_log = next_hash3_log;
@@ -6456,15 +6490,15 @@ impl HcMatchGenerator {
         // shape that `build_dms!` validates on the normal prime path, but the
         // reborrow fast path in `MatchTable::reset` reuses it on `dms.is_primed()`
         // ALONE. A reused-compressor level switch can change the search mls (e.g.
-        // btlazy2 -> lazy) OR the table geometry (hash_log / chain_log / hash3,
-        // captured in `resize` above) independently of each other, and either
-        // leaves the dms hashed for a different shape. Invalidate on EITHER so the
-        // next dict frame re-primes at the new shape (configure runs before reset)
-        // instead of probing a mismatched dms and silently degrading match
-        // quality. Over-invalidation only costs a re-prime, which a real shape
-        // change needs anyway.
+        // btlazy2 -> lazy), the table geometry (hash_log / chain_log / hash3,
+        // captured in `resize`), OR the HC<->BT layout (`uses_bt_changed`)
+        // independently of each other, and any of them leaves the dms hashed for
+        // a different shape. Invalidate on ANY so the next dict frame re-primes at
+        // the new shape (configure runs before reset) instead of probing a
+        // mismatched dms and silently degrading match quality. Over-invalidation
+        // only costs a re-prime, which a real shape change needs anyway.
         let mls_changed = self.table.search_mls != config.search_mls;
-        if resize || mls_changed {
+        if resize || mls_changed || uses_bt_changed {
             self.table.dms.invalidate();
         }
         self.table.search_mls = config.search_mls;
@@ -10427,6 +10461,50 @@ fn fast_attach_cutoff_keeps_virtual_positions_within_u32() {
         (1u64 << (FAST_ATTACH_DICT_CUTOFF_LOG + 1)) > u32::MAX as u64,
         "the next bucket 2^{} would overflow u32 virtual positions",
         FAST_ATTACH_DICT_CUTOFF_LOG + 1,
+    );
+}
+
+#[test]
+fn oversized_dict_hint_routes_fast_to_copy_mode() {
+    // A dict whose region exceeds the tagged attach position field
+    // (`MAX_FAST_ATTACH_DICT_REGION`, 16 MiB) must route the Fast prime to COPY
+    // mode instead of the tagged attach fill, which would overflow the packed
+    // position. The decision is keyed on the load-set size hint, so a hint past
+    // the limit suffices to exercise it without allocating a real 16 MiB dict.
+    // Copy mode leaves the borrowed in-place dict scan (attach-only) unavailable.
+    let mut driver = MatchGeneratorDriver::new(8, 1);
+    driver.set_dictionary_size_hint(MAX_FAST_ATTACH_DICT_REGION + 1);
+    driver.reset(CompressionLevel::Level(1));
+    driver.prime_with_dictionary(b"small dict content with some padding here", [1, 4, 8]);
+    assert!(
+        !driver.borrowed_dict_supported(),
+        "an oversized dict must use copy mode, not the tagged attach fill"
+    );
+}
+
+#[test]
+fn block_samples_match_dict_is_true_for_non_simple_backend() {
+    // Production fallback: a non-Simple backend (here Row, Level 6) has no dict
+    // probe, so the driver wrapper answers CONSERVATIVELY `true` for ANY block —
+    // keeping the dict frame on the scan rather than letting the raw-fast-path
+    // emit a block raw and miss an embedded dict segment (see
+    // `dictionary_segment_in_incompressible_input_is_matched`). Only the
+    // Simple/Fast backend trades the blanket scan for a precise probe.
+    let dict = b"the quick brown fox jumps over the lazy dog 0123456789abcdef";
+    let mut row = MatchGeneratorDriver::new(8, 6);
+    row.set_dictionary_size_hint(dict.len());
+    row.reset(CompressionLevel::Level(6));
+    row.prime_with_dictionary(dict, [1, 4, 8]);
+    assert!(
+        row.block_samples_match_dict(&dict[..32]),
+        "non-Simple backend must stay on the scan (true) for a dict frame"
+    );
+    let random: alloc::vec::Vec<u8> = (0..64u8)
+        .map(|i| i.wrapping_mul(37).wrapping_add(13))
+        .collect();
+    assert!(
+        row.block_samples_match_dict(&random),
+        "non-Simple backend reports true regardless of block content"
     );
 }
 
