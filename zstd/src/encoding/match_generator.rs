@@ -2656,6 +2656,25 @@ impl Matcher for MatchGeneratorDriver {
                 matcher.table.mark_dictionary_primed();
             }
         }
+        // Restore the retained-dictionary budget the per-frame `reset` cleared.
+        // The matcher's `reset` re-inflated `max_window_size` by the resident
+        // dict region (so the dict + next input both stay in the eviction band),
+        // exactly as `prime_with_dictionary` does — but the resident path skips
+        // that prime, so without this the driver-level budget stays 0 and
+        // `retire_dictionary_budget` never shrinks the inflated window as input
+        // evicts the dict. For HashChain (whose `window_low` is measured against
+        // `max_window_size`), a stuck-inflated window would let a post-eviction
+        // match exceed the frame header's base window and emit an over-window
+        // offset. The inflation equals `max_window_size - base`, and
+        // `reported_window_size` is the base `1 << window_log` set by `reset`.
+        let base = self.reported_window_size;
+        let inflated = match self.active_backend() {
+            super::strategy::BackendTag::Simple => self.simple_mut().max_window_size,
+            super::strategy::BackendTag::Dfast => self.dfast_matcher_mut().max_window_size,
+            super::strategy::BackendTag::Row => self.row_matcher_mut().max_window_size,
+            super::strategy::BackendTag::HashChain => self.hc_matcher_mut().table.max_window_size,
+        };
+        self.dictionary_retained_budget = inflated.saturating_sub(base);
     }
 
     fn prime_with_dictionary(&mut self, dict_content: &[u8], offset_hist: [u32; 3]) {
@@ -11408,6 +11427,54 @@ fn prime_with_dictionary_budget_shrinks_after_hc_eviction() {
         driver.hc_matcher().table.max_window_size,
         base_window,
         "retired dictionary budget must not remain reusable for live history"
+    );
+}
+
+#[test]
+fn resident_reapply_restores_retained_dictionary_budget() {
+    // A reused-dict frame that re-borrows the resident dictionary (skips the
+    // re-prime) must restore the retained-dict budget the per-frame `reset`
+    // cleared. The matcher's `reset` re-inflates `max_window_size` by the dict
+    // region; without the restore the driver-level budget stays 0 and
+    // `retire_dictionary_budget` never shrinks that inflated window as the dict
+    // evicts. For the HashChain backend (whose `window_low` is measured against
+    // `max_window_size`) that lets a post-eviction match exceed the frame
+    // header's base window and emit an over-window offset.
+    let mut driver = MatchGeneratorDriver::new(1 << 16, 1);
+    let dict = b"abcdefghABCDEFGHijklmnopqrstuvwxyz0123456789";
+    driver.set_dictionary_size_hint(dict.len());
+    driver.reset_on_hc_lazy(CompressionLevel::Better);
+    driver.prime_with_dictionary(dict, [1, 4, 8]);
+    let base = driver.reported_window_size;
+    assert!(
+        driver.dictionary_retained_budget > 0,
+        "the priming frame must retain a non-zero dict budget"
+    );
+
+    // Second frame: the reset detects the resident dict and re-borrows it.
+    driver.set_dictionary_size_hint(dict.len());
+    driver.reset_on_hc_lazy(CompressionLevel::Better);
+    assert!(
+        driver.dictionary_is_resident(),
+        "the second frame must re-borrow the resident dictionary"
+    );
+    assert_eq!(
+        driver.dictionary_retained_budget, 0,
+        "reset clears the retained-dict budget"
+    );
+    let inflated = driver.hc_matcher().table.max_window_size;
+    assert!(
+        inflated > base,
+        "reset re-inflates the window by the resident dict region \
+         (inflated={inflated}, base={base})"
+    );
+
+    driver.reapply_resident_dictionary([1, 4, 8]);
+    assert_eq!(
+        driver.dictionary_retained_budget,
+        inflated - base,
+        "resident reapply must restore the retained-dict budget (= window \
+         inflation) so the retire path can shrink the window as the dict evicts"
     );
 }
 

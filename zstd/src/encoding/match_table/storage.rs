@@ -1276,10 +1276,17 @@ impl MatchTable {
             // next frame's input both stay in the window — otherwise adding the
             // input drains the dict prefix and `history_abs_start` climbs off
             // it, turning every dms candidate into an out-of-range underflow.
-            // `self.max_window_size` is the un-bumped base `1 << window_log`
-            // (<= 2^30 < MAX_PRIMED_WINDOW_SIZE), so the headroom subtraction
-            // cannot underflow and the sum cannot overflow usize — no
-            // `saturating_*` needed.
+            //
+            // The driver re-establishes `self.max_window_size = 1 << window_log`
+            // (the un-bumped base) on EVERY reset, before this `reset` runs (see
+            // `MatchGeneratorDriver::reset`'s HashChain arm), so this `+=` yields
+            // `base + region` each frame, never an accumulating `base + N*region`.
+            // The driver also restores `dictionary_retained_budget = region` on
+            // the resident path (`reapply_resident_dictionary`) so the retire
+            // path shrinks this back to base as the dict evicts. The headroom
+            // subtraction is underflow-safe regardless of the pre-bump value: the
+            // `MAX_PRIMED_WINDOW_SIZE >= max_window_size` invariant always holds
+            // (every bump clamps to it), so `headroom >= 0` — no `saturating_*`.
             let headroom = MAX_PRIMED_WINDOW_SIZE - self.max_window_size;
             self.max_window_size += region.min(headroom);
             self.history_abs_start = 0;
