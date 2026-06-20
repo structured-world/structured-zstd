@@ -369,6 +369,77 @@ impl FastKernelMatcher {
         self.dict.is_attached()
     }
 
+    /// Cheap dict-relevance probe for the raw-fast-path. A high-entropy-LOOKING
+    /// block can still compress against an EXTERNAL dictionary: the block's own
+    /// content gives no hint (no internal repeat), so only probing the dict
+    /// table reveals it. Sample ~32 evenly-spread positions of `block`, hash
+    /// each into the attached dict table, and return `true` on the first 4-byte
+    /// dict match. The raw-fast-path uses this to keep a dict-matchable block off
+    /// the scan-skip (which would ignore the dictionary). Returns `false` when no
+    /// dict is attached or `block` is too short to hash — the no-dict path never
+    /// calls this, so its incompressibility verdict is unaffected.
+    pub(crate) fn block_samples_match_dict(&self, block: &[u8]) -> bool {
+        use super::fast_kernel::kernel::dict_lookup;
+        const HASH_READ_SIZE: usize = 8;
+        if !self.dict.is_attached() || block.len() < HASH_READ_SIZE {
+            return false;
+        }
+        let Some(dict_tab) = self.dict.table() else {
+            return false;
+        };
+        let dict_end = self.dict.region_len();
+        if dict_end > self.history.len() || dict_end < HASH_READ_SIZE {
+            return false;
+        }
+        let dict_bytes = &self.history[..dict_end];
+        let dhl = dict_tab.hash_log();
+        let mls = self.hash_table.mls();
+        let last = block.len() - HASH_READ_SIZE;
+        // ~32 evenly-spread probes (every position for tiny blocks); a dict that
+        // covers any sampled record trips on the first hit.
+        let step = (block.len() / 32).max(1);
+        let base = block.as_ptr();
+        let mut pos = 0;
+        while pos <= last {
+            // SAFETY: pos <= block.len() - 8 ⇒ `base.add(pos)` has ≥ 8 readable
+            // bytes, the context `dict_lookup`/`hash_ptr_raw` require.
+            let dpos = unsafe {
+                match mls {
+                    4 => dict_lookup::<4>(dict_tab, base.add(pos), dhl),
+                    5 => dict_lookup::<5>(dict_tab, base.add(pos), dhl),
+                    6 => dict_lookup::<6>(dict_tab, base.add(pos), dhl),
+                    7 => dict_lookup::<7>(dict_tab, base.add(pos), dhl),
+                    _ => dict_lookup::<8>(dict_tab, base.add(pos), dhl),
+                }
+            } as usize;
+            // `dpos >= 1` rejects the empty sentinel; verify a real 4-byte match
+            // before declaring the dict relevant, and EXTEND it: only a match
+            // long enough to be worth committing signals a dict that helps. A
+            // short (4-byte) coincidental hit — common when the dict was trained
+            // on data statistically like this block, yet contributes no net
+            // compression — must NOT force a scan, or an incompressible block
+            // with a self-trained dict pays a full wasted scan instead of the
+            // fast raw path. `USEFUL_DICT_MATCH` mirrors the magnitude at which a
+            // dict match starts paying for its (far) offset coding.
+            const USEFUL_DICT_MATCH: usize = 16;
+            if dpos >= 1
+                && dpos + 4 <= dict_end
+                && block[pos..pos + 4] == dict_bytes[dpos..dpos + 4]
+            {
+                let cap = (block.len() - pos).min(dict_end - dpos);
+                let mut len = 4;
+                while len < cap && block[pos + len] == dict_bytes[dpos + len] {
+                    len += 1;
+                }
+                if len >= USEFUL_DICT_MATCH {
+                    return true;
+                }
+            }
+            pos += step;
+        }
+        false
+    }
+
     /// Hash table `mls` (delegates to the inner table). Test-only
     /// crate helper for verifying driver wiring.
     #[cfg(test)]
@@ -1240,7 +1311,21 @@ impl FastKernelMatcher {
         // match the owned flat dict kernel: `window_low` is the absolute floor;
         // `prefix_start_index` the sentinel-aware floor (`>= 1`) for the
         // hash-slot filter. `virtual_len` was checked above.
-        let window_low = virtual_len.saturating_sub(advertised_window);
+        let windowed_low = virtual_len.saturating_sub(advertised_window);
+        // Upstream zstd `ZSTD_getLowestPrefixIndex` with `isDictionary`: while the
+        // dict (committed at virtual `[0, dict_end)`) is still within
+        // `maxDist + loadedDictEnd` of the block end, the floor is the DICT START
+        // (0), NOT the window-clamped `virtual_len - window`. `dict_end` is the
+        // loaded-dict-end here. Without this, a block over the Fast attach cutoff
+        // (now every Fast dict frame) computes `window_low = virtual_len - window`
+        // which lands at or above `dict_end`, so the kernel's `dpos >= window_low`
+        // gate rejects EVERY dict position and the dictionary is ignored for the
+        // whole block (the same prefix-floor bug the owned copy path fixed). Once
+        // the block grows past `window + dict_end` the dict has slid out of the
+        // window and the windowed floor takes over; offsets reaching the dict stay
+        // bounded by `window + dict_end`, so they remain decodable.
+        let dict_in_window = dict_end != 0 && virtual_len <= advertised_window + dict_end;
+        let window_low = if dict_in_window { 0 } else { windowed_low };
         let prefix_start_index = window_low.max(self.prefix_start_index as usize) as u32;
         let bounds = PrefixBounds {
             prefix_start_index,

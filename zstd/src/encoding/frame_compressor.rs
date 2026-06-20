@@ -1269,6 +1269,8 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             if self.content_checksum {
                 self.hasher.write(block);
             }
+            let dict_active =
+                self.dictionary.is_some() && self.state.matcher.supports_dictionary_priming();
             crate::encoding::levels::compress_block_encoded_borrowed(
                 &mut self.state,
                 self.compression_level,
@@ -1276,6 +1278,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 block,
                 start,
                 end,
+                dict_active,
                 out,
                 #[cfg(feature = "lsm")]
                 Some(&mut self.block_decompressed_sizes),
@@ -1605,8 +1608,14 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             // `hint > 2^k`, so this is identical to the raw `hint > cutoff` on
             // 64-bit.
             let cutoff_log = match self.state.strategy_tag {
-                crate::encoding::strategy::StrategyTag::Fast
-                | crate::encoding::strategy::StrategyTag::BtUltra
+                // Fast always attaches now (the copy-mode owned path memmoved the
+                // whole input into history every frame); keep the copy-snapshot
+                // gate in sync with the matcher's attach cutoff so Fast never
+                // captures/restores a copy snapshot it can no longer use.
+                crate::encoding::strategy::StrategyTag::Fast => {
+                    crate::encoding::match_generator::FAST_ATTACH_DICT_CUTOFF_LOG
+                }
+                crate::encoding::strategy::StrategyTag::BtUltra
                 | crate::encoding::strategy::StrategyTag::BtUltra2 => 13,
                 crate::encoding::strategy::StrategyTag::Dfast => 14,
                 crate::encoding::strategy::StrategyTag::Greedy

@@ -667,13 +667,25 @@ pub(crate) fn source_size_ceil_log(size: u64) -> u8 {
     }
 }
 
-/// Upstream zstd `ZSTD_shouldAttachDict` cutoff for the Fast strategy, as a ceil-log
-/// bucket: 8 KiB = `2^13`, and `bucket <= 13` is exactly `hint <= 8192` because
-/// the bucket is monotone in the hint. A hint at or below this (or unknown,
-/// `None`) ATTACHES the dictionary (a separate immutable table); a larger hint
-/// COPIES it into the live table. Shared by `reset` (which records the mode in
-/// the primed-snapshot key) and `prime_with_dictionary` (which acts on it).
-const FAST_ATTACH_DICT_CUTOFF_LOG: u8 = 13;
+/// Attach-vs-copy cutoff for the Fast strategy, as a ceil-log bucket: a hint at
+/// or below `2^this` (or unknown, `None`) ATTACHES the dictionary (a separate
+/// immutable table scanned in place via the borrowed dual-base kernel); a larger
+/// hint would COPY it into the live table.
+///
+/// We set this to `31` (effectively "always attach"), diverging from upstream
+/// zstd's 8 KiB `ZSTD_shouldAttachDict` cutoff ON PURPOSE: upstream copy mode
+/// copies the small CDict TABLES into the cctx and still scans the input in
+/// place, but our flat-history copy path memmoves the whole INPUT into history
+/// every frame (profiled at 30% `__memmove` + 14% `__memset` on a reused 1 MiB
+/// dict encode). Attach mode scans the caller's input in place with the dict as
+/// a separate prefix base, so it is strictly faster for every frame size here
+/// (measured: 1 MiB dict frame 167 us -> 52 us, 0.42x of C; 10 KiB 20.4 us ->
+/// 4.4 us, 0.17x of C). The dual-base kernel carries `window_low`, so
+/// over-window inputs stay in-window and C-decodable. Per the
+/// drop-in-not-binary-parity contract, we make this match decision ourselves.
+/// Shared by `reset` (records the mode in the primed-snapshot key) and
+/// `prime_with_dictionary` (acts on it).
+pub(crate) const FAST_ATTACH_DICT_CUTOFF_LOG: u8 = 31;
 
 /// Dfast counterpart of [`FAST_ATTACH_DICT_CUTOFF_LOG`]: upstream zstd
 /// `ZSTD_dictMatchState` attach cutoff for the double-fast strategy is 16 KiB
@@ -2011,6 +2023,22 @@ impl Matcher for MatchGeneratorDriver {
 
     fn set_dictionary_size_hint(&mut self, size: usize) {
         self.dictionary_size_hint = Some(size);
+    }
+
+    /// Dict-relevance gate for the raw-fast-path. Reached only when a dictionary
+    /// is active (the caller short-circuits on `dict_active`), so this answers
+    /// "could the dict compress this otherwise-incompressible-looking block?".
+    /// The Simple (Fast) backend samples its dict table precisely
+    /// ([`FastKernelMatcher::block_samples_match_dict`]); the other backends
+    /// (Dfast / Row / HashChain / BT) have their own dict structures and no cheap
+    /// probe here, so they answer CONSERVATIVELY `true` — keep the dict frame on
+    /// the scan, exactly the behaviour the old `!dict_active` full-disable gave
+    /// them. Only Fast trades that blanket scan for the precise probe.
+    fn block_samples_match_dict(&self, block: &[u8]) -> bool {
+        match &self.storage {
+            MatcherStorage::Simple(m) => m.block_samples_match_dict(block),
+            _ => true,
+        }
     }
 
     /// Heap bytes this driver owns: the active backend's tables/history, the
@@ -10346,35 +10374,27 @@ fn primed_snapshot_restored_across_level22_tier_hints() {
 }
 
 #[test]
-fn primed_snapshot_not_restored_across_fast_attach_copy_boundary() {
-    // The Fast attach-vs-copy cutoff (8 KiB) falls INSIDE a single resolved
-    // matcher shape: a 8192-byte and a 8193-byte hint both clamp Level 1 to
-    // window_log 14 and the same Fast table widths, so `LevelParams` +
-    // `table_bits` are identical, yet 8192 attaches (separate dict table) while
-    // 8193 copies (dict primed into the live table). The snapshot key must
-    // therefore carry the attach/copy mode itself; without it the two resets
-    // would share a key and a copy-mode snapshot could be restored into an
-    // attach-mode reset (a different `storage` shape). Restore must REFUSE
-    // across the boundary.
-    let mut driver = MatchGeneratorDriver::new(8, 1);
+fn fast_dict_always_attaches_regardless_of_source_size_hint() {
+    // Fast no longer has an attach-vs-copy boundary: every Fast dict frame
+    // attaches (the copy-mode owned path memmoved the whole input into history
+    // each frame; attach scans the input in place via the borrowed dual-base
+    // kernel). So a large hint that used to cross into copy mode (8193 B,
+    // formerly > the 8 KiB cutoff) and a small one (8192 B) BOTH resolve to
+    // attach, and the Simple backend reports a borrowed (in-place) dict scan for
+    // both. This is the regression guard for `FAST_ATTACH_DICT_CUTOFF_LOG`
+    // staying high enough that no Fast hint falls back to the input-copy path.
     let level = CompressionLevel::Level(1);
-
-    // Copy side (hint > 8 KiB): prime + capture.
-    driver.set_source_size_hint(8193);
-    driver.reset(level);
-    driver.prime_with_dictionary(b"abcdefghABCDEFGHijklmnop", [1, 4, 8]);
-    driver.capture_primed_dictionary(level);
-
-    // Attach side (hint <= 8 KiB), same resolved window/table shape.
-    driver.set_source_size_hint(8192);
-    driver.reset(level);
-    let restored = driver.restore_primed_dictionary(level);
-    assert!(
-        !restored,
-        "a copy-mode snapshot (8193 B hint) must NOT be restored into an \
-         attach-mode reset (8192 B hint) that resolves to the same params but a \
-         different dict-table shape"
-    );
+    for hint in [8192u64, 8193, 1 << 20] {
+        let mut driver = MatchGeneratorDriver::new(8, 1);
+        driver.set_source_size_hint(hint);
+        driver.reset(level);
+        driver.prime_with_dictionary(b"abcdefghABCDEFGHijklmnop", [1, 4, 8]);
+        assert!(
+            driver.borrowed_dict_supported(),
+            "Fast dict frame with hint {hint} must attach (borrowed in-place \
+             dict scan), never fall back to the copy-mode input-copy path"
+        );
+    }
 }
 
 #[test]

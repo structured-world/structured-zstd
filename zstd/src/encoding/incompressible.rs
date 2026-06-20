@@ -160,6 +160,23 @@ pub(crate) fn block_looks_incompressible(block: &[u8]) -> bool {
     sample_looks_incompressible(block)
 }
 
+/// Dict-aware incompressibility check: stricter than the plain no-dict
+/// heuristic. With a dictionary attached, a block that LOOKS high-entropy in a
+/// small fixed sample can still compress — either against the dict, or via a
+/// long-range internal repeat the capped sample never spans. So sample the WHOLE
+/// block, which surfaces those repeats; only blocks that stay high-entropy
+/// across their full length are skipped to raw. Truly random data is still
+/// classified incompressible (no repeats anywhere), so the no-dict-quality
+/// rejection of incompressible input is preserved — it is only harder to trip on
+/// the dict path, never weaker.
+#[inline]
+pub(crate) fn block_looks_incompressible_dict(block: &[u8]) -> bool {
+    if block.len() < RAW_FAST_PATH_MIN_BLOCK_LEN {
+        return false;
+    }
+    sample_looks_incompressible_capped(block, block.len())
+}
+
 #[inline]
 pub(crate) fn block_looks_incompressible_strict(block: &[u8]) -> bool {
     if block.len() < RAW_FAST_PATH_MIN_BLOCK_LEN {
@@ -194,7 +211,18 @@ pub(crate) fn block_looks_incompressible_strict(block: &[u8]) -> bool {
 
 #[inline]
 fn sample_looks_incompressible(block: &[u8]) -> bool {
-    let sample_len = block.len().min(RAW_FAST_PATH_MAX_SAMPLE_LEN);
+    sample_looks_incompressible_capped(block, RAW_FAST_PATH_MAX_SAMPLE_LEN)
+}
+
+/// As [`sample_looks_incompressible`] but with an explicit sample cap. A larger
+/// cap scans more of the block, so it detects LONG-RANGE repeats (a region that
+/// re-occurs far away — e.g. a record drawn from a dictionary, or a block whose
+/// second half repeats its first) that the small fixed sample misses by only
+/// looking at disjoint head/mid/tail windows. Used by the dict-aware check,
+/// which samples the whole block: a high-entropy-LOOKING block that actually
+/// repeats (and so will compress, dict or not) must not be skipped to raw.
+fn sample_looks_incompressible_capped(block: &[u8], max_sample_len: usize) -> bool {
+    let sample_len = block.len().min(max_sample_len);
     if sample_len < RAW_FAST_PATH_MIN_SAMPLE_LEN {
         return false;
     }

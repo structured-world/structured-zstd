@@ -459,6 +459,14 @@ pub trait Matcher {
     fn supports_dictionary_priming(&self) -> bool {
         false
     }
+    /// Whether a sample of `block` hashes to a match in an attached dictionary.
+    /// The raw-fast-path uses this to avoid skipping the scan on a block that
+    /// looks incompressible but compresses against the dictionary (an external
+    /// match the block's own content cannot reveal). Defaults to `false` for
+    /// custom matchers (and the no-dict case), leaving the content-only verdict.
+    fn block_samples_match_dict(&self, _block: &[u8]) -> bool {
+        false
+    }
     /// Heap bytes this matcher's allocations hold (tables, history, scratch),
     /// excluding the inline struct itself. Lets a context report its true
     /// footprint via `ZSTD_sizeof_CCtx`. Defaults to `0` for custom matchers.
