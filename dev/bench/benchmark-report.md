@@ -152,163 +152,163 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 
 | Scenario | Label | Level | Dict bytes | Train ms | C bytes (no dict) | C bytes (with dict) | C ratio (no dict) | C ratio (with dict) |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| decodecorpus-z000033 | Repo decode corpus sample | level_16_btopt | 16384 | 67.417 | 460806 | 420487 | 0.4509 | 0.4114 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_17_btopt | 16384 | 67.417 | 444757 | 420480 | 0.4352 | 0.4114 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_1_fast_ldm_dict | 16384 | 67.417 | 571193 | 550048 | 0.5589 | 0.5382 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_22_btultra2_ldm_dict | 16384 | 67.417 | 426278 | 420424 | 0.4171 | 0.4114 |
-| small-10k-random | Small random payload (10 KiB) | level_16_btopt | 1280 | 9.869 | 10250 | 9245 | 1.0010 | 0.9028 |
-| small-10k-random | Small random payload (10 KiB) | level_17_btopt | 1280 | 9.869 | 10250 | 9245 | 1.0010 | 0.9028 |
-| small-10k-random | Small random payload (10 KiB) | level_1_fast_ldm_dict | 1280 | 9.869 | 10250 | 9238 | 1.0010 | 0.9021 |
-| small-10k-random | Small random payload (10 KiB) | level_22_btultra2_ldm_dict | 1280 | 9.869 | 10250 | 9245 | 1.0010 | 0.9028 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_16_btopt | 437 | 2.404 | 146 | 47 | 0.0356 | 0.0115 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_17_btopt | 437 | 2.404 | 146 | 44 | 0.0356 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_1_fast_ldm_dict | 437 | 2.404 | 150 | 44 | 0.0366 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_22_btultra2_ldm_dict | 437 | 2.404 | 146 | 44 | 0.0356 | 0.0107 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_16_btopt | 16384 | 83.301 | 460806 | 420487 | 0.4509 | 0.4114 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_17_btopt | 16384 | 83.301 | 444757 | 420480 | 0.4352 | 0.4114 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_1_fast_ldm_dict | 16384 | 83.301 | 571193 | 550048 | 0.5589 | 0.5382 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_22_btultra2_ldm_dict | 16384 | 83.301 | 426278 | 420424 | 0.4171 | 0.4114 |
+| small-10k-random | Small random payload (10 KiB) | level_16_btopt | 1280 | 10.582 | 10250 | 9245 | 1.0010 | 0.9028 |
+| small-10k-random | Small random payload (10 KiB) | level_17_btopt | 1280 | 10.582 | 10250 | 9245 | 1.0010 | 0.9028 |
+| small-10k-random | Small random payload (10 KiB) | level_1_fast_ldm_dict | 1280 | 10.582 | 10250 | 9238 | 1.0010 | 0.9021 |
+| small-10k-random | Small random payload (10 KiB) | level_22_btultra2_ldm_dict | 1280 | 10.582 | 10250 | 9245 | 1.0010 | 0.9028 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_16_btopt | 437 | 2.206 | 146 | 47 | 0.0356 | 0.0115 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_17_btopt | 437 | 2.206 | 146 | 44 | 0.0356 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_1_fast_ldm_dict | 437 | 2.206 | 150 | 44 | 0.0366 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_22_btultra2_ldm_dict | 437 | 2.206 | 146 | 44 | 0.0356 | 0.0107 |
 
 ## Dictionary Training (Rust FastCOVER vs C FFI)
 
 | Scenario | Label | Dict bytes (requested) | Rust train ms | C train ms | Rust dict bytes | C dict bytes | Rust FastCOVER score | Delta (C/Rust) | Status |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| decodecorpus-z000033 | Repo decode corpus sample | 16384 | 21.265 | 67.417 | 16384 | 16384 | 0 | 3.1703 | rust_faster |
-| small-10k-random | Small random payload (10 KiB) | 1280 | 2.721 | 9.869 | 1280 | 1280 | 0 | 3.6270 | rust_faster |
-| small-4k-log-lines | Small structured log lines (4 KiB) | 512 | 1.341 | 2.404 | 512 | 437 | 0 | 1.7927 | rust_faster |
+| decodecorpus-z000033 | Repo decode corpus sample | 16384 | 22.816 | 83.301 | 16384 | 16384 | 0 | 3.6510 | rust_faster |
+| small-10k-random | Small random payload (10 KiB) | 1280 | 2.596 | 10.582 | 1280 | 1280 | 0 | 4.0763 | rust_faster |
+| small-4k-log-lines | Small structured log lines (4 KiB) | 512 | 1.083 | 2.206 | 512 | 437 | 0 | 2.0369 | rust_faster |
 
 ## Timing Metrics
 
 | Benchmark | ms/iter |
 | --- | ---: |
-| `compress-dict/level_16_btopt/decodecorpus-z000033/matrix/c_ffi_with_dict` | 151.725 |
-| `compress-dict/level_16_btopt/decodecorpus-z000033/matrix/c_ffi_without_dict` | 93.155 |
-| `compress-dict/level_16_btopt/decodecorpus-z000033/matrix/pure_rust_with_dict` | 146.424 |
-| `compress-dict/level_16_btopt/small-10k-random/matrix/c_ffi_with_dict` | 0.452 |
-| `compress-dict/level_16_btopt/small-10k-random/matrix/c_ffi_without_dict` | 0.618 |
-| `compress-dict/level_16_btopt/small-10k-random/matrix/pure_rust_with_dict` | 1.122 |
-| `compress-dict/level_16_btopt/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.034 |
-| `compress-dict/level_16_btopt/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.048 |
-| `compress-dict/level_16_btopt/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.016 |
-| `compress-dict/level_17_btopt/decodecorpus-z000033/matrix/c_ffi_with_dict` | 157.670 |
-| `compress-dict/level_17_btopt/decodecorpus-z000033/matrix/c_ffi_without_dict` | 107.574 |
-| `compress-dict/level_17_btopt/decodecorpus-z000033/matrix/pure_rust_with_dict` | 156.989 |
-| `compress-dict/level_17_btopt/small-10k-random/matrix/c_ffi_with_dict` | 0.558 |
-| `compress-dict/level_17_btopt/small-10k-random/matrix/c_ffi_without_dict` | 0.615 |
-| `compress-dict/level_17_btopt/small-10k-random/matrix/pure_rust_with_dict` | 1.089 |
-| `compress-dict/level_17_btopt/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.086 |
-| `compress-dict/level_17_btopt/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.109 |
+| `compress-dict/level_16_btopt/decodecorpus-z000033/matrix/c_ffi_with_dict` | 163.049 |
+| `compress-dict/level_16_btopt/decodecorpus-z000033/matrix/c_ffi_without_dict` | 76.102 |
+| `compress-dict/level_16_btopt/decodecorpus-z000033/matrix/pure_rust_with_dict` | 149.847 |
+| `compress-dict/level_16_btopt/small-10k-random/matrix/c_ffi_with_dict` | 0.438 |
+| `compress-dict/level_16_btopt/small-10k-random/matrix/c_ffi_without_dict` | 0.688 |
+| `compress-dict/level_16_btopt/small-10k-random/matrix/pure_rust_with_dict` | 1.231 |
+| `compress-dict/level_16_btopt/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.040 |
+| `compress-dict/level_16_btopt/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.052 |
+| `compress-dict/level_16_btopt/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.017 |
+| `compress-dict/level_17_btopt/decodecorpus-z000033/matrix/c_ffi_with_dict` | 170.829 |
+| `compress-dict/level_17_btopt/decodecorpus-z000033/matrix/c_ffi_without_dict` | 92.113 |
+| `compress-dict/level_17_btopt/decodecorpus-z000033/matrix/pure_rust_with_dict` | 158.046 |
+| `compress-dict/level_17_btopt/small-10k-random/matrix/c_ffi_with_dict` | 0.569 |
+| `compress-dict/level_17_btopt/small-10k-random/matrix/c_ffi_without_dict` | 0.682 |
+| `compress-dict/level_17_btopt/small-10k-random/matrix/pure_rust_with_dict` | 1.192 |
+| `compress-dict/level_17_btopt/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.111 |
+| `compress-dict/level_17_btopt/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.133 |
 | `compress-dict/level_17_btopt/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.016 |
-| `compress-dict/level_1_fast_ldm_dict/decodecorpus-z000033/matrix/c_ffi_with_dict` | 7.321 |
-| `compress-dict/level_1_fast_ldm_dict/decodecorpus-z000033/matrix/c_ffi_without_dict` | 6.796 |
-| `compress-dict/level_1_fast_ldm_dict/decodecorpus-z000033/matrix/pure_rust_with_dict` | 6.923 |
-| `compress-dict/level_1_fast_ldm_dict/small-10k-random/matrix/c_ffi_with_dict` | 0.047 |
-| `compress-dict/level_1_fast_ldm_dict/small-10k-random/matrix/c_ffi_without_dict` | 0.031 |
-| `compress-dict/level_1_fast_ldm_dict/small-10k-random/matrix/pure_rust_with_dict` | 0.062 |
-| `compress-dict/level_1_fast_ldm_dict/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.010 |
-| `compress-dict/level_1_fast_ldm_dict/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.015 |
+| `compress-dict/level_1_fast_ldm_dict/decodecorpus-z000033/matrix/c_ffi_with_dict` | 8.084 |
+| `compress-dict/level_1_fast_ldm_dict/decodecorpus-z000033/matrix/c_ffi_without_dict` | 7.512 |
+| `compress-dict/level_1_fast_ldm_dict/decodecorpus-z000033/matrix/pure_rust_with_dict` | 7.489 |
+| `compress-dict/level_1_fast_ldm_dict/small-10k-random/matrix/c_ffi_with_dict` | 0.052 |
+| `compress-dict/level_1_fast_ldm_dict/small-10k-random/matrix/c_ffi_without_dict` | 0.035 |
+| `compress-dict/level_1_fast_ldm_dict/small-10k-random/matrix/pure_rust_with_dict` | 0.068 |
+| `compress-dict/level_1_fast_ldm_dict/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.012 |
+| `compress-dict/level_1_fast_ldm_dict/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.018 |
 | `compress-dict/level_1_fast_ldm_dict/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.002 |
-| `compress-dict/level_22_btultra2_ldm_dict/decodecorpus-z000033/matrix/c_ffi_with_dict` | 236.358 |
-| `compress-dict/level_22_btultra2_ldm_dict/decodecorpus-z000033/matrix/c_ffi_without_dict` | 283.089 |
-| `compress-dict/level_22_btultra2_ldm_dict/decodecorpus-z000033/matrix/pure_rust_with_dict` | 253.265 |
-| `compress-dict/level_22_btultra2_ldm_dict/small-10k-random/matrix/c_ffi_with_dict` | 0.704 |
-| `compress-dict/level_22_btultra2_ldm_dict/small-10k-random/matrix/c_ffi_without_dict` | 0.762 |
-| `compress-dict/level_22_btultra2_ldm_dict/small-10k-random/matrix/pure_rust_with_dict` | 1.445 |
-| `compress-dict/level_22_btultra2_ldm_dict/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.097 |
-| `compress-dict/level_22_btultra2_ldm_dict/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.121 |
-| `compress-dict/level_22_btultra2_ldm_dict/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.040 |
-| `compress/level_16_btopt/decodecorpus-z000033/matrix/c_ffi` | 95.790 |
-| `compress/level_16_btopt/decodecorpus-z000033/matrix/pure_rust` | 153.163 |
-| `compress/level_16_btopt/high-entropy-1m/matrix/c_ffi` | 45.552 |
-| `compress/level_16_btopt/high-entropy-1m/matrix/pure_rust` | 6.355 |
-| `compress/level_16_btopt/large-log-stream/matrix/c_ffi` | 37.229 |
-| `compress/level_16_btopt/large-log-stream/matrix/pure_rust` | 31.107 |
-| `compress/level_16_btopt/low-entropy-1m/matrix/c_ffi` | 3.587 |
-| `compress/level_16_btopt/low-entropy-1m/matrix/pure_rust` | 3.969 |
-| `compress/level_16_btopt/small-10k-random/matrix/c_ffi` | 0.625 |
-| `compress/level_16_btopt/small-10k-random/matrix/pure_rust` | 0.035 |
-| `compress/level_16_btopt/small-1k-random/matrix/c_ffi` | 0.046 |
-| `compress/level_16_btopt/small-1k-random/matrix/pure_rust` | 0.005 |
-| `compress/level_16_btopt/small-4k-log-lines/matrix/c_ffi` | 0.049 |
-| `compress/level_16_btopt/small-4k-log-lines/matrix/pure_rust` | 0.043 |
-| `compress/level_17_btopt/decodecorpus-z000033/matrix/c_ffi` | 115.892 |
-| `compress/level_17_btopt/decodecorpus-z000033/matrix/pure_rust` | 168.044 |
-| `compress/level_17_btopt/high-entropy-1m/matrix/c_ffi` | 48.168 |
-| `compress/level_17_btopt/high-entropy-1m/matrix/pure_rust` | 5.613 |
-| `compress/level_17_btopt/large-log-stream/matrix/c_ffi` | 39.909 |
-| `compress/level_17_btopt/large-log-stream/matrix/pure_rust` | 34.092 |
-| `compress/level_17_btopt/low-entropy-1m/matrix/c_ffi` | 3.714 |
-| `compress/level_17_btopt/low-entropy-1m/matrix/pure_rust` | 3.953 |
-| `compress/level_17_btopt/small-10k-random/matrix/c_ffi` | 0.626 |
-| `compress/level_17_btopt/small-10k-random/matrix/pure_rust` | 0.031 |
-| `compress/level_17_btopt/small-1k-random/matrix/c_ffi` | 0.046 |
+| `compress-dict/level_22_btultra2_ldm_dict/decodecorpus-z000033/matrix/c_ffi_with_dict` | 268.861 |
+| `compress-dict/level_22_btultra2_ldm_dict/decodecorpus-z000033/matrix/c_ffi_without_dict` | 372.639 |
+| `compress-dict/level_22_btultra2_ldm_dict/decodecorpus-z000033/matrix/pure_rust_with_dict` | 254.552 |
+| `compress-dict/level_22_btultra2_ldm_dict/small-10k-random/matrix/c_ffi_with_dict` | 0.741 |
+| `compress-dict/level_22_btultra2_ldm_dict/small-10k-random/matrix/c_ffi_without_dict` | 0.857 |
+| `compress-dict/level_22_btultra2_ldm_dict/small-10k-random/matrix/pure_rust_with_dict` | 1.543 |
+| `compress-dict/level_22_btultra2_ldm_dict/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.123 |
+| `compress-dict/level_22_btultra2_ldm_dict/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.145 |
+| `compress-dict/level_22_btultra2_ldm_dict/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.043 |
+| `compress/level_16_btopt/decodecorpus-z000033/matrix/c_ffi` | 91.941 |
+| `compress/level_16_btopt/decodecorpus-z000033/matrix/pure_rust` | 143.015 |
+| `compress/level_16_btopt/high-entropy-1m/matrix/c_ffi` | 34.084 |
+| `compress/level_16_btopt/high-entropy-1m/matrix/pure_rust` | 6.422 |
+| `compress/level_16_btopt/large-log-stream/matrix/c_ffi` | 25.851 |
+| `compress/level_16_btopt/large-log-stream/matrix/pure_rust` | 22.388 |
+| `compress/level_16_btopt/low-entropy-1m/matrix/c_ffi` | 2.731 |
+| `compress/level_16_btopt/low-entropy-1m/matrix/pure_rust` | 4.066 |
+| `compress/level_16_btopt/small-10k-random/matrix/c_ffi` | 0.691 |
+| `compress/level_16_btopt/small-10k-random/matrix/pure_rust` | 0.041 |
+| `compress/level_16_btopt/small-1k-random/matrix/c_ffi` | 0.051 |
+| `compress/level_16_btopt/small-1k-random/matrix/pure_rust` | 0.006 |
+| `compress/level_16_btopt/small-4k-log-lines/matrix/c_ffi` | 0.054 |
+| `compress/level_16_btopt/small-4k-log-lines/matrix/pure_rust` | 0.042 |
+| `compress/level_17_btopt/decodecorpus-z000033/matrix/c_ffi` | 99.792 |
+| `compress/level_17_btopt/decodecorpus-z000033/matrix/pure_rust` | 153.794 |
+| `compress/level_17_btopt/high-entropy-1m/matrix/c_ffi` | 31.079 |
+| `compress/level_17_btopt/high-entropy-1m/matrix/pure_rust` | 5.644 |
+| `compress/level_17_btopt/large-log-stream/matrix/c_ffi` | 27.309 |
+| `compress/level_17_btopt/large-log-stream/matrix/pure_rust` | 24.483 |
+| `compress/level_17_btopt/low-entropy-1m/matrix/c_ffi` | 2.509 |
+| `compress/level_17_btopt/low-entropy-1m/matrix/pure_rust` | 3.973 |
+| `compress/level_17_btopt/small-10k-random/matrix/c_ffi` | 0.690 |
+| `compress/level_17_btopt/small-10k-random/matrix/pure_rust` | 0.033 |
+| `compress/level_17_btopt/small-1k-random/matrix/c_ffi` | 0.050 |
 | `compress/level_17_btopt/small-1k-random/matrix/pure_rust` | 0.005 |
-| `compress/level_17_btopt/small-4k-log-lines/matrix/c_ffi` | 0.111 |
-| `compress/level_17_btopt/small-4k-log-lines/matrix/pure_rust` | 0.045 |
-| `compress/level_1_fast_ldm/decodecorpus-z000033/matrix/c_ffi` | 6.990 |
-| `compress/level_1_fast_ldm/decodecorpus-z000033/matrix/pure_rust` | 6.589 |
-| `compress/level_1_fast_ldm/high-entropy-1m/matrix/c_ffi` | 3.014 |
-| `compress/level_1_fast_ldm/high-entropy-1m/matrix/pure_rust` | 0.362 |
-| `compress/level_1_fast_ldm/large-log-stream/matrix/c_ffi` | 57.615 |
-| `compress/level_1_fast_ldm/large-log-stream/matrix/pure_rust` | 3.299 |
-| `compress/level_1_fast_ldm/low-entropy-1m/matrix/c_ffi` | 1.947 |
-| `compress/level_1_fast_ldm/low-entropy-1m/matrix/pure_rust` | 0.180 |
-| `compress/level_1_fast_ldm/small-10k-random/matrix/c_ffi` | 0.033 |
-| `compress/level_1_fast_ldm/small-10k-random/matrix/pure_rust` | 0.006 |
-| `compress/level_1_fast_ldm/small-1k-random/matrix/c_ffi` | 0.008 |
+| `compress/level_17_btopt/small-4k-log-lines/matrix/c_ffi` | 0.135 |
+| `compress/level_17_btopt/small-4k-log-lines/matrix/pure_rust` | 0.044 |
+| `compress/level_1_fast_ldm/decodecorpus-z000033/matrix/c_ffi` | 7.793 |
+| `compress/level_1_fast_ldm/decodecorpus-z000033/matrix/pure_rust` | 7.130 |
+| `compress/level_1_fast_ldm/high-entropy-1m/matrix/c_ffi` | 3.766 |
+| `compress/level_1_fast_ldm/high-entropy-1m/matrix/pure_rust` | 0.522 |
+| `compress/level_1_fast_ldm/large-log-stream/matrix/c_ffi` | 41.184 |
+| `compress/level_1_fast_ldm/large-log-stream/matrix/pure_rust` | 3.157 |
+| `compress/level_1_fast_ldm/low-entropy-1m/matrix/c_ffi` | 2.457 |
+| `compress/level_1_fast_ldm/low-entropy-1m/matrix/pure_rust` | 0.197 |
+| `compress/level_1_fast_ldm/small-10k-random/matrix/c_ffi` | 0.037 |
+| `compress/level_1_fast_ldm/small-10k-random/matrix/pure_rust` | 0.007 |
+| `compress/level_1_fast_ldm/small-1k-random/matrix/c_ffi` | 0.009 |
 | `compress/level_1_fast_ldm/small-1k-random/matrix/pure_rust` | 0.002 |
-| `compress/level_1_fast_ldm/small-4k-log-lines/matrix/c_ffi` | 0.017 |
+| `compress/level_1_fast_ldm/small-4k-log-lines/matrix/c_ffi` | 0.020 |
 | `compress/level_1_fast_ldm/small-4k-log-lines/matrix/pure_rust` | 0.009 |
-| `compress/level_22_btultra2_ldm/decodecorpus-z000033/matrix/c_ffi` | 280.966 |
-| `compress/level_22_btultra2_ldm/decodecorpus-z000033/matrix/pure_rust` | 268.833 |
-| `compress/level_22_btultra2_ldm/high-entropy-1m/matrix/c_ffi` | 94.629 |
-| `compress/level_22_btultra2_ldm/high-entropy-1m/matrix/pure_rust` | 7.992 |
-| `compress/level_22_btultra2_ldm/large-log-stream/matrix/c_ffi` | 88.869 |
-| `compress/level_22_btultra2_ldm/large-log-stream/matrix/pure_rust` | 59.681 |
-| `compress/level_22_btultra2_ldm/low-entropy-1m/matrix/c_ffi` | 4.129 |
-| `compress/level_22_btultra2_ldm/low-entropy-1m/matrix/pure_rust` | 2.547 |
-| `compress/level_22_btultra2_ldm/small-10k-random/matrix/c_ffi` | 0.767 |
-| `compress/level_22_btultra2_ldm/small-10k-random/matrix/pure_rust` | 0.032 |
-| `compress/level_22_btultra2_ldm/small-1k-random/matrix/c_ffi` | 0.053 |
-| `compress/level_22_btultra2_ldm/small-1k-random/matrix/pure_rust` | 0.007 |
-| `compress/level_22_btultra2_ldm/small-4k-log-lines/matrix/c_ffi` | 0.122 |
+| `compress/level_22_btultra2_ldm/decodecorpus-z000033/matrix/c_ffi` | 279.199 |
+| `compress/level_22_btultra2_ldm/decodecorpus-z000033/matrix/pure_rust` | 257.557 |
+| `compress/level_22_btultra2_ldm/high-entropy-1m/matrix/c_ffi` | 71.601 |
+| `compress/level_22_btultra2_ldm/high-entropy-1m/matrix/pure_rust` | 7.266 |
+| `compress/level_22_btultra2_ldm/large-log-stream/matrix/c_ffi` | 57.145 |
+| `compress/level_22_btultra2_ldm/large-log-stream/matrix/pure_rust` | 37.402 |
+| `compress/level_22_btultra2_ldm/low-entropy-1m/matrix/c_ffi` | 2.681 |
+| `compress/level_22_btultra2_ldm/low-entropy-1m/matrix/pure_rust` | 2.090 |
+| `compress/level_22_btultra2_ldm/small-10k-random/matrix/c_ffi` | 0.855 |
+| `compress/level_22_btultra2_ldm/small-10k-random/matrix/pure_rust` | 0.033 |
+| `compress/level_22_btultra2_ldm/small-1k-random/matrix/c_ffi` | 0.061 |
+| `compress/level_22_btultra2_ldm/small-1k-random/matrix/pure_rust` | 0.006 |
+| `compress/level_22_btultra2_ldm/small-4k-log-lines/matrix/c_ffi` | 0.147 |
 | `compress/level_22_btultra2_ldm/small-4k-log-lines/matrix/pure_rust` | 0.072 |
-| `decompress-dict/level_16_btopt/decodecorpus-z000033/matrix/c_ffi_with_dict` | 3.067 |
-| `decompress-dict/level_16_btopt/decodecorpus-z000033/matrix/pure_rust_with_dict` | 5.050 |
-| `decompress-dict/level_16_btopt/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
+| `decompress-dict/level_16_btopt/decodecorpus-z000033/matrix/c_ffi_with_dict` | 3.558 |
+| `decompress-dict/level_16_btopt/decodecorpus-z000033/matrix/pure_rust_with_dict` | 4.987 |
+| `decompress-dict/level_16_btopt/small-10k-random/matrix/c_ffi_with_dict` | 0.002 |
 | `decompress-dict/level_16_btopt/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_16_btopt/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_16_btopt/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_17_btopt/decodecorpus-z000033/matrix/c_ffi_with_dict` | 3.063 |
-| `decompress-dict/level_17_btopt/decodecorpus-z000033/matrix/pure_rust_with_dict` | 5.040 |
-| `decompress-dict/level_17_btopt/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
+| `decompress-dict/level_17_btopt/decodecorpus-z000033/matrix/c_ffi_with_dict` | 3.553 |
+| `decompress-dict/level_17_btopt/decodecorpus-z000033/matrix/pure_rust_with_dict` | 4.976 |
+| `decompress-dict/level_17_btopt/small-10k-random/matrix/c_ffi_with_dict` | 0.002 |
 | `decompress-dict/level_17_btopt/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_17_btopt/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_17_btopt/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_1_fast_ldm_dict/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.803 |
-| `decompress-dict/level_1_fast_ldm_dict/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.268 |
+| `decompress-dict/level_1_fast_ldm_dict/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.049 |
+| `decompress-dict/level_1_fast_ldm_dict/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.416 |
 | `decompress-dict/level_1_fast_ldm_dict/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
-| `decompress-dict/level_1_fast_ldm_dict/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
+| `decompress-dict/level_1_fast_ldm_dict/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_1_fast_ldm_dict/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_1_fast_ldm_dict/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_22_btultra2_ldm_dict/decodecorpus-z000033/matrix/c_ffi_with_dict` | 3.096 |
-| `decompress-dict/level_22_btultra2_ldm_dict/decodecorpus-z000033/matrix/pure_rust_with_dict` | 5.103 |
-| `decompress-dict/level_22_btultra2_ldm_dict/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
+| `decompress-dict/level_22_btultra2_ldm_dict/decodecorpus-z000033/matrix/c_ffi_with_dict` | 3.598 |
+| `decompress-dict/level_22_btultra2_ldm_dict/decodecorpus-z000033/matrix/pure_rust_with_dict` | 5.044 |
+| `decompress-dict/level_22_btultra2_ldm_dict/small-10k-random/matrix/c_ffi_with_dict` | 0.002 |
 | `decompress-dict/level_22_btultra2_ldm_dict/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_22_btultra2_ldm_dict/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_22_btultra2_ldm_dict/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress/level_16_btopt/decodecorpus-z000033/c_stream/matrix/c_ffi` | 2.488 |
-| `decompress/level_16_btopt/decodecorpus-z000033/c_stream/matrix/pure_rust` | 4.331 |
-| `decompress/level_16_btopt/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.538 |
-| `decompress/level_16_btopt/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 4.383 |
-| `decompress/level_16_btopt/high-entropy-1m/c_stream/matrix/c_ffi` | 0.065 |
-| `decompress/level_16_btopt/high-entropy-1m/c_stream/matrix/pure_rust` | 0.066 |
-| `decompress/level_16_btopt/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.066 |
-| `decompress/level_16_btopt/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.065 |
-| `decompress/level_16_btopt/large-log-stream/c_stream/matrix/c_ffi` | 1.887 |
-| `decompress/level_16_btopt/large-log-stream/c_stream/matrix/pure_rust` | 0.698 |
-| `decompress/level_16_btopt/large-log-stream/rust_stream/matrix/c_ffi` | 1.874 |
-| `decompress/level_16_btopt/large-log-stream/rust_stream/matrix/pure_rust` | 0.710 |
-| `decompress/level_16_btopt/low-entropy-1m/c_stream/matrix/c_ffi` | 0.126 |
-| `decompress/level_16_btopt/low-entropy-1m/c_stream/matrix/pure_rust` | 0.032 |
-| `decompress/level_16_btopt/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.127 |
-| `decompress/level_16_btopt/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.032 |
+| `decompress/level_16_btopt/decodecorpus-z000033/c_stream/matrix/c_ffi` | 2.736 |
+| `decompress/level_16_btopt/decodecorpus-z000033/c_stream/matrix/pure_rust` | 4.279 |
+| `decompress/level_16_btopt/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.809 |
+| `decompress/level_16_btopt/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 4.321 |
+| `decompress/level_16_btopt/high-entropy-1m/c_stream/matrix/c_ffi` | 0.027 |
+| `decompress/level_16_btopt/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_16_btopt/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.027 |
+| `decompress/level_16_btopt/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_16_btopt/large-log-stream/c_stream/matrix/c_ffi` | 1.357 |
+| `decompress/level_16_btopt/large-log-stream/c_stream/matrix/pure_rust` | 0.441 |
+| `decompress/level_16_btopt/large-log-stream/rust_stream/matrix/c_ffi` | 1.340 |
+| `decompress/level_16_btopt/large-log-stream/rust_stream/matrix/pure_rust` | 0.441 |
+| `decompress/level_16_btopt/low-entropy-1m/c_stream/matrix/c_ffi` | 0.133 |
+| `decompress/level_16_btopt/low-entropy-1m/c_stream/matrix/pure_rust` | 0.030 |
+| `decompress/level_16_btopt/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.133 |
+| `decompress/level_16_btopt/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.030 |
 | `decompress/level_16_btopt/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_16_btopt/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_16_btopt/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -317,26 +317,26 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_16_btopt/small-1k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_16_btopt/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_16_btopt/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_16_btopt/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.002 |
+| `decompress/level_16_btopt/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.003 |
 | `decompress/level_16_btopt/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_16_btopt/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
+| `decompress/level_16_btopt/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.003 |
 | `decompress/level_16_btopt/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_17_btopt/decodecorpus-z000033/c_stream/matrix/c_ffi` | 2.655 |
-| `decompress/level_17_btopt/decodecorpus-z000033/c_stream/matrix/pure_rust` | 4.460 |
-| `decompress/level_17_btopt/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.716 |
-| `decompress/level_17_btopt/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 4.538 |
-| `decompress/level_17_btopt/high-entropy-1m/c_stream/matrix/c_ffi` | 0.064 |
-| `decompress/level_17_btopt/high-entropy-1m/c_stream/matrix/pure_rust` | 0.063 |
-| `decompress/level_17_btopt/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.065 |
-| `decompress/level_17_btopt/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.066 |
-| `decompress/level_17_btopt/large-log-stream/c_stream/matrix/c_ffi` | 1.922 |
-| `decompress/level_17_btopt/large-log-stream/c_stream/matrix/pure_rust` | 0.736 |
-| `decompress/level_17_btopt/large-log-stream/rust_stream/matrix/c_ffi` | 1.921 |
-| `decompress/level_17_btopt/large-log-stream/rust_stream/matrix/pure_rust` | 0.709 |
-| `decompress/level_17_btopt/low-entropy-1m/c_stream/matrix/c_ffi` | 0.126 |
-| `decompress/level_17_btopt/low-entropy-1m/c_stream/matrix/pure_rust` | 0.031 |
-| `decompress/level_17_btopt/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.126 |
-| `decompress/level_17_btopt/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.032 |
+| `decompress/level_17_btopt/decodecorpus-z000033/c_stream/matrix/c_ffi` | 3.037 |
+| `decompress/level_17_btopt/decodecorpus-z000033/c_stream/matrix/pure_rust` | 4.421 |
+| `decompress/level_17_btopt/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 3.099 |
+| `decompress/level_17_btopt/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 4.496 |
+| `decompress/level_17_btopt/high-entropy-1m/c_stream/matrix/c_ffi` | 0.027 |
+| `decompress/level_17_btopt/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_17_btopt/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.027 |
+| `decompress/level_17_btopt/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_17_btopt/large-log-stream/c_stream/matrix/c_ffi` | 1.328 |
+| `decompress/level_17_btopt/large-log-stream/c_stream/matrix/pure_rust` | 0.437 |
+| `decompress/level_17_btopt/large-log-stream/rust_stream/matrix/c_ffi` | 1.331 |
+| `decompress/level_17_btopt/large-log-stream/rust_stream/matrix/pure_rust` | 0.438 |
+| `decompress/level_17_btopt/low-entropy-1m/c_stream/matrix/c_ffi` | 0.132 |
+| `decompress/level_17_btopt/low-entropy-1m/c_stream/matrix/pure_rust` | 0.030 |
+| `decompress/level_17_btopt/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.133 |
+| `decompress/level_17_btopt/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.030 |
 | `decompress/level_17_btopt/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_17_btopt/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_17_btopt/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -345,26 +345,26 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_17_btopt/small-1k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_17_btopt/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_17_btopt/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_17_btopt/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.002 |
+| `decompress/level_17_btopt/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.003 |
 | `decompress/level_17_btopt/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_17_btopt/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
+| `decompress/level_17_btopt/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.003 |
 | `decompress/level_17_btopt/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_1_fast_ldm/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.745 |
-| `decompress/level_1_fast_ldm/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.181 |
-| `decompress/level_1_fast_ldm/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.718 |
-| `decompress/level_1_fast_ldm/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.130 |
-| `decompress/level_1_fast_ldm/high-entropy-1m/c_stream/matrix/c_ffi` | 0.065 |
-| `decompress/level_1_fast_ldm/high-entropy-1m/c_stream/matrix/pure_rust` | 0.064 |
-| `decompress/level_1_fast_ldm/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.061 |
-| `decompress/level_1_fast_ldm/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.065 |
-| `decompress/level_1_fast_ldm/large-log-stream/c_stream/matrix/c_ffi` | 2.069 |
-| `decompress/level_1_fast_ldm/large-log-stream/c_stream/matrix/pure_rust` | 0.817 |
-| `decompress/level_1_fast_ldm/large-log-stream/rust_stream/matrix/c_ffi` | 1.938 |
-| `decompress/level_1_fast_ldm/large-log-stream/rust_stream/matrix/pure_rust` | 0.693 |
-| `decompress/level_1_fast_ldm/low-entropy-1m/c_stream/matrix/c_ffi` | 0.132 |
-| `decompress/level_1_fast_ldm/low-entropy-1m/c_stream/matrix/pure_rust` | 0.029 |
-| `decompress/level_1_fast_ldm/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.132 |
-| `decompress/level_1_fast_ldm/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_1_fast_ldm/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.985 |
+| `decompress/level_1_fast_ldm/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.334 |
+| `decompress/level_1_fast_ldm/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.971 |
+| `decompress/level_1_fast_ldm/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.270 |
+| `decompress/level_1_fast_ldm/high-entropy-1m/c_stream/matrix/c_ffi` | 0.027 |
+| `decompress/level_1_fast_ldm/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_1_fast_ldm/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.027 |
+| `decompress/level_1_fast_ldm/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_1_fast_ldm/large-log-stream/c_stream/matrix/c_ffi` | 1.696 |
+| `decompress/level_1_fast_ldm/large-log-stream/c_stream/matrix/pure_rust` | 0.475 |
+| `decompress/level_1_fast_ldm/large-log-stream/rust_stream/matrix/c_ffi` | 2.054 |
+| `decompress/level_1_fast_ldm/large-log-stream/rust_stream/matrix/pure_rust` | 0.445 |
+| `decompress/level_1_fast_ldm/low-entropy-1m/c_stream/matrix/c_ffi` | 0.207 |
+| `decompress/level_1_fast_ldm/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_1_fast_ldm/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.207 |
+| `decompress/level_1_fast_ldm/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
 | `decompress/level_1_fast_ldm/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_1_fast_ldm/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_1_fast_ldm/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -373,26 +373,26 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_1_fast_ldm/small-1k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_1_fast_ldm/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_1_fast_ldm/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_1_fast_ldm/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.002 |
+| `decompress/level_1_fast_ldm/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.003 |
 | `decompress/level_1_fast_ldm/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_1_fast_ldm/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
+| `decompress/level_1_fast_ldm/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.003 |
 | `decompress/level_1_fast_ldm/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_22_btultra2_ldm/decodecorpus-z000033/c_stream/matrix/c_ffi` | 2.929 |
-| `decompress/level_22_btultra2_ldm/decodecorpus-z000033/c_stream/matrix/pure_rust` | 4.849 |
-| `decompress/level_22_btultra2_ldm/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 3.023 |
-| `decompress/level_22_btultra2_ldm/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 5.000 |
-| `decompress/level_22_btultra2_ldm/high-entropy-1m/c_stream/matrix/c_ffi` | 0.065 |
-| `decompress/level_22_btultra2_ldm/high-entropy-1m/c_stream/matrix/pure_rust` | 0.066 |
-| `decompress/level_22_btultra2_ldm/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.066 |
-| `decompress/level_22_btultra2_ldm/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.067 |
-| `decompress/level_22_btultra2_ldm/large-log-stream/c_stream/matrix/c_ffi` | 1.923 |
-| `decompress/level_22_btultra2_ldm/large-log-stream/c_stream/matrix/pure_rust` | 0.740 |
-| `decompress/level_22_btultra2_ldm/large-log-stream/rust_stream/matrix/c_ffi` | 1.921 |
-| `decompress/level_22_btultra2_ldm/large-log-stream/rust_stream/matrix/pure_rust` | 0.721 |
-| `decompress/level_22_btultra2_ldm/low-entropy-1m/c_stream/matrix/c_ffi` | 0.133 |
-| `decompress/level_22_btultra2_ldm/low-entropy-1m/c_stream/matrix/pure_rust` | 0.032 |
-| `decompress/level_22_btultra2_ldm/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.133 |
-| `decompress/level_22_btultra2_ldm/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.032 |
+| `decompress/level_22_btultra2_ldm/decodecorpus-z000033/c_stream/matrix/c_ffi` | 3.435 |
+| `decompress/level_22_btultra2_ldm/decodecorpus-z000033/c_stream/matrix/pure_rust` | 4.805 |
+| `decompress/level_22_btultra2_ldm/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 3.535 |
+| `decompress/level_22_btultra2_ldm/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 4.934 |
+| `decompress/level_22_btultra2_ldm/high-entropy-1m/c_stream/matrix/c_ffi` | 0.027 |
+| `decompress/level_22_btultra2_ldm/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_22_btultra2_ldm/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.027 |
+| `decompress/level_22_btultra2_ldm/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_22_btultra2_ldm/large-log-stream/c_stream/matrix/c_ffi` | 1.322 |
+| `decompress/level_22_btultra2_ldm/large-log-stream/c_stream/matrix/pure_rust` | 0.441 |
+| `decompress/level_22_btultra2_ldm/large-log-stream/rust_stream/matrix/c_ffi` | 1.335 |
+| `decompress/level_22_btultra2_ldm/large-log-stream/rust_stream/matrix/pure_rust` | 0.439 |
+| `decompress/level_22_btultra2_ldm/low-entropy-1m/c_stream/matrix/c_ffi` | 0.164 |
+| `decompress/level_22_btultra2_ldm/low-entropy-1m/c_stream/matrix/pure_rust` | 0.030 |
+| `decompress/level_22_btultra2_ldm/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.165 |
+| `decompress/level_22_btultra2_ldm/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.030 |
 | `decompress/level_22_btultra2_ldm/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_22_btultra2_ldm/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_22_btultra2_ldm/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -401,16 +401,16 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_22_btultra2_ldm/small-1k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_22_btultra2_ldm/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_22_btultra2_ldm/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_22_btultra2_ldm/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.002 |
+| `decompress/level_22_btultra2_ldm/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.003 |
 | `decompress/level_22_btultra2_ldm/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_22_btultra2_ldm/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
+| `decompress/level_22_btultra2_ldm/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.003 |
 | `decompress/level_22_btultra2_ldm/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.003 |
-| `dict-train/na/decodecorpus-z000033/matrix/c_ffi` | 65.460 |
-| `dict-train/na/decodecorpus-z000033/matrix/pure_rust` | 19.045 |
-| `dict-train/na/small-10k-random/matrix/c_ffi` | 8.714 |
-| `dict-train/na/small-10k-random/matrix/pure_rust` | 2.276 |
-| `dict-train/na/small-4k-log-lines/matrix/c_ffi` | 1.652 |
-| `dict-train/na/small-4k-log-lines/matrix/pure_rust` | 0.852 |
+| `dict-train/na/decodecorpus-z000033/matrix/c_ffi` | 80.826 |
+| `dict-train/na/decodecorpus-z000033/matrix/pure_rust` | 20.024 |
+| `dict-train/na/small-10k-random/matrix/c_ffi` | 10.495 |
+| `dict-train/na/small-10k-random/matrix/pure_rust` | 2.474 |
+| `dict-train/na/small-4k-log-lines/matrix/c_ffi` | 1.899 |
+| `dict-train/na/small-4k-log-lines/matrix/pure_rust` | 0.876 |
 
 ## Strategy group: btultra2
 
@@ -572,193 +572,193 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 
 | Scenario | Label | Level | Dict bytes | Train ms | C bytes (no dict) | C bytes (with dict) | C ratio (no dict) | C ratio (with dict) |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| decodecorpus-z000033 | Repo decode corpus sample | level_18_btultra | 16384 | 103.148 | 426806 | 420494 | 0.4176 | 0.4114 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_19_btultra2 | 16384 | 103.148 | 426543 | 420599 | 0.4173 | 0.4115 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_20_btultra2 | 16384 | 103.148 | 426543 | 420145 | 0.4173 | 0.4111 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_21_btultra2 | 16384 | 103.148 | 426386 | 420411 | 0.4172 | 0.4113 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_22_btultra2 | 16384 | 103.148 | 426312 | 420411 | 0.4171 | 0.4113 |
-| small-10k-random | Small random payload (10 KiB) | level_18_btultra | 1280 | 12.721 | 10250 | 9245 | 1.0010 | 0.9028 |
-| small-10k-random | Small random payload (10 KiB) | level_19_btultra2 | 1280 | 12.721 | 10250 | 9245 | 1.0010 | 0.9028 |
-| small-10k-random | Small random payload (10 KiB) | level_20_btultra2 | 1280 | 12.721 | 10250 | 9245 | 1.0010 | 0.9028 |
-| small-10k-random | Small random payload (10 KiB) | level_21_btultra2 | 1280 | 12.721 | 10250 | 9245 | 1.0010 | 0.9028 |
-| small-10k-random | Small random payload (10 KiB) | level_22_btultra2 | 1280 | 12.721 | 10250 | 9245 | 1.0010 | 0.9028 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_18_btultra | 437 | 2.751 | 146 | 44 | 0.0356 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_19_btultra2 | 437 | 2.751 | 146 | 44 | 0.0356 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_20_btultra2 | 437 | 2.751 | 146 | 44 | 0.0356 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_21_btultra2 | 437 | 2.751 | 146 | 44 | 0.0356 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_22_btultra2 | 437 | 2.751 | 146 | 44 | 0.0356 | 0.0107 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_18_btultra | 16384 | 95.318 | 426806 | 420494 | 0.4176 | 0.4114 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_19_btultra2 | 16384 | 95.318 | 426543 | 420599 | 0.4173 | 0.4115 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_20_btultra2 | 16384 | 95.318 | 426543 | 420145 | 0.4173 | 0.4111 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_21_btultra2 | 16384 | 95.318 | 426386 | 420411 | 0.4172 | 0.4113 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_22_btultra2 | 16384 | 95.318 | 426312 | 420411 | 0.4171 | 0.4113 |
+| small-10k-random | Small random payload (10 KiB) | level_18_btultra | 1280 | 12.051 | 10250 | 9245 | 1.0010 | 0.9028 |
+| small-10k-random | Small random payload (10 KiB) | level_19_btultra2 | 1280 | 12.051 | 10250 | 9245 | 1.0010 | 0.9028 |
+| small-10k-random | Small random payload (10 KiB) | level_20_btultra2 | 1280 | 12.051 | 10250 | 9245 | 1.0010 | 0.9028 |
+| small-10k-random | Small random payload (10 KiB) | level_21_btultra2 | 1280 | 12.051 | 10250 | 9245 | 1.0010 | 0.9028 |
+| small-10k-random | Small random payload (10 KiB) | level_22_btultra2 | 1280 | 12.051 | 10250 | 9245 | 1.0010 | 0.9028 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_18_btultra | 437 | 2.351 | 146 | 44 | 0.0356 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_19_btultra2 | 437 | 2.351 | 146 | 44 | 0.0356 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_20_btultra2 | 437 | 2.351 | 146 | 44 | 0.0356 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_21_btultra2 | 437 | 2.351 | 146 | 44 | 0.0356 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_22_btultra2 | 437 | 2.351 | 146 | 44 | 0.0356 | 0.0107 |
 
 ## Dictionary Training (Rust FastCOVER vs C FFI)
 
 | Scenario | Label | Dict bytes (requested) | Rust train ms | C train ms | Rust dict bytes | C dict bytes | Rust FastCOVER score | Delta (C/Rust) | Status |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| decodecorpus-z000033 | Repo decode corpus sample | 16384 | 28.104 | 103.148 | 16384 | 16384 | 0 | 3.6702 | rust_faster |
-| small-10k-random | Small random payload (10 KiB) | 1280 | 4.082 | 12.721 | 1280 | 1280 | 0 | 3.1164 | rust_faster |
-| small-4k-log-lines | Small structured log lines (4 KiB) | 512 | 1.382 | 2.751 | 512 | 437 | 0 | 1.9906 | rust_faster |
+| decodecorpus-z000033 | Repo decode corpus sample | 16384 | 26.358 | 95.318 | 16384 | 16384 | 0 | 3.6163 | rust_faster |
+| small-10k-random | Small random payload (10 KiB) | 1280 | 3.158 | 12.051 | 1280 | 1280 | 0 | 3.8160 | rust_faster |
+| small-4k-log-lines | Small structured log lines (4 KiB) | 512 | 1.065 | 2.351 | 512 | 437 | 0 | 2.2075 | rust_faster |
 
 ## Timing Metrics
 
 | Benchmark | ms/iter |
 | --- | ---: |
-| `compress-dict/level_18_btultra/decodecorpus-z000033/matrix/c_ffi_with_dict` | 168.533 |
-| `compress-dict/level_18_btultra/decodecorpus-z000033/matrix/c_ffi_without_dict` | 170.495 |
-| `compress-dict/level_18_btultra/decodecorpus-z000033/matrix/pure_rust_with_dict` | 233.427 |
-| `compress-dict/level_18_btultra/small-10k-random/matrix/c_ffi_with_dict` | 0.487 |
-| `compress-dict/level_18_btultra/small-10k-random/matrix/c_ffi_without_dict` | 0.647 |
-| `compress-dict/level_18_btultra/small-10k-random/matrix/pure_rust_with_dict` | 1.464 |
+| `compress-dict/level_18_btultra/decodecorpus-z000033/matrix/c_ffi_with_dict` | 169.542 |
+| `compress-dict/level_18_btultra/decodecorpus-z000033/matrix/c_ffi_without_dict` | 168.665 |
+| `compress-dict/level_18_btultra/decodecorpus-z000033/matrix/pure_rust_with_dict` | 226.622 |
+| `compress-dict/level_18_btultra/small-10k-random/matrix/c_ffi_with_dict` | 0.488 |
+| `compress-dict/level_18_btultra/small-10k-random/matrix/c_ffi_without_dict` | 0.650 |
+| `compress-dict/level_18_btultra/small-10k-random/matrix/pure_rust_with_dict` | 1.490 |
 | `compress-dict/level_18_btultra/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.087 |
 | `compress-dict/level_18_btultra/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.111 |
-| `compress-dict/level_18_btultra/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.032 |
-| `compress-dict/level_19_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 165.181 |
-| `compress-dict/level_19_btultra2/decodecorpus-z000033/matrix/c_ffi_without_dict` | 216.227 |
-| `compress-dict/level_19_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 245.663 |
-| `compress-dict/level_19_btultra2/small-10k-random/matrix/c_ffi_with_dict` | 0.488 |
-| `compress-dict/level_19_btultra2/small-10k-random/matrix/c_ffi_without_dict` | 0.449 |
-| `compress-dict/level_19_btultra2/small-10k-random/matrix/pure_rust_with_dict` | 1.466 |
+| `compress-dict/level_18_btultra/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.033 |
+| `compress-dict/level_19_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 159.524 |
+| `compress-dict/level_19_btultra2/decodecorpus-z000033/matrix/c_ffi_without_dict` | 197.816 |
+| `compress-dict/level_19_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 232.391 |
+| `compress-dict/level_19_btultra2/small-10k-random/matrix/c_ffi_with_dict` | 0.495 |
+| `compress-dict/level_19_btultra2/small-10k-random/matrix/c_ffi_without_dict` | 0.653 |
+| `compress-dict/level_19_btultra2/small-10k-random/matrix/pure_rust_with_dict` | 1.562 |
 | `compress-dict/level_19_btultra2/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.087 |
-| `compress-dict/level_19_btultra2/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.111 |
-| `compress-dict/level_19_btultra2/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.032 |
-| `compress-dict/level_20_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 176.987 |
-| `compress-dict/level_20_btultra2/decodecorpus-z000033/matrix/c_ffi_without_dict` | 221.082 |
-| `compress-dict/level_20_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 241.796 |
-| `compress-dict/level_20_btultra2/small-10k-random/matrix/c_ffi_with_dict` | 0.488 |
-| `compress-dict/level_20_btultra2/small-10k-random/matrix/c_ffi_without_dict` | 0.448 |
-| `compress-dict/level_20_btultra2/small-10k-random/matrix/pure_rust_with_dict` | 1.462 |
+| `compress-dict/level_19_btultra2/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.112 |
+| `compress-dict/level_19_btultra2/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.033 |
+| `compress-dict/level_20_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 170.059 |
+| `compress-dict/level_20_btultra2/decodecorpus-z000033/matrix/c_ffi_without_dict` | 199.523 |
+| `compress-dict/level_20_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 233.052 |
+| `compress-dict/level_20_btultra2/small-10k-random/matrix/c_ffi_with_dict` | 0.494 |
+| `compress-dict/level_20_btultra2/small-10k-random/matrix/c_ffi_without_dict` | 0.660 |
+| `compress-dict/level_20_btultra2/small-10k-random/matrix/pure_rust_with_dict` | 1.485 |
 | `compress-dict/level_20_btultra2/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.087 |
 | `compress-dict/level_20_btultra2/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.111 |
-| `compress-dict/level_20_btultra2/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.032 |
-| `compress-dict/level_21_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 168.269 |
-| `compress-dict/level_21_btultra2/decodecorpus-z000033/matrix/c_ffi_without_dict` | 192.988 |
-| `compress-dict/level_21_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 229.176 |
-| `compress-dict/level_21_btultra2/small-10k-random/matrix/c_ffi_with_dict` | 0.495 |
-| `compress-dict/level_21_btultra2/small-10k-random/matrix/c_ffi_without_dict` | 0.654 |
-| `compress-dict/level_21_btultra2/small-10k-random/matrix/pure_rust_with_dict` | 1.461 |
+| `compress-dict/level_20_btultra2/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.033 |
+| `compress-dict/level_21_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 169.175 |
+| `compress-dict/level_21_btultra2/decodecorpus-z000033/matrix/c_ffi_without_dict` | 211.232 |
+| `compress-dict/level_21_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 233.871 |
+| `compress-dict/level_21_btultra2/small-10k-random/matrix/c_ffi_with_dict` | 0.493 |
+| `compress-dict/level_21_btultra2/small-10k-random/matrix/c_ffi_without_dict` | 0.452 |
+| `compress-dict/level_21_btultra2/small-10k-random/matrix/pure_rust_with_dict` | 1.484 |
 | `compress-dict/level_21_btultra2/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.087 |
 | `compress-dict/level_21_btultra2/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.111 |
-| `compress-dict/level_21_btultra2/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.032 |
-| `compress-dict/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 214.828 |
-| `compress-dict/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi_without_dict` | 247.224 |
-| `compress-dict/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 245.550 |
-| `compress-dict/level_22_btultra2/small-10k-random/matrix/c_ffi_with_dict` | 0.486 |
-| `compress-dict/level_22_btultra2/small-10k-random/matrix/c_ffi_without_dict` | 0.653 |
-| `compress-dict/level_22_btultra2/small-10k-random/matrix/pure_rust_with_dict` | 1.460 |
+| `compress-dict/level_21_btultra2/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.033 |
+| `compress-dict/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 214.766 |
+| `compress-dict/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi_without_dict` | 245.508 |
+| `compress-dict/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 245.738 |
+| `compress-dict/level_22_btultra2/small-10k-random/matrix/c_ffi_with_dict` | 0.488 |
+| `compress-dict/level_22_btultra2/small-10k-random/matrix/c_ffi_without_dict` | 0.654 |
+| `compress-dict/level_22_btultra2/small-10k-random/matrix/pure_rust_with_dict` | 1.478 |
 | `compress-dict/level_22_btultra2/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.087 |
 | `compress-dict/level_22_btultra2/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.111 |
-| `compress-dict/level_22_btultra2/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.032 |
-| `compress/level_18_btultra/decodecorpus-z000033/matrix/c_ffi` | 162.383 |
-| `compress/level_18_btultra/decodecorpus-z000033/matrix/pure_rust` | 229.593 |
-| `compress/level_18_btultra/high-entropy-1m/matrix/c_ffi` | 55.830 |
-| `compress/level_18_btultra/high-entropy-1m/matrix/pure_rust` | 6.886 |
-| `compress/level_18_btultra/large-log-stream/matrix/c_ffi` | 29.197 |
-| `compress/level_18_btultra/large-log-stream/matrix/pure_rust` | 26.302 |
-| `compress/level_18_btultra/low-entropy-1m/matrix/c_ffi` | 3.131 |
-| `compress/level_18_btultra/low-entropy-1m/matrix/pure_rust` | 4.423 |
-| `compress/level_18_btultra/small-10k-random/matrix/c_ffi` | 0.650 |
+| `compress-dict/level_22_btultra2/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.033 |
+| `compress/level_18_btultra/decodecorpus-z000033/matrix/c_ffi` | 154.713 |
+| `compress/level_18_btultra/decodecorpus-z000033/matrix/pure_rust` | 228.215 |
+| `compress/level_18_btultra/high-entropy-1m/matrix/c_ffi` | 51.783 |
+| `compress/level_18_btultra/high-entropy-1m/matrix/pure_rust` | 8.816 |
+| `compress/level_18_btultra/large-log-stream/matrix/c_ffi` | 29.482 |
+| `compress/level_18_btultra/large-log-stream/matrix/pure_rust` | 25.047 |
+| `compress/level_18_btultra/low-entropy-1m/matrix/c_ffi` | 2.544 |
+| `compress/level_18_btultra/low-entropy-1m/matrix/pure_rust` | 4.203 |
+| `compress/level_18_btultra/small-10k-random/matrix/c_ffi` | 0.647 |
 | `compress/level_18_btultra/small-10k-random/matrix/pure_rust` | 0.040 |
 | `compress/level_18_btultra/small-1k-random/matrix/c_ffi` | 0.049 |
 | `compress/level_18_btultra/small-1k-random/matrix/pure_rust` | 0.008 |
-| `compress/level_18_btultra/small-4k-log-lines/matrix/c_ffi` | 0.113 |
+| `compress/level_18_btultra/small-4k-log-lines/matrix/c_ffi` | 0.114 |
 | `compress/level_18_btultra/small-4k-log-lines/matrix/pure_rust` | 0.069 |
-| `compress/level_19_btultra2/decodecorpus-z000033/matrix/c_ffi` | 198.998 |
-| `compress/level_19_btultra2/decodecorpus-z000033/matrix/pure_rust` | 255.802 |
-| `compress/level_19_btultra2/high-entropy-1m/matrix/c_ffi` | 60.699 |
-| `compress/level_19_btultra2/high-entropy-1m/matrix/pure_rust` | 7.826 |
-| `compress/level_19_btultra2/large-log-stream/matrix/c_ffi` | 31.727 |
-| `compress/level_19_btultra2/large-log-stream/matrix/pure_rust` | 24.979 |
-| `compress/level_19_btultra2/low-entropy-1m/matrix/c_ffi` | 3.150 |
-| `compress/level_19_btultra2/low-entropy-1m/matrix/pure_rust` | 2.197 |
-| `compress/level_19_btultra2/small-10k-random/matrix/c_ffi` | 0.653 |
-| `compress/level_19_btultra2/small-10k-random/matrix/pure_rust` | 0.033 |
-| `compress/level_19_btultra2/small-1k-random/matrix/c_ffi` | 0.049 |
+| `compress/level_19_btultra2/decodecorpus-z000033/matrix/c_ffi` | 184.449 |
+| `compress/level_19_btultra2/decodecorpus-z000033/matrix/pure_rust` | 250.378 |
+| `compress/level_19_btultra2/high-entropy-1m/matrix/c_ffi` | 60.015 |
+| `compress/level_19_btultra2/high-entropy-1m/matrix/pure_rust` | 8.611 |
+| `compress/level_19_btultra2/large-log-stream/matrix/c_ffi` | 32.013 |
+| `compress/level_19_btultra2/large-log-stream/matrix/pure_rust` | 23.806 |
+| `compress/level_19_btultra2/low-entropy-1m/matrix/c_ffi` | 2.653 |
+| `compress/level_19_btultra2/low-entropy-1m/matrix/pure_rust` | 2.002 |
+| `compress/level_19_btultra2/small-10k-random/matrix/c_ffi` | 0.647 |
+| `compress/level_19_btultra2/small-10k-random/matrix/pure_rust` | 0.034 |
+| `compress/level_19_btultra2/small-1k-random/matrix/c_ffi` | 0.048 |
 | `compress/level_19_btultra2/small-1k-random/matrix/pure_rust` | 0.006 |
-| `compress/level_19_btultra2/small-4k-log-lines/matrix/c_ffi` | 0.113 |
-| `compress/level_19_btultra2/small-4k-log-lines/matrix/pure_rust` | 0.116 |
-| `compress/level_20_btultra2/decodecorpus-z000033/matrix/c_ffi` | 190.065 |
-| `compress/level_20_btultra2/decodecorpus-z000033/matrix/pure_rust` | 260.541 |
-| `compress/level_20_btultra2/high-entropy-1m/matrix/c_ffi` | 63.648 |
-| `compress/level_20_btultra2/high-entropy-1m/matrix/pure_rust` | 8.430 |
-| `compress/level_20_btultra2/large-log-stream/matrix/c_ffi` | 37.509 |
-| `compress/level_20_btultra2/large-log-stream/matrix/pure_rust` | 27.471 |
-| `compress/level_20_btultra2/low-entropy-1m/matrix/c_ffi` | 3.142 |
-| `compress/level_20_btultra2/low-entropy-1m/matrix/pure_rust` | 2.198 |
-| `compress/level_20_btultra2/small-10k-random/matrix/c_ffi` | 0.649 |
-| `compress/level_20_btultra2/small-10k-random/matrix/pure_rust` | 0.033 |
+| `compress/level_19_btultra2/small-4k-log-lines/matrix/c_ffi` | 0.114 |
+| `compress/level_19_btultra2/small-4k-log-lines/matrix/pure_rust` | 0.118 |
+| `compress/level_20_btultra2/decodecorpus-z000033/matrix/c_ffi` | 188.805 |
+| `compress/level_20_btultra2/decodecorpus-z000033/matrix/pure_rust` | 252.232 |
+| `compress/level_20_btultra2/high-entropy-1m/matrix/c_ffi` | 59.824 |
+| `compress/level_20_btultra2/high-entropy-1m/matrix/pure_rust` | 9.304 |
+| `compress/level_20_btultra2/large-log-stream/matrix/c_ffi` | 38.050 |
+| `compress/level_20_btultra2/large-log-stream/matrix/pure_rust` | 26.180 |
+| `compress/level_20_btultra2/low-entropy-1m/matrix/c_ffi` | 2.657 |
+| `compress/level_20_btultra2/low-entropy-1m/matrix/pure_rust` | 2.053 |
+| `compress/level_20_btultra2/small-10k-random/matrix/c_ffi` | 0.639 |
+| `compress/level_20_btultra2/small-10k-random/matrix/pure_rust` | 0.034 |
 | `compress/level_20_btultra2/small-1k-random/matrix/c_ffi` | 0.049 |
 | `compress/level_20_btultra2/small-1k-random/matrix/pure_rust` | 0.006 |
-| `compress/level_20_btultra2/small-4k-log-lines/matrix/c_ffi` | 0.113 |
-| `compress/level_20_btultra2/small-4k-log-lines/matrix/pure_rust` | 0.115 |
-| `compress/level_21_btultra2/decodecorpus-z000033/matrix/c_ffi` | 210.359 |
-| `compress/level_21_btultra2/decodecorpus-z000033/matrix/pure_rust` | 254.494 |
-| `compress/level_21_btultra2/high-entropy-1m/matrix/c_ffi` | 59.174 |
-| `compress/level_21_btultra2/high-entropy-1m/matrix/pure_rust` | 8.210 |
-| `compress/level_21_btultra2/large-log-stream/matrix/c_ffi` | 40.050 |
-| `compress/level_21_btultra2/large-log-stream/matrix/pure_rust` | 26.108 |
-| `compress/level_21_btultra2/low-entropy-1m/matrix/c_ffi` | 3.199 |
-| `compress/level_21_btultra2/low-entropy-1m/matrix/pure_rust` | 2.239 |
-| `compress/level_21_btultra2/small-10k-random/matrix/c_ffi` | 0.660 |
-| `compress/level_21_btultra2/small-10k-random/matrix/pure_rust` | 0.033 |
+| `compress/level_20_btultra2/small-4k-log-lines/matrix/c_ffi` | 0.115 |
+| `compress/level_20_btultra2/small-4k-log-lines/matrix/pure_rust` | 0.118 |
+| `compress/level_21_btultra2/decodecorpus-z000033/matrix/c_ffi` | 201.721 |
+| `compress/level_21_btultra2/decodecorpus-z000033/matrix/pure_rust` | 254.609 |
+| `compress/level_21_btultra2/high-entropy-1m/matrix/c_ffi` | 64.364 |
+| `compress/level_21_btultra2/high-entropy-1m/matrix/pure_rust` | 8.522 |
+| `compress/level_21_btultra2/large-log-stream/matrix/c_ffi` | 40.252 |
+| `compress/level_21_btultra2/large-log-stream/matrix/pure_rust` | 24.586 |
+| `compress/level_21_btultra2/low-entropy-1m/matrix/c_ffi` | 2.532 |
+| `compress/level_21_btultra2/low-entropy-1m/matrix/pure_rust` | 2.043 |
+| `compress/level_21_btultra2/small-10k-random/matrix/c_ffi` | 0.649 |
+| `compress/level_21_btultra2/small-10k-random/matrix/pure_rust` | 0.034 |
 | `compress/level_21_btultra2/small-1k-random/matrix/c_ffi` | 0.049 |
 | `compress/level_21_btultra2/small-1k-random/matrix/pure_rust` | 0.006 |
-| `compress/level_21_btultra2/small-4k-log-lines/matrix/c_ffi` | 0.113 |
-| `compress/level_21_btultra2/small-4k-log-lines/matrix/pure_rust` | 0.116 |
-| `compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi` | 258.898 |
-| `compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust` | 276.140 |
-| `compress/level_22_btultra2/high-entropy-1m/matrix/c_ffi` | 54.908 |
-| `compress/level_22_btultra2/high-entropy-1m/matrix/pure_rust` | 7.959 |
-| `compress/level_22_btultra2/large-log-stream/matrix/c_ffi` | 44.441 |
-| `compress/level_22_btultra2/large-log-stream/matrix/pure_rust` | 31.227 |
-| `compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi` | 3.112 |
-| `compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust` | 2.206 |
-| `compress/level_22_btultra2/small-10k-random/matrix/c_ffi` | 0.649 |
+| `compress/level_21_btultra2/small-4k-log-lines/matrix/c_ffi` | 0.115 |
+| `compress/level_21_btultra2/small-4k-log-lines/matrix/pure_rust` | 0.118 |
+| `compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi` | 251.552 |
+| `compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust` | 270.859 |
+| `compress/level_22_btultra2/high-entropy-1m/matrix/c_ffi` | 56.087 |
+| `compress/level_22_btultra2/high-entropy-1m/matrix/pure_rust` | 9.584 |
+| `compress/level_22_btultra2/large-log-stream/matrix/c_ffi` | 44.905 |
+| `compress/level_22_btultra2/large-log-stream/matrix/pure_rust` | 29.625 |
+| `compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi` | 2.589 |
+| `compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust` | 2.013 |
+| `compress/level_22_btultra2/small-10k-random/matrix/c_ffi` | 0.646 |
 | `compress/level_22_btultra2/small-10k-random/matrix/pure_rust` | 0.033 |
-| `compress/level_22_btultra2/small-1k-random/matrix/c_ffi` | 0.049 |
+| `compress/level_22_btultra2/small-1k-random/matrix/c_ffi` | 0.048 |
 | `compress/level_22_btultra2/small-1k-random/matrix/pure_rust` | 0.006 |
-| `compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi` | 0.113 |
-| `compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust` | 0.116 |
-| `decompress-dict/level_18_btultra/decodecorpus-z000033/matrix/c_ffi_with_dict` | 3.469 |
+| `compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi` | 0.115 |
+| `compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust` | 0.118 |
+| `decompress-dict/level_18_btultra/decodecorpus-z000033/matrix/c_ffi_with_dict` | 3.468 |
 | `decompress-dict/level_18_btultra/decodecorpus-z000033/matrix/pure_rust_with_dict` | 5.257 |
 | `decompress-dict/level_18_btultra/small-10k-random/matrix/c_ffi_with_dict` | 0.002 |
 | `decompress-dict/level_18_btultra/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_18_btultra/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_18_btultra/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_19_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 3.537 |
-| `decompress-dict/level_19_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 5.355 |
+| `decompress-dict/level_19_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 3.535 |
+| `decompress-dict/level_19_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 5.359 |
 | `decompress-dict/level_19_btultra2/small-10k-random/matrix/c_ffi_with_dict` | 0.002 |
 | `decompress-dict/level_19_btultra2/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_19_btultra2/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_19_btultra2/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_20_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 3.521 |
-| `decompress-dict/level_20_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 5.343 |
+| `decompress-dict/level_20_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 3.526 |
+| `decompress-dict/level_20_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 5.337 |
 | `decompress-dict/level_20_btultra2/small-10k-random/matrix/c_ffi_with_dict` | 0.002 |
 | `decompress-dict/level_20_btultra2/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_20_btultra2/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_20_btultra2/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_21_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 3.496 |
-| `decompress-dict/level_21_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 5.312 |
+| `decompress-dict/level_21_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 3.517 |
+| `decompress-dict/level_21_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 5.348 |
 | `decompress-dict/level_21_btultra2/small-10k-random/matrix/c_ffi_with_dict` | 0.002 |
 | `decompress-dict/level_21_btultra2/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_21_btultra2/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_21_btultra2/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 3.504 |
-| `decompress-dict/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 5.373 |
+| `decompress-dict/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 3.523 |
+| `decompress-dict/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 5.350 |
 | `decompress-dict/level_22_btultra2/small-10k-random/matrix/c_ffi_with_dict` | 0.002 |
 | `decompress-dict/level_22_btultra2/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_22_btultra2/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_22_btultra2/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress/level_18_btultra/decodecorpus-z000033/c_stream/matrix/c_ffi` | 3.321 |
-| `decompress/level_18_btultra/decodecorpus-z000033/c_stream/matrix/pure_rust` | 5.014 |
-| `decompress/level_18_btultra/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 3.443 |
-| `decompress/level_18_btultra/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 5.208 |
-| `decompress/level_18_btultra/high-entropy-1m/c_stream/matrix/c_ffi` | 0.029 |
+| `decompress/level_18_btultra/decodecorpus-z000033/c_stream/matrix/c_ffi` | 3.329 |
+| `decompress/level_18_btultra/decodecorpus-z000033/c_stream/matrix/pure_rust` | 5.013 |
+| `decompress/level_18_btultra/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 3.454 |
+| `decompress/level_18_btultra/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 5.207 |
+| `decompress/level_18_btultra/high-entropy-1m/c_stream/matrix/c_ffi` | 0.028 |
 | `decompress/level_18_btultra/high-entropy-1m/c_stream/matrix/pure_rust` | 0.029 |
 | `decompress/level_18_btultra/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.029 |
 | `decompress/level_18_btultra/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
-| `decompress/level_18_btultra/large-log-stream/c_stream/matrix/c_ffi` | 1.480 |
-| `decompress/level_18_btultra/large-log-stream/c_stream/matrix/pure_rust` | 0.540 |
-| `decompress/level_18_btultra/large-log-stream/rust_stream/matrix/c_ffi` | 1.480 |
-| `decompress/level_18_btultra/large-log-stream/rust_stream/matrix/pure_rust` | 0.543 |
-| `decompress/level_18_btultra/low-entropy-1m/c_stream/matrix/c_ffi` | 0.174 |
-| `decompress/level_18_btultra/low-entropy-1m/c_stream/matrix/pure_rust` | 0.032 |
+| `decompress/level_18_btultra/large-log-stream/c_stream/matrix/c_ffi` | 1.500 |
+| `decompress/level_18_btultra/large-log-stream/c_stream/matrix/pure_rust` | 0.559 |
+| `decompress/level_18_btultra/large-log-stream/rust_stream/matrix/c_ffi` | 1.489 |
+| `decompress/level_18_btultra/large-log-stream/rust_stream/matrix/pure_rust` | 0.560 |
+| `decompress/level_18_btultra/low-entropy-1m/c_stream/matrix/c_ffi` | 0.173 |
+| `decompress/level_18_btultra/low-entropy-1m/c_stream/matrix/pure_rust` | 0.033 |
 | `decompress/level_18_btultra/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.174 |
 | `decompress/level_18_btultra/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.033 |
 | `decompress/level_18_btultra/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
@@ -769,53 +769,53 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_18_btultra/small-1k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_18_btultra/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_18_btultra/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_18_btultra/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.002 |
+| `decompress/level_18_btultra/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.003 |
 | `decompress/level_18_btultra/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_18_btultra/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
+| `decompress/level_18_btultra/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.003 |
 | `decompress/level_18_btultra/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_19_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi` | 3.374 |
-| `decompress/level_19_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust` | 5.116 |
-| `decompress/level_19_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 3.493 |
-| `decompress/level_19_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 5.307 |
+| `decompress/level_19_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi` | 3.390 |
+| `decompress/level_19_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust` | 5.136 |
+| `decompress/level_19_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 3.500 |
+| `decompress/level_19_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 5.309 |
 | `decompress/level_19_btultra2/high-entropy-1m/c_stream/matrix/c_ffi` | 0.029 |
 | `decompress/level_19_btultra2/high-entropy-1m/c_stream/matrix/pure_rust` | 0.029 |
 | `decompress/level_19_btultra2/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.029 |
 | `decompress/level_19_btultra2/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
-| `decompress/level_19_btultra2/large-log-stream/c_stream/matrix/c_ffi` | 1.486 |
-| `decompress/level_19_btultra2/large-log-stream/c_stream/matrix/pure_rust` | 0.545 |
+| `decompress/level_19_btultra2/large-log-stream/c_stream/matrix/c_ffi` | 1.494 |
+| `decompress/level_19_btultra2/large-log-stream/c_stream/matrix/pure_rust` | 0.550 |
 | `decompress/level_19_btultra2/large-log-stream/rust_stream/matrix/c_ffi` | 1.483 |
-| `decompress/level_19_btultra2/large-log-stream/rust_stream/matrix/pure_rust` | 0.544 |
-| `decompress/level_19_btultra2/low-entropy-1m/c_stream/matrix/c_ffi` | 0.173 |
+| `decompress/level_19_btultra2/large-log-stream/rust_stream/matrix/pure_rust` | 0.554 |
+| `decompress/level_19_btultra2/low-entropy-1m/c_stream/matrix/c_ffi` | 0.174 |
 | `decompress/level_19_btultra2/low-entropy-1m/c_stream/matrix/pure_rust` | 0.033 |
-| `decompress/level_19_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.173 |
-| `decompress/level_19_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.033 |
+| `decompress/level_19_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.174 |
+| `decompress/level_19_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.032 |
 | `decompress/level_19_btultra2/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_19_btultra2/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_19_btultra2/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
-| `decompress/level_19_btultra2/small-10k-random/rust_stream/matrix/pure_rust` | 0.000 |
+| `decompress/level_19_btultra2/small-10k-random/rust_stream/matrix/pure_rust` | 0.001 |
 | `decompress/level_19_btultra2/small-1k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_19_btultra2/small-1k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_19_btultra2/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_19_btultra2/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_19_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.002 |
+| `decompress/level_19_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.003 |
 | `decompress/level_19_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_19_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
+| `decompress/level_19_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.003 |
 | `decompress/level_19_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_20_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi` | 3.373 |
-| `decompress/level_20_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust` | 5.116 |
-| `decompress/level_20_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 3.491 |
-| `decompress/level_20_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 5.303 |
-| `decompress/level_20_btultra2/high-entropy-1m/c_stream/matrix/c_ffi` | 0.029 |
+| `decompress/level_20_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi` | 3.379 |
+| `decompress/level_20_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust` | 5.127 |
+| `decompress/level_20_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 3.502 |
+| `decompress/level_20_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 5.327 |
+| `decompress/level_20_btultra2/high-entropy-1m/c_stream/matrix/c_ffi` | 0.028 |
 | `decompress/level_20_btultra2/high-entropy-1m/c_stream/matrix/pure_rust` | 0.029 |
 | `decompress/level_20_btultra2/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.029 |
 | `decompress/level_20_btultra2/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
-| `decompress/level_20_btultra2/large-log-stream/c_stream/matrix/c_ffi` | 1.482 |
-| `decompress/level_20_btultra2/large-log-stream/c_stream/matrix/pure_rust` | 0.544 |
-| `decompress/level_20_btultra2/large-log-stream/rust_stream/matrix/c_ffi` | 1.482 |
-| `decompress/level_20_btultra2/large-log-stream/rust_stream/matrix/pure_rust` | 0.541 |
-| `decompress/level_20_btultra2/low-entropy-1m/c_stream/matrix/c_ffi` | 0.173 |
+| `decompress/level_20_btultra2/large-log-stream/c_stream/matrix/c_ffi` | 1.499 |
+| `decompress/level_20_btultra2/large-log-stream/c_stream/matrix/pure_rust` | 0.575 |
+| `decompress/level_20_btultra2/large-log-stream/rust_stream/matrix/c_ffi` | 1.522 |
+| `decompress/level_20_btultra2/large-log-stream/rust_stream/matrix/pure_rust` | 0.574 |
+| `decompress/level_20_btultra2/low-entropy-1m/c_stream/matrix/c_ffi` | 0.174 |
 | `decompress/level_20_btultra2/low-entropy-1m/c_stream/matrix/pure_rust` | 0.033 |
-| `decompress/level_20_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.174 |
+| `decompress/level_20_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.173 |
 | `decompress/level_20_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.033 |
 | `decompress/level_20_btultra2/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_20_btultra2/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
@@ -825,22 +825,22 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_20_btultra2/small-1k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_20_btultra2/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_20_btultra2/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_20_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.002 |
+| `decompress/level_20_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.003 |
 | `decompress/level_20_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_20_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
+| `decompress/level_20_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.003 |
 | `decompress/level_20_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_21_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi` | 3.359 |
+| `decompress/level_21_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi` | 3.366 |
 | `decompress/level_21_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust` | 5.094 |
-| `decompress/level_21_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 3.465 |
-| `decompress/level_21_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 5.256 |
+| `decompress/level_21_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 3.478 |
+| `decompress/level_21_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 5.269 |
 | `decompress/level_21_btultra2/high-entropy-1m/c_stream/matrix/c_ffi` | 0.029 |
 | `decompress/level_21_btultra2/high-entropy-1m/c_stream/matrix/pure_rust` | 0.029 |
 | `decompress/level_21_btultra2/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.029 |
 | `decompress/level_21_btultra2/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
-| `decompress/level_21_btultra2/large-log-stream/c_stream/matrix/c_ffi` | 1.486 |
-| `decompress/level_21_btultra2/large-log-stream/c_stream/matrix/pure_rust` | 0.543 |
-| `decompress/level_21_btultra2/large-log-stream/rust_stream/matrix/c_ffi` | 1.482 |
-| `decompress/level_21_btultra2/large-log-stream/rust_stream/matrix/pure_rust` | 0.542 |
+| `decompress/level_21_btultra2/large-log-stream/c_stream/matrix/c_ffi` | 1.497 |
+| `decompress/level_21_btultra2/large-log-stream/c_stream/matrix/pure_rust` | 0.561 |
+| `decompress/level_21_btultra2/large-log-stream/rust_stream/matrix/c_ffi` | 1.489 |
+| `decompress/level_21_btultra2/large-log-stream/rust_stream/matrix/pure_rust` | 0.557 |
 | `decompress/level_21_btultra2/low-entropy-1m/c_stream/matrix/c_ffi` | 0.173 |
 | `decompress/level_21_btultra2/low-entropy-1m/c_stream/matrix/pure_rust` | 0.032 |
 | `decompress/level_21_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.174 |
@@ -848,49 +848,49 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_21_btultra2/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_21_btultra2/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_21_btultra2/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
-| `decompress/level_21_btultra2/small-10k-random/rust_stream/matrix/pure_rust` | 0.001 |
+| `decompress/level_21_btultra2/small-10k-random/rust_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_21_btultra2/small-1k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_21_btultra2/small-1k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_21_btultra2/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_21_btultra2/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_21_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.002 |
+| `decompress/level_21_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.003 |
 | `decompress/level_21_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_21_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
+| `decompress/level_21_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.003 |
 | `decompress/level_21_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi` | 3.391 |
-| `decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust` | 5.145 |
-| `decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 3.454 |
-| `decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 5.250 |
-| `decompress/level_22_btultra2/high-entropy-1m/c_stream/matrix/c_ffi` | 0.029 |
+| `decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi` | 3.405 |
+| `decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust` | 5.152 |
+| `decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 3.465 |
+| `decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 5.254 |
+| `decompress/level_22_btultra2/high-entropy-1m/c_stream/matrix/c_ffi` | 0.028 |
 | `decompress/level_22_btultra2/high-entropy-1m/c_stream/matrix/pure_rust` | 0.029 |
 | `decompress/level_22_btultra2/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.029 |
 | `decompress/level_22_btultra2/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
-| `decompress/level_22_btultra2/large-log-stream/c_stream/matrix/c_ffi` | 1.481 |
-| `decompress/level_22_btultra2/large-log-stream/c_stream/matrix/pure_rust` | 0.543 |
-| `decompress/level_22_btultra2/large-log-stream/rust_stream/matrix/c_ffi` | 1.483 |
-| `decompress/level_22_btultra2/large-log-stream/rust_stream/matrix/pure_rust` | 0.543 |
-| `decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi` | 0.174 |
+| `decompress/level_22_btultra2/large-log-stream/c_stream/matrix/c_ffi` | 1.497 |
+| `decompress/level_22_btultra2/large-log-stream/c_stream/matrix/pure_rust` | 0.560 |
+| `decompress/level_22_btultra2/large-log-stream/rust_stream/matrix/c_ffi` | 1.496 |
+| `decompress/level_22_btultra2/large-log-stream/rust_stream/matrix/pure_rust` | 0.604 |
+| `decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi` | 0.173 |
 | `decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust` | 0.033 |
-| `decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.173 |
+| `decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.174 |
 | `decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.033 |
 | `decompress/level_22_btultra2/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_22_btultra2/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_22_btultra2/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
-| `decompress/level_22_btultra2/small-10k-random/rust_stream/matrix/pure_rust` | 0.001 |
+| `decompress/level_22_btultra2/small-10k-random/rust_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_22_btultra2/small-1k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_22_btultra2/small-1k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_22_btultra2/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_22_btultra2/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.002 |
+| `decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.003 |
 | `decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
+| `decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.003 |
 | `decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.003 |
-| `dict-train/na/decodecorpus-z000033/matrix/c_ffi` | 100.019 |
-| `dict-train/na/decodecorpus-z000033/matrix/pure_rust` | 23.547 |
-| `dict-train/na/small-10k-random/matrix/c_ffi` | 12.029 |
-| `dict-train/na/small-10k-random/matrix/pure_rust` | 3.462 |
-| `dict-train/na/small-4k-log-lines/matrix/c_ffi` | 2.405 |
-| `dict-train/na/small-4k-log-lines/matrix/pure_rust` | 1.149 |
+| `dict-train/na/decodecorpus-z000033/matrix/c_ffi` | 91.256 |
+| `dict-train/na/decodecorpus-z000033/matrix/pure_rust` | 19.739 |
+| `dict-train/na/small-10k-random/matrix/c_ffi` | 11.256 |
+| `dict-train/na/small-10k-random/matrix/pure_rust` | 2.634 |
+| `dict-train/na/small-4k-log-lines/matrix/c_ffi` | 1.978 |
+| `dict-train/na/small-4k-log-lines/matrix/pure_rust` | 0.897 |
 
 ## Strategy group: fast-dfast
 
@@ -1080,227 +1080,227 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 
 | Scenario | Label | Level | Dict bytes | Train ms | C bytes (no dict) | C bytes (with dict) | C ratio (no dict) | C ratio (with dict) |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| decodecorpus-z000033 | Repo decode corpus sample | level_-1_fast | 16384 | 82.927 | 595456 | 566610 | 0.5826 | 0.5544 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_1_fast | 16384 | 82.927 | 571525 | 550232 | 0.5592 | 0.5384 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_2_fast | 16384 | 82.927 | 550910 | 522181 | 0.5390 | 0.5109 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_3_dfast | 16384 | 82.927 | 498911 | 492978 | 0.4882 | 0.4823 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_4_dfast | 16384 | 82.927 | 498591 | 478473 | 0.4878 | 0.4682 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_5_greedy | 16384 | 82.927 | 489007 | 468499 | 0.4785 | 0.4584 |
-| small-10k-random | Small random payload (10 KiB) | level_-1_fast | 1280 | 10.927 | 10250 | 9238 | 1.0010 | 0.9021 |
-| small-10k-random | Small random payload (10 KiB) | level_1_fast | 1280 | 10.927 | 10250 | 9238 | 1.0010 | 0.9021 |
-| small-10k-random | Small random payload (10 KiB) | level_2_fast | 1280 | 10.927 | 10250 | 9245 | 1.0010 | 0.9028 |
-| small-10k-random | Small random payload (10 KiB) | level_3_dfast | 1280 | 10.927 | 10250 | 9238 | 1.0010 | 0.9021 |
-| small-10k-random | Small random payload (10 KiB) | level_4_dfast | 1280 | 10.927 | 10250 | 9238 | 1.0010 | 0.9021 |
-| small-10k-random | Small random payload (10 KiB) | level_5_greedy | 1280 | 10.927 | 10250 | 9234 | 1.0010 | 0.9018 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_-1_fast | 437 | 2.768 | 172 | 44 | 0.0420 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_1_fast | 437 | 2.768 | 153 | 44 | 0.0374 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_2_fast | 437 | 2.768 | 153 | 44 | 0.0374 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_3_dfast | 437 | 2.768 | 152 | 44 | 0.0371 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_4_dfast | 437 | 2.768 | 152 | 49 | 0.0371 | 0.0120 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_5_greedy | 437 | 2.768 | 150 | 44 | 0.0366 | 0.0107 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_-1_fast | 16384 | 87.338 | 595456 | 566610 | 0.5826 | 0.5544 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_1_fast | 16384 | 87.338 | 571525 | 550232 | 0.5592 | 0.5384 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_2_fast | 16384 | 87.338 | 550910 | 522181 | 0.5390 | 0.5109 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_3_dfast | 16384 | 87.338 | 498911 | 492978 | 0.4882 | 0.4823 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_4_dfast | 16384 | 87.338 | 498591 | 478473 | 0.4878 | 0.4682 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_5_greedy | 16384 | 87.338 | 489007 | 468499 | 0.4785 | 0.4584 |
+| small-10k-random | Small random payload (10 KiB) | level_-1_fast | 1280 | 12.488 | 10250 | 9238 | 1.0010 | 0.9021 |
+| small-10k-random | Small random payload (10 KiB) | level_1_fast | 1280 | 12.488 | 10250 | 9238 | 1.0010 | 0.9021 |
+| small-10k-random | Small random payload (10 KiB) | level_2_fast | 1280 | 12.488 | 10250 | 9245 | 1.0010 | 0.9028 |
+| small-10k-random | Small random payload (10 KiB) | level_3_dfast | 1280 | 12.488 | 10250 | 9238 | 1.0010 | 0.9021 |
+| small-10k-random | Small random payload (10 KiB) | level_4_dfast | 1280 | 12.488 | 10250 | 9238 | 1.0010 | 0.9021 |
+| small-10k-random | Small random payload (10 KiB) | level_5_greedy | 1280 | 12.488 | 10250 | 9234 | 1.0010 | 0.9018 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_-1_fast | 437 | 2.618 | 172 | 44 | 0.0420 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_1_fast | 437 | 2.618 | 153 | 44 | 0.0374 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_2_fast | 437 | 2.618 | 153 | 44 | 0.0374 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_3_dfast | 437 | 2.618 | 152 | 44 | 0.0371 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_4_dfast | 437 | 2.618 | 152 | 49 | 0.0371 | 0.0120 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_5_greedy | 437 | 2.618 | 150 | 44 | 0.0366 | 0.0107 |
 
 ## Dictionary Training (Rust FastCOVER vs C FFI)
 
 | Scenario | Label | Dict bytes (requested) | Rust train ms | C train ms | Rust dict bytes | C dict bytes | Rust FastCOVER score | Delta (C/Rust) | Status |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| decodecorpus-z000033 | Repo decode corpus sample | 16384 | 22.697 | 82.927 | 16384 | 16384 | 0 | 3.6537 | rust_faster |
-| small-10k-random | Small random payload (10 KiB) | 1280 | 3.025 | 10.927 | 1280 | 1280 | 0 | 3.6122 | rust_faster |
-| small-4k-log-lines | Small structured log lines (4 KiB) | 512 | 1.238 | 2.768 | 512 | 437 | 0 | 2.2359 | rust_faster |
+| decodecorpus-z000033 | Repo decode corpus sample | 16384 | 23.390 | 87.338 | 16384 | 16384 | 0 | 3.7340 | rust_faster |
+| small-10k-random | Small random payload (10 KiB) | 1280 | 3.765 | 12.488 | 1280 | 1280 | 0 | 3.3169 | rust_faster |
+| small-4k-log-lines | Small structured log lines (4 KiB) | 512 | 1.437 | 2.618 | 512 | 437 | 0 | 1.8219 | rust_faster |
 
 ## Timing Metrics
 
 | Benchmark | ms/iter |
 | --- | ---: |
-| `compress-dict/level_-1_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 5.119 |
-| `compress-dict/level_-1_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 4.573 |
-| `compress-dict/level_-1_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 7.293 |
-| `compress-dict/level_-1_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.024 |
-| `compress-dict/level_-1_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.010 |
-| `compress-dict/level_-1_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.065 |
+| `compress-dict/level_-1_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 4.961 |
+| `compress-dict/level_-1_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 4.385 |
+| `compress-dict/level_-1_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 7.925 |
+| `compress-dict/level_-1_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.025 |
+| `compress-dict/level_-1_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.006 |
+| `compress-dict/level_-1_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.067 |
 | `compress-dict/level_-1_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.002 |
 | `compress-dict/level_-1_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.006 |
 | `compress-dict/level_-1_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.002 |
-| `compress-dict/level_1_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 5.512 |
-| `compress-dict/level_1_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 5.112 |
-| `compress-dict/level_1_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 7.532 |
+| `compress-dict/level_1_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 5.272 |
+| `compress-dict/level_1_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 4.832 |
+| `compress-dict/level_1_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 8.012 |
 | `compress-dict/level_1_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.028 |
 | `compress-dict/level_1_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.012 |
-| `compress-dict/level_1_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.065 |
+| `compress-dict/level_1_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.067 |
 | `compress-dict/level_1_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.002 |
-| `compress-dict/level_1_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.009 |
+| `compress-dict/level_1_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.008 |
 | `compress-dict/level_1_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.002 |
-| `compress-dict/level_2_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 6.998 |
-| `compress-dict/level_2_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 6.744 |
-| `compress-dict/level_2_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 9.143 |
-| `compress-dict/level_2_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.028 |
+| `compress-dict/level_2_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 6.200 |
+| `compress-dict/level_2_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 5.978 |
+| `compress-dict/level_2_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 9.232 |
+| `compress-dict/level_2_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.029 |
 | `compress-dict/level_2_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.011 |
 | `compress-dict/level_2_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.056 |
 | `compress-dict/level_2_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.002 |
-| `compress-dict/level_2_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.009 |
+| `compress-dict/level_2_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.008 |
 | `compress-dict/level_2_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.002 |
-| `compress-dict/level_3_dfast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 12.376 |
-| `compress-dict/level_3_dfast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 11.417 |
-| `compress-dict/level_3_dfast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 17.924 |
-| `compress-dict/level_3_dfast/small-10k-random/matrix/c_ffi_with_dict` | 0.057 |
+| `compress-dict/level_3_dfast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 10.522 |
+| `compress-dict/level_3_dfast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 10.952 |
+| `compress-dict/level_3_dfast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 19.589 |
+| `compress-dict/level_3_dfast/small-10k-random/matrix/c_ffi_with_dict` | 0.061 |
 | `compress-dict/level_3_dfast/small-10k-random/matrix/c_ffi_without_dict` | 0.015 |
-| `compress-dict/level_3_dfast/small-10k-random/matrix/pure_rust_with_dict` | 0.060 |
+| `compress-dict/level_3_dfast/small-10k-random/matrix/pure_rust_with_dict` | 0.059 |
 | `compress-dict/level_3_dfast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.003 |
-| `compress-dict/level_3_dfast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.009 |
+| `compress-dict/level_3_dfast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.008 |
 | `compress-dict/level_3_dfast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.003 |
-| `compress-dict/level_4_dfast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 12.649 |
-| `compress-dict/level_4_dfast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 13.217 |
-| `compress-dict/level_4_dfast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 19.078 |
-| `compress-dict/level_4_dfast/small-10k-random/matrix/c_ffi_with_dict` | 0.129 |
-| `compress-dict/level_4_dfast/small-10k-random/matrix/c_ffi_without_dict` | 0.023 |
-| `compress-dict/level_4_dfast/small-10k-random/matrix/pure_rust_with_dict` | 0.059 |
+| `compress-dict/level_4_dfast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 10.796 |
+| `compress-dict/level_4_dfast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 13.886 |
+| `compress-dict/level_4_dfast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 23.513 |
+| `compress-dict/level_4_dfast/small-10k-random/matrix/c_ffi_with_dict` | 0.111 |
+| `compress-dict/level_4_dfast/small-10k-random/matrix/c_ffi_without_dict` | 0.024 |
+| `compress-dict/level_4_dfast/small-10k-random/matrix/pure_rust_with_dict` | 0.060 |
 | `compress-dict/level_4_dfast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.003 |
-| `compress-dict/level_4_dfast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.011 |
+| `compress-dict/level_4_dfast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.010 |
 | `compress-dict/level_4_dfast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.003 |
-| `compress-dict/level_5_greedy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 20.253 |
-| `compress-dict/level_5_greedy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 26.935 |
-| `compress-dict/level_5_greedy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 30.022 |
-| `compress-dict/level_5_greedy/small-10k-random/matrix/c_ffi_with_dict` | 0.132 |
+| `compress-dict/level_5_greedy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 18.348 |
+| `compress-dict/level_5_greedy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 26.210 |
+| `compress-dict/level_5_greedy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 36.764 |
+| `compress-dict/level_5_greedy/small-10k-random/matrix/c_ffi_with_dict` | 0.110 |
 | `compress-dict/level_5_greedy/small-10k-random/matrix/c_ffi_without_dict` | 0.024 |
-| `compress-dict/level_5_greedy/small-10k-random/matrix/pure_rust_with_dict` | 0.358 |
+| `compress-dict/level_5_greedy/small-10k-random/matrix/pure_rust_with_dict` | 0.360 |
 | `compress-dict/level_5_greedy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.005 |
-| `compress-dict/level_5_greedy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.013 |
+| `compress-dict/level_5_greedy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.012 |
 | `compress-dict/level_5_greedy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.004 |
-| `compress/level_-1_fast/decodecorpus-z000033/matrix/c_ffi` | 5.118 |
-| `compress/level_-1_fast/decodecorpus-z000033/matrix/pure_rust` | 6.956 |
-| `compress/level_-1_fast/high-entropy-1m/matrix/c_ffi` | 1.091 |
-| `compress/level_-1_fast/high-entropy-1m/matrix/pure_rust` | 0.526 |
-| `compress/level_-1_fast/large-log-stream/matrix/c_ffi` | 4.443 |
-| `compress/level_-1_fast/large-log-stream/matrix/pure_rust` | 3.322 |
-| `compress/level_-1_fast/low-entropy-1m/matrix/c_ffi` | 0.582 |
-| `compress/level_-1_fast/low-entropy-1m/matrix/pure_rust` | 0.204 |
+| `compress/level_-1_fast/decodecorpus-z000033/matrix/c_ffi` | 4.968 |
+| `compress/level_-1_fast/decodecorpus-z000033/matrix/pure_rust` | 7.455 |
+| `compress/level_-1_fast/high-entropy-1m/matrix/c_ffi` | 1.103 |
+| `compress/level_-1_fast/high-entropy-1m/matrix/pure_rust` | 0.534 |
+| `compress/level_-1_fast/large-log-stream/matrix/c_ffi` | 5.004 |
+| `compress/level_-1_fast/large-log-stream/matrix/pure_rust` | 4.024 |
+| `compress/level_-1_fast/low-entropy-1m/matrix/c_ffi` | 0.616 |
+| `compress/level_-1_fast/low-entropy-1m/matrix/pure_rust` | 0.222 |
 | `compress/level_-1_fast/small-10k-random/matrix/c_ffi` | 0.008 |
 | `compress/level_-1_fast/small-10k-random/matrix/pure_rust` | 0.006 |
 | `compress/level_-1_fast/small-1k-random/matrix/c_ffi` | 0.006 |
 | `compress/level_-1_fast/small-1k-random/matrix/pure_rust` | 0.002 |
-| `compress/level_-1_fast/small-4k-log-lines/matrix/c_ffi` | 0.008 |
+| `compress/level_-1_fast/small-4k-log-lines/matrix/c_ffi` | 0.007 |
 | `compress/level_-1_fast/small-4k-log-lines/matrix/pure_rust` | 0.009 |
-| `compress/level_1_fast/decodecorpus-z000033/matrix/c_ffi` | 5.710 |
-| `compress/level_1_fast/decodecorpus-z000033/matrix/pure_rust` | 7.124 |
-| `compress/level_1_fast/high-entropy-1m/matrix/c_ffi` | 1.144 |
-| `compress/level_1_fast/high-entropy-1m/matrix/pure_rust` | 0.531 |
-| `compress/level_1_fast/large-log-stream/matrix/c_ffi` | 4.540 |
-| `compress/level_1_fast/large-log-stream/matrix/pure_rust` | 3.257 |
-| `compress/level_1_fast/low-entropy-1m/matrix/c_ffi` | 0.597 |
-| `compress/level_1_fast/low-entropy-1m/matrix/pure_rust` | 0.205 |
-| `compress/level_1_fast/small-10k-random/matrix/c_ffi` | 0.014 |
+| `compress/level_1_fast/decodecorpus-z000033/matrix/c_ffi` | 5.504 |
+| `compress/level_1_fast/decodecorpus-z000033/matrix/pure_rust` | 7.594 |
+| `compress/level_1_fast/high-entropy-1m/matrix/c_ffi` | 1.147 |
+| `compress/level_1_fast/high-entropy-1m/matrix/pure_rust` | 0.536 |
+| `compress/level_1_fast/large-log-stream/matrix/c_ffi` | 5.066 |
+| `compress/level_1_fast/large-log-stream/matrix/pure_rust` | 3.864 |
+| `compress/level_1_fast/low-entropy-1m/matrix/c_ffi` | 0.633 |
+| `compress/level_1_fast/low-entropy-1m/matrix/pure_rust` | 0.223 |
+| `compress/level_1_fast/small-10k-random/matrix/c_ffi` | 0.015 |
 | `compress/level_1_fast/small-10k-random/matrix/pure_rust` | 0.007 |
-| `compress/level_1_fast/small-1k-random/matrix/c_ffi` | 0.007 |
+| `compress/level_1_fast/small-1k-random/matrix/c_ffi` | 0.006 |
 | `compress/level_1_fast/small-1k-random/matrix/pure_rust` | 0.002 |
 | `compress/level_1_fast/small-4k-log-lines/matrix/c_ffi` | 0.010 |
 | `compress/level_1_fast/small-4k-log-lines/matrix/pure_rust` | 0.009 |
-| `compress/level_2_fast/decodecorpus-z000033/matrix/c_ffi` | 7.284 |
-| `compress/level_2_fast/decodecorpus-z000033/matrix/pure_rust` | 8.882 |
-| `compress/level_2_fast/high-entropy-1m/matrix/c_ffi` | 1.407 |
-| `compress/level_2_fast/high-entropy-1m/matrix/pure_rust` | 0.536 |
-| `compress/level_2_fast/large-log-stream/matrix/c_ffi` | 5.188 |
-| `compress/level_2_fast/large-log-stream/matrix/pure_rust` | 3.387 |
-| `compress/level_2_fast/low-entropy-1m/matrix/c_ffi` | 0.828 |
-| `compress/level_2_fast/low-entropy-1m/matrix/pure_rust` | 0.208 |
+| `compress/level_2_fast/decodecorpus-z000033/matrix/c_ffi` | 6.809 |
+| `compress/level_2_fast/decodecorpus-z000033/matrix/pure_rust` | 9.007 |
+| `compress/level_2_fast/high-entropy-1m/matrix/c_ffi` | 1.432 |
+| `compress/level_2_fast/high-entropy-1m/matrix/pure_rust` | 0.537 |
+| `compress/level_2_fast/large-log-stream/matrix/c_ffi` | 5.649 |
+| `compress/level_2_fast/large-log-stream/matrix/pure_rust` | 4.087 |
+| `compress/level_2_fast/low-entropy-1m/matrix/c_ffi` | 0.881 |
+| `compress/level_2_fast/low-entropy-1m/matrix/pure_rust` | 0.420 |
 | `compress/level_2_fast/small-10k-random/matrix/c_ffi` | 0.013 |
-| `compress/level_2_fast/small-10k-random/matrix/pure_rust` | 0.007 |
+| `compress/level_2_fast/small-10k-random/matrix/pure_rust` | 0.008 |
 | `compress/level_2_fast/small-1k-random/matrix/c_ffi` | 0.006 |
 | `compress/level_2_fast/small-1k-random/matrix/pure_rust` | 0.002 |
-| `compress/level_2_fast/small-4k-log-lines/matrix/c_ffi` | 0.010 |
-| `compress/level_2_fast/small-4k-log-lines/matrix/pure_rust` | 0.008 |
-| `compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi` | 9.619 |
-| `compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust` | 16.699 |
-| `compress/level_3_dfast/high-entropy-1m/matrix/c_ffi` | 1.064 |
-| `compress/level_3_dfast/high-entropy-1m/matrix/pure_rust` | 0.526 |
-| `compress/level_3_dfast/large-log-stream/matrix/c_ffi` | 6.293 |
-| `compress/level_3_dfast/large-log-stream/matrix/pure_rust` | 3.289 |
-| `compress/level_3_dfast/low-entropy-1m/matrix/c_ffi` | 0.638 |
-| `compress/level_3_dfast/low-entropy-1m/matrix/pure_rust` | 0.463 |
-| `compress/level_3_dfast/small-10k-random/matrix/c_ffi` | 0.018 |
+| `compress/level_2_fast/small-4k-log-lines/matrix/c_ffi` | 0.009 |
+| `compress/level_2_fast/small-4k-log-lines/matrix/pure_rust` | 0.009 |
+| `compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi` | 10.500 |
+| `compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust` | 17.473 |
+| `compress/level_3_dfast/high-entropy-1m/matrix/c_ffi` | 1.737 |
+| `compress/level_3_dfast/high-entropy-1m/matrix/pure_rust` | 0.533 |
+| `compress/level_3_dfast/large-log-stream/matrix/c_ffi` | 6.853 |
+| `compress/level_3_dfast/large-log-stream/matrix/pure_rust` | 3.804 |
+| `compress/level_3_dfast/low-entropy-1m/matrix/c_ffi` | 1.248 |
+| `compress/level_3_dfast/low-entropy-1m/matrix/pure_rust` | 0.485 |
+| `compress/level_3_dfast/small-10k-random/matrix/c_ffi` | 0.017 |
 | `compress/level_3_dfast/small-10k-random/matrix/pure_rust` | 0.006 |
 | `compress/level_3_dfast/small-1k-random/matrix/c_ffi` | 0.007 |
 | `compress/level_3_dfast/small-1k-random/matrix/pure_rust` | 0.002 |
-| `compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi` | 0.011 |
-| `compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust` | 0.010 |
-| `compress/level_4_dfast/decodecorpus-z000033/matrix/c_ffi` | 11.640 |
-| `compress/level_4_dfast/decodecorpus-z000033/matrix/pure_rust` | 16.131 |
-| `compress/level_4_dfast/high-entropy-1m/matrix/c_ffi` | 1.652 |
-| `compress/level_4_dfast/high-entropy-1m/matrix/pure_rust` | 0.524 |
-| `compress/level_4_dfast/large-log-stream/matrix/c_ffi` | 6.227 |
-| `compress/level_4_dfast/large-log-stream/matrix/pure_rust` | 2.766 |
-| `compress/level_4_dfast/low-entropy-1m/matrix/c_ffi` | 1.207 |
-| `compress/level_4_dfast/low-entropy-1m/matrix/pure_rust` | 0.219 |
+| `compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi` | 0.010 |
+| `compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust` | 0.011 |
+| `compress/level_4_dfast/decodecorpus-z000033/matrix/c_ffi` | 12.085 |
+| `compress/level_4_dfast/decodecorpus-z000033/matrix/pure_rust` | 20.305 |
+| `compress/level_4_dfast/high-entropy-1m/matrix/c_ffi` | 1.621 |
+| `compress/level_4_dfast/high-entropy-1m/matrix/pure_rust` | 0.537 |
+| `compress/level_4_dfast/large-log-stream/matrix/c_ffi` | 7.498 |
+| `compress/level_4_dfast/large-log-stream/matrix/pure_rust` | 4.130 |
+| `compress/level_4_dfast/low-entropy-1m/matrix/c_ffi` | 1.058 |
+| `compress/level_4_dfast/low-entropy-1m/matrix/pure_rust` | 0.574 |
 | `compress/level_4_dfast/small-10k-random/matrix/c_ffi` | 0.025 |
 | `compress/level_4_dfast/small-10k-random/matrix/pure_rust` | 0.006 |
 | `compress/level_4_dfast/small-1k-random/matrix/c_ffi` | 0.012 |
 | `compress/level_4_dfast/small-1k-random/matrix/pure_rust` | 0.002 |
 | `compress/level_4_dfast/small-4k-log-lines/matrix/c_ffi` | 0.012 |
-| `compress/level_4_dfast/small-4k-log-lines/matrix/pure_rust` | 0.010 |
-| `compress/level_5_greedy/decodecorpus-z000033/matrix/c_ffi` | 23.161 |
-| `compress/level_5_greedy/decodecorpus-z000033/matrix/pure_rust` | 26.800 |
-| `compress/level_5_greedy/high-entropy-1m/matrix/c_ffi` | 1.518 |
-| `compress/level_5_greedy/high-entropy-1m/matrix/pure_rust` | 2.134 |
-| `compress/level_5_greedy/large-log-stream/matrix/c_ffi` | 8.251 |
-| `compress/level_5_greedy/large-log-stream/matrix/pure_rust` | 5.687 |
-| `compress/level_5_greedy/low-entropy-1m/matrix/c_ffi` | 0.784 |
-| `compress/level_5_greedy/low-entropy-1m/matrix/pure_rust` | 0.616 |
-| `compress/level_5_greedy/small-10k-random/matrix/c_ffi` | 0.026 |
+| `compress/level_4_dfast/small-4k-log-lines/matrix/pure_rust` | 0.011 |
+| `compress/level_5_greedy/decodecorpus-z000033/matrix/c_ffi` | 23.138 |
+| `compress/level_5_greedy/decodecorpus-z000033/matrix/pure_rust` | 28.617 |
+| `compress/level_5_greedy/high-entropy-1m/matrix/c_ffi` | 2.335 |
+| `compress/level_5_greedy/high-entropy-1m/matrix/pure_rust` | 2.720 |
+| `compress/level_5_greedy/large-log-stream/matrix/c_ffi` | 8.615 |
+| `compress/level_5_greedy/large-log-stream/matrix/pure_rust` | 7.446 |
+| `compress/level_5_greedy/low-entropy-1m/matrix/c_ffi` | 1.490 |
+| `compress/level_5_greedy/low-entropy-1m/matrix/pure_rust` | 1.451 |
+| `compress/level_5_greedy/small-10k-random/matrix/c_ffi` | 0.025 |
 | `compress/level_5_greedy/small-10k-random/matrix/pure_rust` | 0.019 |
 | `compress/level_5_greedy/small-1k-random/matrix/c_ffi` | 0.012 |
 | `compress/level_5_greedy/small-1k-random/matrix/pure_rust` | 0.003 |
-| `compress/level_5_greedy/small-4k-log-lines/matrix/c_ffi` | 0.015 |
-| `compress/level_5_greedy/small-4k-log-lines/matrix/pure_rust` | 0.017 |
-| `decompress-dict/level_-1_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.224 |
-| `decompress-dict/level_-1_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 1.700 |
+| `compress/level_5_greedy/small-4k-log-lines/matrix/c_ffi` | 0.014 |
+| `compress/level_5_greedy/small-4k-log-lines/matrix/pure_rust` | 0.018 |
+| `decompress-dict/level_-1_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.214 |
+| `decompress-dict/level_-1_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 1.815 |
 | `decompress-dict/level_-1_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_-1_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_-1_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_-1_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_1_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.042 |
-| `decompress-dict/level_1_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.429 |
+| `decompress-dict/level_1_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.002 |
+| `decompress-dict/level_1_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.515 |
 | `decompress-dict/level_1_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_1_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_1_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_1_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_2_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.163 |
-| `decompress-dict/level_2_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.554 |
+| `decompress-dict/level_2_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.142 |
+| `decompress-dict/level_2_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.679 |
 | `decompress-dict/level_2_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_2_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_2_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_2_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_3_dfast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.359 |
-| `decompress-dict/level_3_dfast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.977 |
+| `decompress-dict/level_3_dfast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.259 |
+| `decompress-dict/level_3_dfast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 4.174 |
 | `decompress-dict/level_3_dfast/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_3_dfast/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_3_dfast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_3_dfast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_4_dfast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.622 |
-| `decompress-dict/level_4_dfast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 4.196 |
+| `decompress-dict/level_4_dfast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.545 |
+| `decompress-dict/level_4_dfast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 4.432 |
 | `decompress-dict/level_4_dfast/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_4_dfast/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_4_dfast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_4_dfast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_5_greedy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.670 |
-| `decompress-dict/level_5_greedy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 4.200 |
-| `decompress-dict/level_5_greedy/small-10k-random/matrix/c_ffi_with_dict` | 0.002 |
+| `decompress-dict/level_5_greedy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.614 |
+| `decompress-dict/level_5_greedy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 4.484 |
+| `decompress-dict/level_5_greedy/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_5_greedy/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_5_greedy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_5_greedy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress/level_-1_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.982 |
-| `decompress/level_-1_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.319 |
-| `decompress/level_-1_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.913 |
-| `decompress/level_-1_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.276 |
-| `decompress/level_-1_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.036 |
-| `decompress/level_-1_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.037 |
-| `decompress/level_-1_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.036 |
-| `decompress/level_-1_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.036 |
-| `decompress/level_-1_fast/large-log-stream/c_stream/matrix/c_ffi` | 2.024 |
-| `decompress/level_-1_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.436 |
-| `decompress/level_-1_fast/large-log-stream/rust_stream/matrix/c_ffi` | 2.022 |
-| `decompress/level_-1_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.438 |
-| `decompress/level_-1_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.208 |
-| `decompress/level_-1_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
-| `decompress/level_-1_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.207 |
-| `decompress/level_-1_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_-1_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.962 |
+| `decompress/level_-1_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.378 |
+| `decompress/level_-1_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.839 |
+| `decompress/level_-1_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.330 |
+| `decompress/level_-1_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.029 |
+| `decompress/level_-1_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_-1_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.029 |
+| `decompress/level_-1_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_-1_fast/large-log-stream/c_stream/matrix/c_ffi` | 1.551 |
+| `decompress/level_-1_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.533 |
+| `decompress/level_-1_fast/large-log-stream/rust_stream/matrix/c_ffi` | 1.559 |
+| `decompress/level_-1_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.532 |
+| `decompress/level_-1_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.174 |
+| `decompress/level_-1_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.031 |
+| `decompress/level_-1_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.174 |
+| `decompress/level_-1_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.031 |
 | `decompress/level_-1_fast/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_-1_fast/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_-1_fast/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -1312,23 +1312,23 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_-1_fast/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.001 |
 | `decompress/level_-1_fast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.001 |
 | `decompress/level_-1_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.003 |
-| `decompress/level_-1_fast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_1_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.960 |
-| `decompress/level_1_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.349 |
-| `decompress/level_1_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.929 |
-| `decompress/level_1_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.274 |
-| `decompress/level_1_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.036 |
-| `decompress/level_1_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.036 |
-| `decompress/level_1_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.037 |
-| `decompress/level_1_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.037 |
-| `decompress/level_1_fast/large-log-stream/c_stream/matrix/c_ffi` | 2.029 |
-| `decompress/level_1_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.441 |
-| `decompress/level_1_fast/large-log-stream/rust_stream/matrix/c_ffi` | 2.024 |
-| `decompress/level_1_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.438 |
-| `decompress/level_1_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.207 |
-| `decompress/level_1_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
-| `decompress/level_1_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.207 |
-| `decompress/level_1_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_-1_fast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.004 |
+| `decompress/level_1_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.890 |
+| `decompress/level_1_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.404 |
+| `decompress/level_1_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.833 |
+| `decompress/level_1_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.332 |
+| `decompress/level_1_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.029 |
+| `decompress/level_1_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_1_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.029 |
+| `decompress/level_1_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_1_fast/large-log-stream/c_stream/matrix/c_ffi` | 1.560 |
+| `decompress/level_1_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.532 |
+| `decompress/level_1_fast/large-log-stream/rust_stream/matrix/c_ffi` | 1.562 |
+| `decompress/level_1_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.528 |
+| `decompress/level_1_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.174 |
+| `decompress/level_1_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.031 |
+| `decompress/level_1_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.174 |
+| `decompress/level_1_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.031 |
 | `decompress/level_1_fast/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_1_fast/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_1_fast/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -1341,22 +1341,22 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_1_fast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.003 |
 | `decompress/level_1_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.003 |
 | `decompress/level_1_fast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_2_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 2.018 |
-| `decompress/level_2_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.405 |
-| `decompress/level_2_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.012 |
-| `decompress/level_2_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.361 |
-| `decompress/level_2_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.036 |
-| `decompress/level_2_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.037 |
-| `decompress/level_2_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.036 |
-| `decompress/level_2_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.036 |
-| `decompress/level_2_fast/large-log-stream/c_stream/matrix/c_ffi` | 2.041 |
-| `decompress/level_2_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.438 |
-| `decompress/level_2_fast/large-log-stream/rust_stream/matrix/c_ffi` | 2.019 |
-| `decompress/level_2_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.438 |
-| `decompress/level_2_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.207 |
-| `decompress/level_2_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
-| `decompress/level_2_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.207 |
-| `decompress/level_2_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_2_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.998 |
+| `decompress/level_2_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.486 |
+| `decompress/level_2_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.958 |
+| `decompress/level_2_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.442 |
+| `decompress/level_2_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.029 |
+| `decompress/level_2_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_2_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.029 |
+| `decompress/level_2_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_2_fast/large-log-stream/c_stream/matrix/c_ffi` | 1.553 |
+| `decompress/level_2_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.524 |
+| `decompress/level_2_fast/large-log-stream/rust_stream/matrix/c_ffi` | 1.561 |
+| `decompress/level_2_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.539 |
+| `decompress/level_2_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.174 |
+| `decompress/level_2_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.030 |
+| `decompress/level_2_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.174 |
+| `decompress/level_2_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.030 |
 | `decompress/level_2_fast/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_2_fast/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_2_fast/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -1369,22 +1369,22 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_2_fast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.003 |
 | `decompress/level_2_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.003 |
 | `decompress/level_2_fast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 2.113 |
-| `decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.427 |
-| `decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.228 |
-| `decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.613 |
-| `decompress/level_3_dfast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.036 |
-| `decompress/level_3_dfast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.035 |
-| `decompress/level_3_dfast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.036 |
-| `decompress/level_3_dfast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.036 |
-| `decompress/level_3_dfast/large-log-stream/c_stream/matrix/c_ffi` | 2.028 |
-| `decompress/level_3_dfast/large-log-stream/c_stream/matrix/pure_rust` | 0.437 |
-| `decompress/level_3_dfast/large-log-stream/rust_stream/matrix/c_ffi` | 1.726 |
-| `decompress/level_3_dfast/large-log-stream/rust_stream/matrix/pure_rust` | 0.595 |
-| `decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.207 |
-| `decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
-| `decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.112 |
-| `decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 2.038 |
+| `decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.522 |
+| `decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.134 |
+| `decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.774 |
+| `decompress/level_3_dfast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.029 |
+| `decompress/level_3_dfast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_3_dfast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.029 |
+| `decompress/level_3_dfast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_3_dfast/large-log-stream/c_stream/matrix/c_ffi` | 1.554 |
+| `decompress/level_3_dfast/large-log-stream/c_stream/matrix/pure_rust` | 0.524 |
+| `decompress/level_3_dfast/large-log-stream/rust_stream/matrix/c_ffi` | 1.731 |
+| `decompress/level_3_dfast/large-log-stream/rust_stream/matrix/pure_rust` | 0.581 |
+| `decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.174 |
+| `decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.030 |
+| `decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.113 |
+| `decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.032 |
 | `decompress/level_3_dfast/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_3_dfast/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_3_dfast/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -1395,24 +1395,24 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_3_dfast/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.003 |
 | `decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.003 |
+| `decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_4_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 2.119 |
-| `decompress/level_4_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.432 |
-| `decompress/level_4_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.237 |
-| `decompress/level_4_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.592 |
-| `decompress/level_4_dfast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.037 |
-| `decompress/level_4_dfast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.036 |
-| `decompress/level_4_dfast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.036 |
-| `decompress/level_4_dfast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.036 |
-| `decompress/level_4_dfast/large-log-stream/c_stream/matrix/c_ffi` | 2.023 |
-| `decompress/level_4_dfast/large-log-stream/c_stream/matrix/pure_rust` | 0.437 |
-| `decompress/level_4_dfast/large-log-stream/rust_stream/matrix/c_ffi` | 1.724 |
-| `decompress/level_4_dfast/large-log-stream/rust_stream/matrix/pure_rust` | 0.589 |
-| `decompress/level_4_dfast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.208 |
-| `decompress/level_4_dfast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
-| `decompress/level_4_dfast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.112 |
-| `decompress/level_4_dfast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_4_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 2.062 |
+| `decompress/level_4_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.530 |
+| `decompress/level_4_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.133 |
+| `decompress/level_4_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.758 |
+| `decompress/level_4_dfast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.029 |
+| `decompress/level_4_dfast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_4_dfast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.029 |
+| `decompress/level_4_dfast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_4_dfast/large-log-stream/c_stream/matrix/c_ffi` | 1.554 |
+| `decompress/level_4_dfast/large-log-stream/c_stream/matrix/pure_rust` | 0.524 |
+| `decompress/level_4_dfast/large-log-stream/rust_stream/matrix/c_ffi` | 1.730 |
+| `decompress/level_4_dfast/large-log-stream/rust_stream/matrix/pure_rust` | 0.575 |
+| `decompress/level_4_dfast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.174 |
+| `decompress/level_4_dfast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.031 |
+| `decompress/level_4_dfast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.113 |
+| `decompress/level_4_dfast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.033 |
 | `decompress/level_4_dfast/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_4_dfast/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_4_dfast/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -1423,24 +1423,24 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_4_dfast/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_4_dfast/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.003 |
 | `decompress/level_4_dfast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_4_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.003 |
+| `decompress/level_4_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_4_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_5_greedy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 2.109 |
-| `decompress/level_5_greedy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.401 |
-| `decompress/level_5_greedy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.347 |
-| `decompress/level_5_greedy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.741 |
-| `decompress/level_5_greedy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.036 |
-| `decompress/level_5_greedy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_5_greedy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.027 |
-| `decompress/level_5_greedy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.036 |
-| `decompress/level_5_greedy/large-log-stream/c_stream/matrix/c_ffi` | 2.032 |
-| `decompress/level_5_greedy/large-log-stream/c_stream/matrix/pure_rust` | 0.437 |
-| `decompress/level_5_greedy/large-log-stream/rust_stream/matrix/c_ffi` | 1.275 |
-| `decompress/level_5_greedy/large-log-stream/rust_stream/matrix/pure_rust` | 0.433 |
-| `decompress/level_5_greedy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.207 |
-| `decompress/level_5_greedy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
-| `decompress/level_5_greedy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.163 |
-| `decompress/level_5_greedy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_5_greedy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 2.082 |
+| `decompress/level_5_greedy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.524 |
+| `decompress/level_5_greedy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.280 |
+| `decompress/level_5_greedy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.938 |
+| `decompress/level_5_greedy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.029 |
+| `decompress/level_5_greedy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_5_greedy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.029 |
+| `decompress/level_5_greedy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_5_greedy/large-log-stream/c_stream/matrix/c_ffi` | 1.554 |
+| `decompress/level_5_greedy/large-log-stream/c_stream/matrix/pure_rust` | 0.524 |
+| `decompress/level_5_greedy/large-log-stream/rust_stream/matrix/c_ffi` | 1.397 |
+| `decompress/level_5_greedy/large-log-stream/rust_stream/matrix/pure_rust` | 0.522 |
+| `decompress/level_5_greedy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.174 |
+| `decompress/level_5_greedy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.031 |
+| `decompress/level_5_greedy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.172 |
+| `decompress/level_5_greedy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.031 |
 | `decompress/level_5_greedy/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_5_greedy/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_5_greedy/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -1451,14 +1451,14 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_5_greedy/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_5_greedy/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.003 |
 | `decompress/level_5_greedy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_5_greedy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.003 |
+| `decompress/level_5_greedy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_5_greedy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.003 |
-| `dict-train/na/decodecorpus-z000033/matrix/c_ffi` | 81.805 |
-| `dict-train/na/decodecorpus-z000033/matrix/pure_rust` | 19.967 |
-| `dict-train/na/small-10k-random/matrix/c_ffi` | 10.535 |
-| `dict-train/na/small-10k-random/matrix/pure_rust` | 2.516 |
-| `dict-train/na/small-4k-log-lines/matrix/c_ffi` | 1.940 |
-| `dict-train/na/small-4k-log-lines/matrix/pure_rust` | 0.906 |
+| `dict-train/na/decodecorpus-z000033/matrix/c_ffi` | 90.210 |
+| `dict-train/na/decodecorpus-z000033/matrix/pure_rust` | 21.055 |
+| `dict-train/na/small-10k-random/matrix/c_ffi` | 11.956 |
+| `dict-train/na/small-10k-random/matrix/pure_rust` | 3.455 |
+| `dict-train/na/small-4k-log-lines/matrix/c_ffi` | 2.394 |
+| `dict-train/na/small-4k-log-lines/matrix/pure_rust` | 1.136 |
 
 ## Strategy group: fast-neg
 
@@ -1648,226 +1648,226 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 
 | Scenario | Label | Level | Dict bytes | Train ms | C bytes (no dict) | C bytes (with dict) | C ratio (no dict) | C ratio (with dict) |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| decodecorpus-z000033 | Repo decode corpus sample | level_-2_fast | 16384 | 82.053 | 613921 | 585842 | 0.6007 | 0.5732 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_-3_fast | 16384 | 82.053 | 634656 | 607365 | 0.6210 | 0.5943 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_-4_fast | 16384 | 82.053 | 654893 | 628810 | 0.6408 | 0.6153 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_-5_fast | 16384 | 82.053 | 671408 | 646342 | 0.6569 | 0.6324 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_-6_fast | 16384 | 82.053 | 685482 | 660928 | 0.6707 | 0.6467 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_-7_fast | 16384 | 82.053 | 699611 | 673742 | 0.6845 | 0.6592 |
-| small-10k-random | Small random payload (10 KiB) | level_-2_fast | 1280 | 5.090 | 10250 | 9245 | 1.0010 | 0.9028 |
-| small-10k-random | Small random payload (10 KiB) | level_-3_fast | 1280 | 5.090 | 10250 | 9245 | 1.0010 | 0.9028 |
-| small-10k-random | Small random payload (10 KiB) | level_-4_fast | 1280 | 5.090 | 10250 | 9245 | 1.0010 | 0.9028 |
-| small-10k-random | Small random payload (10 KiB) | level_-5_fast | 1280 | 5.090 | 10250 | 9245 | 1.0010 | 0.9028 |
-| small-10k-random | Small random payload (10 KiB) | level_-6_fast | 1280 | 5.090 | 10250 | 9238 | 1.0010 | 0.9021 |
-| small-10k-random | Small random payload (10 KiB) | level_-7_fast | 1280 | 5.090 | 10250 | 9245 | 1.0010 | 0.9028 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_-2_fast | 437 | 1.606 | 175 | 44 | 0.0427 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_-3_fast | 437 | 1.606 | 186 | 50 | 0.0454 | 0.0122 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_-4_fast | 437 | 1.606 | 189 | 51 | 0.0461 | 0.0125 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_-5_fast | 437 | 1.606 | 190 | 44 | 0.0464 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_-6_fast | 437 | 1.606 | 248 | 51 | 0.0605 | 0.0125 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_-7_fast | 437 | 1.606 | 202 | 51 | 0.0493 | 0.0125 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_-2_fast | 16384 | 70.727 | 613921 | 585842 | 0.6007 | 0.5732 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_-3_fast | 16384 | 70.727 | 634656 | 607365 | 0.6210 | 0.5943 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_-4_fast | 16384 | 70.727 | 654893 | 628810 | 0.6408 | 0.6153 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_-5_fast | 16384 | 70.727 | 671408 | 646342 | 0.6569 | 0.6324 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_-6_fast | 16384 | 70.727 | 685482 | 660928 | 0.6707 | 0.6467 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_-7_fast | 16384 | 70.727 | 699611 | 673742 | 0.6845 | 0.6592 |
+| small-10k-random | Small random payload (10 KiB) | level_-2_fast | 1280 | 4.854 | 10250 | 9245 | 1.0010 | 0.9028 |
+| small-10k-random | Small random payload (10 KiB) | level_-3_fast | 1280 | 4.854 | 10250 | 9245 | 1.0010 | 0.9028 |
+| small-10k-random | Small random payload (10 KiB) | level_-4_fast | 1280 | 4.854 | 10250 | 9245 | 1.0010 | 0.9028 |
+| small-10k-random | Small random payload (10 KiB) | level_-5_fast | 1280 | 4.854 | 10250 | 9245 | 1.0010 | 0.9028 |
+| small-10k-random | Small random payload (10 KiB) | level_-6_fast | 1280 | 4.854 | 10250 | 9238 | 1.0010 | 0.9021 |
+| small-10k-random | Small random payload (10 KiB) | level_-7_fast | 1280 | 4.854 | 10250 | 9245 | 1.0010 | 0.9028 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_-2_fast | 437 | 1.852 | 175 | 44 | 0.0427 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_-3_fast | 437 | 1.852 | 186 | 50 | 0.0454 | 0.0122 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_-4_fast | 437 | 1.852 | 189 | 51 | 0.0461 | 0.0125 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_-5_fast | 437 | 1.852 | 190 | 44 | 0.0464 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_-6_fast | 437 | 1.852 | 248 | 51 | 0.0605 | 0.0125 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_-7_fast | 437 | 1.852 | 202 | 51 | 0.0493 | 0.0125 |
 
 ## Dictionary Training (Rust FastCOVER vs C FFI)
 
 | Scenario | Label | Dict bytes (requested) | Rust train ms | C train ms | Rust dict bytes | C dict bytes | Rust FastCOVER score | Delta (C/Rust) | Status |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| decodecorpus-z000033 | Repo decode corpus sample | 16384 | 21.628 | 82.053 | 16384 | 16384 | 0 | 3.7938 | rust_faster |
-| small-10k-random | Small random payload (10 KiB) | 1280 | 1.177 | 5.090 | 1280 | 1280 | 0 | 4.3246 | rust_faster |
-| small-4k-log-lines | Small structured log lines (4 KiB) | 512 | 0.565 | 1.606 | 512 | 437 | 0 | 2.8425 | rust_faster |
+| decodecorpus-z000033 | Repo decode corpus sample | 16384 | 20.275 | 70.727 | 16384 | 16384 | 0 | 3.4884 | rust_faster |
+| small-10k-random | Small random payload (10 KiB) | 1280 | 0.585 | 4.854 | 1280 | 1280 | 0 | 8.2974 | rust_faster |
+| small-4k-log-lines | Small structured log lines (4 KiB) | 512 | 0.563 | 1.852 | 512 | 437 | 0 | 3.2895 | rust_faster |
 
 ## Timing Metrics
 
 | Benchmark | ms/iter |
 | --- | ---: |
-| `compress-dict/level_-2_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 4.518 |
-| `compress-dict/level_-2_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 3.903 |
-| `compress-dict/level_-2_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 6.604 |
+| `compress-dict/level_-2_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 4.535 |
+| `compress-dict/level_-2_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 3.973 |
+| `compress-dict/level_-2_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 6.587 |
 | `compress-dict/level_-2_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.019 |
-| `compress-dict/level_-2_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.006 |
-| `compress-dict/level_-2_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.051 |
+| `compress-dict/level_-2_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.009 |
+| `compress-dict/level_-2_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.050 |
 | `compress-dict/level_-2_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.002 |
 | `compress-dict/level_-2_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.006 |
 | `compress-dict/level_-2_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.002 |
-| `compress-dict/level_-3_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 4.072 |
-| `compress-dict/level_-3_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 3.505 |
-| `compress-dict/level_-3_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 6.205 |
+| `compress-dict/level_-3_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 4.095 |
+| `compress-dict/level_-3_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 3.600 |
+| `compress-dict/level_-3_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 6.212 |
 | `compress-dict/level_-3_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.016 |
 | `compress-dict/level_-3_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.006 |
 | `compress-dict/level_-3_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.043 |
-| `compress-dict/level_-3_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.003 |
+| `compress-dict/level_-3_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.002 |
 | `compress-dict/level_-3_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.006 |
 | `compress-dict/level_-3_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.002 |
-| `compress-dict/level_-4_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 3.736 |
-| `compress-dict/level_-4_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 3.192 |
-| `compress-dict/level_-4_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 5.952 |
+| `compress-dict/level_-4_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 3.737 |
+| `compress-dict/level_-4_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 3.295 |
+| `compress-dict/level_-4_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 5.951 |
 | `compress-dict/level_-4_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.014 |
 | `compress-dict/level_-4_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.006 |
-| `compress-dict/level_-4_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.039 |
+| `compress-dict/level_-4_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.038 |
 | `compress-dict/level_-4_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.002 |
 | `compress-dict/level_-4_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.006 |
 | `compress-dict/level_-4_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.002 |
-| `compress-dict/level_-5_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 3.449 |
-| `compress-dict/level_-5_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 2.949 |
-| `compress-dict/level_-5_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 5.780 |
+| `compress-dict/level_-5_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 3.472 |
+| `compress-dict/level_-5_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 3.069 |
+| `compress-dict/level_-5_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 5.811 |
 | `compress-dict/level_-5_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.013 |
 | `compress-dict/level_-5_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.005 |
-| `compress-dict/level_-5_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.036 |
+| `compress-dict/level_-5_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.035 |
 | `compress-dict/level_-5_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.002 |
 | `compress-dict/level_-5_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.006 |
 | `compress-dict/level_-5_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.002 |
-| `compress-dict/level_-6_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 3.187 |
-| `compress-dict/level_-6_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 2.757 |
-| `compress-dict/level_-6_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 5.675 |
+| `compress-dict/level_-6_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 3.206 |
+| `compress-dict/level_-6_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 2.864 |
+| `compress-dict/level_-6_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 5.713 |
 | `compress-dict/level_-6_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.012 |
 | `compress-dict/level_-6_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.005 |
-| `compress-dict/level_-6_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.033 |
+| `compress-dict/level_-6_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.032 |
 | `compress-dict/level_-6_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.002 |
 | `compress-dict/level_-6_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.006 |
 | `compress-dict/level_-6_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.002 |
-| `compress-dict/level_-7_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 3.013 |
-| `compress-dict/level_-7_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 2.575 |
-| `compress-dict/level_-7_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 5.514 |
+| `compress-dict/level_-7_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.997 |
+| `compress-dict/level_-7_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 2.669 |
+| `compress-dict/level_-7_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 5.558 |
 | `compress-dict/level_-7_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.011 |
 | `compress-dict/level_-7_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.005 |
-| `compress-dict/level_-7_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.032 |
+| `compress-dict/level_-7_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.031 |
 | `compress-dict/level_-7_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.002 |
 | `compress-dict/level_-7_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.006 |
 | `compress-dict/level_-7_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.002 |
-| `compress/level_-2_fast/decodecorpus-z000033/matrix/c_ffi` | 4.184 |
-| `compress/level_-2_fast/decodecorpus-z000033/matrix/pure_rust` | 6.176 |
-| `compress/level_-2_fast/high-entropy-1m/matrix/c_ffi` | 1.064 |
-| `compress/level_-2_fast/high-entropy-1m/matrix/pure_rust` | 0.520 |
-| `compress/level_-2_fast/large-log-stream/matrix/c_ffi` | 4.439 |
-| `compress/level_-2_fast/large-log-stream/matrix/pure_rust` | 3.255 |
+| `compress/level_-2_fast/decodecorpus-z000033/matrix/c_ffi` | 4.172 |
+| `compress/level_-2_fast/decodecorpus-z000033/matrix/pure_rust` | 6.494 |
+| `compress/level_-2_fast/high-entropy-1m/matrix/c_ffi` | 1.079 |
+| `compress/level_-2_fast/high-entropy-1m/matrix/pure_rust` | 0.524 |
+| `compress/level_-2_fast/large-log-stream/matrix/c_ffi` | 4.533 |
+| `compress/level_-2_fast/large-log-stream/matrix/pure_rust` | 3.318 |
 | `compress/level_-2_fast/low-entropy-1m/matrix/c_ffi` | 0.576 |
-| `compress/level_-2_fast/low-entropy-1m/matrix/pure_rust` | 0.200 |
+| `compress/level_-2_fast/low-entropy-1m/matrix/pure_rust` | 0.203 |
 | `compress/level_-2_fast/small-10k-random/matrix/c_ffi` | 0.008 |
 | `compress/level_-2_fast/small-10k-random/matrix/pure_rust` | 0.006 |
 | `compress/level_-2_fast/small-1k-random/matrix/c_ffi` | 0.005 |
 | `compress/level_-2_fast/small-1k-random/matrix/pure_rust` | 0.002 |
 | `compress/level_-2_fast/small-4k-log-lines/matrix/c_ffi` | 0.007 |
 | `compress/level_-2_fast/small-4k-log-lines/matrix/pure_rust` | 0.009 |
-| `compress/level_-3_fast/decodecorpus-z000033/matrix/c_ffi` | 3.805 |
-| `compress/level_-3_fast/decodecorpus-z000033/matrix/pure_rust` | 5.891 |
-| `compress/level_-3_fast/high-entropy-1m/matrix/c_ffi` | 1.060 |
-| `compress/level_-3_fast/high-entropy-1m/matrix/pure_rust` | 0.521 |
-| `compress/level_-3_fast/large-log-stream/matrix/c_ffi` | 4.424 |
-| `compress/level_-3_fast/large-log-stream/matrix/pure_rust` | 3.252 |
-| `compress/level_-3_fast/low-entropy-1m/matrix/c_ffi` | 0.572 |
-| `compress/level_-3_fast/low-entropy-1m/matrix/pure_rust` | 0.200 |
-| `compress/level_-3_fast/small-10k-random/matrix/c_ffi` | 0.007 |
+| `compress/level_-3_fast/decodecorpus-z000033/matrix/c_ffi` | 4.065 |
+| `compress/level_-3_fast/decodecorpus-z000033/matrix/pure_rust` | 6.178 |
+| `compress/level_-3_fast/high-entropy-1m/matrix/c_ffi` | 1.062 |
+| `compress/level_-3_fast/high-entropy-1m/matrix/pure_rust` | 0.529 |
+| `compress/level_-3_fast/large-log-stream/matrix/c_ffi` | 4.486 |
+| `compress/level_-3_fast/large-log-stream/matrix/pure_rust` | 3.255 |
+| `compress/level_-3_fast/low-entropy-1m/matrix/c_ffi` | 0.579 |
+| `compress/level_-3_fast/low-entropy-1m/matrix/pure_rust` | 0.201 |
+| `compress/level_-3_fast/small-10k-random/matrix/c_ffi` | 0.008 |
 | `compress/level_-3_fast/small-10k-random/matrix/pure_rust` | 0.006 |
 | `compress/level_-3_fast/small-1k-random/matrix/c_ffi` | 0.005 |
 | `compress/level_-3_fast/small-1k-random/matrix/pure_rust` | 0.002 |
 | `compress/level_-3_fast/small-4k-log-lines/matrix/c_ffi` | 0.007 |
-| `compress/level_-3_fast/small-4k-log-lines/matrix/pure_rust` | 0.008 |
-| `compress/level_-4_fast/decodecorpus-z000033/matrix/c_ffi` | 3.472 |
-| `compress/level_-4_fast/decodecorpus-z000033/matrix/pure_rust` | 5.654 |
-| `compress/level_-4_fast/high-entropy-1m/matrix/c_ffi` | 1.059 |
-| `compress/level_-4_fast/high-entropy-1m/matrix/pure_rust` | 0.519 |
-| `compress/level_-4_fast/large-log-stream/matrix/c_ffi` | 4.489 |
-| `compress/level_-4_fast/large-log-stream/matrix/pure_rust` | 3.255 |
-| `compress/level_-4_fast/low-entropy-1m/matrix/c_ffi` | 0.573 |
-| `compress/level_-4_fast/low-entropy-1m/matrix/pure_rust` | 0.200 |
-| `compress/level_-4_fast/small-10k-random/matrix/c_ffi` | 0.007 |
+| `compress/level_-3_fast/small-4k-log-lines/matrix/pure_rust` | 0.009 |
+| `compress/level_-4_fast/decodecorpus-z000033/matrix/c_ffi` | 3.738 |
+| `compress/level_-4_fast/decodecorpus-z000033/matrix/pure_rust` | 5.975 |
+| `compress/level_-4_fast/high-entropy-1m/matrix/c_ffi` | 1.068 |
+| `compress/level_-4_fast/high-entropy-1m/matrix/pure_rust` | 0.524 |
+| `compress/level_-4_fast/large-log-stream/matrix/c_ffi` | 4.383 |
+| `compress/level_-4_fast/large-log-stream/matrix/pure_rust` | 3.180 |
+| `compress/level_-4_fast/low-entropy-1m/matrix/c_ffi` | 0.576 |
+| `compress/level_-4_fast/low-entropy-1m/matrix/pure_rust` | 0.201 |
+| `compress/level_-4_fast/small-10k-random/matrix/c_ffi` | 0.011 |
 | `compress/level_-4_fast/small-10k-random/matrix/pure_rust` | 0.006 |
 | `compress/level_-4_fast/small-1k-random/matrix/c_ffi` | 0.005 |
 | `compress/level_-4_fast/small-1k-random/matrix/pure_rust` | 0.002 |
 | `compress/level_-4_fast/small-4k-log-lines/matrix/c_ffi` | 0.007 |
-| `compress/level_-4_fast/small-4k-log-lines/matrix/pure_rust` | 0.008 |
-| `compress/level_-5_fast/decodecorpus-z000033/matrix/c_ffi` | 3.568 |
-| `compress/level_-5_fast/decodecorpus-z000033/matrix/pure_rust` | 5.865 |
-| `compress/level_-5_fast/high-entropy-1m/matrix/c_ffi` | 1.055 |
-| `compress/level_-5_fast/high-entropy-1m/matrix/pure_rust` | 0.519 |
-| `compress/level_-5_fast/large-log-stream/matrix/c_ffi` | 4.450 |
-| `compress/level_-5_fast/large-log-stream/matrix/pure_rust` | 3.257 |
-| `compress/level_-5_fast/low-entropy-1m/matrix/c_ffi` | 0.573 |
-| `compress/level_-5_fast/low-entropy-1m/matrix/pure_rust` | 0.200 |
-| `compress/level_-5_fast/small-10k-random/matrix/c_ffi` | 0.007 |
+| `compress/level_-4_fast/small-4k-log-lines/matrix/pure_rust` | 0.009 |
+| `compress/level_-5_fast/decodecorpus-z000033/matrix/c_ffi` | 3.506 |
+| `compress/level_-5_fast/decodecorpus-z000033/matrix/pure_rust` | 5.841 |
+| `compress/level_-5_fast/high-entropy-1m/matrix/c_ffi` | 1.061 |
+| `compress/level_-5_fast/high-entropy-1m/matrix/pure_rust` | 0.525 |
+| `compress/level_-5_fast/large-log-stream/matrix/c_ffi` | 4.376 |
+| `compress/level_-5_fast/large-log-stream/matrix/pure_rust` | 3.198 |
+| `compress/level_-5_fast/low-entropy-1m/matrix/c_ffi` | 0.579 |
+| `compress/level_-5_fast/low-entropy-1m/matrix/pure_rust` | 0.204 |
+| `compress/level_-5_fast/small-10k-random/matrix/c_ffi` | 0.010 |
 | `compress/level_-5_fast/small-10k-random/matrix/pure_rust` | 0.006 |
 | `compress/level_-5_fast/small-1k-random/matrix/c_ffi` | 0.005 |
 | `compress/level_-5_fast/small-1k-random/matrix/pure_rust` | 0.002 |
 | `compress/level_-5_fast/small-4k-log-lines/matrix/c_ffi` | 0.007 |
 | `compress/level_-5_fast/small-4k-log-lines/matrix/pure_rust` | 0.010 |
-| `compress/level_-6_fast/decodecorpus-z000033/matrix/c_ffi` | 3.311 |
-| `compress/level_-6_fast/decodecorpus-z000033/matrix/pure_rust` | 5.706 |
-| `compress/level_-6_fast/high-entropy-1m/matrix/c_ffi` | 1.053 |
-| `compress/level_-6_fast/high-entropy-1m/matrix/pure_rust` | 0.527 |
-| `compress/level_-6_fast/large-log-stream/matrix/c_ffi` | 4.470 |
-| `compress/level_-6_fast/large-log-stream/matrix/pure_rust` | 3.253 |
-| `compress/level_-6_fast/low-entropy-1m/matrix/c_ffi` | 0.572 |
-| `compress/level_-6_fast/low-entropy-1m/matrix/pure_rust` | 0.200 |
-| `compress/level_-6_fast/small-10k-random/matrix/c_ffi` | 0.007 |
+| `compress/level_-6_fast/decodecorpus-z000033/matrix/c_ffi` | 3.298 |
+| `compress/level_-6_fast/decodecorpus-z000033/matrix/pure_rust` | 5.688 |
+| `compress/level_-6_fast/high-entropy-1m/matrix/c_ffi` | 1.063 |
+| `compress/level_-6_fast/high-entropy-1m/matrix/pure_rust` | 0.526 |
+| `compress/level_-6_fast/large-log-stream/matrix/c_ffi` | 4.501 |
+| `compress/level_-6_fast/large-log-stream/matrix/pure_rust` | 3.260 |
+| `compress/level_-6_fast/low-entropy-1m/matrix/c_ffi` | 0.581 |
+| `compress/level_-6_fast/low-entropy-1m/matrix/pure_rust` | 0.204 |
+| `compress/level_-6_fast/small-10k-random/matrix/c_ffi` | 0.010 |
 | `compress/level_-6_fast/small-10k-random/matrix/pure_rust` | 0.006 |
 | `compress/level_-6_fast/small-1k-random/matrix/c_ffi` | 0.005 |
 | `compress/level_-6_fast/small-1k-random/matrix/pure_rust` | 0.002 |
 | `compress/level_-6_fast/small-4k-log-lines/matrix/c_ffi` | 0.007 |
 | `compress/level_-6_fast/small-4k-log-lines/matrix/pure_rust` | 0.009 |
-| `compress/level_-7_fast/decodecorpus-z000033/matrix/c_ffi` | 3.114 |
-| `compress/level_-7_fast/decodecorpus-z000033/matrix/pure_rust` | 5.629 |
-| `compress/level_-7_fast/high-entropy-1m/matrix/c_ffi` | 1.054 |
-| `compress/level_-7_fast/high-entropy-1m/matrix/pure_rust` | 0.521 |
-| `compress/level_-7_fast/large-log-stream/matrix/c_ffi` | 4.429 |
-| `compress/level_-7_fast/large-log-stream/matrix/pure_rust` | 3.269 |
-| `compress/level_-7_fast/low-entropy-1m/matrix/c_ffi` | 0.572 |
-| `compress/level_-7_fast/low-entropy-1m/matrix/pure_rust` | 0.200 |
+| `compress/level_-7_fast/decodecorpus-z000033/matrix/c_ffi` | 3.108 |
+| `compress/level_-7_fast/decodecorpus-z000033/matrix/pure_rust` | 5.608 |
+| `compress/level_-7_fast/high-entropy-1m/matrix/c_ffi` | 1.062 |
+| `compress/level_-7_fast/high-entropy-1m/matrix/pure_rust` | 0.527 |
+| `compress/level_-7_fast/large-log-stream/matrix/c_ffi` | 4.393 |
+| `compress/level_-7_fast/large-log-stream/matrix/pure_rust` | 3.214 |
+| `compress/level_-7_fast/low-entropy-1m/matrix/c_ffi` | 0.579 |
+| `compress/level_-7_fast/low-entropy-1m/matrix/pure_rust` | 0.204 |
 | `compress/level_-7_fast/small-10k-random/matrix/c_ffi` | 0.007 |
 | `compress/level_-7_fast/small-10k-random/matrix/pure_rust` | 0.006 |
 | `compress/level_-7_fast/small-1k-random/matrix/c_ffi` | 0.005 |
 | `compress/level_-7_fast/small-1k-random/matrix/pure_rust` | 0.002 |
 | `compress/level_-7_fast/small-4k-log-lines/matrix/c_ffi` | 0.007 |
-| `compress/level_-7_fast/small-4k-log-lines/matrix/pure_rust` | 0.008 |
-| `decompress-dict/level_-2_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.150 |
-| `decompress-dict/level_-2_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 1.577 |
+| `compress/level_-7_fast/small-4k-log-lines/matrix/pure_rust` | 0.009 |
+| `decompress-dict/level_-2_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.147 |
+| `decompress-dict/level_-2_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 1.573 |
 | `decompress-dict/level_-2_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_-2_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_-2_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_-2_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_-3_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.086 |
+| `decompress-dict/level_-3_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.082 |
 | `decompress-dict/level_-3_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 1.472 |
 | `decompress-dict/level_-3_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_-3_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_-3_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_-3_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_-4_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.992 |
-| `decompress-dict/level_-4_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 1.345 |
+| `decompress-dict/level_-4_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.989 |
+| `decompress-dict/level_-4_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 1.341 |
 | `decompress-dict/level_-4_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_-4_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_-4_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_-4_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_-5_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.942 |
+| `decompress-dict/level_-5_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.936 |
 | `decompress-dict/level_-5_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 1.266 |
 | `decompress-dict/level_-5_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_-5_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_-5_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_-5_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_-6_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.867 |
-| `decompress-dict/level_-6_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 1.173 |
+| `decompress-dict/level_-6_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.865 |
+| `decompress-dict/level_-6_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 1.175 |
 | `decompress-dict/level_-6_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_-6_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_-6_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_-6_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_-7_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.824 |
-| `decompress-dict/level_-7_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 1.108 |
+| `decompress-dict/level_-7_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.827 |
+| `decompress-dict/level_-7_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 1.107 |
 | `decompress-dict/level_-7_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_-7_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_-7_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_-7_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
 | `decompress/level_-2_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.903 |
-| `decompress/level_-2_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.217 |
-| `decompress/level_-2_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.946 |
-| `decompress/level_-2_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.277 |
-| `decompress/level_-2_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.027 |
-| `decompress/level_-2_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_-2_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.027 |
+| `decompress/level_-2_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.212 |
+| `decompress/level_-2_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.896 |
+| `decompress/level_-2_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.281 |
+| `decompress/level_-2_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.035 |
+| `decompress/level_-2_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.035 |
+| `decompress/level_-2_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.035 |
 | `decompress/level_-2_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_-2_fast/large-log-stream/c_stream/matrix/c_ffi` | 2.050 |
-| `decompress/level_-2_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.444 |
-| `decompress/level_-2_fast/large-log-stream/rust_stream/matrix/c_ffi` | 2.052 |
-| `decompress/level_-2_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.446 |
-| `decompress/level_-2_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.213 |
-| `decompress/level_-2_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
-| `decompress/level_-2_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.213 |
+| `decompress/level_-2_fast/large-log-stream/c_stream/matrix/c_ffi` | 2.035 |
+| `decompress/level_-2_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.442 |
+| `decompress/level_-2_fast/large-log-stream/rust_stream/matrix/c_ffi` | 2.027 |
+| `decompress/level_-2_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.437 |
+| `decompress/level_-2_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.212 |
+| `decompress/level_-2_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_-2_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.212 |
 | `decompress/level_-2_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
 | `decompress/level_-2_fast/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_-2_fast/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
@@ -1881,22 +1881,22 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_-2_fast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.001 |
 | `decompress/level_-2_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.003 |
 | `decompress/level_-2_fast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_-3_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.868 |
-| `decompress/level_-3_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.147 |
-| `decompress/level_-3_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.965 |
-| `decompress/level_-3_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.329 |
+| `decompress/level_-3_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.861 |
+| `decompress/level_-3_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.140 |
+| `decompress/level_-3_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.934 |
+| `decompress/level_-3_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.337 |
 | `decompress/level_-3_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.027 |
 | `decompress/level_-3_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
 | `decompress/level_-3_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.027 |
 | `decompress/level_-3_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_-3_fast/large-log-stream/c_stream/matrix/c_ffi` | 2.051 |
-| `decompress/level_-3_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.442 |
-| `decompress/level_-3_fast/large-log-stream/rust_stream/matrix/c_ffi` | 2.053 |
-| `decompress/level_-3_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.444 |
-| `decompress/level_-3_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.214 |
+| `decompress/level_-3_fast/large-log-stream/c_stream/matrix/c_ffi` | 2.033 |
+| `decompress/level_-3_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.448 |
+| `decompress/level_-3_fast/large-log-stream/rust_stream/matrix/c_ffi` | 2.049 |
+| `decompress/level_-3_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.452 |
+| `decompress/level_-3_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.212 |
 | `decompress/level_-3_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
-| `decompress/level_-3_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.214 |
-| `decompress/level_-3_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_-3_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.212 |
+| `decompress/level_-3_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
 | `decompress/level_-3_fast/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_-3_fast/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_-3_fast/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -1909,21 +1909,21 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_-3_fast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.001 |
 | `decompress/level_-3_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.003 |
 | `decompress/level_-3_fast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_-4_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.790 |
-| `decompress/level_-4_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.053 |
-| `decompress/level_-4_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.958 |
-| `decompress/level_-4_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.341 |
-| `decompress/level_-4_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.027 |
+| `decompress/level_-4_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.791 |
+| `decompress/level_-4_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.046 |
+| `decompress/level_-4_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.936 |
+| `decompress/level_-4_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.351 |
+| `decompress/level_-4_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.035 |
 | `decompress/level_-4_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
 | `decompress/level_-4_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.027 |
-| `decompress/level_-4_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_-4_fast/large-log-stream/c_stream/matrix/c_ffi` | 1.252 |
-| `decompress/level_-4_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.441 |
-| `decompress/level_-4_fast/large-log-stream/rust_stream/matrix/c_ffi` | 1.259 |
-| `decompress/level_-4_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.443 |
-| `decompress/level_-4_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.164 |
+| `decompress/level_-4_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.036 |
+| `decompress/level_-4_fast/large-log-stream/c_stream/matrix/c_ffi` | 1.274 |
+| `decompress/level_-4_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.450 |
+| `decompress/level_-4_fast/large-log-stream/rust_stream/matrix/c_ffi` | 1.271 |
+| `decompress/level_-4_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.442 |
+| `decompress/level_-4_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.165 |
 | `decompress/level_-4_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
-| `decompress/level_-4_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.164 |
+| `decompress/level_-4_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.165 |
 | `decompress/level_-4_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
 | `decompress/level_-4_fast/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_-4_fast/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
@@ -1937,21 +1937,21 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_-4_fast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.001 |
 | `decompress/level_-4_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.003 |
 | `decompress/level_-4_fast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_-5_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.744 |
-| `decompress/level_-5_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.987 |
-| `decompress/level_-5_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.959 |
-| `decompress/level_-5_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.359 |
+| `decompress/level_-5_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.741 |
+| `decompress/level_-5_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.981 |
+| `decompress/level_-5_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.945 |
+| `decompress/level_-5_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.366 |
 | `decompress/level_-5_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.027 |
-| `decompress/level_-5_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_-5_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.027 |
+| `decompress/level_-5_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.036 |
+| `decompress/level_-5_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.036 |
 | `decompress/level_-5_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_-5_fast/large-log-stream/c_stream/matrix/c_ffi` | 2.041 |
-| `decompress/level_-5_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.442 |
-| `decompress/level_-5_fast/large-log-stream/rust_stream/matrix/c_ffi` | 2.040 |
-| `decompress/level_-5_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.445 |
-| `decompress/level_-5_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.211 |
+| `decompress/level_-5_fast/large-log-stream/c_stream/matrix/c_ffi` | 2.012 |
+| `decompress/level_-5_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.446 |
+| `decompress/level_-5_fast/large-log-stream/rust_stream/matrix/c_ffi` | 2.022 |
+| `decompress/level_-5_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.447 |
+| `decompress/level_-5_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.207 |
 | `decompress/level_-5_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
-| `decompress/level_-5_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.211 |
+| `decompress/level_-5_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.207 |
 | `decompress/level_-5_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
 | `decompress/level_-5_fast/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_-5_fast/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
@@ -1965,21 +1965,21 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_-5_fast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.001 |
 | `decompress/level_-5_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.003 |
 | `decompress/level_-5_fast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.004 |
-| `decompress/level_-6_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.697 |
-| `decompress/level_-6_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.926 |
-| `decompress/level_-6_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.969 |
-| `decompress/level_-6_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.380 |
-| `decompress/level_-6_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.027 |
-| `decompress/level_-6_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_-6_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.692 |
+| `decompress/level_-6_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.920 |
+| `decompress/level_-6_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.962 |
+| `decompress/level_-6_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.389 |
+| `decompress/level_-6_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.036 |
+| `decompress/level_-6_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.036 |
 | `decompress/level_-6_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.027 |
-| `decompress/level_-6_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_-6_fast/large-log-stream/c_stream/matrix/c_ffi` | 2.041 |
-| `decompress/level_-6_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.441 |
-| `decompress/level_-6_fast/large-log-stream/rust_stream/matrix/c_ffi` | 2.042 |
-| `decompress/level_-6_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.445 |
-| `decompress/level_-6_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.216 |
+| `decompress/level_-6_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.036 |
+| `decompress/level_-6_fast/large-log-stream/c_stream/matrix/c_ffi` | 2.012 |
+| `decompress/level_-6_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.449 |
+| `decompress/level_-6_fast/large-log-stream/rust_stream/matrix/c_ffi` | 2.012 |
+| `decompress/level_-6_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.439 |
+| `decompress/level_-6_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.212 |
 | `decompress/level_-6_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
-| `decompress/level_-6_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.216 |
+| `decompress/level_-6_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.212 |
 | `decompress/level_-6_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
 | `decompress/level_-6_fast/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_-6_fast/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
@@ -1994,20 +1994,20 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_-6_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.003 |
 | `decompress/level_-6_fast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.004 |
 | `decompress/level_-7_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.658 |
-| `decompress/level_-7_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.862 |
-| `decompress/level_-7_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.994 |
-| `decompress/level_-7_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.406 |
-| `decompress/level_-7_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.027 |
+| `decompress/level_-7_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.858 |
+| `decompress/level_-7_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.958 |
+| `decompress/level_-7_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.407 |
+| `decompress/level_-7_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.036 |
 | `decompress/level_-7_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
 | `decompress/level_-7_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.027 |
 | `decompress/level_-7_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_-7_fast/large-log-stream/c_stream/matrix/c_ffi` | 2.040 |
-| `decompress/level_-7_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.445 |
-| `decompress/level_-7_fast/large-log-stream/rust_stream/matrix/c_ffi` | 2.041 |
-| `decompress/level_-7_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.446 |
-| `decompress/level_-7_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.216 |
+| `decompress/level_-7_fast/large-log-stream/c_stream/matrix/c_ffi` | 2.015 |
+| `decompress/level_-7_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.443 |
+| `decompress/level_-7_fast/large-log-stream/rust_stream/matrix/c_ffi` | 1.991 |
+| `decompress/level_-7_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.452 |
+| `decompress/level_-7_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.212 |
 | `decompress/level_-7_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
-| `decompress/level_-7_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.216 |
+| `decompress/level_-7_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.212 |
 | `decompress/level_-7_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
 | `decompress/level_-7_fast/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_-7_fast/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
@@ -2021,12 +2021,12 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_-7_fast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.001 |
 | `decompress/level_-7_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.003 |
 | `decompress/level_-7_fast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.003 |
-| `dict-train/na/decodecorpus-z000033/matrix/c_ffi` | 82.683 |
-| `dict-train/na/decodecorpus-z000033/matrix/pure_rust` | 19.953 |
-| `dict-train/na/small-10k-random/matrix/c_ffi` | 4.440 |
-| `dict-train/na/small-10k-random/matrix/pure_rust` | 0.474 |
-| `dict-train/na/small-4k-log-lines/matrix/c_ffi` | 1.359 |
-| `dict-train/na/small-4k-log-lines/matrix/pure_rust` | 0.336 |
+| `dict-train/na/decodecorpus-z000033/matrix/c_ffi` | 70.992 |
+| `dict-train/na/decodecorpus-z000033/matrix/pure_rust` | 17.337 |
+| `dict-train/na/small-10k-random/matrix/c_ffi` | 4.443 |
+| `dict-train/na/small-10k-random/matrix/pure_rust` | 0.480 |
+| `dict-train/na/small-4k-log-lines/matrix/c_ffi` | 1.380 |
+| `dict-train/na/small-4k-log-lines/matrix/pure_rust` | 0.338 |
 
 ## Strategy group: lazy-lower
 
@@ -2188,195 +2188,195 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 
 | Scenario | Label | Level | Dict bytes | Train ms | C bytes (no dict) | C bytes (with dict) | C ratio (no dict) | C ratio (with dict) |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| decodecorpus-z000033 | Repo decode corpus sample | level_10_lazy | 16384 | 86.892 | 483762 | 462364 | 0.4733 | 0.4524 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_6_lazy | 16384 | 86.892 | 484957 | 464543 | 0.4745 | 0.4545 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_7_lazy | 16384 | 86.892 | 484299 | 464689 | 0.4739 | 0.4547 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_8_lazy | 16384 | 86.892 | 484336 | 463700 | 0.4739 | 0.4537 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_9_lazy | 16384 | 86.892 | 484348 | 462791 | 0.4739 | 0.4528 |
-| small-10k-random | Small random payload (10 KiB) | level_10_lazy | 1280 | 11.065 | 10250 | 9234 | 1.0010 | 0.9018 |
-| small-10k-random | Small random payload (10 KiB) | level_6_lazy | 1280 | 11.065 | 10250 | 9234 | 1.0010 | 0.9018 |
-| small-10k-random | Small random payload (10 KiB) | level_7_lazy | 1280 | 11.065 | 10250 | 9234 | 1.0010 | 0.9018 |
-| small-10k-random | Small random payload (10 KiB) | level_8_lazy | 1280 | 11.065 | 10250 | 9234 | 1.0010 | 0.9018 |
-| small-10k-random | Small random payload (10 KiB) | level_9_lazy | 1280 | 11.065 | 10250 | 9234 | 1.0010 | 0.9018 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_10_lazy | 437 | 2.144 | 150 | 44 | 0.0366 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_6_lazy | 437 | 2.144 | 150 | 44 | 0.0366 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_7_lazy | 437 | 2.144 | 150 | 44 | 0.0366 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_8_lazy | 437 | 2.144 | 150 | 44 | 0.0366 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_9_lazy | 437 | 2.144 | 150 | 44 | 0.0366 | 0.0107 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_10_lazy | 16384 | 71.230 | 483762 | 462364 | 0.4733 | 0.4524 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_6_lazy | 16384 | 71.230 | 484957 | 464543 | 0.4745 | 0.4545 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_7_lazy | 16384 | 71.230 | 484299 | 464689 | 0.4739 | 0.4547 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_8_lazy | 16384 | 71.230 | 484336 | 463700 | 0.4739 | 0.4537 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_9_lazy | 16384 | 71.230 | 484348 | 462791 | 0.4739 | 0.4528 |
+| small-10k-random | Small random payload (10 KiB) | level_10_lazy | 1280 | 9.551 | 10250 | 9234 | 1.0010 | 0.9018 |
+| small-10k-random | Small random payload (10 KiB) | level_6_lazy | 1280 | 9.551 | 10250 | 9234 | 1.0010 | 0.9018 |
+| small-10k-random | Small random payload (10 KiB) | level_7_lazy | 1280 | 9.551 | 10250 | 9234 | 1.0010 | 0.9018 |
+| small-10k-random | Small random payload (10 KiB) | level_8_lazy | 1280 | 9.551 | 10250 | 9234 | 1.0010 | 0.9018 |
+| small-10k-random | Small random payload (10 KiB) | level_9_lazy | 1280 | 9.551 | 10250 | 9234 | 1.0010 | 0.9018 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_10_lazy | 437 | 2.260 | 150 | 44 | 0.0366 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_6_lazy | 437 | 2.260 | 150 | 44 | 0.0366 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_7_lazy | 437 | 2.260 | 150 | 44 | 0.0366 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_8_lazy | 437 | 2.260 | 150 | 44 | 0.0366 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_9_lazy | 437 | 2.260 | 150 | 44 | 0.0366 | 0.0107 |
 
 ## Dictionary Training (Rust FastCOVER vs C FFI)
 
 | Scenario | Label | Dict bytes (requested) | Rust train ms | C train ms | Rust dict bytes | C dict bytes | Rust FastCOVER score | Delta (C/Rust) | Status |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| decodecorpus-z000033 | Repo decode corpus sample | 16384 | 20.532 | 86.892 | 16384 | 16384 | 0 | 4.2320 | rust_faster |
-| small-10k-random | Small random payload (10 KiB) | 1280 | 2.633 | 11.065 | 1280 | 1280 | 0 | 4.2024 | rust_faster |
-| small-4k-log-lines | Small structured log lines (4 KiB) | 512 | 1.081 | 2.144 | 512 | 437 | 0 | 1.9833 | rust_faster |
+| decodecorpus-z000033 | Repo decode corpus sample | 16384 | 20.233 | 71.230 | 16384 | 16384 | 0 | 3.5205 | rust_faster |
+| small-10k-random | Small random payload (10 KiB) | 1280 | 2.585 | 9.551 | 1280 | 1280 | 0 | 3.6948 | rust_faster |
+| small-4k-log-lines | Small structured log lines (4 KiB) | 512 | 1.227 | 2.260 | 512 | 437 | 0 | 1.8419 | rust_faster |
 
 ## Timing Metrics
 
 | Benchmark | ms/iter |
 | --- | ---: |
-| `compress-dict/level_10_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 47.846 |
-| `compress-dict/level_10_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 44.192 |
-| `compress-dict/level_10_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 54.901 |
-| `compress-dict/level_10_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.244 |
-| `compress-dict/level_10_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.046 |
-| `compress-dict/level_10_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.375 |
+| `compress-dict/level_10_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 41.279 |
+| `compress-dict/level_10_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 37.546 |
+| `compress-dict/level_10_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 52.283 |
+| `compress-dict/level_10_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.236 |
+| `compress-dict/level_10_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.043 |
+| `compress-dict/level_10_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.356 |
 | `compress-dict/level_10_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.005 |
-| `compress-dict/level_10_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.012 |
+| `compress-dict/level_10_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.011 |
 | `compress-dict/level_10_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.005 |
-| `compress-dict/level_6_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 24.729 |
-| `compress-dict/level_6_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 30.032 |
-| `compress-dict/level_6_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 35.182 |
-| `compress-dict/level_6_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.134 |
+| `compress-dict/level_6_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 22.403 |
+| `compress-dict/level_6_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 24.875 |
+| `compress-dict/level_6_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 32.721 |
+| `compress-dict/level_6_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.122 |
 | `compress-dict/level_6_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.023 |
-| `compress-dict/level_6_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.371 |
+| `compress-dict/level_6_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.349 |
 | `compress-dict/level_6_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.006 |
-| `compress-dict/level_6_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.014 |
+| `compress-dict/level_6_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.013 |
 | `compress-dict/level_6_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.005 |
-| `compress-dict/level_7_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 28.950 |
-| `compress-dict/level_7_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 30.639 |
-| `compress-dict/level_7_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 40.694 |
-| `compress-dict/level_7_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.134 |
-| `compress-dict/level_7_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.024 |
-| `compress-dict/level_7_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.374 |
+| `compress-dict/level_7_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 26.090 |
+| `compress-dict/level_7_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 25.785 |
+| `compress-dict/level_7_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 40.033 |
+| `compress-dict/level_7_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.122 |
+| `compress-dict/level_7_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.023 |
+| `compress-dict/level_7_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.356 |
 | `compress-dict/level_7_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.006 |
-| `compress-dict/level_7_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.014 |
+| `compress-dict/level_7_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.013 |
 | `compress-dict/level_7_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.005 |
-| `compress-dict/level_8_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 30.640 |
-| `compress-dict/level_8_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 33.854 |
-| `compress-dict/level_8_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 48.950 |
-| `compress-dict/level_8_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.133 |
+| `compress-dict/level_8_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 27.663 |
+| `compress-dict/level_8_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 28.720 |
+| `compress-dict/level_8_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 46.782 |
+| `compress-dict/level_8_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.121 |
 | `compress-dict/level_8_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.023 |
-| `compress-dict/level_8_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.383 |
+| `compress-dict/level_8_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.355 |
 | `compress-dict/level_8_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.006 |
-| `compress-dict/level_8_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.014 |
+| `compress-dict/level_8_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.013 |
 | `compress-dict/level_8_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.005 |
-| `compress-dict/level_9_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 39.295 |
-| `compress-dict/level_9_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 38.803 |
-| `compress-dict/level_9_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 48.644 |
-| `compress-dict/level_9_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.243 |
-| `compress-dict/level_9_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.046 |
-| `compress-dict/level_9_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.375 |
+| `compress-dict/level_9_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 31.845 |
+| `compress-dict/level_9_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 31.543 |
+| `compress-dict/level_9_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 48.183 |
+| `compress-dict/level_9_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.235 |
+| `compress-dict/level_9_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.043 |
+| `compress-dict/level_9_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.352 |
 | `compress-dict/level_9_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.005 |
-| `compress-dict/level_9_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.012 |
+| `compress-dict/level_9_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.011 |
 | `compress-dict/level_9_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.005 |
-| `compress/level_10_lazy/decodecorpus-z000033/matrix/c_ffi` | 46.873 |
-| `compress/level_10_lazy/decodecorpus-z000033/matrix/pure_rust` | 48.720 |
-| `compress/level_10_lazy/high-entropy-1m/matrix/c_ffi` | 2.802 |
-| `compress/level_10_lazy/high-entropy-1m/matrix/pure_rust` | 2.494 |
-| `compress/level_10_lazy/large-log-stream/matrix/c_ffi` | 24.431 |
-| `compress/level_10_lazy/large-log-stream/matrix/pure_rust` | 16.678 |
-| `compress/level_10_lazy/low-entropy-1m/matrix/c_ffi` | 2.831 |
-| `compress/level_10_lazy/low-entropy-1m/matrix/pure_rust` | 1.502 |
-| `compress/level_10_lazy/small-10k-random/matrix/c_ffi` | 0.049 |
-| `compress/level_10_lazy/small-10k-random/matrix/pure_rust` | 0.019 |
+| `compress/level_10_lazy/decodecorpus-z000033/matrix/c_ffi` | 34.877 |
+| `compress/level_10_lazy/decodecorpus-z000033/matrix/pure_rust` | 46.668 |
+| `compress/level_10_lazy/high-entropy-1m/matrix/c_ffi` | 2.626 |
+| `compress/level_10_lazy/high-entropy-1m/matrix/pure_rust` | 2.014 |
+| `compress/level_10_lazy/large-log-stream/matrix/c_ffi` | 42.576 |
+| `compress/level_10_lazy/large-log-stream/matrix/pure_rust` | 19.820 |
+| `compress/level_10_lazy/low-entropy-1m/matrix/c_ffi` | 3.447 |
+| `compress/level_10_lazy/low-entropy-1m/matrix/pure_rust` | 1.783 |
+| `compress/level_10_lazy/small-10k-random/matrix/c_ffi` | 0.046 |
+| `compress/level_10_lazy/small-10k-random/matrix/pure_rust` | 0.017 |
 | `compress/level_10_lazy/small-1k-random/matrix/c_ffi` | 0.015 |
 | `compress/level_10_lazy/small-1k-random/matrix/pure_rust` | 0.003 |
-| `compress/level_10_lazy/small-4k-log-lines/matrix/c_ffi` | 0.014 |
-| `compress/level_10_lazy/small-4k-log-lines/matrix/pure_rust` | 0.019 |
-| `compress/level_6_lazy/decodecorpus-z000033/matrix/c_ffi` | 26.067 |
-| `compress/level_6_lazy/decodecorpus-z000033/matrix/pure_rust` | 29.761 |
-| `compress/level_6_lazy/high-entropy-1m/matrix/c_ffi` | 1.526 |
-| `compress/level_6_lazy/high-entropy-1m/matrix/pure_rust` | 2.160 |
-| `compress/level_6_lazy/large-log-stream/matrix/c_ffi` | 21.432 |
-| `compress/level_6_lazy/large-log-stream/matrix/pure_rust` | 5.496 |
-| `compress/level_6_lazy/low-entropy-1m/matrix/c_ffi` | 1.568 |
-| `compress/level_6_lazy/low-entropy-1m/matrix/pure_rust` | 0.608 |
-| `compress/level_6_lazy/small-10k-random/matrix/c_ffi` | 0.025 |
-| `compress/level_6_lazy/small-10k-random/matrix/pure_rust` | 0.019 |
-| `compress/level_6_lazy/small-1k-random/matrix/c_ffi` | 0.012 |
+| `compress/level_10_lazy/small-4k-log-lines/matrix/c_ffi` | 0.013 |
+| `compress/level_10_lazy/small-4k-log-lines/matrix/pure_rust` | 0.016 |
+| `compress/level_6_lazy/decodecorpus-z000033/matrix/c_ffi` | 22.219 |
+| `compress/level_6_lazy/decodecorpus-z000033/matrix/pure_rust` | 28.896 |
+| `compress/level_6_lazy/high-entropy-1m/matrix/c_ffi` | 1.374 |
+| `compress/level_6_lazy/high-entropy-1m/matrix/pure_rust` | 1.398 |
+| `compress/level_6_lazy/large-log-stream/matrix/c_ffi` | 33.148 |
+| `compress/level_6_lazy/large-log-stream/matrix/pure_rust` | 5.395 |
+| `compress/level_6_lazy/low-entropy-1m/matrix/c_ffi` | 1.675 |
+| `compress/level_6_lazy/low-entropy-1m/matrix/pure_rust` | 0.639 |
+| `compress/level_6_lazy/small-10k-random/matrix/c_ffi` | 0.026 |
+| `compress/level_6_lazy/small-10k-random/matrix/pure_rust` | 0.017 |
+| `compress/level_6_lazy/small-1k-random/matrix/c_ffi` | 0.011 |
 | `compress/level_6_lazy/small-1k-random/matrix/pure_rust` | 0.003 |
-| `compress/level_6_lazy/small-4k-log-lines/matrix/c_ffi` | 0.016 |
-| `compress/level_6_lazy/small-4k-log-lines/matrix/pure_rust` | 0.018 |
-| `compress/level_7_lazy/decodecorpus-z000033/matrix/c_ffi` | 28.159 |
-| `compress/level_7_lazy/decodecorpus-z000033/matrix/pure_rust` | 35.322 |
-| `compress/level_7_lazy/high-entropy-1m/matrix/c_ffi` | 1.852 |
-| `compress/level_7_lazy/high-entropy-1m/matrix/pure_rust` | 2.625 |
-| `compress/level_7_lazy/large-log-stream/matrix/c_ffi` | 21.705 |
-| `compress/level_7_lazy/large-log-stream/matrix/pure_rust` | 5.840 |
-| `compress/level_7_lazy/low-entropy-1m/matrix/c_ffi` | 1.898 |
-| `compress/level_7_lazy/low-entropy-1m/matrix/pure_rust` | 0.921 |
-| `compress/level_7_lazy/small-10k-random/matrix/c_ffi` | 0.025 |
-| `compress/level_7_lazy/small-10k-random/matrix/pure_rust` | 0.019 |
+| `compress/level_6_lazy/small-4k-log-lines/matrix/c_ffi` | 0.015 |
+| `compress/level_6_lazy/small-4k-log-lines/matrix/pure_rust` | 0.016 |
+| `compress/level_7_lazy/decodecorpus-z000033/matrix/c_ffi` | 24.269 |
+| `compress/level_7_lazy/decodecorpus-z000033/matrix/pure_rust` | 33.231 |
+| `compress/level_7_lazy/high-entropy-1m/matrix/c_ffi` | 1.825 |
+| `compress/level_7_lazy/high-entropy-1m/matrix/pure_rust` | 1.974 |
+| `compress/level_7_lazy/large-log-stream/matrix/c_ffi` | 33.536 |
+| `compress/level_7_lazy/large-log-stream/matrix/pure_rust` | 5.926 |
+| `compress/level_7_lazy/low-entropy-1m/matrix/c_ffi` | 1.996 |
+| `compress/level_7_lazy/low-entropy-1m/matrix/pure_rust` | 1.000 |
+| `compress/level_7_lazy/small-10k-random/matrix/c_ffi` | 0.026 |
+| `compress/level_7_lazy/small-10k-random/matrix/pure_rust` | 0.017 |
 | `compress/level_7_lazy/small-1k-random/matrix/c_ffi` | 0.011 |
 | `compress/level_7_lazy/small-1k-random/matrix/pure_rust` | 0.003 |
-| `compress/level_7_lazy/small-4k-log-lines/matrix/c_ffi` | 0.016 |
-| `compress/level_7_lazy/small-4k-log-lines/matrix/pure_rust` | 0.019 |
-| `compress/level_8_lazy/decodecorpus-z000033/matrix/c_ffi` | 31.667 |
-| `compress/level_8_lazy/decodecorpus-z000033/matrix/pure_rust` | 43.571 |
-| `compress/level_8_lazy/high-entropy-1m/matrix/c_ffi` | 1.908 |
-| `compress/level_8_lazy/high-entropy-1m/matrix/pure_rust` | 2.671 |
-| `compress/level_8_lazy/large-log-stream/matrix/c_ffi` | 26.213 |
-| `compress/level_8_lazy/large-log-stream/matrix/pure_rust` | 16.393 |
-| `compress/level_8_lazy/low-entropy-1m/matrix/c_ffi` | 2.521 |
-| `compress/level_8_lazy/low-entropy-1m/matrix/pure_rust` | 1.510 |
-| `compress/level_8_lazy/small-10k-random/matrix/c_ffi` | 0.025 |
-| `compress/level_8_lazy/small-10k-random/matrix/pure_rust` | 0.019 |
+| `compress/level_7_lazy/small-4k-log-lines/matrix/c_ffi` | 0.015 |
+| `compress/level_7_lazy/small-4k-log-lines/matrix/pure_rust` | 0.016 |
+| `compress/level_8_lazy/decodecorpus-z000033/matrix/c_ffi` | 27.424 |
+| `compress/level_8_lazy/decodecorpus-z000033/matrix/pure_rust` | 41.917 |
+| `compress/level_8_lazy/high-entropy-1m/matrix/c_ffi` | 1.845 |
+| `compress/level_8_lazy/high-entropy-1m/matrix/pure_rust` | 2.082 |
+| `compress/level_8_lazy/large-log-stream/matrix/c_ffi` | 41.807 |
+| `compress/level_8_lazy/large-log-stream/matrix/pure_rust` | 19.734 |
+| `compress/level_8_lazy/low-entropy-1m/matrix/c_ffi` | 2.906 |
+| `compress/level_8_lazy/low-entropy-1m/matrix/pure_rust` | 1.785 |
+| `compress/level_8_lazy/small-10k-random/matrix/c_ffi` | 0.026 |
+| `compress/level_8_lazy/small-10k-random/matrix/pure_rust` | 0.017 |
 | `compress/level_8_lazy/small-1k-random/matrix/c_ffi` | 0.011 |
 | `compress/level_8_lazy/small-1k-random/matrix/pure_rust` | 0.003 |
-| `compress/level_8_lazy/small-4k-log-lines/matrix/c_ffi` | 0.016 |
-| `compress/level_8_lazy/small-4k-log-lines/matrix/pure_rust` | 0.019 |
-| `compress/level_9_lazy/decodecorpus-z000033/matrix/c_ffi` | 38.565 |
-| `compress/level_9_lazy/decodecorpus-z000033/matrix/pure_rust` | 43.967 |
-| `compress/level_9_lazy/high-entropy-1m/matrix/c_ffi` | 2.664 |
-| `compress/level_9_lazy/high-entropy-1m/matrix/pure_rust` | 2.655 |
-| `compress/level_9_lazy/large-log-stream/matrix/c_ffi` | 26.612 |
-| `compress/level_9_lazy/large-log-stream/matrix/pure_rust` | 16.599 |
-| `compress/level_9_lazy/low-entropy-1m/matrix/c_ffi` | 3.228 |
-| `compress/level_9_lazy/low-entropy-1m/matrix/pure_rust` | 1.511 |
-| `compress/level_9_lazy/small-10k-random/matrix/c_ffi` | 0.049 |
-| `compress/level_9_lazy/small-10k-random/matrix/pure_rust` | 0.019 |
+| `compress/level_8_lazy/small-4k-log-lines/matrix/c_ffi` | 0.015 |
+| `compress/level_8_lazy/small-4k-log-lines/matrix/pure_rust` | 0.016 |
+| `compress/level_9_lazy/decodecorpus-z000033/matrix/c_ffi` | 30.580 |
+| `compress/level_9_lazy/decodecorpus-z000033/matrix/pure_rust` | 42.662 |
+| `compress/level_9_lazy/high-entropy-1m/matrix/c_ffi` | 2.438 |
+| `compress/level_9_lazy/high-entropy-1m/matrix/pure_rust` | 2.093 |
+| `compress/level_9_lazy/large-log-stream/matrix/c_ffi` | 41.791 |
+| `compress/level_9_lazy/large-log-stream/matrix/pure_rust` | 19.744 |
+| `compress/level_9_lazy/low-entropy-1m/matrix/c_ffi` | 3.589 |
+| `compress/level_9_lazy/low-entropy-1m/matrix/pure_rust` | 1.779 |
+| `compress/level_9_lazy/small-10k-random/matrix/c_ffi` | 0.046 |
+| `compress/level_9_lazy/small-10k-random/matrix/pure_rust` | 0.017 |
 | `compress/level_9_lazy/small-1k-random/matrix/c_ffi` | 0.015 |
 | `compress/level_9_lazy/small-1k-random/matrix/pure_rust` | 0.003 |
-| `compress/level_9_lazy/small-4k-log-lines/matrix/c_ffi` | 0.014 |
-| `compress/level_9_lazy/small-4k-log-lines/matrix/pure_rust` | 0.019 |
-| `decompress-dict/level_10_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.505 |
-| `decompress-dict/level_10_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.931 |
-| `decompress-dict/level_10_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.002 |
+| `compress/level_9_lazy/small-4k-log-lines/matrix/c_ffi` | 0.013 |
+| `compress/level_9_lazy/small-4k-log-lines/matrix/pure_rust` | 0.016 |
+| `decompress-dict/level_10_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.188 |
+| `decompress-dict/level_10_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.858 |
+| `decompress-dict/level_10_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_10_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_10_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_10_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_6_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.616 |
-| `decompress-dict/level_6_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 4.077 |
-| `decompress-dict/level_6_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.002 |
+| `decompress-dict/level_6_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.292 |
+| `decompress-dict/level_6_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 4.017 |
+| `decompress-dict/level_6_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_6_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_6_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_6_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_7_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.574 |
-| `decompress-dict/level_7_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 4.028 |
-| `decompress-dict/level_7_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.002 |
+| `decompress-dict/level_7_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.257 |
+| `decompress-dict/level_7_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.963 |
+| `decompress-dict/level_7_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_7_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_7_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_7_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_8_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.553 |
-| `decompress-dict/level_8_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.993 |
-| `decompress-dict/level_8_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.002 |
+| `decompress-dict/level_8_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.224 |
+| `decompress-dict/level_8_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.914 |
+| `decompress-dict/level_8_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_8_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_8_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_8_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_9_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.514 |
-| `decompress-dict/level_9_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.951 |
-| `decompress-dict/level_9_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.002 |
+| `decompress-dict/level_9_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.198 |
+| `decompress-dict/level_9_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.884 |
+| `decompress-dict/level_9_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_9_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_9_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_9_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress/level_10_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 2.004 |
-| `decompress/level_10_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.239 |
-| `decompress/level_10_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.263 |
-| `decompress/level_10_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.655 |
-| `decompress/level_10_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.035 |
-| `decompress/level_10_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.036 |
-| `decompress/level_10_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.037 |
-| `decompress/level_10_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.035 |
-| `decompress/level_10_lazy/large-log-stream/c_stream/matrix/c_ffi` | 2.061 |
-| `decompress/level_10_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.505 |
-| `decompress/level_10_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 1.338 |
-| `decompress/level_10_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.434 |
-| `decompress/level_10_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.207 |
-| `decompress/level_10_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
-| `decompress/level_10_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.130 |
-| `decompress/level_10_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_10_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.752 |
+| `decompress/level_10_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.058 |
+| `decompress/level_10_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.038 |
+| `decompress/level_10_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.560 |
+| `decompress/level_10_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.067 |
+| `decompress/level_10_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.068 |
+| `decompress/level_10_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.068 |
+| `decompress/level_10_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.069 |
+| `decompress/level_10_lazy/large-log-stream/c_stream/matrix/c_ffi` | 1.936 |
+| `decompress/level_10_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.769 |
+| `decompress/level_10_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 1.880 |
+| `decompress/level_10_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.738 |
+| `decompress/level_10_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.132 |
+| `decompress/level_10_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_10_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.121 |
+| `decompress/level_10_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.032 |
 | `decompress/level_10_lazy/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_10_lazy/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_10_lazy/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -2385,26 +2385,26 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_10_lazy/small-1k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_10_lazy/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_10_lazy/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_10_lazy/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.003 |
+| `decompress/level_10_lazy/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_10_lazy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_10_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.003 |
+| `decompress/level_10_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_10_lazy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_6_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 2.076 |
-| `decompress/level_6_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.319 |
-| `decompress/level_6_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.421 |
-| `decompress/level_6_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.879 |
-| `decompress/level_6_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.034 |
-| `decompress/level_6_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.035 |
-| `decompress/level_6_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.037 |
-| `decompress/level_6_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.035 |
-| `decompress/level_6_lazy/large-log-stream/c_stream/matrix/c_ffi` | 2.032 |
-| `decompress/level_6_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.448 |
-| `decompress/level_6_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 1.348 |
-| `decompress/level_6_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.434 |
-| `decompress/level_6_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.207 |
+| `decompress/level_6_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.797 |
+| `decompress/level_6_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.135 |
+| `decompress/level_6_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.174 |
+| `decompress/level_6_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.784 |
+| `decompress/level_6_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.068 |
+| `decompress/level_6_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.064 |
+| `decompress/level_6_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.067 |
+| `decompress/level_6_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.064 |
+| `decompress/level_6_lazy/large-log-stream/c_stream/matrix/c_ffi` | 1.923 |
+| `decompress/level_6_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.720 |
+| `decompress/level_6_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 1.887 |
+| `decompress/level_6_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.711 |
+| `decompress/level_6_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.132 |
 | `decompress/level_6_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
-| `decompress/level_6_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.129 |
-| `decompress/level_6_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_6_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.121 |
+| `decompress/level_6_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.032 |
 | `decompress/level_6_lazy/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_6_lazy/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_6_lazy/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -2413,26 +2413,26 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_6_lazy/small-1k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_6_lazy/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_6_lazy/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_6_lazy/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.003 |
+| `decompress/level_6_lazy/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_6_lazy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_6_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.003 |
+| `decompress/level_6_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_6_lazy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_7_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 2.054 |
-| `decompress/level_7_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.299 |
-| `decompress/level_7_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.352 |
-| `decompress/level_7_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.820 |
-| `decompress/level_7_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.035 |
-| `decompress/level_7_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.034 |
-| `decompress/level_7_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.037 |
-| `decompress/level_7_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.034 |
-| `decompress/level_7_lazy/large-log-stream/c_stream/matrix/c_ffi` | 2.031 |
-| `decompress/level_7_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.449 |
-| `decompress/level_7_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 1.349 |
-| `decompress/level_7_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.432 |
-| `decompress/level_7_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.207 |
-| `decompress/level_7_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
-| `decompress/level_7_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.130 |
-| `decompress/level_7_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_7_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.785 |
+| `decompress/level_7_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.115 |
+| `decompress/level_7_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.124 |
+| `decompress/level_7_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.724 |
+| `decompress/level_7_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.064 |
+| `decompress/level_7_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.064 |
+| `decompress/level_7_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.065 |
+| `decompress/level_7_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.068 |
+| `decompress/level_7_lazy/large-log-stream/c_stream/matrix/c_ffi` | 1.925 |
+| `decompress/level_7_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.721 |
+| `decompress/level_7_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 1.882 |
+| `decompress/level_7_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.710 |
+| `decompress/level_7_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.132 |
+| `decompress/level_7_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_7_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.120 |
+| `decompress/level_7_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.033 |
 | `decompress/level_7_lazy/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_7_lazy/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_7_lazy/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -2441,26 +2441,26 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_7_lazy/small-1k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_7_lazy/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_7_lazy/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_7_lazy/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.003 |
+| `decompress/level_7_lazy/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_7_lazy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_7_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.003 |
+| `decompress/level_7_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_7_lazy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_8_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 2.027 |
-| `decompress/level_8_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.271 |
-| `decompress/level_8_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.272 |
-| `decompress/level_8_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.683 |
-| `decompress/level_8_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.037 |
-| `decompress/level_8_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.037 |
-| `decompress/level_8_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.035 |
-| `decompress/level_8_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.037 |
-| `decompress/level_8_lazy/large-log-stream/c_stream/matrix/c_ffi` | 2.060 |
-| `decompress/level_8_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.507 |
-| `decompress/level_8_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 1.348 |
-| `decompress/level_8_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.433 |
-| `decompress/level_8_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.208 |
+| `decompress/level_8_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.762 |
+| `decompress/level_8_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.083 |
+| `decompress/level_8_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.056 |
+| `decompress/level_8_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.555 |
+| `decompress/level_8_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.065 |
+| `decompress/level_8_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.065 |
+| `decompress/level_8_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.069 |
+| `decompress/level_8_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.065 |
+| `decompress/level_8_lazy/large-log-stream/c_stream/matrix/c_ffi` | 1.943 |
+| `decompress/level_8_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.779 |
+| `decompress/level_8_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 1.895 |
+| `decompress/level_8_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.737 |
+| `decompress/level_8_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.132 |
 | `decompress/level_8_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
-| `decompress/level_8_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.130 |
-| `decompress/level_8_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_8_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.121 |
+| `decompress/level_8_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.031 |
 | `decompress/level_8_lazy/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_8_lazy/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_8_lazy/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -2469,26 +2469,26 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_8_lazy/small-1k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_8_lazy/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_8_lazy/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_8_lazy/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.003 |
+| `decompress/level_8_lazy/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_8_lazy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_8_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.003 |
+| `decompress/level_8_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_8_lazy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_9_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 2.046 |
-| `decompress/level_9_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.269 |
-| `decompress/level_9_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.283 |
-| `decompress/level_9_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.685 |
-| `decompress/level_9_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.037 |
-| `decompress/level_9_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.035 |
-| `decompress/level_9_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.035 |
-| `decompress/level_9_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.035 |
-| `decompress/level_9_lazy/large-log-stream/c_stream/matrix/c_ffi` | 2.062 |
-| `decompress/level_9_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.505 |
-| `decompress/level_9_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 1.344 |
-| `decompress/level_9_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.432 |
-| `decompress/level_9_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.208 |
-| `decompress/level_9_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
-| `decompress/level_9_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.130 |
-| `decompress/level_9_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_9_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.765 |
+| `decompress/level_9_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.089 |
+| `decompress/level_9_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.058 |
+| `decompress/level_9_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.580 |
+| `decompress/level_9_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.068 |
+| `decompress/level_9_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.068 |
+| `decompress/level_9_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.065 |
+| `decompress/level_9_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.064 |
+| `decompress/level_9_lazy/large-log-stream/c_stream/matrix/c_ffi` | 1.949 |
+| `decompress/level_9_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.772 |
+| `decompress/level_9_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 1.888 |
+| `decompress/level_9_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.717 |
+| `decompress/level_9_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.132 |
+| `decompress/level_9_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_9_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.121 |
+| `decompress/level_9_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.032 |
 | `decompress/level_9_lazy/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_9_lazy/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_9_lazy/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -2497,16 +2497,16 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_9_lazy/small-1k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_9_lazy/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_9_lazy/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_9_lazy/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.003 |
+| `decompress/level_9_lazy/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_9_lazy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_9_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.003 |
+| `decompress/level_9_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_9_lazy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.003 |
-| `dict-train/na/decodecorpus-z000033/matrix/c_ffi` | 87.271 |
-| `dict-train/na/decodecorpus-z000033/matrix/pure_rust` | 20.100 |
-| `dict-train/na/small-10k-random/matrix/c_ffi` | 10.626 |
-| `dict-train/na/small-10k-random/matrix/pure_rust` | 2.484 |
-| `dict-train/na/small-4k-log-lines/matrix/c_ffi` | 1.952 |
-| `dict-train/na/small-4k-log-lines/matrix/pure_rust` | 0.899 |
+| `dict-train/na/decodecorpus-z000033/matrix/c_ffi` | 64.973 |
+| `dict-train/na/decodecorpus-z000033/matrix/pure_rust` | 18.374 |
+| `dict-train/na/small-10k-random/matrix/c_ffi` | 8.763 |
+| `dict-train/na/small-10k-random/matrix/pure_rust` | 2.211 |
+| `dict-train/na/small-4k-log-lines/matrix/c_ffi` | 1.681 |
+| `dict-train/na/small-4k-log-lines/matrix/pure_rust` | 0.847 |
 
 ## Strategy group: lazy-upper
 
@@ -2668,195 +2668,195 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 
 | Scenario | Label | Level | Dict bytes | Train ms | C bytes (no dict) | C bytes (with dict) | C ratio (no dict) | C ratio (with dict) |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| decodecorpus-z000033 | Repo decode corpus sample | level_11_lazy | 16384 | 75.321 | 483348 | 458380 | 0.4729 | 0.4485 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_12_lazy | 16384 | 75.321 | 483348 | 458085 | 0.4729 | 0.4482 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_13_lazy | 16384 | 75.321 | 482849 | 452252 | 0.4724 | 0.4425 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_14_lazy | 16384 | 75.321 | 482463 | 430814 | 0.4721 | 0.4215 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_15_lazy | 16384 | 75.321 | 482283 | 430274 | 0.4719 | 0.4210 |
-| small-10k-random | Small random payload (10 KiB) | level_11_lazy | 1280 | 10.494 | 10250 | 9234 | 1.0010 | 0.9018 |
-| small-10k-random | Small random payload (10 KiB) | level_12_lazy | 1280 | 10.494 | 10250 | 9235 | 1.0010 | 0.9019 |
-| small-10k-random | Small random payload (10 KiB) | level_13_lazy | 1280 | 10.494 | 10250 | 9247 | 1.0010 | 0.9030 |
-| small-10k-random | Small random payload (10 KiB) | level_14_lazy | 1280 | 10.494 | 10250 | 9245 | 1.0010 | 0.9028 |
-| small-10k-random | Small random payload (10 KiB) | level_15_lazy | 1280 | 10.494 | 10250 | 9245 | 1.0010 | 0.9028 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_11_lazy | 437 | 2.782 | 150 | 46 | 0.0366 | 0.0112 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_12_lazy | 437 | 2.782 | 150 | 46 | 0.0366 | 0.0112 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_13_lazy | 437 | 2.782 | 146 | 47 | 0.0356 | 0.0115 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_14_lazy | 437 | 2.782 | 146 | 44 | 0.0356 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_15_lazy | 437 | 2.782 | 146 | 44 | 0.0356 | 0.0107 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_11_lazy | 16384 | 84.305 | 483348 | 458380 | 0.4729 | 0.4485 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_12_lazy | 16384 | 84.305 | 483348 | 458085 | 0.4729 | 0.4482 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_13_lazy | 16384 | 84.305 | 482849 | 452252 | 0.4724 | 0.4425 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_14_lazy | 16384 | 84.305 | 482463 | 430814 | 0.4721 | 0.4215 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_15_lazy | 16384 | 84.305 | 482283 | 430274 | 0.4719 | 0.4210 |
+| small-10k-random | Small random payload (10 KiB) | level_11_lazy | 1280 | 11.569 | 10250 | 9234 | 1.0010 | 0.9018 |
+| small-10k-random | Small random payload (10 KiB) | level_12_lazy | 1280 | 11.569 | 10250 | 9235 | 1.0010 | 0.9019 |
+| small-10k-random | Small random payload (10 KiB) | level_13_lazy | 1280 | 11.569 | 10250 | 9247 | 1.0010 | 0.9030 |
+| small-10k-random | Small random payload (10 KiB) | level_14_lazy | 1280 | 11.569 | 10250 | 9245 | 1.0010 | 0.9028 |
+| small-10k-random | Small random payload (10 KiB) | level_15_lazy | 1280 | 11.569 | 10250 | 9245 | 1.0010 | 0.9028 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_11_lazy | 437 | 2.158 | 150 | 46 | 0.0366 | 0.0112 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_12_lazy | 437 | 2.158 | 150 | 46 | 0.0366 | 0.0112 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_13_lazy | 437 | 2.158 | 146 | 47 | 0.0356 | 0.0115 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_14_lazy | 437 | 2.158 | 146 | 44 | 0.0356 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_15_lazy | 437 | 2.158 | 146 | 44 | 0.0356 | 0.0107 |
 
 ## Dictionary Training (Rust FastCOVER vs C FFI)
 
 | Scenario | Label | Dict bytes (requested) | Rust train ms | C train ms | Rust dict bytes | C dict bytes | Rust FastCOVER score | Delta (C/Rust) | Status |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| decodecorpus-z000033 | Repo decode corpus sample | 16384 | 25.632 | 75.321 | 16384 | 16384 | 0 | 2.9386 | rust_faster |
-| small-10k-random | Small random payload (10 KiB) | 1280 | 2.896 | 10.494 | 1280 | 1280 | 0 | 3.6236 | rust_faster |
-| small-4k-log-lines | Small structured log lines (4 KiB) | 512 | 1.538 | 2.782 | 512 | 437 | 0 | 1.8088 | rust_faster |
+| decodecorpus-z000033 | Repo decode corpus sample | 16384 | 20.842 | 84.305 | 16384 | 16384 | 0 | 4.0450 | rust_faster |
+| small-10k-random | Small random payload (10 KiB) | 1280 | 2.747 | 11.569 | 1280 | 1280 | 0 | 4.2115 | rust_faster |
+| small-4k-log-lines | Small structured log lines (4 KiB) | 512 | 1.090 | 2.158 | 512 | 437 | 0 | 1.9798 | rust_faster |
 
 ## Timing Metrics
 
 | Benchmark | ms/iter |
 | --- | ---: |
-| `compress-dict/level_11_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 47.408 |
-| `compress-dict/level_11_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 52.748 |
-| `compress-dict/level_11_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 66.423 |
-| `compress-dict/level_11_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.378 |
-| `compress-dict/level_11_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.217 |
-| `compress-dict/level_11_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.346 |
+| `compress-dict/level_11_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 46.977 |
+| `compress-dict/level_11_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 50.844 |
+| `compress-dict/level_11_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 58.636 |
+| `compress-dict/level_11_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.282 |
+| `compress-dict/level_11_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.203 |
+| `compress-dict/level_11_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.357 |
 | `compress-dict/level_11_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.012 |
-| `compress-dict/level_11_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.020 |
+| `compress-dict/level_11_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.021 |
 | `compress-dict/level_11_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.005 |
-| `compress-dict/level_12_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 50.053 |
-| `compress-dict/level_12_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 52.007 |
-| `compress-dict/level_12_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 70.461 |
-| `compress-dict/level_12_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.444 |
-| `compress-dict/level_12_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.278 |
-| `compress-dict/level_12_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.350 |
-| `compress-dict/level_12_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.012 |
-| `compress-dict/level_12_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.022 |
-| `compress-dict/level_12_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.005 |
-| `compress-dict/level_13_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 63.533 |
-| `compress-dict/level_13_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 58.166 |
-| `compress-dict/level_13_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 77.290 |
-| `compress-dict/level_13_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.421 |
-| `compress-dict/level_13_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.280 |
-| `compress-dict/level_13_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.673 |
-| `compress-dict/level_13_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.014 |
-| `compress-dict/level_13_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.030 |
+| `compress-dict/level_12_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 49.473 |
+| `compress-dict/level_12_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 55.898 |
+| `compress-dict/level_12_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 67.074 |
+| `compress-dict/level_12_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.308 |
+| `compress-dict/level_12_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.233 |
+| `compress-dict/level_12_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.357 |
+| `compress-dict/level_12_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.013 |
+| `compress-dict/level_12_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.023 |
+| `compress-dict/level_12_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.006 |
+| `compress-dict/level_13_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 64.489 |
+| `compress-dict/level_13_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 38.068 |
+| `compress-dict/level_13_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 82.064 |
+| `compress-dict/level_13_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.281 |
+| `compress-dict/level_13_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.236 |
+| `compress-dict/level_13_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.754 |
+| `compress-dict/level_13_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.015 |
+| `compress-dict/level_13_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.032 |
 | `compress-dict/level_13_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.011 |
-| `compress-dict/level_14_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 88.995 |
-| `compress-dict/level_14_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 71.308 |
-| `compress-dict/level_14_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 76.843 |
-| `compress-dict/level_14_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.558 |
-| `compress-dict/level_14_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.370 |
-| `compress-dict/level_14_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.673 |
-| `compress-dict/level_14_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.086 |
-| `compress-dict/level_14_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.061 |
+| `compress-dict/level_14_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 90.215 |
+| `compress-dict/level_14_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 41.096 |
+| `compress-dict/level_14_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 82.285 |
+| `compress-dict/level_14_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.488 |
+| `compress-dict/level_14_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.425 |
+| `compress-dict/level_14_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.739 |
+| `compress-dict/level_14_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.087 |
+| `compress-dict/level_14_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.063 |
 | `compress-dict/level_14_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.011 |
-| `compress-dict/level_15_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 94.005 |
-| `compress-dict/level_15_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 69.010 |
-| `compress-dict/level_15_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 77.074 |
-| `compress-dict/level_15_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.558 |
-| `compress-dict/level_15_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.370 |
-| `compress-dict/level_15_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.672 |
-| `compress-dict/level_15_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.086 |
-| `compress-dict/level_15_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.061 |
+| `compress-dict/level_15_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 94.123 |
+| `compress-dict/level_15_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 42.090 |
+| `compress-dict/level_15_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 82.698 |
+| `compress-dict/level_15_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.488 |
+| `compress-dict/level_15_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.430 |
+| `compress-dict/level_15_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.732 |
+| `compress-dict/level_15_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.087 |
+| `compress-dict/level_15_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.063 |
 | `compress-dict/level_15_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.011 |
-| `compress/level_11_lazy/decodecorpus-z000033/matrix/c_ffi` | 53.385 |
-| `compress/level_11_lazy/decodecorpus-z000033/matrix/pure_rust` | 61.336 |
-| `compress/level_11_lazy/high-entropy-1m/matrix/c_ffi` | 2.731 |
-| `compress/level_11_lazy/high-entropy-1m/matrix/pure_rust` | 1.691 |
-| `compress/level_11_lazy/large-log-stream/matrix/c_ffi` | 45.009 |
-| `compress/level_11_lazy/large-log-stream/matrix/pure_rust` | 20.461 |
-| `compress/level_11_lazy/low-entropy-1m/matrix/c_ffi` | 3.604 |
-| `compress/level_11_lazy/low-entropy-1m/matrix/pure_rust` | 1.444 |
-| `compress/level_11_lazy/small-10k-random/matrix/c_ffi` | 0.218 |
-| `compress/level_11_lazy/small-10k-random/matrix/pure_rust` | 0.017 |
-| `compress/level_11_lazy/small-1k-random/matrix/c_ffi` | 0.023 |
+| `compress/level_11_lazy/decodecorpus-z000033/matrix/c_ffi` | 47.696 |
+| `compress/level_11_lazy/decodecorpus-z000033/matrix/pure_rust` | 54.663 |
+| `compress/level_11_lazy/high-entropy-1m/matrix/c_ffi` | 2.968 |
+| `compress/level_11_lazy/high-entropy-1m/matrix/pure_rust` | 2.240 |
+| `compress/level_11_lazy/large-log-stream/matrix/c_ffi` | 28.650 |
+| `compress/level_11_lazy/large-log-stream/matrix/pure_rust` | 17.756 |
+| `compress/level_11_lazy/low-entropy-1m/matrix/c_ffi` | 3.128 |
+| `compress/level_11_lazy/low-entropy-1m/matrix/pure_rust` | 1.636 |
+| `compress/level_11_lazy/small-10k-random/matrix/c_ffi` | 0.205 |
+| `compress/level_11_lazy/small-10k-random/matrix/pure_rust` | 0.019 |
+| `compress/level_11_lazy/small-1k-random/matrix/c_ffi` | 0.024 |
 | `compress/level_11_lazy/small-1k-random/matrix/pure_rust` | 0.003 |
 | `compress/level_11_lazy/small-4k-log-lines/matrix/c_ffi` | 0.022 |
-| `compress/level_11_lazy/small-4k-log-lines/matrix/pure_rust` | 0.016 |
-| `compress/level_12_lazy/decodecorpus-z000033/matrix/c_ffi` | 53.767 |
-| `compress/level_12_lazy/decodecorpus-z000033/matrix/pure_rust` | 67.162 |
-| `compress/level_12_lazy/high-entropy-1m/matrix/c_ffi` | 2.695 |
-| `compress/level_12_lazy/high-entropy-1m/matrix/pure_rust` | 1.706 |
-| `compress/level_12_lazy/large-log-stream/matrix/c_ffi` | 48.978 |
-| `compress/level_12_lazy/large-log-stream/matrix/pure_rust` | 20.353 |
-| `compress/level_12_lazy/low-entropy-1m/matrix/c_ffi` | 3.596 |
-| `compress/level_12_lazy/low-entropy-1m/matrix/pure_rust` | 1.844 |
-| `compress/level_12_lazy/small-10k-random/matrix/c_ffi` | 0.279 |
-| `compress/level_12_lazy/small-10k-random/matrix/pure_rust` | 0.017 |
-| `compress/level_12_lazy/small-1k-random/matrix/c_ffi` | 0.026 |
+| `compress/level_11_lazy/small-4k-log-lines/matrix/pure_rust` | 0.018 |
+| `compress/level_12_lazy/decodecorpus-z000033/matrix/c_ffi` | 47.715 |
+| `compress/level_12_lazy/decodecorpus-z000033/matrix/pure_rust` | 58.019 |
+| `compress/level_12_lazy/high-entropy-1m/matrix/c_ffi` | 2.999 |
+| `compress/level_12_lazy/high-entropy-1m/matrix/pure_rust` | 2.242 |
+| `compress/level_12_lazy/large-log-stream/matrix/c_ffi` | 29.973 |
+| `compress/level_12_lazy/large-log-stream/matrix/pure_rust` | 17.737 |
+| `compress/level_12_lazy/low-entropy-1m/matrix/c_ffi` | 3.119 |
+| `compress/level_12_lazy/low-entropy-1m/matrix/pure_rust` | 1.638 |
+| `compress/level_12_lazy/small-10k-random/matrix/c_ffi` | 0.235 |
+| `compress/level_12_lazy/small-10k-random/matrix/pure_rust` | 0.019 |
+| `compress/level_12_lazy/small-1k-random/matrix/c_ffi` | 0.027 |
 | `compress/level_12_lazy/small-1k-random/matrix/pure_rust` | 0.003 |
-| `compress/level_12_lazy/small-4k-log-lines/matrix/c_ffi` | 0.024 |
-| `compress/level_12_lazy/small-4k-log-lines/matrix/pure_rust` | 0.017 |
-| `compress/level_13_lazy/decodecorpus-z000033/matrix/c_ffi` | 69.610 |
-| `compress/level_13_lazy/decodecorpus-z000033/matrix/pure_rust` | 108.738 |
-| `compress/level_13_lazy/high-entropy-1m/matrix/c_ffi` | 9.576 |
-| `compress/level_13_lazy/high-entropy-1m/matrix/pure_rust` | 6.111 |
-| `compress/level_13_lazy/large-log-stream/matrix/c_ffi` | 469.590 |
-| `compress/level_13_lazy/large-log-stream/matrix/pure_rust` | 30.350 |
-| `compress/level_13_lazy/low-entropy-1m/matrix/c_ffi` | 7.031 |
-| `compress/level_13_lazy/low-entropy-1m/matrix/pure_rust` | 4.112 |
-| `compress/level_13_lazy/small-10k-random/matrix/c_ffi` | 0.281 |
-| `compress/level_13_lazy/small-10k-random/matrix/pure_rust` | 0.033 |
-| `compress/level_13_lazy/small-1k-random/matrix/c_ffi` | 0.026 |
-| `compress/level_13_lazy/small-1k-random/matrix/pure_rust` | 0.005 |
+| `compress/level_12_lazy/small-4k-log-lines/matrix/c_ffi` | 0.025 |
+| `compress/level_12_lazy/small-4k-log-lines/matrix/pure_rust` | 0.019 |
+| `compress/level_13_lazy/decodecorpus-z000033/matrix/c_ffi` | 37.537 |
+| `compress/level_13_lazy/decodecorpus-z000033/matrix/pure_rust` | 77.158 |
+| `compress/level_13_lazy/high-entropy-1m/matrix/c_ffi` | 10.574 |
+| `compress/level_13_lazy/high-entropy-1m/matrix/pure_rust` | 6.668 |
+| `compress/level_13_lazy/large-log-stream/matrix/c_ffi` | 347.841 |
+| `compress/level_13_lazy/large-log-stream/matrix/pure_rust` | 23.343 |
+| `compress/level_13_lazy/low-entropy-1m/matrix/c_ffi` | 5.278 |
+| `compress/level_13_lazy/low-entropy-1m/matrix/pure_rust` | 3.484 |
+| `compress/level_13_lazy/small-10k-random/matrix/c_ffi` | 0.238 |
+| `compress/level_13_lazy/small-10k-random/matrix/pure_rust` | 0.046 |
+| `compress/level_13_lazy/small-1k-random/matrix/c_ffi` | 0.027 |
+| `compress/level_13_lazy/small-1k-random/matrix/pure_rust` | 0.006 |
 | `compress/level_13_lazy/small-4k-log-lines/matrix/c_ffi` | 0.033 |
-| `compress/level_13_lazy/small-4k-log-lines/matrix/pure_rust` | 0.026 |
-| `compress/level_14_lazy/decodecorpus-z000033/matrix/c_ffi` | 73.853 |
-| `compress/level_14_lazy/decodecorpus-z000033/matrix/pure_rust` | 110.382 |
-| `compress/level_14_lazy/high-entropy-1m/matrix/c_ffi` | 9.084 |
-| `compress/level_14_lazy/high-entropy-1m/matrix/pure_rust` | 6.773 |
-| `compress/level_14_lazy/large-log-stream/matrix/c_ffi` | 1006.201 |
-| `compress/level_14_lazy/large-log-stream/matrix/pure_rust` | 33.924 |
-| `compress/level_14_lazy/low-entropy-1m/matrix/c_ffi` | 7.293 |
-| `compress/level_14_lazy/low-entropy-1m/matrix/pure_rust` | 3.845 |
-| `compress/level_14_lazy/small-10k-random/matrix/c_ffi` | 0.372 |
-| `compress/level_14_lazy/small-10k-random/matrix/pure_rust` | 0.033 |
-| `compress/level_14_lazy/small-1k-random/matrix/c_ffi` | 0.026 |
-| `compress/level_14_lazy/small-1k-random/matrix/pure_rust` | 0.005 |
-| `compress/level_14_lazy/small-4k-log-lines/matrix/c_ffi` | 0.063 |
-| `compress/level_14_lazy/small-4k-log-lines/matrix/pure_rust` | 0.026 |
-| `compress/level_15_lazy/decodecorpus-z000033/matrix/c_ffi` | 77.427 |
-| `compress/level_15_lazy/decodecorpus-z000033/matrix/pure_rust` | 103.902 |
-| `compress/level_15_lazy/high-entropy-1m/matrix/c_ffi` | 8.778 |
-| `compress/level_15_lazy/high-entropy-1m/matrix/pure_rust` | 5.669 |
-| `compress/level_15_lazy/large-log-stream/matrix/c_ffi` | 3108.145 |
-| `compress/level_15_lazy/large-log-stream/matrix/pure_rust` | 38.061 |
-| `compress/level_15_lazy/low-entropy-1m/matrix/c_ffi` | 7.586 |
-| `compress/level_15_lazy/low-entropy-1m/matrix/pure_rust` | 3.946 |
-| `compress/level_15_lazy/small-10k-random/matrix/c_ffi` | 0.372 |
-| `compress/level_15_lazy/small-10k-random/matrix/pure_rust` | 0.033 |
-| `compress/level_15_lazy/small-1k-random/matrix/c_ffi` | 0.026 |
-| `compress/level_15_lazy/small-1k-random/matrix/pure_rust` | 0.005 |
-| `compress/level_15_lazy/small-4k-log-lines/matrix/c_ffi` | 0.063 |
-| `compress/level_15_lazy/small-4k-log-lines/matrix/pure_rust` | 0.026 |
-| `decompress-dict/level_11_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.205 |
-| `decompress-dict/level_11_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.906 |
+| `compress/level_13_lazy/small-4k-log-lines/matrix/pure_rust` | 0.028 |
+| `compress/level_14_lazy/decodecorpus-z000033/matrix/c_ffi` | 39.465 |
+| `compress/level_14_lazy/decodecorpus-z000033/matrix/pure_rust` | 78.343 |
+| `compress/level_14_lazy/high-entropy-1m/matrix/c_ffi` | 10.647 |
+| `compress/level_14_lazy/high-entropy-1m/matrix/pure_rust` | 6.616 |
+| `compress/level_14_lazy/large-log-stream/matrix/c_ffi` | 746.539 |
+| `compress/level_14_lazy/large-log-stream/matrix/pure_rust` | 24.797 |
+| `compress/level_14_lazy/low-entropy-1m/matrix/c_ffi` | 5.284 |
+| `compress/level_14_lazy/low-entropy-1m/matrix/pure_rust` | 3.488 |
+| `compress/level_14_lazy/small-10k-random/matrix/c_ffi` | 0.428 |
+| `compress/level_14_lazy/small-10k-random/matrix/pure_rust` | 0.046 |
+| `compress/level_14_lazy/small-1k-random/matrix/c_ffi` | 0.027 |
+| `compress/level_14_lazy/small-1k-random/matrix/pure_rust` | 0.006 |
+| `compress/level_14_lazy/small-4k-log-lines/matrix/c_ffi` | 0.065 |
+| `compress/level_14_lazy/small-4k-log-lines/matrix/pure_rust` | 0.028 |
+| `compress/level_15_lazy/decodecorpus-z000033/matrix/c_ffi` | 40.505 |
+| `compress/level_15_lazy/decodecorpus-z000033/matrix/pure_rust` | 77.223 |
+| `compress/level_15_lazy/high-entropy-1m/matrix/c_ffi` | 10.652 |
+| `compress/level_15_lazy/high-entropy-1m/matrix/pure_rust` | 6.655 |
+| `compress/level_15_lazy/large-log-stream/matrix/c_ffi` | 2313.025 |
+| `compress/level_15_lazy/large-log-stream/matrix/pure_rust` | 25.973 |
+| `compress/level_15_lazy/low-entropy-1m/matrix/c_ffi` | 5.293 |
+| `compress/level_15_lazy/low-entropy-1m/matrix/pure_rust` | 3.490 |
+| `compress/level_15_lazy/small-10k-random/matrix/c_ffi` | 0.422 |
+| `compress/level_15_lazy/small-10k-random/matrix/pure_rust` | 0.046 |
+| `compress/level_15_lazy/small-1k-random/matrix/c_ffi` | 0.027 |
+| `compress/level_15_lazy/small-1k-random/matrix/pure_rust` | 0.006 |
+| `compress/level_15_lazy/small-4k-log-lines/matrix/c_ffi` | 0.065 |
+| `compress/level_15_lazy/small-4k-log-lines/matrix/pure_rust` | 0.028 |
+| `decompress-dict/level_11_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.422 |
+| `decompress-dict/level_11_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 4.145 |
 | `decompress-dict/level_11_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_11_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_11_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_11_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_12_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.194 |
-| `decompress-dict/level_12_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.894 |
-| `decompress-dict/level_12_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
+| `decompress-dict/level_12_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.415 |
+| `decompress-dict/level_12_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 4.139 |
+| `decompress-dict/level_12_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.002 |
 | `decompress-dict/level_12_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_12_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_12_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_13_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.308 |
-| `decompress-dict/level_13_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 4.047 |
-| `decompress-dict/level_13_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
+| `decompress-dict/level_13_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.548 |
+| `decompress-dict/level_13_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 4.282 |
+| `decompress-dict/level_13_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.002 |
 | `decompress-dict/level_13_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_13_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_13_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_14_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.513 |
-| `decompress-dict/level_14_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 4.272 |
-| `decompress-dict/level_14_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
+| `decompress-dict/level_14_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.906 |
+| `decompress-dict/level_14_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 4.542 |
+| `decompress-dict/level_14_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.002 |
 | `decompress-dict/level_14_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_14_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_14_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_15_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.493 |
-| `decompress-dict/level_15_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 4.255 |
-| `decompress-dict/level_15_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
+| `decompress-dict/level_15_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.893 |
+| `decompress-dict/level_15_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 4.521 |
+| `decompress-dict/level_15_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.002 |
 | `decompress-dict/level_15_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_15_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_15_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress/level_11_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.738 |
-| `decompress/level_11_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.072 |
-| `decompress/level_11_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.029 |
-| `decompress/level_11_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.573 |
-| `decompress/level_11_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.072 |
-| `decompress/level_11_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.073 |
-| `decompress/level_11_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.061 |
-| `decompress/level_11_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.065 |
-| `decompress/level_11_lazy/large-log-stream/c_stream/matrix/c_ffi` | 1.968 |
-| `decompress/level_11_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.794 |
-| `decompress/level_11_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 1.954 |
-| `decompress/level_11_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.757 |
-| `decompress/level_11_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.132 |
-| `decompress/level_11_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
-| `decompress/level_11_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.122 |
-| `decompress/level_11_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.032 |
+| `decompress/level_11_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.907 |
+| `decompress/level_11_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.330 |
+| `decompress/level_11_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.151 |
+| `decompress/level_11_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.783 |
+| `decompress/level_11_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.028 |
+| `decompress/level_11_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_11_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.029 |
+| `decompress/level_11_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_11_lazy/large-log-stream/c_stream/matrix/c_ffi` | 1.565 |
+| `decompress/level_11_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.588 |
+| `decompress/level_11_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 1.484 |
+| `decompress/level_11_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.541 |
+| `decompress/level_11_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.174 |
+| `decompress/level_11_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.031 |
+| `decompress/level_11_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.135 |
+| `decompress/level_11_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.031 |
 | `decompress/level_11_lazy/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_11_lazy/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_11_lazy/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -2865,25 +2865,25 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_11_lazy/small-1k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_11_lazy/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_11_lazy/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_11_lazy/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.002 |
+| `decompress/level_11_lazy/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.003 |
 | `decompress/level_11_lazy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.003 |
 | `decompress/level_11_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_11_lazy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_12_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.739 |
-| `decompress/level_12_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.078 |
-| `decompress/level_12_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.025 |
-| `decompress/level_12_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.578 |
-| `decompress/level_12_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.072 |
-| `decompress/level_12_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.074 |
-| `decompress/level_12_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.068 |
-| `decompress/level_12_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.073 |
-| `decompress/level_12_lazy/large-log-stream/c_stream/matrix/c_ffi` | 1.965 |
-| `decompress/level_12_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.736 |
-| `decompress/level_12_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 1.928 |
-| `decompress/level_12_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.704 |
-| `decompress/level_12_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.132 |
-| `decompress/level_12_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
-| `decompress/level_12_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.122 |
+| `decompress/level_12_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.931 |
+| `decompress/level_12_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.332 |
+| `decompress/level_12_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.138 |
+| `decompress/level_12_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.797 |
+| `decompress/level_12_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.029 |
+| `decompress/level_12_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_12_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.029 |
+| `decompress/level_12_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_12_lazy/large-log-stream/c_stream/matrix/c_ffi` | 1.568 |
+| `decompress/level_12_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.587 |
+| `decompress/level_12_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 1.483 |
+| `decompress/level_12_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.545 |
+| `decompress/level_12_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.174 |
+| `decompress/level_12_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.030 |
+| `decompress/level_12_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.135 |
 | `decompress/level_12_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.031 |
 | `decompress/level_12_lazy/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_12_lazy/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
@@ -2897,78 +2897,78 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_12_lazy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.003 |
 | `decompress/level_12_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_12_lazy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_13_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.741 |
-| `decompress/level_13_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.074 |
-| `decompress/level_13_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.119 |
-| `decompress/level_13_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.700 |
-| `decompress/level_13_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.064 |
-| `decompress/level_13_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.064 |
-| `decompress/level_13_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.072 |
-| `decompress/level_13_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.073 |
-| `decompress/level_13_lazy/large-log-stream/c_stream/matrix/c_ffi` | 1.985 |
-| `decompress/level_13_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.733 |
-| `decompress/level_13_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 1.941 |
-| `decompress/level_13_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.689 |
-| `decompress/level_13_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.132 |
-| `decompress/level_13_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
-| `decompress/level_13_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.132 |
-| `decompress/level_13_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_13_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.927 |
+| `decompress/level_13_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.327 |
+| `decompress/level_13_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.253 |
+| `decompress/level_13_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.918 |
+| `decompress/level_13_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.029 |
+| `decompress/level_13_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_13_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.029 |
+| `decompress/level_13_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_13_lazy/large-log-stream/c_stream/matrix/c_ffi` | 1.565 |
+| `decompress/level_13_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.587 |
+| `decompress/level_13_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 1.553 |
+| `decompress/level_13_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.517 |
+| `decompress/level_13_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.174 |
+| `decompress/level_13_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.031 |
+| `decompress/level_13_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.174 |
+| `decompress/level_13_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.031 |
 | `decompress/level_13_lazy/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_13_lazy/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_13_lazy/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
-| `decompress/level_13_lazy/small-10k-random/rust_stream/matrix/pure_rust` | 0.000 |
+| `decompress/level_13_lazy/small-10k-random/rust_stream/matrix/pure_rust` | 0.001 |
 | `decompress/level_13_lazy/small-1k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_13_lazy/small-1k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_13_lazy/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_13_lazy/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_13_lazy/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_13_lazy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_13_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
+| `decompress/level_13_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.003 |
 | `decompress/level_13_lazy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_14_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.733 |
-| `decompress/level_14_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.064 |
-| `decompress/level_14_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.109 |
-| `decompress/level_14_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.700 |
-| `decompress/level_14_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.059 |
-| `decompress/level_14_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.062 |
-| `decompress/level_14_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.059 |
-| `decompress/level_14_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.062 |
-| `decompress/level_14_lazy/large-log-stream/c_stream/matrix/c_ffi` | 2.025 |
-| `decompress/level_14_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.746 |
-| `decompress/level_14_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 1.946 |
-| `decompress/level_14_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.713 |
-| `decompress/level_14_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.132 |
-| `decompress/level_14_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.029 |
-| `decompress/level_14_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.132 |
-| `decompress/level_14_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_14_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.922 |
+| `decompress/level_14_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.320 |
+| `decompress/level_14_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.261 |
+| `decompress/level_14_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.918 |
+| `decompress/level_14_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.029 |
+| `decompress/level_14_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_14_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.029 |
+| `decompress/level_14_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_14_lazy/large-log-stream/c_stream/matrix/c_ffi` | 1.564 |
+| `decompress/level_14_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.586 |
+| `decompress/level_14_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 1.553 |
+| `decompress/level_14_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.516 |
+| `decompress/level_14_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.173 |
+| `decompress/level_14_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.031 |
+| `decompress/level_14_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.174 |
+| `decompress/level_14_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.031 |
 | `decompress/level_14_lazy/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_14_lazy/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_14_lazy/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
-| `decompress/level_14_lazy/small-10k-random/rust_stream/matrix/pure_rust` | 0.000 |
+| `decompress/level_14_lazy/small-10k-random/rust_stream/matrix/pure_rust` | 0.001 |
 | `decompress/level_14_lazy/small-1k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_14_lazy/small-1k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_14_lazy/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_14_lazy/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_14_lazy/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_14_lazy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_14_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
+| `decompress/level_14_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.003 |
 | `decompress/level_14_lazy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_15_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.730 |
-| `decompress/level_15_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.054 |
-| `decompress/level_15_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.108 |
-| `decompress/level_15_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.699 |
-| `decompress/level_15_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.064 |
-| `decompress/level_15_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.072 |
-| `decompress/level_15_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.062 |
-| `decompress/level_15_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.061 |
-| `decompress/level_15_lazy/large-log-stream/c_stream/matrix/c_ffi` | 1.985 |
-| `decompress/level_15_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.728 |
-| `decompress/level_15_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 1.956 |
-| `decompress/level_15_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.688 |
-| `decompress/level_15_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.132 |
-| `decompress/level_15_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.029 |
-| `decompress/level_15_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.132 |
-| `decompress/level_15_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_15_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.905 |
+| `decompress/level_15_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.317 |
+| `decompress/level_15_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.254 |
+| `decompress/level_15_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.916 |
+| `decompress/level_15_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.028 |
+| `decompress/level_15_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_15_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.029 |
+| `decompress/level_15_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_15_lazy/large-log-stream/c_stream/matrix/c_ffi` | 1.565 |
+| `decompress/level_15_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.590 |
+| `decompress/level_15_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 1.553 |
+| `decompress/level_15_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.516 |
+| `decompress/level_15_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.174 |
+| `decompress/level_15_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.030 |
+| `decompress/level_15_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.174 |
+| `decompress/level_15_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.031 |
 | `decompress/level_15_lazy/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_15_lazy/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_15_lazy/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -2979,14 +2979,14 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_15_lazy/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_15_lazy/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_15_lazy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.003 |
-| `decompress/level_15_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
+| `decompress/level_15_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.003 |
 | `decompress/level_15_lazy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.003 |
-| `dict-train/na/decodecorpus-z000033/matrix/c_ffi` | 73.030 |
-| `dict-train/na/decodecorpus-z000033/matrix/pure_rust` | 20.081 |
-| `dict-train/na/small-10k-random/matrix/c_ffi` | 9.035 |
-| `dict-train/na/small-10k-random/matrix/pure_rust` | 2.401 |
-| `dict-train/na/small-4k-log-lines/matrix/c_ffi` | 1.663 |
-| `dict-train/na/small-4k-log-lines/matrix/pure_rust` | 0.879 |
+| `dict-train/na/decodecorpus-z000033/matrix/c_ffi` | 83.945 |
+| `dict-train/na/decodecorpus-z000033/matrix/pure_rust` | 19.489 |
+| `dict-train/na/small-10k-random/matrix/c_ffi` | 11.048 |
+| `dict-train/na/small-10k-random/matrix/pure_rust` | 2.597 |
+| `dict-train/na/small-4k-log-lines/matrix/c_ffi` | 1.988 |
+| `dict-train/na/small-4k-log-lines/matrix/pure_rust` | 0.888 |
 
 ## Target `x86_64-gnu`
 
@@ -3140,163 +3140,163 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 
 | Scenario | Label | Level | Dict bytes | Train ms | C bytes (no dict) | C bytes (with dict) | C ratio (no dict) | C ratio (with dict) |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| decodecorpus-z000033 | Repo decode corpus sample | level_16_btopt | 16384 | 30.610 | 460806 | 420487 | 0.4509 | 0.4114 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_17_btopt | 16384 | 30.610 | 444757 | 420480 | 0.4352 | 0.4114 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_1_fast_ldm_dict | 16384 | 30.610 | 571193 | 550048 | 0.5589 | 0.5382 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_22_btultra2_ldm_dict | 16384 | 30.610 | 426278 | 420424 | 0.4171 | 0.4114 |
-| small-10k-random | Small random payload (10 KiB) | level_16_btopt | 1280 | 1.113 | 10250 | 9226 | 1.0010 | 0.9010 |
-| small-10k-random | Small random payload (10 KiB) | level_17_btopt | 1280 | 1.113 | 10250 | 9226 | 1.0010 | 0.9010 |
-| small-10k-random | Small random payload (10 KiB) | level_1_fast_ldm_dict | 1280 | 1.113 | 10250 | 9218 | 1.0010 | 0.9002 |
-| small-10k-random | Small random payload (10 KiB) | level_22_btultra2_ldm_dict | 1280 | 1.113 | 10250 | 9226 | 1.0010 | 0.9010 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_16_btopt | 437 | 0.374 | 146 | 47 | 0.0356 | 0.0115 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_17_btopt | 437 | 0.374 | 146 | 44 | 0.0356 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_1_fast_ldm_dict | 437 | 0.374 | 150 | 44 | 0.0366 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_22_btultra2_ldm_dict | 437 | 0.374 | 146 | 44 | 0.0356 | 0.0107 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_16_btopt | 16384 | 33.101 | 460806 | 420487 | 0.4509 | 0.4114 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_17_btopt | 16384 | 33.101 | 444757 | 420480 | 0.4352 | 0.4114 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_1_fast_ldm_dict | 16384 | 33.101 | 571193 | 550048 | 0.5589 | 0.5382 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_22_btultra2_ldm_dict | 16384 | 33.101 | 426278 | 420424 | 0.4171 | 0.4114 |
+| small-10k-random | Small random payload (10 KiB) | level_16_btopt | 1280 | 1.489 | 10250 | 9226 | 1.0010 | 0.9010 |
+| small-10k-random | Small random payload (10 KiB) | level_17_btopt | 1280 | 1.489 | 10250 | 9226 | 1.0010 | 0.9010 |
+| small-10k-random | Small random payload (10 KiB) | level_1_fast_ldm_dict | 1280 | 1.489 | 10250 | 9218 | 1.0010 | 0.9002 |
+| small-10k-random | Small random payload (10 KiB) | level_22_btultra2_ldm_dict | 1280 | 1.489 | 10250 | 9226 | 1.0010 | 0.9010 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_16_btopt | 437 | 0.598 | 146 | 47 | 0.0356 | 0.0115 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_17_btopt | 437 | 0.598 | 146 | 44 | 0.0356 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_1_fast_ldm_dict | 437 | 0.598 | 150 | 44 | 0.0366 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_22_btultra2_ldm_dict | 437 | 0.598 | 146 | 44 | 0.0356 | 0.0107 |
 
 ## Dictionary Training (Rust FastCOVER vs C FFI)
 
 | Scenario | Label | Dict bytes (requested) | Rust train ms | C train ms | Rust dict bytes | C dict bytes | Rust FastCOVER score | Delta (C/Rust) | Status |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| decodecorpus-z000033 | Repo decode corpus sample | 16384 | 8.812 | 30.610 | 16384 | 16384 | 0 | 3.4737 | rust_faster |
-| small-10k-random | Small random payload (10 KiB) | 1280 | 0.371 | 1.113 | 1280 | 1280 | 0 | 3.0000 | rust_faster |
-| small-4k-log-lines | Small structured log lines (4 KiB) | 512 | 0.376 | 0.374 | 512 | 437 | 0 | 0.9947 | near_parity |
+| decodecorpus-z000033 | Repo decode corpus sample | 16384 | 9.688 | 33.101 | 16384 | 16384 | 0 | 3.4167 | rust_faster |
+| small-10k-random | Small random payload (10 KiB) | 1280 | 0.718 | 1.489 | 1280 | 1280 | 0 | 2.0738 | rust_faster |
+| small-4k-log-lines | Small structured log lines (4 KiB) | 512 | 0.392 | 0.598 | 512 | 437 | 0 | 1.5255 | rust_faster |
 
 ## Timing Metrics
 
 | Benchmark | ms/iter |
 | --- | ---: |
-| `compress-dict/level_16_btopt/decodecorpus-z000033/matrix/c_ffi_with_dict` | 126.882 |
-| `compress-dict/level_16_btopt/decodecorpus-z000033/matrix/c_ffi_without_dict` | 60.893 |
-| `compress-dict/level_16_btopt/decodecorpus-z000033/matrix/pure_rust_with_dict` | 128.465 |
-| `compress-dict/level_16_btopt/small-10k-random/matrix/c_ffi_with_dict` | 0.250 |
-| `compress-dict/level_16_btopt/small-10k-random/matrix/c_ffi_without_dict` | 0.385 |
-| `compress-dict/level_16_btopt/small-10k-random/matrix/pure_rust_with_dict` | 1.003 |
-| `compress-dict/level_16_btopt/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.025 |
-| `compress-dict/level_16_btopt/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.039 |
-| `compress-dict/level_16_btopt/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.014 |
-| `compress-dict/level_17_btopt/decodecorpus-z000033/matrix/c_ffi_with_dict` | 131.424 |
-| `compress-dict/level_17_btopt/decodecorpus-z000033/matrix/c_ffi_without_dict` | 77.389 |
-| `compress-dict/level_17_btopt/decodecorpus-z000033/matrix/pure_rust_with_dict` | 140.327 |
-| `compress-dict/level_17_btopt/small-10k-random/matrix/c_ffi_with_dict` | 0.404 |
-| `compress-dict/level_17_btopt/small-10k-random/matrix/c_ffi_without_dict` | 0.385 |
-| `compress-dict/level_17_btopt/small-10k-random/matrix/pure_rust_with_dict` | 1.014 |
-| `compress-dict/level_17_btopt/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.067 |
-| `compress-dict/level_17_btopt/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.087 |
-| `compress-dict/level_17_btopt/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.014 |
-| `compress-dict/level_1_fast_ldm_dict/decodecorpus-z000033/matrix/c_ffi_with_dict` | 3.974 |
-| `compress-dict/level_1_fast_ldm_dict/decodecorpus-z000033/matrix/c_ffi_without_dict` | 3.463 |
-| `compress-dict/level_1_fast_ldm_dict/decodecorpus-z000033/matrix/pure_rust_with_dict` | 5.164 |
-| `compress-dict/level_1_fast_ldm_dict/small-10k-random/matrix/c_ffi_with_dict` | 0.023 |
+| `compress-dict/level_16_btopt/decodecorpus-z000033/matrix/c_ffi_with_dict` | 132.322 |
+| `compress-dict/level_16_btopt/decodecorpus-z000033/matrix/c_ffi_without_dict` | 65.738 |
+| `compress-dict/level_16_btopt/decodecorpus-z000033/matrix/pure_rust_with_dict` | 122.762 |
+| `compress-dict/level_16_btopt/small-10k-random/matrix/c_ffi_with_dict` | 0.375 |
+| `compress-dict/level_16_btopt/small-10k-random/matrix/c_ffi_without_dict` | 0.453 |
+| `compress-dict/level_16_btopt/small-10k-random/matrix/pure_rust_with_dict` | 0.987 |
+| `compress-dict/level_16_btopt/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.032 |
+| `compress-dict/level_16_btopt/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.041 |
+| `compress-dict/level_16_btopt/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.013 |
+| `compress-dict/level_17_btopt/decodecorpus-z000033/matrix/c_ffi_with_dict` | 139.103 |
+| `compress-dict/level_17_btopt/decodecorpus-z000033/matrix/c_ffi_without_dict` | 79.530 |
+| `compress-dict/level_17_btopt/decodecorpus-z000033/matrix/pure_rust_with_dict` | 133.926 |
+| `compress-dict/level_17_btopt/small-10k-random/matrix/c_ffi_with_dict` | 0.508 |
+| `compress-dict/level_17_btopt/small-10k-random/matrix/c_ffi_without_dict` | 0.451 |
+| `compress-dict/level_17_btopt/small-10k-random/matrix/pure_rust_with_dict` | 1.002 |
+| `compress-dict/level_17_btopt/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.093 |
+| `compress-dict/level_17_btopt/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.112 |
+| `compress-dict/level_17_btopt/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.013 |
+| `compress-dict/level_1_fast_ldm_dict/decodecorpus-z000033/matrix/c_ffi_with_dict` | 3.677 |
+| `compress-dict/level_1_fast_ldm_dict/decodecorpus-z000033/matrix/c_ffi_without_dict` | 3.140 |
+| `compress-dict/level_1_fast_ldm_dict/decodecorpus-z000033/matrix/pure_rust_with_dict` | 4.922 |
+| `compress-dict/level_1_fast_ldm_dict/small-10k-random/matrix/c_ffi_with_dict` | 0.022 |
 | `compress-dict/level_1_fast_ldm_dict/small-10k-random/matrix/c_ffi_without_dict` | 0.016 |
-| `compress-dict/level_1_fast_ldm_dict/small-10k-random/matrix/pure_rust_with_dict` | 0.009 |
+| `compress-dict/level_1_fast_ldm_dict/small-10k-random/matrix/pure_rust_with_dict` | 0.010 |
 | `compress-dict/level_1_fast_ldm_dict/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.004 |
 | `compress-dict/level_1_fast_ldm_dict/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.009 |
 | `compress-dict/level_1_fast_ldm_dict/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.002 |
-| `compress-dict/level_22_btultra2_ldm_dict/decodecorpus-z000033/matrix/c_ffi_with_dict` | 198.274 |
-| `compress-dict/level_22_btultra2_ldm_dict/decodecorpus-z000033/matrix/c_ffi_without_dict` | 220.242 |
-| `compress-dict/level_22_btultra2_ldm_dict/decodecorpus-z000033/matrix/pure_rust_with_dict` | 235.869 |
-| `compress-dict/level_22_btultra2_ldm_dict/small-10k-random/matrix/c_ffi_with_dict` | 0.603 |
-| `compress-dict/level_22_btultra2_ldm_dict/small-10k-random/matrix/c_ffi_without_dict` | 0.523 |
-| `compress-dict/level_22_btultra2_ldm_dict/small-10k-random/matrix/pure_rust_with_dict` | 1.269 |
-| `compress-dict/level_22_btultra2_ldm_dict/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.073 |
-| `compress-dict/level_22_btultra2_ldm_dict/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.095 |
+| `compress-dict/level_22_btultra2_ldm_dict/decodecorpus-z000033/matrix/c_ffi_with_dict` | 231.637 |
+| `compress-dict/level_22_btultra2_ldm_dict/decodecorpus-z000033/matrix/c_ffi_without_dict` | 276.330 |
+| `compress-dict/level_22_btultra2_ldm_dict/decodecorpus-z000033/matrix/pure_rust_with_dict` | 236.319 |
+| `compress-dict/level_22_btultra2_ldm_dict/small-10k-random/matrix/c_ffi_with_dict` | 0.636 |
+| `compress-dict/level_22_btultra2_ldm_dict/small-10k-random/matrix/c_ffi_without_dict` | 0.567 |
+| `compress-dict/level_22_btultra2_ldm_dict/small-10k-random/matrix/pure_rust_with_dict` | 1.282 |
+| `compress-dict/level_22_btultra2_ldm_dict/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.099 |
+| `compress-dict/level_22_btultra2_ldm_dict/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.121 |
 | `compress-dict/level_22_btultra2_ldm_dict/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.038 |
-| `compress/level_16_btopt/decodecorpus-z000033/matrix/c_ffi` | 68.243 |
-| `compress/level_16_btopt/decodecorpus-z000033/matrix/pure_rust` | 123.916 |
-| `compress/level_16_btopt/high-entropy-1m/matrix/c_ffi` | 28.843 |
-| `compress/level_16_btopt/high-entropy-1m/matrix/pure_rust` | 2.607 |
-| `compress/level_16_btopt/large-log-stream/matrix/c_ffi` | 21.450 |
-| `compress/level_16_btopt/large-log-stream/matrix/pure_rust` | 19.447 |
-| `compress/level_16_btopt/low-entropy-1m/matrix/c_ffi` | 1.310 |
-| `compress/level_16_btopt/low-entropy-1m/matrix/pure_rust` | 1.446 |
-| `compress/level_16_btopt/small-10k-random/matrix/c_ffi` | 0.388 |
+| `compress/level_16_btopt/decodecorpus-z000033/matrix/c_ffi` | 71.832 |
+| `compress/level_16_btopt/decodecorpus-z000033/matrix/pure_rust` | 117.506 |
+| `compress/level_16_btopt/high-entropy-1m/matrix/c_ffi` | 29.281 |
+| `compress/level_16_btopt/high-entropy-1m/matrix/pure_rust` | 2.772 |
+| `compress/level_16_btopt/large-log-stream/matrix/c_ffi` | 19.875 |
+| `compress/level_16_btopt/large-log-stream/matrix/pure_rust` | 18.769 |
+| `compress/level_16_btopt/low-entropy-1m/matrix/c_ffi` | 1.272 |
+| `compress/level_16_btopt/low-entropy-1m/matrix/pure_rust` | 1.494 |
+| `compress/level_16_btopt/small-10k-random/matrix/c_ffi` | 0.457 |
 | `compress/level_16_btopt/small-10k-random/matrix/pure_rust` | 0.027 |
-| `compress/level_16_btopt/small-1k-random/matrix/c_ffi` | 0.042 |
+| `compress/level_16_btopt/small-1k-random/matrix/c_ffi` | 0.045 |
 | `compress/level_16_btopt/small-1k-random/matrix/pure_rust` | 0.004 |
-| `compress/level_16_btopt/small-4k-log-lines/matrix/c_ffi` | 0.040 |
-| `compress/level_16_btopt/small-4k-log-lines/matrix/pure_rust` | 0.035 |
-| `compress/level_17_btopt/decodecorpus-z000033/matrix/c_ffi` | 87.587 |
-| `compress/level_17_btopt/decodecorpus-z000033/matrix/pure_rust` | 142.341 |
-| `compress/level_17_btopt/high-entropy-1m/matrix/c_ffi` | 29.104 |
-| `compress/level_17_btopt/high-entropy-1m/matrix/pure_rust` | 2.611 |
-| `compress/level_17_btopt/large-log-stream/matrix/c_ffi` | 21.703 |
-| `compress/level_17_btopt/large-log-stream/matrix/pure_rust` | 21.335 |
-| `compress/level_17_btopt/low-entropy-1m/matrix/c_ffi` | 1.345 |
-| `compress/level_17_btopt/low-entropy-1m/matrix/pure_rust` | 1.448 |
-| `compress/level_17_btopt/small-10k-random/matrix/c_ffi` | 0.390 |
+| `compress/level_16_btopt/small-4k-log-lines/matrix/c_ffi` | 0.043 |
+| `compress/level_16_btopt/small-4k-log-lines/matrix/pure_rust` | 0.034 |
+| `compress/level_17_btopt/decodecorpus-z000033/matrix/c_ffi` | 90.015 |
+| `compress/level_17_btopt/decodecorpus-z000033/matrix/pure_rust` | 136.222 |
+| `compress/level_17_btopt/high-entropy-1m/matrix/c_ffi` | 29.390 |
+| `compress/level_17_btopt/high-entropy-1m/matrix/pure_rust` | 2.678 |
+| `compress/level_17_btopt/large-log-stream/matrix/c_ffi` | 21.425 |
+| `compress/level_17_btopt/large-log-stream/matrix/pure_rust` | 20.280 |
+| `compress/level_17_btopt/low-entropy-1m/matrix/c_ffi` | 1.318 |
+| `compress/level_17_btopt/low-entropy-1m/matrix/pure_rust` | 1.487 |
+| `compress/level_17_btopt/small-10k-random/matrix/c_ffi` | 0.456 |
 | `compress/level_17_btopt/small-10k-random/matrix/pure_rust` | 0.026 |
-| `compress/level_17_btopt/small-1k-random/matrix/c_ffi` | 0.042 |
+| `compress/level_17_btopt/small-1k-random/matrix/c_ffi` | 0.045 |
 | `compress/level_17_btopt/small-1k-random/matrix/pure_rust` | 0.004 |
-| `compress/level_17_btopt/small-4k-log-lines/matrix/c_ffi` | 0.088 |
-| `compress/level_17_btopt/small-4k-log-lines/matrix/pure_rust` | 0.038 |
-| `compress/level_1_fast_ldm/decodecorpus-z000033/matrix/c_ffi` | 3.544 |
-| `compress/level_1_fast_ldm/decodecorpus-z000033/matrix/pure_rust` | 4.767 |
-| `compress/level_1_fast_ldm/high-entropy-1m/matrix/c_ffi` | 1.038 |
-| `compress/level_1_fast_ldm/high-entropy-1m/matrix/pure_rust` | 0.111 |
-| `compress/level_1_fast_ldm/large-log-stream/matrix/c_ffi` | 39.534 |
-| `compress/level_1_fast_ldm/large-log-stream/matrix/pure_rust` | 1.992 |
-| `compress/level_1_fast_ldm/low-entropy-1m/matrix/c_ffi` | 0.537 |
-| `compress/level_1_fast_ldm/low-entropy-1m/matrix/pure_rust` | 0.120 |
+| `compress/level_17_btopt/small-4k-log-lines/matrix/c_ffi` | 0.113 |
+| `compress/level_17_btopt/small-4k-log-lines/matrix/pure_rust` | 0.037 |
+| `compress/level_1_fast_ldm/decodecorpus-z000033/matrix/c_ffi` | 3.239 |
+| `compress/level_1_fast_ldm/decodecorpus-z000033/matrix/pure_rust` | 4.470 |
+| `compress/level_1_fast_ldm/high-entropy-1m/matrix/c_ffi` | 0.898 |
+| `compress/level_1_fast_ldm/high-entropy-1m/matrix/pure_rust` | 0.073 |
+| `compress/level_1_fast_ldm/large-log-stream/matrix/c_ffi` | 35.752 |
+| `compress/level_1_fast_ldm/large-log-stream/matrix/pure_rust` | 1.806 |
+| `compress/level_1_fast_ldm/low-entropy-1m/matrix/c_ffi` | 0.474 |
+| `compress/level_1_fast_ldm/low-entropy-1m/matrix/pure_rust` | 0.114 |
 | `compress/level_1_fast_ldm/small-10k-random/matrix/c_ffi` | 0.018 |
 | `compress/level_1_fast_ldm/small-10k-random/matrix/pure_rust` | 0.005 |
 | `compress/level_1_fast_ldm/small-1k-random/matrix/c_ffi` | 0.006 |
 | `compress/level_1_fast_ldm/small-1k-random/matrix/pure_rust` | 0.001 |
 | `compress/level_1_fast_ldm/small-4k-log-lines/matrix/c_ffi` | 0.011 |
 | `compress/level_1_fast_ldm/small-4k-log-lines/matrix/pure_rust` | 0.007 |
-| `compress/level_22_btultra2_ldm/decodecorpus-z000033/matrix/c_ffi` | 223.984 |
-| `compress/level_22_btultra2_ldm/decodecorpus-z000033/matrix/pure_rust` | 240.081 |
-| `compress/level_22_btultra2_ldm/high-entropy-1m/matrix/c_ffi` | 62.453 |
-| `compress/level_22_btultra2_ldm/high-entropy-1m/matrix/pure_rust` | 2.695 |
-| `compress/level_22_btultra2_ldm/large-log-stream/matrix/c_ffi` | 49.466 |
-| `compress/level_22_btultra2_ldm/large-log-stream/matrix/pure_rust` | 31.700 |
-| `compress/level_22_btultra2_ldm/low-entropy-1m/matrix/c_ffi` | 1.760 |
-| `compress/level_22_btultra2_ldm/low-entropy-1m/matrix/pure_rust` | 1.322 |
-| `compress/level_22_btultra2_ldm/small-10k-random/matrix/c_ffi` | 0.523 |
+| `compress/level_22_btultra2_ldm/decodecorpus-z000033/matrix/c_ffi` | 266.731 |
+| `compress/level_22_btultra2_ldm/decodecorpus-z000033/matrix/pure_rust` | 236.721 |
+| `compress/level_22_btultra2_ldm/high-entropy-1m/matrix/c_ffi` | 68.245 |
+| `compress/level_22_btultra2_ldm/high-entropy-1m/matrix/pure_rust` | 2.790 |
+| `compress/level_22_btultra2_ldm/large-log-stream/matrix/c_ffi` | 50.768 |
+| `compress/level_22_btultra2_ldm/large-log-stream/matrix/pure_rust` | 31.900 |
+| `compress/level_22_btultra2_ldm/low-entropy-1m/matrix/c_ffi` | 1.697 |
+| `compress/level_22_btultra2_ldm/low-entropy-1m/matrix/pure_rust` | 1.221 |
+| `compress/level_22_btultra2_ldm/small-10k-random/matrix/c_ffi` | 0.572 |
 | `compress/level_22_btultra2_ldm/small-10k-random/matrix/pure_rust` | 0.027 |
-| `compress/level_22_btultra2_ldm/small-1k-random/matrix/c_ffi` | 0.046 |
+| `compress/level_22_btultra2_ldm/small-1k-random/matrix/c_ffi` | 0.049 |
 | `compress/level_22_btultra2_ldm/small-1k-random/matrix/pure_rust` | 0.005 |
-| `compress/level_22_btultra2_ldm/small-4k-log-lines/matrix/c_ffi` | 0.095 |
-| `compress/level_22_btultra2_ldm/small-4k-log-lines/matrix/pure_rust` | 0.063 |
-| `decompress-dict/level_16_btopt/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.018 |
-| `decompress-dict/level_16_btopt/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.321 |
+| `compress/level_22_btultra2_ldm/small-4k-log-lines/matrix/c_ffi` | 0.120 |
+| `compress/level_22_btultra2_ldm/small-4k-log-lines/matrix/pure_rust` | 0.064 |
+| `decompress-dict/level_16_btopt/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.978 |
+| `decompress-dict/level_16_btopt/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.079 |
 | `decompress-dict/level_16_btopt/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_16_btopt/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
 | `decompress-dict/level_16_btopt/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
-| `decompress-dict/level_16_btopt/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_17_btopt/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.002 |
-| `decompress-dict/level_17_btopt/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.309 |
+| `decompress-dict/level_16_btopt/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
+| `decompress-dict/level_17_btopt/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.965 |
+| `decompress-dict/level_17_btopt/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.066 |
 | `decompress-dict/level_17_btopt/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_17_btopt/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
 | `decompress-dict/level_17_btopt/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_17_btopt/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress-dict/level_1_fast_ldm_dict/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.969 |
-| `decompress-dict/level_1_fast_ldm_dict/decodecorpus-z000033/matrix/pure_rust_with_dict` | 1.492 |
+| `decompress-dict/level_1_fast_ldm_dict/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.015 |
+| `decompress-dict/level_1_fast_ldm_dict/decodecorpus-z000033/matrix/pure_rust_with_dict` | 1.433 |
 | `decompress-dict/level_1_fast_ldm_dict/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_1_fast_ldm_dict/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
 | `decompress-dict/level_1_fast_ldm_dict/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_1_fast_ldm_dict/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress-dict/level_22_btultra2_ldm_dict/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.045 |
-| `decompress-dict/level_22_btultra2_ldm_dict/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.338 |
+| `decompress-dict/level_22_btultra2_ldm_dict/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.994 |
+| `decompress-dict/level_22_btultra2_ldm_dict/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.091 |
 | `decompress-dict/level_22_btultra2_ldm_dict/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_22_btultra2_ldm_dict/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
 | `decompress-dict/level_22_btultra2_ldm_dict/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_22_btultra2_ldm_dict/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress/level_16_btopt/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.508 |
-| `decompress/level_16_btopt/decodecorpus-z000033/c_stream/matrix/pure_rust` | 2.501 |
-| `decompress/level_16_btopt/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.583 |
-| `decompress/level_16_btopt/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 2.545 |
-| `decompress/level_16_btopt/high-entropy-1m/c_stream/matrix/c_ffi` | 0.084 |
-| `decompress/level_16_btopt/high-entropy-1m/c_stream/matrix/pure_rust` | 0.084 |
-| `decompress/level_16_btopt/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.032 |
-| `decompress/level_16_btopt/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.032 |
-| `decompress/level_16_btopt/large-log-stream/c_stream/matrix/c_ffi` | 0.486 |
-| `decompress/level_16_btopt/large-log-stream/c_stream/matrix/pure_rust` | 0.519 |
-| `decompress/level_16_btopt/large-log-stream/rust_stream/matrix/c_ffi` | 0.485 |
-| `decompress/level_16_btopt/large-log-stream/rust_stream/matrix/pure_rust` | 0.518 |
-| `decompress/level_16_btopt/low-entropy-1m/c_stream/matrix/c_ffi` | 0.101 |
-| `decompress/level_16_btopt/low-entropy-1m/c_stream/matrix/pure_rust` | 0.030 |
-| `decompress/level_16_btopt/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.101 |
-| `decompress/level_16_btopt/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.030 |
+| `decompress/level_16_btopt/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.543 |
+| `decompress/level_16_btopt/decodecorpus-z000033/c_stream/matrix/pure_rust` | 2.339 |
+| `decompress/level_16_btopt/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.587 |
+| `decompress/level_16_btopt/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 2.371 |
+| `decompress/level_16_btopt/high-entropy-1m/c_stream/matrix/c_ffi` | 0.076 |
+| `decompress/level_16_btopt/high-entropy-1m/c_stream/matrix/pure_rust` | 0.076 |
+| `decompress/level_16_btopt/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.026 |
+| `decompress/level_16_btopt/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.036 |
+| `decompress/level_16_btopt/large-log-stream/c_stream/matrix/c_ffi` | 0.468 |
+| `decompress/level_16_btopt/large-log-stream/c_stream/matrix/pure_rust` | 0.447 |
+| `decompress/level_16_btopt/large-log-stream/rust_stream/matrix/c_ffi` | 0.466 |
+| `decompress/level_16_btopt/large-log-stream/rust_stream/matrix/pure_rust` | 0.438 |
+| `decompress/level_16_btopt/low-entropy-1m/c_stream/matrix/c_ffi` | 0.096 |
+| `decompress/level_16_btopt/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_16_btopt/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.095 |
+| `decompress/level_16_btopt/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
 | `decompress/level_16_btopt/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_16_btopt/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_16_btopt/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -3309,22 +3309,22 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_16_btopt/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_16_btopt/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_16_btopt/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_17_btopt/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.684 |
-| `decompress/level_17_btopt/decodecorpus-z000033/c_stream/matrix/pure_rust` | 2.810 |
-| `decompress/level_17_btopt/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.730 |
-| `decompress/level_17_btopt/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 2.849 |
-| `decompress/level_17_btopt/high-entropy-1m/c_stream/matrix/c_ffi` | 0.084 |
-| `decompress/level_17_btopt/high-entropy-1m/c_stream/matrix/pure_rust` | 0.084 |
-| `decompress/level_17_btopt/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.032 |
-| `decompress/level_17_btopt/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.032 |
-| `decompress/level_17_btopt/large-log-stream/c_stream/matrix/c_ffi` | 0.477 |
-| `decompress/level_17_btopt/large-log-stream/c_stream/matrix/pure_rust` | 0.511 |
-| `decompress/level_17_btopt/large-log-stream/rust_stream/matrix/c_ffi` | 0.477 |
-| `decompress/level_17_btopt/large-log-stream/rust_stream/matrix/pure_rust` | 0.512 |
-| `decompress/level_17_btopt/low-entropy-1m/c_stream/matrix/c_ffi` | 0.101 |
-| `decompress/level_17_btopt/low-entropy-1m/c_stream/matrix/pure_rust` | 0.030 |
-| `decompress/level_17_btopt/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.101 |
-| `decompress/level_17_btopt/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.030 |
+| `decompress/level_17_btopt/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.675 |
+| `decompress/level_17_btopt/decodecorpus-z000033/c_stream/matrix/pure_rust` | 2.615 |
+| `decompress/level_17_btopt/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.721 |
+| `decompress/level_17_btopt/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 2.646 |
+| `decompress/level_17_btopt/high-entropy-1m/c_stream/matrix/c_ffi` | 0.076 |
+| `decompress/level_17_btopt/high-entropy-1m/c_stream/matrix/pure_rust` | 0.076 |
+| `decompress/level_17_btopt/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.026 |
+| `decompress/level_17_btopt/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_17_btopt/large-log-stream/c_stream/matrix/c_ffi` | 0.436 |
+| `decompress/level_17_btopt/large-log-stream/c_stream/matrix/pure_rust` | 0.410 |
+| `decompress/level_17_btopt/large-log-stream/rust_stream/matrix/c_ffi` | 0.441 |
+| `decompress/level_17_btopt/large-log-stream/rust_stream/matrix/pure_rust` | 0.415 |
+| `decompress/level_17_btopt/low-entropy-1m/c_stream/matrix/c_ffi` | 0.096 |
+| `decompress/level_17_btopt/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_17_btopt/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.096 |
+| `decompress/level_17_btopt/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
 | `decompress/level_17_btopt/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_17_btopt/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_17_btopt/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -3337,22 +3337,22 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_17_btopt/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_17_btopt/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_17_btopt/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_1_fast_ldm/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.899 |
-| `decompress/level_1_fast_ldm/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.359 |
-| `decompress/level_1_fast_ldm/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.869 |
-| `decompress/level_1_fast_ldm/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.310 |
-| `decompress/level_1_fast_ldm/high-entropy-1m/c_stream/matrix/c_ffi` | 0.032 |
-| `decompress/level_1_fast_ldm/high-entropy-1m/c_stream/matrix/pure_rust` | 0.032 |
-| `decompress/level_1_fast_ldm/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.032 |
-| `decompress/level_1_fast_ldm/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.032 |
-| `decompress/level_1_fast_ldm/large-log-stream/c_stream/matrix/c_ffi` | 0.992 |
-| `decompress/level_1_fast_ldm/large-log-stream/c_stream/matrix/pure_rust` | 1.221 |
-| `decompress/level_1_fast_ldm/large-log-stream/rust_stream/matrix/c_ffi` | 0.564 |
-| `decompress/level_1_fast_ldm/large-log-stream/rust_stream/matrix/pure_rust` | 0.490 |
-| `decompress/level_1_fast_ldm/low-entropy-1m/c_stream/matrix/c_ffi` | 0.167 |
-| `decompress/level_1_fast_ldm/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_1_fast_ldm/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.167 |
-| `decompress/level_1_fast_ldm/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_1_fast_ldm/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.971 |
+| `decompress/level_1_fast_ldm/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.324 |
+| `decompress/level_1_fast_ldm/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.948 |
+| `decompress/level_1_fast_ldm/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.287 |
+| `decompress/level_1_fast_ldm/high-entropy-1m/c_stream/matrix/c_ffi` | 0.038 |
+| `decompress/level_1_fast_ldm/high-entropy-1m/c_stream/matrix/pure_rust` | 0.038 |
+| `decompress/level_1_fast_ldm/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.037 |
+| `decompress/level_1_fast_ldm/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_1_fast_ldm/large-log-stream/c_stream/matrix/c_ffi` | 0.938 |
+| `decompress/level_1_fast_ldm/large-log-stream/c_stream/matrix/pure_rust` | 1.679 |
+| `decompress/level_1_fast_ldm/large-log-stream/rust_stream/matrix/c_ffi` | 0.654 |
+| `decompress/level_1_fast_ldm/large-log-stream/rust_stream/matrix/pure_rust` | 0.397 |
+| `decompress/level_1_fast_ldm/low-entropy-1m/c_stream/matrix/c_ffi` | 0.187 |
+| `decompress/level_1_fast_ldm/low-entropy-1m/c_stream/matrix/pure_rust` | 0.026 |
+| `decompress/level_1_fast_ldm/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.187 |
+| `decompress/level_1_fast_ldm/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.025 |
 | `decompress/level_1_fast_ldm/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_1_fast_ldm/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_1_fast_ldm/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -3365,22 +3365,22 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_1_fast_ldm/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_1_fast_ldm/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_1_fast_ldm/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_22_btultra2_ldm/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.886 |
-| `decompress/level_22_btultra2_ldm/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.117 |
-| `decompress/level_22_btultra2_ldm/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.980 |
-| `decompress/level_22_btultra2_ldm/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.267 |
-| `decompress/level_22_btultra2_ldm/high-entropy-1m/c_stream/matrix/c_ffi` | 0.084 |
-| `decompress/level_22_btultra2_ldm/high-entropy-1m/c_stream/matrix/pure_rust` | 0.084 |
-| `decompress/level_22_btultra2_ldm/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.032 |
-| `decompress/level_22_btultra2_ldm/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.032 |
-| `decompress/level_22_btultra2_ldm/large-log-stream/c_stream/matrix/c_ffi` | 0.477 |
-| `decompress/level_22_btultra2_ldm/large-log-stream/c_stream/matrix/pure_rust` | 0.512 |
-| `decompress/level_22_btultra2_ldm/large-log-stream/rust_stream/matrix/c_ffi` | 0.478 |
-| `decompress/level_22_btultra2_ldm/large-log-stream/rust_stream/matrix/pure_rust` | 0.514 |
-| `decompress/level_22_btultra2_ldm/low-entropy-1m/c_stream/matrix/c_ffi` | 0.173 |
-| `decompress/level_22_btultra2_ldm/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
-| `decompress/level_22_btultra2_ldm/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.174 |
-| `decompress/level_22_btultra2_ldm/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_22_btultra2_ldm/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.868 |
+| `decompress/level_22_btultra2_ldm/decodecorpus-z000033/c_stream/matrix/pure_rust` | 2.899 |
+| `decompress/level_22_btultra2_ldm/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.944 |
+| `decompress/level_22_btultra2_ldm/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.024 |
+| `decompress/level_22_btultra2_ldm/high-entropy-1m/c_stream/matrix/c_ffi` | 0.076 |
+| `decompress/level_22_btultra2_ldm/high-entropy-1m/c_stream/matrix/pure_rust` | 0.076 |
+| `decompress/level_22_btultra2_ldm/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.035 |
+| `decompress/level_22_btultra2_ldm/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.036 |
+| `decompress/level_22_btultra2_ldm/large-log-stream/c_stream/matrix/c_ffi` | 0.433 |
+| `decompress/level_22_btultra2_ldm/large-log-stream/c_stream/matrix/pure_rust` | 0.410 |
+| `decompress/level_22_btultra2_ldm/large-log-stream/rust_stream/matrix/c_ffi` | 0.437 |
+| `decompress/level_22_btultra2_ldm/large-log-stream/rust_stream/matrix/pure_rust` | 0.406 |
+| `decompress/level_22_btultra2_ldm/low-entropy-1m/c_stream/matrix/c_ffi` | 0.157 |
+| `decompress/level_22_btultra2_ldm/low-entropy-1m/c_stream/matrix/pure_rust` | 0.026 |
+| `decompress/level_22_btultra2_ldm/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.157 |
+| `decompress/level_22_btultra2_ldm/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.026 |
 | `decompress/level_22_btultra2_ldm/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_22_btultra2_ldm/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_22_btultra2_ldm/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -3393,12 +3393,12 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_22_btultra2_ldm/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_22_btultra2_ldm/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_22_btultra2_ldm/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `dict-train/na/decodecorpus-z000033/matrix/c_ffi` | 30.682 |
-| `dict-train/na/decodecorpus-z000033/matrix/pure_rust` | 8.641 |
-| `dict-train/na/small-10k-random/matrix/c_ffi` | 0.954 |
-| `dict-train/na/small-10k-random/matrix/pure_rust` | 0.264 |
-| `dict-train/na/small-4k-log-lines/matrix/c_ffi` | 0.279 |
-| `dict-train/na/small-4k-log-lines/matrix/pure_rust` | 0.167 |
+| `dict-train/na/decodecorpus-z000033/matrix/c_ffi` | 31.011 |
+| `dict-train/na/decodecorpus-z000033/matrix/pure_rust` | 7.986 |
+| `dict-train/na/small-10k-random/matrix/c_ffi` | 1.069 |
+| `dict-train/na/small-10k-random/matrix/pure_rust` | 0.274 |
+| `dict-train/na/small-4k-log-lines/matrix/c_ffi` | 0.331 |
+| `dict-train/na/small-4k-log-lines/matrix/pure_rust` | 0.195 |
 
 ## Strategy group: btultra2
 
@@ -3560,199 +3560,199 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 
 | Scenario | Label | Level | Dict bytes | Train ms | C bytes (no dict) | C bytes (with dict) | C ratio (no dict) | C ratio (with dict) |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| decodecorpus-z000033 | Repo decode corpus sample | level_18_btultra | 16384 | 30.581 | 426806 | 420494 | 0.4176 | 0.4114 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_19_btultra2 | 16384 | 30.581 | 426543 | 420599 | 0.4173 | 0.4115 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_20_btultra2 | 16384 | 30.581 | 426543 | 420145 | 0.4173 | 0.4111 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_21_btultra2 | 16384 | 30.581 | 426386 | 420411 | 0.4172 | 0.4113 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_22_btultra2 | 16384 | 30.581 | 426312 | 420411 | 0.4171 | 0.4113 |
-| small-10k-random | Small random payload (10 KiB) | level_18_btultra | 1280 | 1.448 | 10250 | 9226 | 1.0010 | 0.9010 |
-| small-10k-random | Small random payload (10 KiB) | level_19_btultra2 | 1280 | 1.448 | 10250 | 9226 | 1.0010 | 0.9010 |
-| small-10k-random | Small random payload (10 KiB) | level_20_btultra2 | 1280 | 1.448 | 10250 | 9226 | 1.0010 | 0.9010 |
-| small-10k-random | Small random payload (10 KiB) | level_21_btultra2 | 1280 | 1.448 | 10250 | 9226 | 1.0010 | 0.9010 |
-| small-10k-random | Small random payload (10 KiB) | level_22_btultra2 | 1280 | 1.448 | 10250 | 9226 | 1.0010 | 0.9010 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_18_btultra | 437 | 0.694 | 146 | 44 | 0.0356 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_19_btultra2 | 437 | 0.694 | 146 | 44 | 0.0356 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_20_btultra2 | 437 | 0.694 | 146 | 44 | 0.0356 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_21_btultra2 | 437 | 0.694 | 146 | 44 | 0.0356 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_22_btultra2 | 437 | 0.694 | 146 | 44 | 0.0356 | 0.0107 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_18_btultra | 16384 | 30.993 | 426806 | 420494 | 0.4176 | 0.4114 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_19_btultra2 | 16384 | 30.993 | 426543 | 420599 | 0.4173 | 0.4115 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_20_btultra2 | 16384 | 30.993 | 426543 | 420145 | 0.4173 | 0.4111 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_21_btultra2 | 16384 | 30.993 | 426386 | 420411 | 0.4172 | 0.4113 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_22_btultra2 | 16384 | 30.993 | 426312 | 420411 | 0.4171 | 0.4113 |
+| small-10k-random | Small random payload (10 KiB) | level_18_btultra | 1280 | 1.277 | 10250 | 9226 | 1.0010 | 0.9010 |
+| small-10k-random | Small random payload (10 KiB) | level_19_btultra2 | 1280 | 1.277 | 10250 | 9226 | 1.0010 | 0.9010 |
+| small-10k-random | Small random payload (10 KiB) | level_20_btultra2 | 1280 | 1.277 | 10250 | 9226 | 1.0010 | 0.9010 |
+| small-10k-random | Small random payload (10 KiB) | level_21_btultra2 | 1280 | 1.277 | 10250 | 9226 | 1.0010 | 0.9010 |
+| small-10k-random | Small random payload (10 KiB) | level_22_btultra2 | 1280 | 1.277 | 10250 | 9226 | 1.0010 | 0.9010 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_18_btultra | 437 | 0.421 | 146 | 44 | 0.0356 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_19_btultra2 | 437 | 0.421 | 146 | 44 | 0.0356 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_20_btultra2 | 437 | 0.421 | 146 | 44 | 0.0356 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_21_btultra2 | 437 | 0.421 | 146 | 44 | 0.0356 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_22_btultra2 | 437 | 0.421 | 146 | 44 | 0.0356 | 0.0107 |
 
 ## Dictionary Training (Rust FastCOVER vs C FFI)
 
 | Scenario | Label | Dict bytes (requested) | Rust train ms | C train ms | Rust dict bytes | C dict bytes | Rust FastCOVER score | Delta (C/Rust) | Status |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| decodecorpus-z000033 | Repo decode corpus sample | 16384 | 8.275 | 30.581 | 16384 | 16384 | 0 | 3.6956 | rust_faster |
-| small-10k-random | Small random payload (10 KiB) | 1280 | 0.691 | 1.448 | 1280 | 1280 | 0 | 2.0955 | rust_faster |
-| small-4k-log-lines | Small structured log lines (4 KiB) | 512 | 0.458 | 0.694 | 512 | 437 | 0 | 1.5153 | rust_faster |
+| decodecorpus-z000033 | Repo decode corpus sample | 16384 | 8.641 | 30.993 | 16384 | 16384 | 0 | 3.5867 | rust_faster |
+| small-10k-random | Small random payload (10 KiB) | 1280 | 0.319 | 1.277 | 1280 | 1280 | 0 | 4.0031 | rust_faster |
+| small-4k-log-lines | Small structured log lines (4 KiB) | 512 | 0.410 | 0.421 | 512 | 437 | 0 | 1.0268 | near_parity |
 
 ## Timing Metrics
 
 | Benchmark | ms/iter |
 | --- | ---: |
-| `compress-dict/level_18_btultra/decodecorpus-z000033/matrix/c_ffi_with_dict` | 149.594 |
-| `compress-dict/level_18_btultra/decodecorpus-z000033/matrix/c_ffi_without_dict` | 121.980 |
-| `compress-dict/level_18_btultra/decodecorpus-z000033/matrix/pure_rust_with_dict` | 187.729 |
-| `compress-dict/level_18_btultra/small-10k-random/matrix/c_ffi_with_dict` | 0.508 |
-| `compress-dict/level_18_btultra/small-10k-random/matrix/c_ffi_without_dict` | 0.453 |
-| `compress-dict/level_18_btultra/small-10k-random/matrix/pure_rust_with_dict` | 1.131 |
-| `compress-dict/level_18_btultra/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.092 |
-| `compress-dict/level_18_btultra/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.111 |
-| `compress-dict/level_18_btultra/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.029 |
-| `compress-dict/level_19_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 138.804 |
-| `compress-dict/level_19_btultra2/decodecorpus-z000033/matrix/c_ffi_without_dict` | 144.031 |
-| `compress-dict/level_19_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 193.768 |
-| `compress-dict/level_19_btultra2/small-10k-random/matrix/c_ffi_with_dict` | 0.508 |
-| `compress-dict/level_19_btultra2/small-10k-random/matrix/c_ffi_without_dict` | 0.452 |
-| `compress-dict/level_19_btultra2/small-10k-random/matrix/pure_rust_with_dict` | 1.132 |
-| `compress-dict/level_19_btultra2/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.094 |
-| `compress-dict/level_19_btultra2/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.112 |
-| `compress-dict/level_19_btultra2/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.029 |
-| `compress-dict/level_20_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 151.994 |
-| `compress-dict/level_20_btultra2/decodecorpus-z000033/matrix/c_ffi_without_dict` | 146.178 |
-| `compress-dict/level_20_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 196.201 |
-| `compress-dict/level_20_btultra2/small-10k-random/matrix/c_ffi_with_dict` | 0.508 |
-| `compress-dict/level_20_btultra2/small-10k-random/matrix/c_ffi_without_dict` | 0.450 |
-| `compress-dict/level_20_btultra2/small-10k-random/matrix/pure_rust_with_dict` | 1.152 |
-| `compress-dict/level_20_btultra2/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.092 |
-| `compress-dict/level_20_btultra2/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.112 |
-| `compress-dict/level_20_btultra2/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.028 |
-| `compress-dict/level_21_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 150.860 |
-| `compress-dict/level_21_btultra2/decodecorpus-z000033/matrix/c_ffi_without_dict` | 163.151 |
-| `compress-dict/level_21_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 196.448 |
-| `compress-dict/level_21_btultra2/small-10k-random/matrix/c_ffi_with_dict` | 0.509 |
-| `compress-dict/level_21_btultra2/small-10k-random/matrix/c_ffi_without_dict` | 0.450 |
-| `compress-dict/level_21_btultra2/small-10k-random/matrix/pure_rust_with_dict` | 1.136 |
-| `compress-dict/level_21_btultra2/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.094 |
-| `compress-dict/level_21_btultra2/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.112 |
-| `compress-dict/level_21_btultra2/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.028 |
-| `compress-dict/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 212.496 |
-| `compress-dict/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi_without_dict` | 223.775 |
-| `compress-dict/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 219.568 |
-| `compress-dict/level_22_btultra2/small-10k-random/matrix/c_ffi_with_dict` | 0.509 |
-| `compress-dict/level_22_btultra2/small-10k-random/matrix/c_ffi_without_dict` | 0.451 |
-| `compress-dict/level_22_btultra2/small-10k-random/matrix/pure_rust_with_dict` | 1.138 |
-| `compress-dict/level_22_btultra2/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.094 |
-| `compress-dict/level_22_btultra2/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.112 |
-| `compress-dict/level_22_btultra2/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.028 |
-| `compress/level_18_btultra/decodecorpus-z000033/matrix/c_ffi` | 127.648 |
-| `compress/level_18_btultra/decodecorpus-z000033/matrix/pure_rust` | 183.741 |
-| `compress/level_18_btultra/high-entropy-1m/matrix/c_ffi` | 37.806 |
-| `compress/level_18_btultra/high-entropy-1m/matrix/pure_rust` | 2.823 |
-| `compress/level_18_btultra/large-log-stream/matrix/c_ffi` | 21.770 |
-| `compress/level_18_btultra/large-log-stream/matrix/pure_rust` | 21.673 |
-| `compress/level_18_btultra/low-entropy-1m/matrix/c_ffi` | 1.218 |
-| `compress/level_18_btultra/low-entropy-1m/matrix/pure_rust` | 1.517 |
-| `compress/level_18_btultra/small-10k-random/matrix/c_ffi` | 0.460 |
-| `compress/level_18_btultra/small-10k-random/matrix/pure_rust` | 0.031 |
+| `compress-dict/level_18_btultra/decodecorpus-z000033/matrix/c_ffi_with_dict` | 138.846 |
+| `compress-dict/level_18_btultra/decodecorpus-z000033/matrix/c_ffi_without_dict` | 132.446 |
+| `compress-dict/level_18_btultra/decodecorpus-z000033/matrix/pure_rust_with_dict` | 194.189 |
+| `compress-dict/level_18_btultra/small-10k-random/matrix/c_ffi_with_dict` | 0.401 |
+| `compress-dict/level_18_btultra/small-10k-random/matrix/c_ffi_without_dict` | 0.387 |
+| `compress-dict/level_18_btultra/small-10k-random/matrix/pure_rust_with_dict` | 1.228 |
+| `compress-dict/level_18_btultra/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.066 |
+| `compress-dict/level_18_btultra/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.086 |
+| `compress-dict/level_18_btultra/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.031 |
+| `compress-dict/level_19_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 131.722 |
+| `compress-dict/level_19_btultra2/decodecorpus-z000033/matrix/c_ffi_without_dict` | 173.174 |
+| `compress-dict/level_19_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 200.913 |
+| `compress-dict/level_19_btultra2/small-10k-random/matrix/c_ffi_with_dict` | 0.399 |
+| `compress-dict/level_19_btultra2/small-10k-random/matrix/c_ffi_without_dict` | 0.387 |
+| `compress-dict/level_19_btultra2/small-10k-random/matrix/pure_rust_with_dict` | 1.252 |
+| `compress-dict/level_19_btultra2/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.066 |
+| `compress-dict/level_19_btultra2/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.086 |
+| `compress-dict/level_19_btultra2/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.031 |
+| `compress-dict/level_20_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 139.741 |
+| `compress-dict/level_20_btultra2/decodecorpus-z000033/matrix/c_ffi_without_dict` | 154.253 |
+| `compress-dict/level_20_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 200.038 |
+| `compress-dict/level_20_btultra2/small-10k-random/matrix/c_ffi_with_dict` | 0.398 |
+| `compress-dict/level_20_btultra2/small-10k-random/matrix/c_ffi_without_dict` | 0.387 |
+| `compress-dict/level_20_btultra2/small-10k-random/matrix/pure_rust_with_dict` | 1.228 |
+| `compress-dict/level_20_btultra2/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.067 |
+| `compress-dict/level_20_btultra2/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.086 |
+| `compress-dict/level_20_btultra2/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.031 |
+| `compress-dict/level_21_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 138.948 |
+| `compress-dict/level_21_btultra2/decodecorpus-z000033/matrix/c_ffi_without_dict` | 158.184 |
+| `compress-dict/level_21_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 200.324 |
+| `compress-dict/level_21_btultra2/small-10k-random/matrix/c_ffi_with_dict` | 0.400 |
+| `compress-dict/level_21_btultra2/small-10k-random/matrix/c_ffi_without_dict` | 0.388 |
+| `compress-dict/level_21_btultra2/small-10k-random/matrix/pure_rust_with_dict` | 1.266 |
+| `compress-dict/level_21_btultra2/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.066 |
+| `compress-dict/level_21_btultra2/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.086 |
+| `compress-dict/level_21_btultra2/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.031 |
+| `compress-dict/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 179.110 |
+| `compress-dict/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi_without_dict` | 217.229 |
+| `compress-dict/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 227.114 |
+| `compress-dict/level_22_btultra2/small-10k-random/matrix/c_ffi_with_dict` | 0.399 |
+| `compress-dict/level_22_btultra2/small-10k-random/matrix/c_ffi_without_dict` | 0.387 |
+| `compress-dict/level_22_btultra2/small-10k-random/matrix/pure_rust_with_dict` | 1.231 |
+| `compress-dict/level_22_btultra2/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.066 |
+| `compress-dict/level_22_btultra2/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.086 |
+| `compress-dict/level_22_btultra2/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.031 |
+| `compress/level_18_btultra/decodecorpus-z000033/matrix/c_ffi` | 143.668 |
+| `compress/level_18_btultra/decodecorpus-z000033/matrix/pure_rust` | 191.597 |
+| `compress/level_18_btultra/high-entropy-1m/matrix/c_ffi` | 46.819 |
+| `compress/level_18_btultra/high-entropy-1m/matrix/pure_rust` | 2.923 |
+| `compress/level_18_btultra/large-log-stream/matrix/c_ffi` | 23.810 |
+| `compress/level_18_btultra/large-log-stream/matrix/pure_rust` | 21.571 |
+| `compress/level_18_btultra/low-entropy-1m/matrix/c_ffi` | 1.439 |
+| `compress/level_18_btultra/low-entropy-1m/matrix/pure_rust` | 1.472 |
+| `compress/level_18_btultra/small-10k-random/matrix/c_ffi` | 0.386 |
+| `compress/level_18_btultra/small-10k-random/matrix/pure_rust` | 0.030 |
 | `compress/level_18_btultra/small-1k-random/matrix/c_ffi` | 0.044 |
 | `compress/level_18_btultra/small-1k-random/matrix/pure_rust` | 0.006 |
-| `compress/level_18_btultra/small-4k-log-lines/matrix/c_ffi` | 0.111 |
-| `compress/level_18_btultra/small-4k-log-lines/matrix/pure_rust` | 0.057 |
-| `compress/level_19_btultra2/decodecorpus-z000033/matrix/c_ffi` | 148.431 |
-| `compress/level_19_btultra2/decodecorpus-z000033/matrix/pure_rust` | 203.366 |
-| `compress/level_19_btultra2/high-entropy-1m/matrix/c_ffi` | 41.564 |
-| `compress/level_19_btultra2/high-entropy-1m/matrix/pure_rust` | 2.646 |
-| `compress/level_19_btultra2/large-log-stream/matrix/c_ffi` | 24.845 |
-| `compress/level_19_btultra2/large-log-stream/matrix/pure_rust` | 21.248 |
-| `compress/level_19_btultra2/low-entropy-1m/matrix/c_ffi` | 1.230 |
-| `compress/level_19_btultra2/low-entropy-1m/matrix/pure_rust` | 1.174 |
-| `compress/level_19_btultra2/small-10k-random/matrix/c_ffi` | 0.459 |
+| `compress/level_18_btultra/small-4k-log-lines/matrix/c_ffi` | 0.087 |
+| `compress/level_18_btultra/small-4k-log-lines/matrix/pure_rust` | 0.058 |
+| `compress/level_19_btultra2/decodecorpus-z000033/matrix/c_ffi` | 153.760 |
+| `compress/level_19_btultra2/decodecorpus-z000033/matrix/pure_rust` | 215.751 |
+| `compress/level_19_btultra2/high-entropy-1m/matrix/c_ffi` | 60.653 |
+| `compress/level_19_btultra2/high-entropy-1m/matrix/pure_rust` | 2.708 |
+| `compress/level_19_btultra2/large-log-stream/matrix/c_ffi` | 25.606 |
+| `compress/level_19_btultra2/large-log-stream/matrix/pure_rust` | 20.851 |
+| `compress/level_19_btultra2/low-entropy-1m/matrix/c_ffi` | 1.420 |
+| `compress/level_19_btultra2/low-entropy-1m/matrix/pure_rust` | 1.242 |
+| `compress/level_19_btultra2/small-10k-random/matrix/c_ffi` | 0.387 |
 | `compress/level_19_btultra2/small-10k-random/matrix/pure_rust` | 0.027 |
 | `compress/level_19_btultra2/small-1k-random/matrix/c_ffi` | 0.044 |
 | `compress/level_19_btultra2/small-1k-random/matrix/pure_rust` | 0.005 |
-| `compress/level_19_btultra2/small-4k-log-lines/matrix/c_ffi` | 0.111 |
-| `compress/level_19_btultra2/small-4k-log-lines/matrix/pure_rust` | 0.100 |
-| `compress/level_20_btultra2/decodecorpus-z000033/matrix/c_ffi` | 147.291 |
-| `compress/level_20_btultra2/decodecorpus-z000033/matrix/pure_rust` | 202.263 |
-| `compress/level_20_btultra2/high-entropy-1m/matrix/c_ffi` | 41.556 |
-| `compress/level_20_btultra2/high-entropy-1m/matrix/pure_rust` | 2.648 |
-| `compress/level_20_btultra2/large-log-stream/matrix/c_ffi` | 32.887 |
-| `compress/level_20_btultra2/large-log-stream/matrix/pure_rust` | 25.638 |
-| `compress/level_20_btultra2/low-entropy-1m/matrix/c_ffi` | 1.230 |
-| `compress/level_20_btultra2/low-entropy-1m/matrix/pure_rust` | 1.242 |
-| `compress/level_20_btultra2/small-10k-random/matrix/c_ffi` | 0.458 |
+| `compress/level_19_btultra2/small-4k-log-lines/matrix/c_ffi` | 0.087 |
+| `compress/level_19_btultra2/small-4k-log-lines/matrix/pure_rust` | 0.099 |
+| `compress/level_20_btultra2/decodecorpus-z000033/matrix/c_ffi` | 151.698 |
+| `compress/level_20_btultra2/decodecorpus-z000033/matrix/pure_rust` | 215.526 |
+| `compress/level_20_btultra2/high-entropy-1m/matrix/c_ffi` | 56.347 |
+| `compress/level_20_btultra2/high-entropy-1m/matrix/pure_rust` | 2.766 |
+| `compress/level_20_btultra2/large-log-stream/matrix/c_ffi` | 31.997 |
+| `compress/level_20_btultra2/large-log-stream/matrix/pure_rust` | 23.789 |
+| `compress/level_20_btultra2/low-entropy-1m/matrix/c_ffi` | 1.416 |
+| `compress/level_20_btultra2/low-entropy-1m/matrix/pure_rust` | 1.322 |
+| `compress/level_20_btultra2/small-10k-random/matrix/c_ffi` | 0.386 |
 | `compress/level_20_btultra2/small-10k-random/matrix/pure_rust` | 0.027 |
-| `compress/level_20_btultra2/small-1k-random/matrix/c_ffi` | 0.045 |
+| `compress/level_20_btultra2/small-1k-random/matrix/c_ffi` | 0.044 |
 | `compress/level_20_btultra2/small-1k-random/matrix/pure_rust` | 0.005 |
-| `compress/level_20_btultra2/small-4k-log-lines/matrix/c_ffi` | 0.113 |
-| `compress/level_20_btultra2/small-4k-log-lines/matrix/pure_rust` | 0.100 |
-| `compress/level_21_btultra2/decodecorpus-z000033/matrix/c_ffi` | 161.029 |
-| `compress/level_21_btultra2/decodecorpus-z000033/matrix/pure_rust` | 200.772 |
-| `compress/level_21_btultra2/high-entropy-1m/matrix/c_ffi` | 41.593 |
-| `compress/level_21_btultra2/high-entropy-1m/matrix/pure_rust` | 2.651 |
-| `compress/level_21_btultra2/large-log-stream/matrix/c_ffi` | 35.344 |
-| `compress/level_21_btultra2/large-log-stream/matrix/pure_rust` | 23.172 |
-| `compress/level_21_btultra2/low-entropy-1m/matrix/c_ffi` | 1.301 |
-| `compress/level_21_btultra2/low-entropy-1m/matrix/pure_rust` | 1.171 |
-| `compress/level_21_btultra2/small-10k-random/matrix/c_ffi` | 0.461 |
+| `compress/level_20_btultra2/small-4k-log-lines/matrix/c_ffi` | 0.087 |
+| `compress/level_20_btultra2/small-4k-log-lines/matrix/pure_rust` | 0.099 |
+| `compress/level_21_btultra2/decodecorpus-z000033/matrix/c_ffi` | 160.024 |
+| `compress/level_21_btultra2/decodecorpus-z000033/matrix/pure_rust` | 213.499 |
+| `compress/level_21_btultra2/high-entropy-1m/matrix/c_ffi` | 46.672 |
+| `compress/level_21_btultra2/high-entropy-1m/matrix/pure_rust` | 3.075 |
+| `compress/level_21_btultra2/large-log-stream/matrix/c_ffi` | 34.449 |
+| `compress/level_21_btultra2/large-log-stream/matrix/pure_rust` | 22.322 |
+| `compress/level_21_btultra2/low-entropy-1m/matrix/c_ffi` | 1.425 |
+| `compress/level_21_btultra2/low-entropy-1m/matrix/pure_rust` | 1.230 |
+| `compress/level_21_btultra2/small-10k-random/matrix/c_ffi` | 0.387 |
 | `compress/level_21_btultra2/small-10k-random/matrix/pure_rust` | 0.027 |
 | `compress/level_21_btultra2/small-1k-random/matrix/c_ffi` | 0.044 |
 | `compress/level_21_btultra2/small-1k-random/matrix/pure_rust` | 0.005 |
-| `compress/level_21_btultra2/small-4k-log-lines/matrix/c_ffi` | 0.113 |
-| `compress/level_21_btultra2/small-4k-log-lines/matrix/pure_rust` | 0.100 |
-| `compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi` | 223.416 |
-| `compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust` | 227.270 |
-| `compress/level_22_btultra2/high-entropy-1m/matrix/c_ffi` | 41.611 |
-| `compress/level_22_btultra2/high-entropy-1m/matrix/pure_rust` | 2.643 |
-| `compress/level_22_btultra2/large-log-stream/matrix/c_ffi` | 41.773 |
-| `compress/level_22_btultra2/large-log-stream/matrix/pure_rust` | 30.069 |
-| `compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi` | 1.300 |
-| `compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust` | 1.238 |
-| `compress/level_22_btultra2/small-10k-random/matrix/c_ffi` | 0.457 |
+| `compress/level_21_btultra2/small-4k-log-lines/matrix/c_ffi` | 0.088 |
+| `compress/level_21_btultra2/small-4k-log-lines/matrix/pure_rust` | 0.099 |
+| `compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi` | 210.782 |
+| `compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust` | 243.659 |
+| `compress/level_22_btultra2/high-entropy-1m/matrix/c_ffi` | 47.386 |
+| `compress/level_22_btultra2/high-entropy-1m/matrix/pure_rust` | 2.852 |
+| `compress/level_22_btultra2/large-log-stream/matrix/c_ffi` | 39.512 |
+| `compress/level_22_btultra2/large-log-stream/matrix/pure_rust` | 27.584 |
+| `compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi` | 1.422 |
+| `compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust` | 1.248 |
+| `compress/level_22_btultra2/small-10k-random/matrix/c_ffi` | 0.386 |
 | `compress/level_22_btultra2/small-10k-random/matrix/pure_rust` | 0.027 |
-| `compress/level_22_btultra2/small-1k-random/matrix/c_ffi` | 0.045 |
+| `compress/level_22_btultra2/small-1k-random/matrix/c_ffi` | 0.044 |
 | `compress/level_22_btultra2/small-1k-random/matrix/pure_rust` | 0.005 |
-| `compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi` | 0.111 |
-| `compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust` | 0.100 |
-| `decompress-dict/level_18_btultra/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.954 |
-| `decompress-dict/level_18_btultra/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.058 |
+| `compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi` | 0.087 |
+| `compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust` | 0.098 |
+| `decompress-dict/level_18_btultra/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.004 |
+| `decompress-dict/level_18_btultra/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.291 |
 | `decompress-dict/level_18_btultra/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_18_btultra/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
 | `decompress-dict/level_18_btultra/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_18_btultra/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress-dict/level_19_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.991 |
-| `decompress-dict/level_19_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.107 |
+| `decompress-dict/level_19_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.044 |
+| `decompress-dict/level_19_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.343 |
 | `decompress-dict/level_19_btultra2/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_19_btultra2/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
 | `decompress-dict/level_19_btultra2/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_19_btultra2/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress-dict/level_20_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.983 |
-| `decompress-dict/level_20_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.092 |
+| `decompress-dict/level_20_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.034 |
+| `decompress-dict/level_20_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.334 |
 | `decompress-dict/level_20_btultra2/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_20_btultra2/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
 | `decompress-dict/level_20_btultra2/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_20_btultra2/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress-dict/level_21_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.978 |
-| `decompress-dict/level_21_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.202 |
+| `decompress-dict/level_21_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.026 |
+| `decompress-dict/level_21_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.322 |
 | `decompress-dict/level_21_btultra2/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_21_btultra2/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
 | `decompress-dict/level_21_btultra2/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_21_btultra2/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress-dict/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.986 |
-| `decompress-dict/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.097 |
+| `decompress-dict/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.023 |
+| `decompress-dict/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.330 |
 | `decompress-dict/level_22_btultra2/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_22_btultra2/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
 | `decompress-dict/level_22_btultra2/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_22_btultra2/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress/level_18_btultra/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.831 |
-| `decompress/level_18_btultra/decodecorpus-z000033/c_stream/matrix/pure_rust` | 2.850 |
-| `decompress/level_18_btultra/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.932 |
-| `decompress/level_18_btultra/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.013 |
-| `decompress/level_18_btultra/high-entropy-1m/c_stream/matrix/c_ffi` | 0.027 |
-| `decompress/level_18_btultra/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_18_btultra/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.035 |
-| `decompress/level_18_btultra/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_18_btultra/large-log-stream/c_stream/matrix/c_ffi` | 0.435 |
-| `decompress/level_18_btultra/large-log-stream/c_stream/matrix/pure_rust` | 0.407 |
-| `decompress/level_18_btultra/large-log-stream/rust_stream/matrix/c_ffi` | 0.432 |
-| `decompress/level_18_btultra/large-log-stream/rust_stream/matrix/pure_rust` | 0.410 |
-| `decompress/level_18_btultra/low-entropy-1m/c_stream/matrix/c_ffi` | 0.157 |
-| `decompress/level_18_btultra/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_18_btultra/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.157 |
-| `decompress/level_18_btultra/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_18_btultra/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
-| `decompress/level_18_btultra/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_18_btultra/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
-| `decompress/level_18_btultra/small-10k-random/rust_stream/matrix/pure_rust` | 0.000 |
+| `decompress/level_18_btultra/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.863 |
+| `decompress/level_18_btultra/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.086 |
+| `decompress/level_18_btultra/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.972 |
+| `decompress/level_18_btultra/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.251 |
+| `decompress/level_18_btultra/high-entropy-1m/c_stream/matrix/c_ffi` | 0.084 |
+| `decompress/level_18_btultra/high-entropy-1m/c_stream/matrix/pure_rust` | 0.085 |
+| `decompress/level_18_btultra/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.032 |
+| `decompress/level_18_btultra/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.032 |
+| `decompress/level_18_btultra/large-log-stream/c_stream/matrix/c_ffi` | 0.478 |
+| `decompress/level_18_btultra/large-log-stream/c_stream/matrix/pure_rust` | 0.513 |
+| `decompress/level_18_btultra/large-log-stream/rust_stream/matrix/c_ffi` | 0.477 |
+| `decompress/level_18_btultra/large-log-stream/rust_stream/matrix/pure_rust` | 0.514 |
+| `decompress/level_18_btultra/low-entropy-1m/c_stream/matrix/c_ffi` | 0.173 |
+| `decompress/level_18_btultra/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_18_btultra/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.173 |
+| `decompress/level_18_btultra/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_18_btultra/small-10k-random/c_stream/matrix/c_ffi` | 0.001 |
+| `decompress/level_18_btultra/small-10k-random/c_stream/matrix/pure_rust` | 0.001 |
+| `decompress/level_18_btultra/small-10k-random/rust_stream/matrix/c_ffi` | 0.001 |
+| `decompress/level_18_btultra/small-10k-random/rust_stream/matrix/pure_rust` | 0.001 |
 | `decompress/level_18_btultra/small-1k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_18_btultra/small-1k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_18_btultra/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -3761,26 +3761,26 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_18_btultra/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_18_btultra/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_18_btultra/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_19_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.865 |
-| `decompress/level_19_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust` | 2.908 |
-| `decompress/level_19_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.958 |
-| `decompress/level_19_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.056 |
-| `decompress/level_19_btultra2/high-entropy-1m/c_stream/matrix/c_ffi` | 0.036 |
-| `decompress/level_19_btultra2/high-entropy-1m/c_stream/matrix/pure_rust` | 0.036 |
-| `decompress/level_19_btultra2/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.035 |
-| `decompress/level_19_btultra2/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_19_btultra2/large-log-stream/c_stream/matrix/c_ffi` | 0.434 |
-| `decompress/level_19_btultra2/large-log-stream/c_stream/matrix/pure_rust` | 0.407 |
-| `decompress/level_19_btultra2/large-log-stream/rust_stream/matrix/c_ffi` | 0.432 |
-| `decompress/level_19_btultra2/large-log-stream/rust_stream/matrix/pure_rust` | 0.409 |
-| `decompress/level_19_btultra2/low-entropy-1m/c_stream/matrix/c_ffi` | 0.157 |
-| `decompress/level_19_btultra2/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_19_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.157 |
-| `decompress/level_19_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_19_btultra2/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
-| `decompress/level_19_btultra2/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_19_btultra2/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
-| `decompress/level_19_btultra2/small-10k-random/rust_stream/matrix/pure_rust` | 0.000 |
+| `decompress/level_19_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.898 |
+| `decompress/level_19_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.144 |
+| `decompress/level_19_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.001 |
+| `decompress/level_19_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.300 |
+| `decompress/level_19_btultra2/high-entropy-1m/c_stream/matrix/c_ffi` | 0.084 |
+| `decompress/level_19_btultra2/high-entropy-1m/c_stream/matrix/pure_rust` | 0.084 |
+| `decompress/level_19_btultra2/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.032 |
+| `decompress/level_19_btultra2/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.032 |
+| `decompress/level_19_btultra2/large-log-stream/c_stream/matrix/c_ffi` | 0.483 |
+| `decompress/level_19_btultra2/large-log-stream/c_stream/matrix/pure_rust` | 0.513 |
+| `decompress/level_19_btultra2/large-log-stream/rust_stream/matrix/c_ffi` | 0.479 |
+| `decompress/level_19_btultra2/large-log-stream/rust_stream/matrix/pure_rust` | 0.513 |
+| `decompress/level_19_btultra2/low-entropy-1m/c_stream/matrix/c_ffi` | 0.174 |
+| `decompress/level_19_btultra2/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_19_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.173 |
+| `decompress/level_19_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_19_btultra2/small-10k-random/c_stream/matrix/c_ffi` | 0.001 |
+| `decompress/level_19_btultra2/small-10k-random/c_stream/matrix/pure_rust` | 0.001 |
+| `decompress/level_19_btultra2/small-10k-random/rust_stream/matrix/c_ffi` | 0.001 |
+| `decompress/level_19_btultra2/small-10k-random/rust_stream/matrix/pure_rust` | 0.001 |
 | `decompress/level_19_btultra2/small-1k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_19_btultra2/small-1k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_19_btultra2/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -3789,26 +3789,26 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_19_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_19_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_19_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_20_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.868 |
-| `decompress/level_20_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust` | 2.901 |
-| `decompress/level_20_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.957 |
-| `decompress/level_20_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.058 |
-| `decompress/level_20_btultra2/high-entropy-1m/c_stream/matrix/c_ffi` | 0.027 |
-| `decompress/level_20_btultra2/high-entropy-1m/c_stream/matrix/pure_rust` | 0.036 |
-| `decompress/level_20_btultra2/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.035 |
-| `decompress/level_20_btultra2/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.035 |
-| `decompress/level_20_btultra2/large-log-stream/c_stream/matrix/c_ffi` | 0.433 |
-| `decompress/level_20_btultra2/large-log-stream/c_stream/matrix/pure_rust` | 0.408 |
-| `decompress/level_20_btultra2/large-log-stream/rust_stream/matrix/c_ffi` | 0.432 |
-| `decompress/level_20_btultra2/large-log-stream/rust_stream/matrix/pure_rust` | 0.407 |
-| `decompress/level_20_btultra2/low-entropy-1m/c_stream/matrix/c_ffi` | 0.157 |
-| `decompress/level_20_btultra2/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_20_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.157 |
-| `decompress/level_20_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_20_btultra2/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
-| `decompress/level_20_btultra2/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_20_btultra2/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
-| `decompress/level_20_btultra2/small-10k-random/rust_stream/matrix/pure_rust` | 0.000 |
+| `decompress/level_20_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.910 |
+| `decompress/level_20_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.140 |
+| `decompress/level_20_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.003 |
+| `decompress/level_20_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.302 |
+| `decompress/level_20_btultra2/high-entropy-1m/c_stream/matrix/c_ffi` | 0.084 |
+| `decompress/level_20_btultra2/high-entropy-1m/c_stream/matrix/pure_rust` | 0.084 |
+| `decompress/level_20_btultra2/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.032 |
+| `decompress/level_20_btultra2/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.032 |
+| `decompress/level_20_btultra2/large-log-stream/c_stream/matrix/c_ffi` | 0.477 |
+| `decompress/level_20_btultra2/large-log-stream/c_stream/matrix/pure_rust` | 0.512 |
+| `decompress/level_20_btultra2/large-log-stream/rust_stream/matrix/c_ffi` | 0.477 |
+| `decompress/level_20_btultra2/large-log-stream/rust_stream/matrix/pure_rust` | 0.513 |
+| `decompress/level_20_btultra2/low-entropy-1m/c_stream/matrix/c_ffi` | 0.173 |
+| `decompress/level_20_btultra2/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_20_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.173 |
+| `decompress/level_20_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_20_btultra2/small-10k-random/c_stream/matrix/c_ffi` | 0.001 |
+| `decompress/level_20_btultra2/small-10k-random/c_stream/matrix/pure_rust` | 0.001 |
+| `decompress/level_20_btultra2/small-10k-random/rust_stream/matrix/c_ffi` | 0.001 |
+| `decompress/level_20_btultra2/small-10k-random/rust_stream/matrix/pure_rust` | 0.001 |
 | `decompress/level_20_btultra2/small-1k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_20_btultra2/small-1k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_20_btultra2/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -3817,26 +3817,26 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_20_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_20_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_20_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_21_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.856 |
-| `decompress/level_21_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust` | 2.885 |
-| `decompress/level_21_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.943 |
-| `decompress/level_21_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.031 |
-| `decompress/level_21_btultra2/high-entropy-1m/c_stream/matrix/c_ffi` | 0.036 |
-| `decompress/level_21_btultra2/high-entropy-1m/c_stream/matrix/pure_rust` | 0.036 |
-| `decompress/level_21_btultra2/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.027 |
-| `decompress/level_21_btultra2/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_21_btultra2/large-log-stream/c_stream/matrix/c_ffi` | 0.432 |
-| `decompress/level_21_btultra2/large-log-stream/c_stream/matrix/pure_rust` | 0.408 |
-| `decompress/level_21_btultra2/large-log-stream/rust_stream/matrix/c_ffi` | 0.431 |
-| `decompress/level_21_btultra2/large-log-stream/rust_stream/matrix/pure_rust` | 0.408 |
-| `decompress/level_21_btultra2/low-entropy-1m/c_stream/matrix/c_ffi` | 0.157 |
-| `decompress/level_21_btultra2/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_21_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.157 |
-| `decompress/level_21_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_21_btultra2/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
-| `decompress/level_21_btultra2/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_21_btultra2/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
-| `decompress/level_21_btultra2/small-10k-random/rust_stream/matrix/pure_rust` | 0.000 |
+| `decompress/level_21_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.897 |
+| `decompress/level_21_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.117 |
+| `decompress/level_21_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.983 |
+| `decompress/level_21_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.274 |
+| `decompress/level_21_btultra2/high-entropy-1m/c_stream/matrix/c_ffi` | 0.084 |
+| `decompress/level_21_btultra2/high-entropy-1m/c_stream/matrix/pure_rust` | 0.084 |
+| `decompress/level_21_btultra2/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.032 |
+| `decompress/level_21_btultra2/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.032 |
+| `decompress/level_21_btultra2/large-log-stream/c_stream/matrix/c_ffi` | 0.477 |
+| `decompress/level_21_btultra2/large-log-stream/c_stream/matrix/pure_rust` | 0.522 |
+| `decompress/level_21_btultra2/large-log-stream/rust_stream/matrix/c_ffi` | 0.483 |
+| `decompress/level_21_btultra2/large-log-stream/rust_stream/matrix/pure_rust` | 0.513 |
+| `decompress/level_21_btultra2/low-entropy-1m/c_stream/matrix/c_ffi` | 0.173 |
+| `decompress/level_21_btultra2/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_21_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.173 |
+| `decompress/level_21_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_21_btultra2/small-10k-random/c_stream/matrix/c_ffi` | 0.001 |
+| `decompress/level_21_btultra2/small-10k-random/c_stream/matrix/pure_rust` | 0.001 |
+| `decompress/level_21_btultra2/small-10k-random/rust_stream/matrix/c_ffi` | 0.001 |
+| `decompress/level_21_btultra2/small-10k-random/rust_stream/matrix/pure_rust` | 0.001 |
 | `decompress/level_21_btultra2/small-1k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_21_btultra2/small-1k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_21_btultra2/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -3845,26 +3845,26 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_21_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_21_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_21_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.879 |
-| `decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust` | 2.918 |
-| `decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.933 |
-| `decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.022 |
-| `decompress/level_22_btultra2/high-entropy-1m/c_stream/matrix/c_ffi` | 0.027 |
-| `decompress/level_22_btultra2/high-entropy-1m/c_stream/matrix/pure_rust` | 0.036 |
-| `decompress/level_22_btultra2/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.035 |
-| `decompress/level_22_btultra2/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.035 |
-| `decompress/level_22_btultra2/large-log-stream/c_stream/matrix/c_ffi` | 0.432 |
-| `decompress/level_22_btultra2/large-log-stream/c_stream/matrix/pure_rust` | 0.408 |
-| `decompress/level_22_btultra2/large-log-stream/rust_stream/matrix/c_ffi` | 0.430 |
-| `decompress/level_22_btultra2/large-log-stream/rust_stream/matrix/pure_rust` | 0.408 |
-| `decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi` | 0.157 |
-| `decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.157 |
-| `decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_22_btultra2/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
-| `decompress/level_22_btultra2/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_22_btultra2/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
-| `decompress/level_22_btultra2/small-10k-random/rust_stream/matrix/pure_rust` | 0.000 |
+| `decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.922 |
+| `decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.156 |
+| `decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.975 |
+| `decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.254 |
+| `decompress/level_22_btultra2/high-entropy-1m/c_stream/matrix/c_ffi` | 0.084 |
+| `decompress/level_22_btultra2/high-entropy-1m/c_stream/matrix/pure_rust` | 0.084 |
+| `decompress/level_22_btultra2/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.032 |
+| `decompress/level_22_btultra2/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.032 |
+| `decompress/level_22_btultra2/large-log-stream/c_stream/matrix/c_ffi` | 0.478 |
+| `decompress/level_22_btultra2/large-log-stream/c_stream/matrix/pure_rust` | 0.514 |
+| `decompress/level_22_btultra2/large-log-stream/rust_stream/matrix/c_ffi` | 0.477 |
+| `decompress/level_22_btultra2/large-log-stream/rust_stream/matrix/pure_rust` | 0.513 |
+| `decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi` | 0.173 |
+| `decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.174 |
+| `decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_22_btultra2/small-10k-random/c_stream/matrix/c_ffi` | 0.001 |
+| `decompress/level_22_btultra2/small-10k-random/c_stream/matrix/pure_rust` | 0.001 |
+| `decompress/level_22_btultra2/small-10k-random/rust_stream/matrix/c_ffi` | 0.001 |
+| `decompress/level_22_btultra2/small-10k-random/rust_stream/matrix/pure_rust` | 0.001 |
 | `decompress/level_22_btultra2/small-1k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_22_btultra2/small-1k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_22_btultra2/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -3873,12 +3873,12 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `dict-train/na/decodecorpus-z000033/matrix/c_ffi` | 30.300 |
-| `dict-train/na/decodecorpus-z000033/matrix/pure_rust` | 7.949 |
-| `dict-train/na/small-10k-random/matrix/c_ffi` | 0.907 |
-| `dict-train/na/small-10k-random/matrix/pure_rust` | 0.247 |
-| `dict-train/na/small-4k-log-lines/matrix/c_ffi` | 0.250 |
-| `dict-train/na/small-4k-log-lines/matrix/pure_rust` | 0.163 |
+| `dict-train/na/decodecorpus-z000033/matrix/c_ffi` | 31.944 |
+| `dict-train/na/decodecorpus-z000033/matrix/pure_rust` | 8.507 |
+| `dict-train/na/small-10k-random/matrix/c_ffi` | 0.964 |
+| `dict-train/na/small-10k-random/matrix/pure_rust` | 0.265 |
+| `dict-train/na/small-4k-log-lines/matrix/c_ffi` | 0.280 |
+| `dict-train/na/small-4k-log-lines/matrix/pure_rust` | 0.171 |
 
 ## Strategy group: fast-dfast
 
@@ -4068,227 +4068,227 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 
 | Scenario | Label | Level | Dict bytes | Train ms | C bytes (no dict) | C bytes (with dict) | C ratio (no dict) | C ratio (with dict) |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| decodecorpus-z000033 | Repo decode corpus sample | level_-1_fast | 16384 | 31.449 | 595456 | 566610 | 0.5826 | 0.5544 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_1_fast | 16384 | 31.449 | 571525 | 550232 | 0.5592 | 0.5384 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_2_fast | 16384 | 31.449 | 550910 | 522181 | 0.5390 | 0.5109 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_3_dfast | 16384 | 31.449 | 498911 | 492978 | 0.4882 | 0.4823 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_4_dfast | 16384 | 31.449 | 498591 | 478473 | 0.4878 | 0.4682 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_5_greedy | 16384 | 31.449 | 489007 | 468499 | 0.4785 | 0.4584 |
-| small-10k-random | Small random payload (10 KiB) | level_-1_fast | 1280 | 1.096 | 10250 | 9218 | 1.0010 | 0.9002 |
-| small-10k-random | Small random payload (10 KiB) | level_1_fast | 1280 | 1.096 | 10250 | 9218 | 1.0010 | 0.9002 |
-| small-10k-random | Small random payload (10 KiB) | level_2_fast | 1280 | 1.096 | 10250 | 9218 | 1.0010 | 0.9002 |
-| small-10k-random | Small random payload (10 KiB) | level_3_dfast | 1280 | 1.096 | 10250 | 9218 | 1.0010 | 0.9002 |
-| small-10k-random | Small random payload (10 KiB) | level_4_dfast | 1280 | 1.096 | 10250 | 9218 | 1.0010 | 0.9002 |
-| small-10k-random | Small random payload (10 KiB) | level_5_greedy | 1280 | 1.096 | 10250 | 9214 | 1.0010 | 0.8998 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_-1_fast | 437 | 0.392 | 172 | 44 | 0.0420 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_1_fast | 437 | 0.392 | 153 | 44 | 0.0374 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_2_fast | 437 | 0.392 | 153 | 44 | 0.0374 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_3_dfast | 437 | 0.392 | 152 | 44 | 0.0371 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_4_dfast | 437 | 0.392 | 152 | 49 | 0.0371 | 0.0120 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_5_greedy | 437 | 0.392 | 150 | 44 | 0.0366 | 0.0107 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_-1_fast | 16384 | 32.040 | 595456 | 566610 | 0.5826 | 0.5544 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_1_fast | 16384 | 32.040 | 571525 | 550232 | 0.5592 | 0.5384 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_2_fast | 16384 | 32.040 | 550910 | 522181 | 0.5390 | 0.5109 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_3_dfast | 16384 | 32.040 | 498911 | 492978 | 0.4882 | 0.4823 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_4_dfast | 16384 | 32.040 | 498591 | 478473 | 0.4878 | 0.4682 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_5_greedy | 16384 | 32.040 | 489007 | 468499 | 0.4785 | 0.4584 |
+| small-10k-random | Small random payload (10 KiB) | level_-1_fast | 1280 | 1.448 | 10250 | 9218 | 1.0010 | 0.9002 |
+| small-10k-random | Small random payload (10 KiB) | level_1_fast | 1280 | 1.448 | 10250 | 9218 | 1.0010 | 0.9002 |
+| small-10k-random | Small random payload (10 KiB) | level_2_fast | 1280 | 1.448 | 10250 | 9218 | 1.0010 | 0.9002 |
+| small-10k-random | Small random payload (10 KiB) | level_3_dfast | 1280 | 1.448 | 10250 | 9218 | 1.0010 | 0.9002 |
+| small-10k-random | Small random payload (10 KiB) | level_4_dfast | 1280 | 1.448 | 10250 | 9218 | 1.0010 | 0.9002 |
+| small-10k-random | Small random payload (10 KiB) | level_5_greedy | 1280 | 1.448 | 10250 | 9214 | 1.0010 | 0.8998 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_-1_fast | 437 | 0.435 | 172 | 44 | 0.0420 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_1_fast | 437 | 0.435 | 153 | 44 | 0.0374 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_2_fast | 437 | 0.435 | 153 | 44 | 0.0374 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_3_dfast | 437 | 0.435 | 152 | 44 | 0.0371 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_4_dfast | 437 | 0.435 | 152 | 49 | 0.0371 | 0.0120 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_5_greedy | 437 | 0.435 | 150 | 44 | 0.0366 | 0.0107 |
 
 ## Dictionary Training (Rust FastCOVER vs C FFI)
 
 | Scenario | Label | Dict bytes (requested) | Rust train ms | C train ms | Rust dict bytes | C dict bytes | Rust FastCOVER score | Delta (C/Rust) | Status |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| decodecorpus-z000033 | Repo decode corpus sample | 16384 | 8.557 | 31.449 | 16384 | 16384 | 0 | 3.6752 | rust_faster |
-| small-10k-random | Small random payload (10 KiB) | 1280 | 0.387 | 1.096 | 1280 | 1280 | 0 | 2.8320 | rust_faster |
-| small-4k-log-lines | Small structured log lines (4 KiB) | 512 | 0.378 | 0.392 | 512 | 437 | 0 | 1.0370 | near_parity |
+| decodecorpus-z000033 | Repo decode corpus sample | 16384 | 9.326 | 32.040 | 16384 | 16384 | 0 | 3.4356 | rust_faster |
+| small-10k-random | Small random payload (10 KiB) | 1280 | 0.341 | 1.448 | 1280 | 1280 | 0 | 4.2463 | rust_faster |
+| small-4k-log-lines | Small structured log lines (4 KiB) | 512 | 0.363 | 0.435 | 512 | 437 | 0 | 1.1983 | rust_faster |
 
 ## Timing Metrics
 
 | Benchmark | ms/iter |
 | --- | ---: |
-| `compress-dict/level_-1_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.632 |
-| `compress-dict/level_-1_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 2.137 |
-| `compress-dict/level_-1_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 5.056 |
-| `compress-dict/level_-1_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.013 |
+| `compress-dict/level_-1_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.497 |
+| `compress-dict/level_-1_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 2.026 |
+| `compress-dict/level_-1_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 4.763 |
+| `compress-dict/level_-1_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.012 |
 | `compress-dict/level_-1_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.005 |
 | `compress-dict/level_-1_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.009 |
 | `compress-dict/level_-1_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
-| `compress-dict/level_-1_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.005 |
+| `compress-dict/level_-1_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.004 |
 | `compress-dict/level_-1_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.002 |
-| `compress-dict/level_1_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.946 |
-| `compress-dict/level_1_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 2.618 |
-| `compress-dict/level_1_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 5.161 |
-| `compress-dict/level_1_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.020 |
-| `compress-dict/level_1_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.010 |
+| `compress-dict/level_1_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.789 |
+| `compress-dict/level_1_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 2.477 |
+| `compress-dict/level_1_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 4.961 |
+| `compress-dict/level_1_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.016 |
+| `compress-dict/level_1_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.009 |
 | `compress-dict/level_1_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.009 |
 | `compress-dict/level_1_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
 | `compress-dict/level_1_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.007 |
 | `compress-dict/level_1_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.002 |
-| `compress-dict/level_2_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 3.724 |
-| `compress-dict/level_2_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 3.286 |
-| `compress-dict/level_2_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 6.164 |
-| `compress-dict/level_2_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.022 |
+| `compress-dict/level_2_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 3.600 |
+| `compress-dict/level_2_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 3.181 |
+| `compress-dict/level_2_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 6.256 |
+| `compress-dict/level_2_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.018 |
 | `compress-dict/level_2_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.010 |
 | `compress-dict/level_2_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.009 |
 | `compress-dict/level_2_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
-| `compress-dict/level_2_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.006 |
+| `compress-dict/level_2_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.007 |
 | `compress-dict/level_2_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.002 |
-| `compress-dict/level_3_dfast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 6.112 |
-| `compress-dict/level_3_dfast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 5.498 |
-| `compress-dict/level_3_dfast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 12.859 |
-| `compress-dict/level_3_dfast/small-10k-random/matrix/c_ffi_with_dict` | 0.037 |
+| `compress-dict/level_3_dfast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 6.552 |
+| `compress-dict/level_3_dfast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 5.880 |
+| `compress-dict/level_3_dfast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 12.433 |
+| `compress-dict/level_3_dfast/small-10k-random/matrix/c_ffi_with_dict` | 0.035 |
 | `compress-dict/level_3_dfast/small-10k-random/matrix/c_ffi_without_dict` | 0.013 |
-| `compress-dict/level_3_dfast/small-10k-random/matrix/pure_rust_with_dict` | 0.041 |
+| `compress-dict/level_3_dfast/small-10k-random/matrix/pure_rust_with_dict` | 0.043 |
 | `compress-dict/level_3_dfast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
 | `compress-dict/level_3_dfast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.007 |
 | `compress-dict/level_3_dfast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.002 |
-| `compress-dict/level_4_dfast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 6.651 |
-| `compress-dict/level_4_dfast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 6.242 |
-| `compress-dict/level_4_dfast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 14.195 |
-| `compress-dict/level_4_dfast/small-10k-random/matrix/c_ffi_with_dict` | 0.091 |
-| `compress-dict/level_4_dfast/small-10k-random/matrix/c_ffi_without_dict` | 0.020 |
-| `compress-dict/level_4_dfast/small-10k-random/matrix/pure_rust_with_dict` | 0.040 |
+| `compress-dict/level_4_dfast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 6.736 |
+| `compress-dict/level_4_dfast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 6.182 |
+| `compress-dict/level_4_dfast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 12.947 |
+| `compress-dict/level_4_dfast/small-10k-random/matrix/c_ffi_with_dict` | 0.097 |
+| `compress-dict/level_4_dfast/small-10k-random/matrix/c_ffi_without_dict` | 0.019 |
+| `compress-dict/level_4_dfast/small-10k-random/matrix/pure_rust_with_dict` | 0.043 |
 | `compress-dict/level_4_dfast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.002 |
 | `compress-dict/level_4_dfast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.008 |
 | `compress-dict/level_4_dfast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.002 |
-| `compress-dict/level_5_greedy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 12.190 |
-| `compress-dict/level_5_greedy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 11.223 |
-| `compress-dict/level_5_greedy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 21.121 |
-| `compress-dict/level_5_greedy/small-10k-random/matrix/c_ffi_with_dict` | 0.090 |
+| `compress-dict/level_5_greedy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 11.794 |
+| `compress-dict/level_5_greedy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 10.867 |
+| `compress-dict/level_5_greedy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 20.004 |
+| `compress-dict/level_5_greedy/small-10k-random/matrix/c_ffi_with_dict` | 0.106 |
 | `compress-dict/level_5_greedy/small-10k-random/matrix/c_ffi_without_dict` | 0.020 |
-| `compress-dict/level_5_greedy/small-10k-random/matrix/pure_rust_with_dict` | 0.299 |
+| `compress-dict/level_5_greedy/small-10k-random/matrix/pure_rust_with_dict` | 0.319 |
 | `compress-dict/level_5_greedy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.003 |
 | `compress-dict/level_5_greedy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.009 |
 | `compress-dict/level_5_greedy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.003 |
-| `compress/level_-1_fast/decodecorpus-z000033/matrix/c_ffi` | 2.372 |
-| `compress/level_-1_fast/decodecorpus-z000033/matrix/pure_rust` | 4.639 |
-| `compress/level_-1_fast/high-entropy-1m/matrix/c_ffi` | 0.201 |
-| `compress/level_-1_fast/high-entropy-1m/matrix/pure_rust` | 0.066 |
-| `compress/level_-1_fast/large-log-stream/matrix/c_ffi` | 3.032 |
-| `compress/level_-1_fast/large-log-stream/matrix/pure_rust` | 2.047 |
-| `compress/level_-1_fast/low-entropy-1m/matrix/c_ffi` | 0.174 |
-| `compress/level_-1_fast/low-entropy-1m/matrix/pure_rust` | 0.127 |
+| `compress/level_-1_fast/decodecorpus-z000033/matrix/c_ffi` | 2.275 |
+| `compress/level_-1_fast/decodecorpus-z000033/matrix/pure_rust` | 4.324 |
+| `compress/level_-1_fast/high-entropy-1m/matrix/c_ffi` | 0.190 |
+| `compress/level_-1_fast/high-entropy-1m/matrix/pure_rust` | 0.064 |
+| `compress/level_-1_fast/large-log-stream/matrix/c_ffi` | 2.674 |
+| `compress/level_-1_fast/large-log-stream/matrix/pure_rust` | 1.756 |
+| `compress/level_-1_fast/low-entropy-1m/matrix/c_ffi` | 0.156 |
+| `compress/level_-1_fast/low-entropy-1m/matrix/pure_rust` | 0.112 |
 | `compress/level_-1_fast/small-10k-random/matrix/c_ffi` | 0.007 |
 | `compress/level_-1_fast/small-10k-random/matrix/pure_rust` | 0.004 |
 | `compress/level_-1_fast/small-1k-random/matrix/c_ffi` | 0.005 |
 | `compress/level_-1_fast/small-1k-random/matrix/pure_rust` | 0.001 |
 | `compress/level_-1_fast/small-4k-log-lines/matrix/c_ffi` | 0.006 |
 | `compress/level_-1_fast/small-4k-log-lines/matrix/pure_rust` | 0.007 |
-| `compress/level_1_fast/decodecorpus-z000033/matrix/c_ffi` | 2.868 |
-| `compress/level_1_fast/decodecorpus-z000033/matrix/pure_rust` | 4.769 |
-| `compress/level_1_fast/high-entropy-1m/matrix/c_ffi` | 0.230 |
-| `compress/level_1_fast/high-entropy-1m/matrix/pure_rust` | 0.066 |
-| `compress/level_1_fast/large-log-stream/matrix/c_ffi` | 3.036 |
-| `compress/level_1_fast/large-log-stream/matrix/pure_rust` | 2.078 |
-| `compress/level_1_fast/low-entropy-1m/matrix/c_ffi` | 0.175 |
-| `compress/level_1_fast/low-entropy-1m/matrix/pure_rust` | 0.127 |
+| `compress/level_1_fast/decodecorpus-z000033/matrix/c_ffi` | 2.721 |
+| `compress/level_1_fast/decodecorpus-z000033/matrix/pure_rust` | 4.479 |
+| `compress/level_1_fast/high-entropy-1m/matrix/c_ffi` | 0.217 |
+| `compress/level_1_fast/high-entropy-1m/matrix/pure_rust` | 0.065 |
+| `compress/level_1_fast/large-log-stream/matrix/c_ffi` | 2.671 |
+| `compress/level_1_fast/large-log-stream/matrix/pure_rust` | 1.757 |
+| `compress/level_1_fast/low-entropy-1m/matrix/c_ffi` | 0.157 |
+| `compress/level_1_fast/low-entropy-1m/matrix/pure_rust` | 0.113 |
 | `compress/level_1_fast/small-10k-random/matrix/c_ffi` | 0.012 |
 | `compress/level_1_fast/small-10k-random/matrix/pure_rust` | 0.005 |
 | `compress/level_1_fast/small-1k-random/matrix/c_ffi` | 0.005 |
 | `compress/level_1_fast/small-1k-random/matrix/pure_rust` | 0.001 |
 | `compress/level_1_fast/small-4k-log-lines/matrix/c_ffi` | 0.008 |
 | `compress/level_1_fast/small-4k-log-lines/matrix/pure_rust` | 0.007 |
-| `compress/level_2_fast/decodecorpus-z000033/matrix/c_ffi` | 3.517 |
-| `compress/level_2_fast/decodecorpus-z000033/matrix/pure_rust` | 5.714 |
-| `compress/level_2_fast/high-entropy-1m/matrix/c_ffi` | 0.231 |
-| `compress/level_2_fast/high-entropy-1m/matrix/pure_rust` | 0.069 |
-| `compress/level_2_fast/large-log-stream/matrix/c_ffi` | 3.318 |
-| `compress/level_2_fast/large-log-stream/matrix/pure_rust` | 1.942 |
-| `compress/level_2_fast/low-entropy-1m/matrix/c_ffi` | 0.149 |
-| `compress/level_2_fast/low-entropy-1m/matrix/pure_rust` | 0.123 |
-| `compress/level_2_fast/small-10k-random/matrix/c_ffi` | 0.012 |
-| `compress/level_2_fast/small-10k-random/matrix/pure_rust` | 0.005 |
+| `compress/level_2_fast/decodecorpus-z000033/matrix/c_ffi` | 3.407 |
+| `compress/level_2_fast/decodecorpus-z000033/matrix/pure_rust` | 5.660 |
+| `compress/level_2_fast/high-entropy-1m/matrix/c_ffi` | 0.217 |
+| `compress/level_2_fast/high-entropy-1m/matrix/pure_rust` | 0.068 |
+| `compress/level_2_fast/large-log-stream/matrix/c_ffi` | 2.902 |
+| `compress/level_2_fast/large-log-stream/matrix/pure_rust` | 1.759 |
+| `compress/level_2_fast/low-entropy-1m/matrix/c_ffi` | 0.133 |
+| `compress/level_2_fast/low-entropy-1m/matrix/pure_rust` | 0.116 |
+| `compress/level_2_fast/small-10k-random/matrix/c_ffi` | 0.011 |
+| `compress/level_2_fast/small-10k-random/matrix/pure_rust` | 0.006 |
 | `compress/level_2_fast/small-1k-random/matrix/c_ffi` | 0.005 |
 | `compress/level_2_fast/small-1k-random/matrix/pure_rust` | 0.001 |
 | `compress/level_2_fast/small-4k-log-lines/matrix/c_ffi` | 0.008 |
 | `compress/level_2_fast/small-4k-log-lines/matrix/pure_rust` | 0.007 |
-| `compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi` | 5.023 |
-| `compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust` | 11.657 |
-| `compress/level_3_dfast/high-entropy-1m/matrix/c_ffi` | 0.283 |
-| `compress/level_3_dfast/high-entropy-1m/matrix/pure_rust` | 0.065 |
-| `compress/level_3_dfast/large-log-stream/matrix/c_ffi` | 3.551 |
-| `compress/level_3_dfast/large-log-stream/matrix/pure_rust` | 2.287 |
-| `compress/level_3_dfast/low-entropy-1m/matrix/c_ffi` | 0.223 |
-| `compress/level_3_dfast/low-entropy-1m/matrix/pure_rust` | 0.138 |
-| `compress/level_3_dfast/small-10k-random/matrix/c_ffi` | 0.015 |
+| `compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi` | 5.346 |
+| `compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust` | 11.352 |
+| `compress/level_3_dfast/high-entropy-1m/matrix/c_ffi` | 0.288 |
+| `compress/level_3_dfast/high-entropy-1m/matrix/pure_rust` | 0.064 |
+| `compress/level_3_dfast/large-log-stream/matrix/c_ffi` | 3.183 |
+| `compress/level_3_dfast/large-log-stream/matrix/pure_rust` | 2.042 |
+| `compress/level_3_dfast/low-entropy-1m/matrix/c_ffi` | 0.203 |
+| `compress/level_3_dfast/low-entropy-1m/matrix/pure_rust` | 0.131 |
+| `compress/level_3_dfast/small-10k-random/matrix/c_ffi` | 0.016 |
 | `compress/level_3_dfast/small-10k-random/matrix/pure_rust` | 0.004 |
-| `compress/level_3_dfast/small-1k-random/matrix/c_ffi` | 0.006 |
+| `compress/level_3_dfast/small-1k-random/matrix/c_ffi` | 0.007 |
 | `compress/level_3_dfast/small-1k-random/matrix/pure_rust` | 0.001 |
-| `compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi` | 0.008 |
+| `compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi` | 0.009 |
 | `compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust` | 0.008 |
-| `compress/level_4_dfast/decodecorpus-z000033/matrix/c_ffi` | 5.501 |
-| `compress/level_4_dfast/decodecorpus-z000033/matrix/pure_rust` | 13.086 |
-| `compress/level_4_dfast/high-entropy-1m/matrix/c_ffi` | 0.302 |
-| `compress/level_4_dfast/high-entropy-1m/matrix/pure_rust` | 0.065 |
-| `compress/level_4_dfast/large-log-stream/matrix/c_ffi` | 3.612 |
-| `compress/level_4_dfast/large-log-stream/matrix/pure_rust` | 2.334 |
-| `compress/level_4_dfast/low-entropy-1m/matrix/c_ffi` | 0.242 |
-| `compress/level_4_dfast/low-entropy-1m/matrix/pure_rust` | 0.157 |
+| `compress/level_4_dfast/decodecorpus-z000033/matrix/c_ffi` | 5.659 |
+| `compress/level_4_dfast/decodecorpus-z000033/matrix/pure_rust` | 11.973 |
+| `compress/level_4_dfast/high-entropy-1m/matrix/c_ffi` | 0.308 |
+| `compress/level_4_dfast/high-entropy-1m/matrix/pure_rust` | 0.064 |
+| `compress/level_4_dfast/large-log-stream/matrix/c_ffi` | 3.203 |
+| `compress/level_4_dfast/large-log-stream/matrix/pure_rust` | 2.060 |
+| `compress/level_4_dfast/low-entropy-1m/matrix/c_ffi` | 0.221 |
+| `compress/level_4_dfast/low-entropy-1m/matrix/pure_rust` | 0.147 |
 | `compress/level_4_dfast/small-10k-random/matrix/c_ffi` | 0.021 |
 | `compress/level_4_dfast/small-10k-random/matrix/pure_rust` | 0.004 |
 | `compress/level_4_dfast/small-1k-random/matrix/c_ffi` | 0.010 |
 | `compress/level_4_dfast/small-1k-random/matrix/pure_rust` | 0.001 |
 | `compress/level_4_dfast/small-4k-log-lines/matrix/c_ffi` | 0.009 |
 | `compress/level_4_dfast/small-4k-log-lines/matrix/pure_rust` | 0.008 |
-| `compress/level_5_greedy/decodecorpus-z000033/matrix/c_ffi` | 10.359 |
-| `compress/level_5_greedy/decodecorpus-z000033/matrix/pure_rust` | 20.432 |
-| `compress/level_5_greedy/high-entropy-1m/matrix/c_ffi` | 0.510 |
-| `compress/level_5_greedy/high-entropy-1m/matrix/pure_rust` | 0.697 |
-| `compress/level_5_greedy/large-log-stream/matrix/c_ffi` | 5.102 |
-| `compress/level_5_greedy/large-log-stream/matrix/pure_rust` | 4.606 |
-| `compress/level_5_greedy/low-entropy-1m/matrix/c_ffi` | 0.330 |
-| `compress/level_5_greedy/low-entropy-1m/matrix/pure_rust` | 0.269 |
-| `compress/level_5_greedy/small-10k-random/matrix/c_ffi` | 0.022 |
-| `compress/level_5_greedy/small-10k-random/matrix/pure_rust` | 0.014 |
+| `compress/level_5_greedy/decodecorpus-z000033/matrix/c_ffi` | 10.173 |
+| `compress/level_5_greedy/decodecorpus-z000033/matrix/pure_rust` | 19.137 |
+| `compress/level_5_greedy/high-entropy-1m/matrix/c_ffi` | 0.550 |
+| `compress/level_5_greedy/high-entropy-1m/matrix/pure_rust` | 0.834 |
+| `compress/level_5_greedy/large-log-stream/matrix/c_ffi` | 4.443 |
+| `compress/level_5_greedy/large-log-stream/matrix/pure_rust` | 3.914 |
+| `compress/level_5_greedy/low-entropy-1m/matrix/c_ffi` | 0.296 |
+| `compress/level_5_greedy/low-entropy-1m/matrix/pure_rust` | 0.248 |
+| `compress/level_5_greedy/small-10k-random/matrix/c_ffi` | 0.023 |
+| `compress/level_5_greedy/small-10k-random/matrix/pure_rust` | 0.015 |
 | `compress/level_5_greedy/small-1k-random/matrix/c_ffi` | 0.010 |
 | `compress/level_5_greedy/small-1k-random/matrix/pure_rust` | 0.002 |
 | `compress/level_5_greedy/small-4k-log-lines/matrix/c_ffi` | 0.011 |
 | `compress/level_5_greedy/small-4k-log-lines/matrix/pure_rust` | 0.013 |
-| `decompress-dict/level_-1_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.650 |
-| `decompress-dict/level_-1_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 1.126 |
+| `decompress-dict/level_-1_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.649 |
+| `decompress-dict/level_-1_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 1.063 |
 | `decompress-dict/level_-1_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_-1_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
 | `decompress-dict/level_-1_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_-1_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress-dict/level_1_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.975 |
-| `decompress-dict/level_1_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 1.500 |
+| `decompress-dict/level_1_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.017 |
+| `decompress-dict/level_1_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 1.442 |
 | `decompress-dict/level_1_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_1_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
 | `decompress-dict/level_1_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_1_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress-dict/level_2_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.058 |
-| `decompress-dict/level_2_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 1.671 |
+| `decompress-dict/level_2_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.092 |
+| `decompress-dict/level_2_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 1.608 |
 | `decompress-dict/level_2_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_2_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
 | `decompress-dict/level_2_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_2_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress-dict/level_3_dfast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.226 |
-| `decompress-dict/level_3_dfast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.086 |
+| `decompress-dict/level_3_dfast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.265 |
+| `decompress-dict/level_3_dfast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 1.948 |
 | `decompress-dict/level_3_dfast/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_3_dfast/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
 | `decompress-dict/level_3_dfast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_3_dfast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress-dict/level_4_dfast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.351 |
-| `decompress-dict/level_4_dfast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.350 |
+| `decompress-dict/level_4_dfast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.379 |
+| `decompress-dict/level_4_dfast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.187 |
 | `decompress-dict/level_4_dfast/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_4_dfast/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
 | `decompress-dict/level_4_dfast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
-| `decompress-dict/level_4_dfast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_5_greedy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.383 |
-| `decompress-dict/level_5_greedy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.401 |
+| `decompress-dict/level_4_dfast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
+| `decompress-dict/level_5_greedy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.404 |
+| `decompress-dict/level_5_greedy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.233 |
 | `decompress-dict/level_5_greedy/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_5_greedy/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
 | `decompress-dict/level_5_greedy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_5_greedy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress/level_-1_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.508 |
-| `decompress/level_-1_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.853 |
-| `decompress/level_-1_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.881 |
-| `decompress/level_-1_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.292 |
-| `decompress/level_-1_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.032 |
-| `decompress/level_-1_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.032 |
-| `decompress/level_-1_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.032 |
-| `decompress/level_-1_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.032 |
-| `decompress/level_-1_fast/large-log-stream/c_stream/matrix/c_ffi` | 0.560 |
-| `decompress/level_-1_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.500 |
-| `decompress/level_-1_fast/large-log-stream/rust_stream/matrix/c_ffi` | 0.567 |
-| `decompress/level_-1_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.501 |
-| `decompress/level_-1_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.167 |
-| `decompress/level_-1_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_-1_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.167 |
-| `decompress/level_-1_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_-1_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.528 |
+| `decompress/level_-1_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.820 |
+| `decompress/level_-1_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.950 |
+| `decompress/level_-1_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.295 |
+| `decompress/level_-1_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.026 |
+| `decompress/level_-1_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_-1_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.026 |
+| `decompress/level_-1_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.026 |
+| `decompress/level_-1_fast/large-log-stream/c_stream/matrix/c_ffi` | 0.649 |
+| `decompress/level_-1_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.387 |
+| `decompress/level_-1_fast/large-log-stream/rust_stream/matrix/c_ffi` | 0.653 |
+| `decompress/level_-1_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.391 |
+| `decompress/level_-1_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.187 |
+| `decompress/level_-1_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.024 |
+| `decompress/level_-1_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.187 |
+| `decompress/level_-1_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.024 |
 | `decompress/level_-1_fast/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_-1_fast/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_-1_fast/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -4301,22 +4301,22 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_-1_fast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.001 |
 | `decompress/level_-1_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_-1_fast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_1_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.900 |
-| `decompress/level_1_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.361 |
-| `decompress/level_1_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.881 |
-| `decompress/level_1_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.293 |
-| `decompress/level_1_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.032 |
-| `decompress/level_1_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.032 |
-| `decompress/level_1_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.032 |
-| `decompress/level_1_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.032 |
-| `decompress/level_1_fast/large-log-stream/c_stream/matrix/c_ffi` | 0.561 |
-| `decompress/level_1_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.498 |
-| `decompress/level_1_fast/large-log-stream/rust_stream/matrix/c_ffi` | 0.565 |
-| `decompress/level_1_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.503 |
-| `decompress/level_1_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.167 |
-| `decompress/level_1_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_1_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.167 |
-| `decompress/level_1_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_1_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.974 |
+| `decompress/level_1_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.326 |
+| `decompress/level_1_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.951 |
+| `decompress/level_1_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.296 |
+| `decompress/level_1_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.026 |
+| `decompress/level_1_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.026 |
+| `decompress/level_1_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.026 |
+| `decompress/level_1_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.026 |
+| `decompress/level_1_fast/large-log-stream/c_stream/matrix/c_ffi` | 0.653 |
+| `decompress/level_1_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.389 |
+| `decompress/level_1_fast/large-log-stream/rust_stream/matrix/c_ffi` | 0.651 |
+| `decompress/level_1_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.392 |
+| `decompress/level_1_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.187 |
+| `decompress/level_1_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.024 |
+| `decompress/level_1_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.187 |
+| `decompress/level_1_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.024 |
 | `decompress/level_1_fast/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_1_fast/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_1_fast/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -4329,22 +4329,22 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_1_fast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_1_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_1_fast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_2_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.986 |
-| `decompress/level_2_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.472 |
-| `decompress/level_2_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.957 |
-| `decompress/level_2_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.446 |
-| `decompress/level_2_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.032 |
-| `decompress/level_2_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.032 |
-| `decompress/level_2_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.032 |
-| `decompress/level_2_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.032 |
-| `decompress/level_2_fast/large-log-stream/c_stream/matrix/c_ffi` | 0.561 |
-| `decompress/level_2_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.499 |
-| `decompress/level_2_fast/large-log-stream/rust_stream/matrix/c_ffi` | 0.563 |
-| `decompress/level_2_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.492 |
-| `decompress/level_2_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.167 |
-| `decompress/level_2_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_2_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.167 |
-| `decompress/level_2_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_2_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.023 |
+| `decompress/level_2_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.429 |
+| `decompress/level_2_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.010 |
+| `decompress/level_2_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.404 |
+| `decompress/level_2_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.027 |
+| `decompress/level_2_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_2_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.026 |
+| `decompress/level_2_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_2_fast/large-log-stream/c_stream/matrix/c_ffi` | 0.651 |
+| `decompress/level_2_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.388 |
+| `decompress/level_2_fast/large-log-stream/rust_stream/matrix/c_ffi` | 0.653 |
+| `decompress/level_2_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.389 |
+| `decompress/level_2_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.188 |
+| `decompress/level_2_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.024 |
+| `decompress/level_2_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.187 |
+| `decompress/level_2_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.024 |
 | `decompress/level_2_fast/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_2_fast/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_2_fast/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -4357,22 +4357,22 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_2_fast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_2_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_2_fast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.000 |
-| `decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.522 |
-| `decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.111 |
-| `decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.792 |
-| `decompress/level_3_dfast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.031 |
-| `decompress/level_3_dfast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.032 |
-| `decompress/level_3_dfast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.032 |
-| `decompress/level_3_dfast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.032 |
-| `decompress/level_3_dfast/large-log-stream/c_stream/matrix/c_ffi` | 0.561 |
-| `decompress/level_3_dfast/large-log-stream/c_stream/matrix/pure_rust` | 0.498 |
-| `decompress/level_3_dfast/large-log-stream/rust_stream/matrix/c_ffi` | 0.576 |
-| `decompress/level_3_dfast/large-log-stream/rust_stream/matrix/pure_rust` | 1.829 |
-| `decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.167 |
-| `decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.050 |
-| `decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.303 |
+| `decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.044 |
+| `decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.498 |
+| `decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.172 |
+| `decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.705 |
+| `decompress/level_3_dfast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.027 |
+| `decompress/level_3_dfast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_3_dfast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.026 |
+| `decompress/level_3_dfast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.026 |
+| `decompress/level_3_dfast/large-log-stream/c_stream/matrix/c_ffi` | 0.650 |
+| `decompress/level_3_dfast/large-log-stream/c_stream/matrix/pure_rust` | 0.388 |
+| `decompress/level_3_dfast/large-log-stream/rust_stream/matrix/c_ffi` | 0.524 |
+| `decompress/level_3_dfast/large-log-stream/rust_stream/matrix/pure_rust` | 1.871 |
+| `decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.187 |
+| `decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.024 |
+| `decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.055 |
+| `decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.304 |
 | `decompress/level_3_dfast/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_3_dfast/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_3_dfast/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -4385,21 +4385,21 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_4_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.009 |
-| `decompress/level_4_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.545 |
-| `decompress/level_4_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.115 |
-| `decompress/level_4_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.787 |
-| `decompress/level_4_dfast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.031 |
-| `decompress/level_4_dfast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.031 |
-| `decompress/level_4_dfast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.032 |
-| `decompress/level_4_dfast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.032 |
-| `decompress/level_4_dfast/large-log-stream/c_stream/matrix/c_ffi` | 0.561 |
-| `decompress/level_4_dfast/large-log-stream/c_stream/matrix/pure_rust` | 0.500 |
-| `decompress/level_4_dfast/large-log-stream/rust_stream/matrix/c_ffi` | 0.579 |
-| `decompress/level_4_dfast/large-log-stream/rust_stream/matrix/pure_rust` | 1.839 |
-| `decompress/level_4_dfast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.167 |
-| `decompress/level_4_dfast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_4_dfast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.050 |
+| `decompress/level_4_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.047 |
+| `decompress/level_4_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.508 |
+| `decompress/level_4_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.169 |
+| `decompress/level_4_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.697 |
+| `decompress/level_4_dfast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.027 |
+| `decompress/level_4_dfast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_4_dfast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.026 |
+| `decompress/level_4_dfast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_4_dfast/large-log-stream/c_stream/matrix/c_ffi` | 0.653 |
+| `decompress/level_4_dfast/large-log-stream/c_stream/matrix/pure_rust` | 0.389 |
+| `decompress/level_4_dfast/large-log-stream/rust_stream/matrix/c_ffi` | 0.515 |
+| `decompress/level_4_dfast/large-log-stream/rust_stream/matrix/pure_rust` | 1.856 |
+| `decompress/level_4_dfast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.187 |
+| `decompress/level_4_dfast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.024 |
+| `decompress/level_4_dfast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.055 |
 | `decompress/level_4_dfast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.303 |
 | `decompress/level_4_dfast/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_4_dfast/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
@@ -4413,22 +4413,22 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_4_dfast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_4_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_4_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_5_greedy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.016 |
-| `decompress/level_5_greedy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.563 |
-| `decompress/level_5_greedy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.243 |
-| `decompress/level_5_greedy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.954 |
-| `decompress/level_5_greedy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.030 |
-| `decompress/level_5_greedy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.031 |
-| `decompress/level_5_greedy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.032 |
-| `decompress/level_5_greedy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.031 |
-| `decompress/level_5_greedy/large-log-stream/c_stream/matrix/c_ffi` | 0.561 |
-| `decompress/level_5_greedy/large-log-stream/c_stream/matrix/pure_rust` | 0.499 |
-| `decompress/level_5_greedy/large-log-stream/rust_stream/matrix/c_ffi` | 0.455 |
-| `decompress/level_5_greedy/large-log-stream/rust_stream/matrix/pure_rust` | 0.498 |
-| `decompress/level_5_greedy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.167 |
-| `decompress/level_5_greedy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_5_greedy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.172 |
-| `decompress/level_5_greedy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_5_greedy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.055 |
+| `decompress/level_5_greedy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.524 |
+| `decompress/level_5_greedy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.271 |
+| `decompress/level_5_greedy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.846 |
+| `decompress/level_5_greedy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.027 |
+| `decompress/level_5_greedy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_5_greedy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.027 |
+| `decompress/level_5_greedy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_5_greedy/large-log-stream/c_stream/matrix/c_ffi` | 0.654 |
+| `decompress/level_5_greedy/large-log-stream/c_stream/matrix/pure_rust` | 0.389 |
+| `decompress/level_5_greedy/large-log-stream/rust_stream/matrix/c_ffi` | 0.501 |
+| `decompress/level_5_greedy/large-log-stream/rust_stream/matrix/pure_rust` | 0.387 |
+| `decompress/level_5_greedy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.187 |
+| `decompress/level_5_greedy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.024 |
+| `decompress/level_5_greedy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.155 |
+| `decompress/level_5_greedy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.024 |
 | `decompress/level_5_greedy/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_5_greedy/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_5_greedy/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -4441,12 +4441,12 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_5_greedy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_5_greedy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_5_greedy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `dict-train/na/decodecorpus-z000033/matrix/c_ffi` | 30.868 |
-| `dict-train/na/decodecorpus-z000033/matrix/pure_rust` | 8.586 |
-| `dict-train/na/small-10k-random/matrix/c_ffi` | 0.957 |
-| `dict-train/na/small-10k-random/matrix/pure_rust` | 0.268 |
-| `dict-train/na/small-4k-log-lines/matrix/c_ffi` | 0.278 |
-| `dict-train/na/small-4k-log-lines/matrix/pure_rust` | 0.174 |
+| `dict-train/na/decodecorpus-z000033/matrix/c_ffi` | 30.138 |
+| `dict-train/na/decodecorpus-z000033/matrix/pure_rust` | 7.846 |
+| `dict-train/na/small-10k-random/matrix/c_ffi` | 0.915 |
+| `dict-train/na/small-10k-random/matrix/pure_rust` | 0.255 |
+| `dict-train/na/small-4k-log-lines/matrix/c_ffi` | 0.251 |
+| `dict-train/na/small-4k-log-lines/matrix/pure_rust` | 0.161 |
 
 ## Strategy group: fast-neg
 
@@ -4636,227 +4636,227 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 
 | Scenario | Label | Level | Dict bytes | Train ms | C bytes (no dict) | C bytes (with dict) | C ratio (no dict) | C ratio (with dict) |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| decodecorpus-z000033 | Repo decode corpus sample | level_-2_fast | 16384 | 17.892 | 613921 | 585842 | 0.6007 | 0.5732 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_-3_fast | 16384 | 17.892 | 634656 | 607365 | 0.6210 | 0.5943 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_-4_fast | 16384 | 17.892 | 654893 | 628810 | 0.6408 | 0.6153 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_-5_fast | 16384 | 17.892 | 671408 | 646342 | 0.6569 | 0.6324 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_-6_fast | 16384 | 17.892 | 685482 | 660928 | 0.6707 | 0.6467 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_-7_fast | 16384 | 17.892 | 699611 | 673742 | 0.6845 | 0.6592 |
-| small-10k-random | Small random payload (10 KiB) | level_-2_fast | 1280 | 0.682 | 10250 | 9218 | 1.0010 | 0.9002 |
-| small-10k-random | Small random payload (10 KiB) | level_-3_fast | 1280 | 0.682 | 10250 | 9218 | 1.0010 | 0.9002 |
-| small-10k-random | Small random payload (10 KiB) | level_-4_fast | 1280 | 0.682 | 10250 | 9218 | 1.0010 | 0.9002 |
-| small-10k-random | Small random payload (10 KiB) | level_-5_fast | 1280 | 0.682 | 10250 | 9218 | 1.0010 | 0.9002 |
-| small-10k-random | Small random payload (10 KiB) | level_-6_fast | 1280 | 0.682 | 10250 | 9214 | 1.0010 | 0.8998 |
-| small-10k-random | Small random payload (10 KiB) | level_-7_fast | 1280 | 0.682 | 10250 | 9218 | 1.0010 | 0.9002 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_-2_fast | 437 | 0.254 | 175 | 44 | 0.0427 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_-3_fast | 437 | 0.254 | 186 | 50 | 0.0454 | 0.0122 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_-4_fast | 437 | 0.254 | 189 | 51 | 0.0461 | 0.0125 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_-5_fast | 437 | 0.254 | 190 | 44 | 0.0464 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_-6_fast | 437 | 0.254 | 248 | 51 | 0.0605 | 0.0125 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_-7_fast | 437 | 0.254 | 202 | 51 | 0.0493 | 0.0125 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_-2_fast | 16384 | 32.332 | 613921 | 585842 | 0.6007 | 0.5732 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_-3_fast | 16384 | 32.332 | 634656 | 607365 | 0.6210 | 0.5943 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_-4_fast | 16384 | 32.332 | 654893 | 628810 | 0.6408 | 0.6153 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_-5_fast | 16384 | 32.332 | 671408 | 646342 | 0.6569 | 0.6324 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_-6_fast | 16384 | 32.332 | 685482 | 660928 | 0.6707 | 0.6467 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_-7_fast | 16384 | 32.332 | 699611 | 673742 | 0.6845 | 0.6592 |
+| small-10k-random | Small random payload (10 KiB) | level_-2_fast | 1280 | 1.386 | 10250 | 9218 | 1.0010 | 0.9002 |
+| small-10k-random | Small random payload (10 KiB) | level_-3_fast | 1280 | 1.386 | 10250 | 9218 | 1.0010 | 0.9002 |
+| small-10k-random | Small random payload (10 KiB) | level_-4_fast | 1280 | 1.386 | 10250 | 9218 | 1.0010 | 0.9002 |
+| small-10k-random | Small random payload (10 KiB) | level_-5_fast | 1280 | 1.386 | 10250 | 9218 | 1.0010 | 0.9002 |
+| small-10k-random | Small random payload (10 KiB) | level_-6_fast | 1280 | 1.386 | 10250 | 9214 | 1.0010 | 0.8998 |
+| small-10k-random | Small random payload (10 KiB) | level_-7_fast | 1280 | 1.386 | 10250 | 9218 | 1.0010 | 0.9002 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_-2_fast | 437 | 0.603 | 175 | 44 | 0.0427 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_-3_fast | 437 | 0.603 | 186 | 50 | 0.0454 | 0.0122 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_-4_fast | 437 | 0.603 | 189 | 51 | 0.0461 | 0.0125 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_-5_fast | 437 | 0.603 | 190 | 44 | 0.0464 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_-6_fast | 437 | 0.603 | 248 | 51 | 0.0605 | 0.0125 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_-7_fast | 437 | 0.603 | 202 | 51 | 0.0493 | 0.0125 |
 
 ## Dictionary Training (Rust FastCOVER vs C FFI)
 
 | Scenario | Label | Dict bytes (requested) | Rust train ms | C train ms | Rust dict bytes | C dict bytes | Rust FastCOVER score | Delta (C/Rust) | Status |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| decodecorpus-z000033 | Repo decode corpus sample | 16384 | 4.849 | 17.892 | 16384 | 16384 | 0 | 3.6898 | rust_faster |
-| small-10k-random | Small random payload (10 KiB) | 1280 | 0.164 | 0.682 | 1280 | 1280 | 0 | 4.1585 | rust_faster |
-| small-4k-log-lines | Small structured log lines (4 KiB) | 512 | 0.166 | 0.254 | 512 | 437 | 0 | 1.5301 | rust_faster |
+| decodecorpus-z000033 | Repo decode corpus sample | 16384 | 9.938 | 32.332 | 16384 | 16384 | 0 | 3.2534 | rust_faster |
+| small-10k-random | Small random payload (10 KiB) | 1280 | 0.315 | 1.386 | 1280 | 1280 | 0 | 4.4000 | rust_faster |
+| small-4k-log-lines | Small structured log lines (4 KiB) | 512 | 0.422 | 0.603 | 512 | 437 | 0 | 1.4289 | rust_faster |
 
 ## Timing Metrics
 
 | Benchmark | ms/iter |
 | --- | ---: |
-| `compress-dict/level_-2_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.443 |
-| `compress-dict/level_-2_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 1.156 |
-| `compress-dict/level_-2_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.710 |
-| `compress-dict/level_-2_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.005 |
-| `compress-dict/level_-2_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.003 |
-| `compress-dict/level_-2_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.005 |
+| `compress-dict/level_-2_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.242 |
+| `compress-dict/level_-2_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 1.800 |
+| `compress-dict/level_-2_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 4.290 |
+| `compress-dict/level_-2_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.010 |
+| `compress-dict/level_-2_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.005 |
+| `compress-dict/level_-2_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.009 |
 | `compress-dict/level_-2_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
-| `compress-dict/level_-2_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.003 |
-| `compress-dict/level_-2_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `compress-dict/level_-3_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.308 |
-| `compress-dict/level_-3_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 1.052 |
-| `compress-dict/level_-3_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.528 |
-| `compress-dict/level_-3_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.004 |
-| `compress-dict/level_-3_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.003 |
-| `compress-dict/level_-3_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.005 |
+| `compress-dict/level_-2_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.004 |
+| `compress-dict/level_-2_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.002 |
+| `compress-dict/level_-3_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.022 |
+| `compress-dict/level_-3_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 1.612 |
+| `compress-dict/level_-3_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 4.023 |
+| `compress-dict/level_-3_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.008 |
+| `compress-dict/level_-3_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.004 |
+| `compress-dict/level_-3_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.009 |
 | `compress-dict/level_-3_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
-| `compress-dict/level_-3_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.003 |
-| `compress-dict/level_-3_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `compress-dict/level_-4_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.187 |
-| `compress-dict/level_-4_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 0.966 |
-| `compress-dict/level_-4_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.414 |
-| `compress-dict/level_-4_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.004 |
-| `compress-dict/level_-4_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.003 |
-| `compress-dict/level_-4_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.005 |
+| `compress-dict/level_-3_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.004 |
+| `compress-dict/level_-3_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.002 |
+| `compress-dict/level_-4_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.848 |
+| `compress-dict/level_-4_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 1.482 |
+| `compress-dict/level_-4_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.854 |
+| `compress-dict/level_-4_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.007 |
+| `compress-dict/level_-4_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.004 |
+| `compress-dict/level_-4_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.009 |
 | `compress-dict/level_-4_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
-| `compress-dict/level_-4_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.003 |
-| `compress-dict/level_-4_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `compress-dict/level_-5_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.101 |
-| `compress-dict/level_-5_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 0.885 |
-| `compress-dict/level_-5_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.321 |
-| `compress-dict/level_-5_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.004 |
-| `compress-dict/level_-5_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.003 |
-| `compress-dict/level_-5_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.005 |
+| `compress-dict/level_-4_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.004 |
+| `compress-dict/level_-4_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.002 |
+| `compress-dict/level_-5_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.722 |
+| `compress-dict/level_-5_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 1.353 |
+| `compress-dict/level_-5_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.718 |
+| `compress-dict/level_-5_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.006 |
+| `compress-dict/level_-5_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.004 |
+| `compress-dict/level_-5_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.009 |
 | `compress-dict/level_-5_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
-| `compress-dict/level_-5_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.003 |
-| `compress-dict/level_-5_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `compress-dict/level_-6_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.006 |
-| `compress-dict/level_-6_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 0.824 |
-| `compress-dict/level_-6_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.259 |
-| `compress-dict/level_-6_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.003 |
-| `compress-dict/level_-6_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.003 |
-| `compress-dict/level_-6_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.005 |
+| `compress-dict/level_-5_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.004 |
+| `compress-dict/level_-5_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.002 |
+| `compress-dict/level_-6_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.565 |
+| `compress-dict/level_-6_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 1.252 |
+| `compress-dict/level_-6_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.660 |
+| `compress-dict/level_-6_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.006 |
+| `compress-dict/level_-6_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.004 |
+| `compress-dict/level_-6_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.009 |
 | `compress-dict/level_-6_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
-| `compress-dict/level_-6_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.003 |
-| `compress-dict/level_-6_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `compress-dict/level_-7_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.933 |
-| `compress-dict/level_-7_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 0.753 |
-| `compress-dict/level_-7_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.177 |
-| `compress-dict/level_-7_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.003 |
-| `compress-dict/level_-7_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.003 |
-| `compress-dict/level_-7_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.005 |
+| `compress-dict/level_-6_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.004 |
+| `compress-dict/level_-6_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.002 |
+| `compress-dict/level_-7_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.463 |
+| `compress-dict/level_-7_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 1.163 |
+| `compress-dict/level_-7_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.519 |
+| `compress-dict/level_-7_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.006 |
+| `compress-dict/level_-7_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.004 |
+| `compress-dict/level_-7_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.009 |
 | `compress-dict/level_-7_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
-| `compress-dict/level_-7_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.003 |
-| `compress-dict/level_-7_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `compress/level_-2_fast/decodecorpus-z000033/matrix/c_ffi` | 1.275 |
-| `compress/level_-2_fast/decodecorpus-z000033/matrix/pure_rust` | 2.528 |
-| `compress/level_-2_fast/high-entropy-1m/matrix/c_ffi` | 0.081 |
-| `compress/level_-2_fast/high-entropy-1m/matrix/pure_rust` | 0.032 |
-| `compress/level_-2_fast/large-log-stream/matrix/c_ffi` | 1.257 |
-| `compress/level_-2_fast/large-log-stream/matrix/pure_rust` | 1.055 |
-| `compress/level_-2_fast/low-entropy-1m/matrix/c_ffi` | 0.074 |
-| `compress/level_-2_fast/low-entropy-1m/matrix/pure_rust` | 0.066 |
-| `compress/level_-2_fast/small-10k-random/matrix/c_ffi` | 0.004 |
-| `compress/level_-2_fast/small-10k-random/matrix/pure_rust` | 0.002 |
-| `compress/level_-2_fast/small-1k-random/matrix/c_ffi` | 0.003 |
+| `compress-dict/level_-7_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.004 |
+| `compress-dict/level_-7_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.002 |
+| `compress/level_-2_fast/decodecorpus-z000033/matrix/c_ffi` | 2.341 |
+| `compress/level_-2_fast/decodecorpus-z000033/matrix/pure_rust` | 4.047 |
+| `compress/level_-2_fast/high-entropy-1m/matrix/c_ffi` | 0.538 |
+| `compress/level_-2_fast/high-entropy-1m/matrix/pure_rust` | 0.072 |
+| `compress/level_-2_fast/large-log-stream/matrix/c_ffi` | 7.793 |
+| `compress/level_-2_fast/large-log-stream/matrix/pure_rust` | 1.838 |
+| `compress/level_-2_fast/low-entropy-1m/matrix/c_ffi` | 0.486 |
+| `compress/level_-2_fast/low-entropy-1m/matrix/pure_rust` | 0.114 |
+| `compress/level_-2_fast/small-10k-random/matrix/c_ffi` | 0.010 |
+| `compress/level_-2_fast/small-10k-random/matrix/pure_rust` | 0.004 |
+| `compress/level_-2_fast/small-1k-random/matrix/c_ffi` | 0.005 |
 | `compress/level_-2_fast/small-1k-random/matrix/pure_rust` | 0.001 |
-| `compress/level_-2_fast/small-4k-log-lines/matrix/c_ffi` | 0.004 |
-| `compress/level_-2_fast/small-4k-log-lines/matrix/pure_rust` | 0.004 |
-| `compress/level_-3_fast/decodecorpus-z000033/matrix/c_ffi` | 1.154 |
-| `compress/level_-3_fast/decodecorpus-z000033/matrix/pure_rust` | 2.432 |
-| `compress/level_-3_fast/high-entropy-1m/matrix/c_ffi` | 0.080 |
-| `compress/level_-3_fast/high-entropy-1m/matrix/pure_rust` | 0.032 |
-| `compress/level_-3_fast/large-log-stream/matrix/c_ffi` | 1.242 |
-| `compress/level_-3_fast/large-log-stream/matrix/pure_rust` | 1.048 |
-| `compress/level_-3_fast/low-entropy-1m/matrix/c_ffi` | 0.073 |
-| `compress/level_-3_fast/low-entropy-1m/matrix/pure_rust` | 0.066 |
-| `compress/level_-3_fast/small-10k-random/matrix/c_ffi` | 0.004 |
-| `compress/level_-3_fast/small-10k-random/matrix/pure_rust` | 0.002 |
-| `compress/level_-3_fast/small-1k-random/matrix/c_ffi` | 0.003 |
+| `compress/level_-2_fast/small-4k-log-lines/matrix/c_ffi` | 0.006 |
+| `compress/level_-2_fast/small-4k-log-lines/matrix/pure_rust` | 0.007 |
+| `compress/level_-3_fast/decodecorpus-z000033/matrix/c_ffi` | 2.139 |
+| `compress/level_-3_fast/decodecorpus-z000033/matrix/pure_rust` | 3.851 |
+| `compress/level_-3_fast/high-entropy-1m/matrix/c_ffi` | 0.529 |
+| `compress/level_-3_fast/high-entropy-1m/matrix/pure_rust` | 0.065 |
+| `compress/level_-3_fast/large-log-stream/matrix/c_ffi` | 7.794 |
+| `compress/level_-3_fast/large-log-stream/matrix/pure_rust` | 1.835 |
+| `compress/level_-3_fast/low-entropy-1m/matrix/c_ffi` | 0.486 |
+| `compress/level_-3_fast/low-entropy-1m/matrix/pure_rust` | 0.113 |
+| `compress/level_-3_fast/small-10k-random/matrix/c_ffi` | 0.010 |
+| `compress/level_-3_fast/small-10k-random/matrix/pure_rust` | 0.004 |
+| `compress/level_-3_fast/small-1k-random/matrix/c_ffi` | 0.005 |
 | `compress/level_-3_fast/small-1k-random/matrix/pure_rust` | 0.001 |
-| `compress/level_-3_fast/small-4k-log-lines/matrix/c_ffi` | 0.003 |
-| `compress/level_-3_fast/small-4k-log-lines/matrix/pure_rust` | 0.004 |
-| `compress/level_-4_fast/decodecorpus-z000033/matrix/c_ffi` | 1.052 |
-| `compress/level_-4_fast/decodecorpus-z000033/matrix/pure_rust` | 2.318 |
-| `compress/level_-4_fast/high-entropy-1m/matrix/c_ffi` | 0.079 |
-| `compress/level_-4_fast/high-entropy-1m/matrix/pure_rust` | 0.032 |
-| `compress/level_-4_fast/large-log-stream/matrix/c_ffi` | 1.243 |
-| `compress/level_-4_fast/large-log-stream/matrix/pure_rust` | 1.048 |
-| `compress/level_-4_fast/low-entropy-1m/matrix/c_ffi` | 0.074 |
-| `compress/level_-4_fast/low-entropy-1m/matrix/pure_rust` | 0.066 |
-| `compress/level_-4_fast/small-10k-random/matrix/c_ffi` | 0.004 |
-| `compress/level_-4_fast/small-10k-random/matrix/pure_rust` | 0.002 |
-| `compress/level_-4_fast/small-1k-random/matrix/c_ffi` | 0.003 |
+| `compress/level_-3_fast/small-4k-log-lines/matrix/c_ffi` | 0.006 |
+| `compress/level_-3_fast/small-4k-log-lines/matrix/pure_rust` | 0.007 |
+| `compress/level_-4_fast/decodecorpus-z000033/matrix/c_ffi` | 1.999 |
+| `compress/level_-4_fast/decodecorpus-z000033/matrix/pure_rust` | 3.677 |
+| `compress/level_-4_fast/high-entropy-1m/matrix/c_ffi` | 0.533 |
+| `compress/level_-4_fast/high-entropy-1m/matrix/pure_rust` | 0.072 |
+| `compress/level_-4_fast/large-log-stream/matrix/c_ffi` | 7.794 |
+| `compress/level_-4_fast/large-log-stream/matrix/pure_rust` | 1.840 |
+| `compress/level_-4_fast/low-entropy-1m/matrix/c_ffi` | 0.485 |
+| `compress/level_-4_fast/low-entropy-1m/matrix/pure_rust` | 0.117 |
+| `compress/level_-4_fast/small-10k-random/matrix/c_ffi` | 0.010 |
+| `compress/level_-4_fast/small-10k-random/matrix/pure_rust` | 0.004 |
+| `compress/level_-4_fast/small-1k-random/matrix/c_ffi` | 0.004 |
 | `compress/level_-4_fast/small-1k-random/matrix/pure_rust` | 0.001 |
-| `compress/level_-4_fast/small-4k-log-lines/matrix/c_ffi` | 0.003 |
-| `compress/level_-4_fast/small-4k-log-lines/matrix/pure_rust` | 0.004 |
-| `compress/level_-5_fast/decodecorpus-z000033/matrix/c_ffi` | 0.974 |
-| `compress/level_-5_fast/decodecorpus-z000033/matrix/pure_rust` | 2.256 |
-| `compress/level_-5_fast/high-entropy-1m/matrix/c_ffi` | 0.078 |
-| `compress/level_-5_fast/high-entropy-1m/matrix/pure_rust` | 0.032 |
-| `compress/level_-5_fast/large-log-stream/matrix/c_ffi` | 1.245 |
-| `compress/level_-5_fast/large-log-stream/matrix/pure_rust` | 1.041 |
-| `compress/level_-5_fast/low-entropy-1m/matrix/c_ffi` | 0.075 |
-| `compress/level_-5_fast/low-entropy-1m/matrix/pure_rust` | 0.066 |
-| `compress/level_-5_fast/small-10k-random/matrix/c_ffi` | 0.003 |
-| `compress/level_-5_fast/small-10k-random/matrix/pure_rust` | 0.002 |
-| `compress/level_-5_fast/small-1k-random/matrix/c_ffi` | 0.003 |
+| `compress/level_-4_fast/small-4k-log-lines/matrix/c_ffi` | 0.006 |
+| `compress/level_-4_fast/small-4k-log-lines/matrix/pure_rust` | 0.007 |
+| `compress/level_-5_fast/decodecorpus-z000033/matrix/c_ffi` | 1.858 |
+| `compress/level_-5_fast/decodecorpus-z000033/matrix/pure_rust` | 3.569 |
+| `compress/level_-5_fast/high-entropy-1m/matrix/c_ffi` | 0.536 |
+| `compress/level_-5_fast/high-entropy-1m/matrix/pure_rust` | 0.072 |
+| `compress/level_-5_fast/large-log-stream/matrix/c_ffi` | 7.791 |
+| `compress/level_-5_fast/large-log-stream/matrix/pure_rust` | 1.837 |
+| `compress/level_-5_fast/low-entropy-1m/matrix/c_ffi` | 0.486 |
+| `compress/level_-5_fast/low-entropy-1m/matrix/pure_rust` | 0.117 |
+| `compress/level_-5_fast/small-10k-random/matrix/c_ffi` | 0.010 |
+| `compress/level_-5_fast/small-10k-random/matrix/pure_rust` | 0.004 |
+| `compress/level_-5_fast/small-1k-random/matrix/c_ffi` | 0.004 |
 | `compress/level_-5_fast/small-1k-random/matrix/pure_rust` | 0.001 |
-| `compress/level_-5_fast/small-4k-log-lines/matrix/c_ffi` | 0.004 |
-| `compress/level_-5_fast/small-4k-log-lines/matrix/pure_rust` | 0.005 |
-| `compress/level_-6_fast/decodecorpus-z000033/matrix/c_ffi` | 0.908 |
-| `compress/level_-6_fast/decodecorpus-z000033/matrix/pure_rust` | 2.180 |
-| `compress/level_-6_fast/high-entropy-1m/matrix/c_ffi` | 0.079 |
-| `compress/level_-6_fast/high-entropy-1m/matrix/pure_rust` | 0.032 |
-| `compress/level_-6_fast/large-log-stream/matrix/c_ffi` | 1.256 |
-| `compress/level_-6_fast/large-log-stream/matrix/pure_rust` | 1.046 |
-| `compress/level_-6_fast/low-entropy-1m/matrix/c_ffi` | 0.074 |
-| `compress/level_-6_fast/low-entropy-1m/matrix/pure_rust` | 0.066 |
-| `compress/level_-6_fast/small-10k-random/matrix/c_ffi` | 0.003 |
-| `compress/level_-6_fast/small-10k-random/matrix/pure_rust` | 0.002 |
-| `compress/level_-6_fast/small-1k-random/matrix/c_ffi` | 0.003 |
+| `compress/level_-5_fast/small-4k-log-lines/matrix/c_ffi` | 0.006 |
+| `compress/level_-5_fast/small-4k-log-lines/matrix/pure_rust` | 0.008 |
+| `compress/level_-6_fast/decodecorpus-z000033/matrix/c_ffi` | 1.762 |
+| `compress/level_-6_fast/decodecorpus-z000033/matrix/pure_rust` | 3.457 |
+| `compress/level_-6_fast/high-entropy-1m/matrix/c_ffi` | 0.534 |
+| `compress/level_-6_fast/high-entropy-1m/matrix/pure_rust` | 0.065 |
+| `compress/level_-6_fast/large-log-stream/matrix/c_ffi` | 7.788 |
+| `compress/level_-6_fast/large-log-stream/matrix/pure_rust` | 1.838 |
+| `compress/level_-6_fast/low-entropy-1m/matrix/c_ffi` | 0.485 |
+| `compress/level_-6_fast/low-entropy-1m/matrix/pure_rust` | 0.117 |
+| `compress/level_-6_fast/small-10k-random/matrix/c_ffi` | 0.009 |
+| `compress/level_-6_fast/small-10k-random/matrix/pure_rust` | 0.004 |
+| `compress/level_-6_fast/small-1k-random/matrix/c_ffi` | 0.004 |
 | `compress/level_-6_fast/small-1k-random/matrix/pure_rust` | 0.001 |
-| `compress/level_-6_fast/small-4k-log-lines/matrix/c_ffi` | 0.003 |
-| `compress/level_-6_fast/small-4k-log-lines/matrix/pure_rust` | 0.004 |
-| `compress/level_-7_fast/decodecorpus-z000033/matrix/c_ffi` | 0.832 |
-| `compress/level_-7_fast/decodecorpus-z000033/matrix/pure_rust` | 2.125 |
-| `compress/level_-7_fast/high-entropy-1m/matrix/c_ffi` | 0.078 |
-| `compress/level_-7_fast/high-entropy-1m/matrix/pure_rust` | 0.032 |
-| `compress/level_-7_fast/large-log-stream/matrix/c_ffi` | 1.237 |
-| `compress/level_-7_fast/large-log-stream/matrix/pure_rust` | 1.036 |
-| `compress/level_-7_fast/low-entropy-1m/matrix/c_ffi` | 0.074 |
-| `compress/level_-7_fast/low-entropy-1m/matrix/pure_rust` | 0.065 |
-| `compress/level_-7_fast/small-10k-random/matrix/c_ffi` | 0.003 |
-| `compress/level_-7_fast/small-10k-random/matrix/pure_rust` | 0.002 |
-| `compress/level_-7_fast/small-1k-random/matrix/c_ffi` | 0.003 |
+| `compress/level_-6_fast/small-4k-log-lines/matrix/c_ffi` | 0.006 |
+| `compress/level_-6_fast/small-4k-log-lines/matrix/pure_rust` | 0.007 |
+| `compress/level_-7_fast/decodecorpus-z000033/matrix/c_ffi` | 1.673 |
+| `compress/level_-7_fast/decodecorpus-z000033/matrix/pure_rust` | 3.387 |
+| `compress/level_-7_fast/high-entropy-1m/matrix/c_ffi` | 0.529 |
+| `compress/level_-7_fast/high-entropy-1m/matrix/pure_rust` | 0.072 |
+| `compress/level_-7_fast/large-log-stream/matrix/c_ffi` | 7.794 |
+| `compress/level_-7_fast/large-log-stream/matrix/pure_rust` | 1.775 |
+| `compress/level_-7_fast/low-entropy-1m/matrix/c_ffi` | 0.486 |
+| `compress/level_-7_fast/low-entropy-1m/matrix/pure_rust` | 0.113 |
+| `compress/level_-7_fast/small-10k-random/matrix/c_ffi` | 0.009 |
+| `compress/level_-7_fast/small-10k-random/matrix/pure_rust` | 0.008 |
+| `compress/level_-7_fast/small-1k-random/matrix/c_ffi` | 0.004 |
 | `compress/level_-7_fast/small-1k-random/matrix/pure_rust` | 0.001 |
-| `compress/level_-7_fast/small-4k-log-lines/matrix/c_ffi` | 0.003 |
-| `compress/level_-7_fast/small-4k-log-lines/matrix/pure_rust` | 0.004 |
-| `decompress-dict/level_-2_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.395 |
-| `decompress-dict/level_-2_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 0.672 |
-| `decompress-dict/level_-2_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.000 |
+| `compress/level_-7_fast/small-4k-log-lines/matrix/c_ffi` | 0.006 |
+| `compress/level_-7_fast/small-4k-log-lines/matrix/pure_rust` | 0.007 |
+| `decompress-dict/level_-2_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.617 |
+| `decompress-dict/level_-2_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 0.995 |
+| `decompress-dict/level_-2_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_-2_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
 | `decompress-dict/level_-2_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_-2_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress-dict/level_-3_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.386 |
-| `decompress-dict/level_-3_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 0.634 |
-| `decompress-dict/level_-3_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.000 |
+| `decompress-dict/level_-3_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.595 |
+| `decompress-dict/level_-3_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 0.943 |
+| `decompress-dict/level_-3_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_-3_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
 | `decompress-dict/level_-3_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_-3_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress-dict/level_-4_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.350 |
-| `decompress-dict/level_-4_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 0.581 |
-| `decompress-dict/level_-4_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.000 |
+| `decompress-dict/level_-4_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.543 |
+| `decompress-dict/level_-4_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 0.860 |
+| `decompress-dict/level_-4_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_-4_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
 | `decompress-dict/level_-4_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_-4_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress-dict/level_-5_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.337 |
-| `decompress-dict/level_-5_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 0.555 |
-| `decompress-dict/level_-5_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.000 |
+| `decompress-dict/level_-5_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.522 |
+| `decompress-dict/level_-5_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 0.823 |
+| `decompress-dict/level_-5_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_-5_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
 | `decompress-dict/level_-5_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_-5_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress-dict/level_-6_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.313 |
-| `decompress-dict/level_-6_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 0.516 |
-| `decompress-dict/level_-6_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.000 |
+| `decompress-dict/level_-6_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.487 |
+| `decompress-dict/level_-6_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 0.762 |
+| `decompress-dict/level_-6_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_-6_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
 | `decompress-dict/level_-6_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_-6_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress-dict/level_-7_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.304 |
-| `decompress-dict/level_-7_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 0.482 |
-| `decompress-dict/level_-7_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.000 |
+| `decompress-dict/level_-7_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.464 |
+| `decompress-dict/level_-7_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 0.714 |
+| `decompress-dict/level_-7_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_-7_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
 | `decompress-dict/level_-7_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_-7_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress/level_-2_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.318 |
-| `decompress/level_-2_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.509 |
-| `decompress/level_-2_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.574 |
-| `decompress/level_-2_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 0.784 |
-| `decompress/level_-2_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.015 |
-| `decompress/level_-2_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.015 |
-| `decompress/level_-2_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.015 |
-| `decompress/level_-2_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.015 |
-| `decompress/level_-2_fast/large-log-stream/c_stream/matrix/c_ffi` | 0.317 |
-| `decompress/level_-2_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.184 |
-| `decompress/level_-2_fast/large-log-stream/rust_stream/matrix/c_ffi` | 0.318 |
-| `decompress/level_-2_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.185 |
-| `decompress/level_-2_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.080 |
-| `decompress/level_-2_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.010 |
-| `decompress/level_-2_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.080 |
-| `decompress/level_-2_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.010 |
+| `decompress/level_-2_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.496 |
+| `decompress/level_-2_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.771 |
+| `decompress/level_-2_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.943 |
+| `decompress/level_-2_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.271 |
+| `decompress/level_-2_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.037 |
+| `decompress/level_-2_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.037 |
+| `decompress/level_-2_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.037 |
+| `decompress/level_-2_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.037 |
+| `decompress/level_-2_fast/large-log-stream/c_stream/matrix/c_ffi` | 0.654 |
+| `decompress/level_-2_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.397 |
+| `decompress/level_-2_fast/large-log-stream/rust_stream/matrix/c_ffi` | 0.656 |
+| `decompress/level_-2_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.400 |
+| `decompress/level_-2_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.191 |
+| `decompress/level_-2_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_-2_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.191 |
+| `decompress/level_-2_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
 | `decompress/level_-2_fast/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_-2_fast/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_-2_fast/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -4866,25 +4866,25 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_-2_fast/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_-2_fast/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_-2_fast/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.000 |
-| `decompress/level_-2_fast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_-2_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.001 |
-| `decompress/level_-2_fast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.001 |
-| `decompress/level_-3_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.308 |
-| `decompress/level_-3_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.482 |
-| `decompress/level_-3_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.578 |
-| `decompress/level_-3_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 0.779 |
-| `decompress/level_-3_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.015 |
-| `decompress/level_-3_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.015 |
-| `decompress/level_-3_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.014 |
-| `decompress/level_-3_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.015 |
-| `decompress/level_-3_fast/large-log-stream/c_stream/matrix/c_ffi` | 0.316 |
-| `decompress/level_-3_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.182 |
-| `decompress/level_-3_fast/large-log-stream/rust_stream/matrix/c_ffi` | 0.316 |
-| `decompress/level_-3_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.182 |
-| `decompress/level_-3_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.080 |
-| `decompress/level_-3_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.010 |
-| `decompress/level_-3_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.080 |
-| `decompress/level_-3_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.010 |
+| `decompress/level_-2_fast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.001 |
+| `decompress/level_-2_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
+| `decompress/level_-2_fast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
+| `decompress/level_-3_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.484 |
+| `decompress/level_-3_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.736 |
+| `decompress/level_-3_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.957 |
+| `decompress/level_-3_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.271 |
+| `decompress/level_-3_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.037 |
+| `decompress/level_-3_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.037 |
+| `decompress/level_-3_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.037 |
+| `decompress/level_-3_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.037 |
+| `decompress/level_-3_fast/large-log-stream/c_stream/matrix/c_ffi` | 0.654 |
+| `decompress/level_-3_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.403 |
+| `decompress/level_-3_fast/large-log-stream/rust_stream/matrix/c_ffi` | 0.657 |
+| `decompress/level_-3_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.409 |
+| `decompress/level_-3_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.191 |
+| `decompress/level_-3_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_-3_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.191 |
+| `decompress/level_-3_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
 | `decompress/level_-3_fast/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_-3_fast/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_-3_fast/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -4894,25 +4894,25 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_-3_fast/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_-3_fast/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_-3_fast/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.000 |
-| `decompress/level_-3_fast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_-3_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.001 |
-| `decompress/level_-3_fast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.001 |
-| `decompress/level_-4_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.276 |
-| `decompress/level_-4_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.440 |
-| `decompress/level_-4_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.561 |
-| `decompress/level_-4_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 0.757 |
-| `decompress/level_-4_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.015 |
-| `decompress/level_-4_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.015 |
-| `decompress/level_-4_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.015 |
-| `decompress/level_-4_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.015 |
-| `decompress/level_-4_fast/large-log-stream/c_stream/matrix/c_ffi` | 0.316 |
-| `decompress/level_-4_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.182 |
-| `decompress/level_-4_fast/large-log-stream/rust_stream/matrix/c_ffi` | 0.317 |
-| `decompress/level_-4_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.184 |
-| `decompress/level_-4_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.080 |
-| `decompress/level_-4_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.010 |
-| `decompress/level_-4_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.080 |
-| `decompress/level_-4_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.010 |
+| `decompress/level_-3_fast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.001 |
+| `decompress/level_-3_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
+| `decompress/level_-3_fast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
+| `decompress/level_-4_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.438 |
+| `decompress/level_-4_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.669 |
+| `decompress/level_-4_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.940 |
+| `decompress/level_-4_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.246 |
+| `decompress/level_-4_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.037 |
+| `decompress/level_-4_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.037 |
+| `decompress/level_-4_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.030 |
+| `decompress/level_-4_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.037 |
+| `decompress/level_-4_fast/large-log-stream/c_stream/matrix/c_ffi` | 0.569 |
+| `decompress/level_-4_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.412 |
+| `decompress/level_-4_fast/large-log-stream/rust_stream/matrix/c_ffi` | 0.571 |
+| `decompress/level_-4_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.419 |
+| `decompress/level_-4_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.154 |
+| `decompress/level_-4_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_-4_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.154 |
+| `decompress/level_-4_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
 | `decompress/level_-4_fast/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_-4_fast/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_-4_fast/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -4922,25 +4922,25 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_-4_fast/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_-4_fast/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_-4_fast/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.000 |
-| `decompress/level_-4_fast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_-4_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.001 |
-| `decompress/level_-4_fast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.001 |
-| `decompress/level_-5_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.259 |
-| `decompress/level_-5_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.418 |
-| `decompress/level_-5_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.553 |
-| `decompress/level_-5_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 0.750 |
-| `decompress/level_-5_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.015 |
-| `decompress/level_-5_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.015 |
-| `decompress/level_-5_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.015 |
-| `decompress/level_-5_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.015 |
-| `decompress/level_-5_fast/large-log-stream/c_stream/matrix/c_ffi` | 0.316 |
-| `decompress/level_-5_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.181 |
-| `decompress/level_-5_fast/large-log-stream/rust_stream/matrix/c_ffi` | 0.317 |
-| `decompress/level_-5_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.183 |
-| `decompress/level_-5_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.080 |
-| `decompress/level_-5_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.010 |
-| `decompress/level_-5_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.080 |
-| `decompress/level_-5_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.010 |
+| `decompress/level_-4_fast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.001 |
+| `decompress/level_-4_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
+| `decompress/level_-4_fast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
+| `decompress/level_-5_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.417 |
+| `decompress/level_-5_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.634 |
+| `decompress/level_-5_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.939 |
+| `decompress/level_-5_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.236 |
+| `decompress/level_-5_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.037 |
+| `decompress/level_-5_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.037 |
+| `decompress/level_-5_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.037 |
+| `decompress/level_-5_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.037 |
+| `decompress/level_-5_fast/large-log-stream/c_stream/matrix/c_ffi` | 0.655 |
+| `decompress/level_-5_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.409 |
+| `decompress/level_-5_fast/large-log-stream/rust_stream/matrix/c_ffi` | 0.656 |
+| `decompress/level_-5_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.398 |
+| `decompress/level_-5_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.191 |
+| `decompress/level_-5_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_-5_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.191 |
+| `decompress/level_-5_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
 | `decompress/level_-5_fast/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_-5_fast/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_-5_fast/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -4950,25 +4950,25 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_-5_fast/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_-5_fast/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_-5_fast/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.000 |
-| `decompress/level_-5_fast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_-5_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.001 |
-| `decompress/level_-5_fast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_-6_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.234 |
-| `decompress/level_-6_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.388 |
-| `decompress/level_-6_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.542 |
-| `decompress/level_-6_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 0.735 |
-| `decompress/level_-6_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.015 |
-| `decompress/level_-6_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.015 |
-| `decompress/level_-6_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.014 |
-| `decompress/level_-6_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.015 |
-| `decompress/level_-6_fast/large-log-stream/c_stream/matrix/c_ffi` | 0.315 |
-| `decompress/level_-6_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.182 |
-| `decompress/level_-6_fast/large-log-stream/rust_stream/matrix/c_ffi` | 0.316 |
-| `decompress/level_-6_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.183 |
-| `decompress/level_-6_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.080 |
-| `decompress/level_-6_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.010 |
-| `decompress/level_-6_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.080 |
-| `decompress/level_-6_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.010 |
+| `decompress/level_-5_fast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.001 |
+| `decompress/level_-5_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
+| `decompress/level_-5_fast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.003 |
+| `decompress/level_-6_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.395 |
+| `decompress/level_-6_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.592 |
+| `decompress/level_-6_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.942 |
+| `decompress/level_-6_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.218 |
+| `decompress/level_-6_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.037 |
+| `decompress/level_-6_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.037 |
+| `decompress/level_-6_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.031 |
+| `decompress/level_-6_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.031 |
+| `decompress/level_-6_fast/large-log-stream/c_stream/matrix/c_ffi` | 0.655 |
+| `decompress/level_-6_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.414 |
+| `decompress/level_-6_fast/large-log-stream/rust_stream/matrix/c_ffi` | 0.657 |
+| `decompress/level_-6_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.412 |
+| `decompress/level_-6_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.191 |
+| `decompress/level_-6_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_-6_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.191 |
+| `decompress/level_-6_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
 | `decompress/level_-6_fast/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_-6_fast/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_-6_fast/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -4978,25 +4978,25 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_-6_fast/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_-6_fast/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_-6_fast/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.000 |
-| `decompress/level_-6_fast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_-6_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.001 |
-| `decompress/level_-6_fast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_-7_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.223 |
-| `decompress/level_-7_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.359 |
-| `decompress/level_-7_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.537 |
-| `decompress/level_-7_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 0.724 |
-| `decompress/level_-7_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.015 |
-| `decompress/level_-7_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.015 |
-| `decompress/level_-7_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.014 |
-| `decompress/level_-7_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.015 |
-| `decompress/level_-7_fast/large-log-stream/c_stream/matrix/c_ffi` | 0.316 |
-| `decompress/level_-7_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.182 |
-| `decompress/level_-7_fast/large-log-stream/rust_stream/matrix/c_ffi` | 0.317 |
-| `decompress/level_-7_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.184 |
-| `decompress/level_-7_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.080 |
-| `decompress/level_-7_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.011 |
-| `decompress/level_-7_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.080 |
-| `decompress/level_-7_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.010 |
+| `decompress/level_-6_fast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.001 |
+| `decompress/level_-6_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
+| `decompress/level_-6_fast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.003 |
+| `decompress/level_-7_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.374 |
+| `decompress/level_-7_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.553 |
+| `decompress/level_-7_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.939 |
+| `decompress/level_-7_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.208 |
+| `decompress/level_-7_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.030 |
+| `decompress/level_-7_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.030 |
+| `decompress/level_-7_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.030 |
+| `decompress/level_-7_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.037 |
+| `decompress/level_-7_fast/large-log-stream/c_stream/matrix/c_ffi` | 0.653 |
+| `decompress/level_-7_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.410 |
+| `decompress/level_-7_fast/large-log-stream/rust_stream/matrix/c_ffi` | 0.654 |
+| `decompress/level_-7_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.429 |
+| `decompress/level_-7_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.191 |
+| `decompress/level_-7_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_-7_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.191 |
+| `decompress/level_-7_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
 | `decompress/level_-7_fast/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_-7_fast/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_-7_fast/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -5006,15 +5006,15 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_-7_fast/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_-7_fast/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_-7_fast/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.000 |
-| `decompress/level_-7_fast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_-7_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.001 |
-| `decompress/level_-7_fast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.001 |
-| `dict-train/na/decodecorpus-z000033/matrix/c_ffi` | 17.649 |
-| `dict-train/na/decodecorpus-z000033/matrix/pure_rust` | 4.715 |
-| `dict-train/na/small-10k-random/matrix/c_ffi` | 0.508 |
-| `dict-train/na/small-10k-random/matrix/pure_rust` | 0.154 |
-| `dict-train/na/small-4k-log-lines/matrix/c_ffi` | 0.146 |
-| `dict-train/na/small-4k-log-lines/matrix/pure_rust` | 0.095 |
+| `decompress/level_-7_fast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.001 |
+| `decompress/level_-7_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
+| `decompress/level_-7_fast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
+| `dict-train/na/decodecorpus-z000033/matrix/c_ffi` | 30.495 |
+| `dict-train/na/decodecorpus-z000033/matrix/pure_rust` | 7.914 |
+| `dict-train/na/small-10k-random/matrix/c_ffi` | 1.069 |
+| `dict-train/na/small-10k-random/matrix/pure_rust` | 0.273 |
+| `dict-train/na/small-4k-log-lines/matrix/c_ffi` | 0.253 |
+| `dict-train/na/small-4k-log-lines/matrix/pure_rust` | 0.161 |
 
 ## Strategy group: lazy-lower
 
@@ -5176,194 +5176,194 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 
 | Scenario | Label | Level | Dict bytes | Train ms | C bytes (no dict) | C bytes (with dict) | C ratio (no dict) | C ratio (with dict) |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| decodecorpus-z000033 | Repo decode corpus sample | level_10_lazy | 16384 | 31.250 | 483762 | 462364 | 0.4733 | 0.4524 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_6_lazy | 16384 | 31.250 | 484957 | 464543 | 0.4745 | 0.4545 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_7_lazy | 16384 | 31.250 | 484299 | 464689 | 0.4739 | 0.4547 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_8_lazy | 16384 | 31.250 | 484336 | 463700 | 0.4739 | 0.4537 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_9_lazy | 16384 | 31.250 | 484348 | 462791 | 0.4739 | 0.4528 |
-| small-10k-random | Small random payload (10 KiB) | level_10_lazy | 1280 | 1.427 | 10250 | 9214 | 1.0010 | 0.8998 |
-| small-10k-random | Small random payload (10 KiB) | level_6_lazy | 1280 | 1.427 | 10250 | 9214 | 1.0010 | 0.8998 |
-| small-10k-random | Small random payload (10 KiB) | level_7_lazy | 1280 | 1.427 | 10250 | 9214 | 1.0010 | 0.8998 |
-| small-10k-random | Small random payload (10 KiB) | level_8_lazy | 1280 | 1.427 | 10250 | 9214 | 1.0010 | 0.8998 |
-| small-10k-random | Small random payload (10 KiB) | level_9_lazy | 1280 | 1.427 | 10250 | 9214 | 1.0010 | 0.8998 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_10_lazy | 437 | 0.544 | 150 | 44 | 0.0366 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_6_lazy | 437 | 0.544 | 150 | 44 | 0.0366 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_7_lazy | 437 | 0.544 | 150 | 44 | 0.0366 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_8_lazy | 437 | 0.544 | 150 | 44 | 0.0366 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_9_lazy | 437 | 0.544 | 150 | 44 | 0.0366 | 0.0107 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_10_lazy | 16384 | 30.359 | 483762 | 462364 | 0.4733 | 0.4524 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_6_lazy | 16384 | 30.359 | 484957 | 464543 | 0.4745 | 0.4545 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_7_lazy | 16384 | 30.359 | 484299 | 464689 | 0.4739 | 0.4547 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_8_lazy | 16384 | 30.359 | 484336 | 463700 | 0.4739 | 0.4537 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_9_lazy | 16384 | 30.359 | 484348 | 462791 | 0.4739 | 0.4528 |
+| small-10k-random | Small random payload (10 KiB) | level_10_lazy | 1280 | 1.663 | 10250 | 9214 | 1.0010 | 0.8998 |
+| small-10k-random | Small random payload (10 KiB) | level_6_lazy | 1280 | 1.663 | 10250 | 9214 | 1.0010 | 0.8998 |
+| small-10k-random | Small random payload (10 KiB) | level_7_lazy | 1280 | 1.663 | 10250 | 9214 | 1.0010 | 0.8998 |
+| small-10k-random | Small random payload (10 KiB) | level_8_lazy | 1280 | 1.663 | 10250 | 9214 | 1.0010 | 0.8998 |
+| small-10k-random | Small random payload (10 KiB) | level_9_lazy | 1280 | 1.663 | 10250 | 9214 | 1.0010 | 0.8998 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_10_lazy | 437 | 0.434 | 150 | 44 | 0.0366 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_6_lazy | 437 | 0.434 | 150 | 44 | 0.0366 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_7_lazy | 437 | 0.434 | 150 | 44 | 0.0366 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_8_lazy | 437 | 0.434 | 150 | 44 | 0.0366 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_9_lazy | 437 | 0.434 | 150 | 44 | 0.0366 | 0.0107 |
 
 ## Dictionary Training (Rust FastCOVER vs C FFI)
 
 | Scenario | Label | Dict bytes (requested) | Rust train ms | C train ms | Rust dict bytes | C dict bytes | Rust FastCOVER score | Delta (C/Rust) | Status |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| decodecorpus-z000033 | Repo decode corpus sample | 16384 | 8.200 | 31.250 | 16384 | 16384 | 0 | 3.8110 | rust_faster |
-| small-10k-random | Small random payload (10 KiB) | 1280 | 0.391 | 1.427 | 1280 | 1280 | 0 | 3.6496 | rust_faster |
-| small-4k-log-lines | Small structured log lines (4 KiB) | 512 | 0.442 | 0.544 | 512 | 437 | 0 | 1.2308 | rust_faster |
+| decodecorpus-z000033 | Repo decode corpus sample | 16384 | 8.019 | 30.359 | 16384 | 16384 | 0 | 3.7859 | rust_faster |
+| small-10k-random | Small random payload (10 KiB) | 1280 | 0.481 | 1.663 | 1280 | 1280 | 0 | 3.4574 | rust_faster |
+| small-4k-log-lines | Small structured log lines (4 KiB) | 512 | 0.394 | 0.434 | 512 | 437 | 0 | 1.1015 | rust_faster |
 
 ## Timing Metrics
 
 | Benchmark | ms/iter |
 | --- | ---: |
-| `compress-dict/level_10_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 23.850 |
-| `compress-dict/level_10_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 16.691 |
-| `compress-dict/level_10_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 37.239 |
+| `compress-dict/level_10_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 23.861 |
+| `compress-dict/level_10_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 16.571 |
+| `compress-dict/level_10_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 36.264 |
 | `compress-dict/level_10_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.214 |
 | `compress-dict/level_10_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.035 |
 | `compress-dict/level_10_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.326 |
 | `compress-dict/level_10_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.003 |
 | `compress-dict/level_10_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.010 |
 | `compress-dict/level_10_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.004 |
-| `compress-dict/level_6_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 15.013 |
-| `compress-dict/level_6_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 12.837 |
-| `compress-dict/level_6_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 22.970 |
-| `compress-dict/level_6_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.109 |
+| `compress-dict/level_6_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 14.987 |
+| `compress-dict/level_6_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 12.834 |
+| `compress-dict/level_6_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 22.737 |
+| `compress-dict/level_6_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.114 |
 | `compress-dict/level_6_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.019 |
-| `compress-dict/level_6_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.321 |
+| `compress-dict/level_6_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.320 |
 | `compress-dict/level_6_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.003 |
 | `compress-dict/level_6_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.009 |
-| `compress-dict/level_6_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.004 |
-| `compress-dict/level_7_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 17.532 |
-| `compress-dict/level_7_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 13.329 |
-| `compress-dict/level_7_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 26.620 |
-| `compress-dict/level_7_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.109 |
+| `compress-dict/level_6_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.003 |
+| `compress-dict/level_7_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 17.527 |
+| `compress-dict/level_7_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 13.204 |
+| `compress-dict/level_7_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 26.330 |
+| `compress-dict/level_7_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.111 |
 | `compress-dict/level_7_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.019 |
-| `compress-dict/level_7_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.326 |
+| `compress-dict/level_7_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.325 |
 | `compress-dict/level_7_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.003 |
 | `compress-dict/level_7_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.009 |
 | `compress-dict/level_7_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.003 |
-| `compress-dict/level_8_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 18.532 |
-| `compress-dict/level_8_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 15.243 |
-| `compress-dict/level_8_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 33.585 |
+| `compress-dict/level_8_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 18.520 |
+| `compress-dict/level_8_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 15.187 |
+| `compress-dict/level_8_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 32.825 |
 | `compress-dict/level_8_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.110 |
 | `compress-dict/level_8_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.019 |
-| `compress-dict/level_8_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.327 |
+| `compress-dict/level_8_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.325 |
 | `compress-dict/level_8_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.003 |
-| `compress-dict/level_8_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.010 |
+| `compress-dict/level_8_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.009 |
 | `compress-dict/level_8_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.004 |
-| `compress-dict/level_9_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 20.618 |
-| `compress-dict/level_9_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 15.233 |
-| `compress-dict/level_9_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 33.595 |
+| `compress-dict/level_9_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 20.901 |
+| `compress-dict/level_9_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 15.224 |
+| `compress-dict/level_9_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 32.837 |
 | `compress-dict/level_9_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.215 |
 | `compress-dict/level_9_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.035 |
 | `compress-dict/level_9_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.325 |
 | `compress-dict/level_9_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.003 |
 | `compress-dict/level_9_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.010 |
 | `compress-dict/level_9_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.004 |
-| `compress/level_10_lazy/decodecorpus-z000033/matrix/c_ffi` | 15.910 |
-| `compress/level_10_lazy/decodecorpus-z000033/matrix/pure_rust` | 36.083 |
-| `compress/level_10_lazy/high-entropy-1m/matrix/c_ffi` | 0.670 |
-| `compress/level_10_lazy/high-entropy-1m/matrix/pure_rust` | 0.913 |
-| `compress/level_10_lazy/large-log-stream/matrix/c_ffi` | 10.613 |
-| `compress/level_10_lazy/large-log-stream/matrix/pure_rust` | 14.372 |
-| `compress/level_10_lazy/low-entropy-1m/matrix/c_ffi` | 0.913 |
-| `compress/level_10_lazy/low-entropy-1m/matrix/pure_rust` | 0.884 |
+| `compress/level_10_lazy/decodecorpus-z000033/matrix/c_ffi` | 15.772 |
+| `compress/level_10_lazy/decodecorpus-z000033/matrix/pure_rust` | 35.465 |
+| `compress/level_10_lazy/high-entropy-1m/matrix/c_ffi` | 0.707 |
+| `compress/level_10_lazy/high-entropy-1m/matrix/pure_rust` | 0.907 |
+| `compress/level_10_lazy/large-log-stream/matrix/c_ffi` | 10.308 |
+| `compress/level_10_lazy/large-log-stream/matrix/pure_rust` | 12.639 |
+| `compress/level_10_lazy/low-entropy-1m/matrix/c_ffi` | 0.898 |
+| `compress/level_10_lazy/low-entropy-1m/matrix/pure_rust` | 0.817 |
 | `compress/level_10_lazy/small-10k-random/matrix/c_ffi` | 0.037 |
 | `compress/level_10_lazy/small-10k-random/matrix/pure_rust` | 0.015 |
-| `compress/level_10_lazy/small-1k-random/matrix/c_ffi` | 0.013 |
+| `compress/level_10_lazy/small-1k-random/matrix/c_ffi` | 0.012 |
 | `compress/level_10_lazy/small-1k-random/matrix/pure_rust` | 0.002 |
-| `compress/level_10_lazy/small-4k-log-lines/matrix/c_ffi` | 0.012 |
-| `compress/level_10_lazy/small-4k-log-lines/matrix/pure_rust` | 0.013 |
-| `compress/level_6_lazy/decodecorpus-z000033/matrix/c_ffi` | 12.056 |
-| `compress/level_6_lazy/decodecorpus-z000033/matrix/pure_rust` | 22.156 |
-| `compress/level_6_lazy/high-entropy-1m/matrix/c_ffi` | 0.522 |
-| `compress/level_6_lazy/high-entropy-1m/matrix/pure_rust` | 0.874 |
-| `compress/level_6_lazy/large-log-stream/matrix/c_ffi` | 8.815 |
-| `compress/level_6_lazy/large-log-stream/matrix/pure_rust` | 3.720 |
-| `compress/level_6_lazy/low-entropy-1m/matrix/c_ffi` | 0.537 |
-| `compress/level_6_lazy/low-entropy-1m/matrix/pure_rust` | 0.245 |
+| `compress/level_10_lazy/small-4k-log-lines/matrix/c_ffi` | 0.011 |
+| `compress/level_10_lazy/small-4k-log-lines/matrix/pure_rust` | 0.014 |
+| `compress/level_6_lazy/decodecorpus-z000033/matrix/c_ffi` | 12.057 |
+| `compress/level_6_lazy/decodecorpus-z000033/matrix/pure_rust` | 21.888 |
+| `compress/level_6_lazy/high-entropy-1m/matrix/c_ffi` | 0.542 |
+| `compress/level_6_lazy/high-entropy-1m/matrix/pure_rust` | 0.855 |
+| `compress/level_6_lazy/large-log-stream/matrix/c_ffi` | 8.622 |
+| `compress/level_6_lazy/large-log-stream/matrix/pure_rust` | 3.514 |
+| `compress/level_6_lazy/low-entropy-1m/matrix/c_ffi` | 0.533 |
+| `compress/level_6_lazy/low-entropy-1m/matrix/pure_rust` | 0.249 |
 | `compress/level_6_lazy/small-10k-random/matrix/c_ffi` | 0.021 |
 | `compress/level_6_lazy/small-10k-random/matrix/pure_rust` | 0.015 |
 | `compress/level_6_lazy/small-1k-random/matrix/c_ffi` | 0.010 |
 | `compress/level_6_lazy/small-1k-random/matrix/pure_rust` | 0.002 |
 | `compress/level_6_lazy/small-4k-log-lines/matrix/c_ffi` | 0.011 |
 | `compress/level_6_lazy/small-4k-log-lines/matrix/pure_rust` | 0.013 |
-| `compress/level_7_lazy/decodecorpus-z000033/matrix/c_ffi` | 12.490 |
-| `compress/level_7_lazy/decodecorpus-z000033/matrix/pure_rust` | 25.933 |
-| `compress/level_7_lazy/high-entropy-1m/matrix/c_ffi` | 0.586 |
-| `compress/level_7_lazy/high-entropy-1m/matrix/pure_rust` | 0.991 |
-| `compress/level_7_lazy/large-log-stream/matrix/c_ffi` | 8.942 |
-| `compress/level_7_lazy/large-log-stream/matrix/pure_rust` | 3.811 |
-| `compress/level_7_lazy/low-entropy-1m/matrix/c_ffi` | 0.574 |
-| `compress/level_7_lazy/low-entropy-1m/matrix/pure_rust` | 0.286 |
+| `compress/level_7_lazy/decodecorpus-z000033/matrix/c_ffi` | 12.433 |
+| `compress/level_7_lazy/decodecorpus-z000033/matrix/pure_rust` | 25.740 |
+| `compress/level_7_lazy/high-entropy-1m/matrix/c_ffi` | 0.581 |
+| `compress/level_7_lazy/high-entropy-1m/matrix/pure_rust` | 0.988 |
+| `compress/level_7_lazy/large-log-stream/matrix/c_ffi` | 8.678 |
+| `compress/level_7_lazy/large-log-stream/matrix/pure_rust` | 3.635 |
+| `compress/level_7_lazy/low-entropy-1m/matrix/c_ffi` | 0.581 |
+| `compress/level_7_lazy/low-entropy-1m/matrix/pure_rust` | 0.278 |
 | `compress/level_7_lazy/small-10k-random/matrix/c_ffi` | 0.021 |
 | `compress/level_7_lazy/small-10k-random/matrix/pure_rust` | 0.015 |
 | `compress/level_7_lazy/small-1k-random/matrix/c_ffi` | 0.010 |
 | `compress/level_7_lazy/small-1k-random/matrix/pure_rust` | 0.002 |
 | `compress/level_7_lazy/small-4k-log-lines/matrix/c_ffi` | 0.011 |
 | `compress/level_7_lazy/small-4k-log-lines/matrix/pure_rust` | 0.013 |
-| `compress/level_8_lazy/decodecorpus-z000033/matrix/c_ffi` | 14.265 |
-| `compress/level_8_lazy/decodecorpus-z000033/matrix/pure_rust` | 32.932 |
-| `compress/level_8_lazy/high-entropy-1m/matrix/c_ffi` | 0.595 |
-| `compress/level_8_lazy/high-entropy-1m/matrix/pure_rust` | 0.991 |
-| `compress/level_8_lazy/large-log-stream/matrix/c_ffi` | 9.782 |
-| `compress/level_8_lazy/large-log-stream/matrix/pure_rust` | 14.365 |
-| `compress/level_8_lazy/low-entropy-1m/matrix/c_ffi` | 0.854 |
-| `compress/level_8_lazy/low-entropy-1m/matrix/pure_rust` | 0.897 |
+| `compress/level_8_lazy/decodecorpus-z000033/matrix/c_ffi` | 14.201 |
+| `compress/level_8_lazy/decodecorpus-z000033/matrix/pure_rust` | 32.619 |
+| `compress/level_8_lazy/high-entropy-1m/matrix/c_ffi` | 0.587 |
+| `compress/level_8_lazy/high-entropy-1m/matrix/pure_rust` | 0.986 |
+| `compress/level_8_lazy/large-log-stream/matrix/c_ffi` | 9.461 |
+| `compress/level_8_lazy/large-log-stream/matrix/pure_rust` | 12.729 |
+| `compress/level_8_lazy/low-entropy-1m/matrix/c_ffi` | 0.862 |
+| `compress/level_8_lazy/low-entropy-1m/matrix/pure_rust` | 0.828 |
 | `compress/level_8_lazy/small-10k-random/matrix/c_ffi` | 0.021 |
 | `compress/level_8_lazy/small-10k-random/matrix/pure_rust` | 0.015 |
 | `compress/level_8_lazy/small-1k-random/matrix/c_ffi` | 0.010 |
 | `compress/level_8_lazy/small-1k-random/matrix/pure_rust` | 0.002 |
 | `compress/level_8_lazy/small-4k-log-lines/matrix/c_ffi` | 0.011 |
-| `compress/level_8_lazy/small-4k-log-lines/matrix/pure_rust` | 0.013 |
-| `compress/level_9_lazy/decodecorpus-z000033/matrix/c_ffi` | 14.445 |
-| `compress/level_9_lazy/decodecorpus-z000033/matrix/pure_rust` | 32.926 |
-| `compress/level_9_lazy/high-entropy-1m/matrix/c_ffi` | 0.668 |
-| `compress/level_9_lazy/high-entropy-1m/matrix/pure_rust` | 0.992 |
-| `compress/level_9_lazy/large-log-stream/matrix/c_ffi` | 9.993 |
-| `compress/level_9_lazy/large-log-stream/matrix/pure_rust` | 14.368 |
-| `compress/level_9_lazy/low-entropy-1m/matrix/c_ffi` | 0.935 |
-| `compress/level_9_lazy/low-entropy-1m/matrix/pure_rust` | 0.899 |
+| `compress/level_8_lazy/small-4k-log-lines/matrix/pure_rust` | 0.014 |
+| `compress/level_9_lazy/decodecorpus-z000033/matrix/c_ffi` | 14.332 |
+| `compress/level_9_lazy/decodecorpus-z000033/matrix/pure_rust` | 32.628 |
+| `compress/level_9_lazy/high-entropy-1m/matrix/c_ffi` | 0.704 |
+| `compress/level_9_lazy/high-entropy-1m/matrix/pure_rust` | 0.993 |
+| `compress/level_9_lazy/large-log-stream/matrix/c_ffi` | 9.661 |
+| `compress/level_9_lazy/large-log-stream/matrix/pure_rust` | 12.685 |
+| `compress/level_9_lazy/low-entropy-1m/matrix/c_ffi` | 0.917 |
+| `compress/level_9_lazy/low-entropy-1m/matrix/pure_rust` | 0.823 |
 | `compress/level_9_lazy/small-10k-random/matrix/c_ffi` | 0.037 |
 | `compress/level_9_lazy/small-10k-random/matrix/pure_rust` | 0.015 |
-| `compress/level_9_lazy/small-1k-random/matrix/c_ffi` | 0.013 |
+| `compress/level_9_lazy/small-1k-random/matrix/c_ffi` | 0.012 |
 | `compress/level_9_lazy/small-1k-random/matrix/pure_rust` | 0.002 |
 | `compress/level_9_lazy/small-4k-log-lines/matrix/c_ffi` | 0.012 |
 | `compress/level_9_lazy/small-4k-log-lines/matrix/pure_rust` | 0.014 |
-| `decompress-dict/level_10_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.292 |
-| `decompress-dict/level_10_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.041 |
+| `decompress-dict/level_10_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.287 |
+| `decompress-dict/level_10_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.039 |
 | `decompress-dict/level_10_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_10_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
 | `decompress-dict/level_10_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_10_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress-dict/level_6_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.364 |
-| `decompress-dict/level_6_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.173 |
+| `decompress-dict/level_6_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.361 |
+| `decompress-dict/level_6_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.162 |
 | `decompress-dict/level_6_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_6_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
 | `decompress-dict/level_6_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_6_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress-dict/level_7_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.344 |
-| `decompress-dict/level_7_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.122 |
+| `decompress-dict/level_7_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.341 |
+| `decompress-dict/level_7_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.119 |
 | `decompress-dict/level_7_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_7_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
 | `decompress-dict/level_7_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_7_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress-dict/level_8_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.324 |
-| `decompress-dict/level_8_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.094 |
+| `decompress-dict/level_8_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.319 |
+| `decompress-dict/level_8_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.086 |
 | `decompress-dict/level_8_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_8_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
 | `decompress-dict/level_8_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_8_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress-dict/level_9_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.304 |
-| `decompress-dict/level_9_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.060 |
+| `decompress-dict/level_9_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.300 |
+| `decompress-dict/level_9_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.051 |
 | `decompress-dict/level_9_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_9_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
 | `decompress-dict/level_9_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_9_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress/level_10_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.990 |
-| `decompress/level_10_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.407 |
-| `decompress/level_10_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.191 |
-| `decompress/level_10_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.756 |
-| `decompress/level_10_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.027 |
+| `decompress/level_10_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.986 |
+| `decompress/level_10_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.401 |
+| `decompress/level_10_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.187 |
+| `decompress/level_10_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.742 |
+| `decompress/level_10_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.026 |
 | `decompress/level_10_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
 | `decompress/level_10_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.026 |
 | `decompress/level_10_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_10_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.669 |
-| `decompress/level_10_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.441 |
-| `decompress/level_10_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.439 |
-| `decompress/level_10_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.414 |
-| `decompress/level_10_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.188 |
+| `decompress/level_10_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.661 |
+| `decompress/level_10_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.447 |
+| `decompress/level_10_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.430 |
+| `decompress/level_10_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.408 |
+| `decompress/level_10_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.187 |
 | `decompress/level_10_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.025 |
-| `decompress/level_10_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.094 |
+| `decompress/level_10_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.092 |
 | `decompress/level_10_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
 | `decompress/level_10_lazy/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_10_lazy/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
@@ -5377,21 +5377,21 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_10_lazy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_10_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_10_lazy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_6_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.018 |
-| `decompress/level_6_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.457 |
-| `decompress/level_6_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.278 |
-| `decompress/level_6_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.917 |
-| `decompress/level_6_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.027 |
+| `decompress/level_6_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.016 |
+| `decompress/level_6_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.451 |
+| `decompress/level_6_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.276 |
+| `decompress/level_6_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.909 |
+| `decompress/level_6_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.035 |
 | `decompress/level_6_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
 | `decompress/level_6_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.027 |
 | `decompress/level_6_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_6_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.656 |
-| `decompress/level_6_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.395 |
-| `decompress/level_6_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.434 |
-| `decompress/level_6_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.413 |
-| `decompress/level_6_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.188 |
+| `decompress/level_6_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.651 |
+| `decompress/level_6_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.393 |
+| `decompress/level_6_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.430 |
+| `decompress/level_6_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.405 |
+| `decompress/level_6_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.187 |
 | `decompress/level_6_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.025 |
-| `decompress/level_6_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.094 |
+| `decompress/level_6_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.092 |
 | `decompress/level_6_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
 | `decompress/level_6_lazy/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_6_lazy/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
@@ -5405,21 +5405,21 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_6_lazy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_6_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_6_lazy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_7_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.007 |
-| `decompress/level_7_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.442 |
-| `decompress/level_7_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.245 |
-| `decompress/level_7_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.858 |
-| `decompress/level_7_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.027 |
+| `decompress/level_7_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.004 |
+| `decompress/level_7_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.435 |
+| `decompress/level_7_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.244 |
+| `decompress/level_7_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.849 |
+| `decompress/level_7_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.026 |
 | `decompress/level_7_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_7_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.027 |
-| `decompress/level_7_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_7_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.655 |
-| `decompress/level_7_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.398 |
-| `decompress/level_7_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.434 |
-| `decompress/level_7_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.413 |
-| `decompress/level_7_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.188 |
+| `decompress/level_7_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.026 |
+| `decompress/level_7_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.035 |
+| `decompress/level_7_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.651 |
+| `decompress/level_7_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.393 |
+| `decompress/level_7_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.435 |
+| `decompress/level_7_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.404 |
+| `decompress/level_7_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.187 |
 | `decompress/level_7_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.025 |
-| `decompress/level_7_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.094 |
+| `decompress/level_7_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.093 |
 | `decompress/level_7_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
 | `decompress/level_7_lazy/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_7_lazy/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
@@ -5433,19 +5433,19 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_7_lazy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_7_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_7_lazy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_8_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.996 |
-| `decompress/level_8_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.417 |
-| `decompress/level_8_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.202 |
-| `decompress/level_8_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.774 |
-| `decompress/level_8_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.027 |
+| `decompress/level_8_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.992 |
+| `decompress/level_8_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.411 |
+| `decompress/level_8_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.199 |
+| `decompress/level_8_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.764 |
+| `decompress/level_8_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.026 |
 | `decompress/level_8_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_8_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.027 |
-| `decompress/level_8_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_8_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.669 |
-| `decompress/level_8_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.436 |
-| `decompress/level_8_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.433 |
-| `decompress/level_8_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.413 |
-| `decompress/level_8_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.188 |
+| `decompress/level_8_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.026 |
+| `decompress/level_8_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.035 |
+| `decompress/level_8_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.661 |
+| `decompress/level_8_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.447 |
+| `decompress/level_8_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.435 |
+| `decompress/level_8_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.404 |
+| `decompress/level_8_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.187 |
 | `decompress/level_8_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.025 |
 | `decompress/level_8_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.093 |
 | `decompress/level_8_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
@@ -5461,21 +5461,21 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_8_lazy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_8_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_8_lazy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_9_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.000 |
-| `decompress/level_9_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.425 |
-| `decompress/level_9_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.202 |
-| `decompress/level_9_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.774 |
-| `decompress/level_9_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.027 |
+| `decompress/level_9_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.997 |
+| `decompress/level_9_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.419 |
+| `decompress/level_9_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.200 |
+| `decompress/level_9_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.759 |
+| `decompress/level_9_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.026 |
 | `decompress/level_9_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_9_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.027 |
-| `decompress/level_9_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_9_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.669 |
-| `decompress/level_9_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.441 |
-| `decompress/level_9_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.438 |
-| `decompress/level_9_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.413 |
-| `decompress/level_9_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.188 |
+| `decompress/level_9_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.026 |
+| `decompress/level_9_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.035 |
+| `decompress/level_9_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.661 |
+| `decompress/level_9_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.447 |
+| `decompress/level_9_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.434 |
+| `decompress/level_9_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.407 |
+| `decompress/level_9_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.187 |
 | `decompress/level_9_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.025 |
-| `decompress/level_9_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.094 |
+| `decompress/level_9_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.092 |
 | `decompress/level_9_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
 | `decompress/level_9_lazy/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_9_lazy/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
@@ -5489,12 +5489,12 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_9_lazy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_9_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_9_lazy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `dict-train/na/decodecorpus-z000033/matrix/c_ffi` | 30.869 |
-| `dict-train/na/decodecorpus-z000033/matrix/pure_rust` | 7.997 |
-| `dict-train/na/small-10k-random/matrix/c_ffi` | 0.909 |
+| `dict-train/na/decodecorpus-z000033/matrix/c_ffi` | 30.184 |
+| `dict-train/na/decodecorpus-z000033/matrix/pure_rust` | 7.865 |
+| `dict-train/na/small-10k-random/matrix/c_ffi` | 1.054 |
 | `dict-train/na/small-10k-random/matrix/pure_rust` | 0.248 |
 | `dict-train/na/small-4k-log-lines/matrix/c_ffi` | 0.252 |
-| `dict-train/na/small-4k-log-lines/matrix/pure_rust` | 0.162 |
+| `dict-train/na/small-4k-log-lines/matrix/pure_rust` | 0.160 |
 
 ## Strategy group: lazy-upper
 
@@ -5656,195 +5656,195 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 
 | Scenario | Label | Level | Dict bytes | Train ms | C bytes (no dict) | C bytes (with dict) | C ratio (no dict) | C ratio (with dict) |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| decodecorpus-z000033 | Repo decode corpus sample | level_11_lazy | 16384 | 30.471 | 483348 | 458380 | 0.4729 | 0.4485 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_12_lazy | 16384 | 30.471 | 483348 | 458085 | 0.4729 | 0.4482 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_13_lazy | 16384 | 30.471 | 482849 | 452252 | 0.4724 | 0.4425 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_14_lazy | 16384 | 30.471 | 482463 | 430814 | 0.4721 | 0.4215 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_15_lazy | 16384 | 30.471 | 482283 | 430274 | 0.4719 | 0.4210 |
-| small-10k-random | Small random payload (10 KiB) | level_11_lazy | 1280 | 1.170 | 10250 | 9215 | 1.0010 | 0.8999 |
-| small-10k-random | Small random payload (10 KiB) | level_12_lazy | 1280 | 1.170 | 10250 | 9216 | 1.0010 | 0.9000 |
-| small-10k-random | Small random payload (10 KiB) | level_13_lazy | 1280 | 1.170 | 10250 | 9226 | 1.0010 | 0.9010 |
-| small-10k-random | Small random payload (10 KiB) | level_14_lazy | 1280 | 1.170 | 10250 | 9226 | 1.0010 | 0.9010 |
-| small-10k-random | Small random payload (10 KiB) | level_15_lazy | 1280 | 1.170 | 10250 | 9226 | 1.0010 | 0.9010 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_11_lazy | 437 | 0.376 | 150 | 46 | 0.0366 | 0.0112 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_12_lazy | 437 | 0.376 | 150 | 46 | 0.0366 | 0.0112 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_13_lazy | 437 | 0.376 | 146 | 47 | 0.0356 | 0.0115 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_14_lazy | 437 | 0.376 | 146 | 44 | 0.0356 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_15_lazy | 437 | 0.376 | 146 | 44 | 0.0356 | 0.0107 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_11_lazy | 16384 | 17.094 | 483348 | 458380 | 0.4729 | 0.4485 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_12_lazy | 16384 | 17.094 | 483348 | 458085 | 0.4729 | 0.4482 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_13_lazy | 16384 | 17.094 | 482849 | 452252 | 0.4724 | 0.4425 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_14_lazy | 16384 | 17.094 | 482463 | 430814 | 0.4721 | 0.4215 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_15_lazy | 16384 | 17.094 | 482283 | 430274 | 0.4719 | 0.4210 |
+| small-10k-random | Small random payload (10 KiB) | level_11_lazy | 1280 | 0.654 | 10250 | 9215 | 1.0010 | 0.8999 |
+| small-10k-random | Small random payload (10 KiB) | level_12_lazy | 1280 | 0.654 | 10250 | 9216 | 1.0010 | 0.9000 |
+| small-10k-random | Small random payload (10 KiB) | level_13_lazy | 1280 | 0.654 | 10250 | 9226 | 1.0010 | 0.9010 |
+| small-10k-random | Small random payload (10 KiB) | level_14_lazy | 1280 | 0.654 | 10250 | 9226 | 1.0010 | 0.9010 |
+| small-10k-random | Small random payload (10 KiB) | level_15_lazy | 1280 | 0.654 | 10250 | 9226 | 1.0010 | 0.9010 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_11_lazy | 437 | 0.254 | 150 | 46 | 0.0366 | 0.0112 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_12_lazy | 437 | 0.254 | 150 | 46 | 0.0366 | 0.0112 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_13_lazy | 437 | 0.254 | 146 | 47 | 0.0356 | 0.0115 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_14_lazy | 437 | 0.254 | 146 | 44 | 0.0356 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_15_lazy | 437 | 0.254 | 146 | 44 | 0.0356 | 0.0107 |
 
 ## Dictionary Training (Rust FastCOVER vs C FFI)
 
 | Scenario | Label | Dict bytes (requested) | Rust train ms | C train ms | Rust dict bytes | C dict bytes | Rust FastCOVER score | Delta (C/Rust) | Status |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| decodecorpus-z000033 | Repo decode corpus sample | 16384 | 9.151 | 30.471 | 16384 | 16384 | 0 | 3.3298 | rust_faster |
-| small-10k-random | Small random payload (10 KiB) | 1280 | 0.264 | 1.170 | 1280 | 1280 | 0 | 4.4318 | rust_faster |
-| small-4k-log-lines | Small structured log lines (4 KiB) | 512 | 0.358 | 0.376 | 512 | 437 | 0 | 1.0503 | rust_faster |
+| decodecorpus-z000033 | Repo decode corpus sample | 16384 | 4.701 | 17.094 | 16384 | 16384 | 0 | 3.6362 | rust_faster |
+| small-10k-random | Small random payload (10 KiB) | 1280 | 0.187 | 0.654 | 1280 | 1280 | 0 | 3.4973 | rust_faster |
+| small-4k-log-lines | Small structured log lines (4 KiB) | 512 | 0.180 | 0.254 | 512 | 437 | 0 | 1.4111 | rust_faster |
 
 ## Timing Metrics
 
 | Benchmark | ms/iter |
 | --- | ---: |
-| `compress-dict/level_11_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 37.520 |
-| `compress-dict/level_11_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 19.753 |
-| `compress-dict/level_11_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 45.193 |
-| `compress-dict/level_11_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.233 |
-| `compress-dict/level_11_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.164 |
-| `compress-dict/level_11_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.288 |
-| `compress-dict/level_11_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.008 |
-| `compress-dict/level_11_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.016 |
-| `compress-dict/level_11_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.004 |
-| `compress-dict/level_12_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 39.281 |
-| `compress-dict/level_12_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 19.706 |
-| `compress-dict/level_12_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 48.716 |
-| `compress-dict/level_12_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.273 |
-| `compress-dict/level_12_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.203 |
-| `compress-dict/level_12_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.298 |
-| `compress-dict/level_12_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.009 |
-| `compress-dict/level_12_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.019 |
-| `compress-dict/level_12_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.004 |
-| `compress-dict/level_13_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 52.802 |
-| `compress-dict/level_13_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 28.671 |
-| `compress-dict/level_13_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 64.910 |
-| `compress-dict/level_13_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.236 |
-| `compress-dict/level_13_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.206 |
-| `compress-dict/level_13_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.547 |
-| `compress-dict/level_13_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.010 |
-| `compress-dict/level_13_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.026 |
-| `compress-dict/level_13_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.008 |
-| `compress-dict/level_14_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 75.425 |
-| `compress-dict/level_14_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 31.297 |
-| `compress-dict/level_14_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 65.246 |
-| `compress-dict/level_14_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.399 |
-| `compress-dict/level_14_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.201 |
-| `compress-dict/level_14_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.548 |
-| `compress-dict/level_14_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.066 |
-| `compress-dict/level_14_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.049 |
-| `compress-dict/level_14_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.009 |
-| `compress-dict/level_15_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 79.267 |
-| `compress-dict/level_15_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 32.491 |
-| `compress-dict/level_15_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 65.281 |
-| `compress-dict/level_15_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.395 |
-| `compress-dict/level_15_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.200 |
-| `compress-dict/level_15_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.547 |
-| `compress-dict/level_15_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.066 |
-| `compress-dict/level_15_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.049 |
-| `compress-dict/level_15_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.008 |
-| `compress/level_11_lazy/decodecorpus-z000033/matrix/c_ffi` | 18.754 |
-| `compress/level_11_lazy/decodecorpus-z000033/matrix/pure_rust` | 43.942 |
-| `compress/level_11_lazy/high-entropy-1m/matrix/c_ffi` | 0.693 |
-| `compress/level_11_lazy/high-entropy-1m/matrix/pure_rust` | 0.758 |
-| `compress/level_11_lazy/large-log-stream/matrix/c_ffi` | 11.340 |
-| `compress/level_11_lazy/large-log-stream/matrix/pure_rust` | 14.456 |
-| `compress/level_11_lazy/low-entropy-1m/matrix/c_ffi` | 1.023 |
-| `compress/level_11_lazy/low-entropy-1m/matrix/pure_rust` | 0.896 |
-| `compress/level_11_lazy/small-10k-random/matrix/c_ffi` | 0.166 |
-| `compress/level_11_lazy/small-10k-random/matrix/pure_rust` | 0.014 |
-| `compress/level_11_lazy/small-1k-random/matrix/c_ffi` | 0.020 |
-| `compress/level_11_lazy/small-1k-random/matrix/pure_rust` | 0.002 |
-| `compress/level_11_lazy/small-4k-log-lines/matrix/c_ffi` | 0.018 |
-| `compress/level_11_lazy/small-4k-log-lines/matrix/pure_rust` | 0.013 |
-| `compress/level_12_lazy/decodecorpus-z000033/matrix/c_ffi` | 18.650 |
-| `compress/level_12_lazy/decodecorpus-z000033/matrix/pure_rust` | 47.089 |
-| `compress/level_12_lazy/high-entropy-1m/matrix/c_ffi` | 0.728 |
-| `compress/level_12_lazy/high-entropy-1m/matrix/pure_rust` | 0.762 |
-| `compress/level_12_lazy/large-log-stream/matrix/c_ffi` | 14.791 |
-| `compress/level_12_lazy/large-log-stream/matrix/pure_rust` | 15.008 |
-| `compress/level_12_lazy/low-entropy-1m/matrix/c_ffi` | 1.019 |
-| `compress/level_12_lazy/low-entropy-1m/matrix/pure_rust` | 0.896 |
-| `compress/level_12_lazy/small-10k-random/matrix/c_ffi` | 0.204 |
-| `compress/level_12_lazy/small-10k-random/matrix/pure_rust` | 0.014 |
-| `compress/level_12_lazy/small-1k-random/matrix/c_ffi` | 0.023 |
-| `compress/level_12_lazy/small-1k-random/matrix/pure_rust` | 0.002 |
-| `compress/level_12_lazy/small-4k-log-lines/matrix/c_ffi` | 0.020 |
-| `compress/level_12_lazy/small-4k-log-lines/matrix/pure_rust` | 0.014 |
-| `compress/level_13_lazy/decodecorpus-z000033/matrix/c_ffi` | 29.438 |
-| `compress/level_13_lazy/decodecorpus-z000033/matrix/pure_rust` | 58.698 |
-| `compress/level_13_lazy/high-entropy-1m/matrix/c_ffi` | 3.475 |
-| `compress/level_13_lazy/high-entropy-1m/matrix/pure_rust` | 2.741 |
-| `compress/level_13_lazy/large-log-stream/matrix/c_ffi` | 194.346 |
-| `compress/level_13_lazy/large-log-stream/matrix/pure_rust` | 18.797 |
-| `compress/level_13_lazy/low-entropy-1m/matrix/c_ffi` | 2.913 |
-| `compress/level_13_lazy/low-entropy-1m/matrix/pure_rust` | 1.414 |
-| `compress/level_13_lazy/small-10k-random/matrix/c_ffi` | 0.207 |
-| `compress/level_13_lazy/small-10k-random/matrix/pure_rust` | 0.026 |
-| `compress/level_13_lazy/small-1k-random/matrix/c_ffi` | 0.023 |
-| `compress/level_13_lazy/small-1k-random/matrix/pure_rust` | 0.004 |
-| `compress/level_13_lazy/small-4k-log-lines/matrix/c_ffi` | 0.027 |
-| `compress/level_13_lazy/small-4k-log-lines/matrix/pure_rust` | 0.021 |
-| `compress/level_14_lazy/decodecorpus-z000033/matrix/c_ffi` | 35.111 |
-| `compress/level_14_lazy/decodecorpus-z000033/matrix/pure_rust` | 59.476 |
-| `compress/level_14_lazy/high-entropy-1m/matrix/c_ffi` | 3.388 |
-| `compress/level_14_lazy/high-entropy-1m/matrix/pure_rust` | 2.558 |
-| `compress/level_14_lazy/large-log-stream/matrix/c_ffi` | 422.104 |
-| `compress/level_14_lazy/large-log-stream/matrix/pure_rust` | 21.193 |
-| `compress/level_14_lazy/low-entropy-1m/matrix/c_ffi` | 2.916 |
-| `compress/level_14_lazy/low-entropy-1m/matrix/pure_rust` | 1.418 |
-| `compress/level_14_lazy/small-10k-random/matrix/c_ffi` | 0.202 |
-| `compress/level_14_lazy/small-10k-random/matrix/pure_rust` | 0.026 |
-| `compress/level_14_lazy/small-1k-random/matrix/c_ffi` | 0.023 |
-| `compress/level_14_lazy/small-1k-random/matrix/pure_rust` | 0.004 |
-| `compress/level_14_lazy/small-4k-log-lines/matrix/c_ffi` | 0.051 |
-| `compress/level_14_lazy/small-4k-log-lines/matrix/pure_rust` | 0.021 |
-| `compress/level_15_lazy/decodecorpus-z000033/matrix/c_ffi` | 33.370 |
-| `compress/level_15_lazy/decodecorpus-z000033/matrix/pure_rust` | 65.604 |
-| `compress/level_15_lazy/high-entropy-1m/matrix/c_ffi` | 3.292 |
-| `compress/level_15_lazy/high-entropy-1m/matrix/pure_rust` | 2.555 |
-| `compress/level_15_lazy/large-log-stream/matrix/c_ffi` | 1282.351 |
-| `compress/level_15_lazy/large-log-stream/matrix/pure_rust` | 21.967 |
-| `compress/level_15_lazy/low-entropy-1m/matrix/c_ffi` | 2.929 |
-| `compress/level_15_lazy/low-entropy-1m/matrix/pure_rust` | 1.416 |
-| `compress/level_15_lazy/small-10k-random/matrix/c_ffi` | 0.203 |
-| `compress/level_15_lazy/small-10k-random/matrix/pure_rust` | 0.026 |
-| `compress/level_15_lazy/small-1k-random/matrix/c_ffi` | 0.023 |
-| `compress/level_15_lazy/small-1k-random/matrix/pure_rust` | 0.004 |
-| `compress/level_15_lazy/small-4k-log-lines/matrix/c_ffi` | 0.051 |
-| `compress/level_15_lazy/small-4k-log-lines/matrix/pure_rust` | 0.021 |
-| `decompress-dict/level_11_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.258 |
-| `decompress-dict/level_11_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.190 |
-| `decompress-dict/level_11_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
+| `compress-dict/level_11_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 24.141 |
+| `compress-dict/level_11_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 11.453 |
+| `compress-dict/level_11_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 24.209 |
+| `compress-dict/level_11_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.144 |
+| `compress-dict/level_11_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.102 |
+| `compress-dict/level_11_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.180 |
+| `compress-dict/level_11_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.005 |
+| `compress-dict/level_11_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.010 |
+| `compress-dict/level_11_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.002 |
+| `compress-dict/level_12_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 25.642 |
+| `compress-dict/level_12_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 11.438 |
+| `compress-dict/level_12_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 26.655 |
+| `compress-dict/level_12_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.191 |
+| `compress-dict/level_12_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.126 |
+| `compress-dict/level_12_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.178 |
+| `compress-dict/level_12_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.005 |
+| `compress-dict/level_12_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.011 |
+| `compress-dict/level_12_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.002 |
+| `compress-dict/level_13_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 32.879 |
+| `compress-dict/level_13_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 17.161 |
+| `compress-dict/level_13_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 38.282 |
+| `compress-dict/level_13_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.165 |
+| `compress-dict/level_13_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.127 |
+| `compress-dict/level_13_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.319 |
+| `compress-dict/level_13_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.006 |
+| `compress-dict/level_13_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.015 |
+| `compress-dict/level_13_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.005 |
+| `compress-dict/level_14_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 46.615 |
+| `compress-dict/level_14_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 18.350 |
+| `compress-dict/level_14_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 38.590 |
+| `compress-dict/level_14_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.242 |
+| `compress-dict/level_14_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.123 |
+| `compress-dict/level_14_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.320 |
+| `compress-dict/level_14_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.035 |
+| `compress-dict/level_14_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.027 |
+| `compress-dict/level_14_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.005 |
+| `compress-dict/level_15_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 49.034 |
+| `compress-dict/level_15_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 18.898 |
+| `compress-dict/level_15_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 38.480 |
+| `compress-dict/level_15_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.243 |
+| `compress-dict/level_15_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.122 |
+| `compress-dict/level_15_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.319 |
+| `compress-dict/level_15_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.035 |
+| `compress-dict/level_15_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.027 |
+| `compress-dict/level_15_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.005 |
+| `compress/level_11_lazy/decodecorpus-z000033/matrix/c_ffi` | 10.353 |
+| `compress/level_11_lazy/decodecorpus-z000033/matrix/pure_rust` | 23.426 |
+| `compress/level_11_lazy/high-entropy-1m/matrix/c_ffi` | 0.309 |
+| `compress/level_11_lazy/high-entropy-1m/matrix/pure_rust` | 0.361 |
+| `compress/level_11_lazy/large-log-stream/matrix/c_ffi` | 4.407 |
+| `compress/level_11_lazy/large-log-stream/matrix/pure_rust` | 6.712 |
+| `compress/level_11_lazy/low-entropy-1m/matrix/c_ffi` | 0.422 |
+| `compress/level_11_lazy/low-entropy-1m/matrix/pure_rust` | 0.418 |
+| `compress/level_11_lazy/small-10k-random/matrix/c_ffi` | 0.103 |
+| `compress/level_11_lazy/small-10k-random/matrix/pure_rust` | 0.007 |
+| `compress/level_11_lazy/small-1k-random/matrix/c_ffi` | 0.011 |
+| `compress/level_11_lazy/small-1k-random/matrix/pure_rust` | 0.001 |
+| `compress/level_11_lazy/small-4k-log-lines/matrix/c_ffi` | 0.010 |
+| `compress/level_11_lazy/small-4k-log-lines/matrix/pure_rust` | 0.008 |
+| `compress/level_12_lazy/decodecorpus-z000033/matrix/c_ffi` | 10.439 |
+| `compress/level_12_lazy/decodecorpus-z000033/matrix/pure_rust` | 25.043 |
+| `compress/level_12_lazy/high-entropy-1m/matrix/c_ffi` | 0.307 |
+| `compress/level_12_lazy/high-entropy-1m/matrix/pure_rust` | 0.359 |
+| `compress/level_12_lazy/large-log-stream/matrix/c_ffi` | 6.281 |
+| `compress/level_12_lazy/large-log-stream/matrix/pure_rust` | 6.640 |
+| `compress/level_12_lazy/low-entropy-1m/matrix/c_ffi` | 0.421 |
+| `compress/level_12_lazy/low-entropy-1m/matrix/pure_rust` | 0.418 |
+| `compress/level_12_lazy/small-10k-random/matrix/c_ffi` | 0.123 |
+| `compress/level_12_lazy/small-10k-random/matrix/pure_rust` | 0.007 |
+| `compress/level_12_lazy/small-1k-random/matrix/c_ffi` | 0.013 |
+| `compress/level_12_lazy/small-1k-random/matrix/pure_rust` | 0.001 |
+| `compress/level_12_lazy/small-4k-log-lines/matrix/c_ffi` | 0.011 |
+| `compress/level_12_lazy/small-4k-log-lines/matrix/pure_rust` | 0.008 |
+| `compress/level_13_lazy/decodecorpus-z000033/matrix/c_ffi` | 16.771 |
+| `compress/level_13_lazy/decodecorpus-z000033/matrix/pure_rust` | 33.474 |
+| `compress/level_13_lazy/high-entropy-1m/matrix/c_ffi` | 1.579 |
+| `compress/level_13_lazy/high-entropy-1m/matrix/pure_rust` | 1.364 |
+| `compress/level_13_lazy/large-log-stream/matrix/c_ffi` | 72.491 |
+| `compress/level_13_lazy/large-log-stream/matrix/pure_rust` | 8.626 |
+| `compress/level_13_lazy/low-entropy-1m/matrix/c_ffi` | 1.242 |
+| `compress/level_13_lazy/low-entropy-1m/matrix/pure_rust` | 0.671 |
+| `compress/level_13_lazy/small-10k-random/matrix/c_ffi` | 0.126 |
+| `compress/level_13_lazy/small-10k-random/matrix/pure_rust` | 0.013 |
+| `compress/level_13_lazy/small-1k-random/matrix/c_ffi` | 0.013 |
+| `compress/level_13_lazy/small-1k-random/matrix/pure_rust` | 0.002 |
+| `compress/level_13_lazy/small-4k-log-lines/matrix/c_ffi` | 0.015 |
+| `compress/level_13_lazy/small-4k-log-lines/matrix/pure_rust` | 0.012 |
+| `compress/level_14_lazy/decodecorpus-z000033/matrix/c_ffi` | 17.807 |
+| `compress/level_14_lazy/decodecorpus-z000033/matrix/pure_rust` | 32.262 |
+| `compress/level_14_lazy/high-entropy-1m/matrix/c_ffi` | 1.636 |
+| `compress/level_14_lazy/high-entropy-1m/matrix/pure_rust` | 1.344 |
+| `compress/level_14_lazy/large-log-stream/matrix/c_ffi` | 157.785 |
+| `compress/level_14_lazy/large-log-stream/matrix/pure_rust` | 10.242 |
+| `compress/level_14_lazy/low-entropy-1m/matrix/c_ffi` | 1.236 |
+| `compress/level_14_lazy/low-entropy-1m/matrix/pure_rust` | 0.673 |
+| `compress/level_14_lazy/small-10k-random/matrix/c_ffi` | 0.126 |
+| `compress/level_14_lazy/small-10k-random/matrix/pure_rust` | 0.013 |
+| `compress/level_14_lazy/small-1k-random/matrix/c_ffi` | 0.013 |
+| `compress/level_14_lazy/small-1k-random/matrix/pure_rust` | 0.002 |
+| `compress/level_14_lazy/small-4k-log-lines/matrix/c_ffi` | 0.028 |
+| `compress/level_14_lazy/small-4k-log-lines/matrix/pure_rust` | 0.012 |
+| `compress/level_15_lazy/decodecorpus-z000033/matrix/c_ffi` | 18.496 |
+| `compress/level_15_lazy/decodecorpus-z000033/matrix/pure_rust` | 32.153 |
+| `compress/level_15_lazy/high-entropy-1m/matrix/c_ffi` | 1.622 |
+| `compress/level_15_lazy/high-entropy-1m/matrix/pure_rust` | 1.338 |
+| `compress/level_15_lazy/large-log-stream/matrix/c_ffi` | 474.612 |
+| `compress/level_15_lazy/large-log-stream/matrix/pure_rust` | 11.076 |
+| `compress/level_15_lazy/low-entropy-1m/matrix/c_ffi` | 1.236 |
+| `compress/level_15_lazy/low-entropy-1m/matrix/pure_rust` | 0.670 |
+| `compress/level_15_lazy/small-10k-random/matrix/c_ffi` | 0.123 |
+| `compress/level_15_lazy/small-10k-random/matrix/pure_rust` | 0.013 |
+| `compress/level_15_lazy/small-1k-random/matrix/c_ffi` | 0.013 |
+| `compress/level_15_lazy/small-1k-random/matrix/pure_rust` | 0.002 |
+| `compress/level_15_lazy/small-4k-log-lines/matrix/c_ffi` | 0.028 |
+| `compress/level_15_lazy/small-4k-log-lines/matrix/pure_rust` | 0.012 |
+| `decompress-dict/level_11_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.735 |
+| `decompress-dict/level_11_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 1.312 |
+| `decompress-dict/level_11_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_11_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
 | `decompress-dict/level_11_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_11_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress-dict/level_12_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.260 |
-| `decompress-dict/level_12_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.181 |
-| `decompress-dict/level_12_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.002 |
+| `decompress-dict/level_12_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.733 |
+| `decompress-dict/level_12_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 1.310 |
+| `decompress-dict/level_12_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_12_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
 | `decompress-dict/level_12_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_12_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress-dict/level_13_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.376 |
-| `decompress-dict/level_13_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.309 |
-| `decompress-dict/level_13_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
+| `decompress-dict/level_13_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.799 |
+| `decompress-dict/level_13_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 1.380 |
+| `decompress-dict/level_13_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_13_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
 | `decompress-dict/level_13_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
-| `decompress-dict/level_13_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_14_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.571 |
-| `decompress-dict/level_14_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.676 |
-| `decompress-dict/level_14_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
+| `decompress-dict/level_13_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
+| `decompress-dict/level_14_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.895 |
+| `decompress-dict/level_14_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 1.616 |
+| `decompress-dict/level_14_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_14_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
 | `decompress-dict/level_14_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_14_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress-dict/level_15_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.560 |
-| `decompress-dict/level_15_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.658 |
-| `decompress-dict/level_15_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
+| `decompress-dict/level_15_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.913 |
+| `decompress-dict/level_15_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 1.596 |
+| `decompress-dict/level_15_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_15_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
 | `decompress-dict/level_15_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_15_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress/level_11_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.937 |
-| `decompress/level_11_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.411 |
-| `decompress/level_11_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.135 |
-| `decompress/level_11_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.824 |
-| `decompress/level_11_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.032 |
-| `decompress/level_11_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.032 |
-| `decompress/level_11_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.031 |
-| `decompress/level_11_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.032 |
-| `decompress/level_11_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.574 |
-| `decompress/level_11_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.528 |
-| `decompress/level_11_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.482 |
-| `decompress/level_11_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.520 |
-| `decompress/level_11_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.167 |
-| `decompress/level_11_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
-| `decompress/level_11_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.100 |
-| `decompress/level_11_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.030 |
+| `decompress/level_11_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.547 |
+| `decompress/level_11_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.819 |
+| `decompress/level_11_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.677 |
+| `decompress/level_11_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.085 |
+| `decompress/level_11_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.014 |
+| `decompress/level_11_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.014 |
+| `decompress/level_11_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.014 |
+| `decompress/level_11_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.014 |
+| `decompress/level_11_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.304 |
+| `decompress/level_11_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.205 |
+| `decompress/level_11_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.265 |
+| `decompress/level_11_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.186 |
+| `decompress/level_11_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.075 |
+| `decompress/level_11_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.010 |
+| `decompress/level_11_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.044 |
+| `decompress/level_11_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.010 |
 | `decompress/level_11_lazy/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_11_lazy/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_11_lazy/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -5853,26 +5853,26 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_11_lazy/small-1k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_11_lazy/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_11_lazy/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_11_lazy/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.002 |
-| `decompress/level_11_lazy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_11_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
-| `decompress/level_11_lazy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_12_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.935 |
-| `decompress/level_12_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.408 |
-| `decompress/level_12_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.136 |
-| `decompress/level_12_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.825 |
-| `decompress/level_12_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.032 |
-| `decompress/level_12_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.032 |
-| `decompress/level_12_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.032 |
-| `decompress/level_12_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.032 |
-| `decompress/level_12_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.574 |
-| `decompress/level_12_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.529 |
-| `decompress/level_12_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.488 |
-| `decompress/level_12_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.527 |
-| `decompress/level_12_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.167 |
-| `decompress/level_12_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
-| `decompress/level_12_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.100 |
-| `decompress/level_12_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_11_lazy/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.001 |
+| `decompress/level_11_lazy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.001 |
+| `decompress/level_11_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.001 |
+| `decompress/level_11_lazy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.001 |
+| `decompress/level_12_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.551 |
+| `decompress/level_12_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.820 |
+| `decompress/level_12_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.676 |
+| `decompress/level_12_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.078 |
+| `decompress/level_12_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.014 |
+| `decompress/level_12_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.014 |
+| `decompress/level_12_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.014 |
+| `decompress/level_12_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.014 |
+| `decompress/level_12_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.305 |
+| `decompress/level_12_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.206 |
+| `decompress/level_12_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.267 |
+| `decompress/level_12_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.187 |
+| `decompress/level_12_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.075 |
+| `decompress/level_12_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.010 |
+| `decompress/level_12_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.045 |
+| `decompress/level_12_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.010 |
 | `decompress/level_12_lazy/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_12_lazy/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_12_lazy/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -5881,26 +5881,26 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_12_lazy/small-1k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_12_lazy/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_12_lazy/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_12_lazy/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.002 |
-| `decompress/level_12_lazy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_12_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
-| `decompress/level_12_lazy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_13_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.934 |
-| `decompress/level_13_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.414 |
-| `decompress/level_13_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.233 |
-| `decompress/level_13_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.949 |
-| `decompress/level_13_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.032 |
-| `decompress/level_13_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.032 |
-| `decompress/level_13_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.032 |
-| `decompress/level_13_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.032 |
-| `decompress/level_13_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.573 |
-| `decompress/level_13_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.549 |
-| `decompress/level_13_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.566 |
-| `decompress/level_13_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.497 |
-| `decompress/level_13_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.167 |
-| `decompress/level_13_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
-| `decompress/level_13_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.167 |
-| `decompress/level_13_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_12_lazy/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.001 |
+| `decompress/level_12_lazy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.001 |
+| `decompress/level_12_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.001 |
+| `decompress/level_12_lazy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.001 |
+| `decompress/level_13_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.554 |
+| `decompress/level_13_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.826 |
+| `decompress/level_13_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.743 |
+| `decompress/level_13_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.157 |
+| `decompress/level_13_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.014 |
+| `decompress/level_13_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.014 |
+| `decompress/level_13_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.014 |
+| `decompress/level_13_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.014 |
+| `decompress/level_13_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.304 |
+| `decompress/level_13_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.205 |
+| `decompress/level_13_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.299 |
+| `decompress/level_13_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.177 |
+| `decompress/level_13_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.075 |
+| `decompress/level_13_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.010 |
+| `decompress/level_13_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.075 |
+| `decompress/level_13_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.010 |
 | `decompress/level_13_lazy/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_13_lazy/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_13_lazy/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -5909,26 +5909,26 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_13_lazy/small-1k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_13_lazy/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_13_lazy/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_13_lazy/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.002 |
-| `decompress/level_13_lazy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_13_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
-| `decompress/level_13_lazy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_14_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.927 |
-| `decompress/level_14_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.402 |
-| `decompress/level_14_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.231 |
-| `decompress/level_14_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.948 |
-| `decompress/level_14_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.032 |
-| `decompress/level_14_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.032 |
-| `decompress/level_14_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.032 |
-| `decompress/level_14_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.032 |
-| `decompress/level_14_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.573 |
-| `decompress/level_14_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.540 |
-| `decompress/level_14_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.565 |
-| `decompress/level_14_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.502 |
-| `decompress/level_14_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.167 |
-| `decompress/level_14_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
-| `decompress/level_14_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.167 |
-| `decompress/level_14_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_13_lazy/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.001 |
+| `decompress/level_13_lazy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.001 |
+| `decompress/level_13_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.001 |
+| `decompress/level_13_lazy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.001 |
+| `decompress/level_14_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.549 |
+| `decompress/level_14_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.818 |
+| `decompress/level_14_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.740 |
+| `decompress/level_14_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.188 |
+| `decompress/level_14_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.014 |
+| `decompress/level_14_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.014 |
+| `decompress/level_14_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.015 |
+| `decompress/level_14_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.014 |
+| `decompress/level_14_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.304 |
+| `decompress/level_14_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.200 |
+| `decompress/level_14_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.300 |
+| `decompress/level_14_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.175 |
+| `decompress/level_14_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.075 |
+| `decompress/level_14_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.010 |
+| `decompress/level_14_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.075 |
+| `decompress/level_14_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.010 |
 | `decompress/level_14_lazy/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_14_lazy/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_14_lazy/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -5937,26 +5937,26 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_14_lazy/small-1k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_14_lazy/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_14_lazy/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_14_lazy/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.002 |
-| `decompress/level_14_lazy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_14_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
-| `decompress/level_14_lazy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_15_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.925 |
-| `decompress/level_15_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.400 |
-| `decompress/level_15_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.230 |
-| `decompress/level_15_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.941 |
-| `decompress/level_15_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.032 |
-| `decompress/level_15_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.032 |
-| `decompress/level_15_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.032 |
-| `decompress/level_15_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.032 |
-| `decompress/level_15_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.574 |
-| `decompress/level_15_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.539 |
-| `decompress/level_15_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.565 |
-| `decompress/level_15_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.492 |
-| `decompress/level_15_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.167 |
-| `decompress/level_15_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
-| `decompress/level_15_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.167 |
-| `decompress/level_15_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_14_lazy/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.001 |
+| `decompress/level_14_lazy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.001 |
+| `decompress/level_14_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.001 |
+| `decompress/level_14_lazy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.001 |
+| `decompress/level_15_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.547 |
+| `decompress/level_15_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.814 |
+| `decompress/level_15_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.738 |
+| `decompress/level_15_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.152 |
+| `decompress/level_15_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.014 |
+| `decompress/level_15_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.014 |
+| `decompress/level_15_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.014 |
+| `decompress/level_15_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.014 |
+| `decompress/level_15_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.303 |
+| `decompress/level_15_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.198 |
+| `decompress/level_15_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.303 |
+| `decompress/level_15_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.175 |
+| `decompress/level_15_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.075 |
+| `decompress/level_15_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.010 |
+| `decompress/level_15_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.075 |
+| `decompress/level_15_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.010 |
 | `decompress/level_15_lazy/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_15_lazy/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_15_lazy/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -5965,16 +5965,16 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_15_lazy/small-1k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_15_lazy/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_15_lazy/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_15_lazy/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.002 |
-| `decompress/level_15_lazy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_15_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
-| `decompress/level_15_lazy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `dict-train/na/decodecorpus-z000033/matrix/c_ffi` | 30.765 |
-| `dict-train/na/decodecorpus-z000033/matrix/pure_rust` | 8.609 |
-| `dict-train/na/small-10k-random/matrix/c_ffi` | 0.958 |
-| `dict-train/na/small-10k-random/matrix/pure_rust` | 0.265 |
-| `dict-train/na/small-4k-log-lines/matrix/c_ffi` | 0.279 |
-| `dict-train/na/small-4k-log-lines/matrix/pure_rust` | 0.168 |
+| `decompress/level_15_lazy/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.001 |
+| `decompress/level_15_lazy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.001 |
+| `decompress/level_15_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.001 |
+| `decompress/level_15_lazy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.001 |
+| `dict-train/na/decodecorpus-z000033/matrix/c_ffi` | 16.989 |
+| `dict-train/na/decodecorpus-z000033/matrix/pure_rust` | 4.554 |
+| `dict-train/na/small-10k-random/matrix/c_ffi` | 0.481 |
+| `dict-train/na/small-10k-random/matrix/pure_rust` | 0.145 |
+| `dict-train/na/small-4k-log-lines/matrix/c_ffi` | 0.139 |
+| `dict-train/na/small-4k-log-lines/matrix/pure_rust` | 0.089 |
 
 ## Target `x86_64-musl`
 
@@ -6128,163 +6128,163 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 
 | Scenario | Label | Level | Dict bytes | Train ms | C bytes (no dict) | C bytes (with dict) | C ratio (no dict) | C ratio (with dict) |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| decodecorpus-z000033 | Repo decode corpus sample | level_16_btopt | 16384 | 45.393 | 460806 | 420487 | 0.4509 | 0.4114 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_17_btopt | 16384 | 45.393 | 444757 | 420480 | 0.4352 | 0.4114 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_1_fast_ldm_dict | 16384 | 45.393 | 571193 | 550048 | 0.5589 | 0.5382 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_22_btultra2_ldm_dict | 16384 | 45.393 | 426278 | 420424 | 0.4171 | 0.4114 |
-| small-10k-random | Small random payload (10 KiB) | level_16_btopt | 1280 | 10.215 | 10250 | 9226 | 1.0010 | 0.9010 |
-| small-10k-random | Small random payload (10 KiB) | level_17_btopt | 1280 | 10.215 | 10250 | 9226 | 1.0010 | 0.9010 |
-| small-10k-random | Small random payload (10 KiB) | level_1_fast_ldm_dict | 1280 | 10.215 | 10250 | 9218 | 1.0010 | 0.9002 |
-| small-10k-random | Small random payload (10 KiB) | level_22_btultra2_ldm_dict | 1280 | 10.215 | 10250 | 9226 | 1.0010 | 0.9010 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_16_btopt | 437 | 2.558 | 146 | 47 | 0.0356 | 0.0115 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_17_btopt | 437 | 2.558 | 146 | 44 | 0.0356 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_1_fast_ldm_dict | 437 | 2.558 | 150 | 44 | 0.0366 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_22_btultra2_ldm_dict | 437 | 2.558 | 146 | 44 | 0.0356 | 0.0107 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_16_btopt | 16384 | 51.755 | 460806 | 420487 | 0.4509 | 0.4114 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_17_btopt | 16384 | 51.755 | 444757 | 420480 | 0.4352 | 0.4114 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_1_fast_ldm_dict | 16384 | 51.755 | 571193 | 550048 | 0.5589 | 0.5382 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_22_btultra2_ldm_dict | 16384 | 51.755 | 426278 | 420424 | 0.4171 | 0.4114 |
+| small-10k-random | Small random payload (10 KiB) | level_16_btopt | 1280 | 11.705 | 10250 | 9226 | 1.0010 | 0.9010 |
+| small-10k-random | Small random payload (10 KiB) | level_17_btopt | 1280 | 11.705 | 10250 | 9226 | 1.0010 | 0.9010 |
+| small-10k-random | Small random payload (10 KiB) | level_1_fast_ldm_dict | 1280 | 11.705 | 10250 | 9218 | 1.0010 | 0.9002 |
+| small-10k-random | Small random payload (10 KiB) | level_22_btultra2_ldm_dict | 1280 | 11.705 | 10250 | 9226 | 1.0010 | 0.9010 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_16_btopt | 437 | 2.567 | 146 | 47 | 0.0356 | 0.0115 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_17_btopt | 437 | 2.567 | 146 | 44 | 0.0356 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_1_fast_ldm_dict | 437 | 2.567 | 150 | 44 | 0.0366 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_22_btultra2_ldm_dict | 437 | 2.567 | 146 | 44 | 0.0356 | 0.0107 |
 
 ## Dictionary Training (Rust FastCOVER vs C FFI)
 
 | Scenario | Label | Dict bytes (requested) | Rust train ms | C train ms | Rust dict bytes | C dict bytes | Rust FastCOVER score | Delta (C/Rust) | Status |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| decodecorpus-z000033 | Repo decode corpus sample | 16384 | 13.307 | 45.393 | 16384 | 16384 | 0 | 3.4112 | rust_faster |
-| small-10k-random | Small random payload (10 KiB) | 1280 | 2.852 | 10.215 | 1280 | 1280 | 0 | 3.5817 | rust_faster |
-| small-4k-log-lines | Small structured log lines (4 KiB) | 512 | 0.953 | 2.558 | 512 | 437 | 0 | 2.6842 | rust_faster |
+| decodecorpus-z000033 | Repo decode corpus sample | 16384 | 11.628 | 51.755 | 16384 | 16384 | 0 | 4.4509 | rust_faster |
+| small-10k-random | Small random payload (10 KiB) | 1280 | 3.242 | 11.705 | 1280 | 1280 | 0 | 3.6104 | rust_faster |
+| small-4k-log-lines | Small structured log lines (4 KiB) | 512 | 1.134 | 2.567 | 512 | 437 | 0 | 2.2637 | rust_faster |
 
 ## Timing Metrics
 
 | Benchmark | ms/iter |
 | --- | ---: |
-| `compress-dict/level_16_btopt/decodecorpus-z000033/matrix/c_ffi_with_dict` | 101.746 |
-| `compress-dict/level_16_btopt/decodecorpus-z000033/matrix/c_ffi_without_dict` | 53.874 |
-| `compress-dict/level_16_btopt/decodecorpus-z000033/matrix/pure_rust_with_dict` | 114.201 |
-| `compress-dict/level_16_btopt/small-10k-random/matrix/c_ffi_with_dict` | 0.238 |
-| `compress-dict/level_16_btopt/small-10k-random/matrix/c_ffi_without_dict` | 0.457 |
-| `compress-dict/level_16_btopt/small-10k-random/matrix/pure_rust_with_dict` | 0.788 |
-| `compress-dict/level_16_btopt/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.021 |
-| `compress-dict/level_16_btopt/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.098 |
-| `compress-dict/level_16_btopt/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.011 |
-| `compress-dict/level_17_btopt/decodecorpus-z000033/matrix/c_ffi_with_dict` | 105.532 |
-| `compress-dict/level_17_btopt/decodecorpus-z000033/matrix/c_ffi_without_dict` | 73.935 |
-| `compress-dict/level_17_btopt/decodecorpus-z000033/matrix/pure_rust_with_dict` | 126.996 |
-| `compress-dict/level_17_btopt/small-10k-random/matrix/c_ffi_with_dict` | 0.350 |
-| `compress-dict/level_17_btopt/small-10k-random/matrix/c_ffi_without_dict` | 0.459 |
-| `compress-dict/level_17_btopt/small-10k-random/matrix/pure_rust_with_dict` | 0.803 |
-| `compress-dict/level_17_btopt/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.053 |
-| `compress-dict/level_17_btopt/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.138 |
-| `compress-dict/level_17_btopt/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.011 |
-| `compress-dict/level_1_fast_ldm_dict/decodecorpus-z000033/matrix/c_ffi_with_dict` | 3.263 |
-| `compress-dict/level_1_fast_ldm_dict/decodecorpus-z000033/matrix/c_ffi_without_dict` | 2.996 |
-| `compress-dict/level_1_fast_ldm_dict/decodecorpus-z000033/matrix/pure_rust_with_dict` | 4.244 |
-| `compress-dict/level_1_fast_ldm_dict/small-10k-random/matrix/c_ffi_with_dict` | 0.019 |
-| `compress-dict/level_1_fast_ldm_dict/small-10k-random/matrix/c_ffi_without_dict` | 0.088 |
-| `compress-dict/level_1_fast_ldm_dict/small-10k-random/matrix/pure_rust_with_dict` | 0.007 |
-| `compress-dict/level_1_fast_ldm_dict/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.003 |
-| `compress-dict/level_1_fast_ldm_dict/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.051 |
-| `compress-dict/level_1_fast_ldm_dict/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `compress-dict/level_22_btultra2_ldm_dict/decodecorpus-z000033/matrix/c_ffi_with_dict` | 157.837 |
-| `compress-dict/level_22_btultra2_ldm_dict/decodecorpus-z000033/matrix/c_ffi_without_dict` | 214.922 |
-| `compress-dict/level_22_btultra2_ldm_dict/decodecorpus-z000033/matrix/pure_rust_with_dict` | 207.573 |
-| `compress-dict/level_22_btultra2_ldm_dict/small-10k-random/matrix/c_ffi_with_dict` | 0.477 |
-| `compress-dict/level_22_btultra2_ldm_dict/small-10k-random/matrix/c_ffi_without_dict` | 0.564 |
-| `compress-dict/level_22_btultra2_ldm_dict/small-10k-random/matrix/pure_rust_with_dict` | 1.154 |
-| `compress-dict/level_22_btultra2_ldm_dict/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.057 |
-| `compress-dict/level_22_btultra2_ldm_dict/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.141 |
-| `compress-dict/level_22_btultra2_ldm_dict/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.030 |
-| `compress/level_16_btopt/decodecorpus-z000033/matrix/c_ffi` | 54.670 |
-| `compress/level_16_btopt/decodecorpus-z000033/matrix/pure_rust` | 114.137 |
-| `compress/level_16_btopt/high-entropy-1m/matrix/c_ffi` | 23.620 |
-| `compress/level_16_btopt/high-entropy-1m/matrix/pure_rust` | 4.937 |
-| `compress/level_16_btopt/large-log-stream/matrix/c_ffi` | 16.974 |
-| `compress/level_16_btopt/large-log-stream/matrix/pure_rust` | 18.095 |
-| `compress/level_16_btopt/low-entropy-1m/matrix/c_ffi` | 1.960 |
-| `compress/level_16_btopt/low-entropy-1m/matrix/pure_rust` | 3.675 |
-| `compress/level_16_btopt/small-10k-random/matrix/c_ffi` | 0.476 |
-| `compress/level_16_btopt/small-10k-random/matrix/pure_rust` | 0.142 |
-| `compress/level_16_btopt/small-1k-random/matrix/c_ffi` | 0.068 |
-| `compress/level_16_btopt/small-1k-random/matrix/pure_rust` | 0.022 |
-| `compress/level_16_btopt/small-4k-log-lines/matrix/c_ffi` | 0.096 |
-| `compress/level_16_btopt/small-4k-log-lines/matrix/pure_rust` | 0.160 |
-| `compress/level_17_btopt/decodecorpus-z000033/matrix/c_ffi` | 70.152 |
-| `compress/level_17_btopt/decodecorpus-z000033/matrix/pure_rust` | 133.580 |
-| `compress/level_17_btopt/high-entropy-1m/matrix/c_ffi` | 23.661 |
-| `compress/level_17_btopt/high-entropy-1m/matrix/pure_rust` | 4.955 |
-| `compress/level_17_btopt/large-log-stream/matrix/c_ffi` | 18.180 |
-| `compress/level_17_btopt/large-log-stream/matrix/pure_rust` | 19.659 |
-| `compress/level_17_btopt/low-entropy-1m/matrix/c_ffi` | 1.867 |
-| `compress/level_17_btopt/low-entropy-1m/matrix/pure_rust` | 3.557 |
-| `compress/level_17_btopt/small-10k-random/matrix/c_ffi` | 0.472 |
-| `compress/level_17_btopt/small-10k-random/matrix/pure_rust` | 0.140 |
-| `compress/level_17_btopt/small-1k-random/matrix/c_ffi` | 0.068 |
-| `compress/level_17_btopt/small-1k-random/matrix/pure_rust` | 0.023 |
-| `compress/level_17_btopt/small-4k-log-lines/matrix/c_ffi` | 0.135 |
-| `compress/level_17_btopt/small-4k-log-lines/matrix/pure_rust` | 0.163 |
-| `compress/level_1_fast_ldm/decodecorpus-z000033/matrix/c_ffi` | 3.599 |
-| `compress/level_1_fast_ldm/decodecorpus-z000033/matrix/pure_rust` | 4.336 |
-| `compress/level_1_fast_ldm/high-entropy-1m/matrix/c_ffi` | 1.897 |
-| `compress/level_1_fast_ldm/high-entropy-1m/matrix/pure_rust` | 0.514 |
-| `compress/level_1_fast_ldm/large-log-stream/matrix/c_ffi` | 17.767 |
-| `compress/level_1_fast_ldm/large-log-stream/matrix/pure_rust` | 1.919 |
-| `compress/level_1_fast_ldm/low-entropy-1m/matrix/c_ffi` | 0.927 |
-| `compress/level_1_fast_ldm/low-entropy-1m/matrix/pure_rust` | 0.181 |
-| `compress/level_1_fast_ldm/small-10k-random/matrix/c_ffi` | 0.104 |
-| `compress/level_1_fast_ldm/small-10k-random/matrix/pure_rust` | 0.013 |
-| `compress/level_1_fast_ldm/small-1k-random/matrix/c_ffi` | 0.034 |
-| `compress/level_1_fast_ldm/small-1k-random/matrix/pure_rust` | 0.001 |
-| `compress/level_1_fast_ldm/small-4k-log-lines/matrix/c_ffi` | 0.052 |
-| `compress/level_1_fast_ldm/small-4k-log-lines/matrix/pure_rust` | 0.039 |
-| `compress/level_22_btultra2_ldm/decodecorpus-z000033/matrix/c_ffi` | 174.230 |
-| `compress/level_22_btultra2_ldm/decodecorpus-z000033/matrix/pure_rust` | 211.908 |
-| `compress/level_22_btultra2_ldm/high-entropy-1m/matrix/c_ffi` | 54.542 |
-| `compress/level_22_btultra2_ldm/high-entropy-1m/matrix/pure_rust` | 6.790 |
-| `compress/level_22_btultra2_ldm/large-log-stream/matrix/c_ffi` | 36.681 |
-| `compress/level_22_btultra2_ldm/large-log-stream/matrix/pure_rust` | 30.252 |
-| `compress/level_22_btultra2_ldm/low-entropy-1m/matrix/c_ffi` | 1.834 |
-| `compress/level_22_btultra2_ldm/low-entropy-1m/matrix/pure_rust` | 2.183 |
-| `compress/level_22_btultra2_ldm/small-10k-random/matrix/c_ffi` | 0.579 |
-| `compress/level_22_btultra2_ldm/small-10k-random/matrix/pure_rust` | 0.221 |
-| `compress/level_22_btultra2_ldm/small-1k-random/matrix/c_ffi` | 0.072 |
-| `compress/level_22_btultra2_ldm/small-1k-random/matrix/pure_rust` | 0.060 |
-| `compress/level_22_btultra2_ldm/small-4k-log-lines/matrix/c_ffi` | 0.142 |
-| `compress/level_22_btultra2_ldm/small-4k-log-lines/matrix/pure_rust` | 0.256 |
-| `decompress-dict/level_16_btopt/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.600 |
-| `decompress-dict/level_16_btopt/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.759 |
+| `compress-dict/level_16_btopt/decodecorpus-z000033/matrix/c_ffi_with_dict` | 135.560 |
+| `compress-dict/level_16_btopt/decodecorpus-z000033/matrix/c_ffi_without_dict` | 58.749 |
+| `compress-dict/level_16_btopt/decodecorpus-z000033/matrix/pure_rust_with_dict` | 140.204 |
+| `compress-dict/level_16_btopt/small-10k-random/matrix/c_ffi_with_dict` | 0.380 |
+| `compress-dict/level_16_btopt/small-10k-random/matrix/c_ffi_without_dict` | 0.629 |
+| `compress-dict/level_16_btopt/small-10k-random/matrix/pure_rust_with_dict` | 0.953 |
+| `compress-dict/level_16_btopt/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.033 |
+| `compress-dict/level_16_btopt/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.118 |
+| `compress-dict/level_16_btopt/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.013 |
+| `compress-dict/level_17_btopt/decodecorpus-z000033/matrix/c_ffi_with_dict` | 142.241 |
+| `compress-dict/level_17_btopt/decodecorpus-z000033/matrix/c_ffi_without_dict` | 75.452 |
+| `compress-dict/level_17_btopt/decodecorpus-z000033/matrix/pure_rust_with_dict` | 155.131 |
+| `compress-dict/level_17_btopt/small-10k-random/matrix/c_ffi_with_dict` | 0.514 |
+| `compress-dict/level_17_btopt/small-10k-random/matrix/c_ffi_without_dict` | 0.629 |
+| `compress-dict/level_17_btopt/small-10k-random/matrix/pure_rust_with_dict` | 0.967 |
+| `compress-dict/level_17_btopt/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.096 |
+| `compress-dict/level_17_btopt/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.189 |
+| `compress-dict/level_17_btopt/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.014 |
+| `compress-dict/level_1_fast_ldm_dict/decodecorpus-z000033/matrix/c_ffi_with_dict` | 3.882 |
+| `compress-dict/level_1_fast_ldm_dict/decodecorpus-z000033/matrix/c_ffi_without_dict` | 3.539 |
+| `compress-dict/level_1_fast_ldm_dict/decodecorpus-z000033/matrix/pure_rust_with_dict` | 5.234 |
+| `compress-dict/level_1_fast_ldm_dict/small-10k-random/matrix/c_ffi_with_dict` | 0.023 |
+| `compress-dict/level_1_fast_ldm_dict/small-10k-random/matrix/c_ffi_without_dict` | 0.101 |
+| `compress-dict/level_1_fast_ldm_dict/small-10k-random/matrix/pure_rust_with_dict` | 0.009 |
+| `compress-dict/level_1_fast_ldm_dict/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.004 |
+| `compress-dict/level_1_fast_ldm_dict/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.060 |
+| `compress-dict/level_1_fast_ldm_dict/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.002 |
+| `compress-dict/level_22_btultra2_ldm_dict/decodecorpus-z000033/matrix/c_ffi_with_dict` | 233.372 |
+| `compress-dict/level_22_btultra2_ldm_dict/decodecorpus-z000033/matrix/c_ffi_without_dict` | 244.854 |
+| `compress-dict/level_22_btultra2_ldm_dict/decodecorpus-z000033/matrix/pure_rust_with_dict` | 262.198 |
+| `compress-dict/level_22_btultra2_ldm_dict/small-10k-random/matrix/c_ffi_with_dict` | 0.640 |
+| `compress-dict/level_22_btultra2_ldm_dict/small-10k-random/matrix/c_ffi_without_dict` | 0.751 |
+| `compress-dict/level_22_btultra2_ldm_dict/small-10k-random/matrix/pure_rust_with_dict` | 1.454 |
+| `compress-dict/level_22_btultra2_ldm_dict/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.101 |
+| `compress-dict/level_22_btultra2_ldm_dict/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.198 |
+| `compress-dict/level_22_btultra2_ldm_dict/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.039 |
+| `compress/level_16_btopt/decodecorpus-z000033/matrix/c_ffi` | 66.323 |
+| `compress/level_16_btopt/decodecorpus-z000033/matrix/pure_rust` | 133.520 |
+| `compress/level_16_btopt/high-entropy-1m/matrix/c_ffi` | 27.382 |
+| `compress/level_16_btopt/high-entropy-1m/matrix/pure_rust` | 5.696 |
+| `compress/level_16_btopt/large-log-stream/matrix/c_ffi` | 19.385 |
+| `compress/level_16_btopt/large-log-stream/matrix/pure_rust` | 20.025 |
+| `compress/level_16_btopt/low-entropy-1m/matrix/c_ffi` | 2.215 |
+| `compress/level_16_btopt/low-entropy-1m/matrix/pure_rust` | 3.907 |
+| `compress/level_16_btopt/small-10k-random/matrix/c_ffi` | 0.644 |
+| `compress/level_16_btopt/small-10k-random/matrix/pure_rust` | 0.159 |
+| `compress/level_16_btopt/small-1k-random/matrix/c_ffi` | 0.084 |
+| `compress/level_16_btopt/small-1k-random/matrix/pure_rust` | 0.027 |
+| `compress/level_16_btopt/small-4k-log-lines/matrix/c_ffi` | 0.118 |
+| `compress/level_16_btopt/small-4k-log-lines/matrix/pure_rust` | 0.193 |
+| `compress/level_17_btopt/decodecorpus-z000033/matrix/c_ffi` | 84.133 |
+| `compress/level_17_btopt/decodecorpus-z000033/matrix/pure_rust` | 155.786 |
+| `compress/level_17_btopt/high-entropy-1m/matrix/c_ffi` | 27.633 |
+| `compress/level_17_btopt/high-entropy-1m/matrix/pure_rust` | 5.629 |
+| `compress/level_17_btopt/large-log-stream/matrix/c_ffi` | 20.482 |
+| `compress/level_17_btopt/large-log-stream/matrix/pure_rust` | 22.495 |
+| `compress/level_17_btopt/low-entropy-1m/matrix/c_ffi` | 2.133 |
+| `compress/level_17_btopt/low-entropy-1m/matrix/pure_rust` | 3.915 |
+| `compress/level_17_btopt/small-10k-random/matrix/c_ffi` | 0.653 |
+| `compress/level_17_btopt/small-10k-random/matrix/pure_rust` | 0.160 |
+| `compress/level_17_btopt/small-1k-random/matrix/c_ffi` | 0.084 |
+| `compress/level_17_btopt/small-1k-random/matrix/pure_rust` | 0.028 |
+| `compress/level_17_btopt/small-4k-log-lines/matrix/c_ffi` | 0.189 |
+| `compress/level_17_btopt/small-4k-log-lines/matrix/pure_rust` | 0.197 |
+| `compress/level_1_fast_ldm/decodecorpus-z000033/matrix/c_ffi` | 4.185 |
+| `compress/level_1_fast_ldm/decodecorpus-z000033/matrix/pure_rust` | 5.316 |
+| `compress/level_1_fast_ldm/high-entropy-1m/matrix/c_ffi` | 2.099 |
+| `compress/level_1_fast_ldm/high-entropy-1m/matrix/pure_rust` | 0.561 |
+| `compress/level_1_fast_ldm/large-log-stream/matrix/c_ffi` | 19.967 |
+| `compress/level_1_fast_ldm/large-log-stream/matrix/pure_rust` | 1.983 |
+| `compress/level_1_fast_ldm/low-entropy-1m/matrix/c_ffi` | 1.049 |
+| `compress/level_1_fast_ldm/low-entropy-1m/matrix/pure_rust` | 0.220 |
+| `compress/level_1_fast_ldm/small-10k-random/matrix/c_ffi` | 0.119 |
+| `compress/level_1_fast_ldm/small-10k-random/matrix/pure_rust` | 0.016 |
+| `compress/level_1_fast_ldm/small-1k-random/matrix/c_ffi` | 0.040 |
+| `compress/level_1_fast_ldm/small-1k-random/matrix/pure_rust` | 0.002 |
+| `compress/level_1_fast_ldm/small-4k-log-lines/matrix/c_ffi` | 0.062 |
+| `compress/level_1_fast_ldm/small-4k-log-lines/matrix/pure_rust` | 0.050 |
+| `compress/level_22_btultra2_ldm/decodecorpus-z000033/matrix/c_ffi` | 246.593 |
+| `compress/level_22_btultra2_ldm/decodecorpus-z000033/matrix/pure_rust` | 262.137 |
+| `compress/level_22_btultra2_ldm/high-entropy-1m/matrix/c_ffi` | 55.459 |
+| `compress/level_22_btultra2_ldm/high-entropy-1m/matrix/pure_rust` | 7.403 |
+| `compress/level_22_btultra2_ldm/large-log-stream/matrix/c_ffi` | 45.154 |
+| `compress/level_22_btultra2_ldm/large-log-stream/matrix/pure_rust` | 35.432 |
+| `compress/level_22_btultra2_ldm/low-entropy-1m/matrix/c_ffi` | 2.234 |
+| `compress/level_22_btultra2_ldm/low-entropy-1m/matrix/pure_rust` | 2.483 |
+| `compress/level_22_btultra2_ldm/small-10k-random/matrix/c_ffi` | 0.771 |
+| `compress/level_22_btultra2_ldm/small-10k-random/matrix/pure_rust` | 0.250 |
+| `compress/level_22_btultra2_ldm/small-1k-random/matrix/c_ffi` | 0.089 |
+| `compress/level_22_btultra2_ldm/small-1k-random/matrix/pure_rust` | 0.072 |
+| `compress/level_22_btultra2_ldm/small-4k-log-lines/matrix/c_ffi` | 0.200 |
+| `compress/level_22_btultra2_ldm/small-4k-log-lines/matrix/pure_rust` | 0.308 |
+| `decompress-dict/level_16_btopt/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.013 |
+| `decompress-dict/level_16_btopt/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.240 |
 | `decompress-dict/level_16_btopt/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
-| `decompress-dict/level_16_btopt/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
+| `decompress-dict/level_16_btopt/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_16_btopt/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_16_btopt/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_17_btopt/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.590 |
-| `decompress-dict/level_17_btopt/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.756 |
+| `decompress-dict/level_17_btopt/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.995 |
+| `decompress-dict/level_17_btopt/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.223 |
 | `decompress-dict/level_17_btopt/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
-| `decompress-dict/level_17_btopt/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
+| `decompress-dict/level_17_btopt/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_17_btopt/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
-| `decompress-dict/level_17_btopt/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress-dict/level_1_fast_ldm_dict/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.753 |
-| `decompress-dict/level_1_fast_ldm_dict/decodecorpus-z000033/matrix/pure_rust_with_dict` | 1.173 |
+| `decompress-dict/level_17_btopt/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
+| `decompress-dict/level_1_fast_ldm_dict/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.021 |
+| `decompress-dict/level_1_fast_ldm_dict/decodecorpus-z000033/matrix/pure_rust_with_dict` | 1.460 |
 | `decompress-dict/level_1_fast_ldm_dict/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
-| `decompress-dict/level_1_fast_ldm_dict/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
+| `decompress-dict/level_1_fast_ldm_dict/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_1_fast_ldm_dict/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
-| `decompress-dict/level_1_fast_ldm_dict/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress-dict/level_22_btultra2_ldm_dict/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.603 |
-| `decompress-dict/level_22_btultra2_ldm_dict/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.784 |
+| `decompress-dict/level_1_fast_ldm_dict/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
+| `decompress-dict/level_22_btultra2_ldm_dict/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.025 |
+| `decompress-dict/level_22_btultra2_ldm_dict/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.258 |
 | `decompress-dict/level_22_btultra2_ldm_dict/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
-| `decompress-dict/level_22_btultra2_ldm_dict/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
+| `decompress-dict/level_22_btultra2_ldm_dict/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_22_btultra2_ldm_dict/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
-| `decompress-dict/level_22_btultra2_ldm_dict/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress/level_16_btopt/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.174 |
-| `decompress/level_16_btopt/decodecorpus-z000033/c_stream/matrix/pure_rust` | 2.093 |
-| `decompress/level_16_btopt/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.222 |
-| `decompress/level_16_btopt/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 2.119 |
-| `decompress/level_16_btopt/high-entropy-1m/c_stream/matrix/c_ffi` | 0.024 |
-| `decompress/level_16_btopt/high-entropy-1m/c_stream/matrix/pure_rust` | 0.024 |
-| `decompress/level_16_btopt/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.023 |
-| `decompress/level_16_btopt/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.024 |
-| `decompress/level_16_btopt/large-log-stream/c_stream/matrix/c_ffi` | 0.377 |
-| `decompress/level_16_btopt/large-log-stream/c_stream/matrix/pure_rust` | 0.414 |
-| `decompress/level_16_btopt/large-log-stream/rust_stream/matrix/c_ffi` | 0.376 |
-| `decompress/level_16_btopt/large-log-stream/rust_stream/matrix/pure_rust` | 0.415 |
-| `decompress/level_16_btopt/low-entropy-1m/c_stream/matrix/c_ffi` | 0.079 |
-| `decompress/level_16_btopt/low-entropy-1m/c_stream/matrix/pure_rust` | 0.024 |
-| `decompress/level_16_btopt/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.079 |
-| `decompress/level_16_btopt/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.025 |
+| `decompress-dict/level_22_btultra2_ldm_dict/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
+| `decompress/level_16_btopt/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.552 |
+| `decompress/level_16_btopt/decodecorpus-z000033/c_stream/matrix/pure_rust` | 2.476 |
+| `decompress/level_16_btopt/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.597 |
+| `decompress/level_16_btopt/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 2.515 |
+| `decompress/level_16_btopt/high-entropy-1m/c_stream/matrix/c_ffi` | 0.035 |
+| `decompress/level_16_btopt/high-entropy-1m/c_stream/matrix/pure_rust` | 0.036 |
+| `decompress/level_16_btopt/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.028 |
+| `decompress/level_16_btopt/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.036 |
+| `decompress/level_16_btopt/large-log-stream/c_stream/matrix/c_ffi` | 0.461 |
+| `decompress/level_16_btopt/large-log-stream/c_stream/matrix/pure_rust` | 0.444 |
+| `decompress/level_16_btopt/large-log-stream/rust_stream/matrix/c_ffi` | 0.462 |
+| `decompress/level_16_btopt/large-log-stream/rust_stream/matrix/pure_rust` | 0.441 |
+| `decompress/level_16_btopt/low-entropy-1m/c_stream/matrix/c_ffi` | 0.096 |
+| `decompress/level_16_btopt/low-entropy-1m/c_stream/matrix/pure_rust` | 0.030 |
+| `decompress/level_16_btopt/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.096 |
+| `decompress/level_16_btopt/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.030 |
 | `decompress/level_16_btopt/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_16_btopt/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_16_btopt/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -6293,26 +6293,26 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_16_btopt/small-1k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_16_btopt/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_16_btopt/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_16_btopt/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.001 |
+| `decompress/level_16_btopt/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_16_btopt/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_16_btopt/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.001 |
+| `decompress/level_16_btopt/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_16_btopt/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_17_btopt/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.309 |
-| `decompress/level_17_btopt/decodecorpus-z000033/c_stream/matrix/pure_rust` | 2.343 |
-| `decompress/level_17_btopt/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.343 |
-| `decompress/level_17_btopt/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 2.369 |
-| `decompress/level_17_btopt/high-entropy-1m/c_stream/matrix/c_ffi` | 0.023 |
-| `decompress/level_17_btopt/high-entropy-1m/c_stream/matrix/pure_rust` | 0.024 |
-| `decompress/level_17_btopt/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.024 |
-| `decompress/level_17_btopt/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.024 |
-| `decompress/level_17_btopt/large-log-stream/c_stream/matrix/c_ffi` | 0.371 |
-| `decompress/level_17_btopt/large-log-stream/c_stream/matrix/pure_rust` | 0.407 |
-| `decompress/level_17_btopt/large-log-stream/rust_stream/matrix/c_ffi` | 0.372 |
-| `decompress/level_17_btopt/large-log-stream/rust_stream/matrix/pure_rust` | 0.399 |
-| `decompress/level_17_btopt/low-entropy-1m/c_stream/matrix/c_ffi` | 0.079 |
-| `decompress/level_17_btopt/low-entropy-1m/c_stream/matrix/pure_rust` | 0.025 |
-| `decompress/level_17_btopt/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.079 |
-| `decompress/level_17_btopt/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.024 |
+| `decompress/level_17_btopt/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.698 |
+| `decompress/level_17_btopt/decodecorpus-z000033/c_stream/matrix/pure_rust` | 2.770 |
+| `decompress/level_17_btopt/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.749 |
+| `decompress/level_17_btopt/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 2.800 |
+| `decompress/level_17_btopt/high-entropy-1m/c_stream/matrix/c_ffi` | 0.035 |
+| `decompress/level_17_btopt/high-entropy-1m/c_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_17_btopt/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.029 |
+| `decompress/level_17_btopt/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.035 |
+| `decompress/level_17_btopt/large-log-stream/c_stream/matrix/c_ffi` | 0.433 |
+| `decompress/level_17_btopt/large-log-stream/c_stream/matrix/pure_rust` | 0.409 |
+| `decompress/level_17_btopt/large-log-stream/rust_stream/matrix/c_ffi` | 0.433 |
+| `decompress/level_17_btopt/large-log-stream/rust_stream/matrix/pure_rust` | 0.414 |
+| `decompress/level_17_btopt/low-entropy-1m/c_stream/matrix/c_ffi` | 0.095 |
+| `decompress/level_17_btopt/low-entropy-1m/c_stream/matrix/pure_rust` | 0.030 |
+| `decompress/level_17_btopt/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.096 |
+| `decompress/level_17_btopt/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.030 |
 | `decompress/level_17_btopt/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_17_btopt/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_17_btopt/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -6321,26 +6321,26 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_17_btopt/small-1k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_17_btopt/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_17_btopt/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_17_btopt/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.001 |
+| `decompress/level_17_btopt/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_17_btopt/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_17_btopt/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.001 |
+| `decompress/level_17_btopt/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_17_btopt/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_1_fast_ldm/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.705 |
-| `decompress/level_1_fast_ldm/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.053 |
-| `decompress/level_1_fast_ldm/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.692 |
-| `decompress/level_1_fast_ldm/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.013 |
-| `decompress/level_1_fast_ldm/high-entropy-1m/c_stream/matrix/c_ffi` | 0.023 |
-| `decompress/level_1_fast_ldm/high-entropy-1m/c_stream/matrix/pure_rust` | 0.025 |
-| `decompress/level_1_fast_ldm/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.023 |
-| `decompress/level_1_fast_ldm/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.024 |
-| `decompress/level_1_fast_ldm/large-log-stream/c_stream/matrix/c_ffi` | 0.735 |
-| `decompress/level_1_fast_ldm/large-log-stream/c_stream/matrix/pure_rust` | 0.818 |
-| `decompress/level_1_fast_ldm/large-log-stream/rust_stream/matrix/c_ffi` | 0.439 |
-| `decompress/level_1_fast_ldm/large-log-stream/rust_stream/matrix/pure_rust` | 0.392 |
-| `decompress/level_1_fast_ldm/low-entropy-1m/c_stream/matrix/c_ffi` | 0.130 |
-| `decompress/level_1_fast_ldm/low-entropy-1m/c_stream/matrix/pure_rust` | 0.022 |
-| `decompress/level_1_fast_ldm/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.130 |
-| `decompress/level_1_fast_ldm/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.022 |
+| `decompress/level_1_fast_ldm/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.973 |
+| `decompress/level_1_fast_ldm/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.380 |
+| `decompress/level_1_fast_ldm/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.951 |
+| `decompress/level_1_fast_ldm/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.303 |
+| `decompress/level_1_fast_ldm/high-entropy-1m/c_stream/matrix/c_ffi` | 0.028 |
+| `decompress/level_1_fast_ldm/high-entropy-1m/c_stream/matrix/pure_rust` | 0.036 |
+| `decompress/level_1_fast_ldm/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.036 |
+| `decompress/level_1_fast_ldm/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.035 |
+| `decompress/level_1_fast_ldm/large-log-stream/c_stream/matrix/c_ffi` | 0.847 |
+| `decompress/level_1_fast_ldm/large-log-stream/c_stream/matrix/pure_rust` | 0.936 |
+| `decompress/level_1_fast_ldm/large-log-stream/rust_stream/matrix/c_ffi` | 0.654 |
+| `decompress/level_1_fast_ldm/large-log-stream/rust_stream/matrix/pure_rust` | 0.401 |
+| `decompress/level_1_fast_ldm/low-entropy-1m/c_stream/matrix/c_ffi` | 0.188 |
+| `decompress/level_1_fast_ldm/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_1_fast_ldm/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.187 |
+| `decompress/level_1_fast_ldm/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
 | `decompress/level_1_fast_ldm/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_1_fast_ldm/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_1_fast_ldm/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -6349,26 +6349,26 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_1_fast_ldm/small-1k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_1_fast_ldm/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_1_fast_ldm/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_1_fast_ldm/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.001 |
+| `decompress/level_1_fast_ldm/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_1_fast_ldm/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_1_fast_ldm/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.001 |
+| `decompress/level_1_fast_ldm/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_1_fast_ldm/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_22_btultra2_ldm/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.478 |
-| `decompress/level_22_btultra2_ldm/decodecorpus-z000033/c_stream/matrix/pure_rust` | 2.555 |
-| `decompress/level_22_btultra2_ldm/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.551 |
-| `decompress/level_22_btultra2_ldm/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 2.685 |
-| `decompress/level_22_btultra2_ldm/high-entropy-1m/c_stream/matrix/c_ffi` | 0.024 |
-| `decompress/level_22_btultra2_ldm/high-entropy-1m/c_stream/matrix/pure_rust` | 0.024 |
-| `decompress/level_22_btultra2_ldm/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.023 |
-| `decompress/level_22_btultra2_ldm/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.024 |
-| `decompress/level_22_btultra2_ldm/large-log-stream/c_stream/matrix/c_ffi` | 0.371 |
-| `decompress/level_22_btultra2_ldm/large-log-stream/c_stream/matrix/pure_rust` | 0.402 |
-| `decompress/level_22_btultra2_ldm/large-log-stream/rust_stream/matrix/c_ffi` | 0.373 |
-| `decompress/level_22_btultra2_ldm/large-log-stream/rust_stream/matrix/pure_rust` | 0.406 |
-| `decompress/level_22_btultra2_ldm/low-entropy-1m/c_stream/matrix/c_ffi` | 0.134 |
-| `decompress/level_22_btultra2_ldm/low-entropy-1m/c_stream/matrix/pure_rust` | 0.023 |
-| `decompress/level_22_btultra2_ldm/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.135 |
-| `decompress/level_22_btultra2_ldm/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.024 |
+| `decompress/level_22_btultra2_ldm/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.881 |
+| `decompress/level_22_btultra2_ldm/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.019 |
+| `decompress/level_22_btultra2_ldm/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.978 |
+| `decompress/level_22_btultra2_ldm/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.159 |
+| `decompress/level_22_btultra2_ldm/high-entropy-1m/c_stream/matrix/c_ffi` | 0.028 |
+| `decompress/level_22_btultra2_ldm/high-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_22_btultra2_ldm/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.027 |
+| `decompress/level_22_btultra2_ldm/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_22_btultra2_ldm/large-log-stream/c_stream/matrix/c_ffi` | 0.434 |
+| `decompress/level_22_btultra2_ldm/large-log-stream/c_stream/matrix/pure_rust` | 0.414 |
+| `decompress/level_22_btultra2_ldm/large-log-stream/rust_stream/matrix/c_ffi` | 0.431 |
+| `decompress/level_22_btultra2_ldm/large-log-stream/rust_stream/matrix/pure_rust` | 0.414 |
+| `decompress/level_22_btultra2_ldm/low-entropy-1m/c_stream/matrix/c_ffi` | 0.158 |
+| `decompress/level_22_btultra2_ldm/low-entropy-1m/c_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_22_btultra2_ldm/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.158 |
+| `decompress/level_22_btultra2_ldm/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
 | `decompress/level_22_btultra2_ldm/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_22_btultra2_ldm/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_22_btultra2_ldm/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -6377,16 +6377,16 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_22_btultra2_ldm/small-1k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_22_btultra2_ldm/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_22_btultra2_ldm/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_22_btultra2_ldm/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.001 |
+| `decompress/level_22_btultra2_ldm/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_22_btultra2_ldm/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_22_btultra2_ldm/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.001 |
+| `decompress/level_22_btultra2_ldm/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_22_btultra2_ldm/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `dict-train/na/decodecorpus-z000033/matrix/c_ffi` | 44.129 |
-| `dict-train/na/decodecorpus-z000033/matrix/pure_rust` | 9.821 |
-| `dict-train/na/small-10k-random/matrix/c_ffi` | 9.803 |
-| `dict-train/na/small-10k-random/matrix/pure_rust` | 2.682 |
-| `dict-train/na/small-4k-log-lines/matrix/c_ffi` | 2.224 |
-| `dict-train/na/small-4k-log-lines/matrix/pure_rust` | 0.816 |
+| `dict-train/na/decodecorpus-z000033/matrix/c_ffi` | 50.646 |
+| `dict-train/na/decodecorpus-z000033/matrix/pure_rust` | 11.498 |
+| `dict-train/na/small-10k-random/matrix/c_ffi` | 11.334 |
+| `dict-train/na/small-10k-random/matrix/pure_rust` | 3.179 |
+| `dict-train/na/small-4k-log-lines/matrix/c_ffi` | 2.447 |
+| `dict-train/na/small-4k-log-lines/matrix/pure_rust` | 1.033 |
 
 ## Strategy group: btultra2
 
@@ -6548,195 +6548,195 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 
 | Scenario | Label | Level | Dict bytes | Train ms | C bytes (no dict) | C bytes (with dict) | C ratio (no dict) | C ratio (with dict) |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| decodecorpus-z000033 | Repo decode corpus sample | level_18_btultra | 16384 | 58.826 | 426806 | 420494 | 0.4176 | 0.4114 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_19_btultra2 | 16384 | 58.826 | 426543 | 420599 | 0.4173 | 0.4115 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_20_btultra2 | 16384 | 58.826 | 426543 | 420145 | 0.4173 | 0.4111 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_21_btultra2 | 16384 | 58.826 | 426386 | 420411 | 0.4172 | 0.4113 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_22_btultra2 | 16384 | 58.826 | 426312 | 420411 | 0.4171 | 0.4113 |
-| small-10k-random | Small random payload (10 KiB) | level_18_btultra | 1280 | 13.256 | 10250 | 9226 | 1.0010 | 0.9010 |
-| small-10k-random | Small random payload (10 KiB) | level_19_btultra2 | 1280 | 13.256 | 10250 | 9226 | 1.0010 | 0.9010 |
-| small-10k-random | Small random payload (10 KiB) | level_20_btultra2 | 1280 | 13.256 | 10250 | 9226 | 1.0010 | 0.9010 |
-| small-10k-random | Small random payload (10 KiB) | level_21_btultra2 | 1280 | 13.256 | 10250 | 9226 | 1.0010 | 0.9010 |
-| small-10k-random | Small random payload (10 KiB) | level_22_btultra2 | 1280 | 13.256 | 10250 | 9226 | 1.0010 | 0.9010 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_18_btultra | 437 | 3.084 | 146 | 44 | 0.0356 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_19_btultra2 | 437 | 3.084 | 146 | 44 | 0.0356 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_20_btultra2 | 437 | 3.084 | 146 | 44 | 0.0356 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_21_btultra2 | 437 | 3.084 | 146 | 44 | 0.0356 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_22_btultra2 | 437 | 3.084 | 146 | 44 | 0.0356 | 0.0107 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_18_btultra | 16384 | 47.219 | 426806 | 420494 | 0.4176 | 0.4114 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_19_btultra2 | 16384 | 47.219 | 426543 | 420599 | 0.4173 | 0.4115 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_20_btultra2 | 16384 | 47.219 | 426543 | 420145 | 0.4173 | 0.4111 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_21_btultra2 | 16384 | 47.219 | 426386 | 420411 | 0.4172 | 0.4113 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_22_btultra2 | 16384 | 47.219 | 426312 | 420411 | 0.4171 | 0.4113 |
+| small-10k-random | Small random payload (10 KiB) | level_18_btultra | 1280 | 11.763 | 10250 | 9226 | 1.0010 | 0.9010 |
+| small-10k-random | Small random payload (10 KiB) | level_19_btultra2 | 1280 | 11.763 | 10250 | 9226 | 1.0010 | 0.9010 |
+| small-10k-random | Small random payload (10 KiB) | level_20_btultra2 | 1280 | 11.763 | 10250 | 9226 | 1.0010 | 0.9010 |
+| small-10k-random | Small random payload (10 KiB) | level_21_btultra2 | 1280 | 11.763 | 10250 | 9226 | 1.0010 | 0.9010 |
+| small-10k-random | Small random payload (10 KiB) | level_22_btultra2 | 1280 | 11.763 | 10250 | 9226 | 1.0010 | 0.9010 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_18_btultra | 437 | 2.723 | 146 | 44 | 0.0356 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_19_btultra2 | 437 | 2.723 | 146 | 44 | 0.0356 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_20_btultra2 | 437 | 2.723 | 146 | 44 | 0.0356 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_21_btultra2 | 437 | 2.723 | 146 | 44 | 0.0356 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_22_btultra2 | 437 | 2.723 | 146 | 44 | 0.0356 | 0.0107 |
 
 ## Dictionary Training (Rust FastCOVER vs C FFI)
 
 | Scenario | Label | Dict bytes (requested) | Rust train ms | C train ms | Rust dict bytes | C dict bytes | Rust FastCOVER score | Delta (C/Rust) | Status |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| decodecorpus-z000033 | Repo decode corpus sample | 16384 | 15.381 | 58.826 | 16384 | 16384 | 0 | 3.8246 | rust_faster |
-| small-10k-random | Small random payload (10 KiB) | 1280 | 3.917 | 13.256 | 1280 | 1280 | 0 | 3.3842 | rust_faster |
-| small-4k-log-lines | Small structured log lines (4 KiB) | 512 | 1.249 | 3.084 | 512 | 437 | 0 | 2.4692 | rust_faster |
+| decodecorpus-z000033 | Repo decode corpus sample | 16384 | 11.852 | 47.219 | 16384 | 16384 | 0 | 3.9841 | rust_faster |
+| small-10k-random | Small random payload (10 KiB) | 1280 | 3.255 | 11.763 | 1280 | 1280 | 0 | 3.6138 | rust_faster |
+| small-4k-log-lines | Small structured log lines (4 KiB) | 512 | 1.160 | 2.723 | 512 | 437 | 0 | 2.3474 | rust_faster |
 
 ## Timing Metrics
 
 | Benchmark | ms/iter |
 | --- | ---: |
-| `compress-dict/level_18_btultra/decodecorpus-z000033/matrix/c_ffi_with_dict` | 141.754 |
-| `compress-dict/level_18_btultra/decodecorpus-z000033/matrix/c_ffi_without_dict` | 156.318 |
-| `compress-dict/level_18_btultra/decodecorpus-z000033/matrix/pure_rust_with_dict` | 214.422 |
-| `compress-dict/level_18_btultra/small-10k-random/matrix/c_ffi_with_dict` | 0.446 |
-| `compress-dict/level_18_btultra/small-10k-random/matrix/c_ffi_without_dict` | 0.594 |
-| `compress-dict/level_18_btultra/small-10k-random/matrix/pure_rust_with_dict` | 1.396 |
-| `compress-dict/level_18_btultra/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.068 |
-| `compress-dict/level_18_btultra/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.173 |
+| `compress-dict/level_18_btultra/decodecorpus-z000033/matrix/c_ffi_with_dict` | 153.750 |
+| `compress-dict/level_18_btultra/decodecorpus-z000033/matrix/c_ffi_without_dict` | 125.084 |
+| `compress-dict/level_18_btultra/decodecorpus-z000033/matrix/pure_rust_with_dict` | 215.652 |
+| `compress-dict/level_18_btultra/small-10k-random/matrix/c_ffi_with_dict` | 0.515 |
+| `compress-dict/level_18_btultra/small-10k-random/matrix/c_ffi_without_dict` | 0.629 |
+| `compress-dict/level_18_btultra/small-10k-random/matrix/pure_rust_with_dict` | 1.331 |
+| `compress-dict/level_18_btultra/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.094 |
+| `compress-dict/level_18_btultra/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.188 |
 | `compress-dict/level_18_btultra/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.029 |
-| `compress-dict/level_19_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 134.468 |
-| `compress-dict/level_19_btultra2/decodecorpus-z000033/matrix/c_ffi_without_dict` | 163.542 |
-| `compress-dict/level_19_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 221.580 |
-| `compress-dict/level_19_btultra2/small-10k-random/matrix/c_ffi_with_dict` | 0.446 |
-| `compress-dict/level_19_btultra2/small-10k-random/matrix/c_ffi_without_dict` | 0.600 |
-| `compress-dict/level_19_btultra2/small-10k-random/matrix/pure_rust_with_dict` | 1.401 |
-| `compress-dict/level_19_btultra2/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.067 |
-| `compress-dict/level_19_btultra2/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.172 |
+| `compress-dict/level_19_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 142.301 |
+| `compress-dict/level_19_btultra2/decodecorpus-z000033/matrix/c_ffi_without_dict` | 146.966 |
+| `compress-dict/level_19_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 219.728 |
+| `compress-dict/level_19_btultra2/small-10k-random/matrix/c_ffi_with_dict` | 0.514 |
+| `compress-dict/level_19_btultra2/small-10k-random/matrix/c_ffi_without_dict` | 0.632 |
+| `compress-dict/level_19_btultra2/small-10k-random/matrix/pure_rust_with_dict` | 1.334 |
+| `compress-dict/level_19_btultra2/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.096 |
+| `compress-dict/level_19_btultra2/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.189 |
 | `compress-dict/level_19_btultra2/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.029 |
-| `compress-dict/level_20_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 143.624 |
-| `compress-dict/level_20_btultra2/decodecorpus-z000033/matrix/c_ffi_without_dict` | 166.593 |
-| `compress-dict/level_20_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 222.191 |
-| `compress-dict/level_20_btultra2/small-10k-random/matrix/c_ffi_with_dict` | 0.445 |
-| `compress-dict/level_20_btultra2/small-10k-random/matrix/c_ffi_without_dict` | 0.595 |
-| `compress-dict/level_20_btultra2/small-10k-random/matrix/pure_rust_with_dict` | 1.400 |
-| `compress-dict/level_20_btultra2/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.068 |
-| `compress-dict/level_20_btultra2/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.172 |
+| `compress-dict/level_20_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 154.868 |
+| `compress-dict/level_20_btultra2/decodecorpus-z000033/matrix/c_ffi_without_dict` | 147.020 |
+| `compress-dict/level_20_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 220.436 |
+| `compress-dict/level_20_btultra2/small-10k-random/matrix/c_ffi_with_dict` | 0.513 |
+| `compress-dict/level_20_btultra2/small-10k-random/matrix/c_ffi_without_dict` | 0.630 |
+| `compress-dict/level_20_btultra2/small-10k-random/matrix/pure_rust_with_dict` | 1.338 |
+| `compress-dict/level_20_btultra2/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.094 |
+| `compress-dict/level_20_btultra2/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.188 |
 | `compress-dict/level_20_btultra2/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.029 |
-| `compress-dict/level_21_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 141.761 |
-| `compress-dict/level_21_btultra2/decodecorpus-z000033/matrix/c_ffi_without_dict` | 175.193 |
-| `compress-dict/level_21_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 226.651 |
-| `compress-dict/level_21_btultra2/small-10k-random/matrix/c_ffi_with_dict` | 0.441 |
-| `compress-dict/level_21_btultra2/small-10k-random/matrix/c_ffi_without_dict` | 0.599 |
-| `compress-dict/level_21_btultra2/small-10k-random/matrix/pure_rust_with_dict` | 1.403 |
-| `compress-dict/level_21_btultra2/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.067 |
-| `compress-dict/level_21_btultra2/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.172 |
+| `compress-dict/level_21_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 153.515 |
+| `compress-dict/level_21_btultra2/decodecorpus-z000033/matrix/c_ffi_without_dict` | 160.965 |
+| `compress-dict/level_21_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 219.496 |
+| `compress-dict/level_21_btultra2/small-10k-random/matrix/c_ffi_with_dict` | 0.513 |
+| `compress-dict/level_21_btultra2/small-10k-random/matrix/c_ffi_without_dict` | 0.632 |
+| `compress-dict/level_21_btultra2/small-10k-random/matrix/pure_rust_with_dict` | 1.342 |
+| `compress-dict/level_21_btultra2/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.094 |
+| `compress-dict/level_21_btultra2/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.187 |
 | `compress-dict/level_21_btultra2/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.029 |
-| `compress-dict/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 183.573 |
-| `compress-dict/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi_without_dict` | 222.223 |
-| `compress-dict/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 249.448 |
-| `compress-dict/level_22_btultra2/small-10k-random/matrix/c_ffi_with_dict` | 0.437 |
-| `compress-dict/level_22_btultra2/small-10k-random/matrix/c_ffi_without_dict` | 0.593 |
-| `compress-dict/level_22_btultra2/small-10k-random/matrix/pure_rust_with_dict` | 1.402 |
-| `compress-dict/level_22_btultra2/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.068 |
-| `compress-dict/level_22_btultra2/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.172 |
+| `compress-dict/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 214.844 |
+| `compress-dict/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi_without_dict` | 228.299 |
+| `compress-dict/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 243.949 |
+| `compress-dict/level_22_btultra2/small-10k-random/matrix/c_ffi_with_dict` | 0.514 |
+| `compress-dict/level_22_btultra2/small-10k-random/matrix/c_ffi_without_dict` | 0.635 |
+| `compress-dict/level_22_btultra2/small-10k-random/matrix/pure_rust_with_dict` | 1.337 |
+| `compress-dict/level_22_btultra2/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.094 |
+| `compress-dict/level_22_btultra2/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.187 |
 | `compress-dict/level_22_btultra2/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.029 |
-| `compress/level_18_btultra/decodecorpus-z000033/matrix/c_ffi` | 137.541 |
-| `compress/level_18_btultra/decodecorpus-z000033/matrix/pure_rust` | 229.890 |
-| `compress/level_18_btultra/high-entropy-1m/matrix/c_ffi` | 48.352 |
-| `compress/level_18_btultra/high-entropy-1m/matrix/pure_rust` | 7.155 |
-| `compress/level_18_btultra/large-log-stream/matrix/c_ffi` | 23.290 |
-| `compress/level_18_btultra/large-log-stream/matrix/pure_rust` | 24.372 |
-| `compress/level_18_btultra/low-entropy-1m/matrix/c_ffi` | 3.137 |
-| `compress/level_18_btultra/low-entropy-1m/matrix/pure_rust` | 5.218 |
-| `compress/level_18_btultra/small-10k-random/matrix/c_ffi` | 0.607 |
-| `compress/level_18_btultra/small-10k-random/matrix/pure_rust` | 0.230 |
-| `compress/level_18_btultra/small-1k-random/matrix/c_ffi` | 0.091 |
-| `compress/level_18_btultra/small-1k-random/matrix/pure_rust` | 0.076 |
-| `compress/level_18_btultra/small-4k-log-lines/matrix/c_ffi` | 0.174 |
-| `compress/level_18_btultra/small-4k-log-lines/matrix/pure_rust` | 0.276 |
-| `compress/level_19_btultra2/decodecorpus-z000033/matrix/c_ffi` | 163.230 |
-| `compress/level_19_btultra2/decodecorpus-z000033/matrix/pure_rust` | 250.441 |
-| `compress/level_19_btultra2/high-entropy-1m/matrix/c_ffi` | 50.785 |
-| `compress/level_19_btultra2/high-entropy-1m/matrix/pure_rust` | 10.006 |
-| `compress/level_19_btultra2/large-log-stream/matrix/c_ffi` | 25.489 |
-| `compress/level_19_btultra2/large-log-stream/matrix/pure_rust` | 22.884 |
-| `compress/level_19_btultra2/low-entropy-1m/matrix/c_ffi` | 3.077 |
-| `compress/level_19_btultra2/low-entropy-1m/matrix/pure_rust` | 2.476 |
-| `compress/level_19_btultra2/small-10k-random/matrix/c_ffi` | 0.610 |
-| `compress/level_19_btultra2/small-10k-random/matrix/pure_rust` | 0.281 |
-| `compress/level_19_btultra2/small-1k-random/matrix/c_ffi` | 0.089 |
-| `compress/level_19_btultra2/small-1k-random/matrix/pure_rust` | 0.072 |
-| `compress/level_19_btultra2/small-4k-log-lines/matrix/c_ffi` | 0.175 |
-| `compress/level_19_btultra2/small-4k-log-lines/matrix/pure_rust` | 0.370 |
-| `compress/level_20_btultra2/decodecorpus-z000033/matrix/c_ffi` | 168.675 |
-| `compress/level_20_btultra2/decodecorpus-z000033/matrix/pure_rust` | 254.611 |
-| `compress/level_20_btultra2/high-entropy-1m/matrix/c_ffi` | 52.478 |
-| `compress/level_20_btultra2/high-entropy-1m/matrix/pure_rust` | 9.292 |
-| `compress/level_20_btultra2/large-log-stream/matrix/c_ffi` | 31.991 |
-| `compress/level_20_btultra2/large-log-stream/matrix/pure_rust` | 25.331 |
-| `compress/level_20_btultra2/low-entropy-1m/matrix/c_ffi` | 3.002 |
-| `compress/level_20_btultra2/low-entropy-1m/matrix/pure_rust` | 2.502 |
-| `compress/level_20_btultra2/small-10k-random/matrix/c_ffi` | 0.609 |
-| `compress/level_20_btultra2/small-10k-random/matrix/pure_rust` | 0.280 |
-| `compress/level_20_btultra2/small-1k-random/matrix/c_ffi` | 0.088 |
-| `compress/level_20_btultra2/small-1k-random/matrix/pure_rust` | 0.072 |
-| `compress/level_20_btultra2/small-4k-log-lines/matrix/c_ffi` | 0.175 |
-| `compress/level_20_btultra2/small-4k-log-lines/matrix/pure_rust` | 0.366 |
-| `compress/level_21_btultra2/decodecorpus-z000033/matrix/c_ffi` | 171.951 |
-| `compress/level_21_btultra2/decodecorpus-z000033/matrix/pure_rust` | 249.440 |
-| `compress/level_21_btultra2/high-entropy-1m/matrix/c_ffi` | 58.634 |
-| `compress/level_21_btultra2/high-entropy-1m/matrix/pure_rust` | 9.317 |
-| `compress/level_21_btultra2/large-log-stream/matrix/c_ffi` | 34.425 |
-| `compress/level_21_btultra2/large-log-stream/matrix/pure_rust` | 24.357 |
-| `compress/level_21_btultra2/low-entropy-1m/matrix/c_ffi` | 2.901 |
-| `compress/level_21_btultra2/low-entropy-1m/matrix/pure_rust` | 2.453 |
-| `compress/level_21_btultra2/small-10k-random/matrix/c_ffi` | 0.609 |
-| `compress/level_21_btultra2/small-10k-random/matrix/pure_rust` | 0.282 |
-| `compress/level_21_btultra2/small-1k-random/matrix/c_ffi` | 0.089 |
-| `compress/level_21_btultra2/small-1k-random/matrix/pure_rust` | 0.072 |
-| `compress/level_21_btultra2/small-4k-log-lines/matrix/c_ffi` | 0.175 |
-| `compress/level_21_btultra2/small-4k-log-lines/matrix/pure_rust` | 0.366 |
-| `compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi` | 212.248 |
-| `compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust` | 277.827 |
-| `compress/level_22_btultra2/high-entropy-1m/matrix/c_ffi` | 59.350 |
-| `compress/level_22_btultra2/high-entropy-1m/matrix/pure_rust` | 9.795 |
-| `compress/level_22_btultra2/large-log-stream/matrix/c_ffi` | 39.233 |
-| `compress/level_22_btultra2/large-log-stream/matrix/pure_rust` | 29.191 |
-| `compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi` | 2.863 |
-| `compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust` | 2.429 |
-| `compress/level_22_btultra2/small-10k-random/matrix/c_ffi` | 0.610 |
-| `compress/level_22_btultra2/small-10k-random/matrix/pure_rust` | 0.285 |
-| `compress/level_22_btultra2/small-1k-random/matrix/c_ffi` | 0.089 |
-| `compress/level_22_btultra2/small-1k-random/matrix/pure_rust` | 0.072 |
-| `compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi` | 0.174 |
-| `compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust` | 0.371 |
-| `decompress-dict/level_18_btultra/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.035 |
-| `decompress-dict/level_18_btultra/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.501 |
+| `compress/level_18_btultra/decodecorpus-z000033/matrix/c_ffi` | 129.230 |
+| `compress/level_18_btultra/decodecorpus-z000033/matrix/pure_rust` | 215.622 |
+| `compress/level_18_btultra/high-entropy-1m/matrix/c_ffi` | 41.059 |
+| `compress/level_18_btultra/high-entropy-1m/matrix/pure_rust` | 6.291 |
+| `compress/level_18_btultra/large-log-stream/matrix/c_ffi` | 21.644 |
+| `compress/level_18_btultra/large-log-stream/matrix/pure_rust` | 22.794 |
+| `compress/level_18_btultra/low-entropy-1m/matrix/c_ffi` | 2.514 |
+| `compress/level_18_btultra/low-entropy-1m/matrix/pure_rust` | 4.262 |
+| `compress/level_18_btultra/small-10k-random/matrix/c_ffi` | 0.665 |
+| `compress/level_18_btultra/small-10k-random/matrix/pure_rust` | 0.203 |
+| `compress/level_18_btultra/small-1k-random/matrix/c_ffi` | 0.084 |
+| `compress/level_18_btultra/small-1k-random/matrix/pure_rust` | 0.068 |
+| `compress/level_18_btultra/small-4k-log-lines/matrix/c_ffi` | 0.189 |
+| `compress/level_18_btultra/small-4k-log-lines/matrix/pure_rust` | 0.259 |
+| `compress/level_19_btultra2/decodecorpus-z000033/matrix/c_ffi` | 152.043 |
+| `compress/level_19_btultra2/decodecorpus-z000033/matrix/pure_rust` | 239.136 |
+| `compress/level_19_btultra2/high-entropy-1m/matrix/c_ffi` | 44.829 |
+| `compress/level_19_btultra2/high-entropy-1m/matrix/pure_rust` | 7.221 |
+| `compress/level_19_btultra2/large-log-stream/matrix/c_ffi` | 24.645 |
+| `compress/level_19_btultra2/large-log-stream/matrix/pure_rust` | 22.043 |
+| `compress/level_19_btultra2/low-entropy-1m/matrix/c_ffi` | 2.542 |
+| `compress/level_19_btultra2/low-entropy-1m/matrix/pure_rust` | 2.183 |
+| `compress/level_19_btultra2/small-10k-random/matrix/c_ffi` | 0.663 |
+| `compress/level_19_btultra2/small-10k-random/matrix/pure_rust` | 0.251 |
+| `compress/level_19_btultra2/small-1k-random/matrix/c_ffi` | 0.084 |
+| `compress/level_19_btultra2/small-1k-random/matrix/pure_rust` | 0.065 |
+| `compress/level_19_btultra2/small-4k-log-lines/matrix/c_ffi` | 0.189 |
+| `compress/level_19_btultra2/small-4k-log-lines/matrix/pure_rust` | 0.349 |
+| `compress/level_20_btultra2/decodecorpus-z000033/matrix/c_ffi` | 152.458 |
+| `compress/level_20_btultra2/decodecorpus-z000033/matrix/pure_rust` | 238.360 |
+| `compress/level_20_btultra2/high-entropy-1m/matrix/c_ffi` | 44.790 |
+| `compress/level_20_btultra2/high-entropy-1m/matrix/pure_rust` | 7.208 |
+| `compress/level_20_btultra2/large-log-stream/matrix/c_ffi` | 32.517 |
+| `compress/level_20_btultra2/large-log-stream/matrix/pure_rust` | 25.868 |
+| `compress/level_20_btultra2/low-entropy-1m/matrix/c_ffi` | 2.536 |
+| `compress/level_20_btultra2/low-entropy-1m/matrix/pure_rust` | 2.174 |
+| `compress/level_20_btultra2/small-10k-random/matrix/c_ffi` | 0.668 |
+| `compress/level_20_btultra2/small-10k-random/matrix/pure_rust` | 0.251 |
+| `compress/level_20_btultra2/small-1k-random/matrix/c_ffi` | 0.087 |
+| `compress/level_20_btultra2/small-1k-random/matrix/pure_rust` | 0.065 |
+| `compress/level_20_btultra2/small-4k-log-lines/matrix/c_ffi` | 0.189 |
+| `compress/level_20_btultra2/small-4k-log-lines/matrix/pure_rust` | 0.346 |
+| `compress/level_21_btultra2/decodecorpus-z000033/matrix/c_ffi` | 166.873 |
+| `compress/level_21_btultra2/decodecorpus-z000033/matrix/pure_rust` | 239.975 |
+| `compress/level_21_btultra2/high-entropy-1m/matrix/c_ffi` | 44.184 |
+| `compress/level_21_btultra2/high-entropy-1m/matrix/pure_rust` | 7.223 |
+| `compress/level_21_btultra2/large-log-stream/matrix/c_ffi` | 35.439 |
+| `compress/level_21_btultra2/large-log-stream/matrix/pure_rust` | 24.254 |
+| `compress/level_21_btultra2/low-entropy-1m/matrix/c_ffi` | 2.560 |
+| `compress/level_21_btultra2/low-entropy-1m/matrix/pure_rust` | 2.177 |
+| `compress/level_21_btultra2/small-10k-random/matrix/c_ffi` | 0.662 |
+| `compress/level_21_btultra2/small-10k-random/matrix/pure_rust` | 0.250 |
+| `compress/level_21_btultra2/small-1k-random/matrix/c_ffi` | 0.084 |
+| `compress/level_21_btultra2/small-1k-random/matrix/pure_rust` | 0.065 |
+| `compress/level_21_btultra2/small-4k-log-lines/matrix/c_ffi` | 0.190 |
+| `compress/level_21_btultra2/small-4k-log-lines/matrix/pure_rust` | 0.348 |
+| `compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi` | 228.673 |
+| `compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust` | 263.811 |
+| `compress/level_22_btultra2/high-entropy-1m/matrix/c_ffi` | 44.417 |
+| `compress/level_22_btultra2/high-entropy-1m/matrix/pure_rust` | 7.208 |
+| `compress/level_22_btultra2/large-log-stream/matrix/c_ffi` | 41.118 |
+| `compress/level_22_btultra2/large-log-stream/matrix/pure_rust` | 30.541 |
+| `compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi` | 2.528 |
+| `compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust` | 2.178 |
+| `compress/level_22_btultra2/small-10k-random/matrix/c_ffi` | 0.664 |
+| `compress/level_22_btultra2/small-10k-random/matrix/pure_rust` | 0.251 |
+| `compress/level_22_btultra2/small-1k-random/matrix/c_ffi` | 0.084 |
+| `compress/level_22_btultra2/small-1k-random/matrix/pure_rust` | 0.065 |
+| `compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi` | 0.190 |
+| `compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust` | 0.352 |
+| `decompress-dict/level_18_btultra/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.992 |
+| `decompress-dict/level_18_btultra/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.230 |
 | `decompress-dict/level_18_btultra/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_18_btultra/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_18_btultra/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_18_btultra/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_19_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.074 |
-| `decompress-dict/level_19_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.551 |
+| `decompress-dict/level_19_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.025 |
+| `decompress-dict/level_19_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.271 |
 | `decompress-dict/level_19_btultra2/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_19_btultra2/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_19_btultra2/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_19_btultra2/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_20_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.049 |
-| `decompress-dict/level_20_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.545 |
+| `decompress-dict/level_20_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.017 |
+| `decompress-dict/level_20_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.258 |
 | `decompress-dict/level_20_btultra2/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_20_btultra2/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_20_btultra2/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_20_btultra2/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_21_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.057 |
-| `decompress-dict/level_21_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.526 |
+| `decompress-dict/level_21_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.007 |
+| `decompress-dict/level_21_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.253 |
 | `decompress-dict/level_21_btultra2/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_21_btultra2/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_21_btultra2/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_21_btultra2/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.074 |
-| `decompress-dict/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.545 |
+| `decompress-dict/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.020 |
+| `decompress-dict/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.260 |
 | `decompress-dict/level_22_btultra2/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_22_btultra2/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_22_btultra2/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_22_btultra2/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress/level_18_btultra/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.890 |
-| `decompress/level_18_btultra/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.232 |
-| `decompress/level_18_btultra/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.013 |
-| `decompress/level_18_btultra/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.454 |
-| `decompress/level_18_btultra/high-entropy-1m/c_stream/matrix/c_ffi` | 0.030 |
-| `decompress/level_18_btultra/high-entropy-1m/c_stream/matrix/pure_rust` | 0.031 |
-| `decompress/level_18_btultra/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.030 |
-| `decompress/level_18_btultra/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.031 |
-| `decompress/level_18_btultra/large-log-stream/c_stream/matrix/c_ffi` | 0.482 |
-| `decompress/level_18_btultra/large-log-stream/c_stream/matrix/pure_rust` | 0.519 |
-| `decompress/level_18_btultra/large-log-stream/rust_stream/matrix/c_ffi` | 0.507 |
-| `decompress/level_18_btultra/large-log-stream/rust_stream/matrix/pure_rust` | 0.521 |
-| `decompress/level_18_btultra/low-entropy-1m/c_stream/matrix/c_ffi` | 0.173 |
-| `decompress/level_18_btultra/low-entropy-1m/c_stream/matrix/pure_rust` | 0.030 |
-| `decompress/level_18_btultra/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.173 |
-| `decompress/level_18_btultra/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.031 |
+| `decompress/level_18_btultra/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.852 |
+| `decompress/level_18_btultra/decodecorpus-z000033/c_stream/matrix/pure_rust` | 2.968 |
+| `decompress/level_18_btultra/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.959 |
+| `decompress/level_18_btultra/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.163 |
+| `decompress/level_18_btultra/high-entropy-1m/c_stream/matrix/c_ffi` | 0.037 |
+| `decompress/level_18_btultra/high-entropy-1m/c_stream/matrix/pure_rust` | 0.035 |
+| `decompress/level_18_btultra/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.035 |
+| `decompress/level_18_btultra/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.035 |
+| `decompress/level_18_btultra/large-log-stream/c_stream/matrix/c_ffi` | 0.431 |
+| `decompress/level_18_btultra/large-log-stream/c_stream/matrix/pure_rust` | 0.416 |
+| `decompress/level_18_btultra/large-log-stream/rust_stream/matrix/c_ffi` | 0.428 |
+| `decompress/level_18_btultra/large-log-stream/rust_stream/matrix/pure_rust` | 0.416 |
+| `decompress/level_18_btultra/low-entropy-1m/c_stream/matrix/c_ffi` | 0.157 |
+| `decompress/level_18_btultra/low-entropy-1m/c_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_18_btultra/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.157 |
+| `decompress/level_18_btultra/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
 | `decompress/level_18_btultra/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_18_btultra/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_18_btultra/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -6749,22 +6749,22 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_18_btultra/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_18_btultra/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_18_btultra/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_19_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.909 |
-| `decompress/level_19_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.282 |
-| `decompress/level_19_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.024 |
-| `decompress/level_19_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.501 |
-| `decompress/level_19_btultra2/high-entropy-1m/c_stream/matrix/c_ffi` | 0.030 |
-| `decompress/level_19_btultra2/high-entropy-1m/c_stream/matrix/pure_rust` | 0.031 |
-| `decompress/level_19_btultra2/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.031 |
-| `decompress/level_19_btultra2/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.031 |
-| `decompress/level_19_btultra2/large-log-stream/c_stream/matrix/c_ffi` | 0.490 |
-| `decompress/level_19_btultra2/large-log-stream/c_stream/matrix/pure_rust` | 0.519 |
-| `decompress/level_19_btultra2/large-log-stream/rust_stream/matrix/c_ffi` | 0.482 |
-| `decompress/level_19_btultra2/large-log-stream/rust_stream/matrix/pure_rust` | 0.529 |
-| `decompress/level_19_btultra2/low-entropy-1m/c_stream/matrix/c_ffi` | 0.173 |
-| `decompress/level_19_btultra2/low-entropy-1m/c_stream/matrix/pure_rust` | 0.030 |
-| `decompress/level_19_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.174 |
-| `decompress/level_19_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.030 |
+| `decompress/level_19_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.888 |
+| `decompress/level_19_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.024 |
+| `decompress/level_19_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.983 |
+| `decompress/level_19_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.210 |
+| `decompress/level_19_btultra2/high-entropy-1m/c_stream/matrix/c_ffi` | 0.036 |
+| `decompress/level_19_btultra2/high-entropy-1m/c_stream/matrix/pure_rust` | 0.035 |
+| `decompress/level_19_btultra2/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.035 |
+| `decompress/level_19_btultra2/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.035 |
+| `decompress/level_19_btultra2/large-log-stream/c_stream/matrix/c_ffi` | 0.434 |
+| `decompress/level_19_btultra2/large-log-stream/c_stream/matrix/pure_rust` | 0.416 |
+| `decompress/level_19_btultra2/large-log-stream/rust_stream/matrix/c_ffi` | 0.432 |
+| `decompress/level_19_btultra2/large-log-stream/rust_stream/matrix/pure_rust` | 0.416 |
+| `decompress/level_19_btultra2/low-entropy-1m/c_stream/matrix/c_ffi` | 0.157 |
+| `decompress/level_19_btultra2/low-entropy-1m/c_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_19_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.157 |
+| `decompress/level_19_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
 | `decompress/level_19_btultra2/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_19_btultra2/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_19_btultra2/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -6777,22 +6777,22 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_19_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_19_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_19_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_20_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.906 |
-| `decompress/level_20_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.289 |
-| `decompress/level_20_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.030 |
-| `decompress/level_20_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.511 |
-| `decompress/level_20_btultra2/high-entropy-1m/c_stream/matrix/c_ffi` | 0.030 |
-| `decompress/level_20_btultra2/high-entropy-1m/c_stream/matrix/pure_rust` | 0.031 |
-| `decompress/level_20_btultra2/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.031 |
-| `decompress/level_20_btultra2/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.031 |
-| `decompress/level_20_btultra2/large-log-stream/c_stream/matrix/c_ffi` | 0.519 |
-| `decompress/level_20_btultra2/large-log-stream/c_stream/matrix/pure_rust` | 0.559 |
-| `decompress/level_20_btultra2/large-log-stream/rust_stream/matrix/c_ffi` | 0.516 |
-| `decompress/level_20_btultra2/large-log-stream/rust_stream/matrix/pure_rust` | 0.539 |
-| `decompress/level_20_btultra2/low-entropy-1m/c_stream/matrix/c_ffi` | 0.174 |
-| `decompress/level_20_btultra2/low-entropy-1m/c_stream/matrix/pure_rust` | 0.030 |
-| `decompress/level_20_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.173 |
-| `decompress/level_20_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.030 |
+| `decompress/level_20_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.890 |
+| `decompress/level_20_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.025 |
+| `decompress/level_20_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.984 |
+| `decompress/level_20_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.209 |
+| `decompress/level_20_btultra2/high-entropy-1m/c_stream/matrix/c_ffi` | 0.036 |
+| `decompress/level_20_btultra2/high-entropy-1m/c_stream/matrix/pure_rust` | 0.035 |
+| `decompress/level_20_btultra2/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.035 |
+| `decompress/level_20_btultra2/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.035 |
+| `decompress/level_20_btultra2/large-log-stream/c_stream/matrix/c_ffi` | 0.432 |
+| `decompress/level_20_btultra2/large-log-stream/c_stream/matrix/pure_rust` | 0.416 |
+| `decompress/level_20_btultra2/large-log-stream/rust_stream/matrix/c_ffi` | 0.430 |
+| `decompress/level_20_btultra2/large-log-stream/rust_stream/matrix/pure_rust` | 0.415 |
+| `decompress/level_20_btultra2/low-entropy-1m/c_stream/matrix/c_ffi` | 0.157 |
+| `decompress/level_20_btultra2/low-entropy-1m/c_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_20_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.157 |
+| `decompress/level_20_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
 | `decompress/level_20_btultra2/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_20_btultra2/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_20_btultra2/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -6805,22 +6805,22 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_20_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_20_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_20_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_21_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.915 |
-| `decompress/level_21_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.270 |
-| `decompress/level_21_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.007 |
-| `decompress/level_21_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.459 |
-| `decompress/level_21_btultra2/high-entropy-1m/c_stream/matrix/c_ffi` | 0.030 |
-| `decompress/level_21_btultra2/high-entropy-1m/c_stream/matrix/pure_rust` | 0.031 |
-| `decompress/level_21_btultra2/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.031 |
-| `decompress/level_21_btultra2/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.031 |
-| `decompress/level_21_btultra2/large-log-stream/c_stream/matrix/c_ffi` | 0.500 |
-| `decompress/level_21_btultra2/large-log-stream/c_stream/matrix/pure_rust` | 0.559 |
-| `decompress/level_21_btultra2/large-log-stream/rust_stream/matrix/c_ffi` | 0.513 |
-| `decompress/level_21_btultra2/large-log-stream/rust_stream/matrix/pure_rust` | 0.555 |
-| `decompress/level_21_btultra2/low-entropy-1m/c_stream/matrix/c_ffi` | 0.173 |
-| `decompress/level_21_btultra2/low-entropy-1m/c_stream/matrix/pure_rust` | 0.030 |
-| `decompress/level_21_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.173 |
-| `decompress/level_21_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.030 |
+| `decompress/level_21_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.875 |
+| `decompress/level_21_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.004 |
+| `decompress/level_21_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.968 |
+| `decompress/level_21_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.177 |
+| `decompress/level_21_btultra2/high-entropy-1m/c_stream/matrix/c_ffi` | 0.035 |
+| `decompress/level_21_btultra2/high-entropy-1m/c_stream/matrix/pure_rust` | 0.035 |
+| `decompress/level_21_btultra2/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.037 |
+| `decompress/level_21_btultra2/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.035 |
+| `decompress/level_21_btultra2/large-log-stream/c_stream/matrix/c_ffi` | 0.430 |
+| `decompress/level_21_btultra2/large-log-stream/c_stream/matrix/pure_rust` | 0.417 |
+| `decompress/level_21_btultra2/large-log-stream/rust_stream/matrix/c_ffi` | 0.432 |
+| `decompress/level_21_btultra2/large-log-stream/rust_stream/matrix/pure_rust` | 0.418 |
+| `decompress/level_21_btultra2/low-entropy-1m/c_stream/matrix/c_ffi` | 0.157 |
+| `decompress/level_21_btultra2/low-entropy-1m/c_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_21_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.157 |
+| `decompress/level_21_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
 | `decompress/level_21_btultra2/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_21_btultra2/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_21_btultra2/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -6833,22 +6833,22 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_21_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_21_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_21_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.937 |
-| `decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.323 |
-| `decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 2.002 |
-| `decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.455 |
-| `decompress/level_22_btultra2/high-entropy-1m/c_stream/matrix/c_ffi` | 0.032 |
-| `decompress/level_22_btultra2/high-entropy-1m/c_stream/matrix/pure_rust` | 0.031 |
-| `decompress/level_22_btultra2/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.031 |
-| `decompress/level_22_btultra2/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.031 |
-| `decompress/level_22_btultra2/large-log-stream/c_stream/matrix/c_ffi` | 0.478 |
-| `decompress/level_22_btultra2/large-log-stream/c_stream/matrix/pure_rust` | 0.520 |
-| `decompress/level_22_btultra2/large-log-stream/rust_stream/matrix/c_ffi` | 0.491 |
-| `decompress/level_22_btultra2/large-log-stream/rust_stream/matrix/pure_rust` | 0.541 |
-| `decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi` | 0.173 |
-| `decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust` | 0.030 |
-| `decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.174 |
-| `decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.031 |
+| `decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.901 |
+| `decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust` | 3.050 |
+| `decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.957 |
+| `decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 3.163 |
+| `decompress/level_22_btultra2/high-entropy-1m/c_stream/matrix/c_ffi` | 0.036 |
+| `decompress/level_22_btultra2/high-entropy-1m/c_stream/matrix/pure_rust` | 0.036 |
+| `decompress/level_22_btultra2/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.037 |
+| `decompress/level_22_btultra2/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.036 |
+| `decompress/level_22_btultra2/large-log-stream/c_stream/matrix/c_ffi` | 0.433 |
+| `decompress/level_22_btultra2/large-log-stream/c_stream/matrix/pure_rust` | 0.416 |
+| `decompress/level_22_btultra2/large-log-stream/rust_stream/matrix/c_ffi` | 0.432 |
+| `decompress/level_22_btultra2/large-log-stream/rust_stream/matrix/pure_rust` | 0.416 |
+| `decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi` | 0.157 |
+| `decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.157 |
+| `decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
 | `decompress/level_22_btultra2/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_22_btultra2/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_22_btultra2/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -6861,12 +6861,12 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `dict-train/na/decodecorpus-z000033/matrix/c_ffi` | 61.538 |
-| `dict-train/na/decodecorpus-z000033/matrix/pure_rust` | 13.215 |
-| `dict-train/na/small-10k-random/matrix/c_ffi` | 12.627 |
-| `dict-train/na/small-10k-random/matrix/pure_rust` | 3.438 |
-| `dict-train/na/small-4k-log-lines/matrix/c_ffi` | 2.865 |
-| `dict-train/na/small-4k-log-lines/matrix/pure_rust` | 1.096 |
+| `dict-train/na/decodecorpus-z000033/matrix/c_ffi` | 46.645 |
+| `dict-train/na/decodecorpus-z000033/matrix/pure_rust` | 11.554 |
+| `dict-train/na/small-10k-random/matrix/c_ffi` | 11.346 |
+| `dict-train/na/small-10k-random/matrix/pure_rust` | 3.181 |
+| `dict-train/na/small-4k-log-lines/matrix/c_ffi` | 2.449 |
+| `dict-train/na/small-4k-log-lines/matrix/pure_rust` | 1.056 |
 
 ## Strategy group: fast-dfast
 
@@ -7056,223 +7056,223 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 
 | Scenario | Label | Level | Dict bytes | Train ms | C bytes (no dict) | C bytes (with dict) | C ratio (no dict) | C ratio (with dict) |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| decodecorpus-z000033 | Repo decode corpus sample | level_-1_fast | 16384 | 53.625 | 595456 | 566610 | 0.5826 | 0.5544 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_1_fast | 16384 | 53.625 | 571525 | 550232 | 0.5592 | 0.5384 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_2_fast | 16384 | 53.625 | 550910 | 522181 | 0.5390 | 0.5109 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_3_dfast | 16384 | 53.625 | 498911 | 492978 | 0.4882 | 0.4823 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_4_dfast | 16384 | 53.625 | 498591 | 478473 | 0.4878 | 0.4682 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_5_greedy | 16384 | 53.625 | 489007 | 468499 | 0.4785 | 0.4584 |
-| small-10k-random | Small random payload (10 KiB) | level_-1_fast | 1280 | 12.262 | 10250 | 9218 | 1.0010 | 0.9002 |
-| small-10k-random | Small random payload (10 KiB) | level_1_fast | 1280 | 12.262 | 10250 | 9218 | 1.0010 | 0.9002 |
-| small-10k-random | Small random payload (10 KiB) | level_2_fast | 1280 | 12.262 | 10250 | 9218 | 1.0010 | 0.9002 |
-| small-10k-random | Small random payload (10 KiB) | level_3_dfast | 1280 | 12.262 | 10250 | 9218 | 1.0010 | 0.9002 |
-| small-10k-random | Small random payload (10 KiB) | level_4_dfast | 1280 | 12.262 | 10250 | 9218 | 1.0010 | 0.9002 |
-| small-10k-random | Small random payload (10 KiB) | level_5_greedy | 1280 | 12.262 | 10250 | 9214 | 1.0010 | 0.8998 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_-1_fast | 437 | 2.902 | 172 | 44 | 0.0420 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_1_fast | 437 | 2.902 | 153 | 44 | 0.0374 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_2_fast | 437 | 2.902 | 153 | 44 | 0.0374 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_3_dfast | 437 | 2.902 | 152 | 44 | 0.0371 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_4_dfast | 437 | 2.902 | 152 | 49 | 0.0371 | 0.0120 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_5_greedy | 437 | 2.902 | 150 | 44 | 0.0366 | 0.0107 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_-1_fast | 16384 | 52.967 | 595456 | 566610 | 0.5826 | 0.5544 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_1_fast | 16384 | 52.967 | 571525 | 550232 | 0.5592 | 0.5384 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_2_fast | 16384 | 52.967 | 550910 | 522181 | 0.5390 | 0.5109 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_3_dfast | 16384 | 52.967 | 498911 | 492978 | 0.4882 | 0.4823 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_4_dfast | 16384 | 52.967 | 498591 | 478473 | 0.4878 | 0.4682 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_5_greedy | 16384 | 52.967 | 489007 | 468499 | 0.4785 | 0.4584 |
+| small-10k-random | Small random payload (10 KiB) | level_-1_fast | 1280 | 11.870 | 10250 | 9218 | 1.0010 | 0.9002 |
+| small-10k-random | Small random payload (10 KiB) | level_1_fast | 1280 | 11.870 | 10250 | 9218 | 1.0010 | 0.9002 |
+| small-10k-random | Small random payload (10 KiB) | level_2_fast | 1280 | 11.870 | 10250 | 9218 | 1.0010 | 0.9002 |
+| small-10k-random | Small random payload (10 KiB) | level_3_dfast | 1280 | 11.870 | 10250 | 9218 | 1.0010 | 0.9002 |
+| small-10k-random | Small random payload (10 KiB) | level_4_dfast | 1280 | 11.870 | 10250 | 9218 | 1.0010 | 0.9002 |
+| small-10k-random | Small random payload (10 KiB) | level_5_greedy | 1280 | 11.870 | 10250 | 9214 | 1.0010 | 0.8998 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_-1_fast | 437 | 2.596 | 172 | 44 | 0.0420 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_1_fast | 437 | 2.596 | 153 | 44 | 0.0374 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_2_fast | 437 | 2.596 | 153 | 44 | 0.0374 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_3_dfast | 437 | 2.596 | 152 | 44 | 0.0371 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_4_dfast | 437 | 2.596 | 152 | 49 | 0.0371 | 0.0120 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_5_greedy | 437 | 2.596 | 150 | 44 | 0.0366 | 0.0107 |
 
 ## Dictionary Training (Rust FastCOVER vs C FFI)
 
 | Scenario | Label | Dict bytes (requested) | Rust train ms | C train ms | Rust dict bytes | C dict bytes | Rust FastCOVER score | Delta (C/Rust) | Status |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| decodecorpus-z000033 | Repo decode corpus sample | 16384 | 12.373 | 53.625 | 16384 | 16384 | 0 | 4.3340 | rust_faster |
-| small-10k-random | Small random payload (10 KiB) | 1280 | 3.676 | 12.262 | 1280 | 1280 | 0 | 3.3357 | rust_faster |
-| small-4k-log-lines | Small structured log lines (4 KiB) | 512 | 1.319 | 2.902 | 512 | 437 | 0 | 2.2002 | rust_faster |
+| decodecorpus-z000033 | Repo decode corpus sample | 16384 | 12.232 | 52.967 | 16384 | 16384 | 0 | 4.3302 | rust_faster |
+| small-10k-random | Small random payload (10 KiB) | 1280 | 3.326 | 11.870 | 1280 | 1280 | 0 | 3.5689 | rust_faster |
+| small-4k-log-lines | Small structured log lines (4 KiB) | 512 | 1.146 | 2.596 | 512 | 437 | 0 | 2.2653 | rust_faster |
 
 ## Timing Metrics
 
 | Benchmark | ms/iter |
 | --- | ---: |
-| `compress-dict/level_-1_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.787 |
-| `compress-dict/level_-1_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 2.425 |
-| `compress-dict/level_-1_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 5.112 |
+| `compress-dict/level_-1_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.788 |
+| `compress-dict/level_-1_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 2.408 |
+| `compress-dict/level_-1_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 4.989 |
 | `compress-dict/level_-1_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.013 |
-| `compress-dict/level_-1_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.045 |
-| `compress-dict/level_-1_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.009 |
+| `compress-dict/level_-1_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.044 |
+| `compress-dict/level_-1_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.010 |
 | `compress-dict/level_-1_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.002 |
 | `compress-dict/level_-1_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.051 |
 | `compress-dict/level_-1_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.002 |
-| `compress-dict/level_1_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 3.048 |
-| `compress-dict/level_1_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 2.859 |
-| `compress-dict/level_1_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 5.357 |
+| `compress-dict/level_1_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 3.019 |
+| `compress-dict/level_1_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 2.846 |
+| `compress-dict/level_1_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 5.148 |
 | `compress-dict/level_1_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.016 |
-| `compress-dict/level_1_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.094 |
-| `compress-dict/level_1_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.009 |
+| `compress-dict/level_1_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.092 |
+| `compress-dict/level_1_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.010 |
 | `compress-dict/level_1_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.002 |
 | `compress-dict/level_1_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.056 |
 | `compress-dict/level_1_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.002 |
-| `compress-dict/level_2_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 4.067 |
-| `compress-dict/level_2_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 3.859 |
-| `compress-dict/level_2_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 6.879 |
-| `compress-dict/level_2_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.018 |
-| `compress-dict/level_2_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.096 |
-| `compress-dict/level_2_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.009 |
+| `compress-dict/level_2_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 3.898 |
+| `compress-dict/level_2_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 3.722 |
+| `compress-dict/level_2_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 6.637 |
+| `compress-dict/level_2_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.019 |
+| `compress-dict/level_2_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.092 |
+| `compress-dict/level_2_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.010 |
 | `compress-dict/level_2_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.002 |
 | `compress-dict/level_2_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.055 |
 | `compress-dict/level_2_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.002 |
-| `compress-dict/level_3_dfast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 7.068 |
-| `compress-dict/level_3_dfast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 7.132 |
-| `compress-dict/level_3_dfast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 15.600 |
+| `compress-dict/level_3_dfast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 6.910 |
+| `compress-dict/level_3_dfast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 6.913 |
+| `compress-dict/level_3_dfast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 15.209 |
 | `compress-dict/level_3_dfast/small-10k-random/matrix/c_ffi_with_dict` | 0.036 |
-| `compress-dict/level_3_dfast/small-10k-random/matrix/c_ffi_without_dict` | 0.127 |
-| `compress-dict/level_3_dfast/small-10k-random/matrix/pure_rust_with_dict` | 0.045 |
+| `compress-dict/level_3_dfast/small-10k-random/matrix/c_ffi_without_dict` | 0.123 |
+| `compress-dict/level_3_dfast/small-10k-random/matrix/pure_rust_with_dict` | 0.044 |
 | `compress-dict/level_3_dfast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.002 |
-| `compress-dict/level_3_dfast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.063 |
+| `compress-dict/level_3_dfast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.062 |
 | `compress-dict/level_3_dfast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.003 |
-| `compress-dict/level_4_dfast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 7.622 |
-| `compress-dict/level_4_dfast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 8.205 |
-| `compress-dict/level_4_dfast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 17.170 |
-| `compress-dict/level_4_dfast/small-10k-random/matrix/c_ffi_with_dict` | 0.098 |
-| `compress-dict/level_4_dfast/small-10k-random/matrix/c_ffi_without_dict` | 0.103 |
+| `compress-dict/level_4_dfast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 7.270 |
+| `compress-dict/level_4_dfast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 7.754 |
+| `compress-dict/level_4_dfast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 16.327 |
+| `compress-dict/level_4_dfast/small-10k-random/matrix/c_ffi_with_dict` | 0.097 |
+| `compress-dict/level_4_dfast/small-10k-random/matrix/c_ffi_without_dict` | 0.101 |
 | `compress-dict/level_4_dfast/small-10k-random/matrix/pure_rust_with_dict` | 0.044 |
 | `compress-dict/level_4_dfast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.002 |
-| `compress-dict/level_4_dfast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.065 |
+| `compress-dict/level_4_dfast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.063 |
 | `compress-dict/level_4_dfast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.003 |
-| `compress-dict/level_5_greedy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 12.341 |
-| `compress-dict/level_5_greedy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 12.562 |
-| `compress-dict/level_5_greedy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 24.340 |
+| `compress-dict/level_5_greedy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 12.188 |
+| `compress-dict/level_5_greedy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 11.817 |
+| `compress-dict/level_5_greedy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 23.431 |
 | `compress-dict/level_5_greedy/small-10k-random/matrix/c_ffi_with_dict` | 0.112 |
-| `compress-dict/level_5_greedy/small-10k-random/matrix/c_ffi_without_dict` | 0.105 |
-| `compress-dict/level_5_greedy/small-10k-random/matrix/pure_rust_with_dict` | 0.318 |
+| `compress-dict/level_5_greedy/small-10k-random/matrix/c_ffi_without_dict` | 0.102 |
+| `compress-dict/level_5_greedy/small-10k-random/matrix/pure_rust_with_dict` | 0.319 |
 | `compress-dict/level_5_greedy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.003 |
-| `compress-dict/level_5_greedy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.066 |
+| `compress-dict/level_5_greedy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.064 |
 | `compress-dict/level_5_greedy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.003 |
-| `compress/level_-1_fast/decodecorpus-z000033/matrix/c_ffi` | 3.094 |
-| `compress/level_-1_fast/decodecorpus-z000033/matrix/pure_rust` | 5.239 |
-| `compress/level_-1_fast/high-entropy-1m/matrix/c_ffi` | 1.167 |
-| `compress/level_-1_fast/high-entropy-1m/matrix/pure_rust` | 0.556 |
-| `compress/level_-1_fast/large-log-stream/matrix/c_ffi` | 3.200 |
-| `compress/level_-1_fast/large-log-stream/matrix/pure_rust` | 1.986 |
-| `compress/level_-1_fast/low-entropy-1m/matrix/c_ffi` | 0.520 |
-| `compress/level_-1_fast/low-entropy-1m/matrix/pure_rust` | 0.194 |
-| `compress/level_-1_fast/small-10k-random/matrix/c_ffi` | 0.059 |
+| `compress/level_-1_fast/decodecorpus-z000033/matrix/c_ffi` | 3.028 |
+| `compress/level_-1_fast/decodecorpus-z000033/matrix/pure_rust` | 5.078 |
+| `compress/level_-1_fast/high-entropy-1m/matrix/c_ffi` | 1.147 |
+| `compress/level_-1_fast/high-entropy-1m/matrix/pure_rust` | 0.555 |
+| `compress/level_-1_fast/large-log-stream/matrix/c_ffi` | 2.702 |
+| `compress/level_-1_fast/large-log-stream/matrix/pure_rust` | 1.892 |
+| `compress/level_-1_fast/low-entropy-1m/matrix/c_ffi` | 0.499 |
+| `compress/level_-1_fast/low-entropy-1m/matrix/pure_rust` | 0.189 |
+| `compress/level_-1_fast/small-10k-random/matrix/c_ffi` | 0.057 |
 | `compress/level_-1_fast/small-10k-random/matrix/pure_rust` | 0.016 |
 | `compress/level_-1_fast/small-1k-random/matrix/c_ffi` | 0.036 |
 | `compress/level_-1_fast/small-1k-random/matrix/pure_rust` | 0.002 |
-| `compress/level_-1_fast/small-4k-log-lines/matrix/c_ffi` | 0.053 |
+| `compress/level_-1_fast/small-4k-log-lines/matrix/c_ffi` | 0.052 |
 | `compress/level_-1_fast/small-4k-log-lines/matrix/pure_rust` | 0.051 |
-| `compress/level_1_fast/decodecorpus-z000033/matrix/c_ffi` | 3.527 |
-| `compress/level_1_fast/decodecorpus-z000033/matrix/pure_rust` | 5.394 |
-| `compress/level_1_fast/high-entropy-1m/matrix/c_ffi` | 1.216 |
-| `compress/level_1_fast/high-entropy-1m/matrix/pure_rust` | 0.560 |
-| `compress/level_1_fast/large-log-stream/matrix/c_ffi` | 2.824 |
-| `compress/level_1_fast/large-log-stream/matrix/pure_rust` | 1.984 |
-| `compress/level_1_fast/low-entropy-1m/matrix/c_ffi` | 0.511 |
-| `compress/level_1_fast/low-entropy-1m/matrix/pure_rust` | 0.229 |
-| `compress/level_1_fast/small-10k-random/matrix/c_ffi` | 0.109 |
+| `compress/level_1_fast/decodecorpus-z000033/matrix/c_ffi` | 3.485 |
+| `compress/level_1_fast/decodecorpus-z000033/matrix/pure_rust` | 5.276 |
+| `compress/level_1_fast/high-entropy-1m/matrix/c_ffi` | 1.194 |
+| `compress/level_1_fast/high-entropy-1m/matrix/pure_rust` | 0.556 |
+| `compress/level_1_fast/large-log-stream/matrix/c_ffi` | 2.429 |
+| `compress/level_1_fast/large-log-stream/matrix/pure_rust` | 1.930 |
+| `compress/level_1_fast/low-entropy-1m/matrix/c_ffi` | 0.485 |
+| `compress/level_1_fast/low-entropy-1m/matrix/pure_rust` | 0.219 |
+| `compress/level_1_fast/small-10k-random/matrix/c_ffi` | 0.106 |
 | `compress/level_1_fast/small-10k-random/matrix/pure_rust` | 0.016 |
 | `compress/level_1_fast/small-1k-random/matrix/c_ffi` | 0.038 |
 | `compress/level_1_fast/small-1k-random/matrix/pure_rust` | 0.002 |
-| `compress/level_1_fast/small-4k-log-lines/matrix/c_ffi` | 0.058 |
-| `compress/level_1_fast/small-4k-log-lines/matrix/pure_rust` | 0.060 |
-| `compress/level_2_fast/decodecorpus-z000033/matrix/c_ffi` | 4.516 |
-| `compress/level_2_fast/decodecorpus-z000033/matrix/pure_rust` | 6.890 |
-| `compress/level_2_fast/high-entropy-1m/matrix/c_ffi` | 1.478 |
-| `compress/level_2_fast/high-entropy-1m/matrix/pure_rust` | 0.559 |
-| `compress/level_2_fast/large-log-stream/matrix/c_ffi` | 3.450 |
-| `compress/level_2_fast/large-log-stream/matrix/pure_rust` | 2.114 |
-| `compress/level_2_fast/low-entropy-1m/matrix/c_ffi` | 0.783 |
-| `compress/level_2_fast/low-entropy-1m/matrix/pure_rust` | 0.313 |
-| `compress/level_2_fast/small-10k-random/matrix/c_ffi` | 0.109 |
+| `compress/level_1_fast/small-4k-log-lines/matrix/c_ffi` | 0.057 |
+| `compress/level_1_fast/small-4k-log-lines/matrix/pure_rust` | 0.061 |
+| `compress/level_2_fast/decodecorpus-z000033/matrix/c_ffi` | 4.454 |
+| `compress/level_2_fast/decodecorpus-z000033/matrix/pure_rust` | 6.769 |
+| `compress/level_2_fast/high-entropy-1m/matrix/c_ffi` | 1.441 |
+| `compress/level_2_fast/high-entropy-1m/matrix/pure_rust` | 0.557 |
+| `compress/level_2_fast/large-log-stream/matrix/c_ffi` | 2.937 |
+| `compress/level_2_fast/large-log-stream/matrix/pure_rust` | 2.099 |
+| `compress/level_2_fast/low-entropy-1m/matrix/c_ffi` | 0.777 |
+| `compress/level_2_fast/low-entropy-1m/matrix/pure_rust` | 0.307 |
+| `compress/level_2_fast/small-10k-random/matrix/c_ffi` | 0.106 |
 | `compress/level_2_fast/small-10k-random/matrix/pure_rust` | 0.016 |
 | `compress/level_2_fast/small-1k-random/matrix/c_ffi` | 0.039 |
 | `compress/level_2_fast/small-1k-random/matrix/pure_rust` | 0.002 |
 | `compress/level_2_fast/small-4k-log-lines/matrix/c_ffi` | 0.057 |
-| `compress/level_2_fast/small-4k-log-lines/matrix/pure_rust` | 0.062 |
-| `compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi` | 5.793 |
-| `compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust` | 14.016 |
-| `compress/level_3_dfast/high-entropy-1m/matrix/c_ffi` | 1.039 |
-| `compress/level_3_dfast/high-entropy-1m/matrix/pure_rust` | 0.546 |
-| `compress/level_3_dfast/large-log-stream/matrix/c_ffi` | 3.806 |
-| `compress/level_3_dfast/large-log-stream/matrix/pure_rust` | 2.736 |
-| `compress/level_3_dfast/low-entropy-1m/matrix/c_ffi` | 0.396 |
-| `compress/level_3_dfast/low-entropy-1m/matrix/pure_rust` | 0.469 |
-| `compress/level_3_dfast/small-10k-random/matrix/c_ffi` | 0.141 |
+| `compress/level_2_fast/small-4k-log-lines/matrix/pure_rust` | 0.060 |
+| `compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi` | 6.835 |
+| `compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust` | 13.875 |
+| `compress/level_3_dfast/high-entropy-1m/matrix/c_ffi` | 1.719 |
+| `compress/level_3_dfast/high-entropy-1m/matrix/pure_rust` | 0.540 |
+| `compress/level_3_dfast/large-log-stream/matrix/c_ffi` | 3.746 |
+| `compress/level_3_dfast/large-log-stream/matrix/pure_rust` | 2.702 |
+| `compress/level_3_dfast/low-entropy-1m/matrix/c_ffi` | 0.374 |
+| `compress/level_3_dfast/low-entropy-1m/matrix/pure_rust` | 0.458 |
+| `compress/level_3_dfast/small-10k-random/matrix/c_ffi` | 0.138 |
 | `compress/level_3_dfast/small-10k-random/matrix/pure_rust` | 0.004 |
-| `compress/level_3_dfast/small-1k-random/matrix/c_ffi` | 0.043 |
+| `compress/level_3_dfast/small-1k-random/matrix/c_ffi` | 0.042 |
 | `compress/level_3_dfast/small-1k-random/matrix/pure_rust` | 0.001 |
-| `compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi` | 0.065 |
-| `compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust` | 0.063 |
-| `compress/level_4_dfast/decodecorpus-z000033/matrix/c_ffi` | 6.830 |
-| `compress/level_4_dfast/decodecorpus-z000033/matrix/pure_rust` | 16.017 |
-| `compress/level_4_dfast/high-entropy-1m/matrix/c_ffi` | 1.626 |
-| `compress/level_4_dfast/high-entropy-1m/matrix/pure_rust` | 0.547 |
-| `compress/level_4_dfast/large-log-stream/matrix/c_ffi` | 3.675 |
-| `compress/level_4_dfast/large-log-stream/matrix/pure_rust` | 3.086 |
-| `compress/level_4_dfast/low-entropy-1m/matrix/c_ffi` | 0.978 |
-| `compress/level_4_dfast/low-entropy-1m/matrix/pure_rust` | 0.541 |
-| `compress/level_4_dfast/small-10k-random/matrix/c_ffi` | 0.118 |
+| `compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi` | 0.064 |
+| `compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust` | 0.060 |
+| `compress/level_4_dfast/decodecorpus-z000033/matrix/c_ffi` | 6.677 |
+| `compress/level_4_dfast/decodecorpus-z000033/matrix/pure_rust` | 15.952 |
+| `compress/level_4_dfast/high-entropy-1m/matrix/c_ffi` | 1.562 |
+| `compress/level_4_dfast/high-entropy-1m/matrix/pure_rust` | 0.542 |
+| `compress/level_4_dfast/large-log-stream/matrix/c_ffi` | 3.565 |
+| `compress/level_4_dfast/large-log-stream/matrix/pure_rust` | 3.038 |
+| `compress/level_4_dfast/low-entropy-1m/matrix/c_ffi` | 0.894 |
+| `compress/level_4_dfast/low-entropy-1m/matrix/pure_rust` | 0.529 |
+| `compress/level_4_dfast/small-10k-random/matrix/c_ffi` | 0.116 |
 | `compress/level_4_dfast/small-10k-random/matrix/pure_rust` | 0.004 |
-| `compress/level_4_dfast/small-1k-random/matrix/c_ffi` | 0.046 |
+| `compress/level_4_dfast/small-1k-random/matrix/c_ffi` | 0.045 |
 | `compress/level_4_dfast/small-1k-random/matrix/pure_rust` | 0.001 |
-| `compress/level_4_dfast/small-4k-log-lines/matrix/c_ffi` | 0.066 |
-| `compress/level_4_dfast/small-4k-log-lines/matrix/pure_rust` | 0.064 |
-| `compress/level_5_greedy/decodecorpus-z000033/matrix/c_ffi` | 11.539 |
-| `compress/level_5_greedy/decodecorpus-z000033/matrix/pure_rust` | 22.653 |
-| `compress/level_5_greedy/high-entropy-1m/matrix/c_ffi` | 1.319 |
-| `compress/level_5_greedy/high-entropy-1m/matrix/pure_rust` | 2.489 |
-| `compress/level_5_greedy/large-log-stream/matrix/c_ffi` | 5.609 |
-| `compress/level_5_greedy/large-log-stream/matrix/pure_rust` | 5.401 |
-| `compress/level_5_greedy/low-entropy-1m/matrix/c_ffi` | 0.571 |
-| `compress/level_5_greedy/low-entropy-1m/matrix/pure_rust` | 1.445 |
-| `compress/level_5_greedy/small-10k-random/matrix/c_ffi` | 0.119 |
-| `compress/level_5_greedy/small-10k-random/matrix/pure_rust` | 0.120 |
-| `compress/level_5_greedy/small-1k-random/matrix/c_ffi` | 0.046 |
+| `compress/level_4_dfast/small-4k-log-lines/matrix/c_ffi` | 0.065 |
+| `compress/level_4_dfast/small-4k-log-lines/matrix/pure_rust` | 0.061 |
+| `compress/level_5_greedy/decodecorpus-z000033/matrix/c_ffi` | 11.594 |
+| `compress/level_5_greedy/decodecorpus-z000033/matrix/pure_rust` | 22.654 |
+| `compress/level_5_greedy/high-entropy-1m/matrix/c_ffi` | 2.165 |
+| `compress/level_5_greedy/high-entropy-1m/matrix/pure_rust` | 2.483 |
+| `compress/level_5_greedy/large-log-stream/matrix/c_ffi` | 5.799 |
+| `compress/level_5_greedy/large-log-stream/matrix/pure_rust` | 5.238 |
+| `compress/level_5_greedy/low-entropy-1m/matrix/c_ffi` | 1.377 |
+| `compress/level_5_greedy/low-entropy-1m/matrix/pure_rust` | 1.424 |
+| `compress/level_5_greedy/small-10k-random/matrix/c_ffi` | 0.118 |
+| `compress/level_5_greedy/small-10k-random/matrix/pure_rust` | 0.118 |
+| `compress/level_5_greedy/small-1k-random/matrix/c_ffi` | 0.045 |
 | `compress/level_5_greedy/small-1k-random/matrix/pure_rust` | 0.003 |
-| `compress/level_5_greedy/small-4k-log-lines/matrix/c_ffi` | 0.068 |
-| `compress/level_5_greedy/small-4k-log-lines/matrix/pure_rust` | 0.071 |
-| `decompress-dict/level_-1_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.655 |
-| `decompress-dict/level_-1_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 1.084 |
+| `compress/level_5_greedy/small-4k-log-lines/matrix/c_ffi` | 0.066 |
+| `compress/level_5_greedy/small-4k-log-lines/matrix/pure_rust` | 0.069 |
+| `decompress-dict/level_-1_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.652 |
+| `decompress-dict/level_-1_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 1.077 |
 | `decompress-dict/level_-1_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_-1_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_-1_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_-1_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_1_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.021 |
-| `decompress-dict/level_1_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 1.471 |
+| `decompress-dict/level_1_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.019 |
+| `decompress-dict/level_1_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 1.463 |
 | `decompress-dict/level_1_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_1_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_1_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_1_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_2_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.096 |
-| `decompress-dict/level_2_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 1.635 |
+| `decompress-dict/level_2_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.094 |
+| `decompress-dict/level_2_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 1.623 |
 | `decompress-dict/level_2_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_2_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_2_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_2_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_3_dfast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.277 |
-| `decompress-dict/level_3_dfast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.066 |
+| `decompress-dict/level_3_dfast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.283 |
+| `decompress-dict/level_3_dfast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.045 |
 | `decompress-dict/level_3_dfast/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_3_dfast/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_3_dfast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_3_dfast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_4_dfast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.392 |
-| `decompress-dict/level_4_dfast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.307 |
+| `decompress-dict/level_4_dfast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.394 |
+| `decompress-dict/level_4_dfast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.277 |
 | `decompress-dict/level_4_dfast/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_4_dfast/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_4_dfast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_4_dfast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_5_greedy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.415 |
-| `decompress-dict/level_5_greedy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.345 |
+| `decompress-dict/level_5_greedy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.423 |
+| `decompress-dict/level_5_greedy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.326 |
 | `decompress-dict/level_5_greedy/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_5_greedy/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_5_greedy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_5_greedy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress/level_-1_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.531 |
+| `decompress/level_-1_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.530 |
 | `decompress/level_-1_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.833 |
-| `decompress/level_-1_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.948 |
-| `decompress/level_-1_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.299 |
-| `decompress/level_-1_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.038 |
-| `decompress/level_-1_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.037 |
-| `decompress/level_-1_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.037 |
-| `decompress/level_-1_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.036 |
-| `decompress/level_-1_fast/large-log-stream/c_stream/matrix/c_ffi` | 0.656 |
-| `decompress/level_-1_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.419 |
-| `decompress/level_-1_fast/large-log-stream/rust_stream/matrix/c_ffi` | 0.656 |
-| `decompress/level_-1_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.421 |
+| `decompress/level_-1_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.949 |
+| `decompress/level_-1_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.298 |
+| `decompress/level_-1_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.028 |
+| `decompress/level_-1_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_-1_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.027 |
+| `decompress/level_-1_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_-1_fast/large-log-stream/c_stream/matrix/c_ffi` | 0.653 |
+| `decompress/level_-1_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.404 |
+| `decompress/level_-1_fast/large-log-stream/rust_stream/matrix/c_ffi` | 0.657 |
+| `decompress/level_-1_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.403 |
 | `decompress/level_-1_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.188 |
 | `decompress/level_-1_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
 | `decompress/level_-1_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.188 |
@@ -7290,17 +7290,17 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_-1_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_-1_fast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_1_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.972 |
-| `decompress/level_1_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.346 |
-| `decompress/level_1_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.949 |
-| `decompress/level_1_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.305 |
-| `decompress/level_1_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.038 |
-| `decompress/level_1_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.037 |
-| `decompress/level_1_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.038 |
-| `decompress/level_1_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.037 |
-| `decompress/level_1_fast/large-log-stream/c_stream/matrix/c_ffi` | 0.660 |
-| `decompress/level_1_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.428 |
-| `decompress/level_1_fast/large-log-stream/rust_stream/matrix/c_ffi` | 0.657 |
-| `decompress/level_1_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.418 |
+| `decompress/level_1_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.350 |
+| `decompress/level_1_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.951 |
+| `decompress/level_1_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.300 |
+| `decompress/level_1_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.028 |
+| `decompress/level_1_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_1_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.028 |
+| `decompress/level_1_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_1_fast/large-log-stream/c_stream/matrix/c_ffi` | 0.654 |
+| `decompress/level_1_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.407 |
+| `decompress/level_1_fast/large-log-stream/rust_stream/matrix/c_ffi` | 0.654 |
+| `decompress/level_1_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.405 |
 | `decompress/level_1_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.188 |
 | `decompress/level_1_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
 | `decompress/level_1_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.188 |
@@ -7318,19 +7318,19 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_1_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_1_fast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_2_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.023 |
-| `decompress/level_2_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.444 |
-| `decompress/level_2_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.008 |
-| `decompress/level_2_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.413 |
-| `decompress/level_2_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.038 |
-| `decompress/level_2_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.038 |
-| `decompress/level_2_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.038 |
-| `decompress/level_2_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.038 |
-| `decompress/level_2_fast/large-log-stream/c_stream/matrix/c_ffi` | 0.659 |
-| `decompress/level_2_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.419 |
-| `decompress/level_2_fast/large-log-stream/rust_stream/matrix/c_ffi` | 0.657 |
-| `decompress/level_2_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.421 |
+| `decompress/level_2_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.451 |
+| `decompress/level_2_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.009 |
+| `decompress/level_2_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.424 |
+| `decompress/level_2_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.028 |
+| `decompress/level_2_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_2_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.027 |
+| `decompress/level_2_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_2_fast/large-log-stream/c_stream/matrix/c_ffi` | 0.654 |
+| `decompress/level_2_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.408 |
+| `decompress/level_2_fast/large-log-stream/rust_stream/matrix/c_ffi` | 0.654 |
+| `decompress/level_2_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.403 |
 | `decompress/level_2_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.188 |
-| `decompress/level_2_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_2_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
 | `decompress/level_2_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.188 |
 | `decompress/level_2_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
 | `decompress/level_2_fast/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
@@ -7346,20 +7346,20 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_2_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_2_fast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.047 |
-| `decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.517 |
-| `decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.174 |
-| `decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.734 |
-| `decompress/level_3_dfast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.029 |
+| `decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.516 |
+| `decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.177 |
+| `decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.725 |
+| `decompress/level_3_dfast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.028 |
 | `decompress/level_3_dfast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
 | `decompress/level_3_dfast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.030 |
 | `decompress/level_3_dfast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_3_dfast/large-log-stream/c_stream/matrix/c_ffi` | 0.658 |
-| `decompress/level_3_dfast/large-log-stream/c_stream/matrix/pure_rust` | 0.426 |
-| `decompress/level_3_dfast/large-log-stream/rust_stream/matrix/c_ffi` | 0.624 |
-| `decompress/level_3_dfast/large-log-stream/rust_stream/matrix/pure_rust` | 0.881 |
+| `decompress/level_3_dfast/large-log-stream/c_stream/matrix/c_ffi` | 0.656 |
+| `decompress/level_3_dfast/large-log-stream/c_stream/matrix/pure_rust` | 0.406 |
+| `decompress/level_3_dfast/large-log-stream/rust_stream/matrix/c_ffi` | 0.529 |
+| `decompress/level_3_dfast/large-log-stream/rust_stream/matrix/pure_rust` | 0.785 |
 | `decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.188 |
-| `decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
-| `decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.049 |
+| `decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.048 |
 | `decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.053 |
 | `decompress/level_3_dfast/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_3_dfast/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
@@ -7373,20 +7373,20 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_4_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.049 |
-| `decompress/level_4_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.524 |
-| `decompress/level_4_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.170 |
-| `decompress/level_4_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.724 |
+| `decompress/level_4_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.053 |
+| `decompress/level_4_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.526 |
+| `decompress/level_4_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.175 |
+| `decompress/level_4_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.722 |
 | `decompress/level_4_dfast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.028 |
 | `decompress/level_4_dfast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_4_dfast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.030 |
+| `decompress/level_4_dfast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.028 |
 | `decompress/level_4_dfast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_4_dfast/large-log-stream/c_stream/matrix/c_ffi` | 0.657 |
-| `decompress/level_4_dfast/large-log-stream/c_stream/matrix/pure_rust` | 0.405 |
-| `decompress/level_4_dfast/large-log-stream/rust_stream/matrix/c_ffi` | 0.525 |
-| `decompress/level_4_dfast/large-log-stream/rust_stream/matrix/pure_rust` | 0.776 |
+| `decompress/level_4_dfast/large-log-stream/c_stream/matrix/c_ffi` | 0.654 |
+| `decompress/level_4_dfast/large-log-stream/c_stream/matrix/pure_rust` | 0.407 |
+| `decompress/level_4_dfast/large-log-stream/rust_stream/matrix/c_ffi` | 0.523 |
+| `decompress/level_4_dfast/large-log-stream/rust_stream/matrix/pure_rust` | 0.762 |
 | `decompress/level_4_dfast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.188 |
-| `decompress/level_4_dfast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_4_dfast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
 | `decompress/level_4_dfast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.048 |
 | `decompress/level_4_dfast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.053 |
 | `decompress/level_4_dfast/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
@@ -7401,22 +7401,22 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_4_dfast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_4_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_4_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_5_greedy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.057 |
-| `decompress/level_5_greedy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.539 |
-| `decompress/level_5_greedy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.274 |
-| `decompress/level_5_greedy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.886 |
+| `decompress/level_5_greedy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.058 |
+| `decompress/level_5_greedy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.546 |
+| `decompress/level_5_greedy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.285 |
+| `decompress/level_5_greedy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.866 |
 | `decompress/level_5_greedy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.029 |
 | `decompress/level_5_greedy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_5_greedy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.030 |
+| `decompress/level_5_greedy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.028 |
 | `decompress/level_5_greedy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_5_greedy/large-log-stream/c_stream/matrix/c_ffi` | 0.657 |
-| `decompress/level_5_greedy/large-log-stream/c_stream/matrix/pure_rust` | 0.421 |
-| `decompress/level_5_greedy/large-log-stream/rust_stream/matrix/c_ffi` | 0.511 |
-| `decompress/level_5_greedy/large-log-stream/rust_stream/matrix/pure_rust` | 0.400 |
+| `decompress/level_5_greedy/large-log-stream/c_stream/matrix/c_ffi` | 0.654 |
+| `decompress/level_5_greedy/large-log-stream/c_stream/matrix/pure_rust` | 0.409 |
+| `decompress/level_5_greedy/large-log-stream/rust_stream/matrix/c_ffi` | 0.504 |
+| `decompress/level_5_greedy/large-log-stream/rust_stream/matrix/pure_rust` | 0.404 |
 | `decompress/level_5_greedy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.188 |
 | `decompress/level_5_greedy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
 | `decompress/level_5_greedy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.156 |
-| `decompress/level_5_greedy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_5_greedy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
 | `decompress/level_5_greedy/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_5_greedy/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_5_greedy/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -7429,12 +7429,12 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_5_greedy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_5_greedy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_5_greedy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `dict-train/na/decodecorpus-z000033/matrix/c_ffi` | 54.438 |
-| `dict-train/na/decodecorpus-z000033/matrix/pure_rust` | 12.770 |
-| `dict-train/na/small-10k-random/matrix/c_ffi` | 11.485 |
-| `dict-train/na/small-10k-random/matrix/pure_rust` | 3.225 |
-| `dict-train/na/small-4k-log-lines/matrix/c_ffi` | 2.560 |
-| `dict-train/na/small-4k-log-lines/matrix/pure_rust` | 1.060 |
+| `dict-train/na/decodecorpus-z000033/matrix/c_ffi` | 51.367 |
+| `dict-train/na/decodecorpus-z000033/matrix/pure_rust` | 11.552 |
+| `dict-train/na/small-10k-random/matrix/c_ffi` | 11.322 |
+| `dict-train/na/small-10k-random/matrix/pure_rust` | 3.153 |
+| `dict-train/na/small-4k-log-lines/matrix/c_ffi` | 2.435 |
+| `dict-train/na/small-4k-log-lines/matrix/pure_rust` | 1.028 |
 
 ## Strategy group: fast-neg
 
@@ -7624,227 +7624,227 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 
 | Scenario | Label | Level | Dict bytes | Train ms | C bytes (no dict) | C bytes (with dict) | C ratio (no dict) | C ratio (with dict) |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| decodecorpus-z000033 | Repo decode corpus sample | level_-2_fast | 16384 | 43.953 | 613921 | 585842 | 0.6007 | 0.5732 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_-3_fast | 16384 | 43.953 | 634656 | 607365 | 0.6210 | 0.5943 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_-4_fast | 16384 | 43.953 | 654893 | 628810 | 0.6408 | 0.6153 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_-5_fast | 16384 | 43.953 | 671408 | 646342 | 0.6569 | 0.6324 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_-6_fast | 16384 | 43.953 | 685482 | 660928 | 0.6707 | 0.6467 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_-7_fast | 16384 | 43.953 | 699611 | 673742 | 0.6845 | 0.6592 |
-| small-10k-random | Small random payload (10 KiB) | level_-2_fast | 1280 | 9.886 | 10250 | 9218 | 1.0010 | 0.9002 |
-| small-10k-random | Small random payload (10 KiB) | level_-3_fast | 1280 | 9.886 | 10250 | 9218 | 1.0010 | 0.9002 |
-| small-10k-random | Small random payload (10 KiB) | level_-4_fast | 1280 | 9.886 | 10250 | 9218 | 1.0010 | 0.9002 |
-| small-10k-random | Small random payload (10 KiB) | level_-5_fast | 1280 | 9.886 | 10250 | 9218 | 1.0010 | 0.9002 |
-| small-10k-random | Small random payload (10 KiB) | level_-6_fast | 1280 | 9.886 | 10250 | 9214 | 1.0010 | 0.8998 |
-| small-10k-random | Small random payload (10 KiB) | level_-7_fast | 1280 | 9.886 | 10250 | 9218 | 1.0010 | 0.9002 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_-2_fast | 437 | 2.350 | 175 | 44 | 0.0427 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_-3_fast | 437 | 2.350 | 186 | 50 | 0.0454 | 0.0122 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_-4_fast | 437 | 2.350 | 189 | 51 | 0.0461 | 0.0125 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_-5_fast | 437 | 2.350 | 190 | 44 | 0.0464 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_-6_fast | 437 | 2.350 | 248 | 51 | 0.0605 | 0.0125 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_-7_fast | 437 | 2.350 | 202 | 51 | 0.0493 | 0.0125 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_-2_fast | 16384 | 54.289 | 613921 | 585842 | 0.6007 | 0.5732 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_-3_fast | 16384 | 54.289 | 634656 | 607365 | 0.6210 | 0.5943 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_-4_fast | 16384 | 54.289 | 654893 | 628810 | 0.6408 | 0.6153 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_-5_fast | 16384 | 54.289 | 671408 | 646342 | 0.6569 | 0.6324 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_-6_fast | 16384 | 54.289 | 685482 | 660928 | 0.6707 | 0.6467 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_-7_fast | 16384 | 54.289 | 699611 | 673742 | 0.6845 | 0.6592 |
+| small-10k-random | Small random payload (10 KiB) | level_-2_fast | 1280 | 12.191 | 10250 | 9218 | 1.0010 | 0.9002 |
+| small-10k-random | Small random payload (10 KiB) | level_-3_fast | 1280 | 12.191 | 10250 | 9218 | 1.0010 | 0.9002 |
+| small-10k-random | Small random payload (10 KiB) | level_-4_fast | 1280 | 12.191 | 10250 | 9218 | 1.0010 | 0.9002 |
+| small-10k-random | Small random payload (10 KiB) | level_-5_fast | 1280 | 12.191 | 10250 | 9218 | 1.0010 | 0.9002 |
+| small-10k-random | Small random payload (10 KiB) | level_-6_fast | 1280 | 12.191 | 10250 | 9214 | 1.0010 | 0.8998 |
+| small-10k-random | Small random payload (10 KiB) | level_-7_fast | 1280 | 12.191 | 10250 | 9218 | 1.0010 | 0.9002 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_-2_fast | 437 | 2.636 | 175 | 44 | 0.0427 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_-3_fast | 437 | 2.636 | 186 | 50 | 0.0454 | 0.0122 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_-4_fast | 437 | 2.636 | 189 | 51 | 0.0461 | 0.0125 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_-5_fast | 437 | 2.636 | 190 | 44 | 0.0464 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_-6_fast | 437 | 2.636 | 248 | 51 | 0.0605 | 0.0125 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_-7_fast | 437 | 2.636 | 202 | 51 | 0.0493 | 0.0125 |
 
 ## Dictionary Training (Rust FastCOVER vs C FFI)
 
 | Scenario | Label | Dict bytes (requested) | Rust train ms | C train ms | Rust dict bytes | C dict bytes | Rust FastCOVER score | Delta (C/Rust) | Status |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| decodecorpus-z000033 | Repo decode corpus sample | 16384 | 10.427 | 43.953 | 16384 | 16384 | 0 | 4.2153 | rust_faster |
-| small-10k-random | Small random payload (10 KiB) | 1280 | 2.723 | 9.886 | 1280 | 1280 | 0 | 3.6306 | rust_faster |
-| small-4k-log-lines | Small structured log lines (4 KiB) | 512 | 1.067 | 2.350 | 512 | 437 | 0 | 2.2024 | rust_faster |
+| decodecorpus-z000033 | Repo decode corpus sample | 16384 | 12.499 | 54.289 | 16384 | 16384 | 0 | 4.3435 | rust_faster |
+| small-10k-random | Small random payload (10 KiB) | 1280 | 3.432 | 12.191 | 1280 | 1280 | 0 | 3.5522 | rust_faster |
+| small-4k-log-lines | Small structured log lines (4 KiB) | 512 | 1.193 | 2.636 | 512 | 437 | 0 | 2.2096 | rust_faster |
 
 ## Timing Metrics
 
 | Benchmark | ms/iter |
 | --- | ---: |
-| `compress-dict/level_-2_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.091 |
-| `compress-dict/level_-2_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 1.819 |
-| `compress-dict/level_-2_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.754 |
-| `compress-dict/level_-2_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.008 |
-| `compress-dict/level_-2_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.039 |
-| `compress-dict/level_-2_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.007 |
-| `compress-dict/level_-2_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
-| `compress-dict/level_-2_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.043 |
-| `compress-dict/level_-2_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `compress-dict/level_-3_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.930 |
-| `compress-dict/level_-3_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 1.692 |
-| `compress-dict/level_-3_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.513 |
-| `compress-dict/level_-3_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.007 |
-| `compress-dict/level_-3_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.038 |
-| `compress-dict/level_-3_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.007 |
-| `compress-dict/level_-3_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
-| `compress-dict/level_-3_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.044 |
-| `compress-dict/level_-3_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `compress-dict/level_-4_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.785 |
-| `compress-dict/level_-4_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 1.576 |
-| `compress-dict/level_-4_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.361 |
-| `compress-dict/level_-4_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.006 |
-| `compress-dict/level_-4_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.038 |
-| `compress-dict/level_-4_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.007 |
-| `compress-dict/level_-4_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
-| `compress-dict/level_-4_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.043 |
-| `compress-dict/level_-4_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `compress-dict/level_-5_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.675 |
-| `compress-dict/level_-5_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 1.479 |
-| `compress-dict/level_-5_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.268 |
-| `compress-dict/level_-5_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.006 |
-| `compress-dict/level_-5_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.038 |
-| `compress-dict/level_-5_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.007 |
-| `compress-dict/level_-5_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
-| `compress-dict/level_-5_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.043 |
-| `compress-dict/level_-5_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `compress-dict/level_-6_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.563 |
-| `compress-dict/level_-6_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 1.405 |
-| `compress-dict/level_-6_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.193 |
-| `compress-dict/level_-6_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.005 |
-| `compress-dict/level_-6_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.038 |
-| `compress-dict/level_-6_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.007 |
-| `compress-dict/level_-6_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
-| `compress-dict/level_-6_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.043 |
-| `compress-dict/level_-6_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `compress-dict/level_-7_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.482 |
-| `compress-dict/level_-7_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 1.336 |
-| `compress-dict/level_-7_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.066 |
-| `compress-dict/level_-7_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.005 |
-| `compress-dict/level_-7_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.038 |
-| `compress-dict/level_-7_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.007 |
-| `compress-dict/level_-7_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.001 |
-| `compress-dict/level_-7_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.043 |
-| `compress-dict/level_-7_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `compress/level_-2_fast/decodecorpus-z000033/matrix/c_ffi` | 2.360 |
-| `compress/level_-2_fast/decodecorpus-z000033/matrix/pure_rust` | 4.016 |
-| `compress/level_-2_fast/high-entropy-1m/matrix/c_ffi` | 1.049 |
-| `compress/level_-2_fast/high-entropy-1m/matrix/pure_rust` | 0.505 |
-| `compress/level_-2_fast/large-log-stream/matrix/c_ffi` | 2.672 |
-| `compress/level_-2_fast/large-log-stream/matrix/pure_rust` | 1.556 |
-| `compress/level_-2_fast/low-entropy-1m/matrix/c_ffi` | 0.463 |
-| `compress/level_-2_fast/low-entropy-1m/matrix/pure_rust` | 0.156 |
-| `compress/level_-2_fast/small-10k-random/matrix/c_ffi` | 0.050 |
-| `compress/level_-2_fast/small-10k-random/matrix/pure_rust` | 0.013 |
-| `compress/level_-2_fast/small-1k-random/matrix/c_ffi` | 0.031 |
-| `compress/level_-2_fast/small-1k-random/matrix/pure_rust` | 0.001 |
-| `compress/level_-2_fast/small-4k-log-lines/matrix/c_ffi` | 0.045 |
-| `compress/level_-2_fast/small-4k-log-lines/matrix/pure_rust` | 0.049 |
-| `compress/level_-3_fast/decodecorpus-z000033/matrix/c_ffi` | 2.219 |
-| `compress/level_-3_fast/decodecorpus-z000033/matrix/pure_rust` | 3.848 |
-| `compress/level_-3_fast/high-entropy-1m/matrix/c_ffi` | 1.048 |
-| `compress/level_-3_fast/high-entropy-1m/matrix/pure_rust` | 0.504 |
-| `compress/level_-3_fast/large-log-stream/matrix/c_ffi` | 2.669 |
-| `compress/level_-3_fast/large-log-stream/matrix/pure_rust` | 1.558 |
-| `compress/level_-3_fast/low-entropy-1m/matrix/c_ffi` | 0.461 |
-| `compress/level_-3_fast/low-entropy-1m/matrix/pure_rust` | 0.156 |
-| `compress/level_-3_fast/small-10k-random/matrix/c_ffi` | 0.050 |
-| `compress/level_-3_fast/small-10k-random/matrix/pure_rust` | 0.013 |
-| `compress/level_-3_fast/small-1k-random/matrix/c_ffi` | 0.031 |
-| `compress/level_-3_fast/small-1k-random/matrix/pure_rust` | 0.001 |
-| `compress/level_-3_fast/small-4k-log-lines/matrix/c_ffi` | 0.045 |
-| `compress/level_-3_fast/small-4k-log-lines/matrix/pure_rust` | 0.048 |
-| `compress/level_-4_fast/decodecorpus-z000033/matrix/c_ffi` | 2.093 |
-| `compress/level_-4_fast/decodecorpus-z000033/matrix/pure_rust` | 3.666 |
-| `compress/level_-4_fast/high-entropy-1m/matrix/c_ffi` | 1.048 |
-| `compress/level_-4_fast/high-entropy-1m/matrix/pure_rust` | 0.503 |
-| `compress/level_-4_fast/large-log-stream/matrix/c_ffi` | 2.673 |
-| `compress/level_-4_fast/large-log-stream/matrix/pure_rust` | 1.560 |
-| `compress/level_-4_fast/low-entropy-1m/matrix/c_ffi` | 0.462 |
-| `compress/level_-4_fast/low-entropy-1m/matrix/pure_rust` | 0.156 |
-| `compress/level_-4_fast/small-10k-random/matrix/c_ffi` | 0.050 |
-| `compress/level_-4_fast/small-10k-random/matrix/pure_rust` | 0.013 |
-| `compress/level_-4_fast/small-1k-random/matrix/c_ffi` | 0.030 |
-| `compress/level_-4_fast/small-1k-random/matrix/pure_rust` | 0.001 |
-| `compress/level_-4_fast/small-4k-log-lines/matrix/c_ffi` | 0.045 |
-| `compress/level_-4_fast/small-4k-log-lines/matrix/pure_rust` | 0.049 |
-| `compress/level_-5_fast/decodecorpus-z000033/matrix/c_ffi` | 2.001 |
-| `compress/level_-5_fast/decodecorpus-z000033/matrix/pure_rust` | 3.543 |
-| `compress/level_-5_fast/high-entropy-1m/matrix/c_ffi` | 1.044 |
-| `compress/level_-5_fast/high-entropy-1m/matrix/pure_rust` | 0.507 |
-| `compress/level_-5_fast/large-log-stream/matrix/c_ffi` | 2.670 |
-| `compress/level_-5_fast/large-log-stream/matrix/pure_rust` | 1.563 |
-| `compress/level_-5_fast/low-entropy-1m/matrix/c_ffi` | 0.461 |
-| `compress/level_-5_fast/low-entropy-1m/matrix/pure_rust` | 0.155 |
-| `compress/level_-5_fast/small-10k-random/matrix/c_ffi` | 0.050 |
-| `compress/level_-5_fast/small-10k-random/matrix/pure_rust` | 0.013 |
-| `compress/level_-5_fast/small-1k-random/matrix/c_ffi` | 0.030 |
-| `compress/level_-5_fast/small-1k-random/matrix/pure_rust` | 0.001 |
-| `compress/level_-5_fast/small-4k-log-lines/matrix/c_ffi` | 0.045 |
-| `compress/level_-5_fast/small-4k-log-lines/matrix/pure_rust` | 0.050 |
-| `compress/level_-6_fast/decodecorpus-z000033/matrix/c_ffi` | 1.922 |
-| `compress/level_-6_fast/decodecorpus-z000033/matrix/pure_rust` | 3.460 |
-| `compress/level_-6_fast/high-entropy-1m/matrix/c_ffi` | 1.046 |
-| `compress/level_-6_fast/high-entropy-1m/matrix/pure_rust` | 0.505 |
-| `compress/level_-6_fast/large-log-stream/matrix/c_ffi` | 2.682 |
-| `compress/level_-6_fast/large-log-stream/matrix/pure_rust` | 1.562 |
-| `compress/level_-6_fast/low-entropy-1m/matrix/c_ffi` | 0.461 |
-| `compress/level_-6_fast/low-entropy-1m/matrix/pure_rust` | 0.155 |
-| `compress/level_-6_fast/small-10k-random/matrix/c_ffi` | 0.050 |
-| `compress/level_-6_fast/small-10k-random/matrix/pure_rust` | 0.013 |
-| `compress/level_-6_fast/small-1k-random/matrix/c_ffi` | 0.031 |
-| `compress/level_-6_fast/small-1k-random/matrix/pure_rust` | 0.001 |
-| `compress/level_-6_fast/small-4k-log-lines/matrix/c_ffi` | 0.045 |
-| `compress/level_-6_fast/small-4k-log-lines/matrix/pure_rust` | 0.049 |
-| `compress/level_-7_fast/decodecorpus-z000033/matrix/c_ffi` | 1.841 |
-| `compress/level_-7_fast/decodecorpus-z000033/matrix/pure_rust` | 3.435 |
-| `compress/level_-7_fast/high-entropy-1m/matrix/c_ffi` | 1.043 |
-| `compress/level_-7_fast/high-entropy-1m/matrix/pure_rust` | 0.503 |
-| `compress/level_-7_fast/large-log-stream/matrix/c_ffi` | 2.676 |
-| `compress/level_-7_fast/large-log-stream/matrix/pure_rust` | 1.561 |
-| `compress/level_-7_fast/low-entropy-1m/matrix/c_ffi` | 0.461 |
-| `compress/level_-7_fast/low-entropy-1m/matrix/pure_rust` | 0.154 |
-| `compress/level_-7_fast/small-10k-random/matrix/c_ffi` | 0.050 |
-| `compress/level_-7_fast/small-10k-random/matrix/pure_rust` | 0.013 |
-| `compress/level_-7_fast/small-1k-random/matrix/c_ffi` | 0.031 |
-| `compress/level_-7_fast/small-1k-random/matrix/pure_rust` | 0.001 |
-| `compress/level_-7_fast/small-4k-log-lines/matrix/c_ffi` | 0.045 |
-| `compress/level_-7_fast/small-4k-log-lines/matrix/pure_rust` | 0.039 |
-| `decompress-dict/level_-2_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.476 |
-| `decompress-dict/level_-2_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 0.849 |
+| `compress-dict/level_-2_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.533 |
+| `compress-dict/level_-2_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 2.176 |
+| `compress-dict/level_-2_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 4.641 |
+| `compress-dict/level_-2_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.010 |
+| `compress-dict/level_-2_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.044 |
+| `compress-dict/level_-2_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.009 |
+| `compress-dict/level_-2_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.002 |
+| `compress-dict/level_-2_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.050 |
+| `compress-dict/level_-2_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.002 |
+| `compress-dict/level_-3_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.320 |
+| `compress-dict/level_-3_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 2.004 |
+| `compress-dict/level_-3_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 4.373 |
+| `compress-dict/level_-3_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.009 |
+| `compress-dict/level_-3_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.044 |
+| `compress-dict/level_-3_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.009 |
+| `compress-dict/level_-3_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.002 |
+| `compress-dict/level_-3_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.051 |
+| `compress-dict/level_-3_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.002 |
+| `compress-dict/level_-4_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.146 |
+| `compress-dict/level_-4_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 1.867 |
+| `compress-dict/level_-4_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 4.153 |
+| `compress-dict/level_-4_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.008 |
+| `compress-dict/level_-4_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.043 |
+| `compress-dict/level_-4_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.009 |
+| `compress-dict/level_-4_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.002 |
+| `compress-dict/level_-4_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.050 |
+| `compress-dict/level_-4_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.002 |
+| `compress-dict/level_-5_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 2.013 |
+| `compress-dict/level_-5_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 1.757 |
+| `compress-dict/level_-5_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.987 |
+| `compress-dict/level_-5_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.007 |
+| `compress-dict/level_-5_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.043 |
+| `compress-dict/level_-5_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.009 |
+| `compress-dict/level_-5_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.002 |
+| `compress-dict/level_-5_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.051 |
+| `compress-dict/level_-5_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.002 |
+| `compress-dict/level_-6_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.881 |
+| `compress-dict/level_-6_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 1.661 |
+| `compress-dict/level_-6_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.999 |
+| `compress-dict/level_-6_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.006 |
+| `compress-dict/level_-6_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.043 |
+| `compress-dict/level_-6_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.009 |
+| `compress-dict/level_-6_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.002 |
+| `compress-dict/level_-6_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.051 |
+| `compress-dict/level_-6_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.002 |
+| `compress-dict/level_-7_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.781 |
+| `compress-dict/level_-7_fast/decodecorpus-z000033/matrix/c_ffi_without_dict` | 1.597 |
+| `compress-dict/level_-7_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 3.880 |
+| `compress-dict/level_-7_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.006 |
+| `compress-dict/level_-7_fast/small-10k-random/matrix/c_ffi_without_dict` | 0.043 |
+| `compress-dict/level_-7_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.009 |
+| `compress-dict/level_-7_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.002 |
+| `compress-dict/level_-7_fast/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.051 |
+| `compress-dict/level_-7_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.002 |
+| `compress/level_-2_fast/decodecorpus-z000033/matrix/c_ffi` | 2.774 |
+| `compress/level_-2_fast/decodecorpus-z000033/matrix/pure_rust` | 4.911 |
+| `compress/level_-2_fast/high-entropy-1m/matrix/c_ffi` | 1.152 |
+| `compress/level_-2_fast/high-entropy-1m/matrix/pure_rust` | 0.557 |
+| `compress/level_-2_fast/large-log-stream/matrix/c_ffi` | 2.659 |
+| `compress/level_-2_fast/large-log-stream/matrix/pure_rust` | 1.887 |
+| `compress/level_-2_fast/low-entropy-1m/matrix/c_ffi` | 0.500 |
+| `compress/level_-2_fast/low-entropy-1m/matrix/pure_rust` | 0.190 |
+| `compress/level_-2_fast/small-10k-random/matrix/c_ffi` | 0.057 |
+| `compress/level_-2_fast/small-10k-random/matrix/pure_rust` | 0.015 |
+| `compress/level_-2_fast/small-1k-random/matrix/c_ffi` | 0.036 |
+| `compress/level_-2_fast/small-1k-random/matrix/pure_rust` | 0.002 |
+| `compress/level_-2_fast/small-4k-log-lines/matrix/c_ffi` | 0.052 |
+| `compress/level_-2_fast/small-4k-log-lines/matrix/pure_rust` | 0.059 |
+| `compress/level_-3_fast/decodecorpus-z000033/matrix/c_ffi` | 2.591 |
+| `compress/level_-3_fast/decodecorpus-z000033/matrix/pure_rust` | 4.676 |
+| `compress/level_-3_fast/high-entropy-1m/matrix/c_ffi` | 1.154 |
+| `compress/level_-3_fast/high-entropy-1m/matrix/pure_rust` | 0.562 |
+| `compress/level_-3_fast/large-log-stream/matrix/c_ffi` | 2.662 |
+| `compress/level_-3_fast/large-log-stream/matrix/pure_rust` | 1.883 |
+| `compress/level_-3_fast/low-entropy-1m/matrix/c_ffi` | 0.500 |
+| `compress/level_-3_fast/low-entropy-1m/matrix/pure_rust` | 0.193 |
+| `compress/level_-3_fast/small-10k-random/matrix/c_ffi` | 0.057 |
+| `compress/level_-3_fast/small-10k-random/matrix/pure_rust` | 0.016 |
+| `compress/level_-3_fast/small-1k-random/matrix/c_ffi` | 0.036 |
+| `compress/level_-3_fast/small-1k-random/matrix/pure_rust` | 0.002 |
+| `compress/level_-3_fast/small-4k-log-lines/matrix/c_ffi` | 0.051 |
+| `compress/level_-3_fast/small-4k-log-lines/matrix/pure_rust` | 0.060 |
+| `compress/level_-4_fast/decodecorpus-z000033/matrix/c_ffi` | 2.452 |
+| `compress/level_-4_fast/decodecorpus-z000033/matrix/pure_rust` | 4.496 |
+| `compress/level_-4_fast/high-entropy-1m/matrix/c_ffi` | 1.147 |
+| `compress/level_-4_fast/high-entropy-1m/matrix/pure_rust` | 0.557 |
+| `compress/level_-4_fast/large-log-stream/matrix/c_ffi` | 2.658 |
+| `compress/level_-4_fast/large-log-stream/matrix/pure_rust` | 1.890 |
+| `compress/level_-4_fast/low-entropy-1m/matrix/c_ffi` | 0.498 |
+| `compress/level_-4_fast/low-entropy-1m/matrix/pure_rust` | 0.189 |
+| `compress/level_-4_fast/small-10k-random/matrix/c_ffi` | 0.057 |
+| `compress/level_-4_fast/small-10k-random/matrix/pure_rust` | 0.016 |
+| `compress/level_-4_fast/small-1k-random/matrix/c_ffi` | 0.036 |
+| `compress/level_-4_fast/small-1k-random/matrix/pure_rust` | 0.002 |
+| `compress/level_-4_fast/small-4k-log-lines/matrix/c_ffi` | 0.051 |
+| `compress/level_-4_fast/small-4k-log-lines/matrix/pure_rust` | 0.059 |
+| `compress/level_-5_fast/decodecorpus-z000033/matrix/c_ffi` | 2.331 |
+| `compress/level_-5_fast/decodecorpus-z000033/matrix/pure_rust` | 4.376 |
+| `compress/level_-5_fast/high-entropy-1m/matrix/c_ffi` | 1.145 |
+| `compress/level_-5_fast/high-entropy-1m/matrix/pure_rust` | 0.560 |
+| `compress/level_-5_fast/large-log-stream/matrix/c_ffi` | 2.677 |
+| `compress/level_-5_fast/large-log-stream/matrix/pure_rust` | 1.900 |
+| `compress/level_-5_fast/low-entropy-1m/matrix/c_ffi` | 0.500 |
+| `compress/level_-5_fast/low-entropy-1m/matrix/pure_rust` | 0.188 |
+| `compress/level_-5_fast/small-10k-random/matrix/c_ffi` | 0.057 |
+| `compress/level_-5_fast/small-10k-random/matrix/pure_rust` | 0.016 |
+| `compress/level_-5_fast/small-1k-random/matrix/c_ffi` | 0.036 |
+| `compress/level_-5_fast/small-1k-random/matrix/pure_rust` | 0.002 |
+| `compress/level_-5_fast/small-4k-log-lines/matrix/c_ffi` | 0.052 |
+| `compress/level_-5_fast/small-4k-log-lines/matrix/pure_rust` | 0.061 |
+| `compress/level_-6_fast/decodecorpus-z000033/matrix/c_ffi` | 2.236 |
+| `compress/level_-6_fast/decodecorpus-z000033/matrix/pure_rust` | 4.251 |
+| `compress/level_-6_fast/high-entropy-1m/matrix/c_ffi` | 1.143 |
+| `compress/level_-6_fast/high-entropy-1m/matrix/pure_rust` | 0.556 |
+| `compress/level_-6_fast/large-log-stream/matrix/c_ffi` | 2.783 |
+| `compress/level_-6_fast/large-log-stream/matrix/pure_rust` | 1.950 |
+| `compress/level_-6_fast/low-entropy-1m/matrix/c_ffi` | 0.499 |
+| `compress/level_-6_fast/low-entropy-1m/matrix/pure_rust` | 0.191 |
+| `compress/level_-6_fast/small-10k-random/matrix/c_ffi` | 0.057 |
+| `compress/level_-6_fast/small-10k-random/matrix/pure_rust` | 0.015 |
+| `compress/level_-6_fast/small-1k-random/matrix/c_ffi` | 0.035 |
+| `compress/level_-6_fast/small-1k-random/matrix/pure_rust` | 0.002 |
+| `compress/level_-6_fast/small-4k-log-lines/matrix/c_ffi` | 0.051 |
+| `compress/level_-6_fast/small-4k-log-lines/matrix/pure_rust` | 0.060 |
+| `compress/level_-7_fast/decodecorpus-z000033/matrix/c_ffi` | 2.143 |
+| `compress/level_-7_fast/decodecorpus-z000033/matrix/pure_rust` | 4.144 |
+| `compress/level_-7_fast/high-entropy-1m/matrix/c_ffi` | 1.132 |
+| `compress/level_-7_fast/high-entropy-1m/matrix/pure_rust` | 0.558 |
+| `compress/level_-7_fast/large-log-stream/matrix/c_ffi` | 2.697 |
+| `compress/level_-7_fast/large-log-stream/matrix/pure_rust` | 1.941 |
+| `compress/level_-7_fast/low-entropy-1m/matrix/c_ffi` | 0.500 |
+| `compress/level_-7_fast/low-entropy-1m/matrix/pure_rust` | 0.190 |
+| `compress/level_-7_fast/small-10k-random/matrix/c_ffi` | 0.057 |
+| `compress/level_-7_fast/small-10k-random/matrix/pure_rust` | 0.016 |
+| `compress/level_-7_fast/small-1k-random/matrix/c_ffi` | 0.036 |
+| `compress/level_-7_fast/small-1k-random/matrix/pure_rust` | 0.002 |
+| `compress/level_-7_fast/small-4k-log-lines/matrix/c_ffi` | 0.052 |
+| `compress/level_-7_fast/small-4k-log-lines/matrix/pure_rust` | 0.049 |
+| `decompress-dict/level_-2_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.621 |
+| `decompress-dict/level_-2_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 1.012 |
 | `decompress-dict/level_-2_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
-| `decompress-dict/level_-2_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
+| `decompress-dict/level_-2_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_-2_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
-| `decompress-dict/level_-2_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress-dict/level_-3_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.460 |
-| `decompress-dict/level_-3_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 0.803 |
+| `decompress-dict/level_-2_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
+| `decompress-dict/level_-3_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.597 |
+| `decompress-dict/level_-3_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 0.948 |
 | `decompress-dict/level_-3_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
-| `decompress-dict/level_-3_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
+| `decompress-dict/level_-3_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_-3_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
-| `decompress-dict/level_-3_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress-dict/level_-4_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.409 |
-| `decompress-dict/level_-4_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 0.731 |
+| `decompress-dict/level_-3_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
+| `decompress-dict/level_-4_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.545 |
+| `decompress-dict/level_-4_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 0.871 |
 | `decompress-dict/level_-4_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
-| `decompress-dict/level_-4_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
+| `decompress-dict/level_-4_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_-4_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
-| `decompress-dict/level_-4_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress-dict/level_-5_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.390 |
-| `decompress-dict/level_-5_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 0.697 |
+| `decompress-dict/level_-4_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
+| `decompress-dict/level_-5_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.526 |
+| `decompress-dict/level_-5_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 0.833 |
 | `decompress-dict/level_-5_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
-| `decompress-dict/level_-5_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
+| `decompress-dict/level_-5_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_-5_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
-| `decompress-dict/level_-5_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress-dict/level_-6_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.357 |
-| `decompress-dict/level_-6_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 0.647 |
+| `decompress-dict/level_-5_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
+| `decompress-dict/level_-6_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.489 |
+| `decompress-dict/level_-6_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 0.774 |
 | `decompress-dict/level_-6_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
-| `decompress-dict/level_-6_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
+| `decompress-dict/level_-6_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_-6_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
-| `decompress-dict/level_-6_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress-dict/level_-7_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.340 |
-| `decompress-dict/level_-7_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 0.604 |
+| `decompress-dict/level_-6_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
+| `decompress-dict/level_-7_fast/decodecorpus-z000033/matrix/c_ffi_with_dict` | 0.465 |
+| `decompress-dict/level_-7_fast/decodecorpus-z000033/matrix/pure_rust_with_dict` | 0.728 |
 | `decompress-dict/level_-7_fast/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
-| `decompress-dict/level_-7_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.001 |
+| `decompress-dict/level_-7_fast/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_-7_fast/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
-| `decompress-dict/level_-7_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.000 |
-| `decompress/level_-2_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.367 |
-| `decompress/level_-2_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.631 |
-| `decompress/level_-2_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.670 |
-| `decompress/level_-2_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 0.998 |
-| `decompress/level_-2_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.023 |
-| `decompress/level_-2_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.024 |
-| `decompress/level_-2_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.024 |
-| `decompress/level_-2_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.024 |
-| `decompress/level_-2_fast/large-log-stream/c_stream/matrix/c_ffi` | 0.435 |
-| `decompress/level_-2_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.385 |
-| `decompress/level_-2_fast/large-log-stream/rust_stream/matrix/c_ffi` | 0.436 |
-| `decompress/level_-2_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.390 |
-| `decompress/level_-2_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.133 |
-| `decompress/level_-2_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.022 |
-| `decompress/level_-2_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.133 |
-| `decompress/level_-2_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.022 |
+| `decompress-dict/level_-7_fast/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
+| `decompress/level_-2_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.494 |
+| `decompress/level_-2_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.773 |
+| `decompress/level_-2_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.943 |
+| `decompress/level_-2_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.277 |
+| `decompress/level_-2_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.027 |
+| `decompress/level_-2_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_-2_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.028 |
+| `decompress/level_-2_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_-2_fast/large-log-stream/c_stream/matrix/c_ffi` | 0.652 |
+| `decompress/level_-2_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.430 |
+| `decompress/level_-2_fast/large-log-stream/rust_stream/matrix/c_ffi` | 0.658 |
+| `decompress/level_-2_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.421 |
+| `decompress/level_-2_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.191 |
+| `decompress/level_-2_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_-2_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.191 |
+| `decompress/level_-2_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
 | `decompress/level_-2_fast/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_-2_fast/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_-2_fast/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -7854,25 +7854,25 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_-2_fast/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_-2_fast/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_-2_fast/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.000 |
-| `decompress/level_-2_fast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_-2_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.001 |
+| `decompress/level_-2_fast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.001 |
+| `decompress/level_-2_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_-2_fast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_-3_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.350 |
-| `decompress/level_-3_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.602 |
-| `decompress/level_-3_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.699 |
-| `decompress/level_-3_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 0.981 |
-| `decompress/level_-3_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.023 |
-| `decompress/level_-3_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.024 |
-| `decompress/level_-3_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.024 |
-| `decompress/level_-3_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.024 |
-| `decompress/level_-3_fast/large-log-stream/c_stream/matrix/c_ffi` | 0.434 |
-| `decompress/level_-3_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.385 |
-| `decompress/level_-3_fast/large-log-stream/rust_stream/matrix/c_ffi` | 0.438 |
-| `decompress/level_-3_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.390 |
-| `decompress/level_-3_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.133 |
-| `decompress/level_-3_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.022 |
-| `decompress/level_-3_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.133 |
-| `decompress/level_-3_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.022 |
+| `decompress/level_-3_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.481 |
+| `decompress/level_-3_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.743 |
+| `decompress/level_-3_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.956 |
+| `decompress/level_-3_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.279 |
+| `decompress/level_-3_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.029 |
+| `decompress/level_-3_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_-3_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.027 |
+| `decompress/level_-3_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_-3_fast/large-log-stream/c_stream/matrix/c_ffi` | 0.655 |
+| `decompress/level_-3_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.422 |
+| `decompress/level_-3_fast/large-log-stream/rust_stream/matrix/c_ffi` | 0.654 |
+| `decompress/level_-3_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.437 |
+| `decompress/level_-3_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.191 |
+| `decompress/level_-3_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_-3_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.190 |
+| `decompress/level_-3_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
 | `decompress/level_-3_fast/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_-3_fast/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_-3_fast/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -7882,25 +7882,25 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_-3_fast/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_-3_fast/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_-3_fast/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.000 |
-| `decompress/level_-3_fast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_-3_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.001 |
+| `decompress/level_-3_fast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.001 |
+| `decompress/level_-3_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_-3_fast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_-4_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.304 |
-| `decompress/level_-4_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.545 |
-| `decompress/level_-4_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.619 |
-| `decompress/level_-4_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 0.959 |
-| `decompress/level_-4_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.023 |
-| `decompress/level_-4_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.024 |
-| `decompress/level_-4_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.023 |
-| `decompress/level_-4_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.024 |
-| `decompress/level_-4_fast/large-log-stream/c_stream/matrix/c_ffi` | 0.423 |
-| `decompress/level_-4_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.384 |
-| `decompress/level_-4_fast/large-log-stream/rust_stream/matrix/c_ffi` | 0.423 |
-| `decompress/level_-4_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.385 |
-| `decompress/level_-4_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.133 |
-| `decompress/level_-4_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.022 |
-| `decompress/level_-4_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.133 |
-| `decompress/level_-4_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.022 |
+| `decompress/level_-4_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.434 |
+| `decompress/level_-4_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.677 |
+| `decompress/level_-4_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.940 |
+| `decompress/level_-4_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.256 |
+| `decompress/level_-4_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.029 |
+| `decompress/level_-4_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_-4_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.028 |
+| `decompress/level_-4_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_-4_fast/large-log-stream/c_stream/matrix/c_ffi` | 0.566 |
+| `decompress/level_-4_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.416 |
+| `decompress/level_-4_fast/large-log-stream/rust_stream/matrix/c_ffi` | 0.570 |
+| `decompress/level_-4_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.417 |
+| `decompress/level_-4_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.154 |
+| `decompress/level_-4_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_-4_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.154 |
+| `decompress/level_-4_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
 | `decompress/level_-4_fast/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_-4_fast/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_-4_fast/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -7910,25 +7910,25 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_-4_fast/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_-4_fast/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_-4_fast/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.000 |
-| `decompress/level_-4_fast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_-4_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.001 |
+| `decompress/level_-4_fast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.001 |
+| `decompress/level_-4_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_-4_fast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_-5_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.241 |
-| `decompress/level_-5_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.508 |
-| `decompress/level_-5_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.633 |
-| `decompress/level_-5_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 0.939 |
-| `decompress/level_-5_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.023 |
-| `decompress/level_-5_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.024 |
-| `decompress/level_-5_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.024 |
-| `decompress/level_-5_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.024 |
-| `decompress/level_-5_fast/large-log-stream/c_stream/matrix/c_ffi` | 0.435 |
-| `decompress/level_-5_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.386 |
-| `decompress/level_-5_fast/large-log-stream/rust_stream/matrix/c_ffi` | 0.438 |
-| `decompress/level_-5_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.389 |
-| `decompress/level_-5_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.132 |
-| `decompress/level_-5_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.022 |
-| `decompress/level_-5_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.132 |
-| `decompress/level_-5_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.022 |
+| `decompress/level_-5_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.416 |
+| `decompress/level_-5_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.638 |
+| `decompress/level_-5_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.939 |
+| `decompress/level_-5_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.248 |
+| `decompress/level_-5_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.027 |
+| `decompress/level_-5_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_-5_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.028 |
+| `decompress/level_-5_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_-5_fast/large-log-stream/c_stream/matrix/c_ffi` | 0.653 |
+| `decompress/level_-5_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.416 |
+| `decompress/level_-5_fast/large-log-stream/rust_stream/matrix/c_ffi` | 0.661 |
+| `decompress/level_-5_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.408 |
+| `decompress/level_-5_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.191 |
+| `decompress/level_-5_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_-5_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.190 |
+| `decompress/level_-5_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
 | `decompress/level_-5_fast/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_-5_fast/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_-5_fast/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -7938,25 +7938,25 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_-5_fast/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_-5_fast/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_-5_fast/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.000 |
-| `decompress/level_-5_fast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.000 |
+| `decompress/level_-5_fast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.001 |
 | `decompress/level_-5_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
-| `decompress/level_-5_fast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_-6_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.228 |
-| `decompress/level_-6_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.466 |
-| `decompress/level_-6_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.626 |
-| `decompress/level_-6_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 0.905 |
-| `decompress/level_-6_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.024 |
-| `decompress/level_-6_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.024 |
-| `decompress/level_-6_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.024 |
-| `decompress/level_-6_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.024 |
-| `decompress/level_-6_fast/large-log-stream/c_stream/matrix/c_ffi` | 0.435 |
-| `decompress/level_-6_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.384 |
-| `decompress/level_-6_fast/large-log-stream/rust_stream/matrix/c_ffi` | 0.439 |
-| `decompress/level_-6_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.389 |
-| `decompress/level_-6_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.133 |
-| `decompress/level_-6_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.022 |
-| `decompress/level_-6_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.133 |
-| `decompress/level_-6_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.022 |
+| `decompress/level_-5_fast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.003 |
+| `decompress/level_-6_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.394 |
+| `decompress/level_-6_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.601 |
+| `decompress/level_-6_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.938 |
+| `decompress/level_-6_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.232 |
+| `decompress/level_-6_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.030 |
+| `decompress/level_-6_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_-6_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.027 |
+| `decompress/level_-6_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_-6_fast/large-log-stream/c_stream/matrix/c_ffi` | 0.655 |
+| `decompress/level_-6_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.406 |
+| `decompress/level_-6_fast/large-log-stream/rust_stream/matrix/c_ffi` | 0.658 |
+| `decompress/level_-6_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.411 |
+| `decompress/level_-6_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.191 |
+| `decompress/level_-6_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_-6_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.191 |
+| `decompress/level_-6_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
 | `decompress/level_-6_fast/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_-6_fast/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_-6_fast/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -7966,25 +7966,25 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_-6_fast/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_-6_fast/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_-6_fast/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.000 |
-| `decompress/level_-6_fast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.000 |
+| `decompress/level_-6_fast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.001 |
 | `decompress/level_-6_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
-| `decompress/level_-6_fast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_-7_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.214 |
-| `decompress/level_-7_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.430 |
-| `decompress/level_-7_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.643 |
-| `decompress/level_-7_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 0.888 |
-| `decompress/level_-7_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.023 |
-| `decompress/level_-7_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.024 |
-| `decompress/level_-7_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.023 |
-| `decompress/level_-7_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.024 |
-| `decompress/level_-7_fast/large-log-stream/c_stream/matrix/c_ffi` | 0.437 |
-| `decompress/level_-7_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.384 |
-| `decompress/level_-7_fast/large-log-stream/rust_stream/matrix/c_ffi` | 0.436 |
-| `decompress/level_-7_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.387 |
-| `decompress/level_-7_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.133 |
-| `decompress/level_-7_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.022 |
-| `decompress/level_-7_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.133 |
-| `decompress/level_-7_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.022 |
+| `decompress/level_-6_fast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.003 |
+| `decompress/level_-7_fast/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.375 |
+| `decompress/level_-7_fast/decodecorpus-z000033/c_stream/matrix/pure_rust` | 0.559 |
+| `decompress/level_-7_fast/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 0.938 |
+| `decompress/level_-7_fast/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.218 |
+| `decompress/level_-7_fast/high-entropy-1m/c_stream/matrix/c_ffi` | 0.032 |
+| `decompress/level_-7_fast/high-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_-7_fast/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.030 |
+| `decompress/level_-7_fast/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_-7_fast/large-log-stream/c_stream/matrix/c_ffi` | 0.656 |
+| `decompress/level_-7_fast/large-log-stream/c_stream/matrix/pure_rust` | 0.403 |
+| `decompress/level_-7_fast/large-log-stream/rust_stream/matrix/c_ffi` | 0.657 |
+| `decompress/level_-7_fast/large-log-stream/rust_stream/matrix/pure_rust` | 0.409 |
+| `decompress/level_-7_fast/low-entropy-1m/c_stream/matrix/c_ffi` | 0.191 |
+| `decompress/level_-7_fast/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_-7_fast/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.191 |
+| `decompress/level_-7_fast/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
 | `decompress/level_-7_fast/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_-7_fast/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_-7_fast/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -7994,15 +7994,15 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_-7_fast/small-1k-random/rust_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_-7_fast/small-1k-random/rust_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_-7_fast/small-4k-log-lines/c_stream/matrix/c_ffi` | 0.000 |
-| `decompress/level_-7_fast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.000 |
-| `decompress/level_-7_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.001 |
+| `decompress/level_-7_fast/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.001 |
+| `decompress/level_-7_fast/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_-7_fast/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `dict-train/na/decodecorpus-z000033/matrix/c_ffi` | 43.005 |
-| `dict-train/na/decodecorpus-z000033/matrix/pure_rust` | 9.873 |
-| `dict-train/na/small-10k-random/matrix/c_ffi` | 9.643 |
-| `dict-train/na/small-10k-random/matrix/pure_rust` | 2.635 |
-| `dict-train/na/small-4k-log-lines/matrix/c_ffi` | 2.195 |
-| `dict-train/na/small-4k-log-lines/matrix/pure_rust` | 0.830 |
+| `dict-train/na/decodecorpus-z000033/matrix/c_ffi` | 56.170 |
+| `dict-train/na/decodecorpus-z000033/matrix/pure_rust` | 11.689 |
+| `dict-train/na/small-10k-random/matrix/c_ffi` | 11.723 |
+| `dict-train/na/small-10k-random/matrix/pure_rust` | 3.211 |
+| `dict-train/na/small-4k-log-lines/matrix/c_ffi` | 2.476 |
+| `dict-train/na/small-4k-log-lines/matrix/pure_rust` | 1.061 |
 
 ## Strategy group: lazy-lower
 
@@ -8164,191 +8164,191 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 
 | Scenario | Label | Level | Dict bytes | Train ms | C bytes (no dict) | C bytes (with dict) | C ratio (no dict) | C ratio (with dict) |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| decodecorpus-z000033 | Repo decode corpus sample | level_10_lazy | 16384 | 52.204 | 483762 | 462364 | 0.4733 | 0.4524 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_6_lazy | 16384 | 52.204 | 484957 | 464543 | 0.4745 | 0.4545 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_7_lazy | 16384 | 52.204 | 484299 | 464689 | 0.4739 | 0.4547 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_8_lazy | 16384 | 52.204 | 484336 | 463700 | 0.4739 | 0.4537 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_9_lazy | 16384 | 52.204 | 484348 | 462791 | 0.4739 | 0.4528 |
-| small-10k-random | Small random payload (10 KiB) | level_10_lazy | 1280 | 11.296 | 10250 | 9214 | 1.0010 | 0.8998 |
-| small-10k-random | Small random payload (10 KiB) | level_6_lazy | 1280 | 11.296 | 10250 | 9214 | 1.0010 | 0.8998 |
-| small-10k-random | Small random payload (10 KiB) | level_7_lazy | 1280 | 11.296 | 10250 | 9214 | 1.0010 | 0.8998 |
-| small-10k-random | Small random payload (10 KiB) | level_8_lazy | 1280 | 11.296 | 10250 | 9214 | 1.0010 | 0.8998 |
-| small-10k-random | Small random payload (10 KiB) | level_9_lazy | 1280 | 11.296 | 10250 | 9214 | 1.0010 | 0.8998 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_10_lazy | 437 | 2.596 | 150 | 44 | 0.0366 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_6_lazy | 437 | 2.596 | 150 | 44 | 0.0366 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_7_lazy | 437 | 2.596 | 150 | 44 | 0.0366 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_8_lazy | 437 | 2.596 | 150 | 44 | 0.0366 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_9_lazy | 437 | 2.596 | 150 | 44 | 0.0366 | 0.0107 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_10_lazy | 16384 | 52.356 | 483762 | 462364 | 0.4733 | 0.4524 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_6_lazy | 16384 | 52.356 | 484957 | 464543 | 0.4745 | 0.4545 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_7_lazy | 16384 | 52.356 | 484299 | 464689 | 0.4739 | 0.4547 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_8_lazy | 16384 | 52.356 | 484336 | 463700 | 0.4739 | 0.4537 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_9_lazy | 16384 | 52.356 | 484348 | 462791 | 0.4739 | 0.4528 |
+| small-10k-random | Small random payload (10 KiB) | level_10_lazy | 1280 | 12.070 | 10250 | 9214 | 1.0010 | 0.8998 |
+| small-10k-random | Small random payload (10 KiB) | level_6_lazy | 1280 | 12.070 | 10250 | 9214 | 1.0010 | 0.8998 |
+| small-10k-random | Small random payload (10 KiB) | level_7_lazy | 1280 | 12.070 | 10250 | 9214 | 1.0010 | 0.8998 |
+| small-10k-random | Small random payload (10 KiB) | level_8_lazy | 1280 | 12.070 | 10250 | 9214 | 1.0010 | 0.8998 |
+| small-10k-random | Small random payload (10 KiB) | level_9_lazy | 1280 | 12.070 | 10250 | 9214 | 1.0010 | 0.8998 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_10_lazy | 437 | 2.530 | 150 | 44 | 0.0366 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_6_lazy | 437 | 2.530 | 150 | 44 | 0.0366 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_7_lazy | 437 | 2.530 | 150 | 44 | 0.0366 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_8_lazy | 437 | 2.530 | 150 | 44 | 0.0366 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_9_lazy | 437 | 2.530 | 150 | 44 | 0.0366 | 0.0107 |
 
 ## Dictionary Training (Rust FastCOVER vs C FFI)
 
 | Scenario | Label | Dict bytes (requested) | Rust train ms | C train ms | Rust dict bytes | C dict bytes | Rust FastCOVER score | Delta (C/Rust) | Status |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| decodecorpus-z000033 | Repo decode corpus sample | 16384 | 12.012 | 52.204 | 16384 | 16384 | 0 | 4.3460 | rust_faster |
-| small-10k-random | Small random payload (10 KiB) | 1280 | 3.168 | 11.296 | 1280 | 1280 | 0 | 3.5657 | rust_faster |
-| small-4k-log-lines | Small structured log lines (4 KiB) | 512 | 1.203 | 2.596 | 512 | 437 | 0 | 2.1579 | rust_faster |
+| decodecorpus-z000033 | Repo decode corpus sample | 16384 | 12.603 | 52.356 | 16384 | 16384 | 0 | 4.1542 | rust_faster |
+| small-10k-random | Small random payload (10 KiB) | 1280 | 3.457 | 12.070 | 1280 | 1280 | 0 | 3.4915 | rust_faster |
+| small-4k-log-lines | Small structured log lines (4 KiB) | 512 | 1.165 | 2.530 | 512 | 437 | 0 | 2.1717 | rust_faster |
 
 ## Timing Metrics
 
 | Benchmark | ms/iter |
 | --- | ---: |
-| `compress-dict/level_10_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 24.248 |
-| `compress-dict/level_10_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 18.129 |
-| `compress-dict/level_10_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 42.197 |
-| `compress-dict/level_10_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.217 |
-| `compress-dict/level_10_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.145 |
-| `compress-dict/level_10_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.325 |
+| `compress-dict/level_10_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 24.772 |
+| `compress-dict/level_10_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 18.122 |
+| `compress-dict/level_10_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 40.977 |
+| `compress-dict/level_10_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.216 |
+| `compress-dict/level_10_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.146 |
+| `compress-dict/level_10_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.326 |
 | `compress-dict/level_10_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.004 |
-| `compress-dict/level_10_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.071 |
+| `compress-dict/level_10_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.073 |
 | `compress-dict/level_10_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.004 |
-| `compress-dict/level_6_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 15.413 |
-| `compress-dict/level_6_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 14.501 |
-| `compress-dict/level_6_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 27.038 |
-| `compress-dict/level_6_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.111 |
-| `compress-dict/level_6_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.099 |
-| `compress-dict/level_6_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.319 |
+| `compress-dict/level_6_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 15.368 |
+| `compress-dict/level_6_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 14.575 |
+| `compress-dict/level_6_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 27.581 |
+| `compress-dict/level_6_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.114 |
+| `compress-dict/level_6_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.101 |
+| `compress-dict/level_6_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.323 |
 | `compress-dict/level_6_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.004 |
-| `compress-dict/level_6_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.063 |
+| `compress-dict/level_6_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.065 |
 | `compress-dict/level_6_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.004 |
-| `compress-dict/level_7_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 18.057 |
-| `compress-dict/level_7_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 14.220 |
-| `compress-dict/level_7_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 31.077 |
-| `compress-dict/level_7_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.111 |
-| `compress-dict/level_7_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.099 |
-| `compress-dict/level_7_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.323 |
+| `compress-dict/level_7_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 17.989 |
+| `compress-dict/level_7_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 14.542 |
+| `compress-dict/level_7_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 31.148 |
+| `compress-dict/level_7_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.113 |
+| `compress-dict/level_7_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.101 |
+| `compress-dict/level_7_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.326 |
 | `compress-dict/level_7_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.004 |
-| `compress-dict/level_7_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.064 |
+| `compress-dict/level_7_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.065 |
 | `compress-dict/level_7_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.004 |
-| `compress-dict/level_8_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 18.921 |
-| `compress-dict/level_8_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 16.205 |
-| `compress-dict/level_8_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 37.671 |
-| `compress-dict/level_8_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.113 |
-| `compress-dict/level_8_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.100 |
-| `compress-dict/level_8_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.323 |
+| `compress-dict/level_8_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 18.945 |
+| `compress-dict/level_8_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 16.562 |
+| `compress-dict/level_8_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 37.950 |
+| `compress-dict/level_8_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.115 |
+| `compress-dict/level_8_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.101 |
+| `compress-dict/level_8_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.327 |
 | `compress-dict/level_8_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.004 |
-| `compress-dict/level_8_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.064 |
+| `compress-dict/level_8_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.065 |
 | `compress-dict/level_8_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.004 |
-| `compress-dict/level_9_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 21.331 |
-| `compress-dict/level_9_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 17.022 |
-| `compress-dict/level_9_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 38.245 |
+| `compress-dict/level_9_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 21.180 |
+| `compress-dict/level_9_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 17.040 |
+| `compress-dict/level_9_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 37.952 |
 | `compress-dict/level_9_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.217 |
 | `compress-dict/level_9_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.145 |
-| `compress-dict/level_9_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.324 |
+| `compress-dict/level_9_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.325 |
 | `compress-dict/level_9_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.004 |
-| `compress-dict/level_9_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.071 |
+| `compress-dict/level_9_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.073 |
 | `compress-dict/level_9_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.004 |
-| `compress/level_10_lazy/decodecorpus-z000033/matrix/c_ffi` | 17.060 |
-| `compress/level_10_lazy/decodecorpus-z000033/matrix/pure_rust` | 39.721 |
-| `compress/level_10_lazy/high-entropy-1m/matrix/c_ffi` | 2.217 |
-| `compress/level_10_lazy/high-entropy-1m/matrix/pure_rust` | 2.768 |
-| `compress/level_10_lazy/large-log-stream/matrix/c_ffi` | 12.604 |
-| `compress/level_10_lazy/large-log-stream/matrix/pure_rust` | 14.335 |
-| `compress/level_10_lazy/low-entropy-1m/matrix/c_ffi` | 2.077 |
-| `compress/level_10_lazy/low-entropy-1m/matrix/pure_rust` | 2.279 |
-| `compress/level_10_lazy/small-10k-random/matrix/c_ffi` | 0.165 |
-| `compress/level_10_lazy/small-10k-random/matrix/pure_rust` | 0.119 |
-| `compress/level_10_lazy/small-1k-random/matrix/c_ffi` | 0.051 |
+| `compress/level_10_lazy/decodecorpus-z000033/matrix/c_ffi` | 17.078 |
+| `compress/level_10_lazy/decodecorpus-z000033/matrix/pure_rust` | 40.151 |
+| `compress/level_10_lazy/high-entropy-1m/matrix/c_ffi` | 2.299 |
+| `compress/level_10_lazy/high-entropy-1m/matrix/pure_rust` | 2.803 |
+| `compress/level_10_lazy/large-log-stream/matrix/c_ffi` | 13.334 |
+| `compress/level_10_lazy/large-log-stream/matrix/pure_rust` | 14.297 |
+| `compress/level_10_lazy/low-entropy-1m/matrix/c_ffi` | 2.129 |
+| `compress/level_10_lazy/low-entropy-1m/matrix/pure_rust` | 2.259 |
+| `compress/level_10_lazy/small-10k-random/matrix/c_ffi` | 0.160 |
+| `compress/level_10_lazy/small-10k-random/matrix/pure_rust` | 0.118 |
+| `compress/level_10_lazy/small-1k-random/matrix/c_ffi` | 0.049 |
 | `compress/level_10_lazy/small-1k-random/matrix/pure_rust` | 0.003 |
-| `compress/level_10_lazy/small-4k-log-lines/matrix/c_ffi` | 0.076 |
-| `compress/level_10_lazy/small-4k-log-lines/matrix/pure_rust` | 0.069 |
-| `compress/level_6_lazy/decodecorpus-z000033/matrix/c_ffi` | 13.434 |
-| `compress/level_6_lazy/decodecorpus-z000033/matrix/pure_rust` | 25.866 |
-| `compress/level_6_lazy/high-entropy-1m/matrix/c_ffi` | 2.020 |
-| `compress/level_6_lazy/high-entropy-1m/matrix/pure_rust` | 2.461 |
-| `compress/level_6_lazy/large-log-stream/matrix/c_ffi` | 10.777 |
-| `compress/level_6_lazy/large-log-stream/matrix/pure_rust` | 4.962 |
-| `compress/level_6_lazy/low-entropy-1m/matrix/c_ffi` | 1.468 |
-| `compress/level_6_lazy/low-entropy-1m/matrix/pure_rust` | 1.397 |
-| `compress/level_6_lazy/small-10k-random/matrix/c_ffi` | 0.117 |
-| `compress/level_6_lazy/small-10k-random/matrix/pure_rust` | 0.119 |
-| `compress/level_6_lazy/small-1k-random/matrix/c_ffi` | 0.046 |
+| `compress/level_10_lazy/small-4k-log-lines/matrix/c_ffi` | 0.075 |
+| `compress/level_10_lazy/small-4k-log-lines/matrix/pure_rust` | 0.068 |
+| `compress/level_6_lazy/decodecorpus-z000033/matrix/c_ffi` | 13.430 |
+| `compress/level_6_lazy/decodecorpus-z000033/matrix/pure_rust` | 25.973 |
+| `compress/level_6_lazy/high-entropy-1m/matrix/c_ffi` | 2.093 |
+| `compress/level_6_lazy/high-entropy-1m/matrix/pure_rust` | 2.483 |
+| `compress/level_6_lazy/large-log-stream/matrix/c_ffi` | 10.719 |
+| `compress/level_6_lazy/large-log-stream/matrix/pure_rust` | 4.851 |
+| `compress/level_6_lazy/low-entropy-1m/matrix/c_ffi` | 1.586 |
+| `compress/level_6_lazy/low-entropy-1m/matrix/pure_rust` | 1.408 |
+| `compress/level_6_lazy/small-10k-random/matrix/c_ffi` | 0.115 |
+| `compress/level_6_lazy/small-10k-random/matrix/pure_rust` | 0.118 |
+| `compress/level_6_lazy/small-1k-random/matrix/c_ffi` | 0.047 |
 | `compress/level_6_lazy/small-1k-random/matrix/pure_rust` | 0.003 |
-| `compress/level_6_lazy/small-4k-log-lines/matrix/c_ffi` | 0.068 |
-| `compress/level_6_lazy/small-4k-log-lines/matrix/pure_rust` | 0.066 |
-| `compress/level_7_lazy/decodecorpus-z000033/matrix/c_ffi` | 14.010 |
-| `compress/level_7_lazy/decodecorpus-z000033/matrix/pure_rust` | 29.766 |
-| `compress/level_7_lazy/high-entropy-1m/matrix/c_ffi` | 2.487 |
-| `compress/level_7_lazy/high-entropy-1m/matrix/pure_rust` | 2.888 |
-| `compress/level_7_lazy/large-log-stream/matrix/c_ffi` | 11.286 |
-| `compress/level_7_lazy/large-log-stream/matrix/pure_rust` | 5.446 |
-| `compress/level_7_lazy/low-entropy-1m/matrix/c_ffi` | 1.977 |
-| `compress/level_7_lazy/low-entropy-1m/matrix/pure_rust` | 1.731 |
-| `compress/level_7_lazy/small-10k-random/matrix/c_ffi` | 0.117 |
-| `compress/level_7_lazy/small-10k-random/matrix/pure_rust` | 0.117 |
-| `compress/level_7_lazy/small-1k-random/matrix/c_ffi` | 0.047 |
+| `compress/level_6_lazy/small-4k-log-lines/matrix/c_ffi` | 0.067 |
+| `compress/level_6_lazy/small-4k-log-lines/matrix/pure_rust` | 0.068 |
+| `compress/level_7_lazy/decodecorpus-z000033/matrix/c_ffi` | 14.397 |
+| `compress/level_7_lazy/decodecorpus-z000033/matrix/pure_rust` | 30.345 |
+| `compress/level_7_lazy/high-entropy-1m/matrix/c_ffi` | 2.513 |
+| `compress/level_7_lazy/high-entropy-1m/matrix/pure_rust` | 2.885 |
+| `compress/level_7_lazy/large-log-stream/matrix/c_ffi` | 11.127 |
+| `compress/level_7_lazy/large-log-stream/matrix/pure_rust` | 5.201 |
+| `compress/level_7_lazy/low-entropy-1m/matrix/c_ffi` | 1.176 |
+| `compress/level_7_lazy/low-entropy-1m/matrix/pure_rust` | 1.738 |
+| `compress/level_7_lazy/small-10k-random/matrix/c_ffi` | 0.116 |
+| `compress/level_7_lazy/small-10k-random/matrix/pure_rust` | 0.118 |
+| `compress/level_7_lazy/small-1k-random/matrix/c_ffi` | 0.045 |
 | `compress/level_7_lazy/small-1k-random/matrix/pure_rust` | 0.003 |
-| `compress/level_7_lazy/small-4k-log-lines/matrix/c_ffi` | 0.068 |
-| `compress/level_7_lazy/small-4k-log-lines/matrix/pure_rust` | 0.067 |
-| `compress/level_8_lazy/decodecorpus-z000033/matrix/c_ffi` | 15.997 |
-| `compress/level_8_lazy/decodecorpus-z000033/matrix/pure_rust` | 36.603 |
-| `compress/level_8_lazy/high-entropy-1m/matrix/c_ffi` | 2.456 |
-| `compress/level_8_lazy/high-entropy-1m/matrix/pure_rust` | 2.846 |
-| `compress/level_8_lazy/large-log-stream/matrix/c_ffi` | 12.673 |
-| `compress/level_8_lazy/large-log-stream/matrix/pure_rust` | 14.758 |
-| `compress/level_8_lazy/low-entropy-1m/matrix/c_ffi` | 2.300 |
-| `compress/level_8_lazy/low-entropy-1m/matrix/pure_rust` | 2.267 |
-| `compress/level_8_lazy/small-10k-random/matrix/c_ffi` | 0.117 |
-| `compress/level_8_lazy/small-10k-random/matrix/pure_rust` | 0.119 |
+| `compress/level_7_lazy/small-4k-log-lines/matrix/c_ffi` | 0.067 |
+| `compress/level_7_lazy/small-4k-log-lines/matrix/pure_rust` | 0.069 |
+| `compress/level_8_lazy/decodecorpus-z000033/matrix/c_ffi` | 16.109 |
+| `compress/level_8_lazy/decodecorpus-z000033/matrix/pure_rust` | 36.819 |
+| `compress/level_8_lazy/high-entropy-1m/matrix/c_ffi` | 2.505 |
+| `compress/level_8_lazy/high-entropy-1m/matrix/pure_rust` | 2.888 |
+| `compress/level_8_lazy/large-log-stream/matrix/c_ffi` | 12.687 |
+| `compress/level_8_lazy/large-log-stream/matrix/pure_rust` | 14.292 |
+| `compress/level_8_lazy/low-entropy-1m/matrix/c_ffi` | 1.505 |
+| `compress/level_8_lazy/low-entropy-1m/matrix/pure_rust` | 2.274 |
+| `compress/level_8_lazy/small-10k-random/matrix/c_ffi` | 0.116 |
+| `compress/level_8_lazy/small-10k-random/matrix/pure_rust` | 0.118 |
 | `compress/level_8_lazy/small-1k-random/matrix/c_ffi` | 0.045 |
 | `compress/level_8_lazy/small-1k-random/matrix/pure_rust` | 0.003 |
 | `compress/level_8_lazy/small-4k-log-lines/matrix/c_ffi` | 0.067 |
 | `compress/level_8_lazy/small-4k-log-lines/matrix/pure_rust` | 0.067 |
-| `compress/level_9_lazy/decodecorpus-z000033/matrix/c_ffi` | 15.775 |
-| `compress/level_9_lazy/decodecorpus-z000033/matrix/pure_rust` | 36.702 |
-| `compress/level_9_lazy/high-entropy-1m/matrix/c_ffi` | 2.245 |
-| `compress/level_9_lazy/high-entropy-1m/matrix/pure_rust` | 2.846 |
-| `compress/level_9_lazy/large-log-stream/matrix/c_ffi` | 13.457 |
-| `compress/level_9_lazy/large-log-stream/matrix/pure_rust` | 14.626 |
-| `compress/level_9_lazy/low-entropy-1m/matrix/c_ffi` | 2.095 |
-| `compress/level_9_lazy/low-entropy-1m/matrix/pure_rust` | 2.263 |
-| `compress/level_9_lazy/small-10k-random/matrix/c_ffi` | 0.164 |
-| `compress/level_9_lazy/small-10k-random/matrix/pure_rust` | 0.119 |
-| `compress/level_9_lazy/small-1k-random/matrix/c_ffi` | 0.051 |
+| `compress/level_9_lazy/decodecorpus-z000033/matrix/c_ffi` | 15.857 |
+| `compress/level_9_lazy/decodecorpus-z000033/matrix/pure_rust` | 36.929 |
+| `compress/level_9_lazy/high-entropy-1m/matrix/c_ffi` | 2.305 |
+| `compress/level_9_lazy/high-entropy-1m/matrix/pure_rust` | 2.903 |
+| `compress/level_9_lazy/large-log-stream/matrix/c_ffi` | 12.637 |
+| `compress/level_9_lazy/large-log-stream/matrix/pure_rust` | 14.303 |
+| `compress/level_9_lazy/low-entropy-1m/matrix/c_ffi` | 2.136 |
+| `compress/level_9_lazy/low-entropy-1m/matrix/pure_rust` | 2.279 |
+| `compress/level_9_lazy/small-10k-random/matrix/c_ffi` | 0.160 |
+| `compress/level_9_lazy/small-10k-random/matrix/pure_rust` | 0.118 |
+| `compress/level_9_lazy/small-1k-random/matrix/c_ffi` | 0.050 |
 | `compress/level_9_lazy/small-1k-random/matrix/pure_rust` | 0.003 |
 | `compress/level_9_lazy/small-4k-log-lines/matrix/c_ffi` | 0.075 |
-| `compress/level_9_lazy/small-4k-log-lines/matrix/pure_rust` | 0.067 |
-| `decompress-dict/level_10_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.307 |
-| `decompress-dict/level_10_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.152 |
+| `compress/level_9_lazy/small-4k-log-lines/matrix/pure_rust` | 0.068 |
+| `decompress-dict/level_10_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.303 |
+| `decompress-dict/level_10_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.127 |
 | `decompress-dict/level_10_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_10_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_10_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_10_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_6_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.384 |
-| `decompress-dict/level_6_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.264 |
+| `decompress-dict/level_6_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.376 |
+| `decompress-dict/level_6_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.245 |
 | `decompress-dict/level_6_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_6_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_6_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_6_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_7_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.362 |
-| `decompress-dict/level_7_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.219 |
+| `decompress-dict/level_7_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.356 |
+| `decompress-dict/level_7_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.210 |
 | `decompress-dict/level_7_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_7_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_7_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_7_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_8_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.341 |
-| `decompress-dict/level_8_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.195 |
+| `decompress-dict/level_8_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.335 |
+| `decompress-dict/level_8_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.172 |
 | `decompress-dict/level_8_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_8_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_8_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_8_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_9_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.321 |
-| `decompress-dict/level_9_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.157 |
+| `decompress-dict/level_9_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.315 |
+| `decompress-dict/level_9_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.138 |
 | `decompress-dict/level_9_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_9_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_9_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_9_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress/level_10_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.992 |
-| `decompress/level_10_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.408 |
-| `decompress/level_10_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.202 |
-| `decompress/level_10_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.817 |
-| `decompress/level_10_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.030 |
-| `decompress/level_10_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_10_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.989 |
+| `decompress/level_10_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.413 |
+| `decompress/level_10_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.197 |
+| `decompress/level_10_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.811 |
+| `decompress/level_10_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.029 |
+| `decompress/level_10_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
 | `decompress/level_10_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.030 |
-| `decompress/level_10_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_10_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.667 |
-| `decompress/level_10_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.475 |
-| `decompress/level_10_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.430 |
-| `decompress/level_10_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.417 |
+| `decompress/level_10_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_10_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.660 |
+| `decompress/level_10_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.455 |
+| `decompress/level_10_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.429 |
+| `decompress/level_10_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.414 |
 | `decompress/level_10_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.187 |
 | `decompress/level_10_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
 | `decompress/level_10_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.093 |
@@ -8365,22 +8365,22 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_10_lazy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_10_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_10_lazy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_6_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.020 |
-| `decompress/level_6_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.465 |
-| `decompress/level_6_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.295 |
-| `decompress/level_6_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.999 |
-| `decompress/level_6_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.027 |
-| `decompress/level_6_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_6_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.027 |
-| `decompress/level_6_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_6_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.654 |
-| `decompress/level_6_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.412 |
-| `decompress/level_6_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.432 |
-| `decompress/level_6_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.420 |
+| `decompress/level_6_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.019 |
+| `decompress/level_6_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.462 |
+| `decompress/level_6_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.289 |
+| `decompress/level_6_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.981 |
+| `decompress/level_6_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.035 |
+| `decompress/level_6_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_6_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.029 |
+| `decompress/level_6_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_6_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.650 |
+| `decompress/level_6_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.410 |
+| `decompress/level_6_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.431 |
+| `decompress/level_6_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.413 |
 | `decompress/level_6_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.187 |
 | `decompress/level_6_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
 | `decompress/level_6_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.093 |
-| `decompress/level_6_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_6_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
 | `decompress/level_6_lazy/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_6_lazy/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_6_lazy/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -8393,22 +8393,22 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_6_lazy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_6_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_6_lazy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_7_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.010 |
-| `decompress/level_7_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.446 |
-| `decompress/level_7_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.260 |
-| `decompress/level_7_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.939 |
+| `decompress/level_7_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.006 |
+| `decompress/level_7_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.451 |
+| `decompress/level_7_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.257 |
+| `decompress/level_7_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.926 |
 | `decompress/level_7_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.030 |
-| `decompress/level_7_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_7_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.030 |
-| `decompress/level_7_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_7_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.654 |
-| `decompress/level_7_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.409 |
-| `decompress/level_7_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.431 |
-| `decompress/level_7_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.418 |
+| `decompress/level_7_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_7_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.029 |
+| `decompress/level_7_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_7_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.651 |
+| `decompress/level_7_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.410 |
+| `decompress/level_7_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.430 |
+| `decompress/level_7_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.416 |
 | `decompress/level_7_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.187 |
 | `decompress/level_7_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
 | `decompress/level_7_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.093 |
-| `decompress/level_7_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_7_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
 | `decompress/level_7_lazy/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_7_lazy/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_7_lazy/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -8421,18 +8421,18 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_7_lazy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_7_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_7_lazy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_8_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.999 |
-| `decompress/level_8_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.422 |
-| `decompress/level_8_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.215 |
-| `decompress/level_8_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.833 |
-| `decompress/level_8_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.027 |
-| `decompress/level_8_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_8_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.030 |
-| `decompress/level_8_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_8_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.665 |
-| `decompress/level_8_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.471 |
-| `decompress/level_8_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.433 |
-| `decompress/level_8_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.423 |
+| `decompress/level_8_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.000 |
+| `decompress/level_8_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.429 |
+| `decompress/level_8_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.212 |
+| `decompress/level_8_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.828 |
+| `decompress/level_8_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.029 |
+| `decompress/level_8_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_8_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.028 |
+| `decompress/level_8_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_8_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.662 |
+| `decompress/level_8_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.453 |
+| `decompress/level_8_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.429 |
+| `decompress/level_8_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.415 |
 | `decompress/level_8_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.187 |
 | `decompress/level_8_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
 | `decompress/level_8_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.093 |
@@ -8449,18 +8449,18 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_8_lazy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_8_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_8_lazy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_9_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 1.002 |
-| `decompress/level_9_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.433 |
-| `decompress/level_9_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.214 |
-| `decompress/level_9_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.840 |
-| `decompress/level_9_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.027 |
-| `decompress/level_9_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_9_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.028 |
-| `decompress/level_9_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_9_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.667 |
-| `decompress/level_9_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.476 |
-| `decompress/level_9_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.434 |
-| `decompress/level_9_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.423 |
+| `decompress/level_9_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.999 |
+| `decompress/level_9_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.435 |
+| `decompress/level_9_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.210 |
+| `decompress/level_9_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.828 |
+| `decompress/level_9_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.030 |
+| `decompress/level_9_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_9_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.030 |
+| `decompress/level_9_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_9_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.660 |
+| `decompress/level_9_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.456 |
+| `decompress/level_9_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.432 |
+| `decompress/level_9_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.414 |
 | `decompress/level_9_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.187 |
 | `decompress/level_9_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
 | `decompress/level_9_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.093 |
@@ -8477,12 +8477,12 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_9_lazy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_9_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_9_lazy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `dict-train/na/decodecorpus-z000033/matrix/c_ffi` | 51.704 |
-| `dict-train/na/decodecorpus-z000033/matrix/pure_rust` | 11.586 |
-| `dict-train/na/small-10k-random/matrix/c_ffi` | 11.257 |
-| `dict-train/na/small-10k-random/matrix/pure_rust` | 3.104 |
-| `dict-train/na/small-4k-log-lines/matrix/c_ffi` | 2.408 |
-| `dict-train/na/small-4k-log-lines/matrix/pure_rust` | 1.075 |
+| `dict-train/na/decodecorpus-z000033/matrix/c_ffi` | 50.687 |
+| `dict-train/na/decodecorpus-z000033/matrix/pure_rust` | 11.491 |
+| `dict-train/na/small-10k-random/matrix/c_ffi` | 11.138 |
+| `dict-train/na/small-10k-random/matrix/pure_rust` | 3.147 |
+| `dict-train/na/small-4k-log-lines/matrix/c_ffi` | 2.445 |
+| `dict-train/na/small-4k-log-lines/matrix/pure_rust` | 1.028 |
 
 ## Strategy group: lazy-upper
 
@@ -8644,195 +8644,195 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 
 | Scenario | Label | Level | Dict bytes | Train ms | C bytes (no dict) | C bytes (with dict) | C ratio (no dict) | C ratio (with dict) |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| decodecorpus-z000033 | Repo decode corpus sample | level_11_lazy | 16384 | 54.271 | 483348 | 458380 | 0.4729 | 0.4485 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_12_lazy | 16384 | 54.271 | 483348 | 458085 | 0.4729 | 0.4482 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_13_lazy | 16384 | 54.271 | 482849 | 452252 | 0.4724 | 0.4425 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_14_lazy | 16384 | 54.271 | 482463 | 430814 | 0.4721 | 0.4215 |
-| decodecorpus-z000033 | Repo decode corpus sample | level_15_lazy | 16384 | 54.271 | 482283 | 430274 | 0.4719 | 0.4210 |
-| small-10k-random | Small random payload (10 KiB) | level_11_lazy | 1280 | 12.114 | 10250 | 9215 | 1.0010 | 0.8999 |
-| small-10k-random | Small random payload (10 KiB) | level_12_lazy | 1280 | 12.114 | 10250 | 9216 | 1.0010 | 0.9000 |
-| small-10k-random | Small random payload (10 KiB) | level_13_lazy | 1280 | 12.114 | 10250 | 9226 | 1.0010 | 0.9010 |
-| small-10k-random | Small random payload (10 KiB) | level_14_lazy | 1280 | 12.114 | 10250 | 9226 | 1.0010 | 0.9010 |
-| small-10k-random | Small random payload (10 KiB) | level_15_lazy | 1280 | 12.114 | 10250 | 9226 | 1.0010 | 0.9010 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_11_lazy | 437 | 2.681 | 150 | 46 | 0.0366 | 0.0112 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_12_lazy | 437 | 2.681 | 150 | 46 | 0.0366 | 0.0112 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_13_lazy | 437 | 2.681 | 146 | 47 | 0.0356 | 0.0115 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_14_lazy | 437 | 2.681 | 146 | 44 | 0.0356 | 0.0107 |
-| small-4k-log-lines | Small structured log lines (4 KiB) | level_15_lazy | 437 | 2.681 | 146 | 44 | 0.0356 | 0.0107 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_11_lazy | 16384 | 55.788 | 483348 | 458380 | 0.4729 | 0.4485 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_12_lazy | 16384 | 55.788 | 483348 | 458085 | 0.4729 | 0.4482 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_13_lazy | 16384 | 55.788 | 482849 | 452252 | 0.4724 | 0.4425 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_14_lazy | 16384 | 55.788 | 482463 | 430814 | 0.4721 | 0.4215 |
+| decodecorpus-z000033 | Repo decode corpus sample | level_15_lazy | 16384 | 55.788 | 482283 | 430274 | 0.4719 | 0.4210 |
+| small-10k-random | Small random payload (10 KiB) | level_11_lazy | 1280 | 11.645 | 10250 | 9215 | 1.0010 | 0.8999 |
+| small-10k-random | Small random payload (10 KiB) | level_12_lazy | 1280 | 11.645 | 10250 | 9216 | 1.0010 | 0.9000 |
+| small-10k-random | Small random payload (10 KiB) | level_13_lazy | 1280 | 11.645 | 10250 | 9226 | 1.0010 | 0.9010 |
+| small-10k-random | Small random payload (10 KiB) | level_14_lazy | 1280 | 11.645 | 10250 | 9226 | 1.0010 | 0.9010 |
+| small-10k-random | Small random payload (10 KiB) | level_15_lazy | 1280 | 11.645 | 10250 | 9226 | 1.0010 | 0.9010 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_11_lazy | 437 | 2.599 | 150 | 46 | 0.0366 | 0.0112 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_12_lazy | 437 | 2.599 | 150 | 46 | 0.0366 | 0.0112 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_13_lazy | 437 | 2.599 | 146 | 47 | 0.0356 | 0.0115 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_14_lazy | 437 | 2.599 | 146 | 44 | 0.0356 | 0.0107 |
+| small-4k-log-lines | Small structured log lines (4 KiB) | level_15_lazy | 437 | 2.599 | 146 | 44 | 0.0356 | 0.0107 |
 
 ## Dictionary Training (Rust FastCOVER vs C FFI)
 
 | Scenario | Label | Dict bytes (requested) | Rust train ms | C train ms | Rust dict bytes | C dict bytes | Rust FastCOVER score | Delta (C/Rust) | Status |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| decodecorpus-z000033 | Repo decode corpus sample | 16384 | 13.474 | 54.271 | 16384 | 16384 | 0 | 4.0278 | rust_faster |
-| small-10k-random | Small random payload (10 KiB) | 1280 | 3.370 | 12.114 | 1280 | 1280 | 0 | 3.5947 | rust_faster |
-| small-4k-log-lines | Small structured log lines (4 KiB) | 512 | 1.227 | 2.681 | 512 | 437 | 0 | 2.1850 | rust_faster |
+| decodecorpus-z000033 | Repo decode corpus sample | 16384 | 13.722 | 55.788 | 16384 | 16384 | 0 | 4.0656 | rust_faster |
+| small-10k-random | Small random payload (10 KiB) | 1280 | 3.277 | 11.645 | 1280 | 1280 | 0 | 3.5536 | rust_faster |
+| small-4k-log-lines | Small structured log lines (4 KiB) | 512 | 1.148 | 2.599 | 512 | 437 | 0 | 2.2639 | rust_faster |
 
 ## Timing Metrics
 
 | Benchmark | ms/iter |
 | --- | ---: |
-| `compress-dict/level_11_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 38.929 |
-| `compress-dict/level_11_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 20.665 |
-| `compress-dict/level_11_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 49.555 |
-| `compress-dict/level_11_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.346 |
+| `compress-dict/level_11_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 39.125 |
+| `compress-dict/level_11_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 21.222 |
+| `compress-dict/level_11_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 48.739 |
+| `compress-dict/level_11_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.344 |
 | `compress-dict/level_11_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.302 |
-| `compress-dict/level_11_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.326 |
+| `compress-dict/level_11_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.327 |
 | `compress-dict/level_11_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.009 |
-| `compress-dict/level_11_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.084 |
+| `compress-dict/level_11_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.082 |
 | `compress-dict/level_11_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.004 |
-| `compress-dict/level_12_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 41.131 |
-| `compress-dict/level_12_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 21.098 |
-| `compress-dict/level_12_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 53.318 |
+| `compress-dict/level_12_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 40.539 |
+| `compress-dict/level_12_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 21.291 |
+| `compress-dict/level_12_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 51.295 |
 | `compress-dict/level_12_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.415 |
-| `compress-dict/level_12_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.398 |
+| `compress-dict/level_12_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.396 |
 | `compress-dict/level_12_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.327 |
 | `compress-dict/level_12_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.009 |
-| `compress-dict/level_12_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.096 |
+| `compress-dict/level_12_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.092 |
 | `compress-dict/level_12_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.004 |
-| `compress-dict/level_13_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 55.623 |
-| `compress-dict/level_13_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 29.359 |
-| `compress-dict/level_13_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 67.261 |
-| `compress-dict/level_13_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.357 |
-| `compress-dict/level_13_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.395 |
-| `compress-dict/level_13_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.581 |
+| `compress-dict/level_13_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 55.264 |
+| `compress-dict/level_13_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 28.395 |
+| `compress-dict/level_13_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 66.718 |
+| `compress-dict/level_13_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.355 |
+| `compress-dict/level_13_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.394 |
+| `compress-dict/level_13_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.573 |
 | `compress-dict/level_13_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.011 |
 | `compress-dict/level_13_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.103 |
 | `compress-dict/level_13_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.008 |
-| `compress-dict/level_14_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 78.649 |
-| `compress-dict/level_14_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 29.277 |
-| `compress-dict/level_14_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 67.308 |
-| `compress-dict/level_14_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.514 |
+| `compress-dict/level_14_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 78.198 |
+| `compress-dict/level_14_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 28.250 |
+| `compress-dict/level_14_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 66.982 |
+| `compress-dict/level_14_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.513 |
 | `compress-dict/level_14_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.404 |
-| `compress-dict/level_14_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.579 |
+| `compress-dict/level_14_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.576 |
 | `compress-dict/level_14_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.094 |
-| `compress-dict/level_14_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.139 |
+| `compress-dict/level_14_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.136 |
 | `compress-dict/level_14_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.008 |
-| `compress-dict/level_15_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 82.361 |
-| `compress-dict/level_15_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 29.113 |
-| `compress-dict/level_15_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 67.297 |
-| `compress-dict/level_15_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.512 |
-| `compress-dict/level_15_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.403 |
-| `compress-dict/level_15_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.578 |
-| `compress-dict/level_15_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.096 |
+| `compress-dict/level_15_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 83.165 |
+| `compress-dict/level_15_lazy/decodecorpus-z000033/matrix/c_ffi_without_dict` | 30.042 |
+| `compress-dict/level_15_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 67.144 |
+| `compress-dict/level_15_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.514 |
+| `compress-dict/level_15_lazy/small-10k-random/matrix/c_ffi_without_dict` | 0.409 |
+| `compress-dict/level_15_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.575 |
+| `compress-dict/level_15_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.094 |
 | `compress-dict/level_15_lazy/small-4k-log-lines/matrix/c_ffi_without_dict` | 0.137 |
 | `compress-dict/level_15_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.008 |
-| `compress/level_11_lazy/decodecorpus-z000033/matrix/c_ffi` | 20.403 |
-| `compress/level_11_lazy/decodecorpus-z000033/matrix/pure_rust` | 45.873 |
-| `compress/level_11_lazy/high-entropy-1m/matrix/c_ffi` | 2.299 |
-| `compress/level_11_lazy/high-entropy-1m/matrix/pure_rust` | 2.759 |
-| `compress/level_11_lazy/large-log-stream/matrix/c_ffi` | 13.176 |
-| `compress/level_11_lazy/large-log-stream/matrix/pure_rust` | 14.414 |
-| `compress/level_11_lazy/low-entropy-1m/matrix/c_ffi` | 2.083 |
-| `compress/level_11_lazy/low-entropy-1m/matrix/pure_rust` | 2.248 |
-| `compress/level_11_lazy/small-10k-random/matrix/c_ffi` | 0.317 |
-| `compress/level_11_lazy/small-10k-random/matrix/pure_rust` | 0.120 |
-| `compress/level_11_lazy/small-1k-random/matrix/c_ffi` | 0.061 |
+| `compress/level_11_lazy/decodecorpus-z000033/matrix/c_ffi` | 21.082 |
+| `compress/level_11_lazy/decodecorpus-z000033/matrix/pure_rust` | 47.576 |
+| `compress/level_11_lazy/high-entropy-1m/matrix/c_ffi` | 2.357 |
+| `compress/level_11_lazy/high-entropy-1m/matrix/pure_rust` | 2.791 |
+| `compress/level_11_lazy/large-log-stream/matrix/c_ffi` | 16.346 |
+| `compress/level_11_lazy/large-log-stream/matrix/pure_rust` | 14.761 |
+| `compress/level_11_lazy/low-entropy-1m/matrix/c_ffi` | 3.022 |
+| `compress/level_11_lazy/low-entropy-1m/matrix/pure_rust` | 2.271 |
+| `compress/level_11_lazy/small-10k-random/matrix/c_ffi` | 0.318 |
+| `compress/level_11_lazy/small-10k-random/matrix/pure_rust` | 0.119 |
+| `compress/level_11_lazy/small-1k-random/matrix/c_ffi` | 0.059 |
 | `compress/level_11_lazy/small-1k-random/matrix/pure_rust` | 0.003 |
-| `compress/level_11_lazy/small-4k-log-lines/matrix/c_ffi` | 0.087 |
-| `compress/level_11_lazy/small-4k-log-lines/matrix/pure_rust` | 0.068 |
-| `compress/level_12_lazy/decodecorpus-z000033/matrix/c_ffi` | 19.355 |
-| `compress/level_12_lazy/decodecorpus-z000033/matrix/pure_rust` | 48.171 |
-| `compress/level_12_lazy/high-entropy-1m/matrix/c_ffi` | 3.172 |
-| `compress/level_12_lazy/high-entropy-1m/matrix/pure_rust` | 2.788 |
-| `compress/level_12_lazy/large-log-stream/matrix/c_ffi` | 14.753 |
-| `compress/level_12_lazy/large-log-stream/matrix/pure_rust` | 14.800 |
-| `compress/level_12_lazy/low-entropy-1m/matrix/c_ffi` | 2.945 |
-| `compress/level_12_lazy/low-entropy-1m/matrix/pure_rust` | 2.255 |
-| `compress/level_12_lazy/small-10k-random/matrix/c_ffi` | 0.420 |
-| `compress/level_12_lazy/small-10k-random/matrix/pure_rust` | 0.119 |
+| `compress/level_11_lazy/small-4k-log-lines/matrix/c_ffi` | 0.084 |
+| `compress/level_11_lazy/small-4k-log-lines/matrix/pure_rust` | 0.066 |
+| `compress/level_12_lazy/decodecorpus-z000033/matrix/c_ffi` | 20.165 |
+| `compress/level_12_lazy/decodecorpus-z000033/matrix/pure_rust` | 48.230 |
+| `compress/level_12_lazy/high-entropy-1m/matrix/c_ffi` | 3.253 |
+| `compress/level_12_lazy/high-entropy-1m/matrix/pure_rust` | 2.785 |
+| `compress/level_12_lazy/large-log-stream/matrix/c_ffi` | 18.674 |
+| `compress/level_12_lazy/large-log-stream/matrix/pure_rust` | 15.277 |
+| `compress/level_12_lazy/low-entropy-1m/matrix/c_ffi` | 2.997 |
+| `compress/level_12_lazy/low-entropy-1m/matrix/pure_rust` | 2.279 |
+| `compress/level_12_lazy/small-10k-random/matrix/c_ffi` | 0.409 |
+| `compress/level_12_lazy/small-10k-random/matrix/pure_rust` | 0.118 |
 | `compress/level_12_lazy/small-1k-random/matrix/c_ffi` | 0.064 |
 | `compress/level_12_lazy/small-1k-random/matrix/pure_rust` | 0.003 |
-| `compress/level_12_lazy/small-4k-log-lines/matrix/c_ffi` | 0.096 |
+| `compress/level_12_lazy/small-4k-log-lines/matrix/c_ffi` | 0.095 |
 | `compress/level_12_lazy/small-4k-log-lines/matrix/pure_rust` | 0.070 |
-| `compress/level_13_lazy/decodecorpus-z000033/matrix/c_ffi` | 27.338 |
-| `compress/level_13_lazy/decodecorpus-z000033/matrix/pure_rust` | 57.043 |
-| `compress/level_13_lazy/high-entropy-1m/matrix/c_ffi` | 5.291 |
-| `compress/level_13_lazy/high-entropy-1m/matrix/pure_rust` | 5.063 |
-| `compress/level_13_lazy/large-log-stream/matrix/c_ffi` | 159.801 |
-| `compress/level_13_lazy/large-log-stream/matrix/pure_rust` | 19.145 |
-| `compress/level_13_lazy/low-entropy-1m/matrix/c_ffi` | 3.909 |
-| `compress/level_13_lazy/low-entropy-1m/matrix/pure_rust` | 3.260 |
-| `compress/level_13_lazy/small-10k-random/matrix/c_ffi` | 0.413 |
+| `compress/level_13_lazy/decodecorpus-z000033/matrix/c_ffi` | 29.232 |
+| `compress/level_13_lazy/decodecorpus-z000033/matrix/pure_rust` | 58.096 |
+| `compress/level_13_lazy/high-entropy-1m/matrix/c_ffi` | 5.416 |
+| `compress/level_13_lazy/high-entropy-1m/matrix/pure_rust` | 5.201 |
+| `compress/level_13_lazy/large-log-stream/matrix/c_ffi` | 267.643 |
+| `compress/level_13_lazy/large-log-stream/matrix/pure_rust` | 19.585 |
+| `compress/level_13_lazy/low-entropy-1m/matrix/c_ffi` | 4.583 |
+| `compress/level_13_lazy/low-entropy-1m/matrix/pure_rust` | 3.357 |
+| `compress/level_13_lazy/small-10k-random/matrix/c_ffi` | 0.415 |
 | `compress/level_13_lazy/small-10k-random/matrix/pure_rust` | 0.157 |
-| `compress/level_13_lazy/small-1k-random/matrix/c_ffi` | 0.065 |
-| `compress/level_13_lazy/small-1k-random/matrix/pure_rust` | 0.026 |
-| `compress/level_13_lazy/small-4k-log-lines/matrix/c_ffi` | 0.104 |
-| `compress/level_13_lazy/small-4k-log-lines/matrix/pure_rust` | 0.095 |
-| `compress/level_14_lazy/decodecorpus-z000033/matrix/c_ffi` | 29.507 |
-| `compress/level_14_lazy/decodecorpus-z000033/matrix/pure_rust` | 59.281 |
-| `compress/level_14_lazy/high-entropy-1m/matrix/c_ffi` | 5.249 |
-| `compress/level_14_lazy/high-entropy-1m/matrix/pure_rust` | 5.016 |
-| `compress/level_14_lazy/large-log-stream/matrix/c_ffi` | 338.983 |
-| `compress/level_14_lazy/large-log-stream/matrix/pure_rust` | 20.443 |
-| `compress/level_14_lazy/low-entropy-1m/matrix/c_ffi` | 3.906 |
-| `compress/level_14_lazy/low-entropy-1m/matrix/pure_rust` | 3.251 |
-| `compress/level_14_lazy/small-10k-random/matrix/c_ffi` | 0.422 |
-| `compress/level_14_lazy/small-10k-random/matrix/pure_rust` | 0.160 |
+| `compress/level_13_lazy/small-1k-random/matrix/c_ffi` | 0.064 |
+| `compress/level_13_lazy/small-1k-random/matrix/pure_rust` | 0.030 |
+| `compress/level_13_lazy/small-4k-log-lines/matrix/c_ffi` | 0.103 |
+| `compress/level_13_lazy/small-4k-log-lines/matrix/pure_rust` | 0.097 |
+| `compress/level_14_lazy/decodecorpus-z000033/matrix/c_ffi` | 31.357 |
+| `compress/level_14_lazy/decodecorpus-z000033/matrix/pure_rust` | 61.497 |
+| `compress/level_14_lazy/high-entropy-1m/matrix/c_ffi` | 5.504 |
+| `compress/level_14_lazy/high-entropy-1m/matrix/pure_rust` | 5.164 |
+| `compress/level_14_lazy/large-log-stream/matrix/c_ffi` | 572.992 |
+| `compress/level_14_lazy/large-log-stream/matrix/pure_rust` | 20.473 |
+| `compress/level_14_lazy/low-entropy-1m/matrix/c_ffi` | 4.127 |
+| `compress/level_14_lazy/low-entropy-1m/matrix/pure_rust` | 3.515 |
+| `compress/level_14_lazy/small-10k-random/matrix/c_ffi` | 0.427 |
+| `compress/level_14_lazy/small-10k-random/matrix/pure_rust` | 0.157 |
 | `compress/level_14_lazy/small-1k-random/matrix/c_ffi` | 0.064 |
 | `compress/level_14_lazy/small-1k-random/matrix/pure_rust` | 0.026 |
 | `compress/level_14_lazy/small-4k-log-lines/matrix/c_ffi` | 0.140 |
-| `compress/level_14_lazy/small-4k-log-lines/matrix/pure_rust` | 0.097 |
-| `compress/level_15_lazy/decodecorpus-z000033/matrix/c_ffi` | 29.583 |
-| `compress/level_15_lazy/decodecorpus-z000033/matrix/pure_rust` | 58.560 |
-| `compress/level_15_lazy/high-entropy-1m/matrix/c_ffi` | 5.262 |
-| `compress/level_15_lazy/high-entropy-1m/matrix/pure_rust` | 5.035 |
-| `compress/level_15_lazy/large-log-stream/matrix/c_ffi` | 1040.585 |
-| `compress/level_15_lazy/large-log-stream/matrix/pure_rust` | 21.810 |
-| `compress/level_15_lazy/low-entropy-1m/matrix/c_ffi` | 3.895 |
-| `compress/level_15_lazy/low-entropy-1m/matrix/pure_rust` | 3.248 |
+| `compress/level_14_lazy/small-4k-log-lines/matrix/pure_rust` | 0.096 |
+| `compress/level_15_lazy/decodecorpus-z000033/matrix/c_ffi` | 32.579 |
+| `compress/level_15_lazy/decodecorpus-z000033/matrix/pure_rust` | 61.277 |
+| `compress/level_15_lazy/high-entropy-1m/matrix/c_ffi` | 5.457 |
+| `compress/level_15_lazy/high-entropy-1m/matrix/pure_rust` | 5.173 |
+| `compress/level_15_lazy/large-log-stream/matrix/c_ffi` | 1805.016 |
+| `compress/level_15_lazy/large-log-stream/matrix/pure_rust` | 21.723 |
+| `compress/level_15_lazy/low-entropy-1m/matrix/c_ffi` | 4.064 |
+| `compress/level_15_lazy/low-entropy-1m/matrix/pure_rust` | 3.345 |
 | `compress/level_15_lazy/small-10k-random/matrix/c_ffi` | 0.423 |
-| `compress/level_15_lazy/small-10k-random/matrix/pure_rust` | 0.157 |
-| `compress/level_15_lazy/small-1k-random/matrix/c_ffi` | 0.066 |
+| `compress/level_15_lazy/small-10k-random/matrix/pure_rust` | 0.158 |
+| `compress/level_15_lazy/small-1k-random/matrix/c_ffi` | 0.064 |
 | `compress/level_15_lazy/small-1k-random/matrix/pure_rust` | 0.026 |
-| `compress/level_15_lazy/small-4k-log-lines/matrix/c_ffi` | 0.140 |
-| `compress/level_15_lazy/small-4k-log-lines/matrix/pure_rust` | 0.097 |
-| `decompress-dict/level_11_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.323 |
-| `decompress-dict/level_11_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.451 |
+| `compress/level_15_lazy/small-4k-log-lines/matrix/c_ffi` | 0.139 |
+| `compress/level_15_lazy/small-4k-log-lines/matrix/pure_rust` | 0.096 |
+| `decompress-dict/level_11_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.308 |
+| `decompress-dict/level_11_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.148 |
 | `decompress-dict/level_11_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_11_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_11_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_11_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_12_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.323 |
-| `decompress-dict/level_12_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.155 |
+| `decompress-dict/level_12_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.306 |
+| `decompress-dict/level_12_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.136 |
 | `decompress-dict/level_12_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_12_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_12_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_12_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_13_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.410 |
-| `decompress-dict/level_13_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.257 |
+| `decompress-dict/level_13_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.392 |
+| `decompress-dict/level_13_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.236 |
 | `decompress-dict/level_13_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_13_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_13_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_13_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_14_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.568 |
-| `decompress-dict/level_14_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.582 |
+| `decompress-dict/level_14_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.563 |
+| `decompress-dict/level_14_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.577 |
 | `decompress-dict/level_14_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_14_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_14_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_14_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress-dict/level_15_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.562 |
-| `decompress-dict/level_15_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.567 |
+| `decompress-dict/level_15_lazy/decodecorpus-z000033/matrix/c_ffi_with_dict` | 1.554 |
+| `decompress-dict/level_15_lazy/decodecorpus-z000033/matrix/pure_rust_with_dict` | 2.555 |
 | `decompress-dict/level_15_lazy/small-10k-random/matrix/c_ffi_with_dict` | 0.001 |
 | `decompress-dict/level_15_lazy/small-10k-random/matrix/pure_rust_with_dict` | 0.002 |
 | `decompress-dict/level_15_lazy/small-4k-log-lines/matrix/c_ffi_with_dict` | 0.000 |
 | `decompress-dict/level_15_lazy/small-4k-log-lines/matrix/pure_rust_with_dict` | 0.001 |
-| `decompress/level_11_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.984 |
-| `decompress/level_11_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.402 |
-| `decompress/level_11_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.195 |
-| `decompress/level_11_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.813 |
+| `decompress/level_11_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.987 |
+| `decompress/level_11_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.408 |
+| `decompress/level_11_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.189 |
+| `decompress/level_11_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.791 |
 | `decompress/level_11_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.030 |
 | `decompress/level_11_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_11_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.030 |
+| `decompress/level_11_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.028 |
 | `decompress/level_11_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_11_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.665 |
-| `decompress/level_11_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.456 |
+| `decompress/level_11_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.660 |
+| `decompress/level_11_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.470 |
 | `decompress/level_11_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.434 |
-| `decompress/level_11_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.416 |
-| `decompress/level_11_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.188 |
-| `decompress/level_11_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_11_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.094 |
-| `decompress/level_11_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_11_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.419 |
+| `decompress/level_11_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.187 |
+| `decompress/level_11_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_11_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.093 |
+| `decompress/level_11_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
 | `decompress/level_11_lazy/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_11_lazy/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_11_lazy/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -8845,22 +8845,22 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_11_lazy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_11_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_11_lazy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_12_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.982 |
-| `decompress/level_12_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.397 |
-| `decompress/level_12_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.197 |
-| `decompress/level_12_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.804 |
-| `decompress/level_12_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.030 |
-| `decompress/level_12_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_12_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.030 |
+| `decompress/level_12_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.983 |
+| `decompress/level_12_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.403 |
+| `decompress/level_12_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.189 |
+| `decompress/level_12_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.798 |
+| `decompress/level_12_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.034 |
+| `decompress/level_12_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.034 |
+| `decompress/level_12_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.031 |
 | `decompress/level_12_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_12_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.664 |
-| `decompress/level_12_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.454 |
-| `decompress/level_12_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.432 |
-| `decompress/level_12_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.425 |
+| `decompress/level_12_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.662 |
+| `decompress/level_12_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.469 |
+| `decompress/level_12_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.433 |
+| `decompress/level_12_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.419 |
 | `decompress/level_12_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.187 |
-| `decompress/level_12_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_12_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.094 |
-| `decompress/level_12_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_12_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_12_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.093 |
+| `decompress/level_12_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
 | `decompress/level_12_lazy/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_12_lazy/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_12_lazy/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -8873,22 +8873,22 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_12_lazy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_12_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_12_lazy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_13_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.983 |
-| `decompress/level_13_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.399 |
-| `decompress/level_13_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.273 |
-| `decompress/level_13_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.919 |
-| `decompress/level_13_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.030 |
-| `decompress/level_13_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_13_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.028 |
-| `decompress/level_13_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_13_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.665 |
-| `decompress/level_13_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.457 |
-| `decompress/level_13_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.652 |
-| `decompress/level_13_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.406 |
+| `decompress/level_13_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.987 |
+| `decompress/level_13_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.407 |
+| `decompress/level_13_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.265 |
+| `decompress/level_13_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.907 |
+| `decompress/level_13_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.037 |
+| `decompress/level_13_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.036 |
+| `decompress/level_13_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.037 |
+| `decompress/level_13_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.029 |
+| `decompress/level_13_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.662 |
+| `decompress/level_13_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.469 |
+| `decompress/level_13_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.654 |
+| `decompress/level_13_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.422 |
 | `decompress/level_13_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.188 |
-| `decompress/level_13_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_13_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
 | `decompress/level_13_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.187 |
-| `decompress/level_13_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_13_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
 | `decompress/level_13_lazy/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_13_lazy/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_13_lazy/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -8901,22 +8901,22 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_13_lazy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_13_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_13_lazy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_14_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.976 |
-| `decompress/level_14_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.389 |
-| `decompress/level_14_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.269 |
-| `decompress/level_14_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.917 |
+| `decompress/level_14_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.979 |
+| `decompress/level_14_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.399 |
+| `decompress/level_14_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.268 |
+| `decompress/level_14_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.911 |
 | `decompress/level_14_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.030 |
-| `decompress/level_14_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_14_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.030 |
-| `decompress/level_14_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_14_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.664 |
-| `decompress/level_14_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.454 |
-| `decompress/level_14_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.652 |
-| `decompress/level_14_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.405 |
-| `decompress/level_14_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.188 |
-| `decompress/level_14_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_14_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.187 |
-| `decompress/level_14_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_14_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.036 |
+| `decompress/level_14_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.036 |
+| `decompress/level_14_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.036 |
+| `decompress/level_14_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.660 |
+| `decompress/level_14_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.468 |
+| `decompress/level_14_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.651 |
+| `decompress/level_14_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.418 |
+| `decompress/level_14_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.187 |
+| `decompress/level_14_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
+| `decompress/level_14_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.188 |
+| `decompress/level_14_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
 | `decompress/level_14_lazy/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_14_lazy/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_14_lazy/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -8929,22 +8929,22 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_14_lazy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_14_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_14_lazy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `decompress/level_15_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.974 |
-| `decompress/level_15_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.391 |
-| `decompress/level_15_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.271 |
-| `decompress/level_15_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.913 |
-| `decompress/level_15_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.029 |
+| `decompress/level_15_lazy/decodecorpus-z000033/c_stream/matrix/c_ffi` | 0.976 |
+| `decompress/level_15_lazy/decodecorpus-z000033/c_stream/matrix/pure_rust` | 1.402 |
+| `decompress/level_15_lazy/decodecorpus-z000033/rust_stream/matrix/c_ffi` | 1.267 |
+| `decompress/level_15_lazy/decodecorpus-z000033/rust_stream/matrix/pure_rust` | 1.899 |
+| `decompress/level_15_lazy/high-entropy-1m/c_stream/matrix/c_ffi` | 0.037 |
 | `decompress/level_15_lazy/high-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
 | `decompress/level_15_lazy/high-entropy-1m/rust_stream/matrix/c_ffi` | 0.030 |
 | `decompress/level_15_lazy/high-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
-| `decompress/level_15_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.666 |
-| `decompress/level_15_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.458 |
-| `decompress/level_15_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.654 |
-| `decompress/level_15_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.409 |
+| `decompress/level_15_lazy/large-log-stream/c_stream/matrix/c_ffi` | 0.663 |
+| `decompress/level_15_lazy/large-log-stream/c_stream/matrix/pure_rust` | 0.473 |
+| `decompress/level_15_lazy/large-log-stream/rust_stream/matrix/c_ffi` | 0.652 |
+| `decompress/level_15_lazy/large-log-stream/rust_stream/matrix/pure_rust` | 0.418 |
 | `decompress/level_15_lazy/low-entropy-1m/c_stream/matrix/c_ffi` | 0.187 |
-| `decompress/level_15_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_15_lazy/low-entropy-1m/c_stream/matrix/pure_rust` | 0.028 |
 | `decompress/level_15_lazy/low-entropy-1m/rust_stream/matrix/c_ffi` | 0.188 |
-| `decompress/level_15_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.027 |
+| `decompress/level_15_lazy/low-entropy-1m/rust_stream/matrix/pure_rust` | 0.028 |
 | `decompress/level_15_lazy/small-10k-random/c_stream/matrix/c_ffi` | 0.000 |
 | `decompress/level_15_lazy/small-10k-random/c_stream/matrix/pure_rust` | 0.000 |
 | `decompress/level_15_lazy/small-10k-random/rust_stream/matrix/c_ffi` | 0.000 |
@@ -8957,9 +8957,9 @@ Both columns share one pair of atomic counters in the `compare_ffi_memory` bench
 | `decompress/level_15_lazy/small-4k-log-lines/c_stream/matrix/pure_rust` | 0.002 |
 | `decompress/level_15_lazy/small-4k-log-lines/rust_stream/matrix/c_ffi` | 0.002 |
 | `decompress/level_15_lazy/small-4k-log-lines/rust_stream/matrix/pure_rust` | 0.002 |
-| `dict-train/na/decodecorpus-z000033/matrix/c_ffi` | 50.564 |
-| `dict-train/na/decodecorpus-z000033/matrix/pure_rust` | 11.728 |
-| `dict-train/na/small-10k-random/matrix/c_ffi` | 11.692 |
-| `dict-train/na/small-10k-random/matrix/pure_rust` | 3.225 |
-| `dict-train/na/small-4k-log-lines/matrix/c_ffi` | 2.466 |
-| `dict-train/na/small-4k-log-lines/matrix/pure_rust` | 1.070 |
+| `dict-train/na/decodecorpus-z000033/matrix/c_ffi` | 50.877 |
+| `dict-train/na/decodecorpus-z000033/matrix/pure_rust` | 11.509 |
+| `dict-train/na/small-10k-random/matrix/c_ffi` | 11.212 |
+| `dict-train/na/small-10k-random/matrix/pure_rust` | 3.149 |
+| `dict-train/na/small-4k-log-lines/matrix/c_ffi` | 2.450 |
+| `dict-train/na/small-4k-log-lines/matrix/pure_rust` | 1.045 |
