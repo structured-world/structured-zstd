@@ -458,10 +458,13 @@ mod tests {
 
     #[test]
     fn custom_matcher_dict_probe_defaults_to_false() {
-        // `Matcher::block_samples_match_dict` defaults to `false`: a matcher
-        // without a dict-table probe (every backend except the Simple/Fast one
-        // with an attached dictionary) leaves the raw-fast-path on its
-        // content-only verdict.
+        // `Matcher::block_samples_match_dict` defaults to `false`: a CUSTOM matcher
+        // with no dict-table probe leaves the raw-fast-path on its content-only
+        // verdict. NOTE this is the TRAIT DEFAULT, not the production wrapper: the
+        // `MatchGeneratorDriver` overrides it to `true` for non-Simple backends so
+        // a dict frame stays on the scan (covered by
+        // `block_samples_match_dict_is_true_for_non_simple_backend`). Only the
+        // Simple/Fast backend with an attached dictionary runs the precise probe.
         let m = HintProbeMatcher::default();
         assert!(!m.block_samples_match_dict(b"arbitrary block content, no dict probe"));
     }
