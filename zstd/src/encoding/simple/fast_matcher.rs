@@ -266,6 +266,18 @@ pub(crate) struct FastKernelMatcher {
     /// dict table in place instead of clearing + re-committing them). Signals
     /// the frame compressor to SKIP `prime_with_dictionary` this frame.
     dict_resident: bool,
+    /// Upstream zstd `ms->loadedDictEnd` for the COPY-mode dict path (inputs
+    /// over the Fast attach cutoff): the history position one past the last
+    /// dictionary byte committed at the front of `history`. The copy path
+    /// primes the dict into the live hash table as window prefix; this records
+    /// the dict/input boundary so `start_matching` can floor the block prefix
+    /// at the dict start (upstream zstd `ZSTD_getLowestPrefixIndex` with
+    /// `isDictionary`), keeping the whole dict reachable while it is still
+    /// within `maxDist` of the block end. `0` when no copy-mode dict is
+    /// resident (attach mode tracks its own boundary via `dict.region_len()`,
+    /// and a plain frame has none). Cleared on reset / eviction (the dict has
+    /// slid out of the window, so the windowed floor takes over).
+    loaded_dict_end: usize,
 }
 
 impl Clone for FastKernelMatcher {
@@ -289,6 +301,7 @@ impl Clone for FastKernelMatcher {
             dict: self.dict.clone(),
             table_pos_high_water: self.table_pos_high_water,
             dict_resident: self.dict_resident,
+            loaded_dict_end: self.loaded_dict_end,
         }
     }
 
@@ -315,6 +328,7 @@ impl Clone for FastKernelMatcher {
         self.dict.clone_from(&source.dict);
         self.table_pos_high_water = source.table_pos_high_water;
         self.dict_resident = source.dict_resident;
+        self.loaded_dict_end = source.loaded_dict_end;
     }
 }
 
@@ -455,6 +469,7 @@ impl FastKernelMatcher {
             dict: DictAttach::new(),
             table_pos_high_water: 0,
             dict_resident: false,
+            loaded_dict_end: 0,
         }
     }
 
@@ -553,6 +568,10 @@ impl FastKernelMatcher {
             self.hash_table.clear();
         }
         self.table_pos_high_water = 0;
+        // No copy-mode dict is resident across a reset: attach mode re-borrows
+        // its separate dict table (handled above), and the copy path re-primes
+        // (and re-records `loaded_dict_end`) during this frame's dict prime.
+        self.loaded_dict_end = 0;
         if let Some(region) = reborrow_region {
             // Keep `[0, region)` (the resident dict); drop the previous input.
             self.history.truncate(region);
@@ -869,6 +888,12 @@ impl FastKernelMatcher {
         // the dictionary, which is exactly when the dict is no longer
         // reachable anyway.
         self.dict.invalidate();
+        // Same reasoning for the COPY-mode dict boundary: the rebased tail
+        // moves the dict positions, and the drain only fires when history
+        // outgrew the window, i.e. the dict has slid out. Clear it so the
+        // prefix floor reverts to the windowed value (upstream zstd
+        // `ZSTD_window_enforceMaxDist` zeroing `loadedDictEnd`).
+        self.loaded_dict_end = 0;
         self.hash_table.clear();
         self.last_block_start = self.last_block_start.saturating_sub(drop_n);
         // Skip position 0 — `prefix_start_index = 1` means the kernel
@@ -986,7 +1011,23 @@ impl FastKernelMatcher {
         // extension `match_pos > window_low` bound — both paths that
         // upstream zstd expresses against `prefixStart` directly (NOT against
         // a sentinel-1 floor).
-        let window_low = self.history_bytes().len().saturating_sub(advertised_window) as u32;
+        let block_end = self.history_bytes().len();
+        let windowed_low = block_end.saturating_sub(advertised_window) as u32;
+        // Upstream zstd `ZSTD_getLowestPrefixIndex` with `isDictionary`: when a
+        // COPY-mode dict is resident at the front of history AND still within
+        // `maxDist` of the block end (`block_end <= advertised_window +
+        // loadedDictEnd`), the prefix floor is the DICT START, not the
+        // window-clamped floor — so the whole dict stays reachable for the
+        // block. A window-clamped floor computed from the history END would
+        // reject every dict position once the input fills the window, ignoring
+        // the dictionary entirely. Once the block end passes `maxDist +
+        // loadedDictEnd` the dict has slid out of the window and the windowed
+        // floor takes over (eviction also clears `loaded_dict_end`). Offsets
+        // reaching the dict (bounded by `advertised_window + loaded_dict_end`)
+        // stay decodable because the decoder loads the same dictionary.
+        let dict_in_window =
+            self.loaded_dict_end != 0 && block_end <= advertised_window + self.loaded_dict_end;
+        let window_low = if dict_in_window { 0 } else { windowed_low };
         // Sentinel-aware prefix for the hash-table filter — match_idx
         // == 0 (an uninitialized FastHashTable slot) must be rejected
         // by `match_found`, so we floor at `INITIAL_PREFIX_START_INDEX
@@ -1342,6 +1383,15 @@ impl FastKernelMatcher {
         // very small).
         if incompressible_hint == Some(false) {
             self.prime_hash_table_for_range(block_start);
+            // Copy-mode dict prime: the dict now occupies `[0, history.len())`
+            // at the front of history (this is the only caller of the
+            // `Some(false)` hint — see the doc above). Record the dict/input
+            // boundary so `start_matching` floors the block prefix at the dict
+            // start while the dict stays within the window (upstream zstd
+            // `ms->loadedDictEnd`). A multi-slice dict advances this to the
+            // running end on each slice; the final slice leaves the full
+            // dict size.
+            self.loaded_dict_end = self.history.len();
         }
     }
 
