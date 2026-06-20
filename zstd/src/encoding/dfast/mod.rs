@@ -399,6 +399,10 @@ impl DfastMatchGenerator {
             self.window_size = 0;
             self.history.clear();
             self.history_start = 0;
+            // Non-reborrow reset starts with an empty window; clear the block
+            // ledger to match. (The reborrow branch above intentionally keeps a
+            // single `[region]` entry for the resident dict — see below.)
+            self.window_blocks.clear();
             self.dict_resident = false;
             if next_floor <= REBASE_RESET_FLOOR_CEILING {
                 // Fast path: advance the floor; tables keep their contents (a
@@ -425,7 +429,11 @@ impl DfastMatchGenerator {
         // signature does not take one (HC / Row do because they hold
         // per-block input Vecs internally; the dispatcher in
         // `match_generator.rs` resolves the per-backend shape).
-        self.window_blocks.clear();
+        // NOTE: `window_blocks` is cleared per-branch above (the reborrow branch
+        // keeps its `[region]` dict entry; the non-reborrow branch clears). It
+        // must NOT be cleared unconditionally here — doing so dropped the
+        // resident dict block while `window_size`/`history` still counted it,
+        // desyncing the ledger so the next eviction popped the wrong block.
         // Drop any borrowed window: the input slice it pointed at does not
         // outlive the frame, and the next frame re-stages its own (or runs
         // the owned path). A stale pointer must never survive a reset.
