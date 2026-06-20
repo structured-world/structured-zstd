@@ -91,6 +91,10 @@ fn main() {
             let (c_us, c_b) = unsafe {
                 let cdict = zstd_sys::ZSTD_createCDict(dict.as_ptr().cast(), dict.len(), level);
                 let cctx = zstd_sys::ZSTD_createCCtx();
+                // Both creators return null on allocation failure; passing a
+                // null handle to ZSTD_compress_usingCDict is undefined behavior.
+                assert!(!cdict.is_null(), "ZSTD_createCDict returned null");
+                assert!(!cctx.is_null(), "ZSTD_createCCtx returned null");
                 let mut dst: Vec<u8> = vec![0u8; dst_cap];
                 let r = time_min(iters, || {
                     let rc = zstd_sys::ZSTD_compress_usingCDict(

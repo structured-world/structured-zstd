@@ -817,8 +817,7 @@ fn fast_copy_mode_dict_reachable_for_full_block() {
 
     // And the frame must still round-trip against the dictionary.
     let dec_handle = DictionaryHandle::from_dictionary(
-        Dictionary::from_raw_content(dict_id, dict_content)
-            .expect("decoder dict should build"),
+        Dictionary::from_raw_content(dict_id, dict_content).expect("decoder dict should build"),
     );
     let mut output = vec![0u8; input.len()];
     let mut decoder = FrameDecoder::new();

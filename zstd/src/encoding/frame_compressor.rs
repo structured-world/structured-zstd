@@ -3086,13 +3086,29 @@ mod tests {
             .expect("dict should attach");
 
         let first = compressor.compress_independent_frame(payload.as_slice());
+
+        // No-dict baseline at the same level: the dictionary must be
+        // load-bearing, so the dict-applied frame has to beat it. Without this
+        // anchor the equal-length loop below would also pass if EVERY frame
+        // decayed to the no-dict size in lockstep.
+        let mut nodict: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(6));
+        let no_dict_frame = nodict.compress_independent_frame(payload.as_slice());
+        assert!(
+            first.len() < no_dict_frame.len(),
+            "dict must be load-bearing: dict frame {} should beat the no-dict baseline {}",
+            first.len(),
+            no_dict_frame.len(),
+        );
+
         for i in 1..16 {
             let frame = compressor.compress_independent_frame(payload.as_slice());
+            // Byte-identity, not just equal length: a same-size divergence (e.g.
+            // a different match decision once the resident dict bookkeeping
+            // drifts) would slip past a length-only check.
             assert_eq!(
-                frame.len(),
-                first.len(),
-                "frame {i} of a reused dict compressor must stay dict-applied \
-                 (size == first frame), not decay to the no-dict size"
+                frame, first,
+                "frame {i} of a reused dict compressor must stay byte-identical to \
+                 the first (dict still applied, no decay or bookkeeping drift)"
             );
         }
     }

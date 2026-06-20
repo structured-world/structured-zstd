@@ -1122,6 +1122,16 @@ pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
     // Width of the dict table's slot index; the tagged lookup hashes to
     // `dict_hash_log + DICT_TAG_BITS` bits and reads slot `hash >> DICT_TAG_BITS`.
     let dict_hash_log = dict_table.hash_log();
+    // Always-on (not debug_assert): `dict_tagged_lookup` reads the slot with an
+    // UNCHECKED `FastHashTable::get`, sound only while `hash >> DICT_TAG_BITS <
+    // 1 << dict_hash_log`, which requires `dict_hash_log + DICT_TAG_BITS <= 32`
+    // (else the wider hash overflows and the shifted index can exceed the table
+    // length -> OOB read). Enforce it once per block here so the hot per-probe
+    // path stays branchless while release builds still trap an out-of-spec table.
+    assert!(
+        dict_hash_log + DICT_TAG_BITS <= 32,
+        "dict hash_log {dict_hash_log} + tag {DICT_TAG_BITS} exceeds 32-bit hash width",
+    );
 
     // Inner-loop result: literals end (where the match copy begins), the raw
     // match offset, the match length, and the upstream zstd `curr` (probe position,
@@ -1465,6 +1475,13 @@ fn compress_block_fast_dict_borrowed_impl<
     let mut offset_2: u32 = rep[1];
 
     let dict_hash_log = dict_table.hash_log();
+    // Always-on bound for the unchecked tagged-lookup read (see the owned dict
+    // kernel for the full rationale): `dict_hash_log + DICT_TAG_BITS <= 32` keeps
+    // the shifted slot index inside the table in release builds too.
+    assert!(
+        dict_hash_log + DICT_TAG_BITS <= 32,
+        "dict hash_log {dict_hash_log} + tag {DICT_TAG_BITS} exceeds 32-bit hash width",
+    );
 
     // Inner-loop result: literals end (input offset), raw match offset, match
     // length, and the upstream zstd `curr` probe offset for the post-match `curr + 2`
