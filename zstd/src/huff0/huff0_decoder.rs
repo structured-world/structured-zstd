@@ -774,58 +774,139 @@ impl HuffmanTable {
             .as_mut_ptr()
             .cast::<u16>();
 
-        // Per-symbol run fill, upstream zstd `HUF_DEltX1` shape: every live symbol
-        // claims a contiguous run inside its code-length rank, and the
-        // 16-bit entry broadcasts four-at-a-time through a 64-bit store
-        // (LLVM lowered the per-slot `MaybeUninit::write` loop to scalar
-        // `movw`s, and the heap-Vec rank cursor paid a memory-bound bounds
-        // check per symbol — both measured hot on table-dense frames).
-        // `filled` re-proves full [0, table_size) coverage in release
-        // builds before `set_len` exposes the entries.
+        // Sort symbols by code length (counting sort, preserving symbol order
+        // within a length so canonical Huffman assignment stays correct), then
+        // fill the table one code-length GROUP at a time. Within a group the run
+        // length `1 << (max_bits - len)` and the entry's `nbBits = len` are
+        // CONSTANT, so the `match` on the run length hoists out of the symbol
+        // loop and lets the optimiser emit a straight-line specialised store per
+        // group — the upstream zstd `HUF_readDTableX1_wksp` shape. The previous
+        // per-symbol form recomputed a variable run length and used a
+        // runtime-trip-count `while`, which blocked unrolling.
+        //
+        // `sym_off[len]` is the start index of the length-`len` run inside
+        // `sorted`; the prefix sum walks weight-0 first (those symbols are
+        // skipped by the `1..=max_bits` fill below).
+        let mut sorted = [0u8; 256];
+        let mut sym_off = [0usize; 16];
+        let mut acc = 0usize;
+        for len in 0..=(max_bits as usize) {
+            sym_off[len] = acc;
+            acc += self.bit_ranks[len] as usize;
+        }
+        {
+            let mut cursor = sym_off;
+            for (symbol, &len) in self.bits.iter().enumerate() {
+                // `len <= max_bits <= 11`; the mask proves the 16-slot index in
+                // range. At most 256 symbols (weights capped at 255 + the
+                // inferred last), so every cursor stays < 256 and `symbol` fits u8.
+                let g = (len & 0xF) as usize;
+                unsafe {
+                    *sorted.get_unchecked_mut(cursor[g]) = symbol as u8;
+                }
+                cursor[g] += 1;
+            }
+        }
+
+        // `filled` re-proves full [0, table_size) coverage in release builds
+        // before `set_len` exposes the entries.
         let mut filled = 0usize;
-        for (symbol, &bits_for_symbol) in self.bits.iter().enumerate() {
-            if bits_for_symbol == 0 {
+        for len in 1..=max_bits {
+            let count = self.bit_ranks[len as usize] as usize;
+            if count == 0 {
                 continue;
             }
-            // Code lengths are `max_bits + 1 - w` with `1 <= w <= max_bits
-            // <= 11`; the mask only helps the optimizer prove the fixed
-            // 16-slot index in range.
-            let rank = (bits_for_symbol & 0xF) as usize;
-            let base_idx = rank_start[rank];
-            let len = 1usize << (max_bits - bits_for_symbol);
-            rank_start[rank] = base_idx + len;
-            // Release-mode run-bounds gate (a register compare, unlike the
-            // slice form's memory-bound check): a desync between
-            // `bit_ranks` and `bits` must fail loudly, not write OOB.
+            let run_len = 1usize << (max_bits - len);
+            let grp = sym_off[len as usize];
+            let mut u = rank_start[len as usize];
+            // Release-mode bound for the whole group's run of writes (a register
+            // compare): a `bit_ranks`/`bits` desync must fail loudly, not OOB.
             assert!(
-                base_idx + len <= table_size,
-                "huffman rank run [{base_idx}, +{len}) escapes table {table_size}",
+                u + count * run_len <= table_size,
+                "huffman length-{len} group [{u}, +{}) escapes table {table_size}",
+                count * run_len,
             );
-            let packed = u16::from(symbol as u8) | (u16::from(bits_for_symbol) << 8);
-            let packed64 = u64::from(packed) * 0x0001_0001_0001_0001;
-            // SAFETY: `reserve(table_size)` guaranteed the capacity and the
-            // assert above bounds this run inside it; four `u16` slots are
-            // 8 contiguous padding-free bytes, so each unaligned u64 store
-            // initialises exactly four entries.
-            unsafe {
-                let run = slots_ptr.add(base_idx);
-                let mut off = 0usize;
-                while off + 4 <= len {
-                    run.add(off).cast::<u64>().write_unaligned(packed64);
-                    off += 4;
+            // The entry packs the symbol byte + its code length; `* 0x0001…`
+            // broadcasts it into four `u16` lanes of a 64-bit store.
+            macro_rules! packed64 {
+                ($s:expr) => {{
+                    let symbol = unsafe { *sorted.get_unchecked(grp + $s) };
+                    let packed = u16::from(symbol) | (u16::from(len) << 8);
+                    (packed, u64::from(packed) * 0x0001_0001_0001_0001)
+                }};
+            }
+            // SAFETY (all arms): the per-group assert bounds `[u, u + count*run_len)`
+            // inside the `reserve(table_size)` capacity; four `u16` are 8
+            // padding-free bytes, so each unaligned u64 store writes exactly four
+            // entries. `run_len` is a power of two, so the `>= 16` arm's 16-step
+            // covers the run exactly.
+            match run_len {
+                1 => {
+                    for s in 0..count {
+                        let (packed, _) = packed64!(s);
+                        unsafe { slots_ptr.add(u).write(packed) };
+                        u += 1;
+                    }
                 }
-                while off < len {
-                    run.add(off).write(packed);
-                    off += 1;
+                2 => {
+                    for s in 0..count {
+                        let (packed, _) = packed64!(s);
+                        unsafe {
+                            slots_ptr.add(u).write(packed);
+                            slots_ptr.add(u + 1).write(packed);
+                        }
+                        u += 2;
+                    }
+                }
+                4 => {
+                    for s in 0..count {
+                        let (_, p64) = packed64!(s);
+                        unsafe { slots_ptr.add(u).cast::<u64>().write_unaligned(p64) };
+                        u += 4;
+                    }
+                }
+                8 => {
+                    for s in 0..count {
+                        let (_, p64) = packed64!(s);
+                        unsafe {
+                            slots_ptr.add(u).cast::<u64>().write_unaligned(p64);
+                            slots_ptr.add(u + 4).cast::<u64>().write_unaligned(p64);
+                        }
+                        u += 8;
+                    }
+                }
+                _ => {
+                    for s in 0..count {
+                        let (_, p64) = packed64!(s);
+                        let mut off = 0usize;
+                        while off < run_len {
+                            unsafe {
+                                slots_ptr.add(u + off).cast::<u64>().write_unaligned(p64);
+                                slots_ptr
+                                    .add(u + off + 4)
+                                    .cast::<u64>()
+                                    .write_unaligned(p64);
+                                slots_ptr
+                                    .add(u + off + 8)
+                                    .cast::<u64>()
+                                    .write_unaligned(p64);
+                                slots_ptr
+                                    .add(u + off + 12)
+                                    .cast::<u64>()
+                                    .write_unaligned(p64);
+                            }
+                            off += 16;
+                        }
+                        u += run_len;
+                    }
                 }
             }
-            filled += len;
+            filled += count * run_len;
         }
 
         // SAFETY: the rank walk partitions [0, table_size) (anchored by the
-        // `rank_start[0] == table_size` assert) and `filled` proves every
-        // slot in that range was written, so no uninitialised entry is
-        // exposed.
+        // `rank_start[0] == table_size` assert) and `filled` proves every slot in
+        // that range was written, so no uninitialised entry is exposed.
         assert!(
             filled == table_size,
             "huffman table fill covered {filled} of {table_size} slots",
