@@ -802,43 +802,12 @@ const LEVEL_TABLE: [LevelParams; 22] = [
     /*22 */ LevelParams { strategy_tag: super::strategy::StrategyTag::BtUltra2, search: super::strategy::SearchMethod::BinaryTree, window_log: 27, lazy_depth: 2, fast: None, dfast: None, hc: Some(BTULTRA2_HC_CONFIG_L22), row: None },
 ];
 
-/// Upstream zstd `minSrcSize` assumption when building a dictionary's prepared cParams
-/// with an unknown source (`zstd_compress.c` `ZSTD_adjustCParams_internal`,
-/// `ZSTD_cpm_createCDict`: `if (dictSize && srcSize == UNKNOWN) srcSize =
-/// minSrcSize` where `minSrcSize = (1<<9) + 1`). Used by [`cdict_table_logs`].
-const DICT_MIN_SRC_SIZE: u64 = 513;
-
-/// Upstream zstd `ZSTD_dictAndWindowLog` (`zstd_compress.c`): the window log large
-/// enough to address both the source and the dictionary, used when downsizing
-/// the hash / chain logs for a dictionary-bearing compress. `window_log` is the
-/// (already source-clamped) compress window; `src_size` / `dict_size` are the
-/// assumed source and the dictionary length.
-fn dict_and_window_log(window_log: u8, src_size: u64, dict_size: u64) -> u32 {
-    if dict_size == 0 {
-        return window_log as u32;
-    }
-    let window_size: u64 = 1u64 << window_log;
-    // Plain `+` (matches upstream zstd `ZSTD_dictAndWindowLog`): `window_size` is
-    // `1 << window_log` (window_log <= 31) and dict/src are real data sizes
-    // (<= isize::MAX), so these u64 sums cannot overflow in practice.
-    let dict_and_window = dict_size + window_size;
-    if window_size >= dict_size + src_size {
-        // Window already covers source + dictionary.
-        window_log as u32
-    } else {
-        // ceil(log2(dictAndWindowSize)) = highbit32(x - 1) + 1.
-        source_size_ceil_log(dict_and_window) as u32
-    }
-}
-
-/// Upstream zstd `ZSTD_createCDict` table geometry: the `(hash_log, chain_log)` a
-/// dictionary's prepared match-finder tables get, mirroring
-/// `ZSTD_adjustCParams_internal` under `ZSTD_cpm_createCDict`. A dictionary
-/// supplies the long matches, so upstream zstd downsizes the table widths toward the
-/// dict-and-window log (assuming a `minSrcSize` source) while the live window
-/// stays source-sized. `window_log` is the resolved compress window; `hash_log`
-/// / `chain_log` are the level's own widths; `uses_bt` selects the binary-tree
-/// `cycleLog` (`chainLog - 1`) vs the hash-chain one (`chainLog`).
+/// Upstream `ZSTD_createCDict` table geometry: the `(hash_log, chain_log)` a
+/// dictionary's prepared match-finder tables get. Thin adapter over the single
+/// cParams source [`super::cparams::create_cdict_table_logs`], which mirrors
+/// `ZSTD_adjustCParams_internal` under `ZSTD_cpm_createCDict`. `window_log` is
+/// the resolved compress window; `hash_log` / `chain_log` are the level's own
+/// widths; `uses_bt` selects the binary-tree `cycleLog` (`chainLog - 1`).
 fn cdict_table_logs(
     window_log: u8,
     hash_log: usize,
@@ -846,30 +815,14 @@ fn cdict_table_logs(
     uses_bt: bool,
     dict_size: usize,
 ) -> (usize, usize) {
-    let dict_size = dict_size as u64;
-    // createCDict assumes a minSrcSize source when the real size is unknown.
-    let src_size = DICT_MIN_SRC_SIZE;
-    // Source-size window resize (upstream zstd caps windowLog by ceil_log2(src+dict)).
-    // Plain `+`: src_size is the tiny DICT_MIN_SRC_SIZE constant and dict_size
-    // is a real dictionary length, so the u64 sum cannot overflow.
-    let tsize = src_size + dict_size;
-    let resized_window_log = (window_log as u32)
-        .min(source_size_ceil_log(tsize) as u32)
-        .max(1);
-    let daw = dict_and_window_log(resized_window_log as u8, src_size, dict_size);
-    // `ZSTD_cycleLog(chainLog, strategy)`: chainLog - 1 for binary-tree finders.
-    let cycle_log = (chain_log as u32).saturating_sub(uses_bt as u32);
-    let new_hash_log = if hash_log as u32 > daw + 1 {
-        (daw + 1) as usize
-    } else {
-        hash_log
-    };
-    let new_chain_log = if cycle_log > daw {
-        chain_log.saturating_sub((cycle_log - daw) as usize)
-    } else {
-        chain_log
-    };
-    (new_hash_log, new_chain_log)
+    let (h, c) = super::cparams::create_cdict_table_logs(
+        window_log,
+        hash_log as u32,
+        chain_log as u32,
+        uses_bt,
+        dict_size,
+    );
+    (h as usize, c as usize)
 }
 
 /// Smallest window_log the encoder will use regardless of source size.
@@ -912,28 +865,31 @@ fn cparams_tier(source_size: Option<u64>) -> usize {
 /// switches (L2 tier 1, L4) are intentionally not applied here.
 fn apply_cparams_tier(level: i32, source_size: Option<u64>, p: &mut LevelParams) {
     let tier = cparams_tier(source_size);
+    // Single source for the table data: the verbatim upstream
+    // `ZSTD_defaultCParameters[tier][level]` row (`cparams::default_cparams`).
+    // The encoder consumes only the table-shaping widths here; the window /
+    // `table_log` clamp lives in `adjust_params_for_source_size`.
     match level {
         // Fast, all tiers — minMatch only (hashLog handled by the window clamp).
         1 => {
             if let Some(f) = p.fast.as_mut() {
-                f.mls = [7, 6, 6, 5][tier];
+                f.mls = super::cparams::default_cparams(tier, 1).min_match;
             }
         }
         // Fast (base strategy; tier 1 is dfast upstream — not switched here).
-        // (hashLog, minMatch) per tier from `clevels.h` level-2 rows.
         2 => {
             if let Some(f) = p.fast.as_mut() {
-                let (h, m) = [(16u32, 6u32), (14, 5), (15, 5), (15, 4)][tier];
-                f.hash_log = h;
-                f.mls = m;
+                let cp = super::cparams::default_cparams(tier, 2);
+                f.hash_log = cp.hash_log;
+                f.mls = cp.min_match;
             }
         }
-        // Dfast, all tiers — (long hashLog, short chainLog) per tier.
+        // Dfast, all tiers — long hashLog (`hash_log`) + short chainLog (`chain_log`).
         3 => {
             if let Some(d) = p.dfast.as_mut() {
-                let (l, s) = [(17u8, 16u8), (16, 16), (16, 15), (15, 14)][tier];
-                d.long_hash_log = l;
-                d.short_hash_log = s;
+                let cp = super::cparams::default_cparams(tier, 3);
+                d.long_hash_log = cp.hash_log as u8;
+                d.short_hash_log = cp.chain_log as u8;
             }
         }
         _ => {}

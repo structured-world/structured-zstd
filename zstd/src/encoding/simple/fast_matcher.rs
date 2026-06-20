@@ -402,8 +402,10 @@ impl FastKernelMatcher {
 
     fn with_params_table(
         window_log: u8,
-        hash_log: u32,
-        mls: u32,
+        // Redundant here (`hash_table` is already built at this shape), kept in
+        // the signature to mirror `with_params`'s call shape at both sites.
+        _hash_log: u32,
+        _mls: u32,
         step_size: usize,
         hash_table: FastHashTable,
     ) -> Self {
@@ -1615,7 +1617,7 @@ impl FastKernelMatcher {
         // positions and fragment a long cross-seam dict match. `next_to_update`
         // starts at the content start (`HISTORY_DRAIN_BASE == 0`, the default).
         debug_assert!(
-            self.dict.next_to_update() <= range_start.max(HISTORY_DRAIN_BASE),
+            self.dict.next_to_update() <= range_start,
             "dict fill origin {} ran ahead of slice start {range_start}",
             self.dict.next_to_update(),
         );

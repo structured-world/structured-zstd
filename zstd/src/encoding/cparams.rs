@@ -25,37 +25,33 @@ pub(crate) struct CParams {
     pub strategy: u32,
 }
 
-/// Parameter-adjustment mode (`ZSTD_CParamMode_e`): controls how `dictSize`
-/// and an unknown `srcSize` are treated when down-sizing.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CParamMode {
-    /// `ZSTD_cpm_unknown` — public `ZSTD_getCParams` entry.
-    Unknown,
-    /// `ZSTD_cpm_noAttachDict`.
-    NoAttachDict,
-    /// `ZSTD_cpm_createCDict` — CDict-table parameter selection.
-    CreateCDict,
-    /// `ZSTD_cpm_attachDict` — selecting source-only params (dict has its own).
-    AttachDict,
-}
-
 // Upstream constants (zstd.h / zstd_internal.h / clevels.h, 1.5.7).
-const ZSTD_MAX_CLEVEL: i32 = 22;
-const ZSTD_CLEVEL_DEFAULT: i32 = 3;
 const HASHLOG_MIN: u32 = 6;
 const WINDOWLOG_ABSOLUTEMIN: u32 = 10;
 // 64-bit host value; structured-zstd's encoder runs hosted. The 32-bit value
 // is 30, only relevant on 32-bit targets where windowLog never reaches 31 here.
 const WINDOWLOG_MAX: u32 = 31;
 const SHORT_CACHE_TAG_BITS: u32 = 8;
-const TARGETLENGTH_MAX: i32 = 1 << 17;
-/// `ZSTD_minCLevel()` == `-ZSTD_TARGETLENGTH_MAX`.
-const MIN_CLEVEL: i32 = -TARGETLENGTH_MAX;
 /// `ZSTD_CONTENTSIZE_UNKNOWN` == `(0ULL - 1)`.
 pub(crate) const CONTENTSIZE_UNKNOWN: u64 = u64::MAX;
 
+// Level-row selection constants — only the public `get_cparams` entry (the
+// C-reference comparison surface) uses these; the encoder indexes the table via
+// `default_cparams` and never re-selects a level row here.
+#[cfg(feature = "bench_internals")]
+const ZSTD_MAX_CLEVEL: i32 = 22;
+#[cfg(feature = "bench_internals")]
+const ZSTD_CLEVEL_DEFAULT: i32 = 3;
+#[cfg(feature = "bench_internals")]
+const TARGETLENGTH_MAX: i32 = 1 << 17;
+/// `ZSTD_minCLevel()` == `-ZSTD_TARGETLENGTH_MAX`.
+#[cfg(feature = "bench_internals")]
+const MIN_CLEVEL: i32 = -TARGETLENGTH_MAX;
+#[cfg(feature = "bench_internals")]
 const KB_256: u64 = 256 * 1024;
+#[cfg(feature = "bench_internals")]
 const KB_128: u64 = 128 * 1024;
+#[cfg(feature = "bench_internals")]
 const KB_16: u64 = 16 * 1024;
 
 /// `ZSTD_defaultCParameters[4][ZSTD_MAX_CLEVEL+1]` (clevels.h, zstd 1.5.7),
@@ -111,6 +107,17 @@ const DEFAULT_CPARAMS: [[CParams; 23]; 4] = {
     ]
 };
 
+/// The verbatim upstream default-cparams row for a `(tier, level)` pair, the
+/// single source of the `ZSTD_defaultCParameters` table data. `tier` is the
+/// source-size bucket (0 = `>256 KB` .. 3 = `<=16 KB`, see [`get_cparams`]);
+/// `level` is the row (0 = negative-level base, 1..=22). This is the
+/// pre-`adjust_cparams` row: the encoder's level table consumes the raw
+/// `(hashLog, chainLog, minMatch)` widths from it and runs its own
+/// source-size clamp.
+pub(crate) fn default_cparams(tier: usize, level: usize) -> CParams {
+    DEFAULT_CPARAMS[tier][level]
+}
+
 /// `ZSTD_highbit32(val)` — index of the most-significant set bit. Caller
 /// guarantees `val != 0` (matches the upstream `assert(val != 0)`).
 #[inline]
@@ -120,13 +127,10 @@ fn highbit32(val: u32) -> u32 {
 }
 
 /// `ZSTD_getCParamRowSize` (zstd_compress.c): the effective size used to pick
-/// the tier row.
-fn cparam_row_size(src_size_hint: u64, dict_size: usize, mode: CParamMode) -> u64 {
-    let dict_size = if matches!(mode, CParamMode::AttachDict) {
-        0
-    } else {
-        dict_size as u64
-    };
+/// the tier row, for the public `ZSTD_getCParams` (`ZSTD_cpm_unknown`) entry.
+#[cfg(feature = "bench_internals")]
+fn cparam_row_size(src_size_hint: u64, dict_size: usize) -> u64 {
+    let dict_size = dict_size as u64;
     let unknown = src_size_hint == CONTENTSIZE_UNKNOWN;
     let added_size = if unknown && dict_size > 0 { 500 } else { 0 };
     if unknown && dict_size == 0 {
@@ -181,22 +185,18 @@ fn cdict_indices_are_tagged(cp: &CParams) -> bool {
 fn adjust_cparams(
     mut cp: CParams,
     mut src_size: u64,
-    mut dict_size: usize,
-    mode: CParamMode,
+    dict_size: usize,
+    create_cdict: bool,
 ) -> CParams {
     const MIN_SRC_SIZE: u64 = 513; // (1<<9) + 1
     let max_window_resize: u64 = 1u64 << (WINDOWLOG_MAX - 1);
 
-    match mode {
-        CParamMode::Unknown | CParamMode::NoAttachDict => {}
-        CParamMode::CreateCDict => {
-            if dict_size != 0 && src_size == CONTENTSIZE_UNKNOWN {
-                src_size = MIN_SRC_SIZE;
-            }
-        }
-        CParamMode::AttachDict => {
-            dict_size = 0;
-        }
+    // `ZSTD_cpm_createCDict`: an unknown source assumes a `minSrcSize` source so
+    // the dictionary's prepared tables down-size deterministically. The other
+    // modes (`unknown` / `noAttachDict` / `attachDict`) leave `src_size` as-is;
+    // only `unknown` (the public entry) and `createCDict` have live callers here.
+    if create_cdict && dict_size != 0 && src_size == CONTENTSIZE_UNKNOWN {
+        src_size = MIN_SRC_SIZE;
     }
 
     // resize windowLog if input is small enough, to use less memory.
@@ -228,7 +228,7 @@ fn adjust_cparams(
         cp.window_log = WINDOWLOG_ABSOLUTEMIN;
     }
 
-    if matches!(mode, CParamMode::CreateCDict) && cdict_indices_are_tagged(&cp) {
+    if create_cdict && cdict_indices_are_tagged(&cp) {
         let max_short_cache_hash_log = 32 - SHORT_CACHE_TAG_BITS;
         if cp.hash_log > max_short_cache_hash_log {
             cp.hash_log = max_short_cache_hash_log;
@@ -243,13 +243,9 @@ fn adjust_cparams(
 
 /// `ZSTD_getCParams_internal` (zstd_compress.c): tier + level row selection,
 /// negative-level acceleration, then `ZSTD_adjustCParams_internal`.
-pub(crate) fn get_cparams(
-    compression_level: i32,
-    src_size_hint: u64,
-    dict_size: usize,
-    mode: CParamMode,
-) -> CParams {
-    let r_size = cparam_row_size(src_size_hint, dict_size, mode);
+#[cfg(feature = "bench_internals")]
+fn get_cparams(compression_level: i32, src_size_hint: u64, dict_size: usize) -> CParams {
+    let r_size = cparam_row_size(src_size_hint, dict_size);
     let table_id = (u32::from(r_size <= KB_256)
         + u32::from(r_size <= KB_128)
         + u32::from(r_size <= KB_16)) as usize;
@@ -271,11 +267,15 @@ pub(crate) fn get_cparams(
         cp.target_length = (-clamped) as u32;
     }
 
-    adjust_cparams(cp, src_size_hint, dict_size, mode)
+    // `ZSTD_cpm_unknown` (the public entry): no createCDict source assumption.
+    adjust_cparams(cp, src_size_hint, dict_size, /* create_cdict */ false)
 }
 
-/// Public `ZSTD_getCParams` entry: maps `src_size_hint == 0` to UNKNOWN and
-/// uses `Unknown` mode, matching upstream exactly.
+/// Public `ZSTD_getCParams` entry: maps `src_size_hint == 0` to UNKNOWN,
+/// matching upstream exactly. The C-reference comparison surface (`zz_cparams`
+/// validates it byte-for-byte against C `ZSTD_getCParams`); the encoder sizes
+/// its own tables from [`default_cparams`] + [`create_cdict_table_logs`].
+#[cfg(feature = "bench_internals")]
 pub(crate) fn get_cparams_public(
     compression_level: i32,
     src_size_hint: u64,
@@ -286,5 +286,41 @@ pub(crate) fn get_cparams_public(
     } else {
         src_size_hint
     };
-    get_cparams(compression_level, src, dict_size, CParamMode::Unknown)
+    get_cparams(compression_level, src, dict_size)
+}
+
+/// The `(hash_log, chain_log)` a dictionary's prepared match-finder tables get
+/// under `ZSTD_cpm_createCDict` — the single source for the CDict table
+/// geometry (mirrors `ZSTD_adjustCParams_internal` with an unknown source, so
+/// `dictSize` drives `dict_and_window_log` down-sizing while the live window
+/// stays source-sized). `uses_bt` selects the binary-tree `cycleLog`
+/// (`chainLog - 1`). Returns only the table widths; the caller keeps its own
+/// resolved `window_log`. Non-`dictMatchState` strategies (HC / Row / BT) skip
+/// the tagged short-cache cap, matching upstream.
+pub(crate) fn create_cdict_table_logs(
+    window_log: u8,
+    hash_log: u32,
+    chain_log: u32,
+    uses_bt: bool,
+    dict_size: usize,
+) -> (u32, u32) {
+    // Strategy only steers `cycle_log` (>= btlazy2 == 6) and the tagged cap
+    // (<= dfast == 2); pick lazy(4) / btopt(7) so HC/Row/BT stay untagged.
+    let strategy = if uses_bt { 7 } else { 4 };
+    let cp = CParams {
+        window_log: window_log as u32,
+        chain_log,
+        hash_log,
+        search_log: 0,
+        min_match: 0,
+        target_length: 0,
+        strategy,
+    };
+    let adj = adjust_cparams(
+        cp,
+        CONTENTSIZE_UNKNOWN,
+        dict_size,
+        /* create_cdict */ true,
+    );
+    (adj.hash_log, adj.chain_log)
 }
