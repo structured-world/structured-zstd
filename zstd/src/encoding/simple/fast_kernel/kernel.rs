@@ -93,25 +93,47 @@ const HASH_READ_SIZE: usize = 8;
 /// the ratio, per the drop-in-not-binary-parity contract.)
 const MIN_DICT_MATCH_LEN: usize = 8;
 
-/// Dictionary-table lookup (upstream zstd
+/// Short-cache tag width for the dictionary hash table (upstream zstd
+/// `ZSTD_SHORT_CACHE_TAG_BITS`). Each dict slot packs `(position << TAG_BITS) |
+/// tag`, where `tag` is the low `TAG_BITS` of a `hashLog + TAG_BITS`-wide hash.
+/// On lookup the stored tag must equal the query tag, so a colliding dict
+/// position with a different tag is rejected WITHOUT the candidate load + 4-byte
+/// `MEM_read32` the untagged variant pays on every collision — a speed win on
+/// the dict-probe hot path. The slot index `hash >> TAG_BITS` is identical to
+/// the plain `hashLog` hash, so tagging does not change which slot a position
+/// lands in (only adds the collision-reject), keeping the every-position
+/// last-wins fill's nearest-occurrence guarantee intact.
+pub(crate) const DICT_TAG_BITS: u32 = 8;
+pub(crate) const DICT_TAG_MASK: u32 = (1 << DICT_TAG_BITS) - 1;
+
+/// Tagged dictionary-table lookup (upstream zstd
 /// `ZSTD_compressBlock_fast_dictMatchState_generic`, zstd_fast.c:546-548).
-/// Hashes `ptr` to `dict_hash_log` bits and returns the stored dict position
-/// for that slot. `0` is the never-filled sentinel (dict positions start at
-/// `1`), which the caller's `dict_idx >= 1` gate rejects. The caller byte-checks
-/// the candidate with `MEM_read32` before committing, so a hash collision is a
-/// cheap reject rather than a wrong match.
+/// Hashes `ptr` to `dict_hash_log + DICT_TAG_BITS` bits, reads slot
+/// `hash >> DICT_TAG_BITS` (== the plain `dict_hash_log` hash), and returns the
+/// stored dict position ONLY if the packed tag matches; otherwise `0` (the
+/// never-filled sentinel — dict positions start at `1`, and the caller's
+/// `dict_idx >= 1` gate rejects it). The tag check rejects collisions without a
+/// candidate load.
 ///
 /// # Safety
-/// `ptr` must have the readable-bytes context `hash_ptr_raw::<MLS>` requires.
+/// `ptr` must have the readable-bytes context `hash_ptr_raw::<MLS>` requires;
+/// `dict_hash_log + DICT_TAG_BITS <= 32` so the slot index stays in range.
 #[inline(always)]
 pub(crate) unsafe fn dict_lookup<const MLS: u32>(
     dict_table: &FastHashTable,
     ptr: *const u8,
     dict_hash_log: u32,
 ) -> u32 {
-    let h = unsafe { hash_ptr_raw::<MLS>(ptr, dict_hash_log) };
-    // SAFETY: `h` < `1 << dict_hash_log` = table len.
-    unsafe { dict_table.get(h) }
+    let hat = unsafe { hash_ptr_raw::<MLS>(ptr, dict_hash_log + DICT_TAG_BITS) };
+    // SAFETY: `hat >> DICT_TAG_BITS` < `1 << dict_hash_log` = table len. The dict
+    // table is never epoch-advanced (bias 0), so `get` returns the raw stored
+    // `(pos << TAG) | tag` word unchanged.
+    let stored = unsafe { dict_table.get(hat >> DICT_TAG_BITS) };
+    if stored & DICT_TAG_MASK == hat & DICT_TAG_MASK {
+        stored >> DICT_TAG_BITS
+    } else {
+        0
+    }
 }
 
 /// Upstream zstd's `MEM_read32(ptr)` — unaligned native-endian 4-byte load,
@@ -2563,11 +2585,17 @@ mod tests {
         let mut main_table = FastHashTable::new(hash_log, MLS);
         let mut dict_table = FastHashTable::new(hash_log, MLS);
         for pos in 0..=dict.len() - HASH_READ_SIZE {
-            // SAFETY: pos + 8 <= dict.len(); MLS matches the table. Plain
-            // every-position last-wins fill, matching the kernel's untagged
-            // dict lookup.
-            let h = unsafe { hash_ptr_raw::<MLS>(dict.as_ptr().add(pos), hash_log) };
-            unsafe { dict_table.put(h, pos as u32) };
+            // SAFETY: pos + 8 <= dict.len(); MLS matches the table. Tagged
+            // every-position last-wins fill, matching the kernel's tagged dict
+            // lookup (slot + packed tag).
+            let hat =
+                unsafe { hash_ptr_raw::<MLS>(dict.as_ptr().add(pos), hash_log + DICT_TAG_BITS) };
+            unsafe {
+                dict_table.put(
+                    hat >> DICT_TAG_BITS,
+                    ((pos as u32) << DICT_TAG_BITS) | (hat & DICT_TAG_MASK),
+                )
+            };
         }
 
         let mut tuples: Vec<(Vec<u8>, usize, usize)> = Vec::new();

@@ -59,6 +59,7 @@ use crate::encoding::dict_attach::DictAttach;
 
 use super::fast_kernel::hash_table::{FastHashTable, hash_ptr_raw};
 use super::fast_kernel::kernel::compress_block_fast;
+use super::fast_kernel::kernel::{DICT_TAG_BITS, DICT_TAG_MASK};
 
 /// Upstream zstd `ZSTD_defaultCParameters[level=1][srcSize > 256 KiB][Fast]`
 /// constants. Kept for `MatchGeneratorDriver::new`'s initial-state
@@ -1716,16 +1717,34 @@ impl FastKernelMatcher {
         // inflating the offset and erasing the dictionary's ratio benefit (the
         // dict frame ends up larger than the no-dict frame).
         //
-        // Each slot stores the plain dict position. `0` is the empty sentinel —
-        // the dict occupies positions `1..dict_end` and the kernel rejects
-        // `dict_idx < 1`. The kernel byte-checks every candidate with
-        // `MEM_read32` before committing, so a hash collision is a cheap reject.
+        // Each slot stores `(position << DICT_TAG_BITS) | tag` (upstream zstd
+        // `ZSTD_SHORT_CACHE`): the slot index is the plain `dict_hash_log` hash,
+        // the tag is the low `DICT_TAG_BITS` of the wider hash. `0` is the empty
+        // sentinel — the dict occupies positions `1..dict_end` and the kernel
+        // rejects `dict_idx < 1`. The tag lets the kernel reject a colliding
+        // position without the candidate load + `MEM_read32`; tagging does NOT
+        // change the slot, so the last-wins nearest-occurrence guarantee holds.
         let dict_hash_log = dict_table.hash_log();
+        // Every slot packs the position into the `32 - DICT_TAG_BITS`-bit field
+        // (16 MiB with an 8-bit tag). `last_hashable` bounds every position the
+        // loop writes, so one check here covers the whole fill; a larger dict
+        // region would truncate the high position bits and alias offsets.
+        assert!(
+            last_hashable >> (32 - DICT_TAG_BITS) == 0,
+            "dict region too large for the tagged fast-table position field \
+             (last_hashable={last_hashable}, max={})",
+            (1usize << (32 - DICT_TAG_BITS)) - 1,
+        );
         for pos in range_start..=last_hashable {
             // SAFETY: pos <= last_hashable = history_len - 8, so `base.add(pos)`
             // covers >= 8 readable bytes; MLS matches the table's mls.
-            let h = unsafe { hash_ptr_raw::<MLS>(base.add(pos), dict_hash_log) };
-            unsafe { dict_table.put(h, pos as u32) };
+            let hat = unsafe { hash_ptr_raw::<MLS>(base.add(pos), dict_hash_log + DICT_TAG_BITS) };
+            unsafe {
+                dict_table.put(
+                    hat >> DICT_TAG_BITS,
+                    ((pos as u32) << DICT_TAG_BITS) | (hat & DICT_TAG_MASK),
+                )
+            };
         }
         // Every position up to `last_hashable` is hashed; the next `accept_data`
         // slice resumes one past it, picking up the seam positions whose 8-byte
