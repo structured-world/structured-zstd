@@ -10419,15 +10419,18 @@ fn primed_snapshot_restored_across_level22_tier_hints() {
 }
 
 #[test]
-fn fast_dict_always_attaches_regardless_of_source_size_hint() {
-    // Fast no longer has an attach-vs-copy boundary: every Fast dict frame
-    // attaches (the copy-mode owned path memmoved the whole input into history
-    // each frame; attach scans the input in place via the borrowed dual-base
-    // kernel). So a large hint that used to cross into copy mode (8193 B,
-    // formerly > the 8 KiB cutoff) and a small one (8192 B) BOTH resolve to
+fn fast_dict_attaches_within_cutoff_bounds() {
+    // Within the attach bounds, every Fast dict frame attaches (the copy-mode
+    // owned path memmoved the whole input into history each frame; attach scans
+    // the input in place via the borrowed dual-base kernel). All hints here sit
+    // far below `FAST_ATTACH_DICT_CUTOFF_LOG` (2 GiB source) and the dict is far
+    // below `MAX_FAST_ATTACH_DICT_REGION` (16 MiB), so a hint that used to cross
+    // the old 8 KiB cutoff (8193 B) and a small one (8192 B) BOTH resolve to
     // attach, and the Simple backend reports a borrowed (in-place) dict scan for
-    // both. This is the regression guard for `FAST_ATTACH_DICT_CUTOFF_LOG`
-    // staying high enough that no Fast hint falls back to the input-copy path.
+    // both. This guards `FAST_ATTACH_DICT_CUTOFF_LOG` staying high enough that no
+    // in-bounds Fast hint falls back to the input-copy path; the OUT-of-bounds
+    // fallbacks are covered by `fast_attach_cutoff_keeps_virtual_positions_within_u32`
+    // (source) and `oversized_dict_hint_routes_fast_to_copy_mode` (dict size).
     let level = CompressionLevel::Level(1);
     for hint in [8192u64, 8193, 1 << 20] {
         let mut driver = MatchGeneratorDriver::new(8, 1);
