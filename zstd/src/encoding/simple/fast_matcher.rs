@@ -59,7 +59,6 @@ use crate::encoding::dict_attach::DictAttach;
 
 use super::fast_kernel::hash_table::{FastHashTable, hash_ptr_raw};
 use super::fast_kernel::kernel::compress_block_fast;
-use super::fast_kernel::kernel::{DICT_TAG_BITS, DICT_TAG_MASK};
 
 /// Upstream zstd `ZSTD_defaultCParameters[level=1][srcSize > 256 KiB][Fast]`
 /// constants. Kept for `MatchGeneratorDriver::new`'s initial-state
@@ -1656,13 +1655,11 @@ impl FastKernelMatcher {
             return;
         }
         let last_hashable = history_len - HASH_READ_SIZE;
-        // The strided dict fill resumes at the carried-forward fill origin
-        // (`next_to_update`), NOT this slice's `range_start`. The stride phase
-        // stays anchored at the dictionary content start (upstream zstd
-        // `ms->nextToUpdate = ip - base`) across every `accept_data` slice, so
-        // a position whose wide hash read straddles a slice seam — unreachable
-        // by the prior slice (its `last_hashable` stopped `HASH_READ_SIZE - 1`
-        // bytes short) and below this slice's `range_start` — is still hashed
+        // The dict fill resumes at the carried-forward fill origin
+        // (`next_to_update`), NOT this slice's `range_start`: a position whose
+        // wide hash read straddles a slice seam is unreachable by the prior
+        // slice (its `last_hashable` stopped `HASH_READ_SIZE - 1` bytes short)
+        // and sits below this slice's `range_start`, yet must still be hashed
         // here. Restarting at `range_start` instead would drop those seam
         // positions and fragment a long cross-seam dict match. `next_to_update`
         // starts at the content start (`HISTORY_DRAIN_BASE == 0`, the default).
@@ -1671,8 +1668,8 @@ impl FastKernelMatcher {
             "dict fill origin {} ran ahead of slice start {range_start}",
             self.dict.next_to_update(),
         );
-        let stride_start = self.dict.next_to_update();
-        if stride_start > last_hashable {
+        let fill_start = self.dict.next_to_update();
+        if fill_start > last_hashable {
             return;
         }
         let hash_log = self.hash_table.hash_log();
@@ -1681,11 +1678,11 @@ impl FastKernelMatcher {
             .table_mut_or_init(|| FastHashTable::new(hash_log, mls));
         let base = self.history.as_ptr();
         let next = match self.hash_table.mls() {
-            4 => self.prime_dict_table_impl::<4>(base, stride_start, last_hashable),
-            5 => self.prime_dict_table_impl::<5>(base, stride_start, last_hashable),
-            6 => self.prime_dict_table_impl::<6>(base, stride_start, last_hashable),
-            7 => self.prime_dict_table_impl::<7>(base, stride_start, last_hashable),
-            8 => self.prime_dict_table_impl::<8>(base, stride_start, last_hashable),
+            4 => self.prime_dict_table_impl::<4>(base, fill_start, last_hashable),
+            5 => self.prime_dict_table_impl::<5>(base, fill_start, last_hashable),
+            6 => self.prime_dict_table_impl::<6>(base, fill_start, last_hashable),
+            7 => self.prime_dict_table_impl::<7>(base, fill_start, last_hashable),
+            8 => self.prime_dict_table_impl::<8>(base, fill_start, last_hashable),
             _ => unreachable!("FastHashTable construction rejects mls outside 4..=8"),
         };
         self.dict.set_next_to_update(next);
@@ -1694,9 +1691,9 @@ impl FastKernelMatcher {
     /// Monomorphised per-MLS dict-table fill. `base` is a raw pointer into
     /// `self.history` (no borrow held), so mutating `self.dict_table` in the
     /// loop is sound — the loop never touches `history`, which stays put.
-    /// Returns the carried-forward fill origin (the first stride position not
-    /// yet processed), stored as [`DictAttach::next_to_update`] so the next
-    /// `accept_data` slice resumes the stride here without dropping the seam.
+    /// Returns the carried-forward fill origin (one past the last position
+    /// hashed), stored as [`DictAttach::next_to_update`] so the next
+    /// `accept_data` slice resumes here without dropping the seam.
     fn prime_dict_table_impl<const MLS: u32>(
         &mut self,
         base: *const u8,
@@ -1707,83 +1704,34 @@ impl FastKernelMatcher {
             .dict
             .table_mut()
             .expect("prime_dict_table_for_range creates the table before this call");
-        // Mirror upstream `ZSTD_fillHashTableForCDict` (zstd_fast.c:16-49): a
-        // strided fill, NOT every-position. The stride origin is the dictionary
-        // content start (upstream `ms->nextToUpdate = ip - base`), so the fill
-        // PHASE matches upstream — an every-position last-wins fill (or a stride
-        // started at the seam-backfill position) resolves the same hash to a
-        // different dict position and surfaces a worse match (the dict-primed
-        // Fast path then fragments a long dict match into short local ones).
-        // Stride-aligned positions always overwrite (last stride wins); the
-        // `FILL_STEP - 1` positions between them are written only into an empty
-        // slot (first-fill wins). `0` is the empty sentinel — the dict occupies
-        // positions `1..dict_end` and the kernel rejects `dict_idx < 1`, so a
-        // never-filled slot reads back as `0`.
-        // Each slot stores `(position << DICT_TAG_BITS) | tag`, where `tag` is
-        // the low `DICT_TAG_BITS` of a `hash_log + DICT_TAG_BITS`-wide hash and
-        // the slot index is that hash `>> DICT_TAG_BITS` (== the plain
-        // `hash_log` hash). The kernel's tagged lookup rejects a slot whose
-        // stored tag does not match the query, so colliding dict positions with
-        // different tags do not alias — matching upstream's `ZSTD_SHORT_CACHE`.
+        // Every-position last-wins fill. For repetitive dictionary content one
+        // hash maps to many candidate positions, and the kernel emits the match
+        // offset as `ip - position`. Walking every position in increasing order
+        // with last-wins keeps the HIGHEST (nearest-to-the-input) occurrence per
+        // hash, so the emitted offset is the smallest reachable — and small
+        // offsets cost far fewer bits in the offset-code FSE stream than far
+        // ones. A strided fill (stride-overwrite plus in-between fill-if-empty)
+        // instead keeps whichever occurrence the stride alignment happened to
+        // land on; for variable-length records that is frequently a far one,
+        // inflating the offset and erasing the dictionary's ratio benefit (the
+        // dict frame ends up larger than the no-dict frame).
+        //
+        // Each slot stores the plain dict position. `0` is the empty sentinel —
+        // the dict occupies positions `1..dict_end` and the kernel rejects
+        // `dict_idx < 1`. The kernel byte-checks every candidate with
+        // `MEM_read32` before committing, so a hash collision is a cheap reject.
         let dict_hash_log = dict_table.hash_log();
-        // Always-on (not debug_assert): every slot stores `(pos << DICT_TAG_BITS)
-        // | tag`, so a filled position must fit the `32 - DICT_TAG_BITS`-bit
-        // position field (16 MiB with an 8-bit tag). `last_hashable` bounds every
-        // position the loop writes (both the stride `pos` and the in-between
-        // `ipp <= last_hashable`), so checking it once here covers the whole fill
-        // without a per-position branch. A dict region past this limit would
-        // truncate the high position bits and alias dict matches to wrong
-        // offsets; reject it loudly instead of silently corrupting the stream in
-        // release builds (the per-position `debug_assert` below is debug-only and
-        // never sees `ipp`).
-        assert!(
-            last_hashable >> (32 - DICT_TAG_BITS) == 0,
-            "dict region too large for the tagged fast-table position field \
-             (last_hashable={last_hashable}, max={})",
-            (1usize << (32 - DICT_TAG_BITS)) - 1,
-        );
-        const FILL_STEP: usize = 3;
-        let mut pos = range_start;
-        // Upstream bound `ip + step < iend + 2` with `iend` = end-of-input minus
-        // HASH_READ_SIZE; `last_hashable` plays the role of `iend` here.
-        while pos + FILL_STEP < last_hashable + 2 {
-            // SAFETY: pos < last_hashable < history_len - 8, so `base.add(pos)`
+        for pos in range_start..=last_hashable {
+            // SAFETY: pos <= last_hashable = history_len - 8, so `base.add(pos)`
             // covers >= 8 readable bytes; MLS matches the table's mls.
-            debug_assert!(
-                pos >> (32 - DICT_TAG_BITS) == 0,
-                "dict position overflows tagged index"
-            );
-            let hat = unsafe { hash_ptr_raw::<MLS>(base.add(pos), dict_hash_log + DICT_TAG_BITS) };
-            unsafe {
-                dict_table.put(
-                    hat >> DICT_TAG_BITS,
-                    ((pos as u32) << DICT_TAG_BITS) | (hat & DICT_TAG_MASK),
-                )
-            };
-            // In-between positions: fill only an empty slot (first-fill wins),
-            // matching `ZSTD_fillHashTableForCDict` (dtlm_full).
-            for p in 1..FILL_STEP {
-                let ipp = pos + p;
-                if ipp > last_hashable {
-                    break;
-                }
-                let hat2 =
-                    unsafe { hash_ptr_raw::<MLS>(base.add(ipp), dict_hash_log + DICT_TAG_BITS) };
-                let slot2 = hat2 >> DICT_TAG_BITS;
-                if unsafe { dict_table.get(slot2) } == 0 {
-                    unsafe {
-                        dict_table.put(
-                            slot2,
-                            ((ipp as u32) << DICT_TAG_BITS) | (hat2 & DICT_TAG_MASK),
-                        )
-                    };
-                }
-            }
-            pos += FILL_STEP;
+            let h = unsafe { hash_ptr_raw::<MLS>(base.add(pos), dict_hash_log) };
+            unsafe { dict_table.put(h, pos as u32) };
         }
-        // `pos` is now the first stride position past the loop bound — the
-        // resume point for the next slice's fill.
-        pos
+        // Every position up to `last_hashable` is hashed; the next `accept_data`
+        // slice resumes one past it, picking up the seam positions whose 8-byte
+        // hash read straddled this slice's tail (unreachable until more bytes
+        // landed).
+        last_hashable + 1
     }
 }
 
@@ -2645,13 +2593,10 @@ mod tests {
         // seam: its 8-byte hash read straddles the chunk boundary.
         let p = seam - 4;
         let dt = m.dict.table().expect("dict table primed");
-        // Read the dict table exactly as the kernel does: a tagged lookup that
-        // decodes the packed `(position << DICT_TAG_BITS) | tag` slot and
-        // verifies the tag (a bare `get` would compare the packed value to the
-        // plain position and never match). Returns the stored position, or 0
-        // if the slot is empty / the tag mismatches.
+        // Read the dict table exactly as the kernel does: hash the position and
+        // return the stored dict position for that slot (0 if empty).
         let found = unsafe {
-            crate::encoding::simple::fast_kernel::kernel::dict_tagged_lookup::<4>(
+            crate::encoding::simple::fast_kernel::kernel::dict_lookup::<4>(
                 dt,
                 m.history.as_ptr().add(p),
                 dt.hash_log(),
