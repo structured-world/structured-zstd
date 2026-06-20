@@ -2712,6 +2712,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn block_samples_match_dict_fires_only_on_extendable_dict_match() {
+        // Distinct dict bytes so the 4-byte hashes are collision-free at
+        // hash_log=20 and a verbatim run is the only way to hit the table.
+        let dict: alloc::vec::Vec<u8> = (0..200u8)
+            .map(|i| i.wrapping_mul(37).wrapping_add(13))
+            .collect();
+        let mut m = FastKernelMatcher::with_params(20, 20, 4, 2);
+        m.accept_data(dict.clone());
+        m.skip_matching_for_dict_prime();
+        assert!(m.dict_is_attached(), "dict must be attached after prime");
+
+        // A 32-byte verbatim dict run extends well past the 16-byte useful-match
+        // floor → the probe fires.
+        let hit = dict[8..40].to_vec();
+        assert!(
+            m.block_samples_match_dict(&hit),
+            "a long verbatim dict run must trip the dict probe",
+        );
+
+        // An 8-byte dict prefix followed by non-dict bytes stays BELOW the
+        // 16-byte floor → the probe must NOT fire (a short coincidental match
+        // does not signal a dict that compresses the block).
+        let mut short = dict[8..16].to_vec();
+        short.extend((0..56u8).map(|i| i.wrapping_mul(53).wrapping_add(201)));
+        assert!(
+            !m.block_samples_match_dict(&short),
+            "a sub-16-byte dict match must not trip the probe",
+        );
+
+        // A high-entropy block sharing no extendable run with the dict → no hit.
+        let miss: alloc::vec::Vec<u8> = (0..64u8)
+            .map(|i| i.wrapping_mul(91).wrapping_add(7) ^ 0xA5)
+            .collect();
+        assert!(
+            !m.block_samples_match_dict(&miss),
+            "a non-dict block must not trip the probe",
+        );
+
+        // A block too short to hash (< HASH_READ_SIZE) → false, no panic.
+        assert!(
+            !m.block_samples_match_dict(&dict[..4]),
+            "a sub-8-byte block cannot be probed",
+        );
+    }
+
+    #[test]
+    fn block_samples_match_dict_is_false_without_a_dictionary() {
+        // No dict primed → the probe short-circuits to false (the no-dict path
+        // never reaches it, but the guard must hold).
+        let m = FastKernelMatcher::with_params(20, 20, 4, 2);
+        let block: alloc::vec::Vec<u8> = (0..64u8)
+            .map(|i| i.wrapping_mul(37).wrapping_add(13))
+            .collect();
+        assert!(!m.dict_is_attached());
+        assert!(!m.block_samples_match_dict(&block));
+    }
+
     /// Regression: same seam-gap defect for the MAIN hash table, primed
     /// per slice via `skip_matching_with_hint(Some(false))` (the dict
     /// COPY path and multi-slice history priming). Cross-slice matches

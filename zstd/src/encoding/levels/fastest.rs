@@ -457,6 +457,16 @@ mod tests {
     }
 
     #[test]
+    fn custom_matcher_dict_probe_defaults_to_false() {
+        // `Matcher::block_samples_match_dict` defaults to `false`: a matcher
+        // without a dict-table probe (every backend except the Simple/Fast one
+        // with an attached dictionary) leaves the raw-fast-path on its
+        // content-only verdict.
+        let m = HintProbeMatcher::default();
+        assert!(!m.block_samples_match_dict(b"arbitrary block content, no dict probe"));
+    }
+
+    #[test]
     fn rle_branch_passes_compressible_hint_to_skip_matching() {
         let mut state = CompressState {
             matcher: HintProbeMatcher::default(),
