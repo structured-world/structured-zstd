@@ -879,6 +879,14 @@ impl HuffmanTable {
                     }
                 }
                 _ => {
+                    // run_len is a power of two (1 << (max_bits - len)); the 1/2/4/8
+                    // arms above are explicit, so this fallback only sees run_len in
+                    // {16, 32, 64, ...} — every value here is >= 16 and divisible by
+                    // 16, which the 16-entry-per-iteration store loop relies on.
+                    debug_assert!(
+                        run_len >= 16 && run_len.is_multiple_of(16),
+                        "fallback arm expects run_len >= 16 and divisible by 16, got {run_len}"
+                    );
                     for s in 0..count {
                         let (_, p64) = packed64!(s);
                         let mut off = 0usize;
