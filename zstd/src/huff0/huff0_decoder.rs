@@ -790,9 +790,12 @@ impl HuffmanTable {
         let mut sorted = [0u8; 256];
         let mut sym_off = [0usize; 16];
         let mut acc = 0usize;
-        for len in 0..=(max_bits as usize) {
-            sym_off[len] = acc;
-            acc += self.bit_ranks[len] as usize;
+        // Prefix sum of the per-code-length counts: `sym_off[l]` is the start
+        // index of the length-`l` run in `sorted`. `bit_ranks` has exactly
+        // `max_bits + 1` entries (<= 12), so zipping bounds the walk.
+        for (off, &rank) in sym_off.iter_mut().zip(self.bit_ranks.iter()) {
+            *off = acc;
+            acc += rank as usize;
         }
         {
             let mut cursor = sym_off;
