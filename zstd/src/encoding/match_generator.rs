@@ -2640,8 +2640,10 @@ impl Matcher for MatchGeneratorDriver {
         // clears an existing producer's table but does not null the
         // slot — installing here gives the new frame a fresh producer.
         #[cfg(feature = "hash")]
-        if let MatcherStorage::HashChain(hc) = &mut self.storage {
-            let producer = self
+        {
+            // Resolve the derived LDM params first (immutable borrow of the
+            // overrides), then reuse the existing producer's allocation below.
+            let derived_ldm = self
                 .param_overrides
                 .as_ref()
                 .and_then(|ov| ov.ldm)
@@ -2660,9 +2662,27 @@ impl Matcher for MatchGeneratorDriver {
                         min_match_length: ldm_ov.min_match.unwrap_or(0),
                         bucket_size_log: ldm_ov.bucket_size_log.unwrap_or(0),
                     };
-                    super::ldm::LdmProducer::new(seed.derive(strategy_ord))
+                    seed.derive(strategy_ord)
                 });
-            hc.set_ldm_producer(producer);
+            if let MatcherStorage::HashChain(hc) = &mut self.storage {
+                // Reuse the existing producer's hash-table allocation when the
+                // derived params are unchanged: only `clear()` (re-zero the
+                // table + re-seed the rolling hash, no allocation) is needed for
+                // the new frame. A params change (or the first frame) forces a
+                // fresh `LdmProducer::new`. On the reused-encoder compress-dict
+                // path this avoids re-allocating the LDM hash table (large at
+                // btultra2) every frame — upstream zstd reuses its `ldmState_t`
+                // the same way. `clear()` is mandatory here for correctness
+                // regardless of what `BtMatcher::reset` did to the old table.
+                let producer = derived_ldm.map(|p| match hc.take_ldm_producer() {
+                    Some(mut existing) if existing.params() == p => {
+                        existing.clear();
+                        existing
+                    }
+                    _ => super::ldm::LdmProducer::new(p),
+                });
+                hc.set_ldm_producer(producer);
+            }
         }
         // Record the resolved matcher shape for the primed-snapshot key. Captured
         // here (post-resolution, after the test-only param override) so the key
