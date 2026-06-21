@@ -79,6 +79,97 @@ macro_rules! decode_one_body {
     }};
 }
 
+/// Donor-shape fused decode + offset-resolution for one sequence.
+///
+/// Mirrors upstream zstd `ZSTD_decodeSequence` (zstd_decompress_block.c:1228-1346)
+/// branch-for-branch on the 64-bit path: the offset extra-bit read is folded
+/// INTO the `ofBits>1 / ==0 / ==1` branches (no read in the rep-0 arm, one bit
+/// in the rep/1 arm, full read in the real-offset arm), and the repcode history
+/// rotation is resolved inline right there. ml/ll extra bits are read separately
+/// afterwards. This is the branchy counterpart to the branchless
+/// `do_offset_history` RULES table; we read of/ml/ll with individual
+/// demand-refilled `get_bits` instead of one PEXT triple, giving the branch
+/// predictor the offset-width context upstream relies on.
+///
+/// Our offset table stores `base_value = 1 << ofCode`, so `of_base + raw` is the
+/// offBase domain (1/2/3 = repcodes, >=4 = real offset + 3). The arithmetic here
+/// converts to the real-offset domain that the executor consumes and that
+/// `offset_hist` records (verified equal to `do_offset_history` across its full
+/// test matrix). Expands to `(ll, ml, actual_offset)`; rotates `$hist` in place.
+macro_rules! decode_seq_fused_cshape {
+    ($ll_dec:expr, $ml_dec:expr, $of_dec:expr, $br:expr, $hist:expr) => {{
+        let ll_state = $ll_dec.state;
+        let ml_state = $ml_dec.state;
+        let of_state = $of_dec.state;
+
+        let ll_base = ll_state.base_value;
+        let ml_base = ml_state.base_value;
+        let of_base = of_state.base_value;
+        let ll_bits = ll_state.num_additional_bits;
+        let ml_bits = ml_state.num_additional_bits;
+        let of_bits = of_state.num_additional_bits;
+
+        debug_assert!(of_bits <= MAX_OFFSET_CODE);
+
+        // === Offset + repcode (upstream branchy ofBits flow) ===
+        let actual_offset: u32 = if of_bits > 1 {
+            // Real offset: read ofBits, no repcode. offBase = of_base + raw >= 4.
+            let raw = $br.get_bits(of_bits) as u32;
+            let resolved = (of_base + raw).wrapping_sub(3);
+            $hist[2] = $hist[1];
+            $hist[1] = $hist[0];
+            $hist[0] = resolved;
+            resolved
+        } else {
+            let ll0 = ll_base == 0;
+            if of_bits == 0 {
+                // Repcode 0 (most common): no offset bits consumed.
+                let idx = usize::from(ll0);
+                let resolved = $hist[idx];
+                $hist[1] = $hist[idx ^ 1];
+                $hist[0] = resolved;
+                resolved
+            } else {
+                // ofBits == 1: one bit selects among rep1..rep3. The upstream
+                // repcode base for this arm is 1 (our of_base is 2 here).
+                let bit = $br.get_bits(1) as u32;
+                let off_code = 1 + u32::from(ll0) + bit; // in {1,2,3}
+                let mut temp = if off_code == 3 {
+                    $hist[0].wrapping_sub(1)
+                } else {
+                    $hist[off_code as usize]
+                };
+                // 0 is not a valid offset: force corruption to surface downstream
+                // (upstream `temp -= !temp`; our executor rejects offset 0).
+                temp = temp.wrapping_sub(u32::from(temp == 0));
+                if off_code != 1 {
+                    $hist[2] = $hist[1];
+                }
+                $hist[1] = $hist[0];
+                $hist[0] = temp;
+                temp
+            }
+        };
+        debug_assert_ne!(actual_offset, 0);
+
+        // === Match length + literal length extra bits ===
+        let ml = ml_base
+            + if ml_bits > 0 {
+                $br.get_bits(ml_bits) as u32
+            } else {
+                0
+            };
+        let ll = ll_base
+            + if ll_bits > 0 {
+                $br.get_bits(ll_bits) as u32
+            } else {
+                0
+            };
+
+        (ll, ml, actual_offset)
+    }};
+}
+
 /// Textual expansion of per-sequence execute. Fast path: the inlined AVX2
 /// match-copy macro [`exec_sequence_avx2_inline`]. Cold path: legacy
 /// try_push + repeat_lookahead_prefetched. Expands as a statement-block
@@ -336,22 +427,27 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<B: BufferBackend>(
         let mut shadow_hist = *offset_hist;
         let mut fallback_err: Option<DecompressBlockError> = None;
         for i in 0..num_sequences {
-            let seq = decode_one_body!(&mut ll_dec, &mut ml_dec, &mut of_dec, &mut br);
-            let resolved_offset = do_offset_history(seq.of, seq.ll, &mut shadow_hist);
+            let (seq_ll, seq_ml, resolved_offset) = decode_seq_fused_cshape!(
+                &mut ll_dec,
+                &mut ml_dec,
+                &mut of_dec,
+                &mut br,
+                &mut shadow_hist
+            );
             let r = execute_one_body!(
                 buffer,
                 literals_buffer,
                 &mut lit_cur,
                 literals_buffer_len,
-                seq.ll,
-                seq.ml,
+                seq_ll,
+                seq_ml,
                 resolved_offset
             );
             if let Err(e) = r {
                 fallback_err = Some(e);
                 break;
             }
-            seq_sum = seq_sum.wrapping_add(seq.ll).wrapping_add(seq.ml);
+            seq_sum = seq_sum.wrapping_add(seq_ll).wrapping_add(seq_ml);
 
             if i + 1 < num_sequences {
                 br.ensure_bits(max_update_bits);
