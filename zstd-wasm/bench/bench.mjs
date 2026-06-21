@@ -166,7 +166,7 @@ for (const s of ["sample-1.service", "sample-2.service"]) {
 console.log("\n=== dictionary compress/decompress vs @bokuweb/zstd-wasm ===");
 const dictRows = [];
 for (const [scenario, data] of dictSamples) {
-  for (const level of [3, 19]) {
+  for (const level of LEVELS) {
     for (const [name, eng] of Object.entries(engines)) {
       const framed = eng.compressUsingDict(data, dict, level);
       const ok = eq(eng.decompressUsingDict(framed, dict), data);
@@ -184,7 +184,7 @@ for (const [scenario, data] of dictSamples) {
 }
 for (const [scenario, data] of dictSamples) {
   console.log(`\n${scenario} + dict (${data.length} bytes, dict ${dict.length})`);
-  for (const level of [3, 19]) {
+  for (const level of LEVELS) {
     const at = (n) => dictRows.find((r) => r.scenario === scenario && r.level === level && r.name === n);
     const b = at("bokuweb"), s = at("ours-simd128"), sc = at("ours-scalar");
     const x = (o) => (o.cNs / b.cNs).toFixed(2), xd = (o) => (o.dNs / b.dNs).toFixed(2);
