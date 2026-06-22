@@ -543,7 +543,7 @@ impl HcMatcher {
         // more -- total per-find steps are bounded by `max_chain_steps + 16`,
         // not `max_chain_steps`. Intentional: the floor (not `max_chain_steps`)
         // is the binding dict-search constraint at those levels.
-        let dms_budget = max_chain_steps.max(16);
+        let dms_budget = max_chain_steps.max(steps + 16);
         let dms_hash = MatchTable::hash_position_at(concat, current_idx, dms.hash_log, dms.mls);
         let mut dcur = dms.hash_table[dms_hash];
         // Hoist the dms chain-table base pointer (same Vec-header-reload removal
