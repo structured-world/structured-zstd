@@ -447,52 +447,43 @@ impl LevelParams {
         }
     }
 
-    /// Cheap fingerprint pre-splitter level, the C-like `blockSplitterLevel`
-    /// knob. Mirrors the upstream zstd `splitLevels[]` table indexed by strategy in
-    /// `ZSTD_optimalBlockSize` (`{0,0,1,2,2,3,3,4,4,4}` over fast..btultra2):
-    /// fast=0, dfast=1, greedy=2, lazy=2, lazy2=3, btlazy2=3,
-    /// btopt/btultra/btultra2=4. We collapse the upstream zstd `lazy2` and `btlazy2`
-    /// strategies into the hash-chain `Lazy` tag, distinguished here by
-    /// `lazy_depth` (the level table runs both at depth 2), so depth 2 routes
-    /// to split level 3 to match the upstream zstd. `split_level == 0` routes to the
-    /// cheap from-borders heuristic; `1..=4` to byChunks with internal
-    /// sampling level `split_level - 1`. The `savings >= 3` gate in
-    /// `optimal_block_size` keeps incompressible data and the first full block
-    /// whole, so homogeneous frames are not over-split.
+    /// Cheap fingerprint pre-splitter level (the C-like `blockSplitterLevel`):
+    /// the EFFECTIVE upstream `ZSTD_splitBlock` level that
+    /// `ZSTD_optimalBlockSize` dispatches, i.e. `splitLevels[strategy] - 2`
+    /// (clamped at 0), NOT the raw `splitLevels[]` value. `split_level == 0`
+    /// routes to the cheap from-borders heuristic; `1..=4` to byChunks with
+    /// internal sampling level `split_level - 1`. See the body for the
+    /// per-strategy tier table and why the raw-table mapping was wrong.
     fn pre_split(&self) -> Option<u8> {
-        match self.strategy_tag {
-            super::strategy::StrategyTag::Fast => Some(0),
-            super::strategy::StrategyTag::Dfast => Some(1),
-            super::strategy::StrategyTag::Greedy => Some(2),
-            // The lazy2 / btlazy2 band (Lazy at lazy_depth >= 2, and Btlazy2)
-            // uses the rate-1 full-scan chunk splitter (4), NOT the rate-5
-            // sampler (3). The rate-5 sampler combined with the larger
-            // hash_log is sensitive enough to register a phantom statistical
-            // transition on perfectly homogeneous but periodic input (e.g. a
-            // repeating log-line stream whose period does not divide the 8 KB
-            // chunk size): the sampled bytes land on a different phase in each
-            // chunk, so two identical-distribution chunks look different and
-            // the block is split at 8 KB, then re-split on every window,
-            // cascading a large stream into hundreds of tiny blocks whose
-            // per-block headers dwarf the payload. The rate-1 scan reads every
-            // byte, so it sees periodic data as uniform and declines to split,
-            // while still finding genuine content boundaries (measured better
-            // ratio on the real decode corpus, and no longer expands a
-            // periodic stream vs a single full block). lazy/greedy keep the
-            // coarse samplers (lower hash_log => not sensitive enough to
-            // alias here).
-            super::strategy::StrategyTag::Lazy => {
+        use super::strategy::StrategyTag;
+        // Effective upstream `ZSTD_splitBlock` level = `splitLevels[strat] - 2`
+        // (clamped at 0). Upstream `splitLevels[] = {0,0,1,2,2,3,3,4,4,4}` then
+        // subtracts 2 before dispatch, so the byChunks sampling tier is two
+        // steps coarser than the raw table: greedy/lazy(d1)=0 (from-borders),
+        // lazy2/btlazy2=1 (byChunks rate 43), btopt+=2 (byChunks rate 11).
+        // An earlier version mirrored the RAW table AND bumped lazy2 to the
+        // rate-1 full scan (split 4) to dodge a periodic-input phantom-split —
+        // that ran the pre-splitter at up to 43x upstream's sampling cost
+        // (~87% of L9 encode time on the decode corpus). Per the drop-in
+        // contract ratio only needs to stay <= upstream, so matching upstream's
+        // sampling tier (and accepting upstream's identical over-split on
+        // periodic input) is the dominant large-input encode-speed win.
+        Some(match self.strategy_tag {
+            // splitLevels 0/1 -> 0: upstream does not pre-split fast/dfast at
+            // all; from-borders is the cheapest stand-in and rarely splits.
+            StrategyTag::Fast | StrategyTag::Dfast => 0,
+            // greedy / lazy(depth 1): splitLevels 2 -> 0 (from-borders).
+            StrategyTag::Greedy => 0,
+            StrategyTag::Lazy => {
                 if self.lazy_depth >= 2 {
-                    Some(4)
+                    1 // lazy2: splitLevels 3 -> 1 (byChunks rate 43)
                 } else {
-                    Some(2)
+                    0 // lazy depth 1: splitLevels 2 -> 0 (from-borders)
                 }
             }
-            super::strategy::StrategyTag::Btlazy2 => Some(4),
-            super::strategy::StrategyTag::BtOpt
-            | super::strategy::StrategyTag::BtUltra
-            | super::strategy::StrategyTag::BtUltra2 => Some(4),
-        }
+            StrategyTag::Btlazy2 => 1, // splitLevels 3 -> 1 (byChunks rate 43)
+            StrategyTag::BtOpt | StrategyTag::BtUltra | StrategyTag::BtUltra2 => 2,
+        })
     }
 }
 
