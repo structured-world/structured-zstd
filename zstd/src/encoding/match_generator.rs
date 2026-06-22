@@ -6751,33 +6751,32 @@ impl HcMatchGenerator {
             if let Some(best) =
                 self.hc
                     .find_best_match::<DICT>(concat, dms_primed, &self.table, abs_pos, lit_len)
-            {
-                if self.hc.pick_lazy_match::<DICT>(
+                && self.hc.pick_lazy_match::<DICT>(
                     concat,
                     dms_primed,
                     &self.table,
                     abs_pos,
                     lit_len,
                     best,
-                ) {
-                    self.table
-                        .insert_match_span(abs_pos, best.start + best.match_len);
-                    let start = best.start - current_abs_start;
-                    let literals = &current[literals_start..start];
-                    handle_sequence(Sequence::Triple {
-                        literals,
-                        offset: best.offset,
-                        match_len: best.match_len,
-                    });
-                    let _ = encode_offset_with_history(
-                        best.offset as u32,
-                        literals.len() as u32,
-                        &mut self.table.offset_hist,
-                    );
-                    pos = start + best.match_len;
-                    literals_start = pos;
-                    continue;
-                }
+                )
+            {
+                self.table
+                    .insert_match_span(abs_pos, best.start + best.match_len);
+                let start = best.start - current_abs_start;
+                let literals = &current[literals_start..start];
+                handle_sequence(Sequence::Triple {
+                    literals,
+                    offset: best.offset,
+                    match_len: best.match_len,
+                });
+                let _ = encode_offset_with_history(
+                    best.offset as u32,
+                    literals.len() as u32,
+                    &mut self.table.offset_hist,
+                );
+                pos = start + best.match_len;
+                literals_start = pos;
+                continue;
             }
             // No match found, or the lazy lookahead deferred to a later
             // position.
