@@ -494,6 +494,12 @@ impl HcMatcher {
             Some(d) => d,
             None => return best,
         };
+        // Match upstream zstd's effective dict search depth: ZSTD's CDict path
+        // adjusts cParams for the dedicated dict search so it runs deeper than
+        // the bare level searchLog (measured: upstream needs nbAttempts >= 16 to
+        // surface the long dict match on the per-label-dict fixtures, vs the 8
+        // from L6's searchLog=3). Floor the dict-walk budget at 16.
+        let max_chain_steps = max_chain_steps.max(16);
         let base_ptr = concat.as_ptr();
         let dms_hash = MatchTable::hash_position_at(concat, current_idx, dms.hash_log, dms.mls);
         let mut dcur = dms.hash_table[dms_hash];
@@ -545,7 +551,11 @@ impl HcMatcher {
                             lit_len,
                         );
                         best = Self::better_candidate(best, Some(candidate));
-                        if best.is_some_and(|b| b.match_len >= self.target_len) {
+                        // Match upstream zstd `ZSTD_HcFindBestMatch`: the find
+                        // breaks only when the match reaches the input end
+                        // (`ip+ml == iLimit`), NOT on a `target_len` threshold —
+                        // `target_len` gates the lazy lookahead, not the find.
+                        if best.is_some_and(|b| current_idx + b.match_len >= history_tail) {
                             return best;
                         }
                     }
