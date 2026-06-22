@@ -334,12 +334,20 @@ impl HcMatcher {
             .wrapping_sub(1)
             .wrapping_sub(table.index_shift)
             .wrapping_sub(history_abs_start);
+        // Hoist the chain-table base pointer ONCE: through `&MatchTable` the
+        // optimizer reloads the `Vec` (ptr, len) header — and re-checks bounds —
+        // on every `table.chain_table[..]`, a measured ~1.7x of upstream's
+        // per-find load count. `candidate_rel & chain_mask` is always
+        // `< chain_table.len()` (the table is `1 << chain_log` and
+        // `chain_mask == len - 1`), so the raw read is in-bounds.
+        let chain_ptr: *const u32 = table.chain_table.as_ptr();
         while steps < max_chain_steps {
             if cur == HC_EMPTY {
                 break;
             }
             let candidate_rel = cur.wrapping_sub(1) as usize;
-            let next = table.chain_table[candidate_rel & chain_mask];
+            // SAFETY: `candidate_rel & chain_mask < chain_table.len()`.
+            let next = unsafe { *chain_ptr.add(candidate_rel & chain_mask) };
             steps += 1;
             // Self-loop: two positions share `candidate_rel & chain_mask`.
             let self_loop = next == cur;
@@ -489,14 +497,19 @@ impl HcMatcher {
         let dms_budget = max_chain_steps.max(16);
         let dms_hash = MatchTable::hash_position_at(concat, current_idx, dms.hash_log, dms.mls);
         let mut dcur = dms.hash_table[dms_hash];
+        // Hoist the dms chain-table base pointer (same Vec-header-reload removal
+        // as the live walk above).
+        let dms_chain_ptr: *const u32 = dms.chain_table.as_ptr();
         while steps < dms_budget {
             if dcur == 0 {
                 break;
             }
             // Dict position is a concat index in `[0, region)`; the dict is at
-            // the front so `dict_idx < current_idx` always.
+            // the front so `dict_idx < current_idx` always (and
+            // `< dms.chain_table.len()`).
             let dict_idx = (dcur - 1) as usize;
-            let dnext = dms.chain_table[dict_idx];
+            // SAFETY: `dict_idx` is a stored dict position `< chain_table.len()`.
+            let dnext = unsafe { *dms_chain_ptr.add(dict_idx) };
             steps += 1;
             let new_offset = current_idx - dict_idx;
             // Out-of-window dict positions are unreachable to the decoder.
