@@ -1096,8 +1096,46 @@ pub fn estimated_bt_strategy_extra_bytes(strategy_ordinal: u32, window_log: u32)
     super::bt::BtMatcher::estimated_workspace_bytes() + hash3
 }
 
-/// Resolve a [`CompressionLevel`] to internal tuning parameters,
-/// optionally adjusted for a known source size.
+/// Resolve a [`CompressionLevel`] (+ optional source-size hint) to the
+/// concrete [`LevelParams`] the matcher runs: strategy tag, search method
+/// (match-finder), window log, and per-backend config.
+///
+/// ## CRITICAL: input size changes the match-finder (and can change strategy)
+///
+/// The resolved geometry is a function of the SOURCE SIZE, not the level
+/// alone. This is the easy-to-miss part (so read this before assuming a level
+/// maps to one fixed match-finder). It mirrors three upstream zstd stages:
+///
+/// 1. [`LEVEL_TABLE`] holds the tier-0 (source > 256 KiB) base row per level
+///    (upstream `ZSTD_defaultCParameters[0]`). L6-L12 carry
+///    `SearchMethod::RowHash` (the Row match-finder), like upstream's
+///    greedy/lazy default.
+/// 2. [`apply_cparams_tier`] overrides the table-shaping widths for the
+///    smaller source tiers (upstream `ZSTD_getCParams_internal` tier table).
+///    NOTE: upstream ALSO switches STRATEGY in some tiers (L2 → dfast, L4 →
+///    greedy on small sources); those backend switches are NOT yet replicated,
+///    so those levels keep their base strategy on small inputs.
+/// 3. [`adjust_params_for_source_size`] caps `window_log` to
+///    ~`ceil_log2(source_size)` (upstream `ZSTD_adjustCParams_internal`).
+///
+/// THEN, in the matcher `reset`, the greedy/lazy band falls back from
+/// `RowHash` to `SearchMethod::HashChain` when the resolved `window_log <= 14`
+/// — exactly upstream's `ZSTD_resolveRowMatchFinderMode` (the Row match-finder
+/// is used for greedy/lazy/lazy2 ONLY when `windowLog > 14`). Net effect for
+/// the SAME level:
+///
+/// * small input (e.g. a 10 KiB fixture → `window_log` 14) → **HashChain**
+///   (`ZSTD_HcFindBestMatch`, scalar chain walk);
+/// * large input (e.g. 1 MiB → `window_log` 20) → **RowHash** (the SIMD-tag
+///   row match-finder).
+///
+/// A dictionary does NOT change the match-finder: it only downsizes the
+/// prepared tables (`cdict_table_logs`, mirroring `ZSTD_createCDict`'s
+/// small-source assumption), while `window_log` stays source-derived. So
+/// `(L6, 10 KiB, +dict)` is HashChain and `(L6, 1 MiB, +dict)` is RowHash,
+/// both matching upstream. When comparing against C on a fixture, resolve the
+/// match-finder from the fixture's size first, or you may optimise/benchmark a
+/// path C does not even take for that input.
 fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> LevelParams {
     if matches!(level, CompressionLevel::Level(22)) {
         return level22_btultra2_params_for_source_size(source_size);
