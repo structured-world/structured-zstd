@@ -1301,18 +1301,36 @@ impl MatchTable {
             // (every bump clamps to it), so `headroom >= 0` — no `saturating_*`.
             let headroom = MAX_PRIMED_WINDOW_SIZE - self.max_window_size;
             self.max_window_size += region.min(headroom);
-            self.history_abs_start = 0;
-            self.position_base = 0;
-            self.index_shift = 0;
-            // Dict is in the dms; the live tables carry only input — memset them,
-            // keep the dms. Cursors reproduce `skip_matching_dict_bt`'s post-prime
-            // state (skip re-inserting the resident dict region).
-            self.hash_table.fill(HC_EMPTY);
-            self.hash3_table.fill(HC_EMPTY);
-            self.chain_table.fill(HC_EMPTY);
-            self.skip_insert_until_abs = region;
-            self.next_to_update3 = region;
-            self.dictionary_limit_abs = Some(region);
+            // The dict bytes stay at the buffer front `[0, region)`; the dms is
+            // concat-keyed (abs-invariant), so its candidates + extension are
+            // independent of the abs base. The live tables carry only input.
+            // Retire the previous frame's input entries one of two ways:
+            if next_floor <= REBASE_RESET_FLOOR_CEILING {
+                // Floor-advance (no memset): keep the climbing abs base + the
+                // position encoding. The dict sits AT the floor — its abs
+                // `[next_floor, next_floor+region)` is `>= window_low`, so it
+                // stays in-window via the bump above; the previous frame's input
+                // entries are `< next_floor` and wrap out of range on read (the
+                // non-dict fast path's reject-by-wrap, reused for the resident
+                // dict). Skip cursors move into the climbed abs space.
+                self.history_abs_start = next_floor;
+                self.skip_insert_until_abs = next_floor + region;
+                self.next_to_update3 = next_floor + region;
+                self.dictionary_limit_abs = Some(next_floor + region);
+            } else {
+                // Bounded fallback: the floor would climb past the 32-bit
+                // headroom ceiling, so rewind to the origin and zero the live
+                // tables (the dict region is re-pinned at abs `[0, region)`).
+                self.history_abs_start = 0;
+                self.position_base = 0;
+                self.index_shift = 0;
+                self.hash_table.fill(HC_EMPTY);
+                self.hash3_table.fill(HC_EMPTY);
+                self.chain_table.fill(HC_EMPTY);
+                self.skip_insert_until_abs = region;
+                self.next_to_update3 = region;
+                self.dictionary_limit_abs = Some(region);
+            }
             self.dict_resident = true;
             return;
         }

@@ -518,11 +518,22 @@ impl HcMatcher {
         // the bare level searchLog (measured: upstream needs nbAttempts >= 16 to
         // surface the long dict match on the per-label-dict fixtures, vs the 8
         // from L6's searchLog=3). Floor the dict-walk budget at 16.
-        let max_chain_steps = max_chain_steps.max(16);
+        let dms_budget = max_chain_steps.max(16);
+        // Dedicated dms step budget, independent of the live-chain walk's
+        // consumption. Upstream's per-frame index reset keeps the live chain
+        // short so the shared budget still reached the dms; a no-memset
+        // floor-advance lets the live chain accumulate across frames, and the
+        // shared counter would then be exhausted on stale live entries before
+        // the dms loop runs (0 dict attempts -> dict matches silently dropped,
+        // the gradual cross-frame decay). Resetting the counter gives the dict
+        // search its full >= 16 attempts in both the memset and floor-advance
+        // resets; the live chain is short enough in the memset case that the
+        // effective dms attempt count is unchanged.
+        steps = 0;
         let base_ptr = concat.as_ptr();
         let dms_hash = MatchTable::hash_position_at(concat, current_idx, dms.hash_log, dms.mls);
         let mut dcur = dms.hash_table[dms_hash];
-        while steps < max_chain_steps {
+        while steps < dms_budget {
             if dcur == 0 {
                 break;
             }
