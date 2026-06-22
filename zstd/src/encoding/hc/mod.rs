@@ -540,6 +540,12 @@ impl HcMatcher {
     /// [`Self::repcode_candidate`] to its first rep: one window check, one
     /// 4-byte gate, one count — a third of the per-position rep cost the 3-rep
     /// probe paid (and which the lazy lookahead paid again at pos+1 / pos+2).
+    ///
+    /// `#[inline]`: upstream checks the rep INLINE in the lazy loop; keeping
+    /// this tiny single-rep probe out-of-line cost a call frame (prologue /
+    /// epilogue + arg setup) per find (~12% of the lazy scan as a separate
+    /// symbol). Inlining folds it into `find_best_match` like upstream.
+    #[inline]
     pub(crate) fn repcode_candidate_offset1(
         concat: &[u8],
         table: &MatchTable,

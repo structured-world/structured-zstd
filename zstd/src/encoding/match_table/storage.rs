@@ -1027,6 +1027,7 @@ impl MatchTable {
     /// The live (post-`history_start`) slice of the contiguous history
     /// mirror. Match finders operate on this slice rather than the raw
     /// `history` Vec.
+    #[inline]
     pub(crate) fn live_history(&self) -> &[u8] {
         // Borrowed one-shot: expose `[0, block_end)` of the caller's input so
         // candidate/cursor reads land in place (the owned `history` mirror is
