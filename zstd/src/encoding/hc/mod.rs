@@ -653,6 +653,14 @@ impl HcMatcher {
     /// `DICT = true` instance dual-probes the separate dictMatchState. The
     /// dispatcher in `start_matching_lazy` picks the instance from whether a dms
     /// is primed.
+    ///
+    /// `#[inline(never)]`: kept out-of-line (upstream's `ZSTD_HcFindBestMatch`
+    /// is its own function, with the lazy loop thin) so the find's register
+    /// pressure is contained in its own frame instead of competing with the
+    /// per-position loop state; the 16-byte `HcMatch` return travels in
+    /// `rax:rdx`, so the find->loop boundary stays a register pair, not a stack
+    /// spill.
+    #[inline(never)]
     pub(crate) fn find_best_match<const DICT: bool>(
         &self,
         concat: &[u8],
