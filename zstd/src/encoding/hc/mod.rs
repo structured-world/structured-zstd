@@ -500,10 +500,10 @@ impl HcMatcher {
 
     /// Out-of-line dms HC4 walk (upstream `ZSTD_HcFindBestMatch` dms loop,
     /// `zstd_lazy.c:748-770`). Split from [`Self::hash_chain_candidate`] so the
-    /// no-dict hot path keeps its small body / register budget. Runs its own
-    /// step budget (the caller's live-walk `_steps` is intentionally not
-    /// continued, so the dict search is never starved when a no-memset
-    /// floor-advance reset lets the live chain accumulate). The dict sits at the front of `concat`
+    /// no-dict hot path keeps its small body / register budget. Continues the
+    /// caller's `steps` against the shared `max_chain_steps` (upstream zstd:
+    /// the live + dms loops share one `nbAttempts`); the live walk's stale-tail
+    /// early-exit keeps `steps` small so the dms is not starved. The dict sits at the front of `concat`
     /// (`[0, region)`); a dms candidate is a concat index `< current_idx`, so
     /// the offset / extension logic matches the live walk.
     ///
@@ -523,7 +523,7 @@ impl HcMatcher {
         history_abs_start: usize,
         history_tail: usize,
         max_chain_steps: usize,
-        _steps: usize,
+        mut steps: usize,
         mut best: Option<MatchCandidate>,
     ) -> Option<MatchCandidate> {
         let dms = match table.dms.table() {
@@ -536,18 +536,13 @@ impl HcMatcher {
         // surface the long dict match on the per-label-dict fixtures, vs the 8
         // from L6's searchLog=3). Floor the dict-walk budget at 16.
         let dms_budget = max_chain_steps.max(16);
-        // Dedicated dms step budget, independent of the live-chain walk's
-        // consumption. Upstream's per-frame index reset keeps the live chain
-        // short so the shared budget still reached the dms; a no-memset
-        // floor-advance lets the live chain accumulate across frames, and the
-        // shared counter would then be exhausted on stale live entries before
-        // the dms loop runs (0 dict attempts -> dict matches silently dropped,
-        // the gradual cross-frame decay). Resetting the counter gives the dict
-        // search its full >= 16 attempts in both the memset and floor-advance
-        // resets; the live chain is short enough in the memset case that the
-        // effective dms attempt count is unchanged. The caller's live-walk
-        // count (`_steps`) is intentionally not continued here.
-        let mut steps = 0usize;
+        // SHARED step budget with the live-chain walk (upstream zstd parity:
+        // `ZSTD_HcFindBestMatch` runs the live loop then the dms loop off ONE
+        // `nbAttempts`). The caller's `steps` carries the live walk's count; the
+        // dms continues from there against `dms_budget`. The live walk's
+        // early-exit on the stale-tail wrap keeps `steps` small (it doesn't burn
+        // the budget on accumulated cross-frame entries), so the dms still gets
+        // its attempts without a dedicated counter.
         let base_ptr = concat.as_ptr();
         let dms_hash = MatchTable::hash_position_at(concat, current_idx, dms.hash_log, dms.mls);
         let mut dcur = dms.hash_table[dms_hash];
