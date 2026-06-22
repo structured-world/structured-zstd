@@ -6751,35 +6751,44 @@ impl HcMatchGenerator {
             if let Some(best) =
                 self.hc
                     .find_best_match::<DICT>(concat, dms_primed, &self.table, abs_pos, lit_len)
-                && self.hc.pick_lazy_match::<DICT>(
+            {
+                if self.hc.pick_lazy_match::<DICT>(
                     concat,
                     dms_primed,
                     &self.table,
                     abs_pos,
                     lit_len,
                     best,
-                )
-            {
-                self.table
-                    .insert_match_span(abs_pos, best.start + best.match_len);
-                let start = best.start - current_abs_start;
-                let literals = &current[literals_start..start];
-                handle_sequence(Sequence::Triple {
-                    literals,
-                    offset: best.offset,
-                    match_len: best.match_len,
-                });
-                let _ = encode_offset_with_history(
-                    best.offset as u32,
-                    literals.len() as u32,
-                    &mut self.table.offset_hist,
-                );
-                pos = start + best.match_len;
-                literals_start = pos;
+                ) {
+                    self.table
+                        .insert_match_span(abs_pos, best.start + best.match_len);
+                    let start = best.start - current_abs_start;
+                    let literals = &current[literals_start..start];
+                    handle_sequence(Sequence::Triple {
+                        literals,
+                        offset: best.offset,
+                        match_len: best.match_len,
+                    });
+                    let _ = encode_offset_with_history(
+                        best.offset as u32,
+                        literals.len() as u32,
+                        &mut self.table.offset_hist,
+                    );
+                    pos = start + best.match_len;
+                    literals_start = pos;
+                    continue;
+                }
+                // Lazy lookahead found a better match at `abs_pos + 1` / `+ 2`
+                // (defer): advance exactly ONE byte (upstream
+                // `ZSTD_compressBlock_lazy_generic`) so the deferred candidate is
+                // re-evaluated at its own position. The no-match skip below
+                // accelerates by `step`, which once the literal run reaches 256+
+                // bytes is `> 1` and would jump past the deferred candidate.
+                self.table.insert_position(abs_pos);
+                pos += 1;
                 continue;
             }
-            // No match found, or the lazy lookahead deferred to a later
-            // position.
+            // No match found.
             self.table.insert_position(abs_pos);
             // Lazy skipping (upstream zstd `ZSTD_compressBlock_lazy_generic`,
             // zstd_lazy.c:1614): advance faster over runs with no match.

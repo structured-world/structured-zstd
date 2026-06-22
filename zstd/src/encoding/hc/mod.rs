@@ -358,8 +358,15 @@ impl HcMatcher {
             // monotonic, so the rest of the tail is older and also stale -- stop.
             // This is the early-exit the no-memset floor-advance reset needs; in
             // the memset reset the chain has no wrapped entries, so it never
-            // fires. Below-floor (`< floor_idx`) entries are NOT a break: a
-            // chain-slot collision can put an in-window entry after one.
+            // fires. INVARIANT: the memset reset zeroes every slot to `HC_EMPTY`
+            // (caught by the `cur == HC_EMPTY` break above) and uses `idx_bias`
+            // that maps stored positions back to indices `< current_idx`, so no
+            // surviving entry can wrap -- only the floor-advance path retains
+            // cross-frame entries that decode past `current_idx`. If a future
+            // change let a memset-reset chain produce a wrap, this break would
+            // silently cut the walk short (a miss-rate regression, not a
+            // correctness bug). Below-floor (`< floor_idx`) entries are NOT a
+            // break: a chain-slot collision can put an in-window entry after one.
             if candidate_idx >= current_idx {
                 break;
             }
@@ -494,6 +501,15 @@ impl HcMatcher {
         // dedicated dict search deeper than the bare level searchLog (measured:
         // upstream needs nbAttempts >= 16 to surface the long dict match on the
         // per-label-dict fixtures). Floor the shared budget at 16.
+        //
+        // NOTE on the per-find step budget: `steps` is SHARED with the live
+        // walk, but `dms_budget` floors at 16 regardless of how many steps the
+        // live walk already spent. So when `max_chain_steps < 16` (every
+        // standard HC level: L6 `searchLog = 3` -> 8), the live walk can spend
+        // its full `max_chain_steps` and the dms walk can still run up to 16
+        // more -- total per-find steps are bounded by `max_chain_steps + 16`,
+        // not `max_chain_steps`. Intentional: the floor (not `max_chain_steps`)
+        // is the binding dict-search constraint at those levels.
         let dms_budget = max_chain_steps.max(16);
         let dms_hash = MatchTable::hash_position_at(concat, current_idx, dms.hash_log, dms.mls);
         let mut dcur = dms.hash_table[dms_hash];
