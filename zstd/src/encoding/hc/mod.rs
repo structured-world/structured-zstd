@@ -371,7 +371,23 @@ impl HcMatcher {
             // Only process candidates in the live window, in relative space:
             // `floor_idx <= candidate_idx < current_idx`.
             let candidate_idx = (cur as usize).wrapping_add(idx_bias);
-            if candidate_idx >= floor_idx && candidate_idx < current_idx {
+            // A wrapped index (`>= current_idx`) means `abs < history_abs_start`:
+            // a stale entry from a previous frame. The chain is head-insert
+            // monotonic, so once the walk reaches the wrapped (stale) tail every
+            // deeper link is older and also stale — stop. This is the early-exit
+            // the no-memset floor-advance reset needs: without it the chain
+            // accumulates across frames and the walk runs the full
+            // `max_chain_steps` over the stale tail instead of exiting at the
+            // frame boundary (the memset reset used to keep the chain short, so
+            // the walk hit `HC_EMPTY` early). In the memset reset the chain has
+            // no wrapped entries, so this never fires — byte-identical. Stale
+            // BELOW-floor (`< floor_idx`) entries are NOT a break: a chain-slot
+            // collision can put an in-window entry after one, so keep skipping
+            // those (the `>= floor_idx` gate below).
+            if candidate_idx >= current_idx {
+                break;
+            }
+            if candidate_idx >= floor_idx {
                 // `candidate_idx < current_idx` (checked above), so the
                 // subtraction never underflows. `new_offset == abs_pos -
                 // candidate_abs`.
@@ -484,9 +500,10 @@ impl HcMatcher {
 
     /// Out-of-line dms HC4 walk (upstream `ZSTD_HcFindBestMatch` dms loop,
     /// `zstd_lazy.c:748-770`). Split from [`Self::hash_chain_candidate`] so the
-    /// no-dict hot path keeps its small body / register budget. Continues the
-    /// caller's `steps` against the shared `max_chain_steps` so the live + dms
-    /// search is one bounded operation. The dict sits at the front of `concat`
+    /// no-dict hot path keeps its small body / register budget. Runs its own
+    /// step budget (the caller's live-walk `_steps` is intentionally not
+    /// continued, so the dict search is never starved when a no-memset
+    /// floor-advance reset lets the live chain accumulate). The dict sits at the front of `concat`
     /// (`[0, region)`); a dms candidate is a concat index `< current_idx`, so
     /// the offset / extension logic matches the live walk.
     ///
@@ -506,7 +523,7 @@ impl HcMatcher {
         history_abs_start: usize,
         history_tail: usize,
         max_chain_steps: usize,
-        mut steps: usize,
+        _steps: usize,
         mut best: Option<MatchCandidate>,
     ) -> Option<MatchCandidate> {
         let dms = match table.dms.table() {
@@ -528,8 +545,9 @@ impl HcMatcher {
         // the gradual cross-frame decay). Resetting the counter gives the dict
         // search its full >= 16 attempts in both the memset and floor-advance
         // resets; the live chain is short enough in the memset case that the
-        // effective dms attempt count is unchanged.
-        steps = 0;
+        // effective dms attempt count is unchanged. The caller's live-walk
+        // count (`_steps`) is intentionally not continued here.
+        let mut steps = 0usize;
         let base_ptr = concat.as_ptr();
         let dms_hash = MatchTable::hash_position_at(concat, current_idx, dms.hash_log, dms.mls);
         let mut dcur = dms.hash_table[dms_hash];
