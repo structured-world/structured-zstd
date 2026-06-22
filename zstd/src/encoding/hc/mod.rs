@@ -281,6 +281,12 @@ impl HcMatcher {
     /// run ONCE at the end. No per-candidate `Option` / gain merge / backward
     /// extension — that per-attempt overhead is what the old gain-based walk
     /// paid over C.
+    ///
+    /// `#[inline(always)]`: folded INTO the out-of-line `find_best_match` so the
+    /// whole find (rep + chain + dms + selection) is ONE function — upstream's
+    /// `ZSTD_HcFindBestMatch` shape — reached by a single call per position, not
+    /// the find->chain->dms call chain that an out-of-line chain walk adds.
+    #[inline(always)]
     pub(crate) fn hash_chain_candidate<const DICT: bool>(
         &self,
         concat: &[u8],
@@ -597,11 +603,10 @@ impl HcMatcher {
     /// 4-byte gate, one count — a third of the per-position rep cost the 3-rep
     /// probe paid (and which the lazy lookahead paid again at pos+1 / pos+2).
     ///
-    /// `#[inline]`: upstream checks the rep INLINE in the lazy loop; keeping
-    /// this tiny single-rep probe out-of-line cost a call frame (prologue /
-    /// epilogue + arg setup) per find (~12% of the lazy scan as a separate
-    /// symbol). Inlining folds it into `find_best_match` like upstream.
-    #[inline]
+    /// `#[inline(always)]`: upstream checks the rep INLINE in the lazy loop;
+    /// folded into the (out-of-line) `find_best_match` monolith so the rep is
+    /// part of the single per-position find call, not a nested out-of-line probe.
+    #[inline(always)]
     pub(crate) fn repcode_candidate_offset1(
         concat: &[u8],
         table: &MatchTable,
