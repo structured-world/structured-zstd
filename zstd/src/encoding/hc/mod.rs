@@ -199,6 +199,9 @@ impl HcMatcher {
         if current_idx + HC_MIN_MATCH_LEN > concat.len() {
             return None;
         }
+        // Raw base pointer for the upstream zstd-style `MEM_read32` 4-byte rep
+        // gate below (single unaligned load each, no per-rep slice bounds check).
+        let base_ptr = concat.as_ptr();
 
         let mut best = None;
         for rep in reps.into_iter().flatten() {
@@ -214,6 +217,22 @@ impl HcMatcher {
                 continue;
             }
             let candidate_idx = candidate_pos - table.history_abs_start;
+            // Cheap 4-byte equality gate before the wider SIMD count (upstream
+            // zstd `MEM_read32` repcode gate in `ZSTD_compressBlock_lazy`).
+            // `HC_MIN_MATCH_LEN == 4` and `current_idx + 4 <= len` (the early
+            // return above), so a first-4-byte mismatch can never reach the
+            // match floor — reject without the vector load+count. Falls through
+            // to the full count only when the candidate lacks a 4-byte lookahead
+            // (short tail), so the accepted set is byte-identical to the
+            // unconditional count. Mirrors the chain-walk gate.
+            if candidate_idx + 4 <= concat.len()
+                && unsafe {
+                    MatchTable::read_le_u32_ptr(base_ptr.add(candidate_idx))
+                        != MatchTable::read_le_u32_ptr(base_ptr.add(current_idx))
+                }
+            {
+                continue;
+            }
             let match_len = common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
             if match_len >= HC_MIN_MATCH_LEN {
                 let candidate =
