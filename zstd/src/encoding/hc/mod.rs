@@ -536,14 +536,16 @@ impl HcMatcher {
         // per-label-dict fixtures). Floor the shared budget at 16.
         //
         // NOTE on the per-find step budget: `steps` is SHARED with the live
-        // walk, but `dms_budget` floors at 16 regardless of how many steps the
-        // live walk already spent. So when `max_chain_steps < 16` (every
-        // standard HC level: L6 `searchLog = 3` -> 8), the live walk can spend
-        // its full `max_chain_steps` and the dms walk can still run up to 16
-        // more -- total per-find steps are bounded by `max_chain_steps + 16`,
-        // not `max_chain_steps`. Intentional: the floor (not `max_chain_steps`)
-        // is the binding dict-search constraint at those levels.
-        let dms_budget = max_chain_steps.max(steps + 16);
+        // walk. The floor below is `max(max_chain_steps, 16)`, so the live and
+        // dms walks TOGETHER are bounded by it (= 16 at every standard HC level,
+        // where `max_chain_steps < 16`: L6 `searchLog = 3` -> 8); the dms
+        // consumes whatever the live walk left. Giving the dms a fresh 16
+        // attempts on top of the live walk instead (a per-walk, non-shared
+        // budget) was measured +3% cycles on the small-10k-random dict path
+        // with zero ratio change -- the shared floor already surfaces every
+        // dict match that reaches the output, so sharing it is intentional: the
+        // floor (not `max_chain_steps`) is the binding dict-search constraint.
+        let dms_budget = max_chain_steps.max(16);
         let dms_hash = MatchTable::hash_position_at(concat, current_idx, dms.hash_log, dms.mls);
         let mut dcur = dms.hash_table[dms_hash];
         // Hoist the dms chain-table base pointer (same Vec-header-reload removal
