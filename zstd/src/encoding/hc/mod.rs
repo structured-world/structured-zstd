@@ -614,7 +614,7 @@ impl HcMatcher {
     ) -> Option<MatchCandidate> {
         let best = best?;
         if best.match_len >= self.target_len
-            || abs_pos + 1 + HC_MIN_MATCH_LEN > table.history_abs_end()
+            || abs_pos + 1 + HC_MIN_MATCH_LEN > table.history_abs_start + concat.len()
         {
             return Some(best);
         }
@@ -630,7 +630,9 @@ impl HcMatcher {
             }
         }
 
-        if self.lazy_depth >= 2 && abs_pos + 2 + HC_MIN_MATCH_LEN <= table.history_abs_end() {
+        if self.lazy_depth >= 2
+            && abs_pos + 2 + HC_MIN_MATCH_LEN <= table.history_abs_start + concat.len()
+        {
             let next2 =
                 self.find_best_match::<DICT>(concat, dms_primed, table, abs_pos + 2, lit_len + 2);
             if let Some(next2) = next2 {
