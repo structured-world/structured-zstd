@@ -24,6 +24,39 @@ use super::opt::types::MatchCandidate;
 /// Upstream zstd parity: `MIN_MATCH` in `lib/compress/zstd_lazy.c`.
 pub(crate) const HC_MIN_MATCH_LEN: usize = 4;
 
+/// Forward-only match found by the lazy chain walk: the `(offset, length)` pair
+/// upstream's `ZSTD_HcFindBestMatch` returns (`size_t matchLength` in `rax` +
+/// the offset through `offsetPtr`). 16 bytes, so the find result + the lazy
+/// lookahead arg travel in registers (`rax:rdx`) instead of the 24-byte
+/// `MatchCandidate` (`start` included) the old find returned by value, which
+/// the System V ABI spills to the stack and the lazy loop then copies. The
+/// backward extension that produces `start` is deferred to the commit site
+/// (upstream does it once in the lazy loop after rep-vs-chain selection), so it
+/// never touches the per-position find/compare path.
+#[derive(Clone, Copy)]
+pub(crate) struct HcMatch {
+    /// Match offset (`abs_pos - candidate_pos`). Meaningful only when
+    /// [`HcMatch::is_match`] is true.
+    pub(crate) offset: usize,
+    /// Forward match length, or `< HC_MIN_MATCH_LEN` for "no match".
+    pub(crate) match_len: usize,
+}
+
+impl HcMatch {
+    /// The "no match found" sentinel (`match_len = 0`).
+    pub(crate) const NONE: Self = Self {
+        offset: 0,
+        match_len: 0,
+    };
+
+    /// A real match reaches at least `HC_MIN_MATCH_LEN`; shorter is the seed /
+    /// sentinel, not an emittable match.
+    #[inline]
+    pub(crate) fn is_match(self) -> bool {
+        self.match_len >= HC_MIN_MATCH_LEN
+    }
+}
+
 /// Hard cap on chain-walk depth. Used to size the fixed-length
 /// candidate buffer returned by [`HcMatcher::chain_candidates`].
 pub(crate) const MAX_HC_SEARCH_DEPTH: usize = 512;
@@ -79,21 +112,18 @@ impl HcMatcher {
 
     /// Pick the better of two candidate matches by [`match_gain`].
     /// `None` arms pass the surviving `Some` through.
-    pub(crate) fn better_candidate(
-        lhs: Option<MatchCandidate>,
-        rhs: Option<MatchCandidate>,
-    ) -> Option<MatchCandidate> {
-        match (lhs, rhs) {
-            (None, other) | (other, None) => other,
-            (Some(lhs), Some(rhs)) => {
-                let lhs_gain = Self::match_gain(lhs.match_len, lhs.offset);
-                let rhs_gain = Self::match_gain(rhs.match_len, rhs.offset);
-                if rhs_gain > lhs_gain {
-                    Some(rhs)
-                } else {
-                    Some(lhs)
-                }
-            }
+    pub(crate) fn better_candidate(lhs: HcMatch, rhs: HcMatch) -> HcMatch {
+        if !lhs.is_match() {
+            return rhs;
+        }
+        if !rhs.is_match() {
+            return lhs;
+        }
+        if Self::match_gain(rhs.match_len, rhs.offset) > Self::match_gain(lhs.match_len, lhs.offset)
+        {
+            rhs
+        } else {
+            lhs
         }
     }
 
@@ -175,11 +205,7 @@ impl HcMatcher {
     /// Probe the 3 rep-code offsets (with the upstream zstd `ll0 ↦ rep[0] − 1`
     /// fallback) and return the best in-range match. Pure helper —
     /// only reads from `MatchTable`, no HcMatcher state needed.
-    pub(crate) fn repcode_candidate(
-        table: &MatchTable,
-        abs_pos: usize,
-        lit_len: usize,
-    ) -> Option<MatchCandidate> {
+    pub(crate) fn repcode_candidate(table: &MatchTable, abs_pos: usize, lit_len: usize) -> HcMatch {
         let reps = if lit_len == 0 {
             [
                 Some(table.offset_hist[1] as usize),
@@ -197,13 +223,13 @@ impl HcMatcher {
         let concat = table.live_history();
         let current_idx = abs_pos - table.history_abs_start;
         if current_idx + HC_MIN_MATCH_LEN > concat.len() {
-            return None;
+            return HcMatch::NONE;
         }
         // Raw base pointer for the upstream zstd-style `MEM_read32` 4-byte rep
         // gate below (single unaligned load each, no per-rep slice bounds check).
         let base_ptr = concat.as_ptr();
 
-        let mut best = None;
+        let mut best = HcMatch::NONE;
         for rep in reps.into_iter().flatten() {
             if rep == 0 || rep > abs_pos {
                 continue;
@@ -235,9 +261,13 @@ impl HcMatcher {
             }
             let match_len = common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
             if match_len >= HC_MIN_MATCH_LEN {
-                let candidate =
-                    Self::extend_backwards(table, candidate_pos, abs_pos, match_len, lit_len);
-                best = Self::better_candidate(best, Some(candidate));
+                best = Self::better_candidate(
+                    best,
+                    HcMatch {
+                        offset: rep,
+                        match_len,
+                    },
+                );
             }
         }
         best
@@ -257,12 +287,11 @@ impl HcMatcher {
         dms_primed: bool,
         table: &MatchTable,
         abs_pos: usize,
-        lit_len: usize,
-    ) -> Option<MatchCandidate> {
+    ) -> HcMatch {
         let current_idx = abs_pos - table.history_abs_start;
         let history_tail = concat.len();
         if current_idx + HC_MIN_MATCH_LEN > history_tail {
-            return None;
+            return HcMatch::NONE;
         }
 
         // Chain walk is inlined below — avoids the per-call 4 KiB
@@ -449,19 +478,16 @@ impl HcMatcher {
         // No-dict monomorph: keep the original `found` flag (see seed comment).
         let matched = if DICT { ml >= HC_MIN_MATCH_LEN } else { found };
         if !matched {
-            return None;
+            return HcMatch::NONE;
         }
-        // Single backward extension on the winner (upstream does this once in
-        // the lazy loop after rep-vs-chain selection; folded into the find here
-        // so `find_best_match` / the lazy loop keep the `MatchCandidate`
-        // contract). The extension preserves the forward offset.
-        Some(Self::extend_backwards(
-            table,
-            best_idx + history_abs_start,
-            abs_pos,
-            ml,
-            lit_len,
-        ))
+        // Forward `(offset, length)` only — the backward extension that produces
+        // `start` runs once at the commit site (upstream's lazy loop), off the
+        // per-position find/compare path. `offset = abs_pos - (best_idx +
+        // history_abs_start) = current_idx - best_idx`.
+        HcMatch {
+            offset: current_idx - best_idx,
+            match_len: ml,
+        }
     }
 
     /// Out-of-line dms HC4 walk (upstream `ZSTD_HcFindBestMatch` dms loop,
@@ -580,15 +606,14 @@ impl HcMatcher {
         concat: &[u8],
         table: &MatchTable,
         abs_pos: usize,
-        lit_len: usize,
-    ) -> Option<MatchCandidate> {
+    ) -> HcMatch {
         let rep = table.offset_hist[0] as usize;
         if rep == 0 || rep > abs_pos {
-            return None;
+            return HcMatch::NONE;
         }
         let current_idx = abs_pos - table.history_abs_start;
         if current_idx + HC_MIN_MATCH_LEN > concat.len() {
-            return None;
+            return HcMatch::NONE;
         }
         let candidate_pos = abs_pos - rep;
         if candidate_pos
@@ -596,7 +621,7 @@ impl HcMatcher {
                 .history_abs_start
                 .max(abs_pos.saturating_sub(table.max_window_size))
         {
-            return None;
+            return HcMatch::NONE;
         }
         let candidate_idx = candidate_pos - table.history_abs_start;
         // Cheap 4-byte equality gate before the SIMD count (upstream `MEM_read32`
@@ -608,11 +633,17 @@ impl HcMatcher {
                     != MatchTable::read_le_u32_ptr(base_ptr.add(current_idx))
             }
         {
-            return None;
+            return HcMatch::NONE;
         }
         let match_len = common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
-        (match_len >= HC_MIN_MATCH_LEN)
-            .then(|| Self::extend_backwards(table, candidate_pos, abs_pos, match_len, lit_len))
+        if match_len >= HC_MIN_MATCH_LEN {
+            HcMatch {
+                offset: rep,
+                match_len,
+            }
+        } else {
+            HcMatch::NONE
+        }
     }
 
     /// Combine the rep-code and chain-walk candidates and pick the
@@ -629,7 +660,7 @@ impl HcMatcher {
         table: &MatchTable,
         abs_pos: usize,
         lit_len: usize,
-    ) -> Option<MatchCandidate> {
+    ) -> HcMatch {
         // `concat` is the full live history (dict + committed blocks + current
         // block), hoisted ONCE per block by the caller — `live_history()` is
         // loop-invariant for the position scan, so fetching it per find (in
@@ -645,9 +676,9 @@ impl HcMatcher {
         let rep = if lit_len == 0 {
             Self::repcode_candidate(table, abs_pos, lit_len)
         } else {
-            Self::repcode_candidate_offset1(concat, table, abs_pos, lit_len)
+            Self::repcode_candidate_offset1(concat, table, abs_pos)
         };
-        let hash = self.hash_chain_candidate::<DICT>(concat, dms_primed, table, abs_pos, lit_len);
+        let hash = self.hash_chain_candidate::<DICT>(concat, dms_primed, table, abs_pos);
         Self::better_candidate(rep, hash)
     }
 
@@ -674,7 +705,7 @@ impl HcMatcher {
         table: &MatchTable,
         abs_pos: usize,
         lit_len: usize,
-        best: MatchCandidate,
+        best: HcMatch,
     ) -> bool {
         if best.match_len >= self.target_len
             || abs_pos + 1 + HC_MIN_MATCH_LEN > table.history_abs_start + concat.len()
@@ -686,11 +717,8 @@ impl HcMatcher {
 
         let next =
             self.find_best_match::<DICT>(concat, dms_primed, table, abs_pos + 1, lit_len + 1);
-        if let Some(next) = next {
-            let next_gain = Self::match_gain(next.match_len, next.offset);
-            if next_gain > current_gain {
-                return false;
-            }
+        if next.is_match() && Self::match_gain(next.match_len, next.offset) > current_gain {
+            return false;
         }
 
         if self.lazy_depth >= 2
@@ -698,11 +726,10 @@ impl HcMatcher {
         {
             let next2 =
                 self.find_best_match::<DICT>(concat, dms_primed, table, abs_pos + 2, lit_len + 2);
-            if let Some(next2) = next2 {
-                let next2_gain = Self::match_gain(next2.match_len, next2.offset);
-                if next2_gain > current_gain + 4 {
-                    return false;
-                }
+            if next2.is_match()
+                && Self::match_gain(next2.match_len, next2.offset) > current_gain + 4
+            {
+                return false;
             }
         }
 
@@ -1027,8 +1054,8 @@ mod hc_tests {
     fn repcode_candidate_returns_none_when_suffix_too_short() {
         let mut t = table_with_history(b"abc");
         t.offset_hist = [1, 2, 3];
-        // current_idx + HC_MIN_MATCH_LEN > concat.len() → early None.
-        assert!(HcMatcher::repcode_candidate(&t, 0, 1).is_none());
+        // current_idx + HC_MIN_MATCH_LEN > concat.len() → early no-match.
+        assert!(!HcMatcher::repcode_candidate(&t, 0, 1).is_match());
     }
 
     #[test]
@@ -1040,7 +1067,7 @@ mod hc_tests {
         // No match possible at abs_pos=4 because every rep aims past
         // history start.
         let result = HcMatcher::repcode_candidate(&t, 4, 1);
-        assert!(result.is_none(), "no rep can land in-range");
+        assert!(!result.is_match(), "no rep can land in-range");
     }
 
     #[test]
@@ -1048,8 +1075,8 @@ mod hc_tests {
         let hc = HcMatcher::new(2, 4, 32);
         let t = table_with_history(b"abc");
         assert!(
-            hc.find_best_match::<false>(t.live_history(), false, &t, 0, 1)
-                .is_none()
+            !hc.find_best_match::<false>(t.live_history(), false, &t, 0, 1)
+                .is_match()
         );
     }
 
@@ -1087,29 +1114,13 @@ mod hc_tests {
         let hc = HcMatcher::new(2, 16, 64);
 
         // The forward winner (idx 12, forward 8) has no backward room.
-        let c0 = hc
-            .hash_chain_candidate::<false>(t.live_history(), false, &t, 24, 0)
-            .expect("forward match must be found");
+        let c0 = hc.hash_chain_candidate::<false>(t.live_history(), false, &t, 24);
+        assert!(c0.is_match(), "forward match must be found");
         assert_eq!(c0.match_len, 8, "longest forward match is 8 (idx 12)");
         assert_eq!(
             c0.offset, 12,
             "winner is the forward-8 candidate at offset 12"
         );
-
-        // With lit_len=3 the SHORTER-forward candidate (idx 3) could reach a
-        // total of 9 via backward extension, but forward-length selection keeps
-        // candidate 12 (forward 8) — backward room never promotes a shorter
-        // forward match. Result stays 8, not 9.
-        let c3 = hc
-            .hash_chain_candidate::<false>(t.live_history(), false, &t, 24, 3)
-            .expect("forward match must be found");
-        assert_eq!(
-            c3.match_len, 8,
-            "forward-length selection must keep the forward-8 winner (idx 12); \
-             a value of 9 would mean a shorter-forward candidate was promoted \
-             by its backward room (non-upstream gain-based selection)"
-        );
-        assert_eq!(c3.offset, 12, "winner unchanged by lit_len");
     }
 
     /// Forward-length ties keep the FIRST-visited candidate (upstream
@@ -1153,9 +1164,8 @@ mod hc_tests {
         t.chain_table[18 & chain_mask] = HC_EMPTY;
 
         let hc = HcMatcher::new(2, 16, 64);
-        let cand = hc
-            .hash_chain_candidate::<false>(t.live_history(), false, &t, abs_pos, 0)
-            .expect("walk must still produce a match");
+        let cand = hc.hash_chain_candidate::<false>(t.live_history(), false, &t, abs_pos);
+        assert!(cand.is_match(), "walk must still produce a match");
         assert_eq!(
             cand.match_len, 8,
             "both candidates have an 8-byte forward prefix"
