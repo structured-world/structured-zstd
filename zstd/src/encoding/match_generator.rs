@@ -6735,6 +6735,12 @@ impl HcMatchGenerator {
             let lh = self.table.live_history();
             unsafe { core::slice::from_raw_parts(lh.as_ptr(), lh.len()) }
         };
+        // Dict-match-state primed flag, hoisted ONCE for the scan: it is
+        // block-invariant (the dict is primed before the block) and lives on the
+        // cold `dms` cacheline, so the per-find `dms.is_primed()` load was a
+        // measurable hot-path cost (~8% of `hash_chain_candidate` on the
+        // dict-over-random fixture). The `DICT = false` monomorph ignores it.
+        let dms_primed = self.table.dms.is_primed();
 
         let current_abs_end = current_abs_start + current_len;
         self.table
@@ -6746,13 +6752,17 @@ impl HcMatchGenerator {
             let abs_pos = current_abs_start + pos;
             let lit_len = pos - literals_start;
 
-            let best = self
-                .hc
-                .find_best_match::<DICT>(concat, &self.table, abs_pos, lit_len);
-            if let Some(candidate) =
+            let best =
                 self.hc
-                    .pick_lazy_match::<DICT>(concat, &self.table, abs_pos, lit_len, best)
-            {
+                    .find_best_match::<DICT>(concat, dms_primed, &self.table, abs_pos, lit_len);
+            if let Some(candidate) = self.hc.pick_lazy_match::<DICT>(
+                concat,
+                dms_primed,
+                &self.table,
+                abs_pos,
+                lit_len,
+                best,
+            ) {
                 self.table
                     .insert_match_span(abs_pos, candidate.start + candidate.match_len);
                 let start = candidate.start - current_abs_start;

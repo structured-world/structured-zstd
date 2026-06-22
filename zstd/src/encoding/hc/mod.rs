@@ -254,6 +254,7 @@ impl HcMatcher {
     pub(crate) fn hash_chain_candidate<const DICT: bool>(
         &self,
         concat: &[u8],
+        dms_primed: bool,
         table: &MatchTable,
         abs_pos: usize,
         lit_len: usize,
@@ -389,7 +390,10 @@ impl HcMatcher {
         // single `nbAttempts` across the live + dms loops). Skip it when the
         // live walk already reached iLimit (`ml` maximal, and the dms
         // self-tightening gate would read past `history_tail`).
-        if DICT && table.dms.is_primed() && current_idx + ml < history_tail {
+        // `dms_primed` is hoisted by the caller (block-invariant — the dict is
+        // primed before the block scan), replacing a per-find `dms.is_primed()`
+        // load from the cold `dms` cacheline.
+        if DICT && dms_primed && current_idx + ml < history_tail {
             let walk = self.dms_chain_walk(
                 table,
                 concat,
@@ -564,6 +568,7 @@ impl HcMatcher {
     pub(crate) fn find_best_match<const DICT: bool>(
         &self,
         concat: &[u8],
+        dms_primed: bool,
         table: &MatchTable,
         abs_pos: usize,
         lit_len: usize,
@@ -585,7 +590,7 @@ impl HcMatcher {
         } else {
             Self::repcode_candidate_offset1(concat, table, abs_pos, lit_len)
         };
-        let hash = self.hash_chain_candidate::<DICT>(concat, table, abs_pos, lit_len);
+        let hash = self.hash_chain_candidate::<DICT>(concat, dms_primed, table, abs_pos, lit_len);
         Self::better_candidate(rep, hash)
     }
 
@@ -601,6 +606,7 @@ impl HcMatcher {
     pub(crate) fn pick_lazy_match<const DICT: bool>(
         &self,
         concat: &[u8],
+        dms_primed: bool,
         table: &MatchTable,
         abs_pos: usize,
         lit_len: usize,
@@ -615,7 +621,8 @@ impl HcMatcher {
 
         let current_gain = Self::match_gain(best.match_len, best.offset) + 4;
 
-        let next = self.find_best_match::<DICT>(concat, table, abs_pos + 1, lit_len + 1);
+        let next =
+            self.find_best_match::<DICT>(concat, dms_primed, table, abs_pos + 1, lit_len + 1);
         if let Some(next) = next {
             let next_gain = Self::match_gain(next.match_len, next.offset);
             if next_gain > current_gain {
@@ -624,7 +631,8 @@ impl HcMatcher {
         }
 
         if self.lazy_depth >= 2 && abs_pos + 2 + HC_MIN_MATCH_LEN <= table.history_abs_end() {
-            let next2 = self.find_best_match::<DICT>(concat, table, abs_pos + 2, lit_len + 2);
+            let next2 =
+                self.find_best_match::<DICT>(concat, dms_primed, table, abs_pos + 2, lit_len + 2);
             if let Some(next2) = next2 {
                 let next2_gain = Self::match_gain(next2.match_len, next2.offset);
                 if next2_gain > current_gain + 4 {
@@ -975,7 +983,7 @@ mod hc_tests {
         let hc = HcMatcher::new(2, 4, 32);
         let t = table_with_history(b"abc");
         assert!(
-            hc.find_best_match::<false>(t.live_history(), &t, 0, 1)
+            hc.find_best_match::<false>(t.live_history(), false, &t, 0, 1)
                 .is_none()
         );
     }
@@ -1015,7 +1023,7 @@ mod hc_tests {
 
         // The forward winner (idx 12, forward 8) has no backward room.
         let c0 = hc
-            .hash_chain_candidate::<false>(t.live_history(), &t, 24, 0)
+            .hash_chain_candidate::<false>(t.live_history(), false, &t, 24, 0)
             .expect("forward match must be found");
         assert_eq!(c0.match_len, 8, "longest forward match is 8 (idx 12)");
         assert_eq!(
@@ -1028,7 +1036,7 @@ mod hc_tests {
         // candidate 12 (forward 8) — backward room never promotes a shorter
         // forward match. Result stays 8, not 9.
         let c3 = hc
-            .hash_chain_candidate::<false>(t.live_history(), &t, 24, 3)
+            .hash_chain_candidate::<false>(t.live_history(), false, &t, 24, 3)
             .expect("forward match must be found");
         assert_eq!(
             c3.match_len, 8,
@@ -1081,7 +1089,7 @@ mod hc_tests {
 
         let hc = HcMatcher::new(2, 16, 64);
         let cand = hc
-            .hash_chain_candidate::<false>(t.live_history(), &t, abs_pos, 0)
+            .hash_chain_candidate::<false>(t.live_history(), false, &t, abs_pos, 0)
             .expect("walk must still produce a match");
         assert_eq!(
             cand.match_len, 8,
