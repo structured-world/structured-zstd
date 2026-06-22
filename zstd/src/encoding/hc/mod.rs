@@ -486,8 +486,7 @@ impl HcMatcher {
                         == MatchTable::read_le_u32_ptr(base_ptr.add(current_idx + gate_off))
                 };
                 if gate_ok {
-                    let current_ml =
-                        common_prefix_len(&concat[dict_idx..], &concat[current_idx..]);
+                    let current_ml = common_prefix_len(&concat[dict_idx..], &concat[current_idx..]);
                     if current_ml > ml {
                         ml = current_ml;
                         best_idx = dict_idx;
@@ -508,6 +507,53 @@ impl HcMatcher {
         (ml, best_idx, found)
     }
 
+    /// Single-rep (offset_1) probe — the lazy parser's inline rep check
+    /// (upstream `ZSTD_compressBlock_lazy_generic`: only `rep[0]` is tested per
+    /// position, the 3-rep rotation is the optimal parser's). Caller guarantees
+    /// `lit_len > 0`, so `rep[0]` is repcode index 0 with no ll0 rotation, and
+    /// extending it backwards over the literal run is sound. Strips
+    /// [`Self::repcode_candidate`] to its first rep: one window check, one
+    /// 4-byte gate, one count — a third of the per-position rep cost the 3-rep
+    /// probe paid (and which the lazy lookahead paid again at pos+1 / pos+2).
+    pub(crate) fn repcode_candidate_offset1(
+        table: &MatchTable,
+        abs_pos: usize,
+        lit_len: usize,
+    ) -> Option<MatchCandidate> {
+        let rep = table.offset_hist[0] as usize;
+        if rep == 0 || rep > abs_pos {
+            return None;
+        }
+        let concat = table.live_history();
+        let current_idx = abs_pos - table.history_abs_start;
+        if current_idx + HC_MIN_MATCH_LEN > concat.len() {
+            return None;
+        }
+        let candidate_pos = abs_pos - rep;
+        if candidate_pos
+            < table
+                .history_abs_start
+                .max(abs_pos.saturating_sub(table.max_window_size))
+        {
+            return None;
+        }
+        let candidate_idx = candidate_pos - table.history_abs_start;
+        // Cheap 4-byte equality gate before the SIMD count (upstream `MEM_read32`
+        // repcode gate); identical to the per-rep gate in `repcode_candidate`.
+        let base_ptr = concat.as_ptr();
+        if candidate_idx + 4 <= concat.len()
+            && unsafe {
+                MatchTable::read_le_u32_ptr(base_ptr.add(candidate_idx))
+                    != MatchTable::read_le_u32_ptr(base_ptr.add(current_idx))
+            }
+        {
+            return None;
+        }
+        let match_len = common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
+        (match_len >= HC_MIN_MATCH_LEN)
+            .then(|| Self::extend_backwards(table, candidate_pos, abs_pos, match_len, lit_len))
+    }
+
     /// Combine the rep-code and chain-walk candidates and pick the
     /// better of the two. Monomorphised over `DICT` (upstream's compile-time
     /// `dictMode` template param): the `DICT = false` instance compiles WITHOUT
@@ -521,7 +567,17 @@ impl HcMatcher {
         abs_pos: usize,
         lit_len: usize,
     ) -> Option<MatchCandidate> {
-        let rep = Self::repcode_candidate(table, abs_pos, lit_len);
+        // Upstream `ZSTD_compressBlock_lazy_generic` checks only offset_1
+        // (`rep[0]`) inline per position; the 3-rep rotation lives in the
+        // optimal parser, not the lazy loop. For `lit_len > 0` that is exactly
+        // `rep[0]` (repcode index 0, no ll0 rotation), so probe the single rep.
+        // The `lit_len == 0` case keeps the full rotated probe for encode
+        // correctness (the ll0 `rep[0]-1` rule).
+        let rep = if lit_len == 0 {
+            Self::repcode_candidate(table, abs_pos, lit_len)
+        } else {
+            Self::repcode_candidate_offset1(table, abs_pos, lit_len)
+        };
         let hash = self.hash_chain_candidate::<DICT>(table, abs_pos, lit_len);
         Self::better_candidate(rep, hash)
     }
