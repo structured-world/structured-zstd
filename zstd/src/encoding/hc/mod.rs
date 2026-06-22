@@ -295,7 +295,20 @@ impl HcMatcher {
         // the FORWARD match length, seeded at `MIN_MATCH - 1` so the first
         // candidate's self-tightening gate (`match + ml - 3`) degenerates to a
         // first-4-byte compare. `best_idx` is the winning candidate's concat
-        // index; `found` flips once `ml` reaches `MIN_MATCH`.
+        // index.
+        //
+        // `found` is tracked ONLY in the `DICT = false` monomorph. `ml >=
+        // MIN_MATCH` is always exactly equivalent to "a match was found" (ml
+        // only updates via `current_ml > ml`, whose first hit is >= MIN_MATCH),
+        // so the `DICT = true` path uses that equivalence and drops the bool —
+        // the dict monomorph is register-tight (it also runs the dms walk), and
+        // eliding `found` there frees a stack slot (measured: -5% cycles on the
+        // dict path). The `DICT = false` monomorph is NOT register-tight, and
+        // there the equivalent `ml < MIN_MATCH` final check changed codegen
+        // layout enough to cost ~+4% (same instruction count, worse IPC), so it
+        // keeps the original bool. `DICT` is const, so each monomorph compiles
+        // exactly one arm with no runtime branch; in the dict monomorph `found`
+        // is written/read only in dead `!DICT` arms and is fully eliminated.
         let mut ml = HC_MIN_MATCH_LEN - 1;
         let mut best_idx = 0usize;
         let mut found = false;
@@ -367,7 +380,11 @@ impl HcMatcher {
                     if current_ml > ml {
                         ml = current_ml;
                         best_idx = candidate_idx;
-                        found = true;
+                        // Dict path reads `ml >= MIN_MATCH`; only the no-dict
+                        // monomorph keeps the `found` flag (see seed comment).
+                        if !DICT {
+                            found = true;
+                        }
                         // Upstream `if (ip + currentMl == iLimit) break`: reached
                         // the input end (best possible); also keeps the next gate
                         // read in bounds.
@@ -394,6 +411,9 @@ impl HcMatcher {
         // primed before the block scan), replacing a per-find `dms.is_primed()`
         // load from the cold `dms` cacheline.
         if DICT && dms_primed && current_idx + ml < history_tail {
+            // dms runs only in the `DICT = true` monomorph, which uses the
+            // `ml >= MIN_MATCH` match test, so the walk tracks `(ml, best_idx)`
+            // and never the `found` flag.
             let walk = self.dms_chain_walk(
                 table,
                 concat,
@@ -404,14 +424,15 @@ impl HcMatcher {
                 steps,
                 ml,
                 best_idx,
-                found,
             );
             ml = walk.0;
             best_idx = walk.1;
-            found = walk.2;
         }
 
-        if !found {
+        // Dict monomorph: `ml >= MIN_MATCH` is the match test (drops `found`).
+        // No-dict monomorph: keep the original `found` flag (see seed comment).
+        let matched = if DICT { ml >= HC_MIN_MATCH_LEN } else { found };
+        if !matched {
             return None;
         }
         // Single backward extension on the winner (upstream does this once in
@@ -430,12 +451,14 @@ impl HcMatcher {
     /// Out-of-line dms HC4 walk (upstream `ZSTD_HcFindBestMatch` dms loop,
     /// `zstd_lazy.c:751-769`). Split from [`Self::hash_chain_candidate`] so the
     /// no-dict hot path keeps its small body / register budget. Shares the
-    /// caller's forward-length state (`ml` / `best_idx` / `found`) and `steps`
+    /// caller's forward-length state (`ml` / `best_idx`) and `steps`
     /// budget -- the live + dms loops are one bounded operation (upstream's
     /// single `nbAttempts`). The dict sits at the front of `concat`
     /// (`[0, region)`); a dms candidate is a concat index `< current_idx`, so
-    /// the offset / gate / count logic matches the live walk. Returns the
-    /// updated `(ml, best_idx, found)`.
+    /// the offset / gate / count logic matches the live walk. Only the
+    /// `DICT = true` monomorph calls this, and it uses the `ml >= MIN_MATCH`
+    /// match test, so the walk returns `(ml, best_idx)` and tracks no `found`
+    /// flag.
     ///
     /// `#[inline]`: the `DICT = false` monomorph never references this (the
     /// `if DICT &&` gate is a compile-time false), so it is dropped from the
@@ -454,11 +477,10 @@ impl HcMatcher {
         mut steps: usize,
         mut ml: usize,
         mut best_idx: usize,
-        mut found: bool,
-    ) -> (usize, usize, bool) {
+    ) -> (usize, usize) {
         let dms = match table.dms.table() {
             Some(d) => d,
-            None => return (ml, best_idx, found),
+            None => return (ml, best_idx),
         };
         // Match upstream's effective dict search depth: the CDict path runs the
         // dedicated dict search deeper than the bare level searchLog (measured:
@@ -494,7 +516,6 @@ impl HcMatcher {
                     if current_ml > ml {
                         ml = current_ml;
                         best_idx = dict_idx;
-                        found = true;
                         if current_idx + ml >= history_tail {
                             break;
                         }
@@ -508,7 +529,7 @@ impl HcMatcher {
             }
             dcur = dnext;
         }
-        (ml, best_idx, found)
+        (ml, best_idx)
     }
 
     /// Single-rep (offset_1) probe — the lazy parser's inline rep check
