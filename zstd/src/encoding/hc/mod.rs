@@ -349,8 +349,6 @@ impl HcMatcher {
             // SAFETY: `candidate_rel & chain_mask < chain_table.len()`.
             let next = unsafe { *chain_ptr.add(candidate_rel & chain_mask) };
             steps += 1;
-            // Self-loop: two positions share `candidate_rel & chain_mask`.
-            let self_loop = next == cur;
 
             let candidate_idx = (cur as usize).wrapping_add(idx_bias);
             // A wrapped index (`>= current_idx`) means `abs < history_abs_start`:
@@ -410,7 +408,10 @@ impl HcMatcher {
                 }
             }
 
-            if self_loop {
+            // Self-loop (two positions share `candidate_rel & chain_mask`):
+            // checked here where `next` / `cur` are already live, not carried as
+            // a bool across the body (a register in this saturated walk).
+            if next == cur {
                 break;
             }
             cur = next;
