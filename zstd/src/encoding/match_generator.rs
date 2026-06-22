@@ -6743,56 +6743,65 @@ impl HcMatchGenerator {
             let abs_pos = current_abs_start + pos;
             let lit_len = pos - literals_start;
 
-            let best =
+            // `best` is unwrapped here (not threaded into `pick_lazy_match` as
+            // an `Option`) so the 24-byte candidate stays in the caller's frame
+            // and is reused on commit — `pick_lazy_match` only returns a
+            // commit/defer `bool`, avoiding a per-position 32-byte
+            // `Option<MatchCandidate>` stack-arg copy across the call boundary.
+            if let Some(best) =
                 self.hc
-                    .find_best_match::<DICT>(concat, dms_primed, &self.table, abs_pos, lit_len);
-            if let Some(candidate) = self.hc.pick_lazy_match::<DICT>(
-                concat,
-                dms_primed,
-                &self.table,
-                abs_pos,
-                lit_len,
-                best,
-            ) {
-                self.table
-                    .insert_match_span(abs_pos, candidate.start + candidate.match_len);
-                let start = candidate.start - current_abs_start;
-                let literals = &current[literals_start..start];
-                handle_sequence(Sequence::Triple {
-                    literals,
-                    offset: candidate.offset,
-                    match_len: candidate.match_len,
-                });
-                let _ = encode_offset_with_history(
-                    candidate.offset as u32,
-                    literals.len() as u32,
-                    &mut self.table.offset_hist,
-                );
-                pos = start + candidate.match_len;
-                literals_start = pos;
-            } else {
-                self.table.insert_position(abs_pos);
-                // Lazy skipping (upstream zstd `ZSTD_compressBlock_lazy_generic`,
-                // zstd_lazy.c:1614): advance faster over runs with no match.
-                // `step = ((ip - anchor) >> kSearchStrength) + 1` with
-                // kSearchStrength = 8, where `ip - anchor` is the current
-                // literal-run length. On compressible input the run stays short
-                // (step == 1, identical to a 1-byte advance); on incompressible
-                // / dict-over-random input the run grows so the parser skips
-                // ahead (one search per `step` positions) instead of searching
-                // every byte. Skipped positions are not inserted, mirroring
-                // upstream (it inserts only searched positions during a no-match
-                // run). Ratio follows upstream (not byte-identical).
-                let step = ((pos - literals_start) >> 8) + 1;
-                pos += step;
-                // No clamp needed before the tail loop: the search bound and the
-                // hashable bound are both `pos + HC_MIN_MATCH_LEN <= current_len`
-                // (HC_MIN_MATCH_LEN == 4 == the insert width), so there is no
-                // non-searchable-but-hashable anchor to miss. Positions the skip
-                // jumps over inside the searchable region are intentionally not
-                // inserted — same as upstream zstd, which advances past them via
-                // the identical `ip += step` and never hashes them either.
+                    .find_best_match::<DICT>(concat, dms_primed, &self.table, abs_pos, lit_len)
+            {
+                if self.hc.pick_lazy_match::<DICT>(
+                    concat,
+                    dms_primed,
+                    &self.table,
+                    abs_pos,
+                    lit_len,
+                    best,
+                ) {
+                    self.table
+                        .insert_match_span(abs_pos, best.start + best.match_len);
+                    let start = best.start - current_abs_start;
+                    let literals = &current[literals_start..start];
+                    handle_sequence(Sequence::Triple {
+                        literals,
+                        offset: best.offset,
+                        match_len: best.match_len,
+                    });
+                    let _ = encode_offset_with_history(
+                        best.offset as u32,
+                        literals.len() as u32,
+                        &mut self.table.offset_hist,
+                    );
+                    pos = start + best.match_len;
+                    literals_start = pos;
+                    continue;
+                }
             }
+            // No match found, or the lazy lookahead deferred to a later
+            // position.
+            self.table.insert_position(abs_pos);
+            // Lazy skipping (upstream zstd `ZSTD_compressBlock_lazy_generic`,
+            // zstd_lazy.c:1614): advance faster over runs with no match.
+            // `step = ((ip - anchor) >> kSearchStrength) + 1` with
+            // kSearchStrength = 8, where `ip - anchor` is the current
+            // literal-run length. On compressible input the run stays short
+            // (step == 1, identical to a 1-byte advance); on incompressible
+            // / dict-over-random input the run grows so the parser skips
+            // ahead (one search per `step` positions) instead of searching
+            // every byte. Skipped positions are not inserted, mirroring
+            // upstream (it inserts only searched positions during a no-match
+            // run). Ratio follows upstream (not byte-identical).
+            let step = ((pos - literals_start) >> 8) + 1;
+            pos += step;
+            // No clamp needed before the tail loop: the search bound and the
+            // hashable bound are both `pos + HC_MIN_MATCH_LEN <= current_len`
+            // (HC_MIN_MATCH_LEN == 4 == the insert width), so there is no
+            // non-searchable-but-hashable anchor to miss. Positions the skip
+            // jumps over inside the searchable region are intentionally not
+            // inserted — same as upstream zstd, which advances past them via
+            // the identical `ip += step` and never hashes them either.
         }
 
         // Insert remaining hashable positions in the tail (the matching loop

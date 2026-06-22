@@ -617,8 +617,15 @@ impl HcMatcher {
 
     /// Upstream zstd `lazy` / `lazy2` lookahead: evaluate the match a byte
     /// (and optionally two) ahead before committing the current one.
-    /// Returns `Some(best)` if the current match wins, `None` if the
-    /// caller should defer.
+    /// Returns `true` if the current match `best` wins (commit it), `false`
+    /// if the caller should defer to a later position.
+    ///
+    /// Takes the already-unwrapped `best` BY VALUE and returns a `bool` rather
+    /// than threading `Option<MatchCandidate>` in and back out: the caller owns
+    /// `best` (from `find_best_match`) and reuses it on commit, so a 24-byte
+    /// candidate (32-byte `Option`) no longer gets marshalled across this call
+    /// boundary every position (it was a measured ~7% of the lazy scan on the
+    /// stack-arg copy).
     ///
     /// Lazy lookahead queries `pos + 1` / `pos + 2` before they are
     /// inserted into the hash tables — matching the C zstd ordering.
@@ -631,13 +638,12 @@ impl HcMatcher {
         table: &MatchTable,
         abs_pos: usize,
         lit_len: usize,
-        best: Option<MatchCandidate>,
-    ) -> Option<MatchCandidate> {
-        let best = best?;
+        best: MatchCandidate,
+    ) -> bool {
         if best.match_len >= self.target_len
             || abs_pos + 1 + HC_MIN_MATCH_LEN > table.history_abs_start + concat.len()
         {
-            return Some(best);
+            return true;
         }
 
         let current_gain = Self::match_gain(best.match_len, best.offset) + 4;
@@ -647,7 +653,7 @@ impl HcMatcher {
         if let Some(next) = next {
             let next_gain = Self::match_gain(next.match_len, next.offset);
             if next_gain > current_gain {
-                return None;
+                return false;
             }
         }
 
@@ -659,12 +665,12 @@ impl HcMatcher {
             if let Some(next2) = next2 {
                 let next2_gain = Self::match_gain(next2.match_len, next2.offset);
                 if next2_gain > current_gain + 4 {
-                    return None;
+                    return false;
                 }
             }
         }
 
-        Some(best)
+        true
     }
 
     /// Cross-platform dispatcher for the rep-code probe used by the
