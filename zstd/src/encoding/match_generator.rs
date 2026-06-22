@@ -6722,6 +6722,20 @@ impl HcMatchGenerator {
         let current_ptr = self.table.get_last_space().as_ptr();
         let current: &[u8] = unsafe { core::slice::from_raw_parts(current_ptr, current_len) };
 
+        // Full live history (dict + committed blocks + current block), hoisted
+        // ONCE for the whole position scan and threaded into every
+        // `find_best_match` / `pick_lazy_match` call. `live_history()` is
+        // loop-invariant here (the scan mutates the hash/chain tables +
+        // `offset_hist` but never the history bytes or length), so re-fetching
+        // it per find — inside `hash_chain_candidate` + the rep probe, plus
+        // again for each lazy lookahead at pos+1 / pos+2 — was pure
+        // per-position overhead. Same raw-slice detach as `current` so the
+        // loop's `&mut self.table` inserts coexist with this `&[u8]`.
+        let concat: &[u8] = {
+            let lh = self.table.live_history();
+            unsafe { core::slice::from_raw_parts(lh.as_ptr(), lh.len()) }
+        };
+
         let current_abs_end = current_abs_start + current_len;
         self.table
             .backfill_boundary_positions(current_abs_start, current_abs_end);
@@ -6734,10 +6748,10 @@ impl HcMatchGenerator {
 
             let best = self
                 .hc
-                .find_best_match::<DICT>(&self.table, abs_pos, lit_len);
+                .find_best_match::<DICT>(concat, &self.table, abs_pos, lit_len);
             if let Some(candidate) =
                 self.hc
-                    .pick_lazy_match::<DICT>(&self.table, abs_pos, lit_len, best)
+                    .pick_lazy_match::<DICT>(concat, &self.table, abs_pos, lit_len, best)
             {
                 self.table
                     .insert_match_span(abs_pos, candidate.start + candidate.match_len);

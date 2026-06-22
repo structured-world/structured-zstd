@@ -253,11 +253,11 @@ impl HcMatcher {
     /// paid over C.
     pub(crate) fn hash_chain_candidate<const DICT: bool>(
         &self,
+        concat: &[u8],
         table: &MatchTable,
         abs_pos: usize,
         lit_len: usize,
     ) -> Option<MatchCandidate> {
-        let concat = table.live_history();
         let current_idx = abs_pos - table.history_abs_start;
         let history_tail = concat.len();
         if current_idx + HC_MIN_MATCH_LEN > history_tail {
@@ -516,6 +516,7 @@ impl HcMatcher {
     /// 4-byte gate, one count — a third of the per-position rep cost the 3-rep
     /// probe paid (and which the lazy lookahead paid again at pos+1 / pos+2).
     pub(crate) fn repcode_candidate_offset1(
+        concat: &[u8],
         table: &MatchTable,
         abs_pos: usize,
         lit_len: usize,
@@ -524,7 +525,6 @@ impl HcMatcher {
         if rep == 0 || rep > abs_pos {
             return None;
         }
-        let concat = table.live_history();
         let current_idx = abs_pos - table.history_abs_start;
         if current_idx + HC_MIN_MATCH_LEN > concat.len() {
             return None;
@@ -563,10 +563,17 @@ impl HcMatcher {
     /// is primed.
     pub(crate) fn find_best_match<const DICT: bool>(
         &self,
+        concat: &[u8],
         table: &MatchTable,
         abs_pos: usize,
         lit_len: usize,
     ) -> Option<MatchCandidate> {
+        // `concat` is the full live history (dict + committed blocks + current
+        // block), hoisted ONCE per block by the caller — `live_history()` is
+        // loop-invariant for the position scan, so fetching it per find (in
+        // `hash_chain_candidate` + the rep probe) was pure per-position
+        // overhead. See `start_matching_lazy`'s block-level hoist.
+        //
         // Upstream `ZSTD_compressBlock_lazy_generic` checks only offset_1
         // (`rep[0]`) inline per position; the 3-rep rotation lives in the
         // optimal parser, not the lazy loop. For `lit_len > 0` that is exactly
@@ -576,9 +583,9 @@ impl HcMatcher {
         let rep = if lit_len == 0 {
             Self::repcode_candidate(table, abs_pos, lit_len)
         } else {
-            Self::repcode_candidate_offset1(table, abs_pos, lit_len)
+            Self::repcode_candidate_offset1(concat, table, abs_pos, lit_len)
         };
-        let hash = self.hash_chain_candidate::<DICT>(table, abs_pos, lit_len);
+        let hash = self.hash_chain_candidate::<DICT>(concat, table, abs_pos, lit_len);
         Self::better_candidate(rep, hash)
     }
 
@@ -593,6 +600,7 @@ impl HcMatcher {
     /// itself, changing semantics.
     pub(crate) fn pick_lazy_match<const DICT: bool>(
         &self,
+        concat: &[u8],
         table: &MatchTable,
         abs_pos: usize,
         lit_len: usize,
@@ -607,7 +615,7 @@ impl HcMatcher {
 
         let current_gain = Self::match_gain(best.match_len, best.offset) + 4;
 
-        let next = self.find_best_match::<DICT>(table, abs_pos + 1, lit_len + 1);
+        let next = self.find_best_match::<DICT>(concat, table, abs_pos + 1, lit_len + 1);
         if let Some(next) = next {
             let next_gain = Self::match_gain(next.match_len, next.offset);
             if next_gain > current_gain {
@@ -616,7 +624,7 @@ impl HcMatcher {
         }
 
         if self.lazy_depth >= 2 && abs_pos + 2 + HC_MIN_MATCH_LEN <= table.history_abs_end() {
-            let next2 = self.find_best_match::<DICT>(table, abs_pos + 2, lit_len + 2);
+            let next2 = self.find_best_match::<DICT>(concat, table, abs_pos + 2, lit_len + 2);
             if let Some(next2) = next2 {
                 let next2_gain = Self::match_gain(next2.match_len, next2.offset);
                 if next2_gain > current_gain + 4 {
@@ -966,7 +974,10 @@ mod hc_tests {
     fn find_best_match_returns_none_for_short_suffix() {
         let hc = HcMatcher::new(2, 4, 32);
         let t = table_with_history(b"abc");
-        assert!(hc.find_best_match::<false>(&t, 0, 1).is_none());
+        assert!(
+            hc.find_best_match::<false>(t.live_history(), &t, 0, 1)
+                .is_none()
+        );
     }
 
     /// Forward-length selection (upstream `ZSTD_HcFindBestMatch`): the chain
@@ -1004,7 +1015,7 @@ mod hc_tests {
 
         // The forward winner (idx 12, forward 8) has no backward room.
         let c0 = hc
-            .hash_chain_candidate::<false>(&t, 24, 0)
+            .hash_chain_candidate::<false>(t.live_history(), &t, 24, 0)
             .expect("forward match must be found");
         assert_eq!(c0.match_len, 8, "longest forward match is 8 (idx 12)");
         assert_eq!(
@@ -1017,7 +1028,7 @@ mod hc_tests {
         // candidate 12 (forward 8) — backward room never promotes a shorter
         // forward match. Result stays 8, not 9.
         let c3 = hc
-            .hash_chain_candidate::<false>(&t, 24, 3)
+            .hash_chain_candidate::<false>(t.live_history(), &t, 24, 3)
             .expect("forward match must be found");
         assert_eq!(
             c3.match_len, 8,
@@ -1070,7 +1081,7 @@ mod hc_tests {
 
         let hc = HcMatcher::new(2, 16, 64);
         let cand = hc
-            .hash_chain_candidate::<false>(&t, abs_pos, 0)
+            .hash_chain_candidate::<false>(t.live_history(), &t, abs_pos, 0)
             .expect("walk must still produce a match");
         assert_eq!(
             cand.match_len, 8,
