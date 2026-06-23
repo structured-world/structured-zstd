@@ -1,4 +1,3 @@
-
 use super::MatchTable;
 
 /// `bt_pair_index_for_abs` switched from `+` to `wrapping_add` so the

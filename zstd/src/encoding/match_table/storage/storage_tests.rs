@@ -1,4 +1,3 @@
-
 //! Stage D coverage for `MatchTable` entry points that the
 //! end-to-end compression path doesn't naturally hit on CI:
 //!  * `set_dictionary_limit_from_primed_bytes(0)` — the "clear"

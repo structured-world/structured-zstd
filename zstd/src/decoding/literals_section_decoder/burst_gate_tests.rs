@@ -1,4 +1,3 @@
-
 //! Regression coverage for the HUF 4-stream burst-gate boundary
 //! states in `decompress_literals`:
 //!

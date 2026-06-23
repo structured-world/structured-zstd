@@ -1,4 +1,3 @@
-
 use super::portable::{copy16, overlap_copy8, wildcopy_no_overlap, wildcopy_overlap_8byte_stride};
 
 #[test]

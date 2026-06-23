@@ -1,4 +1,3 @@
-
 use super::{CompressionLevel, compress_bound, compress_slice_to_vec};
 
 #[test]

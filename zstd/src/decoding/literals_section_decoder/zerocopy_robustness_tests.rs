@@ -1,4 +1,3 @@
-
 //! Regression coverage for `decode_literals_zerocopy` on
 //! truncated / corrupt payloads: every branch must return a
 //! structured error instead of panicking on out-of-bounds

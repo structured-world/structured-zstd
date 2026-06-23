@@ -2147,8 +2147,8 @@ fn resume_rejects_state_with_different_active_dictionary() {
     let st = emit_resume_state_at(&compressed, n); // active_dictionary_id = None
     let output_offset = info.decompressed_byte_range(n as usize).unwrap().start as usize;
 
-    let raw = std::fs::read("./dict_tests/dictionary").expect("dictionary fixture");
-    let dict = crate::decoding::dictionary::Dictionary::decode_dict(&raw).expect("parse dict");
+    let raw = include_bytes!("../../../dict_tests/dictionary");
+    let dict = crate::decoding::dictionary::Dictionary::decode_dict(raw).expect("parse dict");
     let dict_id = dict.id;
 
     let mut header_src = compressed.as_slice();

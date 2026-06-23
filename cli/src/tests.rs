@@ -1,4 +1,3 @@
-
 use super::*;
 
 fn parse(args: &[&str]) -> color_eyre::Result<Options> {

@@ -1,4 +1,3 @@
-
 use super::{row_tag_match_mask_avx2, row_tag_match_mask_scalar, row_tag_match_mask_sse2};
 
 /// Deterministic LCG fill so the test exercises a realistic spread of

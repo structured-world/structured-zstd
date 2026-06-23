@@ -1,4 +1,3 @@
-
 use super::{STREAM_ABS_HEADROOM, check_stream_abs_headroom};
 
 #[test]

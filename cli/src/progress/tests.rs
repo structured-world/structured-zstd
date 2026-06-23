@@ -1,4 +1,3 @@
-
 use std::time::Duration;
 
 use super::{fmt_duration, fmt_size};

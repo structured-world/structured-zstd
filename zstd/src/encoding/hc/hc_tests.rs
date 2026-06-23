@@ -1,4 +1,3 @@
-
 //! Unit coverage for `HcMatcher` paths the encode-level suite
 //! doesn't naturally hit: short-suffix early returns on probe
 //! helpers, chain-walk self-loop branch, and the lazy-pick

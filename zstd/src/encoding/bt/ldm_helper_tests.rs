@@ -1,4 +1,3 @@
-
 //! Unit coverage for the LDM helper cluster that batch 14 lifted
 //! onto `impl BtMatcher`. The helpers walk the raw-LDM seq store
 //! and translate its (literals, match) sequences into the optimal

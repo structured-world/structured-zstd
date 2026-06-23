@@ -1,4 +1,3 @@
-
 use super::{row_tag_match_mask_neon, row_tag_match_mask_scalar};
 
 fn fill(buf: &mut [u8], mut state: u64) {
