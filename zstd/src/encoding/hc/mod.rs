@@ -24,6 +24,39 @@ use super::opt::types::MatchCandidate;
 /// Upstream zstd parity: `MIN_MATCH` in `lib/compress/zstd_lazy.c`.
 pub(crate) const HC_MIN_MATCH_LEN: usize = 4;
 
+/// Forward-only match found by the lazy chain walk: the `(offset, length)` pair
+/// upstream's `ZSTD_HcFindBestMatch` returns (`size_t matchLength` in `rax` +
+/// the offset through `offsetPtr`). 16 bytes, so the find result + the lazy
+/// lookahead arg travel in registers (`rax:rdx`) instead of the 24-byte
+/// `MatchCandidate` (`start` included) the old find returned by value, which
+/// the System V ABI spills to the stack and the lazy loop then copies. The
+/// backward extension that produces `start` is deferred to the commit site
+/// (upstream does it once in the lazy loop after rep-vs-chain selection), so it
+/// never touches the per-position find/compare path.
+#[derive(Clone, Copy)]
+pub(crate) struct HcMatch {
+    /// Match offset (`abs_pos - candidate_pos`). Meaningful only when
+    /// [`HcMatch::is_match`] is true.
+    pub(crate) offset: usize,
+    /// Forward match length, or `< HC_MIN_MATCH_LEN` for "no match".
+    pub(crate) match_len: usize,
+}
+
+impl HcMatch {
+    /// The "no match found" sentinel (`match_len = 0`).
+    pub(crate) const NONE: Self = Self {
+        offset: 0,
+        match_len: 0,
+    };
+
+    /// A real match reaches at least `HC_MIN_MATCH_LEN`; shorter is the seed /
+    /// sentinel, not an emittable match.
+    #[inline]
+    pub(crate) fn is_match(self) -> bool {
+        self.match_len >= HC_MIN_MATCH_LEN
+    }
+}
+
 /// Hard cap on chain-walk depth. Used to size the fixed-length
 /// candidate buffer returned by [`HcMatcher::chain_candidates`].
 pub(crate) const MAX_HC_SEARCH_DEPTH: usize = 512;
@@ -79,21 +112,18 @@ impl HcMatcher {
 
     /// Pick the better of two candidate matches by [`match_gain`].
     /// `None` arms pass the surviving `Some` through.
-    pub(crate) fn better_candidate(
-        lhs: Option<MatchCandidate>,
-        rhs: Option<MatchCandidate>,
-    ) -> Option<MatchCandidate> {
-        match (lhs, rhs) {
-            (None, other) | (other, None) => other,
-            (Some(lhs), Some(rhs)) => {
-                let lhs_gain = Self::match_gain(lhs.match_len, lhs.offset);
-                let rhs_gain = Self::match_gain(rhs.match_len, rhs.offset);
-                if rhs_gain > lhs_gain {
-                    Some(rhs)
-                } else {
-                    Some(lhs)
-                }
-            }
+    pub(crate) fn better_candidate(lhs: HcMatch, rhs: HcMatch) -> HcMatch {
+        if !lhs.is_match() {
+            return rhs;
+        }
+        if !rhs.is_match() {
+            return lhs;
+        }
+        if Self::match_gain(rhs.match_len, rhs.offset) > Self::match_gain(lhs.match_len, lhs.offset)
+        {
+            rhs
+        } else {
+            lhs
         }
     }
 
@@ -175,11 +205,7 @@ impl HcMatcher {
     /// Probe the 3 rep-code offsets (with the upstream zstd `ll0 ↦ rep[0] − 1`
     /// fallback) and return the best in-range match. Pure helper —
     /// only reads from `MatchTable`, no HcMatcher state needed.
-    pub(crate) fn repcode_candidate(
-        table: &MatchTable,
-        abs_pos: usize,
-        lit_len: usize,
-    ) -> Option<MatchCandidate> {
+    pub(crate) fn repcode_candidate(table: &MatchTable, abs_pos: usize, lit_len: usize) -> HcMatch {
         let reps = if lit_len == 0 {
             [
                 Some(table.offset_hist[1] as usize),
@@ -197,10 +223,13 @@ impl HcMatcher {
         let concat = table.live_history();
         let current_idx = abs_pos - table.history_abs_start;
         if current_idx + HC_MIN_MATCH_LEN > concat.len() {
-            return None;
+            return HcMatch::NONE;
         }
+        // Raw base pointer for the upstream zstd-style `MEM_read32` 4-byte rep
+        // gate below (single unaligned load each, no per-rep slice bounds check).
+        let base_ptr = concat.as_ptr();
 
-        let mut best = None;
+        let mut best = HcMatch::NONE;
         for rep in reps.into_iter().flatten() {
             if rep == 0 || rep > abs_pos {
                 continue;
@@ -214,30 +243,61 @@ impl HcMatcher {
                 continue;
             }
             let candidate_idx = candidate_pos - table.history_abs_start;
+            // Cheap 4-byte equality gate before the wider SIMD count (upstream
+            // zstd `MEM_read32` repcode gate in `ZSTD_compressBlock_lazy`).
+            // `HC_MIN_MATCH_LEN == 4` and `current_idx + 4 <= len` (the early
+            // return above), so a first-4-byte mismatch can never reach the
+            // match floor — reject without the vector load+count. Falls through
+            // to the full count only when the candidate lacks a 4-byte lookahead
+            // (short tail), so the accepted set is byte-identical to the
+            // unconditional count. Mirrors the chain-walk gate.
+            if candidate_idx + 4 <= concat.len()
+                && unsafe {
+                    MatchTable::read_le_u32_ptr(base_ptr.add(candidate_idx))
+                        != MatchTable::read_le_u32_ptr(base_ptr.add(current_idx))
+                }
+            {
+                continue;
+            }
             let match_len = common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
             if match_len >= HC_MIN_MATCH_LEN {
-                let candidate =
-                    Self::extend_backwards(table, candidate_pos, abs_pos, match_len, lit_len);
-                best = Self::better_candidate(best, Some(candidate));
+                best = Self::better_candidate(
+                    best,
+                    HcMatch {
+                        offset: rep,
+                        match_len,
+                    },
+                );
             }
         }
         best
     }
 
-    /// Best hash-chain match at `abs_pos`. Walks the chain via
-    /// [`Self::chain_candidates`], extends each survivor backwards
-    /// over the literal run, and short-circuits as soon as a
-    /// candidate crosses `target_len`.
+    /// Best hash-chain match at `abs_pos`, in upstream zstd's
+    /// `ZSTD_HcFindBestMatch` forward-length model: walk the live chain (and
+    /// the dms) tracking the longest FORWARD match (`currentMl > ml`, ties
+    /// keep the closest), gate each candidate on the self-tightening 4-byte
+    /// tail probe, and extend the single winner backwards over the literal
+    /// run ONCE at the end. No per-candidate `Option` / gain merge / backward
+    /// extension — that per-attempt overhead is what the old gain-based walk
+    /// paid over C.
+    ///
+    /// `#[inline(always)]`: folded INTO the out-of-line `find_best_match` so the
+    /// whole find (rep + chain + dms + selection) is ONE function — upstream's
+    /// `ZSTD_HcFindBestMatch` shape — reached by a single call per position, not
+    /// the find->chain->dms call chain that an out-of-line chain walk adds.
+    #[inline(always)]
     pub(crate) fn hash_chain_candidate<const DICT: bool>(
         &self,
+        concat: &[u8],
+        dms_primed: bool,
         table: &MatchTable,
         abs_pos: usize,
-        lit_len: usize,
-    ) -> Option<MatchCandidate> {
-        let concat = table.live_history();
+    ) -> HcMatch {
         let current_idx = abs_pos - table.history_abs_start;
-        if current_idx + HC_MIN_MATCH_LEN > concat.len() {
-            return None;
+        let history_tail = concat.len();
+        if current_idx + HC_MIN_MATCH_LEN > history_tail {
+            return HcMatch::NONE;
         }
 
         // Chain walk is inlined below — avoids the per-call 4 KiB
@@ -266,57 +326,28 @@ impl HcMatcher {
         let mut steps = 0usize;
         let history_abs_start = table.history_abs_start;
 
-        let mut best: Option<MatchCandidate> = None;
-        // Upstream zstd speculative tail check (`zstd_lazy.c:714`,
-        // `ZSTD_HcFindBestMatch`): once `best` is set, gate the
-        // expensive `common_prefix_len` walk on a 4-byte tail compare
-        // proving the new candidate can possibly reach the *forward*
-        // length required to outscore `best` under
-        // [`Self::better_candidate`] (gain = `len*4 - offset_bits`).
+        // Forward-length match state (upstream `ZSTD_HcFindBestMatch`): `ml` is
+        // the FORWARD match length, seeded at `MIN_MATCH - 1` so the first
+        // candidate's self-tightening gate (`match + ml - 3`) degenerates to a
+        // first-4-byte compare. `best_idx` is the winning candidate's concat
+        // index.
         //
-        // Correctness — backward-extension–aware bound:
-        //   `best.match_len` is the *total* length stored by
-        //   [`Self::extend_backwards`]: forward bytes from
-        //   `current_idx` plus up to `lit_len` backward bytes
-        //   (`B_best = abs_pos − best.start`, capped by `lit_len`).
-        //   A new candidate can in principle replace `B_best` of its
-        //   own length with up to `lit_len` backward bytes, so the
-        //   worst-case forward length it needs to outscore `best`
-        //   is `best.match_len − lit_len + 1`. The 4-byte tail probe
-        //   at offset `best.match_len − lit_len − 3` covers exactly
-        //   that boundary (the read includes the byte at the
-        //   required-forward-length position itself). A mismatch
-        //   there is a proof the candidate cannot win regardless of
-        //   how much it later extends backwards.
-        //   When `best.match_len ≤ lit_len + 3` the worst-case
-        //   forward target is so close to `current_idx` that the
-        //   `common_prefix_len` cost is already trivial — the gate
-        //   is skipped via the `checked_sub`.
-        //
-        // Walk-order argument (offset monotonicity — REQUIRED gate
-        // precondition, enforced per-iteration):
-        //   Chain walks are LIFO in their dense form (newest first →
-        //   strictly increasing offset). But the chain table is
-        //   `chain_log`-bits wide; when a position is re-inserted at
-        //   the same masked chain index after the cycle wraps, an
-        //   older chain link can point into a slot that has since
-        //   been OVERWRITTEN with a newer (closer) position. The
-        //   walker then surfaces a candidate with a SMALLER offset
-        //   than ones it has already returned, breaking monotonicity.
-        //
-        //   The gate's bound (`tail_off = best.match_len − lit_len −
-        //   3` covers exactly the "new forward must reach
-        //   best.match_len − lit_len + 1" requirement) is only sound
-        //   when `new.offset_bits ≥ best.offset_bits`. Otherwise a
-        //   smaller-offset candidate can outscore `best` by gain at
-        //   *equal* total length — and the gate would skip it because
-        //   it only proves `match_len > best.match_len`. The
-        //   `new_offset >= best.offset` per-iteration check below
-        //   enforces the monotonicity precondition; on non-monotonic
-        //   walks we fall through to the full `common_prefix_len` so
-        //   the offset-bits advantage is given a chance to win.
-        let history_tail = concat.len();
-        // Raw base pointer for the upstream zstd-style `MEM_read32` 4-byte gates below
+        // `found` is tracked ONLY in the `DICT = false` monomorph. `ml >=
+        // MIN_MATCH` is always exactly equivalent to "a match was found" (ml
+        // only updates via `current_ml > ml`, whose first hit is >= MIN_MATCH),
+        // so the `DICT = true` path uses that equivalence and drops the bool —
+        // the dict monomorph is register-tight (it also runs the dms walk), and
+        // eliding `found` there frees a stack slot (measured: -5% cycles on the
+        // dict path). The `DICT = false` monomorph is NOT register-tight, and
+        // there the equivalent `ml < MIN_MATCH` final check changed codegen
+        // layout enough to cost ~+4% (same instruction count, worse IPC), so it
+        // keeps the original bool. `DICT` is const, so each monomorph compiles
+        // exactly one arm with no runtime branch; in the dict monomorph `found`
+        // is written/read only in dead `!DICT` arms and is fully eliminated.
+        let mut ml = HC_MIN_MATCH_LEN - 1;
+        let mut best_idx = 0usize;
+        let mut found = false;
+        // Raw base pointer for the upstream zstd-style `MEM_read32` gate
         // (single unaligned load each, no per-candidate slice bounds check).
         let base_ptr = concat.as_ptr();
         // Loop-invariant precompute, hoisted out of the chain walk (upstream zstd:
@@ -338,227 +369,288 @@ impl HcMatcher {
             .wrapping_sub(1)
             .wrapping_sub(table.index_shift)
             .wrapping_sub(history_abs_start);
+        // Hoist the chain-table base pointer ONCE: through `&MatchTable` the
+        // optimizer reloads the `Vec` (ptr, len) header — and re-checks bounds —
+        // on every `table.chain_table[..]`, a measured ~1.7x of upstream's
+        // per-find load count. `candidate_rel & chain_mask` is always
+        // `< chain_table.len()` (the table is `1 << chain_log` and
+        // `chain_mask == len - 1`), so the raw read is in-bounds.
+        let chain_ptr: *const u32 = table.chain_table.as_ptr();
         while steps < max_chain_steps {
             if cur == HC_EMPTY {
                 break;
             }
             let candidate_rel = cur.wrapping_sub(1) as usize;
-            let next = table.chain_table[candidate_rel & chain_mask];
+            // SAFETY: `candidate_rel & chain_mask < chain_table.len()`.
+            let next = unsafe { *chain_ptr.add(candidate_rel & chain_mask) };
             steps += 1;
-            // Self-loop: two positions share `candidate_rel & chain_mask`;
-            // stop after processing this slot.
-            let self_loop = next == cur;
 
-            // Only process candidates in the live window, in relative space:
-            // `floor_idx <= candidate_idx < current_idx`.
             let candidate_idx = (cur as usize).wrapping_add(idx_bias);
-            if candidate_idx >= floor_idx && candidate_idx < current_idx {
-                // `candidate_idx < current_idx` (checked above), so the
-                // subtraction never underflows. `new_offset == abs_pos -
-                // candidate_abs`.
-                let new_offset = current_idx - candidate_idx;
-                // Speculative tail gate — full rationale (backward-extension
-                // bound + walk-order/offset-monotonicity precondition) is in
-                // the comment block right above this loop.
-                let mut skip = false;
-                if let Some(best_ref) = best
-                    && new_offset >= best_ref.offset
-                    && let Some(tail_off) = best_ref.match_len.checked_sub(lit_len + 3)
-                {
-                    let m_end = candidate_idx + tail_off + 4;
-                    let i_end = current_idx + tail_off + 4;
-                    // Bounds-fail is a SAFE skip — see longer rationale in the
-                    // gate's git history. Briefly: under the monotonicity
-                    // precondition above, bounds-fail proves no in-range
-                    // candidate at this `current_idx` can outscore `best`.
-                    // Raw unaligned `u32` load+compare (upstream zstd `MEM_read32`)
-                    // instead of a bounds-checked slice equality — same 4-byte
-                    // tail test, one load each, no `[a..b]` bounds panic path.
-                    if i_end > history_tail || m_end > history_tail {
-                        skip = true;
-                    } else {
-                        // SAFETY: both `+ tail_off` reads are `<= history_tail`
-                        // (checked above), so 4 bytes are in range.
-                        let m = unsafe {
-                            MatchTable::read_le_u32_ptr(base_ptr.add(candidate_idx + tail_off))
-                        };
-                        let i = unsafe {
-                            MatchTable::read_le_u32_ptr(base_ptr.add(current_idx + tail_off))
-                        };
-                        skip = m != i;
-                    }
-                }
-
-                // Cheap 4-byte equality gate before the wider SIMD count
-                // (upstream zstd `MEM_read32` gate in `ZSTD_HcFindBestMatch`).
-                // `HC_MIN_MATCH_LEN == 4`, so a first-4-byte mismatch can never
-                // reach the match floor — reject without the vector
-                // load+count+tzcnt. On dict-primed chains over low-match
-                // (random) input, where `best` stays `None` so the speculative
-                // tail gate above never fires, this rejects the bulk of chain
-                // candidates on a scalar compare instead of a full
-                // `common_prefix_len`. Raw unaligned `u32` load+compare (upstream zstd
-                // `MEM_read32`), not a bounds-checked slice equality. Falls
-                // through to the full count when either side lacks a 4-byte
-                // lookahead (the count handles short tails), so the accepted
-                // set is byte-identical.
-                let four_byte_ok = candidate_idx + 4 > history_tail
-                    || current_idx + 4 > history_tail
-                    || unsafe {
-                        // SAFETY: both `+ 4` reads are `<= history_tail` (checked
-                        // above), so 4 bytes are in range.
-                        MatchTable::read_le_u32_ptr(base_ptr.add(candidate_idx))
-                            == MatchTable::read_le_u32_ptr(base_ptr.add(current_idx))
-                    };
-                if !skip && four_byte_ok {
-                    let match_len =
+            // A wrapped index (`>= current_idx`) means `abs < history_abs_start`:
+            // a stale entry from a previous frame. The chain is head-insert
+            // monotonic, so the rest of the tail is older and also stale -- stop.
+            // This is the early-exit the no-memset floor-advance reset needs; in
+            // the memset reset the chain has no wrapped entries, so it never
+            // fires. INVARIANT: the memset reset zeroes every slot to `HC_EMPTY`
+            // (caught by the `cur == HC_EMPTY` break above) and uses `idx_bias`
+            // that maps stored positions back to indices `< current_idx`, so no
+            // surviving entry can wrap -- only the floor-advance path retains
+            // cross-frame entries that decode past `current_idx`. If a future
+            // change let a memset-reset chain produce a wrap, this break would
+            // silently cut the walk short (a miss-rate regression, not a
+            // correctness bug). Below-floor (`< floor_idx`) entries are NOT a
+            // break: a chain-slot collision can put an in-window entry after one.
+            if candidate_idx >= current_idx {
+                break;
+            }
+            if candidate_idx >= floor_idx {
+                // Upstream zstd's single self-tightening gate (`zstd_lazy.c:714`):
+                //   MEM_read32(match + ml - 3) == MEM_read32(ip + ml - 3)
+                // proves the candidate can possibly reach `ml + 1` before paying
+                // for the full `common_prefix_len`. `ml >= MIN_MATCH - 1 = 3` so
+                // `gate_off >= 0`. The iLimit break below keeps
+                // `current_idx + ml < history_tail` on entry, so
+                // `current_idx + gate_off + 4 = current_idx + ml + 1 <= history_tail`,
+                // and `candidate_idx < current_idx` keeps the match-side read in
+                // range too -- no per-iteration bounds check (matches C's
+                // branchless gate).
+                let gate_off = ml - 3;
+                // SAFETY: both reads are `<= history_tail` per the bound above.
+                let gate_ok = unsafe {
+                    MatchTable::read_le_u32_ptr(base_ptr.add(candidate_idx + gate_off))
+                        == MatchTable::read_le_u32_ptr(base_ptr.add(current_idx + gate_off))
+                };
+                if gate_ok {
+                    let current_ml =
                         common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
-                    if match_len >= HC_MIN_MATCH_LEN {
-                        // Rare accept path: recover the absolute position only
-                        // here (the hot per-candidate body stays in relative
-                        // space). `candidate_abs == candidate_idx +
-                        // history_abs_start`.
-                        let candidate_abs = candidate_idx + history_abs_start;
-                        let candidate = Self::extend_backwards(
-                            table,
-                            candidate_abs,
-                            abs_pos,
-                            match_len,
-                            lit_len,
-                        );
-                        best = Self::better_candidate(best, Some(candidate));
-                        if best.is_some_and(|b| b.match_len >= self.target_len) {
-                            return best;
+                    // `currentMl > ml`: strictly longer forward match wins; ties
+                    // keep the first (closest, the walk is newest-first).
+                    if current_ml > ml {
+                        ml = current_ml;
+                        best_idx = candidate_idx;
+                        // Dict path reads `ml >= MIN_MATCH`; only the no-dict
+                        // monomorph keeps the `found` flag (see seed comment).
+                        if !DICT {
+                            found = true;
+                        }
+                        // Upstream `if (ip + currentMl == iLimit) break`: reached
+                        // the input end (best possible); also keeps the next gate
+                        // read in bounds.
+                        if current_idx + ml >= history_tail {
+                            break;
                         }
                     }
                 }
             }
 
-            if self_loop {
+            // Self-loop (two positions share `candidate_rel & chain_mask`):
+            // checked here where `next` / `cur` are already live, not carried as
+            // a bool across the body (a register in this saturated walk).
+            if next == cur {
                 break;
             }
             cur = next;
         }
 
         // Separate dictionary match state (upstream `ZSTD_dictMatchState`). The
-        // walk is OUT-OF-LINE (`dms_chain_walk`, `#[inline(never)]`) so the
-        // dict-only code never bloats this hot function on no-dict frames, where
-        // the `is_some` guard is a single not-taken branch. `dms_chain_walk`
-        // continues the SAME `steps` budget, so live + dms stay one bounded
-        // operation (upstream zstd's single `nbAttempts`).
-        if DICT && table.dms.is_primed() {
-            best = self.dms_chain_walk(
+        // walk is OUT-OF-LINE so the dict-only code never bloats this hot
+        // function on no-dict frames. It shares `ml` / `steps` (upstream's
+        // single `nbAttempts` across the live + dms loops). Skip it when the
+        // live walk already reached iLimit (`ml` maximal, and the dms
+        // self-tightening gate would read past `history_tail`).
+        // `dms_primed` is hoisted by the caller (block-invariant — the dict is
+        // primed before the block scan), replacing a per-find `dms.is_primed()`
+        // load from the cold `dms` cacheline.
+        if DICT && dms_primed && current_idx + ml < history_tail {
+            // dms runs only in the `DICT = true` monomorph, which uses the
+            // `ml >= MIN_MATCH` match test, so the walk tracks `(ml, best_idx)`
+            // and never the `found` flag.
+            let walk = self.dms_chain_walk(
                 table,
                 concat,
-                abs_pos,
-                lit_len,
                 current_idx,
-                history_abs_start,
                 history_tail,
+                base_ptr,
                 max_chain_steps,
                 steps,
-                best,
+                ml,
+                best_idx,
             );
+            ml = walk.0;
+            best_idx = walk.1;
         }
-        best
+
+        // Dict monomorph: `ml >= MIN_MATCH` is the match test (drops `found`).
+        // No-dict monomorph: keep the original `found` flag (see seed comment).
+        let matched = if DICT { ml >= HC_MIN_MATCH_LEN } else { found };
+        if !matched {
+            return HcMatch::NONE;
+        }
+        // Forward `(offset, length)` only — the backward extension that produces
+        // `start` runs once at the commit site (upstream's lazy loop), off the
+        // per-position find/compare path. `offset = abs_pos - (best_idx +
+        // history_abs_start) = current_idx - best_idx`.
+        HcMatch {
+            offset: current_idx - best_idx,
+            match_len: ml,
+        }
     }
 
     /// Out-of-line dms HC4 walk (upstream `ZSTD_HcFindBestMatch` dms loop,
-    /// `zstd_lazy.c:748-770`). Split from [`Self::hash_chain_candidate`] so the
-    /// no-dict hot path keeps its small body / register budget. Continues the
-    /// caller's `steps` against the shared `max_chain_steps` so the live + dms
-    /// search is one bounded operation. The dict sits at the front of `concat`
+    /// `zstd_lazy.c:751-769`). Split from [`Self::hash_chain_candidate`] so the
+    /// no-dict hot path keeps its small body / register budget. Shares the
+    /// caller's forward-length state (`ml` / `best_idx`) and `steps`
+    /// budget -- the live + dms loops are one bounded operation (upstream's
+    /// single `nbAttempts`). The dict sits at the front of `concat`
     /// (`[0, region)`); a dms candidate is a concat index `< current_idx`, so
-    /// the offset / extension logic matches the live walk.
+    /// the offset / gate / count logic matches the live walk. Only the
+    /// `DICT = true` monomorph calls this, and it uses the `ml >= MIN_MATCH`
+    /// match test, so the walk returns `(ml, best_idx)` and tracks no `found`
+    /// flag.
     ///
-    /// `#[inline]`: with the `DICT` split the `DICT = false` monomorph never
-    /// references this (the `if DICT &&` gate is a compile-time false), so it is
-    /// dropped from the no-dict path entirely; the `DICT = true` monomorph
-    /// inlines it into the dict hot path.
+    /// `#[inline]`: the `DICT = false` monomorph never references this (the
+    /// `if DICT &&` gate is a compile-time false), so it is dropped from the
+    /// no-dict path; the `DICT = true` monomorph inlines it into the dict hot
+    /// path.
     #[inline]
     #[allow(clippy::too_many_arguments)]
     fn dms_chain_walk(
         &self,
         table: &MatchTable,
         concat: &[u8],
-        abs_pos: usize,
-        lit_len: usize,
         current_idx: usize,
-        history_abs_start: usize,
         history_tail: usize,
+        base_ptr: *const u8,
         max_chain_steps: usize,
         mut steps: usize,
-        mut best: Option<MatchCandidate>,
-    ) -> Option<MatchCandidate> {
+        mut ml: usize,
+        mut best_idx: usize,
+    ) -> (usize, usize) {
         let dms = match table.dms.table() {
             Some(d) => d,
-            None => return best,
+            None => return (ml, best_idx),
         };
-        let base_ptr = concat.as_ptr();
+        // Match upstream's effective dict search depth: the CDict path runs the
+        // dedicated dict search deeper than the bare level searchLog (measured:
+        // upstream needs nbAttempts >= 16 to surface the long dict match on the
+        // per-label-dict fixtures). Floor the shared budget at 16.
+        //
+        // NOTE on the per-find step budget: `steps` is SHARED with the live
+        // walk. The floor below is `max(max_chain_steps, 16)`, so the live and
+        // dms walks TOGETHER are bounded by it (= 16 at every standard HC level,
+        // where `max_chain_steps < 16`: L6 `searchLog = 3` -> 8); the dms
+        // consumes whatever the live walk left. Giving the dms a fresh 16
+        // attempts on top of the live walk instead (a per-walk, non-shared
+        // budget) was measured +3% cycles on the small-10k-random dict path
+        // with zero ratio change -- the shared floor already surfaces every
+        // dict match that reaches the output, so sharing it is intentional: the
+        // floor (not `max_chain_steps`) is the binding dict-search constraint.
+        let dms_budget = max_chain_steps.max(16);
         let dms_hash = MatchTable::hash_position_at(concat, current_idx, dms.hash_log, dms.mls);
         let mut dcur = dms.hash_table[dms_hash];
-        while steps < max_chain_steps {
+        // Hoist the dms chain-table base pointer (same Vec-header-reload removal
+        // as the live walk above).
+        let dms_chain_ptr: *const u32 = dms.chain_table.as_ptr();
+        while steps < dms_budget {
             if dcur == 0 {
                 break;
             }
             // Dict position is a concat index in `[0, region)`; the dict is at
-            // the front so `dict_idx < current_idx` always.
+            // the front so `dict_idx < current_idx` always (and
+            // `< dms.chain_table.len()`).
             let dict_idx = (dcur - 1) as usize;
-            let dnext = dms.chain_table[dict_idx];
+            // SAFETY: `dict_idx` is a stored dict position `< chain_table.len()`.
+            let dnext = unsafe { *dms_chain_ptr.add(dict_idx) };
             steps += 1;
             let new_offset = current_idx - dict_idx;
             // Out-of-window dict positions are unreachable to the decoder.
             if new_offset <= table.max_window_size {
-                let mut skip = false;
-                if let Some(best_ref) = best
-                    && new_offset >= best_ref.offset
-                    && let Some(tail_off) = best_ref.match_len.checked_sub(lit_len + 3)
-                {
-                    let m_end = dict_idx + tail_off + 4;
-                    let i_end = current_idx + tail_off + 4;
-                    if i_end > history_tail || m_end > history_tail {
-                        skip = true;
-                    } else {
-                        let m = unsafe {
-                            MatchTable::read_le_u32_ptr(base_ptr.add(dict_idx + tail_off))
-                        };
-                        let i = unsafe {
-                            MatchTable::read_le_u32_ptr(base_ptr.add(current_idx + tail_off))
-                        };
-                        skip = m != i;
-                    }
-                }
-                let four_byte_ok = dict_idx + 4 > history_tail
-                    || current_idx + 4 > history_tail
-                    || unsafe {
-                        MatchTable::read_le_u32_ptr(base_ptr.add(dict_idx))
-                            == MatchTable::read_le_u32_ptr(base_ptr.add(current_idx))
-                    };
-                if !skip && four_byte_ok {
-                    let match_len = common_prefix_len(&concat[dict_idx..], &concat[current_idx..]);
-                    if match_len >= HC_MIN_MATCH_LEN {
-                        let candidate = Self::extend_backwards(
-                            table,
-                            dict_idx + history_abs_start,
-                            abs_pos,
-                            match_len,
-                            lit_len,
-                        );
-                        best = Self::better_candidate(best, Some(candidate));
-                        if best.is_some_and(|b| b.match_len >= self.target_len) {
-                            return best;
+                // Same self-tightening gate as the live walk; the caller's guard
+                // (`current_idx + ml < history_tail`) + the iLimit break keep
+                // `current_idx + (ml - 3) + 4 <= history_tail`, and
+                // `dict_idx < current_idx` keeps the dict-side read in range.
+                let gate_off = ml - 3;
+                // SAFETY: both reads are `<= history_tail` per the bound above.
+                let gate_ok = unsafe {
+                    MatchTable::read_le_u32_ptr(base_ptr.add(dict_idx + gate_off))
+                        == MatchTable::read_le_u32_ptr(base_ptr.add(current_idx + gate_off))
+                };
+                if gate_ok {
+                    let current_ml = common_prefix_len(&concat[dict_idx..], &concat[current_idx..]);
+                    if current_ml > ml {
+                        ml = current_ml;
+                        best_idx = dict_idx;
+                        if current_idx + ml >= history_tail {
+                            break;
                         }
                     }
                 }
             }
-            // Chain links are strictly decreasing (head insert); `dnext == 0`
-            // ends the walk at the loop top.
+            // Chain links are strictly decreasing (head insert); `dnext == dcur`
+            // (or the `dcur == 0` at the top) ends the walk.
             if dnext == dcur {
                 break;
             }
             dcur = dnext;
         }
-        best
+        (ml, best_idx)
+    }
+
+    /// Single-rep (offset_1) probe — the lazy parser's inline rep check
+    /// (upstream `ZSTD_compressBlock_lazy_generic`: only `rep[0]` is tested per
+    /// position, the 3-rep rotation is the optimal parser's). Caller guarantees
+    /// `lit_len > 0`, so `rep[0]` is repcode index 0 with no ll0 rotation, and
+    /// extending it backwards over the literal run is sound. Strips
+    /// [`Self::repcode_candidate`] to its first rep: one window check, one
+    /// 4-byte gate, one count — a third of the per-position rep cost the 3-rep
+    /// probe paid (and which the lazy lookahead paid again at pos+1 / pos+2).
+    ///
+    /// `#[inline(always)]`: upstream checks the rep INLINE in the lazy loop;
+    /// folded into the (out-of-line) `find_best_match` monolith so the rep is
+    /// part of the single per-position find call, not a nested out-of-line probe.
+    #[inline(always)]
+    pub(crate) fn repcode_candidate_offset1(
+        concat: &[u8],
+        table: &MatchTable,
+        abs_pos: usize,
+    ) -> HcMatch {
+        let rep = table.offset_hist[0] as usize;
+        if rep == 0 || rep > abs_pos {
+            return HcMatch::NONE;
+        }
+        let current_idx = abs_pos - table.history_abs_start;
+        if current_idx + HC_MIN_MATCH_LEN > concat.len() {
+            return HcMatch::NONE;
+        }
+        let candidate_pos = abs_pos - rep;
+        if candidate_pos
+            < table
+                .history_abs_start
+                .max(abs_pos.saturating_sub(table.max_window_size))
+        {
+            return HcMatch::NONE;
+        }
+        let candidate_idx = candidate_pos - table.history_abs_start;
+        // Cheap 4-byte equality gate before the SIMD count (upstream `MEM_read32`
+        // repcode gate); identical to the per-rep gate in `repcode_candidate`.
+        let base_ptr = concat.as_ptr();
+        if candidate_idx + 4 <= concat.len()
+            && unsafe {
+                MatchTable::read_le_u32_ptr(base_ptr.add(candidate_idx))
+                    != MatchTable::read_le_u32_ptr(base_ptr.add(current_idx))
+            }
+        {
+            return HcMatch::NONE;
+        }
+        let match_len = common_prefix_len(&concat[candidate_idx..], &concat[current_idx..]);
+        if match_len >= HC_MIN_MATCH_LEN {
+            HcMatch {
+                offset: rep,
+                match_len,
+            }
+        } else {
+            HcMatch::NONE
+        }
     }
 
     /// Combine the rep-code and chain-walk candidates and pick the
@@ -568,21 +660,54 @@ impl HcMatcher {
     /// `DICT = true` instance dual-probes the separate dictMatchState. The
     /// dispatcher in `start_matching_lazy` picks the instance from whether a dms
     /// is primed.
+    ///
+    /// `#[inline(never)]`: kept out-of-line (upstream's `ZSTD_HcFindBestMatch`
+    /// is its own function, with the lazy loop thin) so the find's register
+    /// pressure is contained in its own frame instead of competing with the
+    /// per-position loop state; the 16-byte `HcMatch` return travels in
+    /// `rax:rdx`, so the find->loop boundary stays a register pair, not a stack
+    /// spill.
+    #[inline(never)]
     pub(crate) fn find_best_match<const DICT: bool>(
         &self,
+        concat: &[u8],
+        dms_primed: bool,
         table: &MatchTable,
         abs_pos: usize,
         lit_len: usize,
-    ) -> Option<MatchCandidate> {
-        let rep = Self::repcode_candidate(table, abs_pos, lit_len);
-        let hash = self.hash_chain_candidate::<DICT>(table, abs_pos, lit_len);
+    ) -> HcMatch {
+        // `concat` is the full live history (dict + committed blocks + current
+        // block), hoisted ONCE per block by the caller — `live_history()` is
+        // loop-invariant for the position scan, so fetching it per find (in
+        // `hash_chain_candidate` + the rep probe) was pure per-position
+        // overhead. See `start_matching_lazy`'s block-level hoist.
+        //
+        // Upstream `ZSTD_compressBlock_lazy_generic` checks only offset_1
+        // (`rep[0]`) inline per position; the 3-rep rotation lives in the
+        // optimal parser, not the lazy loop. For `lit_len > 0` that is exactly
+        // `rep[0]` (repcode index 0, no ll0 rotation), so probe the single rep.
+        // The `lit_len == 0` case keeps the full rotated probe for encode
+        // correctness (the ll0 `rep[0]-1` rule).
+        let rep = if lit_len == 0 {
+            Self::repcode_candidate(table, abs_pos, lit_len)
+        } else {
+            Self::repcode_candidate_offset1(concat, table, abs_pos)
+        };
+        let hash = self.hash_chain_candidate::<DICT>(concat, dms_primed, table, abs_pos);
         Self::better_candidate(rep, hash)
     }
 
     /// Upstream zstd `lazy` / `lazy2` lookahead: evaluate the match a byte
     /// (and optionally two) ahead before committing the current one.
-    /// Returns `Some(best)` if the current match wins, `None` if the
-    /// caller should defer.
+    /// Returns `true` if the current match `best` wins (commit it), `false`
+    /// if the caller should defer to a later position.
+    ///
+    /// Takes the already-unwrapped `best` BY VALUE and returns a `bool` rather
+    /// than threading `Option<MatchCandidate>` in and back out: the caller owns
+    /// `best` (from `find_best_match`) and reuses it on commit, so a 24-byte
+    /// candidate (32-byte `Option`) no longer gets marshalled across this call
+    /// boundary every position (it was a measured ~7% of the lazy scan on the
+    /// stack-arg copy).
     ///
     /// Lazy lookahead queries `pos + 1` / `pos + 2` before they are
     /// inserted into the hash tables — matching the C zstd ordering.
@@ -590,39 +715,40 @@ impl HcMatcher {
     /// itself, changing semantics.
     pub(crate) fn pick_lazy_match<const DICT: bool>(
         &self,
+        concat: &[u8],
+        dms_primed: bool,
         table: &MatchTable,
         abs_pos: usize,
         lit_len: usize,
-        best: Option<MatchCandidate>,
-    ) -> Option<MatchCandidate> {
-        let best = best?;
+        best: HcMatch,
+    ) -> bool {
         if best.match_len >= self.target_len
-            || abs_pos + 1 + HC_MIN_MATCH_LEN > table.history_abs_end()
+            || abs_pos + 1 + HC_MIN_MATCH_LEN > table.history_abs_start + concat.len()
         {
-            return Some(best);
+            return true;
         }
 
         let current_gain = Self::match_gain(best.match_len, best.offset) + 4;
 
-        let next = self.find_best_match::<DICT>(table, abs_pos + 1, lit_len + 1);
-        if let Some(next) = next {
-            let next_gain = Self::match_gain(next.match_len, next.offset);
-            if next_gain > current_gain {
-                return None;
+        let next =
+            self.find_best_match::<DICT>(concat, dms_primed, table, abs_pos + 1, lit_len + 1);
+        if next.is_match() && Self::match_gain(next.match_len, next.offset) > current_gain {
+            return false;
+        }
+
+        if self.lazy_depth >= 2
+            && abs_pos + 2 + HC_MIN_MATCH_LEN <= table.history_abs_start + concat.len()
+        {
+            let next2 =
+                self.find_best_match::<DICT>(concat, dms_primed, table, abs_pos + 2, lit_len + 2);
+            if next2.is_match()
+                && Self::match_gain(next2.match_len, next2.offset) > current_gain + 4
+            {
+                return false;
             }
         }
 
-        if self.lazy_depth >= 2 && abs_pos + 2 + HC_MIN_MATCH_LEN <= table.history_abs_end() {
-            let next2 = self.find_best_match::<DICT>(table, abs_pos + 2, lit_len + 2);
-            if let Some(next2) = next2 {
-                let next2_gain = Self::match_gain(next2.match_len, next2.offset);
-                if next2_gain > current_gain + 4 {
-                    return None;
-                }
-            }
-        }
-
-        Some(best)
+        true
     }
 
     /// Cross-platform dispatcher for the rep-code probe used by the
@@ -943,8 +1069,8 @@ mod hc_tests {
     fn repcode_candidate_returns_none_when_suffix_too_short() {
         let mut t = table_with_history(b"abc");
         t.offset_hist = [1, 2, 3];
-        // current_idx + HC_MIN_MATCH_LEN > concat.len() → early None.
-        assert!(HcMatcher::repcode_candidate(&t, 0, 1).is_none());
+        // current_idx + HC_MIN_MATCH_LEN > concat.len() → early no-match.
+        assert!(!HcMatcher::repcode_candidate(&t, 0, 1).is_match());
     }
 
     #[test]
@@ -956,69 +1082,37 @@ mod hc_tests {
         // No match possible at abs_pos=4 because every rep aims past
         // history start.
         let result = HcMatcher::repcode_candidate(&t, 4, 1);
-        assert!(result.is_none(), "no rep can land in-range");
+        assert!(!result.is_match(), "no rep can land in-range");
     }
 
     #[test]
     fn find_best_match_returns_none_for_short_suffix() {
         let hc = HcMatcher::new(2, 4, 32);
         let t = table_with_history(b"abc");
-        assert!(hc.find_best_match::<false>(&t, 0, 1).is_none());
+        assert!(
+            !hc.find_best_match::<false>(t.live_history(), false, &t, 0, 1)
+                .is_match()
+        );
     }
 
-    /// Regression test for the speculative tail check's
-    /// backward-extension bound. The pre-fix gate used `tail_off =
-    /// best.match_len − 3` and was unaware that `extend_backwards`
-    /// could have added up to `lit_len` backward bytes to
-    /// `best.match_len`. The post-fix formula subtracts `lit_len`
-    /// via `checked_sub(lit_len + 3)`.
+    /// Forward-length selection (upstream `ZSTD_HcFindBestMatch`): the chain
+    /// walk keeps the longest FORWARD match (`currentMl > ml`) and applies the
+    /// single backward extension to THAT winner — a shorter-forward candidate
+    /// is NOT promoted just because it has more backward (`lit_len`) room.
+    /// Backward "catch up" happens once, on the forward winner, after the walk;
+    /// it never changes which candidate wins.
     ///
-    /// To actually fail for the pre-fix gate (Copilot review on
-    /// `c16ca32b` flagged that an earlier round of this test did
-    /// not), the fixture is constructed so the first LIFO candidate
-    /// cannot extend backward but a later candidate can — only the
-    /// later candidate's *total* match length (`forward +
-    /// backward_extension`) reaches the new best.
-    ///
-    /// Fixture (40 bytes, indices `0..=39`):
-    ///   `"AAAabcdefZMQabcdefIJBAAAabcdefIJKKKKKKKK"`
-    ///    0123456789012345678901234567890123456789   (ones digit)
-    ///              1111111111222222222233333333     (tens digit, aligned)
-    ///
-    /// Probing `abs_pos = 24, lit_len = 3`:
-    ///   - The 4-byte hash at `idx 24` ("abcd") collides with the
-    ///     hashes at `idx 3` and `idx 12` (also "abcd"). All other
-    ///     positions in `0..24` hash to other buckets, so the chain
-    ///     walker visits exactly `[12, 3]` in LIFO order.
-    ///   - Candidate at `idx 12`: forward 8 bytes (`"abcdefIJ"`
-    ///     matches the probe `"abcdefIJ"` at `24..32` exactly), but
-    ///     the byte right before — `concat[11] = 'Q'` — does NOT
-    ///     equal `concat[23] = 'A'`, so `extend_backwards` cannot
-    ///     extend even one byte despite `lit_len = 3` of available
-    ///     headroom. Total `match_len = 8`, offset = 12.
-    ///   - Candidate at `idx 3`: forward only 6 bytes (`"abcdef"`
-    ///     matches, byte 7 at `idx 9 = 'Z'` differs from probe byte
-    ///     7 at `idx 30 = 'I'`). But the 3 bytes before it —
-    ///     `concat[0..3] = "AAA"` — exactly match `concat[21..24] =
-    ///     "AAA"`, so `extend_backwards` adds 3 backward bytes.
-    ///     Total `match_len = 6 + 3 = 9`, offset = 21.
-    ///
-    /// Gate behaviour at `lit_len = 3`:
-    ///   - Pre-fix: `tail_off = best.match_len - 3 = 5`. For
-    ///     candidate at `idx 3` the gate reads `concat[3+5..3+5+4]
-    ///     = concat[8..12] = "fZMQ"` and compares to probe
-    ///     `concat[29..33] = "fIJK"`. Mismatch → gate SKIPS. The
-    ///     helper never runs `common_prefix_len` on candidate `3`,
-    ///     never extends backwards, and returns `match_len = 8`
-    ///     (the first candidate's match) — losing the 9-byte
-    ///     backward-extended win.
-    ///   - Post-fix: `tail_off = best.match_len - lit_len - 3 = 2`.
-    ///     The gate reads `concat[3+2..3+2+4] = concat[5..9] =
-    ///     "cdef"` and compares to probe `concat[26..30] = "cdef"`.
-    ///     Match → gate PASSES → full count runs, finds forward 6,
-    ///     extends backwards 3, returns `match_len = 9`.
+    /// Fixture (40 bytes): `"AAAabcdefZMQabcdefIJBAAAabcdefIJKKKKKKKK"`.
+    /// Probing `abs_pos = 24`: the 4-byte hash at `idx 24` ("abcd") collides
+    /// with `idx 3` and `idx 12`, so the walk visits `[12, 3]` (LIFO).
+    ///   - `idx 12`: forward 8 (`"abcdefIJ"`), `concat[11] = 'Q'` !=
+    ///     `concat[23] = 'A'` so no backward room. Total 8, offset 12.
+    ///   - `idx 3`: forward only 6 (`"abcdef"`), but `concat[0..3] = "AAA"` ==
+    ///     `concat[21..24]` so it could backward-extend 3 to a TOTAL of 9 — yet
+    ///     its forward length (6) loses to candidate 12's (8), so it is never
+    ///     selected. The forward winner (12) wins at both `lit_len`s.
     #[test]
-    fn hash_chain_candidate_speculative_gate_handles_lit_len_backward_extension() {
+    fn hash_chain_candidate_picks_longest_forward_over_shorter_with_backward_room() {
         let mut t = MatchTable::new(64);
         t.history = b"AAAabcdefZMQabcdefIJBAAAabcdefIJKKKKKKKK".to_vec();
         t.history_start = 0;
@@ -1034,97 +1128,36 @@ mod hc_tests {
 
         let hc = HcMatcher::new(2, 16, 64);
 
-        // `lit_len = 0`: no backward extension headroom — neither
-        // candidate can grow past its forward match length, so the
-        // best wins at forward-only length 8. Both pre-fix and
-        // post-fix gates produce the same answer here.
-        let result_lit0 = hc.hash_chain_candidate::<false>(&t, 24, 0);
-        let len0 = result_lit0.map(|c| c.match_len).unwrap_or(0);
+        // The forward winner (idx 12, forward 8) has no backward room.
+        let c0 = hc.hash_chain_candidate::<false>(t.live_history(), false, &t, 24);
+        assert!(c0.is_match(), "forward match must be found");
+        assert_eq!(c0.match_len, 8, "longest forward match is 8 (idx 12)");
         assert_eq!(
-            len0, 8,
-            "lit_len=0 must return the forward-only 8-byte match at offset 12, \
-             got {len0}"
-        );
-
-        // `lit_len = 3`: the second candidate (`idx 3`) can extend 3
-        // bytes backwards, giving a total length of 9. Pre-fix gate
-        // would skip it; post-fix gate lets it through.
-        let result_lit3 = hc.hash_chain_candidate::<false>(&t, 24, 3);
-        let len3 = result_lit3.map(|c| c.match_len).unwrap_or(0);
-        assert_eq!(
-            len3, 9,
-            "lit_len=3 must return the backward-extended 9-byte match \
-             (forward 6 + backward 3); a value of 8 means the gate over-rejected \
-             the second LIFO candidate and the helper missed the backward-extension \
-             win (pre-fix regression). Got {len3}"
-        );
-
-        // Strict-increase between `lit_len=0` and `lit_len=3` is the
-        // signal the pre-fix gate would NOT have produced. Keep this
-        // assertion explicitly so the test's failure message points
-        // at exactly the regression it guards.
-        assert!(
-            len3 > len0,
-            "speculative gate must allow `lit_len`-dependent strict gains: \
-             lit_len=0 → {len0}, lit_len=3 → {len3}. Equal values means the \
-             gate skipped the backward-extending candidate."
+            c0.offset, 12,
+            "winner is the forward-8 candidate at offset 12"
         );
     }
 
-    /// Regression test for the non-monotonic-walk fallback. When the
-    /// cyclic `chain_table & chain_mask` mask overwrites a slot, the
-    /// chain walker can surface a candidate with a SMALLER offset than
-    /// ones it has already returned. The speculative gate's
-    /// monotonicity precondition (`new.offset_bits ≥ best.offset_bits`)
-    /// is enforced per-iteration via the `new_offset ≥ best.offset`
-    /// check: when monotonicity breaks the gate falls through to
-    /// `common_prefix_len` so the offset-bits advantage is given a
-    /// chance to win.
+    /// Forward-length ties keep the FIRST-visited candidate (upstream
+    /// `ZSTD_HcFindBestMatch` uses `currentMl > ml`, strictly-longer, so an
+    /// equal-length later candidate never displaces the earlier one). The walk
+    /// is newest-first, so in organic chains "first visited" is the closest
+    /// (smallest-offset) position anyway; this test hand-wires the chain into a
+    /// non-monotonic order to pin the tie-break rule itself.
     ///
-    /// Construction: organic LIFO insertion order would never produce
-    /// this layout — when positions are inserted in monotonic order
-    /// the chain links naturally point at strictly older positions
-    /// (the previous `hash_table[hash]`). To force the bug-prone
-    /// scenario this test reaches into `MatchTable` and hand-wires the
-    /// chain so the walker visits `pos 9` first (offset 18) and then
-    /// `pos 18` second (offset 9). The fixture sits four 8-byte
-    /// `"abcdefgh"` chunks at positions `0 / 9 / 18 / 27` (each chunk
-    /// followed by a unique terminator byte that caps cross-chunk
-    /// forward matches at exactly 8); the probe at `abs_pos = 27`
-    /// hashes the same prefix as the earlier chunks, so all chain
-    /// candidates produce an 8-byte forward match and only the
-    /// offset-bits difference can decide the winner.
-    ///
-    /// With the new `new_offset >= best.offset` precondition:
-    ///   * Iter 1: cand_abs 9, offset 18. `best = None` → no gate,
-    ///     full count, `best = (len 8, offset 18)`.
-    ///   * Iter 2: cand_abs 18, offset 9. `new_offset = 9 <
-    ///     best.offset = 18` → gate skipped → full count runs →
-    ///     `better_candidate` picks the smaller-offset winner (equal
-    ///     length, smaller offset_bits → strictly higher gain).
-    ///
-    /// Final `best.offset` must be `9` (the smaller-offset winner).
-    /// Pre-fix code (gate applied unconditionally) would have
-    /// inspected the tail at `tail_off = 8 − 0 − 3 = 5` and the
-    /// 4-byte read at offsets `5..9` covers the chunk-terminator byte
-    /// (different `'A' / 'B' / 'C' / 'D'` per chunk) — gate fails on
-    /// the mismatching terminator and the second candidate gets
-    /// skipped, leaving `best.offset = 18`.
+    /// Fixture: four 8-byte `"abcdefgh"` chunks at `0 / 9 / 18 / 27`, each
+    /// followed by a unique terminator (`'A'/'B'/'C'/'D'`) capping cross-chunk
+    /// forward matches at exactly 8. Probing `abs_pos = 27` with the chain
+    /// hand-wired to visit pos 9 (offset 18) THEN pos 18 (offset 9): both have
+    /// forward length 8, so the first-visited (pos 9, offset 18) wins. The
+    /// self-tightening gate at `ml = 8` also rejects pos 18 (its tail byte is a
+    /// different chunk terminator), so the equal-length later candidate is
+    /// skipped before the count — consistent with ties-keep-first.
     #[test]
-    fn hash_chain_candidate_non_monotonic_walk_accepts_smaller_offset() {
-        // Four 8-byte `"abcdefgh"` chunks, each followed by a unique
-        // terminator byte (`'A' / 'B' / 'C' / 'D'`). The terminators
-        // are part of the same 40-byte stream, so each chunk start
-        // sits 9 bytes after the previous one — chunk starts are at
-        // `0`, `9`, `18`, `27` (not `0/8/16/24` as a naive
-        // chunk-width calculation would suggest). The cross-chunk
-        // forward match between any two chunks caps at exactly 8
-        // because the byte right after each chunk is unique.
+    fn hash_chain_candidate_forward_ties_keep_first_visited() {
         let mut t = MatchTable::new(64);
         t.history = b"abcdefghAabcdefghBabcdefghCabcdefghDZZZZ".to_vec();
         assert_eq!(t.history.len(), 40);
-        // After each "abcdefgh" the next byte is unique ('A'/'B'/'C'
-        // /'D'), capping cross-chunk forward matches at length 8.
         t.history_start = 0;
         t.history_abs_start = 0;
         t.window_size = t.history.len();
@@ -1135,46 +1168,28 @@ mod hc_tests {
         t.ensure_tables();
         t.chunk_lens.push_back(t.history.len());
 
-        // The probe is at abs_pos 27 (start of the fourth
-        // "abcdefgh" chunk). Hand-wire the chain so the walker
-        // visits pos 9 first and pos 18 second.
-        //
-        // Layout: chunks at 0..8, 9..17, 18..26, 27..35. The byte
-        // BEFORE each chunk is the terminator from the previous
-        // chunk's match. Probing at abs_pos 27:
-        //   * candidate 9 → offset 27 − 9 = 18
-        //   * candidate 18 → offset 27 − 18 = 9 (SMALLER — second
-        //     visit, non-monotonic)
         let abs_pos = 27usize;
         let concat = t.live_history();
         let probe_hash = t.hash_position(&concat[abs_pos..]);
-        // `stored = pos + 1` per `MatchTable::stored_abs_position_fast`.
-        // Hand-wire the chain head and the link OUT of pos 9 so the
-        // walk surfaces 9 first, then 18.
+        // Hand-wire the chain head + link so the walk surfaces pos 9 first
+        // (offset 18) then pos 18 (offset 9). `stored = pos + 1`.
         t.hash_table[probe_hash] = 9 + 1;
         let chain_mask = (1usize << t.chain_log) - 1;
         t.chain_table[9 & chain_mask] = 18 + 1;
-        // Terminate the walk after pos 18.
         t.chain_table[18 & chain_mask] = HC_EMPTY;
 
         let hc = HcMatcher::new(2, 16, 64);
-        let result = hc.hash_chain_candidate::<false>(&t, abs_pos, 0);
-        let cand = result.expect("non-monotonic walk must still produce a match");
+        let cand = hc.hash_chain_candidate::<false>(t.live_history(), false, &t, abs_pos);
+        assert!(cand.is_match(), "walk must still produce a match");
         assert_eq!(
             cand.match_len, 8,
-            "both chain candidates have an 8-byte forward prefix match — \
-             expected match_len = 8, got {}",
-            cand.match_len
+            "both candidates have an 8-byte forward prefix"
         );
         assert_eq!(
-            cand.offset, 9,
-            "non-monotonic fallback must surface the smaller-offset winner: \
-             expected offset = 9 (cand_abs 18), got offset = {}. \
-             A regression in the `new_offset >= best.offset` check would \
-             keep the gate active for the smaller-offset second candidate, \
-             skip its full count, and leave best.offset at 18 (the \
-             larger-offset first-visited candidate).",
-            cand.offset
+            cand.offset, 18,
+            "forward-length ties keep the first-visited candidate (pos 9, \
+             offset 18); a value of 9 would mean the equal-length later \
+             candidate displaced it (non-upstream gain-based tie-break)"
         );
     }
 }

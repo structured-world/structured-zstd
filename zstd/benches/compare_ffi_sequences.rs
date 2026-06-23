@@ -61,6 +61,7 @@ use std::path::Path;
 use structured_zstd::encoding::CompressionLevel;
 use structured_zstd::encoding::sequence_capture::{
     CapturedRawSequence, compress_and_collect_sequences, compress_and_collect_sequences_with_dict,
+    compress_and_collect_sequences_with_raw_content,
 };
 
 /// Default level set when `STRUCTURED_ZSTD_BENCH_LEVEL` is unset.
@@ -304,6 +305,14 @@ fn collect_fixtures() -> Vec<(String, Vec<u8>)> {
         logs4k,
     ));
 
+    // 1 KiB variant — the `dict_matrix` `logs-1k` case that carries the L6
+    // Row/lazy dict ratio gap (26 vs 18 bytes; #434).
+    let logs1k = repeated_log_lines(1024);
+    out.push((
+        format!("small-1k-log-lines ({} bytes)", logs1k.len()),
+        logs1k,
+    ));
+
     out
 }
 
@@ -357,9 +366,18 @@ fn build_low_entropy_log(byte_budget: usize) -> Vec<u8> {
 
 fn run_one(_name: &str, input: &[u8], level: i32, max_rows: usize, dict: Option<&[u8]>) {
     let rust_capture = match dict {
-        Some(d) => {
+        // Auto-detect the dict kind the same way the C side's
+        // `ZSTD_CCtx_loadDictionary` does: a serialized dict (zstd dict magic
+        // `0xEC30A437`, LE bytes `37 A4 30 EC`) attaches via the magic path;
+        // anything else is a raw-content dict (the per-label-dict use case).
+        Some(d) if d.starts_with(&[0x37, 0xA4, 0x30, 0xEC]) => {
             compress_and_collect_sequences_with_dict(input, CompressionLevel::Level(level), d)
         }
+        Some(d) => compress_and_collect_sequences_with_raw_content(
+            input,
+            CompressionLevel::Level(level),
+            d,
+        ),
         None => compress_and_collect_sequences(input, CompressionLevel::Level(level)),
     };
     let (ffi_seqs, ffi_tail_lengths) = ffi_generate_sequences(input, level, dict);

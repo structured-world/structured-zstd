@@ -51,6 +51,12 @@ fn main() {
     // is treated as a content dictionary by each). 8 KiB of the same log
     // structure the frames share.
     let dict = repeated_log_lines(8 * 1024);
+    // Optional dump of the structural dict so the sequence comparator
+    // (`compare_ffi_sequences` + `STRUCTURED_ZSTD_BENCH_DICT`) can attach the
+    // exact same bytes when investigating the dict-primed match decisions.
+    if let Ok(path) = std::env::var("DICT_MATRIX_DUMP_DICT") {
+        std::fs::write(path.trim(), &dict).expect("write DICT_MATRIX_DUMP_DICT path");
+    }
     let fixtures: &[(&str, usize)] = &[
         ("logs-512", 512),
         ("logs-1k", 1024),

@@ -81,12 +81,20 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         header.serialize(output);
         output.push(rle_byte);
         BlockType::RLE
-    } else if should_emit_raw_fast_path(
-        compression_level,
-        state.matcher.window_size(),
-        &uncompressed_data,
-        dict_active,
-    ) && !(dict_active && state.matcher.block_samples_match_dict(&uncompressed_data))
+    } else if !(dict_active && state.matcher.block_samples_match_dict(&uncompressed_data))
+        // Evaluation order matters: the dict-match guard is cheap (a constant
+        // `true` for the conservative backends — HC / Row / BT — and a small
+        // table probe for Fast), whereas `should_emit_raw_fast_path` runs a
+        // WHOLE-BLOCK incompressibility scan on the dict path. When a primed
+        // dictionary forces the raw-skip off anyway (guard is `false`), this
+        // short-circuit skips that scan entirely instead of computing it and
+        // throwing the result away. Boolean result is unchanged (AND commutes).
+        && should_emit_raw_fast_path(
+            compression_level,
+            state.matcher.window_size(),
+            &uncompressed_data,
+            dict_active,
+        )
     {
         #[cfg(feature = "lsm")]
         if let Some(sink) = block_decompressed_sizes {
@@ -278,12 +286,16 @@ pub(crate) fn compress_block_encoded_borrowed(
         header.serialize(output);
         output.push(rle_byte);
         BlockType::RLE
-    } else if should_emit_raw_fast_path(
-        compression_level,
-        state.matcher.window_size(),
-        block,
-        dict_active,
-    ) && !(dict_active && state.matcher.block_samples_match_dict(block))
+    } else if !(dict_active && state.matcher.block_samples_match_dict(block))
+        // Same cheap-guard-first short-circuit as the owned path: skip the
+        // whole-block dict-incompressibility scan when a primed dict already
+        // forces the raw-skip off. Boolean result unchanged (AND commutes).
+        && should_emit_raw_fast_path(
+            compression_level,
+            state.matcher.window_size(),
+            block,
+            dict_active,
+        )
     {
         #[cfg(feature = "lsm")]
         if let Some(sink) = block_decompressed_sizes {

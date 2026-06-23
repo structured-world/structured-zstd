@@ -4388,11 +4388,12 @@ mod tests {
     }
 
     /// `level_pre_split` resolves the per-level split knob through the
-    /// `LevelParams` table, mirroring the upstream zstd `splitLevels[]` by strategy
-    /// (`ZSTD_optimalBlockSize`): fast → 0 (from-borders), dfast → 1,
-    /// greedy/lazy → 2, lazy2/btlazy2 (Lazy tag at depth 2) → 3,
-    /// btopt/btultra/btultra2 → 4. `Uncompressed` has no numeric level so it
-    /// stays `None`.
+    /// `LevelParams` table, returning the EFFECTIVE upstream `ZSTD_splitBlock`
+    /// level (`splitLevels[strategy] - 2`, clamped at 0) that
+    /// `ZSTD_optimalBlockSize` dispatches: fast/dfast/greedy/lazy(d1) → 0
+    /// (from-borders), lazy2/btlazy2 → 1 (byChunks rate 43),
+    /// btopt/btultra/btultra2 → 2 (byChunks rate 11). `Uncompressed` has no
+    /// numeric level so it stays `None`.
     #[test]
     fn pre_split_level_dispatches_by_compression_level() {
         use crate::encoding::CompressionLevel;
@@ -4400,8 +4401,8 @@ mod tests {
         assert_eq!(level_pre_split(CompressionLevel::Uncompressed), None);
         // Fastest = level 1 (fast) → 0 (from-borders).
         assert_eq!(level_pre_split(CompressionLevel::Fastest), Some(0));
-        // Default = level 3 (dfast) → 1.
-        assert_eq!(level_pre_split(CompressionLevel::Default), Some(1));
+        // Default = level 3 (dfast) → 0 (splitLevels 1 - 2, clamped).
+        assert_eq!(level_pre_split(CompressionLevel::Default), Some(0));
         // Better is a pure alias for level 7 (lazy): same as Level(7).
         assert_eq!(
             level_pre_split(CompressionLevel::Better),
@@ -4415,19 +4416,20 @@ mod tests {
             level_pre_split(CompressionLevel::Level(13)),
         );
         assert_eq!(level_pre_split(CompressionLevel::Level(2)), Some(0)); // fast
-        assert_eq!(level_pre_split(CompressionLevel::Level(4)), Some(1)); // dfast
-        assert_eq!(level_pre_split(CompressionLevel::Level(5)), Some(2)); // greedy
-        assert_eq!(level_pre_split(CompressionLevel::Level(7)), Some(2)); // lazy (depth 1)
-        // lazy2 / btlazy2 use the rate-1 full-scan splitter (4), not the
-        // rate-5 sampler (3): the sampler phantom-splits homogeneous periodic
-        // input (see `pre_split` comment + `periodic_stream_not_oversplit`).
-        assert_eq!(level_pre_split(CompressionLevel::Level(8)), Some(4)); // lazy2 lower bound
-        assert_eq!(level_pre_split(CompressionLevel::Level(11)), Some(4)); // lazy2 (depth 2)
-        assert_eq!(level_pre_split(CompressionLevel::Level(12)), Some(4)); // lazy2 upper bound
-        assert_eq!(level_pre_split(CompressionLevel::Level(13)), Some(4)); // btlazy2 lower bound
-        assert_eq!(level_pre_split(CompressionLevel::Level(15)), Some(4)); // btlazy2 (depth 2)
-        assert_eq!(level_pre_split(CompressionLevel::Level(16)), Some(4)); // btopt
-        assert_eq!(level_pre_split(CompressionLevel::Level(22)), Some(4)); // btultra2
+        assert_eq!(level_pre_split(CompressionLevel::Level(4)), Some(0)); // dfast
+        assert_eq!(level_pre_split(CompressionLevel::Level(5)), Some(0)); // greedy
+        assert_eq!(level_pre_split(CompressionLevel::Level(7)), Some(0)); // lazy (depth 1)
+        // lazy2 / btlazy2: splitLevels 3 - 2 = 1 (byChunks rate 43, hashLog 8).
+        // The coarse byte-histogram tier is robust to the periodic-input
+        // phantom-split the rate-5/hashLog-10 tier suffered, so it matches
+        // upstream AND stays whole on periodic input (`periodic_stream_not_oversplit`).
+        assert_eq!(level_pre_split(CompressionLevel::Level(8)), Some(1)); // lazy2 lower bound
+        assert_eq!(level_pre_split(CompressionLevel::Level(11)), Some(1)); // lazy2 (depth 2)
+        assert_eq!(level_pre_split(CompressionLevel::Level(12)), Some(1)); // lazy2 upper bound
+        assert_eq!(level_pre_split(CompressionLevel::Level(13)), Some(1)); // btlazy2 lower bound
+        assert_eq!(level_pre_split(CompressionLevel::Level(15)), Some(1)); // btlazy2 (depth 2)
+        assert_eq!(level_pre_split(CompressionLevel::Level(16)), Some(2)); // btopt
+        assert_eq!(level_pre_split(CompressionLevel::Level(22)), Some(2)); // btultra2
     }
 
     /// Regression: a homogeneous but periodic multi-block stream must not be

@@ -447,52 +447,43 @@ impl LevelParams {
         }
     }
 
-    /// Cheap fingerprint pre-splitter level, the C-like `blockSplitterLevel`
-    /// knob. Mirrors the upstream zstd `splitLevels[]` table indexed by strategy in
-    /// `ZSTD_optimalBlockSize` (`{0,0,1,2,2,3,3,4,4,4}` over fast..btultra2):
-    /// fast=0, dfast=1, greedy=2, lazy=2, lazy2=3, btlazy2=3,
-    /// btopt/btultra/btultra2=4. We collapse the upstream zstd `lazy2` and `btlazy2`
-    /// strategies into the hash-chain `Lazy` tag, distinguished here by
-    /// `lazy_depth` (the level table runs both at depth 2), so depth 2 routes
-    /// to split level 3 to match the upstream zstd. `split_level == 0` routes to the
-    /// cheap from-borders heuristic; `1..=4` to byChunks with internal
-    /// sampling level `split_level - 1`. The `savings >= 3` gate in
-    /// `optimal_block_size` keeps incompressible data and the first full block
-    /// whole, so homogeneous frames are not over-split.
+    /// Cheap fingerprint pre-splitter level (the C-like `blockSplitterLevel`):
+    /// the EFFECTIVE upstream `ZSTD_splitBlock` level that
+    /// `ZSTD_optimalBlockSize` dispatches, i.e. `splitLevels[strategy] - 2`
+    /// (clamped at 0), NOT the raw `splitLevels[]` value. `split_level == 0`
+    /// routes to the cheap from-borders heuristic; `1..=4` to byChunks with
+    /// internal sampling level `split_level - 1`. See the body for the
+    /// per-strategy tier table and why the raw-table mapping was wrong.
     fn pre_split(&self) -> Option<u8> {
-        match self.strategy_tag {
-            super::strategy::StrategyTag::Fast => Some(0),
-            super::strategy::StrategyTag::Dfast => Some(1),
-            super::strategy::StrategyTag::Greedy => Some(2),
-            // The lazy2 / btlazy2 band (Lazy at lazy_depth >= 2, and Btlazy2)
-            // uses the rate-1 full-scan chunk splitter (4), NOT the rate-5
-            // sampler (3). The rate-5 sampler combined with the larger
-            // hash_log is sensitive enough to register a phantom statistical
-            // transition on perfectly homogeneous but periodic input (e.g. a
-            // repeating log-line stream whose period does not divide the 8 KB
-            // chunk size): the sampled bytes land on a different phase in each
-            // chunk, so two identical-distribution chunks look different and
-            // the block is split at 8 KB, then re-split on every window,
-            // cascading a large stream into hundreds of tiny blocks whose
-            // per-block headers dwarf the payload. The rate-1 scan reads every
-            // byte, so it sees periodic data as uniform and declines to split,
-            // while still finding genuine content boundaries (measured better
-            // ratio on the real decode corpus, and no longer expands a
-            // periodic stream vs a single full block). lazy/greedy keep the
-            // coarse samplers (lower hash_log => not sensitive enough to
-            // alias here).
-            super::strategy::StrategyTag::Lazy => {
+        use super::strategy::StrategyTag;
+        // Effective upstream `ZSTD_splitBlock` level = `splitLevels[strat] - 2`
+        // (clamped at 0). Upstream `splitLevels[] = {0,0,1,2,2,3,3,4,4,4}` then
+        // subtracts 2 before dispatch, so the byChunks sampling tier is two
+        // steps coarser than the raw table: greedy/lazy(d1)=0 (from-borders),
+        // lazy2/btlazy2=1 (byChunks rate 43), btopt+=2 (byChunks rate 11).
+        // An earlier version mirrored the RAW table AND bumped lazy2 to the
+        // rate-1 full scan (split 4) to dodge a periodic-input phantom-split —
+        // that ran the pre-splitter at up to 43x upstream's sampling cost
+        // (~87% of L9 encode time on the decode corpus). Per the drop-in
+        // contract ratio only needs to stay <= upstream, so matching upstream's
+        // sampling tier (and accepting upstream's identical over-split on
+        // periodic input) is the dominant large-input encode-speed win.
+        Some(match self.strategy_tag {
+            // splitLevels 0/1 -> 0: upstream does not pre-split fast/dfast at
+            // all; from-borders is the cheapest stand-in and rarely splits.
+            StrategyTag::Fast | StrategyTag::Dfast => 0,
+            // greedy / lazy(depth 1): splitLevels 2 -> 0 (from-borders).
+            StrategyTag::Greedy => 0,
+            StrategyTag::Lazy => {
                 if self.lazy_depth >= 2 {
-                    Some(4)
+                    1 // lazy2: splitLevels 3 -> 1 (byChunks rate 43)
                 } else {
-                    Some(2)
+                    0 // lazy depth 1: splitLevels 2 -> 0 (from-borders)
                 }
             }
-            super::strategy::StrategyTag::Btlazy2 => Some(4),
-            super::strategy::StrategyTag::BtOpt
-            | super::strategy::StrategyTag::BtUltra
-            | super::strategy::StrategyTag::BtUltra2 => Some(4),
-        }
+            StrategyTag::Btlazy2 => 1, // splitLevels 3 -> 1 (byChunks rate 43)
+            StrategyTag::BtOpt | StrategyTag::BtUltra | StrategyTag::BtUltra2 => 2,
+        })
     }
 }
 
@@ -1096,8 +1087,46 @@ pub fn estimated_bt_strategy_extra_bytes(strategy_ordinal: u32, window_log: u32)
     super::bt::BtMatcher::estimated_workspace_bytes() + hash3
 }
 
-/// Resolve a [`CompressionLevel`] to internal tuning parameters,
-/// optionally adjusted for a known source size.
+/// Resolve a [`CompressionLevel`] (+ optional source-size hint) to the
+/// concrete [`LevelParams`] the matcher runs: strategy tag, search method
+/// (match-finder), window log, and per-backend config.
+///
+/// ## CRITICAL: input size changes the match-finder (and can change strategy)
+///
+/// The resolved geometry is a function of the SOURCE SIZE, not the level
+/// alone. This is the easy-to-miss part (so read this before assuming a level
+/// maps to one fixed match-finder). It mirrors three upstream zstd stages:
+///
+/// 1. [`LEVEL_TABLE`] holds the tier-0 (source > 256 KiB) base row per level
+///    (upstream `ZSTD_defaultCParameters[0]`). L6-L12 carry
+///    `SearchMethod::RowHash` (the Row match-finder), like upstream's
+///    greedy/lazy default.
+/// 2. [`apply_cparams_tier`] overrides the table-shaping widths for the
+///    smaller source tiers (upstream `ZSTD_getCParams_internal` tier table).
+///    NOTE: upstream ALSO switches STRATEGY in some tiers (L2 → dfast, L4 →
+///    greedy on small sources); those backend switches are NOT yet replicated,
+///    so those levels keep their base strategy on small inputs.
+/// 3. [`adjust_params_for_source_size`] caps `window_log` to
+///    ~`ceil_log2(source_size)` (upstream `ZSTD_adjustCParams_internal`).
+///
+/// THEN, in the matcher `reset`, the greedy/lazy band falls back from
+/// `RowHash` to `SearchMethod::HashChain` when the resolved `window_log <= 14`
+/// — exactly upstream's `ZSTD_resolveRowMatchFinderMode` (the Row match-finder
+/// is used for greedy/lazy/lazy2 ONLY when `windowLog > 14`). Net effect for
+/// the SAME level:
+///
+/// * small input (e.g. a 10 KiB fixture → `window_log` 14) → **HashChain**
+///   (`ZSTD_HcFindBestMatch`, scalar chain walk);
+/// * large input (e.g. 1 MiB → `window_log` 20) → **RowHash** (the SIMD-tag
+///   row match-finder).
+///
+/// A dictionary does NOT change the match-finder: it only downsizes the
+/// prepared tables (`cdict_table_logs`, mirroring `ZSTD_createCDict`'s
+/// small-source assumption), while `window_log` stays source-derived. So
+/// `(L6, 10 KiB, +dict)` is HashChain and `(L6, 1 MiB, +dict)` is RowHash,
+/// both matching upstream. When comparing against C on a fixture, resolve the
+/// match-finder from the fixture's size first, or you may optimise/benchmark a
+/// path C does not even take for that input.
 fn resolve_level_params(level: CompressionLevel, source_size: Option<u64>) -> LevelParams {
     if matches!(level, CompressionLevel::Level(22)) {
         return level22_btultra2_params_for_source_size(source_size);
@@ -6684,6 +6713,26 @@ impl HcMatchGenerator {
         let current_ptr = self.table.get_last_space().as_ptr();
         let current: &[u8] = unsafe { core::slice::from_raw_parts(current_ptr, current_len) };
 
+        // Full live history (dict + committed blocks + current block), hoisted
+        // ONCE for the whole position scan and threaded into every
+        // `find_best_match` / `pick_lazy_match` call. `live_history()` is
+        // loop-invariant here (the scan mutates the hash/chain tables +
+        // `offset_hist` but never the history bytes or length), so re-fetching
+        // it per find — inside `hash_chain_candidate` + the rep probe, plus
+        // again for each lazy lookahead at pos+1 / pos+2 — was pure
+        // per-position overhead. Same raw-slice detach as `current` so the
+        // loop's `&mut self.table` inserts coexist with this `&[u8]`.
+        let concat: &[u8] = {
+            let lh = self.table.live_history();
+            unsafe { core::slice::from_raw_parts(lh.as_ptr(), lh.len()) }
+        };
+        // Dict-match-state primed flag, hoisted ONCE for the scan: it is
+        // block-invariant (the dict is primed before the block) and lives on the
+        // cold `dms` cacheline, so the per-find `dms.is_primed()` load was a
+        // measurable hot-path cost (~8% of `hash_chain_candidate` on the
+        // dict-over-random fixture). The `DICT = false` monomorph ignores it.
+        let dms_primed = self.table.dms.is_primed();
+
         let current_abs_end = current_abs_start + current_len;
         self.table
             .backfill_boundary_positions(current_abs_start, current_abs_end);
@@ -6694,52 +6743,90 @@ impl HcMatchGenerator {
             let abs_pos = current_abs_start + pos;
             let lit_len = pos - literals_start;
 
-            let best = self
-                .hc
-                .find_best_match::<DICT>(&self.table, abs_pos, lit_len);
-            if let Some(candidate) =
+            // `find_best_match` returns the forward `(offset, length)` in
+            // registers (`HcMatch`, 16 bytes) — no 24-byte `MatchCandidate` /
+            // 32-byte `Option` spilled-and-copied per position. The backward
+            // extension that yields `start` runs ONCE here, after the lazy
+            // decision settles, exactly like upstream's lazy loop.
+            let best =
                 self.hc
-                    .pick_lazy_match::<DICT>(&self.table, abs_pos, lit_len, best)
-            {
-                self.table
-                    .insert_match_span(abs_pos, candidate.start + candidate.match_len);
-                let start = candidate.start - current_abs_start;
-                let literals = &current[literals_start..start];
-                handle_sequence(Sequence::Triple {
-                    literals,
-                    offset: candidate.offset,
-                    match_len: candidate.match_len,
-                });
-                let _ = encode_offset_with_history(
-                    candidate.offset as u32,
-                    literals.len() as u32,
-                    &mut self.table.offset_hist,
-                );
-                pos = start + candidate.match_len;
-                literals_start = pos;
-            } else {
+                    .find_best_match::<DICT>(concat, dms_primed, &self.table, abs_pos, lit_len);
+            if best.is_match() {
+                if self.hc.pick_lazy_match::<DICT>(
+                    concat,
+                    dms_primed,
+                    &self.table,
+                    abs_pos,
+                    lit_len,
+                    best,
+                ) {
+                    // Backward-extend over the literal run (upstream `zstd_lazy.c`
+                    // after rep-vs-chain selection). The offset is preserved;
+                    // `start` and `match_len` grow by the same amount, bounded by
+                    // `literals_start` (the `min_abs` floor) so it never crosses
+                    // an already-emitted sequence.
+                    let history_abs_start = self.table.history_abs_start;
+                    let min_abs = abs_pos - lit_len;
+                    let mut start_abs = abs_pos;
+                    let mut cand_abs = abs_pos - best.offset;
+                    let mut match_len = best.match_len;
+                    while start_abs > min_abs
+                        && cand_abs > history_abs_start
+                        && concat[cand_abs - history_abs_start - 1]
+                            == concat[start_abs - history_abs_start - 1]
+                    {
+                        start_abs -= 1;
+                        cand_abs -= 1;
+                        match_len += 1;
+                    }
+                    self.table.insert_match_span(abs_pos, start_abs + match_len);
+                    let start = start_abs - current_abs_start;
+                    let literals = &current[literals_start..start];
+                    handle_sequence(Sequence::Triple {
+                        literals,
+                        offset: best.offset,
+                        match_len,
+                    });
+                    let _ = encode_offset_with_history(
+                        best.offset as u32,
+                        literals.len() as u32,
+                        &mut self.table.offset_hist,
+                    );
+                    pos = start + match_len;
+                    literals_start = pos;
+                    continue;
+                }
+                // Lazy lookahead found a better match at `abs_pos + 1` / `+ 2`
+                // (defer): advance exactly ONE byte (upstream
+                // `ZSTD_compressBlock_lazy_generic`) so the deferred candidate is
+                // re-evaluated at its own position; the no-match skip below could
+                // jump past it once the literal run reaches 256+ bytes.
                 self.table.insert_position(abs_pos);
-                // Lazy skipping (upstream zstd `ZSTD_compressBlock_lazy_generic`,
-                // zstd_lazy.c:1614): advance faster over runs with no match.
-                // `step = ((ip - anchor) >> kSearchStrength) + 1` with
-                // kSearchStrength = 8, where `ip - anchor` is the current
-                // literal-run length. On compressible input the run stays short
-                // (step == 1, identical to a 1-byte advance); on incompressible
-                // / dict-over-random input the run grows so the parser skips
-                // ahead (one search per `step` positions) instead of searching
-                // every byte. Skipped positions are not inserted, mirroring
-                // upstream (it inserts only searched positions during a no-match
-                // run). Ratio follows upstream (not byte-identical).
-                let step = ((pos - literals_start) >> 8) + 1;
-                pos += step;
-                // No clamp needed before the tail loop: the search bound and the
-                // hashable bound are both `pos + HC_MIN_MATCH_LEN <= current_len`
-                // (HC_MIN_MATCH_LEN == 4 == the insert width), so there is no
-                // non-searchable-but-hashable anchor to miss. Positions the skip
-                // jumps over inside the searchable region are intentionally not
-                // inserted — same as upstream zstd, which advances past them via
-                // the identical `ip += step` and never hashes them either.
+                pos += 1;
+                continue;
             }
+            // No match found.
+            self.table.insert_position(abs_pos);
+            // Lazy skipping (upstream zstd `ZSTD_compressBlock_lazy_generic`,
+            // zstd_lazy.c:1614): advance faster over runs with no match.
+            // `step = ((ip - anchor) >> kSearchStrength) + 1` with
+            // kSearchStrength = 8, where `ip - anchor` is the current
+            // literal-run length. On compressible input the run stays short
+            // (step == 1, identical to a 1-byte advance); on incompressible
+            // / dict-over-random input the run grows so the parser skips
+            // ahead (one search per `step` positions) instead of searching
+            // every byte. Skipped positions are not inserted, mirroring
+            // upstream (it inserts only searched positions during a no-match
+            // run). Ratio follows upstream (not byte-identical).
+            let step = ((pos - literals_start) >> 8) + 1;
+            pos += step;
+            // No clamp needed before the tail loop: the search bound and the
+            // hashable bound are both `pos + HC_MIN_MATCH_LEN <= current_len`
+            // (HC_MIN_MATCH_LEN == 4 == the insert width), so there is no
+            // non-searchable-but-hashable anchor to miss. Positions the skip
+            // jumps over inside the searchable region are intentionally not
+            // inserted — same as upstream zstd, which advances past them via
+            // the identical `ip += step` and never hashes them either.
         }
 
         // Insert remaining hashable positions in the tail (the matching loop

@@ -1084,10 +1084,17 @@ macro_rules! row_probe_body {
             // zstd decrements one `nbAttempts` across both rows,
             // zstd_lazy.c:1308): the dict probe only spends what the live
             // walk left over.
-            if attempts < max_walk
+            // Match upstream zstd's effective dict search depth: the CDict path
+            // adjusts cParams (dict-size-aware searchLog) so the dict probe runs
+            // deeper than the bare level searchLog — measured nbAttempts >= 16 to
+            // surface the long dict match on the per-label-dict fixtures, vs the
+            // 8 from L6's searchLog=3. Floor the dict budget at 16 (a full
+            // rowLog-4 row); the dpending mask still bounds it to the row width.
+            let dict_budget = max_walk.max(16);
+            if attempts < dict_budget
                 && let Some(dict) = $m.dict.table()
             {
-                let dict_walk = max_walk - attempts;
+                let dict_walk = dict_budget - attempts;
                 let dict_end = $m.dict.region_len();
                 let drow_base = row << $rl;
                 let dhead = dict.heads[row] as usize;
