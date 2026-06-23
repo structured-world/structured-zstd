@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782061282433,
+  "lastUpdate": 1782194024758,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -69890,6 +69890,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.188,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "fdcd8615dad1c3b6951282ec617d0fdbbff84826",
+          "message": "perf(encode): close the L6-L9 lazy dictionary compress-speed gap (#442)\n\n* test(bench): dict-aware sequence comparator for raw-content dicts\n\nRoute a non-magic STRUCTURED_ZSTD_BENCH_DICT through the raw-content capture\npath (mirrors the C side's ZSTD_CCtx_loadDictionary auto-detect) instead of the\nmagic-only path that panicked with BadMagicNum. Add a small-1k-log-lines fixture\nand a DICT_MATRIX_DUMP_DICT env dump so the L6 dict ratio gap reproduces in the\ncomparator.\n\n* perf(encode): match upstream dict search depth, drop target_len early-return\n\nThe dict-primed lazy/HC search returned at the first candidate reaching\ntarget_len and walked only the bare level searchLog budget (8 at L6), so it\nsettled for the nearest short dict match instead of the long one. Upstream zstd's\nCDict path adjusts cParams so the dedicated dict search runs nbAttempts >= 16\n(measured by sweeping searchLog), and ZSTD_HcFindBestMatch has no target_len\nbreak in the find (only ip+ml == iLimit). Match both: floor the dict-walk budget\nat 16 (HC dms walk + Row dict probe) and break only on reaching the input end.\n\nCloses the small-frame compress-dict ratio gap exactly vs libzstd (logs-1k/512\nL6 1.44x -> 1.00x, 26 -> 18 bytes); larger frames improved, residual tracked\nseparately. Dict-path only (non-dict output unchanged); 823 tests pass.\n\n* perf(encode): 4-byte gate the lazy repcode probe before the SIMD count\n\nThe lazy repcode probe called common_prefix_len (the dispatched SIMD\nextension) for every candidate rep unconditionally. Upstream zstd gates\nthe repcode with a MEM_read32 4-byte compare before extending, and the\nhash-chain walk already does the same. HC_MIN_MATCH_LEN == 4 and the\ncurrent side is guaranteed 4 bytes of lookahead, so a first-4-byte\nmismatch can never reach the match floor: reject on a scalar u32 compare\ninstead of the vector load+count. Byte-identical (the accepted set is\nunchanged); skips the bulk of non-matching reps on real data.\n\n* perf(encode): floor-advance the resident-dict reset, drop the per-frame memset\n\nThe resident-dict reset rewound the abs base to 0 and memset the live\nhash/hash3/chain tables every frame (~23% of small-frame dict-compress).\nThe dms is concat-keyed (abs-invariant), so the reset can instead\nfloor-advance the abs base (like the non-dict fast path): the dict stays\nat the buffer front, in-window via the existing bump, and the previous\nframe's input entries fall below window_low and wrap out of range on\nread - no memset. The bounded fallback (rewind+memset) stays for when the\nfloor would climb past the 32-bit headroom ceiling.\n\nThis alone decayed the dict across frames because dms_chain_walk shared\nits step counter with the live-chain walk: with no memset the live chain\naccumulates across frames, the live walk exhausts the shared budget on\nstale entries, and the dict search got 0 attempts (matches silently\ndropped, worse at deeper search). Give the dict search its own step\nbudget so it always gets its >= 16 attempts. Byte-identical (the live\nchain is short enough in the memset case that the effective dms attempt\ncount is unchanged); verified across the dict matrix + 20000-iter reuse.\n\n* perf(encode): early-exit the live chain walk at the stale frame boundary\n\nCompletes the floor-advance reset. Without the per-frame memset the live\nhash chain accumulates entries across frames; the walk's window check\nonly SKIPPED out-of-window entries (continuing the loop), so it ran the\nfull max_chain_steps over the stale tail every position instead of\nexiting at the frame boundary - turning the memset removal into a net\nregression (i9: 1KB dict L9 +30%, L12 +77%). A wrapped index\n(>= current_idx, i.e. abs < history_abs_start) is a previous-frame entry;\nthe chain is head-insert monotonic so the rest of the tail is stale -\nbreak. In the memset reset the chain has no wrapped entries (hits\nHC_EMPTY first), so this never fires: byte-identical (dict matrix r_B\nunchanged, 209 tests incl. the non-monotonic-walk test).\n\n* fix(bench-dashboard): average each metric over a fixed cohort set\n\nThe aggregate-over-levels chart averaged each snapshot over whatever\n(level, scenario, target) cohorts it happened to have. A snapshot missing\na cohort (one side absent) then had a different denominator, so the line\njumped for reasons unrelated to perf - visible on throughput (MB/s spans\norders of magnitude across levels) but not on the ratio (values approx 1).\nRestrict every snapshot's mean for a metric to the cohorts present in\nEVERY snapshot (the cross-snapshot intersection), so the denominator is\nidentical at each point and the line tracks real perf, not data\ncompleteness.\n\n* perf(encode): share the live+dms chain-walk step budget (upstream parity)\n\nThe dms walk had a dedicated 16-step budget (added in #13 to avoid the\ncross-frame decay). But that diverges from upstream zstd, where the live\nchain and dms loops share ONE nbAttempts — making us do more dict\nattempts than C per position. The decay is already prevented by the live\nwalk's stale-tail early-exit (it stops at the wrapped index instead of\nburning the budget on accumulated cross-frame entries), so the shared\nbudget is safe: ratio byte-identical (dict_matrix r_B unchanged), no\ndecay over the 20000-iter reuse, 823 tests.\n\n* perf(encode): C forward-ml HC chain walk (currentMl>ml, self-tightening gate)\n\n* perf(encode): single-rep (offset_1) lazy probe, match C lazy loop\n\n* docs(encode): document size-driven match-finder selection in resolve_level_params\n\n* perf(encode): hoist live_history out of the per-find lazy hot path\n\n* perf(encode): hoist dms primed flag out of the per-find dict hot path\n\n* perf(encode): use hoisted concat for history_abs_end in pick_lazy_match\n\n* perf(encode): match upstream pre-splitter sampling tier (splitLevels-2)\n\n* test(bench): drop large-corpus L22 exact-sequence-parity check\n\nThe block pre-splitter repartitions >=128KB inputs at upstream's sampling\ntier but with our own match parser, so the level-22 sequence stream\nlegitimately diverges from ZSTD_generateSequences. Binary sequence parity is\nnot a drop-in requirement; our L22 output stays <= upstream (covered by\ncross_validation::level22_stays_within_ffi) and round-trips through the\nreference decoder. The small-corpus (<128KB, no pre-split) parity check stays.\n\n* perf(encode): drop found bool from HC walk in dict monomorph only\n\n* perf(encode): pick_lazy_match returns bool, not Option<MatchCandidate>\n\n* perf(encode): inline live_history + single-rep probe into the lazy find\n\n* perf(encode): hoist chain-table base pointers out of the HC walk loops\n\n* perf(encode): short-circuit whole-block dict scan when raw-skip forced off\n\n* refactor(encode): collapse the lazy commit-if into a let-chain\n\n* fix(encode): advance one byte on lazy defer, not the no-match skip\n\n* perf(encode): drop the carried self-loop bool from the chain walk\n\n* perf(encode): return forward (offset,len) from HC find, backward-extend at commit\n\n* perf(encode): keep scalar find out of line, thin lazy loop\n\n* perf(encode): fold the chain walk + rep into the out-of-line find monolith\n\n* docs(encode): correct the dms shared-budget note\n\n* docs(encode): drop the code-literal from the dms budget note",
+          "timestamp": "2026-06-23T08:05:56+03:00",
+          "tree_id": "23abba1011abada1128e415e26c59e944241e652",
+          "url": "https://github.com/structured-world/structured-zstd/commit/fdcd8615dad1c3b6951282ec617d0fdbbff84826"
+        },
+        "date": 1782194011619,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.077,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.068,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 191.408,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 160.055,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 0.48,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.1,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.582,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.558,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.458,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.498,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.022,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.134,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.022,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.134,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.008,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 9.728,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.22,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.07,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.224,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.33,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 0.969,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.38,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.303,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.05,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.026,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.167,
             "unit": "ms"
           }
         ]
