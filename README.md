@@ -27,10 +27,17 @@ cargo add structured-zstd --no-default-features
 ```
 
 The decoder ships per-CPU-tier SIMD kernels, each behind a cargo feature
-(all on by default; the tier is picked at runtime with `std`, or at compile
-time from `target_feature` on `no_std`): `kernel_scalar`, `kernel_sse2`,
+(the tier is picked at runtime with `std`, or at compile time from
+`target_feature` on `no_std`): `kernel_scalar`, `kernel_sse2`,
 `kernel_bmi2`, `kernel_avx2`, `kernel_vbmi2` (x86) and `kernel_neon`,
-`kernel_sve` (aarch64). The scalar kernel is always compiled (it is the
+`kernel_sve` (aarch64). All are on by default **except `kernel_vbmi2`**
+(AVX-512): on AVX-512 hosts that tier is measurably slower than `kernel_avx2`
+for this decode workload — AVX-512's license-based frequency downclocking
+stalls the surrounding (bursty, memory-bound) code, and the heavier kernel
+never amortizes — so by default the runtime dispatch is capped at AVX2 and
+AVX-512 hosts fall back to the (faster) AVX2 tier. The kernel is still shipped
+and can be opted in with `--features kernel_vbmi2` for a sustained AVX-512
+workload that genuinely benefits. The scalar kernel is always compiled (it is the
 mandatory fallback), so `kernel_scalar` is a marker that gates no code;
 disabling the SIMD tiers is what trims the binary. A scalar-only build —
 `--no-default-features` (or, equivalently, naming the marker explicitly) —
