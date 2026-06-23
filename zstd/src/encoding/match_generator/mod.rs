@@ -2061,5 +2061,93 @@ pub(crate) enum HcBackend {
     Bt(alloc::boxed::Box<super::bt::BtMatcher>),
 }
 
+#[cfg(feature = "bench_internals")]
+pub(crate) fn level22_block_ranges(data: &[u8]) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut cursor = 0usize;
+    let mut savings = 0i64;
+    while cursor < data.len() {
+        let remaining = data.len() - cursor;
+        let candidate_len = remaining.min(super::cost_model::HC_BLOCKSIZE_MAX);
+        let block_len = crate::encoding::frame_compressor::optimal_block_size(
+            CompressionLevel::Level(22),
+            &data[cursor..cursor + candidate_len],
+            remaining,
+            super::cost_model::HC_BLOCKSIZE_MAX,
+            savings,
+        )
+        .min(candidate_len)
+        .max(1);
+        ranges.push((cursor, block_len));
+        cursor += block_len;
+        // The exact upstream zstd gate uses compressed-size savings. For this corpus
+        // parity harness, after the first full block has compressed, savings is
+        // sufficient to authorize the same pre-block splitter path.
+        if cursor >= super::cost_model::HC_BLOCKSIZE_MAX {
+            savings = 3;
+        }
+    }
+    ranges
+}
+
+#[cfg(feature = "bench_internals")]
+fn merge_block_delimiters(sequences: Vec<(usize, usize, usize)>) -> Vec<(usize, usize, usize)> {
+    let mut out = Vec::with_capacity(sequences.len());
+    let mut pending_lits = 0usize;
+    for (lit_len, offset, match_len) in sequences {
+        if offset == 0 && match_len == 0 {
+            pending_lits = pending_lits.saturating_add(lit_len);
+            continue;
+        }
+        out.push((lit_len.saturating_add(pending_lits), offset, match_len));
+        pending_lits = 0;
+    }
+    if pending_lits > 0 {
+        out.push((pending_lits, 0, 0));
+    }
+    out
+}
+
+/// White-box capture of the level-22 sequence stream (literal-length,
+/// offset, match-length triples) the match generator emits for `data`,
+/// with block-delimiter pseudo-sequences merged into the following
+/// triple's literal run. Pure Rust; the C-conformance comparison that
+/// consumes it lives in the `ffi-bench` crate.
+#[cfg(feature = "bench_internals")]
+pub(crate) fn collect_level22_sequences(data: &[u8]) -> Vec<(usize, usize, usize)> {
+    merge_block_delimiters(collect_level22_sequences_with_delimiters(data))
+        .into_iter()
+        .filter(|(_, offset, match_len)| *offset != 0 || *match_len != 0)
+        .collect()
+}
+
+#[cfg(feature = "bench_internals")]
+fn collect_level22_sequences_with_delimiters(data: &[u8]) -> Vec<(usize, usize, usize)> {
+    let mut driver = MatchGeneratorDriver::new(super::cost_model::HC_BLOCKSIZE_MAX, 1);
+    driver.set_source_size_hint(data.len() as u64);
+    driver.reset(CompressionLevel::Level(22));
+
+    let mut sequences = Vec::new();
+    for (chunk_start, chunk_len) in level22_block_ranges(data) {
+        let chunk = &data[chunk_start..chunk_start + chunk_len];
+        let mut space = driver.get_next_space();
+        space[..chunk.len()].copy_from_slice(chunk);
+        space.truncate(chunk.len());
+        driver.commit_space(space);
+        driver.start_matching(|seq| {
+            let entry = match seq {
+                Sequence::Literals { literals } => (literals.len(), 0usize, 0usize),
+                Sequence::Triple {
+                    literals,
+                    offset,
+                    match_len,
+                } => (literals.len(), offset, match_len),
+            };
+            sequences.push(entry);
+        });
+    }
+    sequences
+}
+
 #[cfg(test)]
 mod tests;
