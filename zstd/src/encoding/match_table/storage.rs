@@ -1359,6 +1359,11 @@ impl MatchTable {
             // un-cleared slots decode out-of-range, and no match-find runs before
             // the clone / prime cleans them, so deferring is safe (skipping the
             // fills WITHOUT this hand-off reproduces the reused-CDict decay).
+            // The "always followed by prime/restore" hand-off holds because
+            // removing or replacing a dictionary clears `dictionary_active`
+            // (in `invalidate_primed_dictionary`): this branch is only reached
+            // while a dictionary is attached and will re-prime/restore, so a
+            // subsequent no-dictionary frame can never strand the deferred clear.
             self.history_abs_start = 0;
             self.position_base = 0;
             self.index_shift = 0;
