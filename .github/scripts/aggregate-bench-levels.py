@@ -76,10 +76,18 @@ def merge_relative_json(target):
     payload = None
     seen = set()
     records = []
+    machines = []
+    machine_sigs = set()
     for p in files_for(target, "relative", "json"):
         shard = json.loads(p.read_text())
         if payload is None:
             payload = {k: v for k, v in shard.items() if k != "records"}
+        machine = (shard.get("target") or {}).get("machine")
+        if machine is not None:
+            sig = json.dumps(machine, sort_keys=True)
+            if sig not in machine_sigs:
+                machine_sigs.add(sig)
+                machines.append(machine)
         for rec in shard.get("records", []):
             sig = (rec.get("metric"), rec.get("key"), rec.get("level"))
             if sig in seen:
@@ -90,6 +98,12 @@ def merge_relative_json(target):
         print(f"WARN[{target}]: no benchmark-relative.*.json shards found", file=sys.stderr)
         payload = {"version": 1, "target": {"id": target}, "records": []}
     payload["records"] = records
+    # GitHub assigns each (target, level) job its own runner, so a target's
+    # shards can land on different hosts. `target.machine` keeps the first
+    # shard's fingerprint; if any shard differed, record every distinct one
+    # under `machine_variants` so the divergence is visible, not masked.
+    if len(machines) > 1 and isinstance(payload.get("target"), dict):
+        payload["target"]["machine_variants"] = machines
     Path(f"benchmark-relative.{target}.json").write_text(json.dumps(payload, indent=2) + "\n")
 
 

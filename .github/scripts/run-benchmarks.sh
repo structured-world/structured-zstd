@@ -131,6 +131,89 @@ def markdown_table_escape(value):
     escaped = escaped.replace("%", "&#37;")
     return escaped.replace("\n", "<br>")
 
+def _read_sysfs(path):
+    try:
+        with open(path) as _f:
+            return _f.read().strip()
+    except OSError:
+        return None
+
+
+def collect_machine_info():
+    """Best-effort host fingerprint for the shard that ran this bench: CPU
+    model plus the ISA flags that drive our kernel dispatch (so an AVX-512
+    host is visible even when the AVX2 tier was selected), core count,
+    frequency, cpufreq governor, and memory. Every field is optional —
+    missing ones are dropped so a locked-down runner still yields a valid
+    (smaller) block instead of failing the run."""
+    import platform
+    import subprocess
+
+    def _cmd(args):
+        try:
+            return subprocess.run(
+                args, capture_output=True, text=True, timeout=10
+            ).stdout
+        except Exception:
+            return ""
+
+    info = {
+        "os": platform.system(),
+        "arch": platform.machine(),
+        "hostname": platform.node() or None,
+        "cpus_logical": os.cpu_count(),
+    }
+    system = platform.system()
+    if system == "Linux":
+        cpuinfo = _read_sysfs("/proc/cpuinfo") or ""
+        m = re.search(r"^model name\s*:\s*(.+)$", cpuinfo, re.M)
+        if m:
+            info["cpu_model"] = m.group(1).strip()
+        flags_m = re.search(r"^flags\s*:\s*(.+)$", cpuinfo, re.M)
+        if flags_m:
+            flags = set(flags_m.group(1).split())
+            info["isa"] = {
+                f: (f in flags)
+                for f in ("sse2", "bmi2", "avx2", "avx512f", "avx512vbmi2")
+            }
+        gov = _read_sysfs("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
+        if gov:
+            info["governor"] = gov
+        for key, path in (
+            ("max_freq_mhz", "/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq"),
+            ("cur_freq_mhz", "/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq"),
+        ):
+            raw = _read_sysfs(path)
+            if raw and raw.isdigit():
+                info[key] = round(int(raw) / 1000)
+        meminfo = _read_sysfs("/proc/meminfo") or ""
+        mm = re.search(r"^MemTotal:\s*(\d+)\s*kB", meminfo, re.M)
+        if mm:
+            info["mem_total_mb"] = round(int(mm.group(1)) / 1024)
+        # Memory type/speed need DMI (root): try `sudo -n` then bare, ignore
+        # failures (most hosted runners deny dmidecode — that is fine).
+        dmi = _cmd(["sudo", "-n", "dmidecode", "-t", "memory"]) or _cmd(
+            ["dmidecode", "-t", "memory"]
+        )
+        tm = re.search(r"^\s*Type:\s*(DDR\S+)", dmi, re.M)
+        if tm:
+            info["mem_type"] = tm.group(1)
+        sm = re.search(r"Configured Memory Speed:\s*(\d+)\s*MT/s", dmi)
+        if sm:
+            info["mem_speed_mts"] = int(sm.group(1))
+    elif system == "Darwin":
+        model = _cmd(["sysctl", "-n", "machdep.cpu.brand_string"]).strip()
+        if model:
+            info["cpu_model"] = model
+        freq = _cmd(["sysctl", "-n", "hw.cpufrequency"]).strip()
+        if freq.isdigit() and int(freq) > 0:
+            info["max_freq_mhz"] = round(int(freq) / 1_000_000)
+        memsize = _cmd(["sysctl", "-n", "hw.memsize"]).strip()
+        if memsize.isdigit():
+            info["mem_total_mb"] = round(int(memsize) / 1024 / 1024)
+    return {k: v for k, v in info.items() if v is not None}
+
+
 benchmark_results = []
 timings = []
 ratios = []
@@ -138,6 +221,7 @@ memory_rows = []
 dictionary_rows = []
 dictionary_training_rows = []
 kernel_info = None
+machine_info = collect_machine_info()
 timing_rows = []
 scenario_input_bytes = {}
 scenario_training_bytes = {}
@@ -871,6 +955,11 @@ relative_payload = {
         # reading this can attribute every record to the kernel that
         # produced it. `None` if the bench binary predates REPORT_KERNEL.
         "kernel": kernel_info,
+        # Host fingerprint of the shard that ran this target (CPU model, ISA
+        # flags, governor, frequency, memory). Records which hardware produced
+        # the numbers — e.g. surfaces an AVX-512 runner even when the AVX2
+        # kernel was selected, so a divergence from another arch is explainable.
+        "machine": machine_info,
     },
     "reference_band": {
         "delta_low": DELTA_LOW,
