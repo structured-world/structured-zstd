@@ -48,6 +48,16 @@ def register_target(target, target_meta=None):
             "label": target_meta.get("label") or existing.get("label") or target,
             "triple": target_meta.get("triple") if target_meta.get("triple") is not None else existing.get("triple"),
         }
+        # Carry the per-target kernel + host fingerprint onto targets_meta so
+        # the dashboard can map every record to the CPU kernel that produced it
+        # and the hardware it ran on. `machine_variants` is present only when a
+        # target's level shards ran on more than one distinct host.
+        for opt_key in ("kernel", "machine", "machine_variants"):
+            value = target_meta.get(opt_key)
+            if value is None:
+                value = existing.get(opt_key)
+            if value is not None:
+                merged_meta[opt_key] = value
         targets_meta[target] = merged_meta
 
 
