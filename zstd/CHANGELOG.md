@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.44](https://github.com/structured-world/structured-zstd/compare/v0.0.43...v0.0.44) - 2026-06-23
+
+### Performance
+
+- *(kernel)* disable AVX-512 VBMI2 tier by default; defer dict-frame table clear ([#443](https://github.com/structured-world/structured-zstd/pull/443))
+
 ## [0.0.43](https://github.com/structured-world/structured-zstd/compare/v0.0.42...v0.0.43) - 2026-06-23
 
 ### Performance
