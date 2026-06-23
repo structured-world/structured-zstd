@@ -791,9 +791,22 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
             }
         }
     }
-    debug_assert_eq!(
+    // These two invariants are the SAFETY contract for the uninitialized
+    // `state_table_flat` built below: the scatter-write loop fills every index
+    // in `[0, table_size)` exactly once only if (a) the spread cycled exactly
+    // once through the table (so each symbol got exactly its `cumul`-width run
+    // of slots) and (b) the `cumul` cursors sum to `table_size` (so the runs
+    // partition the whole table). They are asserted in ALL build profiles
+    // (not `debug_assert`) so a regression in probability normalization panics
+    // loudly here instead of leaving uninitialized slots that read as UB.
+    assert_eq!(
         position, 0,
         "FSE spread must cycle exactly once through tableSize positions"
+    );
+    assert_eq!(
+        cumul[probs.len()] as usize,
+        table_size,
+        "FSE cumul cursors must sum to table_size before building nextStateTable"
     );
 
     // Phase 3 — emit `state_table_flat` (upstream zstd `nextStateTable`)
@@ -805,21 +818,23 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
     // Both representations encode the same `(symbol → next_slot)`
     // mapping; [`FSETable::next_state`] is written against the raw-slot
     // convention so the pre-shift is intentionally skipped here.
-    // Every index in `[0, table_size)` is written EXACTLY once by the spread
-    // loop below: the `cumul` cursors partition the table bijectively (the
-    // Phase-2 assert above proves the spread cycles through every position once,
-    // and `sum(count) == table_size`). So a zero-init is dead -- every slot is
-    // overwritten before any read (`into_boxed_slice` + `FSETable` use happen
-    // after the loop). Allocate uninitialized and let the loop fill it, skipping
-    // a per-build `table_size`-element memset (3 FSE builds per block for the
-    // LL/ML/OF streams when custom tables are chosen). The `uninit_vec` lint
-    // cannot see the bijective full-write; soundness is confirmed under miri
-    // (the FSE encoder round-trip exercises this with no use-of-uninit).
+    // Every index in `[0, table_size)` is written EXACTLY once by the scatter
+    // loop below: the `cumul` cursors partition the table bijectively, which the
+    // two asserts above enforce in every build profile. So a zero-init is dead
+    // -- every slot is overwritten before any read (`into_boxed_slice` +
+    // `FSETable` use happen after the loop). Allocate uninitialized and let the
+    // loop fill it, skipping a per-build `table_size`-element memset (3 FSE
+    // builds per block for the LL/ML/OF streams when custom tables are chosen).
+    // The `uninit_vec` lint cannot see the bijective full-write; soundness is
+    // confirmed under miri (the FSE encoder round-trip exercises this with no
+    // use-of-uninit).
     #[allow(clippy::uninit_vec)]
     let mut state_table_flat: alloc::vec::Vec<u16> = {
         let mut v = alloc::vec::Vec::with_capacity(table_size);
         // SAFETY: `with_capacity(table_size)` reserved exactly `table_size`
-        // slots; the loop below writes every index once before the first read.
+        // slots; the asserts above guarantee (in every build profile) that the
+        // scatter loop below writes every index in `[0, table_size)` exactly
+        // once before the first read.
         unsafe { v.set_len(table_size) };
         v
     };
