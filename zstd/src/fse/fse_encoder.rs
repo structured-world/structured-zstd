@@ -805,7 +805,24 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
     // Both representations encode the same `(symbol → next_slot)`
     // mapping; [`FSETable::next_state`] is written against the raw-slot
     // convention so the pre-shift is intentionally skipped here.
-    let mut state_table_flat: alloc::vec::Vec<u16> = alloc::vec![0u16; table_size];
+    // Every index in `[0, table_size)` is written EXACTLY once by the spread
+    // loop below: the `cumul` cursors partition the table bijectively (the
+    // Phase-2 assert above proves the spread cycles through every position once,
+    // and `sum(count) == table_size`). So a zero-init is dead -- every slot is
+    // overwritten before any read (`into_boxed_slice` + `FSETable` use happen
+    // after the loop). Allocate uninitialized and let the loop fill it, skipping
+    // a per-build `table_size`-element memset (3 FSE builds per block for the
+    // LL/ML/OF streams when custom tables are chosen). The `uninit_vec` lint
+    // cannot see the bijective full-write; soundness is confirmed under miri
+    // (the FSE encoder round-trip exercises this with no use-of-uninit).
+    #[allow(clippy::uninit_vec)]
+    let mut state_table_flat: alloc::vec::Vec<u16> = {
+        let mut v = alloc::vec::Vec::with_capacity(table_size);
+        // SAFETY: `with_capacity(table_size)` reserved exactly `table_size`
+        // slots; the loop below writes every index once before the first read.
+        unsafe { v.set_len(table_size) };
+        v
+    };
     let mut cursor = cumul;
     for (u, &symbol_at_slot) in table_symbol.iter().enumerate() {
         let s = symbol_at_slot as usize;
