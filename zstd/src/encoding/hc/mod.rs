@@ -15,6 +15,8 @@
 
 #![allow(dead_code)]
 
+pub(crate) mod priceset;
+
 use super::cost_model::{HC_FORMAT_MINMATCH, HC_OPT_NUM, HcOptimalCostProfile};
 use super::match_table::helpers::common_prefix_len;
 use super::match_table::storage::{HC_EMPTY, MatchTable};
