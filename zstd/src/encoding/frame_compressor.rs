@@ -2842,6 +2842,60 @@ mod tests {
         assert_eq!(decoded, payload);
     }
 
+    // Regression: after `clear_dictionary()` a reused compressor must fully
+    // deactivate the dictionary state. The dict-active matcher reset rewinds the
+    // hash/chain tables to the origin (`position_base = 0`) and DEFERS the table
+    // clear to the next prime/restore. If `clear_dictionary` leaves the matcher
+    // marked dictionary-active, a subsequent NO-dictionary frame hits that
+    // deferred-clear branch but never runs prime/restore, so stale dict-region
+    // entries (old absolute positions) survive at the rewound base and can
+    // surface as bogus matches. The no-dict frame must still round-trip without
+    // the dictionary. Uses Level(16) (btopt → HashChain backend, whose storage
+    // owns the deferred-clear path).
+    #[test]
+    fn clear_dictionary_then_nodict_frame_roundtrips() {
+        let dict_raw = include_bytes!("../../dict_tests/dictionary");
+        // Payload B embeds dictionary bytes up front so a surviving dict-region
+        // chain entry would be a tempting (wrong) match candidate.
+        let mut payload_b = Vec::new();
+        payload_b.extend_from_slice(&dict_raw[..dict_raw.len().min(2048)]);
+        payload_b.extend_from_slice(
+            b"no-dictionary tail no-dictionary tail"
+                .repeat(16)
+                .as_slice(),
+        );
+
+        let mut compressor: FrameCompressor =
+            FrameCompressor::new(super::CompressionLevel::Level(16));
+        compressor
+            .set_dictionary_from_bytes(dict_raw)
+            .expect("dictionary bytes should parse");
+        // Frame A primes the dictionary (sets the matcher dictionary-active).
+        let mut frame_a = Vec::new();
+        compressor.compress_independent_frame_into(
+            b"dictionary-keyed payload dictionary-keyed payload"
+                .repeat(8)
+                .as_slice(),
+            &mut frame_a,
+        );
+        // Remove the dictionary, then compress a no-dictionary frame on the
+        // SAME reused compressor.
+        compressor.clear_dictionary();
+        let mut frame_b = Vec::new();
+        compressor.compress_independent_frame_into(&payload_b, &mut frame_b);
+
+        // Frame B must decode WITHOUT any dictionary.
+        let mut decoder = crate::decoding::FrameDecoder::new();
+        let mut decoded = Vec::with_capacity(payload_b.len() + 64);
+        decoder
+            .decode_all_to_vec(&frame_b, &mut decoded)
+            .expect("no-dict frame after clear_dictionary must decode");
+        assert_eq!(
+            decoded, payload_b,
+            "no-dict frame after clear_dictionary must round-trip exactly"
+        );
+    }
+
     // Regression test: `heap_size()` must count the retained Huffman tables
     // (the active `last_huff_table` and the recycled `huff_table_spare`).
     // A reused context that parks a table would otherwise under-report its

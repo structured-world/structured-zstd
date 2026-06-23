@@ -2811,6 +2811,12 @@ impl Matcher for MatchGeneratorDriver {
             super::strategy::BackendTag::Row => self.row_matcher_mut().offset_hist = offset_hist,
             super::strategy::BackendTag::HashChain => {
                 let matcher = self.hc_matcher_mut();
+                // Clear the chain/hash tables (deferred from the dict-active
+                // `reset`): prime rebuilds them from the dict, so they must start
+                // empty. The reuse hot path skips prime and `clone_from`s a clean
+                // snapshot instead, so only the first-prime / key-mismatch frames
+                // pay the fill -- not every reused-CDict frame.
+                matcher.table.clear_chain_hash_tables();
                 matcher.table.offset_hist = offset_hist;
                 matcher.table.mark_dictionary_primed();
             }
@@ -3197,7 +3203,19 @@ impl Matcher for MatchGeneratorDriver {
             // dictionary of the same length would otherwise keep serving the
             // OLD dictionary's tree.
             super::strategy::BackendTag::HashChain => {
-                self.hc_matcher_mut().table.dms.invalidate();
+                let table = &mut self.hc_matcher_mut().table;
+                table.dms.invalidate();
+                // Deactivate the dictionary state so the next `reset` does not
+                // take the dict-active defer-the-table-clear branch. That branch
+                // rewinds the tables to the origin and hands the clear off to a
+                // following `prime_with_dictionary` / `restore_primed_dictionary`.
+                // After a dictionary is removed (or replaced), the very next
+                // frame may carry no dictionary, in which case neither hand-off
+                // runs and the deferred clear would never execute — leaving stale
+                // dict-region entries at the rewound base. Clearing the flag
+                // routes that reset down the no-dictionary path instead; a
+                // replacement dictionary re-arms the flag when it re-primes.
+                table.dictionary_active = false;
             }
         }
     }
