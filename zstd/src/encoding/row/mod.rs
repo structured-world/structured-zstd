@@ -18,9 +18,10 @@ use core::convert::TryInto;
 use super::Sequence;
 use super::blocks::encode_offset_with_history;
 use super::dict_attach::DictAttach;
+use super::levels::config::RowConfig;
 use super::match_generator::{
     ROW_EMPTY_SLOT, ROW_HASH_BITS, ROW_HASH_KEY_LEN, ROW_LOG, ROW_MIN_MATCH_LEN, ROW_SEARCH_DEPTH,
-    ROW_TAG_BITS, ROW_TARGET_LEN, RowConfig,
+    ROW_TAG_BITS, ROW_TARGET_LEN,
 };
 
 /// Immutable row-hash dictionary index (upstream zstd `ZSTD_RowFindBestMatch`'s

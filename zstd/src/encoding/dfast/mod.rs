@@ -19,10 +19,11 @@ use super::blocks::encode_offset_with_history;
 use super::dict_attach::DictAttach;
 use super::fastpath::{FastpathKernel, select_kernel};
 use super::incompressible::block_looks_incompressible;
+use super::levels::config::MIN_WINDOW_LOG;
 use super::match_generator::{
     DFAST_EMPTY_SLOT, DFAST_HASH_BITS, DFAST_INCOMPRESSIBLE_SKIP_STEP, DFAST_MAX_SKIP_STEP,
     DFAST_MIN_MATCH_LEN, DFAST_REBASE_GUARD_BAND, DFAST_SHORT_HASH_BITS_DELTA,
-    DFAST_SHORT_HASH_LOOKAHEAD, DFAST_SKIP_STEP_GROWTH_INTERVAL, MIN_WINDOW_LOG,
+    DFAST_SHORT_HASH_LOOKAHEAD, DFAST_SKIP_STEP_GROWTH_INTERVAL,
 };
 use super::match_table::helpers::{common_prefix_len_with_kernel, extend_backwards_shared};
 use super::match_table::storage::{REBASE_RESET_FLOOR_CEILING, check_stream_abs_headroom};

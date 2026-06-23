@@ -642,7 +642,7 @@ pub(crate) fn optimal_block_size(
     block_size_max: usize,
     savings: i64,
 ) -> usize {
-    let Some(split_level) = crate::encoding::match_generator::level_pre_split(level) else {
+    let Some(split_level) = crate::encoding::levels::config::level_pre_split(level) else {
         return remaining_src_size.min(block_size_max);
     };
     if remaining_src_size < MAX_BLOCK_SIZE as usize || block_size_max < MAX_BLOCK_SIZE as usize {
@@ -1250,7 +1250,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             if savings >= 3
                 && input.len() - start >= MAX_BLOCK_SIZE as usize
                 && block_capacity >= MAX_BLOCK_SIZE as usize
-                && crate::encoding::match_generator::level_pre_split(self.compression_level)
+                && crate::encoding::levels::config::level_pre_split(self.compression_level)
                     .is_some()
             {
                 warm_presplit_window(&input[start..start + MAX_BLOCK_SIZE as usize]);
@@ -1613,7 +1613,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 // gate in sync with the matcher's attach cutoff so Fast never
                 // captures/restores a copy snapshot it can no longer use.
                 crate::encoding::strategy::StrategyTag::Fast => {
-                    crate::encoding::match_generator::FAST_ATTACH_DICT_CUTOFF_LOG
+                    crate::encoding::levels::config::FAST_ATTACH_DICT_CUTOFF_LOG
                 }
                 crate::encoding::strategy::StrategyTag::BtUltra
                 | crate::encoding::strategy::StrategyTag::BtUltra2 => 13,
@@ -1632,7 +1632,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                     .reapply_resident_dictionary(dict.inner.offset_hist);
             } else {
                 let prefer_copy_snapshot = initial_size_hint.is_some_and(|s| {
-                    crate::encoding::match_generator::source_size_ceil_log(s) > cutoff_log
+                    crate::encoding::levels::config::source_size_ceil_log(s) > cutoff_log
                 });
                 let restored = prefer_copy_snapshot
                     && self
@@ -4451,7 +4451,7 @@ mod tests {
     #[test]
     fn pre_split_level_dispatches_by_compression_level() {
         use crate::encoding::CompressionLevel;
-        use crate::encoding::match_generator::level_pre_split;
+        use crate::encoding::levels::config::level_pre_split;
         assert_eq!(level_pre_split(CompressionLevel::Uncompressed), None);
         // Fastest = level 1 (fast) → 0 (from-borders).
         assert_eq!(level_pre_split(CompressionLevel::Fastest), Some(0));

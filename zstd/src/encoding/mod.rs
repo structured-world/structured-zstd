@@ -97,9 +97,10 @@ mod streaming_encoder;
 pub use frame_compressor::{EncoderDictionary, FrameCompressor};
 #[cfg(feature = "lsm")]
 pub use frame_emit_info::{BlockType, FrameBlock, FrameEmitInfo};
-pub use match_generator::{
-    MatchGeneratorDriver, estimated_bt_strategy_extra_bytes, estimated_compression_workspace_bytes,
+pub use levels::config::{
+    estimated_bt_strategy_extra_bytes, estimated_compression_workspace_bytes,
 };
+pub use match_generator::MatchGeneratorDriver;
 pub use parameters::{
     Bounds, CParameter, CompressionParameters, CompressionParametersBuilder, ParameterError,
     Strategy,
