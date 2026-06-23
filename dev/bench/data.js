@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782208202760,
+  "lastUpdate": 1782219402334,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -70706,6 +70706,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.167,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "bbd74c9d94b5a62c8a797a896196509d063f3cc4",
+          "message": "refactor(encoding): split match_generator monolith + separate tests from production (#445)\n\n* refactor(encoding): extract level config to levels/config.rs\n\nMove the per-level tuning config out of match_generator.rs into a dedicated\nlevels/config.rs: the HcConfig / RowConfig / DfastConfig / FastConfig knobs,\nLevelParams + LEVEL_TABLE, the public-parameter overrides, the source-size\ntiering, and the workspace estimators.\n\nPure mechanical move with no behaviour change: the code is relocated verbatim\n(only the relative `super::` paths rewritten to absolute `crate::encoding::`\nfor the deeper module, and the resolution API widened to pub(crate)), so the\ncompressed output stays byte-identical. match_generator.rs drops 1119 lines\n(13125 -> 12006). Consumers (frame_compressor, dfast, row) and the public\nre-export of the workspace estimators now source the API from levels::config.\n\nPart of #441.\n\n* refactor(encoding): extract price-set SIMD kernels to hc/priceset.rs\n\nMove the optimal parser's per-CPU-tier price-set kernels\n(priceset_range_nonabort_{scalar,avx2,neon,sse41,simd128} plus their\ncached-price / improved-mask helpers) out of match_generator.rs into\nhc/priceset.rs. Verbatim move (kernels unchanged; only the opt-parser type\nimports pulled in and the nonabort entry points widened to pub(crate)), so the\noutput is byte-identical. match_generator.rs: 12006 -> 11306.\n\nPart of #441.\n\n* refactor(encoding): extract HcMatchGenerator to hc/generator.rs\n\nMove the HashChain / binary-tree match generator out of match_generator.rs into\nhc/generator.rs: the HcMatchGenerator storage + methods, the btlazy2 cost\nhelpers, the optimal-plan body macros, and the build_optimal_plan driver. The\ncross-module macros (bt_insert_*, hash3_candidate, for_each_repcode) now resolve\nthrough hc::generator; their consumers (match_table::storage, hc) are repointed.\n\nVerbatim move (only relative paths rewritten to absolute and the driver-facing\nsurface widened to pub(crate)), so the output is byte-identical. The small\nHcBackend enum stays in match_generator (its impl moved). match_generator.rs:\n11306 -> 7438.\n\nPart of #441.\n\n* refactor(encoding): split optimal-parse DP into hc/optimal.rs\n\nMove the binary-tree optimal parser out of hc/generator.rs into hc/optimal.rs:\nthe build_optimal_plan DP + its per-CPU-tier kernels, the candidate-collection /\nprice-set body macros, and the btlazy2 cost helpers, as a second\n`impl HcMatchGenerator` block over the same matcher. Both files are hc/\nsubmodules so no path rewrite was needed; output is byte-identical.\n\nThe DP body macros reference opt types unqualified, which rustc's unused-import\nlint cannot see (so it false-flags every such import) -- handled by a documented\nmodule-level suppression in optimal.rs; generator.rs's now-redundant (qualified)\nimports were removed by hand. hc/generator.rs: 3918 -> 1691.\n\nPart of #441.\n\n* refactor(encoding): isolate dict-prime lifecycle in a child module\n\nConvert match_generator.rs into a directory module and move the seven\ndictionary entry points (resident check + reapply, prime, snapshot\nrestore/capture, invalidate, entropy seed) out of the driver's main\n`Matcher` impl into a `dict_prime` child module.\n\nThe snapshot path reads/writes the driver's most invariant-critical\nprivate state (`primed`, `reset_shape`, the `PrimedKey` snapshot identity\nthat guards against restoring a mismatched matcher shape and emitting an\nundecodable match). A child module reaches those private fields directly,\nso the concern relocates with zero field widening -- encapsulation stays\nintact. The trait surface keeps thin `#[inline]` forwarders to the child's\ninherent `*_impl` helpers, so output is byte-identical.\n\nmatch_generator/mod.rs: 7438 -> 7000.\n\nPart of #441.\n\n* refactor(encoding): move match-generator tests to a tests submodule\n\nRelocate the ~4.9k lines of unit / round-trip tests (parse x search\nmatrix, per-level parameter resolution, greedy/lazy/optimal round-trips,\ndictionary priming) out of the driver module body into a dedicated\n`tests` submodule file. Production code stays in mod.rs; the test file is\n`#[cfg(test)] mod tests;`.\n\nmatch_generator/mod.rs: 7000 -> 2063 (production only).\n\nPart of #441.\n\n* refactor: move inline test modules into tests submodule files\n\nRelocate every inline `#[cfg(test)] mod tests { ... }` block across the\ncrate into a sibling `tests.rs` submodule, leaving each source file with\nproduction code only plus a `#[cfg(test)] mod tests;` declaration. Test\nbodies are moved verbatim (rustfmt re-indents; string literals untouched).\n\nRelative `include_bytes!` paths in the moved dictionary tests gain one\n`../` level to keep resolving to `zstd/dict_tests` from the deeper file\nlocation.\n\nNo production logic changes; the full suite still runs the same 824 cases.\n\n* refactor: move module-scope test code into tests submodules\n\nSeparate the remaining inline test code that was not wrapped in a\n`mod tests { ... }` block (so the earlier sweep did not catch it) into\nsibling `tests.rs` submodules:\n\n- fse, huff0 (mod + encoder): bare module-scope `#[test]` tail blocks.\n- bit_reader_reverse: the `mod test` block plus the two `#[cfg(test)]`\n  helper fns that only its tests used.\n- sequence_section_decoder: module-scope tests plus the two nested\n  `#[cfg(test)] mod` blocks; `super::` paths gain one level for the\n  deeper nesting.\n- hc/generator, hc/priceset: test fns left behind by the match-generator\n  split. The `#[cfg(test)]` `start_matching` driver method stays with the\n  struct (it reaches private fields); only the test cases move.\n\nTwo production helpers (`distribute_weights` / `redistribute_weights`,\ncalled from `legacy_distributed_weights`) that sat among the encoder\ntests are kept in production. Relative `include_bytes!` paths adjusted\nfor the deeper file locations. Suite unchanged at 824 cases; x86_64 +\nBMI2 build cross-checked for the gated bit-reader helper.\n\n* refactor: move named test modules into sibling files\n\nExtract the `#[cfg(test)] mod <name>_tests { ... }` blocks (which the\nfirst sweep skipped because they are not named `tests`) into sibling\nfiles declared `#[cfg(test)] mod <name>_tests;`. A named module relocated\nto its own same-named file keeps its parent, so `super::` paths are\nunchanged and the bodies move verbatim.\n\nCovers compress_bound / hc / tag_mask / neon_tag_mask / ldm_helper /\nextend_with_repcode / bt_pair_index_wrap / stream_abs_headroom / storage\n/ zerocopy_robustness / burst_gate / frame_inspection / inline_helper /\nportable_helper tests across the encoding and decoding trees. Suite\nunchanged at 824 cases; x86_64 build cross-checked for the arch-gated\ntag-mask tests.\n\n* refactor(cli): move test modules into tests submodule files\n\nRelocate the inline `#[cfg(test)] mod tests` blocks in `progress` and\nthe binary root into sibling `tests.rs` files (the crate root's submodule\nlands at `src/tests.rs`). Production code only in the source files; 22\ncli tests unchanged.\n\n* test(decoding): use compile-time dict fixture in frame-decoder test\n\nReplace the lone CWD-relative `std::fs::read(\"./dict_tests/dictionary\")`\nwith the `include_bytes!(\"../../../dict_tests/dictionary\")` the rest of\nthe file already uses, so the test no longer depends on the harness\nworking directory.\n\n* fix(bench): keep bench_internals facade fns in production modules\n\nThe `#[cfg(feature = \"bench_internals\")]` white-box capture helpers\n(`huf_weight_description_for_test`, `huf_encode4x_for_test`,\n`level22_block_ranges` / `merge_block_delimiters` /\n`collect_level22_sequences[_with_delimiters]`) are bench facade reached\nfrom the crate-root `bench_internals` surface, not test cases. The test\nsweep had swept them into the `tests` submodules, so the\n`bench_internals` clippy build could no longer resolve them. Move them\nback to `huff0_encoder` / `match_generator` production (restoring the\n`super::cost_model` paths the deeper nesting had rewritten).\n\n* fix(fuzz): keep fuzz_exports round_trip helpers in production fse module\n\n`fse::round_trip` and its `check_tables` helper are gated\n`#[cfg(any(test, feature = \"fuzz_exports\"))]` and consumed by the `fse`\nfuzz target through the crate's public surface, not test cases. The test\nsweep moved them into `fse/tests.rs` (compiled only under `test`), so the\n`fuzz_exports` build could no longer resolve `round_trip` and the\nencoder's `into_table` / `encode` went dead. Move both back to\n`fse/mod.rs`.",
+          "timestamp": "2026-06-23T15:12:10+03:00",
+          "tree_id": "8eb9232af0bf6db9e81c621fd5b432a65d725824",
+          "url": "https://github.com/structured-world/structured-zstd/commit/bbd74c9d94b5a62c8a797a896196509d063f3cc4"
+        },
+        "date": 1782219391475,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.102,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.113,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 236.738,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 259.368,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 0.727,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.499,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.912,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.019,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.756,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.913,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.027,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.027,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.008,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.008,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 9.307,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 4.821,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.112,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.282,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.325,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 0.981,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.367,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.005,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.026,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.043,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.023,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.124,
             "unit": "ms"
           }
         ]
