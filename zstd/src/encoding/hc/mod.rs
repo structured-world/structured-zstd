@@ -15,6 +15,7 @@
 
 #![allow(dead_code)]
 
+pub(crate) mod generator;
 pub(crate) mod priceset;
 
 use super::cost_model::{HC_FORMAT_MINMATCH, HC_OPT_NUM, HcOptimalCostProfile};
@@ -861,7 +862,7 @@ impl HcMatcher {
         mut f: impl FnMut(MatchCandidate),
     ) {
         let _ = self;
-        super::match_generator::for_each_repcode_candidate_body!(
+        super::hc::generator::for_each_repcode_candidate_body!(
             table,
             abs_pos,
             lit_len,
@@ -891,7 +892,7 @@ impl HcMatcher {
         mut f: impl FnMut(MatchCandidate),
     ) {
         let _ = self;
-        super::match_generator::for_each_repcode_candidate_body!(
+        super::hc::generator::for_each_repcode_candidate_body!(
             table,
             abs_pos,
             lit_len,
@@ -921,7 +922,7 @@ impl HcMatcher {
         mut f: impl FnMut(MatchCandidate),
     ) {
         let _ = self;
-        super::match_generator::for_each_repcode_candidate_body!(
+        super::hc::generator::for_each_repcode_candidate_body!(
             table,
             abs_pos,
             lit_len,
@@ -947,7 +948,7 @@ impl HcMatcher {
         mut f: impl FnMut(MatchCandidate),
     ) {
         let _ = self;
-        super::match_generator::for_each_repcode_candidate_body!(
+        super::hc::generator::for_each_repcode_candidate_body!(
             table,
             abs_pos,
             lit_len,

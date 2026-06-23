@@ -1473,7 +1473,7 @@ impl MatchTable {
         target_abs: usize,
     ) -> usize {
         let search_depth = self.search_depth;
-        super::super::match_generator::bt_insert_step_no_rebase_body!(
+        super::super::hc::generator::bt_insert_step_no_rebase_body!(
             self,
             search_depth,
             abs_pos,
@@ -1496,7 +1496,7 @@ impl MatchTable {
         target_abs: usize,
     ) -> usize {
         let search_depth = self.search_depth;
-        super::super::match_generator::bt_insert_step_no_rebase_body!(
+        super::super::hc::generator::bt_insert_step_no_rebase_body!(
             self,
             search_depth,
             abs_pos,
@@ -1519,7 +1519,7 @@ impl MatchTable {
         target_abs: usize,
     ) -> usize {
         let search_depth = self.search_depth;
-        super::super::match_generator::bt_insert_step_no_rebase_body!(
+        super::super::hc::generator::bt_insert_step_no_rebase_body!(
             self,
             search_depth,
             abs_pos,
@@ -1538,7 +1538,7 @@ impl MatchTable {
         target_abs: usize,
     ) -> usize {
         let search_depth = self.search_depth;
-        super::super::match_generator::bt_insert_step_no_rebase_body!(
+        super::super::hc::generator::bt_insert_step_no_rebase_body!(
             self,
             search_depth,
             abs_pos,
@@ -1643,7 +1643,7 @@ impl MatchTable {
         out: &mut Vec<MatchCandidate>,
     ) {
         let search_depth = self.search_depth;
-        super::super::match_generator::bt_insert_and_collect_matches_body!(
+        super::super::hc::generator::bt_insert_and_collect_matches_body!(
             self,
             search_depth,
             abs_pos,
@@ -1673,7 +1673,7 @@ impl MatchTable {
         out: &mut Vec<MatchCandidate>,
     ) {
         let search_depth = self.search_depth;
-        super::super::match_generator::bt_insert_and_collect_matches_body!(
+        super::super::hc::generator::bt_insert_and_collect_matches_body!(
             self,
             search_depth,
             abs_pos,
@@ -1703,7 +1703,7 @@ impl MatchTable {
         out: &mut Vec<MatchCandidate>,
     ) {
         let search_depth = self.search_depth;
-        super::super::match_generator::bt_insert_and_collect_matches_body!(
+        super::super::hc::generator::bt_insert_and_collect_matches_body!(
             self,
             search_depth,
             abs_pos,
@@ -1729,7 +1729,7 @@ impl MatchTable {
         out: &mut Vec<MatchCandidate>,
     ) {
         let search_depth = self.search_depth;
-        super::super::match_generator::bt_insert_and_collect_matches_body!(
+        super::super::hc::generator::bt_insert_and_collect_matches_body!(
             self,
             search_depth,
             abs_pos,
@@ -2293,7 +2293,7 @@ impl MatchTable {
         current_abs_end: usize,
         min_match_len: usize,
     ) -> Option<MatchCandidate> {
-        super::super::match_generator::hash3_candidate_body!(
+        super::super::hc::generator::hash3_candidate_body!(
             self,
             abs_pos,
             current_abs_end,
@@ -2314,7 +2314,7 @@ impl MatchTable {
         current_abs_end: usize,
         min_match_len: usize,
     ) -> Option<MatchCandidate> {
-        super::super::match_generator::hash3_candidate_body!(
+        super::super::hc::generator::hash3_candidate_body!(
             self,
             abs_pos,
             current_abs_end,
@@ -2335,7 +2335,7 @@ impl MatchTable {
         current_abs_end: usize,
         min_match_len: usize,
     ) -> Option<MatchCandidate> {
-        super::super::match_generator::hash3_candidate_body!(
+        super::super::hc::generator::hash3_candidate_body!(
             self,
             abs_pos,
             current_abs_end,
@@ -2352,7 +2352,7 @@ impl MatchTable {
         current_abs_end: usize,
         min_match_len: usize,
     ) -> Option<MatchCandidate> {
-        super::super::match_generator::hash3_candidate_body!(
+        super::super::hc::generator::hash3_candidate_body!(
             self,
             abs_pos,
             current_abs_end,
