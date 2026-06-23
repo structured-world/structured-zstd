@@ -1635,10 +1635,11 @@
           const lm = profileLogicalMetric(row);
           if (!lm) continue;
           const snap = row.generated_at || row.commit_sha || "local-run";
-          const inner = `${snap}|${lm}|${cohortKey(row)}`;
+          const cohort = cohortKey(row);
+          const inner = `${snap}|${lm}|${cohort}`;
           let agg = innerAgg.get(inner);
           if (!agg) {
-            agg = { snap, lm, rust_sum: 0, ffi_sum: 0, count: 0 };
+            agg = { snap, lm, cohort, rust_sum: 0, ffi_sum: 0, count: 0 };
             innerAgg.set(inner, agg);
           }
           agg.rust_sum += row.rust_value;
@@ -1646,9 +1647,56 @@
           agg.count += 1;
         }
 
+        // Comparability gate: the parser only emits a (level, scenario, target)
+        // row when BOTH rust and ffi have the value, so a snapshot missing a
+        // level for one side (e.g. an ffi bench that failed/was absent) simply
+        // has no cohort there. Averaging each snapshot over whatever cohorts it
+        // happens to have makes the denominator VARY across the timeline: the
+        // mean then jumps when a cohort drops, for a reason unrelated to perf.
+        // Throughput (MB/s spanning orders of magnitude across levels) is far
+        // more sensitive to that than the ratio (values ≈1, where dropping one
+        // barely moves the mean) — which is why a missing point skews the speed
+        // line but not the ratio. Restrict every snapshot's mean for a metric
+        // to the cohorts present in EVERY snapshot for that metric (the
+        // cross-snapshot intersection) so the denominator is identical at every
+        // point and the line tracks real perf, not data completeness.
+        const lmSnapCohorts = new Map(); // lm -> Map(snap -> Set(cohort))
+        for (const inner of innerAgg.values()) {
+          if (inner.count === 0) continue;
+          let bySnap = lmSnapCohorts.get(inner.lm);
+          if (!bySnap) {
+            bySnap = new Map();
+            lmSnapCohorts.set(inner.lm, bySnap);
+          }
+          let set = bySnap.get(inner.snap);
+          if (!set) {
+            set = new Set();
+            bySnap.set(inner.snap, set);
+          }
+          set.add(inner.cohort);
+        }
+        const lmCommonCohorts = new Map(); // lm -> Set(cohort) present in all snaps
+        for (const [lm, bySnap] of lmSnapCohorts) {
+          let common = null;
+          for (const set of bySnap.values()) {
+            if (common === null) {
+              common = new Set(set);
+            } else {
+              for (const c of [...common]) {
+                if (!set.has(c)) common.delete(c);
+              }
+            }
+          }
+          lmCommonCohorts.set(lm, common || new Set());
+        }
+
         const outerAgg = new Map();
         for (const inner of innerAgg.values()) {
           if (inner.count === 0) continue;
+          // Skip cohorts not present in every snapshot for this metric, so the
+          // outer mean's denominator is the same fixed cohort set at each point.
+          const common = lmCommonCohorts.get(inner.lm);
+          if (!common || !common.has(inner.cohort)) continue;
           const key = `${inner.snap}|${inner.lm}`;
           let agg = outerAgg.get(key);
           if (!agg) {
