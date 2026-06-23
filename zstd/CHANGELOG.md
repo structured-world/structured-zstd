@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.43](https://github.com/structured-world/structured-zstd/compare/v0.0.42...v0.0.43) - 2026-06-23
+
+### Performance
+
+- *(encode)* close the L6-L9 lazy dictionary compress-speed gap ([#442](https://github.com/structured-world/structured-zstd/pull/442))
+- *(encode)* reuse the LDM producer table across dict frames ([#440](https://github.com/structured-world/structured-zstd/pull/440))
+- *(decode)* branchy fused decodeSequence on the AVX2 short arm ([#439](https://github.com/structured-world/structured-zstd/pull/439))
+- *(decode)* HUF table-fill by code-length group + scalarize 4-stream burst ([#437](https://github.com/structured-world/structured-zstd/pull/437))
+
 ## [0.0.41](https://github.com/structured-world/structured-zstd/compare/v0.0.40...v0.0.41) - 2026-06-17
 
 ### Performance
