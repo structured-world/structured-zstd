@@ -3203,7 +3203,19 @@ impl Matcher for MatchGeneratorDriver {
             // dictionary of the same length would otherwise keep serving the
             // OLD dictionary's tree.
             super::strategy::BackendTag::HashChain => {
-                self.hc_matcher_mut().table.dms.invalidate();
+                let table = &mut self.hc_matcher_mut().table;
+                table.dms.invalidate();
+                // Deactivate the dictionary state so the next `reset` does not
+                // take the dict-active defer-the-table-clear branch. That branch
+                // rewinds the tables to the origin and hands the clear off to a
+                // following `prime_with_dictionary` / `restore_primed_dictionary`.
+                // After a dictionary is removed (or replaced), the very next
+                // frame may carry no dictionary, in which case neither hand-off
+                // runs and the deferred clear would never execute — leaving stale
+                // dict-region entries at the rewound base. Clearing the flag
+                // routes that reset down the no-dictionary path instead; a
+                // replacement dictionary re-arms the flag when it re-primes.
+                table.dictionary_active = false;
             }
         }
     }
