@@ -2811,6 +2811,12 @@ impl Matcher for MatchGeneratorDriver {
             super::strategy::BackendTag::Row => self.row_matcher_mut().offset_hist = offset_hist,
             super::strategy::BackendTag::HashChain => {
                 let matcher = self.hc_matcher_mut();
+                // Clear the chain/hash tables (deferred from the dict-active
+                // `reset`): prime rebuilds them from the dict, so they must start
+                // empty. The reuse hot path skips prime and `clone_from`s a clean
+                // snapshot instead, so only the first-prime / key-mismatch frames
+                // pay the fill -- not every reused-CDict frame.
+                matcher.table.clear_chain_hash_tables();
                 matcher.table.offset_hist = offset_hist;
                 matcher.table.mark_dictionary_primed();
             }

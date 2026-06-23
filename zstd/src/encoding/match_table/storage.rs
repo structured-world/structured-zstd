@@ -1348,18 +1348,21 @@ impl MatchTable {
             // and every dict match is silently dropped (reused-CDict output
             // degrades to no-dict after a few frames). Rewind to the origin and
             // clear the tables so the next prime lands at a stable low base.
-            // The memset is load-bearing: the stored positions are relative to
-            // `position_base` / `index_shift`, so rewinding those without
-            // zeroing the slots leaves stale entries that decode as in-range
-            // matches and corrupt the parse (verified: skipping the fills
-            // reproduces the decay).
+            // Table CLEARS are deferred to whichever cleanup runs next: a
+            // dict-active reset is always followed by either
+            // `restore_primed_dictionary` (its `clone_from` overwrites every
+            // table wholesale -- the reuse hot path) or `prime_with_dictionary`
+            // (which now clears + rebuilds). Filling here would be thrown away on
+            // the clone path, and that fill dominated tiny dict frames (a 4 KB
+            // frame zero-fills the whole dict-tier chain table -- ~26% of
+            // compress). The rewound `position_base` / `index_shift` make the
+            // un-cleared slots decode out-of-range, and no match-find runs before
+            // the clone / prime cleans them, so deferring is safe (skipping the
+            // fills WITHOUT this hand-off reproduces the reused-CDict decay).
             self.history_abs_start = 0;
             self.position_base = 0;
             self.index_shift = 0;
             self.next_to_update3 = 0;
-            self.hash_table.fill(HC_EMPTY);
-            self.hash3_table.fill(HC_EMPTY);
-            self.chain_table.fill(HC_EMPTY);
         } else if next_floor <= REBASE_RESET_FLOOR_CEILING {
             // Fast path: advance the floor so the previous frame's
             // entries fall below `window_low` and are rejected on read.
@@ -1384,6 +1387,18 @@ impl MatchTable {
             self.hash3_table.fill(HC_EMPTY);
             self.chain_table.fill(HC_EMPTY);
         }
+    }
+
+    /// Zero the hash / hash3 / chain tables to `HC_EMPTY`. The dict-active
+    /// `reset` defers this fill to here (called from `prime_with_dictionary`)
+    /// so the reuse hot path -- which restores a clean snapshot via `clone_from`
+    /// instead of re-priming -- never pays the dict-tier-table memset that
+    /// dominated tiny dict frames. `Vec::fill` on an unallocated (empty) table
+    /// is a no-op, so the unconditional fills are safe before `ensure_tables`.
+    pub(crate) fn clear_chain_hash_tables(&mut self) {
+        self.hash_table.fill(HC_EMPTY);
+        self.hash3_table.fill(HC_EMPTY);
+        self.chain_table.fill(HC_EMPTY);
     }
 
     /// Upstream zstd parity: `ZSTD_compressBlock_btopt_generic` starts its main
