@@ -84,7 +84,14 @@ default = [
     "kernel_sse2",
     "kernel_bmi2",
     "kernel_avx2",
-    "kernel_vbmi2",
+    # `kernel_vbmi2` (AVX-512) is intentionally OFF by default: on AVX-512
+    # hosts the runtime dispatch otherwise selects the VBMI2 decode tier, which
+    # the dashboard's AVX-512 runner measured far SLOWER than the AVX2 tier
+    # (AVX-512 license-based frequency downclocking stalls the whole decode,
+    # and the bursty/memory-bound decode never amortizes the heavier kernel).
+    # With it off, AVX-512 hosts fall back to the AVX2 tier (faster there). The
+    # kernel is kept and can be opted in via `--features kernel_vbmi2` for a
+    # sustained-AVX-512 workload that genuinely benefits.
     "kernel_neon",
     "kernel_sve",
     "kernel_simd128",
