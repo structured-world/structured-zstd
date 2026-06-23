@@ -16,6 +16,7 @@
 #![allow(dead_code)]
 
 pub(crate) mod generator;
+pub(crate) mod optimal;
 pub(crate) mod priceset;
 
 use super::cost_model::{HC_FORMAT_MINMATCH, HC_OPT_NUM, HcOptimalCostProfile};
