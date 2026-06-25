@@ -103,9 +103,14 @@ pub(crate) const DFAST_EMPTY_SLOT: u32 = 0;
 /// advance `position_base` so future inserts stay inside the `u32`
 /// window. Same scheme as `encoding/ldm/table.rs`.
 pub(crate) const DFAST_REBASE_GUARD_BAND: u32 = 1u32 << 30;
-pub(crate) const DFAST_SKIP_SEARCH_STRENGTH: usize = 6;
+// `kSearchStrength` (upstream `zstd_compress_internal.h:32`). The dfast step
+// ramp grows one position every `1 << kSearchStrength` = 256 bytes travelled
+// (upstream `kStepIncr`, zstd_double_fast.c:131). A smaller value accelerates
+// the scan faster and skips source positions upstream still inserts, which
+// drops the short matches upstream finds at a block start — so the
+// `#167`-disabled path must use the upstream 8 to stay byte-identical.
+pub(crate) const DFAST_SKIP_SEARCH_STRENGTH: usize = 8;
 pub(crate) const DFAST_SKIP_STEP_GROWTH_INTERVAL: usize = 1 << DFAST_SKIP_SEARCH_STRENGTH;
-pub(crate) const DFAST_MAX_SKIP_STEP: usize = 8;
 pub(crate) const DFAST_INCOMPRESSIBLE_SKIP_STEP: usize = 16;
 pub(crate) const ROW_HASH_BITS: usize = 20;
 pub(crate) const ROW_LOG: usize = 5;
