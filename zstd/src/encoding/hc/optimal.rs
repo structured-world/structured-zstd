@@ -1373,8 +1373,8 @@ impl HcMatchGenerator {
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
-            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
-            match select_kernel() {
+            use crate::encoding::fastpath::FastpathKernel;
+            match self.table.kernel {
                 FastpathKernel::Avx2Bmi2 => unsafe {
                     self.start_matching_btlazy2_avx2_bmi2(&mut handle_sequence)
                 },
@@ -1673,8 +1673,8 @@ impl HcMatchGenerator {
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
-            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
-            match select_kernel() {
+            use crate::encoding::fastpath::FastpathKernel;
+            match self.table.kernel {
                 FastpathKernel::Avx2Bmi2 => run_main_loop!(build_optimal_plan_impl_avx2_bmi2),
                 FastpathKernel::Sse42 => run_main_loop!(build_optimal_plan_impl_sse42),
                 FastpathKernel::Scalar => run_main_loop!(build_optimal_plan_impl_scalar),
@@ -1868,8 +1868,8 @@ impl HcMatchGenerator {
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
-            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
-            match select_kernel() {
+            use crate::encoding::fastpath::FastpathKernel;
+            match self.table.kernel {
                 FastpathKernel::Avx2Bmi2 => run_seed_loop!(build_optimal_plan_impl_avx2_bmi2),
                 FastpathKernel::Sse42 => run_seed_loop!(build_optimal_plan_impl_sse42),
                 FastpathKernel::Scalar => run_seed_loop!(build_optimal_plan_impl_scalar),
@@ -2222,8 +2222,8 @@ impl HcMatchGenerator {
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
-            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
-            match select_kernel() {
+            use crate::encoding::fastpath::FastpathKernel;
+            match self.table.kernel {
                 FastpathKernel::Avx2Bmi2 => unsafe {
                     self.collect_optimal_candidates_initialized_avx2_bmi2::<S, USE_BT_MATCHFINDER>(
                         abs_pos,

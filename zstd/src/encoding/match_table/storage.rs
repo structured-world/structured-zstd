@@ -262,6 +262,13 @@ pub(crate) struct MatchTable {
     /// Active borrowed block range `[start, end)` within `borrowed_input`,
     /// staged before each borrowed scan.
     pub(crate) borrowed_block: Option<(usize, usize)>,
+    /// SIMD kernel tier, resolved ONCE at construction (upstream-style
+    /// once-per-encoder-invoke detection: the CPU does not change mid-run, so
+    /// `select_kernel()`'s CPUID/`OnceLock` read is paid a single time here).
+    /// The per-block strategy entries and the BT walker dispatch off this
+    /// cached value instead of re-detecting in the hot path. Mirrors the
+    /// `kernel` field the Fast / Row / Dfast matchers already cache.
+    pub(crate) kernel: crate::encoding::fastpath::FastpathKernel,
 }
 
 // Manual `Clone` (not derived) so the per-frame dictionary-snapshot restore can
@@ -302,6 +309,7 @@ impl Clone for MatchTable {
             dms: self.dms.clone(),
             borrowed_input: self.borrowed_input,
             borrowed_block: self.borrowed_block,
+            kernel: self.kernel,
         }
     }
 
@@ -338,6 +346,7 @@ impl Clone for MatchTable {
         self.search_mls = source.search_mls;
         self.borrowed_input = source.borrowed_input;
         self.borrowed_block = source.borrowed_block;
+        self.kernel = source.kernel;
     }
 }
 
@@ -445,6 +454,7 @@ impl MatchTable {
             dms: DictAttach::new(),
             borrowed_input: None,
             borrowed_block: None,
+            kernel: crate::encoding::fastpath::select_kernel(),
         }
     }
 
@@ -1364,8 +1374,8 @@ impl MatchTable {
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
-            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
-            match select_kernel() {
+            use crate::encoding::fastpath::FastpathKernel;
+            match self.kernel {
                 FastpathKernel::Avx2Bmi2 => unsafe {
                     self.bt_insert_step_no_rebase_avx2_bmi2(abs_pos, current_abs_end, target_abs)
                 },
@@ -1510,8 +1520,8 @@ impl MatchTable {
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
-            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
-            match select_kernel() {
+            use crate::encoding::fastpath::FastpathKernel;
+            match self.kernel {
                 FastpathKernel::Avx2Bmi2 => unsafe {
                     self.bt_insert_and_collect_matches_avx2_bmi2(
                         abs_pos,
@@ -1744,8 +1754,8 @@ impl MatchTable {
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
-            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
-            match select_kernel() {
+            use crate::encoding::fastpath::FastpathKernel;
+            match self.kernel {
                 FastpathKernel::Avx2Bmi2 => unsafe {
                     self.bt_update_tree_until_avx2_bmi2(abs_pos, current_abs_end)
                 },
@@ -2263,8 +2273,8 @@ impl MatchTable {
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
-            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
-            match select_kernel() {
+            use crate::encoding::fastpath::FastpathKernel;
+            match self.kernel {
                 FastpathKernel::Avx2Bmi2 => unsafe {
                     self.hash3_candidate_avx2_bmi2(abs_pos, current_abs_end, min_match_len)
                 },
