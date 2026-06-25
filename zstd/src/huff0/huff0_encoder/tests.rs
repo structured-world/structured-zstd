@@ -121,9 +121,13 @@ fn fuzz_limited_weights_power_of_two(iterations: usize) {
 }
 
 /// Degenerate alphabets take the height limiter's `leaves.len() <= 1`
-/// early-out: a single non-zero symbol maps to a one-bit code, and the
-/// all-zero histogram yields no leaf at all. Both must keep the power-of-two
-/// weight-sum invariant the table builder relies on.
+/// early-out: a single non-zero symbol maps to a one-bit code (power-of-two
+/// weight sum), and an all-zero histogram finds no leaf and stays all-zero. A
+/// real block always has at least one literal, so the all-zero input never
+/// reaches production; it is asserted only for the actual early-out behavior
+/// (all-zero weights), not the power-of-two invariant a zero-symbol code cannot
+/// satisfy. A two-symbol alphabet is the smallest input that runs the full
+/// build past the early-out.
 #[test]
 fn build_limited_weights_handles_degenerate_alphabets() {
     // Single non-zero symbol: the lone leaf gets weight 1, every other slot 0.
@@ -149,6 +153,16 @@ fn build_limited_weights_handles_degenerate_alphabets() {
     assert!(
         huffman_weight_sum_is_power_of_two(&w2),
         "two-symbol weights broke the power-of-two invariant: {w2:?}"
+    );
+
+    // All-zero histogram: the early-out finds no leaf and leaves every weight
+    // at zero. This never occurs for a real block (always >= 1 literal), so the
+    // power-of-two invariant (which a zero-symbol code cannot meet) is not
+    // claimed; assert only the actual degenerate output.
+    let empty = build_limited_weights(&alloc::vec![0usize; 8], 11);
+    assert!(
+        empty.iter().all(|&w| w == 0),
+        "all-zero histogram must yield all-zero weights: {empty:?}"
     );
 }
 
