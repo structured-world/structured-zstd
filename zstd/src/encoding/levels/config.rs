@@ -1093,7 +1093,11 @@ pub(crate) fn resolve_level_params(
     level: CompressionLevel,
     source_size: Option<u64>,
 ) -> LevelParams {
-    if matches!(level, CompressionLevel::Level(22)) {
+    // Levels at or above MAX_LEVEL clamp to the max: route every out-of-range
+    // level through the same btultra2 source-size resolver as Level(22), so a
+    // caller passing Level(23+) gets the max config instead of falling through
+    // to the generic cParams path (which would resolve a different geometry).
+    if matches!(level, CompressionLevel::Level(n) if n >= CompressionLevel::MAX_LEVEL) {
         return level22_btultra2_params_for_source_size(source_size);
     }
     let params = match level {
