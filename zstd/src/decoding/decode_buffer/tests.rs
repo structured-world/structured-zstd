@@ -22,7 +22,10 @@ fn dict_offsets_rejected_after_direct_path_window_drop() {
     let backend = UserSliceBackend::from_slice(out.as_mut_slice());
     let mut buf = DecodeBuffer::from_backend(backend, 100);
     let dict = Dictionary::from_raw_content(7, vec![0xAB; 64]).expect("raw-content dictionary");
-    buf.set_dict(&dict.into_handle());
+    // `set_dict` stores a borrowed pointer into the handle's dictionary, so the
+    // handle must outlive `buf`; binding a temporary here would dangle.
+    let handle = dict.into_handle();
+    buf.set_dict(&handle);
 
     // Mimic the inline executor: produce 250 bytes without touching
     // `total_output_counter`, exceeding the 100-byte window.
@@ -375,8 +378,11 @@ fn repeat_from_dict_rejects_output_past_block_ceiling() {
     };
 
     // Fully-dictionary match: empty buffer, offset reaches into the dict.
+    // `set_dict` borrows a pointer into the handle, so it must outlive the
+    // buffer; bind it rather than passing a temporary that would dangle.
     let mut full = DecodeBuffer::<RingBuffer>::new(4 * 1024);
-    full.set_dict(&dict());
+    let full_dict = dict();
+    full.set_dict(&full_dict);
     full.set_block_output_ceiling(8); // max_capacity = 0 + 8 = 8
     let err = full.repeat(200, 100).unwrap_err(); // 0 + 100 > 8, all from dict
     assert!(
@@ -389,7 +395,8 @@ fn repeat_from_dict_rejects_output_past_block_ceiling() {
 
     // Mixed match: part from dict, remainder from buffer history.
     let mut mixed = DecodeBuffer::<RingBuffer>::new(4 * 1024);
-    mixed.set_dict(&dict());
+    let mixed_dict = dict();
+    mixed.set_dict(&mixed_dict);
     mixed.push(b"abcd"); // len = 4
     mixed.set_block_output_ceiling(8); // max_capacity = 4 + 8 = 12
     let err = mixed.repeat(10, 100).unwrap_err(); // 6 from dict + rest, 4 + 100 > 12
@@ -405,12 +412,13 @@ fn repeat_from_dict_rejects_output_past_block_ceiling() {
 #[test]
 fn repeat_from_dict_full_copy_updates_total_output_counter() {
     let mut decode_buf = DecodeBuffer::<RingBuffer>::new(1);
-    decode_buf.set_dict(
-        &crate::decoding::dictionary::DictionaryHandle::from_dictionary(
-            crate::decoding::dictionary::Dictionary::from_raw_content(1, b"0123456789".to_vec())
-                .unwrap(),
-        ),
+    // `set_dict` borrows a pointer into the handle, so it must outlive the
+    // buffer; bind it rather than passing a temporary that would dangle.
+    let handle = crate::decoding::dictionary::DictionaryHandle::from_dictionary(
+        crate::decoding::dictionary::Dictionary::from_raw_content(1, b"0123456789".to_vec())
+            .unwrap(),
     );
+    decode_buf.set_dict(&handle);
 
     decode_buf.repeat(10, 2).unwrap();
     let err = decode_buf.repeat(10, 1).unwrap_err();
