@@ -1246,17 +1246,16 @@ impl DfastMatchGenerator {
             // per-sequence diff vs FFI mentioned in the PR body's
             // deferred section); the audit signed off on the current
             // sparse set as the closest faithful mirror of upstream.
-            let post_match_end = abs_pos + match_len;
-            let insert_targets = [
-                abs_pos + 2,                      // curr + 2
-                post_match_end.saturating_sub(2), // ip - 2 (post-match cursor)
-                post_match_end.saturating_sub(1), // ip - 1
-            ];
-            for &target in &insert_targets {
-                if target > abs_pos && target < post_match_end {
-                    self.insert_position(target);
-                }
-            }
+            // Upstream zstd immediate-repcode insertion (zstd_double_fast.c:314-315):
+            // INSIDE the rep chain, upstream writes BOTH hash tables at the rep
+            // position itself (`hashSmall[hash(ip)] = ip; hashLong[hash(ip)] = ip`)
+            // before advancing — NOT the `curr+2 / ip-2 / ip-1` primary-match
+            // complementary set (that pattern belongs to `_match_found`, lines
+            // 300-304, reached only by the non-rep store path). Inserting the
+            // wrong set here leaves the rep-position keys stale, so a later
+            // position re-resolves the long hash to an older far candidate
+            // instead of the stable rep offset — the dfast ratio gap vs C.
+            self.insert_position(abs_pos);
             // Emit zero-literal rep sequence.
             handle_sequence(Sequence::Triple {
                 literals: &[],
@@ -1396,18 +1395,26 @@ impl DfastMatchGenerator {
         // prefixStart)` + the growing `step`). Match interior: upstream zstd fills only
         // the sparse 3-target set (`curr+2`, `ip-2`, `ip-1`), each clamped to
         // the open match interval.
+        // Upstream zstd complementary insertion (zstd_double_fast.c:300-304) is
+        // ASYMMETRIC across the two tables:
+        //   hashLong:  curr+2, ip-2
+        //   hashSmall: curr+2, ip-1
+        // The previous form inserted curr+2/ip-2/ip-1 into BOTH tables, putting
+        // ip-1 into long and ip-2 into short that upstream never writes —
+        // polluting the long table so later positions resolve to the wrong
+        // (far, non-rep) candidate. Mirror the exact per-table target set.
         let match_start = candidate.start;
         let post_match_end = candidate.start + candidate.match_len;
-        let insert_targets = [
-            match_start + 2,                  // curr + 2
-            post_match_end.saturating_sub(2), // ip - 2 (post-match cursor)
-            post_match_end.saturating_sub(1), // ip - 1
-        ];
-        for &target in &insert_targets {
-            if target > match_start && target < post_match_end {
-                self.insert_position(target);
-            }
-        }
+        // `match_len >= DFAST_REP_MIN_MATCH_LEN` (4) for every committed match,
+        // so `post_match_end >= match_start + 4 >= 4`: the `- 2` / `- 1` cannot
+        // underflow (plain arithmetic, no `saturating_*` masking).
+        let curr_plus_2 = match_start + 2;
+        let ip_minus_2 = post_match_end - 2;
+        let ip_minus_1 = post_match_end - 1;
+        self.insert_long(curr_plus_2);
+        self.insert_long(ip_minus_2);
+        self.insert_short(curr_plus_2);
+        self.insert_short(ip_minus_1);
         // Inline the trailing-block slice rather than calling
         // `get_last_space()` so this matches the gate pattern used by
         // `skip_matching` / `start_matching` (read `window_blocks.back()`
@@ -1629,6 +1636,27 @@ impl DfastMatchGenerator {
 
     #[inline]
     pub(crate) fn insert_position(&mut self, pos: usize) {
+        self.insert_masked::<true, true>(pos);
+    }
+
+    /// Insert `pos` into ONLY the long hash table (upstream zstd asymmetric
+    /// complementary insertion: `hashLong` at `curr+2` and `ip-2`).
+    fn insert_long(&mut self, pos: usize) {
+        self.insert_masked::<false, true>(pos);
+    }
+
+    /// Insert `pos` into ONLY the short hash table (upstream zstd: `hashSmall`
+    /// at `curr+2` and `ip-1`).
+    fn insert_short(&mut self, pos: usize) {
+        self.insert_masked::<true, false>(pos);
+    }
+
+    /// Const-generic insertion core. `SHORT` / `LONG` select which tables to
+    /// write; both `true` is the symmetric `insert_position`. The const flags
+    /// fold at compile time, so `insert_position` stays byte-identical to the
+    /// previous single-function form while the asymmetric variants emit only
+    /// their one write.
+    fn insert_masked<const SHORT: bool, const LONG: bool>(&mut self, pos: usize) {
         // Source the bytes + rebase coordinates through `scan_source()` so a
         // borrowed window's seam / tail re-seeds hash the in-place input
         // exactly as the owned path hashes its `history` concat.
@@ -1669,7 +1697,7 @@ impl DfastMatchGenerator {
         // `start_matching` seam re-seed picks it up once the next block
         // extends the source far enough to form its full 5-byte key.
         let concat = unsafe { core::slice::from_raw_parts(base_ptr.add(start_offset), concat_len) };
-        if idx + 5 <= concat_len {
+        if SHORT && idx + 5 <= concat_len {
             let short = self.short_hash_index(&concat[idx..]);
             debug_assert!(short < self.short_len());
             // Short region starts at `long_len`.
@@ -1677,7 +1705,7 @@ impl DfastMatchGenerator {
             unsafe { *self.tables.get_unchecked_mut(slot) = packed };
         }
 
-        if idx + 8 <= concat_len {
+        if LONG && idx + 8 <= concat_len {
             let long = self.long_hash_index(&concat[idx..]);
             debug_assert!(long < self.long_len());
             unsafe { *self.tables.get_unchecked_mut(long) = packed };
@@ -2255,6 +2283,17 @@ macro_rules! start_matching_fast_loop_body {
                                 match_len,
                                 lit_len_ip0,
                             );
+                            // Upstream zstd `_match_found` (zstd_double_fast.c:287):
+                            // `if (step < 4) hashLong[hl1] = ip1`. Insert the
+                            // lookahead position's long hash before storing the
+                            // match — safe only while `step < 4` (then `ip1` is
+                            // below the post-match cursor `ip + mLength`).
+                            if step < 4 {
+                                let packed_ip1 = ((abs_ip1 - position_base) as u32) + 1;
+                                unsafe {
+                                    *long_hash_ptr.add(hl1_idx) = packed_ip1;
+                                }
+                            }
                             break 'inner InnerExit::Committed(cand);
                         }
                     }
@@ -2533,6 +2572,14 @@ macro_rules! start_matching_fast_loop_body {
                                 }
                             }
                             if short_hit_valid || retry_upgraded {
+                                // Upstream zstd `_match_found` (zstd_double_fast.c:287):
+                                // `if (step < 4) hashLong[hl1] = ip1`.
+                                if step < 4 {
+                                    let packed_ip1 = ((abs_ip1 - position_base) as u32) + 1;
+                                    unsafe {
+                                        *long_hash_ptr.add(hl1_idx) = packed_ip1;
+                                    }
+                                }
                                 break 'inner InnerExit::Committed(chosen);
                             }
                             // Below-floor short hit with no retry
