@@ -2514,3 +2514,105 @@ fn compress_independent_frame_reuses_sticky_dictionary() {
         assert_eq!(&decoded, data, "dict roundtrip failed, len={}", data.len());
     }
 }
+
+/// Walk a frame's block list, returning `(block_type, block_size, last)` per
+/// physical block. `block_type`: 0 = Raw, 1 = RLE, 2 = Compressed.
+fn frame_block_list(frame: &[u8]) -> Vec<(u8, usize, bool)> {
+    let desc = frame[4];
+    let fcs_flag = desc >> 6;
+    let single_segment = (desc >> 5) & 1 == 1;
+    let checksum = (desc >> 2) & 1 == 1;
+    let dict_id_bytes = match desc & 3 {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        _ => 4,
+    };
+    let fcs_bytes = match fcs_flag {
+        0 => usize::from(single_segment),
+        1 => 2,
+        2 => 4,
+        _ => 8,
+    };
+    let mut pos = 4 + 1 + usize::from(!single_segment) + dict_id_bytes + fcs_bytes;
+    let end = frame.len() - if checksum { 4 } else { 0 };
+    let mut blocks = Vec::new();
+    while pos + 3 <= end {
+        let h =
+            frame[pos] as usize | (frame[pos + 1] as usize) << 8 | (frame[pos + 2] as usize) << 16;
+        let last = h & 1 == 1;
+        let btype = ((h >> 1) & 3) as u8;
+        let bsize = h >> 3;
+        let advance = if btype == 1 { 1 } else { bsize };
+        blocks.push((btype, bsize, last));
+        pos += 3 + advance;
+        if last {
+            break;
+        }
+    }
+    blocks
+}
+
+/// An input that is an exact multiple of `MAX_BLOCK_SIZE` must NOT emit a
+/// spurious trailing empty Raw block: the last REAL block carries the
+/// `last_block` flag, matching the C encoder on `ZSTD_e_end`. Exercises both
+/// the one-shot slice loop (`compress_independent_frame`) and the streaming
+/// `Read` loop (`set_source` + `compress`), on incompressible input (Raw
+/// blocks) and highly compressible input (Compressed/RLE blocks). Before the
+/// fix, each frame ended with an extra `R0!` block (3 wasted bytes).
+#[test]
+fn exact_block_multiple_marks_last_real_block() {
+    let cap = MAX_BLOCK_SIZE as usize;
+    for &nblk in &[1usize, 2, 3] {
+        for &compressible in &[false, true] {
+            let input: Vec<u8> = if compressible {
+                vec![0x7Au8; cap * nblk]
+            } else {
+                generate_data(0xC0FF_EE11, cap * nblk)
+            };
+
+            // One-shot slice path.
+            let mut oneshot: FrameCompressor =
+                FrameCompressor::new(super::CompressionLevel::Default);
+            let frame_os = oneshot.compress_independent_frame(&input);
+            let blocks_os = frame_block_list(&frame_os);
+            let last_os = *blocks_os.last().expect("at least one block");
+            assert!(
+                last_os.2,
+                "one-shot last block must set last_block (nblk={nblk}, compressible={compressible}): {blocks_os:?}"
+            );
+            assert!(
+                !(last_os.0 == 0 && last_os.1 == 0),
+                "one-shot must not emit a trailing empty Raw block (nblk={nblk}, compressible={compressible}): {blocks_os:?}"
+            );
+
+            // Streaming Read loop.
+            let mut output = Vec::new();
+            let mut streaming = FrameCompressor::new(super::CompressionLevel::Default);
+            streaming.set_source(input.as_slice());
+            streaming.set_drain(&mut output);
+            streaming.compress();
+            let blocks_st = frame_block_list(&output);
+            let last_st = *blocks_st.last().expect("at least one block");
+            assert!(
+                last_st.2,
+                "streaming last block must set last_block (nblk={nblk}, compressible={compressible}): {blocks_st:?}"
+            );
+            assert!(
+                !(last_st.0 == 0 && last_st.1 == 0),
+                "streaming must not emit a trailing empty Raw block (nblk={nblk}, compressible={compressible}): {blocks_st:?}"
+            );
+
+            // Both frames must round-trip back to the original bytes.
+            for frame in [&frame_os, &output] {
+                let mut decoder = FrameDecoder::new();
+                let mut decoded = Vec::with_capacity(input.len());
+                decoder.decode_all_to_vec(frame, &mut decoded).unwrap();
+                assert_eq!(
+                    decoded, input,
+                    "roundtrip mismatch (nblk={nblk}, compressible={compressible})"
+                );
+            }
+        }
+    }
+}
