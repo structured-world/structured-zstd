@@ -25,14 +25,17 @@ use crate::decoding::errors::DecodeBufferError;
 ///   backlog item #132.
 pub struct DecodeBuffer<B: BufferBackend = RingBuffer> {
     buffer: B,
-    /// Active dictionary, held by shared handle (`Arc`/`Rc`) rather than a
-    /// per-frame owned copy. `repeat_from_dict` reads match bytes straight
-    /// out of the handle's content (libzstd `ZSTD_refDDict` semantics): one
-    /// dictionary copy is shared across every frame AND across decoder
-    /// instances on other threads (`Arc<Dictionary>` is `Send + Sync`), so
-    /// reusing a dictionary costs a refcount bump, never a content memcpy.
-    /// `None` = no dictionary (a no-dict frame can never read a stale one).
-    pub(crate) dict: Option<crate::decoding::dictionary::DictionaryHandle>,
+    /// Borrowed pointer to the active dictionary, mirroring upstream zstd's
+    /// `ZSTD_DCtx` raw `prefixStart`/`dictContent` pointers into a caller-owned
+    /// `DDict` (libzstd `ZSTD_refDDict` semantics): `repeat_from_dict` reads
+    /// match bytes straight out of the pointee with NO per-frame refcount bump.
+    /// The pointee is kept alive for the whole decode by the dictionary owner
+    /// (the `FrameDecoder` registry, or the `&DictionaryHandle` the caller holds
+    /// across `decode_all_with_dict_handle`); `set_dict` re-sets it from a live
+    /// handle each frame. `None` = no dictionary (a no-dict frame can never read
+    /// a stale one). See the `unsafe impl Send/Sync` below for the cross-thread
+    /// contract.
+    pub(crate) dict: Option<core::ptr::NonNull<crate::decoding::dictionary::Dictionary>>,
 
     pub window_size: usize,
     total_output_counter: u64,
@@ -46,6 +49,15 @@ pub struct DecodeBuffer<B: BufferBackend = RingBuffer> {
     #[cfg(feature = "hash")]
     compute_hash: bool,
 }
+
+// SAFETY: the only non-auto-`Send`/`Sync` field is `dict`, a read-only borrowed
+// pointer to a `Send + Sync` `Dictionary` whose owner keeps it alive for the
+// decode (see the `dict` field contract). `repeat_from_dict` reads it through
+// `&self`/`&mut self` without aliasing mutation. The previous `Arc<Dictionary>`
+// was `Send + Sync`; the raw pointer drops the refcount, not the thread-safety.
+// Bounded on `B` so a non-thread-safe backend still suppresses the impl.
+unsafe impl<B: BufferBackend + Send> Send for DecodeBuffer<B> {}
+unsafe impl<B: BufferBackend + Sync> Sync for DecodeBuffer<B> {}
 
 /// Rollback token produced by [`DecodeBuffer::checkpoint`].
 ///
@@ -194,19 +206,20 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     /// (no copy). Empty slice when no dictionary is attached.
     #[inline]
     pub(crate) fn dict_content(&self) -> &[u8] {
-        match &self.dict {
-            Some(h) => &h.as_dict().dict_content,
+        match self.dict {
+            // SAFETY: set by `set_dict` from a live handle; the owner keeps the
+            // pointee alive for the decode (see the `dict` field contract).
+            Some(ptr) => &unsafe { ptr.as_ref() }.dict_content,
             None => &[],
         }
     }
 
-    /// Attach a dictionary by shared handle. This is a refcount bump
-    /// (`Arc`/`Rc` clone) — the dictionary content is shared, never copied,
-    /// so the same dictionary is free to reuse across frames and across
-    /// decoder instances on other threads.
+    /// Point at a dictionary by borrowed pointer (mirrors upstream zstd
+    /// `dctx->prefixStart = ddict->dictContent`): one store, NO refcount bump.
+    /// The pointee is owner-kept-alive for the decode (see the `dict` field).
     #[inline]
-    pub(crate) fn set_dict(&mut self, handle: crate::decoding::dictionary::DictionaryHandle) {
-        self.dict = Some(handle);
+    pub(crate) fn set_dict(&mut self, handle: &crate::decoding::dictionary::DictionaryHandle) {
+        self.dict = Some(core::ptr::NonNull::from(handle.as_dict()));
     }
 
     /// Return the last `n` bytes of the visible buffer as two
@@ -814,14 +827,17 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             // at least part of that repeat is from the dictionary content
             let bytes_from_dict = offset - self.buffer.len();
 
-            // Borrow the dictionary content through the shared handle as a
-            // field access (`self.dict`), kept disjoint from the `self.buffer`
-            // mutation below so the borrow checker allows the read+extend
-            // without an intermediate copy. `None` → empty slice → the
-            // length guard rejects (matches the old empty-`dict_content`
-            // behaviour on the direct/no-dict path).
-            let dict_content: &[u8] = match &self.dict {
-                Some(h) => &h.as_dict().dict_content,
+            // Borrow the dictionary content through the borrowed pointer. The
+            // `NonNull` is `Copy`, so the deref yields a slice tied to the
+            // pointee (owner-kept-alive for the decode), NOT to `&self.dict` —
+            // it is therefore trivially disjoint from the `self.buffer`
+            // mutation below, allowing the read+extend without an intermediate
+            // copy. `None` → empty slice → the length guard rejects (matches the
+            // old no-dict behaviour).
+            let dict_content: &[u8] = match self.dict {
+                // SAFETY: set by `set_dict` from a live handle; owner keeps the
+                // pointee alive for the decode (see the `dict` field contract).
+                Some(ptr) => &unsafe { ptr.as_ref() }.dict_content,
                 None => &[],
             };
             let dict_len = dict_content.len();

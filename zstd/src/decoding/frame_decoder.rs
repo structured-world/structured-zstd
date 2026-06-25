@@ -2862,7 +2862,7 @@ impl FrameDecoder {
                     &mut s.literals_buffer,
                     &mut s.block_content_buffer,
                     s.buffer.window_size,
-                    s.buffer.dict.clone(),
+                    s.buffer.dict,
                 ),
                 DecoderScratchKind::Ring(s) => (
                     &mut s.huf,
@@ -2871,21 +2871,21 @@ impl FrameDecoder {
                     &mut s.literals_buffer,
                     &mut s.block_content_buffer,
                     s.buffer.window_size,
-                    s.buffer.dict.clone(),
+                    s.buffer.dict,
                 ),
             };
         let backend = UserSliceBackend::from_slice(output);
         let mut buffer = DecodeBuffer::from_backend(backend, window_size);
-        // Dictionary matches on the direct path: hand the shared handle
-        // (refcount bump, no copy) to the stack-local buffer so offsets
-        // reaching past the frame's own output resolve through
-        // `repeat_from_dict` — the same ext-dict slow path the
-        // FlatBuf/Ring backends use. The per-sequence hot path is
-        // untouched: the inline-exec dispatch already routes
-        // beyond-prefix offsets to the cold `repeat()` fallback.
-        if let Some(handle) = dict {
-            buffer.set_dict(handle);
-        }
+        // Dictionary matches on the direct path: copy the borrowed dictionary
+        // pointer (one pointer store, no refcount) from the persistent scratch
+        // buffer into the stack-local buffer so offsets reaching past the
+        // frame's own output resolve through `repeat_from_dict` — the same
+        // ext-dict slow path the FlatBuf/Ring backends use. The pointee is the
+        // SAME owner-kept-alive dictionary the persistent buffer points at, so
+        // the contract carries over unchanged. The per-sequence hot path is
+        // untouched: the inline-exec dispatch already routes beyond-prefix
+        // offsets to the cold `repeat()` fallback.
+        buffer.dict = dict;
         let mut direct = DirectScratch {
             huf,
             fse,
@@ -3082,10 +3082,12 @@ impl FrameDecoder {
 
         let written = content_size as usize;
         state.frame_finished = true;
-        // Drop the stack-local DirectScratch (and its DecodeBuffer
-        // borrow on `output`) so we can re-borrow `output` for the
-        // hash pass below.
-        drop(direct);
+        // `direct`'s last use is in the decode loop above; NLL therefore
+        // releases its `&mut output` borrow before here, freeing `output` for
+        // the hash re-borrow below. No explicit `drop(direct)` is needed:
+        // `DirectScratch` now holds only borrowed dict POINTERS (not an owned
+        // `Arc`), so it is not a `Drop` type whose glue would hold the borrow
+        // to end-of-scope.
         // Per-block XXH64 (low 32 bits) over the captured ranges.
         // Mirrors `decode_blocks`' per-block hashing so the digests
         // vector stays identical regardless of which dispatch path

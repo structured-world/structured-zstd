@@ -4,6 +4,17 @@ use super::{DictionaryHandle, FrameDecoder};
 use crate::encoding::{CompressionLevel, FrameCompressor};
 use alloc::vec::Vec;
 
+/// `FrameDecoder` must stay `Send + Sync` (multi-instance contract: one
+/// dictionary shared across decoder instances on other threads). The decode
+/// scratch holds the dictionary by a raw `NonNull` pointer, which suppresses
+/// auto-`Send`/`Sync`; the `unsafe impl`s in `scratch.rs` / `decode_buffer.rs`
+/// restore it. This is a COMPILE-TIME guard — if a future change adds a
+/// non-thread-safe field (or drops one of those impls), this fails to compile.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<FrameDecoder>();
+};
+
 #[test]
 fn decode_all_tight_and_slack_outputs_match_on_single_segment_frame() {
     // Roundtrip a small payload through the encoder, then decode

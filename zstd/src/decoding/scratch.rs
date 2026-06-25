@@ -3,11 +3,12 @@
 use super::buffer_backend::BufferBackend;
 use super::decode_buffer::DecodeBuffer;
 use super::ringbuffer::RingBuffer;
-use crate::decoding::dictionary::DictionaryHandle;
+use crate::decoding::dictionary::{Dictionary, DictionaryHandle};
 use crate::fse::SeqFSETable;
 use crate::huff0::HuffmanTable;
 use alloc::vec::Vec;
 use core::ops::{Deref, DerefMut};
+use core::ptr::NonNull;
 
 use crate::blocks::sequence_section::{
     MAX_LITERAL_LENGTH_CODE, MAX_MATCH_LENGTH_CODE, MAX_OFFSET_CODE,
@@ -254,13 +255,16 @@ impl<B: BufferBackend> DecoderScratch<B> {
         // copy was always wasted work: every block either reads the table
         // by reference (Repeat mode) or rebuilds it (FSE/RLE/Predefined
         // mode), so deferring the copy to the rebuild is strictly faster.
-        self.fse.attach_dict(dict.clone());
-        self.huf.attach_dict(dict.clone());
+        // Pass the handle by reference: each attach reuses the held `Arc` when
+        // it is the same dictionary (frame-over-frame reuse), cloning only on a
+        // fresh/changed dictionary. The previous unconditional `dict.clone()`
+        // ×3 paid 3 refcount bumps on attach + 3 drops at teardown every frame
+        // — pure waste on the reuse hot path (CoordiNode per-label dicts),
+        // which dominates tiny-frame decode cost.
+        self.fse.attach_dict(dict);
+        self.huf.attach_dict(dict);
         self.offset_hist = d.offset_hist;
-        // Share the dictionary content by handle (Arc/Rc clone = refcount
-        // bump) instead of copying it into a per-frame buffer; the decoder
-        // reads match bytes straight out of the shared content.
-        self.buffer.set_dict(dict.clone());
+        self.buffer.set_dict(dict);
         // Upstream zstd parity: `ZSTD_decompressBegin_usingDDict` sets
         // `dctx->ddictIsCold = 1` so the first block of the frame
         // engages the prefetch decoder regardless of long-offset
@@ -281,9 +285,18 @@ pub struct HuffmanScratch {
     /// `Compressed` literals section rebuilds and flips to `Local`; a
     /// `Treeless` section reuses whatever source is current.
     table_source: TableSource,
-    /// Shared dictionary handle backing the table when `Dict`-sourced.
-    dict: Option<DictionaryHandle>,
+    /// Borrowed pointer to the dictionary backing the table when `Dict`-sourced
+    /// — same borrowed-pointer model as [`FSEScratch::dict`] (mirrors upstream
+    /// zstd `dctx->HUFptr`): no refcount, owner-kept-alive, read only while
+    /// `table_source == Dict`. `None` on the no-dict path.
+    dict: Option<NonNull<Dictionary>>,
 }
+
+// SAFETY: identical contract to the `FSEScratch` impls above — `dict` is a
+// read-only borrowed pointer to a `Send + Sync` `Dictionary` whose owner keeps
+// it alive for the decode; no aliasing mutation. Restores auto-`Send`/`Sync`.
+unsafe impl Send for HuffmanScratch {}
+unsafe impl Sync for HuffmanScratch {}
 
 impl HuffmanScratch {
     pub fn new() -> HuffmanScratch {
@@ -308,23 +321,26 @@ impl HuffmanScratch {
         match self.table_source {
             TableSource::Local => &self.table,
             TableSource::Dict => {
-                &self
+                let ptr = self
                     .dict
-                    .as_ref()
-                    .expect("Dict table source requires an attached dictionary handle")
-                    .as_dict()
-                    .huf
-                    .table
+                    .expect("Dict table source requires an attached dictionary pointer");
+                // SAFETY: set by `attach_dict` from a live handle, read only
+                // while `table_source == Dict`; owner keeps the pointee alive
+                // for the decode (see the `dict` field contract).
+                &unsafe { ptr.as_ref() }.huf.table
             }
         }
     }
 
-    /// Attach a shared dictionary copy-on-write: the literals table now
-    /// reads the dictionary's Huffman table by reference (one handle
-    /// clone, no table copy).
-    pub(crate) fn attach_dict(&mut self, dict: DictionaryHandle) {
+    /// Point the literals table at the dictionary's Huffman table by reference
+    /// (no table bytes copied). Mirrors upstream zstd `dctx->HUFptr = ...`:
+    /// store a borrowed pointer + re-arm the source, NO refcount bump.
+    pub(crate) fn attach_dict(&mut self, dict: &DictionaryHandle) {
+        // The COW table-source must be re-armed every frame (a prior frame's
+        // `Compressed` literals section may have flipped it to `Local`).
         self.table_source = TableSource::Dict;
-        self.dict = Some(dict);
+        // Borrowed pointer, set unconditionally (one store, no atomic).
+        self.dict = Some(NonNull::from(dict.as_dict()));
     }
 
     /// Drop any dictionary attachment and revert to the local table.
@@ -405,11 +421,31 @@ pub struct FSEScratch {
     ll_source: TableSource,
     of_source: TableSource,
     ml_source: TableSource,
-    /// Shared dictionary handle backing any axis whose source is `Dict`.
-    /// Held as one `Arc`/`Rc` clone (a refcount bump, not a table copy);
-    /// `None` on the no-dict path.
-    dict: Option<DictionaryHandle>,
+    /// Borrowed pointer to the dictionary backing any `Dict`-sourced axis,
+    /// mirroring upstream zstd's `ZSTD_DCtx` which holds RAW POINTERS into a
+    /// caller-owned `DDict` (`dctx->LLTptr = ddict->entropy.LLTable`): no
+    /// refcount, no per-frame `Arc` clone. The pointee is kept alive for the
+    /// whole decode by the dictionary owner — the `FrameDecoder`'s
+    /// `owned_dicts`/`shared_dicts` registry, or the `&DictionaryHandle` the
+    /// caller holds across `decode_all_with_dict_handle`. `attach_dict` re-sets
+    /// it from a live handle every frame; it is read (`dict_ref`) only while a
+    /// `*_source == Dict`, which is set in that same attach. `None` on the
+    /// no-dict path. See the `unsafe impl Send/Sync` below for the cross-thread
+    /// contract.
+    dict: Option<NonNull<Dictionary>>,
 }
+
+// SAFETY: `dict` is a borrowed pointer to a `Dictionary`, which is itself
+// `Send + Sync` (it owns only `Vec`/table data, no interior mutability). The
+// pointer is never used to mutate — `dict_ref` reads it through `&self` — and
+// the pointee outlives every read by the owner-liveness contract documented on
+// the `dict` field. So moving/sharing an `FSEScratch` across threads carries
+// only a read-only borrow of `Send + Sync` data, exactly as the previous
+// `Arc<Dictionary>` did; the raw pointer drops the per-frame refcount bump, not
+// the thread-safety. The explicit impls restore the auto-`Send`/`Sync` that the
+// `NonNull` field would otherwise suppress.
+unsafe impl Send for FSEScratch {}
+unsafe impl Sync for FSEScratch {}
 
 impl FSEScratch {
     /// Heap bytes owned by the three locally-built sequence FSE tables
@@ -485,24 +521,33 @@ impl FSEScratch {
         }
     }
 
-    fn dict_ref(&self) -> &crate::decoding::dictionary::Dictionary {
-        self.dict
-            .as_ref()
-            .expect("Dict table source requires an attached dictionary handle")
-            .as_dict()
+    fn dict_ref(&self) -> &Dictionary {
+        let ptr = self
+            .dict
+            .expect("Dict table source requires an attached dictionary pointer");
+        // SAFETY: `ptr` was set by `attach_dict` from a live `&DictionaryHandle`
+        // and is read only while a `*_source == Dict` (re-armed in that same
+        // attach); the pointee is kept alive for the whole decode by the
+        // dictionary owner (registry / caller borrow) per the `dict` field
+        // contract. Shared `&self` read, no aliasing mutation.
+        unsafe { ptr.as_ref() }
     }
 
-    /// Attach a shared dictionary copy-on-write: every sequence FSE axis
-    /// now reads the dictionary's tables by reference. No table bytes are
-    /// copied (the eager per-frame entropy-table memcpy is elided); the
-    /// only cost is one handle clone plus copying the precomputed
-    /// long-offset share scalar.
-    pub(crate) fn attach_dict(&mut self, dict: DictionaryHandle) {
+    /// Point every sequence FSE axis at the shared dictionary's tables by
+    /// reference (no table bytes copied — the eager per-frame entropy-table
+    /// memcpy is elided). Mirrors upstream zstd `ZSTD_copyDDictParameters`:
+    /// store borrowed pointers + the precomputed long-offset share, with NO
+    /// refcount bump (the pointee is owner-kept-alive; see the `dict` field).
+    pub(crate) fn attach_dict(&mut self, dict: &DictionaryHandle) {
         self.offsets_long_share = dict.as_dict().fse.offsets_long_share;
+        // Re-arm all three COW axes every frame (a prior frame may have rebuilt
+        // any of them to `Local`).
         self.ll_source = TableSource::Dict;
         self.of_source = TableSource::Dict;
         self.ml_source = TableSource::Dict;
-        self.dict = Some(dict);
+        // Borrowed pointer, set unconditionally every frame (one store, no
+        // atomic) exactly like C's per-frame pointer assignment.
+        self.dict = Some(NonNull::from(dict.as_dict()));
     }
 
     /// Drop any dictionary attachment and revert all axes to `Local`
