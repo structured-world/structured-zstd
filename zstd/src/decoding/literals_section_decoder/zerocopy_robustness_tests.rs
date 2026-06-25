@@ -44,7 +44,7 @@ fn raw_truncated_source_returns_error_no_panic() {
     let source: [u8; 3] = [1, 2, 3];
     let mut target: Vec<u8> = Vec::new();
     let mut scratch = fresh_scratch();
-    let result = decode_literals_zerocopy(&section, &mut scratch, &source, &mut target);
+    let result = decode_literals_zerocopy(&section, &mut scratch, None, &source, &mut target);
     assert!(
         result.is_err(),
         "truncated raw source must error, not panic; got {:?}",
@@ -60,7 +60,7 @@ fn rle_empty_source_returns_error_no_panic() {
     let source: [u8; 0] = [];
     let mut target: Vec<u8> = Vec::new();
     let mut scratch = fresh_scratch();
-    let result = decode_literals_zerocopy(&section, &mut scratch, &source, &mut target);
+    let result = decode_literals_zerocopy(&section, &mut scratch, None, &source, &mut target);
     assert!(
         result.is_err(),
         "empty RLE source must error, not panic; got {:?}",
@@ -83,7 +83,7 @@ fn compressed_truncated_source_returns_error_no_panic() {
     let source: [u8; 3] = [1, 2, 3];
     let mut target: Vec<u8> = Vec::new();
     let mut scratch = fresh_scratch();
-    let result = decode_literals_zerocopy(&section, &mut scratch, &source, &mut target);
+    let result = decode_literals_zerocopy(&section, &mut scratch, None, &source, &mut target);
     // Pin the EXACT contract: a truncated Compressed section must report
     // MissingBytesForLiterals with the precise got/needed, not just "some
     // error" (a weaker is_err() would also pass on MissingNumStreams /
@@ -113,7 +113,7 @@ fn rle_view_excludes_pre_existing_target_bytes() {
     let section = rle_section(4);
     let source: [u8; 1] = [0x42];
     let mut scratch = fresh_scratch();
-    let view = decode_literals_zerocopy(&section, &mut scratch, &source, &mut target)
+    let view = decode_literals_zerocopy(&section, &mut scratch, None, &source, &mut target)
         .expect("RLE with valid source must succeed");
     assert_eq!(view.data.len(), 4, "view length must match regen_size");
     assert!(

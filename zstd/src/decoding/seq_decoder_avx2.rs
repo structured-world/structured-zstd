@@ -218,6 +218,7 @@ macro_rules! decode_seq_fused_cshape {
 macro_rules! execute_one_body {
     (
         $buffer:expr,
+        $dict:expr,
         $literals_buffer:expr,
         $lit_cur:expr,
         $literals_buffer_len:expr,
@@ -305,8 +306,11 @@ macro_rules! execute_one_body {
             if let Err(e) = $buffer.try_push(lits) {
                 break 'exec_inner Err(ExecuteSequencesError::from(e).into());
             }
-            match $buffer.repeat_lookahead_prefetched(resolved_offset_v as usize, seq_ml_v as usize)
-            {
+            match $buffer.repeat_lookahead_prefetched(
+                $dict,
+                resolved_offset_v as usize,
+                seq_ml_v as usize,
+            ) {
                 Ok(()) => Ok(()),
                 Err(e) => Err(ExecuteSequencesError::from(e).into()),
             }
@@ -327,13 +331,14 @@ macro_rules! execute_one_body {
 /// `detect_cpu_kernel() == Avx2`.
 #[target_feature(enable = "bmi2,avx2")]
 #[allow(clippy::too_many_lines)]
-pub(crate) unsafe fn decode_and_execute_sequences_avx2<B: BufferBackend>(
+pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
     section: &SequencesHeader,
     source: &[u8],
-    fse: &mut FSEScratch,
+    fse: &'fse mut FSEScratch,
     buffer: &mut DecodeBuffer<B>,
     offset_hist: &mut [u32; 3],
     literals_buffer: &[u8],
+    dict: Option<&'fse crate::decoding::dictionary::Dictionary>,
 ) -> Result<(), DecompressBlockError> {
     let SeqStreamSetup {
         mut br,
@@ -344,7 +349,7 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<B: BufferBackend>(
         old_buffer_size,
         num_sequences,
         use_long_pipeline,
-    } = init_sequence_stream::<B, Avx2Kernel>(section, source, fse, buffer)?;
+    } = init_sequence_stream::<B, Avx2Kernel>(section, source, fse, buffer, dict)?;
     let literals_buffer_len = literals_buffer.len();
     let mut lit_cur: usize = 0;
     let mut seq_sum: u32 = 0;
@@ -412,6 +417,7 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<B: BufferBackend>(
 
             let r = execute_one_body!(
                 buffer,
+                dict,
                 literals_buffer,
                 &mut lit_cur,
                 literals_buffer_len,
@@ -440,6 +446,7 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<B: BufferBackend>(
                 let exec_seq = ring[slot];
                 let r = execute_one_body!(
                     buffer,
+                    dict,
                     literals_buffer,
                     &mut lit_cur,
                     literals_buffer_len,
@@ -476,6 +483,7 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<B: BufferBackend>(
             );
             let r = execute_one_body!(
                 buffer,
+                dict,
                 literals_buffer,
                 &mut lit_cur,
                 literals_buffer_len,

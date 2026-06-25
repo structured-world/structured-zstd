@@ -6,10 +6,11 @@ use alloc::vec::Vec;
 
 /// `FrameDecoder` must stay `Send + Sync` (multi-instance contract: one
 /// dictionary shared across decoder instances on other threads). The decode
-/// scratch holds the dictionary by a raw `NonNull` pointer, which suppresses
-/// auto-`Send`/`Sync`; the `unsafe impl`s in `scratch.rs` / `decode_buffer.rs`
-/// restore it. This is a COMPILE-TIME guard — if a future change adds a
-/// non-thread-safe field (or drops one of those impls), this fails to compile.
+/// state owns the dictionary as a thread-safe handle (`active_dict:
+/// Option<DictionaryHandle>`) and every `Dict`-sourced table read borrows it as
+/// a call-scoped argument, so `Send`/`Sync` auto-derive with zero `unsafe impl`.
+/// This is a COMPILE-TIME guard — if a future change adds a non-thread-safe
+/// field, this fails to compile.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<FrameDecoder>();

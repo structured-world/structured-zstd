@@ -20,6 +20,7 @@ use crate::cpu_kernel::CpuKernelTag;
 #[cfg(all(target_arch = "x86_64", feature = "kernel_vbmi2"))]
 use crate::cpu_kernel::Vbmi2Kernel;
 use crate::cpu_kernel::{CpuKernel, ScalarKernel, detect_cpu_kernel};
+use crate::decoding::dictionary::Dictionary;
 use crate::decoding::errors::DecompressLiteralsError;
 use crate::huff0::HuffmanDecoder;
 use alloc::vec::Vec;
@@ -32,6 +33,7 @@ use alloc::vec::Vec;
 pub fn decode_literals(
     section: &LiteralsSection,
     scratch: &mut HuffmanScratch,
+    dict: Option<&Dictionary>,
     source: &[u8],
     target: &mut Vec<u8>,
 ) -> Result<u32, DecompressLiteralsError> {
@@ -45,7 +47,7 @@ pub fn decode_literals(
             Ok(1)
         }
         LiteralsSectionType::Compressed | LiteralsSectionType::Treeless => {
-            let bytes_read = decompress_literals(section, scratch, source, target)?;
+            let bytes_read = decompress_literals(section, scratch, dict, source, target)?;
             Ok(bytes_read)
         }
     }
@@ -76,6 +78,7 @@ pub struct LiteralsView<'a> {
 pub fn decode_literals_zerocopy<'a>(
     section: &LiteralsSection,
     scratch: &mut HuffmanScratch,
+    dict: Option<&Dictionary>,
     source: &'a [u8],
     target: &'a mut Vec<u8>,
 ) -> Result<LiteralsView<'a>, DecompressLiteralsError> {
@@ -121,7 +124,7 @@ pub fn decode_literals_zerocopy<'a>(
             })
         }
         LiteralsSectionType::Compressed | LiteralsSectionType::Treeless => {
-            let bytes_used = decompress_literals(section, scratch, source, target)?;
+            let bytes_used = decompress_literals(section, scratch, dict, source, target)?;
             Ok(LiteralsView {
                 data: &target[base..],
                 bytes_used,
@@ -137,6 +140,7 @@ pub fn decode_literals_zerocopy<'a>(
 fn decompress_literals(
     section: &LiteralsSection,
     scratch: &mut HuffmanScratch,
+    dict: Option<&Dictionary>,
     source: &[u8],
     target: &mut Vec<u8>,
 ) -> Result<u32, DecompressLiteralsError> {
@@ -156,13 +160,17 @@ fn decompress_literals(
     match detect_cpu_kernel() {
         #[cfg(all(target_arch = "x86_64", feature = "kernel_vbmi2"))]
         CpuKernelTag::Vbmi2 => unsafe {
-            decompress_literals_vbmi2(section, scratch, source, target)
+            decompress_literals_vbmi2(section, scratch, dict, source, target)
         },
         #[cfg(all(target_arch = "x86_64", feature = "kernel_avx2"))]
-        CpuKernelTag::Avx2 => unsafe { decompress_literals_avx2(section, scratch, source, target) },
+        CpuKernelTag::Avx2 => unsafe {
+            decompress_literals_avx2(section, scratch, dict, source, target)
+        },
         #[cfg(all(target_arch = "x86_64", feature = "kernel_bmi2"))]
-        CpuKernelTag::Bmi2 => unsafe { decompress_literals_bmi2(section, scratch, source, target) },
-        _ => decompress_literals_impl::<ScalarKernel>(section, scratch, source, target),
+        CpuKernelTag::Bmi2 => unsafe {
+            decompress_literals_bmi2(section, scratch, dict, source, target)
+        },
+        _ => decompress_literals_impl::<ScalarKernel>(section, scratch, dict, source, target),
     }
 }
 
@@ -171,10 +179,11 @@ fn decompress_literals(
 unsafe fn decompress_literals_avx2(
     section: &LiteralsSection,
     scratch: &mut HuffmanScratch,
+    dict: Option<&Dictionary>,
     source: &[u8],
     target: &mut Vec<u8>,
 ) -> Result<u32, DecompressLiteralsError> {
-    decompress_literals_impl::<Avx2Kernel>(section, scratch, source, target)
+    decompress_literals_impl::<Avx2Kernel>(section, scratch, dict, source, target)
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "kernel_bmi2"))]
@@ -182,10 +191,11 @@ unsafe fn decompress_literals_avx2(
 unsafe fn decompress_literals_bmi2(
     section: &LiteralsSection,
     scratch: &mut HuffmanScratch,
+    dict: Option<&Dictionary>,
     source: &[u8],
     target: &mut Vec<u8>,
 ) -> Result<u32, DecompressLiteralsError> {
-    decompress_literals_impl::<Bmi2Kernel>(section, scratch, source, target)
+    decompress_literals_impl::<Bmi2Kernel>(section, scratch, dict, source, target)
 }
 
 #[cfg(all(target_arch = "x86_64", feature = "kernel_vbmi2"))]
@@ -193,15 +203,17 @@ unsafe fn decompress_literals_bmi2(
 unsafe fn decompress_literals_vbmi2(
     section: &LiteralsSection,
     scratch: &mut HuffmanScratch,
+    dict: Option<&Dictionary>,
     source: &[u8],
     target: &mut Vec<u8>,
 ) -> Result<u32, DecompressLiteralsError> {
-    decompress_literals_impl::<Vbmi2Kernel>(section, scratch, source, target)
+    decompress_literals_impl::<Vbmi2Kernel>(section, scratch, dict, source, target)
 }
 
 fn decompress_literals_impl<K: CpuKernel>(
     section: &LiteralsSection,
     scratch: &mut HuffmanScratch,
+    dict: Option<&Dictionary>,
     source: &[u8],
     target: &mut Vec<u8>,
 ) -> Result<u32, DecompressLiteralsError> {
@@ -234,7 +246,7 @@ fn decompress_literals_impl<K: CpuKernel>(
             scratch.mark_table_local();
             vprintln!("Built huffman table using {} bytes", bytes_read);
         }
-        LiteralsSectionType::Treeless if scratch.huf_table().max_num_bits == 0 => {
+        LiteralsSectionType::Treeless if scratch.huf_table(dict).max_num_bits == 0 => {
             return Err(err::UninitializedHuffmanTable);
         }
 
@@ -245,7 +257,7 @@ fn decompress_literals_impl<K: CpuKernel>(
 
     // Copy-on-write source: the dictionary's Huffman table (zero-copy) on a
     // Treeless section that still reads `Dict`, else the locally-built one.
-    let table = scratch.huf_table();
+    let table = scratch.huf_table(dict);
 
     if num_streams == 4 {
         //build jumptable

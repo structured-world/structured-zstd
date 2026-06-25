@@ -95,6 +95,7 @@ pub(crate) fn init_sequence_stream<'src, 'fse, B, K>(
     source: &'src [u8],
     fse: &'fse mut FSEScratch,
     buffer: &mut super::decode_buffer::DecodeBuffer<B>,
+    dict: Option<&'fse crate::decoding::dictionary::Dictionary>,
 ) -> Result<SeqStreamSetup<'src, 'fse, K>, DecompressBlockError>
 where
     B: super::buffer_backend::BufferBackend,
@@ -135,9 +136,9 @@ where
     // resolve to the shared dictionary's table (zero-copy) on axes still
     // in `Dict` mode, else the locally-built table. `maybe_update_fse_tables`
     // above has already flipped any rebuilt axis to `Local`.
-    let mut ll_dec = SeqFSEDecoder::new(fse.ll_table());
-    let mut ml_dec = SeqFSEDecoder::new(fse.ml_table());
-    let mut of_dec = SeqFSEDecoder::new(fse.of_table());
+    let mut ll_dec = SeqFSEDecoder::new(fse.ll_table(dict));
+    let mut ml_dec = SeqFSEDecoder::new(fse.ml_table(dict));
+    let mut of_dec = SeqFSEDecoder::new(fse.of_table(dict));
 
     ll_dec
         .init_state(&mut br)
@@ -149,8 +150,9 @@ where
         .init_state(&mut br)
         .map_err(DecodeSequenceError::from)?;
 
-    let max_update_bits =
-        fse.ll_table().accuracy_log + fse.ml_table().accuracy_log + fse.of_table().accuracy_log;
+    let max_update_bits = fse.ll_table(dict).accuracy_log
+        + fse.ml_table(dict).accuracy_log
+        + fse.of_table(dict).accuracy_log;
     debug_assert!(
         max_update_bits <= 56,
         "sequence section update bits exceed 56-bit budget"
@@ -175,7 +177,10 @@ where
     // window_size plus a dict). The gate below asks "does history exceed
     // the prefetch threshold", so on the overflow path the clamped maximum
     // is the correct answer, not a wrapped small value.
-    let total_history = match buffer.window_size.checked_add(buffer.dict_content().len()) {
+    let total_history = match buffer
+        .window_size
+        .checked_add(buffer.dict_content(dict).len())
+    {
         Some(sum) => sum,
         None => usize::MAX,
     };
@@ -235,13 +240,14 @@ where
 /// instructions across the `K::mask_lower_bits` call boundary inside
 /// the impl body — otherwise the per-call target_feature boundary
 /// would keep a function-call trampoline at every BitReader op.
-pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
+pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBackend>(
     section: &SequencesHeader,
     source: &[u8],
-    fse: &mut FSEScratch,
+    fse: &'fse mut FSEScratch,
     buffer: &mut super::decode_buffer::DecodeBuffer<B>,
     offset_hist: &mut [u32; 3],
     literals_buffer: &[u8],
+    dict: Option<&'fse crate::decoding::dictionary::Dictionary>,
 ) -> Result<(), DecompressBlockError> {
     #[cfg(all(target_arch = "aarch64", feature = "kernel_neon"))]
     use crate::cpu_kernel::NeonKernel;
@@ -262,6 +268,7 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
                 buffer,
                 offset_hist,
                 literals_buffer,
+                dict,
             )
         }
         #[cfg(all(target_arch = "x86_64", feature = "kernel_sse2"))]
@@ -278,6 +285,7 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
                 buffer,
                 offset_hist,
                 literals_buffer,
+                dict,
             )
         }
         #[cfg(all(target_arch = "x86_64", feature = "kernel_bmi2"))]
@@ -296,6 +304,7 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
                     buffer,
                     offset_hist,
                     literals_buffer,
+                    dict,
                 )
             }
         }
@@ -310,6 +319,7 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
                     buffer,
                     offset_hist,
                     literals_buffer,
+                    dict,
                 )
             }
         }
@@ -325,6 +335,7 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
                     buffer,
                     offset_hist,
                     literals_buffer,
+                    dict,
                 )
             }
         }
@@ -336,6 +347,7 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
             buffer,
             offset_hist,
             literals_buffer,
+            dict,
         ),
         #[cfg(all(
             target_arch = "aarch64",
@@ -349,6 +361,7 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
             buffer,
             offset_hist,
             literals_buffer,
+            dict,
         ),
     }
 }
@@ -365,15 +378,17 @@ pub fn decode_and_execute_sequences<B: super::buffer_backend::BufferBackend>(
 // reachable per build configuration.
 #[allow(dead_code)]
 pub(crate) fn decode_and_execute_sequences_impl<
+    'fse,
     B: super::buffer_backend::BufferBackend,
     K: crate::cpu_kernel::CpuKernel,
 >(
     section: &SequencesHeader,
     source: &[u8],
-    fse: &mut FSEScratch,
+    fse: &'fse mut FSEScratch,
     buffer: &mut super::decode_buffer::DecodeBuffer<B>,
     offset_hist: &mut [u32; 3],
     literals_buffer: &[u8],
+    dict: Option<&'fse crate::decoding::dictionary::Dictionary>,
 ) -> Result<(), DecompressBlockError> {
     // Consume the one-shot `ddict_is_cold` flag at function entry,
     // BEFORE any early returns (padding-bit validation).
@@ -393,7 +408,7 @@ pub(crate) fn decode_and_execute_sequences_impl<
         old_buffer_size,
         num_sequences,
         use_long_pipeline,
-    } = init_sequence_stream::<B, K>(section, source, fse, buffer)?;
+    } = init_sequence_stream::<B, K>(section, source, fse, buffer, dict)?;
     let literals_buffer_len = literals_buffer.len();
     let mut lit_cur: usize = 0;
     let mut seq_sum: u32 = 0;
@@ -470,6 +485,7 @@ pub(crate) fn decode_and_execute_sequences_impl<
             &mut ml_dec,
             &mut of_dec,
             buffer,
+            dict,
             offset_hist,
             literals_buffer,
             &mut lit_cur,
@@ -530,6 +546,7 @@ pub(crate) fn decode_and_execute_sequences_impl<
             let resolved_offset = do_offset_history(seq.of, seq.ll, &mut shadow_hist);
             if let Err(e) = execute_one_sequence_pipelined(
                 buffer,
+                dict,
                 literals_buffer,
                 &mut lit_cur,
                 literals_buffer_len,
@@ -654,6 +671,7 @@ fn run_pipelined_sequence_loop<
     ml_dec: &mut SeqFSEDecoder<'_>,
     of_dec: &mut SeqFSEDecoder<'_>,
     buffer: &mut super::decode_buffer::DecodeBuffer<B>,
+    dict: Option<&crate::decoding::dictionary::Dictionary>,
     offset_hist: &mut [u32; 3],
     literals_buffer: &[u8],
     lit_cur: &mut usize,
@@ -726,6 +744,7 @@ fn run_pipelined_sequence_loop<
 
         execute_one_sequence_pipelined_resolved(
             buffer,
+            dict,
             literals_buffer,
             lit_cur,
             literals_buffer_len,
@@ -746,6 +765,7 @@ fn run_pipelined_sequence_loop<
         let exec_seq = ring[slot];
         execute_one_sequence_pipelined_resolved(
             buffer,
+            dict,
             literals_buffer,
             lit_cur,
             literals_buffer_len,
@@ -782,6 +802,7 @@ pub(crate) struct ExecSeq {
 #[allow(dead_code)] // live on aarch64 + tests only; see decode_and_execute_sequences_impl
 pub(crate) fn execute_one_sequence_pipelined_resolved<B: super::buffer_backend::BufferBackend>(
     buffer: &mut super::decode_buffer::DecodeBuffer<B>,
+    dict: Option<&crate::decoding::dictionary::Dictionary>,
     literals: &[u8],
     lit_cur: &mut usize,
     lit_len: usize,
@@ -789,6 +810,7 @@ pub(crate) fn execute_one_sequence_pipelined_resolved<B: super::buffer_backend::
 ) -> Result<(), DecompressBlockError> {
     execute_one_sequence_pipelined(
         buffer,
+        dict,
         literals,
         lit_cur,
         lit_len,
@@ -819,13 +841,22 @@ pub(crate) unsafe fn execute_one_sequence_pipelined_bmi2<
     B: super::buffer_backend::BufferBackend,
 >(
     buffer: &mut super::decode_buffer::DecodeBuffer<B>,
+    dict: Option<&crate::decoding::dictionary::Dictionary>,
     literals: &[u8],
     lit_cur: &mut usize,
     lit_len: usize,
     seq: Sequence,
     resolved_offset: u32,
 ) -> Result<(), DecompressBlockError> {
-    execute_one_sequence_pipelined(buffer, literals, lit_cur, lit_len, seq, resolved_offset)
+    execute_one_sequence_pipelined(
+        buffer,
+        dict,
+        literals,
+        lit_cur,
+        lit_len,
+        seq,
+        resolved_offset,
+    )
 }
 
 /// BMI2-tier ExecSeq-unpack wrapper. Delegates to safe K-agnostic
@@ -842,12 +873,13 @@ pub(crate) unsafe fn execute_one_sequence_pipelined_resolved_bmi2<
     B: super::buffer_backend::BufferBackend,
 >(
     buffer: &mut super::decode_buffer::DecodeBuffer<B>,
+    dict: Option<&crate::decoding::dictionary::Dictionary>,
     literals: &[u8],
     lit_cur: &mut usize,
     lit_len: usize,
     exec_seq: ExecSeq,
 ) -> Result<(), DecompressBlockError> {
-    execute_one_sequence_pipelined_resolved(buffer, literals, lit_cur, lit_len, exec_seq)
+    execute_one_sequence_pipelined_resolved(buffer, dict, literals, lit_cur, lit_len, exec_seq)
 }
 
 /// VBMI2-tier exec wrapper. Currently delegates via the AVX2 variant
@@ -867,6 +899,7 @@ pub(crate) unsafe fn execute_one_sequence_pipelined_vbmi2<
     B: super::buffer_backend::BufferBackend,
 >(
     buffer: &mut super::decode_buffer::DecodeBuffer<B>,
+    dict: Option<&crate::decoding::dictionary::Dictionary>,
     literals: &[u8],
     lit_cur: &mut usize,
     lit_len: usize,
@@ -878,6 +911,7 @@ pub(crate) unsafe fn execute_one_sequence_pipelined_vbmi2<
     unsafe {
         execute_one_sequence_pipelined_avx2(
             buffer,
+            dict,
             literals,
             lit_cur,
             lit_len,
@@ -899,6 +933,7 @@ pub(crate) unsafe fn execute_one_sequence_pipelined_resolved_vbmi2<
     B: super::buffer_backend::BufferBackend,
 >(
     buffer: &mut super::decode_buffer::DecodeBuffer<B>,
+    dict: Option<&crate::decoding::dictionary::Dictionary>,
     literals: &[u8],
     lit_cur: &mut usize,
     lit_len: usize,
@@ -906,7 +941,9 @@ pub(crate) unsafe fn execute_one_sequence_pipelined_resolved_vbmi2<
 ) -> Result<(), DecompressBlockError> {
     // SAFETY: VBMI2 ⊇ AVX2+BMI2.
     unsafe {
-        execute_one_sequence_pipelined_resolved_avx2(buffer, literals, lit_cur, lit_len, exec_seq)
+        execute_one_sequence_pipelined_resolved_avx2(
+            buffer, dict, literals, lit_cur, lit_len, exec_seq,
+        )
     }
 }
 
@@ -925,6 +962,7 @@ pub(crate) unsafe fn execute_one_sequence_pipelined_resolved_avx2<
     B: super::buffer_backend::BufferBackend,
 >(
     buffer: &mut super::decode_buffer::DecodeBuffer<B>,
+    dict: Option<&crate::decoding::dictionary::Dictionary>,
     literals: &[u8],
     lit_cur: &mut usize,
     lit_len: usize,
@@ -934,6 +972,7 @@ pub(crate) unsafe fn execute_one_sequence_pipelined_resolved_avx2<
     unsafe {
         execute_one_sequence_pipelined_avx2(
             buffer,
+            dict,
             literals,
             lit_cur,
             lit_len,
@@ -961,6 +1000,7 @@ pub(crate) unsafe fn execute_one_sequence_pipelined_resolved_avx2<
 #[allow(dead_code)] // live on aarch64 + tests only; see decode_and_execute_sequences_impl
 pub(crate) fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBackend>(
     buffer: &mut super::decode_buffer::DecodeBuffer<B>,
+    dict: Option<&crate::decoding::dictionary::Dictionary>,
     literals: &[u8],
     lit_cur: &mut usize,
     lit_len: usize,
@@ -1059,7 +1099,7 @@ pub(crate) fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBac
             // `repeat_from_dict` for these offsets.
             buffer.try_push(lits).map_err(ExecuteSequencesError::from)?;
             buffer
-                .repeat_lookahead_prefetched(offset, seq.ml as usize)
+                .repeat_lookahead_prefetched(dict, offset, seq.ml as usize)
                 .map_err(ExecuteSequencesError::from)?;
             return Ok(());
         }
@@ -1118,7 +1158,7 @@ pub(crate) fn execute_one_sequence_pipelined<B: super::buffer_backend::BufferBac
     // Fallback: the legacy push + repeat chain.
     buffer.try_push(lits).map_err(ExecuteSequencesError::from)?;
     buffer
-        .repeat_lookahead_prefetched(resolved_offset as usize, seq.ml as usize)
+        .repeat_lookahead_prefetched(dict, resolved_offset as usize, seq.ml as usize)
         .map_err(ExecuteSequencesError::from)?;
     Ok(())
 }
@@ -1142,6 +1182,7 @@ pub(crate) unsafe fn execute_one_sequence_pipelined_avx2<
     B: super::buffer_backend::BufferBackend,
 >(
     buffer: &mut super::decode_buffer::DecodeBuffer<B>,
+    dict: Option<&crate::decoding::dictionary::Dictionary>,
     literals: &[u8],
     lit_cur: &mut usize,
     lit_len: usize,
@@ -1186,7 +1227,7 @@ pub(crate) unsafe fn execute_one_sequence_pipelined_avx2<
         if prefix_end.is_none() {
             buffer.try_push(lits).map_err(ExecuteSequencesError::from)?;
             buffer
-                .repeat_lookahead_prefetched(offset, seq.ml as usize)
+                .repeat_lookahead_prefetched(dict, offset, seq.ml as usize)
                 .map_err(ExecuteSequencesError::from)?;
             return Ok(());
         }
@@ -1213,7 +1254,7 @@ pub(crate) unsafe fn execute_one_sequence_pipelined_avx2<
     // through the target_feature boundary). Same as the SSE2 default.
     buffer.try_push(lits).map_err(ExecuteSequencesError::from)?;
     buffer
-        .repeat_lookahead_prefetched(resolved_offset as usize, seq.ml as usize)
+        .repeat_lookahead_prefetched(dict, resolved_offset as usize, seq.ml as usize)
         .map_err(ExecuteSequencesError::from)?;
     Ok(())
 }

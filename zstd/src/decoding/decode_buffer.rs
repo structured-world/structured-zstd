@@ -25,18 +25,12 @@ use crate::decoding::errors::DecodeBufferError;
 ///   backlog item #132.
 pub struct DecodeBuffer<B: BufferBackend = RingBuffer> {
     buffer: B,
-    /// Borrowed pointer to the active dictionary, mirroring upstream zstd's
-    /// `ZSTD_DCtx` raw `prefixStart`/`dictContent` pointers into a caller-owned
-    /// `DDict` (libzstd `ZSTD_refDDict` semantics): `repeat_from_dict` reads
-    /// match bytes straight out of the pointee with NO per-frame refcount bump.
-    /// The pointee is kept alive for the whole decode by the dictionary owner
-    /// (the `FrameDecoder` registry, or the `&DictionaryHandle` the caller holds
-    /// across `decode_all_with_dict_handle`); `set_dict` re-sets it from a live
-    /// handle each frame. `None` = no dictionary (a no-dict frame can never read
-    /// a stale one). See the `unsafe impl Send/Sync` below for the cross-thread
-    /// contract.
-    pub(crate) dict: Option<core::ptr::NonNull<crate::decoding::dictionary::Dictionary>>,
-
+    // No dictionary reference is stored: an out-of-window match reads the
+    // dictionary content through a call-scoped `dict: Option<&Dictionary>`
+    // borrow threaded into `repeat` / `repeat_from_dict` by the decode pipeline
+    // (libzstd `ZSTD_refDDict` semantics — read the dict content, no per-frame
+    // refcount bump). The borrow checker guarantees the dictionary outlives
+    // every read; `DecodeBuffer` itself stays `Send`/`Sync` by auto-derive.
     pub window_size: usize,
     total_output_counter: u64,
     #[cfg(feature = "hash")]
@@ -49,15 +43,6 @@ pub struct DecodeBuffer<B: BufferBackend = RingBuffer> {
     #[cfg(feature = "hash")]
     compute_hash: bool,
 }
-
-// SAFETY: the only non-auto-`Send`/`Sync` field is `dict`, a read-only borrowed
-// pointer to a `Send + Sync` `Dictionary` whose owner keeps it alive for the
-// decode (see the `dict` field contract). `repeat_from_dict` reads it through
-// `&self`/`&mut self` without aliasing mutation. The previous `Arc<Dictionary>`
-// was `Send + Sync`; the raw pointer drops the refcount, not the thread-safety.
-// Bounded on `B` so a non-thread-safe backend still suppresses the impl.
-unsafe impl<B: BufferBackend + Send> Send for DecodeBuffer<B> {}
-unsafe impl<B: BufferBackend + Sync> Sync for DecodeBuffer<B> {}
 
 /// Rollback token produced by [`DecodeBuffer::checkpoint`].
 ///
@@ -100,7 +85,6 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     pub fn new(window_size: usize) -> DecodeBuffer<B> {
         DecodeBuffer {
             buffer: B::new(),
-            dict: None,
             window_size,
             total_output_counter: 0,
             #[cfg(feature = "hash")]
@@ -126,7 +110,6 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         buffer.clear();
         DecodeBuffer {
             buffer,
-            dict: None,
             window_size,
             total_output_counter: 0,
             #[cfg(feature = "hash")]
@@ -179,7 +162,6 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         // `DecoderScratchKind::reserve_buffer(window_size)` before any
         // block writes — that is the only call site that knows whether
         // the frame will actually hit this buffer.
-        self.dict = None;
         self.total_output_counter = 0;
         // Lift the per-block growth ceiling between frames; the sequence
         // decoder re-arms it per block. Non-block callers stay unbounded.
@@ -202,24 +184,17 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         self.buffer.cap()
     }
 
-    /// Active dictionary content bytes, borrowed through the shared handle
-    /// (no copy). Empty slice when no dictionary is attached.
+    /// Active dictionary content bytes, read from the call-scoped `dict` borrow
+    /// (no copy). Empty slice when no dictionary is active for this decode.
     #[inline]
-    pub(crate) fn dict_content(&self) -> &[u8] {
-        match self.dict {
-            // SAFETY: set by `set_dict` from a live handle; the owner keeps the
-            // pointee alive for the decode (see the `dict` field contract).
-            Some(ptr) => &unsafe { ptr.as_ref() }.dict_content,
+    pub(crate) fn dict_content<'d>(
+        &self,
+        dict: Option<&'d crate::decoding::dictionary::Dictionary>,
+    ) -> &'d [u8] {
+        match dict {
+            Some(d) => &d.dict_content,
             None => &[],
         }
-    }
-
-    /// Point at a dictionary by borrowed pointer (mirrors upstream zstd
-    /// `dctx->prefixStart = ddict->dictContent`): one store, NO refcount bump.
-    /// The pointee is owner-kept-alive for the decode (see the `dict` field).
-    #[inline]
-    pub(crate) fn set_dict(&mut self, handle: &crate::decoding::dictionary::DictionaryHandle) {
-        self.dict = Some(core::ptr::NonNull::from(handle.as_dict()));
     }
 
     /// Return the last `n` bytes of the visible buffer as two
@@ -403,8 +378,13 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         Ok(())
     }
 
-    pub fn repeat(&mut self, offset: usize, match_length: usize) -> Result<(), DecodeBufferError> {
-        self.repeat_inner::<false>(offset, match_length)
+    pub fn repeat(
+        &mut self,
+        dict: Option<&crate::decoding::dictionary::Dictionary>,
+        offset: usize,
+        match_length: usize,
+    ) -> Result<(), DecodeBufferError> {
+        self.repeat_inner::<false>(dict, offset, match_length)
     }
 
     /// Same as [`repeat`] but the caller asserts a lookahead
@@ -424,15 +404,17 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     #[inline(always)]
     pub(crate) fn repeat_lookahead_prefetched(
         &mut self,
+        dict: Option<&crate::decoding::dictionary::Dictionary>,
         offset: usize,
         match_length: usize,
     ) -> Result<(), DecodeBufferError> {
-        self.repeat_inner::<true>(offset, match_length)
+        self.repeat_inner::<true>(dict, offset, match_length)
     }
 
     #[inline(always)]
     fn repeat_inner<const SKIP_PREFETCH: bool>(
         &mut self,
+        dict: Option<&crate::decoding::dictionary::Dictionary>,
         offset: usize,
         match_length: usize,
     ) -> Result<(), DecodeBufferError> {
@@ -454,7 +436,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         // upfront `reserve(MAX_BLOCK_SIZE)`) never reaches the check.
 
         if offset > self.buffer.len() {
-            self.repeat_from_dict(offset, match_length)
+            self.repeat_from_dict(dict, offset, match_length)
         } else {
             let buf_len = self.buffer.len();
             let start_idx = buf_len - offset;
@@ -809,6 +791,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     #[cold]
     fn repeat_from_dict(
         &mut self,
+        dict: Option<&crate::decoding::dictionary::Dictionary>,
         offset: usize,
         match_length: usize,
     ) -> Result<(), DecodeBufferError> {
@@ -827,19 +810,12 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             // at least part of that repeat is from the dictionary content
             let bytes_from_dict = offset - self.buffer.len();
 
-            // Borrow the dictionary content through the borrowed pointer. The
-            // `NonNull` is `Copy`, so the deref yields a slice tied to the
-            // pointee (owner-kept-alive for the decode), NOT to `&self.dict` —
-            // it is therefore trivially disjoint from the `self.buffer`
-            // mutation below, allowing the read+extend without an intermediate
-            // copy. `None` → empty slice → the length guard rejects (matches the
-            // old no-dict behaviour).
-            let dict_content: &[u8] = match self.dict {
-                // SAFETY: set by `set_dict` from a live handle; owner keeps the
-                // pointee alive for the decode (see the `dict` field contract).
-                Some(ptr) => &unsafe { ptr.as_ref() }.dict_content,
-                None => &[],
-            };
+            // The dictionary content slice is tied to the call-scoped `dict`
+            // borrow (owner-kept-alive for the decode), trivially disjoint from
+            // the `self.buffer` mutation below, allowing the read+extend without
+            // an intermediate copy. `None` → empty slice → the length guard
+            // rejects (the no-dict path).
+            let dict_content: &[u8] = self.dict_content(dict);
             let dict_len = dict_content.len();
 
             if bytes_from_dict > dict_len {
@@ -870,7 +846,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
                 self.buffer.extend(dict_slice);
 
                 self.total_output_counter += bytes_from_dict as u64;
-                return self.repeat(self.buffer.len(), match_length - bytes_from_dict);
+                return self.repeat(dict, self.buffer.len(), match_length - bytes_from_dict);
             } else {
                 let low = dict_len - bytes_from_dict;
                 let high = low + match_length;
