@@ -18,6 +18,90 @@ fn huffman() {
     assert_eq!(table.codes[5], (1, 4));
 }
 
+// Regression: the non-search literal-table path (fast / negative levels,
+// `build_from_counts_gated(use_search=false)`) builds
+// `build_from_weights(build_limited_weights(counts, 11))` with NO power-of-two
+// guard, so any `counts` whose height-limited weights break the canonical
+// `Σ 2^(weight-1)` invariant panics in `build_from_weights`. Height limiting
+// must ALWAYS restore that invariant (full Kraft sum). Fuzz to prove it does.
+#[test]
+fn build_limited_weights_always_power_of_two() {
+    // A real-shaped literal histogram: 100 symbols with small, skewed counts
+    // (a ~60:1 spread), exactly what a single block produces. Its natural
+    // Huffman depth exceeds the 11-bit limit, and the broken limiter left the
+    // code under-full here, projecting to non-power-of-two weights that
+    // panicked the table builder on the non-search literal path.
+    const TRIGGER: &[usize] = &[
+        53, 53, 45, 13, 21, 31, 36, 16, 59, 25, 27, 19, 50, 56, 49, 34, 38, 49, 24, 50, 61, 30, 54,
+        6, 62, 50, 34, 61, 15, 37, 34, 61, 26, 49, 21, 59, 30, 31, 17, 14, 51, 14, 60, 30, 34, 1,
+        49, 25, 58, 1, 41, 19, 49, 34, 42, 2, 55, 11, 17, 40, 34, 25, 13, 26, 56, 19, 19, 61, 2, 2,
+        45, 24, 53, 10, 31, 46, 61, 49, 38, 10, 14, 28, 26, 19, 20, 42, 18, 34, 44, 55, 1, 0, 37,
+        41, 1, 33, 1, 25, 46, 52,
+    ];
+    assert!(
+        huffman_weight_sum_is_power_of_two(&build_limited_weights(TRIGGER, 11)),
+        "height limiter left a non-power-of-two weight sum on a real-shaped histogram"
+    );
+    let _ = HuffmanTable::build_from_counts_gated(TRIGGER, false);
+
+    let mut state = 0x1234_5678_9abc_def0u64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    for _ in 0..300_000 {
+        let n = 2 + (next() % 255) as usize;
+        let skew = (next() % 6) as u32;
+        let mut counts = alloc::vec![0usize; n];
+        // Counts are byte-frequency histograms of a single block, so each is
+        // bounded by the max block size; keep the fuzz within that envelope.
+        const MAX_COUNT: usize = 128 * 1024;
+        match skew {
+            // Fibonacci-like + geometric distributions force a natural Huffman
+            // depth well past 11 (a Fibonacci ladder hits ~26 distinct values
+            // under MAX_COUNT), so the height limiter actually runs (and its
+            // Kraft-sum restoration is exercised) instead of a shallow tree.
+            4 => {
+                let (mut a, mut b) = (1usize, 1usize);
+                for c in counts.iter_mut() {
+                    *c = a;
+                    let nb = (a + b).min(MAX_COUNT);
+                    a = b;
+                    b = nb;
+                }
+            }
+            5 => {
+                let mut v = MAX_COUNT;
+                for c in counts.iter_mut() {
+                    *c = v.max(1);
+                    v = (v * (2 + (next() % 2) as usize)) / 3;
+                }
+            }
+            _ => {
+                for c in counts.iter_mut() {
+                    *c = match skew {
+                        0 => (next() % 64) as usize,
+                        1 => (next() % 4) as usize,
+                        2 => (next() % 4096) as usize,
+                        _ => 1 + (next() % 3) as usize,
+                    };
+                }
+            }
+        }
+        if counts.iter().filter(|&&c| c > 0).count() < 2 {
+            continue;
+        }
+        let weights = build_limited_weights(&counts, 11);
+        assert!(
+            huffman_weight_sum_is_power_of_two(&weights),
+            "build_limited_weights broke the power-of-two invariant: counts={counts:?} weights={weights:?}"
+        );
+        let _ = HuffmanTable::build_from_counts_gated(&counts, false);
+    }
+}
+
 #[test]
 fn weights() {
     // assert_eq!(distribute_weights(5).as_slice(), &[1, 1, 2, 3, 4]);

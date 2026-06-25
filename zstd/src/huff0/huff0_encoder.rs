@@ -1147,8 +1147,21 @@ fn limited_weights_into(
     work.clear();
     work.extend_from_slice(leaves);
     enforce_max_height(work, max_nb_bits);
-    repair_limited_lengths(work, max_nb_bits);
+    // The height limiter restores a full, canonical code in one pass (matching
+    // upstream `HUF_setMaxHeight`): the Kraft sum `Σ 2^(max_nb_bits - nb_bits)`
+    // lands exactly on `2^max_nb_bits`. A degenerate distribution can stop the
+    // fill short (our node buffer is sized to the leaves, not over-sized like
+    // upstream), leaving the code under- or over-full, which projects to a
+    // non-power-of-two weight sum the table builder rejects; detect that here
+    // and fall back to the distributed-weight construction.
     if work.iter().any(|leaf| leaf.nb_bits > max_nb_bits) {
+        return false;
+    }
+    let kraft_sum = work
+        .iter()
+        .map(|leaf| 1usize << (max_nb_bits - leaf.nb_bits))
+        .sum::<usize>();
+    if kraft_sum != 1usize << max_nb_bits {
         return false;
     }
 
@@ -1166,48 +1179,6 @@ fn build_limited_weights(counts: &[usize], max_nb_bits: usize) -> Vec<usize> {
         out
     } else {
         legacy_distributed_weights(counts)
-    }
-}
-
-fn repair_limited_lengths(nodes: &mut [HuffNode], target_nb_bits: usize) {
-    if nodes.is_empty() {
-        return;
-    }
-
-    for node in nodes.iter_mut() {
-        node.nb_bits = node.nb_bits.min(target_nb_bits);
-    }
-
-    let target_sum = 1usize << target_nb_bits;
-    loop {
-        let kraft_sum = nodes
-            .iter()
-            .map(|node| 1usize << (target_nb_bits - node.nb_bits))
-            .sum::<usize>();
-        if kraft_sum <= target_sum {
-            break;
-        }
-        let overflow = kraft_sum - target_sum;
-        let mut best_idx = None;
-        let mut best_step = 0usize;
-        for (idx, node) in nodes.iter().enumerate().rev() {
-            if node.nb_bits >= target_nb_bits {
-                continue;
-            }
-            let step = 1usize << (target_nb_bits - node.nb_bits - 1);
-            if step <= overflow {
-                best_idx = Some(idx);
-                break;
-            }
-            if best_idx.is_none() || step < best_step {
-                best_idx = Some(idx);
-                best_step = step;
-            }
-        }
-        let Some(idx) = best_idx else {
-            break;
-        };
-        nodes[idx].nb_bits += 1;
     }
 }
 
@@ -1318,26 +1289,39 @@ fn enforce_max_height(nodes: &mut [HuffNode], target_nb_bits: usize) {
         }
     }
 
+    // Cost correction can overshoot below zero. Add the weight back so the
+    // final Kraft sum lands exactly on 2^target_nb_bits (a full, canonical
+    // code); otherwise the weights are non-power-of-two and downstream table
+    // construction rejects them. Only the smallest rank is adjusted to avoid
+    // overshooting again: take the largest node from rank 0 (target_nb_bits)
+    // and shorten it to rank 1 (target_nb_bits - 1). The highest-count symbol
+    // (nodes[0]) keeps the shortest code, so its bit length stays strictly
+    // below target_nb_bits while the tree is over-tall, which bounds the
+    // `n` walk-down and guarantees this loop converges.
     while total_cost < 0 {
         if rank_last[1] == NO_SYMBOL {
-            while n < nodes.len() && nodes[n].nb_bits == target_nb_bits {
-                n += 1;
+            // No rank-1 symbol yet: create one from the largest rank-0 node.
+            while n > 0 && nodes[n].nb_bits == target_nb_bits {
+                n -= 1;
             }
-            if n >= nodes.len() {
-                return;
+            // Upstream relies on an over-sized node buffer here and reads into
+            // its scratch tail; ours is sized exactly to the leaves. If there
+            // is no real rank-0 node left to borrow, the distribution is too
+            // degenerate to height-limit, so stop and let the caller fall back
+            // to the distributed-weight construction.
+            if nodes[n].nb_bits == target_nb_bits || n + 1 >= nodes.len() {
+                break;
             }
-            let pos = n;
-            nodes[pos].nb_bits -= 1;
-            rank_last[1] = pos;
+            nodes[n + 1].nb_bits -= 1;
+            rank_last[1] = n + 1;
             total_cost += 1;
             continue;
         }
-        let pos = rank_last[1] + 1;
-        if pos >= nodes.len() {
-            return;
+        if rank_last[1] + 1 >= nodes.len() {
+            break;
         }
-        nodes[pos].nb_bits -= 1;
-        rank_last[1] = pos;
+        nodes[rank_last[1] + 1].nb_bits -= 1;
+        rank_last[1] += 1;
         total_cost += 1;
     }
 }

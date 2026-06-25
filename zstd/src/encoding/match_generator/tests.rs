@@ -533,10 +533,10 @@ fn level22_uses_target_length_and_large_input_tables() {
 fn bt_levels_16_to_21_pin_clevels_params() {
     // Pins the BT-level (window_log, hash_log, chain_log, search_depth,
     // target_len) tuples so the clevels.h alignment cannot silently drift.
-    // Levels 16-20 mirror upstream `clevels.h` (srcSize > 256 KiB tier,
-    // search_depth = 1 << searchLog); level 21 intentionally keeps a deeper
-    // search_depth (512 vs upstream's 128) — it beats C on ratio there and
-    // the deeper walk is a deliberate ratio-positive divergence.
+    // All rows mirror upstream `clevels.h` (srcSize > 256 KiB tier,
+    // search_depth = 1 << searchLog) verbatim, since the level params are now
+    // derived from `ZSTD_defaultCParameters[tier][level]` rather than a
+    // hand-tuned table.
     let expected = [
         // (level, window_log, hash_log, chain_log, search_depth, target_len)
         (16u8, 22u8, 22usize, 22usize, 32usize, 48usize),
@@ -544,7 +544,7 @@ fn bt_levels_16_to_21_pin_clevels_params() {
         (18, 23, 22, 23, 64, 64),
         (19, 23, 22, 24, 128, 256),
         (20, 25, 23, 25, 128, 256),
-        (21, 26, 24, 24, 512, 256),
+        (21, 26, 24, 26, 128, 512),
     ];
     for (level, wlog, hlog, clog, sd, tl) in expected {
         let p = resolve_level_params(CompressionLevel::Level(level as i32), None);

@@ -500,14 +500,25 @@ impl MatchTable {
             return;
         }
         let idx = abs_pos - self.history_abs_start;
-        let concat = &self.history[self.history_start..];
-        if idx + 4 > concat.len() {
-            return;
-        }
+        // Borrowed-aware: hash the SAME bytes the finder reads via
+        // `live_history()` (borrowed window in no-copy mode, owned mirror
+        // otherwise). Reading `self.history[history_start..]` directly hashed
+        // the EMPTY owned mirror on the borrowed one-shot path, so every hash3
+        // insert early-returned and the HC3 side table stayed empty — btultra2
+        // short-match probing then found nothing. This is the identical bug
+        // already fixed for `insert_position_no_rebase`; the hash3 inserter was
+        // missed. `hash3` is the only value needed past the borrow, so it ends
+        // before the table write.
+        let hash3 = {
+            let concat = self.live_history();
+            if idx + 4 > concat.len() {
+                return;
+            }
+            Self::hash_position_at(concat, idx, self.hash3_log, 3)
+        };
         let Some(relative_pos) = self.relative_position(abs_pos) else {
             return;
         };
-        let hash3 = Self::hash_position_at(concat, idx, self.hash3_log, 3);
         self.hash3_table[hash3] = relative_pos + 1;
     }
 
@@ -1475,10 +1486,13 @@ impl MatchTable {
         &mut self,
         abs_pos: usize,
         current_abs_end: usize,
-        profile: HcOptimalCostProfile,
+        profile: &HcOptimalCostProfile,
         min_match_len: usize,
         best_len_for_skip: &mut usize,
         out: &mut Vec<MatchCandidate>,
+        reps: [u32; 3],
+        lit_len: usize,
+        use_hash3: bool,
     ) {
         #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
         unsafe {
@@ -1489,6 +1503,9 @@ impl MatchTable {
                 min_match_len,
                 best_len_for_skip,
                 out,
+                reps,
+                lit_len,
+                use_hash3,
             )
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -1503,6 +1520,9 @@ impl MatchTable {
                         min_match_len,
                         best_len_for_skip,
                         out,
+                        reps,
+                        lit_len,
+                        use_hash3,
                     )
                 },
                 FastpathKernel::Sse42 => unsafe {
@@ -1513,6 +1533,9 @@ impl MatchTable {
                         min_match_len,
                         best_len_for_skip,
                         out,
+                        reps,
+                        lit_len,
+                        use_hash3,
                     )
                 },
                 FastpathKernel::Scalar => self.bt_insert_and_collect_matches_scalar(
@@ -1522,6 +1545,9 @@ impl MatchTable {
                     min_match_len,
                     best_len_for_skip,
                     out,
+                    reps,
+                    lit_len,
+                    use_hash3,
                 ),
             }
         }
@@ -1538,6 +1564,9 @@ impl MatchTable {
                 min_match_len,
                 best_len_for_skip,
                 out,
+                reps,
+                lit_len,
+                use_hash3,
             )
         }
     }
@@ -1553,10 +1582,13 @@ impl MatchTable {
         &mut self,
         abs_pos: usize,
         current_abs_end: usize,
-        profile: HcOptimalCostProfile,
+        profile: &HcOptimalCostProfile,
         min_match_len: usize,
         best_len_for_skip: &mut usize,
         out: &mut Vec<MatchCandidate>,
+        reps: [u32; 3],
+        lit_len: usize,
+        use_hash3: bool,
     ) {
         let search_depth = self.search_depth;
         super::super::hc::generator::bt_insert_and_collect_matches_body!(
@@ -1568,6 +1600,10 @@ impl MatchTable {
             min_match_len,
             best_len_for_skip,
             out,
+            reps,
+            lit_len,
+            use_hash3,
+            crate::encoding::fastpath::neon::common_prefix_len_ptr,
             crate::encoding::fastpath::neon::count_match_from_indices,
         )
     }
@@ -1583,10 +1619,13 @@ impl MatchTable {
         &mut self,
         abs_pos: usize,
         current_abs_end: usize,
-        profile: HcOptimalCostProfile,
+        profile: &HcOptimalCostProfile,
         min_match_len: usize,
         best_len_for_skip: &mut usize,
         out: &mut Vec<MatchCandidate>,
+        reps: [u32; 3],
+        lit_len: usize,
+        use_hash3: bool,
     ) {
         let search_depth = self.search_depth;
         super::super::hc::generator::bt_insert_and_collect_matches_body!(
@@ -1598,6 +1637,10 @@ impl MatchTable {
             min_match_len,
             best_len_for_skip,
             out,
+            reps,
+            lit_len,
+            use_hash3,
+            crate::encoding::fastpath::sse42::common_prefix_len_ptr,
             crate::encoding::fastpath::sse42::count_match_from_indices,
         )
     }
@@ -1613,10 +1656,13 @@ impl MatchTable {
         &mut self,
         abs_pos: usize,
         current_abs_end: usize,
-        profile: HcOptimalCostProfile,
+        profile: &HcOptimalCostProfile,
         min_match_len: usize,
         best_len_for_skip: &mut usize,
         out: &mut Vec<MatchCandidate>,
+        reps: [u32; 3],
+        lit_len: usize,
+        use_hash3: bool,
     ) {
         let search_depth = self.search_depth;
         super::super::hc::generator::bt_insert_and_collect_matches_body!(
@@ -1628,6 +1674,10 @@ impl MatchTable {
             min_match_len,
             best_len_for_skip,
             out,
+            reps,
+            lit_len,
+            use_hash3,
+            crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr,
             crate::encoding::fastpath::avx2_bmi2::count_match_from_indices,
         )
     }
@@ -1639,10 +1689,13 @@ impl MatchTable {
         &mut self,
         abs_pos: usize,
         current_abs_end: usize,
-        profile: HcOptimalCostProfile,
+        profile: &HcOptimalCostProfile,
         min_match_len: usize,
         best_len_for_skip: &mut usize,
         out: &mut Vec<MatchCandidate>,
+        reps: [u32; 3],
+        lit_len: usize,
+        use_hash3: bool,
     ) {
         let search_depth = self.search_depth;
         super::super::hc::generator::bt_insert_and_collect_matches_body!(
@@ -1654,6 +1707,10 @@ impl MatchTable {
             min_match_len,
             best_len_for_skip,
             out,
+            reps,
+            lit_len,
+            use_hash3,
+            crate::encoding::fastpath::scalar::common_prefix_len_ptr,
             crate::encoding::fastpath::scalar::count_match_from_indices,
         )
     }
@@ -1735,7 +1792,15 @@ impl MatchTable {
             // SAFETY: same NEON umbrella; direct call inlines the BT-walk body.
             let forward =
                 unsafe { self.bt_insert_step_no_rebase_neon(update_abs, current_abs_end, abs_pos) };
-            update_abs += forward.max(1).min(abs_pos - update_abs);
+            // Upstream zstd `ZSTD_updateTree`: `idx += ZSTD_insertBt1(...)` with
+            // NO clamp to the target. The insert step's `forward` skips the
+            // positions a long match already covers, so letting it overshoot
+            // `abs_pos` leaves those positions OUT of the tree exactly as C does
+            // (`nextToUpdate = target` afterwards). Clamping to `abs_pos` inserted
+            // those covered positions, giving our tree extra candidates C never
+            // surfaces (e.g. a longer-but-farther match the optimal parser then
+            // wrongly forces over a cheaper closer one).
+            update_abs += forward.max(1);
         }
         self.skip_insert_until_abs = abs_pos;
     }
@@ -1763,7 +1828,15 @@ impl MatchTable {
             let forward = unsafe {
                 self.bt_insert_step_no_rebase_sse42(update_abs, current_abs_end, abs_pos)
             };
-            update_abs += forward.max(1).min(abs_pos - update_abs);
+            // Upstream zstd `ZSTD_updateTree`: `idx += ZSTD_insertBt1(...)` with
+            // NO clamp to the target. The insert step's `forward` skips the
+            // positions a long match already covers, so letting it overshoot
+            // `abs_pos` leaves those positions OUT of the tree exactly as C does
+            // (`nextToUpdate = target` afterwards). Clamping to `abs_pos` inserted
+            // those covered positions, giving our tree extra candidates C never
+            // surfaces (e.g. a longer-but-farther match the optimal parser then
+            // wrongly forces over a cheaper closer one).
+            update_abs += forward.max(1);
         }
         self.skip_insert_until_abs = abs_pos;
     }
@@ -1791,7 +1864,15 @@ impl MatchTable {
             let forward = unsafe {
                 self.bt_insert_step_no_rebase_avx2_bmi2(update_abs, current_abs_end, abs_pos)
             };
-            update_abs += forward.max(1).min(abs_pos - update_abs);
+            // Upstream zstd `ZSTD_updateTree`: `idx += ZSTD_insertBt1(...)` with
+            // NO clamp to the target. The insert step's `forward` skips the
+            // positions a long match already covers, so letting it overshoot
+            // `abs_pos` leaves those positions OUT of the tree exactly as C does
+            // (`nextToUpdate = target` afterwards). Clamping to `abs_pos` inserted
+            // those covered positions, giving our tree extra candidates C never
+            // surfaces (e.g. a longer-but-farther match the optimal parser then
+            // wrongly forces over a cheaper closer one).
+            update_abs += forward.max(1);
         }
         self.skip_insert_until_abs = abs_pos;
     }
@@ -1810,7 +1891,15 @@ impl MatchTable {
             }
             let forward =
                 self.bt_insert_step_no_rebase_scalar(update_abs, current_abs_end, abs_pos);
-            update_abs += forward.max(1).min(abs_pos - update_abs);
+            // Upstream zstd `ZSTD_updateTree`: `idx += ZSTD_insertBt1(...)` with
+            // NO clamp to the target. The insert step's `forward` skips the
+            // positions a long match already covers, so letting it overshoot
+            // `abs_pos` leaves those positions OUT of the tree exactly as C does
+            // (`nextToUpdate = target` afterwards). Clamping to `abs_pos` inserted
+            // those covered positions, giving our tree extra candidates C never
+            // surfaces (e.g. a longer-but-farther match the optimal parser then
+            // wrongly forces over a cheaper closer one).
+            update_abs += forward.max(1);
         }
         self.skip_insert_until_abs = abs_pos;
     }

@@ -279,6 +279,7 @@ macro_rules! build_optimal_plan_impl_body {
         $initial_state:ident,
         $stats:ident,
         $out:ident,
+        $buffers:expr,
         $collect:ident,
         $priceset:path $(,)?
     ) => {{
@@ -309,104 +310,49 @@ macro_rules! build_optimal_plan_impl_body {
         let abort_on_worse_match: bool =
             <$strategy_ty as crate::encoding::strategy::Strategy>::OPT_LEVEL == 0;
         let opt_level: bool = <$strategy_ty as crate::encoding::strategy::Strategy>::OPT_LEVEL >= 2;
-        let mut nodes = core::mem::take(&mut $self.backend.bt_mut().opt_nodes_scratch);
-        let mut node_prices = core::mem::take(&mut $self.backend.bt_mut().opt_node_prices_scratch);
         // `frontier_limit + 2 <= HC_OPT_NODE_LEN` — bounded by const.
         let frontier_buffer_size = frontier_limit + 2;
-        if nodes.len() < HC_OPT_NODE_LEN {
-            // First optimal-parse use (empty boxed slice) or an undersized
-            // buffer: allocate the fixed upstream-zstd-sized frontier once. The DP
-            // overwrites the active prefix before reading it.
-            nodes = alloc::vec![HcOptimalNode::default(); HC_OPT_NODE_LEN].into_boxed_slice();
-        }
-        // The DP price array, same fixed length as `nodes`. This is the SOLE
-        // home of each position's price (the node struct carries no price), so
-        // the SIMD price-set vector-loads it directly. Initialised to u32::MAX
-        // so unwritten frontier cells compare as "unreachable".
-        if node_prices.len() < HC_OPT_NODE_LEN {
-            node_prices = alloc::vec![u32::MAX; HC_OPT_NODE_LEN].into_boxed_slice();
-        }
-        let mut candidates = core::mem::take(&mut $self.backend.bt_mut().opt_candidates_scratch);
+        // The five DP scratch buffers are owned one level up
+        // (`start_matching_optimal` / `run_btultra2_seed_pass` take them once per
+        // block via `take_optimal_plan_buffers`, size them, and reuse them across
+        // every per-segment call, then restore them once). Borrow the fields here
+        // and reset the per-call ones. Hoisting the take/restore out of this
+        // per-segment body removes five `mem::take`s plus five restores per call,
+        // which on near-random input runs once per literal.
+        let HcOptimalPlanBuffers {
+            nodes,
+            node_prices,
+            candidates,
+            store,
+            price_arena,
+        } = &mut *$buffers;
         candidates.clear();
-        if candidates.capacity() < MAX_HC_SEARCH_DEPTH {
-            candidates.reserve_exact(MAX_HC_SEARCH_DEPTH - candidates.capacity());
-        }
-        let mut store = core::mem::take(&mut $self.backend.bt_mut().opt_store_scratch);
         store.clear();
-        let mut price_arena = core::mem::take(&mut $self.backend.bt_mut().opt_price_arena);
-        if price_arena.len() < HC_OPT_PRICE_ARENA_LEN {
-            price_arena = alloc::vec![[0u32; 2]; HC_OPT_PRICE_ARENA_LEN].into_boxed_slice();
-        }
-        // Single arena → two disjoint fixed-stride regions of `[price,
-        // generation]` pairs (LL cache, ML cache): one base pointer + fixed
-        // offsets, mirroring upstream zstd's single opt workspace. Pairing
-        // price+generation per code keeps the optimal parser's cache probe
-        // on ONE line instead of two strided regions.
-        // SAFETY: `price_arena` is exactly `HC_OPT_PRICE_ARENA_LEN =
-        // 2 * HC_OPT_PRICE_STRIDE` pairs long (just ensured), so the two
-        // STRIDE-wide regions are in bounds and disjoint. The slices alias
-        // the heap buffer `price_arena` owns; that heap address is stable
-        // across the later move of the `price_arena` box into the result
-        // bundle (a `Box` move relocates only the pointer, not the heap
-        // data), and the slices are never used after the bundle is
-        // constructed. The fixed STRIDE (independent of `frontier_limit`)
-        // keeps every code's cell at a constant offset so the monotonic
-        // stamps stay valid across calls with different frontiers.
-        let arena_base = price_arena.as_mut_ptr();
-        let mut ll_cache: &mut [[u32; 2]] =
-            unsafe { core::slice::from_raw_parts_mut(arena_base, HC_OPT_PRICE_STRIDE) };
-        let mut ml_cache: &mut [[u32; 2]] = unsafe {
-            core::slice::from_raw_parts_mut(arena_base.add(HC_OPT_PRICE_STRIDE), HC_OPT_PRICE_STRIDE)
-        };
-        $self.backend.bt_mut().opt_ll_price_stamp = $self
-            .backend
-            .bt_mut()
-            .opt_ll_price_stamp
-            .wrapping_add(1)
-            .max(1);
-        let ll_price_stamp = $self.backend.bt_mut().opt_ll_price_stamp;
-        $self.backend.bt_mut().opt_lit_price_stamp = $self
-            .backend
-            .bt_mut()
-            .opt_lit_price_stamp
-            .wrapping_add(1)
-            .max(1);
-        let lit_price_stamp = $self.backend.bt_mut().opt_lit_price_stamp;
-        $self.backend.bt_mut().opt_ml_price_stamp = $self
-            .backend
-            .bt_mut()
-            .opt_ml_price_stamp
-            .wrapping_add(1)
-            .max(1);
-        let ml_price_stamp = $self.backend.bt_mut().opt_ml_price_stamp;
-        let node0_price = BtMatcher::cached_lit_length_price(
-            profile,
-            $stats,
-            initial_litlen,
-            &mut ll_cache,
-            ll_price_stamp,
-        );
-        nodes[0] = HcOptimalNode {
-            litlen: initial_litlen as u32,
-            reps: initial_reps,
-            ..HcOptimalNode::default()
-        };
-        node_prices[0] = node0_price;
+        // Price-cache slices + monotonic stamps feed ONLY the priced paths (the
+        // matched-seed block and the forward DP loop), both of which run only
+        // when the seed found a candidate. On a no-match seed (the per-literal
+        // case that dominates near-random input, where the forward loop is
+        // skipped) they are never touched, so their setup (the arena slice
+        // creation and the three stamp bumps) is deferred into the
+        // `!candidates.is_empty()` block below. Declared here so they stay in
+        // scope for the forward DP loop; the empty slices / zero stamps are
+        // never read on the no-match path.
+        let mut ll_cache: &mut [[u32; 2]] = &mut [];
+        let mut ml_cache: &mut [[u32; 2]] = &mut [];
+        let mut ll_price_stamp = 0u32;
+        let mut lit_price_stamp = 0u32;
+        let mut ml_price_stamp = 0u32;
         let sufficient_len = profile.sufficient_match_len;
-        let ll0_price = BtMatcher::cached_lit_length_price(
-            profile,
-            $stats,
-            0,
-            &mut ll_cache,
-            ll_price_stamp,
-        );
-        let ll1_price = BtMatcher::cached_lit_length_price(
-            profile,
-            $stats,
-            1,
-            &mut ll_cache,
-            ll_price_stamp,
-        );
+        // `node0_price` / `ll0_price` / `ll1_price` (and the `nodes[0]` base node)
+        // feed ONLY the forward-DP and seed paths below, which run only when the
+        // seed found a candidate. On a no-match seed — the per-literal case that
+        // dominates incompressible / near-random input — they are never read, so
+        // defer the three cached price lookups + base-node init until a candidate
+        // is confirmed (mirrors upstream zstd doing the literal `ip++` without
+        // touching the DP price state). Initialised to 0; assigned in the
+        // `!candidates.is_empty()` block before any reader.
+        let mut ll0_price = 0u32;
+        let mut ll1_price = 0u32;
         let mut pos = 1usize;
         let mut last_pos = 0usize;
         let mut forced_end: Option<usize> = None;
@@ -415,16 +361,23 @@ macro_rules! build_optimal_plan_impl_body {
         // node struct; tracked alongside the forced-seed node).
         let mut forced_end_price: Option<u32> = None;
         let mut seed_forced_shortest_path = false;
-        let mut opt_ldm = HcOptLdmState {
-            seq_store: HcRawSeqStore {
-                pos: 0,
-                pos_in_sequence: 0,
-                size: $self.backend.bt_mut().ldm_sequences.len(),
-            },
-            ..HcOptLdmState::default()
+        // LDM presence is a frame constant (decided before entering the DP), so
+        // it is a const-generic monomorph here, not a hot-loop runtime check:
+        // with HAS_LDM == false every LDM branch below const-folds away and the
+        // opt_ldm workspace is never built.
+        let mut opt_ldm = if HAS_LDM {
+            HcOptLdmState {
+                seq_store: HcRawSeqStore {
+                    pos: 0,
+                    pos_in_sequence: 0,
+                    size: $self.backend.bt_mut().ldm_sequences.len(),
+                },
+                ..HcOptLdmState::default()
+            }
+        } else {
+            HcOptLdmState::default()
         };
-        let has_ldm = !$self.backend.bt_mut().ldm_sequences.is_empty();
-        if has_ldm {
+        if HAS_LDM {
             // `ldm_sequences` are emitted in BLOCK-relative coordinates,
             // but this optimal-parser pass runs over a SEGMENT of the
             // block starting at block-offset `$block_offset` and uses
@@ -451,7 +404,7 @@ macro_rules! build_optimal_plan_impl_body {
         // Upstream zstd-like seed at rPos=0: initialize frontier with matches starting
         // at current position before entering the generic forward DP loop.
         if $current_len >= min_match_len {
-            let seed_ldm = if has_ldm {
+            let seed_ldm = if HAS_LDM {
                 $self.backend.bt_mut().ldm_process_match_candidate(
                     &mut opt_ldm,
                     0,
@@ -475,10 +428,66 @@ macro_rules! build_optimal_plan_impl_body {
                         lit_len: initial_litlen,
                         ldm_candidate: seed_ldm,
                     },
-                    &mut candidates,
+                    &mut *candidates,
                 )
             };
             if !candidates.is_empty() {
+                // Deferred price-cache setup: the arena slices are two disjoint
+                // STRIDE-wide regions of `price_arena` (LL, ML); the fixed STRIDE
+                // keeps each code's cell at a constant offset so the monotonic
+                // stamps stay valid across calls. price_arena is exactly
+                // HC_OPT_PRICE_ARENA_LEN = 2 * HC_OPT_PRICE_STRIDE pairs (sized by
+                // take_optimal_plan_buffers).
+                // SAFETY: the two STRIDE regions are in bounds and disjoint; the
+                // raw slices are confined to this priced path and never outlive
+                // `price_arena` (owned by the caller for the whole call).
+                let arena_base = price_arena.as_mut_ptr();
+                ll_cache =
+                    unsafe { core::slice::from_raw_parts_mut(arena_base, HC_OPT_PRICE_STRIDE) };
+                ml_cache = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        arena_base.add(HC_OPT_PRICE_STRIDE),
+                        HC_OPT_PRICE_STRIDE,
+                    )
+                };
+                $self.backend.bt_mut().opt_ll_price_stamp =
+                    $self.backend.bt_mut().opt_ll_price_stamp.wrapping_add(1).max(1);
+                ll_price_stamp = $self.backend.bt_mut().opt_ll_price_stamp;
+                $self.backend.bt_mut().opt_lit_price_stamp =
+                    $self.backend.bt_mut().opt_lit_price_stamp.wrapping_add(1).max(1);
+                lit_price_stamp = $self.backend.bt_mut().opt_lit_price_stamp;
+                $self.backend.bt_mut().opt_ml_price_stamp =
+                    $self.backend.bt_mut().opt_ml_price_stamp.wrapping_add(1).max(1);
+                ml_price_stamp = $self.backend.bt_mut().opt_ml_price_stamp;
+                // Deferred base/seed prices: only reached on a matched seed (see
+                // the declarations above). Assign before the forward DP / seed
+                // paths below read them.
+                node_prices[0] = BtMatcher::cached_lit_length_price(
+                    profile,
+                    $stats,
+                    initial_litlen,
+                    &mut ll_cache,
+                    ll_price_stamp,
+                );
+                nodes[0] = HcOptimalNode {
+                    litlen: initial_litlen as u32,
+                    reps: initial_reps,
+                    ..HcOptimalNode::default()
+                };
+                ll0_price = BtMatcher::cached_lit_length_price(
+                    profile,
+                    $stats,
+                    0,
+                    &mut ll_cache,
+                    ll_price_stamp,
+                );
+                ll1_price = BtMatcher::cached_lit_length_price(
+                    profile,
+                    $stats,
+                    1,
+                    &mut ll_cache,
+                    ll_price_stamp,
+                );
                 // `min_match_len >= HC_FORMAT_MINMATCH (3)` by invariant.
                 last_pos = (min_match_len - 1).min(frontier_limit);
                 for p in 1..min_match_len.min(frontier_buffer_size) {
@@ -554,8 +563,8 @@ macro_rules! build_optimal_plan_impl_body {
                     }
                     if max_match_len > last_pos {
                         BtMatcher::reset_opt_nodes(
-                            &mut nodes,
-                            &mut node_prices,
+                            &mut *nodes,
+                            &mut *node_prices,
                             last_pos + 1,
                             max_match_len,
                         );
@@ -751,7 +760,7 @@ macro_rules! build_optimal_plan_impl_body {
             }
 
             let abs_pos = $current_abs_start + pos;
-            let ldm_candidate = if has_ldm {
+            let ldm_candidate = if HAS_LDM {
                 $self.backend.bt_mut().ldm_process_match_candidate(
                     &mut opt_ldm,
                     pos,
@@ -776,7 +785,7 @@ macro_rules! build_optimal_plan_impl_body {
                         lit_len: nodes.get_unchecked(pos).litlen as usize,
                         ldm_candidate,
                     },
-                    &mut candidates,
+                    &mut *candidates,
                 )
             };
             // Post-call reads of opt[cur]: fresh, born after `$collect`, so
@@ -844,8 +853,8 @@ macro_rules! build_optimal_plan_impl_body {
                 let max_next = pos + max_match_len;
                 if max_next > last_pos {
                     BtMatcher::reset_opt_nodes(
-                        &mut nodes,
-                        &mut node_prices,
+                        &mut *nodes,
+                        &mut *node_prices,
                         last_pos + 1,
                         max_next,
                     );
@@ -905,8 +914,8 @@ macro_rules! build_optimal_plan_impl_body {
                     {
                         last_pos = last_pos.max(unsafe {
                             $priceset(
-                                &mut node_prices,
-                                &mut nodes,
+                                &mut *node_prices,
+                                &mut *nodes,
                                 ml_cache,
                                 ml_price_stamp,
                                 profile,
@@ -937,56 +946,25 @@ macro_rules! build_optimal_plan_impl_body {
 
         if last_pos == 0 {
             if $current_len == 0 {
-                let price = node_prices[0];
-                return $self.backend.bt_mut().finish_optimal_plan(
-                    HcOptimalPlanBuffers {
-                        nodes,
-                        node_prices,
-                        candidates,
-                        store,
-                        price_arena,
-                    },
-                    (price, initial_reps, initial_litlen, 0),
-                );
+                let price = 0u32; // deferred: node_prices[0] unset on no-match; caller discards price
+                return (price, initial_reps, initial_litlen, 0);
             }
-            let lit_price = {
-                let bt = $self.backend.bt_mut();
-                BtMatcher::cached_literal_price(
-                    profile,
-                    $stats,
-                    $current[0],
-                    &mut bt.opt_lit_price_scratch,
-                    &mut bt.opt_lit_price_generation,
-                    lit_price_stamp,
-                )
-            };
-            // `initial_litlen` is carried across optimal-plan segments;
-            // its real bound is the current block length, not
-            // `current_len`. On i686 (32-bit `usize`) `+ 1` could
-            // theoretically wrap if the invariant ever broke. Catch
-            // that explicitly via `checked_add` rather than letting a
-            // wrapping sum slip into the price lookup.
+            // No match at this position: it is a single literal (upstream zstd
+            // `ZSTD_compressBlock_opt_generic` `if (!nbMatches) { ip++; }`). The
+            // previous code recomputed a literal+length price here purely to fill
+            // the returned price slot — which the per-segment caller discards
+            // (`let (_, ..)`). Skip that recompute: on near-random input this
+            // no-match return runs once per literal, so the two cached price
+            // lookups were pure waste. Byte-identical — the tree, the carried
+            // litlen (+1), and the reps are unchanged; only the discarded price
+            // value differs (now the base-literal node price).
             let next_litlen = initial_litlen
                 .checked_add(1)
                 .expect("optimal parser next litlen out of usize range");
-            let ll_delta = BtMatcher::cached_lit_length_delta_price(
-                profile,
-                $stats,
-                next_litlen,
-                &mut ll_cache,
-                ll_price_stamp,
-            );
-            let price = BtMatcher::add_price_delta(node_prices[0], lit_price, ll_delta);
-            return $self.backend.bt_mut().finish_optimal_plan(
-                HcOptimalPlanBuffers {
-                    nodes,
-                    node_prices,
-                    candidates,
-                    store,
-                    price_arena,
-                },
-                (price, initial_reps, next_litlen, 1),
-            );
+            // node_prices[0] is unset on a no-match seed (deferred); the caller
+            // discards this price anyway.
+            let price = 0u32;
+            return (price, initial_reps, next_litlen, 1);
         }
 
         let target_pos = forced_end.unwrap_or(last_pos.min(frontier_limit));
@@ -999,33 +977,15 @@ macro_rules! build_optimal_plan_impl_body {
             (nodes[target_pos], node_prices[target_pos])
         };
         if last_stretch_price == u32::MAX {
-            return $self.backend.bt_mut().finish_optimal_plan(
-                HcOptimalPlanBuffers {
-                    nodes,
-                    node_prices,
-                    candidates,
-                    store,
-                    price_arena,
-                },
-                (u32::MAX, initial_reps, initial_litlen, $current_len),
-            );
+            return (u32::MAX, initial_reps, initial_litlen, $current_len);
         }
 
         if last_stretch.mlen == 0 {
-            return $self.backend.bt_mut().finish_optimal_plan(
-                HcOptimalPlanBuffers {
-                    nodes,
-                    node_prices,
-                    candidates,
-                    store,
-                    price_arena,
-                },
-                (
-                    last_stretch_price,
-                    last_stretch.reps,
-                    last_stretch.litlen as usize,
-                    target_pos.min($current_len),
-                ),
+            return (
+                last_stretch_price,
+                last_stretch.reps,
+                last_stretch.litlen as usize,
+                target_pos.min($current_len),
             );
         }
 
@@ -1041,20 +1001,11 @@ macro_rules! build_optimal_plan_impl_body {
         } else {
             let tail_literals = last_stretch.litlen as usize;
             if cur < tail_literals {
-                return $self.backend.bt_mut().finish_optimal_plan(
-                    HcOptimalPlanBuffers {
-                        nodes,
-                        node_prices,
-                        candidates,
-                        store,
-                        price_arena,
-                    },
-                    (
-                        last_stretch_price,
-                        last_stretch.reps,
-                        tail_literals,
-                        target_pos.min($current_len),
-                    ),
+                return (
+                    last_stretch_price,
+                    last_stretch.reps,
+                    tail_literals,
+                    target_pos.min($current_len),
                 );
             }
             cur -= tail_literals;
@@ -1135,16 +1086,7 @@ macro_rules! build_optimal_plan_impl_body {
             },
             target_pos.min($current_len),
         );
-        $self.backend.bt_mut().finish_optimal_plan(
-            HcOptimalPlanBuffers {
-                nodes,
-                node_prices,
-                candidates,
-                store,
-                price_arena,
-            },
-            result,
-        )
+        result
     }};
 }
 
@@ -1166,11 +1108,12 @@ macro_rules! collect_optimal_candidates_initialized_body {
         $query:ident,
         $out:ident,
         $bt_matchfinder:ident,
-        $bt_update:ident,
+        $bt_insert_step:ident,
         $bt_insert:ident,
         $for_each_rep:ident,
         $hash3:ident,
-        $cpl:path $(,)?
+        $cpl:path,
+        $cmf:path $(,)?
     ) => {{
         // Per-strategy compile-time const: only BtUltra2 drives the
         // hash3 short-match table. All other monomorphisations drop
@@ -1206,9 +1149,33 @@ macro_rules! collect_optimal_candidates_initialized_body {
             return;
         }
         if $bt_matchfinder {
+            // BT tree catch-up folded inline (was a per-position call to
+            // bt_update_tree_until): insert the positions the parser skipped into
+            // the binary tree before this position's search. Upstream zstd
+            // ZSTD_updateTree shape; `$bt_insert_step` overshoots the target with
+            // no clamp (forward skips match-covered positions), exactly as C.
             // SAFETY: caller is in the same target_feature umbrella as
-            // `$bt_update`; the runtime kernel detector already gated entry.
-            unsafe { $self.table.$bt_update($abs_pos, $current_abs_end) };
+            // `$bt_insert_step`; the runtime kernel detector already gated entry.
+            if $self.table.skip_insert_until_abs < $self.table.history_abs_start {
+                $self.table.skip_insert_until_abs = $self.table.history_abs_start;
+            }
+            let mut update_abs = $self.table.skip_insert_until_abs;
+            let is_btultra2 = $self.table.is_btultra2;
+            while update_abs < $abs_pos {
+                if !$self
+                    .table
+                    .can_skip_rebase_check_at(update_abs, $abs_pos, is_btultra2)
+                {
+                    $self.table.maybe_rebase_positions(update_abs);
+                }
+                let forward = unsafe {
+                    $self
+                        .table
+                        .$bt_insert_step(update_abs, $current_abs_end, $abs_pos)
+                };
+                update_abs += forward.max(1);
+            }
+            $self.table.skip_insert_until_abs = $abs_pos;
         }
         let current_idx = $abs_pos - $self.table.history_abs_start;
         if current_idx + 4 > $self.table.live_history().len() {
@@ -1224,147 +1191,159 @@ macro_rules! collect_optimal_candidates_initialized_body {
             return;
         }
         let mut best_len_for_skip = 0usize;
-        let mut skip_further_match_search = false;
-        let mut rep_len_candidate_found = false;
-        // SAFETY: same umbrella; closure capture is monomorphized per call.
-        unsafe {
-            $self.hc.$for_each_rep(
-                &$self.table,
+        if $bt_matchfinder {
+            // BT path: the rep-code probe and the hash3 short-match probe are
+            // folded INTO bt_insert_and_collect (one out-of-line per-position
+            // match-finder, upstream ZSTD_btGetAllMatches shape). They seed
+            // `best_len_for_skip` and handle the sufficient-match early-out
+            // internally, byte-identically to the prior orchestration.
+            // SAFETY: same umbrella for bt_insert_and_collect_matches.
+            // Inline the BT find monolith here instead of an out-of-line call.
+            // Upstream's ZSTD_insertBtAndGetAllMatches is FORCE_INLINE_TEMPLATE
+            // inlined into the opt loop, so the per-position match-finder is one
+            // body with no call-boundary marshalling (profile / reps / ...).
+            let bt_search_depth = $self.table.search_depth;
+            let best_len_ref = &mut best_len_for_skip;
+            crate::encoding::hc::generator::bt_insert_and_collect_matches_body!(
+                $self.table,
+                bt_search_depth,
                 $abs_pos,
-                lit_len,
-                reps,
                 $current_abs_end,
+                $profile,
                 min_match_len,
-                |rep| {
-                    if rep.match_len >= min_match_len {
-                        rep_len_candidate_found = true;
-                    }
+                best_len_ref,
+                $out,
+                reps,
+                lit_len,
+                use_hash3,
+                $cpl,
+                $cmf,
+            );
+        } else {
+            // HC-chain optimal fallback (no BT tree): the rep + hash3 probes
+            // stay inline here, ahead of the chain walk.
+            let mut skip_further_match_search = false;
+            let mut rep_len_candidate_found = false;
+            // SAFETY: same umbrella; closure capture is monomorphized per call.
+            unsafe {
+                $self.hc.$for_each_rep(
+                    &$self.table,
+                    $abs_pos,
+                    lit_len,
+                    reps,
+                    $current_abs_end,
+                    min_match_len,
+                    |rep| {
+                        if rep.match_len >= min_match_len {
+                            rep_len_candidate_found = true;
+                        }
+                        let _ = crate::encoding::bt::BtMatcher::push_candidate_ladder(
+                            $out,
+                            &mut best_len_for_skip,
+                            rep,
+                            min_match_len,
+                        );
+                        if rep.match_len > $profile.sufficient_match_len {
+                            skip_further_match_search = true;
+                        }
+                        if $abs_pos + rep.match_len >= $current_abs_end {
+                            skip_further_match_search = true;
+                        }
+                    },
+                )
+            };
+            if use_hash3 && !skip_further_match_search && best_len_for_skip < min_match_len {
+                $self.table.update_hash3_until($abs_pos);
+                // SAFETY: same umbrella for hash3_candidate.
+                if let Some(h3) = unsafe {
+                    $self
+                        .table
+                        .$hash3($abs_pos, $current_abs_end, min_match_len)
+                } {
                     let _ = crate::encoding::bt::BtMatcher::push_candidate_ladder(
                         $out,
                         &mut best_len_for_skip,
-                        rep,
+                        h3,
                         min_match_len,
                     );
-                    if rep.match_len > $profile.sufficient_match_len {
+                    if !rep_len_candidate_found
+                        && (h3.match_len > $profile.sufficient_match_len
+                            || $abs_pos + h3.match_len >= $current_abs_end)
+                    {
+                        $self.table.skip_insert_until_abs = $abs_pos + 1;
                         skip_further_match_search = true;
                     }
-                    // `for_each_repcode_candidate_with_reps` caps
-                    // `rep.match_len` at the per-call `tail_limit =
-                    // current_abs_end - abs_pos`, so `abs_pos +
-                    // rep.match_len <= current_abs_end`. The raw sum
-                    // therefore stays in `usize` on every supported
-                    // target.
-                    if $abs_pos + rep.match_len >= $current_abs_end {
-                        skip_further_match_search = true;
-                    }
-                },
-            )
-        };
-        // Hash3 lookup runs only when the strategy enables it. The
-        // `use_hash3` binding above is a per-monomorphisation const,
-        // so non-BtUltra2 instances drop this entire block.
-        if use_hash3 && !skip_further_match_search && best_len_for_skip < min_match_len {
-            $self.table.update_hash3_until($abs_pos);
-            // SAFETY: same umbrella for hash3_candidate.
-            if let Some(h3) = unsafe {
-                $self
-                    .table
-                    .$hash3($abs_pos, $current_abs_end, min_match_len)
-            } {
-                let _ = crate::encoding::bt::BtMatcher::push_candidate_ladder(
-                    $out,
-                    &mut best_len_for_skip,
-                    h3,
-                    min_match_len,
-                );
-                if !rep_len_candidate_found
-                    && (h3.match_len > $profile.sufficient_match_len
-                        || $abs_pos + h3.match_len >= $current_abs_end)
-                {
-                    $self.table.skip_insert_until_abs = $abs_pos + 1;
-                    skip_further_match_search = true;
                 }
             }
-        }
-        if !skip_further_match_search && $bt_matchfinder {
-            // SAFETY: same umbrella for bt_insert_and_collect_matches.
-            unsafe {
-                $self.table.$bt_insert(
-                    $abs_pos,
-                    $current_abs_end,
-                    $profile,
-                    min_match_len,
-                    &mut best_len_for_skip,
-                    $out,
-                )
-            };
-        } else if !skip_further_match_search {
-            $self.table.insert_position($abs_pos);
-            let max_chain_depth = $profile.max_chain_depth.min($self.hc.search_depth);
-            let concat = $self.table.live_history();
-            // Raw `+ 9` is safe here — see `bt_insert_step_no_rebase_body!`
-            // for the full discussion of the upstream `STREAM_ABS_HEADROOM`
-            // cap in `MatchTable::add_data`.
-            let mut match_end_abs = $abs_pos + 9;
-            if max_chain_depth > 0 {
-                for (visited, candidate_abs) in $self
-                    .hc
-                    .chain_candidates(&$self.table, $abs_pos)
-                    .into_iter()
-                    .enumerate()
-                {
-                    if visited >= max_chain_depth {
-                        break;
-                    }
-                    if candidate_abs == usize::MAX {
-                        break;
-                    }
-                    if candidate_abs < $self.table.window_low_abs_for_target($abs_pos)
-                        || candidate_abs >= $abs_pos
+            if !skip_further_match_search {
+                $self.table.insert_position($abs_pos);
+                let max_chain_depth = $profile.max_chain_depth.min($self.hc.search_depth);
+                let concat = $self.table.live_history();
+                // Raw `+ 9` is safe here — see `bt_insert_step_no_rebase_body!`
+                // for the full discussion of the upstream `STREAM_ABS_HEADROOM`
+                // cap in `MatchTable::add_data`.
+                let mut match_end_abs = $abs_pos + 9;
+                if max_chain_depth > 0 {
+                    for (visited, candidate_abs) in $self
+                        .hc
+                        .chain_candidates(&$self.table, $abs_pos)
+                        .into_iter()
+                        .enumerate()
                     {
-                        continue;
-                    }
-                    let candidate_idx = candidate_abs - $self.table.history_abs_start;
-                    debug_assert!(
-                        $abs_pos <= $current_abs_end,
-                        "HC chain walker called past current block end"
-                    );
-                    let tail_limit = $current_abs_end - $abs_pos;
-                    let base = concat.as_ptr();
-                    // SAFETY: history-relative indices; `tail_limit` bounds
-                    // the scan within `concat`. `$cpl` is the kernel-specific
-                    // common_prefix_len_ptr — call inlines because the
-                    // surrounding wrapper carries the same target_feature.
-                    let match_len =
-                        unsafe { $cpl(base.add(candidate_idx), base.add(current_idx), tail_limit) };
-                    if match_len < min_match_len {
-                        continue;
-                    }
-                    let offset = $abs_pos - candidate_abs;
-                    if crate::encoding::bt::BtMatcher::push_candidate_ladder(
-                        $out,
-                        &mut best_len_for_skip,
-                        MatchCandidate {
-                            start: $abs_pos,
-                            offset,
-                            match_len,
-                        },
-                        min_match_len,
-                    ) {
-                        let candidate_end = candidate_abs + match_len;
-                        if candidate_end > match_end_abs {
-                            match_end_abs = candidate_end;
+                        if visited >= max_chain_depth {
+                            break;
+                        }
+                        if candidate_abs == usize::MAX {
+                            break;
+                        }
+                        if candidate_abs < $self.table.window_low_abs_for_target($abs_pos)
+                            || candidate_abs >= $abs_pos
+                        {
+                            continue;
+                        }
+                        let candidate_idx = candidate_abs - $self.table.history_abs_start;
+                        debug_assert!(
+                            $abs_pos <= $current_abs_end,
+                            "HC chain walker called past current block end"
+                        );
+                        let tail_limit = $current_abs_end - $abs_pos;
+                        let base = concat.as_ptr();
+                        // SAFETY: history-relative indices; `tail_limit` bounds
+                        // the scan within `concat`. `$cpl` is the kernel-specific
+                        // common_prefix_len_ptr — call inlines because the
+                        // surrounding wrapper carries the same target_feature.
+                        let match_len = unsafe {
+                            $cpl(base.add(candidate_idx), base.add(current_idx), tail_limit)
+                        };
+                        if match_len < min_match_len {
+                            continue;
+                        }
+                        let offset = $abs_pos - candidate_abs;
+                        if crate::encoding::bt::BtMatcher::push_candidate_ladder(
+                            $out,
+                            &mut best_len_for_skip,
+                            MatchCandidate {
+                                start: $abs_pos,
+                                offset,
+                                match_len,
+                            },
+                            min_match_len,
+                        ) {
+                            let candidate_end = candidate_abs + match_len;
+                            if candidate_end > match_end_abs {
+                                match_end_abs = candidate_end;
+                            }
+                        }
+                        if match_len > HC_OPT_NUM || $abs_pos + match_len >= $current_abs_end {
+                            break;
                         }
                     }
-                    if match_len > HC_OPT_NUM || $abs_pos + match_len >= $current_abs_end {
-                        break;
-                    }
                 }
+                // `match_end_abs` initialized to `abs_pos + 9`; monotonic
+                // updates only ever extend it, so `match_end_abs - 8 >= 1`.
+                $self.table.skip_insert_until_abs =
+                    $self.table.skip_insert_until_abs.max(match_end_abs - 8);
             }
-            // `match_end_abs` initialized to `abs_pos + 9`; monotonic
-            // updates only ever extend it, so `match_end_abs - 8 >= 1`.
-            $self.table.skip_insert_until_abs =
-                $self.table.skip_insert_until_abs.max(match_end_abs - 8);
         }
         if let Some(ldm) = ldm_candidate {
             let _ = crate::encoding::bt::BtMatcher::push_candidate_ladder(
@@ -1475,6 +1454,9 @@ impl HcMatchGenerator {
         )
     }
 
+    // The scalar arm of `run_main_loop!` wraps a safe `*_scalar` call in
+    // `unsafe` (the SIMD arms need it); allow the redundant block here.
+    #[allow(unused_unsafe)]
     pub(crate) fn start_matching_optimal<S: crate::encoding::strategy::Strategy>(
         &mut self,
         mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
@@ -1525,8 +1507,13 @@ impl HcMatchGenerator {
             current_len,
         );
 
+        // Take the five DP scratch buffers ONCE for both the seed pass and the
+        // main pass (upstream shares one workspace across btultra2's two
+        // passes). Threading the same `&mut` into the seed pass removes its
+        // separate take + restore round-trip.
+        let mut plan_buffers = self.take_optimal_plan_buffers();
         if self.should_run_btultra2_seed_pass::<S>(current_len) {
-            self.run_btultra2_seed_pass(current, current_abs_start, current_len);
+            self.run_btultra2_seed_pass(current, current_abs_start, current_len, &mut plan_buffers);
         }
 
         // Const-generic profile selection: every field is folded from
@@ -1535,6 +1522,9 @@ impl HcMatchGenerator {
         // so the optimiser produces the literal at codegen time
         // without a runtime match.
         let profile = HcOptimalCostProfile::const_for_strategy::<S>();
+        // The DP bodies read the strategy's `FAVOR_SMALL_OFFSETS` const directly;
+        // verify the runtime profile (built from the same strategy) agrees.
+        debug_assert_eq!(profile.favor_small_offsets, S::FAVOR_SMALL_OFFSETS);
         let mut opt_state =
             core::mem::replace(&mut self.backend.bt_mut().opt_state, HcOptState::new());
         opt_state.rescale_freqs(current, profile);
@@ -1545,56 +1535,196 @@ impl HcMatchGenerator {
             self.table.opt_start_cursor_and_litlen(current_abs_start);
         let mut plan_literals_cursor = 0usize;
         let match_loop_limit = current_len.saturating_sub(8);
-        while cursor < match_loop_limit {
-            let remaining_len = current_len - cursor;
-            let segment_abs_start = current_abs_start + cursor;
-            let segment_start = best_plan.len();
-            let (_, end_reps, end_litlen, consumed_len) = self.build_optimal_plan::<S>(
-                &current[cursor..],
-                segment_abs_start,
-                remaining_len,
-                HcOptimalPlanState {
-                    block_offset: cursor,
-                    reps: plan_reps,
-                    litlen: plan_litlen,
-                    profile,
-                },
-                &opt_state,
-                &mut best_plan,
-            );
-            BtMatcher::update_plan_stats_segment(
-                current,
-                current_len,
-                &best_plan[segment_start..],
-                &mut plan_literals_cursor,
-                &mut plan_reps,
-                &mut opt_state,
-                profile.accurate,
-            );
-            plan_reps = end_reps;
-            plan_litlen = end_litlen;
-            cursor += consumed_len;
+        // Frame-constant LDM presence, resolved once per block (not per segment
+        // and not in the DP hot loop): drives the HAS_LDM const-generic dispatch.
+        let has_ldm = !self.backend.bt_mut().ldm_sequences.is_empty();
+        // Resolve the SIMD tier ONCE here, never per segment. The per-literal
+        // hot loop then runs under a single kernel-monomorphized expansion
+        // (calling build_optimal_plan_impl_<kernel> directly) instead of
+        // hitting select_kernel()'s OnceLock atomic + a CPU-tier match on every
+        // build_optimal_plan call. Mirrors the Fast matcher dispatch shape.
+        macro_rules! run_main_loop {
+            ($impl_wrapper:ident) => {{
+                while cursor < match_loop_limit {
+                    let remaining_len = current_len - cursor;
+                    let segment_abs_start = current_abs_start + cursor;
+                    let segment_start = best_plan.len();
+                    let state = HcOptimalPlanState {
+                        block_offset: cursor,
+                        reps: plan_reps,
+                        litlen: plan_litlen,
+                        profile,
+                    };
+                    let (_, end_reps, end_litlen, consumed_len) =
+                        match (S::ACCURATE_PRICE, S::FAVOR_SMALL_OFFSETS, has_ldm) {
+                            (true, false, false) => unsafe {
+                                self.$impl_wrapper::<S, true, false, false>(
+                                    &current[cursor..],
+                                    segment_abs_start,
+                                    remaining_len,
+                                    state,
+                                    &opt_state,
+                                    &mut best_plan,
+                                    &mut plan_buffers,
+                                )
+                            },
+                            (true, false, true) => unsafe {
+                                self.$impl_wrapper::<S, true, false, true>(
+                                    &current[cursor..],
+                                    segment_abs_start,
+                                    remaining_len,
+                                    state,
+                                    &opt_state,
+                                    &mut best_plan,
+                                    &mut plan_buffers,
+                                )
+                            },
+                            (true, true, false) => unsafe {
+                                self.$impl_wrapper::<S, true, true, false>(
+                                    &current[cursor..],
+                                    segment_abs_start,
+                                    remaining_len,
+                                    state,
+                                    &opt_state,
+                                    &mut best_plan,
+                                    &mut plan_buffers,
+                                )
+                            },
+                            (true, true, true) => unsafe {
+                                self.$impl_wrapper::<S, true, true, true>(
+                                    &current[cursor..],
+                                    segment_abs_start,
+                                    remaining_len,
+                                    state,
+                                    &opt_state,
+                                    &mut best_plan,
+                                    &mut plan_buffers,
+                                )
+                            },
+                            (false, false, false) => unsafe {
+                                self.$impl_wrapper::<S, false, false, false>(
+                                    &current[cursor..],
+                                    segment_abs_start,
+                                    remaining_len,
+                                    state,
+                                    &opt_state,
+                                    &mut best_plan,
+                                    &mut plan_buffers,
+                                )
+                            },
+                            (false, false, true) => unsafe {
+                                self.$impl_wrapper::<S, false, false, true>(
+                                    &current[cursor..],
+                                    segment_abs_start,
+                                    remaining_len,
+                                    state,
+                                    &opt_state,
+                                    &mut best_plan,
+                                    &mut plan_buffers,
+                                )
+                            },
+                            (false, true, false) => unsafe {
+                                self.$impl_wrapper::<S, false, true, false>(
+                                    &current[cursor..],
+                                    segment_abs_start,
+                                    remaining_len,
+                                    state,
+                                    &opt_state,
+                                    &mut best_plan,
+                                    &mut plan_buffers,
+                                )
+                            },
+                            (false, true, true) => unsafe {
+                                self.$impl_wrapper::<S, false, true, true>(
+                                    &current[cursor..],
+                                    segment_abs_start,
+                                    remaining_len,
+                                    state,
+                                    &opt_state,
+                                    &mut best_plan,
+                                    &mut plan_buffers,
+                                )
+                            },
+                        };
+                    // On a no-match segment (the per-literal case that dominates
+                    // near-random input) nothing was emitted, so the stats
+                    // update is a guaranteed no-op (it early-returns on an empty
+                    // plan slice). Skip the per-literal call + its marshalling.
+                    if best_plan.len() > segment_start {
+                        BtMatcher::update_plan_stats_segment(
+                            current,
+                            current_len,
+                            &best_plan[segment_start..],
+                            &mut plan_literals_cursor,
+                            &mut plan_reps,
+                            &mut opt_state,
+                            profile.accurate,
+                        );
+                    }
+                    plan_reps = end_reps;
+                    plan_litlen = end_litlen;
+                    cursor += consumed_len;
+                }
+            }};
+        }
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        unsafe {
+            run_main_loop!(build_optimal_plan_impl_neon);
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
+            match select_kernel() {
+                FastpathKernel::Avx2Bmi2 => run_main_loop!(build_optimal_plan_impl_avx2_bmi2),
+                FastpathKernel::Sse42 => run_main_loop!(build_optimal_plan_impl_sse42),
+                FastpathKernel::Scalar => run_main_loop!(build_optimal_plan_impl_scalar),
+            }
+        }
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        unsafe {
+            run_main_loop!(build_optimal_plan_impl_simd128);
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_endian = "little"),
+            target_arch = "x86",
+            target_arch = "x86_64",
+            all(target_arch = "wasm32", target_feature = "simd128")
+        )))]
+        {
+            run_main_loop!(build_optimal_plan_impl_scalar);
         }
 
         self.table
             .emit_optimal_plan(current_len, &best_plan, &mut handle_sequence);
         best_plan.clear();
         self.backend.bt_mut().opt_segment_plan_scratch = best_plan;
+        let _ = self
+            .backend
+            .bt_mut()
+            .finish_optimal_plan(plan_buffers, (0, [0; 3], 0, 0));
         self.backend.bt_mut().opt_state = opt_state;
     }
 
+    // The scalar arm of `run_seed_loop!` wraps a safe call in `unsafe`.
+    #[allow(unused_unsafe)]
     fn run_btultra2_seed_pass(
         &mut self,
         current: &[u8],
         current_abs_start: usize,
         current_len: usize,
+        plan_buffers: &mut HcOptimalPlanBuffers,
     ) {
         // The seed pass is BtUltra2-exclusive by name (the only
         // caller is `should_run_btultra2_seed_pass`), so pin `S` to
         // `BtUltra2` for both the cost-profile lookup and the
-        // `build_optimal_plan::<S>` call below.
+        // kernel-dispatched segment loop below.
         type S = crate::encoding::strategy::BtUltra2;
+        // `S` is a concrete type here (not a generic bound), so the `Strategy`
+        // trait must be in scope to read its associated consts in
+        // `run_seed_loop!`.
+        use crate::encoding::strategy::Strategy;
         let seed_profile = HcOptimalCostProfile::const_for_strategy::<S>();
+        debug_assert_eq!(seed_profile.favor_small_offsets, S::FAVOR_SMALL_OFFSETS);
         let mut opt_state =
             core::mem::replace(&mut self.backend.bt_mut().opt_state, HcOptState::new());
         opt_state.rescale_freqs(current, seed_profile);
@@ -1605,39 +1735,164 @@ impl HcMatchGenerator {
         let mut seed_plan = core::mem::take(&mut self.backend.bt_mut().opt_seed_plan_scratch);
         seed_plan.clear();
         let match_loop_limit = current_len.saturating_sub(8);
-        while cursor < match_loop_limit {
-            let remaining_len = current_len - cursor;
-            let segment_abs_start = current_abs_start + cursor;
-            let segment_start = seed_plan.len();
-            let (_, end_reps, end_litlen, consumed_len) = self.build_optimal_plan::<S>(
-                &current[cursor..],
-                segment_abs_start,
-                remaining_len,
-                HcOptimalPlanState {
-                    block_offset: cursor,
-                    reps: seed_reps,
-                    litlen: seed_litlen,
-                    profile: seed_profile,
-                },
-                &opt_state,
-                &mut seed_plan,
-            );
-            BtMatcher::update_plan_stats_segment(
-                current,
-                current_len,
-                &seed_plan[segment_start..],
-                &mut seed_literals_cursor,
-                &mut seed_reps,
-                &mut opt_state,
-                seed_profile.accurate,
-            );
-            seed_plan.truncate(segment_start);
-            seed_reps = end_reps;
-            seed_litlen = end_litlen;
-            cursor += consumed_len;
+        let has_ldm = !self.backend.bt_mut().ldm_sequences.is_empty();
+        // SIMD tier resolved ONCE (see start_matching_optimal): the per-literal
+        // seed loop runs under a single kernel-monomorphized expansion, never
+        // re-entering select_kernel() per segment.
+        macro_rules! run_seed_loop {
+            ($impl_wrapper:ident) => {{
+                while cursor < match_loop_limit {
+                    let remaining_len = current_len - cursor;
+                    let segment_abs_start = current_abs_start + cursor;
+                    let segment_start = seed_plan.len();
+                    let state = HcOptimalPlanState {
+                        block_offset: cursor,
+                        reps: seed_reps,
+                        litlen: seed_litlen,
+                        profile: seed_profile,
+                    };
+                    let (_, end_reps, end_litlen, consumed_len) =
+                        match (S::ACCURATE_PRICE, S::FAVOR_SMALL_OFFSETS, has_ldm) {
+                            (true, false, false) => unsafe {
+                                self.$impl_wrapper::<S, true, false, false>(
+                                    &current[cursor..],
+                                    segment_abs_start,
+                                    remaining_len,
+                                    state,
+                                    &opt_state,
+                                    &mut seed_plan,
+                                    &mut *plan_buffers,
+                                )
+                            },
+                            (true, false, true) => unsafe {
+                                self.$impl_wrapper::<S, true, false, true>(
+                                    &current[cursor..],
+                                    segment_abs_start,
+                                    remaining_len,
+                                    state,
+                                    &opt_state,
+                                    &mut seed_plan,
+                                    &mut *plan_buffers,
+                                )
+                            },
+                            (true, true, false) => unsafe {
+                                self.$impl_wrapper::<S, true, true, false>(
+                                    &current[cursor..],
+                                    segment_abs_start,
+                                    remaining_len,
+                                    state,
+                                    &opt_state,
+                                    &mut seed_plan,
+                                    &mut *plan_buffers,
+                                )
+                            },
+                            (true, true, true) => unsafe {
+                                self.$impl_wrapper::<S, true, true, true>(
+                                    &current[cursor..],
+                                    segment_abs_start,
+                                    remaining_len,
+                                    state,
+                                    &opt_state,
+                                    &mut seed_plan,
+                                    &mut *plan_buffers,
+                                )
+                            },
+                            (false, false, false) => unsafe {
+                                self.$impl_wrapper::<S, false, false, false>(
+                                    &current[cursor..],
+                                    segment_abs_start,
+                                    remaining_len,
+                                    state,
+                                    &opt_state,
+                                    &mut seed_plan,
+                                    &mut *plan_buffers,
+                                )
+                            },
+                            (false, false, true) => unsafe {
+                                self.$impl_wrapper::<S, false, false, true>(
+                                    &current[cursor..],
+                                    segment_abs_start,
+                                    remaining_len,
+                                    state,
+                                    &opt_state,
+                                    &mut seed_plan,
+                                    &mut *plan_buffers,
+                                )
+                            },
+                            (false, true, false) => unsafe {
+                                self.$impl_wrapper::<S, false, true, false>(
+                                    &current[cursor..],
+                                    segment_abs_start,
+                                    remaining_len,
+                                    state,
+                                    &opt_state,
+                                    &mut seed_plan,
+                                    &mut *plan_buffers,
+                                )
+                            },
+                            (false, true, true) => unsafe {
+                                self.$impl_wrapper::<S, false, true, true>(
+                                    &current[cursor..],
+                                    segment_abs_start,
+                                    remaining_len,
+                                    state,
+                                    &opt_state,
+                                    &mut seed_plan,
+                                    &mut *plan_buffers,
+                                )
+                            },
+                        };
+                    // No-match segment: stats update no-ops on the empty slice
+                    // and the truncate has nothing to drop; skip both.
+                    if seed_plan.len() > segment_start {
+                        BtMatcher::update_plan_stats_segment(
+                            current,
+                            current_len,
+                            &seed_plan[segment_start..],
+                            &mut seed_literals_cursor,
+                            &mut seed_reps,
+                            &mut opt_state,
+                            seed_profile.accurate,
+                        );
+                        seed_plan.truncate(segment_start);
+                    }
+                    seed_reps = end_reps;
+                    seed_litlen = end_litlen;
+                    cursor += consumed_len;
+                }
+            }};
+        }
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        unsafe {
+            run_seed_loop!(build_optimal_plan_impl_neon);
+        }
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        {
+            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
+            match select_kernel() {
+                FastpathKernel::Avx2Bmi2 => run_seed_loop!(build_optimal_plan_impl_avx2_bmi2),
+                FastpathKernel::Sse42 => run_seed_loop!(build_optimal_plan_impl_sse42),
+                FastpathKernel::Scalar => run_seed_loop!(build_optimal_plan_impl_scalar),
+            }
+        }
+        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        unsafe {
+            run_seed_loop!(build_optimal_plan_impl_simd128);
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_endian = "little"),
+            target_arch = "x86",
+            target_arch = "x86_64",
+            all(target_arch = "wasm32", target_feature = "simd128")
+        )))]
+        {
+            run_seed_loop!(build_optimal_plan_impl_scalar);
         }
         seed_plan.clear();
         self.backend.bt_mut().opt_seed_plan_scratch = seed_plan;
+        // The DP scratch buffers are owned by the caller (start_matching_optimal)
+        // and shared across both passes, so the seed pass leaves them in place
+        // (`plan_buffers` is a borrow) instead of restoring them here.
         self.backend.bt_mut().opt_state = opt_state;
 
         // Upstream zstd initStats_ultra keeps the collected entropy statistics but
@@ -1654,161 +1909,37 @@ impl HcMatchGenerator {
         self.table.allow_zero_relative_position = true;
     }
 
-    fn build_optimal_plan<S: crate::encoding::strategy::Strategy>(
-        &mut self,
-        current: &[u8],
-        current_abs_start: usize,
-        current_len: usize,
-        initial_state: HcOptimalPlanState,
-        stats: &HcOptState,
-        out: &mut Vec<HcOptimalSequence>,
-    ) -> (u32, [u32; 3], usize, usize) {
-        debug_assert!(S::USE_BT, "build_optimal_plan called on non-BT strategy");
-        debug_assert_eq!(initial_state.profile.accurate, S::ACCURATE_PRICE);
-        debug_assert_eq!(
-            initial_state.profile.favor_small_offsets,
-            S::FAVOR_SMALL_OFFSETS
-        );
-        // `S::ACCURATE_PRICE` / `S::FAVOR_SMALL_OFFSETS` cannot appear
-        // as const-generic arguments yet (`generic_const_exprs` is
-        // still unstable), so dispatch over a 4-arm match — but on the
-        // strategy's ASSOCIATED CONSTS, not the runtime profile (the
-        // `debug_assert_eq`s above pin the runtime profile to those
-        // consts). A const scrutinee folds the three dead arms at
-        // monomorphisation; matching the runtime profile instead kept
-        // all four `#[inline(always)]` DP bodies (~16 KB each) alive in
-        // EVERY `S` instantiation — ~360 KB of the wasm payload.
-        match (S::ACCURATE_PRICE, S::FAVOR_SMALL_OFFSETS) {
-            (true, false) => self.build_optimal_plan_impl::<S, true, false>(
-                current,
-                current_abs_start,
-                current_len,
-                initial_state,
-                stats,
-                out,
-            ),
-            (true, true) => self.build_optimal_plan_impl::<S, true, true>(
-                current,
-                current_abs_start,
-                current_len,
-                initial_state,
-                stats,
-                out,
-            ),
-            (false, false) => self.build_optimal_plan_impl::<S, false, false>(
-                current,
-                current_abs_start,
-                current_len,
-                initial_state,
-                stats,
-                out,
-            ),
-            (false, true) => self.build_optimal_plan_impl::<S, false, true>(
-                current,
-                current_abs_start,
-                current_len,
-                initial_state,
-                stats,
-                out,
-            ),
+    /// Take the five DP scratch buffers out of the backend ONCE per block and
+    /// size them for the optimal-parser frontier, so the per-segment
+    /// `build_optimal_plan` calls borrow and reuse them instead of taking +
+    /// restoring all five every call (which on near-random input runs once per
+    /// literal). Restore with [`BtMatcher::finish_optimal_plan`] after the
+    /// per-segment loop.
+    fn take_optimal_plan_buffers(&mut self) -> HcOptimalPlanBuffers {
+        let bt = self.backend.bt_mut();
+        let mut nodes = core::mem::take(&mut bt.opt_nodes_scratch);
+        let mut node_prices = core::mem::take(&mut bt.opt_node_prices_scratch);
+        let mut candidates = core::mem::take(&mut bt.opt_candidates_scratch);
+        let store = core::mem::take(&mut bt.opt_store_scratch);
+        let mut price_arena = core::mem::take(&mut bt.opt_price_arena);
+        if nodes.len() < HC_OPT_NODE_LEN {
+            nodes = alloc::vec![HcOptimalNode::default(); HC_OPT_NODE_LEN].into_boxed_slice();
         }
-    }
-
-    /// Cross-platform DP entry. Picks the kernel-specific variant so the
-    /// entire optimal-parser DP body (per-position match gathering, price
-    /// updates, traceback) runs inside a single `target_feature` umbrella
-    /// alongside the per-position `collect_optimal_candidates_initialized_
-    /// <kernel>`. This eliminates the final ABI barrier on the hot per-
-    /// position match-collection call — the level22 critical path is now
-    /// one straight-line inline chain from DP body down through BT walk
-    /// and match-length probes.
-    #[inline(always)]
-    fn build_optimal_plan_impl<
-        S: crate::encoding::strategy::Strategy,
-        const ACCURATE_PRICE: bool,
-        const FAVOR_SMALL_OFFSETS: bool,
-    >(
-        &mut self,
-        current: &[u8],
-        current_abs_start: usize,
-        current_len: usize,
-        initial_state: HcOptimalPlanState,
-        stats: &HcOptState,
-        out: &mut Vec<HcOptimalSequence>,
-    ) -> (u32, [u32; 3], usize, usize) {
-        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
-        unsafe {
-            self.build_optimal_plan_impl_neon::<S, ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(
-                current,
-                current_abs_start,
-                current_len,
-                initial_state,
-                stats,
-                out,
-            )
+        if node_prices.len() < HC_OPT_NODE_LEN {
+            node_prices = alloc::vec![u32::MAX; HC_OPT_NODE_LEN].into_boxed_slice();
         }
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
-            match select_kernel() {
-                FastpathKernel::Avx2Bmi2 => unsafe {
-                    self.build_optimal_plan_impl_avx2_bmi2::<S, ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(
-                        current,
-                        current_abs_start,
-                        current_len,
-                        initial_state,
-                        stats,
-                        out,
-                    )
-                },
-                FastpathKernel::Sse42 => unsafe {
-                    self.build_optimal_plan_impl_sse42::<S, ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(
-                        current,
-                        current_abs_start,
-                        current_len,
-                        initial_state,
-                        stats,
-                        out,
-                    )
-                },
-                FastpathKernel::Scalar => self
-                    .build_optimal_plan_impl_scalar::<S, ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(
-                        current,
-                        current_abs_start,
-                        current_len,
-                        initial_state,
-                        stats,
-                        out,
-                    ),
-            }
+        if candidates.capacity() < MAX_HC_SEARCH_DEPTH {
+            candidates.reserve_exact(MAX_HC_SEARCH_DEPTH - candidates.capacity());
         }
-        // wasm with simd128: route through the simd128 DP body (4-lane price-set).
-        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
-        unsafe {
-            self.build_optimal_plan_impl_simd128::<S, ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(
-                current,
-                current_abs_start,
-                current_len,
-                initial_state,
-                stats,
-                out,
-            )
+        if price_arena.len() < HC_OPT_PRICE_ARENA_LEN {
+            price_arena = alloc::vec![[0u32; 2]; HC_OPT_PRICE_ARENA_LEN].into_boxed_slice();
         }
-        #[cfg(not(any(
-            all(target_arch = "aarch64", target_endian = "little"),
-            target_arch = "x86",
-            target_arch = "x86_64",
-            all(target_arch = "wasm32", target_feature = "simd128")
-        )))]
-        {
-            self.build_optimal_plan_impl_scalar::<S, ACCURATE_PRICE, FAVOR_SMALL_OFFSETS>(
-                current,
-                current_abs_start,
-                current_len,
-                initial_state,
-                stats,
-                out,
-            )
+        HcOptimalPlanBuffers {
+            nodes,
+            node_prices,
+            candidates,
+            store,
+            price_arena,
         }
     }
 
@@ -1817,10 +1948,12 @@ impl HcMatchGenerator {
     /// per-position pipeline) directly into the DP loop.
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     #[target_feature(enable = "neon")]
+    #[allow(clippy::too_many_arguments)]
     unsafe fn build_optimal_plan_impl_neon<
         S: crate::encoding::strategy::Strategy,
         const ACCURATE_PRICE: bool,
         const FAVOR_SMALL_OFFSETS: bool,
+        const HAS_LDM: bool,
     >(
         &mut self,
         current: &[u8],
@@ -1829,6 +1962,7 @@ impl HcMatchGenerator {
         initial_state: HcOptimalPlanState,
         stats: &HcOptState,
         out: &mut Vec<HcOptimalSequence>,
+        buffers: &mut HcOptimalPlanBuffers,
     ) -> (u32, [u32; 3], usize, usize) {
         build_optimal_plan_impl_body!(
             self,
@@ -1839,6 +1973,7 @@ impl HcMatchGenerator {
             initial_state,
             stats,
             out,
+            buffers,
             collect_optimal_candidates_initialized_neon,
             crate::encoding::hc::priceset::priceset_range_nonabort_neon,
         )
@@ -1846,10 +1981,12 @@ impl HcMatchGenerator {
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[target_feature(enable = "sse4.2")]
+    #[allow(clippy::too_many_arguments)]
     unsafe fn build_optimal_plan_impl_sse42<
         S: crate::encoding::strategy::Strategy,
         const ACCURATE_PRICE: bool,
         const FAVOR_SMALL_OFFSETS: bool,
+        const HAS_LDM: bool,
     >(
         &mut self,
         current: &[u8],
@@ -1858,6 +1995,7 @@ impl HcMatchGenerator {
         initial_state: HcOptimalPlanState,
         stats: &HcOptState,
         out: &mut Vec<HcOptimalSequence>,
+        buffers: &mut HcOptimalPlanBuffers,
     ) -> (u32, [u32; 3], usize, usize) {
         build_optimal_plan_impl_body!(
             self,
@@ -1868,6 +2006,7 @@ impl HcMatchGenerator {
             initial_state,
             stats,
             out,
+            buffers,
             collect_optimal_candidates_initialized_sse42,
             crate::encoding::hc::priceset::priceset_range_nonabort_sse41,
         )
@@ -1875,10 +2014,12 @@ impl HcMatchGenerator {
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[target_feature(enable = "avx2,bmi2")]
+    #[allow(clippy::too_many_arguments)]
     unsafe fn build_optimal_plan_impl_avx2_bmi2<
         S: crate::encoding::strategy::Strategy,
         const ACCURATE_PRICE: bool,
         const FAVOR_SMALL_OFFSETS: bool,
+        const HAS_LDM: bool,
     >(
         &mut self,
         current: &[u8],
@@ -1887,6 +2028,7 @@ impl HcMatchGenerator {
         initial_state: HcOptimalPlanState,
         stats: &HcOptState,
         out: &mut Vec<HcOptimalSequence>,
+        buffers: &mut HcOptimalPlanBuffers,
     ) -> (u32, [u32; 3], usize, usize) {
         build_optimal_plan_impl_body!(
             self,
@@ -1897,6 +2039,7 @@ impl HcMatchGenerator {
             initial_state,
             stats,
             out,
+            buffers,
             collect_optimal_candidates_initialized_avx2_bmi2,
             crate::encoding::hc::priceset::priceset_range_nonabort_avx2,
         )
@@ -1914,10 +2057,12 @@ impl HcMatchGenerator {
         all(target_arch = "wasm32", target_feature = "simd128"),
         allow(dead_code)
     )]
+    #[allow(clippy::too_many_arguments)]
     fn build_optimal_plan_impl_scalar<
         S: crate::encoding::strategy::Strategy,
         const ACCURATE_PRICE: bool,
         const FAVOR_SMALL_OFFSETS: bool,
+        const HAS_LDM: bool,
     >(
         &mut self,
         current: &[u8],
@@ -1926,6 +2071,7 @@ impl HcMatchGenerator {
         initial_state: HcOptimalPlanState,
         stats: &HcOptState,
         out: &mut Vec<HcOptimalSequence>,
+        buffers: &mut HcOptimalPlanBuffers,
     ) -> (u32, [u32; 3], usize, usize) {
         build_optimal_plan_impl_body!(
             self,
@@ -1936,6 +2082,7 @@ impl HcMatchGenerator {
             initial_state,
             stats,
             out,
+            buffers,
             collect_optimal_candidates_initialized_scalar,
             crate::encoding::hc::priceset::priceset_range_nonabort_scalar,
         )
@@ -1949,10 +2096,12 @@ impl HcMatchGenerator {
     // blocks (needed by the safe scalar wrapper) are redundant inside this
     // target_feature fn.
     #[allow(unused_unsafe)]
+    #[allow(clippy::too_many_arguments)]
     unsafe fn build_optimal_plan_impl_simd128<
         S: crate::encoding::strategy::Strategy,
         const ACCURATE_PRICE: bool,
         const FAVOR_SMALL_OFFSETS: bool,
+        const HAS_LDM: bool,
     >(
         &mut self,
         current: &[u8],
@@ -1961,6 +2110,7 @@ impl HcMatchGenerator {
         initial_state: HcOptimalPlanState,
         stats: &HcOptState,
         out: &mut Vec<HcOptimalSequence>,
+        buffers: &mut HcOptimalPlanBuffers,
     ) -> (u32, [u32; 3], usize, usize) {
         build_optimal_plan_impl_body!(
             self,
@@ -1971,6 +2121,7 @@ impl HcMatchGenerator {
             initial_state,
             stats,
             out,
+            buffers,
             collect_optimal_candidates_initialized_scalar,
             crate::encoding::hc::priceset::priceset_range_nonabort_simd128,
         )
@@ -2144,11 +2295,12 @@ impl HcMatchGenerator {
             query,
             out,
             USE_BT_MATCHFINDER,
-            bt_update_tree_until_neon,
+            bt_insert_step_no_rebase_neon,
             bt_insert_and_collect_matches_neon,
             for_each_repcode_candidate_with_reps_neon,
             hash3_candidate_neon,
             crate::encoding::fastpath::neon::common_prefix_len_ptr,
+            crate::encoding::fastpath::neon::count_match_from_indices,
         )
     }
 
@@ -2174,11 +2326,12 @@ impl HcMatchGenerator {
             query,
             out,
             USE_BT_MATCHFINDER,
-            bt_update_tree_until_sse42,
+            bt_insert_step_no_rebase_sse42,
             bt_insert_and_collect_matches_sse42,
             for_each_repcode_candidate_with_reps_sse42,
             hash3_candidate_sse42,
             crate::encoding::fastpath::sse42::common_prefix_len_ptr,
+            crate::encoding::fastpath::sse42::count_match_from_indices,
         )
     }
 
@@ -2204,11 +2357,12 @@ impl HcMatchGenerator {
             query,
             out,
             USE_BT_MATCHFINDER,
-            bt_update_tree_until_avx2_bmi2,
+            bt_insert_step_no_rebase_avx2_bmi2,
             bt_insert_and_collect_matches_avx2_bmi2,
             for_each_repcode_candidate_with_reps_avx2_bmi2,
             hash3_candidate_avx2_bmi2,
             crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr,
+            crate::encoding::fastpath::avx2_bmi2::count_match_from_indices,
         )
     }
 
@@ -2236,11 +2390,12 @@ impl HcMatchGenerator {
             query,
             out,
             USE_BT_MATCHFINDER,
-            bt_update_tree_until_scalar,
+            bt_insert_step_no_rebase_scalar,
             bt_insert_and_collect_matches_scalar,
             for_each_repcode_candidate_with_reps_scalar,
             hash3_candidate_scalar,
             crate::encoding::fastpath::scalar::common_prefix_len_ptr,
+            crate::encoding::fastpath::scalar::count_match_from_indices,
         )
     }
 }
