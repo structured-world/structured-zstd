@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782219402334,
+  "lastUpdate": 1782406591905,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI": [
@@ -70910,6 +70910,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.124,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "66ea51ff4f6ed95da36ac2cf4a46ad52d53913ad",
+          "message": "perf(opt): close the btopt dict-band gap via upstream getAllMatches shape (#448)\n\n* perf(opt): close the btopt dict-band gap via upstream getAllMatches shape\n\nReshape the optimal-parser per-position find toward upstream's\nZSTD_insertBtAndGetAllMatches shape (one inlined body, one call per\nposition, match-length template resolved once per block), and fix a\nHuffman height-limiter panic reachable on realistic literal histograms.\n\nPerf (byte-identical output across the suite):\n\n- Inline the find monolith into collect (upstream ZSTD_btGetAllMatches\n  shape): rep probe + hash3 probe + BT tree walk folded into one\n  out-of-line body, one call per position, replacing a nested call chain\n  that paid per-position argument marshalling upstream never pays.\n- Resolve the SIMD kernel tier once per block, not per segment: the\n  per-position loop runs under one kernel-monomorphized expansion instead\n  of re-entering the runtime CPU-tier dispatch on every call.\n- Pass the cost profile by reference into the deepest per-position\n  crossing (the 24-byte struct was stack-copied every call).\n- Take the DP scratch buffers once per block and share them across both\n  btultra2 passes, dropping a take + restore round-trip per segment.\n- Trim the no-match literal path: defer price-cache / stamp / base-node\n  setup past the no-match seed, drop a discarded price recompute, skip\n  the no-op plan-stats update on no-match segments.\n\ni9-9900K (BMI2 + AVX2), L16 btopt small-10k-random compress-dict,\nlibzstd control flat at 388 us: pure Rust 932 us -> 657 us (-29%),\n2.40x -> 1.70x vs libzstd.\n\nHuffman fix:\n\nThe height limiter (upstream HUF_setMaxHeight equivalent) walked the\ncost-repair fill in the wrong direction on certain <=128 KB literal\nhistograms, leaving a code whose Kraft sum was not a power of two. The\ntable builder rejects such a code, surfacing as a panic. The limiter now\nfills downward correctly and validates the Kraft sum, falling back to the\ndistributed-weight construction when it cannot reach the bit-length cap;\nthe dead repair helper is removed. Adds a regression test (pinned trigger\nhistogram plus 300k fuzzed histograms capped at the 128 KB literal limit).\n\n* refactor(kernel): resolve the SIMD tier once per invoke, not per block\n\nThe HC / optimal / btlazy2 strategy entries and the BT-walker dispatchers\ncalled select_kernel() per block (btultra2 twice: seed + main pass),\nre-reading the cached OnceLock atomic inside the hot strategy path. The\nFast / Row / Dfast matchers already cache the resolved tier in a field at\nconstruction; mirror that for the binary-tree path.\n\nMatchTable now caches the resolved tier in a field, set once via\nselect_kernel() at construction (once per encoder invoke, since the matcher\nis built once per FrameCompressor). Every per-block strategy entry and BT\ndispatcher reads the cached field instead of re-detecting. select_kernel()\nis now called exactly once per matcher (the documented \"once at the entry\npoint of each encoder call\" contract), never inside a strategy or hot loop.\n\nByte-identical: the cached value equals what select_kernel() returned per\nblock, because the CPU tier is constant for the process lifetime.\n\n* test(opt): assert all kernel tiers emit identical BT-optimal sequences\n\nForcing the cached table.kernel runs each per-CPU tier's monomorphized\nBT-collect / DP wrapper on one machine, pinning the scalar-vs-SIMD\nbit-identity invariant and covering the per-tier wrappers the runtime\ndispatch leaves cold (only the selected tier would otherwise execute).\n\n* test(levels,huff0): cover cParams strategy arms and degenerate weight alphabets\n\n- level_params_strategy_and_search_method_agree_across_tiers: resolves\n  positive levels over every source-size tier, asserting each derived\n  strategy pairs with its search method; exercises the cParams -> LevelParams\n  strategy arms the existing level tests (which used StrategyTag::for_level)\n  left cold.\n- build_limited_weights_handles_degenerate_alphabets: single-symbol and\n  all-zero histograms hit the height limiter's leaves.len() <= 1 early-out.\n\n* test(levels): add regression for out-of-range level clamping\n\nresolve_level_params routes Level(22) through the btultra2-specific\nsource-size resolver but lets Level(23+) fall through to the generic\ncParams path, so an out-of-range level resolves to a DIFFERENT config\nthan the max level. This test asserts Level(MAX_LEVEL + k) == Level(MAX_LEVEL)\nacross source sizes and fails until the clamp routes through the same path.\n\n* fix(levels): clamp out-of-range levels to the max-level resolver\n\nresolve_level_params special-cased only Level(22) for the btultra2\nsource-size resolver; Level(23+) fell through to the generic cParams\nderivation and produced a different config than Level(22). Match\nLevel(n) for n >= MAX_LEVEL so any out-of-range level clamps to the\nsame max-level configuration.\n\n* test(huff0): split the 300k height-limiter fuzz into a stress test\n\nKeep the deterministic TRIGGER regression plus a 4k randomized sweep in\nthe default suite (fast), and move the full 300k sweep behind #[ignore]\nso the normal run stays quick; invoke with --run-ignored for the deep pass.\n\nAlso gate the HC dictionary-match descent on dms.is_primed() (the canonical\nvalidity predicate) instead of walking dms.table() directly, so a\npresent-but-stale DMS table is never searched.\n\n* test(huff0): cover the all-zero degenerate histogram explicitly\n\nThe degenerate-alphabets test comment claimed all-zero coverage but the\nbody only checked single/two-symbol inputs. Add an explicit all-zero\nassertion for the early-out's actual behavior (all weights stay zero) and\nreword the comment: an all-zero histogram never reaches production (a real\nblock always has >= 1 literal) and cannot meet the power-of-two invariant a\nzero-symbol code has no terms for, so only the symbol-bearing cases assert it.\n\n* perf(decode): hold the dict by borrowed pointer, mirror C zero-refcount apply\n\nUpstream zstd's ZSTD_copyDDictParameters stores RAW POINTERS into a\ncaller-owned DDict every frame (dctx->LLTptr = ddict->entropy.LLTable,\nprefixStart = dictContent, ...) — no refcount, no per-frame clone. We held\nan owned Arc<Dictionary> in three places (FSE + Huffman scratch + decode\nbuffer) and re-cloned all three each frame, dropping them at teardown: six\natomic refcount ops per frame on a value the dictionary owner already keeps\nalive for the whole decode. On a tiny frame that fixed per-frame cost is a\nmeasurable share of decode time.\n\nMirror C: the three scratch sites now hold Option<NonNull<Dictionary>>, set\nunconditionally from a live &DictionaryHandle each frame (one pointer store,\nno atomic) and read through a checked unsafe deref while the COW source is\nDict. The pointee is kept alive across the whole decode by the dictionary\nowner — the FrameDecoder owned_dicts/shared_dicts registry, or the\n&DictionaryHandle the caller holds across decode_all_with_dict_handle — so\nthe borrow is valid for every read (documented contract on each dict field).\n\nNonNull suppresses auto-Send/Sync, so unsafe impl Send/Sync is restored on\neach scratch type (the pointee is Send+Sync, read-only, owner-kept-alive);\na compile-time assert pins FrameDecoder: Send + Sync against regression.\n\nByte-identical (same dict tables; only the reference's ownership changed\nfrom owned-Arc to borrowed-pointer). i9 small-10k-random decompress-dict,\nflat c_ffi control: L3 dfast -2.3%, L16 btopt -1.8%.\n\n* test(decode): keep the dictionary handle alive across set_dict\n\n`set_dict` now stores a borrowed `NonNull` into the handle's dictionary\n(07f85a9d), so the handle must outlive the `DecodeBuffer`. Four tests passed a\ntemporary handle (`&dict()`, `&dict.into_handle()`,\n`&DictionaryHandle::from_dictionary(...)`) whose drop at the end of the\nstatement left the stored pointer dangling; the subsequent `repeat_from_dict`\nreads then hit freed memory, surfacing as an access violation (0xc0000005) on\nWindows and silent use-after-free elsewhere. Bind each handle to a local that\noutlives the buffer's reads.\n\n* refactor(decode): hold dict by borrow-checked arg, drop raw pointer\n\nReplace the raw-pointer dictionary hold (NonNull stored in the decode\nscratch + buffer, with `unsafe impl Send/Sync` to restore the auto\ntraits) with a borrow-checked design that the compiler proves sound and\nthat mirrors C's per-frame pointer hand-off without any refcount churn.\n\n- The decode scratch / buffer no longer OWN or POINT AT the dictionary.\n  Every `Dict`-sourced table read (FSE ll/of/ml, HUF, dict content)\n  takes the dictionary as a call-scoped `dict: Option<&Dictionary>`\n  argument, threaded through the whole decode pipeline (block decoder,\n  literals, sequence executors, per-tier SIMD monoliths). Source flags\n  on the scratch still select Local vs Dict; the borrow supplies the\n  bytes only when the flag says Dict.\n- `FrameDecoderState` gains a single owned liveness root,\n  `active_dict: Option<DictionaryHandle>`, set at dict-apply via\n  `set_active_dict` with a `ptr::eq` skip so re-applying the SAME\n  dictionary frame-over-frame (the reuse hot path) clones zero times;\n  one clone only on a genuine dictionary swap. The block loop borrows\n  `&Dictionary` from it, disjoint from the mutable decoder scratch.\n- Removes `NonNull` dict fields, the `unsafe impl Send/Sync` blocks,\n  `DecodeBuffer::set_dict`, and the handle-alive test scaffolding the\n  raw-pointer API forced on callers. `FrameDecoder: Send + Sync` now\n  auto-derives.\n\nbyte-identical decode output; 794 tests pass.\n\n* test(decode): add regression for force_dict active-dict install\n\nA dictless-header frame decoded with a runtime dictionary applied via\nforce_dict arms Dict-sourced scratch tables but, before the fix, never\ninstalls the owning dictionary handle (active_dict). The block loop then\nderives a None dictionary borrow while the scratch source says Dict, so\nthe first dict-table read panics. This test fails on the current code.\n\n* fix(decode): cover forced-dict, lsm snapshot, and reused-decoder dict paths\n\nThree gaps in the borrow-checked dictionary threading, all surfaced by\nreview of the prior refactor:\n\n- `force_dict` armed `Dict`-sourced scratch tables but never installed\n  the owning `active_dict` handle (the other two dict-apply sites did).\n  A dictless-header frame decoded with a runtime dictionary then derived\n  a `None` borrow while the scratch said `Dict`, panicking on the first\n  dict-table read. Add the missing `set_active_dict`. (regression test in\n  the preceding commit)\n\n- The `lsm` resume-snapshot path (`export_entropy` / `restore_entropy`)\n  still called `FSEScratch::reinit_from` / `HuffmanScratch::reinit_resolved_from`\n  with the old arity, breaking the `lsm` build. Thread the dictionary\n  borrow through: export passes the live frame's dictionary (the snapshot\n  resolves Dict axes into self-contained Local bytes); restore passes\n  `None` (the snapshot is already Local).\n\n- A reused decoder keeps `active_dict` across a no-dict frame so the\n  per-apply `ptr::eq` reuse-skip works, but the decode loop derived the\n  dictionary borrow from it unconditionally. A no-dict frame following a\n  dict frame could then resolve a stray out-of-window offset against the\n  stale dictionary content instead of erroring. Gate every `dict_ref`\n  derivation (all four decode sites) on `using_dict.is_some()` so only a\n  genuinely dict-backed frame sees the held dictionary.\n\ndefault + lsm test suites green (795 / 846); byte-identical decode output.",
+          "timestamp": "2026-06-25T19:15:28+03:00",
+          "tree_id": "a961958b5f49e5e9e7ba6a3f3734b85b69a34000",
+          "url": "https://github.com/structured-world/structured-zstd/commit/66ea51ff4f6ed95da36ac2cf4a46ad52d53913ad"
+        },
+        "date": 1782406580464,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.081,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.085,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 225.818,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 203.772,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 1.032,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.718,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.956,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.944,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.811,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.869,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.025,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.126,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.025,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.126,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.008,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 9.339,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.548,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.065,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.239,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.326,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.023,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.365,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.047,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.274,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.048,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.027,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.188,
             "unit": "ms"
           }
         ]
