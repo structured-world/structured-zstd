@@ -1096,6 +1096,19 @@ fn emit_block_structure_report(
     if compressed.len() < 5 {
         return;
     }
+    // Raw hex of the frame head: lets us read the literals-section header and
+    // Huffman tree description (FSE weights vs direct nibbles) by hand when
+    // comparing rust vs ffi generation byte-for-byte on a fixture.
+    let head_len = compressed.len().min(48);
+    let hex: String = compressed[..head_len]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    println!(
+        "REPORT_HEX scenario={} level={} encoder={} head=[{}]",
+        scenario.id, level.name, encoder, hex
+    );
     let desc = compressed[4];
     let fcs_flag = desc >> 6;
     let single_segment = ((desc >> 5) & 0x1) == 1;
