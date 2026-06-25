@@ -640,6 +640,74 @@ fn btultra2_seed_pass_initializes_opt_state() {
     );
 }
 
+/// Every per-CPU kernel tier emits a bit-identical sequence stream. Forcing
+/// `table.kernel` runs each tier's monomorphized BT-collect / DP wrapper on
+/// one machine (only the runtime-selected tier would otherwise execute), which
+/// both pins the scalar-vs-SIMD bit-identity invariant and exercises the
+/// per-tier wrappers the runtime dispatch leaves cold. x86-only: the aarch64
+/// path dispatches NEON unconditionally, so the cached field is read only in
+/// the x86 `cfg` block.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[test]
+fn bt_optimal_all_kernel_tiers_emit_identical_sequences() {
+    use crate::encoding::Sequence;
+    use crate::encoding::fastpath::FastpathKernel;
+
+    // Tiers the running CPU can legally execute: each dispatch arm is `unsafe`
+    // and assumes the tier's target_feature is present. Scalar is always safe;
+    // the SIMD tiers gate on runtime detection so the test stays valid on any
+    // x86 box (including a CI runner without AVX2).
+    let mut tiers = Vec::new();
+    tiers.push(FastpathKernel::Scalar);
+    if std::is_x86_feature_detected!("sse4.2") {
+        tiers.push(FastpathKernel::Sse42);
+    }
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi2") {
+        tiers.push(FastpathKernel::Avx2Bmi2);
+    }
+
+    // Mixed-redundancy input so the BT walk, the rep-code probe, and the hash3
+    // short-match probe all fire (a pure ramp would never exercise the rep path).
+    let data: Vec<u8> = (0..48 * 1024)
+        .map(|i| ((i * 7 + i / 13) % 67) as u8)
+        .collect();
+
+    let run = |tier: FastpathKernel| -> Vec<(usize, usize, usize)> {
+        let mut hc = HcMatchGenerator::new(1 << 20);
+        hc.configure(
+            BTULTRA2_HC_CONFIG,
+            super::super::strategy::StrategyTag::BtUltra2,
+            26,
+        );
+        hc.table.add_data(data.clone(), |_| {});
+        hc.table.kernel = tier;
+        let mut seqs = Vec::new();
+        hc.start_matching(|seq| match seq {
+            Sequence::Triple {
+                literals,
+                offset,
+                match_len,
+            } => seqs.push((literals.len(), offset, match_len)),
+            Sequence::Literals { literals } => seqs.push((literals.len(), 0, 0)),
+        });
+        seqs
+    };
+
+    let reference = run(tiers[0]);
+    assert!(
+        !reference.is_empty(),
+        "btultra2 should emit sequences on mixed-redundancy input"
+    );
+    for &tier in &tiers[1..] {
+        assert_eq!(
+            run(tier),
+            reference,
+            "kernel tier {tier:?} diverged from {:?}: scalar/SIMD bit-identity broken",
+            tiers[0],
+        );
+    }
+}
+
 #[test]
 fn btultra2_profile_disables_small_offset_handicap() {
     // Pre-Phase-3 this test duplicated the profile build with
