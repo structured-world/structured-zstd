@@ -708,23 +708,25 @@ pub(crate) struct CompressState<M: Matcher> {
     /// ties it). So it is gated ON only for large Fast frames; non-Fast
     /// strategies always keep it (their matchers diverge, making the search
     /// load-bearing for ratio — gating those is deferred). Set per frame
-    /// alongside `strategy_tag` via [`fast_huf_search_enabled`].
+    /// alongside `strategy_tag` via [`huf_search_enabled`].
     pub(crate) huf_optimal_search: bool,
 }
 
-/// Whether the Fast-strategy HUF literal build should run the #167 table-log
-/// search for a frame of `source_size` bytes (see
-/// [`CompressState::huf_optimal_search`]). Non-Fast strategies always search.
-/// For Fast, enable the search only above 128 KiB (one full block) — below
-/// that the per-frame setup dominates and the search's ~1.5 us is a large
-/// relative cost for a ratio gain the cheap path forgoes while still tying
-/// upstream zstd. Unknown size (streaming) keeps the search for conservative
-/// ratio.
-pub(crate) fn fast_huf_search_enabled(
+/// Whether the HUF literal build should run the #167 table-log search for a
+/// frame of `source_size` bytes (see [`CompressState::huf_optimal_search`]).
+/// The Fast and DoubleFast strategies do little matching work, so per-frame
+/// HUF setup dominates a small frame and the search's ~1.5 us is a large
+/// relative cost for a ratio gain the cheap single-build forgoes while still
+/// tying upstream zstd. Gate the search to frames above 128 KiB (one full
+/// block) for those two. Higher strategies do enough matching that the search
+/// is a negligible fraction and always run it for the ratio edge. Unknown size
+/// (streaming) keeps the search for conservative ratio.
+pub(crate) fn huf_search_enabled(
     strategy: crate::encoding::strategy::StrategyTag,
     source_size: Option<u64>,
 ) -> bool {
-    if strategy != crate::encoding::strategy::StrategyTag::Fast {
+    use crate::encoding::strategy::StrategyTag;
+    if !matches!(strategy, StrategyTag::Fast | StrategyTag::Dfast) {
         return true;
     }
     match source_size {
@@ -1031,7 +1033,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             crate::encoding::strategy::StrategyTag::for_compression_level(self.compression_level)
         });
         self.state.huf_optimal_search =
-            fast_huf_search_enabled(self.state.strategy_tag, self.source_size_hint);
+            huf_search_enabled(self.state.strategy_tag, self.source_size_hint);
         self.state.matcher.set_param_overrides(Some(overrides));
     }
 
@@ -1628,7 +1630,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // `initial_size_hint` (captured before the `.take()` above) — by here
         // `self.source_size_hint` is None.
         self.state.huf_optimal_search =
-            fast_huf_search_enabled(self.state.strategy_tag, initial_size_hint);
+            huf_search_enabled(self.state.strategy_tag, initial_size_hint);
         let cached_entropy = if use_dictionary_state {
             self.dictionary_entropy_cache.as_ref()
         } else {
