@@ -44,6 +44,24 @@ fn build_limited_weights_always_power_of_two() {
     );
     let _ = HuffmanTable::build_from_counts_gated(TRIGGER, false);
 
+    // A modest randomized sweep keeps ongoing breadth in the default suite
+    // without dominating its wall-clock; the deep 300k sweep is the separate
+    // `#[ignore]` stress test below.
+    fuzz_limited_weights_power_of_two(4_000);
+}
+
+/// Deep randomized sweep over the height limiter. Excluded from the default
+/// run (it is ~30 s); invoke explicitly with `cargo nextest run --run-ignored`.
+#[test]
+#[ignore = "stress: 300k-case height-limiter fuzz, run with --run-ignored"]
+fn build_limited_weights_power_of_two_stress() {
+    fuzz_limited_weights_power_of_two(300_000);
+}
+
+/// Drive `iterations` randomized histograms through the height limiter,
+/// asserting every one yields a power-of-two Kraft sum (and builds without
+/// panicking on the non-search literal path).
+fn fuzz_limited_weights_power_of_two(iterations: usize) {
     let mut state = 0x1234_5678_9abc_def0u64;
     let mut next = || {
         state ^= state << 13;
@@ -51,7 +69,7 @@ fn build_limited_weights_always_power_of_two() {
         state ^= state << 17;
         state
     };
-    for _ in 0..300_000 {
+    for _ in 0..iterations {
         let n = 2 + (next() % 255) as usize;
         let skew = (next() % 6) as u32;
         let mut counts = alloc::vec![0usize; n];

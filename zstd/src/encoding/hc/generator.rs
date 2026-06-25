@@ -874,7 +874,12 @@ macro_rules! bt_insert_and_collect_matches_body {
         // `idx - dict_idx` (no upstream zstd `dmsIndexDelta`). The optimal parser
         // prices these (its DP lookahead values the repcode chain a dict match
         // seeds); the greedy/lazy parser commits the longest.
-        if let Some(dms) = $table.dms.table().filter(|_| compares_left > 0) {
+        // `is_primed()` is the canonical "DMS table is valid to walk" predicate
+        // (set only after a full build, cleared by `invalidate`): gate on it so
+        // a present-but-stale table is never descended. `is_primed()` implies
+        // the table exists (`mark_primed` requires `Some`), so `expect` holds.
+        if compares_left > 0 && $table.dms.is_primed() {
+            let dms = $table.dms.table().expect("is_primed() guarantees a DMS table");
             let region = $table.dms.region_len();
             let dh = $crate::encoding::match_table::storage::MatchTable::hash_position_at(
                 concat,
