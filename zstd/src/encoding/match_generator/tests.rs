@@ -601,6 +601,36 @@ fn level22_non_power_of_two_small_source_uses_tier3_params() {
     assert_eq!(hc.target_len, 999);
 }
 
+/// Levels above `MAX_LEVEL` must resolve identically to `MAX_LEVEL`: an
+/// out-of-range level is clamped, not given a distinct configuration. The
+/// dedicated Level(22) resolver carries btultra2-specific source-size handling,
+/// so a clamped high level has to route through the SAME path, not fall through
+/// to the generic cParams derivation.
+#[test]
+fn levels_above_max_resolve_identically_to_max() {
+    let sizes = [
+        None,
+        Some(1024u64),
+        Some(16 * 1024),
+        Some(128 * 1024),
+        Some(1 << 20),
+    ];
+    for &sz in &sizes {
+        let at_max = resolve_level_params(CompressionLevel::Level(CompressionLevel::MAX_LEVEL), sz);
+        for over in [
+            CompressionLevel::MAX_LEVEL + 1,
+            CompressionLevel::MAX_LEVEL + 50,
+            1000,
+        ] {
+            let clamped = resolve_level_params(CompressionLevel::Level(over), sz);
+            assert!(
+                clamped == at_max,
+                "Level({over}) size {sz:?} must resolve identically to Level(MAX_LEVEL)"
+            );
+        }
+    }
+}
+
 #[test]
 fn level22_small_source_uses_window_bounded_hash3_log() {
     let mut hc = HcMatchGenerator::new(1 << 14);
