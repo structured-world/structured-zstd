@@ -51,6 +51,11 @@ const HASH_READ_SIZE: usize = 8;
 /// rep emissions that upstream produces.
 const DFAST_REP_MIN_MATCH_LEN: usize = 4;
 
+/// Cached `DFTRACE` env flag for the dfast commit-path diagnostic (read once;
+/// see the `DFTRACE` gate in the fast-loop commit handler).
+#[cfg(feature = "std")]
+static DFTRACE_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 #[derive(Clone)]
 pub(crate) struct DfastMatchGenerator {
     pub(crate) max_window_size: usize,
@@ -2058,7 +2063,10 @@ macro_rules! start_matching_fast_loop_body {
             // previous `Option<MatchCandidate>` + sibling `usize`
             // pairing relied on a comment-block to flag the coupling.
             enum InnerExit {
-                Committed(MatchCandidate),
+                // `u8` is a debug path tag (0=rep1, 1=long@ip0, 2=short/_search_next_long,
+                // 3=dict-long, 4=dict-snl), surfaced by the `DFTRACE` env gate in the
+                // commit handler to diagnose match-path / offset divergence vs C ffi.
+                Committed(MatchCandidate, u8),
                 Tail(usize),
             }
 
@@ -2134,9 +2142,15 @@ macro_rules! start_matching_fast_loop_body {
                 let rep1 = $self.offset_hist[0] as usize;
                 if rep1 != 0 && rep1 <= abs_ip1 {
                     let cand_pos_r = abs_ip1 - rep1;
-                    if cand_pos_r >= wlow1
-                        && cand_pos_r >= $current_abs_start + literals_start
-                    {
+                    // Window-low bound ONLY (upstream zstd `zstd_double_fast.c:190`
+                    // gates the rep on nothing but `offset_1 > 0` and the 4-byte
+                    // equality at `ip+1-offset_1`, i.e. the candidate is in the
+                    // prefix). A prior extra `cand_pos_r >= literals_start` clause
+                    // rejected essentially EVERY rep — after a match
+                    // `literals_start ≈ ip`, so any back-reference (cand before
+                    // the literal cursor) failed it — collapsing the rep path and
+                    // forcing the long-hash to mint creeping offsets.
+                    if cand_pos_r >= wlow1 {
                         let cand_idx_r = cand_pos_r - history_abs_start;
                         // 4-byte gate; full forward count only if it passes.
                         let cand4 = unsafe {
@@ -2191,7 +2205,7 @@ macro_rules! start_matching_fast_loop_body {
                                     match_len,
                                     lit_len_ip1,
                                 );
-                                break 'inner InnerExit::Committed(rep_cand);
+                                break 'inner InnerExit::Committed(rep_cand, 0);
                             }
                         }
                     }
@@ -2294,7 +2308,7 @@ macro_rules! start_matching_fast_loop_body {
                                     *long_hash_ptr.add(hl1_idx) = packed_ip1;
                                 }
                             }
-                            break 'inner InnerExit::Committed(cand);
+                            break 'inner InnerExit::Committed(cand, 1);
                         }
                     }
                     }
@@ -2363,7 +2377,7 @@ macro_rules! start_matching_fast_loop_body {
                                     match_len,
                                     lit_len_ip0,
                                 );
-                                break 'inner InnerExit::Committed(cand);
+                                break 'inner InnerExit::Committed(cand, 3);
                             }
                         }
                     }
@@ -2580,7 +2594,7 @@ macro_rules! start_matching_fast_loop_body {
                                         *long_hash_ptr.add(hl1_idx) = packed_ip1;
                                     }
                                 }
-                                break 'inner InnerExit::Committed(chosen);
+                                break 'inner InnerExit::Committed(chosen, 2);
                             }
                             // Below-floor short hit with no retry
                             // upgrade — fall through to the step bump
@@ -2658,7 +2672,7 @@ macro_rules! start_matching_fast_loop_body {
                                     lit_len_ip0,
                                 );
                                 if dcand.match_len >= DFAST_MIN_MATCH_LEN {
-                                    break 'inner InnerExit::Committed(dcand);
+                                    break 'inner InnerExit::Committed(dcand, 4);
                                 }
                             }
                         }
@@ -2686,7 +2700,23 @@ macro_rules! start_matching_fast_loop_body {
             };
 
             match inner_exit {
-                InnerExit::Committed(candidate) => {
+                InnerExit::Committed(candidate, _path_tag) => {
+                    // `DFTRACE` env gate: dump each committed match's path tag +
+                    // (offset, match_len, literal_len) so the match-path / offset
+                    // stream can be diffed against C ffi when chasing a dfast
+                    // ratio divergence. The env is read ONCE into a cached flag
+                    // (a per-commit `getenv` showed up at ~3% of small-frame
+                    // encode); off by default, an atomic load in production.
+                    #[cfg(feature = "std")]
+                    if *DFTRACE_ENABLED.get_or_init(|| std::env::var_os("DFTRACE").is_some()) {
+                        std::eprintln!(
+                            "DFT path={} off={} ml={} ll={}",
+                            _path_tag,
+                            candidate.offset,
+                            candidate.match_len,
+                            candidate.start - $current_abs_start - literals_start,
+                        );
+                    }
                     let start = $self.emit_candidate(
                         $current_abs_start,
                         &mut literals_start,
