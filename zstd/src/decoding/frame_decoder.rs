@@ -1495,6 +1495,14 @@ impl FrameDecoder {
         self.direct_frames
     }
 
+    /// Test-only: whether the decode state currently holds an owning dictionary
+    /// handle (`active_dict`). Every path that arms `Dict`-sourced scratch tables
+    /// must also install this handle, or a later dict-table read resolves `None`.
+    #[cfg(test)]
+    pub(crate) fn active_dict_installed(&self) -> bool {
+        self.state.as_ref().is_some_and(|s| s.active_dict.is_some())
+    }
+
     /// Whether the current frames last block has been decoded yet
     /// If this returns true you can call the drain* functions to get all content
     /// (the read() function will drain automatically if this returns true)
