@@ -708,6 +708,57 @@ fn bt_optimal_all_kernel_tiers_emit_identical_sequences() {
     }
 }
 
+/// Resolving positive levels across the source-size tiers drives every
+/// strategy arm of the cParams -> `LevelParams` derivation, and each resolved
+/// strategy must pair with the matching search method (Fast -> Fast,
+/// Dfast -> DoubleFast, Greedy/Lazy -> RowHash, the binary-tree family ->
+/// BinaryTree). A mismatch means the derivation wired a backend onto the wrong
+/// search path.
+#[test]
+fn level_params_strategy_and_search_method_agree_across_tiers() {
+    use super::super::strategy::{SearchMethod, StrategyTag};
+    // One size per upstream cParams tier (> 256 KiB, 128..256 KiB, 16..128 KiB,
+    // <= 16 KiB) plus the unknown-size default, so the matrix reaches every
+    // tier's strategy choices.
+    let sizes = [
+        Some(1024u64),
+        Some(16 * 1024),
+        Some(128 * 1024),
+        Some(256 * 1024),
+        Some(8 << 20),
+        None,
+    ];
+    let mut seen: Vec<StrategyTag> = Vec::new();
+    for lvl in 1..=22i32 {
+        for &sz in &sizes {
+            let p = resolve_level_params(CompressionLevel::Level(lvl), sz);
+            let consistent = match p.strategy_tag {
+                StrategyTag::Fast => p.search == SearchMethod::Fast,
+                StrategyTag::Dfast => p.search == SearchMethod::DoubleFast,
+                StrategyTag::Greedy | StrategyTag::Lazy => p.search == SearchMethod::RowHash,
+                StrategyTag::Btlazy2
+                | StrategyTag::BtOpt
+                | StrategyTag::BtUltra
+                | StrategyTag::BtUltra2 => p.search == SearchMethod::BinaryTree,
+            };
+            assert!(
+                consistent,
+                "level {lvl} size {sz:?}: strategy {:?} paired with search {:?}",
+                p.strategy_tag, p.search
+            );
+            if !seen.contains(&p.strategy_tag) {
+                seen.push(p.strategy_tag);
+            }
+        }
+    }
+    // The matrix must exercise a spread of arms, not collapse onto one backend.
+    assert!(
+        seen.len() >= 4,
+        "level/size matrix only reached {} strategy arms: {seen:?}",
+        seen.len()
+    );
+}
+
 #[test]
 fn btultra2_profile_disables_small_offset_handicap() {
     // Pre-Phase-3 this test duplicated the profile build with

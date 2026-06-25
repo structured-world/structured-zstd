@@ -102,6 +102,38 @@ fn build_limited_weights_always_power_of_two() {
     }
 }
 
+/// Degenerate alphabets take the height limiter's `leaves.len() <= 1`
+/// early-out: a single non-zero symbol maps to a one-bit code, and the
+/// all-zero histogram yields no leaf at all. Both must keep the power-of-two
+/// weight-sum invariant the table builder relies on.
+#[test]
+fn build_limited_weights_handles_degenerate_alphabets() {
+    // Single non-zero symbol: the lone leaf gets weight 1, every other slot 0.
+    let mut single = alloc::vec![0usize; 8];
+    single[3] = 1000;
+    let w = build_limited_weights(&single, 11);
+    assert!(
+        huffman_weight_sum_is_power_of_two(&w),
+        "single-symbol weights broke the power-of-two invariant: {w:?}"
+    );
+    assert_eq!(w[3], 1, "the only symbol should map to a one-bit code");
+    assert!(
+        w.iter().enumerate().all(|(i, &x)| i == 3 || x == 0),
+        "no symbol other than the single non-zero one may carry a weight: {w:?}"
+    );
+
+    // Two symbols: the smallest alphabet that runs the full build path
+    // (leaves.len() > 1) rather than the degenerate early-out.
+    let mut pair = alloc::vec![0usize; 8];
+    pair[1] = 600;
+    pair[5] = 400;
+    let w2 = build_limited_weights(&pair, 11);
+    assert!(
+        huffman_weight_sum_is_power_of_two(&w2),
+        "two-symbol weights broke the power-of-two invariant: {w2:?}"
+    );
+}
+
 #[test]
 fn weights() {
     // assert_eq!(distribute_weights(5).as_slice(), &[1, 1, 2, 3, 4]);
