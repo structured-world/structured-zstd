@@ -38,7 +38,7 @@ fn rejects_when_internal_state_expects_header() {
     let mut src: &[u8] = &[];
     let h = header(BlockType::RLE, 4, 1);
     let err = d
-        .decode_block_content_from_slice(&h, &mut ws, &mut src)
+        .decode_block_content_from_slice(&h, &mut ws, None, &mut src)
         .expect_err("must err on body before header");
     assert!(matches!(
         err,
@@ -54,7 +54,7 @@ fn rejects_when_internal_state_failed() {
     let mut src: &[u8] = &[0x42];
     let h = header(BlockType::RLE, 4, 1);
     let err = d
-        .decode_block_content_from_slice(&h, &mut ws, &mut src)
+        .decode_block_content_from_slice(&h, &mut ws, None, &mut src)
         .expect_err("must err on Failed state");
     assert!(matches!(err, DecodeBlockContentError::DecoderStateIsFailed));
 }
@@ -68,7 +68,7 @@ fn rle_empty_source_errors_not_panics() {
     let mut src: &[u8] = &[];
     let h = header(BlockType::RLE, 4, 1);
     let err = d
-        .decode_block_content_from_slice(&h, &mut ws, &mut src)
+        .decode_block_content_from_slice(&h, &mut ws, None, &mut src)
         .expect_err("must err on empty RLE source");
     match &err {
         DecodeBlockContentError::ReadError { step, source } => {
@@ -93,7 +93,7 @@ fn raw_truncated_source_errors_not_panics() {
     let mut src: &[u8] = &[1, 2, 3];
     let h = header(BlockType::Raw, 10, 10);
     let err = d
-        .decode_block_content_from_slice(&h, &mut ws, &mut src)
+        .decode_block_content_from_slice(&h, &mut ws, None, &mut src)
         .expect_err("must err on truncated raw source");
     match &err {
         DecodeBlockContentError::ReadError { step, source } => {
@@ -113,7 +113,7 @@ fn compressed_truncated_source_errors_not_panics() {
     let mut src: &[u8] = &[0u8; 8];
     let h = header(BlockType::Compressed, 0, 100);
     let err = d
-        .decode_block_content_from_slice(&h, &mut ws, &mut src)
+        .decode_block_content_from_slice(&h, &mut ws, None, &mut src)
         .expect_err("must err on truncated compressed source");
     match &err {
         DecodeBlockContentError::ReadError { step, source } => {
@@ -158,7 +158,7 @@ fn rle_oversized_against_user_slice_backend_returns_backend_overflow() {
     let mut src: &[u8] = &payload;
     let h = header(BlockType::RLE, 10, 1);
     let err = d
-        .decode_block_content_from_slice(&h, &mut direct, &mut src)
+        .decode_block_content_from_slice(&h, &mut direct, None, &mut src)
         .expect_err("RLE 10 bytes into 4-byte slice must error");
     match err {
         DecodeBlockContentError::BackendOverflow { step } => {
@@ -204,7 +204,7 @@ fn rle_overflow_leaves_source_unadvanced() {
     let mut src: &[u8] = &payload;
     let h = header(BlockType::RLE, 10, 1);
     let _ = d
-        .decode_block_content_from_slice(&h, &mut direct, &mut src)
+        .decode_block_content_from_slice(&h, &mut direct, None, &mut src)
         .expect_err("RLE 10 bytes into 4-byte slice must error");
     assert_eq!(
         src.as_ptr(),
@@ -228,7 +228,7 @@ fn rle_advances_source_by_one_byte_and_extends_buffer() {
     let mut src: &[u8] = &payload;
     let h = header(BlockType::RLE, 7, 1);
     let consumed = d
-        .decode_block_content_from_slice(&h, &mut ws, &mut src)
+        .decode_block_content_from_slice(&h, &mut ws, None, &mut src)
         .expect("RLE happy path");
     assert_eq!(consumed, 1);
     assert_eq!(src, &payload[1..], "1 byte consumed from source");

@@ -533,10 +533,10 @@ fn level22_uses_target_length_and_large_input_tables() {
 fn bt_levels_16_to_21_pin_clevels_params() {
     // Pins the BT-level (window_log, hash_log, chain_log, search_depth,
     // target_len) tuples so the clevels.h alignment cannot silently drift.
-    // Levels 16-20 mirror upstream `clevels.h` (srcSize > 256 KiB tier,
-    // search_depth = 1 << searchLog); level 21 intentionally keeps a deeper
-    // search_depth (512 vs upstream's 128) — it beats C on ratio there and
-    // the deeper walk is a deliberate ratio-positive divergence.
+    // All rows mirror upstream `clevels.h` (srcSize > 256 KiB tier,
+    // search_depth = 1 << searchLog) verbatim, since the level params are now
+    // derived from `ZSTD_defaultCParameters[tier][level]` rather than a
+    // hand-tuned table.
     let expected = [
         // (level, window_log, hash_log, chain_log, search_depth, target_len)
         (16u8, 22u8, 22usize, 22usize, 32usize, 48usize),
@@ -544,7 +544,7 @@ fn bt_levels_16_to_21_pin_clevels_params() {
         (18, 23, 22, 23, 64, 64),
         (19, 23, 22, 24, 128, 256),
         (20, 25, 23, 25, 128, 256),
-        (21, 26, 24, 24, 512, 256),
+        (21, 26, 24, 26, 128, 512),
     ];
     for (level, wlog, hlog, clog, sd, tl) in expected {
         let p = resolve_level_params(CompressionLevel::Level(level as i32), None);
@@ -601,6 +601,36 @@ fn level22_non_power_of_two_small_source_uses_tier3_params() {
     assert_eq!(hc.target_len, 999);
 }
 
+/// Levels above `MAX_LEVEL` must resolve identically to `MAX_LEVEL`: an
+/// out-of-range level is clamped, not given a distinct configuration. The
+/// dedicated Level(22) resolver carries btultra2-specific source-size handling,
+/// so a clamped high level has to route through the SAME path, not fall through
+/// to the generic cParams derivation.
+#[test]
+fn levels_above_max_resolve_identically_to_max() {
+    let sizes = [
+        None,
+        Some(1024u64),
+        Some(16 * 1024),
+        Some(128 * 1024),
+        Some(1 << 20),
+    ];
+    for &sz in &sizes {
+        let at_max = resolve_level_params(CompressionLevel::Level(CompressionLevel::MAX_LEVEL), sz);
+        for over in [
+            CompressionLevel::MAX_LEVEL + 1,
+            CompressionLevel::MAX_LEVEL + 50,
+            1000,
+        ] {
+            let clamped = resolve_level_params(CompressionLevel::Level(over), sz);
+            assert!(
+                clamped == at_max,
+                "Level({over}) size {sz:?} must resolve identically to Level(MAX_LEVEL)"
+            );
+        }
+    }
+}
+
 #[test]
 fn level22_small_source_uses_window_bounded_hash3_log() {
     let mut hc = HcMatchGenerator::new(1 << 14);
@@ -637,6 +667,125 @@ fn btultra2_seed_pass_initializes_opt_state() {
     assert!(
         hc.backend.bt_mut().opt_state.off_code_sum > 0,
         "btultra2 first block should seed offset-code statistics"
+    );
+}
+
+/// Every per-CPU kernel tier emits a bit-identical sequence stream. Forcing
+/// `table.kernel` runs each tier's monomorphized BT-collect / DP wrapper on
+/// one machine (only the runtime-selected tier would otherwise execute), which
+/// both pins the scalar-vs-SIMD bit-identity invariant and exercises the
+/// per-tier wrappers the runtime dispatch leaves cold. x86-only: the aarch64
+/// path dispatches NEON unconditionally, so the cached field is read only in
+/// the x86 `cfg` block.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[test]
+fn bt_optimal_all_kernel_tiers_emit_identical_sequences() {
+    use crate::encoding::Sequence;
+    use crate::encoding::fastpath::FastpathKernel;
+
+    // Tiers the running CPU can legally execute: each dispatch arm is `unsafe`
+    // and assumes the tier's target_feature is present. Scalar is always safe;
+    // the SIMD tiers gate on runtime detection so the test stays valid on any
+    // x86 box (including a CI runner without AVX2).
+    let mut tiers = Vec::new();
+    tiers.push(FastpathKernel::Scalar);
+    if std::is_x86_feature_detected!("sse4.2") {
+        tiers.push(FastpathKernel::Sse42);
+    }
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi2") {
+        tiers.push(FastpathKernel::Avx2Bmi2);
+    }
+
+    // Mixed-redundancy input so the BT walk, the rep-code probe, and the hash3
+    // short-match probe all fire (a pure ramp would never exercise the rep path).
+    let data: Vec<u8> = (0..48 * 1024)
+        .map(|i| ((i * 7 + i / 13) % 67) as u8)
+        .collect();
+
+    let run = |tier: FastpathKernel| -> Vec<(usize, usize, usize)> {
+        let mut hc = HcMatchGenerator::new(1 << 20);
+        hc.configure(
+            BTULTRA2_HC_CONFIG,
+            super::super::strategy::StrategyTag::BtUltra2,
+            26,
+        );
+        hc.table.add_data(data.clone(), |_| {});
+        hc.table.kernel = tier;
+        let mut seqs = Vec::new();
+        hc.start_matching(|seq| match seq {
+            Sequence::Triple {
+                literals,
+                offset,
+                match_len,
+            } => seqs.push((literals.len(), offset, match_len)),
+            Sequence::Literals { literals } => seqs.push((literals.len(), 0, 0)),
+        });
+        seqs
+    };
+
+    let reference = run(tiers[0]);
+    assert!(
+        !reference.is_empty(),
+        "btultra2 should emit sequences on mixed-redundancy input"
+    );
+    for &tier in &tiers[1..] {
+        assert_eq!(
+            run(tier),
+            reference,
+            "kernel tier {tier:?} diverged from {:?}: scalar/SIMD bit-identity broken",
+            tiers[0],
+        );
+    }
+}
+
+/// Resolving positive levels across the source-size tiers drives every
+/// strategy arm of the cParams -> `LevelParams` derivation, and each resolved
+/// strategy must pair with the matching search method (Fast -> Fast,
+/// Dfast -> DoubleFast, Greedy/Lazy -> RowHash, the binary-tree family ->
+/// BinaryTree). A mismatch means the derivation wired a backend onto the wrong
+/// search path.
+#[test]
+fn level_params_strategy_and_search_method_agree_across_tiers() {
+    use super::super::strategy::{SearchMethod, StrategyTag};
+    // One size per upstream cParams tier (> 256 KiB, 128..256 KiB, 16..128 KiB,
+    // <= 16 KiB) plus the unknown-size default, so the matrix reaches every
+    // tier's strategy choices.
+    let sizes = [
+        Some(1024u64),
+        Some(16 * 1024),
+        Some(128 * 1024),
+        Some(256 * 1024),
+        Some(8 << 20),
+        None,
+    ];
+    let mut seen: Vec<StrategyTag> = Vec::new();
+    for lvl in 1..=22i32 {
+        for &sz in &sizes {
+            let p = resolve_level_params(CompressionLevel::Level(lvl), sz);
+            let consistent = match p.strategy_tag {
+                StrategyTag::Fast => p.search == SearchMethod::Fast,
+                StrategyTag::Dfast => p.search == SearchMethod::DoubleFast,
+                StrategyTag::Greedy | StrategyTag::Lazy => p.search == SearchMethod::RowHash,
+                StrategyTag::Btlazy2
+                | StrategyTag::BtOpt
+                | StrategyTag::BtUltra
+                | StrategyTag::BtUltra2 => p.search == SearchMethod::BinaryTree,
+            };
+            assert!(
+                consistent,
+                "level {lvl} size {sz:?}: strategy {:?} paired with search {:?}",
+                p.strategy_tag, p.search
+            );
+            if !seen.contains(&p.strategy_tag) {
+                seen.push(p.strategy_tag);
+            }
+        }
+    }
+    // The matrix must exercise a spread of arms, not collapse onto one backend.
+    assert!(
+        seen.len() >= 4,
+        "level/size matrix only reached {} strategy arms: {seen:?}",
+        seen.len()
     );
 }
 

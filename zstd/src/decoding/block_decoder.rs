@@ -52,6 +52,7 @@ impl BlockDecoder {
         &mut self,
         header: &BlockHeader,
         workspace: &mut W,
+        dict: Option<&crate::decoding::dictionary::Dictionary>,
         source: &mut &[u8],
     ) -> Result<u64, DecodeBlockContentError> {
         use DecoderState as State;
@@ -132,7 +133,7 @@ impl BlockDecoder {
                     });
                 }
                 let (payload, tail) = source.split_at(n);
-                self.decompress_block_inplace(header, workspace, payload)?;
+                self.decompress_block_inplace(header, workspace, dict, payload)?;
                 *source = tail;
                 self.internal_state = State::ReadyToDecodeNextHeader;
                 Ok(u64::from(header.content_size))
@@ -144,6 +145,7 @@ impl BlockDecoder {
         &mut self,
         header: &BlockHeader,
         workspace: &mut W,
+        dict: Option<&crate::decoding::dictionary::Dictionary>,
         mut source: impl Read,
     ) -> Result<u64, DecodeBlockContentError> {
         match self.internal_state {
@@ -199,7 +201,7 @@ impl BlockDecoder {
             }
 
             BlockType::Compressed => {
-                self.decompress_block(header, workspace, source)?;
+                self.decompress_block(header, workspace, dict, source)?;
 
                 self.internal_state = DecoderState::ReadyToDecodeNextHeader;
                 Ok(u64::from(header.content_size))
@@ -211,6 +213,7 @@ impl BlockDecoder {
         &mut self,
         header: &BlockHeader,
         workspace: &mut W,
+        dict: Option<&crate::decoding::dictionary::Dictionary>,
         mut source: impl Read,
     ) -> Result<(), DecompressBlockError> {
         // Streaming-path entry: copy `content_size` bytes from the
@@ -238,6 +241,7 @@ impl BlockDecoder {
             parts.offset_hist,
             parts.literals_buffer,
             raw,
+            dict,
         )
     }
 
@@ -261,6 +265,7 @@ impl BlockDecoder {
         &mut self,
         header: &BlockHeader,
         workspace: &mut W,
+        dict: Option<&crate::decoding::dictionary::Dictionary>,
         raw: &[u8],
     ) -> Result<(), DecompressBlockError> {
         let parts = workspace.split();
@@ -276,6 +281,7 @@ impl BlockDecoder {
             parts.offset_hist,
             parts.literals_buffer,
             raw,
+            dict,
         )
     }
 
@@ -288,15 +294,16 @@ impl BlockDecoder {
     /// lifetime-widening trick is gone — disjoint-field borrows
     /// type-check naturally.
     #[allow(clippy::too_many_arguments)]
-    fn decompress_block_inplace_with_parts<B: super::buffer_backend::BufferBackend>(
+    fn decompress_block_inplace_with_parts<'d, B: super::buffer_backend::BufferBackend>(
         &mut self,
         header: &BlockHeader,
         huf: &mut crate::decoding::scratch::HuffmanScratch,
-        fse: &mut crate::decoding::scratch::FSEScratch,
+        fse: &'d mut crate::decoding::scratch::FSEScratch,
         buffer: &mut crate::decoding::decode_buffer::DecodeBuffer<B>,
         offset_hist: &mut [u32; 3],
         literals_buffer: &mut alloc::vec::Vec<u8>,
         raw: &[u8],
+        dict: Option<&'d crate::decoding::dictionary::Dictionary>,
     ) -> Result<(), DecompressBlockError> {
         let mut section = LiteralsSection::new();
         let bytes_in_literals_header = section.parse_from_header(raw)?;
@@ -338,7 +345,7 @@ impl BlockDecoder {
         let LiteralsView {
             data: literals_view,
             bytes_used: bytes_used_in_literals_section,
-        } = decode_literals_zerocopy(&section, huf, raw_literals, literals_buffer)?;
+        } = decode_literals_zerocopy(&section, huf, dict, raw_literals, literals_buffer)?;
         assert!(
             section.regenerated_size as usize == literals_view.len(),
             "Wrong number of literals: {}, Should have been: {}",
@@ -385,6 +392,7 @@ impl BlockDecoder {
                 buffer,
                 offset_hist,
                 literals_view,
+                dict,
             )?;
         } else {
             if !raw.is_empty() {

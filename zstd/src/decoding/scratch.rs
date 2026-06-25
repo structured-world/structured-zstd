@@ -3,7 +3,7 @@
 use super::buffer_backend::BufferBackend;
 use super::decode_buffer::DecodeBuffer;
 use super::ringbuffer::RingBuffer;
-use crate::decoding::dictionary::DictionaryHandle;
+use crate::decoding::dictionary::{Dictionary, DictionaryHandle};
 use crate::fse::SeqFSETable;
 use crate::huff0::HuffmanTable;
 use alloc::vec::Vec;
@@ -139,7 +139,6 @@ impl<B: BufferBackend> DecoderScratch<B> {
             huf: HuffmanScratch {
                 table: HuffmanTable::new(),
                 table_source: TableSource::Local,
-                dict: None,
             },
             fse: FSEScratch {
                 offsets: AlignedFSETable::new(MAX_OFFSET_CODE),
@@ -150,7 +149,6 @@ impl<B: BufferBackend> DecoderScratch<B> {
                 ll_source: TableSource::Local,
                 of_source: TableSource::Local,
                 ml_source: TableSource::Local,
-                dict: None,
             },
             buffer: DecodeBuffer::new(window_size),
             offset_hist: [1, 4, 8],
@@ -249,18 +247,16 @@ impl<B: BufferBackend> DecoderScratch<B> {
 
     pub fn init_from_dict(&mut self, dict: &DictionaryHandle) {
         let d = dict.as_dict();
-        // Copy-on-write: reference the dictionary's sequence FSE tables by
-        // handle instead of copying them into per-frame scratch. The eager
-        // copy was always wasted work: every block either reads the table
-        // by reference (Repeat mode) or rebuilds it (FSE/RLE/Predefined
-        // mode), so deferring the copy to the rebuild is strictly faster.
-        self.fse.attach_dict(dict.clone());
-        self.huf.attach_dict(dict.clone());
+        // Copy-on-write: the sequence FSE / Huffman tables are READ from the
+        // dictionary by reference (Repeat mode) or rebuilt locally (FSE / RLE /
+        // Predefined / Compressed mode) — never eagerly copied here (the upstream
+        // zstd `ZSTD_copyDDictParameters` memcpy is elided). This only arms the
+        // COW source flags + copies the scalar `offset_hist`; the dictionary
+        // itself is threaded into every read as a call-scoped borrow, so it is
+        // NOT stored and there is NO per-frame refcount bump.
+        self.fse.attach_dict(dict);
+        self.huf.attach_dict();
         self.offset_hist = d.offset_hist;
-        // Share the dictionary content by handle (Arc/Rc clone = refcount
-        // bump) instead of copying it into a per-frame buffer; the decoder
-        // reads match bytes straight out of the shared content.
-        self.buffer.set_dict(dict.clone());
         // Upstream zstd parity: `ZSTD_decompressBegin_usingDDict` sets
         // `dctx->ddictIsCold = 1` so the first block of the frame
         // engages the prefetch decoder regardless of long-offset
@@ -280,9 +276,11 @@ pub struct HuffmanScratch {
     /// locally-built one. `init_from_dict` attaches as `Dict`; a
     /// `Compressed` literals section rebuilds and flips to `Local`; a
     /// `Treeless` section reuses whatever source is current.
+    /// The `Dict`-sourced table reads the dictionary's Huffman table through a
+    /// call-scoped `dict: Option<&Dictionary>` borrow threaded into
+    /// [`Self::huf_table`] by the decode pipeline — no stored reference, no
+    /// refcount. See [`FSEScratch`] for the shared model.
     table_source: TableSource,
-    /// Shared dictionary handle backing the table when `Dict`-sourced.
-    dict: Option<DictionaryHandle>,
 }
 
 impl HuffmanScratch {
@@ -290,7 +288,6 @@ impl HuffmanScratch {
         HuffmanScratch {
             table: HuffmanTable::new(),
             table_source: TableSource::Local,
-            dict: None,
         }
     }
 
@@ -302,35 +299,29 @@ impl HuffmanScratch {
         self.table.heap_bytes()
     }
 
-    /// Live Huffman literals table: the shared dictionary's (zero-copy)
-    /// while the source is still `Dict`, else the locally-built one.
-    pub(crate) fn huf_table(&self) -> &HuffmanTable {
+    /// Live Huffman literals table: the dictionary's (zero-copy) while the
+    /// source is still `Dict`, else the locally-built one. `dict` is the
+    /// call-scoped borrow threaded in by the decode pipeline (must be `Some`
+    /// when the source is `Dict`).
+    pub(crate) fn huf_table<'a>(&'a self, dict: Option<&'a Dictionary>) -> &'a HuffmanTable {
         match self.table_source {
             TableSource::Local => &self.table,
-            TableSource::Dict => {
-                &self
-                    .dict
-                    .as_ref()
-                    .expect("Dict table source requires an attached dictionary handle")
-                    .as_dict()
-                    .huf
-                    .table
-            }
+            TableSource::Dict => &expect_dict(dict).huf.table,
         }
     }
 
-    /// Attach a shared dictionary copy-on-write: the literals table now
-    /// reads the dictionary's Huffman table by reference (one handle
-    /// clone, no table copy).
-    pub(crate) fn attach_dict(&mut self, dict: DictionaryHandle) {
+    /// Point the literals table at the dictionary's Huffman table (no table
+    /// bytes copied): re-arm the COW source only. The dictionary is read later
+    /// through the threaded `dict` borrow, never stored — NO refcount bump.
+    pub(crate) fn attach_dict(&mut self) {
+        // The COW table-source must be re-armed every frame (a prior frame's
+        // `Compressed` literals section may have flipped it to `Local`).
         self.table_source = TableSource::Dict;
-        self.dict = Some(dict);
     }
 
     /// Drop any dictionary attachment and revert to the local table.
     pub(crate) fn detach_dict(&mut self) {
         self.table_source = TableSource::Local;
-        self.dict = None;
     }
 
     /// Flip to the locally-built table (called after a `Compressed`
@@ -343,8 +334,12 @@ impl HuffmanScratch {
     /// Snapshot the live (COW-resolved) Huffman table into `self` as an
     /// owned `Local` copy (LSM resume snapshot/restore): materialises a
     /// `Dict`-sourced table so the result is self-contained.
-    pub(crate) fn reinit_resolved_from(&mut self, other: &HuffmanScratch) {
-        self.table.reinit_from(other.huf_table());
+    pub(crate) fn reinit_resolved_from(
+        &mut self,
+        other: &HuffmanScratch,
+        dict: Option<&Dictionary>,
+    ) {
+        self.table.reinit_from(other.huf_table(dict));
         self.detach_dict();
     }
 }
@@ -363,6 +358,15 @@ impl Default for HuffmanScratch {
 enum TableSource {
     Local,
     Dict,
+}
+
+/// Unwrap the call-scoped dictionary borrow at a `Dict`-sourced read. A `Dict`
+/// table source is only ever set by `attach_dict`, which the decode pipeline
+/// pairs with threading the active dictionary into every read — so `None` here
+/// is an internal invariant violation, not a recoverable input error.
+#[inline]
+fn expect_dict(dict: Option<&Dictionary>) -> &Dictionary {
+    dict.expect("a Dict-sourced table requires the active dictionary borrow")
 }
 
 #[derive(Clone)]
@@ -402,13 +406,15 @@ pub struct FSEScratch {
     /// Repeat-mode blocks leave the source untouched, so they read
     /// straight out of the shared dictionary handle until the first
     /// rebuild. On the no-dict path every axis stays `Local`.
+    /// The `Dict`-sourced axes read the dictionary's tables through a
+    /// call-scoped `dict: Option<&Dictionary>` borrow threaded into the read
+    /// accessors by the decode pipeline (resolved once per decode from the
+    /// owner — the `FrameDecoder` registry or `FrameDecoderState::active_dict`).
+    /// No dictionary reference is STORED here: the borrow checker guarantees the
+    /// dictionary outlives every read, with no refcount and no per-frame clone.
     ll_source: TableSource,
     of_source: TableSource,
     ml_source: TableSource,
-    /// Shared dictionary handle backing any axis whose source is `Dict`.
-    /// Held as one `Arc`/`Rc` clone (a refcount bump, not a table copy);
-    /// `None` on the no-dict path.
-    dict: Option<DictionaryHandle>,
 }
 
 impl FSEScratch {
@@ -432,7 +438,6 @@ impl FSEScratch {
             ll_source: TableSource::Local,
             of_source: TableSource::Local,
             ml_source: TableSource::Local,
-            dict: None,
         }
     }
 
@@ -442,10 +447,10 @@ impl FSEScratch {
     /// result must be self-contained, so any `Dict`-sourced axis in
     /// `other` is materialised by copying the dictionary's table bytes
     /// into the local buffer and the source is set to `Local`.
-    pub fn reinit_from(&mut self, other: &Self) {
-        self.literal_lengths.reinit_from(other.ll_table());
-        self.offsets.reinit_from(other.of_table());
-        self.match_lengths.reinit_from(other.ml_table());
+    pub fn reinit_from(&mut self, other: &Self, dict: Option<&Dictionary>) {
+        self.literal_lengths.reinit_from(other.ll_table(dict));
+        self.offsets.reinit_from(other.of_table(dict));
+        self.match_lengths.reinit_from(other.ml_table(dict));
         // Copy the precomputed long-offset share instead of re-walking
         // the offsets table; the dict computes it once at build time and
         // it is stale-but-correct across Repeat-mode blocks.
@@ -457,59 +462,53 @@ impl FSEScratch {
         self.ll_source = TableSource::Local;
         self.of_source = TableSource::Local;
         self.ml_source = TableSource::Local;
-        self.dict = None;
     }
 
-    /// Live LL decode table: the shared dictionary's (zero-copy) when the
-    /// axis is still `Dict`-sourced, else the locally-built one.
-    pub(crate) fn ll_table(&self) -> &SeqFSETable {
+    /// Live LL decode table: the dictionary's (zero-copy) when the axis is
+    /// still `Dict`-sourced, else the locally-built one. `dict` is the
+    /// call-scoped borrow threaded in by the decode pipeline; it must be
+    /// `Some` whenever any axis is `Dict`-sourced (the caller resolves it from
+    /// the active dictionary before reading).
+    pub(crate) fn ll_table<'a>(&'a self, dict: Option<&'a Dictionary>) -> &'a SeqFSETable {
         match self.ll_source {
             TableSource::Local => &self.literal_lengths,
-            TableSource::Dict => &self.dict_ref().fse.literal_lengths,
+            TableSource::Dict => &expect_dict(dict).fse.literal_lengths,
         }
     }
 
     /// Live OF decode table (see [`Self::ll_table`]).
-    pub(crate) fn of_table(&self) -> &SeqFSETable {
+    pub(crate) fn of_table<'a>(&'a self, dict: Option<&'a Dictionary>) -> &'a SeqFSETable {
         match self.of_source {
             TableSource::Local => &self.offsets,
-            TableSource::Dict => &self.dict_ref().fse.offsets,
+            TableSource::Dict => &expect_dict(dict).fse.offsets,
         }
     }
 
     /// Live ML decode table (see [`Self::ll_table`]).
-    pub(crate) fn ml_table(&self) -> &SeqFSETable {
+    pub(crate) fn ml_table<'a>(&'a self, dict: Option<&'a Dictionary>) -> &'a SeqFSETable {
         match self.ml_source {
             TableSource::Local => &self.match_lengths,
-            TableSource::Dict => &self.dict_ref().fse.match_lengths,
+            TableSource::Dict => &expect_dict(dict).fse.match_lengths,
         }
     }
 
-    fn dict_ref(&self) -> &crate::decoding::dictionary::Dictionary {
-        self.dict
-            .as_ref()
-            .expect("Dict table source requires an attached dictionary handle")
-            .as_dict()
-    }
-
-    /// Attach a shared dictionary copy-on-write: every sequence FSE axis
-    /// now reads the dictionary's tables by reference. No table bytes are
-    /// copied (the eager per-frame entropy-table memcpy is elided); the
-    /// only cost is one handle clone plus copying the precomputed
-    /// long-offset share scalar.
-    pub(crate) fn attach_dict(&mut self, dict: DictionaryHandle) {
+    /// Point every sequence FSE axis at the dictionary's tables (no table bytes
+    /// copied — the eager per-frame entropy-table memcpy is elided). Only the
+    /// COW source flags + the precomputed long-offset share are set; the
+    /// dictionary itself is read later through the threaded `dict` borrow, never
+    /// stored — so this costs NO refcount bump.
+    pub(crate) fn attach_dict(&mut self, dict: &DictionaryHandle) {
         self.offsets_long_share = dict.as_dict().fse.offsets_long_share;
+        // Re-arm all three COW axes every frame (a prior frame may have rebuilt
+        // any of them to `Local`).
         self.ll_source = TableSource::Dict;
         self.of_source = TableSource::Dict;
         self.ml_source = TableSource::Dict;
-        self.dict = Some(dict);
     }
 
-    /// Drop any dictionary attachment and revert all axes to `Local`
-    /// (called on scratch `reset` so a reused workspace does not read a
-    /// previous frame's dictionary tables).
+    /// Revert all axes to `Local` (called on scratch `reset` so a reused
+    /// workspace does not read a previous frame's dictionary tables).
     pub(crate) fn detach_dict(&mut self) {
-        self.dict = None;
         self.ll_source = TableSource::Local;
         self.of_source = TableSource::Local;
         self.ml_source = TableSource::Local;

@@ -663,6 +663,7 @@ impl DecoderScratchKind {
     #[cfg(feature = "lsm")]
     fn export_entropy(
         &self,
+        dict: Option<&crate::decoding::dictionary::Dictionary>,
     ) -> (
         crate::decoding::scratch::FSEScratch,
         crate::decoding::scratch::HuffmanScratch,
@@ -672,10 +673,14 @@ impl DecoderScratchKind {
             Self::Ring(s) => (&s.fse, &s.huf, s.offset_hist),
             Self::Flat(s) => (&s.fse, &s.huf, s.offset_hist),
         };
+        // The live scratch may still be `Dict`-sourced; `reinit_from` /
+        // `reinit_resolved_from` resolve those axes through the borrow into a
+        // self-contained `Local` snapshot, so the dictionary is required here
+        // whenever the captured frame is dict-backed.
         let mut fse = crate::decoding::scratch::FSEScratch::new();
-        fse.reinit_from(fse_src);
+        fse.reinit_from(fse_src, dict);
         let mut huf = crate::decoding::scratch::HuffmanScratch::new();
-        huf.reinit_resolved_from(huf_src);
+        huf.reinit_resolved_from(huf_src, dict);
         (fse, huf, offset_hist)
     }
 
@@ -684,15 +689,18 @@ impl DecoderScratchKind {
     /// same tables a contiguous decode would have carried over.
     #[cfg(feature = "lsm")]
     fn restore_entropy(&mut self, state: &ResumeState) {
+        // The `ResumeState` snapshot is a self-contained `Local` materialization
+        // (export resolved every Dict axis into local bytes and detached), so no
+        // dictionary borrow is needed to install it back.
         match self {
             Self::Ring(s) => {
-                s.fse.reinit_from(&state.fse);
-                s.huf.reinit_resolved_from(&state.huf);
+                s.fse.reinit_from(&state.fse, None);
+                s.huf.reinit_resolved_from(&state.huf, None);
                 s.offset_hist = state.offset_hist;
             }
             Self::Flat(s) => {
-                s.fse.reinit_from(&state.fse);
-                s.huf.reinit_resolved_from(&state.huf);
+                s.fse.reinit_from(&state.fse, None);
+                s.huf.reinit_resolved_from(&state.huf, None);
                 s.offset_hist = state.offset_hist;
             }
         }
@@ -719,10 +727,11 @@ impl DecoderScratchKind {
         decoder: &mut BlockDecoder,
         header: &crate::blocks::block::BlockHeader,
         source: R,
+        dict: Option<&crate::decoding::dictionary::Dictionary>,
     ) -> Result<u64, DecodeBlockContentError> {
         match self {
-            Self::Ring(s) => decoder.decode_block_content(header, s, source),
-            Self::Flat(s) => decoder.decode_block_content(header, s, source),
+            Self::Ring(s) => decoder.decode_block_content(header, s, dict, source),
+            Self::Flat(s) => decoder.decode_block_content(header, s, dict, source),
         }
     }
 
@@ -755,6 +764,14 @@ struct FrameDecoderState {
     bytes_read_counter: u64,
     check_sum: Option<u32>,
     using_dict: Option<u32>,
+    /// The dictionary handle applied to this frame, owned for the frame's whole
+    /// decode so the block loop can hand the scratch a `&Dictionary` borrow at
+    /// every `Dict`-sourced table read. ONE refcount clone per dict-apply (not
+    /// per block, not per frame on the reuse path — the same handle stays held
+    /// across `init_with_dict_handle` -> `decode_blocks`); the decode loop
+    /// borrows from this field (disjoint from `decoder_scratch`) with zero
+    /// further clones. `None` on the no-dict path. Cleared by `reset`.
+    active_dict: Option<DictionaryHandle>,
 }
 
 pub enum BlockDecodingStrategy {
@@ -863,6 +880,7 @@ impl FrameDecoderState {
             bytes_read_counter: u64::from(header_size),
             check_sum: None,
             using_dict: None,
+            active_dict: None,
         })
     }
 
@@ -902,7 +920,29 @@ impl FrameDecoderState {
         self.bytes_read_counter = u64::from(header_size);
         self.check_sum = None;
         self.using_dict = None;
+        // `active_dict` is intentionally NOT cleared here: it is only ever READ
+        // while a scratch table source is `Dict`, which `init_from_dict` arms
+        // on a dict frame and which a no-dict frame leaves `Local` (so a stale
+        // held handle is never read). Keeping it lets the per-apply `ptr::eq`
+        // reuse-check below skip the clone when the SAME dictionary is
+        // re-applied frame-over-frame (the CoordiNode per-label-dict hot path)
+        // — zero refcount churn on reuse, one clone only on a genuine swap.
         Ok(())
+    }
+
+    /// Hold the dictionary handle for this frame's whole decode so the block
+    /// loop can borrow `&Dictionary` at every `Dict`-sourced read. Clones the
+    /// handle ONLY when it is a different dictionary than the one already held
+    /// (`ptr::eq` on the `Arc`'s pointee) — so re-applying the SAME dictionary
+    /// frame-over-frame (the reuse hot path) costs zero refcount churn.
+    fn set_active_dict(&mut self, dict: &DictionaryHandle) {
+        if self
+            .active_dict
+            .as_ref()
+            .is_none_or(|held| !core::ptr::eq(held.as_dict(), dict.as_dict()))
+        {
+            self.active_dict = Some(dict.clone());
+        }
     }
 }
 
@@ -1231,6 +1271,7 @@ impl FrameDecoder {
                 })
                 .ok_or(err::DictNotProvided { dict_id })?;
             state.decoder_scratch.init_from_dict(dict);
+            state.set_active_dict(dict);
             state.using_dict = Some(dict_id);
         }
         Ok(())
@@ -1304,6 +1345,7 @@ impl FrameDecoder {
             });
         }
         state.decoder_scratch.init_from_dict(dict);
+        state.set_active_dict(dict);
         state.using_dict = Some(dict.id());
         Ok(())
     }
@@ -1368,6 +1410,7 @@ impl FrameDecoder {
             })
             .ok_or(err::DictNotProvided { dict_id })?;
         state.decoder_scratch.init_from_dict(dict);
+        state.set_active_dict(dict);
         state.using_dict = Some(dict_id);
 
         Ok(())
@@ -1459,6 +1502,14 @@ impl FrameDecoder {
     #[cfg(test)]
     pub(crate) fn direct_frames(&self) -> u64 {
         self.direct_frames
+    }
+
+    /// Test-only: whether the decode state currently holds an owning dictionary
+    /// handle (`active_dict`). Every path that arms `Dict`-sourced scratch tables
+    /// must also install this handle, or a later dict-table read resolves `None`.
+    #[cfg(test)]
+    pub(crate) fn active_dict_installed(&self) -> bool {
+        self.state.as_ref().is_some_and(|s| s.active_dict.is_some())
     }
 
     /// Whether the current frames last block has been decoded yet
@@ -1556,9 +1607,20 @@ impl FrameDecoder {
             } else {
                 None
             };
+            // Only expose the held dictionary while THIS frame is dict-backed
+            // (`using_dict` is set per dict-apply, cleared on reset). A reused
+            // decoder keeps `active_dict` across a no-dict frame for the
+            // `ptr::eq` reuse-skip, so it must be gated here or a stray
+            // out-of-window offset on a dictless frame would resolve against the
+            // stale dictionary content instead of erroring.
+            let dict_ref = if state.using_dict.is_some() {
+                state.active_dict.as_ref().map(|h| h.as_dict())
+            } else {
+                None
+            };
             let bytes_read_in_block_body = state
                 .decoder_scratch
-                .decode_block_content(&mut block_dec, &block_header, &mut source)
+                .decode_block_content(&mut block_dec, &block_header, &mut source, dict_ref)
                 .map_err(|source| {
                     block_body_decode_error(
                         source,
@@ -1855,10 +1917,22 @@ impl FrameDecoder {
             state.bytes_read_counter += u64::from(block_header_size);
 
             let len_before = state.decoder_scratch.buffer_len();
+            // Only expose the held dictionary while THIS frame is dict-backed
+            // (`using_dict` is set per dict-apply, cleared on reset). A reused
+            // decoder keeps `active_dict` across a no-dict frame for the
+            // `ptr::eq` reuse-skip, so it must be gated here or a stray
+            // out-of-window offset on a dictless frame would resolve against the
+            // stale dictionary content instead of erroring.
+            let dict_ref = if state.using_dict.is_some() {
+                state.active_dict.as_ref().map(|h| h.as_dict())
+            } else {
+                None
+            };
             match state.decoder_scratch.decode_block_content(
                 &mut block_dec,
                 &block_header,
                 &mut source,
+                dict_ref,
             ) {
                 Ok(body_read) => state.bytes_read_counter += body_read,
                 Err(e) => {
@@ -1935,7 +2009,12 @@ impl FrameDecoder {
         // one past the last block (EOF), for which there is no next-block source
         // position to resume from. A resume needs a real following block.
         let resume_state = if emit_resume && !state.frame_finished {
-            let (fse, huf, offset_hist) = state.decoder_scratch.export_entropy();
+            let dict_ref = if state.using_dict.is_some() {
+                state.active_dict.as_ref().map(|h| h.as_dict())
+            } else {
+                None
+            };
+            let (fse, huf, offset_hist) = state.decoder_scratch.export_entropy(dict_ref);
             Some(ResumeState {
                 frame_key: FrameKey::from_state(state, magicless),
                 block_index: state.block_counter as u32,
@@ -2121,9 +2200,25 @@ impl FrameDecoder {
                     }
                     state.bytes_read_counter += u64::from(block_header_size);
 
+                    // Only expose the held dictionary while THIS frame is dict-backed
+                    // (`using_dict` is set per dict-apply, cleared on reset). A reused
+                    // decoder keeps `active_dict` across a no-dict frame for the
+                    // `ptr::eq` reuse-skip, so it must be gated here or a stray
+                    // out-of-window offset on a dictless frame would resolve against the
+                    // stale dictionary content instead of erroring.
+                    let dict_ref = if state.using_dict.is_some() {
+                        state.active_dict.as_ref().map(|h| h.as_dict())
+                    } else {
+                        None
+                    };
                     let bytes_read_in_block_body = state
                         .decoder_scratch
-                        .decode_block_content(&mut block_dec, &block_header, &mut mt_source)
+                        .decode_block_content(
+                            &mut block_dec,
+                            &block_header,
+                            &mut mt_source,
+                            dict_ref,
+                        )
                         .map_err(|source| {
                             block_body_decode_error(
                                 source,
@@ -2853,7 +2948,24 @@ impl FrameDecoder {
         // fields; only `buffer` differs and we don't use that here.
         // Macro-style binding avoids the closure / generic
         // gymnastics of returning multiple `&mut` from a match arm.
-        let (huf, fse, offset_hist, literals_buffer, block_content_buffer, window_size, dict) =
+        // Resolve the dictionary borrow for this frame BEFORE taking the
+        // `&mut` field borrows below — `active_dict` is a disjoint field, so
+        // the shared borrow coexists with the mutable scratch borrows. It is
+        // threaded as a call-scoped argument into every `Dict`-sourced read
+        // (the direct path's `repeat_from_dict` ext-dict slow path), mirroring
+        // C's per-frame pointer hand-off with zero refcount churn.
+        // Only expose the held dictionary while THIS frame is dict-backed
+        // (`using_dict` is set per dict-apply, cleared on reset). A reused
+        // decoder keeps `active_dict` across a no-dict frame for the
+        // `ptr::eq` reuse-skip, so it must be gated here or a stray
+        // out-of-window offset on a dictless frame would resolve against the
+        // stale dictionary content instead of erroring.
+        let dict_ref = if state.using_dict.is_some() {
+            state.active_dict.as_ref().map(|h| h.as_dict())
+        } else {
+            None
+        };
+        let (huf, fse, offset_hist, literals_buffer, block_content_buffer, window_size) =
             match &mut state.decoder_scratch {
                 DecoderScratchKind::Flat(s) => (
                     &mut s.huf,
@@ -2862,7 +2974,6 @@ impl FrameDecoder {
                     &mut s.literals_buffer,
                     &mut s.block_content_buffer,
                     s.buffer.window_size,
-                    s.buffer.dict.clone(),
                 ),
                 DecoderScratchKind::Ring(s) => (
                     &mut s.huf,
@@ -2871,21 +2982,10 @@ impl FrameDecoder {
                     &mut s.literals_buffer,
                     &mut s.block_content_buffer,
                     s.buffer.window_size,
-                    s.buffer.dict.clone(),
                 ),
             };
         let backend = UserSliceBackend::from_slice(output);
-        let mut buffer = DecodeBuffer::from_backend(backend, window_size);
-        // Dictionary matches on the direct path: hand the shared handle
-        // (refcount bump, no copy) to the stack-local buffer so offsets
-        // reaching past the frame's own output resolve through
-        // `repeat_from_dict` — the same ext-dict slow path the
-        // FlatBuf/Ring backends use. The per-sequence hot path is
-        // untouched: the inline-exec dispatch already routes
-        // beyond-prefix offsets to the cold `repeat()` fallback.
-        if let Some(handle) = dict {
-            buffer.set_dict(handle);
-        }
+        let buffer = DecodeBuffer::from_backend(backend, window_size);
         let mut direct = DirectScratch {
             huf,
             fse,
@@ -2975,6 +3075,7 @@ impl FrameDecoder {
             let body_consumed = match block_dec.decode_block_content_from_slice(
                 &block_header,
                 &mut direct,
+                dict_ref,
                 &mut *input,
             ) {
                 Ok(n) => n,
@@ -3082,10 +3183,12 @@ impl FrameDecoder {
 
         let written = content_size as usize;
         state.frame_finished = true;
-        // Drop the stack-local DirectScratch (and its DecodeBuffer
-        // borrow on `output`) so we can re-borrow `output` for the
-        // hash pass below.
-        drop(direct);
+        // `direct`'s last use is in the decode loop above; NLL therefore
+        // releases its `&mut output` borrow before here, freeing `output` for
+        // the hash re-borrow below. No explicit `drop(direct)` is needed:
+        // `DirectScratch` now holds only borrowed dict POINTERS (not an owned
+        // `Arc`), so it is not a `Drop` type whose glue would hold the borrow
+        // to end-of-scope.
         // Per-block XXH64 (low 32 bits) over the captured ranges.
         // Mirrors `decode_blocks`' per-block hashing so the digests
         // vector stays identical regardless of which dispatch path

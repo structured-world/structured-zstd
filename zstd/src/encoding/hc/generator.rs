@@ -479,6 +479,10 @@ macro_rules! bt_insert_and_collect_matches_body {
         $min_match_len:ident,
         $best_len_for_skip:ident,
         $out:ident,
+        $reps:ident,
+        $lit_len:ident,
+        $use_hash3:expr,
+        $cpl:path,
         $cmf:path $(,)?
     ) => {{
         let idx = $abs_pos - $table.history_abs_start;
@@ -490,14 +494,157 @@ macro_rules! bt_insert_and_collect_matches_body {
             let lh = $table.live_history();
             core::slice::from_raw_parts(lh.as_ptr(), lh.len())
         };
-        if idx + 8 > concat.len() {
-            return;
-        }
         debug_assert!(
             $abs_pos <= $current_abs_end,
             "BT collect called past current block end"
         );
         let tail_limit = $current_abs_end - $abs_pos;
+        // ===== Merged rep-code + hash3 probes (reshape toward upstream
+        // ZSTD_btGetAllMatches: rep + hash3 + BT walk in ONE out-of-line frame).
+        // Folded here from the prior separate per-position calls in
+        // collect_optimal_candidates_initialized_body!. Probe order
+        // (rep -> hash3 -> BT walk) + best_len_for_skip seeding are byte-identical
+        // to the previous orchestration. Out-of-line keeps register pressure in
+        // this frame (inlining the same probes into the DP caller regressed). =====
+        let mut skip_further_match_search = false;
+        let mut rep_len_candidate_found = false;
+        if idx + 4 <= concat.len() {
+            let rep_offsets: [Option<usize>; 3] = if $lit_len == 0 {
+                [
+                    Some($reps[1] as usize),
+                    Some($reps[2] as usize),
+                    ($reps[0] > 1).then_some(($reps[0] - 1) as usize),
+                ]
+            } else {
+                [
+                    Some($reps[0] as usize),
+                    Some($reps[1] as usize),
+                    Some($reps[2] as usize),
+                ]
+            };
+            let rbase = concat.as_ptr();
+            let rlen = concat.len();
+            for rep in rep_offsets.into_iter().flatten() {
+                if rep == 0 || rep > $abs_pos {
+                    continue;
+                }
+                let candidate_pos = $abs_pos - rep;
+                if candidate_pos < $table.history_abs_start {
+                    continue;
+                }
+                let candidate_idx = candidate_pos - $table.history_abs_start;
+                // SAFETY: `idx + 4 <= rlen` (guard above) and `candidate_idx < idx`
+                // (rep >= 1), so both 4-byte reads stay inside `concat`.
+                let gate_matches = unsafe {
+                    let cand = rbase.add(candidate_idx).cast::<u32>().read_unaligned();
+                    let cur = rbase.add(idx).cast::<u32>().read_unaligned();
+                    if $min_match_len == 3 {
+                        (cand.to_le() & 0x00FF_FFFF) == (cur.to_le() & 0x00FF_FFFF)
+                    } else {
+                        cand == cur
+                    }
+                };
+                if !gate_matches {
+                    continue;
+                }
+                let rmax = (rlen - candidate_idx).min(rlen - idx).min(tail_limit);
+                // SAFETY: same umbrella; both pointers + `rmax` stay in `concat`.
+                let match_len = unsafe { $cpl(rbase.add(candidate_idx), rbase.add(idx), rmax) };
+                if match_len < $min_match_len {
+                    continue;
+                }
+                rep_len_candidate_found = true;
+                let _ = $crate::encoding::bt::BtMatcher::push_candidate_ladder(
+                    $out,
+                    $best_len_for_skip,
+                    $crate::encoding::opt::types::MatchCandidate {
+                        start: $abs_pos,
+                        offset: rep,
+                        match_len,
+                    },
+                    $min_match_len,
+                );
+                if match_len > $profile.sufficient_match_len
+                    || $abs_pos + match_len >= $current_abs_end
+                {
+                    skip_further_match_search = true;
+                }
+            }
+        }
+        if $use_hash3 && !skip_further_match_search && *$best_len_for_skip < $min_match_len {
+            $table.update_hash3_until($abs_pos);
+            // hash3 short-match probe folded inline (was a separate per-kernel
+            // call): table lookup + one common-prefix scan via `$cpl`, reusing
+            // the BT collect's `concat` / `idx` / `tail_limit`. Labeled block so
+            // the probe's early-outs yield None without returning from the walk.
+            let h3_candidate: Option<$crate::encoding::opt::types::MatchCandidate> =
+                if $table.hash3_log == 0 || idx + 4 > concat.len() {
+                    None
+                } else {
+                    'h3: {
+                        let hh =
+                            $crate::encoding::match_table::storage::MatchTable::hash_position_at(
+                                concat,
+                                idx,
+                                $table.hash3_log,
+                                3,
+                            );
+                        let entry = $table
+                            .hash3_table
+                            .get(hh)
+                            .copied()
+                            .unwrap_or($crate::encoding::match_table::storage::HC_EMPTY);
+                        let Some(cand_abs) =
+                            $crate::encoding::match_table::storage::MatchTable::stored_abs_position_fast(
+                                entry,
+                                $table.position_base,
+                                $table.index_shift,
+                            )
+                        else {
+                            break 'h3 None;
+                        };
+                        if cand_abs < $table.history_abs_start || cand_abs >= $abs_pos {
+                            break 'h3 None;
+                        }
+                        let off = $abs_pos - cand_abs;
+                        if off >= $crate::encoding::bt::HC3_MAX_OFFSET {
+                            break 'h3 None;
+                        }
+                        let cand_idx = cand_abs - $table.history_abs_start;
+                        let hbase = concat.as_ptr();
+                        // SAFETY: cand_idx/idx within history; tail_limit bounds the scan.
+                        let ml = unsafe { $cpl(hbase.add(cand_idx), hbase.add(idx), tail_limit) };
+                        (ml >= $min_match_len).then_some(
+                            $crate::encoding::opt::types::MatchCandidate {
+                                start: $abs_pos,
+                                offset: off,
+                                match_len: ml,
+                            },
+                        )
+                    }
+                };
+            if let Some(h3) = h3_candidate {
+                let _ = $crate::encoding::bt::BtMatcher::push_candidate_ladder(
+                    $out,
+                    $best_len_for_skip,
+                    h3,
+                    $min_match_len,
+                );
+                if !rep_len_candidate_found
+                    && (h3.match_len > $profile.sufficient_match_len
+                        || $abs_pos + h3.match_len >= $current_abs_end)
+                {
+                    $table.skip_insert_until_abs = $abs_pos + 1;
+                    skip_further_match_search = true;
+                }
+            }
+        }
+        if skip_further_match_search {
+            return;
+        }
+        if idx + 8 > concat.len() {
+            return;
+        }
         let hash = $crate::encoding::match_table::storage::MatchTable::hash_position_at(
             concat,
             idx,
@@ -727,7 +874,12 @@ macro_rules! bt_insert_and_collect_matches_body {
         // `idx - dict_idx` (no upstream zstd `dmsIndexDelta`). The optimal parser
         // prices these (its DP lookahead values the repcode chain a dict match
         // seeds); the greedy/lazy parser commits the longest.
-        if let Some(dms) = $table.dms.table() {
+        // `is_primed()` is the canonical "DMS table is valid to walk" predicate
+        // (set only after a full build, cleared by `invalidate`): gate on it so
+        // a present-but-stale table is never descended. `is_primed()` implies
+        // the table exists (`mark_primed` requires `Some`), so `expect` holds.
+        if compares_left > 0 && $table.dms.is_primed() {
+            let dms = $table.dms.table().expect("is_primed() guarantees a DMS table");
             let region = $table.dms.region_len();
             let dh = $crate::encoding::match_table::storage::MatchTable::hash_position_at(
                 concat,
@@ -740,14 +892,19 @@ macro_rules! bt_insert_and_collect_matches_body {
             // `$cmf` resumes from there (upstream zstd commonLengthSmaller/Larger).
             let mut common_smaller = 0usize;
             let mut common_larger = 0usize;
-            let mut dms_compares = $profile.max_chain_depth.min($search_depth);
-            while dms_compares > 0 && dcur != $crate::encoding::match_table::storage::HC_EMPTY {
+            // Shared compare budget (upstream zstd zstd_opt.c:723/781/786): the
+            // dict DUBT descent consumes the SAME `compares_left` the live BT
+            // walk left over (and is skipped entirely once it is zero, via the
+            // `.filter(|_| compares_left > 0)` on the dict table above), instead
+            // of getting a fresh full budget. On a match-dense / populated live
+            // tree this cuts the cold dict-region descent the way C does.
+            while compares_left > 0 && dcur != $crate::encoding::match_table::storage::HC_EMPTY {
                 let dict_idx = (dcur - 1) as usize;
                 // The dict tree holds only dict positions (`< region <= idx`).
                 if dict_idx >= region || dict_idx >= idx {
                     break;
                 }
-                dms_compares -= 1;
+                compares_left -= 1;
                 let pair = 2 * dict_idx;
                 let seed = common_smaller.min(common_larger);
                 // SAFETY: `dict_idx < idx` and `idx + tail_limit <=

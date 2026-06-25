@@ -22,7 +22,7 @@ fn dict_offsets_rejected_after_direct_path_window_drop() {
     let backend = UserSliceBackend::from_slice(out.as_mut_slice());
     let mut buf = DecodeBuffer::from_backend(backend, 100);
     let dict = Dictionary::from_raw_content(7, vec![0xAB; 64]).expect("raw-content dictionary");
-    buf.set_dict(dict.into_handle());
+    let handle = dict.into_handle();
 
     // Mimic the inline executor: produce 250 bytes without touching
     // `total_output_counter`, exceeding the 100-byte window.
@@ -33,7 +33,7 @@ fn dict_offsets_rejected_after_direct_path_window_drop() {
     // offset 110 > len 100 reaches 10 bytes into the dictionary;
     // cumulative output (250) already exceeds the window (100), so
     // this must be rejected, not served from the dictionary.
-    let result = buf.repeat_from_dict(110, 5);
+    let result = buf.repeat_from_dict(Some(handle.as_dict()), 110, 5);
     assert!(
         result.is_err(),
         "dict-backed offset must be unreachable once output exceeded the window, got {result:?}"
@@ -89,7 +89,7 @@ fn test_repeat_doubling_matches_reference_across_offsets() {
             let prefix_slice = &prefix[..offset.max(1)];
             let mut buffer = DecodeBuffer::<RingBuffer>::new(usize::MAX);
             buffer.push(prefix_slice);
-            buffer.repeat(offset, match_length).unwrap();
+            buffer.repeat(None, offset, match_length).unwrap();
             let expected = reference_repeat(prefix_slice, offset, match_length);
             let mut got: Vec<u8> = Vec::new();
             buffer.drain_to_writer(&mut got).unwrap();
@@ -193,11 +193,11 @@ fn short_writer() {
 
     let mut decode_buf = DecodeBuffer::<RingBuffer>::new(100);
     decode_buf.push(b"0123456789");
-    decode_buf.repeat(10, 90).unwrap();
+    decode_buf.repeat(None, 10, 90).unwrap();
     let repeats = 1000;
     for _ in 0..repeats {
         assert_eq!(decode_buf.len(), 100);
-        decode_buf.repeat(10, 50).unwrap();
+        decode_buf.repeat(None, 10, 50).unwrap();
         assert_eq!(decode_buf.len(), 150);
         decode_buf
             .drain_to_window_size_writer(&mut short_writer)
@@ -243,11 +243,11 @@ fn wouldblock_writer() {
 
     let mut decode_buf = DecodeBuffer::<RingBuffer>::new(100);
     decode_buf.push(b"0123456789");
-    decode_buf.repeat(10, 90).unwrap();
+    decode_buf.repeat(None, 10, 90).unwrap();
     let repeats = 1000;
     for _ in 0..repeats {
         assert_eq!(decode_buf.len(), 100);
-        decode_buf.repeat(10, 50).unwrap();
+        decode_buf.repeat(None, 10, 50).unwrap();
         assert_eq!(decode_buf.len(), 150);
         loop {
             match decode_buf.drain_to_window_size_writer(&mut short_writer) {
@@ -303,7 +303,7 @@ fn repeat_overlap_fast_paths_match_reference_behavior() {
     for (offset, match_len) in cases {
         let mut decode_buf = DecodeBuffer::<RingBuffer>::new(4 * 1024);
         decode_buf.push(seed);
-        decode_buf.repeat(offset, match_len).unwrap();
+        decode_buf.repeat(None, offset, match_len).unwrap();
         let got = decode_buf.drain();
         let expected = expected_match_expansion(seed, offset, match_len);
         assert_eq!(got, expected, "offset={offset}, match_len={match_len}");
@@ -314,7 +314,7 @@ fn repeat_overlap_fast_paths_match_reference_behavior() {
 fn repeat_zero_offset_returns_error() {
     let mut decode_buf = DecodeBuffer::<RingBuffer>::new(1024);
     decode_buf.push(b"abcdef");
-    let err = decode_buf.repeat(0, 5).unwrap_err();
+    let err = decode_buf.repeat(None, 0, 5).unwrap_err();
     assert!(matches!(
         err,
         crate::decoding::errors::DecodeBufferError::ZeroOffset
@@ -336,7 +336,7 @@ fn repeat_rejects_output_past_block_ceiling() {
     let mut decode_buf = DecodeBuffer::<RingBuffer>::new(4 * 1024);
     decode_buf.push(b"abcdef"); // len = 6
     decode_buf.set_block_output_ceiling(8); // max_capacity = 6 + 8 = 14
-    let err = decode_buf.repeat(4, 16).unwrap_err(); // 6 + 16 = 22 > 14
+    let err = decode_buf.repeat(None, 4, 16).unwrap_err(); // 6 + 16 = 22 > 14
     assert!(
         matches!(
             err,
@@ -355,7 +355,7 @@ fn repeat_within_block_ceiling_still_succeeds() {
     decode_buf.push(b"abcdef"); // len = 6
     decode_buf.set_block_output_ceiling(8); // max_capacity = 14
     decode_buf
-        .repeat(4, 8)
+        .repeat(None, 4, 8)
         .expect("6 + 8 = 14 == ceiling is allowed");
     assert_eq!(decode_buf.len(), 14);
 }
@@ -376,9 +376,11 @@ fn repeat_from_dict_rejects_output_past_block_ceiling() {
 
     // Fully-dictionary match: empty buffer, offset reaches into the dict.
     let mut full = DecodeBuffer::<RingBuffer>::new(4 * 1024);
-    full.set_dict(dict());
+    let full_dict = dict();
     full.set_block_output_ceiling(8); // max_capacity = 0 + 8 = 8
-    let err = full.repeat(200, 100).unwrap_err(); // 0 + 100 > 8, all from dict
+    let err = full
+        .repeat(Some(full_dict.as_dict()), 200, 100)
+        .unwrap_err(); // 0 + 100 > 8, all from dict
     assert!(
         matches!(
             err,
@@ -389,10 +391,12 @@ fn repeat_from_dict_rejects_output_past_block_ceiling() {
 
     // Mixed match: part from dict, remainder from buffer history.
     let mut mixed = DecodeBuffer::<RingBuffer>::new(4 * 1024);
-    mixed.set_dict(dict());
+    let mixed_dict = dict();
     mixed.push(b"abcd"); // len = 4
     mixed.set_block_output_ceiling(8); // max_capacity = 4 + 8 = 12
-    let err = mixed.repeat(10, 100).unwrap_err(); // 6 from dict + rest, 4 + 100 > 12
+    let err = mixed
+        .repeat(Some(mixed_dict.as_dict()), 10, 100)
+        .unwrap_err(); // 6 from dict + rest, 4 + 100 > 12
     assert!(
         matches!(
             err,
@@ -405,15 +409,15 @@ fn repeat_from_dict_rejects_output_past_block_ceiling() {
 #[test]
 fn repeat_from_dict_full_copy_updates_total_output_counter() {
     let mut decode_buf = DecodeBuffer::<RingBuffer>::new(1);
-    decode_buf.set_dict(
-        crate::decoding::dictionary::DictionaryHandle::from_dictionary(
-            crate::decoding::dictionary::Dictionary::from_raw_content(1, b"0123456789".to_vec())
-                .unwrap(),
-        ),
+    let handle = crate::decoding::dictionary::DictionaryHandle::from_dictionary(
+        crate::decoding::dictionary::Dictionary::from_raw_content(1, b"0123456789".to_vec())
+            .unwrap(),
     );
 
-    decode_buf.repeat(10, 2).unwrap();
-    let err = decode_buf.repeat(10, 1).unwrap_err();
+    decode_buf.repeat(Some(handle.as_dict()), 10, 2).unwrap();
+    let err = decode_buf
+        .repeat(Some(handle.as_dict()), 10, 1)
+        .unwrap_err();
     assert!(matches!(
         err,
         crate::decoding::errors::DecodeBufferError::OffsetTooBig { .. }
@@ -429,7 +433,7 @@ fn repeat_overlap_fast_paths_match_reference_behavior_with_wrapped_ringbuffer() 
 
     decode_buf.push(seed);
     model_push(&mut model, seed);
-    decode_buf.repeat(16, 16).unwrap();
+    decode_buf.repeat(None, 16, 16).unwrap();
     model_repeat(&mut model, 16, 16);
 
     let drained = decode_buf.drain_to_window_size().unwrap();
@@ -438,7 +442,7 @@ fn repeat_overlap_fast_paths_match_reference_behavior_with_wrapped_ringbuffer() 
 
     let cases = [(3usize, 97usize), (16usize, 64usize), (7usize, 73usize)];
     for (offset, match_len) in cases {
-        decode_buf.repeat(offset, match_len).unwrap();
+        decode_buf.repeat(None, offset, match_len).unwrap();
         model_repeat(&mut model, offset, match_len);
 
         if let Some(got) = decode_buf.drain_to_window_size() {
@@ -504,7 +508,7 @@ fn repeat_short_offset_matches_canonical_for_all_offsets_and_lengths() {
         ] {
             let mut buf = DecodeBuffer::<RingBuffer>::new(8192);
             buf.push(&base[..offset]);
-            buf.repeat(offset, match_length).unwrap_or_else(|e| {
+            buf.repeat(None, offset, match_length).unwrap_or_else(|e| {
                 panic!("repeat failed for offset={offset} match_length={match_length}: {e:?}")
             });
 

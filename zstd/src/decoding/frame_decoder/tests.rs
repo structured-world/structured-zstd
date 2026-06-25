@@ -4,6 +4,53 @@ use super::{DictionaryHandle, FrameDecoder};
 use crate::encoding::{CompressionLevel, FrameCompressor};
 use alloc::vec::Vec;
 
+/// `FrameDecoder` must stay `Send + Sync` (multi-instance contract: one
+/// dictionary shared across decoder instances on other threads). The decode
+/// state owns the dictionary as a thread-safe handle (`active_dict:
+/// Option<DictionaryHandle>`) and every `Dict`-sourced table read borrows it as
+/// a call-scoped argument, so `Send`/`Sync` auto-derive with zero `unsafe impl`.
+/// This is a COMPILE-TIME guard — if a future change adds a non-thread-safe
+/// field, this fails to compile.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<FrameDecoder>();
+};
+
+#[test]
+fn force_dict_installs_active_dictionary_handle() {
+    // Regression: `force_dict` arms `Dict`-sourced scratch tables for a
+    // dictless-header frame, so it MUST also install the OWNING dictionary
+    // handle (`active_dict`). Without it the block loop derives a `None`
+    // dictionary borrow while the scratch sources say `Dict`, so the first
+    // dict-table read hits the unwrap and panics (and dict-content matches
+    // resolve against an empty/stale dictionary instead of the forced one).
+    let payload: Vec<u8> = (0..256u32).map(|i| (i & 0xFF) as u8).collect();
+    let mut compressor = FrameCompressor::new(CompressionLevel::Default);
+    compressor.set_source(payload.as_slice());
+    let mut compressed = Vec::new();
+    compressor.set_drain(&mut compressed);
+    compressor.compress();
+
+    let raw = include_bytes!("../../../dict_tests/dictionary");
+    let dict = crate::decoding::dictionary::Dictionary::decode_dict(raw).expect("parse dict");
+    let dict_id = dict.id;
+
+    let mut dec = FrameDecoder::new();
+    dec.add_dict(dict).expect("register owned dict");
+    dec.reset(compressed.as_slice())
+        .expect("reset on a dictless-header frame");
+    assert!(
+        !dec.active_dict_installed(),
+        "a dictless-header reset must not install any dictionary"
+    );
+    dec.force_dict(dict_id)
+        .expect("force_dict applies the dict");
+    assert!(
+        dec.active_dict_installed(),
+        "force_dict must install the owning dictionary handle"
+    );
+}
+
 #[test]
 fn decode_all_tight_and_slack_outputs_match_on_single_segment_frame() {
     // Roundtrip a small payload through the encoder, then decode

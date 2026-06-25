@@ -25,15 +25,12 @@ use crate::decoding::errors::DecodeBufferError;
 ///   backlog item #132.
 pub struct DecodeBuffer<B: BufferBackend = RingBuffer> {
     buffer: B,
-    /// Active dictionary, held by shared handle (`Arc`/`Rc`) rather than a
-    /// per-frame owned copy. `repeat_from_dict` reads match bytes straight
-    /// out of the handle's content (libzstd `ZSTD_refDDict` semantics): one
-    /// dictionary copy is shared across every frame AND across decoder
-    /// instances on other threads (`Arc<Dictionary>` is `Send + Sync`), so
-    /// reusing a dictionary costs a refcount bump, never a content memcpy.
-    /// `None` = no dictionary (a no-dict frame can never read a stale one).
-    pub(crate) dict: Option<crate::decoding::dictionary::DictionaryHandle>,
-
+    // No dictionary reference is stored: an out-of-window match reads the
+    // dictionary content through a call-scoped `dict: Option<&Dictionary>`
+    // borrow threaded into `repeat` / `repeat_from_dict` by the decode pipeline
+    // (libzstd `ZSTD_refDDict` semantics — read the dict content, no per-frame
+    // refcount bump). The borrow checker guarantees the dictionary outlives
+    // every read; `DecodeBuffer` itself stays `Send`/`Sync` by auto-derive.
     pub window_size: usize,
     total_output_counter: u64,
     #[cfg(feature = "hash")]
@@ -88,7 +85,6 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     pub fn new(window_size: usize) -> DecodeBuffer<B> {
         DecodeBuffer {
             buffer: B::new(),
-            dict: None,
             window_size,
             total_output_counter: 0,
             #[cfg(feature = "hash")]
@@ -114,7 +110,6 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         buffer.clear();
         DecodeBuffer {
             buffer,
-            dict: None,
             window_size,
             total_output_counter: 0,
             #[cfg(feature = "hash")]
@@ -167,7 +162,6 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         // `DecoderScratchKind::reserve_buffer(window_size)` before any
         // block writes — that is the only call site that knows whether
         // the frame will actually hit this buffer.
-        self.dict = None;
         self.total_output_counter = 0;
         // Lift the per-block growth ceiling between frames; the sequence
         // decoder re-arms it per block. Non-block callers stay unbounded.
@@ -190,23 +184,17 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         self.buffer.cap()
     }
 
-    /// Active dictionary content bytes, borrowed through the shared handle
-    /// (no copy). Empty slice when no dictionary is attached.
+    /// Active dictionary content bytes, read from the call-scoped `dict` borrow
+    /// (no copy). Empty slice when no dictionary is active for this decode.
     #[inline]
-    pub(crate) fn dict_content(&self) -> &[u8] {
-        match &self.dict {
-            Some(h) => &h.as_dict().dict_content,
+    pub(crate) fn dict_content<'d>(
+        &self,
+        dict: Option<&'d crate::decoding::dictionary::Dictionary>,
+    ) -> &'d [u8] {
+        match dict {
+            Some(d) => &d.dict_content,
             None => &[],
         }
-    }
-
-    /// Attach a dictionary by shared handle. This is a refcount bump
-    /// (`Arc`/`Rc` clone) — the dictionary content is shared, never copied,
-    /// so the same dictionary is free to reuse across frames and across
-    /// decoder instances on other threads.
-    #[inline]
-    pub(crate) fn set_dict(&mut self, handle: crate::decoding::dictionary::DictionaryHandle) {
-        self.dict = Some(handle);
     }
 
     /// Return the last `n` bytes of the visible buffer as two
@@ -390,8 +378,13 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         Ok(())
     }
 
-    pub fn repeat(&mut self, offset: usize, match_length: usize) -> Result<(), DecodeBufferError> {
-        self.repeat_inner::<false>(offset, match_length)
+    pub fn repeat(
+        &mut self,
+        dict: Option<&crate::decoding::dictionary::Dictionary>,
+        offset: usize,
+        match_length: usize,
+    ) -> Result<(), DecodeBufferError> {
+        self.repeat_inner::<false>(dict, offset, match_length)
     }
 
     /// Same as [`repeat`] but the caller asserts a lookahead
@@ -411,15 +404,17 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     #[inline(always)]
     pub(crate) fn repeat_lookahead_prefetched(
         &mut self,
+        dict: Option<&crate::decoding::dictionary::Dictionary>,
         offset: usize,
         match_length: usize,
     ) -> Result<(), DecodeBufferError> {
-        self.repeat_inner::<true>(offset, match_length)
+        self.repeat_inner::<true>(dict, offset, match_length)
     }
 
     #[inline(always)]
     fn repeat_inner<const SKIP_PREFETCH: bool>(
         &mut self,
+        dict: Option<&crate::decoding::dictionary::Dictionary>,
         offset: usize,
         match_length: usize,
     ) -> Result<(), DecodeBufferError> {
@@ -441,7 +436,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         // upfront `reserve(MAX_BLOCK_SIZE)`) never reaches the check.
 
         if offset > self.buffer.len() {
-            self.repeat_from_dict(offset, match_length)
+            self.repeat_from_dict(dict, offset, match_length)
         } else {
             let buf_len = self.buffer.len();
             let start_idx = buf_len - offset;
@@ -796,6 +791,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
     #[cold]
     fn repeat_from_dict(
         &mut self,
+        dict: Option<&crate::decoding::dictionary::Dictionary>,
         offset: usize,
         match_length: usize,
     ) -> Result<(), DecodeBufferError> {
@@ -814,16 +810,12 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             // at least part of that repeat is from the dictionary content
             let bytes_from_dict = offset - self.buffer.len();
 
-            // Borrow the dictionary content through the shared handle as a
-            // field access (`self.dict`), kept disjoint from the `self.buffer`
-            // mutation below so the borrow checker allows the read+extend
-            // without an intermediate copy. `None` → empty slice → the
-            // length guard rejects (matches the old empty-`dict_content`
-            // behaviour on the direct/no-dict path).
-            let dict_content: &[u8] = match &self.dict {
-                Some(h) => &h.as_dict().dict_content,
-                None => &[],
-            };
+            // The dictionary content slice is tied to the call-scoped `dict`
+            // borrow (owner-kept-alive for the decode), trivially disjoint from
+            // the `self.buffer` mutation below, allowing the read+extend without
+            // an intermediate copy. `None` → empty slice → the length guard
+            // rejects (the no-dict path).
+            let dict_content: &[u8] = self.dict_content(dict);
             let dict_len = dict_content.len();
 
             if bytes_from_dict > dict_len {
@@ -854,7 +846,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
                 self.buffer.extend(dict_slice);
 
                 self.total_output_counter += bytes_from_dict as u64;
-                return self.repeat(self.buffer.len(), match_length - bytes_from_dict);
+                return self.repeat(dict, self.buffer.len(), match_length - bytes_from_dict);
             } else {
                 let low = dict_len - bytes_from_dict;
                 let high = low + match_length;

@@ -69,7 +69,7 @@ fn roundtrip_assert(data: &[u8]) -> u8 {
     let (section, source) = build_huf4x_block(data);
     let mut scratch = HuffmanScratch::new();
     let mut target = Vec::new();
-    let bytes_read = decode_literals(&section, &mut scratch, &source, &mut target)
+    let bytes_read = decode_literals(&section, &mut scratch, None, &source, &mut target)
         .expect("decode_literals must succeed on a well-formed roundtrip");
     assert_eq!(
         bytes_read as usize,
@@ -243,7 +243,7 @@ fn burst_gate_malformed_small_regen_returns_error() {
 
     let mut scratch = HuffmanScratch::new();
     let mut target = Vec::new();
-    let result = decode_literals(&section, &mut scratch, &source, &mut target);
+    let result = decode_literals(&section, &mut scratch, None, &source, &mut target);
 
     assert!(
         result.is_err(),

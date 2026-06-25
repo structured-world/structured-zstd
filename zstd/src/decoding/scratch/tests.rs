@@ -36,7 +36,7 @@ fn reinit_from_clears_cold_dict_flag() {
     let mut dst = FSEScratch::new();
     dst.ddict_is_cold = true; // simulate a prior cold-dict frame's flag
     let src = FSEScratch::new(); // clean local-only source, not cold
-    dst.reinit_from(&src);
+    dst.reinit_from(&src, None);
     assert!(
         !dst.ddict_is_cold,
         "reinit_from must clear ddict_is_cold on a local-only snapshot"
@@ -66,7 +66,7 @@ fn init_from_dict_is_zero_copy_cow_then_reset_detaches() {
     );
     // Dict-sourced axis resolves to the dictionary's table...
     assert_eq!(
-        scratch.fse.ll_table().decode().len(),
+        scratch.fse.ll_table(Some(dict.as_dict())).decode().len(),
         dict_ll_len,
         "Dict-sourced axis must resolve to the shared dictionary's table"
     );
@@ -85,7 +85,7 @@ fn init_from_dict_is_zero_copy_cow_then_reset_detaches() {
         "dict fixture should carry a built HUF table"
     );
     assert_eq!(
-        scratch.huf.huf_table().max_num_bits,
+        scratch.huf.huf_table(Some(dict.as_dict())).max_num_bits,
         dict_huf_bits,
         "Dict-sourced HUF axis must resolve to the dictionary's table"
     );
@@ -96,11 +96,11 @@ fn init_from_dict_is_zero_copy_cow_then_reset_detaches() {
 
     scratch.reset(1024);
     assert!(
-        scratch.fse.ll_table().decode().is_empty(),
+        scratch.fse.ll_table(None).decode().is_empty(),
         "reset must detach the dictionary copy-on-write source"
     );
     assert_eq!(
-        scratch.huf.huf_table().max_num_bits,
+        scratch.huf.huf_table(None).max_num_bits,
         0,
         "reset must detach the HUF dictionary copy-on-write source"
     );

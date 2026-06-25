@@ -344,6 +344,7 @@ mod init_sequence_stream_tests {
             &source,
             &mut fse,
             &mut buffer,
+            None,
         );
         assert!(
             matches!(
@@ -389,6 +390,7 @@ mod init_sequence_stream_tests {
             &mut buf,
             &mut offset_hist,
             &lits,
+            None,
         );
 
         let mut fse = FSEScratch::new();
@@ -401,6 +403,7 @@ mod init_sequence_stream_tests {
             &mut buf,
             &mut offset_hist,
             &lits,
+            None,
         );
     }
 
@@ -429,6 +432,7 @@ mod init_sequence_stream_tests {
                 &mut buf,
                 &mut offset_hist,
                 &lits,
+                None,
             )
         };
     }
@@ -458,6 +462,7 @@ mod init_sequence_stream_tests {
                 &mut buf,
                 &mut offset_hist,
                 &lits,
+                None,
             )
         };
     }
@@ -494,6 +499,7 @@ mod init_sequence_stream_tests {
                 &mut buf,
                 &mut offset_hist,
                 &lits,
+                None,
             )
         };
     }

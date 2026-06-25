@@ -58,6 +58,7 @@ macro_rules! decode_one_body {
 macro_rules! execute_one_body {
     (
         $buffer:expr,
+        $dict:expr,
         $literals_buffer:expr,
         $lit_cur:expr,
         $literals_buffer_len:expr,
@@ -76,6 +77,7 @@ macro_rules! execute_one_body {
         };
         super::sequence_section_decoder::execute_one_sequence_pipelined(
             $buffer,
+            $dict,
             $literals_buffer,
             $lit_cur,
             $literals_buffer_len,
@@ -87,13 +89,14 @@ macro_rules! execute_one_body {
 
 /// Scalar-tier monolithic decode + execute.
 #[allow(clippy::too_many_lines)]
-pub(crate) fn decode_and_execute_sequences_scalar<B: BufferBackend>(
+pub(crate) fn decode_and_execute_sequences_scalar<'fse, B: BufferBackend>(
     section: &SequencesHeader,
     source: &[u8],
-    fse: &mut FSEScratch,
+    fse: &'fse mut FSEScratch,
     buffer: &mut DecodeBuffer<B>,
     offset_hist: &mut [u32; 3],
     literals_buffer: &[u8],
+    dict: Option<&'fse crate::decoding::dictionary::Dictionary>,
 ) -> Result<(), DecompressBlockError> {
     let SeqStreamSetup {
         mut br,
@@ -104,7 +107,7 @@ pub(crate) fn decode_and_execute_sequences_scalar<B: BufferBackend>(
         old_buffer_size,
         num_sequences,
         use_long_pipeline,
-    } = init_sequence_stream::<B, ScalarKernel>(section, source, fse, buffer)?;
+    } = init_sequence_stream::<B, ScalarKernel>(section, source, fse, buffer, dict)?;
     let literals_buffer_len = literals_buffer.len();
     let mut lit_cur: usize = 0;
     let mut seq_sum: u32 = 0;
@@ -158,6 +161,7 @@ pub(crate) fn decode_and_execute_sequences_scalar<B: BufferBackend>(
 
             let r = execute_one_body!(
                 buffer,
+                dict,
                 literals_buffer,
                 &mut lit_cur,
                 literals_buffer_len,
@@ -185,6 +189,7 @@ pub(crate) fn decode_and_execute_sequences_scalar<B: BufferBackend>(
                 let exec_seq = ring[slot];
                 let r = execute_one_body!(
                     buffer,
+                    dict,
                     literals_buffer,
                     &mut lit_cur,
                     literals_buffer_len,
@@ -215,6 +220,7 @@ pub(crate) fn decode_and_execute_sequences_scalar<B: BufferBackend>(
             let resolved_offset = do_offset_history(seq.of, seq.ll, &mut shadow_hist);
             let r = execute_one_body!(
                 buffer,
+                dict,
                 literals_buffer,
                 &mut lit_cur,
                 literals_buffer_len,

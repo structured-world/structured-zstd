@@ -791,8 +791,8 @@ impl HcMatcher {
         }
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         {
-            use crate::encoding::fastpath::{FastpathKernel, select_kernel};
-            match select_kernel() {
+            use crate::encoding::fastpath::FastpathKernel;
+            match table.kernel {
                 FastpathKernel::Avx2Bmi2 => unsafe {
                     self.for_each_repcode_candidate_with_reps_avx2_bmi2(
                         table,
