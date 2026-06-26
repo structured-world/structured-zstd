@@ -519,7 +519,7 @@ jobs:
       # failing the whole dashboard shard. Cache wasm-pack's tool dir so the
       # tarball is fetched at most once across runs.
       - name: Cache wasm-pack binaryen download
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.cache/.wasm-pack
           key: wasm-pack-binaryen-${{ runner.os }}
