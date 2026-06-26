@@ -719,10 +719,6 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel>(
     let mut ip1 = brs[1].index;
     let mut ip2 = brs[2].index;
     let mut ip3 = brs[3].index;
-    let mut nbl0 = brs[0].bits_consumed - max_num_bits;
-    let mut nbl1 = brs[1].bits_consumed - max_num_bits;
-    let mut nbl2 = brs[2].bits_consumed - max_num_bits;
-    let mut nbl3 = brs[3].bits_consumed - max_num_bits;
     let mut c0 = cursors[0];
     let mut c1 = cursors[1];
     let mut c2 = cursors[2];
@@ -755,7 +751,7 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel>(
     // `min_ip >= bytes_per_iter_upper` gate at loop entry keeps `ip -=
     // nb_bytes` and the 8-byte window read in-bounds (see the budget note).
     macro_rules! reload1 {
-        ($b:ident, $ip:ident, $nbl:ident, $src:expr) => {{
+        ($b:ident, $ip:ident, $src:expr) => {{
             let ctz = $b.trailing_zeros();
             $ip -= (ctz >> 3) as usize;
             let nb_bits = (ctz & 7) as u8;
@@ -765,7 +761,6 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel>(
                     .unwrap_unchecked()
             });
             $b = (new_window | 1) << nb_bits;
-            $nbl = nb_bits;
         }};
     }
     // One burst: `$n` symbols across all four streams. `$n` is a literal so
@@ -847,10 +842,10 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel>(
         // the sentinel must land at bit `nb_bits` so the next reload's `ctz`
         // accumulates the sub-byte phase; resetting it to bit 0 loses the
         // phase between reloads.
-        reload1!(b0, ip0, nbl0, src0);
-        reload1!(b1, ip1, nbl1, src1);
-        reload1!(b2, ip2, nbl2, src2);
-        reload1!(b3, ip3, nbl3, src3);
+        reload1!(b0, ip0, src0);
+        reload1!(b1, ip1, src1);
+        reload1!(b2, ip2, src2);
+        reload1!(b3, ip3, src3);
     }
 
     // Commit cursors to the caller's array (the drain phase reads them)
@@ -871,21 +866,26 @@ unsafe fn run_4stream_burst_loop<K: CpuKernel>(
     // sub-byte phase from the last reload plus the `max_num_bits` consumed
     // for the state just extracted), `state = b >> table_shift`.
     macro_rules! writeback {
-        ($i:literal, $b:ident, $ip:ident, $nbl:ident, $src:expr) => {{
+        ($i:literal, $b:ident, $ip:ident, $src:expr) => {{
             brs[$i].index = $ip;
             brs[$i].bit_container = u64::from_le_bytes(unsafe {
                 $src.get_unchecked($ip..$ip + 8)
                     .try_into()
                     .unwrap_unchecked()
             });
-            brs[$i].bits_consumed = $nbl + max_num_bits;
+            // bits_consumed = sub-byte phase + max_num_bits. After the final
+            // reload b{s} = (window | 1) << nb_bits, so trailing_zeros(b{s}) is
+            // exactly that nb_bits (the sentinel sits at bit nb_bits). Recompute
+            // it here instead of carrying a per-stream `nbl` register across the
+            // whole burst loop — four fewer loop-live values.
+            brs[$i].bits_consumed = $b.trailing_zeros() as u8 + max_num_bits;
             decoders[$i].state = $b >> table_shift;
         }};
     }
-    writeback!(0, b0, ip0, nbl0, src0);
-    writeback!(1, b1, ip1, nbl1, src1);
-    writeback!(2, b2, ip2, nbl2, src2);
-    writeback!(3, b3, ip3, nbl3, src3);
+    writeback!(0, b0, ip0, src0);
+    writeback!(1, b1, ip1, src1);
+    writeback!(2, b2, ip2, src2);
+    writeback!(3, b3, ip3, src3);
 }
 
 #[cfg(test)]

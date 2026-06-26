@@ -5,6 +5,16 @@ on:
     branches:
       - main
 
+# Serialize release-plz runs. Two pushes landing within ~1 min (two PRs merged
+# back-to-back) otherwise start two overlapping runs that race on the release-PR
+# git refs: one closes the release PR, the other's recreate fails on the
+# already-taken ref, leaving the release PR closed with no replacement.
+# `cancel-in-progress: false` QUEUES the second run rather than cancelling it —
+# the `release` (publish) step must never be interrupted mid-publish.
+concurrency:
+  group: release-plz-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   release-plz:
     runs-on: ubuntu-latest
