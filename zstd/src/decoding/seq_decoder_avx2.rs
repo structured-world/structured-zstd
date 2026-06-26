@@ -50,17 +50,17 @@ macro_rules! decode_one_body {
 
         let sum_wide = u16::from(of_num_bits) + u16::from(ml_num_bits) + u16::from(ll_num_bits);
         let (obits, ml_add, ll_add) = if sum_wide <= 56 {
-            let sum = sum_wide as u8;
-            $br.ensure_bits(sum);
-            // SAFETY: enclosing fn is target_feature(bmi2,avx2); vendor
-            // policy cached at BitReader::new gates the PEXT-direct path.
-            let triple = if $br.use_pext_triple_fast() {
-                unsafe { $br.peek_bits_triple_bmi2(sum, of_num_bits, ml_num_bits, ll_num_bits) }
-            } else {
-                $br.peek_bits_triple(sum, of_num_bits, ml_num_bits, ll_num_bits)
-            };
-            $br.consume(sum);
-            triple
+            // Upstream `ZSTD_decodeSequence` reads OF/ML/LL as three separate
+            // `BIT_readBitsFast` after one reload. The fields are independent so
+            // the CPU pipelines them; the old PEXT-triple folded all three into
+            // one serial `pext` dependency. One `ensure_bits` up front, then
+            // three unchecked reads (same bit order, byte-identical).
+            $br.ensure_bits(sum_wide as u8);
+            (
+                $br.get_bits_unchecked(of_num_bits),
+                $br.get_bits_unchecked(ml_num_bits),
+                $br.get_bits_unchecked(ll_num_bits),
+            )
         } else {
             (
                 $br.get_bits(of_num_bits),
@@ -481,6 +481,20 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
                 &mut br,
                 &mut shadow_hist
             );
+            // Advance the FSE states for the NEXT sequence before executing the
+            // current one, mirroring upstream `ZSTD_decodeSequence` (which
+            // updates the states inside decode, then calls `ZSTD_execSequence`).
+            // The execute reads no bits, so moving it after the state update is
+            // byte-identical (value bits then state-transition bits are consumed
+            // in the same order); it stops the three FSE states and the bit
+            // reader from staying live across the heavy match copy, cutting
+            // register pressure in the hot loop.
+            if i + 1 < num_sequences {
+                br.ensure_bits(max_update_bits);
+                ll_dec.update_state_fast(&mut br);
+                ml_dec.update_state_fast(&mut br);
+                of_dec.update_state_fast(&mut br);
+            }
             let r = execute_one_body!(
                 buffer,
                 dict,
@@ -496,13 +510,6 @@ pub(crate) unsafe fn decode_and_execute_sequences_avx2<'fse, B: BufferBackend>(
                 break;
             }
             seq_sum = seq_sum.wrapping_add(seq_ll).wrapping_add(seq_ml);
-
-            if i + 1 < num_sequences {
-                br.ensure_bits(max_update_bits);
-                ll_dec.update_state_fast(&mut br);
-                ml_dec.update_state_fast(&mut br);
-                of_dec.update_state_fast(&mut br);
-            }
         }
         if let Some(e) = fallback_err {
             let _ = buffer.try_restore_checkpoint(buffer_checkpoint);
