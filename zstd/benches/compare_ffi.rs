@@ -1127,6 +1127,15 @@ fn emit_block_structure_report(
     };
     let mut pos = 4 + 1 + usize::from(!single_segment) + dict_id_bytes + fcs_bytes;
     let payload_end = compressed.len() - if checksum { 4 } else { 0 };
+    // A truncated/invalid frame must report `parse=error`, not fall through to a
+    // normal REPORT_BLK that would make it look like a valid empty/partial frame.
+    if pos > payload_end {
+        println!(
+            "REPORT_BLK scenario={} level={} encoder={} parse=error",
+            scenario.id, level.name, encoder
+        );
+        return;
+    }
     let mut blocks: Vec<(char, usize, bool)> = Vec::new();
     while pos + 3 <= payload_end {
         let h = compressed[pos] as usize
@@ -1139,8 +1148,21 @@ fn emit_block_structure_report(
             0 => ('R', bsize), // Raw
             1 => ('L', 1),     // RLE (1 byte payload)
             2 => ('C', bsize), // Compressed
-            _ => ('?', bsize),
+            _ => {
+                println!(
+                    "REPORT_BLK scenario={} level={} encoder={} parse=error",
+                    scenario.id, level.name, encoder
+                );
+                return;
+            }
         };
+        if pos + 3 + advance > payload_end {
+            println!(
+                "REPORT_BLK scenario={} level={} encoder={} parse=error",
+                scenario.id, level.name, encoder
+            );
+            return;
+        }
         blocks.push((kind, bsize, last));
         pos += 3 + advance;
         if last {

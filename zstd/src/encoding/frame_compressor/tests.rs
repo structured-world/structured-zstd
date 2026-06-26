@@ -2562,56 +2562,66 @@ fn frame_block_list(frame: &[u8]) -> Vec<(u8, usize, bool)> {
 /// fix, each frame ended with an extra `R0!` block (3 wasted bytes).
 #[test]
 fn exact_block_multiple_marks_last_real_block() {
-    let cap = MAX_BLOCK_SIZE as usize;
-    for &nblk in &[1usize, 2, 3] {
-        for &compressible in &[false, true] {
-            let input: Vec<u8> = if compressible {
-                vec![0x7Au8; cap * nblk]
-            } else {
-                generate_data(0xC0FF_EE11, cap * nblk)
-            };
+    // The fix is driven by `block_capacity`, so cover both the default 128 KiB
+    // cap (`None`) and a smaller configured `target_block_size` — the EOF path
+    // must mark the last real block in both.
+    const CUSTOM_CAP: u32 = 16 * 1024;
+    for &(cap, target) in &[
+        (MAX_BLOCK_SIZE as usize, None),
+        (CUSTOM_CAP as usize, Some(CUSTOM_CAP)),
+    ] {
+        for &nblk in &[1usize, 2, 3] {
+            for &compressible in &[false, true] {
+                let input: Vec<u8> = if compressible {
+                    vec![0x7Au8; cap * nblk]
+                } else {
+                    generate_data(0xC0FF_EE11, cap * nblk)
+                };
 
-            // One-shot slice path.
-            let mut oneshot: FrameCompressor =
-                FrameCompressor::new(super::CompressionLevel::Default);
-            let frame_os = oneshot.compress_independent_frame(&input);
-            let blocks_os = frame_block_list(&frame_os);
-            let last_os = *blocks_os.last().expect("at least one block");
-            assert!(
-                last_os.2,
-                "one-shot last block must set last_block (nblk={nblk}, compressible={compressible}): {blocks_os:?}"
-            );
-            assert!(
-                !(last_os.0 == 0 && last_os.1 == 0),
-                "one-shot must not emit a trailing empty Raw block (nblk={nblk}, compressible={compressible}): {blocks_os:?}"
-            );
-
-            // Streaming Read loop.
-            let mut output = Vec::new();
-            let mut streaming = FrameCompressor::new(super::CompressionLevel::Default);
-            streaming.set_source(input.as_slice());
-            streaming.set_drain(&mut output);
-            streaming.compress();
-            let blocks_st = frame_block_list(&output);
-            let last_st = *blocks_st.last().expect("at least one block");
-            assert!(
-                last_st.2,
-                "streaming last block must set last_block (nblk={nblk}, compressible={compressible}): {blocks_st:?}"
-            );
-            assert!(
-                !(last_st.0 == 0 && last_st.1 == 0),
-                "streaming must not emit a trailing empty Raw block (nblk={nblk}, compressible={compressible}): {blocks_st:?}"
-            );
-
-            // Both frames must round-trip back to the original bytes.
-            for frame in [&frame_os, &output] {
-                let mut decoder = FrameDecoder::new();
-                let mut decoded = Vec::with_capacity(input.len());
-                decoder.decode_all_to_vec(frame, &mut decoded).unwrap();
-                assert_eq!(
-                    decoded, input,
-                    "roundtrip mismatch (nblk={nblk}, compressible={compressible})"
+                // One-shot slice path.
+                let mut oneshot: FrameCompressor =
+                    FrameCompressor::new(super::CompressionLevel::Default);
+                oneshot.set_target_block_size(target);
+                let frame_os = oneshot.compress_independent_frame(&input);
+                let blocks_os = frame_block_list(&frame_os);
+                let last_os = *blocks_os.last().expect("at least one block");
+                assert!(
+                    last_os.2,
+                    "one-shot last block must set last_block (cap={cap}, nblk={nblk}, compressible={compressible}): {blocks_os:?}"
                 );
+                assert!(
+                    !(last_os.0 == 0 && last_os.1 == 0),
+                    "one-shot must not emit a trailing empty Raw block (cap={cap}, nblk={nblk}, compressible={compressible}): {blocks_os:?}"
+                );
+
+                // Streaming Read loop.
+                let mut output = Vec::new();
+                let mut streaming = FrameCompressor::new(super::CompressionLevel::Default);
+                streaming.set_target_block_size(target);
+                streaming.set_source(input.as_slice());
+                streaming.set_drain(&mut output);
+                streaming.compress();
+                let blocks_st = frame_block_list(&output);
+                let last_st = *blocks_st.last().expect("at least one block");
+                assert!(
+                    last_st.2,
+                    "streaming last block must set last_block (cap={cap}, nblk={nblk}, compressible={compressible}): {blocks_st:?}"
+                );
+                assert!(
+                    !(last_st.0 == 0 && last_st.1 == 0),
+                    "streaming must not emit a trailing empty Raw block (cap={cap}, nblk={nblk}, compressible={compressible}): {blocks_st:?}"
+                );
+
+                // Both frames must round-trip back to the original bytes.
+                for frame in [&frame_os, &output] {
+                    let mut decoder = FrameDecoder::new();
+                    let mut decoded = Vec::with_capacity(input.len());
+                    decoder.decode_all_to_vec(frame, &mut decoded).unwrap();
+                    assert_eq!(
+                        decoded, input,
+                        "roundtrip mismatch (cap={cap}, nblk={nblk}, compressible={compressible})"
+                    );
+                }
             }
         }
     }

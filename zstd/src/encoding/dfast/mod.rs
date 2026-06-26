@@ -1788,9 +1788,8 @@ macro_rules! start_matching_fast_loop_body {
         // early-skip path (the `block_looks_incompressible_strict` short
         // circuit + `miss_run` / `DFAST_LOCAL_SKIP_TRIGGER` thresholding).
         // The step ramp is now driven purely by distance traveled
-        // (`DFAST_SKIP_STEP_GROWTH_INTERVAL = 64`, upstream zstd parity except
-        // upstream zstd uses 256 — see "Upstream zstd-deviation audit" in the PR body),
-        // so blocks the strict gate used to bail out of early now scan
+        // (`DFAST_SKIP_STEP_GROWTH_INTERVAL = 256`, matching upstream zstd's
+        // `kStepIncr = 1 << kSearchStrength`), so blocks the strict gate used to bail out of early now scan
         // through the standard ramp. `block_looks_incompressible_strict`
         // is still used by `levels/fastest.rs` for the Fastest preset
         // and by `incompressible.rs` unit tests, so the helper itself

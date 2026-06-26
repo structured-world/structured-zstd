@@ -701,13 +701,13 @@ pub(crate) struct CompressState<M: Matcher> {
     /// `CompressState` by hand must also supply a value.
     pub(crate) strategy_tag: crate::encoding::strategy::StrategyTag,
     /// Whether the HUF literal table build runs the #167 table-log search
-    /// (`true`) or the cheap single-build (`false`). For the Fast strategy the
-    /// search is a clean ratio win over upstream zstd but costs ~1.5 us per
-    /// literal section — negligible on large inputs, ~20% on small ones — and
-    /// the Fast matcher is byte-faithful to upstream zstd (so the cheap path
-    /// ties it). So it is gated ON only for large Fast frames; non-Fast
-    /// strategies always keep it (their matchers diverge, making the search
-    /// load-bearing for ratio — gating those is deferred). Set per frame
+    /// (`true`) or the cheap single-build (`false`). The search is a clean
+    /// ratio win over upstream zstd but costs ~1.5 us per literal section —
+    /// negligible on large inputs, ~20% on small ones. The Fast and DoubleFast
+    /// matchers are byte-faithful to upstream zstd, so the cheap path ties them;
+    /// the search is therefore gated ON only for large (> 128 KiB) Fast and
+    /// DoubleFast frames. Higher strategies always keep it (their matchers
+    /// diverge, making the search load-bearing for ratio). Set per frame
     /// alongside `strategy_tag` via [`huf_search_enabled`].
     pub(crate) huf_optimal_search: bool,
 }
