@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.45](https://github.com/structured-world/structured-zstd/compare/v0.0.44...v0.0.45) - 2026-06-26
+
+### Fixed
+
+- *(dfast)* upstream-identical sequence generation + faster HUF decode ([#450](https://github.com/structured-world/structured-zstd/pull/450))
+
+### Performance
+
+- *(opt)* close the btopt dict-band gap via upstream getAllMatches shape ([#448](https://github.com/structured-world/structured-zstd/pull/448))
+
+### Refactored
+
+- *(encoding)* split match_generator monolith + separate tests from production ([#445](https://github.com/structured-world/structured-zstd/pull/445))
+
 ## [0.0.44](https://github.com/structured-world/structured-zstd/compare/v0.0.43...v0.0.44) - 2026-06-23
 
 ### Performance
