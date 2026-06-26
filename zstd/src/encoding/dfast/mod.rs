@@ -1210,47 +1210,6 @@ impl DfastMatchGenerator {
             if match_len < DFAST_REP_MIN_MATCH_LEN {
                 break;
             }
-            // Sparse complementary insertion (upstream parity,
-            // `zstd_double_fast.c:300-304`): upstream inserts ONLY at
-            // `curr+2`, `ip-2`, `ip-1` after a match — three specific
-            // positions, not the whole match range. The previous
-            // `insert_positions(abs_pos, abs_pos + match_len)` made
-            // sense only under the 4-slot bucket; with single-slot
-            // upstream zstd parity it would just overwrite every bucket along
-            // the match span and discard whichever positions the
-            // producer was about to re-probe.
-            //
-            // At the floor `match_len == DFAST_REP_MIN_MATCH_LEN (= 4)`
-            // the three targets collapse to two distinct positions.
-            // With `post_match_end = abs_pos + 4` the three offsets
-            // resolve to:
-            //   `curr + 2` = abs_pos + 2
-            //   `ip - 2`   = abs_pos + 4 - 2 = abs_pos + 2  ← same as curr+2
-            //   `ip - 1`   = abs_pos + 4 - 1 = abs_pos + 3  ← distinct
-            // So `curr+2` and `ip-2` write the same slot twice;
-            // single-slot overwrite is idempotent, so the duplicate
-            // write is correctness-neutral. It's one wasted store on
-            // the shortest rep extension and not worth a branch to
-            // dedup. For `match_len >= 5` all three offsets are
-            // distinct.
-            //
-            // Why `abs_pos` itself is NOT in the insert set, despite
-            // not being written by the fast loop's pre-check insert
-            // (the previous range form `insert_positions(abs_pos,
-            // post_match_end)` did include it): upstream
-            // `ZSTD_compressBlock_doubleFast_*` likewise does not
-            // insert at the rep-extension start. After a rep match,
-            // upstream just advances `ip` and reruns the outer fast
-            // loop, which writes the new `curr` (the post-rep cursor)
-            // — never the rep's own start. The three offsets above
-            // are upstream's primary-match-emit insertion pattern,
-            // mirrored here to preserve hit rate on the chains that
-            // follow a rep extension. The hash-state delta vs the
-            // prior range-insert behavior is intentional and tracked
-            // by the sequence-stream comparator harness (the
-            // per-sequence diff vs FFI mentioned in the PR body's
-            // deferred section); the audit signed off on the current
-            // sparse set as the closest faithful mirror of upstream.
             // Upstream zstd immediate-repcode insertion (zstd_double_fast.c:314-315):
             // INSIDE the rep chain, upstream writes BOTH hash tables at the rep
             // position itself (`hashSmall[hash(ip)] = ip; hashLong[hash(ip)] = ip`)

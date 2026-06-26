@@ -1137,6 +1137,7 @@ fn emit_block_structure_report(
         return;
     }
     let mut blocks: Vec<(char, usize, bool)> = Vec::new();
+    let mut saw_last = false;
     while pos + 3 <= payload_end {
         let h = compressed[pos] as usize
             | (compressed[pos + 1] as usize) << 8
@@ -1166,8 +1167,19 @@ fn emit_block_structure_report(
         blocks.push((kind, bsize, last));
         pos += 3 + advance;
         if last {
+            saw_last = true;
             break;
         }
+    }
+    // A clean frame ends exactly on a terminal (`last`) block with no leftover
+    // bytes; otherwise it was truncated (e.g. 1-2 trailing bytes that cannot
+    // form a block header) and must report a parse error, not a block list.
+    if !saw_last || pos != payload_end {
+        println!(
+            "REPORT_BLK scenario={} level={} encoder={} parse=error",
+            scenario.id, level.name, encoder
+        );
+        return;
     }
     let list: Vec<String> = blocks
         .iter()
