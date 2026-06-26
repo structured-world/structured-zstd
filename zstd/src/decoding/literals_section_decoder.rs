@@ -446,13 +446,46 @@ fn decompress_literals_impl<K: CpuKernel>(
         // a no-op; eliding it also lets us hold `target_ptr` without an
         // intervening `&mut Vec<u8>` borrow that invalidates the pointer
         // under stacked-borrows.
+        // Per-stream tail decode, mirroring upstream zstd `HUF_decodeStreamX1`
+        // (huf_decompress.c:546): decode in groups of 4 with ONE reload per
+        // group, then the final < 4 symbols per-symbol. The previous form
+        // reloaded the bit reader on EVERY symbol, so each trailing symbol near
+        // a stream end paid `refill_slow` — the dominant drain cost on a
+        // literal-heavy frame.
+        let group_bits = 4 * max_num_bits;
         for i in 0..4 {
-            while brs[i].bits_remaining() > -max_bits && cursors[i] < ends[i] {
-                let byte = decoders[i].decode_symbol_and_advance(&mut brs[i]);
-                unsafe {
-                    target_ptr.add(cursors[i]).write(byte);
+            // Phase 1 (upstream `HUF_decodeStreamX1` lines 551-557): decode in
+            // groups of four with a SINGLE reload per group. Output-based bound
+            // (`cursors[i] + 4 <= ends[i]`), like upstream's `p < pEnd-3`, so a
+            // group only runs while four whole symbols remain — it never reads
+            // past the last symbol into the zero padding.
+            while cursors[i] + 4 <= ends[i] {
+                brs[i].ensure_bits(group_bits);
+                for _ in 0..4 {
+                    let byte = decoders[i].decode_symbol_and_advance_no_refill(&mut brs[i]);
+                    unsafe {
+                        target_ptr.add(cursors[i]).write(byte);
+                    }
+                    cursors[i] += 1;
                 }
-                cursors[i] += 1;
+            }
+            // Phase 2 (upstream `HUF_decodeStreamX1` line 568 `while (p < pEnd)`):
+            // the final < 4 symbols. ONE reload covers them (<= 3 * max_num_bits
+            // bits), then NO per-symbol reload — so the trailing symbols at the
+            // stream end never pay the cold `refill_slow` each. `bits_remaining`
+            // is reload-timing-independent (the padding lands in either
+            // `extra_bits` or `bits_consumed`, and `(64 - bits_consumed) -
+            // extra_bits` is identical), so the end-of-stream check below still
+            // holds exactly.
+            if cursors[i] < ends[i] {
+                brs[i].ensure_bits(group_bits);
+                while cursors[i] < ends[i] {
+                    let byte = decoders[i].decode_symbol_and_advance_no_refill(&mut brs[i]);
+                    unsafe {
+                        target_ptr.add(cursors[i]).write(byte);
+                    }
+                    cursors[i] += 1;
+                }
             }
             if brs[i].bits_remaining() != -max_bits {
                 return Err(DecompressLiteralsError::BitstreamReadMismatch {
