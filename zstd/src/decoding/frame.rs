@@ -60,41 +60,43 @@ pub fn read_frame_header_with_format(
         window_descriptor: 0,
     };
 
-    if !desc.single_segment_flag() {
-        r.read_exact(&mut buf[0..1])
-            .map_err(err::WindowDescriptorReadError)?;
-        frame_header.window_descriptor = buf[0];
-        bytes_read += 1;
-    }
-
+    // Sizes of the remaining variable header fields are all encoded in the
+    // descriptor, so the rest of the header (window descriptor + dictionary id
+    // + frame content size, at most 1 + 4 + 8 = 13 bytes) is read in ONE bulk
+    // `read_exact` and parsed by direct indexing — mirroring upstream zstd
+    // `ZSTD_getFrameHeader`, which slices the whole header out of the source in
+    // one shot. The previous form issued a separate trait `read_exact` per
+    // field; on a tiny frame those per-field reads (each a generic
+    // `Read::read_exact` loop + `map_err`) dominated decode.
+    let window_len = usize::from(!desc.single_segment_flag());
     let dict_id_len = desc.dictionary_id_bytes()? as usize;
-    if dict_id_len != 0 {
-        let buf = &mut buf[..dict_id_len];
-        r.read_exact(buf).map_err(err::DictionaryIdReadError)?;
-        bytes_read += dict_id_len;
-        let mut dict_id = 0u32;
+    let fcs_len = desc.frame_content_size_bytes()? as usize;
+    let rest_len = window_len + dict_id_len + fcs_len;
 
-        #[allow(clippy::needless_range_loop)]
+    let mut rest = [0u8; 13];
+    let rest = &mut rest[..rest_len];
+    r.read_exact(rest).map_err(err::FrameDescriptorReadError)?;
+    bytes_read += rest_len;
+
+    let mut off = 0;
+    if window_len != 0 {
+        frame_header.window_descriptor = rest[off];
+        off += 1;
+    }
+    if dict_id_len != 0 {
+        let mut dict_id = 0u32;
         for i in 0..dict_id_len {
-            dict_id += (buf[i] as u32) << (8 * i);
+            dict_id += (rest[off + i] as u32) << (8 * i);
         }
+        off += dict_id_len;
         if dict_id != 0 {
             frame_header.dict_id = Some(dict_id);
         }
     }
-
-    let fcs_len = desc.frame_content_size_bytes()? as usize;
     if fcs_len != 0 {
-        let mut fcs_buf = [0u8; 8];
-        let fcs_buf = &mut fcs_buf[..fcs_len];
-        r.read_exact(fcs_buf)
-            .map_err(err::FrameContentSizeReadError)?;
-        bytes_read += fcs_len;
         let mut fcs = 0u64;
-
-        #[allow(clippy::needless_range_loop)]
         for i in 0..fcs_len {
-            fcs += (fcs_buf[i] as u64) << (8 * i);
+            fcs += (rest[off + i] as u64) << (8 * i);
         }
         if fcs_len == 2 {
             fcs += 256;
