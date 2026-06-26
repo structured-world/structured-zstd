@@ -18,6 +18,7 @@ pub(crate) fn read_frame_header(r: impl Read) -> Result<(FrameHeader, u8), ReadF
 /// frame detection is bypassed — the caller MUST know out-of-band
 /// that the stream is magicless. Upstream zstd parity:
 /// `ZSTD_f_zstd1_magicless` via `ZSTD_d_format`.
+#[inline]
 pub fn read_frame_header_with_format(
     mut r: impl Read,
     magicless: bool,
@@ -60,6 +61,10 @@ pub fn read_frame_header_with_format(
         window_descriptor: 0,
     };
 
+    // Each variable header field is read with its own field-specific error so
+    // a truncated frame reports which field is missing. The slice `read_exact`
+    // override (`io_nostd`) makes each of these a single bounds-checked copy,
+    // so the small per-field reads are not the cost they once were.
     if !desc.single_segment_flag() {
         r.read_exact(&mut buf[0..1])
             .map_err(err::WindowDescriptorReadError)?;
@@ -73,10 +78,8 @@ pub fn read_frame_header_with_format(
         r.read_exact(buf).map_err(err::DictionaryIdReadError)?;
         bytes_read += dict_id_len;
         let mut dict_id = 0u32;
-
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..dict_id_len {
-            dict_id += (buf[i] as u32) << (8 * i);
+        for (i, &b) in buf.iter().enumerate() {
+            dict_id += (b as u32) << (8 * i);
         }
         if dict_id != 0 {
             frame_header.dict_id = Some(dict_id);
@@ -91,10 +94,8 @@ pub fn read_frame_header_with_format(
             .map_err(err::FrameContentSizeReadError)?;
         bytes_read += fcs_len;
         let mut fcs = 0u64;
-
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..fcs_len {
-            fcs += (fcs_buf[i] as u64) << (8 * i);
+        for (i, &b) in fcs_buf.iter().enumerate() {
+            fcs += (b as u64) << (8 * i);
         }
         if fcs_len == 2 {
             fcs += 256;

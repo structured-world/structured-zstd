@@ -21,9 +21,9 @@ use super::fastpath::{FastpathKernel, select_kernel};
 use super::incompressible::block_looks_incompressible;
 use super::levels::config::MIN_WINDOW_LOG;
 use super::match_generator::{
-    DFAST_EMPTY_SLOT, DFAST_HASH_BITS, DFAST_INCOMPRESSIBLE_SKIP_STEP, DFAST_MAX_SKIP_STEP,
-    DFAST_MIN_MATCH_LEN, DFAST_REBASE_GUARD_BAND, DFAST_SHORT_HASH_BITS_DELTA,
-    DFAST_SHORT_HASH_LOOKAHEAD, DFAST_SKIP_STEP_GROWTH_INTERVAL,
+    DFAST_EMPTY_SLOT, DFAST_HASH_BITS, DFAST_INCOMPRESSIBLE_SKIP_STEP, DFAST_MIN_MATCH_LEN,
+    DFAST_REBASE_GUARD_BAND, DFAST_SHORT_HASH_BITS_DELTA, DFAST_SHORT_HASH_LOOKAHEAD,
+    DFAST_SKIP_STEP_GROWTH_INTERVAL,
 };
 use super::match_table::helpers::{common_prefix_len_with_kernel, extend_backwards_shared};
 use super::match_table::storage::{REBASE_RESET_FLOOR_CEILING, check_stream_abs_headroom};
@@ -50,6 +50,11 @@ const HASH_READ_SIZE: usize = 8;
 /// using the hash-search floor on either site silently drops 4-byte
 /// rep emissions that upstream produces.
 const DFAST_REP_MIN_MATCH_LEN: usize = 4;
+
+/// Cached `DFTRACE` env flag for the dfast commit-path diagnostic (read once;
+/// see the `DFTRACE` gate in the fast-loop commit handler).
+#[cfg(feature = "std")]
+static DFTRACE_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 #[derive(Clone)]
 pub(crate) struct DfastMatchGenerator {
@@ -1205,58 +1210,16 @@ impl DfastMatchGenerator {
             if match_len < DFAST_REP_MIN_MATCH_LEN {
                 break;
             }
-            // Sparse complementary insertion (upstream parity,
-            // `zstd_double_fast.c:300-304`): upstream inserts ONLY at
-            // `curr+2`, `ip-2`, `ip-1` after a match — three specific
-            // positions, not the whole match range. The previous
-            // `insert_positions(abs_pos, abs_pos + match_len)` made
-            // sense only under the 4-slot bucket; with single-slot
-            // upstream zstd parity it would just overwrite every bucket along
-            // the match span and discard whichever positions the
-            // producer was about to re-probe.
-            //
-            // At the floor `match_len == DFAST_REP_MIN_MATCH_LEN (= 4)`
-            // the three targets collapse to two distinct positions.
-            // With `post_match_end = abs_pos + 4` the three offsets
-            // resolve to:
-            //   `curr + 2` = abs_pos + 2
-            //   `ip - 2`   = abs_pos + 4 - 2 = abs_pos + 2  ← same as curr+2
-            //   `ip - 1`   = abs_pos + 4 - 1 = abs_pos + 3  ← distinct
-            // So `curr+2` and `ip-2` write the same slot twice;
-            // single-slot overwrite is idempotent, so the duplicate
-            // write is correctness-neutral. It's one wasted store on
-            // the shortest rep extension and not worth a branch to
-            // dedup. For `match_len >= 5` all three offsets are
-            // distinct.
-            //
-            // Why `abs_pos` itself is NOT in the insert set, despite
-            // not being written by the fast loop's pre-check insert
-            // (the previous range form `insert_positions(abs_pos,
-            // post_match_end)` did include it): upstream
-            // `ZSTD_compressBlock_doubleFast_*` likewise does not
-            // insert at the rep-extension start. After a rep match,
-            // upstream just advances `ip` and reruns the outer fast
-            // loop, which writes the new `curr` (the post-rep cursor)
-            // — never the rep's own start. The three offsets above
-            // are upstream's primary-match-emit insertion pattern,
-            // mirrored here to preserve hit rate on the chains that
-            // follow a rep extension. The hash-state delta vs the
-            // prior range-insert behavior is intentional and tracked
-            // by the sequence-stream comparator harness (the
-            // per-sequence diff vs FFI mentioned in the PR body's
-            // deferred section); the audit signed off on the current
-            // sparse set as the closest faithful mirror of upstream.
-            let post_match_end = abs_pos + match_len;
-            let insert_targets = [
-                abs_pos + 2,                      // curr + 2
-                post_match_end.saturating_sub(2), // ip - 2 (post-match cursor)
-                post_match_end.saturating_sub(1), // ip - 1
-            ];
-            for &target in &insert_targets {
-                if target > abs_pos && target < post_match_end {
-                    self.insert_position(target);
-                }
-            }
+            // Upstream zstd immediate-repcode insertion (zstd_double_fast.c:314-315):
+            // INSIDE the rep chain, upstream writes BOTH hash tables at the rep
+            // position itself (`hashSmall[hash(ip)] = ip; hashLong[hash(ip)] = ip`)
+            // before advancing — NOT the `curr+2 / ip-2 / ip-1` primary-match
+            // complementary set (that pattern belongs to `_match_found`, lines
+            // 300-304, reached only by the non-rep store path). Inserting the
+            // wrong set here leaves the rep-position keys stale, so a later
+            // position re-resolves the long hash to an older far candidate
+            // instead of the stable rep offset — the dfast ratio gap vs C.
+            self.insert_position(abs_pos);
             // Emit zero-literal rep sequence.
             handle_sequence(Sequence::Triple {
                 literals: &[],
@@ -1386,6 +1349,7 @@ impl DfastMatchGenerator {
         current_abs_start: usize,
         literals_start: &mut usize,
         candidate: MatchCandidate,
+        scan_pos: usize,
         handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
     ) -> usize {
         // Upstream zstd `zstd_double_fast.c` parity: the inner search loop already
@@ -1396,18 +1360,34 @@ impl DfastMatchGenerator {
         // prefixStart)` + the growing `step`). Match interior: upstream zstd fills only
         // the sparse 3-target set (`curr+2`, `ip-2`, `ip-1`), each clamped to
         // the open match interval.
-        let match_start = candidate.start;
+        // Upstream zstd complementary insertion (zstd_double_fast.c:300-304) is
+        // ASYMMETRIC across the two tables:
+        //   hashLong:  curr+2, ip-2
+        //   hashSmall: curr+2, ip-1
+        // The previous form inserted curr+2/ip-2/ip-1 into BOTH tables, putting
+        // ip-1 into long and ip-2 into short that upstream never writes —
+        // polluting the long table so later positions resolve to the wrong
+        // (far, non-rep) candidate. Mirror the exact per-table target set.
+        //
+        // `curr` is the iteration's SCAN position (`scan_pos`, upstream `curr`
+        // = `(U32)(ip-base)` fixed at zstd_double_fast.c:184), NOT the match
+        // start: upstream advances `ip` for a rep1 (`ip++`, the match begins at
+        // `scan+1`) and rewinds it during backward catch-up, but `curr` stays
+        // pinned to the scan cursor. Anchoring `curr+2` on `match_start` instead
+        // shifts the insert by +1 on every rep1 (and by the catch-up length on
+        // extended matches), seeding the short hash with the wrong positions —
+        // a divergence that compounds across a block.
         let post_match_end = candidate.start + candidate.match_len;
-        let insert_targets = [
-            match_start + 2,                  // curr + 2
-            post_match_end.saturating_sub(2), // ip - 2 (post-match cursor)
-            post_match_end.saturating_sub(1), // ip - 1
-        ];
-        for &target in &insert_targets {
-            if target > match_start && target < post_match_end {
-                self.insert_position(target);
-            }
-        }
+        // `match_len >= DFAST_REP_MIN_MATCH_LEN` (4) for every committed match,
+        // so `post_match_end >= 4`: the `- 2` / `- 1` cannot underflow (plain
+        // arithmetic, no `saturating_*` masking).
+        let curr_plus_2 = scan_pos + 2;
+        let ip_minus_2 = post_match_end - 2;
+        let ip_minus_1 = post_match_end - 1;
+        self.insert_long(curr_plus_2);
+        self.insert_long(ip_minus_2);
+        self.insert_short(curr_plus_2);
+        self.insert_short(ip_minus_1);
         // Inline the trailing-block slice rather than calling
         // `get_last_space()` so this matches the gate pattern used by
         // `skip_matching` / `start_matching` (read `window_blocks.back()`
@@ -1629,6 +1609,27 @@ impl DfastMatchGenerator {
 
     #[inline]
     pub(crate) fn insert_position(&mut self, pos: usize) {
+        self.insert_masked::<true, true>(pos);
+    }
+
+    /// Insert `pos` into ONLY the long hash table (upstream zstd asymmetric
+    /// complementary insertion: `hashLong` at `curr+2` and `ip-2`).
+    fn insert_long(&mut self, pos: usize) {
+        self.insert_masked::<false, true>(pos);
+    }
+
+    /// Insert `pos` into ONLY the short hash table (upstream zstd: `hashSmall`
+    /// at `curr+2` and `ip-1`).
+    fn insert_short(&mut self, pos: usize) {
+        self.insert_masked::<true, false>(pos);
+    }
+
+    /// Const-generic insertion core. `SHORT` / `LONG` select which tables to
+    /// write; both `true` is the symmetric `insert_position`. The const flags
+    /// fold at compile time, so `insert_position` stays byte-identical to the
+    /// previous single-function form while the asymmetric variants emit only
+    /// their one write.
+    fn insert_masked<const SHORT: bool, const LONG: bool>(&mut self, pos: usize) {
         // Source the bytes + rebase coordinates through `scan_source()` so a
         // borrowed window's seam / tail re-seeds hash the in-place input
         // exactly as the owned path hashes its `history` concat.
@@ -1669,7 +1670,7 @@ impl DfastMatchGenerator {
         // `start_matching` seam re-seed picks it up once the next block
         // extends the source far enough to form its full 5-byte key.
         let concat = unsafe { core::slice::from_raw_parts(base_ptr.add(start_offset), concat_len) };
-        if idx + 5 <= concat_len {
+        if SHORT && idx + 5 <= concat_len {
             let short = self.short_hash_index(&concat[idx..]);
             debug_assert!(short < self.short_len());
             // Short region starts at `long_len`.
@@ -1677,7 +1678,7 @@ impl DfastMatchGenerator {
             unsafe { *self.tables.get_unchecked_mut(slot) = packed };
         }
 
-        if idx + 8 <= concat_len {
+        if LONG && idx + 8 <= concat_len {
             let long = self.long_hash_index(&concat[idx..]);
             debug_assert!(long < self.long_len());
             unsafe { *self.tables.get_unchecked_mut(long) = packed };
@@ -1746,9 +1747,8 @@ macro_rules! start_matching_fast_loop_body {
         // early-skip path (the `block_looks_incompressible_strict` short
         // circuit + `miss_run` / `DFAST_LOCAL_SKIP_TRIGGER` thresholding).
         // The step ramp is now driven purely by distance traveled
-        // (`DFAST_SKIP_STEP_GROWTH_INTERVAL = 64`, upstream zstd parity except
-        // upstream zstd uses 256 — see "Upstream zstd-deviation audit" in the PR body),
-        // so blocks the strict gate used to bail out of early now scan
+        // (`DFAST_SKIP_STEP_GROWTH_INTERVAL = 256`, matching upstream zstd's
+        // `kStepIncr = 1 << kSearchStrength`), so blocks the strict gate used to bail out of early now scan
         // through the standard ramp. `block_looks_incompressible_strict`
         // is still used by `levels/fastest.rs` for the Fastest preset
         // and by `incompressible.rs` unit tests, so the helper itself
@@ -1937,6 +1937,7 @@ macro_rules! start_matching_fast_loop_body {
                         $current_abs_start,
                         &mut literals_start,
                         committed,
+                        $current_abs_start + ip0,
                         $handle_sequence,
                     );
                     pos = start + committed.match_len;
@@ -2030,7 +2031,13 @@ macro_rules! start_matching_fast_loop_body {
             // previous `Option<MatchCandidate>` + sibling `usize`
             // pairing relied on a comment-block to flag the coupling.
             enum InnerExit {
-                Committed(MatchCandidate),
+                // `u8` is a debug path tag (0=rep1, 1=long@ip0, 2=short/_search_next_long,
+                // 3=dict-long, 4=dict-snl), surfaced by the `DFTRACE` env gate in the
+                // commit handler to diagnose match-path / offset divergence vs C ffi.
+                // `usize` is the iteration's scan position `abs_ip0` (upstream `curr`,
+                // zstd_double_fast.c:184) — the complementary insertion anchors on it,
+                // NOT on the (rep1 `+1` / catch-up adjusted) match start.
+                Committed(MatchCandidate, u8, usize),
                 Tail(usize),
             }
 
@@ -2106,9 +2113,15 @@ macro_rules! start_matching_fast_loop_body {
                 let rep1 = $self.offset_hist[0] as usize;
                 if rep1 != 0 && rep1 <= abs_ip1 {
                     let cand_pos_r = abs_ip1 - rep1;
-                    if cand_pos_r >= wlow1
-                        && cand_pos_r >= $current_abs_start + literals_start
-                    {
+                    // Window-low bound ONLY (upstream zstd `zstd_double_fast.c:190`
+                    // gates the rep on nothing but `offset_1 > 0` and the 4-byte
+                    // equality at `ip+1-offset_1`, i.e. the candidate is in the
+                    // prefix). A prior extra `cand_pos_r >= literals_start` clause
+                    // rejected essentially EVERY rep — after a match
+                    // `literals_start ≈ ip`, so any back-reference (cand before
+                    // the literal cursor) failed it — collapsing the rep path and
+                    // forcing the long-hash to mint creeping offsets.
+                    if cand_pos_r >= wlow1 {
                         let cand_idx_r = cand_pos_r - history_abs_start;
                         // 4-byte gate; full forward count only if it passes.
                         let cand4 = unsafe {
@@ -2163,7 +2176,7 @@ macro_rules! start_matching_fast_loop_body {
                                     match_len,
                                     lit_len_ip1,
                                 );
-                                break 'inner InnerExit::Committed(rep_cand);
+                                break 'inner InnerExit::Committed(rep_cand, 0, abs_ip0);
                             }
                         }
                     }
@@ -2255,7 +2268,18 @@ macro_rules! start_matching_fast_loop_body {
                                 match_len,
                                 lit_len_ip0,
                             );
-                            break 'inner InnerExit::Committed(cand);
+                            // Upstream zstd `_match_found` (zstd_double_fast.c:287):
+                            // `if (step < 4) hashLong[hl1] = ip1`. Insert the
+                            // lookahead position's long hash before storing the
+                            // match — safe only while `step < 4` (then `ip1` is
+                            // below the post-match cursor `ip + mLength`).
+                            if step < 4 {
+                                let packed_ip1 = ((abs_ip1 - position_base) as u32) + 1;
+                                unsafe {
+                                    *long_hash_ptr.add(hl1_idx) = packed_ip1;
+                                }
+                            }
+                            break 'inner InnerExit::Committed(cand, 1, abs_ip0);
                         }
                     }
                     }
@@ -2324,7 +2348,7 @@ macro_rules! start_matching_fast_loop_body {
                                     match_len,
                                     lit_len_ip0,
                                 );
-                                break 'inner InnerExit::Committed(cand);
+                                break 'inner InnerExit::Committed(cand, 3, abs_ip0);
                             }
                         }
                     }
@@ -2533,7 +2557,15 @@ macro_rules! start_matching_fast_loop_body {
                                 }
                             }
                             if short_hit_valid || retry_upgraded {
-                                break 'inner InnerExit::Committed(chosen);
+                                // Upstream zstd `_match_found` (zstd_double_fast.c:287):
+                                // `if (step < 4) hashLong[hl1] = ip1`.
+                                if step < 4 {
+                                    let packed_ip1 = ((abs_ip1 - position_base) as u32) + 1;
+                                    unsafe {
+                                        *long_hash_ptr.add(hl1_idx) = packed_ip1;
+                                    }
+                                }
+                                break 'inner InnerExit::Committed(chosen, 2, abs_ip0);
                             }
                             // Below-floor short hit with no retry
                             // upgrade — fall through to the step bump
@@ -2611,7 +2643,7 @@ macro_rules! start_matching_fast_loop_body {
                                     lit_len_ip0,
                                 );
                                 if dcand.match_len >= DFAST_MIN_MATCH_LEN {
-                                    break 'inner InnerExit::Committed(dcand);
+                                    break 'inner InnerExit::Committed(dcand, 4, abs_ip0);
                                 }
                             }
                         }
@@ -2619,8 +2651,10 @@ macro_rules! start_matching_fast_loop_body {
                 }
 
                 // Step bump on distance (upstream zstd `zstd_double_fast.c:224-228`).
+                // Upstream grows the step unbounded (one per `kStepIncr` travelled);
+                // no cap, so the scan stride matches byte-for-byte.
                 if ip1 >= next_step_pos {
-                    step = (step + 1).min(DFAST_MAX_SKIP_STEP);
+                    step += 1;
                     next_step_pos += DFAST_SKIP_STEP_GROWTH_INTERVAL;
                 }
 
@@ -2639,11 +2673,28 @@ macro_rules! start_matching_fast_loop_body {
             };
 
             match inner_exit {
-                InnerExit::Committed(candidate) => {
+                InnerExit::Committed(candidate, _path_tag, scan_pos) => {
+                    // `DFTRACE` env gate: dump each committed match's path tag +
+                    // (offset, match_len, literal_len) so the match-path / offset
+                    // stream can be diffed against C ffi when chasing a dfast
+                    // ratio divergence. The env is read ONCE into a cached flag
+                    // (a per-commit `getenv` showed up at ~3% of small-frame
+                    // encode); off by default, an atomic load in production.
+                    #[cfg(feature = "std")]
+                    if *DFTRACE_ENABLED.get_or_init(|| std::env::var_os("DFTRACE").is_some()) {
+                        std::eprintln!(
+                            "DFT path={} off={} ml={} ll={}",
+                            _path_tag,
+                            candidate.offset,
+                            candidate.match_len,
+                            candidate.start - $current_abs_start - literals_start,
+                        );
+                    }
                     let start = $self.emit_candidate(
                         $current_abs_start,
                         &mut literals_start,
                         candidate,
+                        scan_pos,
                         $handle_sequence,
                     );
                     pos = start + candidate.match_len;

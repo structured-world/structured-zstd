@@ -346,7 +346,16 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         }
 
         let raw_description_is_representable = weights.len() <= 128;
-        let raw_description_bytes = weights.len().div_ceil(2);
+        // Upstream zstd `HUF_writeCTable_wksp` (huf_compress.c:276) keeps the FSE
+        // weight description ONLY when `hSize < maxSymbolValue/2` (FLOOR). Our
+        // `weights.len()` equals `maxSymbolValue` (the implicit last symbol is not
+        // written; see `write_raw_weight_description`), so the threshold is
+        // `weights.len() / 2`. `div_ceil` was 1 byte too permissive on odd symbol
+        // counts: it kept the FSE description in a boundary band where upstream
+        // emits the cheap direct nibbles, producing a frame that is fractionally
+        // smaller but markedly slower to decode (the decoder pays an FSE
+        // weight-table build + FSE weight decode instead of a nibble unpack).
+        let raw_description_bytes = weights.len() / 2;
         if encoded.len() > 1
             && (encoded.len() < raw_description_bytes || !raw_description_is_representable)
         {

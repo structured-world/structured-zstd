@@ -259,6 +259,26 @@ impl<'t> HuffmanDecoder<'t> {
         packed as u8
     }
 
+    /// Decode one symbol WITHOUT refilling the bit reader. The caller must have
+    /// guaranteed enough buffered bits (via `ensure_bits`) for this and any
+    /// batched siblings. Mirrors upstream zstd `HUF_decodeSymbolX1`
+    /// (`BIT_lookBitsFast` + `BIT_skipBits`, no per-symbol reload): the drain
+    /// reloads once per group of symbols instead of once per symbol, so the
+    /// tail symbols near a stream end don't each pay `refill_slow`. The advance
+    /// uses the scalar form (byte-identical to the BMI2 `_bzhi` path) since the
+    /// drain handles only a handful of trailing symbols per stream.
+    #[inline(always)]
+    pub fn decode_symbol_and_advance_no_refill<K: crate::cpu_kernel::CpuKernel>(
+        &mut self,
+        br: &mut BitReaderReversed<'_, K>,
+    ) -> u8 {
+        let packed = self.table.packed_decode[self.state as usize];
+        let num_bits = (packed >> 8) as u8;
+        let new_bits = br.get_bits_unchecked(num_bits);
+        self.state = ((self.state << num_bits) & self.table.state_mask) | new_bits;
+        packed as u8
+    }
+
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[target_feature(enable = "bmi2")]
     unsafe fn decode_symbol_and_advance_x86_bmi2<K: crate::cpu_kernel::CpuKernel>(

@@ -120,7 +120,7 @@ impl<W: Write> StreamingEncoder<W, MatchGeneratorDriver> {
         self.state.strategy_tag = self.strategy_override.unwrap_or_else(|| {
             crate::encoding::strategy::StrategyTag::for_compression_level(self.compression_level)
         });
-        self.state.huf_optimal_search = crate::encoding::frame_compressor::fast_huf_search_enabled(
+        self.state.huf_optimal_search = crate::encoding::frame_compressor::huf_search_enabled(
             self.state.strategy_tag,
             self.pledged_content_size.or(self.source_size_hint),
         );
@@ -574,7 +574,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         self.state.strategy_tag = self.strategy_override.unwrap_or_else(|| {
             crate::encoding::strategy::StrategyTag::for_compression_level(self.compression_level)
         });
-        self.state.huf_optimal_search = crate::encoding::frame_compressor::fast_huf_search_enabled(
+        self.state.huf_optimal_search = crate::encoding::frame_compressor::huf_search_enabled(
             self.state.strategy_tag,
             self.pledged_content_size.or(self.source_size_hint),
         );
