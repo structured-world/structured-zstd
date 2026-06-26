@@ -701,30 +701,32 @@ pub(crate) struct CompressState<M: Matcher> {
     /// `CompressState` by hand must also supply a value.
     pub(crate) strategy_tag: crate::encoding::strategy::StrategyTag,
     /// Whether the HUF literal table build runs the #167 table-log search
-    /// (`true`) or the cheap single-build (`false`). For the Fast strategy the
-    /// search is a clean ratio win over upstream zstd but costs ~1.5 us per
-    /// literal section — negligible on large inputs, ~20% on small ones — and
-    /// the Fast matcher is byte-faithful to upstream zstd (so the cheap path
-    /// ties it). So it is gated ON only for large Fast frames; non-Fast
-    /// strategies always keep it (their matchers diverge, making the search
-    /// load-bearing for ratio — gating those is deferred). Set per frame
-    /// alongside `strategy_tag` via [`fast_huf_search_enabled`].
+    /// (`true`) or the cheap single-build (`false`). The search is a clean
+    /// ratio win over upstream zstd but costs ~1.5 us per literal section —
+    /// negligible on large inputs, ~20% on small ones. The Fast and DoubleFast
+    /// matchers are byte-faithful to upstream zstd, so the cheap path ties them;
+    /// the search is therefore gated ON only for large (> 128 KiB) Fast and
+    /// DoubleFast frames. Higher strategies always keep it (their matchers
+    /// diverge, making the search load-bearing for ratio). Set per frame
+    /// alongside `strategy_tag` via [`huf_search_enabled`].
     pub(crate) huf_optimal_search: bool,
 }
 
-/// Whether the Fast-strategy HUF literal build should run the #167 table-log
-/// search for a frame of `source_size` bytes (see
-/// [`CompressState::huf_optimal_search`]). Non-Fast strategies always search.
-/// For Fast, enable the search only above 128 KiB (one full block) — below
-/// that the per-frame setup dominates and the search's ~1.5 us is a large
-/// relative cost for a ratio gain the cheap path forgoes while still tying
-/// upstream zstd. Unknown size (streaming) keeps the search for conservative
-/// ratio.
-pub(crate) fn fast_huf_search_enabled(
+/// Whether the HUF literal build should run the #167 table-log search for a
+/// frame of `source_size` bytes (see [`CompressState::huf_optimal_search`]).
+/// The Fast and DoubleFast strategies do little matching work, so per-frame
+/// HUF setup dominates a small frame and the search's ~1.5 us is a large
+/// relative cost for a ratio gain the cheap single-build forgoes while still
+/// tying upstream zstd. Gate the search to frames above 128 KiB (one full
+/// block) for those two. Higher strategies do enough matching that the search
+/// is a negligible fraction and always run it for the ratio edge. Unknown size
+/// (streaming) keeps the search for conservative ratio.
+pub(crate) fn huf_search_enabled(
     strategy: crate::encoding::strategy::StrategyTag,
     source_size: Option<u64>,
 ) -> bool {
-    if strategy != crate::encoding::strategy::StrategyTag::Fast {
+    use crate::encoding::strategy::StrategyTag;
+    if !matches!(strategy, StrategyTag::Fast | StrategyTag::Dfast) {
         return true;
     }
     match source_size {
@@ -802,10 +804,12 @@ fn initial_all_blocks_cap(initial_size_hint: Option<u64>, block_capacity: usize)
 /// `fill_block` appends source bytes to `buf` (which already holds any
 /// carried pre-split suffix) until `buf.len() == block_capacity` or the
 /// source is exhausted, returning `(bytes_appended, reached_eof)`.
-/// `reached_eof` is true iff the block could NOT be filled to
-/// `block_capacity` — the boundary the historical `Read`-loop produced (an
-/// input that is an exact multiple of the block size still yields a
-/// trailing empty last block on the next iteration).
+/// `reached_eof` is true when no more input follows this block: either the
+/// block could not be filled to `block_capacity`, or it filled exactly and the
+/// source is confirmed exhausted (the slice knows its length; the reader probes
+/// one byte ahead). An input that is an exact multiple of the block size
+/// therefore marks its final full block `last_block` rather than emitting a
+/// spurious trailing empty block.
 ///
 /// The slice impl exists so the slice entry points
 /// (`compress_independent_frame_into`, `compress_oneshot_*` fallbacks)
@@ -832,7 +836,14 @@ impl OwnedBlockSource for &[u8] {
         let take = want.min(self.len());
         buf.extend_from_slice(&self[..take]);
         *self = &self[take..];
-        (take, take < want)
+        // EOF when this fill could not top the block to `block_capacity`
+        // (`take < want`) OR it exactly consumed the last input bytes
+        // (`self` now empty). The slice knows its own length, so a block that
+        // exactly fills capacity at end-of-input is reported as the final
+        // block here — the loop marks it `last_block` instead of emitting a
+        // spurious trailing empty block on the next iteration. Mirrors the C
+        // encoder, which marks the last real block last on `ZSTD_e_end`.
+        (take, take < want || self.is_empty())
     }
 }
 
@@ -840,7 +851,26 @@ impl OwnedBlockSource for &[u8] {
 /// preserves the historical sizing behaviour — an initialized target region
 /// bounded by the source-size hint, grown (doubling, capped) only when the
 /// hint under-counted.
-pub(crate) struct ReaderBlockSource<Rd>(pub(crate) Rd);
+/// `peeked` holds a single look-ahead byte: when a block fills exactly to
+/// `block_capacity`, `fill_block` reads one more byte to learn whether the
+/// stream ended on that boundary. A `None` from that probe sets EOF (so the
+/// just-filled block is marked last, mirroring the C encoder on `ZSTD_e_end`);
+/// a byte is stashed here and prepended to the next block instead of leaking a
+/// spurious trailing empty block when the input is an exact multiple of the
+/// block size.
+pub(crate) struct ReaderBlockSource<Rd> {
+    pub(crate) reader: Rd,
+    peeked: Option<u8>,
+}
+
+impl<Rd> ReaderBlockSource<Rd> {
+    pub(crate) fn new(reader: Rd) -> Self {
+        Self {
+            reader,
+            peeked: None,
+        }
+    }
+}
 
 impl<Rd: Read> OwnedBlockSource for ReaderBlockSource<Rd> {
     fn fill_block(
@@ -852,6 +882,14 @@ impl<Rd: Read> OwnedBlockSource for ReaderBlockSource<Rd> {
         let start = buf.len();
         let mut filled = start;
         let mut reached_eof = false;
+        // Prepend the look-ahead byte read past the previous full block. In
+        // stream order it follows any carried pre-split suffix already in
+        // `buf`, so it is appended after that suffix and counted as part of
+        // this block's appended bytes.
+        if let Some(b) = self.peeked.take() {
+            buf.push(b);
+            filled += 1;
+        }
         // Size the read buffer to the bytes this block actually expects
         // rather than always zero-filling a full MAX_BLOCK_SIZE: a small
         // frame otherwise pays a 128 KiB `resize(_, 0)` memset per block
@@ -892,12 +930,29 @@ impl<Rd: Read> OwnedBlockSource for ReaderBlockSource<Rd> {
                 buf.resize(grow_to, 0);
             }
             let read_end = buf.len();
-            let new_bytes = self.0.read(&mut buf[filled..read_end]).unwrap();
+            let new_bytes = self.reader.read(&mut buf[filled..read_end]).unwrap();
             if new_bytes == 0 {
                 reached_eof = true;
                 break;
             }
             filled += new_bytes;
+        }
+        // Look ahead one byte when the block filled exactly to capacity: a
+        // 0-byte read means the stream ended on the block boundary, so this
+        // block is the last one (the loop marks it `last_block`); otherwise
+        // stash the byte for the next block. Without this, an input that is an
+        // exact multiple of the block size would emit a spurious trailing
+        // empty block (the next iteration reads 0 and serializes an empty
+        // last Raw block). A blocking reader's probe read is consistent with
+        // the existing pull model — the next `fill_block` would block on the
+        // same byte anyway.
+        if !reached_eof && filled == block_capacity {
+            let mut probe = [0u8; 1];
+            if self.reader.read(&mut probe).unwrap() == 0 {
+                reached_eof = true;
+            } else {
+                self.peeked = Some(probe[0]);
+            }
         }
         buf.truncate(filled);
         (filled - start, reached_eof)
@@ -978,7 +1033,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             crate::encoding::strategy::StrategyTag::for_compression_level(self.compression_level)
         });
         self.state.huf_optimal_search =
-            fast_huf_search_enabled(self.state.strategy_tag, self.source_size_hint);
+            huf_search_enabled(self.state.strategy_tag, self.source_size_hint);
         self.state.matcher.set_param_overrides(Some(overrides));
     }
 
@@ -1506,7 +1561,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             prep.initial_size_hint,
             self.block_capacity(),
         ));
-        let mut block_source = ReaderBlockSource(&mut source);
+        let mut block_source = ReaderBlockSource::new(&mut source);
         let total_uncompressed = self.run_owned_block_loop(
             &mut block_source,
             prep.initial_size_hint,
@@ -1575,7 +1630,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // `initial_size_hint` (captured before the `.take()` above) — by here
         // `self.source_size_hint` is None.
         self.state.huf_optimal_search =
-            fast_huf_search_enabled(self.state.strategy_tag, initial_size_hint);
+            huf_search_enabled(self.state.strategy_tag, initial_size_hint);
         let cached_entropy = if use_dictionary_state {
             self.dictionary_entropy_cache.as_ref()
         } else {

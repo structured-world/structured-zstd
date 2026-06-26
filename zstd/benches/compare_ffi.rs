@@ -293,6 +293,8 @@ fn bench_compress(c: &mut Criterion) {
                 emit_report_line(scenario, level, &rust_compressed, &ffi_compressed);
                 emit_frame_header_report(scenario, level, "rust", &rust_compressed);
                 emit_frame_header_report(scenario, level, "ffi", &ffi_compressed);
+                emit_block_structure_report(scenario, level, "rust", &rust_compressed);
+                emit_block_structure_report(scenario, level, "ffi", &ffi_compressed);
             }
 
             let benchmark_name = format!("compress/{}/{}/{}", level.name, scenario.id, "matrix");
@@ -1082,6 +1084,114 @@ fn emit_frame_header_report(
         checksum,
         fcs_bytes,
         dict_id_bytes,
+    );
+}
+
+fn emit_block_structure_report(
+    scenario: &Scenario,
+    level: LevelConfig,
+    encoder: &'static str,
+    compressed: &[u8],
+) {
+    if compressed.len() < 5 {
+        return;
+    }
+    // Raw hex of the frame head: lets us read the literals-section header and
+    // Huffman tree description (FSE weights vs direct nibbles) by hand when
+    // comparing rust vs ffi generation byte-for-byte on a fixture.
+    let head_len = compressed.len().min(48);
+    let hex: String = compressed[..head_len]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    println!(
+        "REPORT_HEX scenario={} level={} encoder={} head=[{}]",
+        scenario.id, level.name, encoder, hex
+    );
+    let desc = compressed[4];
+    let fcs_flag = desc >> 6;
+    let single_segment = ((desc >> 5) & 0x1) == 1;
+    let checksum = ((desc >> 2) & 0x1) == 1;
+    let dict_id_bytes: usize = match desc & 0x3 {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        _ => 4,
+    };
+    let fcs_bytes: usize = match fcs_flag {
+        0 => usize::from(single_segment),
+        1 => 2,
+        2 => 4,
+        _ => 8,
+    };
+    let mut pos = 4 + 1 + usize::from(!single_segment) + dict_id_bytes + fcs_bytes;
+    let payload_end = compressed.len() - if checksum { 4 } else { 0 };
+    // A truncated/invalid frame must report `parse=error`, not fall through to a
+    // normal REPORT_BLK that would make it look like a valid empty/partial frame.
+    if pos > payload_end {
+        println!(
+            "REPORT_BLK scenario={} level={} encoder={} parse=error",
+            scenario.id, level.name, encoder
+        );
+        return;
+    }
+    let mut blocks: Vec<(char, usize, bool)> = Vec::new();
+    let mut saw_last = false;
+    while pos + 3 <= payload_end {
+        let h = compressed[pos] as usize
+            | (compressed[pos + 1] as usize) << 8
+            | (compressed[pos + 2] as usize) << 16;
+        let last = (h & 1) == 1;
+        let btype = (h >> 1) & 0x3;
+        let bsize = h >> 3;
+        let (kind, advance) = match btype {
+            0 => ('R', bsize), // Raw
+            1 => ('L', 1),     // RLE (1 byte payload)
+            2 => ('C', bsize), // Compressed
+            _ => {
+                println!(
+                    "REPORT_BLK scenario={} level={} encoder={} parse=error",
+                    scenario.id, level.name, encoder
+                );
+                return;
+            }
+        };
+        if pos + 3 + advance > payload_end {
+            println!(
+                "REPORT_BLK scenario={} level={} encoder={} parse=error",
+                scenario.id, level.name, encoder
+            );
+            return;
+        }
+        blocks.push((kind, bsize, last));
+        pos += 3 + advance;
+        if last {
+            saw_last = true;
+            break;
+        }
+    }
+    // A clean frame ends exactly on a terminal (`last`) block with no leftover
+    // bytes; otherwise it was truncated (e.g. 1-2 trailing bytes that cannot
+    // form a block header) and must report a parse error, not a block list.
+    if !saw_last || pos != payload_end {
+        println!(
+            "REPORT_BLK scenario={} level={} encoder={} parse=error",
+            scenario.id, level.name, encoder
+        );
+        return;
+    }
+    let list: Vec<String> = blocks
+        .iter()
+        .map(|(k, s, l)| format!("{k}{s}{}", if *l { "!" } else { "" }))
+        .collect();
+    println!(
+        "REPORT_BLK scenario={} level={} encoder={} n_blocks={} blocks=[{}]",
+        scenario.id,
+        level.name,
+        encoder,
+        blocks.len(),
+        list.join(","),
     );
 }
 

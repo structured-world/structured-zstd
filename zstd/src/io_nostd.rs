@@ -169,6 +169,22 @@ impl Read for &[u8] {
         *self = rest;
         Ok(size)
     }
+
+    /// Direct slice read_exact: one bounds check + one copy + advance, instead
+    /// of the default trait loop (`read` in a `while` with a re-slice and a
+    /// trailing emptiness check per call). On the in-memory decode path the
+    /// frame-header parser issues several small `read_exact`s per frame, so the
+    /// default loop's per-call overhead dominated a tiny-frame decompress.
+    #[inline]
+    fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), Error> {
+        if self.len() < buf.len() {
+            return Err(Error::from(ErrorKind::UnexpectedEof));
+        }
+        let (head, rest) = self.split_at(buf.len());
+        buf.copy_from_slice(head);
+        *self = rest;
+        Ok(())
+    }
 }
 
 impl<T> Read for &mut T
@@ -177,6 +193,14 @@ where
 {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
         (*self).read(buf)
+    }
+
+    /// Delegate to the inner reader's `read_exact` so a `&mut &[u8]` (the
+    /// in-memory decode source) reaches the direct slice override above rather
+    /// than the default trait loop.
+    #[inline]
+    fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), Error> {
+        (*self).read_exact(buf)
     }
 }
 
