@@ -18,6 +18,7 @@ pub(crate) fn read_frame_header(r: impl Read) -> Result<(FrameHeader, u8), ReadF
 /// frame detection is bypassed — the caller MUST know out-of-band
 /// that the stream is magicless. Upstream zstd parity:
 /// `ZSTD_f_zstd1_magicless` via `ZSTD_d_format`.
+#[inline]
 pub fn read_frame_header_with_format(
     mut r: impl Read,
     magicless: bool,

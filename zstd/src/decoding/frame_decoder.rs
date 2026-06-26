@@ -854,6 +854,7 @@ impl FrameDecoderState {
     /// non-direct fallback reserves `window_size` once in
     /// `decode_all_impl` / `decode_blocks` via `reserve_buffer` before
     /// any block write.
+    #[inline]
     pub(crate) fn new_with_format(
         source: impl Read,
         magicless: bool,
@@ -898,6 +899,7 @@ impl FrameDecoderState {
     /// `DecoderScratchKind::reserve_buffer(window_size)` before any block
     /// write. A reused scratch whose new frame fits within prior capacity
     /// reuses it; a larger one grows on that same `reserve_buffer` call.
+    #[inline]
     pub(crate) fn reset_with_format(
         &mut self,
         source: impl Read,
@@ -1186,6 +1188,7 @@ impl FrameDecoder {
     /// Note that all bytes currently in the decodebuffer from any previous frame will be lost. Collect them with collect()/collect_to_writer()
     ///
     /// equivalent to reset()
+    #[inline]
     pub fn init(&mut self, source: impl Read) -> Result<(), FrameDecoderError> {
         self.reset(source)
     }
@@ -1222,6 +1225,7 @@ impl FrameDecoder {
     /// Note that all bytes currently in the decodebuffer from any previous frame will be lost. Collect them with collect()/collect_to_writer()
     ///
     /// equivalent to init()
+    #[inline]
     pub fn reset(&mut self, source: impl Read) -> Result<(), FrameDecoderError> {
         use FrameDecoderError as err;
         // Fresh frame → start with an empty per-block checksum vec so
