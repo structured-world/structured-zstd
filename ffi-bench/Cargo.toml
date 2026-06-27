@@ -32,6 +32,9 @@ zstd = { version = "0.13.3", features = ["zdict_builder", "experimental"] }
 criterion = "0.8"
 rand = "0.10"
 dhat = "0.3"
+# Third-party pure-Rust zstd codec, for the cross-implementation comparison
+# example (`zrip_compare`). Encode-focused (levels -7..4, Fast/DFast).
+zrip = "0.6"
 
 [features]
 # Forward the structured-zstd features the bench/test/example sources gate on
@@ -50,6 +53,11 @@ dhat-heap = ["structured-zstd/dhat-heap"]
 [[bench]]
 name = "decode_all"
 path = "../zstd/benches/decode_all.rs"
+harness = false
+
+[[bench]]
+name = "decode_loop"
+path = "../zstd/benches/decode_loop.rs"
 harness = false
 
 [[bench]]
@@ -189,6 +197,10 @@ name = "decode_loop_z000033"
 path = "../zstd/examples/decode_loop_z000033.rs"
 
 [[example]]
+name = "zrip_compare"
+path = "examples/zrip_compare.rs"
+
+[[example]]
 name = "encode_l4"
 path = "../zstd/examples/encode_l4.rs"
 
@@ -237,3 +249,15 @@ required-features = ["bench_internals"]
 name = "dict_matrix"
 path = "../zstd/examples/dict_matrix.rs"
 required-features = ["dict_builder"]
+
+[[example]]
+name = "interop_small"
+path = "examples/interop_small.rs"
+
+[[example]]
+name = "encode_small"
+path = "examples/encode_small.rs"
+
+[[example]]
+name = "ratio_parity"
+path = "examples/ratio_parity.rs"

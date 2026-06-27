@@ -149,6 +149,10 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                     compression_level,
                 ),
                 huf_optimal_search: true,
+                literal_compression_disabled: matches!(
+                    compression_level,
+                    CompressionLevel::Level(n) if n < 0
+                ),
             },
             pending: Vec::new(),
             encoded_scratch: Vec::new(),

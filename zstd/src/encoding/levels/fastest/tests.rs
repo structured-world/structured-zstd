@@ -67,6 +67,7 @@ fn rle_branch_passes_compressible_hint_to_skip_matching() {
         offset_hist: [1, 4, 8],
         strategy_tag: crate::encoding::strategy::StrategyTag::Fast,
         huf_optimal_search: true,
+        literal_compression_disabled: false,
     };
     let mut output = Vec::new();
 
@@ -102,6 +103,7 @@ fn raw_fast_path_emits_raw_block_and_passes_incompressible_hint() {
         offset_hist: [1, 4, 8],
         strategy_tag: crate::encoding::strategy::StrategyTag::Fast,
         huf_optimal_search: true,
+        literal_compression_disabled: false,
     };
     let mut output = Vec::new();
 

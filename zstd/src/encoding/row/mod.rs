@@ -546,9 +546,15 @@ macro_rules! lazy_parse_body {
                 };
                 let picked = 'pick: {
                     let Some(best) = best else { break 'pick None };
-                    if best.match_len >= $m.target_len
-                        || abs_pos + 1 + $m.mls > $m.history_abs_end()
-                    {
+                    // Upstream zstd's lazy parse (ZSTD_compressBlock_lazy_generic,
+                    // zstd_lazy.c) has NO targetLength / sufficient_len early-out:
+                    // it always runs the depth-1 lookahead while a successor
+                    // position exists, comparing the two by gain. Committing here
+                    // on `match_len >= target_len` collapsed the lazy levels to
+                    // greedy (target_len is as low as the minMatch, so the test
+                    // fired on every match) and lost ~7% ratio vs C on the lazy
+                    // band. Only the out-of-bounds guard stays.
+                    if abs_pos + 1 + $m.mls > $m.history_abs_end() {
                         break 'pick Some(best);
                     }
                     // SAFETY: the enclosing kernel is only entered when its

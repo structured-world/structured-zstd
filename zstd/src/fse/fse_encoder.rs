@@ -410,6 +410,48 @@ pub(crate) fn build_table_from_symbol_counts(
     build_table_from_counts(counts, max_log, avoid_0_numbit)
 }
 
+/// Build the FSE CTable for a sequence stream (LL / ML / OF), applying upstream
+/// zstd's last-symbol adjustment (`ZSTD_buildCTable`,
+/// zstd_compress_sequences.c:269-278): the final sequence's symbol is emitted
+/// through the FSE initial state, not a normal transition, so when its count
+/// exceeds 1 upstream drops one occurrence from the histogram and normalizes
+/// against `nbSeq - 1`. The table-log is still derived from the full `nbSeq`.
+/// `last_code` is the stream code of the last sequence (an index into `counts`,
+/// `<= max_symbol`). `use_low_prob_count` follows `nbSeq - 1` exactly as
+/// upstream's `ZSTD_useLowProbCount(nbSeq_1)`.
+pub(crate) fn build_seq_ctable(counts: &mut [usize], max_log: u8, last_code: usize) -> FSETable {
+    let total = counts.iter().sum::<usize>();
+    let max_symbol = counts
+        .iter()
+        .rposition(|&count| count > 0)
+        .unwrap_or_default();
+    // Derived from the full nbSeq, matching upstream (the adjustment touches only
+    // the normalized distribution, never the table-log).
+    let table_log = optimal_table_log(max_log, total, max_symbol);
+    let mut probs = [0i32; 256];
+    // Borrow the caller's histogram and drop the last sequence's symbol in place
+    // for the normalize, then put it back — no per-table copy. `normalize_counts`
+    // only re-borrows `counts` immutably, so it sees the decrement, and the
+    // restore leaves the selection-time histogram untouched for the caller.
+    let adjust = counts[last_code] > 1;
+    if adjust {
+        counts[last_code] -= 1;
+    }
+    let norm_total = if adjust { total - 1 } else { total };
+    normalize_counts(
+        &mut probs[..=max_symbol],
+        table_log,
+        &counts[..=max_symbol],
+        norm_total,
+        max_symbol,
+        norm_total >= 2048,
+    );
+    if adjust {
+        counts[last_code] += 1;
+    }
+    build_table_from_probabilities(&probs[..=max_symbol], table_log)
+}
+
 fn build_table_from_counts(counts: &[usize], max_log: u8, avoid_0_numbit: bool) -> FSETable {
     let total = counts.iter().sum::<usize>();
     // FSE table construction needs at least two samples in the histogram.

@@ -343,6 +343,7 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
                 offset_hist: [1, 4, 8],
                 strategy_tag: *strat,
                 huf_optimal_search: true,
+                literal_compression_disabled: false,
             };
             let mut emit_state = CompressState::<EntropyOnlyMatcher> {
                 matcher: EntropyOnlyMatcher,
@@ -353,6 +354,7 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
                 offset_hist: [1, 4, 8],
                 strategy_tag: *strat,
                 huf_optimal_search: true,
+                literal_compression_disabled: false,
             };
             let mut workspace = EstimatorWorkspace::default();
             let est = estimate_block_parts_size(&mut est_state, &literals, &[], &mut workspace);
@@ -398,6 +400,7 @@ fn raw_partition_fallback_restores_repeat_offset_history() {
         offset_hist: [10, 20, 30],
         strategy_tag: crate::encoding::strategy::StrategyTag::Fast,
         huf_optimal_search: true,
+        literal_compression_disabled: false,
     };
     let source = [0xA5; 8];
     let sequences = [RawSequence {
@@ -518,11 +521,12 @@ fn fast_band_strategies_prefer_repeat_fse_table() {
         let mode = super::choose_table_from_counts(
             Some(&previous),
             fse_tables.ll_default_ref(),
-            &counts,
+            &mut counts,
             total,
             1, // highest non-zero code in {0,1}
             9,
             strategy,
+            None,
         );
         assert!(
             matches!(mode, FseTableMode::RepeatLast(_)),

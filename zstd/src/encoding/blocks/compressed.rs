@@ -6,7 +6,9 @@ use crate::{
     encoding::block_header::BlockHeader,
     encoding::frame_compressor::{CompressState, FseTables, PreviousFseTable, SharedFseTable},
     encoding::{Matcher, Sequence},
-    fse::fse_encoder::{FSETable, build_table_from_symbol_counts, fse_header_bits_for_counts},
+    fse::fse_encoder::{
+        FSETable, build_seq_ctable, build_table_from_symbol_counts, fse_header_bits_for_counts,
+    },
     huff0::huff0_encoder,
 };
 
@@ -345,6 +347,7 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
             offset_hist: state.offset_hist,
             strategy_tag: state.strategy_tag,
             huf_optimal_search: state.huf_optimal_search,
+            literal_compression_disabled: state.literal_compression_disabled,
         },
         workspace,
     };
@@ -515,7 +518,15 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
     output: &mut Vec<u8>,
     sequences: &mut Vec<crate::blocks::sequence_section::Sequence>,
 ) {
-    encode_raw_sequences_into(raw_sequences, &mut state.offset_hist, sequences);
+    encode_raw_sequences_into(
+        raw_sequences,
+        &mut state.offset_hist,
+        sequences,
+        matches!(
+            state.strategy_tag,
+            crate::encoding::strategy::StrategyTag::Fast
+        ),
+    );
 
     // literals section
 
@@ -554,7 +565,16 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
     // small-input framing economy (single-segment header, store-raw fallback
     // for non-shrinking blocks) lives in `append_frame_header` /
     // `compress_block_encoded`, not in this literals path.
-    if !literals_vec.is_empty() && all_bytes_identical(literals_vec) {
+    if state.literal_compression_disabled {
+        // Upstream zstd `ZSTD_literalsCompressionIsDisabled` (auto mode:
+        // `strategy == ZSTD_fast && targetLength > 0`, i.e. the negative levels):
+        // emit RAW literals, skipping the Huffman pass entirely
+        // (`ZSTD_noCompressLiterals`). Trades ratio for encode speed and matches
+        // C's negative-band frames byte-for-byte (the literals section there is
+        // Raw, not Compressed/RLE).
+        raw_literals(literals_vec, &mut writer);
+        state.clear_huff_table();
+    } else if !literals_vec.is_empty() && all_bytes_identical(literals_vec) {
         rle_literals(literals_vec, &mut writer);
         state.clear_huff_table();
     } else if literals_vec.len() >= min_lits {
@@ -612,32 +632,47 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
         }
         let total = sequences.len();
 
+        // Stream codes of the LAST sequence: upstream zstd codes the final symbol
+        // of each stream via the FSE init-state and drops one occurrence of it
+        // from the emitted table's histogram (see `build_seq_ctable`). `Some`
+        // here because these modes are written to the frame.
+        let (last_ll, last_ml, last_of) = sequences.last().map_or((0, 0, 0), |seq| {
+            (
+                encode_literal_length(seq.ll).0 as usize,
+                encode_match_len(seq.ml).0 as usize,
+                encode_offset(seq.of).0 as usize,
+            )
+        });
+
         let ll_mode = choose_table_from_counts(
             state.fse_tables.ll_previous.as_ref(),
             state.fse_tables.ll_default_ref(),
-            &ll_counts,
+            &mut ll_counts,
             total,
             ll_max,
             9,
             state.strategy_tag,
+            Some(last_ll),
         );
         let ml_mode = choose_table_from_counts(
             state.fse_tables.ml_previous.as_ref(),
             state.fse_tables.ml_default_ref(),
-            &ml_counts,
+            &mut ml_counts,
             total,
             ml_max,
             9,
             state.strategy_tag,
+            Some(last_ml),
         );
         let of_mode = choose_table_from_counts(
             state.fse_tables.of_previous.as_ref(),
             state.fse_tables.of_default_ref(),
-            &of_counts,
+            &mut of_counts,
             total,
             of_max,
             8,
             state.strategy_tag,
+            Some(last_of),
         );
 
         writer.write_bits(encode_fse_table_modes(&ll_mode, &ml_mode, &of_mode), 8);
@@ -703,6 +738,10 @@ fn estimate_block_parts_size<M: Matcher>(
         raw_sequences,
         &mut state.offset_hist,
         &mut workspace.sequences,
+        matches!(
+            state.strategy_tag,
+            crate::encoding::strategy::StrategyTag::Fast
+        ),
     );
 
     let lit_bytes = estimate_literals_section_bytes(
@@ -711,6 +750,7 @@ fn estimate_block_parts_size<M: Matcher>(
         &mut workspace.lit_counts,
         state.strategy_tag,
         state.huf_optimal_search,
+        state.literal_compression_disabled,
     );
 
     let seq_bytes = if workspace.sequences.is_empty() {
@@ -735,9 +775,16 @@ fn estimate_literals_section_bytes(
     counts: &mut [usize; 256],
     strategy: crate::encoding::strategy::StrategyTag,
     huf_search: bool,
+    lit_disabled: bool,
 ) -> usize {
     // Mirror `encode_block_parts_with_sequence_scratch` literal-mode branches
-    // **in the same order**. The emitter pre-checks `all_identical`
+    // **in the same order**. The disabled gate (negative levels: raw literals,
+    // no Huffman) is checked FIRST exactly as the emitter does.
+    if lit_disabled {
+        *last_huff = None;
+        return uncompressed_literals_header_bytes(literals.len()) + literals.len();
+    }
+    // The emitter pre-checks `all_identical`
     // (any non-empty section) BEFORE the `min_lits` gate — RLE and raw
     // share `uncompressed_literals_header_bytes(len)` (1/2/3/5 bytes by
     // length tier), so on all-identical inputs RLE = lhSize + 1 equals
@@ -1202,6 +1249,7 @@ fn encode_raw_sequences_into(
     raw_sequences: &[RawSequence],
     offset_hist: &mut [u32; 3],
     out: &mut Vec<crate::blocks::sequence_section::Sequence>,
+    fast_repcode: bool,
 ) {
     out.clear();
     // `reserve_exact` argument is the increment over LENGTH, not capacity —
@@ -1209,15 +1257,33 @@ fn encode_raw_sequences_into(
     if out.capacity() < raw_sequences.len() {
         out.reserve_exact(raw_sequences.len() - out.len());
     }
-    out.extend(
-        raw_sequences
-            .iter()
-            .map(|seq| crate::blocks::sequence_section::Sequence {
-                ll: seq.ll,
-                ml: seq.ml,
-                of: encode_offset_with_history(seq.offset, seq.ll, offset_hist),
-            }),
-    );
+    // The strategy branch is hoisted out of the per-sequence loop so the
+    // offBase-policy choice is paid once per block, not per sequence. Upstream
+    // zstd's fast matcher emits only offBase 1 (rep[0] when litLength > 0,
+    // rep[1] when litLength == 0 via the secondary-position check) or an explicit
+    // offset — it never emits offBase 2/3. greedy+ search all three repeat
+    // offsets, which is what the full `encode_offset_with_history` mirrors.
+    if fast_repcode {
+        out.extend(
+            raw_sequences
+                .iter()
+                .map(|seq| crate::blocks::sequence_section::Sequence {
+                    ll: seq.ll,
+                    ml: seq.ml,
+                    of: encode_offset_with_history_fast(seq.offset, seq.ll, offset_hist),
+                }),
+        );
+    } else {
+        out.extend(
+            raw_sequences
+                .iter()
+                .map(|seq| crate::blocks::sequence_section::Sequence {
+                    ll: seq.ll,
+                    ml: seq.ml,
+                    of: encode_offset_with_history(seq.offset, seq.ll, offset_hist),
+                }),
+        );
+    }
 }
 
 fn clone_fse_tables(fse_tables: &FseTables) -> FseTables {
@@ -1565,11 +1631,14 @@ fn choose_table<'a>(
     choose_table_from_counts(
         previous,
         default_table,
-        &counts,
+        &mut counts,
         total,
         max_symbol,
         max_log,
         strategy,
+        // Estimator-only path (no emitted table): price the unadjusted histogram,
+        // matching upstream's `ZSTD_NCountCost`.
+        None,
     )
 }
 
@@ -1583,7 +1652,11 @@ fn choose_table<'a>(
 fn choose_table_from_counts<'a>(
     previous: Option<&'a PreviousFseTable>,
     default_table: &'a FSETable,
-    counts: &[usize; 256],
+    // `&mut` only so the emitted-table build can borrow the histogram, drop the
+    // last symbol in place for its normalize, and restore it (see
+    // `build_seq_ctable`) — no per-table copy. Every selection-time read
+    // re-borrows it immutably; the value is unchanged on return.
+    counts: &mut [usize; 256],
     total: usize,
     // The highest symbol code with a non-zero count, tracked by the caller as it
     // builds `counts`. The sequence-code alphabets are tiny (LL <= 35, ML <= 52,
@@ -1597,6 +1670,13 @@ fn choose_table_from_counts<'a>(
     max_symbol: usize,
     max_log: u8,
     strategy: crate::encoding::strategy::StrategyTag,
+    // The stream code of the LAST sequence, when this call emits a table that
+    // will be written to the frame (`Some`). Upstream zstd drops one occurrence
+    // of that code from the histogram before normalizing the emitted custom
+    // table (it is coded via the FSE init-state, not a transition). `None` for
+    // the cost-estimator call sites, which — like upstream's `ZSTD_NCountCost` —
+    // price the unadjusted histogram.
+    last_code: Option<usize>,
 ) -> FseTableMode<'a> {
     if total == 0 {
         return FseTableMode::Predefined(default_table);
@@ -1704,11 +1784,12 @@ fn choose_table_from_counts<'a>(
         // place the state tables are constructed). `distinct_symbols > 1`
         // held when `new_total_cost` was computed, so the histogram has the
         // two-sample minimum `build_table_from_symbol_counts` requires.
-        Some(Choice::New) => FseTableMode::Encoded(build_table_from_symbol_counts(
-            &counts[..=max_symbol],
-            max_log,
-            use_low_prob_count,
-        )),
+        Some(Choice::New) => FseTableMode::Encoded(match last_code {
+            Some(lc) => build_seq_ctable(&mut counts[..=max_symbol], max_log, lc),
+            None => {
+                build_table_from_symbol_counts(&counts[..=max_symbol], max_log, use_low_prob_count)
+            }
+        }),
         None => {
             let fallback_counts = [counts[0], 0];
             let fallback = if max_symbol == 0 {
@@ -2083,6 +2164,40 @@ pub(in crate::encoding) fn encode_offset_with_history(
     }
 
     encoded
+}
+
+/// Fast-matcher offset→offBase conversion, mirroring upstream zstd's
+/// `ZSTD_compressBlock_fast`: emit offBase 1 only for the immediate repeat
+/// offset (`rep[0]` when `lit_len > 0`, `rep[1]` when `lit_len == 0` — the
+/// litLength-0 rotation per RFC 8878 §3.1.2.5), and an explicit offset
+/// otherwise. Unlike [`encode_offset_with_history`] it never probes `rep[1]`
+/// (`lit_len > 0`) or `rep[2]`/`rep[0]-1` (`lit_len == 0`), so it does not
+/// rewrite an explicit offset that happens to coincide with a deeper repeat
+/// into offBase 2/3. That keeps the negative/fast band's sequence stream
+/// byte-identical to the C reference (the deeper-repeat rewrite both costs a
+/// per-sequence probe the fast matcher never pays and can shift the FSE symbol
+/// histogram the wrong way). The repeat-offset history update follows directly
+/// from the emitted code, identical to the full converter's rules.
+pub(in crate::encoding) fn encode_offset_with_history_fast(
+    actual_offset: u32,
+    lit_len: u32,
+    offset_hist: &mut [u32; 3],
+) -> u32 {
+    if lit_len > 0 {
+        if actual_offset == offset_hist[0] {
+            return 1; // rep[0] match: history unchanged
+        }
+    } else if actual_offset == offset_hist[1] {
+        // litLength-0 offBase 1 decodes as rep[1]: promote it, demote rep[0].
+        offset_hist[1] = offset_hist[0];
+        offset_hist[0] = actual_offset;
+        return 1;
+    }
+    // Explicit offset: rotate the full repeat-offset history.
+    offset_hist[2] = offset_hist[1];
+    offset_hist[1] = offset_hist[0];
+    offset_hist[0] = actual_offset;
+    actual_offset + 3
 }
 
 fn encode_offset(len: u32) -> (u8, u32, usize) {

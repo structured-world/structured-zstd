@@ -2272,6 +2272,33 @@ fn fast_oneshot_borrowed_split_emits_subblock() {
     );
 }
 
+/// Regression: `set_compression_level` must resync
+/// `state.literal_compression_disabled` so reusing a compressor and switching to
+/// a negative level emits raw literals (matching C
+/// `ZSTD_literalsCompressionIsDisabled`), not the Huffman-compressed literals
+/// carried over from the prior non-negative level.
+#[cfg(feature = "std")]
+#[test]
+fn set_compression_level_resyncs_literal_disable_for_negatives() {
+    use super::CompressionLevel;
+    let data = vec![0xABu8; 256];
+    let mut out = Vec::new();
+    // Construction at a non-negative level keeps literal (Huffman) compression on.
+    let mut compressor = FrameCompressor::new(CompressionLevel::Level(3));
+    compressor.set_source(data.as_slice());
+    compressor.set_drain(&mut out);
+    assert!(
+        !compressor.state.literal_compression_disabled,
+        "L3 construction must leave literal compression enabled",
+    );
+    // Switching to a negative level must immediately disable it.
+    compressor.set_compression_level(CompressionLevel::Level(-5));
+    assert!(
+        compressor.state.literal_compression_disabled,
+        "set_compression_level to a negative level must disable literal compression",
+    );
+}
+
 /// Regression: `set_compression_level` followed by `compress()` must
 /// refresh `state.strategy_tag` through the reset-time sync so the
 /// literal-compression gates (`min_literals_to_compress`,

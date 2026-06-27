@@ -4,6 +4,32 @@
 
 use super::*;
 
+// Test-local L22 BtUltra2 HcConfig fixtures. Production resolves L22 through
+// `cparams::get_cparams`; these fixed shapes are test INPUT for exercising the
+// matcher's BtUltra2 behaviour (seed pass, kernel-tier identity, hash3 window
+// clamp) at known geometries, independent of the level→param mapping.
+const BTULTRA2_HC_CONFIG: HcConfig = HcConfig {
+    hash_log: 24,
+    chain_log: 24,
+    search_depth: 512,
+    target_len: 256,
+    search_mls: 4,
+};
+const BTULTRA2_HC_CONFIG_L22: HcConfig = HcConfig {
+    hash_log: 25,
+    chain_log: 27,
+    search_depth: 512,
+    target_len: 999,
+    search_mls: 4,
+};
+const BTULTRA2_HC_CONFIG_L22_16K: HcConfig = HcConfig {
+    hash_log: 15,
+    chain_log: 15,
+    search_depth: 1 << 10,
+    target_len: 999,
+    search_mls: 4,
+};
+
 #[cfg(test)]
 impl MatchGeneratorDriver {
     /// Test-only: stage a parse×search recipe override applied on the
@@ -176,8 +202,8 @@ fn row_mls_knob_gates_matches_and_roundtrips() {
 #[test]
 fn parse_mode_follows_search_axis_not_strategy_tag() {
     use super::super::strategy::{ParseMode, SearchMethod};
-    // LEVEL_TABLE[15] is level 16: BtOpt tag, BinaryTree search.
-    let mut p = LEVEL_TABLE[15];
+    // Level 16: BtOpt tag, BinaryTree search (resolved via get_cparams).
+    let mut p = resolve_level_params(CompressionLevel::Level(16), None);
     assert_eq!(p.parse(), ParseMode::Optimal, "BinaryTree search → Optimal");
     // Override the Bt-tagged level's search to a non-BT backend: parse must
     // follow the search axis (derive from lazy_depth), not stay Optimal.
@@ -1618,14 +1644,12 @@ fn driver_small_source_hint_shrinks_dfast_hash_tables() {
     let hinted_long = driver.dfast_matcher().long_len();
     let hinted_short = driver.dfast_matcher().short_len();
 
-    // The wire `window_log` stays at its floor (decoder-interop), but the
-    // internal dfast tables are sized from the RAW 1 KiB source, not the
-    // floored window: `table_window = 1 << ceil_log2(1024) = 1 << 10`, so
-    // both tables land at the `MIN_WINDOW_LOG` floor (the long table at
-    // `dfast_hash_bits_for_window(1 << 10) = 10`, the short table one
-    // `DFAST_SHORT_HASH_BITS_DELTA` step below but clamped back up to
-    // `MIN_WINDOW_LOG`).
-    assert_eq!(driver.window_size(), 1 << MIN_HINTED_WINDOW_LOG);
+    // The window is now sized the C-faithful way: `get_cparams` clamps it to
+    // the raw 1 KiB source (`window_log = ceil_log2(1024) = 10 = MIN_WINDOW_LOG`),
+    // dropping the old MIN_HINTED_WINDOW_LOG 16 KiB interop floor (verified safe:
+    // such small-window frames decode in the C reference). Both dfast tables
+    // follow at that window.
+    assert_eq!(driver.window_size(), 1 << MIN_WINDOW_LOG);
     assert_eq!(hinted_long, 1 << MIN_WINDOW_LOG);
     assert_eq!(hinted_short, 1 << MIN_WINDOW_LOG);
     assert!(
@@ -1767,12 +1791,13 @@ fn driver_small_source_hint_shrinks_row_hash_tables() {
         "a window>14 source hint should reduce the row hash table footprint"
     );
 
-    // A tiny hint floors the resolved window at MIN_HINTED_WINDOW_LOG = 14;
-    // upstream uses the HASH-CHAIN matcher (not Row) at windowLog <= 14, so the
-    // driver must route greedy/lazy/lazy2 to the HashChain backend there.
+    // A tiny hint clamps the resolved window the C-faithful way (no interop
+    // floor): a 1 KiB source -> window_log 10 (MIN_WINDOW_LOG). Upstream uses
+    // the HASH-CHAIN matcher (not Row) at windowLog <= 14, so the driver must
+    // route greedy/lazy/lazy2 to the HashChain backend there.
     driver.set_source_size_hint(1024);
     driver.reset(CompressionLevel::Level(5));
-    assert_eq!(driver.window_size(), 1 << MIN_HINTED_WINDOW_LOG);
+    assert_eq!(driver.window_size(), 1 << MIN_WINDOW_LOG);
     assert_eq!(
         driver.active_backend(),
         super::super::strategy::BackendTag::HashChain,
@@ -2085,7 +2110,9 @@ fn source_hint_clamps_driver_slice_size_to_window() {
     driver.reset(CompressionLevel::Default);
 
     let window = driver.window_size() as usize;
-    assert_eq!(window, 1 << MIN_HINTED_WINDOW_LOG);
+    // C-faithful: a 1 KiB hint clamps the window to window_log 10 (no interop
+    // floor), and the driver's slice size follows that resolved window.
+    assert_eq!(window, 1 << MIN_WINDOW_LOG);
     assert_eq!(driver.slice_size, window);
 
     let space = driver.get_next_space();
@@ -2107,7 +2134,9 @@ fn pooled_space_keeps_capacity_when_slice_size_shrinks() {
     driver.reset(CompressionLevel::Default);
 
     let small = driver.get_next_space();
-    assert_eq!(small.len(), 1 << MIN_HINTED_WINDOW_LOG);
+    // Slice size follows the C-faithful resolved window: a 1 KiB hint clamps it
+    // to window_log 10 (MIN_WINDOW_LOG), not the old 16 KiB interop floor.
+    assert_eq!(small.len(), 1 << MIN_WINDOW_LOG);
     assert!(
         small.capacity() >= large_capacity,
         "pooled buffer capacity should be preserved to avoid shrink/grow churn"
@@ -2497,14 +2526,13 @@ fn primed_snapshot_restored_for_hints_in_same_window_bucket() {
 
 #[test]
 fn primed_snapshot_restored_across_level22_tier_hints() {
-    // Level 22 collapses several ceil-log buckets onto one upstream zstd source-size
-    // tier: `resolve_level_params(Level(22), ..)` selects the HC config and
-    // window_log by raw `<= 16 KiB / 128 KiB / 256 KiB` thresholds, so a 20 KiB
-    // and a 100 KiB hint (ceil-log buckets 15 and 17) both land in the
-    // `<= 128 KiB` tier and resolve to the IDENTICAL matcher (same window_log,
-    // same HC hash/chain/search geometry). Keying on the raw ceil-log bucket
-    // would still reject the restore here because the buckets differ; the key
-    // must compare the resolved matcher shape so these share one snapshot.
+    // The snapshot key compares the RESOLVED matcher shape, not the raw
+    // ceil-log source bucket. Under the C-faithful `get_cparams` resolution the
+    // Level 22 window is clamped to `ceil_log2(source)`, so two different hints
+    // that round to the SAME window_log resolve to the identical matcher and
+    // must share one primed-dictionary snapshot. 20 KiB and 25 KiB both clamp
+    // to window_log 15 (same `<= 128 KiB` cParams tier) despite differing raw
+    // sizes; keying on the raw size would wrongly reject the restore.
     let mut driver = MatchGeneratorDriver::new(8, 1);
     let level = CompressionLevel::Level(22);
 
@@ -2514,7 +2542,7 @@ fn primed_snapshot_restored_across_level22_tier_hints() {
     driver.prime_with_dictionary(b"abcdefghABCDEFGHijklmnop", [1, 4, 8]);
     driver.capture_primed_dictionary(level);
 
-    driver.set_source_size_hint(100 * 1024);
+    driver.set_source_size_hint(25 * 1024);
     driver.reset(level);
     let window_b = driver.window_size();
     assert_eq!(
@@ -2527,8 +2555,8 @@ fn primed_snapshot_restored_across_level22_tier_hints() {
     assert!(
         restored,
         "Level 22 snapshot captured at a 20 KiB hint must be restored into a \
-         100 KiB hint that resolves to the same upstream zstd tier (different ceil-log \
-         buckets, identical matcher shape)"
+         25 KiB hint that resolves to the same window_log 15 (different raw \
+         sizes, identical matcher shape)"
     );
 }
 
@@ -2882,11 +2910,17 @@ fn driver_row_commit_recycles_block_buffer_into_pool() {
 }
 
 #[test]
-fn adjust_params_for_zero_source_size_uses_min_hinted_window_floor() {
+fn adjust_params_for_zero_source_size_clamps_window_to_absolute_min() {
+    // C `ZSTD_adjustCParams_internal` clamps the window straight to the source
+    // size with NO extra hinted-window floor: a zero source size lands on
+    // `WINDOWLOG_ABSOLUTEMIN` (= MIN_WINDOW_LOG = 10), not the old project-only
+    // 16 KiB (`window_log` 14) floor. This pins the override re-cap to the same
+    // C-faithful adjuster (`cparams::adjust_cparams`) the `get_cparams` main
+    // path uses, so the two paths down-size identically.
     let mut params = resolve_level_params(CompressionLevel::Level(4), None);
     params.window_log = 22;
     let adjusted = adjust_params_for_source_size(params, 0);
-    assert_eq!(adjusted.window_log, MIN_HINTED_WINDOW_LOG);
+    assert_eq!(adjusted.window_log, MIN_WINDOW_LOG);
 }
 
 #[test]
@@ -4861,30 +4895,28 @@ fn fast_levels_dispatch_per_level_hash_log_and_mls() {
     assert_eq!(f1.mls, 7);
     assert_eq!(f1.step_size, 2);
 
-    // Negative levels — upstream zstd row-0 ("base for negative"):
-    // hash_log=13, mls=7. The 32 KiB table is L1d-resident (every
-    // probe an L1 hit, vs an L2 access for a 64 KiB hash_log=14
-    // table), and minMatch=7 drops short-distance 6-byte matches —
-    // upstream zstd parity on both ratio and throughput.
-    // step_size follows upstream zstd's formula: targetLength = -level,
-    // step_size = (-level) + 1, giving 2..8 for L-1..L-7.
+    // Negative levels — upstream zstd row-0 ("base for negative") at the
+    // > 256 KB / unknown tier: hash_log=13, mls=6. The 32 KiB table (2^13 * 4 B)
+    // is L1d-resident (every probe an L1 hit, vs an L2 access for a 64 KiB
+    // hash_log=14 table). step_size follows upstream zstd's formula:
+    // targetLength = -level, step_size = (-level) + 1, giving 2..8 for L-1..L-7.
     for n in -7..=-1 {
         let f = resolve_level_params(CompressionLevel::Level(n), None)
             .fast
             .unwrap();
         assert_eq!(f.hash_log, 13, "Level({n}) fast_hash_log");
-        assert_eq!(f.mls, 7, "Level({n}) fast_mls");
+        assert_eq!(f.mls, 6, "Level({n}) fast_mls");
         let expected_step = ((-n) as usize) + 1;
         assert_eq!(f.step_size, expected_step, "Level({n}) fast_step_size");
     }
 
-    // Fastest + Uncompressed keep hash_log=14 / mls=6 (their own
-    // tuning; not part of the negative-level upstream zstd ladder).
+    // Fastest resolves to upstream level 1 (the get_cparams consolidation), so
+    // it carries level 1's row: window 19, hash_log 14, mls 7, step 2.
     let pf = resolve_level_params(CompressionLevel::Fastest, None);
     let ff = pf.fast.unwrap();
     assert_eq!(
         (pf.window_log, ff.hash_log, ff.mls, ff.step_size),
-        (19, 14, 6, 2),
+        (19, 14, 7, 2),
     );
     // Uncompressed keeps window_log=17 (no history references, smaller
     // decoder reservation); fast cParams same as negative-base row.
