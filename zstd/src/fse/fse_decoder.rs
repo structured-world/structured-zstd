@@ -27,7 +27,10 @@ impl<'t, E: FseEntry, const CAP: usize> FSEDecoderImpl<'t, E, CAP> {
     /// Initialize a new Finite State Entropy decoder.
     pub fn new(table: &'t FSETableImpl<E, CAP>) -> FSEDecoderImpl<'t, E, CAP> {
         FSEDecoderImpl {
-            state: table.decode.first().copied().unwrap_or_default(),
+            // Placeholder; `init_state` overwrites it before the first read.
+            // (Was `decode[0]`, but the decode array is now `MaybeUninit` — its
+            // first slot is uninitialised until the build fills it.)
+            state: E::default(),
             table,
         }
     }
@@ -169,15 +172,20 @@ impl<'t, E: FseEntry, const CAP: usize> FSEDecoderImpl<'t, E, CAP> {
     fn read_entry(&self, idx: usize) -> E {
         #[cfg(feature = "fuzz_exports")]
         {
-            self.table.decode[idx]
+            // Bound on the LIVE span (`decode_len`, not `CAP`): the tail is
+            // `MaybeUninit` and reading it would be UB, so a mis-shaped fuzz
+            // table surfaces as a panic here. Indexing `[..decode_len]` first
+            // makes the panic, not the `assume_init`, the failure mode.
+            self.table.decode[..self.table.decode_len][idx].assume_init()
         }
         #[cfg(not(feature = "fuzz_exports"))]
-        // SAFETY: see comments at the individual call sites — `idx` is
-        // invariant-bounded by the FSE table-build / state-transition
-        // contract. LLVM cannot prove this on its own because the
-        // invariant spans `build_decoding_table` and decode call sites.
+        // SAFETY: `idx` is invariant-bounded by the FSE table-build /
+        // state-transition contract to `< decode_len`, and the build wrote
+        // every entry in `[0, decode_len)`, so the read is in-bounds AND
+        // initialised. LLVM cannot prove this on its own because the invariant
+        // spans `build_decoding_table` and the decode call sites.
         unsafe {
-            *self.table.decode.get_unchecked(idx)
+            self.table.decode.get_unchecked(idx).assume_init_read()
         }
     }
 
@@ -242,7 +250,15 @@ pub struct FSETableImpl<E: FseEntry, const CAP: usize> {
     /// contiguous `memcpy` (array assignment) — mirroring the upstream zstd's
     /// fixed-array `ZSTD_entropyDTables_t` copied by `ZSTD_copyDDictParameters`
     /// — instead of a heap copy through a separate allocation.
-    decode: [E; CAP],
+    ///
+    /// `MaybeUninit` so constructing a fresh table does NOT memset the whole
+    /// `CAP`-entry array (12 KiB across the three seq tables): the build writes
+    /// every live entry `[0, decode_len)` and the decoder reads only that span
+    /// (`init_state` proves `decode_len == 1 << accuracy_log` and every state is
+    /// `< decode_len`), so the unused tail never needs initialisation. On tiny
+    /// frames that memset dominated the whole decode (the per-`FrameDecoder`
+    /// fixed cost); skipping it is the win there.
+    decode: [core::mem::MaybeUninit<E>; CAP],
     /// Number of live entries in `decode` (`1 << accuracy_log`).
     decode_len: usize,
     /// Reused scratch buffer for symbol spreading to avoid per-build allocations.
@@ -292,9 +308,15 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
     pub fn new(max_symbol: u8) -> Self {
         FSETableImpl {
             max_symbol,
-            symbol_probabilities: Vec::with_capacity(256), //will never be more than 256 symbols because u8
+            // Lazy: the first `read_probabilities` grows it. Pre-reserving 256
+            // i32 here was a heap allocation paid per fresh table (3 seq + the
+            // HUF weight table per `DecoderScratch`), part of the per-frame fixed
+            // cost that dominates tiny-frame decode.
+            symbol_probabilities: Vec::new(),
             symbol_spread_buffer: Vec::new(),
-            decode: [E::default(); CAP],
+            // Uninitialised — no `CAP`-entry memset; the build fills the live
+            // span before any read (see the field doc).
+            decode: [const { core::mem::MaybeUninit::uninit() }; CAP],
             decode_len: 0,
             accuracy_log: 0,
         }
@@ -311,9 +333,11 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
     /// Live decode entries (`decode[..decode_len]`).
     #[inline(always)]
     pub fn decode(&self) -> &[E] {
-        // SAFETY-free: decode_len is always <= CAP (set only by the build,
-        // which rejects accuracy_log overflowing the table size).
-        &self.decode[..self.decode_len]
+        // SAFETY: the build initialised every entry in `[0, decode_len)` and set
+        // `decode_len <= CAP`, so the live prefix is fully initialised;
+        // `MaybeUninit<E>` shares E's layout, so reinterpreting it as `&[E]` is
+        // sound.
+        unsafe { core::slice::from_raw_parts(self.decode.as_ptr().cast::<E>(), self.decode_len) }
     }
 
     /// Test-only: populate the decode table directly from a slice of entries
@@ -322,7 +346,14 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
     #[cfg(test)]
     pub(crate) fn set_decode_for_test(&mut self, entries: &[E]) {
         assert!(entries.len() <= CAP, "test entries exceed table CAP");
-        self.decode[..entries.len()].copy_from_slice(entries);
+        // Write the entries into the `MaybeUninit` slots (E: Copy, same layout).
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                entries.as_ptr(),
+                self.decode.as_mut_ptr().cast::<E>(),
+                entries.len(),
+            );
+        }
         self.decode_len = entries.len();
     }
 
@@ -782,7 +813,7 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
             // instead of re-walking the finished table. `from_raw`
             // zero-inits the meta fields, so the no-meta arms match
             // the post-pass results exactly.
-            self.decode[state_idx] = match meta {
+            self.decode[state_idx] = core::mem::MaybeUninit::new(match meta {
                 SeqMeta::None => entry,
                 SeqMeta::Packed(packed) => {
                     let m = packed.get(symbol as usize).copied().unwrap_or(0);
@@ -795,7 +826,7 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
                         entry
                     }
                 }
-            };
+            });
         }
 
         // Commit the live span. The loop wrote every `state_idx ∈
@@ -942,7 +973,9 @@ impl FSETableImpl<SeqSymbol, 512> {
         debug_assert_eq!(self.decode_len, self.symbol_spread_buffer.len());
         for i in 0..self.decode_len {
             let sym = self.symbol_spread_buffer[i] as usize;
-            let entry = &mut self.decode[i];
+            // SAFETY: `i < decode_len`, and the build initialised every entry in
+            // that span before this enrich pass runs.
+            let entry = unsafe { self.decode[i].assume_init_mut() };
             if sym < packed.len() {
                 let meta = packed[sym];
                 entry.base_value = meta & 0x00FF_FFFF;
@@ -960,7 +993,8 @@ impl FSETableImpl<SeqSymbol, 512> {
         debug_assert_eq!(self.decode_len, self.symbol_spread_buffer.len());
         for i in 0..self.decode_len {
             let code = self.symbol_spread_buffer[i];
-            let entry = &mut self.decode[i];
+            // SAFETY: `i < decode_len`, entry initialised by the build above.
+            let entry = unsafe { self.decode[i].assume_init_mut() };
             entry.base_value = 0;
             entry.num_additional_bits = 0;
             if code < 32 {
@@ -990,12 +1024,12 @@ impl FSETableImpl<SeqSymbol, 512> {
         // Spread buffer drives the enrich pass (symbol per slot); one slot.
         self.symbol_spread_buffer.push(symbol);
         // Single RLE entry at slot 0 (upstream zstd RLE DTable: one state).
-        self.decode[0] = SeqSymbol {
+        self.decode[0] = core::mem::MaybeUninit::new(SeqSymbol {
             new_state: 0,
             num_bits: 0,
             num_additional_bits: 0,
             base_value: 0,
-        };
+        });
         self.decode_len = 1;
         // accuracy_log stays 0 (upstream zstd RLE DTable tableLog); init_state
         // reads 0 state bits and update_state keeps the single state.
