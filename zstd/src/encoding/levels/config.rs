@@ -22,15 +22,19 @@ pub(crate) struct HcConfig {
     pub(crate) chain_log: usize,
     pub(crate) search_depth: usize,
     pub(crate) target_len: usize,
-    /// Binary-tree finder hash width — upstream `mls = BOUNDED(3, minMatch, 6)`
-    /// (`ZSTD_selectBtGetAllMatches`, zstd_opt.c:896). Every BT level's
-    /// `minMatch` already lies in `[3, 6]` (btlazy2 / btopt L16 = 5, btopt L17 =
-    /// 4, btultra / btultra2 L18-22 = 3), so this is exactly `cp.min_match` — NOT
-    /// clamped up to 4, which would build a 4-byte BT hash on levels 18+ and
-    /// diverge from C's 3-byte one. Carried explicitly per level so a
-    /// `target_length` override can't silently change the finder's hashing
-    /// width. Only the BT body reads it; HC / lazy levels keep it at 4 (their
-    /// `hash_position` is always 4-byte).
+    /// Binary-tree finder hash width. Upstream uses `mls = BOUNDED(3, minMatch, 6)`
+    /// (`ZSTD_selectBtGetAllMatches`, zstd_opt.c:896) — i.e. mls=3 on the
+    /// btultra/btultra2 levels (L18-22, minMatch=3) — and surfaces 3-byte matches
+    /// through a fallback-only HC3 finder (zstd_opt.c:691-720: distance < 256 KiB,
+    /// taken only when no longer/repcode match exists). Our optimal parser does
+    /// NOT yet replicate that 3-byte handling — it emits short matches C prices
+    /// out, breaking level-22 sequence parity — so the BT hash width is clamped UP
+    /// to 4 (`cp.min_match.clamp(4, 6)`) to keep the finder from surfacing those
+    /// 3-byte matches and so match C's output. This is a deliberate workaround,
+    /// NOT C's finder width; drop the clamp once the optimal parser is C-faithful
+    /// at minMatch 3 (tracked in #337). Carried explicitly per level so a
+    /// `target_length` override can't silently change the finder's hashing width.
+    /// Only the BT body reads it; HC / lazy levels keep it at 4.
     pub(crate) search_mls: usize,
 }
 
@@ -569,7 +573,11 @@ fn level_params_from_cparams(cp: crate::encoding::cparams::CParams) -> LevelPara
         chain_log: cp.chain_log as usize,
         search_depth,
         target_len,
-        search_mls: cp.min_match as usize,
+        // Clamp UP to 4: C's BT finder uses mls=3 on L18-22, but our optimal
+        // parser diverges on the resulting 3-byte matches (breaks level-22
+        // sequence parity), so we keep the finder at >=4 as a workaround until
+        // the parser is C-faithful at minMatch 3. See `HcConfig::search_mls` (#337).
+        search_mls: cp.min_match.clamp(4, 6) as usize,
     };
     let row = RowConfig {
         hash_bits: cp.hash_log as usize,
