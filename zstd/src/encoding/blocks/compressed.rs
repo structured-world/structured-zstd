@@ -1649,6 +1649,15 @@ fn choose_table<'a>(
 /// ll/ml/of stream); the iterator form is kept for the cost
 /// estimator's call sites where the data is already in iterator
 /// form.
+// The eight inputs are the cohesive FSE-table-selection set, each carrying its
+// own perf / correctness rationale below (the `&mut` histogram for the no-copy
+// emit build, the caller-tracked `max_symbol` / `last_code` that avoid a
+// per-stream rescan). Bundling them into a struct would only relocate that
+// documented rationale away from the signature without removing any input.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "cohesive FSE-selection inputs, each justified inline"
+)]
 fn choose_table_from_counts<'a>(
     previous: Option<&'a PreviousFseTable>,
     default_table: &'a FSETable,
