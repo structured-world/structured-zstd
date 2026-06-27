@@ -2272,6 +2272,32 @@ fn fast_oneshot_borrowed_split_emits_subblock() {
     );
 }
 
+/// Regression: `set_parameters` must key `literal_compression_disabled` off the
+/// RESOLVED strategy / target length (C `ZSTD_literalsCompressionIsDisabled` =
+/// `strategy == fast && targetLength > 0`), not the signed level. A negative
+/// level overridden onto a non-fast strategy must keep literal (Huffman)
+/// compression enabled.
+#[cfg(feature = "std")]
+#[test]
+fn set_parameters_keeps_literals_compressed_under_nonfast_strategy_override() {
+    use super::CompressionLevel;
+    use crate::encoding::parameters::{CompressionParameters, Strategy};
+    let data = vec![0xABu8; 256];
+    let mut out = Vec::new();
+    let mut compressor = FrameCompressor::new(CompressionLevel::Level(3));
+    compressor.set_source(data.as_slice());
+    compressor.set_drain(&mut out);
+    let params = CompressionParameters::builder(CompressionLevel::Level(-5))
+        .strategy(Strategy::Btultra2)
+        .build()
+        .expect("valid params");
+    compressor.set_parameters(&params);
+    assert!(
+        !compressor.state.literal_compression_disabled,
+        "a non-fast strategy override on a negative level must keep literals compressed",
+    );
+}
+
 /// Regression: `set_compression_level` must resync
 /// `state.literal_compression_disabled` so reusing a compressor and switching to
 /// a negative level emits raw literals (matching C
