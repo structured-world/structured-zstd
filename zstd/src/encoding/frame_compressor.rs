@@ -1048,10 +1048,24 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         });
         self.state.huf_optimal_search =
             huf_search_enabled(self.state.strategy_tag, self.source_size_hint);
-        self.state.literal_compression_disabled = matches!(
-            self.compression_level,
-            crate::encoding::CompressionLevel::Level(n) if n < 0
-        );
+        // C `ZSTD_literalsCompressionIsDisabled` (ps_auto): raw literals iff the
+        // EFFECTIVE cParams are the fast strategy with targetLength > 0. A
+        // strategy override (e.g. negative level + BtUltra2) flips `strategy_tag`
+        // away from fast, so the resolved tag — not the signed level — gates
+        // this. For the fast strategy the level table sets targetLength > 0
+        // exactly on the negative (acceleration) rows, so absent an explicit
+        // targetLength override `level < 0` is that test; an override wins.
+        self.state.literal_compression_disabled = self.state.strategy_tag
+            == crate::encoding::strategy::StrategyTag::Fast
+            && overrides.target_length.map_or_else(
+                || {
+                    matches!(
+                        self.compression_level,
+                        crate::encoding::CompressionLevel::Level(n) if n < 0
+                    )
+                },
+                |tl| tl > 0,
+            );
         self.state.matcher.set_param_overrides(Some(overrides));
     }
 
