@@ -2,6 +2,23 @@ use super::*;
 use crate::decoding::errors::FSETableError;
 
 #[test]
+fn build_from_probabilities_rejects_table_exceeding_capacity() {
+    // A `SeqFSETable`'s decode array holds CAP = 512 entries (acc_log <= 9). An
+    // acc_log whose `table_size` exceeds CAP must be rejected, not run the build
+    // and panic-overrun the fixed 512+8 fast-spread scratch (or the `[_; 512]`
+    // decode array) — `build_from_probabilities` is a public entry reachable
+    // from fuzz harnesses with acc_log up to ENTRY_MAX_ACCURACY_LOG (16).
+    let mut t = SeqFSETable::new(0);
+    // acc_log 10 -> table_size 1024 > 512; the single symbol owns the whole
+    // table, so there are no -1 entries and the fast-spread path fires.
+    let res = t.build_from_probabilities(10, &[1024]);
+    assert!(
+        matches!(res, Err(FSETableError::AccLogTooBig { .. })),
+        "table_size > CAP must be rejected, got {res:?}",
+    );
+}
+
+#[test]
 fn build_from_probabilities_rejects_sum_too_small() {
     // acc_log=4 → table_size=16. Valid sum (treating -1 as 1)
     // is 16. Use a distribution that sums to 8 (probs sum 8,
