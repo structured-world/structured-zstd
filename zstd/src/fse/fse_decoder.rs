@@ -614,24 +614,65 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
             }
         }
 
-        // Pass 2: distribute positive-probability symbols across the
-        // [0, negative_idx) range using the upstream zstd's `next_position`
-        // walker, and initialise `symbol_next[s] = prob` so the
-        // build loop's counter reaches `2*prob - 1` over `prob`
-        // iterations (matching upstream zstd `symbolNext[s]++` semantics).
-        let mut position = 0usize;
-        for symbol in 0..nb_symbols {
-            let prob = probs[symbol];
-            if prob <= 0 {
-                continue;
+        // Pass 2: distribute positive-probability symbols. With NO
+        // low-probability (-1) symbols — the common case on small frames, where
+        // the encoder keeps `useLowProbCount` off below 2048 sequences — take the
+        // upstream zstd fast spread (`ZSTD_buildFSETable_body`,
+        // zstd_decompress_block.c:529-574): lay the symbols down in order with
+        // 8-byte writes, then distribute them in a branch-miss-free two-stage
+        // pass unrolled by 2. This replaces the per-symbol variable-length inner
+        // loop + lowprob `while` skip below, which dominated the FSE-build
+        // self-time on the decode profile. The two passes are provably identical
+        // when there are no -1 symbols: both place the k-th in-order symbol at
+        // `next_position`-walk step k.
+        if negative_idx == table_size {
+            let mut in_order = [0u8; FSE_FAST_SPREAD_BUF];
+            let mut pos = 0usize;
+            for symbol in 0..nb_symbols {
+                let prob = probs[symbol];
+                if prob <= 0 {
+                    continue;
+                }
+                symbol_next[symbol] = prob as u32;
+                let n = prob as usize;
+                // 8 copies of the symbol byte; lay down 8 at a time (counts are
+                // mostly <= 8 on small table-logs, so the inner loop rarely runs).
+                let bytes = ((symbol as u8) as u64)
+                    .wrapping_mul(0x0101_0101_0101_0101)
+                    .to_le_bytes();
+                in_order[pos..pos + 8].copy_from_slice(&bytes);
+                let mut i = 8;
+                while i < n {
+                    in_order[pos + i..pos + i + 8].copy_from_slice(&bytes);
+                    i += 8;
+                }
+                pos += n;
             }
-            symbol_next[symbol] = prob as u32;
-            let symbol_u8 = symbol as u8;
-            for _ in 0..prob {
-                spread[position] = symbol_u8;
-                position = next_position(position, table_size);
-                while position >= negative_idx {
+            let table_mask = table_size - 1;
+            let step = (table_size >> 1) + (table_size >> 3) + 3;
+            let mut position = 0usize;
+            let mut s = 0usize;
+            while s < table_size {
+                spread[position] = in_order[s];
+                spread[(position + step) & table_mask] = in_order[s + 1];
+                position = (position + 2 * step) & table_mask;
+                s += 2;
+            }
+        } else {
+            let mut position = 0usize;
+            for symbol in 0..nb_symbols {
+                let prob = probs[symbol];
+                if prob <= 0 {
+                    continue;
+                }
+                symbol_next[symbol] = prob as u32;
+                let symbol_u8 = symbol as u8;
+                for _ in 0..prob {
+                    spread[position] = symbol_u8;
                     position = next_position(position, table_size);
+                    while position >= negative_idx {
+                        position = next_position(position, table_size);
+                    }
                 }
             }
         }
@@ -1167,6 +1208,12 @@ fn highest_bit_set(x: u32) -> u32 {
 //utility functions for building the decoding table from probabilities
 /// Calculate the position of the next entry of the table given the current
 /// position and size of the table.
+/// In-order spread scratch for the fast `build_decoding_table_inner` path:
+/// the largest sequence FSE table is `1 << 9 = 512` entries, plus 8 bytes of
+/// slack so the 8-byte symbol lay-down can over-write past the last symbol
+/// without bounds-checking each tail write.
+const FSE_FAST_SPREAD_BUF: usize = 512 + 8;
+
 fn next_position(mut p: usize, table_size: usize) -> usize {
     p += (table_size >> 1) + (table_size >> 3) + 3;
     p &= table_size - 1;
