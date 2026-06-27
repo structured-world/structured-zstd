@@ -172,11 +172,12 @@ impl<'t, E: FseEntry, const CAP: usize> FSEDecoderImpl<'t, E, CAP> {
     fn read_entry(&self, idx: usize) -> E {
         #[cfg(feature = "fuzz_exports")]
         {
-            // Bound on the LIVE span (`decode_len`, not `CAP`): the tail is
-            // `MaybeUninit` and reading it would be UB, so a mis-shaped fuzz
-            // table surfaces as a panic here. Indexing `[..decode_len]` first
-            // makes the panic, not the `assume_init`, the failure mode.
-            self.table.decode[..self.table.decode_len][idx].assume_init()
+            // Bound on the LIVE span (`decode_len`, not `CAP`) first: the tail is
+            // `MaybeUninit` and reading it would be UB, so a mis-shaped fuzz table
+            // surfaces as a panic on the slice index, not the `assume_init`.
+            // SAFETY: past the bounds check `idx < decode_len`, and the build
+            // initialised every entry in `[0, decode_len)`.
+            unsafe { self.table.decode[..self.table.decode_len][idx].assume_init() }
         }
         #[cfg(not(feature = "fuzz_exports"))]
         // SAFETY: `idx` is invariant-bounded by the FSE table-build /
