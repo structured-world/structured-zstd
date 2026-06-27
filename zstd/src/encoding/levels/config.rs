@@ -22,12 +22,15 @@ pub(crate) struct HcConfig {
     pub(crate) chain_log: usize,
     pub(crate) search_depth: usize,
     pub(crate) target_len: usize,
-    /// Binary-tree finder hash width (upstream zstd `mls = BOUNDED(4, minMatch, 6)`),
-    /// carried explicitly per level so it is NOT inferred from `target_len`
-    /// (a `target_length` override must not silently flip the finder between
-    /// 5- and 4-byte hashing). Only the BT body reads it; HC/lazy levels keep
-    /// it at 4 (their `hash_position` is always 4-byte). 5 for the
-    /// minMatch=5 BT levels (btlazy2 + btopt L16), 4 elsewhere.
+    /// Binary-tree finder hash width — upstream `mls = BOUNDED(3, minMatch, 6)`
+    /// (`ZSTD_selectBtGetAllMatches`, zstd_opt.c:896). Every BT level's
+    /// `minMatch` already lies in `[3, 6]` (btlazy2 / btopt L16 = 5, btopt L17 =
+    /// 4, btultra / btultra2 L18-22 = 3), so this is exactly `cp.min_match` — NOT
+    /// clamped up to 4, which would build a 4-byte BT hash on levels 18+ and
+    /// diverge from C's 3-byte one. Carried explicitly per level so a
+    /// `target_length` override can't silently change the finder's hashing
+    /// width. Only the BT body reads it; HC / lazy levels keep it at 4 (their
+    /// `hash_position` is always 4-byte).
     pub(crate) search_mls: usize,
 }
 

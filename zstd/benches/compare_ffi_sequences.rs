@@ -209,7 +209,10 @@ fn parse_levels_env() -> Vec<i32> {
         return DEFAULT_LEVELS.to_vec();
     }
     if trimmed.eq_ignore_ascii_case("all") {
-        return (1..=MAX_SUPPORTED_LEVEL).collect();
+        // Include the negative band (the production compressor handles it, and
+        // the per-level parser above now accepts it) so "run everything" does
+        // not silently skip the negative-level coverage. `0` is not a level.
+        return (-7..=MAX_SUPPORTED_LEVEL).filter(|&l| l != 0).collect();
     }
     // Order matters because a negative level's leading `-` must not be read as
     // an empty range bound:
