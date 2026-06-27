@@ -600,6 +600,18 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         }
 
         let table_size = 1 << self.accuracy_log;
+        // The decode array is `[E; CAP]` and the fast-spread scratch is a fixed
+        // `FSE_FAST_SPREAD_BUF`; a `table_size` above CAP would overrun both.
+        // The wire path never exceeds CAP (sequence acc_log <= 9, HUF <= 6), but
+        // `build_from_probabilities` accepts acc_log up to
+        // `ENTRY_MAX_ACCURACY_LOG` (16) and is reachable from fuzz, so reject an
+        // oversized table as a typed error instead of panic-overrunning.
+        if table_size > CAP {
+            return Err(FSETableError::AccLogTooBig {
+                got: self.accuracy_log,
+                max: CAP.trailing_zeros() as u8,
+            });
+        }
 
         // === Spread step ===
         // Reuse the persistent scratch buffer; clear then resize to
@@ -1243,9 +1255,11 @@ fn highest_bit_set(x: u32) -> u32 {
 /// Calculate the position of the next entry of the table given the current
 /// position and size of the table.
 /// In-order spread scratch for the fast `build_decoding_table_inner` path:
-/// the largest sequence FSE table is `1 << 9 = 512` entries, plus 8 bytes of
-/// slack so the 8-byte symbol lay-down can over-write past the last symbol
-/// without bounds-checking each tail write.
+/// the largest table reaching it is `1 << 9 = 512` entries (the
+/// `table_size <= CAP` guard in `build_decoding_table_inner` rejects anything
+/// larger before the spread runs), plus 8 bytes of slack so the 8-byte symbol
+/// lay-down can over-write past the last symbol without bounds-checking each
+/// tail write.
 const FSE_FAST_SPREAD_BUF: usize = 512 + 8;
 
 fn next_position(mut p: usize, table_size: usize) -> usize {
