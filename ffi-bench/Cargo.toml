@@ -53,6 +53,11 @@ path = "../zstd/benches/decode_all.rs"
 harness = false
 
 [[bench]]
+name = "decode_loop"
+path = "../zstd/benches/decode_loop.rs"
+harness = false
+
+[[bench]]
 name = "huf_decode_kernels"
 path = "../zstd/benches/huf_decode_kernels.rs"
 harness = false
