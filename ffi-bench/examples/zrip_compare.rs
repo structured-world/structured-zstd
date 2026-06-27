@@ -187,7 +187,9 @@ fn main() {
 
     // Summary: where we MISS the speed goal (slower than C), and any ratio-floor
     // violation (compressing worse than C, which the drop-in contract forbids).
-    println!("\n===== SPEED MISSES (ours < C; goal ours/C >= 1.0) =====");
+    // Threshold 0.95, not 1.0: list only SIGNIFICANT misses (>5% slower than C);
+    // sub-5% noise around parity is intentionally excluded from the report.
+    println!("\n===== SPEED MISSES (ours/C < 0.95, i.e. >5% slower than C; goal >= 1.0) =====");
     let mut enc_miss: Vec<&Cell> = cells.iter().filter(|c| c.enc_o_c < 0.95).collect();
     enc_miss.sort_by(|a, b| a.enc_o_c.partial_cmp(&b.enc_o_c).unwrap());
     println!("-- encode (worst first) --");
