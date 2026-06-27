@@ -724,25 +724,18 @@ pub(crate) struct CompressState<M: Matcher> {
 
 /// Whether the HUF literal build should run the #167 table-log search for a
 /// frame of `source_size` bytes (see [`CompressState::huf_optimal_search`]).
-/// The Fast and DoubleFast strategies do little matching work, so per-frame
-/// HUF setup dominates a small frame and the search's ~1.5 us is a large
-/// relative cost for a ratio gain the cheap single-build forgoes while still
-/// tying upstream zstd. Gate the search to frames above 128 KiB (one full
-/// block) for those two. Higher strategies do enough matching that the search
-/// is a negligible fraction and always run it for the ratio edge. Unknown size
-/// (streaming) keeps the search for conservative ratio.
+/// Upstream gates the optimal-depth tableLog probe to
+/// `HUF_OPTIMAL_DEPTH_THRESHOLD = ZSTD_btultra` (huf.h:117): only btultra /
+/// btultra2 search the tableLog, every lower strategy (fast .. btopt) takes the
+/// single-shot fast path (`HUF_optimalTableLog`, huf_compress.c:1284-1287).
+/// Mirror that so our literal tableLog choice tracks upstream's instead of
+/// spending the search to beat it on ratio at a speed cost.
 pub(crate) fn huf_search_enabled(
     strategy: crate::encoding::strategy::StrategyTag,
-    source_size: Option<u64>,
+    _source_size: Option<u64>,
 ) -> bool {
     use crate::encoding::strategy::StrategyTag;
-    if !matches!(strategy, StrategyTag::Fast | StrategyTag::Dfast) {
-        return true;
-    }
-    match source_size {
-        Some(size) => size > 128 * 1024,
-        None => true,
-    }
+    matches!(strategy, StrategyTag::BtUltra | StrategyTag::BtUltra2)
 }
 
 impl<M: Matcher> CompressState<M> {
