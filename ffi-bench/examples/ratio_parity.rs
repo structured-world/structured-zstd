@@ -14,16 +14,17 @@ fn main() {
     for lvl in [-7i32, -5, -3, -1, 1, 3] {
         let ours = compress_slice_to_vec(&data, CompressionLevel::Level(lvl));
         let c = zstd::bulk::compress(&data, lvl).expect("c compress");
-        // Sanity: both must round-trip through the C decoder (drop-in contract).
-        let c_decodes_ours = zstd::bulk::decompress(&ours, data.len().max(1))
-            .map(|d| d == data)
-            .unwrap_or(false);
+        // Sanity: ours MUST round-trip through the C decoder (drop-in contract).
+        // Fail loud on the exact regression this example exists to catch instead
+        // of printing `false` and exiting 0.
+        let c_decoded =
+            zstd::bulk::decompress(&ours, data.len().max(1)).expect("C decoder rejected ours");
+        assert_eq!(c_decoded, data, "C decoder mismatch for L{lvl}");
         println!(
-            "L{lvl:<3} ours={:>5}B  C={:>5}B  ours/C={:.3}  (C decodes ours: {})",
+            "L{lvl:<3} ours={:>5}B  C={:>5}B  ours/C={:.3}  (C decodes ours: ok)",
             ours.len(),
             c.len(),
             ours.len() as f64 / c.len() as f64,
-            c_decodes_ours,
         );
         // Byte-level diff: first differing index + a hex window around it from
         // each frame, so a 1-byte header divergence is pinpointed exactly.

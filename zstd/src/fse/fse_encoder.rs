@@ -416,9 +416,12 @@ pub(crate) fn build_table_from_symbol_counts(
 /// through the FSE initial state, not a normal transition, so when its count
 /// exceeds 1 upstream drops one occurrence from the histogram and normalizes
 /// against `nbSeq - 1`. The table-log is still derived from the full `nbSeq`.
-/// `last_code` is the stream code of the last sequence (an index into `counts`,
-/// `<= max_symbol`). `use_low_prob_count` follows `nbSeq - 1` exactly as
-/// upstream's `ZSTD_useLowProbCount(nbSeq_1)`.
+/// When the count is exactly 1 upstream adjusts NEITHER — it gates both
+/// `count[last]--` and `nbSeq_1--` on `count > 1` (zstd_compress_sequences.c:271-273),
+/// so the histogram and the normalization total both stay at the full `nbSeq`
+/// (the `else { total }` branch below). `last_code` is the stream code of the
+/// last sequence (an index into `counts`, `<= max_symbol`). `use_low_prob_count`
+/// follows `nbSeq_1` exactly as upstream's `ZSTD_useLowProbCount(nbSeq_1)`.
 pub(crate) fn build_seq_ctable(counts: &mut [usize], max_log: u8, last_code: usize) -> FSETable {
     let total = counts.iter().sum::<usize>();
     let max_symbol = counts
@@ -433,6 +436,11 @@ pub(crate) fn build_seq_ctable(counts: &mut [usize], max_log: u8, last_code: usi
     // for the normalize, then put it back — no per-table copy. `normalize_counts`
     // only re-borrows `counts` immutably, so it sees the decrement, and the
     // restore leaves the selection-time histogram untouched for the caller.
+    // C gates BOTH the decrement and `nbSeq_1--` on `count > 1`
+    // (zstd_compress_sequences.c:271-273). A count of exactly 1 therefore leaves
+    // the histogram unchanged AND normalizes against the full `total` (= nbSeq),
+    // NOT `total - 1` — using `total - 1` here would diverge from C and break the
+    // byte-parity this establishes.
     let adjust = counts[last_code] > 1;
     if adjust {
         counts[last_code] -= 1;
