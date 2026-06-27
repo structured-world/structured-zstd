@@ -149,6 +149,48 @@ fn main() {
     }
 }
 
+/// Corpus-file resolution order for a decodecorpus fixture, mirroring
+/// `support::load_decode_corpus_scenario`: explicit env path (its directory for
+/// fixtures other than the one it names), `CARGO_MANIFEST_DIR/decodecorpus_files`,
+/// then repo-relative fallbacks — so every fixture resolves under cargo-driven,
+/// prebuilt-binary, and hand-run layouts alike.
+fn corpus_candidates(fname: &str) -> Vec<std::path::PathBuf> {
+    let mut paths = Vec::new();
+    if let Ok(explicit) = std::env::var("STRUCTURED_ZSTD_BENCH_CORPUS_PATH") {
+        let trimmed = explicit.trim();
+        if !trimmed.is_empty() {
+            let explicit = std::path::PathBuf::from(trimmed);
+            // The env var names a single corpus file (z000033); reuse it
+            // directly for that fixture and its parent directory for the others.
+            if explicit.file_name().is_some_and(|n| n == fname) {
+                paths.push(explicit);
+            } else if let Some(dir) = explicit.parent() {
+                paths.push(dir.join(fname));
+            }
+        }
+    }
+    if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
+        paths.push(
+            Path::new(&manifest_dir)
+                .join("decodecorpus_files")
+                .join(fname),
+        );
+    }
+    paths.push(std::path::PathBuf::from("decodecorpus_files").join(fname));
+    paths.push(std::path::PathBuf::from("zstd/decodecorpus_files").join(fname));
+    paths
+}
+
+/// Split an inclusive `lo-hi` range on its separating `-` — the first `-`
+/// preceded by a digit — so negative bounds parse correctly (`-7--1` → `-7`,
+/// `-1`; `1-9` → `1`, `9`). Returns `None` when no digit-preceded separator
+/// exists.
+fn split_inclusive_range(s: &str) -> Option<(&str, &str)> {
+    let bytes = s.as_bytes();
+    let sep = (1..bytes.len()).find(|&i| bytes[i] == b'-' && bytes[i - 1].is_ascii_digit())?;
+    Some((&s[..sep], &s[sep + 1..]))
+}
+
 /// Parse `STRUCTURED_ZSTD_BENCH_LEVEL` env var into a level list.
 ///
 /// Forms accepted: single (`3`), range (`1-15`), comma list
@@ -167,10 +209,27 @@ fn parse_levels_env() -> Vec<i32> {
         return DEFAULT_LEVELS.to_vec();
     }
     if trimmed.eq_ignore_ascii_case("all") {
-        return (1..=MAX_SUPPORTED_LEVEL).collect();
+        // Include the negative band (the production compressor handles it, and
+        // the per-level parser above now accepts it) so "run everything" does
+        // not silently skip the negative-level coverage. `0` is not a level.
+        return (-7..=MAX_SUPPORTED_LEVEL).filter(|&l| l != 0).collect();
     }
-    let parsed: Vec<i32> = if let Some((lo, hi)) = trimmed.split_once('-') {
-        match (lo.trim().parse::<i32>(), hi.trim().parse::<i32>()) {
+    // Order matters because a negative level's leading `-` must not be read as
+    // an empty range bound:
+    //   1. bare integer (incl. a single negative like `-5`),
+    //   2. comma list (items may be negative: `-7,-5`, `3,-1`) — checked BEFORE
+    //      the range split, which would otherwise swallow the list's minus,
+    //   3. inclusive `lo-hi` range on the digit-preceded separator so negative
+    //      bounds (`-7--1`) parse correctly.
+    let parsed: Vec<i32> = if let Ok(single) = trimmed.parse::<i32>() {
+        vec![single]
+    } else if trimmed.contains(',') {
+        trimmed
+            .split(',')
+            .filter_map(|s| s.trim().parse::<i32>().ok())
+            .collect()
+    } else if let Some((lo, hi)) = split_inclusive_range(trimmed) {
+        match (lo.parse::<i32>(), hi.parse::<i32>()) {
             (Ok(a), Ok(b)) if a <= b => (a..=b).collect(),
             _ => {
                 eprintln!(
@@ -181,14 +240,15 @@ fn parse_levels_env() -> Vec<i32> {
             }
         }
     } else {
-        trimmed
-            .split(',')
-            .filter_map(|s| s.trim().parse::<i32>().ok())
-            .collect()
+        eprintln!(
+            "warn: STRUCTURED_ZSTD_BENCH_LEVEL={trimmed:?} is not a level, list, or range; \
+             falling back to default levels {DEFAULT_LEVELS:?}",
+        );
+        return DEFAULT_LEVELS.to_vec();
     };
     let (supported, dropped): (Vec<i32>, Vec<i32>) = parsed
         .into_iter()
-        .partition(|&l| (1..=MAX_SUPPORTED_LEVEL).contains(&l));
+        .partition(|&l| ((-7..=MAX_SUPPORTED_LEVEL).contains(&l)) && l != 0);
     if !dropped.is_empty() {
         eprintln!(
             "warn: dropping unsupported levels {dropped:?} (supported numeric levels \
@@ -262,21 +322,8 @@ fn collect_fixtures() -> Vec<(String, Vec<u8>)> {
     // Without (1) and (2), the canonical fixture would silently
     // skip on CI runs that bypass cargo, undermining the audit
     // (PR #149 review round 3 #11).
-    let mut candidate_paths: Vec<std::path::PathBuf> = Vec::new();
-    if let Ok(explicit) = std::env::var("STRUCTURED_ZSTD_BENCH_CORPUS_PATH") {
-        let trimmed = explicit.trim();
-        if !trimmed.is_empty() {
-            candidate_paths.push(std::path::PathBuf::from(trimmed));
-        }
-    }
-    if let Ok(manifest_dir) = std::env::var("CARGO_MANIFEST_DIR") {
-        candidate_paths.push(Path::new(&manifest_dir).join("decodecorpus_files/z000033"));
-    }
-    candidate_paths.push(std::path::PathBuf::from("decodecorpus_files/z000033"));
-    candidate_paths.push(std::path::PathBuf::from("zstd/decodecorpus_files/z000033"));
-
     let mut found = false;
-    for p in &candidate_paths {
+    for p in &corpus_candidates("z000033") {
         if let Ok(bytes) = fs::read(p)
             && !bytes.is_empty()
         {
@@ -290,6 +337,22 @@ fn collect_fixtures() -> Vec<(String, Vec<u8>)> {
             "warn: decodecorpus z000033 not found via STRUCTURED_ZSTD_BENCH_CORPUS_PATH, \
              CARGO_MANIFEST_DIR, or repo-relative paths — skipping",
         );
+    }
+
+    // Smaller decodecorpus frames (single-block) where the negative/fast band
+    // over-compresses vs C — these are the ratio-parity targets.
+    for fname in ["z000002", "z000000"] {
+        // Same resolution order as z000033 (explicit env path, CARGO_MANIFEST_DIR,
+        // repo-relative) so these targets are not silently skipped under the
+        // direct-binary / repo-root layouts.
+        for p in &corpus_candidates(fname) {
+            if let Ok(bytes) = fs::read(p)
+                && !bytes.is_empty()
+            {
+                out.push((format!("{fname} ({} bytes)", bytes.len()), bytes));
+                break;
+            }
+        }
     }
 
     let log = build_low_entropy_log(16 * 1024);

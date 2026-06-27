@@ -27,7 +27,10 @@ impl<'t, E: FseEntry, const CAP: usize> FSEDecoderImpl<'t, E, CAP> {
     /// Initialize a new Finite State Entropy decoder.
     pub fn new(table: &'t FSETableImpl<E, CAP>) -> FSEDecoderImpl<'t, E, CAP> {
         FSEDecoderImpl {
-            state: table.decode.first().copied().unwrap_or_default(),
+            // Placeholder; `init_state` overwrites it before the first read.
+            // (Was `decode[0]`, but the decode array is now `MaybeUninit` — its
+            // first slot is uninitialised until the build fills it.)
+            state: E::default(),
             table,
         }
     }
@@ -169,15 +172,21 @@ impl<'t, E: FseEntry, const CAP: usize> FSEDecoderImpl<'t, E, CAP> {
     fn read_entry(&self, idx: usize) -> E {
         #[cfg(feature = "fuzz_exports")]
         {
-            self.table.decode[idx]
+            // Bound on the LIVE span (`decode_len`, not `CAP`) first: the tail is
+            // `MaybeUninit` and reading it would be UB, so a mis-shaped fuzz table
+            // surfaces as a panic on the slice index, not the `assume_init`.
+            // SAFETY: past the bounds check `idx < decode_len`, and the build
+            // initialised every entry in `[0, decode_len)`.
+            unsafe { self.table.decode[..self.table.decode_len][idx].assume_init() }
         }
         #[cfg(not(feature = "fuzz_exports"))]
-        // SAFETY: see comments at the individual call sites — `idx` is
-        // invariant-bounded by the FSE table-build / state-transition
-        // contract. LLVM cannot prove this on its own because the
-        // invariant spans `build_decoding_table` and decode call sites.
+        // SAFETY: `idx` is invariant-bounded by the FSE table-build /
+        // state-transition contract to `< decode_len`, and the build wrote
+        // every entry in `[0, decode_len)`, so the read is in-bounds AND
+        // initialised. LLVM cannot prove this on its own because the invariant
+        // spans `build_decoding_table` and the decode call sites.
         unsafe {
-            *self.table.decode.get_unchecked(idx)
+            self.table.decode.get_unchecked(idx).assume_init_read()
         }
     }
 
@@ -242,7 +251,15 @@ pub struct FSETableImpl<E: FseEntry, const CAP: usize> {
     /// contiguous `memcpy` (array assignment) — mirroring the upstream zstd's
     /// fixed-array `ZSTD_entropyDTables_t` copied by `ZSTD_copyDDictParameters`
     /// — instead of a heap copy through a separate allocation.
-    decode: [E; CAP],
+    ///
+    /// `MaybeUninit` so constructing a fresh table does NOT memset the whole
+    /// `CAP`-entry array (12 KiB across the three seq tables): the build writes
+    /// every live entry `[0, decode_len)` and the decoder reads only that span
+    /// (`init_state` proves `decode_len == 1 << accuracy_log` and every state is
+    /// `< decode_len`), so the unused tail never needs initialisation. On tiny
+    /// frames that memset dominated the whole decode (the per-`FrameDecoder`
+    /// fixed cost); skipping it is the win there.
+    decode: [core::mem::MaybeUninit<E>; CAP],
     /// Number of live entries in `decode` (`1 << accuracy_log`).
     decode_len: usize,
     /// Reused scratch buffer for symbol spreading to avoid per-build allocations.
@@ -292,9 +309,15 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
     pub fn new(max_symbol: u8) -> Self {
         FSETableImpl {
             max_symbol,
-            symbol_probabilities: Vec::with_capacity(256), //will never be more than 256 symbols because u8
+            // Lazy: the first `read_probabilities` grows it. Pre-reserving 256
+            // i32 here was a heap allocation paid per fresh table (3 seq + the
+            // HUF weight table per `DecoderScratch`), part of the per-frame fixed
+            // cost that dominates tiny-frame decode.
+            symbol_probabilities: Vec::new(),
             symbol_spread_buffer: Vec::new(),
-            decode: [E::default(); CAP],
+            // Uninitialised — no `CAP`-entry memset; the build fills the live
+            // span before any read (see the field doc).
+            decode: [const { core::mem::MaybeUninit::uninit() }; CAP],
             decode_len: 0,
             accuracy_log: 0,
         }
@@ -311,9 +334,11 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
     /// Live decode entries (`decode[..decode_len]`).
     #[inline(always)]
     pub fn decode(&self) -> &[E] {
-        // SAFETY-free: decode_len is always <= CAP (set only by the build,
-        // which rejects accuracy_log overflowing the table size).
-        &self.decode[..self.decode_len]
+        // SAFETY: the build initialised every entry in `[0, decode_len)` and set
+        // `decode_len <= CAP`, so the live prefix is fully initialised;
+        // `MaybeUninit<E>` shares E's layout, so reinterpreting it as `&[E]` is
+        // sound.
+        unsafe { core::slice::from_raw_parts(self.decode.as_ptr().cast::<E>(), self.decode_len) }
     }
 
     /// Test-only: populate the decode table directly from a slice of entries
@@ -322,7 +347,14 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
     #[cfg(test)]
     pub(crate) fn set_decode_for_test(&mut self, entries: &[E]) {
         assert!(entries.len() <= CAP, "test entries exceed table CAP");
-        self.decode[..entries.len()].copy_from_slice(entries);
+        // Write the entries into the `MaybeUninit` slots (E: Copy, same layout).
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                entries.as_ptr(),
+                self.decode.as_mut_ptr().cast::<E>(),
+                entries.len(),
+            );
+        }
         self.decode_len = entries.len();
     }
 
@@ -569,6 +601,18 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         }
 
         let table_size = 1 << self.accuracy_log;
+        // The decode array is `[E; CAP]` and the fast-spread scratch is a fixed
+        // `FSE_FAST_SPREAD_BUF`; a `table_size` above CAP would overrun both.
+        // The wire path never exceeds CAP (sequence acc_log <= 9, HUF <= 6), but
+        // `build_from_probabilities` accepts acc_log up to
+        // `ENTRY_MAX_ACCURACY_LOG` (16) and is reachable from fuzz, so reject an
+        // oversized table as a typed error instead of panic-overrunning.
+        if table_size > CAP {
+            return Err(FSETableError::AccLogTooBig {
+                got: self.accuracy_log,
+                max: CAP.trailing_zeros() as u8,
+            });
+        }
 
         // === Spread step ===
         // Reuse the persistent scratch buffer; clear then resize to
@@ -614,24 +658,65 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
             }
         }
 
-        // Pass 2: distribute positive-probability symbols across the
-        // [0, negative_idx) range using the upstream zstd's `next_position`
-        // walker, and initialise `symbol_next[s] = prob` so the
-        // build loop's counter reaches `2*prob - 1` over `prob`
-        // iterations (matching upstream zstd `symbolNext[s]++` semantics).
-        let mut position = 0usize;
-        for symbol in 0..nb_symbols {
-            let prob = probs[symbol];
-            if prob <= 0 {
-                continue;
+        // Pass 2: distribute positive-probability symbols. With NO
+        // low-probability (-1) symbols — the common case on small frames, where
+        // the encoder keeps `useLowProbCount` off below 2048 sequences — take the
+        // upstream zstd fast spread (`ZSTD_buildFSETable_body`,
+        // zstd_decompress_block.c:529-574): lay the symbols down in order with
+        // 8-byte writes, then distribute them in a branch-miss-free two-stage
+        // pass unrolled by 2. This replaces the per-symbol variable-length inner
+        // loop + lowprob `while` skip below, which dominated the FSE-build
+        // self-time on the decode profile. The two passes are provably identical
+        // when there are no -1 symbols: both place the k-th in-order symbol at
+        // `next_position`-walk step k.
+        if negative_idx == table_size {
+            let mut in_order = [0u8; FSE_FAST_SPREAD_BUF];
+            let mut pos = 0usize;
+            for symbol in 0..nb_symbols {
+                let prob = probs[symbol];
+                if prob <= 0 {
+                    continue;
+                }
+                symbol_next[symbol] = prob as u32;
+                let n = prob as usize;
+                // 8 copies of the symbol byte; lay down 8 at a time (counts are
+                // mostly <= 8 on small table-logs, so the inner loop rarely runs).
+                let bytes = ((symbol as u8) as u64)
+                    .wrapping_mul(0x0101_0101_0101_0101)
+                    .to_le_bytes();
+                in_order[pos..pos + 8].copy_from_slice(&bytes);
+                let mut i = 8;
+                while i < n {
+                    in_order[pos + i..pos + i + 8].copy_from_slice(&bytes);
+                    i += 8;
+                }
+                pos += n;
             }
-            symbol_next[symbol] = prob as u32;
-            let symbol_u8 = symbol as u8;
-            for _ in 0..prob {
-                spread[position] = symbol_u8;
-                position = next_position(position, table_size);
-                while position >= negative_idx {
+            let table_mask = table_size - 1;
+            let step = (table_size >> 1) + (table_size >> 3) + 3;
+            let mut position = 0usize;
+            let mut s = 0usize;
+            while s < table_size {
+                spread[position] = in_order[s];
+                spread[(position + step) & table_mask] = in_order[s + 1];
+                position = (position + 2 * step) & table_mask;
+                s += 2;
+            }
+        } else {
+            let mut position = 0usize;
+            for symbol in 0..nb_symbols {
+                let prob = probs[symbol];
+                if prob <= 0 {
+                    continue;
+                }
+                symbol_next[symbol] = prob as u32;
+                let symbol_u8 = symbol as u8;
+                for _ in 0..prob {
+                    spread[position] = symbol_u8;
                     position = next_position(position, table_size);
+                    while position >= negative_idx {
+                        position = next_position(position, table_size);
+                    }
                 }
             }
         }
@@ -741,7 +826,7 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
             // instead of re-walking the finished table. `from_raw`
             // zero-inits the meta fields, so the no-meta arms match
             // the post-pass results exactly.
-            self.decode[state_idx] = match meta {
+            self.decode[state_idx] = core::mem::MaybeUninit::new(match meta {
                 SeqMeta::None => entry,
                 SeqMeta::Packed(packed) => {
                     let m = packed.get(symbol as usize).copied().unwrap_or(0);
@@ -754,7 +839,7 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
                         entry
                     }
                 }
-            };
+            });
         }
 
         // Commit the live span. The loop wrote every `state_idx ∈
@@ -901,7 +986,9 @@ impl FSETableImpl<SeqSymbol, 512> {
         debug_assert_eq!(self.decode_len, self.symbol_spread_buffer.len());
         for i in 0..self.decode_len {
             let sym = self.symbol_spread_buffer[i] as usize;
-            let entry = &mut self.decode[i];
+            // SAFETY: `i < decode_len`, and the build initialised every entry in
+            // that span before this enrich pass runs.
+            let entry = unsafe { self.decode[i].assume_init_mut() };
             if sym < packed.len() {
                 let meta = packed[sym];
                 entry.base_value = meta & 0x00FF_FFFF;
@@ -919,7 +1006,8 @@ impl FSETableImpl<SeqSymbol, 512> {
         debug_assert_eq!(self.decode_len, self.symbol_spread_buffer.len());
         for i in 0..self.decode_len {
             let code = self.symbol_spread_buffer[i];
-            let entry = &mut self.decode[i];
+            // SAFETY: `i < decode_len`, entry initialised by the build above.
+            let entry = unsafe { self.decode[i].assume_init_mut() };
             entry.base_value = 0;
             entry.num_additional_bits = 0;
             if code < 32 {
@@ -949,12 +1037,12 @@ impl FSETableImpl<SeqSymbol, 512> {
         // Spread buffer drives the enrich pass (symbol per slot); one slot.
         self.symbol_spread_buffer.push(symbol);
         // Single RLE entry at slot 0 (upstream zstd RLE DTable: one state).
-        self.decode[0] = SeqSymbol {
+        self.decode[0] = core::mem::MaybeUninit::new(SeqSymbol {
             new_state: 0,
             num_bits: 0,
             num_additional_bits: 0,
             base_value: 0,
-        };
+        });
         self.decode_len = 1;
         // accuracy_log stays 0 (upstream zstd RLE DTable tableLog); init_state
         // reads 0 state bits and update_state keeps the single state.
@@ -1167,6 +1255,14 @@ fn highest_bit_set(x: u32) -> u32 {
 //utility functions for building the decoding table from probabilities
 /// Calculate the position of the next entry of the table given the current
 /// position and size of the table.
+/// In-order spread scratch for the fast `build_decoding_table_inner` path:
+/// the largest table reaching it is `1 << 9 = 512` entries (the
+/// `table_size <= CAP` guard in `build_decoding_table_inner` rejects anything
+/// larger before the spread runs), plus 8 bytes of slack so the 8-byte symbol
+/// lay-down can over-write past the last symbol without bounds-checking each
+/// tail write.
+const FSE_FAST_SPREAD_BUF: usize = 512 + 8;
+
 fn next_position(mut p: usize, table_size: usize) -> usize {
     p += (table_size >> 1) + (table_size >> 3) + 3;
     p &= table_size - 1;

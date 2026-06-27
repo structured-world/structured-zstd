@@ -710,6 +710,16 @@ pub(crate) struct CompressState<M: Matcher> {
     /// diverge, making the search load-bearing for ratio). Set per frame
     /// alongside `strategy_tag` via [`huf_search_enabled`].
     pub(crate) huf_optimal_search: bool,
+    /// Mirror of upstream zstd's `ZSTD_literalsCompressionIsDisabled`
+    /// (zstd_compress_internal.h): in the default (`auto`) literal-compression
+    /// mode the literals section is emitted RAW (no Huffman) when
+    /// `strategy == ZSTD_fast && targetLength > 0`. For the levels we resolve,
+    /// that is exactly the negative levels (Fast strategy with `targetLength =
+    /// -level > 0`; L1/L2 are Fast with `targetLength == 0`). C trades the
+    /// literal-Huffman pass for speed there, so matching it keeps both the frame
+    /// size and the encode cost in parity on the negative band. Set per frame
+    /// alongside `strategy_tag`.
+    pub(crate) literal_compression_disabled: bool,
 }
 
 /// Whether the HUF literal build should run the #167 table-log search for a
@@ -980,6 +990,10 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                     compression_level,
                 ),
                 huf_optimal_search: true,
+                literal_compression_disabled: matches!(
+                    compression_level,
+                    crate::encoding::CompressionLevel::Level(n) if n < 0
+                ),
             },
             magicless: false,
             content_checksum: false,
@@ -1034,6 +1048,24 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         });
         self.state.huf_optimal_search =
             huf_search_enabled(self.state.strategy_tag, self.source_size_hint);
+        // C `ZSTD_literalsCompressionIsDisabled` (ps_auto): raw literals iff the
+        // EFFECTIVE cParams are the fast strategy with targetLength > 0. A
+        // strategy override (e.g. negative level + BtUltra2) flips `strategy_tag`
+        // away from fast, so the resolved tag — not the signed level — gates
+        // this. For the fast strategy the level table sets targetLength > 0
+        // exactly on the negative (acceleration) rows, so absent an explicit
+        // targetLength override `level < 0` is that test; an override wins.
+        self.state.literal_compression_disabled = self.state.strategy_tag
+            == crate::encoding::strategy::StrategyTag::Fast
+            && overrides.target_length.map_or_else(
+                || {
+                    matches!(
+                        self.compression_level,
+                        crate::encoding::CompressionLevel::Level(n) if n < 0
+                    )
+                },
+                |tl| tl > 0,
+            );
         self.state.matcher.set_param_overrides(Some(overrides));
     }
 
@@ -1367,6 +1399,10 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                     compression_level,
                 ),
                 huf_optimal_search: true,
+                literal_compression_disabled: matches!(
+                    compression_level,
+                    crate::encoding::CompressionLevel::Level(n) if n < 0
+                ),
             },
             compression_level,
             magicless: false,
@@ -2331,6 +2367,14 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     ) -> CompressionLevel {
         let old = self.compression_level;
         self.compression_level = compression_level;
+        // Resync the raw-literals gate: negative levels disable literal (Huffman)
+        // compression (C `ZSTD_literalsCompressionIsDisabled`). `prepare_frame`
+        // never recomputes this, so it must be refreshed on the level switch the
+        // same way the constructors and `set_parameters` do.
+        self.state.literal_compression_disabled = matches!(
+            compression_level,
+            CompressionLevel::Level(n) if n < 0
+        );
         // Drop sticky overrides so the level switch yields plain geometry.
         self.strategy_override = None;
         self.state.matcher.clear_param_overrides();

@@ -38,20 +38,13 @@ pub(crate) const CONTENTSIZE_UNKNOWN: u64 = u64::MAX;
 // Level-row selection constants — only the public `get_cparams` entry (the
 // C-reference comparison surface) uses these; the encoder indexes the table via
 // `default_cparams` and never re-selects a level row here.
-#[cfg(feature = "bench_internals")]
 const ZSTD_MAX_CLEVEL: i32 = 22;
-#[cfg(feature = "bench_internals")]
 const ZSTD_CLEVEL_DEFAULT: i32 = 3;
-#[cfg(feature = "bench_internals")]
 const TARGETLENGTH_MAX: i32 = 1 << 17;
 /// `ZSTD_minCLevel()` == `-ZSTD_TARGETLENGTH_MAX`.
-#[cfg(feature = "bench_internals")]
 const MIN_CLEVEL: i32 = -TARGETLENGTH_MAX;
-#[cfg(feature = "bench_internals")]
 const KB_256: u64 = 256 * 1024;
-#[cfg(feature = "bench_internals")]
 const KB_128: u64 = 128 * 1024;
-#[cfg(feature = "bench_internals")]
 const KB_16: u64 = 16 * 1024;
 
 /// `ZSTD_defaultCParameters[4][ZSTD_MAX_CLEVEL+1]` (clevels.h, zstd 1.5.7),
@@ -107,17 +100,6 @@ const DEFAULT_CPARAMS: [[CParams; 23]; 4] = {
     ]
 };
 
-/// The verbatim upstream default-cparams row for a `(tier, level)` pair, the
-/// single source of the `ZSTD_defaultCParameters` table data. `tier` is the
-/// source-size bucket (0 = `>256 KB` .. 3 = `<=16 KB`, see [`get_cparams`]);
-/// `level` is the row (0 = negative-level base, 1..=22). This is the
-/// pre-`adjust_cparams` row: the encoder's level table consumes the raw
-/// `(hashLog, chainLog, minMatch)` widths from it and runs its own
-/// source-size clamp.
-pub(crate) fn default_cparams(tier: usize, level: usize) -> CParams {
-    DEFAULT_CPARAMS[tier][level]
-}
-
 /// `ZSTD_highbit32(val)` — index of the most-significant set bit. Caller
 /// guarantees `val != 0` (matches the upstream `assert(val != 0)`).
 #[inline]
@@ -128,7 +110,6 @@ fn highbit32(val: u32) -> u32 {
 
 /// `ZSTD_getCParamRowSize` (zstd_compress.c): the effective size used to pick
 /// the tier row, for the public `ZSTD_getCParams` (`ZSTD_cpm_unknown`) entry.
-#[cfg(feature = "bench_internals")]
 fn cparam_row_size(src_size_hint: u64, dict_size: usize) -> u64 {
     let dict_size = dict_size as u64;
     let unknown = src_size_hint == CONTENTSIZE_UNKNOWN;
@@ -182,7 +163,7 @@ fn cdict_indices_are_tagged(cp: &CParams) -> bool {
 /// means unknown; `src_size == 0` means literally zero. The row-match-finder
 /// hashLog cap is omitted here because this port only consumes the Fast /
 /// Dfast cparams (no row hash); add it before relying on row-strategy output.
-fn adjust_cparams(
+pub(crate) fn adjust_cparams(
     mut cp: CParams,
     mut src_size: u64,
     dict_size: usize,
@@ -243,8 +224,7 @@ fn adjust_cparams(
 
 /// `ZSTD_getCParams_internal` (zstd_compress.c): tier + level row selection,
 /// negative-level acceleration, then `ZSTD_adjustCParams_internal`.
-#[cfg(feature = "bench_internals")]
-fn get_cparams(compression_level: i32, src_size_hint: u64, dict_size: usize) -> CParams {
+pub(crate) fn get_cparams(compression_level: i32, src_size_hint: u64, dict_size: usize) -> CParams {
     let r_size = cparam_row_size(src_size_hint, dict_size);
     let table_id = (u32::from(r_size <= KB_256)
         + u32::from(r_size <= KB_128)
@@ -253,6 +233,13 @@ fn get_cparams(compression_level: i32, src_size_hint: u64, dict_size: usize) -> 
     let row: usize = if compression_level == 0 {
         ZSTD_CLEVEL_DEFAULT as usize
     } else if compression_level < 0 {
+        // Row 0 is upstream's "base for negative" row. At the >256 KB / unknown
+        // tier it is hashLog=13 / minMatch=6 (smaller tiers drop minMatch to 5):
+        // the 32 KiB hash table (2^13 * 4 B) stays L1d-resident on contemporary
+        // cores, so every probe is an L1 hit (hashLog=14 would overflow a 32 KiB
+        // L1d into L2). A short minMatch keeps the table cheap; the throughput
+        // win on the negative ladder comes from the step-size acceleration
+        // below, not from the match length.
         0
     } else if compression_level > ZSTD_MAX_CLEVEL {
         ZSTD_MAX_CLEVEL as usize
@@ -263,6 +250,12 @@ fn get_cparams(compression_level: i32, src_size_hint: u64, dict_size: usize) -> 
     let mut cp = DEFAULT_CPARAMS[table_id][row];
 
     if compression_level < 0 {
+        // Negative-level acceleration: upstream stores `targetLength = -level`,
+        // which the fast match-finder turns into `stepSize = targetLength + 1`
+        // (see the fast kernel). A larger step skips more positions per
+        // iteration, so L-1..L-7 trade ratio for speed along a 2..8 step
+        // gradient. Clamp to MIN_CLEVEL before negating so `i32::MIN` can't
+        // overflow on `-level`.
         let clamped = compression_level.max(MIN_CLEVEL);
         cp.target_length = (-clamped) as u32;
     }

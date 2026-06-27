@@ -22,12 +22,19 @@ pub(crate) struct HcConfig {
     pub(crate) chain_log: usize,
     pub(crate) search_depth: usize,
     pub(crate) target_len: usize,
-    /// Binary-tree finder hash width (upstream zstd `mls = BOUNDED(4, minMatch, 6)`),
-    /// carried explicitly per level so it is NOT inferred from `target_len`
-    /// (a `target_length` override must not silently flip the finder between
-    /// 5- and 4-byte hashing). Only the BT body reads it; HC/lazy levels keep
-    /// it at 4 (their `hash_position` is always 4-byte). 5 for the
-    /// minMatch=5 BT levels (btlazy2 + btopt L16), 4 elsewhere.
+    /// Binary-tree finder hash width. Upstream uses `mls = BOUNDED(3, minMatch, 6)`
+    /// (`ZSTD_selectBtGetAllMatches`, zstd_opt.c:896) — i.e. mls=3 on the
+    /// btultra/btultra2 levels (L18-22, minMatch=3) — and surfaces 3-byte matches
+    /// through a fallback-only HC3 finder (zstd_opt.c:691-720: distance < 256 KiB,
+    /// taken only when no longer/repcode match exists). Our optimal parser does
+    /// NOT yet replicate that 3-byte handling — it emits short matches C prices
+    /// out, breaking level-22 sequence parity — so the BT hash width is clamped UP
+    /// to 4 (`cp.min_match.clamp(4, 6)`) to keep the finder from surfacing those
+    /// 3-byte matches and so match C's output. This is a deliberate workaround,
+    /// NOT C's finder width; drop the clamp once the optimal parser is C-faithful
+    /// at minMatch 3 (tracked in #337). Carried explicitly per level so a
+    /// `target_length` override can't silently change the finder's hashing width.
+    /// Only the BT body reads it; HC / lazy levels keep it at 4.
     pub(crate) search_mls: usize,
 }
 
@@ -70,46 +77,6 @@ pub(crate) const HC_OVERRIDE_DEFAULT: HcConfig = HcConfig {
     search_mls: 4,
 };
 
-pub(crate) const BTULTRA2_HC_CONFIG: HcConfig = HcConfig {
-    hash_log: 24,
-    chain_log: 24,
-    search_depth: 512,
-    target_len: 256,
-    search_mls: 4,
-};
-
-pub(crate) const BTULTRA2_HC_CONFIG_L22: HcConfig = HcConfig {
-    hash_log: 25,
-    chain_log: 27,
-    search_depth: 512,
-    target_len: 999,
-    search_mls: 4,
-};
-
-pub(crate) const BTULTRA2_HC_CONFIG_L22_256K: HcConfig = HcConfig {
-    hash_log: 19,
-    chain_log: 19,
-    search_depth: 1 << 13,
-    target_len: 999,
-    search_mls: 4,
-};
-
-pub(crate) const BTULTRA2_HC_CONFIG_L22_128K: HcConfig = HcConfig {
-    hash_log: 17,
-    chain_log: 18,
-    search_depth: 1 << 11,
-    target_len: 999,
-    search_mls: 4,
-};
-
-pub(crate) const BTULTRA2_HC_CONFIG_L22_16K: HcConfig = HcConfig {
-    hash_log: 15,
-    chain_log: 15,
-    search_depth: 1 << 10,
-    target_len: 999,
-    search_mls: 4,
-};
-
 // Default Row config: only used by tests and the test-only parse×search
 // override (production greedy L5 carries its own `ROW_L5`).
 #[cfg(test)]
@@ -145,69 +112,6 @@ pub(crate) const ROW_L5: RowConfig = RowConfig {
     mls: ROW_MIN_MATCH_LEN,
 };
 
-// Upstream zstd `clevels.h` unbounded defaults for the lazy band, verified via
-// `ZSTD_getCParams(level, 0, 0)`:
-//   L6  { w21 c18 h19 s3 mml5 t4  lazy  } → rowLog 4, depth 1<<3 = 8
-//   L7  { w21 c19 h20 s4 mml5 t8  lazy  } → rowLog 4, depth 16
-//   L8  { w21 c19 h20 s4 mml5 t16 lazy2 } → rowLog 4, depth 16
-//   L9  { w22 c20 h21 s4 mml5 t16 lazy2 } → rowLog 4, depth 16
-//   L10 { w22 c21 h22 s5 mml5 t16 lazy2 } → rowLog 5, depth 32
-//   L11 { w22 c21 h22 s6 mml5 t16 lazy2 } → rowLog 6, depth 64
-//   L12 { w22 c22 h23 s6 mml5 t32 lazy2 } → rowLog 6, depth 64
-// `rowLog = clamp(searchLog, 4, 6)`, `depth = 1 << min(searchLog, rowLog)`
-// (same derivation as `ROW_L5` above). `hash_bits` carries the upstream zstd
-// `hashLog`; the hinted-source clamp in `configure` caps it by the window
-// exactly like the upstream zstd `ZSTD_adjustCParams` path.
-pub(crate) const ROW_L6: RowConfig = RowConfig {
-    hash_bits: 19,
-    row_log: 4,
-    search_depth: 8,
-    target_len: 4,
-    mls: ROW_MIN_MATCH_LEN,
-};
-pub(crate) const ROW_L7: RowConfig = RowConfig {
-    hash_bits: 20,
-    row_log: 4,
-    search_depth: 16,
-    target_len: 8,
-    mls: ROW_MIN_MATCH_LEN,
-};
-pub(crate) const ROW_L8: RowConfig = RowConfig {
-    hash_bits: 20,
-    row_log: 4,
-    search_depth: 16,
-    target_len: 16,
-    mls: ROW_MIN_MATCH_LEN,
-};
-pub(crate) const ROW_L9: RowConfig = RowConfig {
-    hash_bits: 21,
-    row_log: 4,
-    search_depth: 16,
-    target_len: 16,
-    mls: ROW_MIN_MATCH_LEN,
-};
-pub(crate) const ROW_L10: RowConfig = RowConfig {
-    hash_bits: 22,
-    row_log: 5,
-    search_depth: 32,
-    target_len: 16,
-    mls: ROW_MIN_MATCH_LEN,
-};
-pub(crate) const ROW_L11: RowConfig = RowConfig {
-    hash_bits: 22,
-    row_log: 6,
-    search_depth: 64,
-    target_len: 16,
-    mls: ROW_MIN_MATCH_LEN,
-};
-pub(crate) const ROW_L12: RowConfig = RowConfig {
-    hash_bits: 23,
-    row_log: 6,
-    search_depth: 64,
-    target_len: 32,
-    mls: ROW_MIN_MATCH_LEN,
-};
-
 /// Per-level Double-Fast hash sizing, mirroring the upstream zstd `clevels.h` columns
 /// (config-driven, not a hardcoded constant): `long_hash_log` =
 /// `cParams.hashLog` (the long 8-byte hash table), `short_hash_log` =
@@ -221,15 +125,10 @@ pub(crate) struct DfastConfig {
     pub(crate) short_hash_log: u8,
 }
 
-// Upstream zstd clevels.h default row (srcSize > 256 KB): L3 {hashLog 17, chainLog 16},
-// L4 {hashLog 18, chainLog 18}.
+// Upstream zstd clevels.h default row (srcSize > 256 KB): L3 {hashLog 17, chainLog 16}.
 pub(crate) const DFAST_L3: DfastConfig = DfastConfig {
     long_hash_log: 17,
     short_hash_log: 16,
-};
-pub(crate) const DFAST_L4: DfastConfig = DfastConfig {
-    long_hash_log: 18,
-    short_hash_log: 18,
 };
 
 /// Per-level Fast-strategy tuning, only consumed by the `FastKernelMatcher`
@@ -252,11 +151,6 @@ pub(crate) const FAST_L1: FastConfig = FastConfig {
     // here is the tier-0 value; `fast_l1_mls_for_source_size` lowers it per the
     // tier in `adjust_params_for_source_size`.
     mls: 7,
-    step_size: 2,
-};
-pub(crate) const FAST_L2: FastConfig = FastConfig {
-    hash_log: 16,
-    mls: 6,
     step_size: 2,
 };
 
@@ -633,67 +527,6 @@ pub(crate) fn hc_hash_bits_for_window(max_window_size: usize) -> usize {
     window_log.max(MIN_WINDOW_LOG as usize)
 }
 
-/// Parameter table for numeric compression levels 1–22.
-///
-/// Each entry maps a zstd compression level to the best-available matcher
-/// backend and tuning knobs. High levels map to dedicated parse modes:
-/// btopt (16-17), btultra (18), btultra2 (19-22) — matching upstream zstd
-/// `clevels.h` (level 19 is `ZSTD_btultra2`, not plain btultra).
-///
-/// Index 0 = level 1, index 21 = level 22.
-#[rustfmt::skip]
-pub(crate) const LEVEL_TABLE: [LevelParams; 22] = [
-    // Exactly one of fast/dfast/hc/row is Some per row, matching the strategy
-    // backend; the rest are None (not dead placeholders).
-    // Lvl  Strategy       wlog  lazy  per-strategy config
-    // ---  -------------- ----  ----  -------------------
-    /* 1 */ LevelParams { strategy_tag: crate::encoding::strategy::StrategyTag::Fast, search: crate::encoding::strategy::SearchMethod::Fast, window_log: 19, lazy_depth: 0, fast: Some(FAST_L1), dfast: None, hc: None, row: None },
-    /* 2 */ LevelParams { strategy_tag: crate::encoding::strategy::StrategyTag::Fast, search: crate::encoding::strategy::SearchMethod::Fast, window_log: 20, lazy_depth: 0, fast: Some(FAST_L2), dfast: None, hc: None, row: None },
-    /* 3 */ LevelParams { strategy_tag: crate::encoding::strategy::StrategyTag::Dfast, search: crate::encoding::strategy::SearchMethod::DoubleFast, window_log: 21, lazy_depth: 1, fast: None, dfast: Some(DFAST_L3), hc: None, row: None },
-    /* 4 */ LevelParams { strategy_tag: crate::encoding::strategy::StrategyTag::Dfast, search: crate::encoding::strategy::SearchMethod::DoubleFast, window_log: 21, lazy_depth: 1, fast: None, dfast: Some(DFAST_L4), hc: None, row: None },
-    // target_len column for L5..=L15 matches upstream zstd cParams.targetLength
-    // from clevels.h table[0] (default — srcSize > 256 KB). Upstream zstd uses
-    // it as the lazy outer loop's `sufficient_len` (nice-match) threshold.
-    // Inflating it above upstream zstd forces the chain walk to complete
-    // search_depth iterations instead of breaking on the first
-    // long-enough match — the dominant cost in the L5..=L15 speed
-    // regression vs FFI (see lazy_band_target_len_matches_default_table).
-    /* 5 */ LevelParams { strategy_tag: crate::encoding::strategy::StrategyTag::Greedy, search: crate::encoding::strategy::SearchMethod::RowHash, window_log: 21, lazy_depth: 0, fast: None, dfast: None, hc: None, row: Some(ROW_L5) },
-    // L6-12: the upstream zstd runs the lazy/lazy2 strategies on the ROW-based
-    // match finder by default (`ZSTD_resolveRowMatchFinderMode`: row mode
-    // is on for greedy..lazy2 whenever SIMD is available) — a bounded
-    // SIMD tag scan per row instead of a pointer-chasing hash-chain walk.
-    // Our HashChain walk on these levels was ~75% of L10 wall time on the
-    // 1 MiB corpus (dependent chain-table loads). Same `RowConfig`
-    // derivation as `ROW_L5` above, upstream zstd values per level in the
-    // `ROW_L6..ROW_L12` comment block.
-    /* 6 */ LevelParams { strategy_tag: crate::encoding::strategy::StrategyTag::Lazy, search: crate::encoding::strategy::SearchMethod::RowHash, window_log: 21, lazy_depth: 1, fast: None, dfast: None, hc: None, row: Some(ROW_L6) },
-    /* 7 */ LevelParams { strategy_tag: crate::encoding::strategy::StrategyTag::Lazy, search: crate::encoding::strategy::SearchMethod::RowHash, window_log: 21, lazy_depth: 1, fast: None, dfast: None, hc: None, row: Some(ROW_L7) },
-    /* 8 */ LevelParams { strategy_tag: crate::encoding::strategy::StrategyTag::Lazy, search: crate::encoding::strategy::SearchMethod::RowHash, window_log: 21, lazy_depth: 2, fast: None, dfast: None, hc: None, row: Some(ROW_L8) },
-    /* 9 */ LevelParams { strategy_tag: crate::encoding::strategy::StrategyTag::Lazy, search: crate::encoding::strategy::SearchMethod::RowHash, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: None, row: Some(ROW_L9) },
-    /*10 */ LevelParams { strategy_tag: crate::encoding::strategy::StrategyTag::Lazy, search: crate::encoding::strategy::SearchMethod::RowHash, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: None, row: Some(ROW_L10) },
-    /*11 */ LevelParams { strategy_tag: crate::encoding::strategy::StrategyTag::Lazy, search: crate::encoding::strategy::SearchMethod::RowHash, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: None, row: Some(ROW_L11) },
-    /*12 */ LevelParams { strategy_tag: crate::encoding::strategy::StrategyTag::Lazy, search: crate::encoding::strategy::SearchMethod::RowHash, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: None, row: Some(ROW_L12) },
-    // L13-15: reference uses btlazy2 (binary-tree finder) with searchLog 4/5/6
-    // (search_depth 16/32/64) and targetLength 32. We run the hash-chain Lazy
-    // parser here, so we mirror the reference search budget rather than inflate
-    // it: matching the table keeps speed near the reference and makes per-level
-    // perf divergences comparable. The binary-tree finder that would let a
-    // smaller searchLog find longer matches (and re-establish a strict ratio
-    // ladder above L12) is tracked separately; until it lands these levels sit
-    // close to L12 on hash-chain inputs by design.
-    /*13 */ LevelParams { strategy_tag: crate::encoding::strategy::StrategyTag::Btlazy2, search: crate::encoding::strategy::SearchMethod::BinaryTree, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 22, search_depth: 16, target_len: 32, search_mls: 5 }), row: None },
-    /*14 */ LevelParams { strategy_tag: crate::encoding::strategy::StrategyTag::Btlazy2, search: crate::encoding::strategy::SearchMethod::BinaryTree, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 23, chain_log: 22, search_depth: 32, target_len: 32, search_mls: 5 }), row: None },
-    /*15 */ LevelParams { strategy_tag: crate::encoding::strategy::StrategyTag::Btlazy2, search: crate::encoding::strategy::SearchMethod::BinaryTree, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 23, chain_log: 23, search_depth: 64, target_len: 32, search_mls: 5 }), row: None },
-    /*16 */ LevelParams { strategy_tag: crate::encoding::strategy::StrategyTag::BtOpt, search: crate::encoding::strategy::SearchMethod::BinaryTree, window_log: 22, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 22, search_depth: 32, target_len: 48, search_mls: 5 }), row: None },
-    /*17 */ LevelParams { strategy_tag: crate::encoding::strategy::StrategyTag::BtOpt, search: crate::encoding::strategy::SearchMethod::BinaryTree, window_log: 23, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 23, search_depth: 32, target_len: 64, search_mls: 4 }), row: None },
-    /*18 */ LevelParams { strategy_tag: crate::encoding::strategy::StrategyTag::BtUltra, search: crate::encoding::strategy::SearchMethod::BinaryTree, window_log: 23, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 23, search_depth: 64, target_len: 64, search_mls: 4 }), row: None },
-    /*19 */ LevelParams { strategy_tag: crate::encoding::strategy::StrategyTag::BtUltra2, search: crate::encoding::strategy::SearchMethod::BinaryTree, window_log: 23, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 22, chain_log: 24, search_depth: 128, target_len: 256, search_mls: 4 }), row: None },
-    /*20 */ LevelParams { strategy_tag: crate::encoding::strategy::StrategyTag::BtUltra2, search: crate::encoding::strategy::SearchMethod::BinaryTree, window_log: 25, lazy_depth: 2, fast: None, dfast: None, hc: Some(HcConfig { hash_log: 23, chain_log: 25, search_depth: 128, target_len: 256, search_mls: 4 }), row: None },
-    /*21 */ LevelParams { strategy_tag: crate::encoding::strategy::StrategyTag::BtUltra2, search: crate::encoding::strategy::SearchMethod::BinaryTree, window_log: 26, lazy_depth: 2, fast: None, dfast: None, hc: Some(BTULTRA2_HC_CONFIG), row: None },
-    /*22 */ LevelParams { strategy_tag: crate::encoding::strategy::StrategyTag::BtUltra2, search: crate::encoding::strategy::SearchMethod::BinaryTree, window_log: 27, lazy_depth: 2, fast: None, dfast: None, hc: Some(BTULTRA2_HC_CONFIG_L22), row: None },
-];
-
 /// Upstream `ZSTD_createCDict` table geometry: the `(hash_log, chain_log)` a
 /// dictionary's prepared match-finder tables get. Thin adapter over the single
 /// cParams source [`crate::encoding::cparams::create_cdict_table_logs`], which mirrors
@@ -719,42 +552,7 @@ pub(crate) fn cdict_table_logs(
 
 /// Smallest window_log the encoder will use regardless of source size.
 pub(crate) const MIN_WINDOW_LOG: u8 = 10;
-/// Conservative floor for source-size-hinted window tuning.
-///
-/// Hinted windows below 16 KiB (`window_log < 14`) currently regress C-FFI
-/// interoperability on certain compressed-block patterns. Keep hinted
-/// windows at 16 KiB or larger until that compatibility gap is closed.
-pub(crate) const MIN_HINTED_WINDOW_LOG: u8 = 14;
 
-/// Adjust level parameters for a known source size.
-///
-/// This derives a cap from `ceil(log2(src_size))`, then clamps it to
-/// [`MIN_HINTED_WINDOW_LOG`] (16 KiB). A zero-byte size hint is treated as
-/// [`MIN_WINDOW_LOG`] for the raw ceil-log step and then promoted to the hinted
-/// floor. This keeps tables bounded for small inputs while preserving the
-/// encoder's baseline minimum supported window.
-/// For the HC backend, `hash_log` and `chain_log` are reduced
-/// proportionally.
-/// Source-size tier index, matching upstream `ZSTD_getCParams_internal`'s
-/// `tableID = (rSize<=256K)+(rSize<=128K)+(rSize<=16K)`: 0 = > 256 KiB or
-/// unknown, 1 = 128..256 KiB, 2 = 16..128 KiB, 3 = <= 16 KiB.
-fn cparams_tier(source_size: Option<u64>) -> usize {
-    match source_size {
-        Some(size) if size <= 16 * 1024 => 3,
-        Some(size) if size <= 128 * 1024 => 2,
-        Some(size) if size <= 256 * 1024 => 1,
-        _ => 0,
-    }
-}
-
-/// Override a Fast (L1/L2) or Dfast (L3) level row's table-shaping cParams
-/// (hashLog / chainLog / minMatch) by source-size tier, matching the
-/// reference `ZSTD_defaultCParameters[tableID][level]`. L1 keeps its base
-/// hashLog (the source-size window clamp in `adjust_params_for_source_size`
-/// already lands on the reference value) and only tiers minMatch; L2 also
-/// tiers hashLog (the tier-0 value 16 oversized the table on medium inputs,
-/// the page-fault pathology); L3 tiers both dfast hash widths. Strategy
-/// switches (L2 tier 1, L4) are intentionally not applied here.
 /// Translate a verbatim upstream `ZSTD_defaultCParameters[tier][level]` row
 /// (`cparams::CParams`) into our resolved [`LevelParams`], reproducing
 /// upstream's cParams -> matcher-config derivation so the encoder follows C's
@@ -775,7 +573,11 @@ fn level_params_from_cparams(cp: crate::encoding::cparams::CParams) -> LevelPara
         chain_log: cp.chain_log as usize,
         search_depth,
         target_len,
-        search_mls: cp.min_match as usize,
+        // Clamp UP to 4: C's BT finder uses mls=3 on L18-22, but our optimal
+        // parser diverges on the resulting 3-byte matches (breaks level-22
+        // sequence parity), so we keep the finder at >=4 as a workaround until
+        // the parser is C-faithful at minMatch 3. See `HcConfig::search_mls` (#337).
+        search_mls: cp.min_match.clamp(4, 6) as usize,
     };
     let row = RowConfig {
         hash_bits: cp.hash_log as usize,
@@ -843,138 +645,80 @@ fn level_params_from_cparams(cp: crate::encoding::cparams::CParams) -> LevelPara
     }
 }
 
-fn apply_cparams_tier(level: i32, source_size: Option<u64>, p: &mut LevelParams) {
-    let tier = cparams_tier(source_size);
-    // Single source for the table data: the verbatim upstream
-    // `ZSTD_defaultCParameters[tier][level]` row (`cparams::default_cparams`).
-    // The encoder consumes only the table-shaping widths here; the window /
-    // `table_log` clamp lives in `adjust_params_for_source_size`.
-    match level {
-        // Fast, all tiers — minMatch only (hashLog handled by the window clamp).
-        1 => {
-            if let Some(f) = p.fast.as_mut() {
-                f.mls = crate::encoding::cparams::default_cparams(tier, 1).min_match;
-            }
-        }
-        // Fast (base strategy; tier 1 is dfast upstream — not switched here).
-        2 => {
-            if let Some(f) = p.fast.as_mut() {
-                let cp = crate::encoding::cparams::default_cparams(tier, 2);
-                f.hash_log = cp.hash_log;
-                f.mls = cp.min_match;
-            }
-        }
-        // Dfast, all tiers — long hashLog (`hash_log`) + short chainLog (`chain_log`).
-        3 => {
-            if let Some(d) = p.dfast.as_mut() {
-                let cp = crate::encoding::cparams::default_cparams(tier, 3);
-                d.long_hash_log = cp.hash_log as u8;
-                d.short_hash_log = cp.chain_log as u8;
-            }
-        }
-        _ => {}
-    }
-}
-
+/// Down-size a synthesized backend's window / hash / chain logs for a known
+/// source size by routing through the single C-faithful adjuster
+/// [`adjust_cparams`](crate::encoding::cparams::adjust_cparams)
+/// (`ZSTD_adjustCParams_internal`).
+///
+/// Used only on the param-override re-cap path: [`apply_param_overrides`]
+/// synthesizes a backend's full-size default config when a strategy override
+/// moves off the native level row, and this re-applies the source-size cap
+/// C-faithfully — the SAME adjuster the `get_cparams` main path uses, so the
+/// override path and the level path now down-size identically (no extra hinted
+/// 16 KiB window floor, no per-backend headroom that diverged from C). The
+/// Dfast backend self-sizes its tables in `reset`, so only its window is capped.
 pub(crate) fn adjust_params_for_source_size(mut params: LevelParams, src_size: u64) -> LevelParams {
-    // Derive a source-size-based cap from ceil(log2(src_size)), then
-    // clamp first to MIN_WINDOW_LOG (baseline encoder minimum) and then to
-    // MIN_HINTED_WINDOW_LOG (16 KiB hinted floor). For tiny or zero hints we
-    // therefore keep a 16 KiB effective minimum window in hinted mode.
-    // Raw ceil(log2(src_size)) drives the internal table sizes. The
-    // advertised `window_log` is separately floored at MIN_HINTED_WINDOW_LOG
-    // (a decoder-interop requirement on the wire format), but the hash /
-    // chain table widths are internal and never appear in the frame, so they
-    // can track the actual source size below that floor.
-    let raw_src_log = source_size_ceil_log(src_size);
-    let src_log = raw_src_log.max(MIN_WINDOW_LOG).max(MIN_HINTED_WINDOW_LOG);
-    if src_log < params.window_log {
-        params.window_log = src_log;
-    }
-    // Internal match-finder tables are sized from `table_log` — the RAW
-    // source log (floored only at the baseline `MIN_WINDOW_LOG`), NOT the
-    // wire `window_log` floor. The table widths never appear in the frame, so
-    // for small inputs they can track the actual source size and avoid
-    // zeroing a window-sized table per frame; large inputs keep the level's
-    // widths. The cap is applied with the same per-backend headroom the
-    // level table uses, so the load factor (and match quality) is unchanged.
-    // The Dfast backend derives its table widths from the source in `reset`
-    // (`set_hash_bits` recomputes there), so it is not adjusted here. The Row
-    // backend's width IS capped here, mirroring the upstream zstd (see the Row branch).
-    let table_log = raw_src_log.max(MIN_WINDOW_LOG);
+    use crate::encoding::cparams::{CParams, adjust_cparams};
+    use crate::encoding::strategy::{BackendTag, StrategyTag};
+
     let backend = params.backend();
-    if backend == crate::encoding::strategy::BackendTag::HashChain {
-        let hc = params
+    // Lift the active backend's source-cappable logs into a flat CParams. Dfast
+    // contributes none (window-only); its table widths self-size in `reset`.
+    let (hash_log, chain_log): (u32, u32) = match backend {
+        BackendTag::Simple => (params.fast.as_ref().map_or(0, |f| f.hash_log), 0),
+        BackendTag::HashChain => params
             .hc
-            .as_mut()
-            .expect("HashChain level row carries an HcConfig");
-        if (table_log + 2) < hc.hash_log as u8 {
-            hc.hash_log = (table_log + 2) as usize;
+            .as_ref()
+            .map_or((0, 0), |h| (h.hash_log as u32, h.chain_log as u32)),
+        BackendTag::Row => (params.row.as_ref().map_or(0, |r| r.hash_bits as u32), 0),
+        BackendTag::Dfast => (0, 0),
+    };
+    // The chain cap (`ZSTD_cycleLog`) reads only `strategy >= btlazy2(6)`, so a
+    // coarse 6/3 split is exact for it; `adjust_cparams`'s other strategy use
+    // (`cdict_indices_are_tagged`) is gated on `create_cdict = false` here.
+    let strategy = if matches!(
+        params.strategy_tag,
+        StrategyTag::Btlazy2 | StrategyTag::BtOpt | StrategyTag::BtUltra | StrategyTag::BtUltra2
+    ) {
+        6
+    } else {
+        3
+    };
+    let adj = adjust_cparams(
+        CParams {
+            window_log: u32::from(params.window_log),
+            chain_log,
+            hash_log,
+            search_log: 1,
+            min_match: 4,
+            target_length: 0,
+            strategy,
+        },
+        src_size,
+        0,
+        false,
+    );
+    params.window_log = adj.window_log as u8;
+    match backend {
+        BackendTag::Simple => {
+            if let Some(f) = params.fast.as_mut() {
+                f.hash_log = adj.hash_log;
+            }
         }
-        if (table_log + 1) < hc.chain_log as u8 {
-            hc.chain_log = (table_log + 1) as usize;
+        BackendTag::HashChain => {
+            if let Some(h) = params.hc.as_mut() {
+                h.hash_log = adj.hash_log as usize;
+                h.chain_log = adj.chain_log as usize;
+            }
         }
-    } else if backend == crate::encoding::strategy::BackendTag::Row {
-        let row = params
-            .row
-            .as_mut()
-            .expect("Row level row carries a RowConfig");
-        // Upstream zstd `ZSTD_adjustCParams_internal` (zstd_compress.c): once
-        // the window is source-capped, `hashLog <= windowLog + 1`. The row
-        // table is `2^hash_bits` slots, exactly upstream's row hashTable
-        // `2^hashLog` slots, so the same cap applies. Without it the row table
-        // stays at the level's unbounded width (e.g. L12 hash_bits 23 = 4x
-        // upstream's source-capped 21), the dominant peak-memory excess on the
-        // row band.
-        let row_cap = (table_log + 1) as usize;
-        if row_cap < row.hash_bits {
-            row.hash_bits = row_cap;
+        BackendTag::Row => {
+            if let Some(r) = params.row.as_mut() {
+                r.hash_bits = adj.hash_log as usize;
+            }
         }
-    } else if backend == crate::encoding::strategy::BackendTag::Simple {
-        let fast = params
-            .fast
-            .as_mut()
-            .expect("Fast level row carries a FastConfig");
-        let fast_cap = (table_log + 1) as u32;
-        if fast_cap < fast.hash_log {
-            fast.hash_log = fast_cap;
-        }
+        BackendTag::Dfast => {}
     }
     params
-}
-
-fn level22_btultra2_params_for_source_size(source_size: Option<u64>) -> LevelParams {
-    let mut hc = match source_size {
-        Some(size) if size <= 16 * 1024 => BTULTRA2_HC_CONFIG_L22_16K,
-        Some(size) if size <= 128 * 1024 => BTULTRA2_HC_CONFIG_L22_128K,
-        Some(size) if size <= 256 * 1024 => BTULTRA2_HC_CONFIG_L22_256K,
-        _ => BTULTRA2_HC_CONFIG_L22,
-    };
-    let mut window_log = match source_size {
-        Some(size) if size <= 16 * 1024 => 14,
-        Some(size) if size <= 128 * 1024 => 17,
-        Some(size) if size <= 256 * 1024 => 18,
-        _ => 27,
-    };
-    if let Some(size) = source_size
-        && size > 256 * 1024
-    {
-        let src_log = source_size_ceil_log(size);
-        window_log = window_log.min(src_log.max(MIN_WINDOW_LOG));
-        let adjusted_table_log = window_log as usize + 1;
-        hc.hash_log = hc.hash_log.min(adjusted_table_log);
-        hc.chain_log = hc.chain_log.min(adjusted_table_log);
-    }
-    LevelParams {
-        strategy_tag: crate::encoding::strategy::StrategyTag::BtUltra2,
-        search: crate::encoding::strategy::SearchMethod::BinaryTree,
-        window_log,
-        lazy_depth: 2,
-        fast: None,
-        dfast: None,
-        hc: Some(hc),
-        row: None,
-    }
 }
 
 /// Estimated steady-state heap footprint of a one-shot compression context
@@ -1093,25 +837,20 @@ pub(crate) fn resolve_level_params(
     level: CompressionLevel,
     source_size: Option<u64>,
 ) -> LevelParams {
-    // Levels at or above MAX_LEVEL clamp to the max: route every out-of-range
-    // level through the same btultra2 source-size resolver as Level(22), so a
-    // caller passing Level(23+) gets the max config instead of falling through
-    // to the generic cParams path (which would resolve a different geometry).
-    if matches!(level, CompressionLevel::Level(n) if n >= CompressionLevel::MAX_LEVEL) {
-        return level22_btultra2_params_for_source_size(source_size);
-    }
-    let params = match level {
-        CompressionLevel::Uncompressed => LevelParams {
+    // Uncompressed = raw blocks, no match-finder. Not a cParams level, so it is
+    // the one row resolved by hand rather than through `get_cparams`.
+    if matches!(level, CompressionLevel::Uncompressed) {
+        return LevelParams {
             strategy_tag: crate::encoding::strategy::StrategyTag::Fast,
             search: crate::encoding::strategy::SearchMethod::Fast,
-            // Uncompressed frames emit raw blocks and never reference
-            // history; advertising a larger window only inflates
-            // decoder-side buffer reservation. Stay at 17 (128 KiB).
+            // Raw frames emit literal blocks and never reference history;
+            // advertising a wider window only inflates the decoder-side buffer
+            // reservation, so clamp to 17 (128 KiB) regardless of input size.
             window_log: 17,
             lazy_depth: 0,
-            // Beyond-upstream zstd: hash_log=14 (vs upstream zstd's 13) for 2× fewer
-            // collisions on structured corpora. Upstream zstd's "base for negative"
-            // row has targetLength=1 → step_size = 1 + 0 + 1 = 2.
+            // Beyond-upstream: hash_log=14 (vs upstream's row-0 13) for ~2× fewer
+            // collisions on structured corpora; mls=6 / step_size=2 mirror the
+            // upstream "base for negative" row (targetLength=1 -> step 2).
             fast: Some(FastConfig {
                 hash_log: 14,
                 mls: 6,
@@ -1120,99 +859,34 @@ pub(crate) fn resolve_level_params(
             dfast: None,
             hc: None,
             row: None,
-        },
-        CompressionLevel::Fastest => {
-            // Only the Fast-specific cParams
-            // (fast_hash_log / fast_mls / fast_step_size) align
-            // with Uncompressed / negative-base row. window_log
-            // stays at LEVEL_TABLE[0]'s value (19) — Fastest still
-            // does real compression on a full window, unlike
-            // Uncompressed which clamps to 17.
-            let mut p = LEVEL_TABLE[0];
-            p.fast = Some(FastConfig {
-                hash_log: 14,
-                mls: 6,
-                step_size: 2,
-            });
-            p
-        }
-        CompressionLevel::Default => {
-            // Default == Level(DEFAULT_LEVEL); tier it the same way an explicit
-            // positive level is, so hinted default compression shrinks its
-            // table widths on small / medium frames instead of keeping the
-            // tier-0 row (the oversized-table page-fault pathology).
-            let mut p = LEVEL_TABLE[CompressionLevel::DEFAULT_LEVEL as usize - 1];
-            apply_cparams_tier(CompressionLevel::DEFAULT_LEVEL, source_size, &mut p);
-            p
-        }
-        CompressionLevel::Better => LEVEL_TABLE[6],
-        // Level 13: the first dominant point of the deep-lazy band. The
-        // mls-wide row key lifted the shallow band's ratio enough that
-        // level 11 no longer strictly beats level 7 on the ladder corpus;
-        // the `Best` alias belongs on a config that dominates everything
-        // below it rather than on a hair-thin margin.
-        CompressionLevel::Best => LEVEL_TABLE[12],
-        CompressionLevel::Level(n) => {
-            if n > 0 {
-                // Source-size-tiered cParams, derived verbatim from upstream
-                // `ZSTD_defaultCParameters[tableID][level]` (the same 4-way table
-                // C selects via `ZSTD_getCParams_internal`). This follows C's
-                // per-(level, srcSize) STRATEGY + table widths, not a single
-                // hand-tuned `LEVEL_TABLE` row: small / medium frames now ramp to
-                // the reference strategy (e.g. btopt at L11 for <= 16 KiB) instead
-                // of staying on the tier-0 backend.
-                let tier = cparams_tier(source_size);
-                let lvl = (n as usize).min(CompressionLevel::MAX_LEVEL as usize);
-                level_params_from_cparams(crate::encoding::cparams::default_cparams(tier, lvl))
-            } else if n == 0 {
-                // Level 0 = default, matching C zstd semantics. Tier it like the
-                // `Default` alias so `Level(0)` and `Default` stay identical.
-                let mut p = LEVEL_TABLE[CompressionLevel::DEFAULT_LEVEL as usize - 1];
-                apply_cparams_tier(CompressionLevel::DEFAULT_LEVEL, source_size, &mut p);
-                p
-            } else {
-                // Negative levels — upstream zstd sets
-                // targetLength = -level (clampedCompressionLevel),
-                // yielding step_size = (-level) + 1 since
-                // !(targetLength) = 0 when targetLength > 0.
-                // So L-1..L-7 get step_size 2..8. Acceleration
-                // gradient comes from larger step skipping more
-                // positions per iter (faster, worse ratio).
-                // Clamp to upstream zstd's MIN_LEVEL before negating so
-                // i32::MIN can't overflow on `-n`.
-                let clamped = n.max(CompressionLevel::MIN_LEVEL);
-                let target_length = (-clamped) as usize;
-                let step_size = target_length + 1;
-                // Upstream zstd row-0 ("base for negative", clevels.h srcSize>256KB):
-                // hashLog=13, minMatch=7. The 32 KiB hash table (2^13 * 4B)
-                // is L1d-resident on contemporary cores, so every probe is an
-                // L1 hit; hashLog=14 (64 KiB) overflows a 32 KiB L1d and turns
-                // each probe into an L2 access. minMatch=7 (vs 6) skips
-                // short-distance 6-byte matches: fewer sequences, less
-                // extension/emit work, and parity with the upstream zstd's negative
-                // ladder on both ratio and throughput.
-                LevelParams {
-                    strategy_tag: crate::encoding::strategy::StrategyTag::Fast,
-                    search: crate::encoding::strategy::SearchMethod::Fast,
-                    window_log: 19,
-                    lazy_depth: 0,
-                    fast: Some(FastConfig {
-                        hash_log: 13,
-                        mls: 7,
-                        step_size,
-                    }),
-                    dfast: None,
-                    hc: None,
-                    row: None,
-                }
-            }
-        }
-    };
-    if let Some(size) = source_size {
-        adjust_params_for_source_size(params, size)
-    } else {
-        params
+        };
     }
+    // Every other level resolves through the SINGLE C-faithful cParams source,
+    // `cparams::get_cparams` (the port of `ZSTD_getCParams`). One place selects
+    // strategy + table widths + the negative-level acceleration per
+    // (level, srcSize) + the source-size window/hash down-clamp, so the encoder
+    // never re-derives parameters from a parallel hand-tuned path. Named presets
+    // map to their numeric level; the cParams source clamps out-of-range levels
+    // (>22 to 22, negatives to MIN_CLEVEL) itself.
+    let numeric: i32 = match level {
+        CompressionLevel::Uncompressed => unreachable!("handled above"),
+        // Fastest = upstream level 1 (fast strategy, smallest real-compression
+        // tables).
+        CompressionLevel::Fastest => 1,
+        // Default = upstream level 3 (the libzstd default).
+        CompressionLevel::Default => CompressionLevel::DEFAULT_LEVEL,
+        // Better = level 7: the lazy2 band — clearly above the fast/dfast levels
+        // on ratio while still well under the binary-tree cost cliff.
+        CompressionLevel::Better => 7,
+        // Best = level 13: the first point of the deep binary-tree band that
+        // strictly dominates every level below it on ratio (lower levels can tie
+        // on window-bound corpora), so the alias sits on a config that always
+        // wins rather than on a hair-thin margin.
+        CompressionLevel::Best => 13,
+        CompressionLevel::Level(n) => n,
+    };
+    let src = source_size.unwrap_or(crate::encoding::cparams::CONTENTSIZE_UNKNOWN);
+    level_params_from_cparams(crate::encoding::cparams::get_cparams(numeric, src, 0))
 }
 
 /// The cheap fingerprint pre-splitter level for a compression level (the
