@@ -37,8 +37,8 @@ pub(crate) struct RowDictTables {
     pub(crate) tags: Vec<u8>,
 }
 use super::match_table::helpers::{
-    INCOMPRESSIBLE_SKIP_STEP, LazyMatchConfig, best_len_offset_candidate, extend_backwards_shared,
-    pick_lazy_match_shared, repcode_candidate_shared,
+    INCOMPRESSIBLE_SKIP_STEP, best_len_offset_candidate, extend_backwards_shared,
+    repcode_candidate_shared,
 };
 use super::match_table::storage::REBASE_RESET_FLOOR_CEILING;
 use super::opt::types::MatchCandidate;
@@ -498,8 +498,8 @@ macro_rules! gen_row_find_monolith {
 }
 
 /// The lazy row parse BODY as a macro — same per-tier monolith shape as
-/// `greedy_parse_body!` for the lazy levels (lookahead via
-/// `pick_lazy_match_shared`; both probe sites call the tier's shared
+/// `greedy_parse_body!` for the lazy levels (lookahead via the shared
+/// `lazy_decide!` macro; both probe sites call the tier's shared
 /// `$find` search function).
 macro_rules! lazy_parse_body {
     ($m:expr, $handle:expr, $rl:expr, $find:ident) => {{
@@ -1893,18 +1893,24 @@ impl RowMatchGenerator {
         lit_len: usize,
         best: Option<MatchCandidate>,
     ) -> Option<MatchCandidate> {
-        pick_lazy_match_shared(
-            abs_pos,
-            lit_len,
-            best,
-            LazyMatchConfig {
-                target_len: self.target_len,
-                min_match_len: self.mls,
-                lazy_depth: self.lazy_depth,
-                history_abs_end: self.history_abs_end(),
-            },
-            |next_pos, next_lit_len| self.best_match_rl::<K, ROW_LOG>(next_pos, next_lit_len),
-        )
+        let best = best?;
+        // Same C-faithful length decision as the production monolith — route
+        // through the shared `lazy_decide!` macro (test-only path; its finder is
+        // out-of-line here, so the macro adds no register cost). `None` = commit.
+        match crate::encoding::lazy_parse::lazy_decide!(
+            best_len = best.match_len,
+            best_off = best.offset,
+            target_len = self.target_len,
+            lazy_depth = self.lazy_depth,
+            abs_pos = abs_pos,
+            lit_len = lit_len,
+            history_end = self.history_abs_end(),
+            min_match = self.mls,
+            search = |p, l| self.best_match_rl::<K, ROW_LOG>(p, l),
+        ) {
+            ::core::option::Option::None => Some(best),
+            ::core::option::Option::Some(_) => None,
+        }
     }
 
     #[allow(dead_code)]
