@@ -698,18 +698,18 @@ impl HcMatcher {
     /// Returns `true` if the current match `best` wins (commit it), `false`
     /// if the caller should defer to a later position.
     ///
-    /// Takes the already-unwrapped `best` BY VALUE and returns a `bool` rather
-    /// than threading `Option<MatchCandidate>` in and back out: the caller owns
-    /// `best` (from `find_best_match`) and reuses it on commit, so a 24-byte
-    /// candidate (32-byte `Option`) no longer gets marshalled across this call
-    /// boundary every position (it was a measured ~7% of the lazy scan on the
-    /// stack-arg copy).
+    /// Takes the already-unwrapped `best` BY VALUE and returns the lazy
+    /// commit/defer decision WITH the carried lookahead match so the caller can
+    /// reuse it instead of re-searching the deferred position (upstream's lazy
+    /// depth loop searches each position once). `None` = COMMIT `best`;
+    /// `Some(carry)` = DEFER and the caller should advance one byte using `carry`
+    /// (the `pos + 1` search result) as its next `best`.
     ///
-    /// Lazy lookahead queries `pos + 1` / `pos + 2` before they are
-    /// inserted into the hash tables — matching the C zstd ordering.
-    /// Seeding before comparing would let a position match against
-    /// itself, changing semantics.
-    pub(crate) fn pick_lazy_match<const DICT: bool>(
+    /// The caller inserts `abs_pos` into the hash tables BEFORE calling this, so
+    /// the `pos + 1` / `pos + 2` lookahead sees `abs_pos` at offset 1 — matching
+    /// upstream, where the searched position is inserted during its own search,
+    /// before the depth loop probes the next one.
+    pub(crate) fn lazy_decide_carry<const DICT: bool>(
         &self,
         concat: &[u8],
         dms_primed: bool,
@@ -717,12 +717,10 @@ impl HcMatcher {
         abs_pos: usize,
         lit_len: usize,
         best: HcMatch,
-    ) -> bool {
+    ) -> Option<Option<HcMatch>> {
         let history_end = table.history_abs_start + concat.len();
         // HC's finder is out-of-line by design (`#[inline(never)]`), so the
-        // shared decision macro expands here with no register cost. HC re-picks
-        // the deferred position from its caller, so it ignores the carry and
-        // only reports commit-vs-defer.
+        // shared decision macro expands here with no register cost.
         crate::encoding::lazy_parse::lazy_decide!(
             best_len = best.match_len,
             best_off = best.offset,
@@ -737,7 +735,6 @@ impl HcMatcher {
                 m.is_match().then_some(m)
             },
         )
-        .is_none()
     }
 
     /// Cross-platform dispatcher for the rep-code probe used by the
