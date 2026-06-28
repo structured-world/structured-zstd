@@ -961,27 +961,19 @@ impl HcMatcher {
     /// don't otherwise use.
     pub(crate) fn extend_backwards(
         table: &MatchTable,
-        mut candidate_pos: usize,
-        mut abs_pos: usize,
-        mut match_len: usize,
+        candidate_pos: usize,
+        abs_pos: usize,
+        match_len: usize,
         lit_len: usize,
     ) -> MatchCandidate {
-        let concat = table.live_history();
-        let min_abs_pos = abs_pos - lit_len;
-        while abs_pos > min_abs_pos
-            && candidate_pos > table.history_abs_start
-            && concat[candidate_pos - table.history_abs_start - 1]
-                == concat[abs_pos - table.history_abs_start - 1]
-        {
-            candidate_pos -= 1;
-            abs_pos -= 1;
-            match_len += 1;
-        }
-        MatchCandidate {
-            start: abs_pos,
-            offset: abs_pos - candidate_pos,
+        crate::encoding::match_table::helpers::extend_backwards_shared(
+            table.live_history(),
+            table.history_abs_start,
+            candidate_pos,
+            abs_pos,
             match_len,
-        }
+            lit_len,
+        )
     }
 
     /// Upstream zstd parity: per-pass clamp of the "good enough — stop probing"
