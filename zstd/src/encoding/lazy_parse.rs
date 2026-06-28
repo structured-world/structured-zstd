@@ -45,11 +45,12 @@ pub(crate) fn lazy_match_gain(match_len: usize, offset: usize) -> i32 {
 /// `search = |pos, lit| <expr>` is a SPLICE, not a closure: the macro inlines
 /// `<expr>` with `pos` / `lit` bound, yielding `Option<M>` for any match `M`
 /// with `.match_len` / `.offset` (`usize`). Mirrors zstd_lazy.c:1629-1700 — the
-/// depth-1 lookahead defers when `gain(next) > gain(best) + 4`, the depth-2 one
-/// (only at `lazy_depth >= 2`) when `gain(next2) > gain(best) + 7` (a `+3`
-/// increment over depth-1, NOT `+4`). The only early-outs are the out-of-bounds
-/// guard and the `target_len` sufficient-length shortcut (pass `usize::MAX` to
-/// disable it, as upstream's lazy parse does — it belongs to the OPT parser).
+/// depth-1 lookahead defers when the one-ahead match is longer (ties go to the
+/// smaller offset); the depth-2 one (only at `lazy_depth >= 2`) when it is
+/// strictly more than +1 longer. This length heuristic is faster than upstream's
+/// gain weighting and still beats C on ratio (drop-in, not binary parity). The
+/// only early-outs are the out-of-bounds guard and the `target_len`
+/// sufficient-length shortcut (pass `usize::MAX` to disable it).
 macro_rules! lazy_decide {
     (
         best_len = $bl:expr,
@@ -63,6 +64,7 @@ macro_rules! lazy_decide {
         search = |$p:ident, $l:ident| $search:expr $(,)?
     ) => {{
         let best_len = $bl;
+        let best_off = $bo;
         let abs_pos = $abs;
         let history_end = $hist;
         let min_match = $mm;
@@ -70,15 +72,18 @@ macro_rules! lazy_decide {
             ::core::option::Option::None
         } else {
             let lit_len = $lit;
-            let current_gain =
-                $crate::encoding::lazy_parse::lazy_match_gain(best_len, $bo) + 4;
             let next1 = {
                 let $p = abs_pos + 1;
                 let $l = lit_len + 1;
                 $search
             };
+            // Length heuristic: the established choice — faster than the gain
+            // formula and still beats C on ratio (algorithmic freedom, not
+            // binary parity). Depth-1 breaks ties on the smaller offset; depth-2
+            // needs strictly +1 length.
             let win1 = ::core::matches!(&next1, ::core::option::Option::Some(n)
-                if $crate::encoding::lazy_parse::lazy_match_gain(n.match_len, n.offset) > current_gain);
+                if n.match_len > best_len
+                    || (n.match_len == best_len && n.offset < best_off));
             if win1 {
                 ::core::option::Option::Some(next1)
             } else if $depth >= 2 && abs_pos + 2 + min_match <= history_end {
@@ -88,7 +93,7 @@ macro_rules! lazy_decide {
                     $search
                 };
                 let win2 = ::core::matches!(&next2, ::core::option::Option::Some(n)
-                    if $crate::encoding::lazy_parse::lazy_match_gain(n.match_len, n.offset) > current_gain + 3);
+                    if n.match_len > best_len + 1);
                 if win2 {
                     ::core::option::Option::Some(next1)
                 } else {
