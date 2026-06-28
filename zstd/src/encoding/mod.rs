@@ -79,6 +79,7 @@ pub(crate) mod hc;
 // `not(feature = "hash")` the method shrinks to the legacy
 // `ldm_sequences.clear()` stub).
 #[cfg(feature = "hash")]
+pub(crate) mod lazy_parse;
 pub(crate) mod ldm;
 pub(crate) mod match_table;
 pub(crate) mod opt;

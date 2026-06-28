@@ -106,12 +106,7 @@ impl HcMatcher {
     /// statically from inside `better_candidate`.
     #[inline]
     pub(crate) fn match_gain(match_len: usize, offset: usize) -> i32 {
-        debug_assert!(
-            offset > 0,
-            "zstd offsets are 1-indexed, offset=0 is invalid"
-        );
-        let offset_bits = 32 - (offset as u32).leading_zeros() as i32;
-        (match_len as i32) * 4 - offset_bits
+        crate::encoding::lazy_parse::lazy_match_gain(match_len, offset)
     }
 
     /// Pick the better of two candidate matches by [`match_gain`].
@@ -726,38 +721,21 @@ impl HcMatcher {
         lit_len: usize,
         best: HcMatch,
     ) -> bool {
-        if best.match_len >= self.target_len
-            || abs_pos + 1 + HC_MIN_MATCH_LEN > table.history_abs_start + concat.len()
-        {
-            return true;
-        }
-
-        let current_gain = Self::match_gain(best.match_len, best.offset) + 4;
-
-        let next =
-            self.find_best_match::<DICT>(concat, dms_primed, table, abs_pos + 1, lit_len + 1);
-        if next.is_match() && Self::match_gain(next.match_len, next.offset) > current_gain {
-            return false;
-        }
-
-        if self.lazy_depth >= 2
-            && abs_pos + 2 + HC_MIN_MATCH_LEN <= table.history_abs_start + concat.len()
-        {
-            let next2 =
-                self.find_best_match::<DICT>(concat, dms_primed, table, abs_pos + 2, lit_len + 2);
-            // Upstream's depth-2 bias is +7 over the base gain vs +4 at depth-1
-            // (zstd_lazy.c:1658 vs 1694), i.e. a +3 increment. `current_gain`
-            // already carries the depth-1 +4, so the extra is +3, not +4 (the
-            // +4 here double-counted, making depth-2 one stricter than upstream
-            // and deferring to ip+2 less often on lazy2 levels).
-            if next2.is_match()
-                && Self::match_gain(next2.match_len, next2.offset) > current_gain + 3
-            {
-                return false;
-            }
-        }
-
-        true
+        let history_end = table.history_abs_start + concat.len();
+        crate::encoding::lazy_parse::lazy_should_commit(
+            best.match_len,
+            best.offset,
+            self.target_len,
+            self.lazy_depth,
+            abs_pos,
+            lit_len,
+            history_end,
+            HC_MIN_MATCH_LEN,
+            |pos, ll| {
+                let m = self.find_best_match::<DICT>(concat, dms_primed, table, pos, ll);
+                m.is_match().then_some((m.match_len, m.offset))
+            },
+        )
     }
 
     /// Cross-platform dispatcher for the rep-code probe used by the
