@@ -745,8 +745,13 @@ impl HcMatcher {
         {
             let next2 =
                 self.find_best_match::<DICT>(concat, dms_primed, table, abs_pos + 2, lit_len + 2);
+            // Upstream's depth-2 bias is +7 over the base gain vs +4 at depth-1
+            // (zstd_lazy.c:1658 vs 1694), i.e. a +3 increment. `current_gain`
+            // already carries the depth-1 +4, so the extra is +3, not +4 (the
+            // +4 here double-counted, making depth-2 one stricter than upstream
+            // and deferring to ip+2 less often on lazy2 levels).
             if next2.is_match()
-                && Self::match_gain(next2.match_len, next2.offset) > current_gain + 4
+                && Self::match_gain(next2.match_len, next2.offset) > current_gain + 3
             {
                 return false;
             }
