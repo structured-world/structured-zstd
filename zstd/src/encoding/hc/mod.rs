@@ -101,16 +101,12 @@ impl HcMatcher {
 
     /// Upstream zstd "match gain" heuristic: `match_len * 4 - offset_bits`.
     /// The lazy lookahead uses this to compare a candidate at the
-    /// current position against one a byte (or two) ahead. Pure
-    /// associated function — kept off `&self` so it can be called
-    /// statically from inside `better_candidate`.
-    #[inline]
-    pub(crate) fn match_gain(match_len: usize, offset: usize) -> i32 {
-        crate::encoding::lazy_parse::lazy_match_gain(match_len, offset)
-    }
-
-    /// Pick the better of two candidate matches by [`match_gain`].
-    /// `None` arms pass the surviving `Some` through.
+    /// Pick the better of two candidate matches by LENGTH (ties to the smaller
+    /// offset), the same selector the chain walk and the shared Row/Dfast
+    /// repcode probe use. Upstream `ZSTD_compressBlock_lazy_generic` compares
+    /// the repcode against the searched match by length at depth 0 (`ml2 >
+    /// matchLength`, the repcode keeps ties); a longer or equal-length-closer
+    /// match wins. `None` arms pass the surviving `Some` through.
     pub(crate) fn better_candidate(lhs: HcMatch, rhs: HcMatch) -> HcMatch {
         if !lhs.is_match() {
             return rhs;
@@ -118,7 +114,8 @@ impl HcMatcher {
         if !rhs.is_match() {
             return lhs;
         }
-        if Self::match_gain(rhs.match_len, rhs.offset) > Self::match_gain(lhs.match_len, lhs.offset)
+        if rhs.match_len > lhs.match_len
+            || (rhs.match_len == lhs.match_len && rhs.offset < lhs.offset)
         {
             rhs
         } else {

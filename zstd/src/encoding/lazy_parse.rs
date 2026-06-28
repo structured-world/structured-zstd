@@ -13,20 +13,6 @@
 //! strategy and is injected here as a closure — the decision itself is a
 //! handful of comparisons per position, so sharing it adds no spill pressure.
 
-/// Upstream "match gain" heuristic (`gain = match_len*4 - offset_bits`) used by
-/// the lazy lookahead to compare a candidate against one ahead
-/// (`ZSTD_compressBlock_lazy_generic`, zstd_lazy.c). `offset` is the raw match
-/// distance and must be `> 0` (zstd offsets are 1-indexed).
-#[inline]
-pub(crate) fn lazy_match_gain(match_len: usize, offset: usize) -> i32 {
-    debug_assert!(
-        offset > 0,
-        "zstd offsets are 1-indexed, offset=0 is invalid"
-    );
-    let offset_bits = 32 - (offset as u32).leading_zeros() as i32;
-    (match_len as i32) * 4 - offset_bits
-}
-
 /// C-faithful lazy commit/defer decision, ONE source for every strategy.
 ///
 /// Expanded INLINE at the call site (like upstream's single
