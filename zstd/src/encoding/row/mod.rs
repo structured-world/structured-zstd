@@ -546,46 +546,36 @@ macro_rules! lazy_parse_body {
                 };
                 let picked = 'pick: {
                     let Some(best) = best else { break 'pick None };
-                    // Upstream lazy (ZSTD_compressBlock_lazy_generic) has NO
-                    // sufficient-length early-out — that belongs to the OPT
-                    // parser; one here collapses lazy to greedy (-7% ratio vs C),
-                    // so target_len = MAX disables it. The shared C-faithful
-                    // driver owns the gain commit/defer decision (gain, not raw
-                    // length) and the out-of-bounds guard.
+                    // Row's finder ($find) is inlined in this target_feature
+                    // kernel, so the shared decision is a MACRO (spliced inline) —
+                    // a closure would de-inline $find across the call boundary and
+                    // regress the band. target_len = MAX: upstream lazy has no
+                    // sufficient-length early-out (that is the OPT parser's; one
+                    // here collapses lazy to greedy, -7% ratio vs C). The macro
+                    // weighs candidates by upstream gain (not raw length) and
+                    // returns the carry so the deferred position is searched once.
                     let lazy_depth = $m.lazy_depth;
                     let history_end = $m.history_abs_end();
                     let mls = $m.mls;
-                    // Carry the one-ahead result on a defer so it is not
-                    // re-searched next iteration (upstream's lazy chain searches
-                    // each position once; carry trades <=+25 B/484 KB for the
-                    // dropped duplicate search).
-                    let mut deferred = None;
-                    let commit = crate::encoding::lazy_parse::lazy_should_commit(
-                        best.match_len,
-                        best.offset,
-                        usize::MAX,
-                        lazy_depth,
-                        abs_pos,
-                        lit_len,
-                        history_end,
-                        mls,
-                        |p, l| {
-                            // SAFETY: the enclosing kernel is only entered when
-                            // its tier was runtime-detected, so the same-feature
-                            // search fn's target_feature contract is upheld.
-                            let m = unsafe { $m.$find::<K, $rl>(p, l, None) };
-                            let len_off = m.as_ref().map(|n| (n.match_len, n.offset));
-                            if p == abs_pos + 1 {
-                                deferred = m;
-                            }
-                            len_off
-                        },
+                    let decision = $crate::encoding::lazy_parse::lazy_decide!(
+                        best_len = best.match_len,
+                        best_off = best.offset,
+                        target_len = usize::MAX,
+                        lazy_depth = lazy_depth,
+                        abs_pos = abs_pos,
+                        lit_len = lit_len,
+                        history_end = history_end,
+                        min_match = mls,
+                        // SAFETY: the enclosing kernel is only entered when its
+                        // tier was runtime-detected, upholding $find's
+                        // target_feature contract.
+                        search = |p, l| unsafe { $m.$find::<K, $rl>(p, l, None) },
                     );
-                    if commit {
-                        Some(best)
-                    } else {
-                        carried = Some(deferred);
+                    if let Some(carry) = decision {
+                        carried = Some(carry);
                         None
+                    } else {
+                        Some(best)
                     }
                 };
                 if let Some(candidate) = picked {

@@ -722,20 +722,25 @@ impl HcMatcher {
         best: HcMatch,
     ) -> bool {
         let history_end = table.history_abs_start + concat.len();
-        crate::encoding::lazy_parse::lazy_should_commit(
-            best.match_len,
-            best.offset,
-            self.target_len,
-            self.lazy_depth,
-            abs_pos,
-            lit_len,
-            history_end,
-            HC_MIN_MATCH_LEN,
-            |pos, ll| {
+        // HC's finder is out-of-line by design (`#[inline(never)]`), so the
+        // shared decision macro expands here with no register cost. HC re-picks
+        // the deferred position from its caller, so it ignores the carry and
+        // only reports commit-vs-defer.
+        crate::encoding::lazy_parse::lazy_decide!(
+            best_len = best.match_len,
+            best_off = best.offset,
+            target_len = self.target_len,
+            lazy_depth = self.lazy_depth,
+            abs_pos = abs_pos,
+            lit_len = lit_len,
+            history_end = history_end,
+            min_match = HC_MIN_MATCH_LEN,
+            search = |pos, ll| {
                 let m = self.find_best_match::<DICT>(concat, dms_primed, table, pos, ll);
-                m.is_match().then_some((m.match_len, m.offset))
+                m.is_match().then_some(m)
             },
         )
+        .is_none()
     }
 
     /// Cross-platform dispatcher for the rep-code probe used by the

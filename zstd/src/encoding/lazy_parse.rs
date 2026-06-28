@@ -27,60 +27,77 @@ pub(crate) fn lazy_match_gain(match_len: usize, offset: usize) -> i32 {
     (match_len as i32) * 4 - offset_bits
 }
 
-/// C-faithful lazy commit/defer decision shared by every strategy's parse loop.
+/// C-faithful lazy commit/defer decision, ONE source for every strategy.
 ///
-/// Returns `true` to COMMIT the current best match, `false` to DEFER (a
-/// lookahead position wins and the caller should advance one byte and re-pick).
+/// Expanded INLINE at the call site (like upstream's single
+/// `FORCE_INLINE_TEMPLATE ZSTD_compressBlock_lazy_generic`, zstd_lazy.c:1516):
+/// the strategy's match finder is spliced in directly, so it stays inlined
+/// inside the caller's (target_feature) kernel — a `fn` taking the finder as a
+/// closure de-inlines a `#[target_feature]` finder across the call boundary and
+/// regressed the Row band ~6%; a macro does not.
 ///
-/// Mirrors upstream `ZSTD_compressBlock_lazy_generic` (zstd_lazy.c:1629-1700):
-/// the depth-1 lookahead defers when `gain(next) > gain(best) + 4`; the depth-2
-/// lookahead (only when `lazy_depth >= 2`) defers when
-/// `gain(next2) > gain(best) + 7` — i.e. a `+3` increment over depth-1, NOT
-/// `+4`. The only early-out is the out-of-bounds guard plus the
-/// `target_len` sufficient-length shortcut.
+/// Evaluates to `Option<Option<M>>`:
+/// - `None` → COMMIT the current best match;
+/// - `Some(carry)` → DEFER and carry `carry` (the one-ahead `Option<M>`) to the
+///   next position so it is not re-searched (upstream searches each position
+///   once). A caller that re-searches instead just tests `.is_none()`.
 ///
-/// `search(abs_pos, lit_len) -> Option<(match_len, offset)>` runs the
-/// strategy's own match finder at a position (injected so the kernel stays
-/// specialized). `history_end` is the absolute end of searchable input and
-/// `min_match` the finder's minimum match length (its forward-bounds margin).
-#[inline]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one shared parse driver with genuinely distinct inputs (best, \
-              target, depth, position, bounds, finder); bundling them would only \
-              obscure the C-faithful decision it mirrors"
-)]
-pub(crate) fn lazy_should_commit(
-    best_len: usize,
-    best_off: usize,
-    target_len: usize,
-    lazy_depth: u8,
-    abs_pos: usize,
-    lit_len: usize,
-    history_end: usize,
-    min_match: usize,
-    mut search: impl FnMut(usize, usize) -> Option<(usize, usize)>,
-) -> bool {
-    if best_len >= target_len || abs_pos + 1 + min_match > history_end {
-        return true;
-    }
-
-    let current_gain = lazy_match_gain(best_len, best_off) + 4;
-
-    if let Some((next_len, next_off)) = search(abs_pos + 1, lit_len + 1)
-        && lazy_match_gain(next_len, next_off) > current_gain
-    {
-        return false;
-    }
-
-    if lazy_depth >= 2 && abs_pos + 2 + min_match <= history_end {
-        // +3 over depth-1's +4 = upstream's +7 base bias at depth 2.
-        if let Some((next_len, next_off)) = search(abs_pos + 2, lit_len + 2)
-            && lazy_match_gain(next_len, next_off) > current_gain + 3
-        {
-            return false;
+/// `search = |pos, lit| <expr>` is a SPLICE, not a closure: the macro inlines
+/// `<expr>` with `pos` / `lit` bound, yielding `Option<M>` for any match `M`
+/// with `.match_len` / `.offset` (`usize`). Mirrors zstd_lazy.c:1629-1700 — the
+/// depth-1 lookahead defers when `gain(next) > gain(best) + 4`, the depth-2 one
+/// (only at `lazy_depth >= 2`) when `gain(next2) > gain(best) + 7` (a `+3`
+/// increment over depth-1, NOT `+4`). The only early-outs are the out-of-bounds
+/// guard and the `target_len` sufficient-length shortcut (pass `usize::MAX` to
+/// disable it, as upstream's lazy parse does — it belongs to the OPT parser).
+macro_rules! lazy_decide {
+    (
+        best_len = $bl:expr,
+        best_off = $bo:expr,
+        target_len = $target:expr,
+        lazy_depth = $depth:expr,
+        abs_pos = $abs:expr,
+        lit_len = $lit:expr,
+        history_end = $hist:expr,
+        min_match = $mm:expr,
+        search = |$p:ident, $l:ident| $search:expr $(,)?
+    ) => {{
+        let best_len = $bl;
+        let abs_pos = $abs;
+        let history_end = $hist;
+        let min_match = $mm;
+        if best_len >= $target || abs_pos + 1 + min_match > history_end {
+            ::core::option::Option::None
+        } else {
+            let lit_len = $lit;
+            let current_gain =
+                $crate::encoding::lazy_parse::lazy_match_gain(best_len, $bo) + 4;
+            let next1 = {
+                let $p = abs_pos + 1;
+                let $l = lit_len + 1;
+                $search
+            };
+            let win1 = ::core::matches!(&next1, ::core::option::Option::Some(n)
+                if $crate::encoding::lazy_parse::lazy_match_gain(n.match_len, n.offset) > current_gain);
+            if win1 {
+                ::core::option::Option::Some(next1)
+            } else if $depth >= 2 && abs_pos + 2 + min_match <= history_end {
+                let next2 = {
+                    let $p = abs_pos + 2;
+                    let $l = lit_len + 2;
+                    $search
+                };
+                let win2 = ::core::matches!(&next2, ::core::option::Option::Some(n)
+                    if $crate::encoding::lazy_parse::lazy_match_gain(n.match_len, n.offset) > current_gain + 3);
+                if win2 {
+                    ::core::option::Option::Some(next1)
+                } else {
+                    ::core::option::Option::None
+                }
+            } else {
+                ::core::option::Option::None
+            }
         }
-    }
-
-    true
+    }};
 }
+pub(crate) use lazy_decide;
