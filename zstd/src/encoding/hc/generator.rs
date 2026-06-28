@@ -1292,26 +1292,23 @@ impl HcMatchGenerator {
                     best,
                 ) {
                     // Backward-extend over the literal run (upstream `zstd_lazy.c`
-                    // after rep-vs-chain selection). The offset is preserved;
-                    // `start` and `match_len` grow by the same amount, bounded by
-                    // `literals_start` (the `min_abs` floor) so it never crosses
-                    // an already-emitted sequence.
-                    let history_abs_start = self.table.history_abs_start;
-                    let min_abs = abs_pos - lit_len;
-                    let mut start_abs = abs_pos;
-                    let mut cand_abs = abs_pos - best.offset;
-                    let mut match_len = best.match_len;
-                    while start_abs > min_abs
-                        && cand_abs > history_abs_start
-                        && concat[cand_abs - history_abs_start - 1]
-                            == concat[start_abs - history_abs_start - 1]
-                    {
-                        start_abs -= 1;
-                        cand_abs -= 1;
-                        match_len += 1;
-                    }
-                    self.table.insert_match_span(abs_pos, start_abs + match_len);
-                    let start = start_abs - current_abs_start;
+                    // after rep-vs-chain selection) through the shared raw-pointer
+                    // helper the Row / Dfast probes use — one back-extension
+                    // source, and it drops the per-step slice bounds checks this
+                    // hot loop paid. The offset is preserved; `start` and
+                    // `match_len` grow together, bounded by `literals_start` (the
+                    // `lit_len` floor) so it never crosses an emitted sequence.
+                    let ext = crate::encoding::match_table::helpers::extend_backwards_shared(
+                        concat,
+                        self.table.history_abs_start,
+                        abs_pos - best.offset,
+                        abs_pos,
+                        best.match_len,
+                        lit_len,
+                    );
+                    let match_len = ext.match_len;
+                    self.table.insert_match_span(abs_pos, ext.start + match_len);
+                    let start = ext.start - current_abs_start;
                     let literals = &current[literals_start..start];
                     handle_sequence(Sequence::Triple {
                         literals,
