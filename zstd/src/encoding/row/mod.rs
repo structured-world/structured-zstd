@@ -546,54 +546,47 @@ macro_rules! lazy_parse_body {
                 };
                 let picked = 'pick: {
                     let Some(best) = best else { break 'pick None };
-                    // Upstream zstd's lazy parse (ZSTD_compressBlock_lazy_generic,
-                    // zstd_lazy.c) has NO targetLength / sufficient_len early-out:
-                    // it always runs the depth-1 lookahead while a successor
-                    // position exists, comparing the two by gain. Committing here
-                    // on `match_len >= target_len` collapsed the lazy levels to
-                    // greedy (target_len is as low as the minMatch, so the test
-                    // fired on every match) and lost ~7% ratio vs C on the lazy
-                    // band. Only the out-of-bounds guard stays.
-                    if abs_pos + 1 + $m.mls > $m.history_abs_end() {
-                        break 'pick Some(best);
+                    // Upstream lazy (ZSTD_compressBlock_lazy_generic) has NO
+                    // sufficient-length early-out — that belongs to the OPT
+                    // parser; one here collapses lazy to greedy (-7% ratio vs C),
+                    // so target_len = MAX disables it. The shared C-faithful
+                    // driver owns the gain commit/defer decision (gain, not raw
+                    // length) and the out-of-bounds guard.
+                    let lazy_depth = $m.lazy_depth;
+                    let history_end = $m.history_abs_end();
+                    let mls = $m.mls;
+                    // Carry the one-ahead result on a defer so it is not
+                    // re-searched next iteration (upstream's lazy chain searches
+                    // each position once; carry trades <=+25 B/484 KB for the
+                    // dropped duplicate search).
+                    let mut deferred = None;
+                    let commit = crate::encoding::lazy_parse::lazy_should_commit(
+                        best.match_len,
+                        best.offset,
+                        usize::MAX,
+                        lazy_depth,
+                        abs_pos,
+                        lit_len,
+                        history_end,
+                        mls,
+                        |p, l| {
+                            // SAFETY: the enclosing kernel is only entered when
+                            // its tier was runtime-detected, so the same-feature
+                            // search fn's target_feature contract is upheld.
+                            let m = unsafe { $m.$find::<K, $rl>(p, l, None) };
+                            let len_off = m.as_ref().map(|n| (n.match_len, n.offset));
+                            if p == abs_pos + 1 {
+                                deferred = m;
+                            }
+                            len_off
+                        },
+                    );
+                    if commit {
+                        Some(best)
+                    } else {
+                        carried = Some(deferred);
+                        None
                     }
-                    // SAFETY: the enclosing kernel is only entered when its
-                    // tier was runtime-detected, so the same-feature search
-                    // fn's target_feature contract is upheld.
-                    let next = unsafe { $m.$find::<K, $rl>(abs_pos + 1, lit_len + 1, None) };
-                    if let Some(n) = next
-                        && (n.match_len > best.match_len
-                            || (n.match_len == best.match_len && n.offset < best.offset))
-                    {
-                        // Defer: the lookahead wins; carry its result so the
-                        // next iteration starts from it instead of searching
-                        // the same position again. Reusing the pre-insert
-                        // result is INTENTIONAL: the deferred-position insert
-                        // only ADDS a row entry, so the carried candidate's
-                        // positions and lengths stay valid — at most the
-                        // carried view misses the just-inserted neighbour as
-                        // a candidate. Upstream zstd's lazy chain has the
-                        // same property (a searched position is never
-                        // searched again, zstd_lazy.c lazy_generic), and the
-                        // size impact is measured at +25 bytes on a 484 KB
-                        // corpus while removing a full duplicate search per
-                        // deferral.
-                        carried = Some(next);
-                        break 'pick None;
-                    }
-                    if $m.lazy_depth >= 2 && abs_pos + 2 + $m.mls <= $m.history_abs_end() {
-                        let next2 = unsafe { $m.$find::<K, $rl>(abs_pos + 2, lit_len + 2, None) };
-                        if let Some(n2) = next2
-                            && n2.match_len > best.match_len + 1
-                        {
-                            // Two-ahead defer: carry the one-ahead result
-                            // (the next iteration's own lookahead re-probes
-                            // two-ahead with the deferred position inserted).
-                            carried = Some(next);
-                            break 'pick None;
-                        }
-                    }
-                    Some(best)
                 };
                 if let Some(candidate) = picked {
                     $m.insert_match_span::<$rl>(abs_pos, candidate.start + candidate.match_len);
