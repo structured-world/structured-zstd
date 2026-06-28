@@ -59,7 +59,7 @@ pub(crate) fn lazy_should_commit(
     lit_len: usize,
     history_end: usize,
     min_match: usize,
-    mut search: impl FnMut(usize, usize) -> Option<(usize, usize)>,
+    search: impl Fn(usize, usize) -> Option<(usize, usize)>,
 ) -> bool {
     if best_len >= target_len || abs_pos + 1 + min_match > history_end {
         return true;
