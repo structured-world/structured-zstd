@@ -1651,10 +1651,22 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // through this same `compress()` entry point, so re-syncing here
         // covers level switches without touching the matcher dispatch.
         // A public-parameter strategy override (#27) wins over the level's
-        // derived tag so the literal-compression gates and dict-attach
-        // cutoff below see the strategy the matcher actually runs.
+        // derived tag so the literal-compression gates and dict-attach cutoff
+        // below see the strategy the matcher actually runs. Otherwise resolve
+        // the strategy SIZE-ADAPTIVELY through the same path the matcher's reset
+        // used (`resolve_level_params` -> `get_cparams`, the port of upstream
+        // `ZSTD_getCParams`): a small frame promotes a level to a higher
+        // strategy (e.g. L13 over a <=16 KiB frame becomes btultra). Re-deriving
+        // from the bare level would make the literal-compression / HUF-search
+        // gates disagree with the matcher's actual parse on small frames (the
+        // gate would think btlazy2 and skip the HUF table-log search the btultra
+        // frame runs, costing a few bytes on small literal sections).
         self.state.strategy_tag = self.strategy_override.unwrap_or_else(|| {
-            crate::encoding::strategy::StrategyTag::for_compression_level(self.compression_level)
+            crate::encoding::levels::config::resolve_level_params(
+                self.compression_level,
+                initial_size_hint,
+            )
+            .strategy_tag
         });
         // `initial_size_hint` (captured before the `.take()` above) — by here
         // `self.source_size_hint` is None.

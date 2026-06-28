@@ -342,3 +342,49 @@ fn hinted_small_compressible_frames_use_single_segment_across_levels() {
         assert_eq!(c_decode(&compressed), data);
     }
 }
+
+/// The bench `small-4k-log-lines` fixture: four rotating log lines tiled to
+/// `len` bytes (byte-identical to the `compare_ffi` scenario).
+fn repeated_log_lines(len: usize) -> Vec<u8> {
+    const LINES: &[&str] = &[
+        "ts=2026-03-26T21:39:28Z level=INFO msg=\"flush memtable\" tenant=demo table=orders region=eu-west\n",
+        "ts=2026-03-26T21:39:29Z level=INFO msg=\"rotate segment\" tenant=demo table=orders region=eu-west\n",
+        "ts=2026-03-26T21:39:30Z level=INFO msg=\"compact level\" tenant=demo table=orders region=eu-west\n",
+        "ts=2026-03-26T21:39:31Z level=INFO msg=\"write block\" tenant=demo table=orders region=eu-west\n",
+    ];
+    let mut bytes = Vec::with_capacity(len);
+    while bytes.len() < len {
+        for line in LINES {
+            if bytes.len() == len {
+                break;
+            }
+            let remaining = len - bytes.len();
+            bytes.extend_from_slice(&line.as_bytes()[..line.len().min(remaining)]);
+        }
+    }
+    bytes
+}
+
+/// Regression: a one-shot frame whose source-size hint places it in a small
+/// cParams tier must run the same parse strategy C resolves, so its literal
+/// section is never larger than C's. For a <=16 KiB frame upstream
+/// `ZSTD_getCParams` promotes levels 13-17 to btultra/btultra2, which enables
+/// the HUF table-log search. The matcher already resolved that strategy, but
+/// the literal-compression / HUF-search gate used to re-derive it from the bare
+/// level (btlazy2/btopt) and skip the search, overshooting C by 4 bytes on the
+/// 4 KiB log fixture. The gate now reads the matcher's resolved strategy.
+#[test]
+fn small_hinted_frames_match_c_literal_section_levels_13_to_17() {
+    let data = repeated_log_lines(4 * 1024);
+    for level in 13..=17 {
+        let ours = compress_hinted(&data, CompressionLevel::Level(level));
+        let c = zstd::bulk::compress(data.as_slice(), level).expect("C compress");
+        assert!(
+            ours.len() <= c.len(),
+            "level {level}: ours {} > C {} (small-tier strategy must match C)",
+            ours.len(),
+            c.len()
+        );
+        assert_eq!(c_decode(&ours), data, "roundtrip level={level}");
+    }
+}
