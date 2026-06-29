@@ -1275,9 +1275,15 @@ impl HcMatchGenerator {
         // match is carried here and reused next iteration instead of re-searched.
         // `None` means search this position fresh.
         let mut carried: Option<HcMatch> = None;
+        // Set when the previous position deferred WITHOUT a carry (depth-2:
+        // `abs_pos + 2` won but `abs_pos + 1` was cold). If this position then
+        // misses, the no-match skip below must advance by exactly ONE so it
+        // cannot hop over the already-proven `abs_pos + 2` winner.
+        let mut deferred_without_carry = false;
         while pos + HC_MIN_MATCH_LEN <= current_len {
             let abs_pos = current_abs_start + pos;
             let lit_len = pos - literals_start;
+            let forced_single_step = core::mem::take(&mut deferred_without_carry);
 
             // Reuse the carried lookahead match (searched WITH the previous
             // position already inserted, so its offset-1 candidate is visible)
@@ -1312,8 +1318,11 @@ impl HcMatchGenerator {
                     // match when it is real (so it is not re-searched — upstream
                     // searches each position once); the `NONE` sentinel is the
                     // depth-2 defer-without-carry case (`abs_pos + 2` won but
-                    // `abs_pos + 1` had no match), so search the next fresh.
+                    // `abs_pos + 1` had no match), so search the next fresh and
+                    // pin the following advance to one byte (below) so the skip
+                    // heuristic cannot hop over that `abs_pos + 2` winner.
                     carried = carry.is_match().then_some(carry);
+                    deferred_without_carry = carried.is_none();
                     pos += 1;
                     continue;
                 }
@@ -1363,7 +1372,13 @@ impl HcMatchGenerator {
             // every byte. Skipped positions are not inserted, mirroring
             // upstream (it inserts only searched positions during a no-match
             // run). Ratio follows upstream (not byte-identical).
-            let step = ((pos - literals_start) >> 8) + 1;
+            // A miss one byte after a depth-2 defer-without-carry must advance by
+            // exactly one so the skip cannot pass the proven `abs_pos + 2` match.
+            let step = if forced_single_step {
+                1
+            } else {
+                ((pos - literals_start) >> 8) + 1
+            };
             pos += step;
             // No clamp needed before the tail loop: the search bound and the
             // hashable bound are both `pos + HC_MIN_MATCH_LEN <= current_len`

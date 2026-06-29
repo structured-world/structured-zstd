@@ -530,6 +530,13 @@ macro_rules! lazy_parse_body {
             while pos + mls <= current_len {
                 let abs_pos = current_abs_start + pos;
                 let lit_len = pos - literals_start;
+                // The previous iteration deferred (carried set) — including the
+                // depth-2 defer-WITHOUT-carry case (`Some(None)`, where
+                // `abs_pos + 1` was cold but `abs_pos + 2` won). `carried.take()`
+                // below clears that, so capture it now: if this position then
+                // misses, the skip must advance by one so it cannot hop over the
+                // proven `abs_pos + 2` winner.
+                let deferred_from_prev = carried.is_some();
 
                 // Hash the position ONCE per iteration: the probe consumes it
                 // and the defer branch reuses it for the insert (upstream zstd
@@ -611,9 +618,11 @@ macro_rules! lazy_parse_body {
                         Some((row, tag)) => $m.insert_at::<$rl>(abs_pos, row, tag),
                         None => $m.insert_position::<$rl>(abs_pos),
                     }
-                    if carried.is_some() {
+                    if carried.is_some() || deferred_from_prev {
                         // Defer: the lookahead found a better match — step
-                        // exactly one to take it next iteration.
+                        // exactly one to take it next iteration. `deferred_from_prev`
+                        // covers the depth-2 defer-without-carry miss so the skip
+                        // below can't hop over the proven `abs_pos + 2` winner.
                         pos += 1;
                     } else {
                         // Complete miss: accelerate through weakly-matching
@@ -1898,10 +1907,12 @@ impl RowMatchGenerator {
         // Same C-faithful length decision as the production monolith — route
         // through the shared `lazy_decide!` macro (test-only path; its finder is
         // out-of-line here, so the macro adds no register cost). `None` = commit.
+        // `target_len = usize::MAX` matches the production row lazy body: upstream
+        // lazy has no sufficient-length early-out (that belongs to the OPT parser).
         match crate::encoding::lazy_parse::lazy_decide!(
             best_len = best.match_len,
             best_off = best.offset,
-            target_len = self.target_len,
+            target_len = usize::MAX,
             lazy_depth = self.lazy_depth,
             abs_pos = abs_pos,
             lit_len = lit_len,
