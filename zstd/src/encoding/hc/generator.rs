@@ -1299,19 +1299,21 @@ impl HcMatchGenerator {
                 // position during its own search, before the depth loop probes
                 // the next one.
                 self.table.insert_position(abs_pos);
-                let decision = self.hc.lazy_decide_carry::<DICT>(
+                if let Some(carry) = self.hc.lazy_decide_carry::<DICT>(
                     concat,
                     dms_primed,
                     &self.table,
                     abs_pos,
                     lit_len,
                     best,
-                );
-                if decision.is_match() {
-                    // Lazy lookahead found a better match at `abs_pos + 1`:
-                    // advance exactly ONE byte and carry that match so it is
-                    // not re-searched (upstream searches each position once).
-                    carried = Some(decision);
+                ) {
+                    // DEFER: the lazy lookahead found a better match one (or two)
+                    // bytes ahead. Advance exactly ONE byte. Reuse the lookahead
+                    // match when it is real (so it is not re-searched — upstream
+                    // searches each position once); the `NONE` sentinel is the
+                    // depth-2 defer-without-carry case (`abs_pos + 2` won but
+                    // `abs_pos + 1` had no match), so search the next fresh.
+                    carried = carry.is_match().then_some(carry);
                     pos += 1;
                     continue;
                 }

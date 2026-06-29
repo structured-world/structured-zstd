@@ -1035,9 +1035,16 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         self.strategy_override = overrides.strategy.map(|s| s.tag());
         // Keep `state.strategy_tag` consistent immediately so the borrowed
         // one-shot eligibility gate (`borrowed_eligible`) and literal gates
-        // are correct even before the next `compress()` re-sync.
+        // are correct even before the next `compress()` re-sync. Resolve it
+        // size-adaptively (same `resolve_level_params` path `prepare_frame`
+        // uses) so a hint already set here yields the same strategy the matcher
+        // will run, not the bare level-only mapping.
         self.state.strategy_tag = self.strategy_override.unwrap_or_else(|| {
-            crate::encoding::strategy::StrategyTag::for_compression_level(self.compression_level)
+            crate::encoding::levels::config::resolve_level_params(
+                self.compression_level,
+                self.source_size_hint,
+            )
+            .strategy_tag
         });
         self.state.huf_optimal_search =
             huf_search_enabled(self.state.strategy_tag, self.source_size_hint);

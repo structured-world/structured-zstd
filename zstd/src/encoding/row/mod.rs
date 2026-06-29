@@ -552,8 +552,9 @@ macro_rules! lazy_parse_body {
                     // regress the band. target_len = MAX: upstream lazy has no
                     // sufficient-length early-out (that is the OPT parser's; one
                     // here collapses lazy to greedy, -7% ratio vs C). The macro
-                    // weighs candidates by upstream gain (not raw length) and
-                    // returns the carry so the deferred position is searched once.
+                    // weighs candidates by length (ties to the smaller offset)
+                    // and returns the carry so the deferred position is searched
+                    // once.
                     let lazy_depth = $m.lazy_depth;
                     let history_end = $m.history_abs_end();
                     let mls = $m.mls;

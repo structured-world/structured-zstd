@@ -92,3 +92,6 @@ macro_rules! lazy_decide {
     }};
 }
 pub(crate) use lazy_decide;
+
+#[cfg(test)]
+mod tests;

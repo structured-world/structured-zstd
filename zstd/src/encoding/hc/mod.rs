@@ -699,13 +699,12 @@ impl HcMatcher {
     /// if the caller should defer to a later position.
     ///
     /// Takes the already-unwrapped `best` BY VALUE and returns the lazy
-    /// commit/defer decision as a 16-byte [`HcMatch`] (System V `rax:rdx`, no
-    /// stack-returned `Option<Option<HcMatch>>` marshalled across this hot call
-    /// boundary): a NON-match return (`!is_match`, the `NONE` sentinel) = COMMIT
-    /// `best`; a real-match return = DEFER, and the caller advances one byte
-    /// reusing that match (the `pos + 1` search result) as its next `best`
-    /// instead of re-searching (upstream's lazy depth loop searches each
-    /// position once).
+    /// commit/defer decision: `None` = COMMIT `best`; `Some(carry)` = DEFER and
+    /// advance one byte. The caller reuses `carry` as the next `best` when it is
+    /// a real match (`carry.is_match()`), or searches the next position fresh
+    /// when it is the `NONE` sentinel — the depth-2 defer-WITHOUT-carry case
+    /// (the `abs_pos + 2` probe wins but `abs_pos + 1` had no match). That case
+    /// must DEFER, not commit, or lazy2 misses the two-ahead match.
     ///
     /// The caller inserts `abs_pos` into the hash tables BEFORE calling this, so
     /// the `pos + 1` / `pos + 2` lookahead sees `abs_pos` at offset 1 — matching
@@ -719,14 +718,15 @@ impl HcMatcher {
         abs_pos: usize,
         lit_len: usize,
         best: HcMatch,
-    ) -> HcMatch {
+    ) -> Option<HcMatch> {
         let history_end = table.history_abs_start + concat.len();
         // HC's finder is out-of-line by design (`#[inline(never)]`), so the
-        // shared decision macro expands here with no register cost. Flatten the
-        // macro's `Option<Option<HcMatch>>` to a 16-byte `HcMatch` for the
-        // return: `None` (commit) and the unreachable `Some(None)` collapse to
-        // the `NONE` sentinel, `Some(Some(carry))` (defer) returns `carry` — a
-        // deferred lookahead is always a real match, so no information is lost.
+        // shared decision macro expands here with no register cost. Map the
+        // macro's `Option<Option<HcMatch>>` to one `Option` level: `None`
+        // (commit) stays `None`; `Some(Some(carry))` (defer with a reusable
+        // lookahead) -> `Some(carry)`; `Some(None)` (depth-2 defer with no
+        // carryable match one byte ahead) -> `Some(NONE)` so the caller still
+        // DEFERS but searches the next position fresh.
         match crate::encoding::lazy_parse::lazy_decide!(
             best_len = best.match_len,
             best_off = best.offset,
@@ -741,8 +741,9 @@ impl HcMatcher {
                 m.is_match().then_some(m)
             },
         ) {
-            Some(Some(carry)) => carry,
-            _ => HcMatch::NONE,
+            ::core::option::Option::None => ::core::option::Option::None,
+            ::core::option::Option::Some(::core::option::Option::Some(carry)) => Some(carry),
+            ::core::option::Option::Some(::core::option::Option::None) => Some(HcMatch::NONE),
         }
     }
 
