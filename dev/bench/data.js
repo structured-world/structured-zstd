@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782591353112,
+  "lastUpdate": 1782742041120,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI (x86_64-gnu)": [
@@ -611,6 +611,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.168,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "e73d9d9093f7813b97b7ee759b683393138396b1",
+          "message": "perf(huf+lazy): gate HUF table-log on the size-adaptive strategy, unify the lazy parser (#455)\n\n* perf(huf): gate optimal-depth tableLog search to btultra+ (match C)\n\n* perf(huf): match C FSE_optimalTableLog for the cheap-path literal tableLog\n\n* fix(lazy): match C depth-2 lookahead bias (+3 increment, not +4)\n\n* refactor(lazy): extract shared C-faithful lazy commit/defer decision\n\nHoist the lazy lookahead's commit-vs-defer decision (the gain comparison,\ndepth-1/depth-2 bias, bounds) into one shared helper, mirroring upstream's\nsingle ZSTD_compressBlock_lazy_generic instead of a per-strategy copy. Wire the\nHC matcher to it (byte-identical) and route HcMatcher::match_gain through the\nshared gain fn. Row and dfast follow.\n\n* refactor(lazy): wire Row lookahead to shared C-faithful driver\n\nRow's lazy lookahead used a raw match-length comparison; route it through\nlazy_parse::lazy_should_commit so it weighs candidates by upstream's gain\n(match_len*4 - offset_bits) like HC/C, keeping Row's carry-forward (the FnMut\nclosure captures the ip+1 result) and its no-sufficient-length policy\n(target_len = MAX). Behavior-changing on the Row band (the lazy outsiders);\nto be ratio+speed verified on the bench host before merge.\n\n* Revert \"refactor(lazy): wire Row lookahead to shared C-faithful driver\"\n\nThis reverts commit dc493a53270692e1fae1545ea88a92f49217c914.\n\n* Reapply \"refactor(lazy): wire Row lookahead to shared C-faithful driver\"\n\nThis reverts commit d6eb1f3da4e0c8fc43ba7f8eff6b442fd20b3a1c.\n\n* refactor(lazy): convert shared lazy decision to an inline macro\n\nThe fn+closure driver de-inlined Row's #[target_feature] finder across the call\nboundary (+~6% on the lazy band, measured at dc493a53). Replace it with a\nmacro_rules! that splices the finder inline at the call site — upstream's lazy\nparse is one FORCE_INLINE_TEMPLATE with the search method as a template param,\nso the finder is never behind a call boundary. HC keeps its out-of-line finder\n(it ignores the carry and re-picks), Row inlines its finder and uses the carry.\nOne source for the C-faithful gain decision, no per-strategy copies.\n\n* refactor(matcher): route HC back-extension through extend_backwards_shared\n\nHC carried its own copy of the catch-up loop; Row already delegates to\nmatch_table::helpers::extend_backwards_shared. Make HC a thin wrapper too so the\nback-extension (upstream zstd_lazy.c:1707-1718 parity) has one implementation.\nByte-identical.\n\n* refactor(lazy): reconcile the shared lazy decision to the length heuristic\n\nThe gain weighting (committed earlier) cost ~6% on the lazy band with no ratio\nwin — the length heuristic that Row already used is faster and still beats C\n(drop-in, not binary parity). Switch lazy_decide! to length: Row's monolith\nreturns to its prior (faster) behaviour, HC moves from gain to length (one\nsource). best_off is bound once; with target_len=usize::MAX (Row) the\nsufficient-length early-out folds away, so the hot loop gains no branch.\n\n* refactor(lazy): route the test-only Row lazy probe through lazy_decide!\n\npick_lazy_match_rl (a dead-in-production, test-only path) carried its own copy\nof the lazy decision via pick_lazy_match_shared + LazyMatchConfig. Route it\nthrough the same lazy_decide! macro the production monolith uses and delete the\nnow-unused fn + config struct. The tests now exercise the exact decision that\nships. Byte-identical.\n\n* fix(huf): gate literal HUF search on the size-adaptive strategy\n\nThe literal-compression / HUF table-log-search gate read strategy_tag from the\nbare compression level, but the matcher resolves strategy size-adaptively\n(upstream ZSTD_getCParams: a <=16 KiB frame promotes levels 13-17 to\nbtultra/btultra2). On small frames the gate therefore thought btlazy2/btopt and\nskipped the HUF table-log search the matcher's btultra frame should run,\novershooting C by 4 bytes on the small-4k-log-lines literal section (L13-17).\n\nResolve strategy_tag through the same resolve_level_params -> get_cparams path\nthe matcher uses, so the gate and the parse agree. small-4k-log-lines L13-17 go\n150 -> 146, matching C; full local ratio matrix shows no new rust>ffi cases.\n\n* refactor(hc): select repcode-vs-chain by length, matching C and the chain walk\n\nHcMatcher::better_candidate ranked the repcode probe against the hash-chain\nmatch by gain (ml*4 - offset_bits), while the chain walk itself, lazy_decide!,\nand the shared Row/Dfast repcode probe all rank by length. Upstream\nZSTD_compressBlock_lazy_generic compares the repcode against the searched match\nby length at depth 0 (ml2 > matchLength, the repcode keeps ties). Rank by length\n(ties to the smaller offset) so HC's selection is internally consistent and\nC-faithful. Drops the now-unused match_gain / lazy_match_gain.\n\n* refactor(hc): share the lazy back-extension via extend_backwards_shared\n\nThe HC lazy loop hand-inlined the catch-up back-extension with slice indexing,\na fourth copy of the same logic the Row / Dfast probes reach through\nmatch_table::helpers::extend_backwards_shared. Call the shared helper (it is\n#[inline] and raw-pointer, so the hot loop also sheds the per-step slice bounds\nchecks). One back-extension source; byte-identical output.\n\n* perf(hc): carry the lazy lookahead instead of re-searching the deferred position\n\nThe HC lazy loop searched the lookahead position inside pick_lazy_match, threw\nit away, then re-searched it next iteration (double work on every defer). Carry\nthe lookahead match forward like the Row parser and upstream's lazy depth loop\n(each position searched once). Insert abs_pos before the lookahead so the\nabs_pos+1 probe sees it at offset 1 — matching upstream, where the searched\nposition is inserted during its own search before the depth loop probes the next.\nBehavior-changing (the defer decision now sees the offset-1 candidate); i9 ratio\n+ speed verification follows.\n\n* perf(hc): return the lazy carry decision in registers (16-byte HcMatch)\n\nlazy_decide_carry returned Option<Option<HcMatch>> (>16 bytes, stack-returned\nvia sret), marshalled across the hot per-position boundary on every match — it\nspilled the register-tight lazy2 (depth-2) monomorph and cost ~2.3% on the\nsmall-10k-random L10/L12 band. Flatten the return to a bare 16-byte HcMatch\n(System V rax:rdx): the NONE sentinel means commit, a real match means\ndefer-carry. Byte-identical output.\n\n* fix(no-std): keep lazy_parse ungated, gate ldm on the hash feature\n\nDeclaring pub(crate) mod lazy_parse wedged it between the #[cfg(feature = hash)]\nand the mod ldm that attribute guards, so lazy_parse became hash-gated (absent in\nno_std core compression) and ldm lost its gate (unresolved twox_hash without the\nhash feature). lazy_parse is core; ldm is the hash-gated module.\n\n* fix(hc): defer on the depth-2 no-carry lazy lookahead instead of committing\n\nlazy_decide_carry collapsed the macro's Some(None) into the NONE sentinel, which\nthe generator read as COMMIT. Some(None) is reachable at lazy_depth>=2 when the\nabs_pos+2 probe wins but abs_pos+1 has no match (cold bucket); it must DEFER one\nbyte (searching the next position fresh), or lazy2 misses the two-ahead match.\nReturn Option<HcMatch>: None=commit, Some(real)=defer-with-carry,\nSome(NONE)=defer-without-carry.\n\nResolve the eager set_parameters strategy_tag sync size-adaptively through the\nsame resolve_level_params path prepare_frame uses, not the bare level mapping.\nReword the row lazy_parse_body inline note: the decision weighs by length (ties\nto the smaller offset), matching the macro after the gain helper removal.\n\nAdd lazy_parse macro-contract tests: the Some(None) defer, the carry defer, the\nplain commit, and the target_len early-out.\n\n* fix(lazy): pin a one-byte advance after a depth-2 defer-without-carry\n\nWhen the lazy lookahead defers because abs_pos+2 won but abs_pos+1 was cold\n(the Some(None) / defer-without-carry case), the deferred position carries no\nmatch. If abs_pos+1 then misses, the no-match skip heuristic (step grows with\nthe literal-run length) could hop past the already-proven abs_pos+2 winner.\n\nTrack that state in both lazy parsers and pin the next advance to one byte on\nthe following miss so abs_pos+2 stays reachable, matching upstream's lazy depth\nloop (it steps one position at a time, never skipping a proven match):\n- HcMatcher generator: deferred_without_carry -> forced_single_step.\n- Row lazy_parse_body: deferred_from_prev keeps the one-byte advance.\n\nAlso align the test-only Row pick_lazy_match_rl with the production row body:\ntarget_len = usize::MAX (lazy has no sufficient-length early-out).",
+          "timestamp": "2026-06-29T16:24:31+03:00",
+          "tree_id": "25eda9a826138b7b124e5901f7f43106654d572a",
+          "url": "https://github.com/structured-world/structured-zstd/commit/e73d9d9093f7813b97b7ee759b683393138396b1"
+        },
+        "date": 1782742026445,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.084,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.113,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 217.556,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 225.209,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 0.54,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.226,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.85,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.962,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.702,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.887,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.026,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.026,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 10.57,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.567,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.07,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.216,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.408,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.06,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.373,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.047,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.026,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.155,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.027,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.188,
             "unit": "ms"
           }
         ]
