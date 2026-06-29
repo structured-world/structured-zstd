@@ -3050,7 +3050,13 @@ impl FrameDecoder {
                     *input = &probe[n..];
                     state.bytes_read_counter += u64::from(hsize) + n as u64;
                     state.block_counter += 1;
-                    #[cfg(feature = "hash")]
+                    // Consume the trailing 4-byte content checksum UNCONDITIONALLY
+                    // when the frame declares one — exactly like the general
+                    // direct loop and `decode_blocks`. Only the hash SEEDING is
+                    // `hash`-gated; the byte consumption / counter / `check_sum`
+                    // must not be, or a no-`hash` build leaves the 4 bytes in
+                    // `*input` (misparsed as the next frame) and never sets
+                    // `check_sum` (so `is_finished` stays false).
                     if state.frame_header.descriptor.content_checksum_flag() {
                         let mut chksum = [0u8; 4];
                         Read::read_exact(input, &mut chksum).map_err(err::FailedToReadChecksum)?;
@@ -3059,6 +3065,7 @@ impl FrameDecoder {
                         // Mirror the general path: seed the scratch hash so
                         // `verify_content_checksum` / `get_calculated_checksum`
                         // read the digest. Skipped under `ContentChecksum::None`.
+                        #[cfg(feature = "hash")]
                         if self.content_checksum != ContentChecksum::None {
                             use core::hash::Hasher;
                             let mut h = twox_hash::XxHash64::with_seed(0);

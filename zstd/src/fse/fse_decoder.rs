@@ -391,14 +391,18 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         self.accuracy_log = 0;
     }
 
-    /// Whether this table holds a built decode table (`accuracy_log > 0`). A
-    /// just-reset / never-built table reads as `false`; resetting it again is a
-    /// no-op, so the per-frame scratch reset can skip it (mirrors upstream zstd,
-    /// which never clears entropy tables per frame — it marks them invalid by
-    /// flag and rebuilds lazily).
+    /// Whether this table holds a built decode table. A just-reset / never-built
+    /// table reads as `false`; resetting it again is a no-op, so the per-frame
+    /// scratch reset can skip it (mirrors upstream zstd, which never clears
+    /// entropy tables per frame — it marks them invalid by flag and rebuilds
+    /// lazily). The signal is `decode_len != 0`, NOT `accuracy_log != 0`: a valid
+    /// RLE DTable (`build_rle`) has `decode_len == 1` but `accuracy_log == 0`, so
+    /// an `accuracy_log` check would miss it and leave a used RLE table uncleared
+    /// for a later Repeat-mode frame. `init_state` uses the same `decode_len`
+    /// signal for "uninitialized".
     #[inline]
     pub(crate) fn is_populated(&self) -> bool {
-        self.accuracy_log != 0
+        self.decode_len != 0
     }
 
     /// Build the equivalent encoder-side table from a parsed decoder table.
