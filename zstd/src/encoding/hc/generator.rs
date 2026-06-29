@@ -1299,57 +1299,54 @@ impl HcMatchGenerator {
                 // position during its own search, before the depth loop probes
                 // the next one.
                 self.table.insert_position(abs_pos);
-                match self.hc.lazy_decide_carry::<DICT>(
+                let decision = self.hc.lazy_decide_carry::<DICT>(
                     concat,
                     dms_primed,
                     &self.table,
                     abs_pos,
                     lit_len,
                     best,
-                ) {
-                    None => {
-                        // COMMIT. Backward-extend over the literal run (upstream
-                        // `zstd_lazy.c` after rep-vs-chain selection) through the
-                        // shared raw-pointer helper the Row / Dfast probes use —
-                        // one back-extension source, no per-step slice bounds
-                        // checks. `abs_pos` is already inserted above, so the
-                        // forward span fill starts at `abs_pos + 1`.
-                        let ext = crate::encoding::match_table::helpers::extend_backwards_shared(
-                            concat,
-                            self.table.history_abs_start,
-                            abs_pos - best.offset,
-                            abs_pos,
-                            best.match_len,
-                            lit_len,
-                        );
-                        let match_len = ext.match_len;
-                        self.table
-                            .insert_match_span(abs_pos + 1, ext.start + match_len);
-                        let start = ext.start - current_abs_start;
-                        let literals = &current[literals_start..start];
-                        handle_sequence(Sequence::Triple {
-                            literals,
-                            offset: best.offset,
-                            match_len,
-                        });
-                        let _ = encode_offset_with_history(
-                            best.offset as u32,
-                            literals.len() as u32,
-                            &mut self.table.offset_hist,
-                        );
-                        pos = start + match_len;
-                        literals_start = pos;
-                        continue;
-                    }
-                    Some(carry) => {
-                        // Lazy lookahead found a better match at `abs_pos + 1`:
-                        // advance exactly ONE byte and carry that match so it is
-                        // not re-searched (upstream searches each position once).
-                        carried = carry;
-                        pos += 1;
-                        continue;
-                    }
+                );
+                if decision.is_match() {
+                    // Lazy lookahead found a better match at `abs_pos + 1`:
+                    // advance exactly ONE byte and carry that match so it is
+                    // not re-searched (upstream searches each position once).
+                    carried = Some(decision);
+                    pos += 1;
+                    continue;
                 }
+                // COMMIT `best`. Backward-extend over the literal run (upstream
+                // `zstd_lazy.c` after rep-vs-chain selection) through the shared
+                // raw-pointer helper the Row / Dfast probes use — one
+                // back-extension source, no per-step slice bounds checks.
+                // `abs_pos` is already inserted above, so the forward span fill
+                // starts at `abs_pos + 1`.
+                let ext = crate::encoding::match_table::helpers::extend_backwards_shared(
+                    concat,
+                    self.table.history_abs_start,
+                    abs_pos - best.offset,
+                    abs_pos,
+                    best.match_len,
+                    lit_len,
+                );
+                let match_len = ext.match_len;
+                self.table
+                    .insert_match_span(abs_pos + 1, ext.start + match_len);
+                let start = ext.start - current_abs_start;
+                let literals = &current[literals_start..start];
+                handle_sequence(Sequence::Triple {
+                    literals,
+                    offset: best.offset,
+                    match_len,
+                });
+                let _ = encode_offset_with_history(
+                    best.offset as u32,
+                    literals.len() as u32,
+                    &mut self.table.offset_hist,
+                );
+                pos = start + match_len;
+                literals_start = pos;
+                continue;
             }
             // No match found.
             self.table.insert_position(abs_pos);

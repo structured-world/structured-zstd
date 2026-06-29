@@ -699,11 +699,13 @@ impl HcMatcher {
     /// if the caller should defer to a later position.
     ///
     /// Takes the already-unwrapped `best` BY VALUE and returns the lazy
-    /// commit/defer decision WITH the carried lookahead match so the caller can
-    /// reuse it instead of re-searching the deferred position (upstream's lazy
-    /// depth loop searches each position once). `None` = COMMIT `best`;
-    /// `Some(carry)` = DEFER and the caller should advance one byte using `carry`
-    /// (the `pos + 1` search result) as its next `best`.
+    /// commit/defer decision as a 16-byte [`HcMatch`] (System V `rax:rdx`, no
+    /// stack-returned `Option<Option<HcMatch>>` marshalled across this hot call
+    /// boundary): a NON-match return (`!is_match`, the `NONE` sentinel) = COMMIT
+    /// `best`; a real-match return = DEFER, and the caller advances one byte
+    /// reusing that match (the `pos + 1` search result) as its next `best`
+    /// instead of re-searching (upstream's lazy depth loop searches each
+    /// position once).
     ///
     /// The caller inserts `abs_pos` into the hash tables BEFORE calling this, so
     /// the `pos + 1` / `pos + 2` lookahead sees `abs_pos` at offset 1 — matching
@@ -717,11 +719,15 @@ impl HcMatcher {
         abs_pos: usize,
         lit_len: usize,
         best: HcMatch,
-    ) -> Option<Option<HcMatch>> {
+    ) -> HcMatch {
         let history_end = table.history_abs_start + concat.len();
         // HC's finder is out-of-line by design (`#[inline(never)]`), so the
-        // shared decision macro expands here with no register cost.
-        crate::encoding::lazy_parse::lazy_decide!(
+        // shared decision macro expands here with no register cost. Flatten the
+        // macro's `Option<Option<HcMatch>>` to a 16-byte `HcMatch` for the
+        // return: `None` (commit) and the unreachable `Some(None)` collapse to
+        // the `NONE` sentinel, `Some(Some(carry))` (defer) returns `carry` — a
+        // deferred lookahead is always a real match, so no information is lost.
+        match crate::encoding::lazy_parse::lazy_decide!(
             best_len = best.match_len,
             best_off = best.offset,
             target_len = self.target_len,
@@ -734,7 +740,10 @@ impl HcMatcher {
                 let m = self.find_best_match::<DICT>(concat, dms_primed, table, pos, ll);
                 m.is_match().then_some(m)
             },
-        )
+        ) {
+            Some(Some(carry)) => carry,
+            _ => HcMatch::NONE,
+        }
     }
 
     /// Cross-platform dispatcher for the rep-code probe used by the
