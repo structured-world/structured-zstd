@@ -2946,6 +2946,62 @@ impl FrameDecoder {
             .as_mut()
             .expect("caller ensures init populated state");
 
+        // Fast path: a frame that is a single RAW block spanning the whole
+        // declared content. Upstream zstd handles this as one `ZSTD_copyRawBlock`
+        // (a `memmove`) inside `ZSTD_decompressFrame`; do the same here — a direct
+        // `copy_from_slice` into the caller's output slice — skipping the
+        // `DirectScratch` / `DecodeBuffer` / `UserSliceBackend` wrapper
+        // construction and the general per-block loop. Incompressible payloads
+        // (random / already-compressed data) emit exactly this shape, so the win
+        // lands on small high-entropy frames where the per-frame machinery, not
+        // the 1-block copy, dominates.
+        {
+            let mut probe = *input;
+            let mut header_dec = block_decoder::new();
+            if let Ok((bh, hsize)) = header_dec.read_block_header(&mut probe) {
+                let n = bh.decompressed_size as usize;
+                if bh.last_block
+                    && matches!(bh.block_type, crate::blocks::block::BlockType::Raw)
+                    && n as u64 == content_size
+                    && probe.len() >= n
+                    && output.len() >= n
+                {
+                    output[..n].copy_from_slice(&probe[..n]);
+                    *input = &probe[n..];
+                    state.bytes_read_counter += u64::from(hsize) + n as u64;
+                    state.block_counter += 1;
+                    #[cfg(feature = "hash")]
+                    if state.frame_header.descriptor.content_checksum_flag() {
+                        let mut chksum = [0u8; 4];
+                        Read::read_exact(input, &mut chksum).map_err(err::FailedToReadChecksum)?;
+                        state.bytes_read_counter += 4;
+                        state.check_sum = Some(u32::from_le_bytes(chksum));
+                        // Mirror the general path: seed the scratch hash so
+                        // `verify_content_checksum` / `get_calculated_checksum`
+                        // read the digest. Skipped under `ContentChecksum::None`.
+                        if self.content_checksum != ContentChecksum::None {
+                            use core::hash::Hasher;
+                            let mut h = twox_hash::XxHash64::with_seed(0);
+                            h.write(&output[..n]);
+                            match &mut state.decoder_scratch {
+                                DecoderScratchKind::Flat(s) => s.buffer.hash = h,
+                                DecoderScratchKind::Ring(s) => s.buffer.hash = h,
+                            }
+                        }
+                    }
+                    #[cfg(all(feature = "lsm", feature = "hash"))]
+                    if self.per_block_checksums_enabled {
+                        use core::hash::Hasher;
+                        let mut h = twox_hash::XxHash64::with_seed(0);
+                        h.write(&output[..n]);
+                        self.computed_block_checksums.push(h.finish() as u32);
+                    }
+                    state.frame_finished = true;
+                    return Ok(n);
+                }
+            }
+        }
+
         // Borrow persistent fields out of whichever scratch variant
         // `init` produced (Flat for single_segment, Ring for
         // multi-segment) — both expose the same HUF/FSE/Vec
