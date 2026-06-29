@@ -123,3 +123,21 @@ fn to_encoder_table_rejects_accuracy_log_above_nine() {
         "accuracy_log > 9 must not be reusable as an encoder table"
     );
 }
+
+/// Regression: `is_populated` must report a built table for RLE tables, not just
+/// FSE-mode ones. `build_rle` sets `decode_len = 1` but leaves `accuracy_log` at
+/// 0 (a valid RLE DTable's tableLog), so an `accuracy_log != 0` check would miss
+/// it — and the per-frame scratch reset that gates on `is_populated` would then
+/// SKIP clearing a used RLE sequence table, letting a later Repeat-mode frame
+/// read stale RLE state. The "built" signal is `decode_len != 0`, matching the
+/// uninitialized check `init_state` uses.
+#[test]
+fn is_populated_detects_built_rle_table() {
+    let mut t = SeqFSETable::new(9);
+    assert!(!t.is_populated(), "a fresh table must report unpopulated");
+    t.build_rle(7);
+    assert!(
+        t.is_populated(),
+        "an RLE table (decode_len = 1, accuracy_log = 0) must report populated"
+    );
+}
