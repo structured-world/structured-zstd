@@ -753,21 +753,10 @@ fn bench_dictionary(c: &mut Criterion) {
             configure_group(&mut group, scenario, BenchOp::Compress);
             group.throughput(Throughput::Bytes(scenario.throughput_bytes()));
 
-            // Construct the FFI compressor INSIDE `b.iter` to match the
-            // per-iter setup shape used by both *_with_dict arms below.
-            // Reusing one compressor outside the loop here biased the
-            // baseline: `c_ffi_with_dict` paid CCtx-create + CDict attach
-            // every iter, but `c_ffi_without_dict` paid only the compress
-            // call, making the dict-vs-nodict delta look larger than the
-            // real attach cost.
-            group.bench_function("c_ffi_without_dict", |b| {
-                b.iter(|| {
-                    let mut compressor = zstd::bulk::Compressor::new(level.ffi_level).unwrap();
-                    configure_ffi_bulk_compressor(&mut compressor, &level);
-                    black_box(compressor.compress(&scenario.bytes).unwrap())
-                })
-            });
-
+            // No-dict baseline for this level/scenario is already measured by the
+            // plain `compress/{level}/{scenario}/matrix/c_ffi` group, so this
+            // dict group only times the two dictionary arms.
+            //
             // c_ffi_with_dict + pure_rust_with_dict: STEADY-STATE measurement.
             // Both build the compressor + attach the dictionary ONCE before
             // `b.iter`, then compress in the loop reusing that context — the

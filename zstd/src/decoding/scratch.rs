@@ -216,9 +216,22 @@ impl<B: BufferBackend> DecoderScratch<B> {
 
         self.buffer.reset(window_size);
 
-        self.fse.literal_lengths.reset();
-        self.fse.match_lengths.reset();
-        self.fse.offsets.reset();
+        // Mirror upstream zstd's `ZSTD_decompressBegin`: it never clears the
+        // entropy tables per frame (marks them invalid by flag, rebuilds lazily).
+        // Resetting an already-empty table is a no-op on the observable state
+        // (`accuracy_log`/`max_num_bits` stay 0, the buffers stay empty), so a
+        // RAW / RLE / zero-sequence frame — which never builds a table — skips
+        // the clears (and the Huffman `[0; 13]` rank-count memset) entirely.
+        // Byte-identical: the table is cleared exactly when it was built.
+        if self.fse.literal_lengths.is_populated() {
+            self.fse.literal_lengths.reset();
+        }
+        if self.fse.match_lengths.is_populated() {
+            self.fse.match_lengths.reset();
+        }
+        if self.fse.offsets.is_populated() {
+            self.fse.offsets.reset();
+        }
         // Reset the cached pipeline-gate signal alongside the FSE
         // table reset — otherwise scratch reuse across frames could
         // engage the long pipeline on a new frame's Repeat-mode
@@ -239,7 +252,14 @@ impl<B: BufferBackend> DecoderScratch<B> {
         // the documented "no behaviour change" property.
         self.fse.ddict_is_cold = false;
 
-        self.huf.table.reset();
+        // Same lazy-entropy skip as the FSE tables above: a Huffman table that
+        // was never built this round (`max_num_bits == 0`) is already in its
+        // reset state, so re-running `reset` (clearing 6 buffers + the
+        // `[0; 13]` rank-count memset) is wasted no-op work on RAW / RLE / raw-
+        // literal frames. Byte-identical.
+        if self.huf.table.max_num_bits != 0 {
+            self.huf.table.reset();
+        }
         // Mirror the FSE detach: a reused workspace must not read a
         // previous frame's dictionary Huffman table.
         self.huf.detach_dict();

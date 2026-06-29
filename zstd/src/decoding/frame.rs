@@ -106,6 +106,94 @@ pub fn read_frame_header_with_format(
     Ok((frame_header, bytes_read as u8))
 }
 
+/// Slice-direct equivalent of [`read_frame_header_with_format`]: parses the
+/// header straight out of `input` with byte indexing + `from_le_bytes`, instead
+/// of per-field `read_exact` calls through the `Read` trait, and advances
+/// `*input` past the consumed bytes EXACTLY as the `Read` version does — so the
+/// skippable-frame and truncation contracts are byte-identical. The decode path
+/// already holds a `&[u8]`, so this avoids the `io::impls` `Read`-trait
+/// dispatch the generic version pays per field, mirroring upstream zstd, which
+/// parses the header from a raw pointer (`MEM_readLE32` / byte reads).
+pub(crate) fn read_frame_header_from_slice(
+    input: &mut &[u8],
+    magicless: bool,
+) -> Result<(FrameHeader, u8), ReadFrameHeaderError> {
+    use ReadFrameHeaderError as err;
+    fn eof() -> crate::io::Error {
+        crate::io::Error::from(crate::io::ErrorKind::UnexpectedEof)
+    }
+    fn take<'a>(input: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
+        if input.len() < n {
+            return None;
+        }
+        let (head, tail) = input.split_at(n);
+        *input = tail;
+        Some(head)
+    }
+
+    let mut bytes_read: u8 = 0;
+    if !magicless {
+        let m = take(input, 4).ok_or_else(|| err::MagicNumberReadError(eof()))?;
+        let magic_num = u32::from_le_bytes([m[0], m[1], m[2], m[3]]);
+        bytes_read = 4;
+        if (0x184D2A50..=0x184D2A5F).contains(&magic_num) {
+            let s = take(input, 4).ok_or_else(|| err::FrameDescriptorReadError(eof()))?;
+            let skip_size = u32::from_le_bytes([s[0], s[1], s[2], s[3]]);
+            return Err(ReadFrameHeaderError::SkipFrame {
+                magic_number: magic_num,
+                length: skip_size,
+            });
+        }
+        if magic_num != MAGIC_NUM {
+            return Err(ReadFrameHeaderError::BadMagicNumber(magic_num));
+        }
+    }
+
+    let d = take(input, 1).ok_or_else(|| err::FrameDescriptorReadError(eof()))?;
+    let desc = FrameDescriptor(d[0]);
+    bytes_read += 1;
+
+    let mut frame_header = FrameHeader {
+        descriptor: FrameDescriptor(desc.0),
+        dict_id: None,
+        frame_content_size: 0,
+        window_descriptor: 0,
+    };
+
+    if !desc.single_segment_flag() {
+        let w = take(input, 1).ok_or_else(|| err::WindowDescriptorReadError(eof()))?;
+        frame_header.window_descriptor = w[0];
+        bytes_read += 1;
+    }
+
+    let dict_id_len = desc.dictionary_id_bytes()? as usize;
+    if dict_id_len != 0 {
+        let b = take(input, dict_id_len).ok_or_else(|| err::DictionaryIdReadError(eof()))?;
+        bytes_read += dict_id_len as u8;
+        let mut buf4 = [0u8; 4];
+        buf4[..dict_id_len].copy_from_slice(b);
+        let dict_id = u32::from_le_bytes(buf4);
+        if dict_id != 0 {
+            frame_header.dict_id = Some(dict_id);
+        }
+    }
+
+    let fcs_len = desc.frame_content_size_bytes()? as usize;
+    if fcs_len != 0 {
+        let b = take(input, fcs_len).ok_or_else(|| err::FrameContentSizeReadError(eof()))?;
+        bytes_read += fcs_len as u8;
+        let mut buf8 = [0u8; 8];
+        buf8[..fcs_len].copy_from_slice(b);
+        let mut fcs = u64::from_le_bytes(buf8);
+        if fcs_len == 2 {
+            fcs += 256;
+        }
+        frame_header.frame_content_size = fcs;
+    }
+
+    Ok((frame_header, bytes_read))
+}
+
 /// A frame header has a variable size, with a minimum of 2 bytes, and a maximum of 14 bytes.
 pub struct FrameHeader {
     pub descriptor: FrameDescriptor,

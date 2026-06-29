@@ -860,6 +860,16 @@ impl FrameDecoderState {
         magicless: bool,
     ) -> Result<FrameDecoderState, FrameDecoderError> {
         let (frame, header_size) = frame::read_frame_header_with_format(source, magicless)?;
+        Self::new_with_parsed_header(frame, header_size)
+    }
+
+    /// Build a fresh state from an already-parsed frame header (the non-parsing
+    /// tail of [`new_with_format`]). Shared by the `Read` path and the
+    /// slice-direct path ([`FrameDecoder::reset_from_slice`]).
+    pub(crate) fn new_with_parsed_header(
+        frame: frame::FrameHeader,
+        header_size: u8,
+    ) -> Result<FrameDecoderState, FrameDecoderError> {
         let window_size = frame.window_size()?;
 
         if window_size > MAXIMUM_ALLOWED_WINDOW_SIZE {
@@ -906,6 +916,18 @@ impl FrameDecoderState {
         magicless: bool,
     ) -> Result<(), FrameDecoderError> {
         let (frame_header, header_size) = frame::read_frame_header_with_format(source, magicless)?;
+        self.reset_with_parsed_header(frame_header, header_size)
+    }
+
+    /// Apply an already-parsed frame header to this state (the non-parsing tail
+    /// of [`reset_with_format`]). Shared by the `Read` path and the slice-direct
+    /// path ([`FrameDecoder::reset_from_slice`]).
+    #[inline]
+    pub(crate) fn reset_with_parsed_header(
+        &mut self,
+        frame_header: frame::FrameHeader,
+        header_size: u8,
+    ) -> Result<(), FrameDecoderError> {
         let window_size = frame_header.window_size()?;
 
         if window_size > MAXIMUM_ALLOWED_WINDOW_SIZE {
@@ -1252,6 +1274,64 @@ impl FrameDecoder {
         // layer (e.g. AEAD). Returning here leaves `self.state` in
         // a re-resettable shape — next `reset()` re-parses the
         // frame header without intermediate cleanup.
+        #[cfg(feature = "lsm")]
+        if let Some(state) = self.state.as_ref() {
+            self.validate_expectations(&state.frame_header)?;
+        }
+        if let Some(dict_id) = dict_id {
+            let state = self.state.as_mut().expect("state initialized");
+            let owned_dicts = &self.owned_dicts;
+            #[cfg(target_has_atomic = "ptr")]
+            let shared_dicts = &self.shared_dicts;
+            let dict = owned_dicts
+                .get(&dict_id)
+                .or_else(|| {
+                    #[cfg(target_has_atomic = "ptr")]
+                    {
+                        shared_dicts.get(&dict_id)
+                    }
+                    #[cfg(not(target_has_atomic = "ptr"))]
+                    {
+                        None
+                    }
+                })
+                .ok_or(err::DictNotProvided { dict_id })?;
+            state.decoder_scratch.init_from_dict(dict);
+            state.set_active_dict(dict);
+            state.using_dict = Some(dict_id);
+        }
+        Ok(())
+    }
+
+    /// Slice-direct equivalent of [`reset`](Self::reset) for the in-memory
+    /// decode path: parses the frame header straight out of `*input` via
+    /// [`frame::read_frame_header_from_slice`] (no `Read`-trait `read_exact`
+    /// per field) and advances `*input` past it, then applies it through the
+    /// shared parsed-header path. Behaviour — including skippable-frame and
+    /// truncation errors, dictionary-id resolution, and pinned-expectation
+    /// validation — is identical to `reset`; only the header read avoids the
+    /// `io::impls` dispatch.
+    pub(crate) fn reset_from_slice(&mut self, input: &mut &[u8]) -> Result<(), FrameDecoderError> {
+        use FrameDecoderError as err;
+        #[cfg(all(feature = "lsm", feature = "hash"))]
+        self.computed_block_checksums.clear();
+        let magicless = self.magicless;
+        let (frame_header, header_size) = frame::read_frame_header_from_slice(input, magicless)?;
+        let dict_id = match &mut self.state {
+            Some(s) => {
+                s.reset_with_parsed_header(frame_header, header_size)?;
+                s.frame_header.dictionary_id()
+            }
+            None => {
+                self.state = Some(FrameDecoderState::new_with_parsed_header(
+                    frame_header,
+                    header_size,
+                )?);
+                self.state
+                    .as_ref()
+                    .and_then(|state| state.frame_header.dictionary_id())
+            }
+        };
         #[cfg(feature = "lsm")]
         if let Some(state) = self.state.as_ref() {
             self.validate_expectations(&state.frame_header)?;
@@ -2286,11 +2366,11 @@ impl FrameDecoder {
     ) -> Result<usize, FrameDecoderError> {
         #[cfg(not(feature = "lsm"))]
         {
-            self.decode_all_impl(input, output, |this, src| this.init(src))
+            self.decode_all_impl(input, output, |this, src| this.reset_from_slice(src))
         }
         #[cfg(feature = "lsm")]
         {
-            self.decode_all_impl(input, output, |this, src| this.init(src), None)
+            self.decode_all_impl(input, output, |this, src| this.reset_from_slice(src), None)
         }
     }
 
@@ -2341,7 +2421,7 @@ impl FrameDecoder {
         self.decode_all_impl(
             input,
             output,
-            |this, src| this.init(src),
+            |this, src| this.reset_from_slice(src),
             Some(&mut visitor),
         )
     }
@@ -2945,6 +3025,69 @@ impl FrameDecoder {
             .state
             .as_mut()
             .expect("caller ensures init populated state");
+
+        // Fast path: a frame that is a single RAW block spanning the whole
+        // declared content. Upstream zstd handles this as one `ZSTD_copyRawBlock`
+        // (a `memmove`) inside `ZSTD_decompressFrame`; do the same here — a direct
+        // `copy_from_slice` into the caller's output slice — skipping the
+        // `DirectScratch` / `DecodeBuffer` / `UserSliceBackend` wrapper
+        // construction and the general per-block loop. Incompressible payloads
+        // (random / already-compressed data) emit exactly this shape, so the win
+        // lands on small high-entropy frames where the per-frame machinery, not
+        // the 1-block copy, dominates.
+        {
+            let mut probe = *input;
+            let mut header_dec = block_decoder::new();
+            if let Ok((bh, hsize)) = header_dec.read_block_header(&mut probe) {
+                let n = bh.decompressed_size as usize;
+                if bh.last_block
+                    && matches!(bh.block_type, crate::blocks::block::BlockType::Raw)
+                    && n as u64 == content_size
+                    && probe.len() >= n
+                    && output.len() >= n
+                {
+                    output[..n].copy_from_slice(&probe[..n]);
+                    *input = &probe[n..];
+                    state.bytes_read_counter += u64::from(hsize) + n as u64;
+                    state.block_counter += 1;
+                    // Consume the trailing 4-byte content checksum UNCONDITIONALLY
+                    // when the frame declares one — exactly like the general
+                    // direct loop and `decode_blocks`. Only the hash SEEDING is
+                    // `hash`-gated; the byte consumption / counter / `check_sum`
+                    // must not be, or a no-`hash` build leaves the 4 bytes in
+                    // `*input` (misparsed as the next frame) and never sets
+                    // `check_sum` (so `is_finished` stays false).
+                    if state.frame_header.descriptor.content_checksum_flag() {
+                        let mut chksum = [0u8; 4];
+                        Read::read_exact(input, &mut chksum).map_err(err::FailedToReadChecksum)?;
+                        state.bytes_read_counter += 4;
+                        state.check_sum = Some(u32::from_le_bytes(chksum));
+                        // Mirror the general path: seed the scratch hash so
+                        // `verify_content_checksum` / `get_calculated_checksum`
+                        // read the digest. Skipped under `ContentChecksum::None`.
+                        #[cfg(feature = "hash")]
+                        if self.content_checksum != ContentChecksum::None {
+                            use core::hash::Hasher;
+                            let mut h = twox_hash::XxHash64::with_seed(0);
+                            h.write(&output[..n]);
+                            match &mut state.decoder_scratch {
+                                DecoderScratchKind::Flat(s) => s.buffer.hash = h,
+                                DecoderScratchKind::Ring(s) => s.buffer.hash = h,
+                            }
+                        }
+                    }
+                    #[cfg(all(feature = "lsm", feature = "hash"))]
+                    if self.per_block_checksums_enabled {
+                        use core::hash::Hasher;
+                        let mut h = twox_hash::XxHash64::with_seed(0);
+                        h.write(&output[..n]);
+                        self.computed_block_checksums.push(h.finish() as u32);
+                    }
+                    state.frame_finished = true;
+                    return Ok(n);
+                }
+            }
+        }
 
         // Borrow persistent fields out of whichever scratch variant
         // `init` produced (Flat for single_segment, Ring for
