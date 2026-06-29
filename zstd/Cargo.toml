@@ -1,6 +1,6 @@
 [package]
 name = "structured-zstd"
-version = "0.0.45"
+version = "0.0.46"
 rust-version = "1.92"
 authors = [
     "Moritz Borcherding <moritz.borcherding@web.de>",
