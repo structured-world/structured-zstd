@@ -391,6 +391,16 @@ impl<E: FseEntry, const CAP: usize> FSETableImpl<E, CAP> {
         self.accuracy_log = 0;
     }
 
+    /// Whether this table holds a built decode table (`accuracy_log > 0`). A
+    /// just-reset / never-built table reads as `false`; resetting it again is a
+    /// no-op, so the per-frame scratch reset can skip it (mirrors upstream zstd,
+    /// which never clears entropy tables per frame — it marks them invalid by
+    /// flag and rebuilds lazily).
+    #[inline]
+    pub(crate) fn is_populated(&self) -> bool {
+        self.accuracy_log != 0
+    }
+
     /// Build the equivalent encoder-side table from a parsed decoder table.
     pub(crate) fn to_encoder_table(&self) -> Option<crate::fse::fse_encoder::FSETable> {
         if self.accuracy_log == 0 || self.symbol_probabilities.is_empty() {
