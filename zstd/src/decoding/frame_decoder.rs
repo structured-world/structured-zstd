@@ -860,6 +860,16 @@ impl FrameDecoderState {
         magicless: bool,
     ) -> Result<FrameDecoderState, FrameDecoderError> {
         let (frame, header_size) = frame::read_frame_header_with_format(source, magicless)?;
+        Self::new_with_parsed_header(frame, header_size)
+    }
+
+    /// Build a fresh state from an already-parsed frame header (the non-parsing
+    /// tail of [`new_with_format`]). Shared by the `Read` path and the
+    /// slice-direct path ([`FrameDecoder::reset_from_slice`]).
+    pub(crate) fn new_with_parsed_header(
+        frame: frame::FrameHeader,
+        header_size: u8,
+    ) -> Result<FrameDecoderState, FrameDecoderError> {
         let window_size = frame.window_size()?;
 
         if window_size > MAXIMUM_ALLOWED_WINDOW_SIZE {
@@ -906,6 +916,18 @@ impl FrameDecoderState {
         magicless: bool,
     ) -> Result<(), FrameDecoderError> {
         let (frame_header, header_size) = frame::read_frame_header_with_format(source, magicless)?;
+        self.reset_with_parsed_header(frame_header, header_size)
+    }
+
+    /// Apply an already-parsed frame header to this state (the non-parsing tail
+    /// of [`reset_with_format`]). Shared by the `Read` path and the slice-direct
+    /// path ([`FrameDecoder::reset_from_slice`]).
+    #[inline]
+    pub(crate) fn reset_with_parsed_header(
+        &mut self,
+        frame_header: frame::FrameHeader,
+        header_size: u8,
+    ) -> Result<(), FrameDecoderError> {
         let window_size = frame_header.window_size()?;
 
         if window_size > MAXIMUM_ALLOWED_WINDOW_SIZE {
@@ -1252,6 +1274,64 @@ impl FrameDecoder {
         // layer (e.g. AEAD). Returning here leaves `self.state` in
         // a re-resettable shape — next `reset()` re-parses the
         // frame header without intermediate cleanup.
+        #[cfg(feature = "lsm")]
+        if let Some(state) = self.state.as_ref() {
+            self.validate_expectations(&state.frame_header)?;
+        }
+        if let Some(dict_id) = dict_id {
+            let state = self.state.as_mut().expect("state initialized");
+            let owned_dicts = &self.owned_dicts;
+            #[cfg(target_has_atomic = "ptr")]
+            let shared_dicts = &self.shared_dicts;
+            let dict = owned_dicts
+                .get(&dict_id)
+                .or_else(|| {
+                    #[cfg(target_has_atomic = "ptr")]
+                    {
+                        shared_dicts.get(&dict_id)
+                    }
+                    #[cfg(not(target_has_atomic = "ptr"))]
+                    {
+                        None
+                    }
+                })
+                .ok_or(err::DictNotProvided { dict_id })?;
+            state.decoder_scratch.init_from_dict(dict);
+            state.set_active_dict(dict);
+            state.using_dict = Some(dict_id);
+        }
+        Ok(())
+    }
+
+    /// Slice-direct equivalent of [`reset`](Self::reset) for the in-memory
+    /// decode path: parses the frame header straight out of `*input` via
+    /// [`frame::read_frame_header_from_slice`] (no `Read`-trait `read_exact`
+    /// per field) and advances `*input` past it, then applies it through the
+    /// shared parsed-header path. Behaviour — including skippable-frame and
+    /// truncation errors, dictionary-id resolution, and pinned-expectation
+    /// validation — is identical to `reset`; only the header read avoids the
+    /// `io::impls` dispatch.
+    pub(crate) fn reset_from_slice(&mut self, input: &mut &[u8]) -> Result<(), FrameDecoderError> {
+        use FrameDecoderError as err;
+        #[cfg(all(feature = "lsm", feature = "hash"))]
+        self.computed_block_checksums.clear();
+        let magicless = self.magicless;
+        let (frame_header, header_size) = frame::read_frame_header_from_slice(input, magicless)?;
+        let dict_id = match &mut self.state {
+            Some(s) => {
+                s.reset_with_parsed_header(frame_header, header_size)?;
+                s.frame_header.dictionary_id()
+            }
+            None => {
+                self.state = Some(FrameDecoderState::new_with_parsed_header(
+                    frame_header,
+                    header_size,
+                )?);
+                self.state
+                    .as_ref()
+                    .and_then(|state| state.frame_header.dictionary_id())
+            }
+        };
         #[cfg(feature = "lsm")]
         if let Some(state) = self.state.as_ref() {
             self.validate_expectations(&state.frame_header)?;
@@ -2286,11 +2366,11 @@ impl FrameDecoder {
     ) -> Result<usize, FrameDecoderError> {
         #[cfg(not(feature = "lsm"))]
         {
-            self.decode_all_impl(input, output, |this, src| this.init(src))
+            self.decode_all_impl(input, output, |this, src| this.reset_from_slice(src))
         }
         #[cfg(feature = "lsm")]
         {
-            self.decode_all_impl(input, output, |this, src| this.init(src), None)
+            self.decode_all_impl(input, output, |this, src| this.reset_from_slice(src), None)
         }
     }
 
@@ -2341,7 +2421,7 @@ impl FrameDecoder {
         self.decode_all_impl(
             input,
             output,
-            |this, src| this.init(src),
+            |this, src| this.reset_from_slice(src),
             Some(&mut visitor),
         )
     }
