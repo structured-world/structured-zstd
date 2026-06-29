@@ -492,7 +492,10 @@ impl HuffmanTable {
         if use_search {
             Self::build_from_counts(counts)
         } else {
-            Self::build_from_weights(&build_limited_weights(counts, 11))
+            // Match upstream's cheap path: tableLog = FSE_optimalTableLog(11,
+            // srcSize, maxSV, minus=1) (huf_compress.c:1286), height-limit to it,
+            // not the raw natural height (11) which can cost a few bytes vs C.
+            Self::build_from_weights(&build_limited_weights(counts, cheap_huf_table_log(counts)))
         }
     }
 
@@ -508,7 +511,10 @@ impl HuffmanTable {
         // build (gated behind `bench_internals`).
         #[cfg(feature = "bench_internals")]
         if FORCE_CHEAP_HUF.load(core::sync::atomic::Ordering::Relaxed) {
-            return Self::build_from_weights(&build_limited_weights(counts, 11));
+            return Self::build_from_weights(&build_limited_weights(
+                counts,
+                cheap_huf_table_log(counts),
+            ));
         }
 
         let min_table_log = symbol_cardinality.ilog2() as usize + 1;
@@ -1178,6 +1184,21 @@ fn limited_weights_into(
         out[leaf.symbol] = max_nb_bits - leaf.nb_bits + 1;
     }
     true
+}
+
+/// Upstream HUF cheap/fast-path tableLog (`HUF_optimalTableLog`,
+/// huf_compress.c:1286) for strategies below btultra, where the optimal-depth
+/// probe is gated off: the single-shot
+/// `FSE_optimalTableLog_internal(HUF_TABLELOG_DEFAULT = 11, srcSize, maxSV, minus = 1)`.
+/// Degenerate `srcSize <= 1` (RLE-shaped, where `ilog2(srcSize - 1)` is undefined)
+/// falls back to the natural-height cap of 11.
+fn cheap_huf_table_log(counts: &[usize]) -> usize {
+    let total: usize = counts.iter().sum();
+    if total <= 1 {
+        return 11;
+    }
+    let max_symbol = counts.iter().rposition(|&c| c > 0).unwrap_or(0);
+    crate::fse::fse_encoder::optimal_table_log(11, total, max_symbol, 1) as usize
 }
 
 fn build_limited_weights(counts: &[usize], max_nb_bits: usize) -> Vec<usize> {

@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 use crate::encoding::Sequence;
 use crate::encoding::blocks::encode_offset_with_history;
 use crate::encoding::cost_model::HC_PREDEF_THRESHOLD;
-use crate::encoding::hc::{HC_MIN_MATCH_LEN, MAX_HC_SEARCH_DEPTH};
+use crate::encoding::hc::{HC_MIN_MATCH_LEN, HcMatch, MAX_HC_SEARCH_DEPTH};
 use crate::encoding::levels::config::HcConfig;
 use crate::encoding::match_generator::{HC_SEARCH_DEPTH, HC_TARGET_LEN, HcBackend};
 use crate::encoding::match_table::storage::HC3_HASH_LOG;
@@ -1270,20 +1270,42 @@ impl HcMatchGenerator {
 
         let mut pos = 0usize;
         let mut literals_start = 0usize;
+        // Lookahead carry (upstream's lazy depth loop searches each position
+        // ONCE): when the lookahead defers to `abs_pos + 1`, its already-computed
+        // match is carried here and reused next iteration instead of re-searched.
+        // `None` means search this position fresh.
+        let mut carried: Option<HcMatch> = None;
+        // Set when the previous position deferred WITHOUT a carry (depth-2:
+        // `abs_pos + 2` won but `abs_pos + 1` was cold). If this position then
+        // misses, the no-match skip below must advance by exactly ONE so it
+        // cannot hop over the already-proven `abs_pos + 2` winner.
+        let mut deferred_without_carry = false;
         while pos + HC_MIN_MATCH_LEN <= current_len {
             let abs_pos = current_abs_start + pos;
             let lit_len = pos - literals_start;
+            let forced_single_step = core::mem::take(&mut deferred_without_carry);
 
-            // `find_best_match` returns the forward `(offset, length)` in
-            // registers (`HcMatch`, 16 bytes) — no 24-byte `MatchCandidate` /
-            // 32-byte `Option` spilled-and-copied per position. The backward
-            // extension that yields `start` runs ONCE here, after the lazy
-            // decision settles, exactly like upstream's lazy loop.
-            let best =
-                self.hc
-                    .find_best_match::<DICT>(concat, dms_primed, &self.table, abs_pos, lit_len);
+            // Reuse the carried lookahead match (searched WITH the previous
+            // position already inserted, so its offset-1 candidate is visible)
+            // or search this position fresh. `find_best_match` returns the
+            // forward `(offset, length)` in registers (`HcMatch`, 16 bytes).
+            let best = match carried.take() {
+                Some(m) => m,
+                None => self.hc.find_best_match::<DICT>(
+                    concat,
+                    dms_primed,
+                    &self.table,
+                    abs_pos,
+                    lit_len,
+                ),
+            };
             if best.is_match() {
-                if self.hc.pick_lazy_match::<DICT>(
+                // Insert `abs_pos` BEFORE the lookahead so the `abs_pos + 1`
+                // probe sees it at offset 1 — upstream inserts the searched
+                // position during its own search, before the depth loop probes
+                // the next one.
+                self.table.insert_position(abs_pos);
+                if let Some(carry) = self.hc.lazy_decide_carry::<DICT>(
                     concat,
                     dms_primed,
                     &self.table,
@@ -1291,49 +1313,50 @@ impl HcMatchGenerator {
                     lit_len,
                     best,
                 ) {
-                    // Backward-extend over the literal run (upstream `zstd_lazy.c`
-                    // after rep-vs-chain selection). The offset is preserved;
-                    // `start` and `match_len` grow by the same amount, bounded by
-                    // `literals_start` (the `min_abs` floor) so it never crosses
-                    // an already-emitted sequence.
-                    let history_abs_start = self.table.history_abs_start;
-                    let min_abs = abs_pos - lit_len;
-                    let mut start_abs = abs_pos;
-                    let mut cand_abs = abs_pos - best.offset;
-                    let mut match_len = best.match_len;
-                    while start_abs > min_abs
-                        && cand_abs > history_abs_start
-                        && concat[cand_abs - history_abs_start - 1]
-                            == concat[start_abs - history_abs_start - 1]
-                    {
-                        start_abs -= 1;
-                        cand_abs -= 1;
-                        match_len += 1;
-                    }
-                    self.table.insert_match_span(abs_pos, start_abs + match_len);
-                    let start = start_abs - current_abs_start;
-                    let literals = &current[literals_start..start];
-                    handle_sequence(Sequence::Triple {
-                        literals,
-                        offset: best.offset,
-                        match_len,
-                    });
-                    let _ = encode_offset_with_history(
-                        best.offset as u32,
-                        literals.len() as u32,
-                        &mut self.table.offset_hist,
-                    );
-                    pos = start + match_len;
-                    literals_start = pos;
+                    // DEFER: the lazy lookahead found a better match one (or two)
+                    // bytes ahead. Advance exactly ONE byte. Reuse the lookahead
+                    // match when it is real (so it is not re-searched — upstream
+                    // searches each position once); the `NONE` sentinel is the
+                    // depth-2 defer-without-carry case (`abs_pos + 2` won but
+                    // `abs_pos + 1` had no match), so search the next fresh and
+                    // pin the following advance to one byte (below) so the skip
+                    // heuristic cannot hop over that `abs_pos + 2` winner.
+                    carried = carry.is_match().then_some(carry);
+                    deferred_without_carry = carried.is_none();
+                    pos += 1;
                     continue;
                 }
-                // Lazy lookahead found a better match at `abs_pos + 1` / `+ 2`
-                // (defer): advance exactly ONE byte (upstream
-                // `ZSTD_compressBlock_lazy_generic`) so the deferred candidate is
-                // re-evaluated at its own position; the no-match skip below could
-                // jump past it once the literal run reaches 256+ bytes.
-                self.table.insert_position(abs_pos);
-                pos += 1;
+                // COMMIT `best`. Backward-extend over the literal run (upstream
+                // `zstd_lazy.c` after rep-vs-chain selection) through the shared
+                // raw-pointer helper the Row / Dfast probes use — one
+                // back-extension source, no per-step slice bounds checks.
+                // `abs_pos` is already inserted above, so the forward span fill
+                // starts at `abs_pos + 1`.
+                let ext = crate::encoding::match_table::helpers::extend_backwards_shared(
+                    concat,
+                    self.table.history_abs_start,
+                    abs_pos - best.offset,
+                    abs_pos,
+                    best.match_len,
+                    lit_len,
+                );
+                let match_len = ext.match_len;
+                self.table
+                    .insert_match_span(abs_pos + 1, ext.start + match_len);
+                let start = ext.start - current_abs_start;
+                let literals = &current[literals_start..start];
+                handle_sequence(Sequence::Triple {
+                    literals,
+                    offset: best.offset,
+                    match_len,
+                });
+                let _ = encode_offset_with_history(
+                    best.offset as u32,
+                    literals.len() as u32,
+                    &mut self.table.offset_hist,
+                );
+                pos = start + match_len;
+                literals_start = pos;
                 continue;
             }
             // No match found.
@@ -1349,7 +1372,13 @@ impl HcMatchGenerator {
             // every byte. Skipped positions are not inserted, mirroring
             // upstream (it inserts only searched positions during a no-match
             // run). Ratio follows upstream (not byte-identical).
-            let step = ((pos - literals_start) >> 8) + 1;
+            // A miss one byte after a depth-2 defer-without-carry must advance by
+            // exactly one so the skip cannot pass the proven `abs_pos + 2` match.
+            let step = if forced_single_step {
+                1
+            } else {
+                ((pos - literals_start) >> 8) + 1
+            };
             pos += step;
             // No clamp needed before the tail loop: the search bound and the
             // hashable bound are both `pos + HC_MIN_MATCH_LEN <= current_len`

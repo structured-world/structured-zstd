@@ -430,7 +430,7 @@ pub(crate) fn build_seq_ctable(counts: &mut [usize], max_log: u8, last_code: usi
         .unwrap_or_default();
     // Derived from the full nbSeq, matching upstream (the adjustment touches only
     // the normalized distribution, never the table-log).
-    let table_log = optimal_table_log(max_log, total, max_symbol);
+    let table_log = optimal_table_log(max_log, total, max_symbol, 2);
     let mut probs = [0i32; 256];
     // Borrow the caller's histogram and drop the last sequence's symbol in place
     // for the normalize, then put it back — no per-table copy. `normalize_counts`
@@ -475,7 +475,7 @@ fn build_table_from_counts(counts: &[usize], max_log: u8, avoid_0_numbit: bool) 
         .iter()
         .rposition(|&count| count > 0)
         .unwrap_or_default();
-    let table_log = optimal_table_log(max_log, total, max_symbol);
+    let table_log = optimal_table_log(max_log, total, max_symbol, 2);
     let mut probs = [0i32; 256];
     normalize_counts(
         &mut probs[..counts.len()],
@@ -568,7 +568,7 @@ pub(crate) fn fse_header_bits_for_counts(
         .iter()
         .rposition(|&count| count > 0)
         .unwrap_or_default();
-    let table_log = optimal_table_log(max_log, total, max_symbol);
+    let table_log = optimal_table_log(max_log, total, max_symbol, 2);
     let mut probs = [0i32; 256];
     normalize_counts(
         &mut probs[..counts.len()],
@@ -591,8 +591,17 @@ fn min_table_log(total: usize, max_symbol: usize) -> u8 {
     min_bits_src.min(min_bits_symbols) as u8
 }
 
-fn optimal_table_log(max_table_log: u8, total: usize, max_symbol: usize) -> u8 {
-    let max_bits_src = (total - 1).ilog2().saturating_sub(2) as u8;
+/// Upstream `FSE_optimalTableLog_internal` (fse_compress.c:357). `minus` is the
+/// accuracy reduction applied to the source-size bit estimate: FSE passes `2`,
+/// HUF passes `1` (huf_compress.c:1286). Reused by the HUF cheap/fast tableLog
+/// path so our single-shot literal tableLog matches upstream's exactly.
+pub(crate) fn optimal_table_log(
+    max_table_log: u8,
+    total: usize,
+    max_symbol: usize,
+    minus: u8,
+) -> u8 {
+    let max_bits_src = (total - 1).ilog2().saturating_sub(minus as u32) as u8;
     let min_bits = min_table_log(total, max_symbol);
     let mut table_log = max_table_log;
     if max_bits_src < table_log {

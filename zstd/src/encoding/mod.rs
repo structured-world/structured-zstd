@@ -69,6 +69,7 @@ pub(crate) mod hc;
 // LDM uses `twox_hash::XxHash64` (per-window XXH64 over the
 // `min_match_length` byte slice, upstream zstd `zstd_ldm.c:315`). The
 // `twox-hash` dependency is gated behind the `hash` feature so
+pub(crate) mod lazy_parse;
 // `default-features = false` builds (no_std, embedded) don't pull
 // it in. `BtMatcher::ldm_producer` and the `cfg(feature = "hash")`
 // blocks inside `BtMatcher::prepare_ldm_candidates` /

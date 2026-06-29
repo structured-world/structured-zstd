@@ -101,21 +101,12 @@ impl HcMatcher {
 
     /// Upstream zstd "match gain" heuristic: `match_len * 4 - offset_bits`.
     /// The lazy lookahead uses this to compare a candidate at the
-    /// current position against one a byte (or two) ahead. Pure
-    /// associated function — kept off `&self` so it can be called
-    /// statically from inside `better_candidate`.
-    #[inline]
-    pub(crate) fn match_gain(match_len: usize, offset: usize) -> i32 {
-        debug_assert!(
-            offset > 0,
-            "zstd offsets are 1-indexed, offset=0 is invalid"
-        );
-        let offset_bits = 32 - (offset as u32).leading_zeros() as i32;
-        (match_len as i32) * 4 - offset_bits
-    }
-
-    /// Pick the better of two candidate matches by [`match_gain`].
-    /// `None` arms pass the surviving `Some` through.
+    /// Pick the better of two candidate matches by LENGTH (ties to the smaller
+    /// offset), the same selector the chain walk and the shared Row/Dfast
+    /// repcode probe use. Upstream `ZSTD_compressBlock_lazy_generic` compares
+    /// the repcode against the searched match by length at depth 0 (`ml2 >
+    /// matchLength`, the repcode keeps ties); a longer or equal-length-closer
+    /// match wins. `None` arms pass the surviving `Some` through.
     pub(crate) fn better_candidate(lhs: HcMatch, rhs: HcMatch) -> HcMatch {
         if !lhs.is_match() {
             return rhs;
@@ -123,7 +114,8 @@ impl HcMatcher {
         if !rhs.is_match() {
             return lhs;
         }
-        if Self::match_gain(rhs.match_len, rhs.offset) > Self::match_gain(lhs.match_len, lhs.offset)
+        if rhs.match_len > lhs.match_len
+            || (rhs.match_len == lhs.match_len && rhs.offset < lhs.offset)
         {
             rhs
         } else {
@@ -706,18 +698,19 @@ impl HcMatcher {
     /// Returns `true` if the current match `best` wins (commit it), `false`
     /// if the caller should defer to a later position.
     ///
-    /// Takes the already-unwrapped `best` BY VALUE and returns a `bool` rather
-    /// than threading `Option<MatchCandidate>` in and back out: the caller owns
-    /// `best` (from `find_best_match`) and reuses it on commit, so a 24-byte
-    /// candidate (32-byte `Option`) no longer gets marshalled across this call
-    /// boundary every position (it was a measured ~7% of the lazy scan on the
-    /// stack-arg copy).
+    /// Takes the already-unwrapped `best` BY VALUE and returns the lazy
+    /// commit/defer decision: `None` = COMMIT `best`; `Some(carry)` = DEFER and
+    /// advance one byte. The caller reuses `carry` as the next `best` when it is
+    /// a real match (`carry.is_match()`), or searches the next position fresh
+    /// when it is the `NONE` sentinel — the depth-2 defer-WITHOUT-carry case
+    /// (the `abs_pos + 2` probe wins but `abs_pos + 1` had no match). That case
+    /// must DEFER, not commit, or lazy2 misses the two-ahead match.
     ///
-    /// Lazy lookahead queries `pos + 1` / `pos + 2` before they are
-    /// inserted into the hash tables — matching the C zstd ordering.
-    /// Seeding before comparing would let a position match against
-    /// itself, changing semantics.
-    pub(crate) fn pick_lazy_match<const DICT: bool>(
+    /// The caller inserts `abs_pos` into the hash tables BEFORE calling this, so
+    /// the `pos + 1` / `pos + 2` lookahead sees `abs_pos` at offset 1 — matching
+    /// upstream, where the searched position is inserted during its own search,
+    /// before the depth loop probes the next one.
+    pub(crate) fn lazy_decide_carry<const DICT: bool>(
         &self,
         concat: &[u8],
         dms_primed: bool,
@@ -725,34 +718,33 @@ impl HcMatcher {
         abs_pos: usize,
         lit_len: usize,
         best: HcMatch,
-    ) -> bool {
-        if best.match_len >= self.target_len
-            || abs_pos + 1 + HC_MIN_MATCH_LEN > table.history_abs_start + concat.len()
-        {
-            return true;
+    ) -> Option<HcMatch> {
+        let history_end = table.history_abs_start + concat.len();
+        // HC's finder is out-of-line by design (`#[inline(never)]`), so the
+        // shared decision macro expands here with no register cost. Map the
+        // macro's `Option<Option<HcMatch>>` to one `Option` level: `None`
+        // (commit) stays `None`; `Some(Some(carry))` (defer with a reusable
+        // lookahead) -> `Some(carry)`; `Some(None)` (depth-2 defer with no
+        // carryable match one byte ahead) -> `Some(NONE)` so the caller still
+        // DEFERS but searches the next position fresh.
+        match crate::encoding::lazy_parse::lazy_decide!(
+            best_len = best.match_len,
+            best_off = best.offset,
+            target_len = self.target_len,
+            lazy_depth = self.lazy_depth,
+            abs_pos = abs_pos,
+            lit_len = lit_len,
+            history_end = history_end,
+            min_match = HC_MIN_MATCH_LEN,
+            search = |pos, ll| {
+                let m = self.find_best_match::<DICT>(concat, dms_primed, table, pos, ll);
+                m.is_match().then_some(m)
+            },
+        ) {
+            ::core::option::Option::None => ::core::option::Option::None,
+            ::core::option::Option::Some(::core::option::Option::Some(carry)) => Some(carry),
+            ::core::option::Option::Some(::core::option::Option::None) => Some(HcMatch::NONE),
         }
-
-        let current_gain = Self::match_gain(best.match_len, best.offset) + 4;
-
-        let next =
-            self.find_best_match::<DICT>(concat, dms_primed, table, abs_pos + 1, lit_len + 1);
-        if next.is_match() && Self::match_gain(next.match_len, next.offset) > current_gain {
-            return false;
-        }
-
-        if self.lazy_depth >= 2
-            && abs_pos + 2 + HC_MIN_MATCH_LEN <= table.history_abs_start + concat.len()
-        {
-            let next2 =
-                self.find_best_match::<DICT>(concat, dms_primed, table, abs_pos + 2, lit_len + 2);
-            if next2.is_match()
-                && Self::match_gain(next2.match_len, next2.offset) > current_gain + 4
-            {
-                return false;
-            }
-        }
-
-        true
     }
 
     /// Cross-platform dispatcher for the rep-code probe used by the
@@ -973,27 +965,19 @@ impl HcMatcher {
     /// don't otherwise use.
     pub(crate) fn extend_backwards(
         table: &MatchTable,
-        mut candidate_pos: usize,
-        mut abs_pos: usize,
-        mut match_len: usize,
+        candidate_pos: usize,
+        abs_pos: usize,
+        match_len: usize,
         lit_len: usize,
     ) -> MatchCandidate {
-        let concat = table.live_history();
-        let min_abs_pos = abs_pos - lit_len;
-        while abs_pos > min_abs_pos
-            && candidate_pos > table.history_abs_start
-            && concat[candidate_pos - table.history_abs_start - 1]
-                == concat[abs_pos - table.history_abs_start - 1]
-        {
-            candidate_pos -= 1;
-            abs_pos -= 1;
-            match_len += 1;
-        }
-        MatchCandidate {
-            start: abs_pos,
-            offset: abs_pos - candidate_pos,
+        crate::encoding::match_table::helpers::extend_backwards_shared(
+            table.live_history(),
+            table.history_abs_start,
+            candidate_pos,
+            abs_pos,
             match_len,
-        }
+            lit_len,
+        )
     }
 
     /// Upstream zstd parity: per-pass clamp of the "good enough — stop probing"

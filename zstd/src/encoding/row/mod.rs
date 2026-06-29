@@ -37,8 +37,8 @@ pub(crate) struct RowDictTables {
     pub(crate) tags: Vec<u8>,
 }
 use super::match_table::helpers::{
-    INCOMPRESSIBLE_SKIP_STEP, LazyMatchConfig, best_len_offset_candidate, extend_backwards_shared,
-    pick_lazy_match_shared, repcode_candidate_shared,
+    INCOMPRESSIBLE_SKIP_STEP, best_len_offset_candidate, extend_backwards_shared,
+    repcode_candidate_shared,
 };
 use super::match_table::storage::REBASE_RESET_FLOOR_CEILING;
 use super::opt::types::MatchCandidate;
@@ -498,8 +498,8 @@ macro_rules! gen_row_find_monolith {
 }
 
 /// The lazy row parse BODY as a macro — same per-tier monolith shape as
-/// `greedy_parse_body!` for the lazy levels (lookahead via
-/// `pick_lazy_match_shared`; both probe sites call the tier's shared
+/// `greedy_parse_body!` for the lazy levels (lookahead via the shared
+/// `lazy_decide!` macro; both probe sites call the tier's shared
 /// `$find` search function).
 macro_rules! lazy_parse_body {
     ($m:expr, $handle:expr, $rl:expr, $find:ident) => {{
@@ -530,6 +530,13 @@ macro_rules! lazy_parse_body {
             while pos + mls <= current_len {
                 let abs_pos = current_abs_start + pos;
                 let lit_len = pos - literals_start;
+                // The previous iteration deferred (carried set) — including the
+                // depth-2 defer-WITHOUT-carry case (`Some(None)`, where
+                // `abs_pos + 1` was cold but `abs_pos + 2` won). `carried.take()`
+                // below clears that, so capture it now: if this position then
+                // misses, the skip must advance by one so it cannot hop over the
+                // proven `abs_pos + 2` winner.
+                let deferred_from_prev = carried.is_some();
 
                 // Hash the position ONCE per iteration: the probe consumes it
                 // and the defer branch reuses it for the insert (upstream zstd
@@ -546,54 +553,38 @@ macro_rules! lazy_parse_body {
                 };
                 let picked = 'pick: {
                     let Some(best) = best else { break 'pick None };
-                    // Upstream zstd's lazy parse (ZSTD_compressBlock_lazy_generic,
-                    // zstd_lazy.c) has NO targetLength / sufficient_len early-out:
-                    // it always runs the depth-1 lookahead while a successor
-                    // position exists, comparing the two by gain. Committing here
-                    // on `match_len >= target_len` collapsed the lazy levels to
-                    // greedy (target_len is as low as the minMatch, so the test
-                    // fired on every match) and lost ~7% ratio vs C on the lazy
-                    // band. Only the out-of-bounds guard stays.
-                    if abs_pos + 1 + $m.mls > $m.history_abs_end() {
-                        break 'pick Some(best);
+                    // Row's finder ($find) is inlined in this target_feature
+                    // kernel, so the shared decision is a MACRO (spliced inline) —
+                    // a closure would de-inline $find across the call boundary and
+                    // regress the band. target_len = MAX: upstream lazy has no
+                    // sufficient-length early-out (that is the OPT parser's; one
+                    // here collapses lazy to greedy, -7% ratio vs C). The macro
+                    // weighs candidates by length (ties to the smaller offset)
+                    // and returns the carry so the deferred position is searched
+                    // once.
+                    let lazy_depth = $m.lazy_depth;
+                    let history_end = $m.history_abs_end();
+                    let mls = $m.mls;
+                    let decision = $crate::encoding::lazy_parse::lazy_decide!(
+                        best_len = best.match_len,
+                        best_off = best.offset,
+                        target_len = usize::MAX,
+                        lazy_depth = lazy_depth,
+                        abs_pos = abs_pos,
+                        lit_len = lit_len,
+                        history_end = history_end,
+                        min_match = mls,
+                        // SAFETY: the enclosing kernel is only entered when its
+                        // tier was runtime-detected, upholding $find's
+                        // target_feature contract.
+                        search = |p, l| unsafe { $m.$find::<K, $rl>(p, l, None) },
+                    );
+                    if let Some(carry) = decision {
+                        carried = Some(carry);
+                        None
+                    } else {
+                        Some(best)
                     }
-                    // SAFETY: the enclosing kernel is only entered when its
-                    // tier was runtime-detected, so the same-feature search
-                    // fn's target_feature contract is upheld.
-                    let next = unsafe { $m.$find::<K, $rl>(abs_pos + 1, lit_len + 1, None) };
-                    if let Some(n) = next
-                        && (n.match_len > best.match_len
-                            || (n.match_len == best.match_len && n.offset < best.offset))
-                    {
-                        // Defer: the lookahead wins; carry its result so the
-                        // next iteration starts from it instead of searching
-                        // the same position again. Reusing the pre-insert
-                        // result is INTENTIONAL: the deferred-position insert
-                        // only ADDS a row entry, so the carried candidate's
-                        // positions and lengths stay valid — at most the
-                        // carried view misses the just-inserted neighbour as
-                        // a candidate. Upstream zstd's lazy chain has the
-                        // same property (a searched position is never
-                        // searched again, zstd_lazy.c lazy_generic), and the
-                        // size impact is measured at +25 bytes on a 484 KB
-                        // corpus while removing a full duplicate search per
-                        // deferral.
-                        carried = Some(next);
-                        break 'pick None;
-                    }
-                    if $m.lazy_depth >= 2 && abs_pos + 2 + $m.mls <= $m.history_abs_end() {
-                        let next2 = unsafe { $m.$find::<K, $rl>(abs_pos + 2, lit_len + 2, None) };
-                        if let Some(n2) = next2
-                            && n2.match_len > best.match_len + 1
-                        {
-                            // Two-ahead defer: carry the one-ahead result
-                            // (the next iteration's own lookahead re-probes
-                            // two-ahead with the deferred position inserted).
-                            carried = Some(next);
-                            break 'pick None;
-                        }
-                    }
-                    Some(best)
                 };
                 if let Some(candidate) = picked {
                     $m.insert_match_span::<$rl>(abs_pos, candidate.start + candidate.match_len);
@@ -627,9 +618,11 @@ macro_rules! lazy_parse_body {
                         Some((row, tag)) => $m.insert_at::<$rl>(abs_pos, row, tag),
                         None => $m.insert_position::<$rl>(abs_pos),
                     }
-                    if carried.is_some() {
+                    if carried.is_some() || deferred_from_prev {
                         // Defer: the lookahead found a better match — step
-                        // exactly one to take it next iteration.
+                        // exactly one to take it next iteration. `deferred_from_prev`
+                        // covers the depth-2 defer-without-carry miss so the skip
+                        // below can't hop over the proven `abs_pos + 2` winner.
                         pos += 1;
                     } else {
                         // Complete miss: accelerate through weakly-matching
@@ -1910,18 +1903,26 @@ impl RowMatchGenerator {
         lit_len: usize,
         best: Option<MatchCandidate>,
     ) -> Option<MatchCandidate> {
-        pick_lazy_match_shared(
-            abs_pos,
-            lit_len,
-            best,
-            LazyMatchConfig {
-                target_len: self.target_len,
-                min_match_len: self.mls,
-                lazy_depth: self.lazy_depth,
-                history_abs_end: self.history_abs_end(),
-            },
-            |next_pos, next_lit_len| self.best_match_rl::<K, ROW_LOG>(next_pos, next_lit_len),
-        )
+        let best = best?;
+        // Same C-faithful length decision as the production monolith — route
+        // through the shared `lazy_decide!` macro (test-only path; its finder is
+        // out-of-line here, so the macro adds no register cost). `None` = commit.
+        // `target_len = usize::MAX` matches the production row lazy body: upstream
+        // lazy has no sufficient-length early-out (that belongs to the OPT parser).
+        match crate::encoding::lazy_parse::lazy_decide!(
+            best_len = best.match_len,
+            best_off = best.offset,
+            target_len = usize::MAX,
+            lazy_depth = self.lazy_depth,
+            abs_pos = abs_pos,
+            lit_len = lit_len,
+            history_end = self.history_abs_end(),
+            min_match = self.mls,
+            search = |p, l| self.best_match_rl::<K, ROW_LOG>(p, l),
+        ) {
+            ::core::option::Option::None => Some(best),
+            ::core::option::Option::Some(_) => None,
+        }
     }
 
     #[allow(dead_code)]
