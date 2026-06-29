@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.46](https://github.com/structured-world/structured-zstd/compare/v0.0.45...v0.0.46) - 2026-06-29
+
+### Performance
+
+- *(huf+lazy)* gate HUF table-log on the size-adaptive strategy, unify the lazy parser ([#455](https://github.com/structured-world/structured-zstd/pull/455))
+- *(levels)* consolidate cparams + negative-band byte-parity with C ([#454](https://github.com/structured-world/structured-zstd/pull/454))
+- *(decode)* hot-loop register-pressure trims + release-plz concurrency guard ([#452](https://github.com/structured-world/structured-zstd/pull/452))
+
 ## [0.0.45](https://github.com/structured-world/structured-zstd/compare/v0.0.44...v0.0.45) - 2026-06-26
 
 ### Fixed
