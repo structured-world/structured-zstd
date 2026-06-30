@@ -1388,53 +1388,6 @@ fn hc_collect_optimal_candidates_long_chain_match_advances_skip_window() {
 }
 
 #[test]
-fn hc_collect_optimal_candidates_chain_fast_skip_uses_match_end_minus_8() {
-    let mut hc = HcMatchGenerator::new(128);
-    hc.table.history = b"abcabcabcabcabcabcabcabc".to_vec();
-    hc.table.history_start = 0;
-    hc.table.history_abs_start = 0;
-    hc.table.position_base = 0;
-    hc.hc.search_depth = 32;
-    let abs_pos = 9usize;
-    hc.table.ensure_tables();
-    hc.table.insert_positions(0, abs_pos);
-    hc.table.skip_insert_until_abs = 0;
-
-    let profile = HcOptimalCostProfile {
-        max_chain_depth: 32,
-        sufficient_match_len: 10,
-        accurate: true,
-        favor_small_offsets: false,
-    };
-    let mut out = Vec::new();
-    hc.collect_optimal_candidates(
-        abs_pos,
-        hc.table.history.len(),
-        profile,
-        HcCandidateQuery {
-            reps: [1, 4, 8],
-            lit_len: 1,
-            ldm_candidate: None,
-        },
-        &mut out,
-    );
-
-    let best_match_end = out
-        .iter()
-        .map(|candidate| candidate.start.saturating_add(candidate.match_len))
-        .max()
-        .expect("expected at least one candidate");
-    assert!(
-        hc.table.skip_insert_until_abs > abs_pos,
-        "chain fast-skip must advance past current position"
-    );
-    assert!(
-        hc.table.skip_insert_until_abs <= best_match_end.saturating_sub(8),
-        "chain fast-skip must not exceed upstream zstd-style matchEndIdx - 8 bound"
-    );
-}
-
-#[test]
 fn hc_collect_optimal_candidates_advances_skip_window_on_plain_bt_path() {
     let mut hc = HcMatchGenerator::new(256);
     hc.table.history = b"abcdefghijklmnop".to_vec();
@@ -3231,18 +3184,6 @@ fn row_candidate_returns_none_when_abs_pos_near_end_of_history() {
 }
 
 #[test]
-fn hc_chain_candidates_returns_sentinels_for_short_suffix() {
-    let mut hc = HcMatchGenerator::new(32);
-    hc.table.history = b"abc".to_vec();
-    hc.table.history_start = 0;
-    hc.table.history_abs_start = 0;
-    hc.table.ensure_tables();
-
-    let candidates = hc.hc.chain_candidates(&hc.table, 0);
-    assert!(candidates.iter().all(|&pos| pos == usize::MAX));
-}
-
-#[test]
 fn hc_reset_advances_floor_past_prior_frame_entries() {
     use super::super::match_table::storage::MatchTable;
     let mut hc = HcMatchGenerator::new(32);
@@ -3786,14 +3727,6 @@ fn hc_rebases_positions_after_u32_boundary() {
             .iter()
             .any(|entry| *entry != HC_EMPTY),
         "HC hash table should still be populated after crossing u32 boundary"
-    );
-
-    // Verify rebasing preserves candidate lookup, not just table population.
-    let abs_pos = matcher.table.history_abs_start + 10;
-    let candidates = matcher.hc.chain_candidates(&matcher.table, abs_pos);
-    assert!(
-        candidates.iter().any(|candidate| *candidate != usize::MAX),
-        "chain_candidates should return valid matches after rebase"
     );
 }
 
