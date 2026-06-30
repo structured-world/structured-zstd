@@ -733,6 +733,24 @@ macro_rules! bt_insert_and_collect_matches_body {
             .wrapping_sub($table.index_shift)
             .wrapping_sub(window_low);
         let win_range = $abs_pos - window_low;
+        // Decode biases: fold the per-node coordinate conversions into
+        // loop-invariant additions. The gate-validated chain entry
+        // `match_stored` maps to its absolute position, its history-relative
+        // index and its BT pair slot by a single add each, instead of
+        // re-reading `position_base` / `index_shift` / `history_abs_start` /
+        // `bt_mask` from `self` and round-tripping `index_shift` through the
+        // slot computation on every node. Upstream zstd walks one
+        // window-relative `matchIndex` directly (`match = base + matchIndex`,
+        // slot `2*(matchIndex & btMask)`); these biases are the
+        // single-coordinate equivalent. Wrapping throughout: the window gate
+        // already proved `match_stored ∈ [window_low, abs_pos)` before decode,
+        // mirroring the `win_off` form above.
+        let abs_bias = $table
+            .position_base
+            .wrapping_sub(1)
+            .wrapping_sub($table.index_shift);
+        let idx_bias = abs_bias.wrapping_sub($table.history_abs_start);
+        let bt_bias = $table.position_base.wrapping_sub(1);
         // Raw `+ 9` is safe here — see `bt_insert_step_no_rebase_body!`
         // for the full discussion of the upstream `STREAM_ABS_HEADROOM`
         // cap in `MatchTable::add_data`.
@@ -763,19 +781,21 @@ macro_rules! bt_insert_and_collect_matches_body {
         while compares_left > 0 && (match_stored as usize).wrapping_add(win_off) < win_range {
             compares_left -= 1;
             // The condition proved this candidate is in `[window_low,
-            // abs_pos)`, so `match_stored >= 1` (HC_EMPTY is out of range) and
-            // the `- 1` cannot underflow; candidate_abs == base + match_stored.
-            let candidate_abs = ($table.position_base + (match_stored as usize - 1))
-                .wrapping_sub($table.index_shift);
-
-            let next_pair_idx = $table.bt_pair_index_for_abs(candidate_abs);
+            // abs_pos)`, so `match_stored >= 1` (HC_EMPTY is out of range).
+            // Decode via the precomputed biases (single add each), the
+            // single-coordinate form of upstream's `matchIndex`.
+            let stored = match_stored as usize;
+            let candidate_abs = stored.wrapping_add(abs_bias);
+            // `2*(candidate_abs + index_shift & bt_mask)` with `index_shift`
+            // folded away: `candidate_abs + index_shift == stored + bt_bias`.
+            let next_pair_idx = 2 * (stored.wrapping_add(bt_bias) & bt_mask);
             // SAFETY: `next_pair_idx (+1)` = `2*(candidate_abs & bt_mask) (+1)`
             // ≤ `chain_table.len()-1`; `chain_ptr` is the hoisted live base,
             // table not realloc'd during the walk.
             let next_smaller = unsafe { *chain_ptr.add(next_pair_idx) };
             let next_larger = unsafe { *chain_ptr.add(next_pair_idx + 1) };
             let seed_len = common_length_smaller.min(common_length_larger);
-            let candidate_idx = candidate_abs - $table.history_abs_start;
+            let candidate_idx = stored.wrapping_add(idx_bias);
             // SAFETY: BT walk invariant — `candidate_idx + tail_limit ≤
             // concat.len()`.
             let match_len = unsafe { $cmf(concat, idx, candidate_idx, tail_limit, seed_len) };
