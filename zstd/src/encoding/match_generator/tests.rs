@@ -1276,6 +1276,9 @@ fn hc_repcode_candidates_respect_litlen_dependent_rep_order() {
 #[test]
 fn hc_collect_optimal_candidates_keeps_reps_when_chain_depth_zero() {
     let mut hc = HcMatchGenerator::new(64);
+    // Optimal candidate collection is binary-tree only; tag the generator as a
+    // BT strategy (BtOpt shares Lazy's OPT_LEVEL=0 / USE_HASH3=false consts).
+    hc.strategy_tag = crate::encoding::strategy::StrategyTag::BtOpt;
     hc.hc.search_depth = 0;
     hc.table.history = b"xyzxyzxyzxyz".to_vec();
     hc.table.history_start = 0;
@@ -1314,6 +1317,7 @@ fn hc_collect_optimal_candidates_keeps_reps_when_chain_depth_zero() {
 #[test]
 fn hc_collect_optimal_candidates_rep_tail_match_skips_chain_probe() {
     let mut hc = HcMatchGenerator::new(64);
+    hc.strategy_tag = crate::encoding::strategy::StrategyTag::BtOpt;
     hc.table.history = b"aaaaaaaaaa".to_vec();
     hc.table.history_start = 0;
     hc.table.history_abs_start = 0;
@@ -1352,6 +1356,7 @@ fn hc_collect_optimal_candidates_rep_tail_match_skips_chain_probe() {
 #[test]
 fn hc_collect_optimal_candidates_long_chain_match_advances_skip_window() {
     let mut hc = HcMatchGenerator::new(128);
+    hc.strategy_tag = crate::encoding::strategy::StrategyTag::BtOpt;
     hc.table.history = b"abcabcabcabcabcabcabcabc".to_vec();
     hc.table.history_start = 0;
     hc.table.history_abs_start = 0;
@@ -1390,6 +1395,7 @@ fn hc_collect_optimal_candidates_long_chain_match_advances_skip_window() {
 #[test]
 fn hc_collect_optimal_candidates_advances_skip_window_on_plain_bt_path() {
     let mut hc = HcMatchGenerator::new(256);
+    hc.strategy_tag = crate::encoding::strategy::StrategyTag::BtOpt;
     hc.table.history = b"abcdefghijklmnop".to_vec();
     hc.table.history_start = 0;
     hc.table.history_abs_start = 0;
@@ -1441,6 +1447,7 @@ fn hc_collect_optimal_candidates_advances_skip_window_on_plain_bt_path() {
 #[test]
 fn hc_ldm_candidates_are_merged_into_optimal_candidates() {
     let mut hc = HcMatchGenerator::new(512);
+    hc.strategy_tag = crate::encoding::strategy::StrategyTag::BtOpt;
     hc.table.history = (0..256).map(|i| (i % 251) as u8).collect();
     hc.table.history_start = 0;
     hc.table.history_abs_start = 0;

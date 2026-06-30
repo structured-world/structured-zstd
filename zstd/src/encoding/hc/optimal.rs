@@ -2042,12 +2042,15 @@ impl HcMatchGenerator {
                 out,
             ),
             StrategyTag::Fast | StrategyTag::Dfast | StrategyTag::Greedy | StrategyTag::Lazy => {
-                self.collect_optimal_candidates_initialized::<strategy::Lazy>(
-                    abs_pos,
-                    current_abs_end,
-                    profile,
-                    query,
-                    out,
+                // Optimal candidate collection is binary-tree only (btopt /
+                // btultra / btultra2 / btlazy2). The Fast / Dfast / Greedy / Lazy
+                // strategies never run the optimal parser — they drive their own
+                // match finders — and their generators keep `chain_table` as an
+                // HC chain, not BT pair slots. Routing them here would walk that
+                // chain as a binary tree. Reaching this arm is a caller bug.
+                unreachable!(
+                    "collect_optimal_candidates is binary-tree only; \
+                     non-BT strategies use their own match finder"
                 )
             }
         }
