@@ -2687,3 +2687,45 @@ fn exact_block_multiple_marks_last_real_block() {
         }
     }
 }
+
+#[test]
+fn dict_compress_bt_level_tiny_source_round_trips_through_prime_dms_bt() {
+    // End-to-end cover for the dictionary match binary-tree (`prime_dms_bt`, a
+    // ZSTD_dictMatchState analog built only on the BT strategies, level >= 13):
+    // compress a tiny source with a small raw-content dictionary at level 19
+    // (BtUltra2) and round-trip it. This drives the BT dict-prime + dict-match
+    // search path that non-BT levels (Fast/Dfast/Lazy) never reach.
+    //
+    // The `prime_dms_bt` dms-table sizing previously used
+    // `ceil_log2(region).clamp(10, hash_log)`, which panicked ("min > max") when
+    // the matcher's `hash_log` adjusted below the 10 floor — the exact bound
+    // arithmetic is pinned directly by `storage::dms_hash_log_tests`. On this
+    // build the window-log floor keeps `hash_log >= 10` so this end-to-end path
+    // stays above the boundary; the unit test exercises `hash_log < 10`.
+    let raw_dict: Vec<u8> = (0..100u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+        .collect();
+    let dict_id = 1u32;
+    let dict_for_encoder =
+        crate::decoding::Dictionary::from_raw_content(dict_id, raw_dict.clone()).unwrap();
+    let dict_for_decoder =
+        crate::decoding::Dictionary::from_raw_content(dict_id, raw_dict).unwrap();
+
+    let data = b"hello world".to_vec();
+
+    let mut compressor: FrameCompressor =
+        FrameCompressor::new(super::CompressionLevel::from_level(19));
+    compressor
+        .set_dictionary(dict_for_encoder)
+        .expect("raw-content dictionary should attach");
+    // Runs the BT dict-prime + dict-match path end to end.
+    let out = compressor.compress_independent_frame(data.as_slice());
+
+    let mut decoder = FrameDecoder::new();
+    decoder.add_dict(dict_for_decoder).unwrap();
+    let mut decoded = Vec::with_capacity(data.len());
+    decoder
+        .decode_all_to_vec(&out, &mut decoded)
+        .expect("dict BT-level frame should round-trip");
+    assert_eq!(decoded, data);
+}
