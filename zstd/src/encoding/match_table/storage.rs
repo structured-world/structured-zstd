@@ -97,6 +97,9 @@ mod bt_pair_index_wrap_tests;
 #[cfg(test)]
 mod stream_abs_headroom_tests;
 
+#[cfg(test)]
+mod dms_hash_log_tests;
+
 /// Knuth-style 3-byte hash multiplier. Upstream zstd parity:
 /// `ZSTD_HASH3PRIME` in `lib/compress/zstd_compress_internal.h`. Used
 /// by the HC3 short-match side table and by the 3-byte branch of the
@@ -350,6 +353,14 @@ impl Clone for MatchTable {
     }
 }
 
+/// Hash-log for a dictionary-match-state table: `ceil_log2(region)` (a table
+/// sized to the dict region), with a 10-bit minimum bounded above by the
+/// matcher's own `hash_log` (the dms table need not exceed the live table).
+pub(crate) fn dms_hash_log(region: usize, hash_log: usize) -> usize {
+    debug_assert!(region >= 1, "dms_hash_log called with empty region");
+    (usize::BITS - (region - 1).leading_zeros()).clamp(10, hash_log as u32) as usize
+}
+
 /// Shared scaffold for the two `prime_dms_*` dictionary-match-state builders.
 ///
 /// Both resolve the dict `region` (capped to the live history), bail on an
@@ -372,9 +383,10 @@ macro_rules! build_dms {
             $self.dms.invalidate();
             return;
         }
-        // Dict-sized hash log: ceil-log2(region) clamped to [10, hash_log].
+        // Dict-sized hash log: ceil-log2(region), bounded to the matcher's
+        // `hash_log`. See [`dms_hash_log`] for the bound rationale.
         let dms_hash_log =
-            (usize::BITS - (region - 1).leading_zeros()).clamp(10, $self.hash_log as u32) as usize;
+            $crate::encoding::match_table::storage::dms_hash_log(region, $self.hash_log);
         // CDict cache: the tables depend only on the dict bytes (re-committed
         // identically to the front of history every frame) and the
         // (region, mls, hash_log) shape, so a primed same-shape table is valid
