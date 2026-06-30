@@ -1350,8 +1350,16 @@ fn hc_collect_optimal_candidates_panics_for_non_bt_strategy() {
 fn hc_collect_optimal_candidates_dispatches_every_bt_strategy() {
     use crate::encoding::fastpath::FastpathKernel;
     use crate::encoding::strategy::StrategyTag;
-    // The public dispatcher must route every BT strategy tag to the collector.
-    // Run under the scalar kernel so the scalar dispatch arm is exercised too.
+    // The public dispatcher must route every BT strategy tag to the collector
+    // AND to the specialization carrying that tag's consts — not just survive.
+    // The observable dimension is `USE_HASH3` (BtUltra / BtUltra2 = true; BtOpt /
+    // Btlazy2 = false): only the hash3 specializations surface a 3-byte match
+    // that the 4-byte BT hash cannot find. (BtOpt vs Btlazy2 share identical
+    // collect consts, so they are indistinguishable at runtime — the type
+    // mapping there is compiler-enforced.) Fixture: `abc` repeats at 0 and 12
+    // with a differing 4th byte (`Q` vs `Z`), so hash3 finds a length-3 match at
+    // offset 12 while the 4-byte hash of `abcZ` misses `abcQ`. Run under the
+    // scalar kernel so the scalar dispatch arm is exercised too.
     for tag in [
         StrategyTag::BtOpt,
         StrategyTag::BtUltra,
@@ -1361,32 +1369,40 @@ fn hc_collect_optimal_candidates_dispatches_every_bt_strategy() {
         let mut hc = HcMatchGenerator::new(64);
         hc.strategy_tag = tag;
         hc.table.kernel = FastpathKernel::Scalar;
-        hc.table.history = b"abcabcabcabcabcabc".to_vec();
+        hc.table.history = b"abcQ00000000abcZ00000000".to_vec();
         hc.table.history_start = 0;
         hc.table.history_abs_start = 0;
         hc.table.hash_log = 8;
         hc.table.chain_log = 8;
-        // BtUltra / BtUltra2 drive the hash3 short-match table; size it so the
-        // collector's hash3 probe has a live table.
         hc.table.hash3_log = 8;
         hc.table.ensure_tables();
+        let abs_pos = 12usize;
         let profile = HcOptimalCostProfile {
-            max_chain_depth: 4,
+            max_chain_depth: 8,
             sufficient_match_len: usize::MAX / 2,
             accurate: false,
             favor_small_offsets: false,
         };
         let mut out = Vec::new();
         hc.collect_optimal_candidates(
-            6,
+            abs_pos,
             hc.table.history.len(),
             profile,
             HcCandidateQuery {
-                reps: [1, 2, 3],
+                // Reps past abs_pos are skipped, so the only candidate source is
+                // the (hash3 / BT) match finder — keeping the observable clean.
+                reps: [50, 60, 70],
                 lit_len: 1,
                 ldm_candidate: None,
             },
             &mut out,
+        );
+        let uses_hash3 = matches!(tag, StrategyTag::BtUltra | StrategyTag::BtUltra2);
+        let found_hash3_match = out.iter().any(|c| c.offset == 12 && c.match_len == 3);
+        assert_eq!(
+            found_hash3_match, uses_hash3,
+            "tag {tag:?}: presence of the hash3-only 3-byte match must equal USE_HASH3 \
+             (a cross-group dispatch mis-mapping would flip this)"
         );
     }
 }
