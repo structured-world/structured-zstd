@@ -1315,6 +1315,83 @@ fn hc_collect_optimal_candidates_keeps_reps_when_chain_depth_zero() {
 }
 
 #[test]
+#[should_panic(expected = "binary-tree only")]
+fn hc_collect_optimal_candidates_panics_for_non_bt_strategy() {
+    // Optimal candidate collection is binary-tree only. A non-BT strategy tag
+    // (Lazy here) reaching the public dispatcher is a caller bug — it must panic
+    // rather than walk the HC chain_table as BT pair slots.
+    let mut hc = HcMatchGenerator::new(64);
+    hc.strategy_tag = crate::encoding::strategy::StrategyTag::Lazy;
+    hc.table.history = b"abcabcabcabc".to_vec();
+    hc.table.history_start = 0;
+    hc.table.history_abs_start = 0;
+    hc.table.ensure_tables();
+    let profile = HcOptimalCostProfile {
+        max_chain_depth: 0,
+        sufficient_match_len: usize::MAX / 2,
+        accurate: false,
+        favor_small_offsets: false,
+    };
+    let mut out = Vec::new();
+    hc.collect_optimal_candidates(
+        6,
+        hc.table.history.len(),
+        profile,
+        HcCandidateQuery {
+            reps: [1, 2, 3],
+            lit_len: 1,
+            ldm_candidate: None,
+        },
+        &mut out,
+    );
+}
+
+#[test]
+fn hc_collect_optimal_candidates_dispatches_every_bt_strategy() {
+    use crate::encoding::fastpath::FastpathKernel;
+    use crate::encoding::strategy::StrategyTag;
+    // The public dispatcher must route every BT strategy tag to the collector.
+    // Run under the scalar kernel so the scalar dispatch arm is exercised too.
+    for tag in [
+        StrategyTag::BtOpt,
+        StrategyTag::BtUltra,
+        StrategyTag::BtUltra2,
+        StrategyTag::Btlazy2,
+    ] {
+        let mut hc = HcMatchGenerator::new(64);
+        hc.strategy_tag = tag;
+        hc.table.kernel = FastpathKernel::Scalar;
+        hc.table.history = b"abcabcabcabcabcabc".to_vec();
+        hc.table.history_start = 0;
+        hc.table.history_abs_start = 0;
+        hc.table.hash_log = 8;
+        hc.table.chain_log = 8;
+        // BtUltra / BtUltra2 drive the hash3 short-match table; size it so the
+        // collector's hash3 probe has a live table.
+        hc.table.hash3_log = 8;
+        hc.table.ensure_tables();
+        let profile = HcOptimalCostProfile {
+            max_chain_depth: 4,
+            sufficient_match_len: usize::MAX / 2,
+            accurate: false,
+            favor_small_offsets: false,
+        };
+        let mut out = Vec::new();
+        hc.collect_optimal_candidates(
+            6,
+            hc.table.history.len(),
+            profile,
+            HcCandidateQuery {
+                reps: [1, 2, 3],
+                lit_len: 1,
+                ldm_candidate: None,
+            },
+            &mut out,
+        );
+    }
+}
+
+#[test]
 fn hc_collect_optimal_candidates_rep_tail_match_skips_chain_probe() {
     let mut hc = HcMatchGenerator::new(64);
     hc.strategy_tag = crate::encoding::strategy::StrategyTag::BtOpt;
