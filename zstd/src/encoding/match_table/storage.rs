@@ -354,11 +354,20 @@ impl Clone for MatchTable {
 }
 
 /// Hash-log for a dictionary-match-state table: `ceil_log2(region)` (a table
-/// sized to the dict region), with a 10-bit minimum bounded above by the
+/// sized to the dict region), with a 10-bit minimum but never wider than the
 /// matcher's own `hash_log` (the dms table need not exceed the live table).
+///
+/// A tiny source makes `ZSTD_adjustCParams` legitimately shrink the matcher's
+/// `hash_log` below 10 (a BT strategy, level >= 13, with a dictionary). The
+/// minimum is therefore `min(10, hash_log)`, not a fixed 10: when `hash_log`
+/// is already below 10 the 10-bit floor would invert the clamp bounds
+/// (`min > max`) and panic. Collapsing the floor to `hash_log` keeps the clamp
+/// valid and sizes the dms table to the (small) live-table width — matching
+/// what upstream's dict cParams `hashLog` yields for the same small dictionary.
 pub(crate) fn dms_hash_log(region: usize, hash_log: usize) -> usize {
     debug_assert!(region >= 1, "dms_hash_log called with empty region");
-    (usize::BITS - (region - 1).leading_zeros()).clamp(10, hash_log as u32) as usize
+    let hash_log = hash_log as u32;
+    (usize::BITS - (region - 1).leading_zeros()).clamp(10.min(hash_log), hash_log) as usize
 }
 
 /// Shared scaffold for the two `prime_dms_*` dictionary-match-state builders.
