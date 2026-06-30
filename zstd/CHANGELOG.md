@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.48](https://github.com/structured-world/structured-zstd/compare/v0.0.47...v0.0.48) - 2026-06-30
+
+### Fixed
+
+- *(encoding)* bound the dms-table hash-log floor by the matcher hash_log ([#459](https://github.com/structured-world/structured-zstd/pull/459))
+
 ## [0.0.47](https://github.com/structured-world/structured-zstd/compare/v0.0.46...v0.0.47) - 2026-06-30
 
 ### Performance
