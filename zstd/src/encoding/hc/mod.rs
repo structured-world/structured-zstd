@@ -547,6 +547,19 @@ impl HcMatcher {
         // Hoist the dms chain-table base pointer (same Vec-header-reload removal
         // as the live walk above).
         let dms_chain_ptr: *const u32 = dms.chain_table.as_ptr();
+        // Reachability floor, hoisted out of the loop. A dict position is
+        // decoder-reachable iff its offset (`current_idx - dict_idx`) does not
+        // exceed `max_window_size`, i.e. `dict_idx >= current_idx -
+        // max_window_size`. Comparing `dict_idx` against this precomputed floor
+        // drops the per-iteration `current_idx - dict_idx` subtract from the hot
+        // path (the offset is only needed when a candidate WINS, which is rare on
+        // the walk) and frees the `max_window_size` register inside the loop.
+        // `saturating_sub` is the intended business logic, not an overflow guard:
+        // when `current_idx <= max_window_size` the whole live history fits the
+        // window, so every dict position is reachable and the floor is 0. Mirrors
+        // C's `ZSTD_HcFindBestMatch` dms loop, which bounds reachability by chain
+        // construction rather than re-checking each candidate.
+        let dict_reachable_floor = current_idx.saturating_sub(table.max_window_size);
         while steps < dms_budget {
             if dcur == 0 {
                 break;
@@ -558,9 +571,8 @@ impl HcMatcher {
             // SAFETY: `dict_idx` is a stored dict position `< chain_table.len()`.
             let dnext = unsafe { *dms_chain_ptr.add(dict_idx) };
             steps += 1;
-            let new_offset = current_idx - dict_idx;
             // Out-of-window dict positions are unreachable to the decoder.
-            if new_offset <= table.max_window_size {
+            if dict_idx >= dict_reachable_floor {
                 // Same self-tightening gate as the live walk; the caller's guard
                 // (`current_idx + ml < history_tail`) + the iLimit break keep
                 // `current_idx + (ml - 3) + 4 <= history_tail`, and

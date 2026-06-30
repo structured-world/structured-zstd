@@ -1434,6 +1434,60 @@ impl FrameDecoder {
         Ok(())
     }
 
+    /// Slice-direct equivalent of [`reset_with_dict_handle`](Self::reset_with_dict_handle)
+    /// for the in-memory decode path: parses the frame header straight out of
+    /// `*input` via [`frame::read_frame_header_from_slice`] (no `Read`-trait
+    /// `read_exact` per field) and applies it through the shared parsed-header
+    /// path, then attaches `dict`. Behaviour — dictionary-id mismatch, pinned
+    /// expectations, scratch init — is identical to `reset_with_dict_handle`;
+    /// only the header read avoids the `io::impls` dispatch.
+    pub(crate) fn reset_from_slice_with_dict_handle(
+        &mut self,
+        input: &mut &[u8],
+        dict: &DictionaryHandle,
+    ) -> Result<(), FrameDecoderError> {
+        use FrameDecoderError as err;
+        #[cfg(all(feature = "lsm", feature = "hash"))]
+        self.computed_block_checksums.clear();
+        Self::validate_registered_dictionary(dict.as_dict())?;
+        let magicless = self.magicless;
+        let (frame_header, header_size) = frame::read_frame_header_from_slice(input, magicless)?;
+        match &mut self.state {
+            Some(s) => s.reset_with_parsed_header(frame_header, header_size)?,
+            None => {
+                self.state = Some(FrameDecoderState::new_with_parsed_header(
+                    frame_header,
+                    header_size,
+                )?);
+            }
+        }
+        #[cfg(feature = "lsm")]
+        {
+            let header = &self
+                .state
+                .as_ref()
+                .expect("state populated by reset_with_parsed_header/new_with_parsed_header")
+                .frame_header;
+            self.validate_expectations(header)?;
+        }
+        let state = self
+            .state
+            .as_mut()
+            .expect("state populated by reset_with_parsed_header/new_with_parsed_header");
+        if let Some(dict_id) = state.frame_header.dictionary_id()
+            && dict_id != dict.id()
+        {
+            return Err(err::DictIdMismatch {
+                expected: dict_id,
+                provided: dict.id(),
+            });
+        }
+        state.decoder_scratch.init_from_dict(dict);
+        state.set_active_dict(dict);
+        state.using_dict = Some(dict.id());
+        Ok(())
+    }
+
     /// Add a dictionary that can be selected dynamically by frame dictionary ID.
     ///
     /// Returns [`FrameDecoderError::DictAlreadyRegistered`] if the ID is already
@@ -2452,7 +2506,7 @@ impl FrameDecoder {
         #[cfg(not(feature = "lsm"))]
         {
             self.decode_all_impl(input, output, |this, src| {
-                this.init_with_dict_handle(src, dict)
+                this.reset_from_slice_with_dict_handle(src, dict)
             })
         }
         #[cfg(feature = "lsm")]
@@ -2460,7 +2514,7 @@ impl FrameDecoder {
             self.decode_all_impl(
                 input,
                 output,
-                |this, src| this.init_with_dict_handle(src, dict),
+                |this, src| this.reset_from_slice_with_dict_handle(src, dict),
                 None,
             )
         }
