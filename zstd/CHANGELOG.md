@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.47](https://github.com/structured-world/structured-zstd/compare/v0.0.46...v0.0.47) - 2026-06-30
+
+### Performance
+
+- *(codec)* dict-band hot-path — slice header parse, dms-walk floor, SIMD prefix leading word ([#458](https://github.com/structured-world/structured-zstd/pull/458))
+- *(decode)* cut per-frame fixed overhead on the in-memory path ([#456](https://github.com/structured-world/structured-zstd/pull/456))
+
 ## [0.0.46](https://github.com/structured-world/structured-zstd/compare/v0.0.45...v0.0.46) - 2026-06-29
 
 ### Performance
