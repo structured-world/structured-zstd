@@ -157,7 +157,7 @@ macro_rules! start_matching_btlazy2_body {
                 // SAFETY: called inside the wrapper's `#[target_feature]`
                 // umbrella (the scalar wrapper's `$collect` is a safe fn).
                 unsafe {
-                    $self.$collect::<crate::encoding::strategy::Btlazy2, true>(
+                    $self.$collect::<crate::encoding::strategy::Btlazy2>(
                         sel_abs,
                         current_abs_end,
                         profile,
@@ -419,7 +419,7 @@ macro_rules! build_optimal_plan_impl_body {
             // `$collect` kernel variant; the runtime kernel detector already
             // gated entry into the wrapper.
             unsafe {
-                $self.$collect::<$strategy_ty, true>(
+                $self.$collect::<$strategy_ty>(
                     $current_abs_start,
                     current_abs_end,
                     profile,
@@ -776,7 +776,7 @@ macro_rules! build_optimal_plan_impl_body {
             // stay live across the call; the post-call reads below are a
             // separate, fresh load of the same stable `nodes[pos]`.
             unsafe {
-                $self.$collect::<$strategy_ty, true>(
+                $self.$collect::<$strategy_ty>(
                     abs_pos,
                     current_abs_end,
                     profile,
@@ -1107,11 +1107,7 @@ macro_rules! collect_optimal_candidates_initialized_body {
         $profile:ident,
         $query:ident,
         $out:ident,
-        $bt_matchfinder:ident,
         $bt_insert_step:ident,
-        $bt_insert:ident,
-        $for_each_rep:ident,
-        $hash3:ident,
         $cpl:path,
         $cmf:path $(,)?
     ) => {{
@@ -2015,7 +2011,7 @@ impl HcMatchGenerator {
         // allowed.
         match self.strategy_tag {
             StrategyTag::BtUltra2 => self
-                .collect_optimal_candidates_initialized::<strategy::BtUltra2, true>(
+                .collect_optimal_candidates_initialized::<strategy::BtUltra2>(
                     abs_pos,
                     current_abs_end,
                     profile,
@@ -2023,7 +2019,7 @@ impl HcMatchGenerator {
                     out,
                 ),
             StrategyTag::BtUltra => self
-                .collect_optimal_candidates_initialized::<strategy::BtUltra, true>(
+                .collect_optimal_candidates_initialized::<strategy::BtUltra>(
                     abs_pos,
                     current_abs_end,
                     profile,
@@ -2031,23 +2027,22 @@ impl HcMatchGenerator {
                     out,
                 ),
             StrategyTag::Btlazy2 => self
-                .collect_optimal_candidates_initialized::<strategy::Btlazy2, true>(
+                .collect_optimal_candidates_initialized::<strategy::Btlazy2>(
                     abs_pos,
                     current_abs_end,
                     profile,
                     query,
                     out,
                 ),
-            StrategyTag::BtOpt => self
-                .collect_optimal_candidates_initialized::<strategy::BtOpt, true>(
-                    abs_pos,
-                    current_abs_end,
-                    profile,
-                    query,
-                    out,
-                ),
+            StrategyTag::BtOpt => self.collect_optimal_candidates_initialized::<strategy::BtOpt>(
+                abs_pos,
+                current_abs_end,
+                profile,
+                query,
+                out,
+            ),
             StrategyTag::Fast | StrategyTag::Dfast | StrategyTag::Greedy | StrategyTag::Lazy => {
-                self.collect_optimal_candidates_initialized::<strategy::Lazy, false>(
+                self.collect_optimal_candidates_initialized::<strategy::Lazy>(
                     abs_pos,
                     current_abs_end,
                     profile,
@@ -2069,10 +2064,7 @@ impl HcMatchGenerator {
     /// future caller that isn't already inside a kernel umbrella.
     #[allow(dead_code)]
     #[inline(always)]
-    pub(crate) fn collect_optimal_candidates_initialized<
-        S: crate::encoding::strategy::Strategy,
-        const USE_BT_MATCHFINDER: bool,
-    >(
+    pub(crate) fn collect_optimal_candidates_initialized<S: crate::encoding::strategy::Strategy>(
         &mut self,
         abs_pos: usize,
         current_abs_end: usize,
@@ -2082,7 +2074,7 @@ impl HcMatchGenerator {
     ) {
         #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
         unsafe {
-            self.collect_optimal_candidates_initialized_neon::<S, USE_BT_MATCHFINDER>(
+            self.collect_optimal_candidates_initialized_neon::<S>(
                 abs_pos,
                 current_abs_end,
                 profile,
@@ -2095,7 +2087,7 @@ impl HcMatchGenerator {
             use crate::encoding::fastpath::FastpathKernel;
             match self.table.kernel {
                 FastpathKernel::Avx2Bmi2 => unsafe {
-                    self.collect_optimal_candidates_initialized_avx2_bmi2::<S, USE_BT_MATCHFINDER>(
+                    self.collect_optimal_candidates_initialized_avx2_bmi2::<S>(
                         abs_pos,
                         current_abs_end,
                         profile,
@@ -2104,7 +2096,7 @@ impl HcMatchGenerator {
                     )
                 },
                 FastpathKernel::Sse42 => unsafe {
-                    self.collect_optimal_candidates_initialized_sse42::<S, USE_BT_MATCHFINDER>(
+                    self.collect_optimal_candidates_initialized_sse42::<S>(
                         abs_pos,
                         current_abs_end,
                         profile,
@@ -2112,14 +2104,13 @@ impl HcMatchGenerator {
                         out,
                     )
                 },
-                FastpathKernel::Scalar => self
-                    .collect_optimal_candidates_initialized_scalar::<S, USE_BT_MATCHFINDER>(
-                        abs_pos,
-                        current_abs_end,
-                        profile,
-                        query,
-                        out,
-                    ),
+                FastpathKernel::Scalar => self.collect_optimal_candidates_initialized_scalar::<S>(
+                    abs_pos,
+                    current_abs_end,
+                    profile,
+                    query,
+                    out,
+                ),
             }
         }
         #[cfg(not(any(
@@ -2128,7 +2119,7 @@ impl HcMatchGenerator {
             target_arch = "x86_64"
         )))]
         {
-            self.collect_optimal_candidates_initialized_scalar::<S, USE_BT_MATCHFINDER>(
+            self.collect_optimal_candidates_initialized_scalar::<S>(
                 abs_pos,
                 current_abs_end,
                 profile,
@@ -2147,7 +2138,6 @@ impl HcMatchGenerator {
     #[target_feature(enable = "neon")]
     unsafe fn collect_optimal_candidates_initialized_neon<
         S: crate::encoding::strategy::Strategy,
-        const USE_BT_MATCHFINDER: bool,
     >(
         &mut self,
         abs_pos: usize,
@@ -2164,11 +2154,7 @@ impl HcMatchGenerator {
             profile,
             query,
             out,
-            USE_BT_MATCHFINDER,
             bt_insert_step_no_rebase_neon,
-            bt_insert_and_collect_matches_neon,
-            for_each_repcode_candidate_with_reps_neon,
-            hash3_candidate_neon,
             crate::encoding::fastpath::neon::common_prefix_len_ptr,
             crate::encoding::fastpath::neon::count_match_from_indices,
         )
@@ -2178,7 +2164,6 @@ impl HcMatchGenerator {
     #[target_feature(enable = "sse4.2")]
     unsafe fn collect_optimal_candidates_initialized_sse42<
         S: crate::encoding::strategy::Strategy,
-        const USE_BT_MATCHFINDER: bool,
     >(
         &mut self,
         abs_pos: usize,
@@ -2195,11 +2180,7 @@ impl HcMatchGenerator {
             profile,
             query,
             out,
-            USE_BT_MATCHFINDER,
             bt_insert_step_no_rebase_sse42,
-            bt_insert_and_collect_matches_sse42,
-            for_each_repcode_candidate_with_reps_sse42,
-            hash3_candidate_sse42,
             crate::encoding::fastpath::sse42::common_prefix_len_ptr,
             crate::encoding::fastpath::sse42::count_match_from_indices,
         )
@@ -2209,7 +2190,6 @@ impl HcMatchGenerator {
     #[target_feature(enable = "avx2,bmi2")]
     unsafe fn collect_optimal_candidates_initialized_avx2_bmi2<
         S: crate::encoding::strategy::Strategy,
-        const USE_BT_MATCHFINDER: bool,
     >(
         &mut self,
         abs_pos: usize,
@@ -2226,11 +2206,7 @@ impl HcMatchGenerator {
             profile,
             query,
             out,
-            USE_BT_MATCHFINDER,
             bt_insert_step_no_rebase_avx2_bmi2,
-            bt_insert_and_collect_matches_avx2_bmi2,
-            for_each_repcode_candidate_with_reps_avx2_bmi2,
-            hash3_candidate_avx2_bmi2,
             crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr,
             crate::encoding::fastpath::avx2_bmi2::count_match_from_indices,
         )
@@ -2242,7 +2218,6 @@ impl HcMatchGenerator {
     #[allow(unused_unsafe)]
     pub(crate) fn collect_optimal_candidates_initialized_scalar<
         S: crate::encoding::strategy::Strategy,
-        const USE_BT_MATCHFINDER: bool,
     >(
         &mut self,
         abs_pos: usize,
@@ -2259,11 +2234,7 @@ impl HcMatchGenerator {
             profile,
             query,
             out,
-            USE_BT_MATCHFINDER,
             bt_insert_step_no_rebase_scalar,
-            bt_insert_and_collect_matches_scalar,
-            for_each_repcode_candidate_with_reps_scalar,
-            hash3_candidate_scalar,
             crate::encoding::fastpath::scalar::common_prefix_len_ptr,
             crate::encoding::fastpath::scalar::count_match_from_indices,
         )
