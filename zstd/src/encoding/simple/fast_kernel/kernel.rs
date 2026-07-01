@@ -1102,7 +1102,11 @@ pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
     );
     debug_assert_eq!(MLS, main_table.mls());
     debug_assert_eq!(MLS, dict_table.mls());
-    debug_assert_eq!(main_table.hash_log(), dict_table.hash_log());
+    // Main and dict tables carry INDEPENDENT hash_logs: the dict table is sized
+    // to the CDict geometry (upstream `ZSTD_cpm_createCDict`: dict-and-window
+    // log off a `minSrcSize` source), which for a small dictionary is narrower
+    // than the source-window-sized main table. `dict_lookup` hashes with the
+    // dict table's own `dict_hash_log` (read below), so they need not match.
 
     let prefix_start_index = bounds.prefix_start_index;
     let window_low = bounds.window_low as usize;

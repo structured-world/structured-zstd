@@ -1772,8 +1772,25 @@ impl FastKernelMatcher {
         if fill_start > last_hashable {
             return;
         }
-        let hash_log = self.hash_table.hash_log();
+        // Size the dict table to the CDict geometry (upstream
+        // `ZSTD_cpm_createCDict`: `ZSTD_adjustCParams_internal` drives hashLog
+        // down to the dict-and-window log off a `minSrcSize` source), NOT the
+        // source-window-sized main table. For a small dictionary this is a
+        // narrower table, and the Fast dictMatchState hashes `ip` with
+        // `dictCParams->hashLog` — so the occurrence a hash bucket resolves to
+        // matches upstream's, which the wider main-table geometry does not.
+        // `create_cdict_table_logs` only ever downsizes, so feeding the already
+        // source-capped main `hash_log` as the base yields the same result as
+        // the un-capped level base would.
+        let main_hash_log = self.hash_table.hash_log();
         let mls = self.hash_table.mls();
+        let (hash_log, _) = crate::encoding::cparams::create_cdict_table_logs(
+            main_hash_log as u8,
+            main_hash_log,
+            main_hash_log,
+            /* uses_bt */ false,
+            history_len,
+        );
         self.dict
             .table_mut_or_init(|| FastHashTable::new(hash_log, mls));
         let base = self.history.as_ptr();
@@ -1804,17 +1821,17 @@ impl FastKernelMatcher {
             .dict
             .table_mut()
             .expect("prime_dict_table_for_range creates the table before this call");
-        // Every-position last-wins fill. For repetitive dictionary content one
-        // hash maps to many candidate positions, and the kernel emits the match
-        // offset as `ip - position`. Walking every position in increasing order
-        // with last-wins keeps the HIGHEST (nearest-to-the-input) occurrence per
-        // hash, so the emitted offset is the smallest reachable — and small
-        // offsets cost far fewer bits in the offset-code FSE stream than far
-        // ones. A strided fill (stride-overwrite plus in-between fill-if-empty)
-        // instead keeps whichever occurrence the stride alignment happened to
-        // land on; for variable-length records that is frequently a far one,
-        // inflating the offset and erasing the dictionary's ratio benefit (the
-        // dict frame ends up larger than the no-dict frame).
+        // Upstream `ZSTD_fillHashTableForCDict` (zstd_fast.c:16-49) fill policy,
+        // replicated exactly: step by `fastHashFillStep = 3`. The step position
+        // (`s`, `s+3`, ...) OVERWRITES its slot unconditionally; the two
+        // intermediate positions (`s+1`, `s+2`) fill ONLY an empty slot. So a
+        // bucket ends up holding the LAST step position that hashed to it, else
+        // the FIRST intermediate one — the exact occurrence set C's
+        // dictMatchState searches. A full every-position last-wins fill keeps a
+        // different (nearer) occurrence per bucket and diverges from C's match
+        // selection, which fragments C's long dict matches into several short
+        // ones and inflates the offset stream (measured: small-4k-log-lines
+        // level_-2 dict frame 58 B vs C's 44 B under last-wins).
         //
         // Each slot stores `(position << DICT_TAG_BITS) | tag` (upstream zstd
         // `ZSTD_SHORT_CACHE`): the slot index is the plain `dict_hash_log` hash,
@@ -1845,16 +1862,43 @@ impl FastKernelMatcher {
              (last_hashable={last_hashable}, max={})",
             (1usize << (32 - DICT_TAG_BITS)) - 1,
         );
-        for pos in range_start..=last_hashable {
-            // SAFETY: pos <= last_hashable = history_len - 8, so `base.add(pos)`
-            // covers >= 8 readable bytes; MLS matches the table's mls.
-            let hat = unsafe { hash_ptr_raw::<MLS>(base.add(pos), dict_hash_log + DICT_TAG_BITS) };
+        // `fastHashFillStep` from upstream. The step loop is aligned to
+        // `range_start` (our fill origin = `next_to_update`), mirroring C's
+        // `ip = base + nextToUpdate` start, and stops where C does
+        // (`s + step < iend + 2`, `iend == last_hashable`) so the final partial
+        // group's out-of-bounds step is skipped exactly as upstream.
+        const FILL_STEP: usize = 3;
+        let mut s = range_start;
+        while s + FILL_STEP < last_hashable + 2 {
+            // Step position: unconditional overwrite (last-wins among steps).
+            // SAFETY: s <= last_hashable = history_len - 8, so `base.add(s)`
+            // covers >= 8 readable bytes; MLS matches the table's mls. The slot
+            // `hat >> DICT_TAG_BITS < 1 << dict_hash_log` = table len.
+            let hat = unsafe { hash_ptr_raw::<MLS>(base.add(s), dict_hash_log + DICT_TAG_BITS) };
             unsafe {
                 dict_table.put(
                     hat >> DICT_TAG_BITS,
-                    ((pos as u32) << DICT_TAG_BITS) | (hat & DICT_TAG_MASK),
+                    ((s as u32) << DICT_TAG_BITS) | (hat & DICT_TAG_MASK),
                 )
             };
+            // Intermediate positions: fill an empty slot only (first-wins).
+            for p in 1..FILL_STEP {
+                let pos = s + p;
+                // SAFETY: pos <= s + 2 <= last_hashable (loop bound), so
+                // `base.add(pos)` covers >= 8 bytes; slot < table len as above.
+                let hat =
+                    unsafe { hash_ptr_raw::<MLS>(base.add(pos), dict_hash_log + DICT_TAG_BITS) };
+                let slot = hat >> DICT_TAG_BITS;
+                if unsafe { dict_table.get(slot) } == 0 {
+                    unsafe {
+                        dict_table.put(
+                            slot,
+                            ((pos as u32) << DICT_TAG_BITS) | (hat & DICT_TAG_MASK),
+                        )
+                    };
+                }
+            }
+            s += FILL_STEP;
         }
         // Every position up to `last_hashable` is hashed; the next `accept_data`
         // slice resumes one past it, picking up the seam positions whose 8-byte
