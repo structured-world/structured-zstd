@@ -22,41 +22,6 @@ fn table_with_history(buf: &[u8]) -> MatchTable {
 }
 
 #[test]
-fn chain_candidates_returns_sentinels_when_suffix_too_short() {
-    let hc = HcMatcher::new(2, 4, 32);
-    // History exactly at min-prefix - 1 → idx + 4 > concat.len() →
-    // early return with all-sentinel buffer.
-    let t = table_with_history(b"abc");
-    let buf = hc.chain_candidates(&t, 0);
-    assert!(buf.iter().all(|&v| v == usize::MAX));
-}
-
-#[test]
-fn chain_candidates_terminates_on_self_loop_with_in_range_pick() {
-    // Construct a self-loop in the chain: hash_table → cur,
-    // chain_table[cur_rel] = cur (points back to itself). The walker
-    // must pick the position (in-range) and stop.
-    let mut hc = HcMatcher::new(2, 4, 32);
-    hc.search_depth = 4;
-    let mut t = table_with_history(b"abcdef_abcdef_abcdef");
-    let abs_pos = 10usize;
-    // The walker hashes the suffix at `abs_pos`, not the prefix at 0.
-    let concat = t.live_history();
-    let hash = t.hash_position(&concat[abs_pos..]);
-    // Stored = relative + 1 → stored=6 means candidate_rel=5.
-    t.hash_table[hash] = 6;
-    let chain_mask = (1 << t.chain_log) - 1;
-    t.chain_table[5 & chain_mask] = 6; // self-loop
-
-    let buf = hc.chain_candidates(&t, abs_pos);
-    assert_eq!(
-        buf[0], 5,
-        "self-loop pick must surface the in-range candidate"
-    );
-    assert_eq!(buf[1], usize::MAX, "walker must stop after self-loop");
-}
-
-#[test]
 fn repcode_candidate_returns_none_when_suffix_too_short() {
     let mut t = table_with_history(b"abc");
     t.offset_hist = [1, 2, 3];

@@ -1276,6 +1276,9 @@ fn hc_repcode_candidates_respect_litlen_dependent_rep_order() {
 #[test]
 fn hc_collect_optimal_candidates_keeps_reps_when_chain_depth_zero() {
     let mut hc = HcMatchGenerator::new(64);
+    // Optimal candidate collection is binary-tree only; tag the generator as a
+    // BT strategy (BtOpt shares Lazy's OPT_LEVEL=0 / USE_HASH3=false consts).
+    hc.strategy_tag = crate::encoding::strategy::StrategyTag::BtOpt;
     hc.hc.search_depth = 0;
     hc.table.history = b"xyzxyzxyzxyz".to_vec();
     hc.table.history_start = 0;
@@ -1312,8 +1315,102 @@ fn hc_collect_optimal_candidates_keeps_reps_when_chain_depth_zero() {
 }
 
 #[test]
+#[should_panic(expected = "binary-tree only")]
+fn hc_collect_optimal_candidates_panics_for_non_bt_strategy() {
+    // Optimal candidate collection is binary-tree only. A non-BT strategy tag
+    // (Lazy here) reaching the public dispatcher is a caller bug — it must panic
+    // rather than walk the HC chain_table as BT pair slots.
+    let mut hc = HcMatchGenerator::new(64);
+    hc.strategy_tag = crate::encoding::strategy::StrategyTag::Lazy;
+    hc.table.history = b"abcabcabcabc".to_vec();
+    hc.table.history_start = 0;
+    hc.table.history_abs_start = 0;
+    hc.table.ensure_tables();
+    let profile = HcOptimalCostProfile {
+        max_chain_depth: 0,
+        sufficient_match_len: usize::MAX / 2,
+        accurate: false,
+        favor_small_offsets: false,
+    };
+    let mut out = Vec::new();
+    hc.collect_optimal_candidates(
+        6,
+        hc.table.history.len(),
+        profile,
+        HcCandidateQuery {
+            reps: [1, 2, 3],
+            lit_len: 1,
+            ldm_candidate: None,
+        },
+        &mut out,
+    );
+}
+
+#[test]
+fn hc_collect_optimal_candidates_dispatches_every_bt_strategy() {
+    use crate::encoding::fastpath::FastpathKernel;
+    use crate::encoding::strategy::StrategyTag;
+    // The public dispatcher must route every BT strategy tag to the collector
+    // AND to the specialization carrying that tag's consts — not just survive.
+    // The observable dimension is `USE_HASH3` (BtUltra / BtUltra2 = true; BtOpt /
+    // Btlazy2 = false): only the hash3 specializations surface a 3-byte match
+    // that the 4-byte BT hash cannot find. (BtOpt vs Btlazy2 share identical
+    // collect consts, so they are indistinguishable at runtime — the type
+    // mapping there is compiler-enforced.) Fixture: `abc` repeats at 0 and 12
+    // with a differing 4th byte (`Q` vs `Z`), so hash3 finds a length-3 match at
+    // offset 12 while the 4-byte hash of `abcZ` misses `abcQ`. Run under the
+    // scalar kernel so the scalar dispatch arm is exercised too.
+    for tag in [
+        StrategyTag::BtOpt,
+        StrategyTag::BtUltra,
+        StrategyTag::BtUltra2,
+        StrategyTag::Btlazy2,
+    ] {
+        let mut hc = HcMatchGenerator::new(64);
+        hc.strategy_tag = tag;
+        hc.table.kernel = FastpathKernel::Scalar;
+        hc.table.history = b"abcQ00000000abcZ00000000".to_vec();
+        hc.table.history_start = 0;
+        hc.table.history_abs_start = 0;
+        hc.table.hash_log = 8;
+        hc.table.chain_log = 8;
+        hc.table.hash3_log = 8;
+        hc.table.ensure_tables();
+        let abs_pos = 12usize;
+        let profile = HcOptimalCostProfile {
+            max_chain_depth: 8,
+            sufficient_match_len: usize::MAX / 2,
+            accurate: false,
+            favor_small_offsets: false,
+        };
+        let mut out = Vec::new();
+        hc.collect_optimal_candidates(
+            abs_pos,
+            hc.table.history.len(),
+            profile,
+            HcCandidateQuery {
+                // Reps past abs_pos are skipped, so the only candidate source is
+                // the (hash3 / BT) match finder — keeping the observable clean.
+                reps: [50, 60, 70],
+                lit_len: 1,
+                ldm_candidate: None,
+            },
+            &mut out,
+        );
+        let uses_hash3 = matches!(tag, StrategyTag::BtUltra | StrategyTag::BtUltra2);
+        let found_hash3_match = out.iter().any(|c| c.offset == 12 && c.match_len == 3);
+        assert_eq!(
+            found_hash3_match, uses_hash3,
+            "tag {tag:?}: presence of the hash3-only 3-byte match must equal USE_HASH3 \
+             (a cross-group dispatch mis-mapping would flip this)"
+        );
+    }
+}
+
+#[test]
 fn hc_collect_optimal_candidates_rep_tail_match_skips_chain_probe() {
     let mut hc = HcMatchGenerator::new(64);
+    hc.strategy_tag = crate::encoding::strategy::StrategyTag::BtOpt;
     hc.table.history = b"aaaaaaaaaa".to_vec();
     hc.table.history_start = 0;
     hc.table.history_abs_start = 0;
@@ -1352,6 +1449,7 @@ fn hc_collect_optimal_candidates_rep_tail_match_skips_chain_probe() {
 #[test]
 fn hc_collect_optimal_candidates_long_chain_match_advances_skip_window() {
     let mut hc = HcMatchGenerator::new(128);
+    hc.strategy_tag = crate::encoding::strategy::StrategyTag::BtOpt;
     hc.table.history = b"abcabcabcabcabcabcabcabc".to_vec();
     hc.table.history_start = 0;
     hc.table.history_abs_start = 0;
@@ -1388,55 +1486,9 @@ fn hc_collect_optimal_candidates_long_chain_match_advances_skip_window() {
 }
 
 #[test]
-fn hc_collect_optimal_candidates_chain_fast_skip_uses_match_end_minus_8() {
-    let mut hc = HcMatchGenerator::new(128);
-    hc.table.history = b"abcabcabcabcabcabcabcabc".to_vec();
-    hc.table.history_start = 0;
-    hc.table.history_abs_start = 0;
-    hc.table.position_base = 0;
-    hc.hc.search_depth = 32;
-    let abs_pos = 9usize;
-    hc.table.ensure_tables();
-    hc.table.insert_positions(0, abs_pos);
-    hc.table.skip_insert_until_abs = 0;
-
-    let profile = HcOptimalCostProfile {
-        max_chain_depth: 32,
-        sufficient_match_len: 10,
-        accurate: true,
-        favor_small_offsets: false,
-    };
-    let mut out = Vec::new();
-    hc.collect_optimal_candidates(
-        abs_pos,
-        hc.table.history.len(),
-        profile,
-        HcCandidateQuery {
-            reps: [1, 4, 8],
-            lit_len: 1,
-            ldm_candidate: None,
-        },
-        &mut out,
-    );
-
-    let best_match_end = out
-        .iter()
-        .map(|candidate| candidate.start.saturating_add(candidate.match_len))
-        .max()
-        .expect("expected at least one candidate");
-    assert!(
-        hc.table.skip_insert_until_abs > abs_pos,
-        "chain fast-skip must advance past current position"
-    );
-    assert!(
-        hc.table.skip_insert_until_abs <= best_match_end.saturating_sub(8),
-        "chain fast-skip must not exceed upstream zstd-style matchEndIdx - 8 bound"
-    );
-}
-
-#[test]
 fn hc_collect_optimal_candidates_advances_skip_window_on_plain_bt_path() {
     let mut hc = HcMatchGenerator::new(256);
+    hc.strategy_tag = crate::encoding::strategy::StrategyTag::BtOpt;
     hc.table.history = b"abcdefghijklmnop".to_vec();
     hc.table.history_start = 0;
     hc.table.history_abs_start = 0;
@@ -1488,6 +1540,7 @@ fn hc_collect_optimal_candidates_advances_skip_window_on_plain_bt_path() {
 #[test]
 fn hc_ldm_candidates_are_merged_into_optimal_candidates() {
     let mut hc = HcMatchGenerator::new(512);
+    hc.strategy_tag = crate::encoding::strategy::StrategyTag::BtOpt;
     hc.table.history = (0..256).map(|i| (i % 251) as u8).collect();
     hc.table.history_start = 0;
     hc.table.history_abs_start = 0;
@@ -3231,18 +3284,6 @@ fn row_candidate_returns_none_when_abs_pos_near_end_of_history() {
 }
 
 #[test]
-fn hc_chain_candidates_returns_sentinels_for_short_suffix() {
-    let mut hc = HcMatchGenerator::new(32);
-    hc.table.history = b"abc".to_vec();
-    hc.table.history_start = 0;
-    hc.table.history_abs_start = 0;
-    hc.table.ensure_tables();
-
-    let candidates = hc.hc.chain_candidates(&hc.table, 0);
-    assert!(candidates.iter().all(|&pos| pos == usize::MAX));
-}
-
-#[test]
 fn hc_reset_advances_floor_past_prior_frame_entries() {
     use super::super::match_table::storage::MatchTable;
     let mut hc = HcMatchGenerator::new(32);
@@ -3786,14 +3827,6 @@ fn hc_rebases_positions_after_u32_boundary() {
             .iter()
             .any(|entry| *entry != HC_EMPTY),
         "HC hash table should still be populated after crossing u32 boundary"
-    );
-
-    // Verify rebasing preserves candidate lookup, not just table population.
-    let abs_pos = matcher.table.history_abs_start + 10;
-    let candidates = matcher.hc.chain_candidates(&matcher.table, abs_pos);
-    assert!(
-        candidates.iter().any(|candidate| *candidate != usize::MAX),
-        "chain_candidates should return valid matches after rebase"
     );
 }
 

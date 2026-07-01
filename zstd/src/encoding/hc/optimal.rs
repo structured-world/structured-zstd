@@ -157,7 +157,7 @@ macro_rules! start_matching_btlazy2_body {
                 // SAFETY: called inside the wrapper's `#[target_feature]`
                 // umbrella (the scalar wrapper's `$collect` is a safe fn).
                 unsafe {
-                    $self.$collect::<crate::encoding::strategy::Btlazy2, true>(
+                    $self.$collect::<crate::encoding::strategy::Btlazy2>(
                         sel_abs,
                         current_abs_end,
                         profile,
@@ -419,7 +419,7 @@ macro_rules! build_optimal_plan_impl_body {
             // `$collect` kernel variant; the runtime kernel detector already
             // gated entry into the wrapper.
             unsafe {
-                $self.$collect::<$strategy_ty, true>(
+                $self.$collect::<$strategy_ty>(
                     $current_abs_start,
                     current_abs_end,
                     profile,
@@ -776,7 +776,7 @@ macro_rules! build_optimal_plan_impl_body {
             // stay live across the call; the post-call reads below are a
             // separate, fresh load of the same stable `nodes[pos]`.
             unsafe {
-                $self.$collect::<$strategy_ty, true>(
+                $self.$collect::<$strategy_ty>(
                     abs_pos,
                     current_abs_end,
                     profile,
@@ -1107,11 +1107,7 @@ macro_rules! collect_optimal_candidates_initialized_body {
         $profile:ident,
         $query:ident,
         $out:ident,
-        $bt_matchfinder:ident,
         $bt_insert_step:ident,
-        $bt_insert:ident,
-        $for_each_rep:ident,
-        $hash3:ident,
         $cpl:path,
         $cmf:path $(,)?
     ) => {{
@@ -1148,7 +1144,7 @@ macro_rules! collect_optimal_candidates_initialized_body {
             }
             return;
         }
-        if $bt_matchfinder {
+        {
             // BT tree catch-up folded inline (was a per-position call to
             // bt_update_tree_until): insert the positions the parser skipped into
             // the binary tree before this position's search. Upstream zstd
@@ -1191,17 +1187,12 @@ macro_rules! collect_optimal_candidates_initialized_body {
             return;
         }
         let mut best_len_for_skip = 0usize;
-        if $bt_matchfinder {
-            // BT path: the rep-code probe and the hash3 short-match probe are
-            // folded INTO bt_insert_and_collect (one out-of-line per-position
-            // match-finder, upstream ZSTD_btGetAllMatches shape). They seed
-            // `best_len_for_skip` and handle the sufficient-match early-out
-            // internally, byte-identically to the prior orchestration.
-            // SAFETY: same umbrella for bt_insert_and_collect_matches.
-            // Inline the BT find monolith here instead of an out-of-line call.
-            // Upstream's ZSTD_insertBtAndGetAllMatches is FORCE_INLINE_TEMPLATE
-            // inlined into the opt loop, so the per-position match-finder is one
-            // body with no call-boundary marshalling (profile / reps / ...).
+        {
+            // Per-position match-finder: the rep-code probe, the hash3
+            // short-match probe and the binary-tree walk folded into one body
+            // (upstream ZSTD_insertBtAndGetAllMatches, FORCE_INLINE_TEMPLATE into
+            // the opt loop). Seeds `best_len_for_skip` and handles the
+            // sufficient-match early-out internally.
             let bt_search_depth = $self.table.search_depth;
             let best_len_ref = &mut best_len_for_skip;
             crate::encoding::hc::generator::bt_insert_and_collect_matches_body!(
@@ -1219,131 +1210,6 @@ macro_rules! collect_optimal_candidates_initialized_body {
                 $cpl,
                 $cmf,
             );
-        } else {
-            // HC-chain optimal fallback (no BT tree): the rep + hash3 probes
-            // stay inline here, ahead of the chain walk.
-            let mut skip_further_match_search = false;
-            let mut rep_len_candidate_found = false;
-            // SAFETY: same umbrella; closure capture is monomorphized per call.
-            unsafe {
-                $self.hc.$for_each_rep(
-                    &$self.table,
-                    $abs_pos,
-                    lit_len,
-                    reps,
-                    $current_abs_end,
-                    min_match_len,
-                    |rep| {
-                        if rep.match_len >= min_match_len {
-                            rep_len_candidate_found = true;
-                        }
-                        let _ = crate::encoding::bt::BtMatcher::push_candidate_ladder(
-                            $out,
-                            &mut best_len_for_skip,
-                            rep,
-                            min_match_len,
-                        );
-                        if rep.match_len > $profile.sufficient_match_len {
-                            skip_further_match_search = true;
-                        }
-                        if $abs_pos + rep.match_len >= $current_abs_end {
-                            skip_further_match_search = true;
-                        }
-                    },
-                )
-            };
-            if use_hash3 && !skip_further_match_search && best_len_for_skip < min_match_len {
-                $self.table.update_hash3_until($abs_pos);
-                // SAFETY: same umbrella for hash3_candidate.
-                if let Some(h3) = unsafe {
-                    $self
-                        .table
-                        .$hash3($abs_pos, $current_abs_end, min_match_len)
-                } {
-                    let _ = crate::encoding::bt::BtMatcher::push_candidate_ladder(
-                        $out,
-                        &mut best_len_for_skip,
-                        h3,
-                        min_match_len,
-                    );
-                    if !rep_len_candidate_found
-                        && (h3.match_len > $profile.sufficient_match_len
-                            || $abs_pos + h3.match_len >= $current_abs_end)
-                    {
-                        $self.table.skip_insert_until_abs = $abs_pos + 1;
-                        skip_further_match_search = true;
-                    }
-                }
-            }
-            if !skip_further_match_search {
-                $self.table.insert_position($abs_pos);
-                let max_chain_depth = $profile.max_chain_depth.min($self.hc.search_depth);
-                let concat = $self.table.live_history();
-                // Raw `+ 9` is safe here — see `bt_insert_step_no_rebase_body!`
-                // for the full discussion of the upstream `STREAM_ABS_HEADROOM`
-                // cap in `MatchTable::add_data`.
-                let mut match_end_abs = $abs_pos + 9;
-                if max_chain_depth > 0 {
-                    for (visited, candidate_abs) in $self
-                        .hc
-                        .chain_candidates(&$self.table, $abs_pos)
-                        .into_iter()
-                        .enumerate()
-                    {
-                        if visited >= max_chain_depth {
-                            break;
-                        }
-                        if candidate_abs == usize::MAX {
-                            break;
-                        }
-                        if candidate_abs < $self.table.window_low_abs_for_target($abs_pos)
-                            || candidate_abs >= $abs_pos
-                        {
-                            continue;
-                        }
-                        let candidate_idx = candidate_abs - $self.table.history_abs_start;
-                        debug_assert!(
-                            $abs_pos <= $current_abs_end,
-                            "HC chain walker called past current block end"
-                        );
-                        let tail_limit = $current_abs_end - $abs_pos;
-                        let base = concat.as_ptr();
-                        // SAFETY: history-relative indices; `tail_limit` bounds
-                        // the scan within `concat`. `$cpl` is the kernel-specific
-                        // common_prefix_len_ptr — call inlines because the
-                        // surrounding wrapper carries the same target_feature.
-                        let match_len = unsafe {
-                            $cpl(base.add(candidate_idx), base.add(current_idx), tail_limit)
-                        };
-                        if match_len < min_match_len {
-                            continue;
-                        }
-                        let offset = $abs_pos - candidate_abs;
-                        if crate::encoding::bt::BtMatcher::push_candidate_ladder(
-                            $out,
-                            &mut best_len_for_skip,
-                            MatchCandidate {
-                                start: $abs_pos,
-                                offset,
-                                match_len,
-                            },
-                            min_match_len,
-                        ) {
-                            let candidate_end = candidate_abs + match_len;
-                            if candidate_end > match_end_abs {
-                                match_end_abs = candidate_end;
-                            }
-                        }
-                        if match_len > HC_OPT_NUM || $abs_pos + match_len >= $current_abs_end {
-                            break;
-                        }
-                    }
-                }
-                // `match_end_abs` initialized to `abs_pos + 9`; monotonic
-                // updates only ever extend it, so `match_end_abs - 8 >= 1`.
-                $self.table.skip_insert_until_abs =
-                    $self.table.skip_insert_until_abs.max(match_end_abs - 8);
-            }
         }
         if let Some(ldm) = ldm_candidate {
             let _ = crate::encoding::bt::BtMatcher::push_candidate_ladder(
@@ -2145,7 +2011,7 @@ impl HcMatchGenerator {
         // allowed.
         match self.strategy_tag {
             StrategyTag::BtUltra2 => self
-                .collect_optimal_candidates_initialized::<strategy::BtUltra2, true>(
+                .collect_optimal_candidates_initialized::<strategy::BtUltra2>(
                     abs_pos,
                     current_abs_end,
                     profile,
@@ -2153,7 +2019,7 @@ impl HcMatchGenerator {
                     out,
                 ),
             StrategyTag::BtUltra => self
-                .collect_optimal_candidates_initialized::<strategy::BtUltra, true>(
+                .collect_optimal_candidates_initialized::<strategy::BtUltra>(
                     abs_pos,
                     current_abs_end,
                     profile,
@@ -2161,28 +2027,30 @@ impl HcMatchGenerator {
                     out,
                 ),
             StrategyTag::Btlazy2 => self
-                .collect_optimal_candidates_initialized::<strategy::Btlazy2, true>(
+                .collect_optimal_candidates_initialized::<strategy::Btlazy2>(
                     abs_pos,
                     current_abs_end,
                     profile,
                     query,
                     out,
                 ),
-            StrategyTag::BtOpt => self
-                .collect_optimal_candidates_initialized::<strategy::BtOpt, true>(
-                    abs_pos,
-                    current_abs_end,
-                    profile,
-                    query,
-                    out,
-                ),
+            StrategyTag::BtOpt => self.collect_optimal_candidates_initialized::<strategy::BtOpt>(
+                abs_pos,
+                current_abs_end,
+                profile,
+                query,
+                out,
+            ),
             StrategyTag::Fast | StrategyTag::Dfast | StrategyTag::Greedy | StrategyTag::Lazy => {
-                self.collect_optimal_candidates_initialized::<strategy::Lazy, false>(
-                    abs_pos,
-                    current_abs_end,
-                    profile,
-                    query,
-                    out,
+                // Optimal candidate collection is binary-tree only (btopt /
+                // btultra / btultra2 / btlazy2). The Fast / Dfast / Greedy / Lazy
+                // strategies never run the optimal parser — they drive their own
+                // match finders — and their generators keep `chain_table` as an
+                // HC chain, not BT pair slots. Routing them here would walk that
+                // chain as a binary tree. Reaching this arm is a caller bug.
+                unreachable!(
+                    "collect_optimal_candidates is binary-tree only; \
+                     non-BT strategies use their own match finder"
                 )
             }
         }
@@ -2199,10 +2067,7 @@ impl HcMatchGenerator {
     /// future caller that isn't already inside a kernel umbrella.
     #[allow(dead_code)]
     #[inline(always)]
-    pub(crate) fn collect_optimal_candidates_initialized<
-        S: crate::encoding::strategy::Strategy,
-        const USE_BT_MATCHFINDER: bool,
-    >(
+    pub(crate) fn collect_optimal_candidates_initialized<S: crate::encoding::strategy::Strategy>(
         &mut self,
         abs_pos: usize,
         current_abs_end: usize,
@@ -2212,7 +2077,7 @@ impl HcMatchGenerator {
     ) {
         #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
         unsafe {
-            self.collect_optimal_candidates_initialized_neon::<S, USE_BT_MATCHFINDER>(
+            self.collect_optimal_candidates_initialized_neon::<S>(
                 abs_pos,
                 current_abs_end,
                 profile,
@@ -2225,7 +2090,7 @@ impl HcMatchGenerator {
             use crate::encoding::fastpath::FastpathKernel;
             match self.table.kernel {
                 FastpathKernel::Avx2Bmi2 => unsafe {
-                    self.collect_optimal_candidates_initialized_avx2_bmi2::<S, USE_BT_MATCHFINDER>(
+                    self.collect_optimal_candidates_initialized_avx2_bmi2::<S>(
                         abs_pos,
                         current_abs_end,
                         profile,
@@ -2234,7 +2099,7 @@ impl HcMatchGenerator {
                     )
                 },
                 FastpathKernel::Sse42 => unsafe {
-                    self.collect_optimal_candidates_initialized_sse42::<S, USE_BT_MATCHFINDER>(
+                    self.collect_optimal_candidates_initialized_sse42::<S>(
                         abs_pos,
                         current_abs_end,
                         profile,
@@ -2242,14 +2107,13 @@ impl HcMatchGenerator {
                         out,
                     )
                 },
-                FastpathKernel::Scalar => self
-                    .collect_optimal_candidates_initialized_scalar::<S, USE_BT_MATCHFINDER>(
-                        abs_pos,
-                        current_abs_end,
-                        profile,
-                        query,
-                        out,
-                    ),
+                FastpathKernel::Scalar => self.collect_optimal_candidates_initialized_scalar::<S>(
+                    abs_pos,
+                    current_abs_end,
+                    profile,
+                    query,
+                    out,
+                ),
             }
         }
         #[cfg(not(any(
@@ -2258,7 +2122,7 @@ impl HcMatchGenerator {
             target_arch = "x86_64"
         )))]
         {
-            self.collect_optimal_candidates_initialized_scalar::<S, USE_BT_MATCHFINDER>(
+            self.collect_optimal_candidates_initialized_scalar::<S>(
                 abs_pos,
                 current_abs_end,
                 profile,
@@ -2277,7 +2141,6 @@ impl HcMatchGenerator {
     #[target_feature(enable = "neon")]
     unsafe fn collect_optimal_candidates_initialized_neon<
         S: crate::encoding::strategy::Strategy,
-        const USE_BT_MATCHFINDER: bool,
     >(
         &mut self,
         abs_pos: usize,
@@ -2294,11 +2157,7 @@ impl HcMatchGenerator {
             profile,
             query,
             out,
-            USE_BT_MATCHFINDER,
             bt_insert_step_no_rebase_neon,
-            bt_insert_and_collect_matches_neon,
-            for_each_repcode_candidate_with_reps_neon,
-            hash3_candidate_neon,
             crate::encoding::fastpath::neon::common_prefix_len_ptr,
             crate::encoding::fastpath::neon::count_match_from_indices,
         )
@@ -2308,7 +2167,6 @@ impl HcMatchGenerator {
     #[target_feature(enable = "sse4.2")]
     unsafe fn collect_optimal_candidates_initialized_sse42<
         S: crate::encoding::strategy::Strategy,
-        const USE_BT_MATCHFINDER: bool,
     >(
         &mut self,
         abs_pos: usize,
@@ -2325,11 +2183,7 @@ impl HcMatchGenerator {
             profile,
             query,
             out,
-            USE_BT_MATCHFINDER,
             bt_insert_step_no_rebase_sse42,
-            bt_insert_and_collect_matches_sse42,
-            for_each_repcode_candidate_with_reps_sse42,
-            hash3_candidate_sse42,
             crate::encoding::fastpath::sse42::common_prefix_len_ptr,
             crate::encoding::fastpath::sse42::count_match_from_indices,
         )
@@ -2339,7 +2193,6 @@ impl HcMatchGenerator {
     #[target_feature(enable = "avx2,bmi2")]
     unsafe fn collect_optimal_candidates_initialized_avx2_bmi2<
         S: crate::encoding::strategy::Strategy,
-        const USE_BT_MATCHFINDER: bool,
     >(
         &mut self,
         abs_pos: usize,
@@ -2356,11 +2209,7 @@ impl HcMatchGenerator {
             profile,
             query,
             out,
-            USE_BT_MATCHFINDER,
             bt_insert_step_no_rebase_avx2_bmi2,
-            bt_insert_and_collect_matches_avx2_bmi2,
-            for_each_repcode_candidate_with_reps_avx2_bmi2,
-            hash3_candidate_avx2_bmi2,
             crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr,
             crate::encoding::fastpath::avx2_bmi2::count_match_from_indices,
         )
@@ -2372,7 +2221,6 @@ impl HcMatchGenerator {
     #[allow(unused_unsafe)]
     pub(crate) fn collect_optimal_candidates_initialized_scalar<
         S: crate::encoding::strategy::Strategy,
-        const USE_BT_MATCHFINDER: bool,
     >(
         &mut self,
         abs_pos: usize,
@@ -2389,11 +2237,7 @@ impl HcMatchGenerator {
             profile,
             query,
             out,
-            USE_BT_MATCHFINDER,
             bt_insert_step_no_rebase_scalar,
-            bt_insert_and_collect_matches_scalar,
-            for_each_repcode_candidate_with_reps_scalar,
-            hash3_candidate_scalar,
             crate::encoding::fastpath::scalar::common_prefix_len_ptr,
             crate::encoding::fastpath::scalar::count_match_from_indices,
         )
