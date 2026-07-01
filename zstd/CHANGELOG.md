@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.49](https://github.com/structured-world/structured-zstd/compare/v0.0.48...v0.0.49) - 2026-07-01
+
+### Performance
+
+- *(compress)* inline the row search into the lazy parse monolith ([#461](https://github.com/structured-world/structured-zstd/pull/461))
+- *(opt)* fold BT-walk coordinate decode; drop dead hash-chain optimal path ([#462](https://github.com/structured-world/structured-zstd/pull/462))
+
 ## [0.0.48](https://github.com/structured-world/structured-zstd/compare/v0.0.47...v0.0.48) - 2026-06-30
 
 ### Fixed
