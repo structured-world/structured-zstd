@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1782820526320,
+  "lastUpdate": 1782867004062,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI (x86_64-gnu)": [
@@ -2039,6 +2039,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.074,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "d7074b253962f814fa77ddeb756c38d605c9322f",
+          "message": "perf(opt): fold BT-walk coordinate decode; drop dead hash-chain optimal path (#462)\n\n* refactor(opt): drop the non-upstream hash-chain optimal fallback\n\nThe optimal parser's per-position match-finder always used the binary-tree\nbranch (every production call site selects it): upstream zstd's optimal\nparser (ZSTD_insertBtAndGetAllMatches) is binary-tree only, with no\nhash-chain variant — the chain is upstream's lazy parser\n(ZSTD_HcFindBestMatch), a different path. The else-branch hash-chain\noptimal walk and its chain_candidates helper had no upstream counterpart and\nwere dead in every shipped binary (const-folded out, absent from objdump).\n\nRemove the dead else-branch, the chain_candidates helper, and the two tests\nthat exercised the chain optimal path through the test-only dispatcher; the\nBT path's own skip-window / rebase coverage remains. Byte-identical.\n\n* refactor(opt): drop the now-vestigial USE_BT_MATCHFINDER const generic\n\nWith the hash-chain optimal fallback gone, the per-position match-finder is\nunconditionally the binary-tree walk, so the USE_BT_MATCHFINDER const generic\n(and the macro metavars that only fed the removed chain branch:\nbt_insert_and_collect method handle, for_each_repcode, hash3) carried no\ninformation. Remove the const generic from the collect entry points and the\nfour kernel wrappers, and drop the dead macro parameters. Byte-identical.\n\n* perf(opt): fold per-node coordinate decode in the BT walk\n\nThe BT match-finder's hot per-node loop decoded the chain entry into three\ncoordinates each iteration: candidate_abs (position_base + stored - 1 -\nindex_shift), the BT pair slot (via bt_pair_index_for_abs, which re-read\nindex_shift and bt_mask and round-tripped index_shift back in), and\ncandidate_idx (candidate_abs - history_abs_start). That reloaded four struct\nfields and ran ~6 arithmetic ops per node.\n\nPrecompute the three loop-invariant biases once before the walk so each\ncoordinate is a single wrapping_add from the stored entry — the\nsingle-coordinate form of upstream zstd's window-relative matchIndex\n(match = base + matchIndex, slot = 2*(matchIndex & btMask)). Byte-identical:\nthe folded values equal the originals for every gate-validated entry.\n\n* refactor(opt): enforce binary-tree-only contract on the optimal collect\n\nThe optimal candidate collector is binary-tree only; the Fast / Dfast /\nGreedy / Lazy strategies never run the optimal parser (they drive their own\nmatch finders) and keep chain_table as an HC chain, not BT pair slots. The\npublic dispatcher's non-BT arm previously routed those tags into the BT\ncollect, which would walk the HC chain as a binary tree. Make that arm\nunreachable so misuse fails loudly, and tag the test-only shim callers as a\nBT strategy (BtOpt shares Lazy's OPT_LEVEL=0 / USE_HASH3=false consts, so the\ncollect behavior is unchanged). No production caller hit the non-BT arm (the\non-encode path goes through build_optimal_plan_impl directly).\n\n* test(opt): cover the optimal-collect dispatcher arms + BT-only contract\n\nAdds a should_panic test proving a non-BT strategy tag reaching\ncollect_optimal_candidates panics (the binary-tree-only contract), covering\nthe unreachable arm, and a dispatch test exercising every BT tag (BtOpt /\nBtUltra / BtUltra2 / Btlazy2) under the scalar kernel so the dispatcher's\nper-tag and scalar arms are covered.\n\n* test(opt): assert per-tag dispatch via the hash3 observable\n\nThe dispatch test previously only proved each BT tag ran without panicking,\nso a cross-group mis-mapping (e.g. BtUltra routed to the BtOpt\nspecialization) would slip through. Add a USE_HASH3 observable: a fixture\nwhere `abc` repeats with a differing 4th byte, so the hash3 specializations\n(BtUltra / BtUltra2) surface a length-3 match at offset 12 that the 4-byte BT\nhash misses, while the non-hash3 ones (BtOpt / Btlazy2) do not. Assert the\nmatch's presence equals the tag's USE_HASH3. (BtOpt vs Btlazy2 share identical\ncollect consts, so they are runtime-indistinguishable; that mapping is\ncompiler-enforced.)",
+          "timestamp": "2026-07-01T03:08:53+03:00",
+          "tree_id": "f142691bfe1a7faf911493cfec212c977b33fe3b",
+          "url": "https://github.com/structured-world/structured-zstd/commit/d7074b253962f814fa77ddeb756c38d605c9322f"
+        },
+        "date": 1782866989717,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.084,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.111,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 190.324,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 222.74,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 0.611,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.264,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.839,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 2.202,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.707,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 2.088,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.027,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.027,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.157,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.009,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 10.031,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.55,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.071,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.24,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.384,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.057,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.37,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.047,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.025,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.155,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.026,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.188,
             "unit": "ms"
           }
         ]
