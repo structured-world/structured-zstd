@@ -468,41 +468,15 @@ macro_rules! row_best_match {
     }};
 }
 
-/// Per-tier standalone search function (upstream zstd's
-/// `ZSTD_RowFindBestMatch` shape, `zstd_lazy.c`): rep + row probe behind ONE
-/// symbol so the lazy parse's two probe sites (current position + lookahead)
-/// share a single copy instead of expanding the whole search body twice —
-/// the duplicated expansion doubled the kernel's icache footprint and left
-/// the lookahead copy as an outlined closure call.
-macro_rules! gen_row_find_monolith {
-    ($name:ident, $use_mask:literal, $maskmac:ident, $cpl:path $(, $tf:literal)?) => {
-        $(#[target_feature(enable = $tf)])?
-        #[cfg_attr(
-            all(
-                target_arch = "wasm32",
-                target_feature = "simd128",
-                feature = "kernel_simd128"
-            ),
-            allow(dead_code)
-        )]
-        #[allow(unused_unsafe)]
-        unsafe fn $name<K: RowTags, const ROW_LOG: usize>(
-            &mut self,
-            abs_pos: usize,
-            lit_len: usize,
-            hash: Option<(usize, u8)>,
-        ) -> Option<MatchCandidate> {
-            row_best_match!(self, abs_pos, lit_len, hash, ROW_LOG, $use_mask, $maskmac, $cpl)
-        }
-    };
-}
-
 /// The lazy row parse BODY as a macro — same per-tier monolith shape as
-/// `greedy_parse_body!` for the lazy levels (lookahead via the shared
-/// `lazy_decide!` macro; both probe sites call the tier's shared
-/// `$find` search function).
+/// `greedy_parse_body!` for the lazy levels. Upstream zstd's `ZSTD_searchMax`
+/// is `FORCE_INLINE_TEMPLATE` into `ZSTD_compressBlock_lazy_generic`, so the
+/// search at every probe site (current position + the `lazy_decide!` lookahead)
+/// expands the rep + row-probe body inline via `row_best_match!` rather than
+/// calling an out-of-line per-tier `#[target_feature]` search method — keeping
+/// the whole per-position pipeline one monolith with no per-position call cost.
 macro_rules! lazy_parse_body {
-    ($m:expr, $handle:expr, $rl:expr, $find:ident) => {{
+    ($m:expr, $handle:expr, $rl:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
         #[allow(unused_labels)]
         'parse: {
             debug_assert_eq!($rl, $m.row_log);
@@ -547,21 +521,30 @@ macro_rules! lazy_parse_body {
                     Some(best) => (None, best),
                     None => {
                         let hash = $m.hash_and_row(abs_pos);
-                        let best = unsafe { $m.$find::<K, $rl>(abs_pos, lit_len, hash) };
+                        // Search spliced INLINE (upstream zstd `ZSTD_searchMax`
+                        // is `FORCE_INLINE_TEMPLATE` into `lazy_generic`): expand
+                        // the rep + row-probe body here rather than calling an
+                        // out-of-line per-tier `#[target_feature]` `$find` method
+                        // (a `target_feature` fn cannot inline across the call
+                        // boundary, so the call cost + arg marshalling was paid
+                        // per position — the dominant instruction-count gap vs C).
+                        let best = row_best_match!(
+                            $m, abs_pos, lit_len, hash, $rl, $use_mask, $maskmac, $cpl
+                        );
                         (hash, best)
                     }
                 };
                 let picked = 'pick: {
                     let Some(best) = best else { break 'pick None };
-                    // Row's finder ($find) is inlined in this target_feature
-                    // kernel, so the shared decision is a MACRO (spliced inline) —
-                    // a closure would de-inline $find across the call boundary and
-                    // regress the band. target_len = MAX: upstream lazy has no
-                    // sufficient-length early-out (that is the OPT parser's; one
-                    // here collapses lazy to greedy, -7% ratio vs C). The macro
-                    // weighs candidates by length (ties to the smaller offset)
-                    // and returns the carry so the deferred position is searched
-                    // once.
+                    // The decision is a MACRO (spliced inline); its lookahead
+                    // `search` splice expands the row-probe body inline too, so the
+                    // whole per-position pipeline stays one `target_feature`
+                    // monolith with no out-of-line search call at any probe site.
+                    // target_len = MAX: upstream lazy has no sufficient-length
+                    // early-out (that is the OPT parser's; one here collapses lazy
+                    // to greedy, -7% ratio vs C). The macro weighs candidates by
+                    // length (ties to the smaller offset) and returns the carry so
+                    // the deferred position is searched once.
                     let lazy_depth = $m.lazy_depth;
                     let history_end = $m.history_abs_end();
                     let mls = $m.mls;
@@ -574,10 +557,12 @@ macro_rules! lazy_parse_body {
                         lit_len = lit_len,
                         history_end = history_end,
                         min_match = mls,
-                        // SAFETY: the enclosing kernel is only entered when its
-                        // tier was runtime-detected, upholding $find's
+                        // Lookahead search, also spliced inline (no out-of-line
+                        // call): the enclosing kernel runs only when its tier was
+                        // runtime-detected, upholding the row-probe's
                         // target_feature contract.
-                        search = |p, l| unsafe { $m.$find::<K, $rl>(p, l, None) },
+                        search =
+                            |p, l| row_best_match!($m, p, l, None, $rl, $use_mask, $maskmac, $cpl),
                     );
                     if let Some(carry) = decision {
                         carried = Some(carry);
@@ -661,9 +646,7 @@ macro_rules! lazy_parse_body {
 
 /// Per-tier lazy kernels (see `gen_greedy_monolith` — same SIMD pairing).
 macro_rules! gen_lazy_monolith {
-    ($name:ident, $find:ident, $use_mask:literal, $maskmac:ident, $cpl:path $(, $tf:literal)?) => {
-        gen_row_find_monolith!($find, $use_mask, $maskmac, $cpl $(, $tf)?);
-
+    ($name:ident, $use_mask:literal, $maskmac:ident, $cpl:path $(, $tf:literal)?) => {
         $(#[target_feature(enable = $tf)])?
         // wasm32+simd128 resolves the dispatch at compile time to the
         // simd128 kernel, leaving the scalar monolith uncalled there
@@ -681,7 +664,7 @@ macro_rules! gen_lazy_monolith {
             &mut self,
             mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
         ) {
-            lazy_parse_body!(self, handle_sequence, ROW_LOG, $find)
+            lazy_parse_body!(self, handle_sequence, ROW_LOG, $use_mask, $maskmac, $cpl)
         }
     };
 }
@@ -1991,7 +1974,6 @@ impl RowMatchGenerator {
 
     gen_lazy_monolith!(
         lazy_scalar,
-        find_best_scalar,
         false,
         row_tag_mask_scalar,
         crate::encoding::fastpath::scalar::common_prefix_len_ptr
@@ -1999,7 +1981,6 @@ impl RowMatchGenerator {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     gen_lazy_monolith!(
         lazy_sse42,
-        find_best_sse42,
         true,
         row_tag_mask_sse2,
         crate::encoding::fastpath::sse42::common_prefix_len_ptr,
@@ -2008,7 +1989,6 @@ impl RowMatchGenerator {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     gen_lazy_monolith!(
         lazy_avx2bmi2,
-        find_best_avx2bmi2,
         true,
         row_tag_mask_avx2,
         crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr,
@@ -2017,7 +1997,6 @@ impl RowMatchGenerator {
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     gen_lazy_monolith!(
         lazy_neon,
-        find_best_neon,
         true,
         row_tag_mask_neon,
         crate::encoding::fastpath::neon::common_prefix_len_ptr,
@@ -2030,7 +2009,6 @@ impl RowMatchGenerator {
     ))]
     gen_lazy_monolith!(
         lazy_simd128,
-        find_best_simd128,
         true,
         row_tag_mask_simd128,
         crate::encoding::fastpath::scalar::common_prefix_len_ptr
