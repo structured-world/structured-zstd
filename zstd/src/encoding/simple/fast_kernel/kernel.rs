@@ -1108,6 +1108,18 @@ pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
     // than the source-window-sized main table. `dict_lookup` hashes with the
     // dict table's own `dict_hash_log` (read below), so they need not match.
 
+    // The dict path is 2-cursor (ip0/ip1), matching upstream
+    // `ZSTD_compressBlock_fast_dictMatchState_generic`, so it uses upstream's
+    // exact `stepSize = targetLength + !(targetLength)`. The shared level
+    // step_size carries a `+1` that only the 4-cursor NON-dict pipeline needs
+    // (its `step_size >= 2` invariant); undo it here so the dict scan advances
+    // one position at a time like C at the base fast tier. Stepping one MORE
+    // than C skipped candidate positions and coarsened the parse, inflating the
+    // dict frame on the negative-level band (measured: level_-2 50 B -> 44 B,
+    // now byte-exact with the reference across the whole fast dict band).
+    // step_size >= 2 at entry, so `- 1 >= 1`.
+    let step_size = step_size - 1;
+
     let prefix_start_index = bounds.prefix_start_index;
     let window_low = bounds.window_low as usize;
     let dict_end = dict_end as usize;
@@ -1467,7 +1479,10 @@ fn compress_block_fast_dict_borrowed_impl<
     );
     assert_eq!(MLS, main_table.mls());
     assert_eq!(MLS, dict_table.mls());
-    assert_eq!(main_table.hash_log(), dict_table.hash_log());
+    // 2-cursor dict scan uses upstream's exact
+    // `stepSize = targetLength + !(targetLength)`; undo the shared level `+1`
+    // (needed only by the 4-cursor non-dict pipeline). See the flat kernel.
+    let step_size = step_size - 1;
 
     // Window bounds in VIRTUAL `[dict][input]` coords, so the gates match the
     // owned flat kernel: `window_low` is the absolute floor, `prefix_start_index`
