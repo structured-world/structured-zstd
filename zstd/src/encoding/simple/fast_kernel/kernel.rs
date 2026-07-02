@@ -73,6 +73,12 @@ const SEARCH_STRENGTH: usize = 8;
 /// incompressible-region step acceleration.
 const K_STEP_INCR: usize = 1 << (SEARCH_STRENGTH - 1);
 
+/// Upstream zstd's `kStepIncr` for the **dictMatchState** fast path
+/// (`zstd_fast.c:553`) is `1 << kSearchStrength = 256` — DOUBLE the no-dict /
+/// extDict value (`zstd_fast.c:234`,`:754`). The dict scan therefore ramps its
+/// no-match step half as often as the plain fast scan.
+const K_STEP_INCR_DICT: usize = 1 << SEARCH_STRENGTH;
+
 /// Upstream zstd `HASH_READ_SIZE`. The forward-progress invariant is that the
 /// hash read at `ip0` MUST stay inside `[base, iend)`, so the
 /// `ilimit = iend - HASH_READ_SIZE` cap is applied to the loop
@@ -1184,6 +1190,14 @@ pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
         let mut dict_idx = unsafe { dict_lookup::<MLS>(dict_table, base.add(ip0), dict_hash_log) };
         let mut curr = ip0;
 
+        // No-match step accelerator (upstream zstd `zstd_fast.c:552-554`):
+        // `step`/`next_step` reset once per found match (declared inside the
+        // outer loop like C), and the inner search loop bumps `step` every
+        // `K_STEP_INCR_DICT` bytes of fruitless scanning so incompressible
+        // stretches skip ahead instead of probing every `step_size` position.
+        let mut step = step_size;
+        let mut next_step = ip0 + K_STEP_INCR_DICT;
+
         let found: Option<DictMatch> = loop {
             // SAFETY: ip1 <= ilimit ⇒ ≥ 8 readable bytes at ip1.
             let hash1 = unsafe { hash_ptr_raw::<MLS>(base.add(ip1), main_hlog) };
@@ -1291,8 +1305,12 @@ pub(crate) fn compress_block_fast_dict<const MLS: u32, const USE_CMOV: bool>(
             dict_idx = unsafe { dict_lookup::<MLS>(dict_table, base.add(ip1), dict_hash_log) };
             main_idx =
                 unsafe { (*main_tbl.get_unchecked(hash1 as usize)).saturating_sub(main_bias) };
+            if ip1 >= next_step {
+                step += 1;
+                next_step += K_STEP_INCR_DICT;
+            }
             ip0 = ip1;
-            ip1 += step_size;
+            ip1 += step;
             if ip1 > ilimit {
                 break None;
             }
@@ -1546,6 +1564,11 @@ fn compress_block_fast_dict_borrowed_impl<
             unsafe { dict_lookup::<MLS>(dict_table, inp_base.add(ip0), dict_hash_log) };
         let mut curr = ip0;
 
+        // No-match step accelerator (upstream zstd `zstd_fast.c:552-554`),
+        // reset once per found match; see the flat kernel for the rationale.
+        let mut step = step_size;
+        let mut next_step = ip0 + K_STEP_INCR_DICT;
+
         let found: Option<DictMatch> = loop {
             // SAFETY: ip1 <= ilimit ⇒ ≥ 8 readable bytes at ip1.
             let hash1 = unsafe { hash_ptr_raw::<MLS>(inp_base.add(ip1), main_hlog) };
@@ -1686,8 +1709,12 @@ fn compress_block_fast_dict_borrowed_impl<
             dict_idx = unsafe { dict_lookup::<MLS>(dict_table, inp_base.add(ip1), dict_hash_log) };
             main_idx =
                 unsafe { (*main_tbl.get_unchecked(hash1 as usize)).saturating_sub(main_bias) };
+            if ip1 >= next_step {
+                step += 1;
+                next_step += K_STEP_INCR_DICT;
+            }
             ip0 = ip1;
-            ip1 += step_size;
+            ip1 += step;
             if ip1 > ilimit {
                 break None;
             }
