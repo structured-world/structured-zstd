@@ -1749,7 +1749,7 @@ fn driver_huge_source_hint_with_dict_does_not_overflow_hc_reserve() {
     // truncate.
     let mut driver = MatchGeneratorDriver::new(32, 2);
     driver.set_source_size_hint(u64::MAX);
-    driver.set_dictionary_size_hint(64 * 1024);
+    driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(64 * 1024));
     driver.reset(CompressionLevel::Level(16));
 
     // The saturated `usize::MAX` reserve target must be clamped to the HC
@@ -1810,7 +1810,7 @@ fn driver_dfast_dictionary_tables_take_the_cdict_geometry() {
         .collect();
     let mut driver = MatchGeneratorDriver::new(32, 2);
     driver.set_source_size_hint(1024);
-    driver.set_dictionary_size_hint(dict.len());
+    driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
     driver.reset(CompressionLevel::Level(3));
     driver.prime_with_dictionary(&dict, [1, 4, 8]);
     let cd = crate::encoding::cparams::get_cdict_cparams(3, dict.len());
@@ -1841,7 +1841,7 @@ fn driver_fast_dictionary_table_takes_the_cdict_hash_log() {
         .collect();
     let mut driver = MatchGeneratorDriver::new(32, 2);
     driver.set_source_size_hint(1024);
-    driver.set_dictionary_size_hint(dict.len());
+    driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
     driver.reset(CompressionLevel::Level(1));
     driver.prime_with_dictionary(&dict, [1, 4, 8]);
     let expected = crate::encoding::cparams::get_cdict_cparams(1, dict.len()).hash_log;
@@ -1854,6 +1854,63 @@ fn driver_fast_dictionary_table_takes_the_cdict_hash_log() {
         driver.simple_mut().hash_log() < expected,
         "the source-capped main table is narrower than the CDict table"
     );
+}
+
+/// The Fast dictionary table follows the CDict `hashLog` of the frame's
+/// level (13 at L1, 12 at L-1 for a 20 KiB dictionary) across level changes
+/// on one driver. (L1 and L-1 also differ in `mls`, so the reset rebuilds
+/// the main table and drops the resident dictionary table anyway; the Dfast
+/// test below is the case where only the CDict geometry changes.)
+#[test]
+fn driver_fast_dictionary_table_follows_the_cdict_geometry_across_levels() {
+    let dict: Vec<u8> = (0..20 * 1024u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+    for level in [1, -1] {
+        driver.set_source_size_hint(1024);
+        driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
+        driver.reset(CompressionLevel::Level(level));
+        if !driver.dictionary_is_resident() {
+            driver.prime_with_dictionary(&dict, [1, 4, 8]);
+        }
+        let expected = crate::encoding::cparams::get_cdict_cparams(level, dict.len()).hash_log;
+        let built = driver
+            .simple_mut()
+            .built_dict_table_hash_log()
+            .expect("attached dictionary table");
+        assert_eq!(built, expected, "level {level}: dict table hashLog");
+    }
+}
+
+/// Regression: same for the Dfast attached tables. L3 and L4 share the
+/// source-capped live widths on a 1 KiB source, but a 300 KiB dictionary's
+/// CDict tables are 17 / 16 bits at L3 and 18 / 18 at L4; a resident L3
+/// table re-borrowed by the L4 frame would be probed at the wrong widths.
+#[test]
+fn driver_dfast_dictionary_tables_follow_the_cdict_geometry_across_levels() {
+    let dict: Vec<u8> = (0..300 * 1024u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+    for level in [3, 4] {
+        driver.set_source_size_hint(1024);
+        driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
+        driver.reset(CompressionLevel::Level(level));
+        if !driver.dictionary_is_resident() {
+            driver.prime_with_dictionary(&dict, [1, 4, 8]);
+        }
+        let cd = crate::encoding::cparams::get_cdict_cparams(level, dict.len());
+        let built = driver
+            .dfast_matcher()
+            .dict_table_bits()
+            .expect("attached dictionary tables");
+        assert_eq!(
+            built,
+            (cd.hash_log as usize, cd.chain_log as usize),
+            "level {level}: dict table widths"
+        );
+    }
 }
 
 /// Regression: a dictionary frame takes its finder geometry from the CDict
@@ -1876,7 +1933,7 @@ fn driver_dictionary_frame_ignores_finder_overrides() {
         .collect();
     let mut driver = MatchGeneratorDriver::new(32, 2);
     driver.set_source_size_hint(1 << 14);
-    driver.set_dictionary_size_hint(dict.len());
+    driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
     driver.set_param_overrides(Some(ov));
     driver.reset(CompressionLevel::Level(6));
     driver.prime_with_dictionary(&dict, [1, 4, 8]);
@@ -1904,6 +1961,25 @@ fn driver_dictionary_frame_ignores_finder_overrides() {
         dict_matches >= 2,
         "the attached dictionary must be found through the CDict geometry (got {dict_matches})"
     );
+}
+
+/// Regression: the "cdict overrides" rule holds for every dictionary
+/// backend, not only the lazy band: a 4 KiB CDict resolves L2 to the fast
+/// strategy (Simple backend) and a `BtUltra2` strategy override must not
+/// re-route the dictionary frame onto the optimal backend.
+#[test]
+fn driver_dictionary_frame_ignores_a_strategy_override_on_a_fast_cdict() {
+    use super::super::strategy::BackendTag;
+    let ov = super::super::parameters::ParamOverrides {
+        strategy: Some(crate::encoding::Strategy::Btultra2),
+        ..Default::default()
+    };
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+    driver.set_source_size_hint(100 * 1024);
+    driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(4096));
+    driver.set_param_overrides(Some(ov));
+    driver.reset(CompressionLevel::Level(2));
+    assert_eq!(driver.active_backend(), BackendTag::Simple);
 }
 
 #[test]
@@ -2861,7 +2937,9 @@ fn oversized_dict_hint_routes_fast_to_copy_mode() {
     // the limit suffices to exercise it without allocating a real 16 MiB dict.
     // Copy mode leaves the borrowed in-place dict scan (attach-only) unavailable.
     let mut driver = MatchGeneratorDriver::new(8, 1);
-    driver.set_dictionary_size_hint(MAX_FAST_ATTACH_DICT_REGION + 1);
+    driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(
+        MAX_FAST_ATTACH_DICT_REGION + 1,
+    ));
     driver.reset(CompressionLevel::Level(1));
     driver.prime_with_dictionary(b"small dict content with some padding here", [1, 4, 8]);
     assert!(
@@ -2880,7 +2958,7 @@ fn block_samples_match_dict_is_true_for_non_simple_backend() {
     // Simple/Fast backend trades the blanket scan for a precise probe.
     let dict = b"the quick brown fox jumps over the lazy dog 0123456789abcdef";
     let mut row = MatchGeneratorDriver::new(8, 6);
-    row.set_dictionary_size_hint(dict.len());
+    row.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
     row.reset(CompressionLevel::Level(6));
     row.prime_with_dictionary(dict, [1, 4, 8]);
     assert!(
@@ -3890,7 +3968,7 @@ fn resident_reapply_restores_retained_dictionary_budget() {
     // header's base window and emit an over-window offset.
     let mut driver = MatchGeneratorDriver::new(1 << 16, 1);
     let dict = b"abcdefghABCDEFGHijklmnopqrstuvwxyz0123456789";
-    driver.set_dictionary_size_hint(dict.len());
+    driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
     driver.reset_on_hc_lazy(CompressionLevel::Better);
     driver.prime_with_dictionary(dict, [1, 4, 8]);
     let base = driver.reported_window_size;
@@ -3900,7 +3978,7 @@ fn resident_reapply_restores_retained_dictionary_budget() {
     );
 
     // Second frame: the reset detects the resident dict and re-borrows it.
-    driver.set_dictionary_size_hint(dict.len());
+    driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
     driver.reset_on_hc_lazy(CompressionLevel::Better);
     assert!(
         driver.dictionary_is_resident(),

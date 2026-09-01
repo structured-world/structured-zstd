@@ -515,29 +515,6 @@ pub(crate) fn hc_hash_bits_for_window(max_window_size: usize) -> usize {
     window_log.max(MIN_WINDOW_LOG as usize)
 }
 
-/// Upstream `ZSTD_createCDict` table geometry: the `(hash_log, chain_log)` a
-/// dictionary's prepared match-finder tables get. Thin adapter over the single
-/// cParams source [`crate::encoding::cparams::create_cdict_table_logs`], which mirrors
-/// `ZSTD_adjustCParams_internal` under `ZSTD_cpm_createCDict`. `window_log` is
-/// the resolved compress window; `hash_log` / `chain_log` are the level's own
-/// widths; `uses_bt` selects the binary-tree `cycleLog` (`chainLog - 1`).
-pub(crate) fn cdict_table_logs(
-    window_log: u8,
-    hash_log: usize,
-    chain_log: usize,
-    uses_bt: bool,
-    dict_size: usize,
-) -> (usize, usize) {
-    let (h, c) = crate::encoding::cparams::create_cdict_table_logs(
-        window_log,
-        hash_log as u32,
-        chain_log as u32,
-        uses_bt,
-        dict_size,
-    );
-    (h as usize, c as usize)
-}
-
 /// Smallest window_log the encoder will use regardless of source size.
 pub(crate) const MIN_WINDOW_LOG: u8 = 10;
 
@@ -834,13 +811,11 @@ pub fn estimated_bt_strategy_extra_bytes(strategy_ordinal: u32, window_log: u32)
 /// * large input (e.g. 1 MiB → `window_log` 20) → rows (the SIMD-tag
 ///   row match-finder).
 ///
-/// A dictionary does NOT change the match-finder: it only downsizes the
-/// prepared tables (`cdict_table_logs`, mirroring `ZSTD_createCDict`'s
-/// small-source assumption), while `window_log` stays source-derived. So
-/// `(L6, 10 KiB, +dict)` is HashChain and `(L6, 1 MiB, +dict)` is RowHash,
-/// both matching upstream. When comparing against C on a fixture, resolve the
-/// match-finder from the fixture's size first, or you may optimise/benchmark a
-/// path C does not even take for that input.
+/// A dictionary frame resolves through [`resolve_level_params_with_dict`]
+/// instead: the CDict's cParams (its own size tier) with the frame's
+/// source-derived `window_log`. When comparing against C on a fixture,
+/// resolve the match-finder from the fixture's size (and dictionary) first,
+/// or you may optimise/benchmark a path C does not even take for that input.
 pub(crate) fn resolve_level_params(
     level: CompressionLevel,
     source_size: Option<u64>,

@@ -1721,6 +1721,14 @@ impl FastKernelMatcher {
     /// CDict's cParams (`ZSTD_createCDict`), independent of the
     /// source-capped main table.
     pub(crate) fn set_dict_table_hash_log(&mut self, hash_log: Option<u32>) {
+        // A resident table of another width must not be re-borrowed by
+        // `reset` (the attach epoch keeps a primed table when the main table's
+        // shape is unchanged); drop it so the frame re-primes at this width.
+        if let (Some(table), Some(hash_log)) = (self.dict.table(), hash_log)
+            && table.hash_log() != hash_log
+        {
+            self.dict.invalidate();
+        }
         self.dict_table_hash_log = hash_log;
     }
 

@@ -1555,8 +1555,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     }
 
     /// The level params the matcher's reset resolves for the next frame
-    /// (dictionary-aware when a dictionary will be used) and whether a
-    /// lazy-band dictionary plan applies (the matcher then runs the CDict's
+    /// (dictionary-aware when a dictionary will be used) and whether the
+    /// frame is a dictionary frame (the matcher then runs the CDict's
     /// strategy and ignores a strategy override).
     fn resolve_frame_params(
         &self,
@@ -1565,13 +1565,13 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     ) -> (crate::encoding::levels::config::LevelParams, bool) {
         match self.dictionary.as_ref().filter(|_| with_dictionary) {
             Some(dict) if !dict.inner.dict_content.is_empty() => {
-                let (params, plan) =
+                let (params, _plan) =
                     crate::encoding::levels::config::resolve_level_params_with_dict(
                         self.compression_level,
                         hint,
-                        dict.inner.dict_content.len(),
+                        dict.inner.sizes().serialized,
                     );
-                (params, plan.is_some())
+                (params, true)
             }
             _ => (
                 crate::encoding::levels::config::resolve_level_params(self.compression_level, hint),
@@ -1743,16 +1743,14 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             // is applied separately and should not force larger matcher sizing.
             self.state.matcher.set_source_size_hint(size_hint);
         }
-        // Hand the matcher the dictionary's content size so its binary-tree /
-        // hash-chain tables shrink to the dictionary's cParams tier (upstream zstd CDict
-        // economics: the dictionary supplies long matches, so a source-sized live
-        // table is wasted peak memory). The eviction window stays source-sized so
-        // the dictionary bytes remain referenceable. Set before `reset` (which
-        // consumes it) and only when a dictionary will actually be primed.
+        // Hand the matcher the dictionary's sizes so the frame runs the CDict's
+        // cParams tier and sizes its dictionary tables from the content. Set
+        // before `reset` (which consumes it) and only when a dictionary will
+        // actually be primed.
         if use_dictionary_state && let Some(dict) = self.dictionary.as_ref() {
             self.state
                 .matcher
-                .set_dictionary_size_hint(dict.inner.dict_content.len());
+                .set_dictionary_size_hint(dict.inner.sizes());
         }
         // Clearing buffers to allow re-using of the compressor
         self.state.matcher.reset(self.compression_level);

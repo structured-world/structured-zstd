@@ -287,14 +287,11 @@ pub struct MatchGeneratorDriver {
     dictionary_retained_budget: usize,
     // Source size hint for next frame (set via set_source_size_hint, cleared on reset).
     source_size_hint: Option<u64>,
-    // Dictionary content size for the next frame (set via set_dictionary_size_hint,
-    // consumed on reset). When present on a binary-tree / hash-chain backend, the
-    // match-finder hash/chain tables are sized from the DICTIONARY (upstream zstd CDict
-    // economics: a loaded dictionary supplies the long matches, so the live tables
-    // can shrink to the dict's size tier) while the eviction window stays
-    // source-sized. Mirrors upstream zstd `ZSTD_getCParamRowSize`, which picks the cParams
-    // table column from `dictSize` for a dictionary-bearing compress.
-    dictionary_size_hint: Option<usize>,
+    // Dictionary sizes for the next frame (set via set_dictionary_size_hint,
+    // consumed on reset): the serialized size keys the CDict cParams tier the
+    // frame runs (upstream `ZSTD_getCParamRowSize` on `dictSize`), the content
+    // size the dictionary tables and attach cutoffs.
+    dictionary_size_hint: Option<super::DictionarySizes>,
     // Normalized `ceil_log2` bucket of the frame's source-size hint, captured at
     // `reset` (where `source_size_hint` is consumed) via [`source_size_ceil_log`].
     // `None` means the frame was unhinted. Drives `prime_with_dictionary`'s upstream zstd
@@ -962,8 +959,8 @@ impl Matcher for MatchGeneratorDriver {
         self.source_size_hint = Some(size);
     }
 
-    fn set_dictionary_size_hint(&mut self, size: usize) {
-        self.dictionary_size_hint = Some(size);
+    fn set_dictionary_size_hint(&mut self, sizes: super::DictionarySizes) {
+        self.dictionary_size_hint = Some(sizes);
     }
 
     /// Dict-relevance gate for the raw-fast-path. Reached only when a dictionary
@@ -1007,7 +1004,12 @@ impl Matcher for MatchGeneratorDriver {
 
     fn reset(&mut self, level: CompressionLevel) {
         let hint = self.source_size_hint.take();
-        let dict_hint = self.dictionary_size_hint.take();
+        // An empty dictionary is "no dictionary": it primes nothing, so every
+        // dictionary-frame decision below must see `None` for it.
+        let dict_hint = self
+            .dictionary_size_hint
+            .take()
+            .filter(|sizes| sizes.content > 0);
         // Snapshot the hint's normalized ceil-log bucket for the primed-snapshot
         // key and prime_with_dictionary's attach/copy mode decision (the hint is
         // consumed here, but priming happens just after reset). Storing the
@@ -1018,15 +1020,17 @@ impl Matcher for MatchGeneratorDriver {
         // to copy mode. Captured here (from the load-set size hint = actual dict
         // length) so the prime decision and the snapshot-key / epoch bits agree.
         self.reset_dict_attach_ok =
-            dict_hint.is_none_or(|size| size <= MAX_FAST_ATTACH_DICT_REGION);
+            dict_hint.is_none_or(|sizes| sizes.content <= MAX_FAST_ATTACH_DICT_REGION);
         let hinted = hint.is_some();
-        // A dictionary frame on the greedy / lazy band takes its cParams and
-        // match-finder from the CDict's cParams (upstream
-        // `ZSTD_resetCCtx_usingCDict`); `dict_plan` carries that decision to
-        // the Row backend.
-        let (params, dict_plan) = match dict_hint.filter(|&size| size > 0) {
-            Some(dict_size) => crate::encoding::levels::config::resolve_level_params_with_dict(
-                level, hint, dict_size,
+        // A dictionary frame takes its cParams and match-finder from the
+        // CDict's cParams (upstream `ZSTD_resetCCtx_usingCDict`), whose tier
+        // is keyed by the serialized dictionary size; a lazy-band CDict also
+        // carries `dict_plan` to the Row backend.
+        let (params, dict_plan) = match dict_hint {
+            Some(sizes) => crate::encoding::levels::config::resolve_level_params_with_dict(
+                level,
+                hint,
+                sizes.serialized,
             ),
             None => (Self::level_params(level, hint), None),
         };
@@ -1071,13 +1075,14 @@ impl Matcher for MatchGeneratorDriver {
         // byte-identical to plain level-based compression.
         if let Some(ov) = self.param_overrides
             && !ov.is_empty()
-            && dict_plan.is_some()
+            && dict_hint.is_some()
         {
-            // A dictionary frame runs the CDict's cParams (upstream
-            // `ZSTD_resetCCtx_byAttachingCDict` / `byCopyingCDict`: "cdict
-            // overrides"); only the caller's windowLog is kept. Reshaping the
-            // live search would probe the dictionary's tables with another
-            // geometry / key width than they were indexed with.
+            // A dictionary frame runs the CDict's cParams whatever its
+            // strategy (upstream `ZSTD_resetCCtx_byAttachingCDict` /
+            // `byCopyingCDict`: "cdict overrides"); only the caller's
+            // windowLog is kept. Reshaping the live search would probe the
+            // dictionary's tables with another geometry / key width than they
+            // were indexed with.
             if let Some(window_log) = ov.window_log {
                 params.window_log = window_log;
             }
@@ -1101,63 +1106,14 @@ impl Matcher for MatchGeneratorDriver {
                 }
             }
         }
-        // Dictionary-driven table sizing — parity with upstream zstd `ZSTD_createCDict`
-        // (`ZSTD_getCParams_internal(level, UNKNOWN, dictSize, ZSTD_cpm_createCDict)`
-        // → `ZSTD_adjustCParams_internal`). A loaded dictionary supplies the
-        // long-distance matches, so upstream zstd sizes the prepared match-finder tables
-        // to the DICTIONARY (assuming a `minSrcSize` source), not the live
-        // window: it downsizes `hashLog`/`chainLog` toward the dict-and-window
-        // log while leaving the frame's eviction `window_log` source-derived so
-        // the dictionary bytes stay referenceable (`ZSTD_resetCCtx_byCopyingCDict`
-        // copies the small CDict tables but keeps the source window). We apply
-        // the same downsizing to the level's own hc geometry and cap (min) so a
-        // dict never inflates the level tables. Only the binary-tree / hash-chain
-        // backend reads `hc.{hash,chain}_log`; Simple/Dfast/Row derive their
-        // widths from the source window in their `reset` arms.
-        // A zero-length dictionary is "no dictionary": running the CDict sizing
-        // path for `Some(0)` is not a no-op — `cdict_table_logs(.., 0)` still
-        // collapses the HC/BT tables toward the 513-byte upstream zstd tier via
-        // `DICT_MIN_SRC_SIZE`, tanking ratio/perf on the next frame. Priming
-        // already treats empty content as empty, so skip the downsizing here too.
-        if let Some(dict_size) = dict_hint.filter(|&size| size > 0) {
-            // Derive the dict-tier geometry from the level's FULL (un-source-capped)
-            // hc widths. `Self::level_params(level, hint)` already source-capped
-            // `params.hc`; feeding those capped widths into `cdict_table_logs` and
-            // then `.min()`-ing would double-cap, so on a small hinted source with a
-            // large dictionary the prepared tables collapse below what the dict needs
-            // — defeating the `ZSTD_createCDict` geometry this mirrors. Take the
-            // un-hinted base widths instead and assign the result directly:
-            // `cdict_table_logs` only ever downsizes, so it never exceeds the base
-            // level geometry, while the eviction `window_log` stays source-derived so
-            // the dictionary bytes remain referenceable. Active public-parameter
-            // overrides (#27) are applied to the base too, so a strategy override
-            // that routes onto HashChain/BinaryTree still gets dict-tier sizing and
-            // explicit hash/chain overrides feed through as the geometry ceiling.
-            let mut base_params = Self::level_params(level, None);
-            if let Some(ov) = self.param_overrides
-                && !ov.is_empty()
-            {
-                apply_param_overrides(&mut base_params, &ov);
-            }
-            if let (Some(hc), Some(base_hc)) = (params.hc.as_mut(), base_params.hc) {
-                let uses_bt = matches!(
-                    params.strategy_tag,
-                    super::strategy::StrategyTag::Btlazy2
-                        | super::strategy::StrategyTag::BtOpt
-                        | super::strategy::StrategyTag::BtUltra
-                        | super::strategy::StrategyTag::BtUltra2
-                );
-                let (dict_hash_log, dict_chain_log) = cdict_table_logs(
-                    params.window_log,
-                    base_hc.hash_log,
-                    base_hc.chain_log,
-                    uses_bt,
-                    dict_size,
-                );
-                hc.hash_log = dict_hash_log;
-                hc.chain_log = dict_chain_log;
-            }
-        }
+        // A dictionary frame's hash-chain / binary-tree widths are the CDict's
+        // (`resolve_level_params_with_dict`): verbatim when the dictionary is
+        // copied into the live tables (`ZSTD_resetCCtx_byCopyingCDict` builds
+        // the context from the CDict's cParams), re-adjusted to the source
+        // alone when it is attached (`byAttachingCDict`: the live tables hold
+        // no dictionary entry, the dms carries its own dict-sized tables), so
+        // a small source under a large attached dictionary keeps small live
+        // tables. Nothing re-sizes `params.hc` here.
         // Upstream `ZSTD_resolveRowMatchFinderMode` (zstd_compress.c:238): the
         // greedy/lazy/lazy2 band searches rows only above a 2^14 window and a
         // hash chain otherwise. The Row backend runs that switch itself
@@ -1299,11 +1255,7 @@ impl Matcher for MatchGeneratorDriver {
                 // frames may keep the main table across the reset via an
                 // epoch advance — copy-mode and no-dict frames must memset
                 // it back to bias 0 for the raw-slice kernels.
-                // `Some(0)` is "no dictionary" (the dict-sizing path above
-                // filters it the same way): an empty dict primes nothing, so
-                // an epoch-advance reset would preserve stale attach state
-                // instead of clearing it.
-                let dict_attach_epoch = matches!(dict_hint, Some(size) if size > 0)
+                let dict_attach_epoch = dict_hint.is_some()
                     && self.reset_dict_attach_ok
                     && self
                         .reset_size_log
@@ -1318,7 +1270,7 @@ impl Matcher for MatchGeneratorDriver {
                 // key components mirror `reset_shape` below: Simple leaves
                 // `resolved_table_bits` 0, never carries an LDM override,
                 // and `fast_attach` is false in copy mode by construction.
-                let table_overwritten_by_restore = matches!(dict_hint, Some(size) if size > 0)
+                let table_overwritten_by_restore = dict_hint.is_some()
                     && !dict_attach_epoch
                     && self.primed.as_ref().is_some_and(|(_, _, captured)| {
                         *captured
@@ -1340,7 +1292,7 @@ impl Matcher for MatchGeneratorDriver {
                 // hash_log between the main and dict tables (so one hash keys
                 // both), and shrinking only the main table would break that
                 // invariant and the small-frame dict ratio.
-                let hash_log = if dict_hint.is_some_and(|s| s > 0) {
+                let hash_log = if dict_hint.is_some() {
                     fast.hash_log
                 } else {
                     fast.hash_log.min(params.window_log as u32 + 1)
@@ -1350,10 +1302,10 @@ impl Matcher for MatchGeneratorDriver {
                 // UNKNOWN, dictSize)` adjusted for a `minSrcSize` source), not
                 // the source-capped main width: a small source must not
                 // shrink the table a large dictionary was sized for.
-                m.set_dict_table_hash_log(dict_hint.filter(|&s| s > 0).map(|dict_size| {
+                m.set_dict_table_hash_log(dict_hint.map(|sizes| {
                     crate::encoding::cparams::get_cdict_cparams(
                         crate::encoding::levels::config::numeric_level(level),
-                        dict_size,
+                        sizes.serialized,
                     )
                     .hash_log
                 }));
@@ -1389,10 +1341,10 @@ impl Matcher for MatchGeneratorDriver {
                 // The attached dictionary tables take the CDict's geometry
                 // (upstream hashes the dictMatchState tables with
                 // `dictCParams`), not the source-capped live widths.
-                dfast.set_dict_table_bits(dict_hint.filter(|&s| s > 0).map(|dict_size| {
+                dfast.set_dict_table_bits(dict_hint.map(|sizes| {
                     let cd = crate::encoding::cparams::get_cdict_cparams(
                         crate::encoding::levels::config::numeric_level(level),
-                        dict_size,
+                        sizes.serialized,
                     );
                     (cd.hash_log as usize, cd.chain_log as usize)
                 }));
@@ -1450,15 +1402,12 @@ impl Matcher for MatchGeneratorDriver {
                 // allocation. Was the source of L10-lazy peak-alloc ~2.15x the
                 // upstream zstd on a 1 MiB input. Only applied when hinted; an
                 // unknown-size stream keeps the full level tables.
-                // Skip for dict-bearing frames: their `hc_cfg.{hash,chain}_log`
-                // were already sized to the dictionary content tier via
-                // `cdict_table_logs` (the dict supplies the long-distance
-                // matches, so upstream `ZSTD_createCDict` sizes the prepared
-                // tables to the dict, not the source window). Re-applying the
-                // source-window cap here would collapse those dict-tier logs
-                // back to the small hinted source — the same double-cap the
-                // synthesis sites avoid by using the un-hinted base width.
-                if hinted && !matches!(dict_hint, Some(size) if size > 0) {
+                // Skip for dictionary frames: their `hc_cfg.{hash,chain}_log`
+                // are the CDict's (verbatim when the dictionary is copied
+                // into the live tables, source-adjusted when it is attached);
+                // re-applying the source-window cap would collapse a copied
+                // dictionary's tables to the small hinted source.
+                if hinted && dict_hint.is_none() {
                     let wlog = hc_hash_bits_for_window(table_window_size);
                     let uses_bt = matches!(
                         strategy_tag,
@@ -1490,7 +1439,8 @@ impl Matcher for MatchGeneratorDriver {
                     // dict-hint addition; `reserve_history` applies the
                     // tighter window ceiling to the result.
                     let src_hint = usize::try_from(src).unwrap_or(usize::MAX);
-                    let expected = src_hint.saturating_add(dict_hint.unwrap_or(0));
+                    let expected =
+                        src_hint.saturating_add(dict_hint.map_or(0, |sizes| sizes.content));
                     hc.table.reserve_history(expected);
                 }
             }

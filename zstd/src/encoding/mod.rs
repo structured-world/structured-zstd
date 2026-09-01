@@ -355,6 +355,39 @@ impl CompressionLevel {
     }
 }
 
+/// The sizes of a dictionary handed to [`Matcher::set_dictionary_size_hint`].
+///
+/// Upstream picks the CDict's cParams tier from the size of the serialized
+/// dictionary buffer (`ZSTD_createCDict(dictBuffer, dictSize, level)`, header
+/// and entropy tables included), while the dictionary tables and the attach
+/// cutoffs are sized from the content that is actually indexed.
+///
+/// # Examples
+/// ```
+/// use structured_zstd::encoding::DictionarySizes;
+/// let sizes = DictionarySizes::raw_content(4096);
+/// assert_eq!(sizes.serialized, sizes.content);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DictionarySizes {
+    /// Bytes of dictionary content the matcher indexes.
+    pub content: usize,
+    /// Bytes of the serialized dictionary (the CDict cParams tier key); equal
+    /// to `content` for a raw-content dictionary.
+    pub serialized: usize,
+}
+
+impl DictionarySizes {
+    /// Sizes of a raw-content dictionary: nothing but the content is
+    /// serialized.
+    pub const fn raw_content(len: usize) -> Self {
+        Self {
+            content: len,
+            serialized: len,
+        }
+    }
+}
+
 /// Trait used by the encoder that users can use to extend the matching facilities with their own algorithm
 /// making their own tradeoffs between runtime, memory usage and compression ratio
 ///
@@ -402,13 +435,13 @@ pub trait Matcher {
     /// test stubs. The built-in runtime matcher (`MatchGeneratorDriver`)
     /// overrides this hook and applies the hint during level resolution.
     fn set_source_size_hint(&mut self, _size: u64) {}
-    /// Hint the byte size of the dictionary that will be primed into the next
-    /// frame. The built-in runtime matcher uses it to size the binary-tree /
-    /// hash-chain match-finder tables from the dictionary's cParams tier rather
-    /// than the source window (upstream zstd CDict economics), while keeping the
-    /// eviction window source-sized. Default no-op for custom matchers and test
-    /// stubs; consumed at the next [`reset`](Self::reset).
-    fn set_dictionary_size_hint(&mut self, _size: usize) {}
+    /// Hint the sizes of the dictionary that will be primed into the next
+    /// frame. The built-in runtime matcher resolves the frame's cParams from
+    /// the dictionary's CDict tier (upstream `ZSTD_createCDict`, keyed by the
+    /// serialized size) and sizes its dictionary tables from the content.
+    /// Default no-op for custom matchers and test stubs; consumed at the next
+    /// [`reset`](Self::reset).
+    fn set_dictionary_size_hint(&mut self, _sizes: DictionarySizes) {}
     /// Drop any per-frame fine-grained parameter overrides installed via
     /// the public parameter API, reverting to plain level-based geometry
     /// at the next [`reset`](Self::reset). Called by

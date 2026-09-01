@@ -1149,6 +1149,7 @@ fn set_dictionary_rejects_zero_dictionary_id() {
         huf: crate::decoding::scratch::HuffmanScratch::new(),
         dict_content: vec![1, 2, 3],
         offset_hist: [1, 4, 8],
+        serialized_len: 3,
     };
 
     let mut compressor: FrameCompressor<
@@ -1171,6 +1172,7 @@ fn set_dictionary_rejects_zero_repeat_offsets() {
         huf: crate::decoding::scratch::HuffmanScratch::new(),
         dict_content: vec![1, 2, 3],
         offset_hist: [0, 4, 8],
+        serialized_len: 3,
     };
 
     let mut compressor: FrameCompressor<
@@ -2910,6 +2912,73 @@ fn dictionary_frame_state_records_the_cdict_strategy_not_the_override() {
     let _ = enc.compress_independent_frame(&payload);
     assert_eq!(enc.state.strategy_tag, StrategyTag::Lazy);
     assert_eq!(enc.state.pre_split, Some(2));
+}
+
+/// Regression: the same holds for a CDict outside the lazy band. A 4 KiB
+/// CDict resolves L2 to the fast strategy, and a `Btultra2` override must
+/// not replace it (only `window_log` is the caller's on a dictionary frame).
+#[test]
+fn dictionary_frame_keeps_a_fast_cdict_strategy_under_a_strategy_override() {
+    use crate::encoding::strategy::StrategyTag;
+    use crate::encoding::{CompressionParameters, Strategy};
+    let dict_raw = noise_bytes(4 * 1024, 5);
+    let payload = noise_bytes(100 * 1024, 9);
+    let mut enc: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(2));
+    enc.set_dictionary(
+        crate::decoding::Dictionary::from_raw_content(0xD1C7_0014, dict_raw).unwrap(),
+    )
+    .unwrap();
+    let params = CompressionParameters::builder(super::CompressionLevel::Level(2))
+        .strategy(Strategy::Btultra2)
+        .build()
+        .expect("valid override");
+    enc.set_parameters(&params);
+    enc.set_source_size_hint(payload.len() as u64);
+    let _ = enc.compress_independent_frame(&payload);
+    assert_eq!(enc.state.strategy_tag, StrategyTag::Fast);
+    assert_eq!(enc.state.pre_split, Some(0));
+}
+
+/// Regression: the CDict's cParams tier is picked from the SERIALIZED
+/// dictionary size (`ZSTD_createCDict(dictBuffer, dictSize, level)`), not
+/// from its content length. A dictionary whose content plus the 498-byte
+/// unknown-source margin fits the `<= 16 KiB` tier while its serialized
+/// size does not resolves L11 to btlazy2 (the `<= 128 KiB` row), not btopt.
+#[test]
+fn dictionary_cdict_tier_follows_the_serialized_dictionary_size() {
+    use crate::encoding::strategy::StrategyTag;
+    // 16384 - 498 - 100: the content alone selects the `<= 16 KiB` tier.
+    let content = noise_bytes(15_786, 11);
+    let raw = serialized_dictionary(0xD1C7_0015, &content);
+    assert!(content.len() + 498 <= 16 * 1024);
+    assert!(raw.len() + 498 > 16 * 1024);
+    let payload = noise_bytes(8 * 1024, 9);
+    let mut enc: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(11));
+    enc.set_dictionary_from_bytes(&raw).unwrap();
+    enc.set_source_size_hint(payload.len() as u64);
+    let _ = enc.compress_independent_frame(&payload);
+    assert_eq!(enc.state.strategy_tag, StrategyTag::Btlazy2);
+}
+
+/// A serialized dictionary (magic, id, entropy tables, repeat offsets,
+/// content) around `content`. The entropy section is the fixed blob the
+/// dictionary parser tests use.
+fn serialized_dictionary(id: u32, content: &[u8]) -> Vec<u8> {
+    let mut raw = crate::decoding::dictionary::MAGIC_NUM.to_vec();
+    raw.extend_from_slice(&id.to_le_bytes());
+    raw.extend_from_slice(&[
+        54, 16, 192, 155, 4, 0, 207, 59, 239, 121, 158, 116, 220, 93, 114, 229, 110, 41, 249, 95,
+        165, 255, 83, 202, 254, 68, 74, 159, 63, 161, 100, 151, 137, 21, 184, 183, 189, 100, 235,
+        209, 251, 174, 91, 75, 91, 185, 19, 39, 75, 146, 98, 177, 249, 14, 4, 35, 0, 0, 0, 40, 40,
+        20, 10, 12, 204, 37, 196, 1, 173, 122, 0, 4, 0, 128, 1, 2, 2, 25, 32, 27, 27, 22, 24, 26,
+        18, 12, 12, 15, 16, 11, 69, 37, 225, 48, 20, 12, 6, 2, 161, 80, 40, 20, 44, 137, 145, 204,
+        46, 0, 0, 0, 0, 0, 116, 253, 16, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ]);
+    for rep in [1u32, 4, 8] {
+        raw.extend_from_slice(&rep.to_le_bytes());
+    }
+    raw.extend_from_slice(content);
+    raw
 }
 
 /// Regression: the borrowed (in-place) one-shot path must keep the

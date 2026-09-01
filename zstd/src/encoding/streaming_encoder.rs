@@ -502,12 +502,12 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             !matches!(self.compression_level, CompressionLevel::Uncompressed)
                 && self.state.matcher.supports_dictionary_priming()
                 && self.dictionary.is_some();
-        // The dictionary content size drives dict-tier match-finder sizing
-        // (consumed inside `reset`), so hand it over BEFORE reset.
+        // The dictionary sizes select the CDict cParams tier (consumed inside
+        // `reset`), so hand them over BEFORE reset.
         if use_dictionary_state && let Some(dict) = self.dictionary.as_ref() {
             self.state
                 .matcher
-                .set_dictionary_size_hint(dict.inner.dict_content.len());
+                .set_dictionary_size_hint(dict.inner.sizes());
         }
         self.state.matcher.reset(self.compression_level);
         // Seed the repeat-offset history from the dictionary (upstream zstd
