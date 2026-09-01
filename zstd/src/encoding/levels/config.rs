@@ -970,3 +970,6 @@ pub(crate) fn level_pre_split(level: CompressionLevel) -> Option<usize> {
         .pre_split()
         .map(usize::from)
 }
+
+#[cfg(test)]
+mod tests;
