@@ -194,6 +194,12 @@ impl Matcher for CapturingMatcher {
         self.inner.set_source_size_hint(size);
     }
 
+    fn set_dictionary_size_hint(&mut self, size: usize) {
+        // Forwarded so the frame's cParams derive from the dictionary exactly
+        // as in production (`resolve_level_params_with_dict`).
+        self.inner.set_dictionary_size_hint(size);
+    }
+
     fn prime_with_dictionary(&mut self, dict_content: &[u8], offset_hist: [u32; 3]) {
         self.inner.prime_with_dictionary(dict_content, offset_hist);
     }

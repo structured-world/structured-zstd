@@ -321,8 +321,11 @@ fn driver_level5_greedy_tail_rep_only_reachable() {
     // implicit anchor, no further because anchor itself is the
     // current `abs_pos`).
     let first: &[u8] = b"ABCDABCDABCDABCD"; // 16 bytes — strict period 4
-    let second: &[u8] = b"ABCDA"; // 5 bytes — exact GREEDY_MIN_LOOKAHEAD
-    let mut driver = MatchGeneratorDriver::new(16, 2);
+    // The parse never searches the last 16 bytes of a block (upstream
+    // `lazy_generic` `ilimit`), so the slice carries the period-4 rep past
+    // that tail: the rep probe at the first position finds offset 4.
+    let second: &[u8] = b"ABCDABCDABCDABCDABCDA"; // 21 bytes
+    let mut driver = MatchGeneratorDriver::new(32, 2);
     driver.reset(CompressionLevel::Level(5));
 
     let mut first_space = driver.get_next_space();
@@ -1794,14 +1797,17 @@ fn driver_chain_log_override_survives_row_to_hc_fallback() {
     space.truncate(12);
     driver.commit_space(space);
     driver.skip_matching_with_hint(None);
-    // The override (10) is below the window cap (14), so the resolved HC chain
-    // table must reflect it — NOT the upstream zstd `hashLog - 1` (18, clamped to the
-    // window 14). Pre-fix this resolved to 14.
+    // The override (10) is below the window cap (14), so the resolved chain
+    // table must reflect it — NOT the level's `chainLog`.
+    assert!(
+        driver.row_matcher().uses_hash_chain(),
+        "windowLog <= 14 searches the hash chain"
+    );
     assert_eq!(
-        driver.hc_matcher().table.chain_log,
+        driver.row_matcher().hc_chain_log(),
         chain_log_override as usize,
-        "explicit chain_log override must survive the Row->HC fallback, got {}",
-        driver.hc_matcher().table.chain_log
+        "explicit chain_log override must reach the hash chain, got {}",
+        driver.row_matcher().hc_chain_log()
     );
 }
 
@@ -1853,8 +1859,12 @@ fn driver_small_source_hint_shrinks_row_hash_tables() {
     assert_eq!(driver.window_size(), 1 << MIN_WINDOW_LOG);
     assert_eq!(
         driver.active_backend(),
-        super::super::strategy::BackendTag::HashChain,
-        "windowLog <= 14 must fall back to the upstream zstd hash-chain matchfinder",
+        super::super::strategy::BackendTag::Row,
+        "greedy/lazy stay on the Row backend; it switches the finder itself",
+    );
+    assert!(
+        driver.row_matcher().uses_hash_chain(),
+        "windowLog <= 14 must search the upstream zstd hash chain",
     );
 }
 
@@ -2816,12 +2826,13 @@ fn row_prime_with_dictionary_preserves_history_for_first_full_block() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
     // Level(5) is the greedy Row backend (LEVEL_TABLE row 5: Greedy / RowHash).
     // Level(4) now routes to Dfast, so this test must use Level(5) to actually
-    // exercise `RowMatchGenerator`'s dictionary priming. The 16-byte dict +
-    // 16-byte block lets the whole block match the primed dict (offset = dict
-    // length = 16).
+    // exercise `RowMatchGenerator`'s dictionary priming. The 40-byte dict +
+    // 40-byte block lets the whole block match the primed dict (offset = dict
+    // length = 40); the block exceeds the 16-byte tail the parse never
+    // searches (upstream `lazy_generic` `ilimit`).
     driver.reset(CompressionLevel::Level(5));
 
-    let payload = b"abcdefghijklmnop";
+    let payload = b"abcdefghijklmnopqrstuvwxyz0123456789ABCD";
     driver.prime_with_dictionary(payload, [1, 4, 8]);
 
     let mut space = driver.get_next_space();
