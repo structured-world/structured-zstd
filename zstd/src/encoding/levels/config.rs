@@ -205,42 +205,28 @@ impl LevelParams {
         }
     }
 
-    /// Cheap fingerprint pre-splitter level (the C-like `blockSplitterLevel`):
-    /// the EFFECTIVE upstream `ZSTD_splitBlock` level that
-    /// `ZSTD_optimalBlockSize` dispatches, i.e. `splitLevels[strategy] - 2`
-    /// (clamped at 0), NOT the raw `splitLevels[]` value. `split_level == 0`
-    /// routes to the cheap from-borders heuristic; `1..=4` to byChunks with
-    /// internal sampling level `split_level - 1`. See the body for the
-    /// per-strategy tier table and why the raw-table mapping was wrong.
+    /// Cheap fingerprint pre-splitter level: the `ZSTD_splitBlock` level
+    /// upstream `ZSTD_optimalBlockSize` (zstd_compress.c:4552) dispatches by
+    /// default, `splitLevels[strategy] = {0,0,1,2,2,3,3,4,4,4}` indexed by
+    /// the upstream strategy ordinal. Only an EXPLICIT `blockSplitterLevel`
+    /// (2..=6) is shifted down by 2 there; the default table is used as is.
+    /// `0` routes to the from-borders heuristic; `1..=4` to byChunks with
+    /// sampling tier `level - 1` (rates 43 / 11 / 5 / 1).
     pub(crate) fn pre_split(&self) -> Option<u8> {
         use crate::encoding::strategy::StrategyTag;
-        // Effective upstream `ZSTD_splitBlock` level = `splitLevels[strat] - 2`
-        // (clamped at 0). Upstream `splitLevels[] = {0,0,1,2,2,3,3,4,4,4}` then
-        // subtracts 2 before dispatch, so the byChunks sampling tier is two
-        // steps coarser than the raw table: greedy/lazy(d1)=0 (from-borders),
-        // lazy2/btlazy2=1 (byChunks rate 43), btopt+=2 (byChunks rate 11).
-        // An earlier version mirrored the RAW table AND bumped lazy2 to the
-        // rate-1 full scan (split 4) to dodge a periodic-input phantom-split —
-        // that ran the pre-splitter at up to 43x upstream's sampling cost
-        // (~87% of L9 encode time on the decode corpus). Per the drop-in
-        // contract ratio only needs to stay <= upstream, so matching upstream's
-        // sampling tier (and accepting upstream's identical over-split on
-        // periodic input) is the dominant large-input encode-speed win.
         Some(match self.strategy_tag {
-            // splitLevels 0/1 -> 0: upstream does not pre-split fast/dfast at
-            // all; from-borders is the cheapest stand-in and rarely splits.
-            StrategyTag::Fast | StrategyTag::Dfast => 0,
-            // greedy / lazy(depth 1): splitLevels 2 -> 0 (from-borders).
-            StrategyTag::Greedy => 0,
+            StrategyTag::Fast => 0,
+            StrategyTag::Dfast => 1,
+            StrategyTag::Greedy => 2,
             StrategyTag::Lazy => {
                 if self.lazy_depth >= 2 {
-                    1 // lazy2: splitLevels 3 -> 1 (byChunks rate 43)
+                    3 // lazy2
                 } else {
-                    0 // lazy depth 1: splitLevels 2 -> 0 (from-borders)
+                    2 // lazy
                 }
             }
-            StrategyTag::Btlazy2 => 1, // splitLevels 3 -> 1 (byChunks rate 43)
-            StrategyTag::BtOpt | StrategyTag::BtUltra | StrategyTag::BtUltra2 => 2,
+            StrategyTag::Btlazy2 => 3,
+            StrategyTag::BtOpt | StrategyTag::BtUltra | StrategyTag::BtUltra2 => 4,
         })
     }
 }

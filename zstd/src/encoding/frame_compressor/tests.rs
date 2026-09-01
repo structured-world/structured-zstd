@@ -2052,12 +2052,12 @@ fn split_block_from_borders_returns_midpoint_for_centred_transition() {
 }
 
 /// `level_pre_split` resolves the per-level split knob through the
-/// `LevelParams` table, returning the EFFECTIVE upstream `ZSTD_splitBlock`
-/// level (`splitLevels[strategy] - 2`, clamped at 0) that
-/// `ZSTD_optimalBlockSize` dispatches: fast/dfast/greedy/lazy(d1) → 0
-/// (from-borders), lazy2/btlazy2 → 1 (byChunks rate 43),
-/// btopt/btultra/btultra2 → 2 (byChunks rate 11). `Uncompressed` has no
-/// numeric level so it stays `None`.
+/// `LevelParams` table, returning the upstream `ZSTD_splitBlock` level that
+/// `ZSTD_optimalBlockSize` dispatches by default, `splitLevels[strategy] =
+/// {0,0,1,2,2,3,3,4,4,4}`: fast → 0 (from-borders), dfast → 1 (byChunks
+/// rate 43), greedy/lazy → 2 (rate 11), lazy2/btlazy2 → 3 (rate 5),
+/// btopt/btultra/btultra2 → 4 (rate 1). `Uncompressed` has no numeric
+/// level so it stays `None`.
 #[test]
 fn pre_split_level_dispatches_by_compression_level() {
     use crate::encoding::CompressionLevel;
@@ -2065,8 +2065,8 @@ fn pre_split_level_dispatches_by_compression_level() {
     assert_eq!(level_pre_split(CompressionLevel::Uncompressed), None);
     // Fastest = level 1 (fast) → 0 (from-borders).
     assert_eq!(level_pre_split(CompressionLevel::Fastest), Some(0));
-    // Default = level 3 (dfast) → 0 (splitLevels 1 - 2, clamped).
-    assert_eq!(level_pre_split(CompressionLevel::Default), Some(0));
+    // Default = level 3 (dfast) → 1 (byChunks rate 43).
+    assert_eq!(level_pre_split(CompressionLevel::Default), Some(1));
     // Better is a pure alias for level 7 (lazy): same as Level(7).
     assert_eq!(
         level_pre_split(CompressionLevel::Better),
@@ -2080,33 +2080,28 @@ fn pre_split_level_dispatches_by_compression_level() {
         level_pre_split(CompressionLevel::Level(13)),
     );
     assert_eq!(level_pre_split(CompressionLevel::Level(2)), Some(0)); // fast
-    assert_eq!(level_pre_split(CompressionLevel::Level(4)), Some(0)); // dfast
-    assert_eq!(level_pre_split(CompressionLevel::Level(5)), Some(0)); // greedy
-    assert_eq!(level_pre_split(CompressionLevel::Level(7)), Some(0)); // lazy (depth 1)
-    // lazy2 / btlazy2: splitLevels 3 - 2 = 1 (byChunks rate 43, hashLog 8).
-    // The coarse byte-histogram tier is robust to the periodic-input
-    // phantom-split the rate-5/hashLog-10 tier suffered, so it matches
-    // upstream AND stays whole on periodic input (`periodic_stream_not_oversplit`).
-    assert_eq!(level_pre_split(CompressionLevel::Level(8)), Some(1)); // lazy2 lower bound
-    assert_eq!(level_pre_split(CompressionLevel::Level(11)), Some(1)); // lazy2 (depth 2)
-    assert_eq!(level_pre_split(CompressionLevel::Level(12)), Some(1)); // lazy2 upper bound
-    assert_eq!(level_pre_split(CompressionLevel::Level(13)), Some(1)); // btlazy2 lower bound
-    assert_eq!(level_pre_split(CompressionLevel::Level(15)), Some(1)); // btlazy2 (depth 2)
-    assert_eq!(level_pre_split(CompressionLevel::Level(16)), Some(2)); // btopt
-    assert_eq!(level_pre_split(CompressionLevel::Level(22)), Some(2)); // btultra2
+    assert_eq!(level_pre_split(CompressionLevel::Level(4)), Some(1)); // dfast
+    assert_eq!(level_pre_split(CompressionLevel::Level(5)), Some(2)); // greedy
+    assert_eq!(level_pre_split(CompressionLevel::Level(7)), Some(2)); // lazy (depth 1)
+    assert_eq!(level_pre_split(CompressionLevel::Level(8)), Some(3)); // lazy2 lower bound
+    assert_eq!(level_pre_split(CompressionLevel::Level(11)), Some(3)); // lazy2 (depth 2)
+    assert_eq!(level_pre_split(CompressionLevel::Level(12)), Some(3)); // lazy2 upper bound
+    assert_eq!(level_pre_split(CompressionLevel::Level(13)), Some(3)); // btlazy2 lower bound
+    assert_eq!(level_pre_split(CompressionLevel::Level(15)), Some(3)); // btlazy2 (depth 2)
+    assert_eq!(level_pre_split(CompressionLevel::Level(16)), Some(4)); // btopt
+    assert_eq!(level_pre_split(CompressionLevel::Level(22)), Some(4)); // btultra2
 }
 
-/// Regression: a homogeneous but periodic multi-block stream must not be
-/// pre-split into tiny blocks at the lazy2 / btlazy2 levels. The rate-5
-/// chunk sampler used to phantom-split such input at every 8 KB chunk,
-/// cascading a large stream into hundreds of tiny blocks whose per-block
-/// headers ballooned the output (~5x vs the lazy level next door). With
-/// the rate-1 full-scan splitter the periodic stream is seen as uniform
-/// and stays a few full blocks. We assert the lazy2 (L8) and btlazy2 (L15)
-/// outputs stay within 2x of the lazy (L7) output on the same input, and
-/// that every output round-trips.
+/// A homogeneous but periodic multi-block stream at the lazy (L7), lazy2
+/// (L8) and btlazy2 (L15) levels round-trips. The lazy2 / btlazy2 tier
+/// (upstream `splitLevels` 3, byChunks rate 5) pre-splits this input into
+/// more blocks than the lazy tier, exactly as upstream does (528 vs 189
+/// bytes on 512 KB, byte-identical to `ZSTD_compress2`); the size parity
+/// with the reference is asserted in `ffi-bench`
+/// (`periodic_stream_presplit_matches_reference`), this test only pins the
+/// round-trip and that the outputs stay small.
 #[test]
-fn periodic_stream_not_oversplit() {
+fn periodic_stream_roundtrips_at_every_presplit_tier() {
     use crate::encoding::{CompressionLevel, compress_slice_to_vec};
     const LINES: &[&str] = &[
         "ts=2026-03-26T21:39:28Z level=INFO msg=\"flush memtable\" tenant=demo table=orders region=eu-west\n",
@@ -2127,18 +2122,15 @@ fn periodic_stream_not_oversplit() {
     let l7 = compress_slice_to_vec(&data, CompressionLevel::Level(7)); // lazy depth1
     let l8 = compress_slice_to_vec(&data, CompressionLevel::Level(8)); // lazy2
     let l15 = compress_slice_to_vec(&data, CompressionLevel::Level(15)); // btlazy2
-    assert!(
-        l8.len() < l7.len() * 2,
-        "lazy2 over-split periodic stream: l7={} l8={}",
-        l7.len(),
-        l8.len()
-    );
-    assert!(
-        l15.len() < l7.len() * 2,
-        "btlazy2 over-split periodic stream: l7={} l15={}",
-        l7.len(),
-        l15.len()
-    );
+    // 512 KB of four repeating lines: every tier stays within a few block
+    // headers of the ~190-byte single-block frame (upstream: 189 / 528 / 528).
+    for (level, out) in [(7, &l7), (8, &l8), (15, &l15)] {
+        assert!(
+            out.len() < 1024,
+            "L{level} periodic stream ballooned: {} bytes",
+            out.len()
+        );
+    }
     for out in [&l7, &l8, &l15] {
         let mut decoder = FrameDecoder::new();
         let mut round = Vec::with_capacity(data.len());

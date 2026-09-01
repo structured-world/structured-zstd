@@ -261,3 +261,7 @@ path = "examples/encode_small.rs"
 [[example]]
 name = "ratio_parity"
 path = "examples/ratio_parity.rs"
+
+[[example]]
+name = "periodic_presplit"
+path = "examples/periodic_presplit.rs"
