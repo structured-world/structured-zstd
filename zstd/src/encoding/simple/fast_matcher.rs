@@ -1769,17 +1769,16 @@ impl FastKernelMatcher {
             "dict fill origin {} ran ahead of slice start {range_start}",
             self.dict.next_to_update(),
         );
-        let fill_start = self.dict.next_to_update();
-        if fill_start > last_hashable {
+        if self.dict.next_to_update() > last_hashable {
             return;
         }
-        // Size the dict table to the CDict geometry (upstream
-        // `ZSTD_cpm_createCDict`: `ZSTD_adjustCParams_internal` drives hashLog
-        // down to the dict-and-window log off a `minSrcSize` source), NOT the
-        // source-window-sized main table. For a small dictionary this is a
-        // narrower table, and the Fast dictMatchState hashes `ip` with
-        // `dictCParams->hashLog` — so the occurrence a hash bucket resolves to
-        // matches upstream's, which the wider main-table geometry does not.
+        // Size the dict table to the CDict geometry of the WHOLE dictionary
+        // (upstream `ZSTD_cpm_createCDict`: `ZSTD_adjustCParams_internal`
+        // drives hashLog down to the dict-and-window log off a `minSrcSize`
+        // source and `dictSize`), NOT the source-window-sized main table nor
+        // the slice at hand. For a small dictionary this is a narrower table,
+        // and the Fast dictMatchState hashes `ip` with `dictCParams->hashLog`,
+        // so the occurrence a hash bucket resolves to matches upstream's.
         // `create_cdict_table_logs` only ever downsizes, so feeding the already
         // source-capped main `hash_log` as the base yields the same result as
         // the un-capped level base would.
@@ -1790,8 +1789,19 @@ impl FastKernelMatcher {
             main_hash_log,
             main_hash_log,
             /* uses_bt */ false,
-            history_len,
+            dict_len,
         );
+        // A retained table of another width belongs to another dictionary
+        // (or geometry); rebuild from the start.
+        if self
+            .dict
+            .table()
+            .is_some_and(|t| t.hash_log() != hash_log || t.mls() != mls)
+        {
+            self.dict.invalidate();
+            self.dict.set_region_len(history_len);
+        }
+        let fill_start = self.dict.next_to_update();
         self.dict
             .table_mut_or_init(|| FastHashTable::new(hash_log, mls));
         let base = self.history.as_ptr();
@@ -1809,9 +1819,9 @@ impl FastKernelMatcher {
     /// Monomorphised per-MLS dict-table fill. `base` is a raw pointer into
     /// `self.history` (no borrow held), so mutating `self.dict_table` in the
     /// loop is sound — the loop never touches `history`, which stays put.
-    /// Returns the carried-forward fill origin (one past the last position
-    /// hashed), stored as [`DictAttach::next_to_update`] so the next
-    /// `accept_data` slice resumes here without dropping the seam.
+    /// Returns the carried-forward fill origin (the first stride position not
+    /// yet processed), stored as [`DictAttach::next_to_update`] so the next
+    /// `accept_data` slice resumes there with the stride phase intact.
     fn prime_dict_table_impl<const MLS: u32>(
         &mut self,
         base: *const u8,
@@ -1901,11 +1911,14 @@ impl FastKernelMatcher {
             }
             s += FILL_STEP;
         }
-        // Every position up to `last_hashable` is hashed; the next `accept_data`
-        // slice resumes one past it, picking up the seam positions whose 8-byte
-        // hash read straddled this slice's tail (unreachable until more bytes
-        // landed).
-        last_hashable + 1
+        // Upstream fills the whole dictionary in ONE stride pass; a slice
+        // that ends inside a stride group hands the group's unprocessed
+        // positions (`s ..= last_hashable`, at most two) to the next slice
+        // by resuming at `s`, which keeps the stride phase and also reaches
+        // the seam positions whose 8-byte hash read straddled this slice's
+        // tail. Returning `last_hashable + 1` would drop them and shift the
+        // phase by the leftover.
+        s
     }
 }
 
