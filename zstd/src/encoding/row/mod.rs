@@ -2900,7 +2900,36 @@ impl RowMatchGenerator {
                 self.hc_chain.resize(chain_len, empty);
             }
             self.hc_layout = self.finder;
+        } else {
+            // Rows mode never reads the chain / tree tables; a reused
+            // compressor coming back from a btlazy2 level (same Row storage,
+            // no backend swap) must not retain them (tens of MiB) alongside
+            // the live row tables.
+            self.hc_hash = Vec::new();
+            self.hc_chain = Vec::new();
         }
+    }
+
+    /// Combined length of the chain / tree tables. Test-only.
+    #[cfg(test)]
+    pub(crate) fn hc_tables_len(&self) -> usize {
+        self.hc_hash.len() + self.hc_chain.len()
+    }
+
+    /// The absolute coordinate floor. Test-only.
+    #[cfg(test)]
+    pub(crate) fn abs_floor(&self) -> usize {
+        self.history_abs_start
+    }
+
+    /// Force the absolute coordinate floor (simulates a long-lived reused
+    /// compressor whose cumulative cursor nears `u32::MAX`). Test-only.
+    #[cfg(test)]
+    pub(crate) fn set_abs_floor(&mut self, floor: usize) {
+        self.history_abs_start = floor;
+        self.low_limit = floor;
+        self.prefix_low = floor;
+        self.lazy_next_to_update = floor;
     }
 
     /// The empty-slot value of the chain / tree tables for the active finder.
@@ -2972,6 +3001,17 @@ impl RowMatchGenerator {
     /// `buffer` must stay live and unmodified until `clear_borrowed_window`
     /// or `reset` — the matcher stores a raw pointer into it.
     pub(crate) unsafe fn set_borrowed_window(&mut self, buffer: &[u8]) {
+        // Same `u32` headroom guard as `add_data`: the borrowed reuse path
+        // advances the coordinate floor per frame without ever committing
+        // through `add_data`, so after ~4 GiB of cumulative reused frames the
+        // inserted positions would wrap `u32` and every candidate would read
+        // as stale. Rebase the origin down before this frame's positions are
+        // stored (`rebase_positions` zeroes the floor; the previous frame's
+        // stale entries collapse to empty, exactly what the advanced floor
+        // already made them).
+        if self.history_abs_start + buffer.len() >= u32::MAX as usize - 1 - BT_IDX_BASE {
+            self.rebase_positions();
+        }
         self.borrowed_input = Some((buffer.as_ptr(), buffer.len()));
         self.borrowed_block = None;
         self.borrowed_extent = 0;

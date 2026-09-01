@@ -2006,6 +2006,61 @@ fn driver_no_dictionary_reset_drops_the_attached_tables() {
     );
 }
 
+/// Regression: switching a reused compressor from a tree level back to a
+/// rows level (both on the Row backend, so no backend swap runs) releases
+/// the chain / tree tables — they are tens of MiB at the btlazy2 levels and
+/// the rows finder never reads them.
+#[test]
+fn driver_rows_reset_releases_the_tree_tables() {
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+    driver.set_source_size_hint(1 << 20);
+    driver.reset(CompressionLevel::Level(15));
+    let mut space = driver.get_next_space();
+    space[..12].copy_from_slice(b"abcabcabcabc");
+    space.truncate(12);
+    driver.commit_space(space);
+    driver.skip_matching_with_hint(None);
+    assert!(
+        driver.row_matcher().hc_tables_len() > 0,
+        "tree tables live at L15"
+    );
+    driver.set_source_size_hint(1 << 20);
+    driver.reset(CompressionLevel::Level(5));
+    let mut space = driver.get_next_space();
+    space[..12].copy_from_slice(b"abcabcabcabc");
+    space.truncate(12);
+    driver.commit_space(space);
+    driver.skip_matching_with_hint(None);
+    assert_eq!(
+        driver.row_matcher().hc_tables_len(),
+        0,
+        "a rows frame must not retain the previous tree tables"
+    );
+}
+
+/// Regression: registering a borrowed window rebases the coordinate origin
+/// before the cumulative floor would push stored `u32` positions past
+/// `u32::MAX` (the owned path does this in `add_data`; the borrowed reuse
+/// path advanced the floor per frame without ever rebasing, so after ~4 GiB
+/// of reused one-shot frames every inserted position wrapped and matching
+/// silently degraded).
+#[test]
+fn borrowed_window_rebases_before_the_u32_cursor_wraps() {
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+    driver.set_source_size_hint(1 << 20);
+    driver.reset(CompressionLevel::Level(5));
+    let buf = alloc::vec![0u8; 1 << 20];
+    let floor = u32::MAX as usize - (1 << 19);
+    driver.row_matcher_mut().set_abs_floor(floor);
+    // SAFETY: `buf` outlives the borrowed window in this test.
+    unsafe { driver.row_matcher_mut().set_borrowed_window(&buf) };
+    let after = driver.row_matcher_mut().abs_floor();
+    assert!(
+        after + buf.len() < u32::MAX as usize - 1,
+        "borrowed window left the floor at {after}: positions would wrap u32"
+    );
+}
+
 /// Regression: a Dfast attach-mode dictionary table primed for an
 /// unknown-size frame (attach at the FULL live widths) must not be
 /// re-borrowed by a frame past the 16 KiB attach cutoff whose live widths

@@ -293,6 +293,10 @@ pub(crate) fn apply_param_overrides(
             params.dfast.get_or_insert(DFAST_L3);
         }
         SearchMethod::RowHash | SearchMethod::BinaryTreeLazy => {
+            // `ROW_L5` already carries `mls = ROW_MIN_MATCH_LEN = 5`, the
+            // upstream `minMatch` of the whole greedy..btlazy2 band at the
+            // >256 KiB tier, so a synthesized btlazy2 override hashes at the
+            // same width as a native btlazy2 row.
             let row = params.row.get_or_insert(ROW_L5);
             row.bt = matches!(params.search, SearchMethod::BinaryTreeLazy);
         }
