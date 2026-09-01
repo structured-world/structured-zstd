@@ -1922,9 +1922,11 @@ fn row_short_block_emits_literals_only() {
     );
     assert_eq!(reconstructed, b"abcde");
 
-    // Then feed a clearly matchable block and ensure the Triple arm is reachable.
+    // Then feed a clearly matchable block and ensure the Triple arm is
+    // reachable. The block must exceed the 16-byte tail the lazy parse never
+    // searches (upstream zstd `lazy_generic` `ilimit`).
     saw_triple = false;
-    matcher.add_data(b"abcdeabcde".to_vec(), |_| {});
+    matcher.add_data(b"abcdeabcdeabcdeabcde-padding-past-ilimit".to_vec(), |_| {});
     matcher.start_matching(|seq| {
         if let Sequence::Triple { .. } = seq {
             saw_triple = true;
@@ -1968,7 +1970,10 @@ fn row_backfills_previous_block_tail_for_cross_boundary_match() {
 
     let mut first_block = alloc::vec![0xA5; 64];
     first_block.extend_from_slice(b"XYZ");
-    let second_block = b"XYZXYZtail".to_vec();
+    // Long enough for the lazy parse to search: upstream zstd
+    // `lazy_generic` stops 16 bytes before the block end, so a block shorter
+    // than that is emitted as literals regardless of history.
+    let second_block = b"XYZXYZtail-padding-past-ilimit".to_vec();
 
     let replay_sequence = |decoded: &mut Vec<u8>, seq: Sequence<'_>| match seq {
         Sequence::Literals { literals } => decoded.extend_from_slice(literals),

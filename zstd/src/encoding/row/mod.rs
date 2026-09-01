@@ -24,6 +24,35 @@ use super::match_generator::{
     ROW_TAG_BITS, ROW_TARGET_LEN,
 };
 
+/// Upstream zstd lazy-parse bounds (`zstd_lazy.c`): the row parse stops
+/// `8 + ZSTD_ROW_HASH_CACHE_SIZE` bytes before the block end, a miss steps
+/// by `(ip - anchor) >> kSearchStrength + 1`, and steps above
+/// `kLazySkippingStep` stop indexing the skipped-over positions.
+const LAZY_ROW_ILIMIT_MARGIN: usize = 16;
+const LAZY_SEARCH_STRENGTH: u32 = 8;
+const LAZY_SKIPPING_STEP: usize = 8;
+
+/// Upstream zstd `ZSTD_highbit32(offBase)` term of the lazy gain formula:
+/// `offBase` is `offset + 3` for a real offset and 1 for repcode 1
+/// (`off == 0` here), whose highbit is 0.
+#[inline(always)]
+fn offbase_highbit(off: usize) -> i64 {
+    if off == 0 {
+        0
+    } else {
+        i64::from(31 - ((off + 3) as u32).leading_zeros())
+    }
+}
+
+/// Unaligned little-endian 4-byte read (upstream zstd `MEM_read32`).
+///
+/// # Safety
+/// `p..p + 4` must be readable.
+#[inline(always)]
+unsafe fn rd32(p: *const u8) -> u32 {
+    u32::from_le_bytes(unsafe { p.cast::<[u8; 4]>().read_unaligned() })
+}
+
 /// Immutable row-hash dictionary index (upstream zstd `ZSTD_RowFindBestMatch`'s
 /// `dictMatchState` probe). Built once over the dictionary region and probed as
 /// ONE fixed-width row (`<= row_entries` tag-matched candidates) AFTER the live
@@ -457,24 +486,232 @@ macro_rules! greedy_parse_body {
     }};
 }
 
-/// Rep + row best-of-two probe (the lazy search step) with the probe body
-/// expanded inline under the enclosing tier umbrella.
-macro_rules! row_best_match {
-    ($m:expr, $abs_pos:expr, $lit_len:expr, $hash:expr, $rl:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
-        let rep = $m.repcode_candidate($abs_pos, $lit_len);
-        row_probe_body!(
-            $m, $abs_pos, $lit_len, $hash, rep, $rl, $use_mask, $maskmac, $cpl
-        )
+/// Upstream zstd `ZSTD_RowFindBestMatch` (zstd_lazy.c:1141) at one position:
+/// the row is walked newest-first until the first entry below the window
+/// floor, the in-window candidates are buffered (and their data prefetched),
+/// then each is gated by a 4-byte compare at the current best length
+/// (`match + ml - 3`) before the full count. Lengths are FORWARD only (the
+/// catch-up belongs to the parse). Evaluates to `(ml, offset)`: `ml == 3`
+/// means nothing found (upstream's `ml = 4-1`), `offset` is the distance.
+/// Leftover attempts fund the dictionary row (upstream `dictMatchState`).
+macro_rules! row_find_best_match {
+    ($m:expr, $abs_pos:expr, $row:expr, $tag:expr, $rl:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
+        let concat = $m.live_history();
+        let hist_start = $m.history_abs_start;
+        let cur_idx = $abs_pos - hist_start;
+        // SAFETY: the parse searches only positions >= 16 bytes before the
+        // block end, so `cur_idx + 16 <= concat.len()`.
+        let cur_ptr = unsafe { concat.as_ptr().add(cur_idx) };
+        let limit = concat.len() - cur_idx;
+        let row_entries = 1usize << $rl;
+        let row_mask = row_entries - 1;
+        let row_base = $row << $rl;
+        let head = $m.row_heads[$row] as usize;
+        let window_low = hist_start.max($abs_pos.saturating_sub($m.max_window_size));
+        let budget = $m.search_depth.min(row_entries);
+        let mut attempts = budget;
+        let mut ml = 3usize;
+        let mut best_off = 0usize;
+        let entries_bits: u64 = if row_entries >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << row_entries) - 1
+        };
+        let mut buf = [0u32; 64];
+        let mut n = 0usize;
+        {
+            #[allow(unused_mut)]
+            let mut pending: u64 = if $use_mask {
+                let m =
+                    $maskmac!(&$m.row_tags[row_base..row_base + row_entries], $tag) & entries_bits;
+                if head == 0 {
+                    m
+                } else {
+                    ((m >> head) | (m << (row_entries - head))) & entries_bits
+                }
+            } else {
+                0
+            };
+            #[allow(unused_mut)]
+            let mut scan = 0usize;
+            while attempts > 0 {
+                let slot_opt = if $use_mask {
+                    if pending == 0 {
+                        None
+                    } else {
+                        let i = pending.trailing_zeros() as usize;
+                        pending &= pending - 1;
+                        Some((head + i) & row_mask)
+                    }
+                } else {
+                    let mut found = None;
+                    while scan < row_entries {
+                        let s = (head + scan) & row_mask;
+                        scan += 1;
+                        if $m.row_tags[row_base + s] == $tag {
+                            found = Some(s);
+                            break;
+                        }
+                    }
+                    found
+                };
+                let Some(slot) = slot_opt else { break };
+                let raw = $m.row_positions[row_base + slot];
+                // Newest-first order: the first empty / below-floor entry ends
+                // the walk (upstream `if (matchIndex < lowLimit) break`).
+                if raw == ROW_EMPTY_SLOT || (raw as usize) < window_low {
+                    break;
+                }
+                if (raw as usize) >= $abs_pos {
+                    continue;
+                }
+                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                {
+                    #[cfg(target_arch = "x86")]
+                    use core::arch::x86::{_MM_HINT_T0, _mm_prefetch};
+                    #[cfg(target_arch = "x86_64")]
+                    use core::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+                    // SAFETY: prefetch is a hint; the candidate lies in the live
+                    // history.
+                    unsafe {
+                        _mm_prefetch(
+                            concat.as_ptr().add(raw as usize - hist_start).cast(),
+                            _MM_HINT_T0,
+                        );
+                    }
+                }
+                buf[n] = raw;
+                n += 1;
+                attempts -= 1;
+            }
+        }
+        for &raw in &buf[..n] {
+            let cand_idx = raw as usize - hist_start;
+            // SAFETY: `cand_idx < cur_idx`; the gate reads 4 bytes at
+            // `+ ml - 3` where `ml + 1 <= limit` (the count breaks out of the
+            // loop at `ml == limit`), so both reads stay inside `concat`.
+            unsafe {
+                let cand_ptr = concat.as_ptr().add(cand_idx);
+                if rd32(cand_ptr.add(ml - 3)) == rd32(cur_ptr.add(ml - 3)) {
+                    let cml = $cpl(cand_ptr, cur_ptr, limit);
+                    if cml > ml {
+                        ml = cml;
+                        best_off = $abs_pos - raw as usize;
+                        if cml == limit {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        // Dictionary row: funded by the attempts the live row left (upstream
+        // shares one `nbAttempts`), floored at a full 16-entry row so the CDict
+        // search depth stays effective on small-level dictionaries.
+        let dict_budget = budget.max(16);
+        let used = budget - attempts;
+        if ml < limit
+            && used < dict_budget
+            && let Some(dict) = $m.dict.table()
+        {
+            let mut dattempts = dict_budget - used;
+            let dict_end = $m.dict.region_len();
+            let dhead = dict.heads[$row] as usize;
+            #[allow(unused_mut)]
+            let mut dpending: u64 = if $use_mask {
+                let m =
+                    $maskmac!(&dict.tags[row_base..row_base + row_entries], $tag) & entries_bits;
+                if dhead == 0 {
+                    m
+                } else {
+                    ((m >> dhead) | (m << (row_entries - dhead))) & entries_bits
+                }
+            } else {
+                0
+            };
+            #[allow(unused_mut)]
+            let mut dscan = 0usize;
+            while dattempts > 0 {
+                let slot_opt = if $use_mask {
+                    if dpending == 0 {
+                        None
+                    } else {
+                        let i = dpending.trailing_zeros() as usize;
+                        dpending &= dpending - 1;
+                        Some((dhead + i) & row_mask)
+                    }
+                } else {
+                    let mut found = None;
+                    while dscan < row_entries {
+                        let s = (dhead + dscan) & row_mask;
+                        dscan += 1;
+                        if dict.tags[row_base + s] == $tag {
+                            found = Some(s);
+                            break;
+                        }
+                    }
+                    found
+                };
+                let Some(slot) = slot_opt else { break };
+                let dp = dict.positions[row_base + slot];
+                if dp == ROW_EMPTY_SLOT {
+                    break;
+                }
+                dattempts -= 1;
+                let dp = dp as usize;
+                if dp + 4 > dict_end {
+                    continue;
+                }
+                // SAFETY: `dp + 4 <= dict_end <= cur_idx`, `cur_idx + 4 <= concat.len()`.
+                unsafe {
+                    let dptr = concat.as_ptr().add(dp);
+                    if rd32(dptr) == rd32(cur_ptr) {
+                        let cml = $cpl(dptr, cur_ptr, limit);
+                        if cml > ml {
+                            ml = cml;
+                            best_off = $abs_pos - (hist_start + dp);
+                            if cml == limit {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        (ml, best_off)
     }};
 }
 
-/// The lazy row parse BODY as a macro — same per-tier monolith shape as
-/// `greedy_parse_body!` for the lazy levels. Upstream zstd's `ZSTD_searchMax`
-/// is `FORCE_INLINE_TEMPLATE` into `ZSTD_compressBlock_lazy_generic`, so the
-/// search at every probe site (current position + the `lazy_decide!` lookahead)
-/// expands the rep + row-probe body inline via `row_best_match!` rather than
-/// calling an out-of-line per-tier `#[target_feature]` search method — keeping
-/// the whole per-position pipeline one monolith with no per-position call cost.
+/// Upstream zstd `ZSTD_searchMax` for the row lazy parse: index the not yet
+/// indexed gap up to `$p` (skipped while lazy-skipping; a long gap keeps only
+/// its 96 head + 32 tail positions), search `$p`, then index `$p` itself.
+/// `$ntu` is the parse's `nextToUpdate` local, `$skip` its `lazySkipping`.
+macro_rules! lazy_search_at {
+    ($m:expr, $p:expr, $ntu:ident, $skip:ident, $rl:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
+        let p = $p;
+        if !$skip && $ntu < p {
+            $m.insert_match_span::<$rl>($ntu, p);
+        }
+        let r = match $m.hash_and_row(p) {
+            Some((row, tag)) => {
+                let r = row_find_best_match!($m, p, row, tag, $rl, $use_mask, $maskmac, $cpl);
+                $m.insert_at::<$rl>(p, row, tag);
+                r
+            }
+            None => (3usize, 0usize),
+        };
+        $ntu = p + 1;
+        r
+    }};
+}
+
+/// The lazy row parse BODY: upstream zstd `ZSTD_compressBlock_lazy_generic`
+/// (zstd_lazy.c:1516) for the row-hash search, expanded per SIMD tier so the
+/// search splices (`lazy_search_at!`, upstream's `FORCE_INLINE_TEMPLATE
+/// ZSTD_searchMax`) inline into the parse loop as ONE monolith. Same
+/// decisions as upstream: repcode 1 probed one byte ahead, gain-weighted
+/// depth-1/depth-2 lookahead (each position searched once), catch-up on the
+/// chosen match only, immediate-repcode loop after every stored sequence,
+/// `>> 8` miss acceleration with lazy skipping past step 8.
 macro_rules! lazy_parse_body {
     ($m:expr, $handle:expr, $rl:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
         #[allow(unused_labels)]
@@ -491,153 +728,220 @@ macro_rules! lazy_parse_body {
                 $m.insert_positions::<$rl>(backfill_start, current_abs_start);
             }
 
-            let mls = $m.mls;
-            let mut pos = 0usize;
-            let mut literals_start = 0usize;
-            // Lookahead search result carried into the next iteration
-            // (upstream zstd's lazy chain, `zstd_lazy.c` lazy_generic: a
-            // deferred position's successor is never searched twice — the
-            // depth loop carries the better match forward). `Some(r)` means
-            // this iteration's position was already searched as the previous
-            // iteration's lookahead, with result `r`.
-            let mut carried: Option<Option<MatchCandidate>> = None;
-            while pos + mls <= current_len {
-                let abs_pos = current_abs_start + pos;
-                let lit_len = pos - literals_start;
-                // The previous iteration deferred (carried set) — including the
-                // depth-2 defer-WITHOUT-carry case (`Some(None)`, where
-                // `abs_pos + 1` was cold but `abs_pos + 2` won). `carried.take()`
-                // below clears that, so capture it now: if this position then
-                // misses, the skip must advance by one so it cannot hop over the
-                // proven `abs_pos + 2` winner.
-                let deferred_from_prev = carried.is_some();
+            let hist_start = $m.history_abs_start;
+            let depth = $m.lazy_depth;
+            let block_end = current_abs_start + current_len;
+            let ilimit = block_end.saturating_sub(LAZY_ROW_ILIMIT_MARGIN);
+            let mut anchor = current_abs_start;
+            // `ip += (dictAndPrefixLength == 0)`: nothing precedes the first byte.
+            let mut ip = current_abs_start + usize::from(current_abs_start == hist_start);
+            let mut next_to_update = current_abs_start;
+            let mut lazy_skipping = false;
+            // Repcodes reaching below the window are disabled for the block
+            // (upstream `maxRep`); the bound also keeps every rep read inside
+            // the live history since `ip` only grows.
+            let max_rep = ip - hist_start.max(ip.saturating_sub($m.max_window_size));
+            let mut offset_1 = ($m.offset_hist[0] as usize).min(max_rep + 1) % (max_rep + 1);
+            let mut offset_2 = ($m.offset_hist[1] as usize).min(max_rep + 1) % (max_rep + 1);
 
-                // Hash the position ONCE per iteration: the probe consumes it
-                // and the defer branch reuses it for the insert (upstream zstd
-                // hashes once per position — `ZSTD_RowFindBestMatch` updates
-                // the row as part of the search, `zstd_lazy.c`). A carried
-                // iteration skips both: the search already ran.
-                let (hash, best) = match carried.take() {
-                    Some(best) => (None, best),
-                    None => {
-                        let hash = $m.hash_and_row(abs_pos);
-                        // Search spliced INLINE (upstream zstd `ZSTD_searchMax`
-                        // is `FORCE_INLINE_TEMPLATE` into `lazy_generic`): expand
-                        // the rep + row-probe body here rather than calling an
-                        // out-of-line per-tier `#[target_feature]` `$find` method
-                        // (a `target_feature` fn cannot inline across the call
-                        // boundary, so the call cost + arg marshalling was paid
-                        // per position — the dominant instruction-count gap vs C).
-                        let best = row_best_match!(
-                            $m, abs_pos, lit_len, hash, $rl, $use_mask, $maskmac, $cpl
-                        );
-                        (hash, best)
+            while ip < ilimit {
+                let mut match_length = 0usize;
+                // `0` = repcode 1 (`offset_1`), else a real distance.
+                let mut off = 0usize;
+                let mut start = ip + 1;
+                {
+                    let base = $m.live_history().as_ptr();
+                    // SAFETY: `ip + 1 + 4 <= block_end` (`ip < ilimit`), and
+                    // `offset_1 <= max_rep` keeps the rep source in history.
+                    unsafe {
+                        let cur = base.add(ip + 1 - hist_start);
+                        if offset_1 > 0 && rd32(cur.sub(offset_1)) == rd32(cur) {
+                            match_length =
+                                $cpl(cur.add(4).sub(offset_1), cur.add(4), block_end - (ip + 5))
+                                    + 4;
+                        }
                     }
-                };
-                let picked = 'pick: {
-                    let Some(best) = best else { break 'pick None };
-                    // The decision is a MACRO (spliced inline); its lookahead
-                    // `search` splice expands the row-probe body inline too, so the
-                    // whole per-position pipeline stays one `target_feature`
-                    // monolith with no out-of-line search call at any probe site.
-                    // target_len = MAX: upstream lazy has no sufficient-length
-                    // early-out (that is the OPT parser's; one here collapses lazy
-                    // to greedy, -7% ratio vs C). The macro weighs candidates by
-                    // length (ties to the smaller offset) and returns the carry so
-                    // the deferred position is searched once.
-                    let lazy_depth = $m.lazy_depth;
-                    let history_end = $m.history_abs_end();
-                    let mls = $m.mls;
-                    let decision = $crate::encoding::lazy_parse::lazy_decide!(
-                        best_len = best.match_len,
-                        best_off = best.offset,
-                        target_len = usize::MAX,
-                        lazy_depth = lazy_depth,
-                        abs_pos = abs_pos,
-                        lit_len = lit_len,
-                        history_end = history_end,
-                        min_match = mls,
-                        // Lookahead search, also spliced inline (no out-of-line
-                        // call): the enclosing kernel runs only when its tier was
-                        // runtime-detected, upholding the row-probe's
-                        // target_feature contract.
-                        search =
-                            |p, l| row_best_match!($m, p, l, None, $rl, $use_mask, $maskmac, $cpl),
+                }
+                // Upstream: a depth-0 rep hit is stored without searching.
+                if !(match_length >= 4 && depth == 0) {
+                    let (ml2, off2) = lazy_search_at!(
+                        $m,
+                        ip,
+                        next_to_update,
+                        lazy_skipping,
+                        $rl,
+                        $use_mask,
+                        $maskmac,
+                        $cpl
                     );
-                    if let Some(carry) = decision {
-                        carried = Some(carry);
-                        None
-                    } else {
-                        Some(best)
+                    if ml2 > match_length {
+                        match_length = ml2;
+                        start = ip;
+                        off = off2;
                     }
-                };
-                if let Some(candidate) = picked {
-                    $m.insert_match_span::<$rl>(abs_pos, candidate.start + candidate.match_len);
-                    // Trailing literals of the current block. Read via
-                    // `live_history()` (borrowed-aware) sliced at the block's
-                    // offset within the live region: owned →
-                    // `live_history()[window_size - current_len..]` (byte-identical
-                    // to the old `history[history.len()-current_len..]`); borrowed →
-                    // `live_history()[block_start..]` (the in-place input, since the
-                    // owned `history` mirror is empty under the no-copy path).
-                    let current = &$m.live_history()[(current_abs_start - $m.history_abs_start)..];
-                    let start = candidate.start - current_abs_start;
-                    let literals = &current[literals_start..start];
+                    if match_length < 4 {
+                        let step = ((ip - anchor) >> LAZY_SEARCH_STRENGTH) + 1;
+                        ip += step;
+                        lazy_skipping = step > LAZY_SKIPPING_STEP;
+                        continue;
+                    }
+                    if depth >= 1 {
+                        while ip < ilimit {
+                            ip += 1;
+                            {
+                                let base = $m.live_history().as_ptr();
+                                // SAFETY: `ip + 4 <= block_end`, `offset_1 <= max_rep`.
+                                unsafe {
+                                    let cur = base.add(ip - hist_start);
+                                    if offset_1 > 0 && rd32(cur) == rd32(cur.sub(offset_1)) {
+                                        let ml_rep = $cpl(
+                                            cur.add(4).sub(offset_1),
+                                            cur.add(4),
+                                            block_end - (ip + 4),
+                                        ) + 4;
+                                        let gain2 = (ml_rep * 3) as i64;
+                                        let gain1 =
+                                            (match_length * 3) as i64 - offbase_highbit(off) + 1;
+                                        if ml_rep >= 4 && gain2 > gain1 {
+                                            match_length = ml_rep;
+                                            off = 0;
+                                            start = ip;
+                                        }
+                                    }
+                                }
+                            }
+                            let (ml2, off2) = lazy_search_at!(
+                                $m,
+                                ip,
+                                next_to_update,
+                                lazy_skipping,
+                                $rl,
+                                $use_mask,
+                                $maskmac,
+                                $cpl
+                            );
+                            let gain2 = (ml2 * 4) as i64 - offbase_highbit(off2);
+                            let gain1 = (match_length * 4) as i64 - offbase_highbit(off) + 4;
+                            if ml2 >= 4 && gain2 > gain1 {
+                                match_length = ml2;
+                                off = off2;
+                                start = ip;
+                                continue;
+                            }
+                            if depth == 2 && ip < ilimit {
+                                ip += 1;
+                                {
+                                    let base = $m.live_history().as_ptr();
+                                    // SAFETY: as above.
+                                    unsafe {
+                                        let cur = base.add(ip - hist_start);
+                                        if offset_1 > 0 && rd32(cur) == rd32(cur.sub(offset_1)) {
+                                            let ml_rep = $cpl(
+                                                cur.add(4).sub(offset_1),
+                                                cur.add(4),
+                                                block_end - (ip + 4),
+                                            ) + 4;
+                                            let gain2 = (ml_rep * 4) as i64;
+                                            let gain1 = (match_length * 4) as i64
+                                                - offbase_highbit(off)
+                                                + 1;
+                                            if ml_rep >= 4 && gain2 > gain1 {
+                                                match_length = ml_rep;
+                                                off = 0;
+                                                start = ip;
+                                            }
+                                        }
+                                    }
+                                }
+                                let (ml2, off2) = lazy_search_at!(
+                                    $m,
+                                    ip,
+                                    next_to_update,
+                                    lazy_skipping,
+                                    $rl,
+                                    $use_mask,
+                                    $maskmac,
+                                    $cpl
+                                );
+                                let gain2 = (ml2 * 4) as i64 - offbase_highbit(off2);
+                                let gain1 = (match_length * 4) as i64 - offbase_highbit(off) + 7;
+                                if ml2 >= 4 && gain2 > gain1 {
+                                    match_length = ml2;
+                                    off = off2;
+                                    start = ip;
+                                    continue;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+                if off != 0 {
+                    // Catch-up: absorb preceding literal bytes that also match,
+                    // never past `anchor` nor below the prefix floor.
+                    let concat = $m.live_history();
+                    while start > anchor
+                        && start - off > hist_start
+                        && concat[start - 1 - hist_start] == concat[start - 1 - off - hist_start]
+                    {
+                        start -= 1;
+                        match_length += 1;
+                    }
+                    offset_2 = offset_1;
+                    offset_1 = off;
+                }
+                {
+                    let concat = $m.live_history();
+                    let literals = &concat[anchor - hist_start..start - hist_start];
                     $handle(Sequence::Triple {
                         literals,
-                        offset: candidate.offset,
-                        match_len: candidate.match_len,
+                        offset: offset_1,
+                        match_len: match_length,
                     });
                     let _ = encode_offset_with_history(
-                        candidate.offset as u32,
-                        literals.len() as u32,
+                        offset_1 as u32,
+                        (start - anchor) as u32,
                         &mut $m.offset_hist,
                     );
-                    pos = start + candidate.match_len;
-                    literals_start = pos;
-                } else {
-                    // Reuse the iteration's hash for the defer-path insert
-                    // when available (a carried iteration never hashed and
-                    // falls back to the rehashing insert).
-                    match hash {
-                        Some((row, tag)) => $m.insert_at::<$rl>(abs_pos, row, tag),
-                        None => $m.insert_position::<$rl>(abs_pos),
+                }
+                anchor = start + match_length;
+                ip = anchor;
+                lazy_skipping = false;
+
+                // Immediate repcode: `offset_2` right after the stored match,
+                // swapping the two reps on every hit.
+                while ip <= ilimit && offset_2 > 0 {
+                    let base = $m.live_history().as_ptr();
+                    // SAFETY: `ip + 4 <= block_end`, `offset_2 <= max_rep`.
+                    let rep_len = unsafe {
+                        let cur = base.add(ip - hist_start);
+                        if rd32(cur) != rd32(cur.sub(offset_2)) {
+                            break;
+                        }
+                        $cpl(cur.add(4).sub(offset_2), cur.add(4), block_end - (ip + 4)) + 4
+                    };
+                    core::mem::swap(&mut offset_1, &mut offset_2);
+                    {
+                        let concat = $m.live_history();
+                        $handle(Sequence::Triple {
+                            literals: &concat[ip - hist_start..ip - hist_start],
+                            offset: offset_1,
+                            match_len: rep_len,
+                        });
+                        let _ = encode_offset_with_history(offset_1 as u32, 0, &mut $m.offset_hist);
                     }
-                    if carried.is_some() || deferred_from_prev {
-                        // Defer: the lookahead found a better match — step
-                        // exactly one to take it next iteration. `deferred_from_prev`
-                        // covers the depth-2 defer-without-carry miss so the skip
-                        // below can't hop over the proven `abs_pos + 2` winner.
-                        pos += 1;
-                    } else {
-                        // Complete miss: accelerate through weakly-matching
-                        // stretches (upstream zstd `ip += (ip - anchor) >>
-                        // kSearchStrength + 1`, zstd_lazy.c lazy_generic).
-                        // Same softened `SKIP_STRENGTH = 10` as the greedy
-                        // kernel above: the step stays 1 until the literal
-                        // run hits ~1 KiB, protecting ratio on short runs.
-                        const SKIP_STRENGTH: u32 = 10;
-                        pos += ((lit_len as u32) >> SKIP_STRENGTH) as usize + 1;
-                    }
+                    ip += rep_len;
+                    anchor = ip;
                 }
             }
 
-            while pos + ROW_HASH_KEY_LEN <= current_len {
-                $m.insert_position::<$rl>(current_abs_start + pos);
-                pos += 1;
+            if next_to_update < block_end {
+                $m.insert_match_span::<$rl>(next_to_update, block_end);
             }
-
-            if literals_start < current_len {
-                // Trailing literals of the current block. Read via
-                // `live_history()` (borrowed-aware) sliced at the block's
-                // offset within the live region: owned →
-                // `live_history()[window_size - current_len..]` (byte-identical
-                // to the old `history[history.len()-current_len..]`); borrowed →
-                // `live_history()[block_start..]` (the in-place input, since the
-                // owned `history` mirror is empty under the no-copy path).
-                let current = &$m.live_history()[(current_abs_start - $m.history_abs_start)..];
+            if anchor < block_end {
+                let concat = $m.live_history();
                 $handle(Sequence::Literals {
-                    literals: &current[literals_start..],
+                    literals: &concat[anchor - hist_start..],
                 });
             }
         }
