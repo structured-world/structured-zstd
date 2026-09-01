@@ -34,7 +34,7 @@ rand = "0.10"
 dhat = "0.3"
 # Third-party pure-Rust zstd codec, for the cross-implementation comparison
 # example (`zrip_compare`). Encode-focused (levels -7..4, Fast/DFast).
-zrip = "0.7"
+zrip = "0.8"
 
 [features]
 # Forward the structured-zstd features the bench/test/example sources gate on
