@@ -349,11 +349,13 @@ pub(crate) fn apply_param_overrides(
                     row.chain_log = chain_log as usize;
                 }
                 if let Some(search_log) = ov.search_log {
-                    // Upstream zstd: rowLog = clamp(searchLog, 4, 6);
-                    //        nbAttempts = 1 << min(searchLog, rowLog).
-                    let row_log = (search_log as usize).clamp(4, 6);
-                    row.row_log = row_log;
-                    row.search_depth = 1usize << (search_log as usize).min(row_log);
+                    // Upstream zstd: rowLog = clamp(searchLog, 4, 6); the
+                    // compare budget stays the FULL `1 << searchLog`
+                    // (`nbAttempts`) — the chain walk and the tree walk
+                    // consume it directly, and the row probe bounds its own
+                    // budget by the row size at the search site.
+                    row.row_log = (search_log as usize).clamp(4, 6);
+                    row.search_depth = 1usize << search_log;
                 }
                 if let Some(target_length) = ov.target_length {
                     row.target_len = target_length as usize;

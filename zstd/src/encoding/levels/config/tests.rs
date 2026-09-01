@@ -50,6 +50,30 @@ fn oversized_attach_dictionary_resolves_the_copy_geometry() {
     }
 }
 
+/// Regression: an explicit `search_log` override keeps the FULL
+/// `1 << search_log` compare budget for the chain / tree finders (upstream
+/// `nbAttempts`); only the row finder's per-row budget is bounded by
+/// `row_log`, and it applies that bound at the search site. Capping the
+/// stored depth at `1 << row_log` silently truncated e.g. `search_log(7)`
+/// on btlazy2 to 64 compares.
+#[test]
+fn search_log_override_keeps_the_full_depth_for_chain_and_tree() {
+    use crate::encoding::parameters::ParamOverrides;
+    let ov = ParamOverrides {
+        search_log: Some(7),
+        ..Default::default()
+    };
+    let mut params = resolve_level_params(CompressionLevel::Level(15), Some(1 << 20));
+    super::apply_param_overrides(&mut params, &ov);
+    let row = params.row.expect("btlazy2 carries a row config");
+    assert_eq!(row.row_log, 6, "rowLog clamps to 4..=6");
+    assert_eq!(
+        row.search_depth,
+        1 << 7,
+        "the tree walk budget is 1 << searchLog, not capped by rowLog"
+    );
+}
+
 /// The parameters the encoder actually runs for a (level, source size) pair
 /// are upstream's `ZSTD_getCParams(level, size, 0)` for that pair: strategy,
 /// window / hash / chain widths, search depth, minMatch and targetLength, on
