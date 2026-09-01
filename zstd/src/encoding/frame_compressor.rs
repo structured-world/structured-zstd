@@ -640,6 +640,10 @@ fn warm_presplit_window(window: &[u8]) {
     core::hint::black_box(acc);
 }
 
+/// [`optimal_block_size_with`] at a level's default pre-split tier; the
+/// frame loop resolves the tier itself, so only tests and the
+/// `bench_internals` block-boundary probe read this form.
+#[cfg(any(test, feature = "bench_internals"))]
 pub(crate) fn optimal_block_size(
     level: CompressionLevel,
     block: &[u8],
