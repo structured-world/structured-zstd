@@ -3157,13 +3157,13 @@ fn row_hash_and_row_extracts_high_bits() {
 
     let idx = pos - matcher.history_abs_start;
     let concat = matcher.live_history();
-    // Mirror `row_key_value`: an mls-wide masked key when 8 lookahead bytes
-    // exist, the 4-byte key in the tail. `idx = 8` on a 16-byte history has
-    // exactly 8 bytes left, so the wide arm applies here.
+    // Mirror `row_hash_raw`: the mls-wide key is the top bytes of the shifted
+    // 8-byte read (the 4-byte key applies only in the last < 8 bytes of the
+    // window). `idx = 8` on a 16-byte history has exactly 8 bytes left, so
+    // the wide arm applies here.
     let key_len = matcher.mls.min(6);
-    let value = u64::from_le_bytes(concat[idx..idx + 8].try_into().unwrap())
-        & ((1u64 << (key_len * 8)) - 1);
-    let hash = crate::encoding::fastpath::hash_mix_u64_with_kernel(matcher.hash_kernel, value);
+    let value = u64::from_le_bytes(concat[idx..idx + 8].try_into().unwrap());
+    let hash = (value << (64 - 8 * key_len)).wrapping_mul(crate::encoding::row::ROW_HASH_PRIME);
     let total_bits = matcher.row_hash_log + ROW_TAG_BITS;
     let combined = hash >> (u64::BITS as usize - total_bits);
     let expected_row =

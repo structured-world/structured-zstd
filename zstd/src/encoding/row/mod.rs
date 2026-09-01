@@ -13,7 +13,6 @@
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use core::convert::TryInto;
 
 use super::Sequence;
 use super::blocks::encode_offset_with_history;
@@ -43,6 +42,22 @@ const ROW_UPDATE_MAX_START: usize = 96;
 const ROW_UPDATE_MAX_END: usize = 32;
 /// Hash-cache sentinel for a position too close to the end to hash.
 const ROW_CACHE_NONE: u32 = u32::MAX;
+
+/// Row hash multiplier (upstream zstd `prime8bytes`, `zstd_compress_internal.h`):
+/// the key bytes are shifted to the top of a 64-bit word and multiplied; the
+/// row and tag are the product's top bits (`ZSTD_hashPtrSalted` shape).
+pub(crate) const ROW_HASH_PRIME: u64 = 0xCF1B_BCDC_B7A5_6463;
+
+/// Per-parse view of the live history: raw base pointer + length + absolute
+/// start, hoisted ONCE per block so the hot loops read no `Option` branch
+/// and no `Vec` header per access. Valid for the whole parse: the history
+/// buffer is never reallocated while a block is being scanned.
+#[derive(Clone, Copy)]
+struct RowScan {
+    base: *const u8,
+    len: usize,
+    hist_start: usize,
+}
 
 /// Upstream zstd `ZSTD_highbit32(offBase)` term of the lazy gain formula:
 /// `offBase` is `offset + 3` for a real offset and 1 for repcode 1
@@ -507,18 +522,23 @@ macro_rules! greedy_parse_body {
 /// means nothing found (upstream's `ml = 4-1`), `offset` is the distance.
 /// Leftover attempts fund the dictionary row (upstream `dictMatchState`).
 macro_rules! row_find_best_match {
-    ($m:expr, $abs_pos:expr, $row:expr, $tag:expr, $rl:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
-        let concat = $m.live_history();
-        let hist_start = $m.history_abs_start;
+    ($m:expr, $ctx:ident, $abs_pos:expr, $row:expr, $tag:expr, $rl:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
+        let hist_start = $ctx.hist_start;
         let cur_idx = $abs_pos - hist_start;
         // SAFETY: the parse searches only positions >= 16 bytes before the
-        // block end, so `cur_idx + 16 <= concat.len()`.
-        let cur_ptr = unsafe { concat.as_ptr().add(cur_idx) };
-        let limit = concat.len() - cur_idx;
+        // block end, so `cur_idx + 16 <= $ctx.len`.
+        let cur_ptr = unsafe { $ctx.base.add(cur_idx) };
+        let limit = $ctx.len - cur_idx;
         let row_entries = 1usize << $rl;
         let row_mask = row_entries - 1;
         let row_base = $row << $rl;
-        let head = $m.row_heads[$row] as usize;
+        // SAFETY (table indexing below): `$row < row_heads.len()` and
+        // `row_base + row_entries <= row_tags.len() == row_positions.len()`
+        // by the `ensure_tables` sizing (`row` is masked to `row_hash_log`
+        // bits, `row_log == $rl`), the same argument as `insert_at`.
+        debug_assert_eq!($rl, $m.row_log);
+        debug_assert!(row_base + row_entries <= $m.row_positions.len());
+        let head = unsafe { *$m.row_heads.get_unchecked($row) } as usize;
         let window_low = hist_start.max($abs_pos.saturating_sub($m.max_window_size));
         let budget = $m.search_depth.min(row_entries);
         let mut attempts = budget;
@@ -534,8 +554,11 @@ macro_rules! row_find_best_match {
         {
             #[allow(unused_mut)]
             let mut pending: u64 = if $use_mask {
-                let m =
-                    $maskmac!(&$m.row_tags[row_base..row_base + row_entries], $tag) & entries_bits;
+                // SAFETY: see the table-indexing note above.
+                let tags = unsafe {
+                    core::slice::from_raw_parts($m.row_tags.as_ptr().add(row_base), row_entries)
+                };
+                let m = $maskmac!(tags, $tag) & entries_bits;
                 if head == 0 {
                     m
                 } else {
@@ -568,7 +591,8 @@ macro_rules! row_find_best_match {
                     found
                 };
                 let Some(slot) = slot_opt else { break };
-                let raw = $m.row_positions[row_base + slot];
+                // SAFETY: `slot < row_entries`; see the table-indexing note.
+                let raw = unsafe { *$m.row_positions.get_unchecked(row_base + slot) };
                 // Newest-first order: the first empty / below-floor entry ends
                 // the walk (upstream `if (matchIndex < lowLimit) break`).
                 if raw == ROW_EMPTY_SLOT || (raw as usize) < window_low {
@@ -586,13 +610,11 @@ macro_rules! row_find_best_match {
                     // SAFETY: prefetch is a hint; the candidate lies in the live
                     // history.
                     unsafe {
-                        _mm_prefetch(
-                            concat.as_ptr().add(raw as usize - hist_start).cast(),
-                            _MM_HINT_T0,
-                        );
+                        _mm_prefetch($ctx.base.add(raw as usize - hist_start).cast(), _MM_HINT_T0);
                     }
                 }
-                buf[n] = raw;
+                // SAFETY: `n < attempts_at_entry <= row_entries <= 64`.
+                unsafe { *buf.get_unchecked_mut(n) = raw };
                 n += 1;
                 attempts -= 1;
             }
@@ -603,7 +625,7 @@ macro_rules! row_find_best_match {
             // `+ ml - 3` where `ml + 1 <= limit` (the count breaks out of the
             // loop at `ml == limit`), so both reads stay inside `concat`.
             unsafe {
-                let cand_ptr = concat.as_ptr().add(cand_idx);
+                let cand_ptr = $ctx.base.add(cand_idx);
                 if rd32(cand_ptr.add(ml - 3)) == rd32(cur_ptr.add(ml - 3)) {
                     let cml = $cpl(cand_ptr, cur_ptr, limit);
                     if cml > ml {
@@ -675,7 +697,7 @@ macro_rules! row_find_best_match {
                 }
                 // SAFETY: `dp + 4 <= dict_end <= cur_idx`, `cur_idx + 4 <= concat.len()`.
                 unsafe {
-                    let dptr = concat.as_ptr().add(dp);
+                    let dptr = $ctx.base.add(dp);
                     if rd32(dptr) == rd32(cur_ptr) {
                         let cml = $cpl(dptr, cur_ptr, limit);
                         if cml > ml {
@@ -698,25 +720,25 @@ macro_rules! row_find_best_match {
 /// its 96 head + 32 tail positions), search `$p`, then index `$p` itself.
 /// `$ntu` is the parse's `nextToUpdate` local, `$skip` its `lazySkipping`.
 macro_rules! lazy_search_at {
-    ($m:expr, $p:expr, $ntu:ident, $skip:ident, $cache:ident, $rl:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
+    ($m:expr, $ctx:ident, $p:expr, $ntu:ident, $skip:ident, $cache:ident, $rl:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
         let p = $p;
         let (row, tag) = if $skip {
             // Lazy skipping: the skipped-over gap is not indexed and the cache
             // is not maintained; the position is hashed directly.
-            row_cache_hash!($m, $rl, p)
+            row_cache_hash!($m, $ctx, $rl, p)
         } else {
             if p - $ntu > ROW_UPDATE_SKIP_THRESHOLD {
-                row_cache_insert_range!($m, $cache, $rl, $ntu, $ntu + ROW_UPDATE_MAX_START);
-                row_cache_fill!($m, $cache, $rl, p - ROW_UPDATE_MAX_END);
-                row_cache_insert_range!($m, $cache, $rl, p - ROW_UPDATE_MAX_END, p);
+                row_cache_insert_range!($m, $ctx, $cache, $rl, $ntu, $ntu + ROW_UPDATE_MAX_START);
+                row_cache_fill!($m, $ctx, $cache, $rl, p - ROW_UPDATE_MAX_END);
+                row_cache_insert_range!($m, $ctx, $cache, $rl, p - ROW_UPDATE_MAX_END, p);
             } else {
-                row_cache_insert_range!($m, $cache, $rl, $ntu, p);
+                row_cache_insert_range!($m, $ctx, $cache, $rl, $ntu, p);
             }
-            row_cache_next!($m, $cache, $rl, p)
+            row_cache_next!($m, $ctx, $cache, $rl, p)
         };
         let r = if row != ROW_CACHE_NONE {
             let row = row as usize;
-            let r = row_find_best_match!($m, p, row, tag, $rl, $use_mask, $maskmac, $cpl);
+            let r = row_find_best_match!($m, $ctx, p, row, tag, $rl, $use_mask, $maskmac, $cpl);
             $m.insert_at::<$rl>(p, row, tag);
             r
         } else {
@@ -731,8 +753,8 @@ macro_rules! lazy_search_at {
 /// `ZSTD_row_fillHashCache` / `ZSTD_row_nextCachedHash` body): `(row, tag)`
 /// with `row == ROW_CACHE_NONE` past the hashable end.
 macro_rules! row_cache_hash {
-    ($m:expr, $rl:expr, $pos:expr) => {{
-        match $m.hash_and_row($pos) {
+    ($m:expr, $ctx:ident, $rl:expr, $pos:expr) => {{
+        match $m.row_hash_at($ctx, $pos) {
             Some((row, tag)) => {
                 $m.prefetch_row::<$rl>(row);
                 (row as u32, tag)
@@ -745,10 +767,10 @@ macro_rules! row_cache_hash {
 /// Upstream zstd `ZSTD_row_fillHashCache`: (re)load the cache for the
 /// positions `$from .. $from + ROW_HASH_CACHE_SIZE`.
 macro_rules! row_cache_fill {
-    ($m:expr, $cache:ident, $rl:expr, $from:expr) => {{
+    ($m:expr, $ctx:ident, $cache:ident, $rl:expr, $from:expr) => {{
         let from = $from;
         for pos in from..from + ROW_HASH_CACHE_SIZE {
-            $cache[pos & (ROW_HASH_CACHE_SIZE - 1)] = row_cache_hash!($m, $rl, pos);
+            $cache[pos & (ROW_HASH_CACHE_SIZE - 1)] = row_cache_hash!($m, $ctx, $rl, pos);
         }
     }};
 }
@@ -758,11 +780,11 @@ macro_rules! row_cache_fill {
 /// that row). Valid only while positions are consumed in sequence from the
 /// last fill, exactly as upstream.
 macro_rules! row_cache_next {
-    ($m:expr, $cache:ident, $rl:expr, $pos:expr) => {{
+    ($m:expr, $ctx:ident, $cache:ident, $rl:expr, $pos:expr) => {{
         let pos = $pos;
         let slot = pos & (ROW_HASH_CACHE_SIZE - 1);
         let cur = $cache[slot];
-        $cache[slot] = row_cache_hash!($m, $rl, pos + ROW_HASH_CACHE_SIZE);
+        $cache[slot] = row_cache_hash!($m, $ctx, $rl, pos + ROW_HASH_CACHE_SIZE);
         cur
     }};
 }
@@ -770,9 +792,9 @@ macro_rules! row_cache_next {
 /// Upstream zstd `ZSTD_row_update_internalImpl` with the cache: index every
 /// position of `$from .. $to` through the hash cache.
 macro_rules! row_cache_insert_range {
-    ($m:expr, $cache:ident, $rl:expr, $from:expr, $to:expr) => {{
+    ($m:expr, $ctx:ident, $cache:ident, $rl:expr, $from:expr, $to:expr) => {{
         for pos in $from..$to {
-            let (row, tag) = row_cache_next!($m, $cache, $rl, pos);
+            let (row, tag) = row_cache_next!($m, $ctx, $cache, $rl, pos);
             if row != ROW_CACHE_NONE {
                 $m.insert_at::<$rl>(pos, row as usize, tag);
             }
@@ -804,7 +826,8 @@ macro_rules! lazy_parse_body {
                 $m.insert_positions::<$rl>(backfill_start, current_abs_start);
             }
 
-            let hist_start = $m.history_abs_start;
+            let scan = $m.scan_ctx();
+            let hist_start = scan.hist_start;
             let depth = $m.lazy_depth;
             let block_end = current_abs_start + current_len;
             let ilimit = block_end.saturating_sub(LAZY_ROW_ILIMIT_MARGIN);
@@ -815,7 +838,7 @@ macro_rules! lazy_parse_body {
             let mut lazy_skipping = false;
             // Upstream `ZSTD_row_fillHashCache(ms, base, rowLog, mls, nextToUpdate, ilimit)`.
             let mut hash_cache = [(ROW_CACHE_NONE, 0u8); ROW_HASH_CACHE_SIZE];
-            row_cache_fill!($m, hash_cache, $rl, next_to_update);
+            row_cache_fill!($m, scan, hash_cache, $rl, next_to_update);
             // Repcodes reaching below the window are disabled for the block
             // (upstream `maxRep`); the bound also keeps every rep read inside
             // the live history since `ip` only grows.
@@ -829,7 +852,7 @@ macro_rules! lazy_parse_body {
                 let mut off = 0usize;
                 let mut start = ip + 1;
                 {
-                    let base = $m.live_history().as_ptr();
+                    let base = scan.base;
                     // SAFETY: `ip + 1 + 4 <= block_end` (`ip < ilimit`), and
                     // `offset_1 <= max_rep` keeps the rep source in history.
                     unsafe {
@@ -845,6 +868,7 @@ macro_rules! lazy_parse_body {
                 if !(match_length >= 4 && depth == 0) {
                     let (ml2, off2) = lazy_search_at!(
                         $m,
+                        scan,
                         ip,
                         next_to_update,
                         lazy_skipping,
@@ -869,7 +893,7 @@ macro_rules! lazy_parse_body {
                         while ip < ilimit {
                             ip += 1;
                             {
-                                let base = $m.live_history().as_ptr();
+                                let base = scan.base;
                                 // SAFETY: `ip + 4 <= block_end`, `offset_1 <= max_rep`.
                                 unsafe {
                                     let cur = base.add(ip - hist_start);
@@ -892,6 +916,7 @@ macro_rules! lazy_parse_body {
                             }
                             let (ml2, off2) = lazy_search_at!(
                                 $m,
+                                scan,
                                 ip,
                                 next_to_update,
                                 lazy_skipping,
@@ -912,7 +937,7 @@ macro_rules! lazy_parse_body {
                             if depth == 2 && ip < ilimit {
                                 ip += 1;
                                 {
-                                    let base = $m.live_history().as_ptr();
+                                    let base = scan.base;
                                     // SAFETY: as above.
                                     unsafe {
                                         let cur = base.add(ip - hist_start);
@@ -936,6 +961,7 @@ macro_rules! lazy_parse_body {
                                 }
                                 let (ml2, off2) = lazy_search_at!(
                                     $m,
+                                    scan,
                                     ip,
                                     next_to_update,
                                     lazy_skipping,
@@ -990,14 +1016,14 @@ macro_rules! lazy_parse_body {
                 ip = anchor;
                 if lazy_skipping {
                     // A match ends lazy skipping; the cache is stale, refill it.
-                    row_cache_fill!($m, hash_cache, $rl, next_to_update);
+                    row_cache_fill!($m, scan, hash_cache, $rl, next_to_update);
                     lazy_skipping = false;
                 }
 
                 // Immediate repcode: `offset_2` right after the stored match,
                 // swapping the two reps on every hit.
                 while ip <= ilimit && offset_2 > 0 {
-                    let base = $m.live_history().as_ptr();
+                    let base = scan.base;
                     // SAFETY: `ip + 4 <= block_end`, `offset_2 <= max_rep`.
                     let rep_len = unsafe {
                         let cur = base.add(ip - hist_start);
@@ -1662,6 +1688,10 @@ pub(crate) struct RowMatchGenerator {
     /// a local in the parse loops so the per-position compare reads a
     /// register, not this field. Default `ROW_MIN_MATCH_LEN` (5).
     pub(crate) mls: usize,
+    /// `64 - 8 * key width`: left shift placing the hash key at the top of
+    /// the 64-bit word (upstream zstd `ZSTD_hashNPtr`, key width = `mls`
+    /// capped at 6). Kept in sync with `mls` by `configure`.
+    row_key_shift: u32,
     pub(crate) lazy_depth: u8,
     /// Cached fastpath kernel for `hash_mix_u64`; see Dfast for rationale.
     pub(crate) hash_kernel: crate::encoding::fastpath::FastpathKernel,
@@ -1722,6 +1752,7 @@ impl RowMatchGenerator {
             search_depth: ROW_SEARCH_DEPTH,
             target_len: ROW_TARGET_LEN,
             mls: ROW_MIN_MATCH_LEN,
+            row_key_shift: (64 - 8 * ROW_MIN_MATCH_LEN.min(6)) as u32,
             lazy_depth: 1,
             hash_kernel: crate::encoding::fastpath::select_kernel(),
             row_heads: Vec::new(),
@@ -1790,6 +1821,7 @@ impl RowMatchGenerator {
         // floor can't be satisfied: the hash only surfaces candidates
         // sharing the 4-byte key) and a sane upper bound.
         self.mls = config.mls.clamp(ROW_HASH_KEY_LEN, 7);
+        self.row_key_shift = (64 - 8 * self.mls.min(6)) as u32;
         self.set_hash_bits(config.hash_bits.max(self.row_log + 1));
     }
 
@@ -2213,38 +2245,57 @@ impl RowMatchGenerator {
     /// the probe's real-byte key there. Those few dict-tail entries stay
     /// unreachable, mirroring the upstream zstd, whose dictionary load also stops
     /// hashing short of the dictionary end.
+    /// Row hash of the key at `base[idx..]` (upstream zstd `ZSTD_hashPtrSalted`
+    /// shape): the `mls`-byte key (8-byte read shifted to the top of the
+    /// word; the last < 8 bytes of the window fall back to a 4-byte key)
+    /// times [`ROW_HASH_PRIME`]. A position hashes identically in the probe,
+    /// the cache and the dictionary fill, so every table agrees on its row.
+    ///
+    /// # Safety
+    /// `idx + ROW_HASH_KEY_LEN <= len` and `base` must point to `len` bytes.
     #[inline(always)]
-    fn row_key_value(concat: &[u8], idx: usize, key_len: usize) -> u64 {
-        if idx + 8 <= concat.len() {
-            let v = u64::from_le_bytes(concat[idx..idx + 8].try_into().unwrap());
-            v & ((1u64 << (key_len * 8)) - 1)
-        } else {
-            u32::from_le_bytes(concat[idx..idx + ROW_HASH_KEY_LEN].try_into().unwrap()) as u64
+    unsafe fn row_hash_raw(base: *const u8, len: usize, idx: usize, key_shift: u32) -> u64 {
+        let value = unsafe {
+            if idx + 8 <= len {
+                u64::from_le_bytes(base.add(idx).cast::<[u8; 8]>().read_unaligned())
+            } else {
+                u64::from(rd32(base.add(idx)))
+            }
+        };
+        (value << key_shift).wrapping_mul(ROW_HASH_PRIME)
+    }
+
+    /// The live history as a [`RowScan`] for one parse.
+    #[inline(always)]
+    fn scan_ctx(&self) -> RowScan {
+        let history = self.live_history();
+        RowScan {
+            base: history.as_ptr(),
+            len: history.len(),
+            hist_start: self.history_abs_start,
         }
     }
 
+    /// `(row, tag)` of `abs_pos` through a hoisted [`RowScan`]; `None` when
+    /// fewer than `ROW_HASH_KEY_LEN` bytes follow the position.
     #[inline(always)]
-    pub(crate) fn hash_and_row(&self, abs_pos: usize) -> Option<(usize, u8)> {
-        let idx = abs_pos - self.history_abs_start;
-        let concat = self.live_history();
-        if idx + ROW_HASH_KEY_LEN > concat.len() {
+    fn row_hash_at(&self, ctx: RowScan, abs_pos: usize) -> Option<(usize, u8)> {
+        let idx = abs_pos - ctx.hist_start;
+        if idx + ROW_HASH_KEY_LEN > ctx.len {
             return None;
         }
-        // Upstream zstd `ZSTD_hashPtrSalted` hashes `mls` bytes (5-6 on the row
-        // levels), not 4: a wider key cuts the false tag hits whose
-        // candidates then cost a data load + reject in the probe. Read 8
-        // bytes and mask to the key width when the tail allows; the last
-        // <8 bytes of the window keep the 4-byte key (a position hashes
-        // identically in the probe and the insert either way, so the
-        // mixed tail stays self-consistent).
-        let value = Self::row_key_value(concat, idx, self.mls.min(6));
-        let hash = crate::encoding::fastpath::hash_mix_u64_with_kernel(self.hash_kernel, value);
+        // SAFETY: `idx + ROW_HASH_KEY_LEN <= ctx.len`, `ctx` views the live history.
+        let hash = unsafe { Self::row_hash_raw(ctx.base, ctx.len, idx, self.row_key_shift) };
         let total_bits = self.row_hash_log + ROW_TAG_BITS;
         let combined = hash >> (u64::BITS as usize - total_bits);
         let row_mask = (1usize << self.row_hash_log) - 1;
         let row = ((combined >> ROW_TAG_BITS) as usize) & row_mask;
-        let tag = combined as u8;
-        Some((row, tag))
+        Some((row, combined as u8))
+    }
+
+    #[inline(always)]
+    pub(crate) fn hash_and_row(&self, abs_pos: usize) -> Option<(usize, u8)> {
+        self.row_hash_at(self.scan_ctx(), abs_pos)
     }
 
     fn backfill_start(&self, current_abs_start: usize) -> usize {
@@ -2841,8 +2892,7 @@ impl RowMatchGenerator {
         }
         let row_log = self.row_log;
         let row_hash_log = self.row_hash_log;
-        let hash_kernel = self.hash_kernel;
-        let key_len = self.mls.min(6);
+        let key_shift = self.row_key_shift;
         let history_start = self.history_start;
         let concat_len = self.history.len() - history_start;
         // Row hash needs `ROW_HASH_KEY_LEN` readable bytes of lookahead.
@@ -2875,15 +2925,11 @@ impl RowMatchGenerator {
         // is u32-bounded upstream).
         for concat in start_concat..safe_end {
             unsafe {
-                // Same key reader as the live `hash_and_row` (width and
-                // endianness): any divergence buckets dict rows differently
-                // and loses every attached-dict match.
-                let value = Self::row_key_value(
-                    core::slice::from_raw_parts(base.add(history_start), concat_len),
-                    concat,
-                    key_len,
-                );
-                let hash = crate::encoding::fastpath::hash_mix_u64_with_kernel(hash_kernel, value);
+                // Same hash as the live `row_hash_at` (key width, shift and
+                // prime): any divergence buckets dict rows differently and
+                // loses every attached-dict match.
+                let hash =
+                    Self::row_hash_raw(base.add(history_start), concat_len, concat, key_shift);
                 let combined = hash >> (u64::BITS as usize - total_bits);
                 let row = ((combined >> ROW_TAG_BITS) as usize) & row_count_mask;
                 let tag = combined as u8;
