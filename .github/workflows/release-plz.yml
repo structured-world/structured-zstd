@@ -36,7 +36,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Create release PR
-        uses: release-plz/action@v0.5.130
+        uses: release-plz/action@v0.5.131
         with:
           command: release-pr
           config: .release-plz.toml
@@ -44,7 +44,7 @@ jobs:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
 
       - name: Create GitHub Release
-        uses: release-plz/action@v0.5.130
+        uses: release-plz/action@v0.5.131
         with:
           command: release
           config: .release-plz.toml
