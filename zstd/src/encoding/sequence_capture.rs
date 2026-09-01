@@ -394,6 +394,13 @@ fn compress_and_collect_sequences_impl(
     // assumes streaming sizing, which would diverge from libzstd's
     // `ZSTD_generateSequences` (which receives `srcSize` directly).
     compressor.set_source_size_hint(input.len() as u64);
+    // Full blocks only: upstream's `ZSTD_generateSequences` runs
+    // `ZSTD_compress2` in sequence-collecting mode, where every block is
+    // written raw (`cSize = blockSize + 3`) so the `savings >= 3` gate of
+    // `ZSTD_optimalBlockSize` never opens and the pre-splitter never cuts.
+    // Matching that keeps both streams' block boundaries (and therefore
+    // block-entry parse state) aligned for the comparison.
+    compressor.set_pre_split_disabled(true);
     compressor.compress();
     // `Rc::try_unwrap` succeeds because the inner `CapturingMatcher`
     // is dropped when `compressor` goes out of scope at the end of the
