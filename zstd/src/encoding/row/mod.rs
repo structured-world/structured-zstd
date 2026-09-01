@@ -837,6 +837,12 @@ macro_rules! dubt_insert1 {
         let curr: usize = $curr;
         let cur_abs = curr - BT_IDX_BASE;
         debug_assert!(cur_abs >= $ctx.low_limit);
+        // The node's bytes must still be resident: eviction raises
+        // `low_limit` past everything it drops, and the sort floors on it.
+        debug_assert!(
+            cur_abs >= hist_start && cur_abs - hist_start <= $ctx.len,
+            "sorting a node whose bytes were evicted (abs {cur_abs}, history starts {hist_start})",
+        );
         let cur_idx = cur_abs - hist_start;
         // SAFETY: `cur_abs` was linked by `dubt_update!` from a searched
         // position of this or an earlier block, so it lies in the live
@@ -855,6 +861,8 @@ macro_rules! dubt_insert1 {
         let mut common_larger = 0usize;
         let mut nb = $nb_compares;
         while nb > 0 && match_index > window_low {
+            // Sorted nodes hold only earlier positions.
+            debug_assert!(match_index < curr, "sort walk reached a future node");
             let next_ptr = 2 * (match_index & bt_mask);
             let mut ml = common_smaller.min(common_larger);
             let m_idx = match_index - BT_IDX_BASE - hist_start;
@@ -974,6 +982,8 @@ macro_rules! dubt_find_best_match {
             match_index = $m.hc_hash[h] as usize;
             $m.hc_hash[h] = curr as u32;
             while nb_compares > 0 && match_index > window_low {
+                // Tree nodes hold only earlier positions.
+                debug_assert!(match_index < curr, "tree walk reached a future node");
                 let next_ptr = 2 * (match_index & bt_mask);
                 let mut ml = common_smaller.min(common_larger);
                 let m_idx = match_index - BT_IDX_BASE - hist_start;
@@ -1113,6 +1123,7 @@ macro_rules! dubt_find_best_match {
                     nb_compares -= 1;
                 }
             }
+            debug_assert!(match_end_idx >= 8 + BT_IDX_BASE);
             $ntu = match_end_idx - 8 - BT_IDX_BASE;
             (best_len, best_off)
         }
@@ -2594,6 +2605,19 @@ impl RowMatchGenerator {
             self.history_start += removed_len;
             self.history_abs_start += removed_len;
         }
+        // Evicted bytes are gone from `history`, so the valid-data floor
+        // rises with them (upstream `window.lowLimit`: the oldest byte the
+        // buffer still holds). The distance-only window floor
+        // (`pos - search_window`) can trail the eviction by up to a block, and
+        // the DUBT walks floor on `low_limit` — without this they would
+        // dereference evicted positions that are still inside the advertised
+        // window.
+        if self.low_limit < self.history_abs_start {
+            self.low_limit = self.history_abs_start;
+        }
+        if self.prefix_low < self.low_limit {
+            self.prefix_low = self.low_limit;
+        }
         self.compact_history();
         let added = data.len();
         self.history.extend_from_slice(&data);
@@ -2613,6 +2637,13 @@ impl RowMatchGenerator {
             self.window_size -= removed_len;
             self.history_start += removed_len;
             self.history_abs_start += removed_len;
+        }
+        // Same valid-data floor raise as `add_data`'s eviction loop.
+        if self.low_limit < self.history_abs_start {
+            self.low_limit = self.history_abs_start;
+        }
+        if self.prefix_low < self.low_limit {
+            self.prefix_low = self.low_limit;
         }
     }
 

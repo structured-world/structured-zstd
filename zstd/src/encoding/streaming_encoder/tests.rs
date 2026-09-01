@@ -192,6 +192,48 @@ fn streaming_encoder_pre_splits_full_blocks_like_the_frame_compressor() {
     }
 }
 
+/// Regression: a streamed periodic input at the btlazy2 levels round-trips.
+/// The pre-splitter cuts short mid-stream blocks out of full 128 KiB
+/// buffers; the binary-tree lazy backend must accept those short committed
+/// blocks (this crashed with an out-of-bounds access in the AVX2 row
+/// monolith on x86).
+#[test]
+fn streaming_periodic_btlazy2_roundtrips() {
+    const LINES: &[&[u8]] = &[
+        b"ts=2026-03-26T21:39:28Z level=INFO msg=\"flush memtable\" tenant=demo table=orders region=eu-west\n",
+        b"ts=2026-03-26T21:39:29Z level=INFO msg=\"rotate segment\" tenant=demo table=orders region=eu-west\n",
+        b"ts=2026-03-26T21:39:30Z level=INFO msg=\"compact level\" tenant=demo table=orders region=eu-west\n",
+        b"ts=2026-03-26T21:39:31Z level=INFO msg=\"write block\" tenant=demo table=orders region=eu-west\n",
+    ];
+    // Past the L15 window (2^22): the crash needed candidates farther than
+    // the current best's offset magnitude, which only exist once the input
+    // exceeds the window.
+    let target = 6 * 1024 * 1024usize;
+    let mut data = Vec::with_capacity(target);
+    'fill: loop {
+        for line in LINES {
+            if data.len() + line.len() > target {
+                break 'fill;
+            }
+            data.extend_from_slice(line);
+        }
+    }
+    for level in [13, 15] {
+        let mut out = Vec::new();
+        let mut enc = StreamingEncoder::new(&mut out, CompressionLevel::Level(level));
+        for chunk in data.chunks(64 * 1024) {
+            enc.write_all(chunk).unwrap();
+        }
+        enc.finish().unwrap();
+        let mut decoder = crate::decoding::FrameDecoder::new();
+        let mut round = Vec::with_capacity(data.len());
+        decoder
+            .decode_all_to_vec(&out, &mut round)
+            .unwrap_or_else(|e| panic!("L{level} decode failed: {e:?}"));
+        assert_eq!(round, data, "L{level} streamed periodic roundtrip");
+    }
+}
+
 /// The streaming raw-literals gate follows the effective parameters like the
 /// frame compressor's: a positive `target_length` override on a fast level
 /// disables literal compression on a plain frame, while a dictionary frame
