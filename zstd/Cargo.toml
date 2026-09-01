@@ -8,14 +8,14 @@ authors = [
 ]
 edition = "2024"
 license = "Apache-2.0"
-homepage = "https://github.com/structured-world/structured-zstd"
+homepage = "https://structured-world.github.io/structured-zstd/dev/bench/"
 repository = "https://github.com/structured-world/structured-zstd"
-description = "Pure Rust zstd implementation — managed fork of ruzstd. Dictionary decompression, no FFI."
+description = "Pure-Rust Zstandard (zstd) compression and decompression: all levels, streaming, dictionaries, no_std and WebAssembly ready — no FFI, no cmake"
 exclude = ["fuzz_decodecorpus/*", "decodecorpus_files/*", "dict_tests/files/**"]
 # Package metadata points at a crate-local symlink so the packaged crate and repo root README stay in sync.
 readme = "README.md"
-keywords = ["zstd", "zstandard", "decompression", "compression", "pure-rust"]
-categories = ["compression"]
+keywords = ["zstd", "zstandard", "decompression", "compression", "no-std"]
+categories = ["compression", "no-std", "wasm", "encoding"]
 # The C-binding benches, conformance tests, and FFI diagnostic examples live in
 # the non-published `ffi-bench` crate so this library never depends on the C
 # `zstd` bindings. Auto-discovery is disabled because those source files still
