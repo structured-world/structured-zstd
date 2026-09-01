@@ -89,6 +89,8 @@ struct RowScan {
     prefix_start: usize,
     dict_frame: bool,
     attached: bool,
+    /// Search through the hash-chain finder instead of the row table.
+    use_chain: bool,
 }
 
 /// Upstream zstd `ZSTD_highbit32(offBase)` term of the lazy gain formula:
@@ -572,7 +574,7 @@ macro_rules! row_find_best_match {
 macro_rules! lazy_search_at {
     ($m:expr, $ctx:ident, $p:expr, $ntu:ident, $skip:ident, $cache:ident, $rl:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
         let p = $p;
-        if $m.use_chain {
+        if $ctx.use_chain {
             hc_find_best_match!($m, $ctx, p, $ntu, $skip, $cpl)
         } else {
             let (row, tag) = if $skip {
@@ -814,7 +816,7 @@ macro_rules! lazy_parse_body {
             let block_end = current_abs_start + current_len;
             // Upstream `ilimit`: `iend - 8 - ZSTD_ROW_HASH_CACHE_SIZE` for the
             // row search, `iend - 8` for the hash chain.
-            let ilimit = block_end.saturating_sub(if $m.use_chain {
+            let ilimit = block_end.saturating_sub(if scan.use_chain {
                 LAZY_HC_ILIMIT_MARGIN
             } else {
                 LAZY_ROW_ILIMIT_MARGIN
@@ -870,6 +872,13 @@ macro_rules! lazy_parse_body {
             let prefix_start = scan.prefix_start;
             let search_window = scan.search_window;
             let rep_ok = |pos: usize, off: usize| -> bool {
+                if !dict_frame {
+                    // The block-start clamp below keeps every carried rep
+                    // in-window for the whole block (the window floor never
+                    // advances faster than the position) and searched
+                    // offsets are in-window by construction.
+                    return off != 0;
+                }
                 if off == 0 || off > pos {
                     return false;
                 }
@@ -2500,6 +2509,7 @@ impl RowMatchGenerator {
             prefix_start: self.dict_prefix_start(),
             dict_frame: self.dict_plan.is_some(),
             attached: self.dict_plan.is_some_and(|p| p.attach),
+            use_chain: self.use_chain,
         }
     }
 
