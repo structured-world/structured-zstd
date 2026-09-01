@@ -697,6 +697,61 @@ pub(crate) fn optimal_block_size_with(
         .min(MAX_BLOCK_SIZE as usize)
 }
 
+/// Record in `state` the strategy the matcher runs for the next frame (the
+/// honoured public override, else the size- and dictionary-adaptive
+/// resolution in `params`) and its pre-split tier; the literal gates and the
+/// block splitter read these, and upstream indexes `splitLevels` by the
+/// effective strategy too. Shared by the frame compressor and the streaming
+/// encoder so both entry points cut and gate blocks identically.
+pub(crate) fn sync_effective_strategy<M: Matcher>(
+    state: &mut CompressState<M>,
+    level: CompressionLevel,
+    params: &crate::encoding::levels::config::LevelParams,
+    strategy_override: Option<(crate::encoding::strategy::StrategyTag, u8)>,
+) {
+    match strategy_override {
+        Some((tag, lazy_depth)) => {
+            state.strategy_tag = tag;
+            state.pre_split = Some(crate::encoding::levels::config::pre_split_for(
+                tag, lazy_depth,
+            ));
+        }
+        None => {
+            state.strategy_tag = params.strategy_tag;
+            state.pre_split = if matches!(level, CompressionLevel::Uncompressed) {
+                None
+            } else {
+                params.pre_split()
+            };
+        }
+    }
+}
+
+/// The level params the matcher's reset resolves for a frame: through the
+/// dictionary's CDict tier when a dictionary is in play, else by source size.
+/// Returns whether the frame is a dictionary frame (the matcher then runs the
+/// CDict's strategy and ignores a strategy override).
+pub(crate) fn resolve_frame_params(
+    level: CompressionLevel,
+    hint: Option<u64>,
+    dictionary: Option<&EncoderDictionary>,
+) -> (crate::encoding::levels::config::LevelParams, bool) {
+    match dictionary {
+        Some(dict) if !dict.inner.dict_content.is_empty() => {
+            let (params, _plan) = crate::encoding::levels::config::resolve_level_params_with_dict(
+                level,
+                hint,
+                dict.inner.sizes().serialized,
+            );
+            (params, true)
+        }
+        _ => (
+            crate::encoding::levels::config::resolve_level_params(level, hint),
+            false,
+        ),
+    }
+}
+
 pub(crate) struct CompressState<M: Matcher> {
     pub(crate) matcher: M,
     pub(crate) last_huff_table: Option<crate::huff0::huff0_encoder::HuffmanTable>,
@@ -1563,21 +1618,11 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         hint: Option<u64>,
         with_dictionary: bool,
     ) -> (crate::encoding::levels::config::LevelParams, bool) {
-        match self.dictionary.as_ref().filter(|_| with_dictionary) {
-            Some(dict) if !dict.inner.dict_content.is_empty() => {
-                let (params, _plan) =
-                    crate::encoding::levels::config::resolve_level_params_with_dict(
-                        self.compression_level,
-                        hint,
-                        dict.inner.sizes().serialized,
-                    );
-                (params, true)
-            }
-            _ => (
-                crate::encoding::levels::config::resolve_level_params(self.compression_level, hint),
-                false,
-            ),
-        }
+        resolve_frame_params(
+            self.compression_level,
+            hint,
+            self.dictionary.as_ref().filter(|_| with_dictionary),
+        )
     }
 
     /// Record the strategy the matcher actually runs for the next frame (a
@@ -1590,23 +1635,12 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         params: &crate::encoding::levels::config::LevelParams,
         override_applies: bool,
     ) {
-        match self.strategy_override.filter(|_| override_applies) {
-            Some((tag, lazy_depth)) => {
-                self.state.strategy_tag = tag;
-                self.state.pre_split = Some(crate::encoding::levels::config::pre_split_for(
-                    tag, lazy_depth,
-                ));
-            }
-            None => {
-                self.state.strategy_tag = params.strategy_tag;
-                self.state.pre_split =
-                    if matches!(self.compression_level, CompressionLevel::Uncompressed) {
-                        None
-                    } else {
-                        params.pre_split()
-                    };
-            }
-        }
+        sync_effective_strategy(
+            &mut self.state,
+            self.compression_level,
+            params,
+            self.strategy_override.filter(|_| override_applies),
+        );
     }
 
     /// Provide a hint about the total uncompressed size for the next frame.

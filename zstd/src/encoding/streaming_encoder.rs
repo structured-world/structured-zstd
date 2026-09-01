@@ -50,12 +50,17 @@ pub struct StreamingEncoder<W: Write, M: Matcher = MatchGeneratorDriver> {
     /// when the header omits the field. Default `true`.
     content_size_flag: bool,
     bytes_consumed: u64,
-    /// Effective strategy tag when a public-parameter
+    /// Upstream `ZSTD_compress_frameChunk` `savings`: bytes consumed minus
+    /// bytes produced so far in this frame; the block pre-splitter only cuts
+    /// full blocks once the frame has saved enough.
+    savings: i64,
+    /// Effective strategy tag (and lazy depth) when a public-parameter
     /// [`Strategy`](crate::encoding::Strategy) override (#27) is active, mirroring
     /// [`FrameCompressor`](crate::encoding::FrameCompressor)'s field. `Some`
-    /// survives frame start so the literal-compression gates run the same
-    /// strategy the matcher does; `None` keeps the level-derived tag.
-    strategy_override: Option<crate::encoding::strategy::StrategyTag>,
+    /// survives frame start so the literal-compression gates and the block
+    /// splitter run the same strategy the matcher does; `None` keeps the
+    /// level-derived tag.
+    strategy_override: Option<(crate::encoding::strategy::StrategyTag, u8)>,
     /// `ZSTD_f_zstd1_magicless` — omit the 4-byte magic number prefix.
     /// Default false. See [`Self::set_magicless`].
     magicless: bool,
@@ -116,10 +121,15 @@ impl<W: Write> StreamingEncoder<W, MatchGeneratorDriver> {
         let overrides = params.overrides();
         // Persist the strategy override so `ensure_frame_started`'s level-based
         // resync does not discard it (matching `FrameCompressor::set_parameters`).
-        self.strategy_override = overrides.strategy.map(|s| s.tag());
-        self.state.strategy_tag = self.strategy_override.unwrap_or_else(|| {
-            crate::encoding::strategy::StrategyTag::for_compression_level(self.compression_level)
-        });
+        self.strategy_override = overrides.strategy.map(|s| (s.tag(), s.lazy_depth()));
+        self.state.strategy_tag = self.strategy_override.map_or_else(
+            || {
+                crate::encoding::strategy::StrategyTag::for_compression_level(
+                    self.compression_level,
+                )
+            },
+            |(tag, _)| tag,
+        );
         self.state.huf_optimal_search = crate::encoding::frame_compressor::huf_search_enabled(
             self.state.strategy_tag,
             self.pledged_content_size.or(self.source_size_hint),
@@ -167,6 +177,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             source_size_hint: None,
             content_size_flag: true,
             bytes_consumed: 0,
+            savings: 0,
             strategy_override: None,
             magicless: false,
             content_checksum: false,
@@ -570,20 +581,27 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             self.state.fse_tables.ml_previous = None;
             self.state.fse_tables.of_previous = None;
         }
-        // Sync `state.strategy_tag` from the active compression level so the
-        // literal-compression gates (`min_literals_to_compress`, `min_gain`
-        // in `encoding::blocks::compressed`) see the correct strategy for
-        // every frame. Mirrors `FrameCompressor::compress` and keeps both
-        // entry points byte-equivalent at the gate level. A public-parameter
-        // strategy override (#27) wins over the level's derived tag so the
-        // gates see the strategy the matcher actually runs.
-        self.state.strategy_tag = self.strategy_override.unwrap_or_else(|| {
-            crate::encoding::strategy::StrategyTag::for_compression_level(self.compression_level)
-        });
-        self.state.huf_optimal_search = crate::encoding::frame_compressor::huf_search_enabled(
-            self.state.strategy_tag,
-            self.pledged_content_size.or(self.source_size_hint),
+        // Sync `state.strategy_tag` / `state.pre_split` to the strategy the
+        // matcher's reset resolved (size- and dictionary-adaptive; a public
+        // strategy override wins on a plain frame, a dictionary frame runs the
+        // CDict's strategy) so the literal-compression gates and the block
+        // pre-splitter agree with the parse. Mirrors `FrameCompressor::compress`
+        // and keeps both entry points byte-equivalent.
+        let hint = self.pledged_content_size.or(self.source_size_hint);
+        let (params, dict_frame) = crate::encoding::frame_compressor::resolve_frame_params(
+            self.compression_level,
+            hint,
+            self.dictionary.as_ref().filter(|_| use_dictionary_state),
         );
+        crate::encoding::frame_compressor::sync_effective_strategy(
+            &mut self.state,
+            self.compression_level,
+            &params,
+            self.strategy_override.filter(|_| !dict_frame),
+        );
+        self.state.huf_optimal_search =
+            crate::encoding::frame_compressor::huf_search_enabled(self.state.strategy_tag, hint);
+        self.savings = 0;
         #[cfg(feature = "hash")]
         {
             self.hasher = XxHash64::with_seed(0);
@@ -668,6 +686,47 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         space
     }
 
+    /// Where the full pending block is cut (upstream `ZSTD_compress_frameChunk`
+    /// sizing every block with `ZSTD_optimalBlockSize`): the pre-splitter's
+    /// boundary once the frame has saved enough, else the whole block.
+    /// `remaining` is the input still to come as far as the splitter knows:
+    /// a full block again while writes continue, the buffered bytes at the
+    /// end of the frame.
+    fn pre_split_len(&self, block_capacity: usize, remaining: usize) -> usize {
+        if matches!(self.compression_level, CompressionLevel::Uncompressed) {
+            return self.pending.len();
+        }
+        crate::encoding::frame_compressor::optimal_block_size_with(
+            self.state.pre_split.map(usize::from),
+            &self.pending,
+            remaining,
+            block_capacity,
+            self.savings,
+        )
+        .min(self.pending.len())
+    }
+
+    /// Emit the first `block_len` pending bytes as a non-last block; the
+    /// suffix stays pending (the next block starts with it, as the frame
+    /// compressor's reader path carries a pre-split suffix). On a drain
+    /// error the whole pending buffer is restored so no input is lost.
+    fn emit_pending_prefix(
+        &mut self,
+        block_len: usize,
+        block_capacity: usize,
+    ) -> Result<(), Error> {
+        let mut suffix = self.allocate_pending_space(block_capacity);
+        suffix.extend_from_slice(&self.pending[block_len..]);
+        let mut block = mem::replace(&mut self.pending, suffix);
+        block.truncate(block_len);
+        if let Err((err, mut restored_block)) = self.encode_block(block, false) {
+            restored_block.extend_from_slice(&self.pending);
+            self.pending = restored_block;
+            return Err(err);
+        }
+        Ok(())
+    }
+
     fn emit_full_pending_block(
         &mut self,
         block_capacity: usize,
@@ -676,11 +735,8 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         if self.pending.len() != block_capacity {
             return None;
         }
-
-        let new_pending = self.allocate_pending_space(block_capacity);
-        let full_block = mem::replace(&mut self.pending, new_pending);
-        if let Err((err, restored_block)) = self.encode_block(full_block, false) {
-            self.pending = restored_block;
+        let block_len = self.pre_split_len(block_capacity, block_capacity);
+        if let Err(err) = self.emit_pending_prefix(block_len, block_capacity) {
             let err = self.fail(err);
             if consumed > 0 {
                 return Some(Ok(consumed));
@@ -691,13 +747,26 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
     }
 
     fn emit_pending_block(&mut self, last_block: bool) -> Result<(), Error> {
+        let block_capacity = self.block_capacity();
+        if last_block {
+            // A full final buffer is cut like any other block (the reader
+            // path splits it with `remaining = len`); each cut prefix goes
+            // out as a non-last block and the suffix is re-examined.
+            while self.pending.len() == block_capacity {
+                let block_len = self.pre_split_len(block_capacity, self.pending.len());
+                if block_len == self.pending.len() {
+                    break;
+                }
+                self.emit_pending_prefix(block_len, block_capacity)
+                    .map_err(|err| self.fail(err))?;
+            }
+        }
         let block = mem::take(&mut self.pending);
         if let Err((err, restored_block)) = self.encode_block(block, last_block) {
             self.pending = restored_block;
             return Err(self.fail(err));
         }
         if !last_block {
-            let block_capacity = self.block_capacity();
             self.pending = self.allocate_pending_space(block_capacity);
         }
         Ok(())
@@ -731,6 +800,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             encoded.reserve(needed_capacity.saturating_sub(encoded.len()));
         }
         let mut moved_into_matcher = false;
+        let raw_len = raw_block.as_ref().map_or(0, Vec::len);
         if raw_block.as_ref().is_some_and(|block| block.is_empty()) {
             let header = BlockHeader {
                 last_block,
@@ -794,6 +864,9 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             };
             return Err((err, restored));
         }
+        // `savings` counts the block header too, as upstream's
+        // `ZSTD_compress_frameChunk` does (`cSize` includes it).
+        self.savings += raw_len as i64 - encoded.len() as i64;
 
         if moved_into_matcher {
             #[cfg(feature = "hash")]

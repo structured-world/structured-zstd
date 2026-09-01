@@ -155,6 +155,43 @@ impl Write for PartialThenFailWriter {
     }
 }
 
+/// Regression: the streaming encoder cuts full 128 KiB blocks with the same
+/// pre-splitter (`ZSTD_compress_frameChunk` via `ZSTD_splitBlock`) as the
+/// frame compressor's reader path, so both entry points emit the same frame
+/// for the same pledged input. Without it the streaming frame (the CLI path)
+/// was 5.8 % larger at L6 on this corpus file.
+#[test]
+fn streaming_encoder_pre_splits_full_blocks_like_the_frame_compressor() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/decodecorpus_files/z000033");
+    let data = std::fs::read(path).unwrap();
+    for level in [6, 16] {
+        let mut streamed = Vec::new();
+        let mut enc = StreamingEncoder::new(&mut streamed, CompressionLevel::Level(level));
+        enc.set_pledged_content_size(data.len() as u64).unwrap();
+        for chunk in data.chunks(8192) {
+            enc.write_all(chunk).unwrap();
+        }
+        enc.finish().unwrap();
+        let mut read = Vec::new();
+        let mut fc: crate::encoding::FrameCompressor<&[u8], &mut Vec<u8>> =
+            crate::encoding::FrameCompressor::new(CompressionLevel::Level(level));
+        fc.set_source_size_hint(data.len() as u64);
+        fc.set_source(&data[..]);
+        fc.set_drain(&mut read);
+        fc.compress();
+        // The block stream after the frame header must be identical (the
+        // headers may describe the window differently).
+        let (_, streamed_header) =
+            crate::decoding::frame::read_frame_header(&streamed[..]).unwrap();
+        let (_, read_header) = crate::decoding::frame::read_frame_header(&read[..]).unwrap();
+        assert_eq!(
+            streamed[usize::from(streamed_header)..],
+            read[usize::from(read_header)..],
+            "level {level}: streaming blocks must be pre-split like the reader path"
+        );
+    }
+}
+
 /// Pre-write `set_magicless(true)` → emitted frame omits the
 /// magic prefix AND round-trips through a magicless-aware
 /// decoder.
