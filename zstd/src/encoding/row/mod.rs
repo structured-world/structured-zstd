@@ -32,6 +32,18 @@ const LAZY_ROW_ILIMIT_MARGIN: usize = 16;
 const LAZY_SEARCH_STRENGTH: u32 = 8;
 const LAZY_SKIPPING_STEP: usize = 8;
 
+/// Upstream zstd `ZSTD_ROW_HASH_CACHE_SIZE`: the row hash cache runs this
+/// many positions ahead of the parse, prefetching each position's row.
+const ROW_HASH_CACHE_SIZE: usize = 8;
+/// Upstream zstd `ZSTD_row_update_internal` gap rule: a gap of more than
+/// `ROW_UPDATE_SKIP_THRESHOLD` un-indexed positions indexes only its first
+/// `ROW_UPDATE_MAX_START` and last `ROW_UPDATE_MAX_END`.
+const ROW_UPDATE_SKIP_THRESHOLD: usize = 384;
+const ROW_UPDATE_MAX_START: usize = 96;
+const ROW_UPDATE_MAX_END: usize = 32;
+/// Hash-cache sentinel for a position too close to the end to hash.
+const ROW_CACHE_NONE: u32 = u32::MAX;
+
 /// Upstream zstd `ZSTD_highbit32(offBase)` term of the lazy gain formula:
 /// `offBase` is `offset + 3` for a real offset and 1 for repcode 1
 /// (`off == 0` here), whose highbit is 0.
@@ -686,21 +698,85 @@ macro_rules! row_find_best_match {
 /// its 96 head + 32 tail positions), search `$p`, then index `$p` itself.
 /// `$ntu` is the parse's `nextToUpdate` local, `$skip` its `lazySkipping`.
 macro_rules! lazy_search_at {
-    ($m:expr, $p:expr, $ntu:ident, $skip:ident, $rl:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
+    ($m:expr, $p:expr, $ntu:ident, $skip:ident, $cache:ident, $rl:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
         let p = $p;
-        if !$skip && $ntu < p {
-            $m.insert_match_span::<$rl>($ntu, p);
-        }
-        let r = match $m.hash_and_row(p) {
-            Some((row, tag)) => {
-                let r = row_find_best_match!($m, p, row, tag, $rl, $use_mask, $maskmac, $cpl);
-                $m.insert_at::<$rl>(p, row, tag);
-                r
+        let (row, tag) = if $skip {
+            // Lazy skipping: the skipped-over gap is not indexed and the cache
+            // is not maintained; the position is hashed directly.
+            row_cache_hash!($m, $rl, p)
+        } else {
+            if p - $ntu > ROW_UPDATE_SKIP_THRESHOLD {
+                row_cache_insert_range!($m, $cache, $rl, $ntu, $ntu + ROW_UPDATE_MAX_START);
+                row_cache_fill!($m, $cache, $rl, p - ROW_UPDATE_MAX_END);
+                row_cache_insert_range!($m, $cache, $rl, p - ROW_UPDATE_MAX_END, p);
+            } else {
+                row_cache_insert_range!($m, $cache, $rl, $ntu, p);
             }
-            None => (3usize, 0usize),
+            row_cache_next!($m, $cache, $rl, p)
+        };
+        let r = if row != ROW_CACHE_NONE {
+            let row = row as usize;
+            let r = row_find_best_match!($m, p, row, tag, $rl, $use_mask, $maskmac, $cpl);
+            $m.insert_at::<$rl>(p, row, tag);
+            r
+        } else {
+            (3usize, 0usize)
         };
         $ntu = p + 1;
         r
+    }};
+}
+
+/// Hash one position for the row cache and prefetch its row (upstream zstd
+/// `ZSTD_row_fillHashCache` / `ZSTD_row_nextCachedHash` body): `(row, tag)`
+/// with `row == ROW_CACHE_NONE` past the hashable end.
+macro_rules! row_cache_hash {
+    ($m:expr, $rl:expr, $pos:expr) => {{
+        match $m.hash_and_row($pos) {
+            Some((row, tag)) => {
+                $m.prefetch_row::<$rl>(row);
+                (row as u32, tag)
+            }
+            None => (ROW_CACHE_NONE, 0u8),
+        }
+    }};
+}
+
+/// Upstream zstd `ZSTD_row_fillHashCache`: (re)load the cache for the
+/// positions `$from .. $from + ROW_HASH_CACHE_SIZE`.
+macro_rules! row_cache_fill {
+    ($m:expr, $cache:ident, $rl:expr, $from:expr) => {{
+        let from = $from;
+        for pos in from..from + ROW_HASH_CACHE_SIZE {
+            $cache[pos & (ROW_HASH_CACHE_SIZE - 1)] = row_cache_hash!($m, $rl, pos);
+        }
+    }};
+}
+
+/// Upstream zstd `ZSTD_row_nextCachedHash`: take `$pos`'s cached hash and
+/// replace it with the hash of `$pos + ROW_HASH_CACHE_SIZE` (prefetching
+/// that row). Valid only while positions are consumed in sequence from the
+/// last fill, exactly as upstream.
+macro_rules! row_cache_next {
+    ($m:expr, $cache:ident, $rl:expr, $pos:expr) => {{
+        let pos = $pos;
+        let slot = pos & (ROW_HASH_CACHE_SIZE - 1);
+        let cur = $cache[slot];
+        $cache[slot] = row_cache_hash!($m, $rl, pos + ROW_HASH_CACHE_SIZE);
+        cur
+    }};
+}
+
+/// Upstream zstd `ZSTD_row_update_internalImpl` with the cache: index every
+/// position of `$from .. $to` through the hash cache.
+macro_rules! row_cache_insert_range {
+    ($m:expr, $cache:ident, $rl:expr, $from:expr, $to:expr) => {{
+        for pos in $from..$to {
+            let (row, tag) = row_cache_next!($m, $cache, $rl, pos);
+            if row != ROW_CACHE_NONE {
+                $m.insert_at::<$rl>(pos, row as usize, tag);
+            }
+        }
     }};
 }
 
@@ -737,6 +813,9 @@ macro_rules! lazy_parse_body {
             let mut ip = current_abs_start + usize::from(current_abs_start == hist_start);
             let mut next_to_update = current_abs_start;
             let mut lazy_skipping = false;
+            // Upstream `ZSTD_row_fillHashCache(ms, base, rowLog, mls, nextToUpdate, ilimit)`.
+            let mut hash_cache = [(ROW_CACHE_NONE, 0u8); ROW_HASH_CACHE_SIZE];
+            row_cache_fill!($m, hash_cache, $rl, next_to_update);
             // Repcodes reaching below the window are disabled for the block
             // (upstream `maxRep`); the bound also keeps every rep read inside
             // the live history since `ip` only grows.
@@ -769,6 +848,7 @@ macro_rules! lazy_parse_body {
                         ip,
                         next_to_update,
                         lazy_skipping,
+                        hash_cache,
                         $rl,
                         $use_mask,
                         $maskmac,
@@ -815,6 +895,7 @@ macro_rules! lazy_parse_body {
                                 ip,
                                 next_to_update,
                                 lazy_skipping,
+                                hash_cache,
                                 $rl,
                                 $use_mask,
                                 $maskmac,
@@ -858,6 +939,7 @@ macro_rules! lazy_parse_body {
                                     ip,
                                     next_to_update,
                                     lazy_skipping,
+                                    hash_cache,
                                     $rl,
                                     $use_mask,
                                     $maskmac,
@@ -906,7 +988,11 @@ macro_rules! lazy_parse_body {
                 }
                 anchor = start + match_length;
                 ip = anchor;
-                lazy_skipping = false;
+                if lazy_skipping {
+                    // A match ends lazy skipping; the cache is stale, refill it.
+                    row_cache_fill!($m, hash_cache, $rl, next_to_update);
+                    lazy_skipping = false;
+                }
 
                 // Immediate repcode: `offset_2` right after the stored match,
                 // swapping the two reps on every hit.
@@ -2583,12 +2669,9 @@ impl RowMatchGenerator {
     /// the row backend ~11x slower than FFI on those streams. The upstream zstd
     /// caps the fill at 96 + 32 positions regardless of match length.
     fn insert_match_span<const ROW_LOG: usize>(&mut self, start: usize, end: usize) {
-        const SKIP_THRESHOLD: usize = 384;
-        const MAX_START: usize = 96;
-        const MAX_END: usize = 32;
-        if end.saturating_sub(start) > SKIP_THRESHOLD {
-            self.insert_positions::<ROW_LOG>(start, start + MAX_START);
-            self.insert_positions::<ROW_LOG>(end - MAX_END, end);
+        if end.saturating_sub(start) > ROW_UPDATE_SKIP_THRESHOLD {
+            self.insert_positions::<ROW_LOG>(start, start + ROW_UPDATE_MAX_START);
+            self.insert_positions::<ROW_LOG>(end - ROW_UPDATE_MAX_END, end);
         } else {
             self.insert_positions::<ROW_LOG>(start, end);
         }
@@ -2637,11 +2720,21 @@ impl RowMatchGenerator {
             // SAFETY: prefetch is a hint and never faults; the indexes are in
             // bounds by the same `ensure_tables` sizing as `insert_at`.
             unsafe {
+                _mm_prefetch(self.row_heads.as_ptr().add(row).cast(), _MM_HINT_T0);
                 _mm_prefetch(self.row_tags.as_ptr().add(row_base).cast(), _MM_HINT_T0);
                 _mm_prefetch(
                     self.row_positions.as_ptr().add(row_base).cast(),
                     _MM_HINT_T0,
                 );
+                // Upstream zstd `ZSTD_row_prefetch` (zstd_lazy.c:816): rows of
+                // >= 32 entries span several 64-byte lines of positions; the
+                // second line is fetched too.
+                if ROW_LOG >= 5 {
+                    _mm_prefetch(
+                        self.row_positions.as_ptr().add(row_base + 16).cast(),
+                        _MM_HINT_T0,
+                    );
+                }
             }
         }
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
