@@ -31,7 +31,7 @@ impl MatchGeneratorDriver {
                 self.dfast_matcher_mut().offset_hist = offset_hist
             }
             super::super::strategy::BackendTag::Row => {
-                self.row_matcher_mut().offset_hist = offset_hist
+                self.row_matcher_mut().set_offset_hist(offset_hist)
             }
             super::super::strategy::BackendTag::HashChain => {
                 let matcher = self.hc_matcher_mut();
@@ -83,7 +83,7 @@ impl MatchGeneratorDriver {
                 self.dfast_matcher_mut().offset_hist = offset_hist
             }
             super::super::strategy::BackendTag::Row => {
-                self.row_matcher_mut().offset_hist = offset_hist
+                self.row_matcher_mut().set_offset_hist(offset_hist)
             }
             super::super::strategy::BackendTag::HashChain => {
                 let matcher = self.hc_matcher_mut();

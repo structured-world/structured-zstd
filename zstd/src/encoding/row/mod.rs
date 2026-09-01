@@ -871,12 +871,28 @@ macro_rules! lazy_parse_body {
             // Upstream `ZSTD_row_fillHashCache(ms, base, rowLog, mls, nextToUpdate, ilimit)`.
             let mut hash_cache = [(ROW_CACHE_NONE, 0u8); ROW_HASH_CACHE_SIZE];
             row_cache_fill!($m, scan, hash_cache, $rl, next_to_update);
+            // Upstream `rep[0..2]` entering the block: carried from the
+            // previous lazy block, else the frame / dictionary history.
             // Repcodes reaching below the window are disabled for the block
-            // (upstream `maxRep`); the bound also keeps every rep read inside
-            // the live history since `ip` only grows.
+            // (upstream `maxRep`, remembered in `offset_saved` so an unused
+            // one is handed back at the end); the bound also keeps every rep
+            // read inside the live history since `ip` only grows.
+            let [rep_in_1, rep_in_2] = $m
+                .lazy_reps
+                .unwrap_or([$m.offset_hist[0] as usize, $m.offset_hist[1] as usize]);
             let max_rep = ip - hist_start.max(ip.saturating_sub($m.max_window_size));
-            let mut offset_1 = ($m.offset_hist[0] as usize).min(max_rep + 1) % (max_rep + 1);
-            let mut offset_2 = ($m.offset_hist[1] as usize).min(max_rep + 1) % (max_rep + 1);
+            let mut offset_1 = rep_in_1;
+            let mut offset_2 = rep_in_2;
+            let mut offset_saved_1 = 0usize;
+            let mut offset_saved_2 = 0usize;
+            if offset_2 > max_rep {
+                offset_saved_2 = offset_2;
+                offset_2 = 0;
+            }
+            if offset_1 > max_rep {
+                offset_saved_1 = offset_1;
+                offset_1 = 0;
+            }
 
             while ip < ilimit {
                 let mut match_length = 0usize;
@@ -1083,6 +1099,26 @@ macro_rules! lazy_parse_body {
             // first search, which then reads full 8-byte keys across the
             // boundary) is carried in `lazy_next_to_update`.
             $m.lazy_next_to_update = next_to_update;
+            // Upstream's rep save: a disabled `offset_1` that became valid
+            // rotates the saved one into `rep[1]`; unused disabled reps are
+            // restored as they were.
+            let offset_saved_2 = if offset_saved_1 != 0 && offset_1 != 0 {
+                offset_saved_1
+            } else {
+                offset_saved_2
+            };
+            $m.lazy_reps = Some([
+                if offset_1 != 0 {
+                    offset_1
+                } else {
+                    offset_saved_1
+                },
+                if offset_2 != 0 {
+                    offset_2
+                } else {
+                    offset_saved_2
+                },
+            ]);
             if anchor < block_end {
                 let concat = $m.live_history();
                 $handle(Sequence::Literals {
@@ -1729,6 +1765,16 @@ pub(crate) struct RowMatchGenerator {
     /// the previous tail from here (with the block's data now readable
     /// past it, as upstream), instead of a per-block backfill.
     lazy_next_to_update: usize,
+    /// Upstream `rep[0..2]` as the lazy parse left them at the end of the
+    /// previous block (`ZSTD_compressBlock_lazy_generic` saves `offset_1` /
+    /// `offset_2`, restoring a window-disabled rep it never used). `None`
+    /// until the first lazy block of a frame: then the reps come from
+    /// `offset_hist` (frame start or dictionary). Kept apart from
+    /// `offset_hist` because the block encoder may encode a searched
+    /// offset that equals a rep as a repcode (no rotation) where upstream
+    /// stores it raw and rotates, so the encoder-side history and
+    /// upstream's parse-side reps legitimately differ.
+    lazy_reps: Option<[usize; 2]>,
     pub(crate) lazy_depth: u8,
     /// Cached fastpath kernel for `hash_mix_u64`; see Dfast for rationale.
     pub(crate) hash_kernel: crate::encoding::fastpath::FastpathKernel,
@@ -1791,6 +1837,7 @@ impl RowMatchGenerator {
             mls: ROW_MIN_MATCH_LEN,
             row_hash_mls: ROW_MIN_MATCH_LEN.clamp(4, 6) as u32,
             lazy_next_to_update: 0,
+            lazy_reps: None,
             lazy_depth: 1,
             hash_kernel: crate::encoding::fastpath::select_kernel(),
             row_heads: Vec::new(),
@@ -1863,6 +1910,13 @@ impl RowMatchGenerator {
         self.set_hash_bits(config.hash_bits.max(self.row_log + 1));
     }
 
+    /// Replace the repeat-offset history (dictionary priming): the lazy
+    /// parse's carried reps restart from it at the next block.
+    pub(crate) fn set_offset_hist(&mut self, offset_hist: [u32; 3]) {
+        self.offset_hist = offset_hist;
+        self.lazy_reps = None;
+    }
+
     pub(crate) fn reset(&mut self) {
         // Floor-advance reset (same shape as the dfast/HC backends): instead
         // of re-zeroing the row tables per frame (a multi-MiB memset that
@@ -1897,8 +1951,10 @@ impl RowMatchGenerator {
             self.row_positions.fill(ROW_EMPTY_SLOT);
             self.row_tags.fill(0);
         }
-        // Nothing of the previous frame is indexed for the new one.
+        // Nothing of the previous frame is indexed for the new one, and the
+        // lazy reps restart from the frame's initial history.
         self.lazy_next_to_update = self.history_abs_start;
+        self.lazy_reps = None;
         // Block buffers are returned to the caller's pool per block in
         // `add_data`, so there is nothing window-side to recycle here.
         self.chunk_lens.clear();
