@@ -2939,6 +2939,59 @@ fn dictionary_frame_keeps_a_fast_cdict_strategy_under_a_strategy_override() {
     assert_eq!(enc.state.pre_split, Some(0));
 }
 
+/// Regression: parameters whose level is `Uncompressed` may be set while a
+/// dictionary is attached (uncompressed mode ignores the dictionary, as
+/// `prepare_frame` does); the immediate strategy sync must not resolve the
+/// dictionary's CDict tier for a level that has no numeric value.
+#[test]
+fn set_parameters_uncompressed_with_a_dictionary_attached_does_not_resolve_a_cdict() {
+    use crate::encoding::CompressionParameters;
+    use crate::encoding::strategy::StrategyTag;
+    let dict_raw = noise_bytes(4 * 1024, 5);
+    let mut enc: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(3));
+    enc.set_dictionary(
+        crate::decoding::Dictionary::from_raw_content(0xD1C7_0016, dict_raw).unwrap(),
+    )
+    .unwrap();
+    let params = CompressionParameters::builder(super::CompressionLevel::Uncompressed)
+        .build()
+        .expect("valid parameters");
+    enc.set_parameters(&params);
+    assert_eq!(enc.state.strategy_tag, StrategyTag::Fast);
+    assert_eq!(enc.state.pre_split, None);
+    let payload = noise_bytes(2048, 9);
+    let frame = enc.compress_independent_frame(&payload);
+    let mut decoder = FrameDecoder::new();
+    let mut decoded = Vec::with_capacity(payload.len());
+    decoder.decode_all_to_vec(&frame, &mut decoded).unwrap();
+    assert_eq!(decoded, payload);
+}
+
+/// Regression: on a dictionary frame the matcher ignores every public
+/// override but `window_log`, so the raw-literals gate
+/// (`ZSTD_literalsCompressionIsDisabled`: fast strategy with a positive
+/// targetLength) must read the CDict's targetLength (0 at level 1), not a
+/// `target_length` override the matcher does not run.
+#[test]
+fn dictionary_frame_literal_gate_ignores_a_target_length_override() {
+    use crate::encoding::CompressionParameters;
+    let dict_raw = noise_bytes(4 * 1024, 5);
+    let mut enc: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(1));
+    enc.set_dictionary(
+        crate::decoding::Dictionary::from_raw_content(0xD1C7_0017, dict_raw).unwrap(),
+    )
+    .unwrap();
+    let params = CompressionParameters::builder(super::CompressionLevel::Level(1))
+        .target_length(8)
+        .build()
+        .expect("valid override");
+    enc.set_parameters(&params);
+    assert!(
+        !enc.state.literal_compression_disabled,
+        "a dictionary frame keeps the CDict's targetLength 0: literals stay compressed"
+    );
+}
+
 /// Regression: the CDict's cParams tier is picked from the SERIALIZED
 /// dictionary size (`ZSTD_createCDict(dictBuffer, dictSize, level)`), not
 /// from its content length. A dictionary whose content plus the 498-byte

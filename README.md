@@ -63,7 +63,7 @@ Complete [RFC 8878](https://www.rfc-editor.org/rfc/rfc8878) implementation, incl
 
 All standard compression levels are wired and produce valid Zstandard frames decodable by both this crate and upstream C zstd:
 
-- **Named presets:** `Fastest` (≈1), `Default` (≈3), `Better` (≈7), `Best` (≈11)
+- **Named presets:** `Fastest` (≈1), `Default` (≈3), `Better` (≈7), `Best` (≈13)
 - **Numeric levels:** `0..=22` and negative ultra-fast levels via `CompressionLevel::from_level(n)` — C zstd-compatible numbering
 - **Fine-grained parameters:** override individual knobs (`windowLog`, `hashLog`, `chainLog`, `searchLog`, `minMatch`, `targetLength`, `strategy`) and activate **long-distance matching** via `CompressionParameters::builder(...)`, the drop-in equivalent of C zstd's `ZSTD_CCtx_setParameter` surface
 - **Streaming encoder** via `std::io::Write`

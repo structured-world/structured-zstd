@@ -727,6 +727,26 @@ pub(crate) fn sync_effective_strategy<M: Matcher>(
     }
 }
 
+/// Upstream `ZSTD_literalsCompressionIsDisabled` (`ps_auto`): raw literals
+/// iff the EFFECTIVE cParams are the fast strategy with `targetLength > 0`.
+/// The effective strategy tag gates this (a strategy override can move a
+/// negative level off fast). For the fast strategy the level table sets
+/// `targetLength > 0` exactly on the negative (acceleration) rows, so absent
+/// an honoured `target_length` override `level < 0` is that test; the caller
+/// drops the override on a dictionary frame, where the matcher runs the
+/// CDict's targetLength instead.
+pub(crate) fn literal_compression_disabled(
+    strategy_tag: crate::encoding::strategy::StrategyTag,
+    level: CompressionLevel,
+    target_length_override: Option<u32>,
+) -> bool {
+    strategy_tag == crate::encoding::strategy::StrategyTag::Fast
+        && target_length_override.map_or_else(
+            || matches!(level, CompressionLevel::Level(n) if n < 0),
+            |tl| tl > 0,
+        )
+}
+
 /// The level params the matcher's reset resolves for a frame: through the
 /// dictionary's CDict tier when a dictionary is in play, else by source size.
 /// Returns whether the frame is a dictionary frame (the matcher then runs the
@@ -1129,28 +1149,21 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         // size-adaptively (same `resolve_level_params` path `prepare_frame`
         // uses) so a hint already set here yields the same strategy the matcher
         // will run, not the bare level-only mapping.
-        let (params, planned) = self.resolve_frame_params(self.source_size_hint, true);
-        self.sync_effective_strategy(&params, !planned);
+        // The dictionary counts only when the frame will prime it (same gate
+        // as `prepare_frame`'s `use_dictionary_state`): uncompressed mode
+        // ignores an attached dictionary and has no CDict tier to resolve.
+        let with_dictionary = !matches!(self.compression_level, CompressionLevel::Uncompressed)
+            && self.state.matcher.supports_dictionary_priming();
+        let (params, dict_frame) =
+            self.resolve_frame_params(self.source_size_hint, with_dictionary);
+        self.sync_effective_strategy(&params, !dict_frame);
         self.state.huf_optimal_search =
             huf_search_enabled(self.state.strategy_tag, self.source_size_hint);
-        // C `ZSTD_literalsCompressionIsDisabled` (ps_auto): raw literals iff the
-        // EFFECTIVE cParams are the fast strategy with targetLength > 0. A
-        // strategy override (e.g. negative level + BtUltra2) flips `strategy_tag`
-        // away from fast, so the resolved tag — not the signed level — gates
-        // this. For the fast strategy the level table sets targetLength > 0
-        // exactly on the negative (acceleration) rows, so absent an explicit
-        // targetLength override `level < 0` is that test; an override wins.
-        self.state.literal_compression_disabled = self.state.strategy_tag
-            == crate::encoding::strategy::StrategyTag::Fast
-            && overrides.target_length.map_or_else(
-                || {
-                    matches!(
-                        self.compression_level,
-                        crate::encoding::CompressionLevel::Level(n) if n < 0
-                    )
-                },
-                |tl| tl > 0,
-            );
+        self.state.literal_compression_disabled = literal_compression_disabled(
+            self.state.strategy_tag,
+            self.compression_level,
+            overrides.target_length.filter(|_| !dict_frame),
+        );
         self.state.matcher.set_param_overrides(Some(overrides));
     }
 

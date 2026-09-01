@@ -61,6 +61,10 @@ pub struct StreamingEncoder<W: Write, M: Matcher = MatchGeneratorDriver> {
     /// splitter run the same strategy the matcher does; `None` keeps the
     /// level-derived tag.
     strategy_override: Option<(crate::encoding::strategy::StrategyTag, u8)>,
+    /// Public `target_length` override (#27), kept so the raw-literals gate
+    /// resolved at frame start reads the value the matcher runs (dropped on a
+    /// dictionary frame, where the CDict's targetLength applies).
+    target_length_override: Option<u32>,
     /// `ZSTD_f_zstd1_magicless` — omit the 4-byte magic number prefix.
     /// Default false. See [`Self::set_magicless`].
     magicless: bool,
@@ -122,6 +126,7 @@ impl<W: Write> StreamingEncoder<W, MatchGeneratorDriver> {
         // Persist the strategy override so `ensure_frame_started`'s level-based
         // resync does not discard it (matching `FrameCompressor::set_parameters`).
         self.strategy_override = overrides.strategy.map(|s| (s.tag(), s.lazy_depth()));
+        self.target_length_override = overrides.target_length;
         self.state.strategy_tag = self.strategy_override.map_or_else(
             || {
                 crate::encoding::strategy::StrategyTag::for_compression_level(
@@ -179,6 +184,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             bytes_consumed: 0,
             savings: 0,
             strategy_override: None,
+            target_length_override: None,
             magicless: false,
             content_checksum: false,
             dictionary: None,
@@ -601,6 +607,12 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         );
         self.state.huf_optimal_search =
             crate::encoding::frame_compressor::huf_search_enabled(self.state.strategy_tag, hint);
+        self.state.literal_compression_disabled =
+            crate::encoding::frame_compressor::literal_compression_disabled(
+                self.state.strategy_tag,
+                self.compression_level,
+                self.target_length_override.filter(|_| !dict_frame),
+            );
         self.savings = 0;
         #[cfg(feature = "hash")]
         {

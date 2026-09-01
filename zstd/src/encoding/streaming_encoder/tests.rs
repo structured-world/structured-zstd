@@ -192,6 +192,35 @@ fn streaming_encoder_pre_splits_full_blocks_like_the_frame_compressor() {
     }
 }
 
+/// The streaming raw-literals gate follows the effective parameters like the
+/// frame compressor's: a positive `target_length` override on a fast level
+/// disables literal compression on a plain frame, while a dictionary frame
+/// keeps the CDict's targetLength (0 at level 1) and ignores the override.
+#[test]
+fn streaming_encoder_literal_gate_follows_the_effective_target_length() {
+    use crate::encoding::CompressionParameters;
+    let params = CompressionParameters::builder(CompressionLevel::Level(1))
+        .target_length(8)
+        .build()
+        .expect("valid override");
+    let mut plain = StreamingEncoder::new(Vec::new(), CompressionLevel::Level(1));
+    plain.set_parameters(&params).unwrap();
+    plain.write_all(b"plain frame payload").unwrap();
+    assert!(plain.state.literal_compression_disabled);
+    let dict: Vec<u8> = (0..4096u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let mut with_dict = StreamingEncoder::new(Vec::new(), CompressionLevel::Level(1));
+    with_dict.set_parameters(&params).unwrap();
+    with_dict
+        .set_encoder_dictionary(crate::encoding::EncoderDictionary::from_dictionary(
+            crate::decoding::Dictionary::from_raw_content(0xD1C7_0018, dict).unwrap(),
+        ))
+        .unwrap();
+    with_dict.write_all(b"dictionary frame payload").unwrap();
+    assert!(!with_dict.state.literal_compression_disabled);
+}
+
 /// Pre-write `set_magicless(true)` → emitted frame omits the
 /// magic prefix AND round-trips through a magicless-aware
 /// decoder.
