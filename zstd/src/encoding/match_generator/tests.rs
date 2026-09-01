@@ -284,7 +284,7 @@ fn l4_greedy_round_trip(slice_size: usize, max_slices: usize, data: &[u8]) -> (u
     // early-return guard) gets exercised.
     if data.is_empty() {
         let mut space = driver.get_next_space();
-        space.truncate(0);
+        space.clear();
         driver.commit_space(space);
         driver.start_matching(|seq| match seq {
             Sequence::Literals { literals } => reconstructed.extend_from_slice(literals),
@@ -365,7 +365,7 @@ fn driver_level4_greedy_empty_input_emits_nothing() {
     // `window.back()` unwrap — that's a separate path covered by
     // existing reset tests).
     let mut space = driver.get_next_space();
-    space.truncate(0);
+    space.clear();
     driver.commit_space(space);
     let mut emitted_anything = false;
     driver.start_matching(|_| emitted_anything = true);
@@ -3248,7 +3248,7 @@ fn hash_mix_crc_path_is_available_and_matches_accelerated_impl_when_supported() 
 
 #[test]
 fn hc_hash3_position_matches_hash3_formula() {
-    let bytes = [b'a', b'b', b'c', b'd'];
+    let bytes = *b"abcd";
     let read32 = u32::from_le_bytes(bytes);
     let expected = (((read32 << 8).wrapping_mul(HC_PRIME3BYTES)) >> (32 - HC3_HASH_LOG)) as usize;
     assert_eq!(
@@ -3261,7 +3261,7 @@ fn hc_hash3_position_matches_hash3_formula() {
 fn hc_hash_position_matches_hash4_formula() {
     let mut hc = HcMatchGenerator::new(1 << 20);
     hc.configure(HC_CONFIG, super::super::strategy::StrategyTag::Lazy, 22);
-    let bytes = [b'a', b'b', b'c', b'd'];
+    let bytes = *b"abcd";
     let read32 = u32::from_le_bytes(bytes);
     let expected = ((read32.wrapping_mul(HC_PRIME4BYTES)) >> (32 - hc.table.hash_log)) as usize;
     assert_eq!(hc.table.hash_position(&bytes), expected);
@@ -3275,7 +3275,7 @@ fn btultra2_main_hash_uses_hash4_formula() {
         super::super::strategy::StrategyTag::BtUltra2,
         27,
     );
-    let bytes = [b'a', b'b', b'c', b'd', b'e', b'f', b'g', b'h'];
+    let bytes = *b"abcdefgh";
     let read32 = u32::from_le_bytes(bytes[..4].try_into().unwrap());
     let expected = ((read32.wrapping_mul(HC_PRIME4BYTES)) >> (32 - hc.table.hash_log)) as usize;
     let actual = super::super::match_table::storage::MatchTable::hash_position_with_mls(
