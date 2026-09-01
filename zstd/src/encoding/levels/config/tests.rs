@@ -6,6 +6,50 @@ use crate::encoding::CompressionLevel;
 use crate::encoding::cparams::get_cparams;
 use crate::encoding::strategy::{SearchMethod, StrategyTag};
 
+/// Regression: a dictionary whose content cannot be indexed by the tagged
+/// attach tables (Fast / Dfast position fields hold at most 2^24 bytes) is
+/// primed in COPY mode, so the frame must run the CDict's verbatim table
+/// geometry (`ZSTD_resetCCtx_byCopyingCDict`), not the source-capped
+/// attach-mode widths a 4 KiB source would resolve: copying a 17 MiB
+/// dictionary into source-sized tables collides away its matches.
+#[test]
+fn oversized_attach_dictionary_resolves_the_copy_geometry() {
+    use crate::encoding::DictionarySizes;
+    use crate::encoding::cparams::{copy_cparams, get_cdict_cparams};
+    let sizes = DictionarySizes::raw_content(17 * 1024 * 1024);
+    for level in [1, 3] {
+        let (params, _plan) = super::resolve_level_params_with_dict(
+            CompressionLevel::Level(level),
+            Some(4096),
+            sizes,
+        );
+        let cdict = get_cdict_cparams(level, sizes.serialized);
+        let copy = copy_cparams(
+            cdict,
+            u32::from(
+                super::resolve_level_params(CompressionLevel::Level(level), Some(4096)).window_log,
+            ),
+        );
+        match level {
+            1 => {
+                let f = params.fast.expect("fast config");
+                assert_eq!(
+                    f.hash_log, copy.hash_log,
+                    "L1: copy-mode dictionary frame keeps the CDict hashLog"
+                );
+            }
+            _ => {
+                let d = params.dfast.expect("dfast config");
+                assert_eq!(
+                    (u32::from(d.long_hash_log), u32::from(d.short_hash_log)),
+                    (copy.hash_log, copy.chain_log),
+                    "L3: copy-mode dictionary frame keeps the CDict table geometry"
+                );
+            }
+        }
+    }
+}
+
 /// The parameters the encoder actually runs for a (level, source size) pair
 /// are upstream's `ZSTD_getCParams(level, size, 0)` for that pair: strategy,
 /// window / hash / chain widths, search depth, minMatch and targetLength, on

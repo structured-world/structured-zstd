@@ -32,14 +32,27 @@ use crate::io::{Read, Write};
 #[derive(Clone)]
 pub struct EncoderDictionary {
     pub(crate) inner: crate::decoding::Dictionary,
+    /// Size of the serialized dictionary this was built from (header, entropy
+    /// tables, repeat offsets and content); the CDict cParams tier key
+    /// (upstream `ZSTD_createCDict(dictBuffer, dictSize, level)`). Falls back
+    /// to the content length when the wrapped [`Dictionary`] was handed over
+    /// already parsed ([`Self::from_dictionary`]) — exact for raw-content
+    /// dictionaries, a close lower bound otherwise.
+    serialized_len: usize,
 }
 
 impl EncoderDictionary {
     /// Wrap an already-parsed [`Dictionary`](crate::decoding::Dictionary) for
     /// encoder use. A fully-decoded dictionary is valid here; only the encoder
-    /// entropy tables, content, and offset history are read.
+    /// entropy tables, content, and offset history are read. The CDict cParams
+    /// tier is keyed by the content length here; prefer [`Self::from_bytes`]
+    /// when the serialized blob is at hand — it keys the tier by the exact
+    /// serialized size as upstream `ZSTD_createCDict` does.
     pub fn from_dictionary(dictionary: crate::decoding::Dictionary) -> Self {
-        Self { inner: dictionary }
+        Self {
+            serialized_len: dictionary.dict_content.len(),
+            inner: dictionary,
+        }
     }
 
     /// Parse a serialized dictionary blob for encoder use, skipping the decode
@@ -51,7 +64,16 @@ impl EncoderDictionary {
     ) -> Result<Self, crate::decoding::errors::DictionaryDecodeError> {
         Ok(Self {
             inner: crate::decoding::Dictionary::decode_dict_for_encoding(raw_dictionary)?,
+            serialized_len: raw_dictionary.len(),
         })
+    }
+
+    /// The content and serialized sizes the encoder's matcher is hinted with.
+    pub(crate) fn sizes(&self) -> crate::encoding::DictionarySizes {
+        crate::encoding::DictionarySizes {
+            content: self.inner.dict_content.len(),
+            serialized: self.serialized_len,
+        }
     }
 
     /// The dictionary id.
@@ -768,7 +790,7 @@ pub(crate) fn resolve_frame_params(
             let (params, _plan) = crate::encoding::levels::config::resolve_level_params_with_dict(
                 level,
                 hint,
-                dict.inner.sizes().serialized,
+                dict.sizes(),
             );
             (params, true)
         }
@@ -1802,9 +1824,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // before `reset` (which consumes it) and only when a dictionary will
         // actually be primed.
         if use_dictionary_state && let Some(dict) = self.dictionary.as_ref() {
-            self.state
-                .matcher
-                .set_dictionary_size_hint(dict.inner.sizes());
+            self.state.matcher.set_dictionary_size_hint(dict.sizes());
         }
         // Clearing buffers to allow re-using of the compressor
         self.state.matcher.reset(self.compression_level);

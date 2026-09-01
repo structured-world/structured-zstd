@@ -917,14 +917,14 @@ pub(crate) struct RowDictPlan {
 pub(crate) fn resolve_level_params_with_dict(
     level: CompressionLevel,
     source_size: Option<u64>,
-    dict_size: usize,
+    sizes: crate::encoding::DictionarySizes,
 ) -> (LevelParams, Option<RowDictPlan>) {
     use crate::encoding::cparams::{
         CONTENTSIZE_UNKNOWN, attach_cparams, copy_cparams, get_cdict_cparams, should_attach_dict,
         uses_row_match_finder,
     };
     let base = resolve_level_params(level, source_size);
-    if dict_size == 0 {
+    if sizes.content == 0 {
         return (base, None);
     }
     // The CDict's cParams decide the frame's strategy REGARDLESS of the
@@ -933,8 +933,19 @@ pub(crate) fn resolve_level_params_with_dict(
     // btopt, but a 300 KiB CDict is btlazy2 and the frame runs btlazy2; L4
     // on a 1 MiB source is dfast, but a 4 KiB CDict is greedy. Only the
     // frame's own `windowLog` is kept.
-    let cdict = get_cdict_cparams(numeric_level(level), dict_size);
-    let attach = should_attach_dict(&cdict, source_size);
+    let cdict = get_cdict_cparams(numeric_level(level), sizes.serialized);
+    // `ZSTD_shouldAttachDict`, bounded by the backend's attach representability:
+    // the Fast / Dfast attached tables pack the dict position next to a tag, so
+    // they index at most 2^24 content bytes. A larger dictionary is primed in
+    // COPY mode, and the frame must then run the CDict's verbatim table
+    // geometry (`byCopyingCDict`) — copying it into source-capped attach-mode
+    // tables would collide away its matches.
+    let attach_fits = match cdict.strategy {
+        1 => sizes.content <= MAX_FAST_ATTACH_DICT_REGION,
+        2 => sizes.content <= crate::encoding::dfast::DFAST_ATTACH_DICT_MAX_LEN,
+        _ => true,
+    };
+    let attach = should_attach_dict(&cdict, source_size) && attach_fits;
     let window_log = u32::from(base.window_log);
     let frame = if attach {
         attach_cparams(

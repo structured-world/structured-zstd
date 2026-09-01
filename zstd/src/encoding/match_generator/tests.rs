@@ -1782,14 +1782,20 @@ fn driver_huge_source_hint_with_dict_does_not_overflow_hc_reserve() {
 fn dictionary_frame_takes_the_cdict_strategy_across_backend_families() {
     use crate::encoding::levels::config::resolve_level_params_with_dict;
     use crate::encoding::strategy::{BackendTag, StrategyTag};
-    let (params, plan) =
-        resolve_level_params_with_dict(CompressionLevel::Level(13), Some(4096), 300 * 1024);
+    let (params, plan) = resolve_level_params_with_dict(
+        CompressionLevel::Level(13),
+        Some(4096),
+        crate::encoding::DictionarySizes::raw_content(300 * 1024),
+    );
     assert_eq!(params.strategy_tag, StrategyTag::Btlazy2);
     assert_eq!(params.backend(), BackendTag::Row);
     assert!(plan.is_some(), "a lazy-band CDict carries a plan");
     assert!(params.row.is_some_and(|r| r.bt));
-    let (params, plan) =
-        resolve_level_params_with_dict(CompressionLevel::Level(2), Some(100 * 1024), 4096);
+    let (params, plan) = resolve_level_params_with_dict(
+        CompressionLevel::Level(2),
+        Some(100 * 1024),
+        crate::encoding::DictionarySizes::raw_content(4096),
+    );
     assert_eq!(params.strategy_tag, StrategyTag::Fast);
     assert_eq!(params.backend(), BackendTag::Simple);
     assert!(
@@ -1960,6 +1966,43 @@ fn driver_dictionary_frame_ignores_finder_overrides() {
     assert!(
         dict_matches >= 2,
         "the attached dictionary must be found through the CDict geometry (got {dict_matches})"
+    );
+}
+
+/// Regression: a reset WITHOUT a dictionary drops the resident attached
+/// tables (both backends receive a `None` geometry): the previous dictionary
+/// frame's cache must not be re-borrowed by a frame whose header declares no
+/// dictionary.
+#[test]
+fn driver_no_dictionary_reset_drops_the_attached_tables() {
+    let dict: Vec<u8> = (0..20 * 1024u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    // Dfast: dict frame at L3, then a plain L3 frame.
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+    driver.set_source_size_hint(1024);
+    driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
+    driver.reset(CompressionLevel::Level(3));
+    driver.prime_with_dictionary(&dict, [1, 4, 8]);
+    assert!(driver.dfast_matcher().dict_table_bits().is_some());
+    driver.set_source_size_hint(1024);
+    driver.reset(CompressionLevel::Level(3));
+    assert!(
+        driver.dfast_matcher().dict_table_bits().is_none(),
+        "a no-dictionary frame must not keep the attached Dfast tables"
+    );
+    // Fast: dict frame at L1, then a plain L1 frame.
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+    driver.set_source_size_hint(1024);
+    driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
+    driver.reset(CompressionLevel::Level(1));
+    driver.prime_with_dictionary(&dict, [1, 4, 8]);
+    assert!(driver.simple_mut().built_dict_table_hash_log().is_some());
+    driver.set_source_size_hint(1024);
+    driver.reset(CompressionLevel::Level(1));
+    assert!(
+        driver.simple_mut().built_dict_table_hash_log().is_none(),
+        "a no-dictionary frame must not keep the attached Fast table"
     );
 }
 

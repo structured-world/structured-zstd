@@ -1027,11 +1027,9 @@ impl Matcher for MatchGeneratorDriver {
         // is keyed by the serialized dictionary size; a lazy-band CDict also
         // carries `dict_plan` to the Row backend.
         let (params, dict_plan) = match dict_hint {
-            Some(sizes) => crate::encoding::levels::config::resolve_level_params_with_dict(
-                level,
-                hint,
-                sizes.serialized,
-            ),
+            Some(sizes) => {
+                crate::encoding::levels::config::resolve_level_params_with_dict(level, hint, sizes)
+            }
             None => (Self::level_params(level, hint), None),
         };
         #[cfg_attr(not(test), allow(unused_mut))]

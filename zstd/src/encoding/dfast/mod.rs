@@ -757,13 +757,20 @@ impl DfastMatchGenerator {
     /// dictionary frame: the CDict's `hashLog` / `chainLog`; `None` uses the
     /// live widths.
     pub(crate) fn set_dict_table_bits(&mut self, bits: Option<(usize, usize)>) {
-        // A resident table of another geometry (a level change that keeps the
-        // source-capped live widths) must not be re-borrowed by `reset`: the
-        // dual-probe kernel would hash at the new widths into the old table.
-        // Dropping it here makes the reset re-prime instead.
-        if let (Some(table), Some((long_bits, short_bits))) = (self.dict.table(), bits)
-            && (table.long_bits != long_bits || table.short_bits != short_bits)
-        {
+        // A resident table must not be re-borrowed by `reset` when the next
+        // frame carries no dictionary (`None`: the frame header declares
+        // none, so no output may reference the dict bytes) or resolves
+        // another CDict geometry (the dual-probe kernel would hash at the
+        // new widths into the old table). Dropping it makes the reset
+        // re-prime (or run plain) instead.
+        let stale = match (self.dict.table(), bits) {
+            (Some(_), None) => true,
+            (Some(table), Some((long_bits, short_bits))) => {
+                table.long_bits != long_bits || table.short_bits != short_bits
+            }
+            (None, _) => false,
+        };
+        if stale {
             self.dict.invalidate();
         }
         self.dict_table_bits = bits;

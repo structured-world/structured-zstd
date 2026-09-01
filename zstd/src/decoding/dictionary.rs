@@ -39,11 +39,6 @@ pub struct Dictionary {
     /// <https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md#repeat-offsets>
     /// for more.
     pub offset_hist: [u32; 3],
-    /// Size of the serialized dictionary this was parsed from (header,
-    /// entropy tables, repeat offsets and content); the content length for a
-    /// raw-content dictionary. The encoder keys the CDict cParams tier on it
-    /// (upstream `ZSTD_createCDict(dictBuffer, dictSize, level)`).
-    pub(crate) serialized_len: usize,
 }
 
 #[cfg(target_has_atomic = "ptr")]
@@ -89,18 +84,9 @@ impl Dictionary {
             id,
             fse: FSEScratch::new(),
             huf: HuffmanScratch::new(),
-            serialized_len: dict_content.len(),
             dict_content,
             offset_hist: [1, 4, 8],
         })
-    }
-
-    /// The content and serialized sizes the encoder's matcher is hinted with.
-    pub(crate) fn sizes(&self) -> crate::encoding::DictionarySizes {
-        crate::encoding::DictionarySizes {
-            content: self.dict_content.len(),
-            serialized: self.serialized_len,
-        }
     }
 
     /// Parses the dictionary from `raw`, initializes its tables,
@@ -159,7 +145,6 @@ impl Dictionary {
             huf: HuffmanScratch::new(),
             dict_content: Vec::new(),
             offset_hist: [1, 4, 8],
-            serialized_len: raw.len(),
         };
 
         let magic_num: [u8; 4] = raw[..4].try_into().expect("optimized away");

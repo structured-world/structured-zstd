@@ -1149,7 +1149,6 @@ fn set_dictionary_rejects_zero_dictionary_id() {
         huf: crate::decoding::scratch::HuffmanScratch::new(),
         dict_content: vec![1, 2, 3],
         offset_hist: [1, 4, 8],
-        serialized_len: 3,
     };
 
     let mut compressor: FrameCompressor<
@@ -1172,7 +1171,6 @@ fn set_dictionary_rejects_zero_repeat_offsets() {
         huf: crate::decoding::scratch::HuffmanScratch::new(),
         dict_content: vec![1, 2, 3],
         offset_hist: [0, 4, 8],
-        serialized_len: 3,
     };
 
     let mut compressor: FrameCompressor<
