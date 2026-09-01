@@ -2056,9 +2056,9 @@ fn split_block_from_borders_returns_midpoint_for_centred_transition() {
 }
 
 /// `level_pre_split` resolves the per-level split knob through the
-/// `LevelParams` table: the tiers two steps coarser than upstream's default
-/// `splitLevels` (see `pre_split_for` for why): fast/dfast/greedy/lazy → 0
-/// (from-borders), lazy2/btlazy2 → 1 (byChunks rate 43),
+/// `LevelParams` table: upstream's `splitLevels` up to lazy depth 1
+/// (fast → 0, dfast → 1, greedy/lazy → 2), two steps coarser above (see
+/// `pre_split_for` for why): lazy2/btlazy2 → 1 (byChunks rate 43),
 /// btopt/btultra/btultra2 → 2 (rate 11). `Uncompressed` has no numeric level
 /// so it stays `None`.
 #[test]
@@ -2068,8 +2068,8 @@ fn pre_split_level_dispatches_by_compression_level() {
     assert_eq!(level_pre_split(CompressionLevel::Uncompressed), None);
     // Fastest = level 1 (fast) → 0 (from-borders).
     assert_eq!(level_pre_split(CompressionLevel::Fastest), Some(0));
-    // Default = level 3 (dfast) → 0 (from-borders).
-    assert_eq!(level_pre_split(CompressionLevel::Default), Some(0));
+    // Default = level 3 (dfast) → 1 (byChunks rate 43).
+    assert_eq!(level_pre_split(CompressionLevel::Default), Some(1));
     // Better is a pure alias for level 7 (lazy): same as Level(7).
     assert_eq!(
         level_pre_split(CompressionLevel::Better),
@@ -2083,9 +2083,9 @@ fn pre_split_level_dispatches_by_compression_level() {
         level_pre_split(CompressionLevel::Level(13)),
     );
     assert_eq!(level_pre_split(CompressionLevel::Level(2)), Some(0)); // fast
-    assert_eq!(level_pre_split(CompressionLevel::Level(4)), Some(0)); // dfast
-    assert_eq!(level_pre_split(CompressionLevel::Level(5)), Some(0)); // greedy
-    assert_eq!(level_pre_split(CompressionLevel::Level(7)), Some(0)); // lazy (depth 1)
+    assert_eq!(level_pre_split(CompressionLevel::Level(4)), Some(1)); // dfast
+    assert_eq!(level_pre_split(CompressionLevel::Level(5)), Some(2)); // greedy
+    assert_eq!(level_pre_split(CompressionLevel::Level(7)), Some(2)); // lazy (depth 1)
     assert_eq!(level_pre_split(CompressionLevel::Level(8)), Some(1)); // lazy2 lower bound
     assert_eq!(level_pre_split(CompressionLevel::Level(11)), Some(1)); // lazy2 (depth 2)
     assert_eq!(level_pre_split(CompressionLevel::Level(12)), Some(1)); // lazy2 upper bound
@@ -2869,7 +2869,7 @@ fn pre_split_tier_follows_the_effective_strategy() {
         .build()
         .expect("valid override");
     enc.set_parameters(&params);
-    assert_eq!(enc.state.pre_split, Some(0), "lazy override: tier 0");
+    assert_eq!(enc.state.pre_split, Some(2), "lazy override: tier 2");
     // A 4 KiB source promotes L13 from btlazy2 (tier 1) to btopt (tier 2).
     let mut enc: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(13));
     enc.set_source_size_hint(4096);
@@ -2909,7 +2909,7 @@ fn dictionary_frame_state_records_the_cdict_strategy_not_the_override() {
     // the frame state the block loop reads.
     let _ = enc.compress_independent_frame(&payload);
     assert_eq!(enc.state.strategy_tag, StrategyTag::Lazy);
-    assert_eq!(enc.state.pre_split, Some(0));
+    assert_eq!(enc.state.pre_split, Some(2));
 }
 
 /// Regression: the same holds for a CDict outside the lazy band. A 4 KiB

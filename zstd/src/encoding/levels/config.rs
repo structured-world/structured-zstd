@@ -230,25 +230,34 @@ impl LevelParams {
 ///
 /// Upstream's default is `splitLevels[strategy] = {0,0,1,2,2,3,3,4,4,4}`
 /// (zstd_compress.c:4552, used as is; only an explicit `blockSplitterLevel`
-/// is shifted down by 2). That table is DELIBERATELY not followed: it puts
-/// greedy/lazy on byChunks rate 11, lazy2/btlazy2 on rate 5 and the optimal
-/// band on the full rate-1 scan, which on periodic input over-splits every
-/// block into tiny pieces (100 MiB of repeated log lines: 140,625 bytes at
-/// L8-L10 and 3.6x the time, exactly like upstream) while on real data it
-/// buys nothing over the two-steps-coarser tiers below (decodecorpus L8-L12:
-/// 170 bytes of 483 KiB). The drop-in contract asks for ratio <= upstream,
-/// not for upstream's block boundaries, so the coarser tiers stay: 8,944
-/// bytes and 3.6x faster than upstream on the periodic stream, <= upstream
-/// on every measured fixture.
+/// is shifted down by 2). It is followed up to lazy depth 1 — the finer
+/// sampling is a real ratio win on mixed data (decodecorpus at greedy/lazy:
+/// the borders tier compressed 4.6-4.9 % WORSE than upstream, the upstream
+/// rate-11 tier <= upstream) — but the lazy2/btlazy2 rate-5 and optimal-band
+/// rate-1 tiers are DELIBERATELY kept two steps coarser: on periodic input
+/// they over-split every block into tiny pieces exactly like upstream does
+/// (100 MiB of repeated log lines at L8-L12: 140,625 bytes and 3.6x the
+/// time upstream-tier, 9,742 bytes coarse — 14x better than upstream) while
+/// on real data they buy under 0.1 % (decodecorpus L8-L12: 170 bytes of
+/// 483 KiB). The drop-in contract asks for ratio <= upstream, not for
+/// upstream's block boundaries.
 pub(crate) fn pre_split_for(tag: crate::encoding::strategy::StrategyTag, lazy_depth: u8) -> u8 {
     use crate::encoding::strategy::StrategyTag;
     match tag {
-        // from-borders: cheap, rarely splits.
-        StrategyTag::Fast | StrategyTag::Dfast | StrategyTag::Greedy => 0,
-        // lazy (depth 1) stays on from-borders; lazy2 on byChunks rate 43.
-        StrategyTag::Lazy => u8::from(lazy_depth >= 2),
+        // Upstream tiers: borders / byChunks rate 43 / rate 11.
+        StrategyTag::Fast => 0,
+        StrategyTag::Dfast => 1,
+        StrategyTag::Greedy => 2,
+        // lazy (depth 1) = upstream rate 11; lazy2 coarsened to rate 43.
+        StrategyTag::Lazy => {
+            if lazy_depth >= 2 {
+                1
+            } else {
+                2
+            }
+        }
         StrategyTag::Btlazy2 => 1,
-        // byChunks rate 11.
+        // Coarsened to byChunks rate 11 (upstream: rate 1).
         StrategyTag::BtOpt | StrategyTag::BtUltra | StrategyTag::BtUltra2 => 2,
     }
 }
