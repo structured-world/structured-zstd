@@ -201,7 +201,7 @@ impl MatchGeneratorDriver {
             space.clear();
             space.extend_from_slice(&dict_content[start..end]);
             self.commit_space(space);
-            self.skip_matching_for_dictionary_priming();
+            self.skip_matching_for_dictionary_priming(dict_content.len());
             committed_dict_budget += end - start;
             start = end;
         }

@@ -874,7 +874,7 @@ impl MatchGeneratorDriver {
         self.reset_size_log.is_none_or(|log| log <= cutoff)
     }
 
-    fn skip_matching_for_dictionary_priming(&mut self) {
+    fn skip_matching_for_dictionary_priming(&mut self, dict_len: usize) {
         match self.active_backend() {
             super::strategy::BackendTag::Simple => {
                 // Upstream zstd `ZSTD_shouldAttachDict` mode selection for the Fast
@@ -893,7 +893,7 @@ impl MatchGeneratorDriver {
                         .reset_size_log
                         .is_none_or(|log| log <= FAST_ATTACH_DICT_CUTOFF_LOG);
                 if attach {
-                    self.simple_mut().skip_matching_for_dict_prime();
+                    self.simple_mut().skip_matching_for_dict_prime(dict_len);
                 } else {
                     self.simple_mut().skip_matching_with_hint(Some(false));
                 }

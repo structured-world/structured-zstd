@@ -1706,9 +1706,9 @@ impl FastKernelMatcher {
     /// matches (dict fallback), matching the upstream zstd's `prefixStart`/dict split.
     /// Replaces the [`Self::skip_matching_with_hint`]`(Some(false))` call the
     /// driver used to make for Fast-backend priming.
-    pub(crate) fn skip_matching_for_dict_prime(&mut self) {
+    pub(crate) fn skip_matching_for_dict_prime(&mut self, dict_len: usize) {
         let block_start = self.extend_history_with_pending();
-        self.prime_dict_table_for_range(block_start);
+        self.prime_dict_table_for_range(block_start, dict_len);
     }
 
     /// Mark the dict table as fully built (CDict-equivalent). Called by the
@@ -1737,8 +1737,9 @@ impl FastKernelMatcher {
 
     /// Build (or extend) [`Self::dict_table`] over `history[range_start..]`,
     /// the freshly-appended dictionary bytes. Lazily allocates the dict table
-    /// at the same `(hash_log, mls)` as the main table so one hash keys both.
-    fn prime_dict_table_for_range(&mut self, range_start: usize) {
+    /// at the CDict geometry of the whole `dict_len`-byte dictionary and the
+    /// main table's `mls`, so one hash keys both.
+    fn prime_dict_table_for_range(&mut self, range_start: usize, dict_len: usize) {
         const HASH_READ_SIZE: usize = 8;
         let history_len = self.history.len();
         // Record the dict/input boundary regardless of whether any position

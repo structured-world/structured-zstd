@@ -634,13 +634,13 @@ fn dict_prime_indexes_positions_across_chunk_seam() {
         .map(|i| i.wrapping_mul(37).wrapping_add(13))
         .collect();
     m.accept_data(chunk1);
-    m.skip_matching_for_dict_prime();
+    m.skip_matching_for_dict_prime(32);
     let seam = m.history.len(); // end of first chunk
     let chunk2: alloc::vec::Vec<u8> = (16..32u8)
         .map(|i| i.wrapping_mul(37).wrapping_add(13))
         .collect();
     m.accept_data(chunk2);
-    m.skip_matching_for_dict_prime();
+    m.skip_matching_for_dict_prime(32);
 
     // A position in the (HASH_READ_SIZE - 1)-byte gap just below the
     // seam: its 8-byte hash read straddles the chunk boundary.
@@ -661,6 +661,65 @@ fn dict_prime_indexes_positions_across_chunk_seam() {
     );
 }
 
+/// Regression: a dictionary primed in slices must build the same table as
+/// one primed in a single pass. Upstream's stride-3 fill
+/// (`ZSTD_fillHashTableForCDict`) runs once over the whole dictionary; a
+/// slice ending inside a stride group must hand the group's unprocessed
+/// positions to the next slice, else the fill phase shifts by the leftover
+/// and those positions are never hashed.
+#[test]
+fn dict_prime_in_slices_matches_single_pass_fill() {
+    let dict: alloc::vec::Vec<u8> = (0..96u8)
+        .map(|i| i.wrapping_mul(37).wrapping_add(13))
+        .collect();
+    let mut whole = FastKernelMatcher::with_params(16, 16, 4, 2);
+    whole.accept_data(dict.clone());
+    whole.skip_matching_for_dict_prime(dict.len());
+
+    // A 30-byte first slice hashes up to position 22: the stride groups
+    // 0..=18 complete and the group at 21 cannot (its step is past the
+    // slice's hashable end), so the second slice must resume at 21.
+    let mut sliced = FastKernelMatcher::with_params(16, 16, 4, 2);
+    sliced.accept_data(dict[..30].to_vec());
+    sliced.skip_matching_for_dict_prime(dict.len());
+    sliced.accept_data(dict[30..].to_vec());
+    sliced.skip_matching_for_dict_prime(dict.len());
+
+    let a = whole.dict.table().expect("single-pass dict table");
+    let b = sliced.dict.table().expect("sliced dict table");
+    assert_eq!(a.hash_log(), b.hash_log(), "dict table width");
+    for slot in 0..(1u32 << a.hash_log()) {
+        // SAFETY: `slot` is below the table length.
+        let (x, y) = unsafe { (a.get(slot), b.get(slot)) };
+        assert_eq!(
+            x, y,
+            "dict table slot {slot} differs between sliced and single-pass fills"
+        );
+    }
+}
+
+/// Regression: the dict table takes the CDict geometry of the WHOLE
+/// dictionary (upstream sizes the CDict tables from `dictSize`), not of the
+/// first slice that happens to allocate it.
+#[test]
+fn dict_prime_sizes_the_table_from_the_whole_dictionary() {
+    let dict: alloc::vec::Vec<u8> = (0..3000u32)
+        .map(|i| (i.wrapping_mul(37) ^ (i >> 5)) as u8)
+        .collect();
+    let mut m = FastKernelMatcher::with_params(20, 20, 4, 2);
+    m.accept_data(dict[..30].to_vec());
+    m.skip_matching_for_dict_prime(dict.len());
+    m.accept_data(dict[30..].to_vec());
+    m.skip_matching_for_dict_prime(dict.len());
+    let (expected, _) =
+        crate::encoding::cparams::create_cdict_table_logs(20, 20, 20, false, dict.len());
+    assert_eq!(
+        m.dict.table().expect("dict table primed").hash_log(),
+        expected,
+        "dict table width must follow the whole dictionary's CDict geometry",
+    );
+}
+
 #[test]
 fn block_samples_match_dict_fires_only_on_extendable_dict_match() {
     // Distinct dict bytes so the 4-byte hashes are collision-free at
@@ -670,7 +729,7 @@ fn block_samples_match_dict_fires_only_on_extendable_dict_match() {
         .collect();
     let mut m = FastKernelMatcher::with_params(20, 20, 4, 2);
     m.accept_data(dict.clone());
-    m.skip_matching_for_dict_prime();
+    m.skip_matching_for_dict_prime(dict.len());
     assert!(m.dict_is_attached(), "dict must be attached after prime");
 
     // A 32-byte verbatim dict run extends well past the 16-byte useful-match
