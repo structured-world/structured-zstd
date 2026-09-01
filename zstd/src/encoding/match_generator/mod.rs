@@ -1067,6 +1067,18 @@ impl Matcher for MatchGeneratorDriver {
         // byte-identical to plain level-based compression.
         if let Some(ov) = self.param_overrides
             && !ov.is_empty()
+            && dict_plan.is_some()
+        {
+            // A dictionary frame runs the CDict's cParams (upstream
+            // `ZSTD_resetCCtx_byAttachingCDict` / `byCopyingCDict`: "cdict
+            // overrides"); only the caller's windowLog is kept. Reshaping the
+            // live search would probe the dictionary's tables with another
+            // geometry / key width than they were indexed with.
+            if let Some(window_log) = ov.window_log {
+                params.window_log = window_log;
+            }
+        } else if let Some(ov) = self.param_overrides
+            && !ov.is_empty()
         {
             apply_param_overrides(&mut params, &ov);
             // `Self::level_params(level, hint)` applied the source-size cap

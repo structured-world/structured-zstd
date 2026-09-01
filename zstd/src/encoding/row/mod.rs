@@ -712,6 +712,9 @@ macro_rules! hc_find_best_match {
         while match_index != ROW_EMPTY_SLOT && (match_index as usize) >= window_low && attempts > 0
         {
             let cand = match_index as usize;
+            // The floor advances past every indexed position between frames,
+            // so a link never points at or past the searched position.
+            debug_assert!(cand < p);
             // SAFETY: `cand < p`; the gate reads 4 bytes at `+ ml - 3` with
             // `ml + 1 <= limit` (the count breaks out at `ml == limit`).
             unsafe {
@@ -2237,6 +2240,11 @@ pub(crate) struct RowMatchGenerator {
     /// staged before each borrowed scan so `live_history()` exposes
     /// `[0, end)` and the parse loop scans `[start, end)`.
     pub(crate) borrowed_block: Option<(usize, usize)>,
+    /// Furthest input offset any block of the current borrowed frame
+    /// reached: the next `reset` advances the coordinate floor past it, so
+    /// the positions this frame indexed can never resurface as another
+    /// frame's (the owned path gets the same from its history length).
+    borrowed_extent: usize,
 }
 
 impl RowMatchGenerator {
@@ -2277,6 +2285,7 @@ impl RowMatchGenerator {
             dict: DictAttach::new(),
             borrowed_input: None,
             borrowed_block: None,
+            borrowed_extent: 0,
         }
     }
 
@@ -2441,7 +2450,11 @@ impl RowMatchGenerator {
         // TAGS can still produce the occasional false mask hit whose
         // candidate then fails the window check; the upstream zstd's tag table
         // persists across frames with the same behaviour.
-        let next_floor = self.history_abs_start + (self.history.len() - self.history_start);
+        // Past everything the previous frame indexed: its owned history, or
+        // the extent of its borrowed input.
+        let next_floor = self.history_abs_start
+            + (self.history.len() - self.history_start).max(self.borrowed_extent);
+        self.borrowed_extent = 0;
         self.window_size = 0;
         self.history.clear();
         self.history_start = 0;
@@ -2861,13 +2874,14 @@ impl RowMatchGenerator {
     /// Register the borrowed input window (the whole caller slice). Borrowed
     /// blocks staged after this read their bytes from `buffer` in place.
     ///
-    /// Zeroes `history_abs_start`: borrowed positions are absolute input
-    /// offsets (0-based), so the floor-advance reset's persistent non-zero
-    /// floor must be cleared for the duration of the borrowed frame. The
-    /// owned history is unused while borrowed (no `add_data` copy), so this
-    /// is safe; every probed candidate is byte-verified by the prefix
-    /// compare, so any stale table entry left from a prior frame is rejected
-    /// (or, if its bytes coincidentally match, is a genuine in-window match).
+    /// The coordinate floor (`history_abs_start`, advanced by `reset` past
+    /// every position the previous frame indexed) is kept: input offset `o`
+    /// is absolute position `floor + o`, so a stale table entry of an
+    /// earlier frame lies below the window floor and is never taken, and
+    /// the chain / tree walks never meet a position at or past the one they
+    /// search (offset 0 "self-matches" from a zeroed floor were a corrupt
+    /// frame). The owned history is unused while borrowed (no `add_data`
+    /// copy).
     ///
     /// # Safety
     /// `buffer` must stay live and unmodified until `clear_borrowed_window`
@@ -2875,11 +2889,9 @@ impl RowMatchGenerator {
     pub(crate) unsafe fn set_borrowed_window(&mut self, buffer: &[u8]) {
         self.borrowed_input = Some((buffer.as_ptr(), buffer.len()));
         self.borrowed_block = None;
-        self.history_abs_start = 0;
-        // The window bounds follow the coordinate origin (no dictionary on
-        // the borrowed path).
-        self.low_limit = 0;
-        self.prefix_low = 0;
+        self.borrowed_extent = 0;
+        // No dictionary on the borrowed path; the window bounds start at
+        // the floor `reset` set.
         self.loaded_dict_end = 0;
     }
 
@@ -2899,14 +2911,15 @@ impl RowMatchGenerator {
             "borrowed block bounds out of range: start={block_start} end={block_end} total={total}",
         );
         self.borrowed_block = Some((block_start, block_end));
+        self.borrowed_extent = self.borrowed_extent.max(block_end);
     }
 
     /// `(current_abs_start, current_len)` for the active scan. Borrowed: the
-    /// staged block range (absolute input offsets). Owned: derived from the
+    /// staged block range, at the coordinate floor. Owned: derived from the
     /// last committed chunk in the live window.
     fn current_block_range(&self) -> (usize, usize) {
         if let Some((start, end)) = self.borrowed_block {
-            (start, end - start)
+            (self.history_abs_start + start, end - start)
         } else {
             let current_len = *self.chunk_lens.back().unwrap();
             (
@@ -3770,11 +3783,14 @@ impl RowMatchGenerator {
             if from < indexable_end {
                 let scan = self.scan_ctx();
                 if self.finder == LazyFinder::Chain {
+                    // Absolute positions, like every other chain insert: a
+                    // reused matcher's floor sits past its previous frames.
                     let chain_mask = (1usize << self.hc_chain_log) - 1;
                     for idx in from..indexable_end {
-                        let h = self.hc_hash_at(scan, hist_start + idx);
-                        self.hc_chain[idx & chain_mask] = self.hc_hash[h];
-                        self.hc_hash[h] = idx as u32;
+                        let abs = hist_start + idx;
+                        let h = self.hc_hash_at(scan, abs);
+                        self.hc_chain[abs & chain_mask] = self.hc_hash[h];
+                        self.hc_hash[h] = abs as u32;
                     }
                 } else {
                     match self.row_log {

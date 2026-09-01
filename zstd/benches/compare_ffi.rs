@@ -158,12 +158,16 @@ fn ffi_encode_to_vec(input: &[u8], level: i32, ldm: bool) -> Vec<u8> {
         // (14 on the 1 MB corpus) while one-shot keeps pre-splitting (~90
         // blocks, ~5% smaller output, 7x the entropy work). Pairing our
         // one-shot encoder with streaming C misstates both time and size.
+        // Reserve the bound without initialising it: a zero-fill of the
+        // whole `compressBound` per timed iteration would charge the C arm
+        // an input-sized memset the Rust arm (which grows its output by the
+        // bytes actually emitted) never pays.
         let bound = zstd_sys::ZSTD_compressBound(input.len());
-        let mut output: Vec<u8> = vec![0u8; bound];
+        let mut output: Vec<u8> = Vec::with_capacity(bound);
         let written = zstd_sys::ZSTD_compress2(
             cctx,
             output.as_mut_ptr() as *mut core::ffi::c_void,
-            output.len(),
+            bound,
             input.as_ptr() as *const core::ffi::c_void,
             input.len(),
         );
@@ -171,7 +175,8 @@ fn ffi_encode_to_vec(input: &[u8], level: i32, ldm: bool) -> Vec<u8> {
             zstd_sys::ZSTD_isError(written) == 0,
             "ZSTD_compress2 failed (code = {written})"
         );
-        output.truncate(written);
+        // `ZSTD_compress2` initialised exactly `written <= bound` bytes.
+        output.set_len(written);
 
         zstd_sys::ZSTD_freeCCtx(cctx);
         output
