@@ -76,12 +76,12 @@ fn rust_encode_to_vec(input: &[u8], level: &LevelConfig) -> Vec<u8> {
     enc.compress_independent_frame(input)
 }
 
-/// FFI encode helper used by criterion's timing loop. Uses
-/// `ZSTD_compressStream2` into a growing-output `Vec` — same shape as
-/// the pure-Rust `compress_to_vec` so output-buffer growth profiles
-/// match cross-side. When `ldm` is set, `ZSTD_c_enableLongDistanceMatching`
-/// is turned on alongside the level so the FFI reference mirrors the Rust
-/// LDM variant (#362).
+/// FFI encode helper used by criterion's timing loop: one-shot
+/// `ZSTD_compress2` on a `ZSTD_compressBound`-sized `Vec`, the same
+/// single-call frame the pure-Rust `compress_independent_frame` produces
+/// (see the block-splitting note inside). When `ldm` is set,
+/// `ZSTD_c_enableLongDistanceMatching` is turned on alongside the level so
+/// the FFI reference mirrors the Rust LDM variant (#362).
 fn ffi_encode_to_vec(input: &[u8], level: i32, ldm: bool) -> Vec<u8> {
     use zstd::zstd_safe::zstd_sys;
     // SAFETY: `ZSTD_createCCtx` returns null on OOM, asserted below.
@@ -149,48 +149,29 @@ fn ffi_encode_to_vec(input: &[u8], level: i32, ldm: bool) -> Vec<u8> {
         let rc = zstd_sys::ZSTD_CCtx_setPledgedSrcSize(cctx, input.len() as u64);
         assert!(zstd_sys::ZSTD_isError(rc) == 0, "setPledgedSrcSize failed");
 
-        let recommended_in = zstd_sys::ZSTD_CStreamInSize();
-        let recommended_out = zstd_sys::ZSTD_CStreamOutSize();
-        let mut output: Vec<u8> = Vec::new();
-        let mut chunk = vec![0u8; recommended_out];
-        let mut in_pos: usize = 0;
-        loop {
-            let chunk_end = (in_pos + recommended_in).min(input.len());
-            let mut zin = zstd_sys::ZSTD_inBuffer {
-                src: input.as_ptr() as *const core::ffi::c_void,
-                size: chunk_end,
-                pos: in_pos,
-            };
-            let mode = if chunk_end == input.len() {
-                zstd_sys::ZSTD_EndDirective::ZSTD_e_end
-            } else {
-                zstd_sys::ZSTD_EndDirective::ZSTD_e_continue
-            };
-            loop {
-                let mut zout = zstd_sys::ZSTD_outBuffer {
-                    dst: chunk.as_mut_ptr() as *mut core::ffi::c_void,
-                    size: chunk.len(),
-                    pos: 0,
-                };
-                let remaining = zstd_sys::ZSTD_compressStream2(cctx, &mut zout, &mut zin, mode);
-                assert!(
-                    zstd_sys::ZSTD_isError(remaining) == 0,
-                    "ZSTD_compressStream2 failed (code = {remaining})"
-                );
-                output.extend_from_slice(&chunk[..zout.pos]);
-                let frame_complete =
-                    matches!(mode, zstd_sys::ZSTD_EndDirective::ZSTD_e_end) && remaining == 0;
-                let chunk_consumed = matches!(mode, zstd_sys::ZSTD_EndDirective::ZSTD_e_continue)
-                    && zin.pos == zin.size;
-                if frame_complete || chunk_consumed {
-                    break;
-                }
-            }
-            in_pos = zin.pos;
-            if in_pos == input.len() && matches!(mode, zstd_sys::ZSTD_EndDirective::ZSTD_e_end) {
-                break;
-            }
-        }
+        // One-shot `ZSTD_compress2`, the path `compress_independent_frame`
+        // mirrors. The streaming API (`ZSTD_compressStream2`) is NOT
+        // equivalent even when handed the whole input at once: it buffers
+        // `blockSizeMax` (128 KB) and runs `ZSTD_compress_frameChunk` per
+        // 128 KB, whose `ZSTD_optimalBlockSize` never splits a remainder
+        // below 128 KB, so streaming emits at most two blocks per 128 KB
+        // (14 on the 1 MB corpus) while one-shot keeps pre-splitting (~90
+        // blocks, ~5% smaller output, 7x the entropy work). Pairing our
+        // one-shot encoder with streaming C misstates both time and size.
+        let bound = zstd_sys::ZSTD_compressBound(input.len());
+        let mut output: Vec<u8> = vec![0u8; bound];
+        let written = zstd_sys::ZSTD_compress2(
+            cctx,
+            output.as_mut_ptr() as *mut core::ffi::c_void,
+            output.len(),
+            input.as_ptr() as *const core::ffi::c_void,
+            input.len(),
+        );
+        assert!(
+            zstd_sys::ZSTD_isError(written) == 0,
+            "ZSTD_compress2 failed (code = {written})"
+        );
+        output.truncate(written);
 
         zstd_sys::ZSTD_freeCCtx(cctx);
         output
