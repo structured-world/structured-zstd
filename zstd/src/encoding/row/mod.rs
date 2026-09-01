@@ -3009,7 +3009,11 @@ impl RowMatchGenerator {
         // stored (`rebase_positions` zeroes the floor; the previous frame's
         // stale entries collapse to empty, exactly what the advanced floor
         // already made them).
-        if self.history_abs_start + buffer.len() >= u32::MAX as usize - 1 - BT_IDX_BASE {
+        // u64 arithmetic: on a 32-bit target the sum itself overflows
+        // `usize` right where the guard must fire.
+        if self.history_abs_start as u64 + buffer.len() as u64
+            >= u32::MAX as u64 - 1 - BT_IDX_BASE as u64
+        {
             self.rebase_positions();
         }
         self.borrowed_input = Some((buffer.as_ptr(), buffer.len()));
