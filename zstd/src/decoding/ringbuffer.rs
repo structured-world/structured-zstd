@@ -473,18 +473,12 @@ impl RingBuffer {
     /// by the buffer.
     // SAFETY: other code relies on this pointing to initialized halves of the buffer only
     fn data_slice_lengths(&self) -> (usize, usize) {
-        let len_after_head;
-        let len_to_tail;
-
         // TODO can we do this branchless?
         if self.tail >= self.head {
-            len_after_head = self.tail - self.head;
-            len_to_tail = 0;
+            (self.tail - self.head, 0)
         } else {
-            len_after_head = self.cap - self.head;
-            len_to_tail = self.tail;
+            (self.cap - self.head, self.tail)
         }
-        (len_after_head, len_to_tail)
     }
 
     // SAFETY: other code relies on this pointing to initialized halves of the buffer only
@@ -513,18 +507,12 @@ impl RingBuffer {
     // at the beginning/end of the buffer. Everything else must be initialized
     /// Returns the size of the two unoccupied sections of memory used by the buffer.
     fn free_slice_lengths(&self) -> (usize, usize) {
-        let len_to_head;
-        let len_after_tail;
-
         // TODO can we do this branchless?
         if self.tail < self.head {
-            len_after_tail = self.head - self.tail;
-            len_to_head = 0;
+            (0, self.head - self.tail)
         } else {
-            len_after_tail = self.cap - self.tail;
-            len_to_head = self.head;
+            (self.head, self.cap - self.tail)
         }
-        (len_to_head, len_after_tail)
     }
 
     /// Returns mutable references to the available space and the size of that available space,
