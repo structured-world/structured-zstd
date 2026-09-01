@@ -11,11 +11,11 @@
 ## Highlights
 
 - **Production-grade decoder** — complete [RFC 8878](https://www.rfc-editor.org/rfc/rfc8878) implementation: dictionary-backed streams, raw / RLE / compressed blocks, the full frame format, optional content checksums, runtime-dispatched SIMD kernels (SSE2 / BMI2 / AVX2 / NEON, opt-in AVX-512).
-- **Full-range encoder** — every C-zstd level (`-7..=22`) produces valid frames decodable by this crate and by upstream C zstd; named presets, per-knob parameter overrides, long-distance matching, streaming via `std::io::Write`.
+- **Full-range encoder** — every C-zstd level (`-131072..=22`) produces valid frames decodable by this crate and by upstream C zstd; named presets, per-knob parameter overrides, long-distance matching, streaming via `std::io::Write`.
 - **Dictionaries end to end** — compress and decompress with the same dictionary format C zstd consumes; reusable parsed handles; pure-Rust COVER / FastCOVER training behind the `dict_builder` feature.
 - **Wire-compatible both ways** — frames interoperate with C zstd in either direction; interop is enforced in CI against the reference implementation.
 - **`no_std` ready** — the decoder builds with `--no-default-features` for embedded and sandboxed targets.
-- **WebAssembly / npm** — the same codec as a dependency-free npm package with automatic SIMD selection.
+- **WebAssembly / npm** — the same codec as an npm package with automatic SIMD selection; no native addons, no postinstall scripts.
 - **Continuously benchmarked** — a public [dashboard](https://structured-world.github.io/structured-zstd/dev/bench/) tracks speed and ratio against C zstd on every merge.
 
 ## Quick start
@@ -238,7 +238,7 @@ storage-format authors:
 - **Skippable frames** — a typed `SkippableFrame` API (`structured_zstd::skippable`) for interleaving application metadata with zstd data.
 - **Block-subset partial decode** — `FrameDecoder::decode_blocks_partial` decodes only the inner blocks covering a requested range (skipping the trailing ones) and preserves the clean prefix on a corrupt block.
 - **Block-to-byte-range lookup** — `FrameEmitInfo::decompressed_byte_range(block_index)` maps a block to its decompressed byte range, so a range query can locate which blocks cover a target byte window.
-- **Resumable decoding** — request a `ResumeState` (cross-block entropy tables + repcode history + next-block coordinates) from a partial decode, then feed it back to continue from a later block without re-decompressing the prefix, even across a dropped decoder.
+- **Resumable decoding** — request a `ResumeState` (cross-block entropy tables + repcode history + next-block coordinates) from a partial decode, then feed it back to continue from a later block, even across a dropped decoder. The state does not carry the match window: the resuming call also supplies the tail of the already-decompressed output (the last `min(window_size, resume_offset)` bytes) via `ResumeInput::window_prime`.
 
 ```toml
 [dependencies]
