@@ -217,36 +217,39 @@ impl LevelParams {
         }
     }
 
-    /// Cheap fingerprint pre-splitter level: the `ZSTD_splitBlock` level
-    /// upstream `ZSTD_optimalBlockSize` (zstd_compress.c:4552) dispatches by
-    /// default, `splitLevels[strategy] = {0,0,1,2,2,3,3,4,4,4}` indexed by
-    /// the upstream strategy ordinal. Only an EXPLICIT `blockSplitterLevel`
-    /// (2..=6) is shifted down by 2 there; the default table is used as is.
-    /// `0` routes to the from-borders heuristic; `1..=4` to byChunks with
-    /// sampling tier `level - 1` (rates 43 / 11 / 5 / 1).
+    /// Cheap fingerprint pre-splitter level (the `ZSTD_splitBlock` level;
+    /// `0` = from-borders heuristic, `1..=4` = byChunks with sampling tier
+    /// `level - 1`, rates 43 / 11 / 5 / 1). See [`pre_split_for`].
     pub(crate) fn pre_split(&self) -> Option<u8> {
         Some(pre_split_for(self.strategy_tag, self.lazy_depth))
     }
 }
 
-/// Upstream `splitLevels[strategy]` (see [`LevelParams::pre_split`]) for an
-/// effective strategy: the tag plus, for the collapsed `Lazy` tag, its lazy
-/// depth (lazy = 2, lazy2 = 3).
+/// The pre-splitter level for an effective strategy (the tag plus, for the
+/// collapsed `Lazy` tag, its lazy depth).
+///
+/// Upstream's default is `splitLevels[strategy] = {0,0,1,2,2,3,3,4,4,4}`
+/// (zstd_compress.c:4552, used as is; only an explicit `blockSplitterLevel`
+/// is shifted down by 2). That table is DELIBERATELY not followed: it puts
+/// greedy/lazy on byChunks rate 11, lazy2/btlazy2 on rate 5 and the optimal
+/// band on the full rate-1 scan, which on periodic input over-splits every
+/// block into tiny pieces (100 MiB of repeated log lines: 140,625 bytes at
+/// L8-L10 and 3.6x the time, exactly like upstream) while on real data it
+/// buys nothing over the two-steps-coarser tiers below (decodecorpus L8-L12:
+/// 170 bytes of 483 KiB). The drop-in contract asks for ratio <= upstream,
+/// not for upstream's block boundaries, so the coarser tiers stay: 8,944
+/// bytes and 3.6x faster than upstream on the periodic stream, <= upstream
+/// on every measured fixture.
 pub(crate) fn pre_split_for(tag: crate::encoding::strategy::StrategyTag, lazy_depth: u8) -> u8 {
     use crate::encoding::strategy::StrategyTag;
     match tag {
-        StrategyTag::Fast => 0,
-        StrategyTag::Dfast => 1,
-        StrategyTag::Greedy => 2,
-        StrategyTag::Lazy => {
-            if lazy_depth >= 2 {
-                3
-            } else {
-                2
-            }
-        }
-        StrategyTag::Btlazy2 => 3,
-        StrategyTag::BtOpt | StrategyTag::BtUltra | StrategyTag::BtUltra2 => 4,
+        // from-borders: cheap, rarely splits.
+        StrategyTag::Fast | StrategyTag::Dfast | StrategyTag::Greedy => 0,
+        // lazy (depth 1) stays on from-borders; lazy2 on byChunks rate 43.
+        StrategyTag::Lazy => u8::from(lazy_depth >= 2),
+        StrategyTag::Btlazy2 => 1,
+        // byChunks rate 11.
+        StrategyTag::BtOpt | StrategyTag::BtUltra | StrategyTag::BtUltra2 => 2,
     }
 }
 
