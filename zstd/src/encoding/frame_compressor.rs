@@ -664,6 +664,13 @@ pub(crate) fn optimal_block_size(
 
 /// [`optimal_block_size`] with the pre-split level already resolved
 /// (`None` = never split, only full blocks).
+///
+/// Out of line on purpose: inlined into the per-block frame loop it grew the
+/// loop body and shifted the code layout around `run_fast_kernel_block`,
+/// costing the Fast levels 17-24 % on 1 MiB+ inputs on x86 (measured on the
+/// i9; the kernel's own instructions were byte-identical). One call per block
+/// is noise; the compact caller is not.
+#[inline(never)]
 pub(crate) fn optimal_block_size_with(
     pre_split: Option<usize>,
     block: &[u8],
