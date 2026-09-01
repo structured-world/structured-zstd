@@ -83,6 +83,18 @@ fn rust_encode_to_vec(input: &[u8], level: &LevelConfig) -> Vec<u8> {
 /// `ZSTD_c_enableLongDistanceMatching` is turned on alongside the level so
 /// the FFI reference mirrors the Rust LDM variant (#362).
 fn ffi_encode_to_vec(input: &[u8], level: i32, ldm: bool) -> Vec<u8> {
+    let mut output = Vec::new();
+    ffi_encode_into(input, level, ldm, &mut output);
+    output
+}
+
+/// [`ffi_encode_to_vec`] into a caller-owned buffer (the C `dst` contract):
+/// the timing loop hands in one buffer reserved to `ZSTD_compressBound`
+/// ONCE, so the iteration neither allocates nor zero-fills an input-sized
+/// output (a per-iteration `vec![0; bound]` charged the C arm a memset the
+/// Rust arm never pays, and its alloc / free churn perturbed the Rust
+/// arm's heap layout enough to move small-frame samples by several %).
+fn ffi_encode_into(input: &[u8], level: i32, ldm: bool, output: &mut Vec<u8>) {
     use zstd::zstd_safe::zstd_sys;
     // SAFETY: `ZSTD_createCCtx` returns null on OOM, asserted below.
     // The CCtx is freed before returning.
@@ -158,12 +170,9 @@ fn ffi_encode_to_vec(input: &[u8], level: i32, ldm: bool) -> Vec<u8> {
         // (14 on the 1 MB corpus) while one-shot keeps pre-splitting (~90
         // blocks, ~5% smaller output, 7x the entropy work). Pairing our
         // one-shot encoder with streaming C misstates both time and size.
-        // Reserve the bound without initialising it: a zero-fill of the
-        // whole `compressBound` per timed iteration would charge the C arm
-        // an input-sized memset the Rust arm (which grows its output by the
-        // bytes actually emitted) never pays.
         let bound = zstd_sys::ZSTD_compressBound(input.len());
-        let mut output: Vec<u8> = Vec::with_capacity(bound);
+        output.clear();
+        output.reserve(bound);
         let written = zstd_sys::ZSTD_compress2(
             cctx,
             output.as_mut_ptr() as *mut core::ffi::c_void,
@@ -179,7 +188,6 @@ fn ffi_encode_to_vec(input: &[u8], level: i32, ldm: bool) -> Vec<u8> {
         output.set_len(written);
 
         zstd_sys::ZSTD_freeCCtx(cctx);
-        output
     }
 }
 
@@ -293,12 +301,12 @@ fn bench_compress(c: &mut Criterion) {
             });
 
             group.bench_function("c_ffi", |b| {
+                // One output buffer for the whole sample (the C caller's
+                // `dst`); see `ffi_encode_into`.
+                let mut output = Vec::new();
                 b.iter(|| {
-                    black_box(ffi_encode_to_vec(
-                        &scenario.bytes[..],
-                        level.ffi_level,
-                        level.ldm,
-                    ))
+                    ffi_encode_into(&scenario.bytes[..], level.ffi_level, level.ldm, &mut output);
+                    black_box(&output);
                 })
             });
 

@@ -79,6 +79,15 @@ const BT_UNSORTED_MARK: u32 = 1;
 /// A tree link "pointer" whose write is discarded (upstream `dummy32`).
 const BT_DISCARD: usize = usize::MAX;
 
+/// [`LazyFinder`] as the const parameter of the lazy monoliths: each
+/// finder is compiled into its own monolith (the others fold away), so a
+/// tier carries one parse per finder instead of three finders in every
+/// parse; the chain and tree monoliths ignore `ROW_LOG` and are
+/// instantiated once.
+const FINDER_ROWS: u8 = 0;
+const FINDER_CHAIN: u8 = 1;
+const FINDER_TREE: u8 = 2;
+
 /// The match finder the lazy parse searches (upstream `searchMethod_e`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LazyFinder {
@@ -113,7 +122,6 @@ struct RowScan {
     prefix_start: usize,
     dict_frame: bool,
     attached: bool,
-    finder: LazyFinder,
 }
 
 impl RowScan {
@@ -627,11 +635,11 @@ macro_rules! row_find_best_match {
 /// its 96 head + 32 tail positions), search `$p`, then index `$p` itself.
 /// `$ntu` is the parse's `nextToUpdate` local, `$skip` its `lazySkipping`.
 macro_rules! lazy_search_at {
-    ($m:expr, $ctx:ident, $p:expr, $ntu:ident, $skip:ident, $cache:ident, $rl:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
+    ($m:expr, $ctx:ident, $p:expr, $ntu:ident, $skip:ident, $cache:ident, $rl:expr, $finder:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
         let p = $p;
-        if $ctx.finder == LazyFinder::Tree {
+        if $finder == FINDER_TREE {
             dubt_find_best_match!($m, $ctx, p, $ntu, $cpl)
-        } else if $ctx.finder == LazyFinder::Chain {
+        } else if $finder == FINDER_CHAIN {
             hc_find_best_match!($m, $ctx, p, $ntu, $skip, $cpl)
         } else {
             let (row, tag) = if $skip {
@@ -1173,10 +1181,18 @@ macro_rules! row_cache_insert_range {
 /// chosen match only, immediate-repcode loop after every stored sequence,
 /// `>> 8` miss acceleration with lazy skipping past step 8.
 macro_rules! lazy_parse_body {
-    ($m:expr, $handle:expr, $rl:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
+    ($m:expr, $handle:expr, $rl:expr, $finder:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
         #[allow(unused_labels)]
         'parse: {
-            debug_assert_eq!($rl, $m.row_log);
+            debug_assert!($finder != FINDER_ROWS || $rl == $m.row_log);
+            debug_assert_eq!(
+                $finder,
+                match $m.finder {
+                    LazyFinder::Rows => FINDER_ROWS,
+                    LazyFinder::Chain => FINDER_CHAIN,
+                    LazyFinder::Tree => FINDER_TREE,
+                }
+            );
             $m.ensure_tables();
 
             let (current_abs_start, current_len) = $m.current_block_range();
@@ -1190,7 +1206,7 @@ macro_rules! lazy_parse_body {
             let depth = $m.lazy_depth;
             // Upstream `ilimit`: `iend - 8 - ZSTD_ROW_HASH_CACHE_SIZE` for the
             // row search, `iend - 8` for the hash chain and the binary tree.
-            let ilimit = block_end.saturating_sub(if scan.finder == LazyFinder::Rows {
+            let ilimit = block_end.saturating_sub(if $finder == FINDER_ROWS {
                 LAZY_ROW_ILIMIT_MARGIN
             } else {
                 LAZY_HC_ILIMIT_MARGIN
@@ -1224,7 +1240,7 @@ macro_rules! lazy_parse_body {
             let mut lazy_skipping = false;
             // Upstream `ZSTD_row_fillHashCache(ms, base, rowLog, mls, nextToUpdate, ilimit)`.
             let mut hash_cache = [(ROW_CACHE_NONE, 0u8); ROW_HASH_CACHE_SIZE];
-            if scan.finder == LazyFinder::Rows {
+            if $finder == FINDER_ROWS {
                 row_cache_fill!($m, scan, hash_cache, $rl, next_to_update);
             }
             // Upstream `rep[0..2]` entering the block: carried from the
@@ -1314,6 +1330,7 @@ macro_rules! lazy_parse_body {
                         lazy_skipping,
                         hash_cache,
                         $rl,
+                        $finder,
                         $use_mask,
                         $maskmac,
                         $cpl
@@ -1372,6 +1389,7 @@ macro_rules! lazy_parse_body {
                                 lazy_skipping,
                                 hash_cache,
                                 $rl,
+                                $finder,
                                 $use_mask,
                                 $maskmac,
                                 $cpl
@@ -1419,6 +1437,7 @@ macro_rules! lazy_parse_body {
                                     lazy_skipping,
                                     hash_cache,
                                     $rl,
+                                    $finder,
                                     $use_mask,
                                     $maskmac,
                                     $cpl
@@ -1475,7 +1494,7 @@ macro_rules! lazy_parse_body {
                 ip = anchor;
                 if lazy_skipping {
                     // A match ends lazy skipping; the row cache is stale, refill it.
-                    if scan.finder == LazyFinder::Rows {
+                    if $finder == FINDER_ROWS {
                         row_cache_fill!($m, scan, hash_cache, $rl, next_to_update);
                     }
                     lazy_skipping = false;
@@ -1558,11 +1577,29 @@ macro_rules! gen_lazy_monolith {
             allow(dead_code)
         )]
         #[allow(unused_unsafe)]
-        unsafe fn $name<K: RowTags, const ROW_LOG: usize>(
+        unsafe fn $name<K: RowTags, const ROW_LOG: usize, const FINDER: u8>(
             &mut self,
             mut handle_sequence: impl for<'a> FnMut(Sequence<'a>),
         ) {
-            lazy_parse_body!(self, handle_sequence, ROW_LOG, $use_mask, $maskmac, $cpl)
+            lazy_parse_body!(self, handle_sequence, ROW_LOG, FINDER, $use_mask, $maskmac, $cpl)
+        }
+    };
+}
+
+/// Bind the runtime finder and (for rows) `row_log` to the const parameters
+/// of a lazy monolith: rows per `ROW_LOG` 4..=6, the chain and the tree
+/// once each (they ignore `ROW_LOG`). Cold, once per block.
+macro_rules! dispatch_lazy {
+    ($self:ident . $m:ident :: <$k:ty> ( $($arg:expr),* )) => {
+        match $self.finder {
+            LazyFinder::Rows => match $self.row_log {
+                4 => $self.$m::<$k, 4, FINDER_ROWS>($($arg),*),
+                5 => $self.$m::<$k, 5, FINDER_ROWS>($($arg),*),
+                6 => $self.$m::<$k, 6, FINDER_ROWS>($($arg),*),
+                _ => unreachable!("row_log is clamped to 4..=6 in configure()"),
+            },
+            LazyFinder::Chain => $self.$m::<$k, 4, FINDER_CHAIN>($($arg),*),
+            LazyFinder::Tree => $self.$m::<$k, 4, FINDER_TREE>($($arg),*),
         }
     };
 }
@@ -3004,7 +3041,6 @@ impl RowMatchGenerator {
             prefix_start: self.prefix_low,
             dict_frame,
             attached: dict_frame && self.dict_plan.is_some_and(|p| p.attach),
-            finder: self.finder,
         }
     }
 
@@ -3123,7 +3159,7 @@ impl RowMatchGenerator {
         ))]
         {
             // SAFETY: simd128 is a compile-time feature here; no runtime gate.
-            unsafe { dispatch_row_log!(self.lazy_simd128::<Simd128Tags>(handle_sequence)) }
+            unsafe { dispatch_lazy!(self.lazy_simd128::<Simd128Tags>(handle_sequence)) }
         }
         #[cfg(not(all(
             target_arch = "wasm32",
@@ -3134,20 +3170,20 @@ impl RowMatchGenerator {
             match self.tag_kernel {
                 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
                 FastpathKernel::Avx2Bmi2 => unsafe {
-                    dispatch_row_log!(self.lazy_avx2bmi2::<Avx2Bmi2Tags>(handle_sequence))
+                    dispatch_lazy!(self.lazy_avx2bmi2::<Avx2Bmi2Tags>(handle_sequence))
                 },
                 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
                 FastpathKernel::Sse42 => unsafe {
-                    dispatch_row_log!(self.lazy_sse42::<Sse42Tags>(handle_sequence))
+                    dispatch_lazy!(self.lazy_sse42::<Sse42Tags>(handle_sequence))
                 },
                 #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
                 FastpathKernel::Neon => unsafe {
-                    dispatch_row_log!(self.lazy_neon::<NeonTags>(handle_sequence))
+                    dispatch_lazy!(self.lazy_neon::<NeonTags>(handle_sequence))
                 },
                 // SAFETY: the scalar kernel has no `#[target_feature]`; the
                 // fn is `unsafe` only for macro uniformity.
                 FastpathKernel::Scalar => unsafe {
-                    dispatch_row_log!(self.lazy_scalar::<ScalarTags>(handle_sequence))
+                    dispatch_lazy!(self.lazy_scalar::<ScalarTags>(handle_sequence))
                 },
             }
         }
