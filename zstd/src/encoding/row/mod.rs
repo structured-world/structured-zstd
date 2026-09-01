@@ -43,10 +43,31 @@ const ROW_UPDATE_MAX_END: usize = 32;
 /// Hash-cache sentinel for a position too close to the end to hash.
 const ROW_CACHE_NONE: u32 = u32::MAX;
 
-/// Row hash multiplier (upstream zstd `prime8bytes`, `zstd_compress_internal.h`):
-/// the key bytes are shifted to the top of a 64-bit word and multiplied; the
-/// row and tag are the product's top bits (`ZSTD_hashPtrSalted` shape).
-pub(crate) const ROW_HASH_PRIME: u64 = 0xCF1B_BCDC_B7A5_6463;
+/// Upstream zstd hash multipliers per key width (`zstd_compress_internal.h`
+/// `prime4bytes` / `prime5bytes` / `prime6bytes`): `ZSTD_hash4` multiplies
+/// the 32-bit key, `ZSTD_hash5` / `ZSTD_hash6` shift the 8-byte read so the
+/// key occupies the top 40 / 48 bits and multiply; the salt is XORed into
+/// the product and the row + tag are its top `hashLog + 8` bits.
+pub(crate) const ROW_HASH_PRIME4: u32 = 2_654_435_761;
+pub(crate) const ROW_HASH_PRIME5: u64 = 889_523_592_379;
+pub(crate) const ROW_HASH_PRIME6: u64 = 227_718_039_650_203;
+
+/// Upstream zstd `ZSTD_bitmix` (zstd_compress.c:1971, XXH3 rrmxmx shape).
+const fn zstd_bitmix(mut val: u64, len: u64) -> u64 {
+    val ^= val.rotate_right(49) ^ val.rotate_right(24);
+    val = val.wrapping_mul(0x9FB2_1C65_1E98_DF25);
+    val ^= (val >> 35).wrapping_add(len);
+    val = val.wrapping_mul(0x9FB2_1C65_1E98_DF25);
+    val ^ (val >> 28)
+}
+
+/// Row hash salt of a freshly created upstream context:
+/// `ZSTD_advanceHashSalt` on `hashSalt = hashSaltEntropy = 0`
+/// (zstd_compress.c:1980, run by `ZSTD_reset_matchState` for a CCtx). A
+/// fixed salt keeps row assignment identical to a fresh `ZSTD_CCtx`; the
+/// per-reset re-salting upstream does on context reuse only serves to
+/// defeat stale tags, which the position floor rejects here anyway.
+pub(crate) const ROW_HASH_SALT: u64 = zstd_bitmix(0, 8) ^ zstd_bitmix(0, 4);
 
 /// Per-parse view of the live history: raw base pointer + length + absolute
 /// start, hoisted ONCE per block so the hot loops read no `Option` branch
@@ -591,6 +612,12 @@ macro_rules! row_find_best_match {
                     found
                 };
                 let Some(slot) = slot_opt else { break };
+                // Upstream `if (matchPos == 0) continue`: slot 0 is never an
+                // entry (the tag byte there is upstream's head), and the
+                // skip does not spend an attempt.
+                if slot == 0 {
+                    continue;
+                }
                 // SAFETY: `slot < row_entries`; see the table-indexing note.
                 let raw = unsafe { *$m.row_positions.get_unchecked(row_base + slot) };
                 // Newest-first order: the first empty / below-floor entry ends
@@ -686,6 +713,9 @@ macro_rules! row_find_best_match {
                     found
                 };
                 let Some(slot) = slot_opt else { break };
+                if slot == 0 {
+                    continue;
+                }
                 let dp = dict.positions[row_base + slot];
                 if dp == ROW_EMPTY_SLOT {
                     break;
@@ -821,11 +851,6 @@ macro_rules! lazy_parse_body {
             if current_len == 0 {
                 break 'parse;
             }
-            let backfill_start = $m.backfill_start(current_abs_start);
-            if backfill_start < current_abs_start {
-                $m.insert_positions::<$rl>(backfill_start, current_abs_start);
-            }
-
             let scan = $m.scan_ctx();
             let hist_start = scan.hist_start;
             let depth = $m.lazy_depth;
@@ -834,7 +859,14 @@ macro_rules! lazy_parse_body {
             let mut anchor = current_abs_start;
             // `ip += (dictAndPrefixLength == 0)`: nothing precedes the first byte.
             let mut ip = current_abs_start + usize::from(current_abs_start == hist_start);
-            let mut next_to_update = current_abs_start;
+            // Upstream `nextToUpdate`: resume where the previous lazy block
+            // stopped indexing (its last <= 16 bytes, now readable with the
+            // full 8-byte key); a stale cursor (another parse ran in
+            // between, or the floor moved past it) restarts at the 3 bytes
+            // preceding the block, the widest key overlap that still hashes.
+            let mut next_to_update = $m
+                .lazy_next_to_update
+                .clamp($m.backfill_start(current_abs_start), current_abs_start);
             let mut lazy_skipping = false;
             // Upstream `ZSTD_row_fillHashCache(ms, base, rowLog, mls, nextToUpdate, ilimit)`.
             let mut hash_cache = [(ROW_CACHE_NONE, 0u8); ROW_HASH_CACHE_SIZE];
@@ -1047,9 +1079,10 @@ macro_rules! lazy_parse_body {
                 }
             }
 
-            if next_to_update < block_end {
-                $m.insert_match_span::<$rl>(next_to_update, block_end);
-            }
+            // The un-indexed tail (upstream leaves it to the next block's
+            // first search, which then reads full 8-byte keys across the
+            // boundary) is carried in `lazy_next_to_update`.
+            $m.lazy_next_to_update = next_to_update;
             if anchor < block_end {
                 let concat = $m.live_history();
                 $handle(Sequence::Literals {
@@ -1688,10 +1721,14 @@ pub(crate) struct RowMatchGenerator {
     /// a local in the parse loops so the per-position compare reads a
     /// register, not this field. Default `ROW_MIN_MATCH_LEN` (5).
     pub(crate) mls: usize,
-    /// `64 - 8 * key width`: left shift placing the hash key at the top of
-    /// the 64-bit word (upstream zstd `ZSTD_hashNPtr`, key width = `mls`
-    /// capped at 6). Kept in sync with `mls` by `configure`.
-    row_key_shift: u32,
+    /// Hash key width in bytes, `mls` bounded to 4..=6 (upstream zstd
+    /// `ZSTD_hashPtrSalted`'s `mls` switch). Kept in sync by `configure`.
+    row_hash_mls: u32,
+    /// Upstream `nextToUpdate` carried across blocks by the lazy parse: the
+    /// first position not yet indexed. The block after a lazy block indexes
+    /// the previous tail from here (with the block's data now readable
+    /// past it, as upstream), instead of a per-block backfill.
+    lazy_next_to_update: usize,
     pub(crate) lazy_depth: u8,
     /// Cached fastpath kernel for `hash_mix_u64`; see Dfast for rationale.
     pub(crate) hash_kernel: crate::encoding::fastpath::FastpathKernel,
@@ -1752,7 +1789,8 @@ impl RowMatchGenerator {
             search_depth: ROW_SEARCH_DEPTH,
             target_len: ROW_TARGET_LEN,
             mls: ROW_MIN_MATCH_LEN,
-            row_key_shift: (64 - 8 * ROW_MIN_MATCH_LEN.min(6)) as u32,
+            row_hash_mls: ROW_MIN_MATCH_LEN.clamp(4, 6) as u32,
+            lazy_next_to_update: 0,
             lazy_depth: 1,
             hash_kernel: crate::encoding::fastpath::select_kernel(),
             row_heads: Vec::new(),
@@ -1821,7 +1859,7 @@ impl RowMatchGenerator {
         // floor can't be satisfied: the hash only surfaces candidates
         // sharing the 4-byte key) and a sane upper bound.
         self.mls = config.mls.clamp(ROW_HASH_KEY_LEN, 7);
-        self.row_key_shift = (64 - 8 * self.mls.min(6)) as u32;
+        self.row_hash_mls = self.mls.clamp(4, 6) as u32;
         self.set_hash_bits(config.hash_bits.max(self.row_log + 1));
     }
 
@@ -1859,6 +1897,8 @@ impl RowMatchGenerator {
             self.row_positions.fill(ROW_EMPTY_SLOT);
             self.row_tags.fill(0);
         }
+        // Nothing of the previous frame is indexed for the new one.
+        self.lazy_next_to_update = self.history_abs_start;
         // Block buffers are returned to the caller's pool per block in
         // `add_data`, so there is nothing window-side to recycle here.
         self.chunk_lens.clear();
@@ -1972,6 +2012,7 @@ impl RowMatchGenerator {
                 (abs - delta) as u32
             };
         }
+        self.lazy_next_to_update = self.lazy_next_to_update.saturating_sub(delta);
         self.history_abs_start -= delta;
     }
 
@@ -2245,24 +2286,42 @@ impl RowMatchGenerator {
     /// the probe's real-byte key there. Those few dict-tail entries stay
     /// unreachable, mirroring the upstream zstd, whose dictionary load also stops
     /// hashing short of the dictionary end.
-    /// Row hash of the key at `base[idx..]` (upstream zstd `ZSTD_hashPtrSalted`
-    /// shape): the `mls`-byte key (8-byte read shifted to the top of the
-    /// word; the last < 8 bytes of the window fall back to a 4-byte key)
-    /// times [`ROW_HASH_PRIME`]. A position hashes identically in the probe,
-    /// the cache and the dictionary fill, so every table agrees on its row.
+    /// Upstream zstd `ZSTD_hashPtrSalted(p, hashLog + 8, mls, salt)` of the
+    /// key at `base[idx..]`: the `mls`-byte key hashed by `ZSTD_hash4` /
+    /// `ZSTD_hash5` / `ZSTD_hash6`, salted with [`ROW_HASH_SALT`], reduced to
+    /// its top `total_bits` (= row bits + tag bits). A position hashes
+    /// identically in the probe, the cache and the dictionary fill, so every
+    /// table agrees on its row. Only the last < 8 bytes of the window (never
+    /// reached by the lazy parse, which stops 16 bytes early) fall back to
+    /// the 4-byte key.
     ///
     /// # Safety
     /// `idx + ROW_HASH_KEY_LEN <= len` and `base` must point to `len` bytes.
     #[inline(always)]
-    unsafe fn row_hash_raw(base: *const u8, len: usize, idx: usize, key_shift: u32) -> u64 {
-        let value = unsafe {
-            if idx + 8 <= len {
-                u64::from_le_bytes(base.add(idx).cast::<[u8; 8]>().read_unaligned())
+    pub(crate) unsafe fn row_hash_raw(
+        base: *const u8,
+        len: usize,
+        idx: usize,
+        mls: u32,
+        total_bits: usize,
+    ) -> u64 {
+        debug_assert!(total_bits <= 32);
+        // SAFETY: `idx + 4 <= len`; the 8-byte read is taken only when it fits.
+        unsafe {
+            let p = base.add(idx);
+            if mls == 4 || idx + 8 > len {
+                let v = rd32(p).wrapping_mul(ROW_HASH_PRIME4) ^ (ROW_HASH_SALT as u32);
+                u64::from(v >> (32 - total_bits))
             } else {
-                u64::from(rd32(base.add(idx)))
+                let v = u64::from_le_bytes(p.cast::<[u8; 8]>().read_unaligned());
+                let h = if mls == 5 {
+                    (v << 24).wrapping_mul(ROW_HASH_PRIME5)
+                } else {
+                    (v << 16).wrapping_mul(ROW_HASH_PRIME6)
+                };
+                (h ^ ROW_HASH_SALT) >> (64 - total_bits)
             }
-        };
-        (value << key_shift).wrapping_mul(ROW_HASH_PRIME)
+        }
     }
 
     /// The live history as a [`RowScan`] for one parse.
@@ -2284,10 +2343,10 @@ impl RowMatchGenerator {
         if idx + ROW_HASH_KEY_LEN > ctx.len {
             return None;
         }
-        // SAFETY: `idx + ROW_HASH_KEY_LEN <= ctx.len`, `ctx` views the live history.
-        let hash = unsafe { Self::row_hash_raw(ctx.base, ctx.len, idx, self.row_key_shift) };
         let total_bits = self.row_hash_log + ROW_TAG_BITS;
-        let combined = hash >> (u64::BITS as usize - total_bits);
+        // SAFETY: `idx + ROW_HASH_KEY_LEN <= ctx.len`, `ctx` views the live history.
+        let combined =
+            unsafe { Self::row_hash_raw(ctx.base, ctx.len, idx, self.row_hash_mls, total_bits) };
         let row_mask = (1usize << self.row_hash_log) - 1;
         let row = ((combined >> ROW_TAG_BITS) as usize) & row_mask;
         Some((row, combined as u8))
@@ -2817,7 +2876,13 @@ impl RowMatchGenerator {
         debug_assert!(row_base + row_entries <= self.row_positions.len());
         unsafe {
             let head = *self.row_heads.get_unchecked(row) as usize;
-            let next = head.wrapping_sub(1) & row_mask;
+            // Upstream `ZSTD_row_nextIndex`: slot 0 is never written (it
+            // holds the head byte in upstream's tag row), so the cursor
+            // cycles over `1..=row_mask`.
+            let next = match head.wrapping_sub(1) & row_mask {
+                0 => row_mask,
+                n => n,
+            };
             *self.row_heads.get_unchecked_mut(row) = next as u8;
             *self.row_tags.get_unchecked_mut(row_base + next) = tag;
             // `abs_pos < u32::MAX` holds: `add_data` caps a Row frame's
@@ -2892,7 +2957,7 @@ impl RowMatchGenerator {
         }
         let row_log = self.row_log;
         let row_hash_log = self.row_hash_log;
-        let key_shift = self.row_key_shift;
+        let hash_mls = self.row_hash_mls;
         let history_start = self.history_start;
         let concat_len = self.history.len() - history_start;
         // Row hash needs `ROW_HASH_KEY_LEN` readable bytes of lookahead.
@@ -2925,17 +2990,27 @@ impl RowMatchGenerator {
         // is u32-bounded upstream).
         for concat in start_concat..safe_end {
             unsafe {
-                // Same hash as the live `row_hash_at` (key width, shift and
-                // prime): any divergence buckets dict rows differently and
+                // Same hash as the live `row_hash_at` (key width, prime and
+                // salt): any divergence buckets dict rows differently and
                 // loses every attached-dict match.
-                let hash =
-                    Self::row_hash_raw(base.add(history_start), concat_len, concat, key_shift);
-                let combined = hash >> (u64::BITS as usize - total_bits);
+                let combined = Self::row_hash_raw(
+                    base.add(history_start),
+                    concat_len,
+                    concat,
+                    hash_mls,
+                    total_bits,
+                );
                 let row = ((combined >> ROW_TAG_BITS) as usize) & row_count_mask;
                 let tag = combined as u8;
                 let row_base = row << row_log;
                 let head = *heads.add(row) as usize;
-                let next = head.wrapping_sub(1) & row_mask;
+                // Upstream `ZSTD_row_nextIndex`: slot 0 is never written (it
+                // holds the head byte in upstream's tag row), so the cursor
+                // cycles over `1..=row_mask`.
+                let next = match head.wrapping_sub(1) & row_mask {
+                    0 => row_mask,
+                    n => n,
+                };
                 *heads.add(row) = next as u8;
                 *tags.add(row_base + next) = tag;
                 *positions.add(row_base + next) = concat as u32;
