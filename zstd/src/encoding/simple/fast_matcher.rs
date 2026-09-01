@@ -266,6 +266,10 @@ pub(crate) struct FastKernelMatcher {
     /// dict table in place instead of clearing + re-committing them). Signals
     /// the frame compressor to SKIP `prime_with_dictionary` this frame.
     dict_resident: bool,
+    /// The attached dictionary table's `hashLog` (the CDict's cParams,
+    /// `ZSTD_createCDict`), set by the driver before a dictionary frame's
+    /// reset; `None` derives it from the main table's width.
+    dict_table_hash_log: Option<u32>,
     /// Upstream zstd `ms->loadedDictEnd` for the COPY-mode dict path (inputs
     /// over the Fast attach cutoff): the history position one past the last
     /// dictionary byte committed at the front of `history`. The copy path
@@ -301,6 +305,7 @@ impl Clone for FastKernelMatcher {
             dict: self.dict.clone(),
             table_pos_high_water: self.table_pos_high_water,
             dict_resident: self.dict_resident,
+            dict_table_hash_log: self.dict_table_hash_log,
             loaded_dict_end: self.loaded_dict_end,
         }
     }
@@ -540,6 +545,7 @@ impl FastKernelMatcher {
             dict: DictAttach::new(),
             table_pos_high_water: 0,
             dict_resident: false,
+            dict_table_hash_log: None,
             loaded_dict_end: 0,
         }
     }
@@ -1711,6 +1717,19 @@ impl FastKernelMatcher {
         self.prime_dict_table_for_range(block_start, dict_len);
     }
 
+    /// The dictionary table's `hashLog` for the next dictionary frame: the
+    /// CDict's cParams (`ZSTD_createCDict`), independent of the
+    /// source-capped main table.
+    pub(crate) fn set_dict_table_hash_log(&mut self, hash_log: Option<u32>) {
+        self.dict_table_hash_log = hash_log;
+    }
+
+    /// `hashLog` of the built dictionary table, if attached. Test-only.
+    #[cfg(test)]
+    pub(crate) fn built_dict_table_hash_log(&self) -> Option<u32> {
+        self.dict.table().map(|t| t.hash_log())
+    }
+
     /// Mark the dict table as fully built (CDict-equivalent). Called by the
     /// driver after the final dictionary chunk has been primed, so the next
     /// frame's [`Self::prime_dict_table_for_range`] skips the re-hash while
@@ -1773,24 +1792,26 @@ impl FastKernelMatcher {
             return;
         }
         // Size the dict table to the CDict geometry of the WHOLE dictionary
-        // (upstream `ZSTD_cpm_createCDict`: `ZSTD_adjustCParams_internal`
-        // drives hashLog down to the dict-and-window log off a `minSrcSize`
-        // source and `dictSize`), NOT the source-window-sized main table nor
-        // the slice at hand. For a small dictionary this is a narrower table,
-        // and the Fast dictMatchState hashes `ip` with `dictCParams->hashLog`,
-        // so the occurrence a hash bucket resolves to matches upstream's.
-        // `create_cdict_table_logs` only ever downsizes, so feeding the already
-        // source-capped main `hash_log` as the base yields the same result as
-        // the un-capped level base would.
+        // (upstream `ZSTD_createCDict`: `ZSTD_getCParams(level, UNKNOWN,
+        // dictSize)` adjusted for a `minSrcSize` source), NOT the
+        // source-capped main table nor the slice at hand: the Fast
+        // dictMatchState hashes `ip` with `dictCParams->hashLog`, so the
+        // occurrence a hash bucket resolves to matches upstream's. The driver
+        // resolves that log from the level's CDict cParams
+        // (`dict_table_hash_log`); a matcher driven without it derives the
+        // same downsizing from its own table width.
         let main_hash_log = self.hash_table.hash_log();
         let mls = self.hash_table.mls();
-        let (hash_log, _) = crate::encoding::cparams::create_cdict_table_logs(
-            main_hash_log as u8,
-            main_hash_log,
-            main_hash_log,
-            /* uses_bt */ false,
-            dict_len,
-        );
+        let hash_log = self.dict_table_hash_log.unwrap_or_else(|| {
+            crate::encoding::cparams::create_cdict_table_logs(
+                main_hash_log as u8,
+                main_hash_log,
+                main_hash_log,
+                /* uses_bt */ false,
+                dict_len,
+            )
+            .0
+        });
         // A retained table of another width belongs to another dictionary
         // (or geometry); rebuild from the start.
         if self

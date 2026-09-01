@@ -1341,6 +1341,18 @@ impl Matcher for MatchGeneratorDriver {
                 } else {
                     fast.hash_log.min(params.window_log as u32 + 1)
                 };
+                // The attached dictionary table takes the CDict's `hashLog`
+                // (upstream `ZSTD_createCDict`: `ZSTD_getCParams(level,
+                // UNKNOWN, dictSize)` adjusted for a `minSrcSize` source), not
+                // the source-capped main width: a small source must not
+                // shrink the table a large dictionary was sized for.
+                m.set_dict_table_hash_log(dict_hint.filter(|&s| s > 0).map(|dict_size| {
+                    crate::encoding::cparams::get_cdict_cparams(
+                        crate::encoding::levels::config::numeric_level(level),
+                        dict_size,
+                    )
+                    .hash_log
+                }));
                 m.reset(
                     params.window_log,
                     hash_log,

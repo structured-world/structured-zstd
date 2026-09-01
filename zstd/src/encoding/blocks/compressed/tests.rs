@@ -342,6 +342,7 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
                 block_scratch: CompressedBlockScratch::new(),
                 offset_hist: [1, 4, 8],
                 strategy_tag: *strat,
+                pre_split: None,
                 huf_optimal_search: true,
                 literal_compression_disabled: false,
             };
@@ -353,6 +354,7 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
                 block_scratch: CompressedBlockScratch::new(),
                 offset_hist: [1, 4, 8],
                 strategy_tag: *strat,
+                pre_split: None,
                 huf_optimal_search: true,
                 literal_compression_disabled: false,
             };
@@ -399,6 +401,7 @@ fn raw_partition_fallback_restores_repeat_offset_history() {
         block_scratch: super::CompressedBlockScratch::new(),
         offset_hist: [10, 20, 30],
         strategy_tag: crate::encoding::strategy::StrategyTag::Fast,
+        pre_split: None,
         huf_optimal_search: true,
         literal_compression_disabled: false,
     };

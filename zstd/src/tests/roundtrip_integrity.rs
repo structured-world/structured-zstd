@@ -580,7 +580,7 @@ fn numeric_levels_map_to_named_variants() {
         CompressionLevel::Better
     ));
     assert!(matches!(
-        CompressionLevel::from_level(11),
+        CompressionLevel::from_level(13),
         CompressionLevel::Best
     ));
     assert!(matches!(
@@ -630,13 +630,13 @@ fn numeric_level_7_matches_better() {
     );
 }
 
-/// `from_level(11)` must be equivalent to `Best`.
+/// `from_level(13)` must be equivalent to `Best`.
 #[test]
-fn numeric_level_11_matches_best() {
+fn numeric_level_13_matches_best() {
     let data = generate_compressible(9003, 64 * 1024);
     let best = compress_to_vec(&data[..], CompressionLevel::Best);
-    let level_11 = compress_to_vec(&data[..], CompressionLevel::from_level(11));
-    assert_eq!(best, level_11, "Level(11) output must be identical to Best");
+    let level_13 = compress_to_vec(&data[..], CompressionLevel::from_level(13));
+    assert_eq!(best, level_13, "Level(13) output must be identical to Best");
 }
 
 /// `from_level(0)` and direct `Level(0)` map to default compression (level 3).

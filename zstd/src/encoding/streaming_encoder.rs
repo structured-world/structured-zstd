@@ -148,6 +148,8 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                 strategy_tag: crate::encoding::strategy::StrategyTag::for_compression_level(
                     compression_level,
                 ),
+                pre_split: crate::encoding::levels::config::level_pre_split(compression_level)
+                    .map(|tier| tier as u8),
                 huf_optimal_search: true,
                 literal_compression_disabled: matches!(
                     compression_level,

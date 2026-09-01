@@ -225,21 +225,28 @@ impl LevelParams {
     /// `0` routes to the from-borders heuristic; `1..=4` to byChunks with
     /// sampling tier `level - 1` (rates 43 / 11 / 5 / 1).
     pub(crate) fn pre_split(&self) -> Option<u8> {
-        use crate::encoding::strategy::StrategyTag;
-        Some(match self.strategy_tag {
-            StrategyTag::Fast => 0,
-            StrategyTag::Dfast => 1,
-            StrategyTag::Greedy => 2,
-            StrategyTag::Lazy => {
-                if self.lazy_depth >= 2 {
-                    3 // lazy2
-                } else {
-                    2 // lazy
-                }
+        Some(pre_split_for(self.strategy_tag, self.lazy_depth))
+    }
+}
+
+/// Upstream `splitLevels[strategy]` (see [`LevelParams::pre_split`]) for an
+/// effective strategy: the tag plus, for the collapsed `Lazy` tag, its lazy
+/// depth (lazy = 2, lazy2 = 3).
+pub(crate) fn pre_split_for(tag: crate::encoding::strategy::StrategyTag, lazy_depth: u8) -> u8 {
+    use crate::encoding::strategy::StrategyTag;
+    match tag {
+        StrategyTag::Fast => 0,
+        StrategyTag::Dfast => 1,
+        StrategyTag::Greedy => 2,
+        StrategyTag::Lazy => {
+            if lazy_depth >= 2 {
+                3
+            } else {
+                2
             }
-            StrategyTag::Btlazy2 => 3,
-            StrategyTag::BtOpt | StrategyTag::BtUltra | StrategyTag::BtUltra2 => 4,
-        })
+        }
+        StrategyTag::Btlazy2 => 3,
+        StrategyTag::BtOpt | StrategyTag::BtUltra | StrategyTag::BtUltra2 => 4,
     }
 }
 
@@ -731,12 +738,13 @@ pub fn estimated_compression_workspace_bytes(level: CompressionLevel) -> usize {
         params.strategy_tag,
         StrategyTag::BtOpt | StrategyTag::BtUltra | StrategyTag::BtUltra2
     );
-    // The lazy backend adds its chain / tree table (`4 << chain_log`) when the
-    // level searches the chain (window <= 2^14) or the btlazy2 tree.
+    // The lazy backend's chain / tree finders (window <= 2^14, or a btlazy2
+    // level) use a plain hash table (`4 << hash_bits`) plus the chain / tree
+    // table (`4 << chain_log`) instead of the row tables.
     let row_chain = params
         .row
         .filter(|r| r.bt || params.window_log <= 14)
-        .map_or(0, |r| 4usize << r.chain_log);
+        .map_or(0, |r| (4usize << r.hash_bits) + (4usize << r.chain_log));
     let tables = params.fast.map(|f| 4usize << f.hash_log).unwrap_or(0)
         + row_chain
         + params
@@ -758,6 +766,7 @@ pub fn estimated_compression_workspace_bytes(level: CompressionLevel) -> usize {
             .unwrap_or(0)
         + params
             .row
+            .filter(|r| !(r.bt || params.window_log <= 14))
             .map(|r| (4usize << r.hash_bits) + (2usize << r.hash_bits))
             .unwrap_or(0);
     // BT modes box a `BtMatcher`; its retained scratch layout is budgeted
@@ -872,7 +881,7 @@ pub(crate) fn resolve_level_params(
 }
 
 /// The upstream numeric level a preset maps to.
-fn numeric_level(level: CompressionLevel) -> i32 {
+pub(crate) fn numeric_level(level: CompressionLevel) -> i32 {
     match level {
         CompressionLevel::Uncompressed => unreachable!("raw frames resolve no cParams"),
         // Fastest = upstream level 1 (fast strategy, smallest real-compression
@@ -930,8 +939,24 @@ pub(crate) fn resolve_level_params_with_dict(
         return (base, None);
     }
     let cdict = get_cdict_cparams(numeric_level(level), dict_size);
-    if !(3..=6).contains(&cdict.strategy) {
+    if cdict.strategy < 3 {
         return (base, None);
+    }
+    if cdict.strategy > 6 {
+        // The CDict resolves to an optimal strategy: the frame runs it (on
+        // the HashChain backend, which primes the dictionary itself); no
+        // lazy-backend plan.
+        let window_log = u32::from(base.window_log);
+        let frame = if should_attach_dict(&cdict, source_size) {
+            attach_cparams(
+                cdict,
+                source_size.unwrap_or(CONTENTSIZE_UNKNOWN),
+                window_log,
+            )
+        } else {
+            copy_cparams(cdict, window_log)
+        };
+        return (level_params_from_cparams(frame), None);
     }
     let use_row = uses_row_match_finder(&cdict);
     let attach = should_attach_dict(&cdict, source_size);

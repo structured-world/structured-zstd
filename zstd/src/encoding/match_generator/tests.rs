@@ -1772,6 +1772,32 @@ fn driver_huge_source_hint_with_dict_does_not_overflow_hc_reserve() {
     driver.skip_matching_with_hint(None);
 }
 
+/// Regression: the Fast dictionary table takes the CDict's `hashLog`
+/// (upstream `ZSTD_createCDict` sizes it from the dictionary), not the
+/// source-capped main table's: a 1 KiB source caps the main table at
+/// `hashLog` 11 while a 20 KiB dictionary needs the wider CDict table.
+#[test]
+fn driver_fast_dictionary_table_takes_the_cdict_hash_log() {
+    let dict: Vec<u8> = (0..20 * 1024u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+    driver.set_source_size_hint(1024);
+    driver.set_dictionary_size_hint(dict.len());
+    driver.reset(CompressionLevel::Level(1));
+    driver.prime_with_dictionary(&dict, [1, 4, 8]);
+    let expected = crate::encoding::cparams::get_cdict_cparams(1, dict.len()).hash_log;
+    let built = driver
+        .simple_mut()
+        .built_dict_table_hash_log()
+        .expect("attached dictionary table");
+    assert_eq!(built, expected, "dict table hashLog must be the CDict's");
+    assert!(
+        driver.simple_mut().hash_log() < expected,
+        "the source-capped main table is narrower than the CDict table"
+    );
+}
+
 /// Regression: a dictionary frame takes its finder geometry from the CDict
 /// (upstream `ZSTD_resetCCtx_byAttachingCDict`: "cdict overrides"), so
 /// public `search_log` / `min_match` overrides must not reshape the live

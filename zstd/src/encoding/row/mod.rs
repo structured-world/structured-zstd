@@ -2502,7 +2502,8 @@ impl RowMatchGenerator {
         // `set_borrowed_window` after this reset.
         self.borrowed_input = None;
         self.borrowed_block = None;
-        if next_floor <= REBASE_RESET_FLOOR_CEILING && !self.row_positions.is_empty() {
+        let tables_allocated = !self.row_positions.is_empty() || !self.hc_hash.is_empty();
+        if next_floor <= REBASE_RESET_FLOOR_CEILING && tables_allocated {
             self.history_abs_start = next_floor;
         } else {
             // Bounded fallback: rewind the coordinate space and zero the
@@ -2680,6 +2681,12 @@ impl RowMatchGenerator {
         self.ensure_tables();
         let (current_abs_start, current_len) = self.current_block_range();
         let current_abs_end = current_abs_start + current_len;
+        if self.finder != LazyFinder::Rows {
+            // The chain / tree hold no rows to seed; the next lazy block
+            // links the skipped block's tail from the carried cursor.
+            self.lazy_next_to_update = current_abs_end.saturating_sub(ROW_HASH_KEY_LEN - 1);
+            return;
+        }
         let backfill_start = self.backfill_start(current_abs_start);
         if backfill_start < current_abs_start {
             self.insert_positions::<ROW_LOG>(backfill_start, current_abs_start);
@@ -2818,8 +2825,18 @@ impl RowMatchGenerator {
     pub(crate) fn ensure_tables(&mut self) {
         let row_count = 1usize << self.row_hash_log;
         let row_entries = 1usize << self.row_log;
-        let total = row_count * row_entries;
-        if self.row_positions.len() != total {
+        // Only the active finder's tables are held: the chain / tree
+        // finders never read the rows (tens of MiB at the btlazy2 levels).
+        let total = if self.finder == LazyFinder::Rows {
+            row_count * row_entries
+        } else {
+            0
+        };
+        if total == 0 {
+            self.row_heads = Vec::new();
+            self.row_positions = Vec::new();
+            self.row_tags = Vec::new();
+        } else if self.row_positions.len() != total {
             // Resize in place: `set_hash_bits` width changes `clear()` the
             // vecs but keep their capacity. The previous `vec![..]` form
             // re-allocated all three tables on every width change — three

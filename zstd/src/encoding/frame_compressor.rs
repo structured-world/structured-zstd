@@ -169,7 +169,9 @@ pub struct FrameCompressor<
     /// literal-compression gates and dict-attach cutoff see the strategy
     /// the matcher actually runs, not the base level's. `None` keeps the
     /// level-derived tag.
-    strategy_override: Option<crate::encoding::strategy::StrategyTag>,
+    /// A public-parameter strategy override: its tag and lazy depth (the
+    /// collapsed `Lazy` tag needs the depth for the pre-split tier).
+    strategy_override: Option<(crate::encoding::strategy::StrategyTag, u8)>,
 }
 
 #[derive(Clone, Default)]
@@ -727,6 +729,9 @@ pub(crate) struct CompressState<M: Matcher> {
     /// encoder constructor) plumb this explicitly. Tests that build
     /// `CompressState` by hand must also supply a value.
     pub(crate) strategy_tag: crate::encoding::strategy::StrategyTag,
+    /// Pre-split tier of the effective strategy (upstream `splitLevels`),
+    /// synced with `strategy_tag`; `None` never pre-splits (raw frames).
+    pub(crate) pre_split: Option<u8>,
     /// Whether the HUF literal table build runs the #167 table-log search
     /// (`true`) or the cheap single-build (`false`). The search is a clean
     /// ratio win over upstream zstd but costs ~1.5 us per literal section —
@@ -1009,6 +1014,8 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 strategy_tag: crate::encoding::strategy::StrategyTag::for_compression_level(
                     compression_level,
                 ),
+                pre_split: crate::encoding::levels::config::level_pre_split(compression_level)
+                    .map(|tier| tier as u8),
                 huf_optimal_search: true,
                 literal_compression_disabled: matches!(
                     compression_level,
@@ -1060,20 +1067,18 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
     pub fn set_parameters(&mut self, params: &crate::encoding::CompressionParameters) {
         self.compression_level = params.level();
         let overrides = params.overrides();
-        self.strategy_override = overrides.strategy.map(|s| s.tag());
+        self.strategy_override = overrides.strategy.map(|s| (s.tag(), s.lazy_depth()));
         // Keep `state.strategy_tag` consistent immediately so the borrowed
         // one-shot eligibility gate (`borrowed_eligible`) and literal gates
         // are correct even before the next `compress()` re-sync. Resolve it
         // size-adaptively (same `resolve_level_params` path `prepare_frame`
         // uses) so a hint already set here yields the same strategy the matcher
         // will run, not the bare level-only mapping.
-        self.state.strategy_tag = self.strategy_override.unwrap_or_else(|| {
-            crate::encoding::levels::config::resolve_level_params(
-                self.compression_level,
-                self.source_size_hint,
-            )
-            .strategy_tag
-        });
+        let params = crate::encoding::levels::config::resolve_level_params(
+            self.compression_level,
+            self.source_size_hint,
+        );
+        self.sync_effective_strategy(&params);
         self.state.huf_optimal_search =
             huf_search_enabled(self.state.strategy_tag, self.source_size_hint);
         // C `ZSTD_literalsCompressionIsDisabled` (ps_auto): raw literals iff the
@@ -1426,6 +1431,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 strategy_tag: crate::encoding::strategy::StrategyTag::for_compression_level(
                     compression_level,
                 ),
+                pre_split: crate::encoding::levels::config::level_pre_split(compression_level)
+                    .map(|tier| tier as u8),
                 huf_optimal_search: true,
                 literal_compression_disabled: matches!(
                     compression_level,
@@ -1532,6 +1539,49 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         self.compressed_data.replace(compressed_data)
     }
 
+    /// Diagnostic switch: cut full blocks only, never pre-split. Used by
+    /// the sequence capture so its block structure matches upstream's
+    /// `ZSTD_generateSequences` (see `pre_split_disabled`).
+    #[cfg(feature = "bench_internals")]
+    pub fn set_pre_split_disabled(&mut self, disabled: bool) {
+        self.pre_split_disabled = disabled;
+    }
+
+    /// The pre-split level the block loops apply: the effective strategy's
+    /// tier (`state.pre_split`) unless the diagnostic switch is on.
+    fn pre_split_level(&self) -> Option<usize> {
+        if self.pre_split_disabled {
+            None
+        } else {
+            self.state.pre_split.map(usize::from)
+        }
+    }
+
+    /// Record the strategy the matcher actually runs for the next frame (a
+    /// public-parameter override, else the size- and dictionary-adaptive
+    /// resolution in `params`) and its pre-split tier: the literal gates and
+    /// the block splitter read these, and upstream indexes `splitLevels` by
+    /// the effective strategy too.
+    fn sync_effective_strategy(&mut self, params: &crate::encoding::levels::config::LevelParams) {
+        match self.strategy_override {
+            Some((tag, lazy_depth)) => {
+                self.state.strategy_tag = tag;
+                self.state.pre_split = Some(crate::encoding::levels::config::pre_split_for(
+                    tag, lazy_depth,
+                ));
+            }
+            None => {
+                self.state.strategy_tag = params.strategy_tag;
+                self.state.pre_split =
+                    if matches!(self.compression_level, CompressionLevel::Uncompressed) {
+                        None
+                    } else {
+                        params.pre_split()
+                    };
+            }
+        }
+    }
+
     /// Provide a hint about the total uncompressed size for the next frame.
     ///
     /// When set, the encoder selects smaller hash tables and windows for
@@ -1541,24 +1591,6 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// history is primed separately and does not inflate the hinted size or
     /// advertised frame window.
     /// Must be called before [`compress`](Self::compress).
-    /// Diagnostic switch: cut full blocks only, never pre-split. Used by
-    /// the sequence capture so its block structure matches upstream's
-    /// `ZSTD_generateSequences` (see `pre_split_disabled`).
-    #[cfg(feature = "bench_internals")]
-    pub fn set_pre_split_disabled(&mut self, disabled: bool) {
-        self.pre_split_disabled = disabled;
-    }
-
-    /// The pre-split level the block loops apply: the level's tier unless
-    /// the diagnostic switch is on.
-    fn pre_split_level(&self) -> Option<usize> {
-        if self.pre_split_disabled {
-            None
-        } else {
-            crate::encoding::levels::config::level_pre_split(self.compression_level)
-        }
-    }
-
     pub fn set_source_size_hint(&mut self, size: u64) {
         self.source_size_hint = Some(size);
     }
@@ -1715,13 +1747,24 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // gates disagree with the matcher's actual parse on small frames (the
         // gate would think btlazy2 and skip the HUF table-log search the btultra
         // frame runs, costing a few bytes on small literal sections).
-        self.state.strategy_tag = self.strategy_override.unwrap_or_else(|| {
-            crate::encoding::levels::config::resolve_level_params(
+        // A dictionary frame runs the CDict's strategy (upstream
+        // `ZSTD_resetCCtx_usingCDict`), so resolve through the same
+        // dictionary-aware path the matcher's reset took.
+        let params = match self.dictionary.as_ref().filter(|_| use_dictionary_state) {
+            Some(dict) if !dict.inner.dict_content.is_empty() => {
+                crate::encoding::levels::config::resolve_level_params_with_dict(
+                    self.compression_level,
+                    initial_size_hint,
+                    dict.inner.dict_content.len(),
+                )
+                .0
+            }
+            _ => crate::encoding::levels::config::resolve_level_params(
                 self.compression_level,
                 initial_size_hint,
-            )
-            .strategy_tag
-        });
+            ),
+        };
+        self.sync_effective_strategy(&params);
         // `initial_size_hint` (captured before the `.take()` above) — by here
         // `self.source_size_hint` is None.
         self.state.huf_optimal_search =

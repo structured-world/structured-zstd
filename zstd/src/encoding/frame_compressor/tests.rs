@@ -2795,6 +2795,93 @@ fn reused_compressor_copied_chain_dictionary_frame_is_byte_identical() {
     }
 }
 
+/// Regression: a small dictionary on a btlazy2 level resolves to an optimal
+/// CDict strategy (the <= 16 KiB CDict tier puts L13 at btopt), and upstream
+/// runs the CDict's strategy for the frame. The frame must take that route
+/// and index the dictionary into the finder it actually searches; primed
+/// into tables the lazy tree never reads, the dictionary contributed
+/// nothing and the frame came out as large as without it.
+#[test]
+fn small_dictionary_on_btlazy2_level_contributes_matches() {
+    let dict_raw = noise_bytes(4096, 11);
+    let mut payload = Vec::with_capacity(100 * 1024);
+    let mut i = 0usize;
+    while payload.len() < 100 * 1024 {
+        payload.extend_from_slice(&noise_bytes(200, 300 + i as u32));
+        let at = (i * 613) % (dict_raw.len() - 64);
+        payload.extend_from_slice(&dict_raw[at..at + 64]);
+        i += 1;
+    }
+    let dict_id = 0xD1C7_0012;
+    let dict = || {
+        crate::decoding::Dictionary::from_raw_content(dict_id, dict_raw.clone())
+            .expect("raw-content dictionary")
+    };
+    let level = super::CompressionLevel::Level(13);
+    let mut with_dict: FrameCompressor = FrameCompressor::new(level);
+    with_dict.set_dictionary(dict()).expect("dict attach");
+    let frame = with_dict.compress_independent_frame(&payload);
+    let mut plain: FrameCompressor = FrameCompressor::new(level);
+    let no_dict = plain.compress_independent_frame(&payload);
+    // Every 264-byte record carries a 64-byte dictionary slice: the
+    // dictionary must remove well over a tenth of the output.
+    assert!(
+        frame.len() * 10 < no_dict.len() * 9,
+        "the dictionary must supply matches at L13 ({} vs {} without it)",
+        frame.len(),
+        no_dict.len()
+    );
+    let mut decoder = FrameDecoder::new();
+    decoder.add_dict(dict()).unwrap();
+    let mut decoded = Vec::with_capacity(payload.len());
+    decoder.decode_all_to_vec(&frame, &mut decoded).unwrap();
+    assert_eq!(decoded, payload);
+}
+
+/// Regression: the pre-split tier follows the EFFECTIVE strategy (upstream
+/// indexes `splitLevels` by `cParams.strategy`): a strategy override on a
+/// level, or a small source promoting a level, must move the tier with it.
+#[test]
+fn pre_split_tier_follows_the_effective_strategy() {
+    use crate::encoding::{CompressionParameters, Strategy};
+    let mut enc: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(1));
+    assert_eq!(
+        enc.state.pre_split,
+        Some(0),
+        "L1 is fast: the borders splitter"
+    );
+    let params = CompressionParameters::builder(super::CompressionLevel::Level(1))
+        .strategy(Strategy::Btultra2)
+        .build()
+        .expect("valid override");
+    enc.set_parameters(&params);
+    assert_eq!(enc.state.pre_split, Some(4), "btultra2 override: tier 4");
+    let params = CompressionParameters::builder(super::CompressionLevel::Level(1))
+        .strategy(Strategy::Lazy2)
+        .build()
+        .expect("valid override");
+    enc.set_parameters(&params);
+    assert_eq!(enc.state.pre_split, Some(3), "lazy2 override: tier 3");
+    let params = CompressionParameters::builder(super::CompressionLevel::Level(1))
+        .strategy(Strategy::Lazy)
+        .build()
+        .expect("valid override");
+    enc.set_parameters(&params);
+    assert_eq!(enc.state.pre_split, Some(2), "lazy override: tier 2");
+    // A 4 KiB source promotes L13 from btlazy2 (tier 3) to btopt (tier 4).
+    let mut enc: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(13));
+    enc.set_source_size_hint(4096);
+    let params = CompressionParameters::builder(super::CompressionLevel::Level(13))
+        .build()
+        .expect("valid params");
+    enc.set_parameters(&params);
+    assert_eq!(
+        enc.state.pre_split,
+        Some(4),
+        "L13 on a 4 KiB source is btopt"
+    );
+}
+
 /// Regression: the borrowed (in-place) one-shot path must keep the
 /// coordinate floor above every position a previous frame indexed. Zeroing
 /// the floor per borrowed frame left the chain / tree tables holding the
