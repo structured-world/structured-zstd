@@ -239,10 +239,9 @@ fn sample_looks_incompressible_capped(block: &[u8], max_sample_len: usize) -> bo
     // head / middle / tail probes so capped samples still reject
     // mixed-entropy blocks whose center is compressible.
     let mut regions: [&[u8]; 3] = [&[], &[], &[]];
-    let region_count;
-    if sample_len == block.len() {
+    let region_count = if sample_len == block.len() {
         regions[0] = block;
-        region_count = 1;
+        1
     } else {
         let head_len = sample_len / 3;
         let mid_len = sample_len / 3;
@@ -251,8 +250,8 @@ fn sample_looks_incompressible_capped(block: &[u8], max_sample_len: usize) -> bo
         regions[0] = &block[..head_len];
         regions[1] = &block[mid_start..mid_start + mid_len];
         regions[2] = &block[block.len() - tail_len..];
-        region_count = 3;
-    }
+        3
+    };
 
     // `repeat_guard` is the FINAL verdict threshold, fixed before scanning.
     // It needs the total 4-byte-quad count up front (one quad per 4 bytes of

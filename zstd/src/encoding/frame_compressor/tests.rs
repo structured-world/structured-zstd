@@ -232,15 +232,17 @@ fn dictionary_compression_roundtrips_with_dict_builder_dictionary() {
     let decoder_dict =
         crate::decoding::Dictionary::from_raw_content(dict_id, raw_dict.clone()).unwrap();
 
-    // Payload that the trained dict actually covers (same line shape as the
-    // training corpus, just unseen `idx` values). The dict primes the whole
-    // `tenant=demo table=orders key=… region=eu` line, so its benefit is the
-    // first occurrence's literals — substantial and unambiguous — rather than
-    // the 24-byte shared prefix of an otherwise-different payload, where the
-    // marginal gain is below the dict-id frame overhead. (The deeper
-    // partial-match dict ratio gap is tracked separately, not gated here.)
+    // Payload the trained dictionary genuinely covers: training lines in a
+    // permuted order, so whole lines are dictionary matches while the
+    // payload does not simply repeat its previous line. (A payload of
+    // unseen `key=` values is NOT such a case: every line then matches the
+    // previous one through the repeat offset, and upstream too compresses
+    // it smaller WITHOUT the dictionary, the dictionary id and the
+    // dictionary-tier parameters costing more than the first line's
+    // literals.)
     let mut payload = Vec::new();
-    for idx in 1000..1096u32 {
+    for i in 0..96u32 {
+        let idx = (i * 37 + 11) % 256;
         payload.extend_from_slice(
             format!("tenant=demo table=orders key={idx} region=eu\n").as_bytes(),
         );
@@ -2052,12 +2054,11 @@ fn split_block_from_borders_returns_midpoint_for_centred_transition() {
 }
 
 /// `level_pre_split` resolves the per-level split knob through the
-/// `LevelParams` table, returning the EFFECTIVE upstream `ZSTD_splitBlock`
-/// level (`splitLevels[strategy] - 2`, clamped at 0) that
-/// `ZSTD_optimalBlockSize` dispatches: fast/dfast/greedy/lazy(d1) → 0
-/// (from-borders), lazy2/btlazy2 → 1 (byChunks rate 43),
-/// btopt/btultra/btultra2 → 2 (byChunks rate 11). `Uncompressed` has no
-/// numeric level so it stays `None`.
+/// `LevelParams` table: upstream's `splitLevels` up to lazy depth 1
+/// (fast → 0, dfast → 1, greedy/lazy → 2), two steps coarser above (see
+/// `pre_split_for` for why): lazy2/btlazy2 → 1 (byChunks rate 43),
+/// btopt/btultra/btultra2 → 2 (rate 11). `Uncompressed` has no numeric level
+/// so it stays `None`.
 #[test]
 fn pre_split_level_dispatches_by_compression_level() {
     use crate::encoding::CompressionLevel;
@@ -2065,8 +2066,8 @@ fn pre_split_level_dispatches_by_compression_level() {
     assert_eq!(level_pre_split(CompressionLevel::Uncompressed), None);
     // Fastest = level 1 (fast) → 0 (from-borders).
     assert_eq!(level_pre_split(CompressionLevel::Fastest), Some(0));
-    // Default = level 3 (dfast) → 0 (splitLevels 1 - 2, clamped).
-    assert_eq!(level_pre_split(CompressionLevel::Default), Some(0));
+    // Default = level 3 (dfast) → 1 (byChunks rate 43).
+    assert_eq!(level_pre_split(CompressionLevel::Default), Some(1));
     // Better is a pure alias for level 7 (lazy): same as Level(7).
     assert_eq!(
         level_pre_split(CompressionLevel::Better),
@@ -2080,13 +2081,9 @@ fn pre_split_level_dispatches_by_compression_level() {
         level_pre_split(CompressionLevel::Level(13)),
     );
     assert_eq!(level_pre_split(CompressionLevel::Level(2)), Some(0)); // fast
-    assert_eq!(level_pre_split(CompressionLevel::Level(4)), Some(0)); // dfast
-    assert_eq!(level_pre_split(CompressionLevel::Level(5)), Some(0)); // greedy
-    assert_eq!(level_pre_split(CompressionLevel::Level(7)), Some(0)); // lazy (depth 1)
-    // lazy2 / btlazy2: splitLevels 3 - 2 = 1 (byChunks rate 43, hashLog 8).
-    // The coarse byte-histogram tier is robust to the periodic-input
-    // phantom-split the rate-5/hashLog-10 tier suffered, so it matches
-    // upstream AND stays whole on periodic input (`periodic_stream_not_oversplit`).
+    assert_eq!(level_pre_split(CompressionLevel::Level(4)), Some(1)); // dfast
+    assert_eq!(level_pre_split(CompressionLevel::Level(5)), Some(2)); // greedy
+    assert_eq!(level_pre_split(CompressionLevel::Level(7)), Some(2)); // lazy (depth 1)
     assert_eq!(level_pre_split(CompressionLevel::Level(8)), Some(1)); // lazy2 lower bound
     assert_eq!(level_pre_split(CompressionLevel::Level(11)), Some(1)); // lazy2 (depth 2)
     assert_eq!(level_pre_split(CompressionLevel::Level(12)), Some(1)); // lazy2 upper bound
@@ -2096,17 +2093,15 @@ fn pre_split_level_dispatches_by_compression_level() {
     assert_eq!(level_pre_split(CompressionLevel::Level(22)), Some(2)); // btultra2
 }
 
-/// Regression: a homogeneous but periodic multi-block stream must not be
-/// pre-split into tiny blocks at the lazy2 / btlazy2 levels. The rate-5
-/// chunk sampler used to phantom-split such input at every 8 KB chunk,
-/// cascading a large stream into hundreds of tiny blocks whose per-block
-/// headers ballooned the output (~5x vs the lazy level next door). With
-/// the rate-1 full-scan splitter the periodic stream is seen as uniform
-/// and stays a few full blocks. We assert the lazy2 (L8) and btlazy2 (L15)
-/// outputs stay within 2x of the lazy (L7) output on the same input, and
-/// that every output round-trips.
+/// A homogeneous but periodic multi-block stream at the lazy (L7), lazy2
+/// (L8) and btlazy2 (L15) levels round-trips and stays small: the lazy2 /
+/// btlazy2 tier (byChunks rate 43, two steps coarser than upstream's rate 5,
+/// see `pre_split_for`) must not over-split the periodic input the way
+/// upstream does (528 bytes on 512 KB vs 189 for the lazy tier). The size
+/// bound against the reference is asserted in `ffi-bench`
+/// (`periodic_stream_presplit_matches_reference`).
 #[test]
-fn periodic_stream_not_oversplit() {
+fn periodic_stream_roundtrips_at_every_presplit_tier() {
     use crate::encoding::{CompressionLevel, compress_slice_to_vec};
     const LINES: &[&str] = &[
         "ts=2026-03-26T21:39:28Z level=INFO msg=\"flush memtable\" tenant=demo table=orders region=eu-west\n",
@@ -2127,18 +2122,15 @@ fn periodic_stream_not_oversplit() {
     let l7 = compress_slice_to_vec(&data, CompressionLevel::Level(7)); // lazy depth1
     let l8 = compress_slice_to_vec(&data, CompressionLevel::Level(8)); // lazy2
     let l15 = compress_slice_to_vec(&data, CompressionLevel::Level(15)); // btlazy2
-    assert!(
-        l8.len() < l7.len() * 2,
-        "lazy2 over-split periodic stream: l7={} l8={}",
-        l7.len(),
-        l8.len()
-    );
-    assert!(
-        l15.len() < l7.len() * 2,
-        "btlazy2 over-split periodic stream: l7={} l15={}",
-        l7.len(),
-        l15.len()
-    );
+    // 512 KB of four repeating lines: every tier stays within a few block
+    // headers of the ~190-byte single-block frame (upstream: 189 / 528 / 528).
+    for (level, out) in [(7, &l7), (8, &l8), (15, &l15)] {
+        assert!(
+            out.len() < 1024,
+            "L{level} periodic stream ballooned: {} bytes",
+            out.len()
+        );
+    }
     for out in [&l7, &l8, &l15] {
         let mut decoder = FrameDecoder::new();
         let mut round = Vec::with_capacity(data.len());
@@ -2728,4 +2720,389 @@ fn dict_compress_bt_level_tiny_source_round_trips_through_prime_dms_bt() {
         .decode_all_to_vec(&out, &mut decoded)
         .expect("dict BT-level frame should round-trip");
     assert_eq!(decoded, data);
+}
+
+/// Pseudo-random bytes (no self-repeats), so a match into them can only
+/// come from the dictionary or a verbatim copy.
+fn noise_bytes(len: usize, seed: u32) -> Vec<u8> {
+    let mut x = seed;
+    (0..len)
+        .map(|_| {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (x >> 24) as u8
+        })
+        .collect()
+}
+
+/// Regression: a COPIED dictionary (source above the 32 KiB attach cutoff)
+/// whose CDict cParams select the hash-chain finder (a 4 KiB dictionary
+/// resolves to a window of 2^14 or less) must be indexed at ABSOLUTE
+/// positions. On a reused compressor whose primed snapshot does not fit the
+/// next frame (a larger source, so another window) the dictionary is
+/// re-indexed with the coordinate floor past the previous frame; relative
+/// indices then fall below the window floor and the dictionary silently
+/// stops matching. The warm frame must equal a cold compressor's and stay
+/// smaller than the dictionary-less frame.
+#[test]
+fn reused_compressor_copied_chain_dictionary_frame_is_byte_identical() {
+    let dict_raw = noise_bytes(4096, 7);
+    // Noise with dictionary slices sprinkled in: only the dictionary can
+    // supply those matches.
+    let make_payload = |target: usize, seed: u32| {
+        let mut payload = Vec::with_capacity(target);
+        let mut i = 0usize;
+        while payload.len() < target {
+            payload.extend_from_slice(&noise_bytes(200, seed + i as u32));
+            let at = (i * 613) % (dict_raw.len() - 64);
+            payload.extend_from_slice(&dict_raw[at..at + 64]);
+            i += 1;
+        }
+        payload
+    };
+    let first = make_payload(100 * 1024, 100);
+    let second = make_payload(200 * 1024, 5000);
+    let dict_id = 0xD1C7_0011;
+    let dict = || {
+        crate::decoding::Dictionary::from_raw_content(dict_id, dict_raw.clone())
+            .expect("raw-content dictionary")
+    };
+    let level = super::CompressionLevel::Level(6);
+    let mut warm: FrameCompressor = FrameCompressor::new(level);
+    warm.set_dictionary(dict()).expect("dict attach");
+    let _ = warm.compress_independent_frame(&first);
+    let warm_frame = warm.compress_independent_frame(&second);
+    let mut cold: FrameCompressor = FrameCompressor::new(level);
+    cold.set_dictionary(dict()).expect("dict attach");
+    let cold_frame = cold.compress_independent_frame(&second);
+    assert_eq!(
+        warm_frame, cold_frame,
+        "a reused compressor must index the copied dictionary at absolute positions"
+    );
+    let mut plain: FrameCompressor = FrameCompressor::new(level);
+    let no_dict = plain.compress_independent_frame(&second);
+    assert!(
+        cold_frame.len() < no_dict.len(),
+        "the copied dictionary must supply matches ({} vs {} without it)",
+        cold_frame.len(),
+        no_dict.len()
+    );
+    for frame in [&warm_frame, &cold_frame] {
+        let mut decoder = FrameDecoder::new();
+        decoder.add_dict(dict()).unwrap();
+        let mut decoded = Vec::with_capacity(second.len());
+        decoder.decode_all_to_vec(frame, &mut decoded).unwrap();
+        assert_eq!(decoded, second);
+    }
+}
+
+/// Regression: a small dictionary on a btlazy2 level resolves to an optimal
+/// CDict strategy (the <= 16 KiB CDict tier puts L13 at btopt), and upstream
+/// runs the CDict's strategy for the frame. The frame must take that route
+/// and index the dictionary into the finder it actually searches; primed
+/// into tables the lazy tree never reads, the dictionary contributed
+/// nothing and the frame came out as large as without it.
+#[test]
+fn small_dictionary_on_btlazy2_level_contributes_matches() {
+    let dict_raw = noise_bytes(4096, 11);
+    let mut payload = Vec::with_capacity(100 * 1024);
+    let mut i = 0usize;
+    while payload.len() < 100 * 1024 {
+        payload.extend_from_slice(&noise_bytes(200, 300 + i as u32));
+        let at = (i * 613) % (dict_raw.len() - 64);
+        payload.extend_from_slice(&dict_raw[at..at + 64]);
+        i += 1;
+    }
+    let dict_id = 0xD1C7_0012;
+    let dict = || {
+        crate::decoding::Dictionary::from_raw_content(dict_id, dict_raw.clone())
+            .expect("raw-content dictionary")
+    };
+    let level = super::CompressionLevel::Level(13);
+    let mut with_dict: FrameCompressor = FrameCompressor::new(level);
+    with_dict.set_dictionary(dict()).expect("dict attach");
+    let frame = with_dict.compress_independent_frame(&payload);
+    let mut plain: FrameCompressor = FrameCompressor::new(level);
+    let no_dict = plain.compress_independent_frame(&payload);
+    // Every 264-byte record carries a 64-byte dictionary slice: the
+    // dictionary must remove well over a tenth of the output.
+    assert!(
+        frame.len() * 10 < no_dict.len() * 9,
+        "the dictionary must supply matches at L13 ({} vs {} without it)",
+        frame.len(),
+        no_dict.len()
+    );
+    let mut decoder = FrameDecoder::new();
+    decoder.add_dict(dict()).unwrap();
+    let mut decoded = Vec::with_capacity(payload.len());
+    decoder.decode_all_to_vec(&frame, &mut decoded).unwrap();
+    assert_eq!(decoded, payload);
+}
+
+/// Regression: the pre-split tier follows the EFFECTIVE strategy (upstream
+/// indexes `splitLevels` by `cParams.strategy`): a strategy override on a
+/// level, or a small source promoting a level, must move the tier with it.
+#[test]
+fn pre_split_tier_follows_the_effective_strategy() {
+    use crate::encoding::{CompressionParameters, Strategy};
+    let mut enc: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(1));
+    assert_eq!(
+        enc.state.pre_split,
+        Some(0),
+        "L1 is fast: the borders splitter"
+    );
+    let params = CompressionParameters::builder(super::CompressionLevel::Level(1))
+        .strategy(Strategy::Btultra2)
+        .build()
+        .expect("valid override");
+    enc.set_parameters(&params);
+    assert_eq!(enc.state.pre_split, Some(2), "btultra2 override: tier 2");
+    let params = CompressionParameters::builder(super::CompressionLevel::Level(1))
+        .strategy(Strategy::Lazy2)
+        .build()
+        .expect("valid override");
+    enc.set_parameters(&params);
+    assert_eq!(enc.state.pre_split, Some(1), "lazy2 override: tier 1");
+    let params = CompressionParameters::builder(super::CompressionLevel::Level(1))
+        .strategy(Strategy::Lazy)
+        .build()
+        .expect("valid override");
+    enc.set_parameters(&params);
+    assert_eq!(enc.state.pre_split, Some(2), "lazy override: tier 2");
+    // A 4 KiB source promotes L13 from btlazy2 (tier 1) to btopt (tier 2).
+    let mut enc: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(13));
+    enc.set_source_size_hint(4096);
+    let params = CompressionParameters::builder(super::CompressionLevel::Level(13))
+        .build()
+        .expect("valid params");
+    enc.set_parameters(&params);
+    assert_eq!(
+        enc.state.pre_split,
+        Some(2),
+        "L13 on a 4 KiB source is btopt"
+    );
+}
+
+/// Regression: on a dictionary frame the matcher runs the CDict's strategy
+/// and ignores a public strategy override ("cdict overrides"), so the frame
+/// state the literal gates and the block splitter read must record the
+/// CDict's strategy too, not the override.
+#[test]
+fn dictionary_frame_state_records_the_cdict_strategy_not_the_override() {
+    use crate::encoding::strategy::StrategyTag;
+    use crate::encoding::{CompressionParameters, Strategy};
+    let dict_raw = noise_bytes(20 * 1024, 5);
+    let payload = noise_bytes(16 * 1024, 9);
+    let mut enc: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(6));
+    enc.set_dictionary(
+        crate::decoding::Dictionary::from_raw_content(0xD1C7_0013, dict_raw).unwrap(),
+    )
+    .unwrap();
+    let params = CompressionParameters::builder(super::CompressionLevel::Level(6))
+        .strategy(Strategy::Btultra2)
+        .build()
+        .expect("valid override");
+    enc.set_parameters(&params);
+    enc.set_source_size_hint(payload.len() as u64);
+    // The 20 KiB CDict resolves L6 to lazy; the override must not leak into
+    // the frame state the block loop reads.
+    let _ = enc.compress_independent_frame(&payload);
+    assert_eq!(enc.state.strategy_tag, StrategyTag::Lazy);
+    assert_eq!(enc.state.pre_split, Some(2));
+}
+
+/// Regression: the same holds for a CDict outside the lazy band. A 4 KiB
+/// CDict resolves L2 to the fast strategy, and a `Btultra2` override must
+/// not replace it (only `window_log` is the caller's on a dictionary frame).
+#[test]
+fn dictionary_frame_keeps_a_fast_cdict_strategy_under_a_strategy_override() {
+    use crate::encoding::strategy::StrategyTag;
+    use crate::encoding::{CompressionParameters, Strategy};
+    let dict_raw = noise_bytes(4 * 1024, 5);
+    let payload = noise_bytes(100 * 1024, 9);
+    let mut enc: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(2));
+    enc.set_dictionary(
+        crate::decoding::Dictionary::from_raw_content(0xD1C7_0014, dict_raw).unwrap(),
+    )
+    .unwrap();
+    let params = CompressionParameters::builder(super::CompressionLevel::Level(2))
+        .strategy(Strategy::Btultra2)
+        .build()
+        .expect("valid override");
+    enc.set_parameters(&params);
+    enc.set_source_size_hint(payload.len() as u64);
+    let _ = enc.compress_independent_frame(&payload);
+    assert_eq!(enc.state.strategy_tag, StrategyTag::Fast);
+    assert_eq!(enc.state.pre_split, Some(0));
+}
+
+/// Regression: the raw-literals gate is recomputed when the dictionary
+/// state changes AFTER `set_parameters`. A positive `target_length` on a
+/// fast level disables literal compression on a plain frame, but a
+/// dictionary frame runs the CDict's targetLength (0 at level 1) and must
+/// compress literals; the inverse (parameters set while a dictionary was
+/// attached, then `clear_dictionary`) must re-enable the override.
+#[test]
+fn literal_gate_follows_dictionary_attach_and_clear() {
+    use crate::encoding::CompressionParameters;
+    let dict_raw = noise_bytes(4 * 1024, 5);
+    let payload = noise_bytes(2048, 9);
+    let params = CompressionParameters::builder(super::CompressionLevel::Level(1))
+        .target_length(8)
+        .build()
+        .expect("valid override");
+    // set_parameters THEN attach: the dictionary frame ignores the override.
+    let mut enc: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(1));
+    enc.set_parameters(&params);
+    assert!(enc.state.literal_compression_disabled);
+    enc.set_dictionary(
+        crate::decoding::Dictionary::from_raw_content(0xD1C7_0019, dict_raw.clone()).unwrap(),
+    )
+    .unwrap();
+    let _ = enc.compress_independent_frame(&payload);
+    assert!(
+        !enc.state.literal_compression_disabled,
+        "a dictionary frame keeps the CDict targetLength: literals stay compressed"
+    );
+    // Attach THEN set_parameters THEN clear: the plain frame honours it again.
+    let mut enc: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(1));
+    enc.set_dictionary(
+        crate::decoding::Dictionary::from_raw_content(0xD1C7_001A, dict_raw).unwrap(),
+    )
+    .unwrap();
+    enc.set_parameters(&params);
+    enc.clear_dictionary();
+    let _ = enc.compress_independent_frame(&payload);
+    assert!(
+        enc.state.literal_compression_disabled,
+        "without the dictionary the target_length override applies again"
+    );
+}
+
+/// Regression: parameters whose level is `Uncompressed` may be set while a
+/// dictionary is attached (uncompressed mode ignores the dictionary, as
+/// `prepare_frame` does); the immediate strategy sync must not resolve the
+/// dictionary's CDict tier for a level that has no numeric value.
+#[test]
+fn set_parameters_uncompressed_with_a_dictionary_attached_does_not_resolve_a_cdict() {
+    use crate::encoding::CompressionParameters;
+    use crate::encoding::strategy::StrategyTag;
+    let dict_raw = noise_bytes(4 * 1024, 5);
+    let mut enc: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(3));
+    enc.set_dictionary(
+        crate::decoding::Dictionary::from_raw_content(0xD1C7_0016, dict_raw).unwrap(),
+    )
+    .unwrap();
+    let params = CompressionParameters::builder(super::CompressionLevel::Uncompressed)
+        .build()
+        .expect("valid parameters");
+    enc.set_parameters(&params);
+    assert_eq!(enc.state.strategy_tag, StrategyTag::Fast);
+    assert_eq!(enc.state.pre_split, None);
+    let payload = noise_bytes(2048, 9);
+    let frame = enc.compress_independent_frame(&payload);
+    let mut decoder = FrameDecoder::new();
+    let mut decoded = Vec::with_capacity(payload.len());
+    decoder.decode_all_to_vec(&frame, &mut decoded).unwrap();
+    assert_eq!(decoded, payload);
+}
+
+/// Regression: on a dictionary frame the matcher ignores every public
+/// override but `window_log`, so the raw-literals gate
+/// (`ZSTD_literalsCompressionIsDisabled`: fast strategy with a positive
+/// targetLength) must read the CDict's targetLength (0 at level 1), not a
+/// `target_length` override the matcher does not run.
+#[test]
+fn dictionary_frame_literal_gate_ignores_a_target_length_override() {
+    use crate::encoding::CompressionParameters;
+    let dict_raw = noise_bytes(4 * 1024, 5);
+    let mut enc: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(1));
+    enc.set_dictionary(
+        crate::decoding::Dictionary::from_raw_content(0xD1C7_0017, dict_raw).unwrap(),
+    )
+    .unwrap();
+    let params = CompressionParameters::builder(super::CompressionLevel::Level(1))
+        .target_length(8)
+        .build()
+        .expect("valid override");
+    enc.set_parameters(&params);
+    assert!(
+        !enc.state.literal_compression_disabled,
+        "a dictionary frame keeps the CDict's targetLength 0: literals stay compressed"
+    );
+}
+
+/// Regression: the CDict's cParams tier is picked from the SERIALIZED
+/// dictionary size (`ZSTD_createCDict(dictBuffer, dictSize, level)`), not
+/// from its content length. A dictionary whose content plus the 498-byte
+/// unknown-source margin fits the `<= 16 KiB` tier while its serialized
+/// size does not resolves L11 to btlazy2 (the `<= 128 KiB` row), not btopt.
+#[test]
+fn dictionary_cdict_tier_follows_the_serialized_dictionary_size() {
+    use crate::encoding::strategy::StrategyTag;
+    // 16384 - 498 - 100: the content alone selects the `<= 16 KiB` tier.
+    let content = noise_bytes(15_786, 11);
+    let raw = serialized_dictionary(0xD1C7_0015, &content);
+    assert!(content.len() + 498 <= 16 * 1024);
+    assert!(raw.len() + 498 > 16 * 1024);
+    let payload = noise_bytes(8 * 1024, 9);
+    let mut enc: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(11));
+    enc.set_dictionary_from_bytes(&raw).unwrap();
+    enc.set_source_size_hint(payload.len() as u64);
+    let _ = enc.compress_independent_frame(&payload);
+    assert_eq!(enc.state.strategy_tag, StrategyTag::Btlazy2);
+}
+
+/// A serialized dictionary (magic, id, entropy tables, repeat offsets,
+/// content) around `content`. The entropy section is the fixed blob the
+/// dictionary parser tests use.
+fn serialized_dictionary(id: u32, content: &[u8]) -> Vec<u8> {
+    let mut raw = crate::decoding::dictionary::MAGIC_NUM.to_vec();
+    raw.extend_from_slice(&id.to_le_bytes());
+    raw.extend_from_slice(&[
+        54, 16, 192, 155, 4, 0, 207, 59, 239, 121, 158, 116, 220, 93, 114, 229, 110, 41, 249, 95,
+        165, 255, 83, 202, 254, 68, 74, 159, 63, 161, 100, 151, 137, 21, 184, 183, 189, 100, 235,
+        209, 251, 174, 91, 75, 91, 185, 19, 39, 75, 146, 98, 177, 249, 14, 4, 35, 0, 0, 0, 40, 40,
+        20, 10, 12, 204, 37, 196, 1, 173, 122, 0, 4, 0, 128, 1, 2, 2, 25, 32, 27, 27, 22, 24, 26,
+        18, 12, 12, 15, 16, 11, 69, 37, 225, 48, 20, 12, 6, 2, 161, 80, 40, 20, 44, 137, 145, 204,
+        46, 0, 0, 0, 0, 0, 116, 253, 16, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ]);
+    for rep in [1u32, 4, 8] {
+        raw.extend_from_slice(&rep.to_le_bytes());
+    }
+    raw.extend_from_slice(content);
+    raw
+}
+
+/// Regression: the borrowed (in-place) one-shot path must keep the
+/// coordinate floor above every position a previous frame indexed. Zeroing
+/// the floor per borrowed frame left the chain / tree tables holding the
+/// previous frame's positions as if they were this frame's: a stale entry
+/// at the current position was accepted as a match of offset 0 (a corrupt
+/// frame), a later one read past the input. Compressing the same input
+/// twice on one compressor must give the same decodable frame.
+#[test]
+fn reused_compressor_borrowed_chain_frames_are_byte_identical() {
+    let payload: Vec<u8> = (0..10 * 1024usize)
+        .flat_map(|i| format!("row={i} val={}\n", (i * 7919) % 1000).into_bytes())
+        .take(10 * 1024)
+        .collect();
+    // 10 KiB one-shot: window 2^14, so the lazy backend searches the chain.
+    let mut enc: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(6));
+    let frame1 = enc.compress_independent_frame(&payload);
+    let frame2 = enc.compress_independent_frame(&payload);
+    let frame3 = enc.compress_independent_frame(&payload);
+    assert_eq!(
+        frame1, frame2,
+        "second borrowed frame must not see stale positions"
+    );
+    assert_eq!(
+        frame1, frame3,
+        "third borrowed frame must not see stale positions"
+    );
+    for frame in [&frame1, &frame2, &frame3] {
+        let mut decoder = FrameDecoder::new();
+        let mut decoded = Vec::with_capacity(payload.len());
+        decoder.decode_all_to_vec(frame, &mut decoded).unwrap();
+        assert_eq!(decoded, payload);
+    }
 }

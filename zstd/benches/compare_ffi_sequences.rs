@@ -452,7 +452,7 @@ fn run_one(_name: &str, input: &[u8], level: i32, max_rows: usize, dict: Option<
     let mut differ = 0usize;
     let mut rust_only = 0usize;
     let mut ffi_only = 0usize;
-    for r in &rows {
+    for (_, r) in &rows {
         match r {
             DiffRow::Equal => equal += 1,
             DiffRow::Differ { .. } => differ += 1,
@@ -492,7 +492,7 @@ fn run_one(_name: &str, input: &[u8], level: i32, max_rows: usize, dict: Option<
     }
     let mut printed = 0usize;
     let mut header_printed = false;
-    for (idx, r) in rows.iter().enumerate() {
+    for (idx, (pos, r)) in rows.iter().enumerate() {
         if matches!(r, DiffRow::Equal) {
             continue;
         }
@@ -506,34 +506,37 @@ fn run_one(_name: &str, input: &[u8], level: i32, max_rows: usize, dict: Option<
         if !header_printed {
             println!();
             println!(
-                "  {:>5} | {:^28} | {:^28} | verdict",
-                "idx", "rust (blk:idx ll/of/ml)", "ffi  (blk:idx ll/of/ml)"
+                "  {:>5} | {:>8} | {:^28} | {:^28} | verdict",
+                "idx", "pos", "rust (blk:idx ll/of/ml)", "ffi  (blk:idx ll/of/ml)"
             );
-            println!("  {}", "-".repeat(80));
+            println!("  {}", "-".repeat(91));
             header_printed = true;
         }
         match r {
             DiffRow::Equal => unreachable!(),
             DiffRow::Differ { rust, ffi } => {
                 println!(
-                    "  {:>5} | {:<28} | {:<28} | DIFFER",
+                    "  {:>5} | {:>8} | {:<28} | {:<28} | DIFFER",
                     idx,
+                    pos,
                     fmt_rust(rust),
                     fmt_ffi(ffi),
                 );
             }
             DiffRow::RustOnly(rust) => {
                 println!(
-                    "  {:>5} | {:<28} | {:<28} | RUST_ONLY",
+                    "  {:>5} | {:>8} | {:<28} | {:<28} | RUST_ONLY",
                     idx,
+                    pos,
                     fmt_rust(rust),
                     "—",
                 );
             }
             DiffRow::FfiOnly(ffi) => {
                 println!(
-                    "  {:>5} | {:<28} | {:<28} | FFI_ONLY",
+                    "  {:>5} | {:>8} | {:<28} | {:<28} | FFI_ONLY",
                     idx,
+                    pos,
                     "—",
                     fmt_ffi(ffi),
                 );
@@ -604,7 +607,10 @@ fn align_and_diff(
     rust_tails: &[u32],
     ffi: &[FfiSeq],
     ffi_tails: &[u32],
-) -> Vec<DiffRow> {
+) -> Vec<(u64, DiffRow)> {
+    // Each row is tagged with the absolute input position it was emitted
+    // at (the start of the emitting side's literal run), so a divergence
+    // can be reproduced on a prefix of the input.
     let mut rust_iter = rust.iter().peekable();
     let mut ffi_iter = ffi.iter().peekable();
     let mut rust_pos: u64 = 0;
@@ -649,14 +655,14 @@ fn align_and_diff(
             (None, None) => break,
             (Some(r), None) => {
                 let r = **r;
+                out.push((rust_pos, DiffRow::RustOnly(r)));
                 rust_pos += r.ll as u64 + r.ml as u64;
-                out.push(DiffRow::RustOnly(r));
                 rust_iter.next();
             }
             (None, Some(f)) => {
                 let f = **f;
+                out.push((ffi_pos, DiffRow::FfiOnly(f)));
                 ffi_pos += f.ll as u64 + f.ml as u64;
-                out.push(DiffRow::FfiOnly(f));
                 ffi_iter.next();
             }
             (Some(r), Some(f)) => {
@@ -675,9 +681,9 @@ fn align_and_diff(
                     let r = **r;
                     let f = **f;
                     if r.ll == f.ll && r.of == f.of && r.ml == f.ml {
-                        out.push(DiffRow::Equal);
+                        out.push((rust_pos, DiffRow::Equal));
                     } else {
-                        out.push(DiffRow::Differ { rust: r, ffi: f });
+                        out.push((rust_pos, DiffRow::Differ { rust: r, ffi: f }));
                     }
                     rust_pos = r_next_pos;
                     ffi_pos = f_next_pos;
@@ -685,13 +691,13 @@ fn align_and_diff(
                     ffi_iter.next();
                 } else if rust_pos < ffi_pos {
                     let r = **r;
+                    out.push((rust_pos, DiffRow::RustOnly(r)));
                     rust_pos = r_next_pos;
-                    out.push(DiffRow::RustOnly(r));
                     rust_iter.next();
                 } else {
                     let f = **f;
+                    out.push((ffi_pos, DiffRow::FfiOnly(f)));
                     ffi_pos = f_next_pos;
-                    out.push(DiffRow::FfiOnly(f));
                     ffi_iter.next();
                 }
             }

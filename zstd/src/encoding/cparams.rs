@@ -225,6 +225,68 @@ pub(crate) fn adjust_cparams(
 /// `ZSTD_getCParams_internal` (zstd_compress.c): tier + level row selection,
 /// negative-level acceleration, then `ZSTD_adjustCParams_internal`.
 pub(crate) fn get_cparams(compression_level: i32, src_size_hint: u64, dict_size: usize) -> CParams {
+    get_cparams_mode(compression_level, src_size_hint, dict_size, false)
+}
+
+/// The cParams a `ZSTD_CDict` is built with (`ZSTD_createCDict`:
+/// `ZSTD_getCParams_internal(level, ZSTD_CONTENTSIZE_UNKNOWN, dictSize,
+/// ZSTD_cpm_createCDict)`): the tier row is picked by `dictSize + 500 - 2`
+/// (the unknown-source row size), then the tables are down-sized for a
+/// `minSrcSize` source. A frame compressed with the dictionary takes its
+/// strategy, table widths, search depth and match-finder from THESE, not
+/// from the level's plain row (`ZSTD_resetCCtx_usingCDict`).
+pub(crate) fn get_cdict_cparams(compression_level: i32, dict_size: usize) -> CParams {
+    get_cparams_mode(compression_level, CONTENTSIZE_UNKNOWN, dict_size, true)
+}
+
+/// `ZSTD_resetCCtx_byAttachingCDict` cParams: the CDict's cParams re-adjusted
+/// for the frame's source alone (`ZSTD_cpm_attachDict` ignores the dictionary
+/// size, the dictionary keeps its own tables) with the frame's own
+/// `windowLog` kept.
+pub(crate) fn attach_cparams(cdict: CParams, src_size: u64, window_log: u32) -> CParams {
+    let mut cp = adjust_cparams(cdict, src_size, 0, false);
+    cp.window_log = window_log;
+    cp
+}
+
+/// `ZSTD_resetCCtx_byCopyingCDict` cParams: the CDict's cParams verbatim with
+/// the frame's own `windowLog`.
+pub(crate) fn copy_cparams(cdict: CParams, window_log: u32) -> CParams {
+    let mut cp = cdict;
+    cp.window_log = window_log;
+    cp
+}
+
+/// `ZSTD_resolveRowMatchFinderMode(ZSTD_ps_auto, cp)`: the greedy / lazy /
+/// lazy2 strategies search rows only above a 2^14 window. A CDict resolves
+/// this from its own cParams and the frame inherits the answer.
+pub(crate) fn uses_row_match_finder(cp: &CParams) -> bool {
+    (3..=5).contains(&cp.strategy) && cp.window_log > 14
+}
+
+/// `ZSTD_shouldAttachDict`: the CDict tables are referenced in place
+/// (`dictMatchState`) for sources up to the strategy's cutoff or of unknown
+/// size, and copied into the frame's tables above it.
+pub(crate) fn should_attach_dict(cdict: &CParams, src_size: Option<u64>) -> bool {
+    const KB: u64 = 1024;
+    // `attachDictSizeCutoffs[strategy]`: fast 8 KB, dfast 16 KB, greedy /
+    // lazy / lazy2 / btlazy2 / btopt 32 KB, btultra / btultra2 8 KB.
+    let cutoff = match cdict.strategy {
+        1 => 8 * KB,
+        2 => 16 * KB,
+        3..=7 => 32 * KB,
+        _ => 8 * KB,
+    };
+    src_size.is_none_or(|s| s <= cutoff)
+}
+
+/// `ZSTD_getCParams_internal` with the `ZSTD_cpm_createCDict` switch.
+fn get_cparams_mode(
+    compression_level: i32,
+    src_size_hint: u64,
+    dict_size: usize,
+    create_cdict: bool,
+) -> CParams {
     let r_size = cparam_row_size(src_size_hint, dict_size);
     let table_id = (u32::from(r_size <= KB_256)
         + u32::from(r_size <= KB_128)
@@ -260,8 +322,7 @@ pub(crate) fn get_cparams(compression_level: i32, src_size_hint: u64, dict_size:
         cp.target_length = (-clamped) as u32;
     }
 
-    // `ZSTD_cpm_unknown` (the public entry): no createCDict source assumption.
-    adjust_cparams(cp, src_size_hint, dict_size, /* create_cdict */ false)
+    adjust_cparams(cp, src_size_hint, dict_size, create_cdict)
 }
 
 /// Public `ZSTD_getCParams` entry: maps `src_size_hint == 0` to UNKNOWN,

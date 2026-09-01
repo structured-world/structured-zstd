@@ -296,14 +296,12 @@ pub enum CompressionLevel {
     /// evaluates up to two positions ahead before committing to a match,
     /// trading speed for a better compression ratio than [`CompressionLevel::Default`].
     Better,
-    /// This level is roughly equivalent to Zstd level 11.
+    /// This level is equivalent to Zstd level 13.
     ///
-    /// Uses the hash-chain matcher with a deep lazy2 matching strategy and
-    /// a 16 MiB window. Compared to [`CompressionLevel::Better`], this level
-    /// uses larger hash and chain tables (2 M / 1 M entries vs 1 M / 512 K),
-    /// a deeper search (32 candidates vs 16), and a higher target match
-    /// length (128 vs 48), trading speed for the best compression ratio
-    /// available in this crate.
+    /// Uses the lazy2 parse over the binary-tree match finder (`btlazy2`),
+    /// the first level of the deep band that strictly dominates every level
+    /// below it on ratio; compared to [`CompressionLevel::Better`] it
+    /// trades speed for the best ratio of the named presets.
     Best,
     /// Numeric compression level.
     ///
@@ -315,14 +313,14 @@ pub enum CompressionLevel {
     ///
     /// Named variants map to specific numeric levels:
     /// [`Fastest`](Self::Fastest) = 1, [`Default`](Self::Default) = 3,
-    /// [`Better`](Self::Better) = 7, [`Best`](Self::Best) = 11.
+    /// [`Better`](Self::Better) = 7, [`Best`](Self::Best) = 13.
     /// [`Best`](Self::Best) remains the highest-ratio named preset, but
-    /// [`Level`](Self::Level) values above 11 can target stronger (slower)
+    /// [`Level`](Self::Level) values above 13 can target stronger (slower)
     /// tuning than the named hierarchy.
     ///
-    /// Levels above 11 use progressively larger windows and deeper search.
-    /// Levels 16–17 use a `btopt`-style price parser, 18–19 use `btultra`,
-    /// and 20–22 use a `btultra2`-style two-pass selection profile.
+    /// Levels above 13 use progressively larger windows and deeper search.
+    /// Levels 16–17 use a `btopt`-style price parser, 18 uses `btultra`,
+    /// and 19–22 use a `btultra2`-style two-pass selection profile.
     ///
     /// Semver note: this variant was added after the initial enum shape and
     /// is a breaking API change for downstream crates that exhaustively
@@ -340,7 +338,7 @@ impl CompressionLevel {
 
     /// Create a compression level from a numeric value.
     ///
-    /// Returns named variants for canonical levels (`0`/`3`, `1`, `7`, `11`)
+    /// Returns named variants for canonical levels (`0`/`3`, `1`, `7`, `13`)
     /// and [`Level`](Self::Level) for all other values.
     ///
     /// With the default matcher backend (`MatchGeneratorDriver`), values
@@ -351,8 +349,41 @@ impl CompressionLevel {
             0 | Self::DEFAULT_LEVEL => Self::Default,
             1 => Self::Fastest,
             7 => Self::Better,
-            11 => Self::Best,
+            13 => Self::Best,
             _ => Self::Level(level),
+        }
+    }
+}
+
+/// The sizes of a dictionary handed to [`Matcher::set_dictionary_size_hint`].
+///
+/// Upstream picks the CDict's cParams tier from the size of the serialized
+/// dictionary buffer (`ZSTD_createCDict(dictBuffer, dictSize, level)`, header
+/// and entropy tables included), while the dictionary tables and the attach
+/// cutoffs are sized from the content that is actually indexed.
+///
+/// # Examples
+/// ```
+/// use structured_zstd::encoding::DictionarySizes;
+/// let sizes = DictionarySizes::raw_content(4096);
+/// assert_eq!(sizes.serialized, sizes.content);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DictionarySizes {
+    /// Bytes of dictionary content the matcher indexes.
+    pub content: usize,
+    /// Bytes of the serialized dictionary (the CDict cParams tier key); equal
+    /// to `content` for a raw-content dictionary.
+    pub serialized: usize,
+}
+
+impl DictionarySizes {
+    /// Sizes of a raw-content dictionary: nothing but the content is
+    /// serialized.
+    pub const fn raw_content(len: usize) -> Self {
+        Self {
+            content: len,
+            serialized: len,
         }
     }
 }
@@ -404,13 +435,13 @@ pub trait Matcher {
     /// test stubs. The built-in runtime matcher (`MatchGeneratorDriver`)
     /// overrides this hook and applies the hint during level resolution.
     fn set_source_size_hint(&mut self, _size: u64) {}
-    /// Hint the byte size of the dictionary that will be primed into the next
-    /// frame. The built-in runtime matcher uses it to size the binary-tree /
-    /// hash-chain match-finder tables from the dictionary's cParams tier rather
-    /// than the source window (upstream zstd CDict economics), while keeping the
-    /// eviction window source-sized. Default no-op for custom matchers and test
-    /// stubs; consumed at the next [`reset`](Self::reset).
-    fn set_dictionary_size_hint(&mut self, _size: usize) {}
+    /// Hint the sizes of the dictionary that will be primed into the next
+    /// frame. The built-in runtime matcher resolves the frame's cParams from
+    /// the dictionary's CDict tier (upstream `ZSTD_createCDict`, keyed by the
+    /// serialized size) and sizes its dictionary tables from the content.
+    /// Default no-op for custom matchers and test stubs; consumed at the next
+    /// [`reset`](Self::reset).
+    fn set_dictionary_size_hint(&mut self, _sizes: DictionarySizes) {}
     /// Drop any per-frame fine-grained parameter overrides installed via
     /// the public parameter API, reverting to plain level-based geometry
     /// at the next [`reset`](Self::reset). Called by

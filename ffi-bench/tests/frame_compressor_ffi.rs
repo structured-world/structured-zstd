@@ -37,6 +37,43 @@ fn c_decode(compressed: &[u8]) -> Vec<u8> {
     decoded
 }
 
+/// The pre-splitter tier selected per strategy matches upstream's default
+/// `splitLevels[strategy]`: on a homogeneous but periodic 512 KB log stream
+/// the lazy2 / btlazy2 tier (byChunks rate 5) splits into more blocks than
+/// the lazy tier, exactly as `ZSTD_compress2` does, so every level's output
+/// is no larger than the reference's (a wrong tier shows up either as a
+/// ballooned lazy2 frame the reference does not produce, or as a larger
+/// frame on the levels where upstream splits and we would not).
+#[test]
+fn periodic_stream_presplit_matches_reference() {
+    const LINES: &[&str] = &[
+        "ts=2026-03-26T21:39:28Z level=INFO msg=\"flush memtable\" tenant=demo table=orders region=eu-west\n",
+        "ts=2026-03-26T21:39:29Z level=INFO msg=\"rotate segment\" tenant=demo table=orders region=eu-west\n",
+        "ts=2026-03-26T21:39:30Z level=INFO msg=\"compact level\" tenant=demo table=orders region=eu-west\n",
+        "ts=2026-03-26T21:39:31Z level=INFO msg=\"write block\" tenant=demo table=orders region=eu-west\n",
+    ];
+    let target = 512 * 1024usize;
+    let mut data = Vec::with_capacity(target);
+    let mut i = 0;
+    while data.len() < target {
+        let line = LINES[i % LINES.len()].as_bytes();
+        let take = line.len().min(target - data.len());
+        data.extend_from_slice(&line[..take]);
+        i += 1;
+    }
+    for level in [3i32, 5, 7, 8, 11, 15, 16] {
+        let ours = compress_to_vec(&data[..], CompressionLevel::Level(level));
+        let reference = zstd::bulk::compress(&data[..], level).expect("C compress");
+        assert!(
+            ours.len() <= reference.len(),
+            "L{level}: ours {} bytes > reference {} bytes on the periodic stream",
+            ours.len(),
+            reference.len()
+        );
+        assert_eq!(c_decode(&ours[..]), data, "L{level} roundtrip through C");
+    }
+}
+
 /// Frame content size is written correctly and C zstd can decompress the output.
 #[test]
 fn fcs_header_written_and_c_zstd_compatible() {

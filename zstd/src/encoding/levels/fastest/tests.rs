@@ -66,6 +66,7 @@ fn rle_branch_passes_compressible_hint_to_skip_matching() {
         block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
         offset_hist: [1, 4, 8],
         strategy_tag: crate::encoding::strategy::StrategyTag::Fast,
+        pre_split: None,
         huf_optimal_search: true,
         literal_compression_disabled: false,
     };
@@ -102,6 +103,7 @@ fn raw_fast_path_emits_raw_block_and_passes_incompressible_hint() {
         block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
         offset_hist: [1, 4, 8],
         strategy_tag: crate::encoding::strategy::StrategyTag::Fast,
+        pre_split: None,
         huf_optimal_search: true,
         literal_compression_disabled: false,
     };

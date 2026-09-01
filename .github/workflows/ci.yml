@@ -463,12 +463,14 @@ jobs:
           for p in simd scalar; do
             sz=$(stat -c %s "zstd-wasm/npm/$p/structured_zstd_wasm_bg.wasm")
             echo "$p payload: $sz bytes"
-            # Ceiling (~1 MiB) over the ~550 KiB baseline; bumped from 768 KiB
-            # when the per-tier match kernels (monomorphised per MLS + the
-            # simd128/scalar count tiers) legitimately grew the module, with
-            # headroom for the remaining backends gaining simd128 tiers.
-            if [ "$sz" -gt 1048576 ]; then
-              echo "::error::$p .wasm is $sz bytes, over the 1 MiB budget"
+            # Ceiling (1.25 MiB) over the ~1 MiB current size; bumped from
+            # 768 KiB when the per-tier match kernels (monomorphised per MLS +
+            # the simd128/scalar count tiers) legitimately grew the module, and
+            # from 1 MiB when the lazy backend gained its third (binary-tree)
+            # finder, with headroom for the remaining backends gaining
+            # simd128 tiers.
+            if [ "$sz" -gt 1310720 ]; then
+              echo "::error::$p .wasm is $sz bytes, over the 1.25 MiB budget"
               exit 1
             fi
           done

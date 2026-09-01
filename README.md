@@ -63,7 +63,7 @@ Complete [RFC 8878](https://www.rfc-editor.org/rfc/rfc8878) implementation, incl
 
 All standard compression levels are wired and produce valid Zstandard frames decodable by both this crate and upstream C zstd:
 
-- **Named presets:** `Fastest` (≈1), `Default` (≈3), `Better` (≈7), `Best` (≈11)
+- **Named presets:** `Fastest` (≈1), `Default` (≈3), `Better` (≈7), `Best` (≈13)
 - **Numeric levels:** `0..=22` and negative ultra-fast levels via `CompressionLevel::from_level(n)` — C zstd-compatible numbering
 - **Fine-grained parameters:** override individual knobs (`windowLog`, `hashLog`, `chainLog`, `searchLog`, `minMatch`, `targetLength`, `strategy`) and activate **long-distance matching** via `CompressionParameters::builder(...)`, the drop-in equivalent of C zstd's `ZSTD_CCtx_setParameter` surface
 - **Streaming encoder** via `std::io::Write`
@@ -89,13 +89,13 @@ Behind the `dict_builder` feature flag, the `dictionary` module can:
 |-------------|----------|---------|
 | 1-2         | `Fast`     | `Simple` matcher |
 | 3-4         | `Dfast`    | `Dfast` two-tier hash |
-| 5           | `Greedy`   | `Row` matcher (`lazy_depth=0`) |
-| 6-15        | `Lazy` / `Lazy2` | `HashChain` (`lazy_depth=1` or `2`) |
+| 5-12        | `Greedy` / `Lazy` / `Lazy2` | `Row` lazy parse (`lazy_depth=0/1/2`): row match-finder above a 2^14 window, hash chain at or below it |
+| 13-15       | `Btlazy2`  | `Row` lazy parse over the lazily-sorted binary tree |
 | 16-17       | `BtOpt`    | `HashChain` candidates + `btopt` price parser |
 | 18          | `BtUltra`  | `HashChain` candidates + `btultra` price parser |
 | 19-22       | `BtUltra2` | `HashChain` candidates + `btultra2` dual-profile parse |
 
-The level → strategy column matches upstream zstd `ZSTD_defaultCParameters[0]` at `zstd/lib/compress/clevels.h:25-50` (srcSize > 256 KiB tier). Upstream routes `greedy`/`lazy`/`lazy2` through its row-based matchfinder when `windowLog > 14`; we route `Greedy` through the row matcher (matching upstream) but `Lazy`/`Lazy2` through the hash-chain matcher — an intentional architectural difference, not an oversight.
+The level → strategy column matches upstream zstd `ZSTD_defaultCParameters[0]` at `zstd/lib/compress/clevels.h:25-50` (srcSize > 256 KiB tier); smaller sources shift the row per upstream's size tiers. The whole greedy..btlazy2 band runs upstream's `ZSTD_compressBlock_lazy_generic` parse on the `Row` backend over the three upstream match finders (rows / hash chain per `ZSTD_resolveRowMatchFinderMode`, lazily-sorted binary tree for `btlazy2`).
 
 </details>
 

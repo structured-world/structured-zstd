@@ -107,17 +107,21 @@ pub(crate) enum SearchMethod {
     HashChain,
     /// Binary-tree finder for the optimal parser (upstream zstd `ZSTD_BtGetAllMatches`).
     BinaryTree,
+    /// Lazily-sorted binary-tree finder inside the lazy parse (upstream zstd
+    /// `ZSTD_btlazy2`: `ZSTD_BtFindBestMatch` searched by `lazy_generic`).
+    BinaryTreeLazy,
 }
 
 impl SearchMethod {
     /// Storage backend (matcher variant) this search method runs in.
     /// `BinaryTree` shares the `HashChain` storage (the BT scratch lives
-    /// inside the hash-chain matcher, gated by `uses_bt`).
+    /// inside the hash-chain matcher, gated by `uses_bt`); `BinaryTreeLazy`
+    /// is the third finder of the lazy (Row) backend.
     pub(crate) const fn backend(self) -> BackendTag {
         match self {
             Self::Fast => BackendTag::Simple,
             Self::DoubleFast => BackendTag::Dfast,
-            Self::RowHash => BackendTag::Row,
+            Self::RowHash | Self::BinaryTreeLazy => BackendTag::Row,
             Self::HashChain | Self::BinaryTree => BackendTag::HashChain,
         }
     }
@@ -270,30 +274,24 @@ impl Strategy for Lazy {
     const SUFFICIENT_MATCH_LEN: usize = 32;
 }
 
-/// Levels 13-15 — upstream zstd `ZSTD_btlazy2`. Binary-tree match finder driving
-/// a greedy/lazy parse (NOT the optimal DP). Reuses the BT candidate
-/// collector to surface the longest match per position, then commits it
-/// greedily. minMatch = 5 (`search_mls`); the BT find runs to full depth
-/// (no `sufficient_match_len` early bail — upstream zstd `ZSTD_BtFindBestMatch`
-/// does not cap by `targetLength`), so `MAX_CHAIN_DEPTH` must be large
-/// enough that the runtime `HcConfig::search_depth` (16/32/64 for
-/// L13/14/15) governs the BT walk, not this const.
+/// Levels 13-15 — upstream zstd `ZSTD_btlazy2`: the lazy2 parse over the
+/// lazily-sorted binary-tree finder (`ZSTD_BtFindBestMatch`), the third
+/// finder of the lazy (Row) backend. Not the optimal DP: the BT find runs to
+/// full depth and the parse commits by the lazy gain rule.
 #[derive(Copy, Clone, Debug, Default)]
 pub(crate) struct Btlazy2;
 
 impl Strategy for Btlazy2 {
-    const BACKEND: BackendTag = BackendTag::HashChain;
+    const BACKEND: BackendTag = BackendTag::Row;
     const MIN_MATCH: usize = 5;
     const ACCURATE_PRICE: bool = false;
     const FAVOR_SMALL_OFFSETS: bool = true;
     const USE_HASH3: bool = false;
-    const USE_BT: bool = true;
+    const USE_BT: bool = false;
     const OPT_LEVEL: u8 = 0;
-    // L15 configures search_depth = 64; keep the cap at 64 so
-    // `max_chain_depth.min(search_depth)` lets the level's search_depth
-    // govern (BtOpt's 32 would silently halve L15's BT walk).
+    // Placeholder optimal-parser consts; see `Fast` for the
+    // unreachable-by-design contract.
     const MAX_CHAIN_DEPTH: usize = 64;
-    // Full BT find, no early bail (upstream zstd `ZSTD_BtFindBestMatch`).
     const SUFFICIENT_MATCH_LEN: usize = usize::MAX;
 }
 
@@ -367,9 +365,8 @@ pub(crate) enum StrategyTag {
     Dfast,
     Greedy,
     Lazy,
-    /// Upstream zstd `ZSTD_btlazy2` (levels 13-15): binary-tree match finder with a
-    /// lazy parse (not the optimal DP). Shares the BT table layout / finder
-    /// with the opt strategies (`uses_bt`) but selects greedily/lazily.
+    /// Upstream zstd `ZSTD_btlazy2` (levels 13-15): the lazy2 parse over the
+    /// lazily-sorted binary-tree finder, on the lazy (Row) backend.
     Btlazy2,
     BtOpt,
     BtUltra,
@@ -421,7 +418,8 @@ impl StrategyTag {
             CompressionLevel::Fastest => Self::Fast,
             CompressionLevel::Default => Self::Dfast,
             CompressionLevel::Better => Self::Lazy,
-            CompressionLevel::Best => Self::Lazy,
+            // `Best` is level 13 (`levels::config::numeric_level`).
+            CompressionLevel::Best => Self::Btlazy2,
             CompressionLevel::Level(n) => {
                 if n <= 0 {
                     if n == 0 { Self::Dfast } else { Self::Fast }
@@ -441,16 +439,16 @@ impl StrategyTag {
     }
 
     /// Bridge to [`BackendTag`] for the dispatcher entry point.
-    /// Greedy AND lazy run on the Row finder (upstream zstd
-    /// `ZSTD_resolveRowMatchFinderMode`: row mode is the default for
-    /// greedy..lazy2); the BT strategies keep the HashChain storage
-    /// (their tree scratch lives inside it).
+    /// Greedy, lazy AND btlazy2 run on the lazy (Row) backend, which hosts
+    /// the row, hash-chain and lazily-sorted binary-tree finders of upstream's
+    /// `lazy_generic` parse; the optimal strategies keep the HashChain
+    /// storage (their tree scratch lives inside it).
     pub(crate) const fn backend(self) -> BackendTag {
         match self {
             Self::Fast => BackendTag::Simple,
             Self::Dfast => BackendTag::Dfast,
-            Self::Greedy | Self::Lazy => BackendTag::Row,
-            Self::Btlazy2 | Self::BtOpt | Self::BtUltra | Self::BtUltra2 => BackendTag::HashChain,
+            Self::Greedy | Self::Lazy | Self::Btlazy2 => BackendTag::Row,
+            Self::BtOpt | Self::BtUltra | Self::BtUltra2 => BackendTag::HashChain,
         }
     }
 
@@ -463,9 +461,8 @@ impl StrategyTag {
             Self::Fast => SearchMethod::Fast,
             Self::Dfast => SearchMethod::DoubleFast,
             Self::Greedy | Self::Lazy => SearchMethod::RowHash,
-            Self::Btlazy2 | Self::BtOpt | Self::BtUltra | Self::BtUltra2 => {
-                SearchMethod::BinaryTree
-            }
+            Self::Btlazy2 => SearchMethod::BinaryTreeLazy,
+            Self::BtOpt | Self::BtUltra | Self::BtUltra2 => SearchMethod::BinaryTree,
         }
     }
 

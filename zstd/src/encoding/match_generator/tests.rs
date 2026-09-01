@@ -284,7 +284,7 @@ fn l4_greedy_round_trip(slice_size: usize, max_slices: usize, data: &[u8]) -> (u
     // early-return guard) gets exercised.
     if data.is_empty() {
         let mut space = driver.get_next_space();
-        space.truncate(0);
+        space.clear();
         driver.commit_space(space);
         driver.start_matching(|seq| match seq {
             Sequence::Literals { literals } => reconstructed.extend_from_slice(literals),
@@ -321,8 +321,11 @@ fn driver_level5_greedy_tail_rep_only_reachable() {
     // implicit anchor, no further because anchor itself is the
     // current `abs_pos`).
     let first: &[u8] = b"ABCDABCDABCDABCD"; // 16 bytes — strict period 4
-    let second: &[u8] = b"ABCDA"; // 5 bytes — exact GREEDY_MIN_LOOKAHEAD
-    let mut driver = MatchGeneratorDriver::new(16, 2);
+    // The parse never searches the last 16 bytes of a block (upstream
+    // `lazy_generic` `ilimit`), so the slice carries the period-4 rep past
+    // that tail: the rep probe at the first position finds offset 4.
+    let second: &[u8] = b"ABCDABCDABCDABCDABCDA"; // 21 bytes
+    let mut driver = MatchGeneratorDriver::new(32, 2);
     driver.reset(CompressionLevel::Level(5));
 
     let mut first_space = driver.get_next_space();
@@ -362,7 +365,7 @@ fn driver_level4_greedy_empty_input_emits_nothing() {
     // `window.back()` unwrap — that's a separate path covered by
     // existing reset tests).
     let mut space = driver.get_next_space();
-    space.truncate(0);
+    space.clear();
     driver.commit_space(space);
     let mut emitted_anything = false;
     driver.start_matching(|_| emitted_anything = true);
@@ -792,10 +795,12 @@ fn level_params_strategy_and_search_method_agree_across_tiers() {
                 StrategyTag::Fast => p.search == SearchMethod::Fast,
                 StrategyTag::Dfast => p.search == SearchMethod::DoubleFast,
                 StrategyTag::Greedy | StrategyTag::Lazy => p.search == SearchMethod::RowHash,
-                StrategyTag::Btlazy2
-                | StrategyTag::BtOpt
-                | StrategyTag::BtUltra
-                | StrategyTag::BtUltra2 => p.search == SearchMethod::BinaryTree,
+                StrategyTag::Btlazy2 => {
+                    p.search == SearchMethod::BinaryTreeLazy && p.row.is_some_and(|r| r.bt)
+                }
+                StrategyTag::BtOpt | StrategyTag::BtUltra | StrategyTag::BtUltra2 => {
+                    p.search == SearchMethod::BinaryTree
+                }
             };
             assert!(
                 consistent,
@@ -1352,19 +1357,16 @@ fn hc_collect_optimal_candidates_dispatches_every_bt_strategy() {
     use crate::encoding::strategy::StrategyTag;
     // The public dispatcher must route every BT strategy tag to the collector
     // AND to the specialization carrying that tag's consts — not just survive.
-    // The observable dimension is `USE_HASH3` (BtUltra / BtUltra2 = true; BtOpt /
-    // Btlazy2 = false): only the hash3 specializations surface a 3-byte match
-    // that the 4-byte BT hash cannot find. (BtOpt vs Btlazy2 share identical
-    // collect consts, so they are indistinguishable at runtime — the type
-    // mapping there is compiler-enforced.) Fixture: `abc` repeats at 0 and 12
-    // with a differing 4th byte (`Q` vs `Z`), so hash3 finds a length-3 match at
+    // The observable dimension is `USE_HASH3` (BtUltra / BtUltra2 = true; BtOpt
+    // = false): only the hash3 specializations surface a 3-byte match that the
+    // 4-byte BT hash cannot find. Fixture: `abc` repeats at 0 and 12 with a
+    // differing 4th byte (`Q` vs `Z`), so hash3 finds a length-3 match at
     // offset 12 while the 4-byte hash of `abcZ` misses `abcQ`. Run under the
     // scalar kernel so the scalar dispatch arm is exercised too.
     for tag in [
         StrategyTag::BtOpt,
         StrategyTag::BtUltra,
         StrategyTag::BtUltra2,
-        StrategyTag::Btlazy2,
     ] {
         let mut hc = HcMatchGenerator::new(64);
         hc.strategy_tag = tag;
@@ -1747,7 +1749,7 @@ fn driver_huge_source_hint_with_dict_does_not_overflow_hc_reserve() {
     // truncate.
     let mut driver = MatchGeneratorDriver::new(32, 2);
     driver.set_source_size_hint(u64::MAX);
-    driver.set_dictionary_size_hint(64 * 1024);
+    driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(64 * 1024));
     driver.reset(CompressionLevel::Level(16));
 
     // The saturated `usize::MAX` reserve target must be clamped to the HC
@@ -1768,6 +1770,342 @@ fn driver_huge_source_hint_with_dict_does_not_overflow_hc_reserve() {
     space.truncate(12);
     driver.commit_space(space);
     driver.skip_matching_with_hint(None);
+}
+
+/// Regression: a dictionary frame runs the CDict's strategy even when the
+/// source-size tier put the plain level in another backend family
+/// (upstream `ZSTD_resetCCtx_usingCDict` takes the CDict's cParams
+/// unconditionally): L13 on a 4 KiB source is btopt, but a 300 KiB CDict
+/// is btlazy2, so the frame is btlazy2 on the lazy backend with a plan; L2
+/// on a 100 KiB source is dfast, but a 4 KiB CDict is fast.
+#[test]
+fn dictionary_frame_takes_the_cdict_strategy_across_backend_families() {
+    use crate::encoding::levels::config::resolve_level_params_with_dict;
+    use crate::encoding::strategy::{BackendTag, StrategyTag};
+    let (params, plan) = resolve_level_params_with_dict(
+        CompressionLevel::Level(13),
+        Some(4096),
+        crate::encoding::DictionarySizes::raw_content(300 * 1024),
+    );
+    assert_eq!(params.strategy_tag, StrategyTag::Btlazy2);
+    assert_eq!(params.backend(), BackendTag::Row);
+    assert!(plan.is_some(), "a lazy-band CDict carries a plan");
+    assert!(params.row.is_some_and(|r| r.bt));
+    let (params, plan) = resolve_level_params_with_dict(
+        CompressionLevel::Level(2),
+        Some(100 * 1024),
+        crate::encoding::DictionarySizes::raw_content(4096),
+    );
+    assert_eq!(params.strategy_tag, StrategyTag::Fast);
+    assert_eq!(params.backend(), BackendTag::Simple);
+    assert!(
+        plan.is_none(),
+        "the Fast backend primes its dictionary itself"
+    );
+}
+
+/// Regression: the Dfast attached dictionary tables take the CDict's
+/// `hashLog` / `chainLog` (upstream hashes the dictMatchState tables with
+/// `dictCParams`), not the live tables' source-capped widths: a 1 KiB
+/// source caps the live tables at 11 / 10 bits while a 20 KiB dictionary's
+/// CDict tables are 16 / 15 bits.
+#[test]
+fn driver_dfast_dictionary_tables_take_the_cdict_geometry() {
+    let dict: Vec<u8> = (0..20 * 1024u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+    driver.set_source_size_hint(1024);
+    driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
+    driver.reset(CompressionLevel::Level(3));
+    driver.prime_with_dictionary(&dict, [1, 4, 8]);
+    let cd = crate::encoding::cparams::get_cdict_cparams(3, dict.len());
+    let live = driver.dfast_matcher().live_table_bits();
+    let built = driver
+        .dfast_matcher()
+        .dict_table_bits()
+        .expect("attached dictionary tables");
+    assert_eq!(
+        built,
+        (cd.hash_log as usize, cd.chain_log as usize),
+        "dict tables must have the CDict geometry"
+    );
+    assert!(
+        live.0 < built.0,
+        "the source-capped live tables are narrower ({live:?} vs {built:?})"
+    );
+}
+
+/// Regression: the Fast dictionary table takes the CDict's `hashLog`
+/// (upstream `ZSTD_createCDict` sizes it from the dictionary), not the
+/// source-capped main table's: a 1 KiB source caps the main table at
+/// `hashLog` 11 while a 20 KiB dictionary needs the wider CDict table.
+#[test]
+fn driver_fast_dictionary_table_takes_the_cdict_hash_log() {
+    let dict: Vec<u8> = (0..20 * 1024u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+    driver.set_source_size_hint(1024);
+    driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
+    driver.reset(CompressionLevel::Level(1));
+    driver.prime_with_dictionary(&dict, [1, 4, 8]);
+    let expected = crate::encoding::cparams::get_cdict_cparams(1, dict.len()).hash_log;
+    let built = driver
+        .simple_mut()
+        .built_dict_table_hash_log()
+        .expect("attached dictionary table");
+    assert_eq!(built, expected, "dict table hashLog must be the CDict's");
+    assert!(
+        driver.simple_mut().hash_log() < expected,
+        "the source-capped main table is narrower than the CDict table"
+    );
+}
+
+/// The Fast dictionary table follows the CDict `hashLog` of the frame's
+/// level (13 at L1, 12 at L-1 for a 20 KiB dictionary) across level changes
+/// on one driver. (L1 and L-1 also differ in `mls`, so the reset rebuilds
+/// the main table and drops the resident dictionary table anyway; the Dfast
+/// test below is the case where only the CDict geometry changes.)
+#[test]
+fn driver_fast_dictionary_table_follows_the_cdict_geometry_across_levels() {
+    let dict: Vec<u8> = (0..20 * 1024u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+    for level in [1, -1] {
+        driver.set_source_size_hint(1024);
+        driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
+        driver.reset(CompressionLevel::Level(level));
+        if !driver.dictionary_is_resident() {
+            driver.prime_with_dictionary(&dict, [1, 4, 8]);
+        }
+        let expected = crate::encoding::cparams::get_cdict_cparams(level, dict.len()).hash_log;
+        let built = driver
+            .simple_mut()
+            .built_dict_table_hash_log()
+            .expect("attached dictionary table");
+        assert_eq!(built, expected, "level {level}: dict table hashLog");
+    }
+}
+
+/// Regression: same for the Dfast attached tables. L3 and L4 share the
+/// source-capped live widths on a 1 KiB source, but a 300 KiB dictionary's
+/// CDict tables are 17 / 16 bits at L3 and 18 / 18 at L4; a resident L3
+/// table re-borrowed by the L4 frame would be probed at the wrong widths.
+#[test]
+fn driver_dfast_dictionary_tables_follow_the_cdict_geometry_across_levels() {
+    let dict: Vec<u8> = (0..300 * 1024u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+    for level in [3, 4] {
+        driver.set_source_size_hint(1024);
+        driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
+        driver.reset(CompressionLevel::Level(level));
+        if !driver.dictionary_is_resident() {
+            driver.prime_with_dictionary(&dict, [1, 4, 8]);
+        }
+        let cd = crate::encoding::cparams::get_cdict_cparams(level, dict.len());
+        let built = driver
+            .dfast_matcher()
+            .dict_table_bits()
+            .expect("attached dictionary tables");
+        assert_eq!(
+            built,
+            (cd.hash_log as usize, cd.chain_log as usize),
+            "level {level}: dict table widths"
+        );
+    }
+}
+
+/// Regression: a dictionary frame takes its finder geometry from the CDict
+/// (upstream `ZSTD_resetCCtx_byAttachingCDict`: "cdict overrides"), so
+/// public `search_log` / `min_match` overrides must not reshape the live
+/// search away from the tables the dictionary was indexed with; only the
+/// window override survives. A 20 KiB dictionary on a 16 KiB source is
+/// attached with the row finder at the CDict's `rowLog` 4 and key width 4;
+/// an override to 6 / 6 would probe rows of another width with another key
+/// and lose every dictionary match.
+#[test]
+fn driver_dictionary_frame_ignores_finder_overrides() {
+    let ov = super::super::parameters::ParamOverrides {
+        search_log: Some(6),
+        min_match: Some(6),
+        ..Default::default()
+    };
+    let dict: Vec<u8> = (0..20 * 1024u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+    driver.set_source_size_hint(1 << 14);
+    driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
+    driver.set_param_overrides(Some(ov));
+    driver.reset(CompressionLevel::Level(6));
+    driver.prime_with_dictionary(&dict, [1, 4, 8]);
+    assert_eq!(
+        driver.active_backend(),
+        super::super::strategy::BackendTag::Row
+    );
+    // A block made of two dictionary slices: every match must come from the
+    // dictionary, through the geometry it was indexed with.
+    let mut block = dict[1000..1064].to_vec();
+    block.extend_from_slice(&dict[5000..5064]);
+    let mut space = driver.get_next_space();
+    space.clear();
+    space.extend_from_slice(&block);
+    driver.commit_space(space);
+    let mut dict_matches = 0usize;
+    driver.start_matching(|seq| {
+        if let Sequence::Triple { offset, .. } = seq
+            && offset > block.len()
+        {
+            dict_matches += 1;
+        }
+    });
+    assert!(
+        dict_matches >= 2,
+        "the attached dictionary must be found through the CDict geometry (got {dict_matches})"
+    );
+}
+
+/// Regression: a reset WITHOUT a dictionary drops the resident attached
+/// tables (both backends receive a `None` geometry): the previous dictionary
+/// frame's cache must not be re-borrowed by a frame whose header declares no
+/// dictionary.
+#[test]
+fn driver_no_dictionary_reset_drops_the_attached_tables() {
+    let dict: Vec<u8> = (0..20 * 1024u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    // Dfast: dict frame at L3, then a plain L3 frame.
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+    driver.set_source_size_hint(1024);
+    driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
+    driver.reset(CompressionLevel::Level(3));
+    driver.prime_with_dictionary(&dict, [1, 4, 8]);
+    assert!(driver.dfast_matcher().dict_table_bits().is_some());
+    driver.set_source_size_hint(1024);
+    driver.reset(CompressionLevel::Level(3));
+    assert!(
+        driver.dfast_matcher().dict_table_bits().is_none(),
+        "a no-dictionary frame must not keep the attached Dfast tables"
+    );
+    // Fast: dict frame at L1, then a plain L1 frame.
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+    driver.set_source_size_hint(1024);
+    driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
+    driver.reset(CompressionLevel::Level(1));
+    driver.prime_with_dictionary(&dict, [1, 4, 8]);
+    assert!(driver.simple_mut().built_dict_table_hash_log().is_some());
+    driver.set_source_size_hint(1024);
+    driver.reset(CompressionLevel::Level(1));
+    assert!(
+        driver.simple_mut().built_dict_table_hash_log().is_none(),
+        "a no-dictionary frame must not keep the attached Fast table"
+    );
+}
+
+/// Regression: switching a reused compressor from a tree level back to a
+/// rows level (both on the Row backend, so no backend swap runs) releases
+/// the chain / tree tables — they are tens of MiB at the btlazy2 levels and
+/// the rows finder never reads them.
+#[test]
+fn driver_rows_reset_releases_the_tree_tables() {
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+    driver.set_source_size_hint(1 << 20);
+    driver.reset(CompressionLevel::Level(15));
+    let mut space = driver.get_next_space();
+    space[..12].copy_from_slice(b"abcabcabcabc");
+    space.truncate(12);
+    driver.commit_space(space);
+    driver.skip_matching_with_hint(None);
+    assert!(
+        driver.row_matcher().hc_tables_len() > 0,
+        "tree tables live at L15"
+    );
+    driver.set_source_size_hint(1 << 20);
+    driver.reset(CompressionLevel::Level(5));
+    let mut space = driver.get_next_space();
+    space[..12].copy_from_slice(b"abcabcabcabc");
+    space.truncate(12);
+    driver.commit_space(space);
+    driver.skip_matching_with_hint(None);
+    assert_eq!(
+        driver.row_matcher().hc_tables_len(),
+        0,
+        "a rows frame must not retain the previous tree tables"
+    );
+}
+
+/// Regression: registering a borrowed window rebases the coordinate origin
+/// before the cumulative floor would push stored `u32` positions past
+/// `u32::MAX` (the owned path does this in `add_data`; the borrowed reuse
+/// path advanced the floor per frame without ever rebasing, so after ~4 GiB
+/// of reused one-shot frames every inserted position wrapped and matching
+/// silently degraded).
+#[test]
+fn borrowed_window_rebases_before_the_u32_cursor_wraps() {
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+    driver.set_source_size_hint(1 << 20);
+    driver.reset(CompressionLevel::Level(5));
+    let buf = alloc::vec![0u8; 1 << 20];
+    let floor = u32::MAX as usize - (1 << 19);
+    driver.row_matcher_mut().set_abs_floor(floor);
+    // SAFETY: `buf` outlives the borrowed window in this test.
+    unsafe { driver.row_matcher_mut().set_borrowed_window(&buf) };
+    let after = driver.row_matcher_mut().abs_floor();
+    assert!(
+        after + buf.len() < u32::MAX as usize - 1,
+        "borrowed window left the floor at {after}: positions would wrap u32"
+    );
+}
+
+/// Regression: a Dfast attach-mode dictionary table primed for an
+/// unknown-size frame (attach at the FULL live widths) must not be
+/// re-borrowed by a frame past the 16 KiB attach cutoff whose live widths
+/// happen to be the same: that frame runs COPY mode (dict merged into the
+/// live tables), and searching the stale attached table instead defeats the
+/// cutoff. (A hinted small attach frame is already safe: its source-capped
+/// live widths differ, and `set_hash_bits` drops the cache on any change.)
+#[test]
+fn driver_dfast_attach_table_is_dropped_when_the_next_frame_copies() {
+    let dict: Vec<u8> = (0..20 * 1024u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+    driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
+    driver.reset(CompressionLevel::Level(3));
+    driver.prime_with_dictionary(&dict, [1, 4, 8]);
+    assert!(driver.dfast_matcher().dict_table_bits().is_some());
+    // Same dictionary, 100 KiB source: past the attach cutoff, copy mode.
+    driver.set_source_size_hint(100 * 1024);
+    driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
+    driver.reset(CompressionLevel::Level(3));
+    assert!(
+        !driver.dictionary_is_resident(),
+        "a copy-mode frame must not re-borrow the attached table"
+    );
+    assert!(driver.dfast_matcher().dict_table_bits().is_none());
+}
+
+/// Regression: the "cdict overrides" rule holds for every dictionary
+/// backend, not only the lazy band: a 4 KiB CDict resolves L2 to the fast
+/// strategy (Simple backend) and a `BtUltra2` strategy override must not
+/// re-route the dictionary frame onto the optimal backend.
+#[test]
+fn driver_dictionary_frame_ignores_a_strategy_override_on_a_fast_cdict() {
+    use super::super::strategy::BackendTag;
+    let ov = super::super::parameters::ParamOverrides {
+        strategy: Some(crate::encoding::Strategy::Btultra2),
+        ..Default::default()
+    };
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+    driver.set_source_size_hint(100 * 1024);
+    driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(4096));
+    driver.set_param_overrides(Some(ov));
+    driver.reset(CompressionLevel::Level(2));
+    assert_eq!(driver.active_backend(), BackendTag::Simple);
 }
 
 #[test]
@@ -1794,14 +2132,17 @@ fn driver_chain_log_override_survives_row_to_hc_fallback() {
     space.truncate(12);
     driver.commit_space(space);
     driver.skip_matching_with_hint(None);
-    // The override (10) is below the window cap (14), so the resolved HC chain
-    // table must reflect it — NOT the upstream zstd `hashLog - 1` (18, clamped to the
-    // window 14). Pre-fix this resolved to 14.
+    // The override (10) is below the window cap (14), so the resolved chain
+    // table must reflect it — NOT the level's `chainLog`.
+    assert!(
+        driver.row_matcher().uses_hash_chain(),
+        "windowLog <= 14 searches the hash chain"
+    );
     assert_eq!(
-        driver.hc_matcher().table.chain_log,
+        driver.row_matcher().hc_chain_log(),
         chain_log_override as usize,
-        "explicit chain_log override must survive the Row->HC fallback, got {}",
-        driver.hc_matcher().table.chain_log
+        "explicit chain_log override must reach the hash chain, got {}",
+        driver.row_matcher().hc_chain_log()
     );
 }
 
@@ -1853,8 +2194,53 @@ fn driver_small_source_hint_shrinks_row_hash_tables() {
     assert_eq!(driver.window_size(), 1 << MIN_WINDOW_LOG);
     assert_eq!(
         driver.active_backend(),
+        super::super::strategy::BackendTag::Row,
+        "greedy/lazy stay on the Row backend; it switches the finder itself",
+    );
+    assert!(
+        driver.row_matcher().uses_hash_chain(),
+        "windowLog <= 14 must search the upstream zstd hash chain",
+    );
+}
+
+/// btlazy2 levels run on the lazy (Row) backend with the binary-tree finder,
+/// wherever the source-size tier puts strategy 6: L13 at tier 0, L10 at the
+/// <= 16 KiB tier (where L11 is already btopt, an optimal level on the
+/// HashChain backend).
+#[test]
+fn driver_btlazy2_levels_search_the_binary_tree_on_the_row_backend() {
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+    driver.reset(CompressionLevel::Level(13));
+    let mut space = driver.get_next_space();
+    space[..12].copy_from_slice(b"abcabcabcabc");
+    space.truncate(12);
+    driver.commit_space(space);
+    driver.skip_matching_with_hint(None);
+    assert_eq!(
+        driver.active_backend(),
+        super::super::strategy::BackendTag::Row
+    );
+    assert!(driver.row_matcher().uses_binary_tree());
+
+    driver.set_source_size_hint(1 << 12);
+    driver.reset(CompressionLevel::Level(10));
+    let mut space = driver.get_next_space();
+    space[..12].copy_from_slice(b"abcabcabcabc");
+    space.truncate(12);
+    driver.commit_space(space);
+    driver.skip_matching_with_hint(None);
+    assert_eq!(
+        driver.active_backend(),
+        super::super::strategy::BackendTag::Row
+    );
+    assert!(driver.row_matcher().uses_binary_tree());
+
+    driver.set_source_size_hint(1 << 12);
+    driver.reset(CompressionLevel::Level(11));
+    assert_eq!(
+        driver.active_backend(),
         super::super::strategy::BackendTag::HashChain,
-        "windowLog <= 14 must fall back to the upstream zstd hash-chain matchfinder",
+        "L11 on a <= 16 KiB source is btopt (optimal parser)"
     );
 }
 
@@ -1922,9 +2308,11 @@ fn row_short_block_emits_literals_only() {
     );
     assert_eq!(reconstructed, b"abcde");
 
-    // Then feed a clearly matchable block and ensure the Triple arm is reachable.
+    // Then feed a clearly matchable block and ensure the Triple arm is
+    // reachable. The block must exceed the 16-byte tail the lazy parse never
+    // searches (upstream zstd `lazy_generic` `ilimit`).
     saw_triple = false;
-    matcher.add_data(b"abcdeabcde".to_vec(), |_| {});
+    matcher.add_data(b"abcdeabcdeabcdeabcde-padding-past-ilimit".to_vec(), |_| {});
     matcher.start_matching(|seq| {
         if let Sequence::Triple { .. } = seq {
             saw_triple = true;
@@ -1968,7 +2356,10 @@ fn row_backfills_previous_block_tail_for_cross_boundary_match() {
 
     let mut first_block = alloc::vec![0xA5; 64];
     first_block.extend_from_slice(b"XYZ");
-    let second_block = b"XYZXYZtail".to_vec();
+    // Long enough for the lazy parse to search: upstream zstd
+    // `lazy_generic` stops 16 bytes before the block end, so a block shorter
+    // than that is emitted as literals regardless of history.
+    let second_block = b"XYZXYZtail-padding-past-ilimit".to_vec();
 
     let replay_sequence = |decoded: &mut Vec<u8>, seq: Sequence<'_>| match seq {
         Sequence::Literals { literals } => decoded.extend_from_slice(literals),
@@ -2240,10 +2631,11 @@ fn driver_best_to_fastest_releases_oversized_hc_tables() {
 fn driver_better_to_best_resizes_hc_tables() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
 
-    // The lazy band runs on the Row backend now, so the HC resize path is
-    // exercised across two BT levels whose native `HcConfig` widths differ:
-    // L13 (hash_log 22, chain_log 22) -> L15 (hash_log 23, chain_log 23).
-    driver.reset(CompressionLevel::Level(13));
+    // The lazy band (btlazy2 included) runs on the Row backend, so the HC
+    // resize path is exercised across two optimal levels whose native
+    // `HcConfig` widths differ: L16 (hash_log 22, chain_log 22) -> L20
+    // (hash_log 23, chain_log 25).
+    driver.reset(CompressionLevel::Level(16));
     assert_eq!(driver.window_size(), (1u64 << 22));
 
     let mut space = driver.get_next_space();
@@ -2256,9 +2648,9 @@ fn driver_better_to_best_resizes_hc_tables() {
     let better_hash_len = hc.table.hash_table.len();
     let better_chain_len = hc.table.chain_table.len();
 
-    // Switch to L15 — must resize to larger tables.
-    driver.reset(CompressionLevel::Level(15));
-    assert_eq!(driver.window_size(), (1u64 << 22));
+    // Switch to L20 — must resize to larger tables.
+    driver.reset(CompressionLevel::Level(20));
+    assert_eq!(driver.window_size(), (1u64 << 25));
 
     // Feed data to trigger ensure_tables with new sizes.
     let mut space = driver.get_next_space();
@@ -2270,13 +2662,13 @@ fn driver_better_to_best_resizes_hc_tables() {
     let hc = driver.hc_matcher();
     assert!(
         hc.table.hash_table.len() > better_hash_len,
-        "L15 hash_table ({}) should be larger than L13 ({})",
+        "L20 hash_table ({}) should be larger than L16 ({})",
         hc.table.hash_table.len(),
         better_hash_len
     );
     assert!(
         hc.table.chain_table.len() > better_chain_len,
-        "L15 chain_table ({}) should be larger than L13 ({})",
+        "L20 chain_table ({}) should be larger than L16 ({})",
         hc.table.chain_table.len(),
         better_chain_len
     );
@@ -2671,7 +3063,9 @@ fn oversized_dict_hint_routes_fast_to_copy_mode() {
     // the limit suffices to exercise it without allocating a real 16 MiB dict.
     // Copy mode leaves the borrowed in-place dict scan (attach-only) unavailable.
     let mut driver = MatchGeneratorDriver::new(8, 1);
-    driver.set_dictionary_size_hint(MAX_FAST_ATTACH_DICT_REGION + 1);
+    driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(
+        MAX_FAST_ATTACH_DICT_REGION + 1,
+    ));
     driver.reset(CompressionLevel::Level(1));
     driver.prime_with_dictionary(b"small dict content with some padding here", [1, 4, 8]);
     assert!(
@@ -2690,7 +3084,7 @@ fn block_samples_match_dict_is_true_for_non_simple_backend() {
     // Simple/Fast backend trades the blanket scan for a precise probe.
     let dict = b"the quick brown fox jumps over the lazy dog 0123456789abcdef";
     let mut row = MatchGeneratorDriver::new(8, 6);
-    row.set_dictionary_size_hint(dict.len());
+    row.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
     row.reset(CompressionLevel::Level(6));
     row.prime_with_dictionary(dict, [1, 4, 8]);
     assert!(
@@ -2811,12 +3205,13 @@ fn row_prime_with_dictionary_preserves_history_for_first_full_block() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
     // Level(5) is the greedy Row backend (LEVEL_TABLE row 5: Greedy / RowHash).
     // Level(4) now routes to Dfast, so this test must use Level(5) to actually
-    // exercise `RowMatchGenerator`'s dictionary priming. The 16-byte dict +
-    // 16-byte block lets the whole block match the primed dict (offset = dict
-    // length = 16).
+    // exercise `RowMatchGenerator`'s dictionary priming. The 40-byte dict +
+    // 40-byte block lets the whole block match the primed dict (offset = dict
+    // length = 40); the block exceeds the 16-byte tail the parse never
+    // searches (upstream `lazy_generic` `ilimit`).
     driver.reset(CompressionLevel::Level(5));
 
-    let payload = b"abcdefghijklmnop";
+    let payload = b"abcdefghijklmnopqrstuvwxyz0123456789ABCD";
     driver.prime_with_dictionary(payload, [1, 4, 8]);
 
     let mut space = driver.get_next_space();
@@ -3152,13 +3547,15 @@ fn row_hash_and_row_extracts_high_bits() {
 
     let idx = pos - matcher.history_abs_start;
     let concat = matcher.live_history();
-    // Mirror `row_key_value`: an mls-wide masked key when 8 lookahead bytes
-    // exist, the 4-byte key in the tail. `idx = 8` on a 16-byte history has
-    // exactly 8 bytes left, so the wide arm applies here.
-    let key_len = matcher.mls.min(6);
-    let value = u64::from_le_bytes(concat[idx..idx + 8].try_into().unwrap())
-        & ((1u64 << (key_len * 8)) - 1);
-    let hash = crate::encoding::fastpath::hash_mix_u64_with_kernel(matcher.hash_kernel, value);
+    // Mirror upstream `ZSTD_hash5PtrS` (the row levels hash a 5-byte key;
+    // `ROW_CONFIG` carries `mls = ROW_MIN_MATCH_LEN = 5`): the 8-byte read
+    // shifted so the key fills the top 40 bits, times `prime5bytes`, XOR the
+    // fresh-context salt, top `hashLog + 8` bits. `idx = 8` on a 16-byte
+    // history has exactly 8 bytes left, so the wide arm applies here.
+    assert_eq!(matcher.mls.min(6), 5, "test mirrors the 5-byte key hash");
+    let value = u64::from_le_bytes(concat[idx..idx + 8].try_into().unwrap());
+    let hash = ((value << 24).wrapping_mul(crate::encoding::row::ROW_HASH_PRIME5))
+        ^ crate::encoding::row::ROW_HASH_SALT;
     let total_bits = matcher.row_hash_log + ROW_TAG_BITS;
     let combined = hash >> (u64::BITS as usize - total_bits);
     let expected_row =
@@ -3230,7 +3627,7 @@ fn hash_mix_crc_path_is_available_and_matches_accelerated_impl_when_supported() 
 
 #[test]
 fn hc_hash3_position_matches_hash3_formula() {
-    let bytes = [b'a', b'b', b'c', b'd'];
+    let bytes = *b"abcd";
     let read32 = u32::from_le_bytes(bytes);
     let expected = (((read32 << 8).wrapping_mul(HC_PRIME3BYTES)) >> (32 - HC3_HASH_LOG)) as usize;
     assert_eq!(
@@ -3243,7 +3640,7 @@ fn hc_hash3_position_matches_hash3_formula() {
 fn hc_hash_position_matches_hash4_formula() {
     let mut hc = HcMatchGenerator::new(1 << 20);
     hc.configure(HC_CONFIG, super::super::strategy::StrategyTag::Lazy, 22);
-    let bytes = [b'a', b'b', b'c', b'd'];
+    let bytes = *b"abcd";
     let read32 = u32::from_le_bytes(bytes);
     let expected = ((read32.wrapping_mul(HC_PRIME4BYTES)) >> (32 - hc.table.hash_log)) as usize;
     assert_eq!(hc.table.hash_position(&bytes), expected);
@@ -3257,7 +3654,7 @@ fn btultra2_main_hash_uses_hash4_formula() {
         super::super::strategy::StrategyTag::BtUltra2,
         27,
     );
-    let bytes = [b'a', b'b', b'c', b'd', b'e', b'f', b'g', b'h'];
+    let bytes = *b"abcdefgh";
     let read32 = u32::from_le_bytes(bytes[..4].try_into().unwrap());
     let expected = ((read32.wrapping_mul(HC_PRIME4BYTES)) >> (32 - hc.table.hash_log)) as usize;
     let actual = super::super::match_table::storage::MatchTable::hash_position_with_mls(
@@ -3697,7 +4094,7 @@ fn resident_reapply_restores_retained_dictionary_budget() {
     // header's base window and emit an over-window offset.
     let mut driver = MatchGeneratorDriver::new(1 << 16, 1);
     let dict = b"abcdefghABCDEFGHijklmnopqrstuvwxyz0123456789";
-    driver.set_dictionary_size_hint(dict.len());
+    driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
     driver.reset_on_hc_lazy(CompressionLevel::Better);
     driver.prime_with_dictionary(dict, [1, 4, 8]);
     let base = driver.reported_window_size;
@@ -3707,7 +4104,7 @@ fn resident_reapply_restores_retained_dictionary_budget() {
     );
 
     // Second frame: the reset detects the resident dict and re-borrows it.
-    driver.set_dictionary_size_hint(dict.len());
+    driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
     driver.reset_on_hc_lazy(CompressionLevel::Better);
     assert!(
         driver.dictionary_is_resident(),
@@ -5091,10 +5488,13 @@ fn upper_lazy_band_params_match_default_table() {
     ];
     for (level, wlog, hlog, clog, sd) in expected {
         let params = resolve_level_params(CompressionLevel::Level(level), None);
-        let hc = params.hc.unwrap();
-        assert_eq!(hc.search_depth, sd, "L{level}: search_depth");
+        // btlazy2 runs on the lazy (Row) backend: the tree geometry lives in
+        // its `RowConfig` (`hash_bits` / `chain_log`), with the tree flag set.
+        let row = params.row.unwrap();
+        assert!(row.bt, "L{level}: binary-tree finder");
+        assert_eq!(row.search_depth, sd, "L{level}: search_depth");
         assert_eq!(params.window_log, wlog, "L{level}: window_log");
-        assert_eq!(hc.hash_log, hlog, "L{level}: hash_log");
-        assert_eq!(hc.chain_log, clog, "L{level}: chain_log");
+        assert_eq!(row.hash_bits, hlog, "L{level}: hash_log");
+        assert_eq!(row.chain_log, clog, "L{level}: chain_log");
     }
 }

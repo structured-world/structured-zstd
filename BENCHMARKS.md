@@ -36,7 +36,7 @@ encoder:
 - `structured-zstd::Fastest` vs `zstd` level `1`
 - `structured-zstd::Default` vs `zstd` level `3`
 - `structured-zstd::Better` vs `zstd` level `7`
-- `structured-zstd::Best` vs `zstd` level `11`
+- `structured-zstd::Best` vs `zstd` level `13`
 
 Dictionary benchmarks currently include:
 

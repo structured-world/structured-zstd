@@ -155,6 +155,133 @@ impl Write for PartialThenFailWriter {
     }
 }
 
+/// Regression: the streaming encoder cuts full 128 KiB blocks with the same
+/// pre-splitter (`ZSTD_compress_frameChunk` via `ZSTD_splitBlock`) as the
+/// frame compressor's reader path, so both entry points emit the same frame
+/// for the same pledged input. Without it the streaming frame (the CLI path)
+/// was 5.8 % larger at L6 on this corpus file.
+#[test]
+fn streaming_encoder_pre_splits_full_blocks_like_the_frame_compressor() {
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/decodecorpus_files/z000033");
+    let data = std::fs::read(path).unwrap();
+    for level in [6, 16] {
+        let mut streamed = Vec::new();
+        let mut enc = StreamingEncoder::new(&mut streamed, CompressionLevel::Level(level));
+        enc.set_pledged_content_size(data.len() as u64).unwrap();
+        for chunk in data.chunks(8192) {
+            enc.write_all(chunk).unwrap();
+        }
+        enc.finish().unwrap();
+        let mut read = Vec::new();
+        let mut fc: crate::encoding::FrameCompressor<&[u8], &mut Vec<u8>> =
+            crate::encoding::FrameCompressor::new(CompressionLevel::Level(level));
+        fc.set_source_size_hint(data.len() as u64);
+        fc.set_source(&data[..]);
+        fc.set_drain(&mut read);
+        fc.compress();
+        // The block stream after the frame header must be identical (the
+        // headers may describe the window differently).
+        let (_, streamed_header) =
+            crate::decoding::frame::read_frame_header(&streamed[..]).unwrap();
+        let (_, read_header) = crate::decoding::frame::read_frame_header(&read[..]).unwrap();
+        assert_eq!(
+            streamed[usize::from(streamed_header)..],
+            read[usize::from(read_header)..],
+            "level {level}: streaming blocks must be pre-split like the reader path"
+        );
+    }
+}
+
+/// Regression: the matcher and the frame gates resolve from the SAME size
+/// (`pledged_content_size.or(source_size_hint)`), whatever order the setters
+/// ran in. A 4 KiB pledge followed by a 1 MiB advisory hint left the matcher
+/// on the 1 MiB backend while the gates synchronized to the 4 KiB strategy.
+#[test]
+fn streaming_encoder_matcher_and_gates_resolve_from_one_size() {
+    let mut enc = StreamingEncoder::new(Vec::new(), CompressionLevel::Level(13));
+    enc.set_pledged_content_size(4096).unwrap();
+    enc.set_source_size_hint(1 << 20).unwrap();
+    enc.write_all(&[0u8; 4096]).unwrap();
+    assert_eq!(
+        enc.state.matcher.active_backend(),
+        enc.state.strategy_tag.backend(),
+        "matcher backend must match the synchronized strategy ({:?})",
+        enc.state.strategy_tag,
+    );
+    enc.finish().unwrap();
+}
+
+/// Regression: a streamed periodic input at the btlazy2 levels round-trips.
+/// The pre-splitter cuts short mid-stream blocks out of full 128 KiB
+/// buffers; the binary-tree lazy backend must accept those short committed
+/// blocks (this crashed with an out-of-bounds access in the AVX2 row
+/// monolith on x86).
+#[test]
+fn streaming_periodic_btlazy2_roundtrips() {
+    const LINES: &[&[u8]] = &[
+        b"ts=2026-03-26T21:39:28Z level=INFO msg=\"flush memtable\" tenant=demo table=orders region=eu-west\n",
+        b"ts=2026-03-26T21:39:29Z level=INFO msg=\"rotate segment\" tenant=demo table=orders region=eu-west\n",
+        b"ts=2026-03-26T21:39:30Z level=INFO msg=\"compact level\" tenant=demo table=orders region=eu-west\n",
+        b"ts=2026-03-26T21:39:31Z level=INFO msg=\"write block\" tenant=demo table=orders region=eu-west\n",
+    ];
+    // Past the L15 window (2^22): the crash needed candidates farther than
+    // the current best's offset magnitude, which only exist once the input
+    // exceeds the window.
+    let target = 6 * 1024 * 1024usize;
+    let mut data = Vec::with_capacity(target);
+    'fill: loop {
+        for line in LINES {
+            if data.len() + line.len() > target {
+                break 'fill;
+            }
+            data.extend_from_slice(line);
+        }
+    }
+    for level in [13, 15] {
+        let mut out = Vec::new();
+        let mut enc = StreamingEncoder::new(&mut out, CompressionLevel::Level(level));
+        for chunk in data.chunks(64 * 1024) {
+            enc.write_all(chunk).unwrap();
+        }
+        enc.finish().unwrap();
+        let mut decoder = crate::decoding::FrameDecoder::new();
+        let mut round = Vec::with_capacity(data.len());
+        decoder
+            .decode_all_to_vec(&out, &mut round)
+            .unwrap_or_else(|e| panic!("L{level} decode failed: {e:?}"));
+        assert_eq!(round, data, "L{level} streamed periodic roundtrip");
+    }
+}
+
+/// The streaming raw-literals gate follows the effective parameters like the
+/// frame compressor's: a positive `target_length` override on a fast level
+/// disables literal compression on a plain frame, while a dictionary frame
+/// keeps the CDict's targetLength (0 at level 1) and ignores the override.
+#[test]
+fn streaming_encoder_literal_gate_follows_the_effective_target_length() {
+    use crate::encoding::CompressionParameters;
+    let params = CompressionParameters::builder(CompressionLevel::Level(1))
+        .target_length(8)
+        .build()
+        .expect("valid override");
+    let mut plain = StreamingEncoder::new(Vec::new(), CompressionLevel::Level(1));
+    plain.set_parameters(&params).unwrap();
+    plain.write_all(b"plain frame payload").unwrap();
+    assert!(plain.state.literal_compression_disabled);
+    let dict: Vec<u8> = (0..4096u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let mut with_dict = StreamingEncoder::new(Vec::new(), CompressionLevel::Level(1));
+    with_dict.set_parameters(&params).unwrap();
+    with_dict
+        .set_encoder_dictionary(crate::encoding::EncoderDictionary::from_dictionary(
+            crate::decoding::Dictionary::from_raw_content(0xD1C7_0018, dict).unwrap(),
+        ))
+        .unwrap();
+    with_dict.write_all(b"dictionary frame payload").unwrap();
+    assert!(!with_dict.state.literal_compression_disabled);
+}
+
 /// Pre-write `set_magicless(true)` → emitted frame omits the
 /// magic prefix AND round-trips through a magicless-aware
 /// decoder.

@@ -16,17 +16,15 @@ fn strategy_consts_match_tag_bridge() {
     assert_strategy_matches_tag::<BtUltra2>(StrategyTag::BtUltra2);
 }
 
-/// Pin the `Btlazy2` tag's full bridge: it runs the BinaryTree finder on
-/// the HashChain backend with a Lazy parse (upstream zstd `ZSTD_btlazy2`).
+/// Pin the `Btlazy2` tag's full bridge: the lazily-sorted binary-tree
+/// finder inside the lazy2 parse on the lazy (Row) backend (upstream zstd
+/// `ZSTD_btlazy2`), never the optimal DP.
 #[test]
 fn btlazy2_tag_bridge_contract() {
-    assert_eq!(StrategyTag::Btlazy2.backend(), BackendTag::HashChain);
-    assert_eq!(StrategyTag::Btlazy2.search(), SearchMethod::BinaryTree);
+    assert_eq!(StrategyTag::Btlazy2.backend(), BackendTag::Row);
+    assert_eq!(StrategyTag::Btlazy2.search(), SearchMethod::BinaryTreeLazy);
+    assert_eq!(SearchMethod::BinaryTreeLazy.backend(), BackendTag::Row);
     assert_eq!(StrategyTag::Btlazy2.parse_mode(), ParseMode::Lazy2);
-    // The BT walk cap must let L15's search_depth = 64 govern (BtOpt's
-    // 32 would silently halve it); full find, no early bail.
-    assert_eq!(Btlazy2::MAX_CHAIN_DEPTH, 64);
-    assert_eq!(Btlazy2::SUFFICIENT_MATCH_LEN, usize::MAX);
 }
 
 #[test]
@@ -87,16 +85,17 @@ fn level_to_tag_matches_default_table() {
 // `clippy::assertions_on_constants` requires this form for
 // const-only inputs.
 
-// `use_bt_aligns_with_parse_mode`: Lazy2 strategies must not walk
-// the BT; BtOpt / BtUltra / BtUltra2 must. Invariant that lets
-// the inner optimal parser drop the `if self.parse_mode == Lazy2
-// …` branch in favour of `if !S::USE_BT`.
+// `use_bt_aligns_with_parse_mode`: the lazy strategies (btlazy2
+// included: its tree lives in the lazy backend) must not run the
+// optimal parser's BT walk; BtOpt / BtUltra / BtUltra2 must. Invariant
+// that lets the inner optimal parser drop the `if self.parse_mode ==
+// Lazy2 …` branch in favour of `if !S::USE_BT`.
 const _USE_BT_LAYOUT: () = {
     assert!(!Fast::USE_BT);
     assert!(!Dfast::USE_BT);
     assert!(!Greedy::USE_BT);
     assert!(!Lazy::USE_BT);
-    assert!(Btlazy2::USE_BT);
+    assert!(!Btlazy2::USE_BT);
     assert!(BtOpt::USE_BT);
     assert!(BtUltra::USE_BT);
     assert!(BtUltra2::USE_BT);
@@ -126,14 +125,9 @@ const _USE_HASH3_LAYOUT: () = {
 // silently.
 const _COST_MODEL_LAYOUT: () = {
     assert!(!Lazy::ACCURATE_PRICE && Lazy::FAVOR_SMALL_OFFSETS);
-    assert!(!Btlazy2::ACCURATE_PRICE && Btlazy2::FAVOR_SMALL_OFFSETS);
     assert!(!BtOpt::ACCURATE_PRICE && BtOpt::FAVOR_SMALL_OFFSETS);
     assert!(BtUltra::ACCURATE_PRICE && !BtUltra::FAVOR_SMALL_OFFSETS);
     assert!(BtUltra2::ACCURATE_PRICE && !BtUltra2::FAVOR_SMALL_OFFSETS);
-    // btlazy2 runs the full BT find (no early bail) and a search depth
-    // that lets L15's configured search_depth=64 govern; see `Btlazy2`.
-    assert!(Btlazy2::MAX_CHAIN_DEPTH == 64);
-    assert!(Btlazy2::SUFFICIENT_MATCH_LEN == usize::MAX);
     assert!(BtOpt::MAX_CHAIN_DEPTH == 32);
     // 1 << searchLog for clevels.h level 18 (searchLog = 6).
     assert!(BtUltra::MAX_CHAIN_DEPTH == 64);
