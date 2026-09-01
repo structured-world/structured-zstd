@@ -1772,6 +1772,32 @@ fn driver_huge_source_hint_with_dict_does_not_overflow_hc_reserve() {
     driver.skip_matching_with_hint(None);
 }
 
+/// Regression: a dictionary frame runs the CDict's strategy even when the
+/// source-size tier put the plain level in another backend family
+/// (upstream `ZSTD_resetCCtx_usingCDict` takes the CDict's cParams
+/// unconditionally): L13 on a 4 KiB source is btopt, but a 300 KiB CDict
+/// is btlazy2, so the frame is btlazy2 on the lazy backend with a plan; L2
+/// on a 100 KiB source is dfast, but a 4 KiB CDict is fast.
+#[test]
+fn dictionary_frame_takes_the_cdict_strategy_across_backend_families() {
+    use crate::encoding::levels::config::resolve_level_params_with_dict;
+    use crate::encoding::strategy::{BackendTag, StrategyTag};
+    let (params, plan) =
+        resolve_level_params_with_dict(CompressionLevel::Level(13), Some(4096), 300 * 1024);
+    assert_eq!(params.strategy_tag, StrategyTag::Btlazy2);
+    assert_eq!(params.backend(), BackendTag::Row);
+    assert!(plan.is_some(), "a lazy-band CDict carries a plan");
+    assert!(params.row.is_some_and(|r| r.bt));
+    let (params, plan) =
+        resolve_level_params_with_dict(CompressionLevel::Level(2), Some(100 * 1024), 4096);
+    assert_eq!(params.strategy_tag, StrategyTag::Fast);
+    assert_eq!(params.backend(), BackendTag::Simple);
+    assert!(
+        plan.is_none(),
+        "the Fast backend primes its dictionary itself"
+    );
+}
+
 /// Regression: the Fast dictionary table takes the CDict's `hashLog`
 /// (upstream `ZSTD_createCDict` sizes it from the dictionary), not the
 /// source-capped main table's: a 1 KiB source caps the main table at

@@ -923,8 +923,9 @@ pub(crate) struct RowDictPlan {
 /// re-adjusted to the source when the dictionary is attached
 /// (`ZSTD_resetCCtx_byAttachingCDict`), verbatim when it is copied
 /// (`ZSTD_resetCCtx_byCopyingCDict`); only the frame's own `windowLog` is
-/// kept. Levels outside the greedy / lazy / btlazy2 band, and dictionaries
-/// whose cParams leave that band, keep the plain level params (no plan).
+/// kept. The CDict's strategy is taken whatever backend family the plain
+/// level resolved to; a lazy-band CDict (greedy..btlazy2) also carries the
+/// lazy backend's [`RowDictPlan`].
 pub(crate) fn resolve_level_params_with_dict(
     level: CompressionLevel,
     source_size: Option<u64>,
@@ -935,30 +936,16 @@ pub(crate) fn resolve_level_params_with_dict(
         uses_row_match_finder,
     };
     let base = resolve_level_params(level, source_size);
-    if dict_size == 0 || base.backend() != crate::encoding::strategy::BackendTag::Row {
+    if dict_size == 0 {
         return (base, None);
     }
+    // The CDict's cParams decide the frame's strategy REGARDLESS of the
+    // backend family the plain level resolved to for this source size
+    // (upstream takes them unconditionally): L13 on a 4 KiB source is
+    // btopt, but a 300 KiB CDict is btlazy2 and the frame runs btlazy2; L4
+    // on a 1 MiB source is dfast, but a 4 KiB CDict is greedy. Only the
+    // frame's own `windowLog` is kept.
     let cdict = get_cdict_cparams(numeric_level(level), dict_size);
-    if cdict.strategy < 3 {
-        return (base, None);
-    }
-    if cdict.strategy > 6 {
-        // The CDict resolves to an optimal strategy: the frame runs it (on
-        // the HashChain backend, which primes the dictionary itself); no
-        // lazy-backend plan.
-        let window_log = u32::from(base.window_log);
-        let frame = if should_attach_dict(&cdict, source_size) {
-            attach_cparams(
-                cdict,
-                source_size.unwrap_or(CONTENTSIZE_UNKNOWN),
-                window_log,
-            )
-        } else {
-            copy_cparams(cdict, window_log)
-        };
-        return (level_params_from_cparams(frame), None);
-    }
-    let use_row = uses_row_match_finder(&cdict);
     let attach = should_attach_dict(&cdict, source_size);
     let window_log = u32::from(base.window_log);
     let frame = if attach {
@@ -970,11 +957,17 @@ pub(crate) fn resolve_level_params_with_dict(
     } else {
         copy_cparams(cdict, window_log)
     };
+    let params = level_params_from_cparams(frame);
+    if !(3..=6).contains(&cdict.strategy) {
+        // Fast / dfast / optimal strategies: their backends prime the
+        // dictionary themselves; no lazy-backend plan.
+        return (params, None);
+    }
     (
-        level_params_from_cparams(frame),
+        params,
         Some(RowDictPlan {
             attach,
-            use_row,
+            use_row: uses_row_match_finder(&cdict),
             cdict,
         }),
     )

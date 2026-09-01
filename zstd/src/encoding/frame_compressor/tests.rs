@@ -232,15 +232,17 @@ fn dictionary_compression_roundtrips_with_dict_builder_dictionary() {
     let decoder_dict =
         crate::decoding::Dictionary::from_raw_content(dict_id, raw_dict.clone()).unwrap();
 
-    // Payload that the trained dict actually covers (same line shape as the
-    // training corpus, just unseen `idx` values). The dict primes the whole
-    // `tenant=demo table=orders key=… region=eu` line, so its benefit is the
-    // first occurrence's literals — substantial and unambiguous — rather than
-    // the 24-byte shared prefix of an otherwise-different payload, where the
-    // marginal gain is below the dict-id frame overhead. (The deeper
-    // partial-match dict ratio gap is tracked separately, not gated here.)
+    // Payload the trained dictionary genuinely covers: training lines in a
+    // permuted order, so whole lines are dictionary matches while the
+    // payload does not simply repeat its previous line. (A payload of
+    // unseen `key=` values is NOT such a case: every line then matches the
+    // previous one through the repeat offset, and upstream too compresses
+    // it smaller WITHOUT the dictionary, the dictionary id and the
+    // dictionary-tier parameters costing more than the first line's
+    // literals.)
     let mut payload = Vec::new();
-    for idx in 1000..1096u32 {
+    for i in 0..96u32 {
+        let idx = (i * 37 + 11) % 256;
         payload.extend_from_slice(
             format!("tenant=demo table=orders key={idx} region=eu\n").as_bytes(),
         );
