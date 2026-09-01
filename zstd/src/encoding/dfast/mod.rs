@@ -160,11 +160,29 @@ pub(crate) struct DfastMatchGenerator {
 /// shapes, sized to the same `(long_hash_bits, short_hash_bits)`. Held by the
 /// shared [`DictAttach`] level-1 lifecycle; the per-tier dual-probe LOOKUP is
 /// level-2 in this backend's kernel. Slots hold a +1-biased concat index
-/// (`DFAST_EMPTY_SLOT = 0` is "no entry").
+/// shifted by [`DFAST_DICT_TAG_BITS`] with the hash tag in the low bits
+/// (upstream `ZSTD_SHORT_CACHE`); `DFAST_EMPTY_SLOT = 0` is "no entry".
 #[derive(Debug, Default, Clone)]
 pub(crate) struct DfastDictTables {
     pub(crate) long: alloc::vec::Vec<u32>,
     pub(crate) short: alloc::vec::Vec<u32>,
+}
+
+/// Upstream `ZSTD_SHORT_CACHE_TAG_BITS`: the low bits of a dictionary slot
+/// hold a hash tag so a probe rejects most collisions without touching the
+/// dictionary bytes (with the CDict's small tables most slots are occupied,
+/// and every untagged collision on incompressible input is a cache miss).
+pub(crate) const DFAST_DICT_TAG_BITS: u32 = 8;
+const DFAST_DICT_TAG_MASK: u32 = (1 << DFAST_DICT_TAG_BITS) - 1;
+/// Largest dictionary the tagged slots can index (`(index + 1) << 8` must fit
+/// `u32`); larger dictionaries take the copy path.
+pub(crate) const DFAST_ATTACH_DICT_MAX_LEN: usize = (1usize << (32 - DFAST_DICT_TAG_BITS)) - 2;
+
+/// The tag of a hash product whose top bits (above `shift`) form the slot
+/// index: the `DFAST_DICT_TAG_BITS` bits right below the index.
+#[inline(always)]
+fn dfast_dict_tag(mixed: u64, shift: usize) -> u32 {
+    ((mixed >> (shift - DFAST_DICT_TAG_BITS as usize)) as u32) & DFAST_DICT_TAG_MASK
 }
 
 impl DfastMatchGenerator {
@@ -793,10 +811,16 @@ impl DfastMatchGenerator {
                 // Upstream zstd 5-byte short hash (ZSTD_hash5 shape): low 5 bytes in
                 // the high 40 bits (`v8 << 24`), matching `short_hash_index`.
                 let short_idx = ((v8 << 24).wrapping_mul(PRIME) >> short_shift) as usize;
-                let long_idx = (v8.wrapping_mul(PRIME) >> long_shift) as usize;
-                let packed = (pos as u32) + 1;
-                *short_ptr.add(short_idx) = packed;
-                *long_ptr.add(long_idx) = packed;
+                let long_mixed = v8.wrapping_mul(PRIME);
+                let short_mixed = (v8 << 24).wrapping_mul(PRIME);
+                let long_idx = (long_mixed >> long_shift) as usize;
+                // Upstream `ZSTD_writeTaggedIndex`: the slot packs the index
+                // with the next `DFAST_DICT_TAG_BITS` bits of the hash, so a
+                // probe rejects a colliding slot on the tag alone, without
+                // loading the dictionary bytes.
+                let index = ((pos as u32) + 1) << DFAST_DICT_TAG_BITS;
+                *short_ptr.add(short_idx) = index | dfast_dict_tag(short_mixed, short_shift);
+                *long_ptr.add(long_idx) = index | dfast_dict_tag(long_mixed, long_shift);
             }
             pos += 1;
         }
@@ -809,8 +833,10 @@ impl DfastMatchGenerator {
                 let lo4 = (load_ptr as *const u32).read_unaligned() as u64;
                 let b5 = *load_ptr.add(4) as u64;
                 let v5 = (lo4 | (b5 << 32)) << 24;
-                let short_idx = (v5.wrapping_mul(PRIME) >> short_shift) as usize;
-                *short_ptr.add(short_idx) = (pos as u32) + 1;
+                let short_mixed = v5.wrapping_mul(PRIME);
+                let short_idx = (short_mixed >> short_shift) as usize;
+                *short_ptr.add(short_idx) = (((pos as u32) + 1) << DFAST_DICT_TAG_BITS)
+                    | dfast_dict_tag(short_mixed, short_shift);
             }
             pos += 1;
         }
@@ -2296,8 +2322,13 @@ macro_rules! start_matching_fast_loop_body {
                     // SAFETY: when `use_dict`, `dict_long_ptr` is non-null and
                     // sized `1 << long_hash_bits`; `hl0_idx < 1 << long_hash_bits`.
                     let dl = unsafe { *dict_long_ptr.add(hl0_idx) };
-                    if dl != DFAST_EMPTY_SLOT {
-                        let dp = (dl as usize) - 1;
+                    // Tag check first (upstream `dictTagsMatchL`): a
+                    // colliding slot never loads the dictionary bytes.
+                    if dl != DFAST_EMPTY_SLOT
+                        && (dl & DFAST_DICT_TAG_MASK)
+                            == dfast_dict_tag(v8_0.wrapping_mul(PRIME), long_shift)
+                    {
+                        let dp = ((dl >> DFAST_DICT_TAG_BITS) as usize) - 1;
                         // Dict long slots were only written for positions with
                         // 8-byte lookahead, so `dp + 8 <= dict_len <= concat_len`;
                         // `dp < dict_end` keeps the match inside the dict region.
@@ -2498,8 +2529,11 @@ macro_rules! start_matching_fast_loop_body {
                                 // SAFETY: `use_dict` ⇒ `dict_long_ptr` non-null,
                                 // sized `1 << long_hash_bits`; `hl1_idx` is in range.
                                 let dl1 = unsafe { *dict_long_ptr.add(hl1_idx) };
-                                if dl1 != DFAST_EMPTY_SLOT {
-                                    let dp1 = (dl1 as usize) - 1;
+                                if dl1 != DFAST_EMPTY_SLOT
+                                    && (dl1 & DFAST_DICT_TAG_MASK)
+                                        == dfast_dict_tag(v8_1.wrapping_mul(PRIME), long_shift)
+                                {
+                                    let dp1 = ((dl1 >> DFAST_DICT_TAG_BITS) as usize) - 1;
                                     if dp1 < dict_end {
                                         debug_assert!(
                                             dp1 + HASH_READ_SIZE <= concat_len,
@@ -2595,8 +2629,11 @@ macro_rules! start_matching_fast_loop_body {
                     // SAFETY: `use_dict` ⇒ `dict_short_ptr` non-null, sized
                     // `1 << short_hash_bits`; `hs0_idx < 1 << short_hash_bits`.
                     let ds = unsafe { *dict_short_ptr.add(hs0_idx) };
-                    if ds != DFAST_EMPTY_SLOT {
-                        let dp = (ds as usize) - 1;
+                    if ds != DFAST_EMPTY_SLOT
+                        && (ds & DFAST_DICT_TAG_MASK)
+                            == dfast_dict_tag((v8_0 << 24).wrapping_mul(PRIME), short_shift)
+                    {
+                        let dp = ((ds >> DFAST_DICT_TAG_BITS) as usize) - 1;
                         if dp < dict_end {
                             debug_assert!(
                                 dp + 4 <= concat_len,

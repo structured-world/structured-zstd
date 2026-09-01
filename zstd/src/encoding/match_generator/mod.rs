@@ -906,9 +906,13 @@ impl MatchGeneratorDriver {
                 // dense scan matches it as window history). `skip_matching_for_dict_attach`
                 // self-gates on `use_fast_loop` (only fast-loop levels carry the
                 // dual-probe; general-path levels fall back to the dense copy).
-                let attach = self
-                    .reset_size_log
-                    .is_none_or(|log| log <= DFAST_ATTACH_DICT_CUTOFF_LOG);
+                // The tagged dictionary slots index at most
+                // `DFAST_ATTACH_DICT_MAX_LEN` bytes; a larger dictionary is
+                // copied into the live tables instead.
+                let attach = dict_len <= crate::encoding::dfast::DFAST_ATTACH_DICT_MAX_LEN
+                    && self
+                        .reset_size_log
+                        .is_none_or(|log| log <= DFAST_ATTACH_DICT_CUTOFF_LOG);
                 if attach {
                     self.dfast_matcher_mut().skip_matching_for_dict_attach();
                 } else {
