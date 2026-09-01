@@ -53,8 +53,12 @@ pub(crate) struct RowConfig {
     pub(crate) mls: usize,
     /// Upstream `cParams.chainLog`: the hash-chain table the greedy/lazy
     /// parse searches instead of rows when the window is 2^14 or smaller
-    /// (upstream `ZSTD_resolveRowMatchFinderMode`).
+    /// (upstream `ZSTD_resolveRowMatchFinderMode`), or the binary tree
+    /// (`2^(chainLog-1)` nodes) of a btlazy2 level.
     pub(crate) chain_log: usize,
+    /// Upstream `ZSTD_btlazy2`: the lazy parse searches the lazily-sorted
+    /// binary tree (`ZSTD_BtFindBestMatch`) instead of rows / the chain.
+    pub(crate) bt: bool,
 }
 
 // Only used as the default HashChain config when the test-only parse×search
@@ -91,6 +95,7 @@ pub(crate) const ROW_CONFIG: RowConfig = RowConfig {
     target_len: ROW_TARGET_LEN,
     mls: ROW_MIN_MATCH_LEN,
     chain_log: ROW_HASH_BITS,
+    bt: false,
 };
 
 // Level-5 greedy is the ONLY strategy routed to the Row backend
@@ -116,6 +121,7 @@ pub(crate) const ROW_L5: RowConfig = RowConfig {
     target_len: 2,
     mls: ROW_MIN_MATCH_LEN,
     chain_log: 18,
+    bt: false,
 };
 
 /// Per-level Double-Fast hash sizing, mirroring the upstream zstd `clevels.h` columns
@@ -267,25 +273,12 @@ pub(crate) fn apply_param_overrides(
         SearchMethod::DoubleFast => {
             params.dfast.get_or_insert(DFAST_L3);
         }
-        SearchMethod::RowHash => {
-            params.row.get_or_insert(ROW_L5);
+        SearchMethod::RowHash | SearchMethod::BinaryTreeLazy => {
+            let row = params.row.get_or_insert(ROW_L5);
+            row.bt = matches!(params.search, SearchMethod::BinaryTreeLazy);
         }
         SearchMethod::HashChain | SearchMethod::BinaryTree => {
-            // A `Btlazy2` strategy override moved off a non-HC row needs the
-            // BT 5-byte finder hash (upstream zstd minMatch 5); other synthesized HC
-            // rows keep the 4-byte default. An explicit `min_match` override
-            // below refines this further.
-            params.hc.get_or_insert(HcConfig {
-                search_mls: if matches!(
-                    params.strategy_tag,
-                    crate::encoding::strategy::StrategyTag::Btlazy2
-                ) {
-                    5
-                } else {
-                    HC_OVERRIDE_DEFAULT.search_mls
-                },
-                ..HC_OVERRIDE_DEFAULT
-            });
+            params.hc.get_or_insert(HC_OVERRIDE_DEFAULT);
         }
     }
 
@@ -321,11 +314,11 @@ pub(crate) fn apply_param_overrides(
                 }
             }
         }
-        SearchMethod::RowHash => {
+        SearchMethod::RowHash | SearchMethod::BinaryTreeLazy => {
             if let Some(row) = params.row.as_mut() {
                 // Row hash-table width override (mirrors dfast `long_hash_log`
                 // / hc `hash_log`); `chain_log` sizes the hash chain the same
-                // backend searches on a <= 2^14 window.
+                // backend searches on a <= 2^14 window, or its binary tree.
                 if let Some(hash_log) = ov.hash_log {
                     row.hash_bits = hash_log as usize;
                 }
@@ -574,6 +567,8 @@ fn level_params_from_cparams(cp: crate::encoding::cparams::CParams) -> LevelPara
         target_len,
         mls: cp.min_match as usize,
         chain_log: cp.chain_log as usize,
+        // Upstream `ZSTD_btlazy2` (strategy 6).
+        bt: cp.strategy == 6,
     };
     let bt = |tag| LevelParams {
         strategy_tag: tag,
@@ -585,9 +580,9 @@ fn level_params_from_cparams(cp: crate::encoding::cparams::CParams) -> LevelPara
         hc: Some(hc),
         row: None,
     };
-    let row_lvl = |tag, lazy_depth| LevelParams {
+    let row_lvl = |tag, search, lazy_depth| LevelParams {
         strategy_tag: tag,
-        search: SearchMethod::RowHash,
+        search,
         window_log,
         lazy_depth,
         fast: None,
@@ -624,10 +619,11 @@ fn level_params_from_cparams(cp: crate::encoding::cparams::CParams) -> LevelPara
             hc: None,
             row: None,
         },
-        3 => row_lvl(StrategyTag::Greedy, 0),
-        4 => row_lvl(StrategyTag::Lazy, 1),
-        5 => row_lvl(StrategyTag::Lazy, 2),
-        6 => bt(StrategyTag::Btlazy2),
+        3 => row_lvl(StrategyTag::Greedy, SearchMethod::RowHash, 0),
+        4 => row_lvl(StrategyTag::Lazy, SearchMethod::RowHash, 1),
+        5 => row_lvl(StrategyTag::Lazy, SearchMethod::RowHash, 2),
+        // btlazy2: the same lazy2 parse over the lazily-sorted binary tree.
+        6 => row_lvl(StrategyTag::Btlazy2, SearchMethod::BinaryTreeLazy, 2),
         7 => bt(StrategyTag::BtOpt),
         8 => bt(StrategyTag::BtUltra),
         _ => bt(StrategyTag::BtUltra2),
@@ -659,7 +655,10 @@ pub(crate) fn adjust_params_for_source_size(mut params: LevelParams, src_size: u
             .hc
             .as_ref()
             .map_or((0, 0), |h| (h.hash_log as u32, h.chain_log as u32)),
-        BackendTag::Row => (params.row.as_ref().map_or(0, |r| r.hash_bits as u32), 0),
+        BackendTag::Row => params
+            .row
+            .as_ref()
+            .map_or((0, 0), |r| (r.hash_bits as u32, r.chain_log as u32)),
         BackendTag::Dfast => (0, 0),
     };
     // The chain cap (`ZSTD_cycleLog`) reads only `strategy >= btlazy2(6)`, so a
@@ -703,6 +702,7 @@ pub(crate) fn adjust_params_for_source_size(mut params: LevelParams, src_size: u
         BackendTag::Row => {
             if let Some(r) = params.row.as_mut() {
                 r.hash_bits = adj.hash_log as usize;
+                r.chain_log = adj.chain_log as usize;
             }
         }
         BackendTag::Dfast => {}
@@ -729,9 +729,16 @@ pub fn estimated_compression_workspace_bytes(level: CompressionLevel) -> usize {
     );
     let uses_bt = matches!(
         params.strategy_tag,
-        StrategyTag::Btlazy2 | StrategyTag::BtOpt | StrategyTag::BtUltra | StrategyTag::BtUltra2
+        StrategyTag::BtOpt | StrategyTag::BtUltra | StrategyTag::BtUltra2
     );
+    // The lazy backend adds its chain / tree table (`4 << chain_log`) when the
+    // level searches the chain (window <= 2^14) or the btlazy2 tree.
+    let row_chain = params
+        .row
+        .filter(|r| r.bt || params.window_log <= 14)
+        .map_or(0, |r| 4usize << r.chain_log);
     let tables = params.fast.map(|f| 4usize << f.hash_log).unwrap_or(0)
+        + row_chain
         + params
             .dfast
             .map(|d| (4usize << d.long_hash_log) + (4usize << d.short_hash_log))
@@ -806,10 +813,11 @@ pub fn estimated_bt_strategy_extra_bytes(strategy_ordinal: u32, window_log: u32)
 ///
 /// THEN, inside the Row backend, the greedy/lazy band searches a hash chain
 /// instead of rows when the resolved `window_log <= 14`
-/// (`RowMatchGenerator::use_chain`) — exactly upstream's
+/// (`RowMatchGenerator::finder`) — exactly upstream's
 /// `ZSTD_resolveRowMatchFinderMode` (the Row match-finder is used for
-/// greedy/lazy/lazy2 ONLY when `windowLog > 14`); the parse itself is the
-/// same `lazy_generic` body either way. Net effect for the SAME level:
+/// greedy/lazy/lazy2 ONLY when `windowLog > 14`) — and a btlazy2 level
+/// searches the lazily-sorted binary tree; the parse itself is the same
+/// `lazy_generic` body in all three cases. Net effect for the SAME level:
 ///
 /// * small input (e.g. a 10 KiB fixture → `window_log` 14) → hash chain
 ///   (`ZSTD_HcFindBestMatch`, scalar chain walk);
@@ -906,8 +914,8 @@ pub(crate) struct RowDictPlan {
 /// re-adjusted to the source when the dictionary is attached
 /// (`ZSTD_resetCCtx_byAttachingCDict`), verbatim when it is copied
 /// (`ZSTD_resetCCtx_byCopyingCDict`); only the frame's own `windowLog` is
-/// kept. Levels outside the greedy / lazy band, and dictionaries whose
-/// cParams leave that band, keep the plain level params (no plan).
+/// kept. Levels outside the greedy / lazy / btlazy2 band, and dictionaries
+/// whose cParams leave that band, keep the plain level params (no plan).
 pub(crate) fn resolve_level_params_with_dict(
     level: CompressionLevel,
     source_size: Option<u64>,
@@ -922,7 +930,7 @@ pub(crate) fn resolve_level_params_with_dict(
         return (base, None);
     }
     let cdict = get_cdict_cparams(numeric_level(level), dict_size);
-    if !(3..=5).contains(&cdict.strategy) {
+    if !(3..=6).contains(&cdict.strategy) {
         return (base, None);
     }
     let use_row = uses_row_match_finder(&cdict);

@@ -795,10 +795,12 @@ fn level_params_strategy_and_search_method_agree_across_tiers() {
                 StrategyTag::Fast => p.search == SearchMethod::Fast,
                 StrategyTag::Dfast => p.search == SearchMethod::DoubleFast,
                 StrategyTag::Greedy | StrategyTag::Lazy => p.search == SearchMethod::RowHash,
-                StrategyTag::Btlazy2
-                | StrategyTag::BtOpt
-                | StrategyTag::BtUltra
-                | StrategyTag::BtUltra2 => p.search == SearchMethod::BinaryTree,
+                StrategyTag::Btlazy2 => {
+                    p.search == SearchMethod::BinaryTreeLazy && p.row.is_some_and(|r| r.bt)
+                }
+                StrategyTag::BtOpt | StrategyTag::BtUltra | StrategyTag::BtUltra2 => {
+                    p.search == SearchMethod::BinaryTree
+                }
             };
             assert!(
                 consistent,
@@ -1355,19 +1357,16 @@ fn hc_collect_optimal_candidates_dispatches_every_bt_strategy() {
     use crate::encoding::strategy::StrategyTag;
     // The public dispatcher must route every BT strategy tag to the collector
     // AND to the specialization carrying that tag's consts — not just survive.
-    // The observable dimension is `USE_HASH3` (BtUltra / BtUltra2 = true; BtOpt /
-    // Btlazy2 = false): only the hash3 specializations surface a 3-byte match
-    // that the 4-byte BT hash cannot find. (BtOpt vs Btlazy2 share identical
-    // collect consts, so they are indistinguishable at runtime — the type
-    // mapping there is compiler-enforced.) Fixture: `abc` repeats at 0 and 12
-    // with a differing 4th byte (`Q` vs `Z`), so hash3 finds a length-3 match at
+    // The observable dimension is `USE_HASH3` (BtUltra / BtUltra2 = true; BtOpt
+    // = false): only the hash3 specializations surface a 3-byte match that the
+    // 4-byte BT hash cannot find. Fixture: `abc` repeats at 0 and 12 with a
+    // differing 4th byte (`Q` vs `Z`), so hash3 finds a length-3 match at
     // offset 12 while the 4-byte hash of `abcZ` misses `abcQ`. Run under the
     // scalar kernel so the scalar dispatch arm is exercised too.
     for tag in [
         StrategyTag::BtOpt,
         StrategyTag::BtUltra,
         StrategyTag::BtUltra2,
-        StrategyTag::Btlazy2,
     ] {
         let mut hc = HcMatchGenerator::new(64);
         hc.strategy_tag = tag;
@@ -1868,6 +1867,47 @@ fn driver_small_source_hint_shrinks_row_hash_tables() {
     );
 }
 
+/// btlazy2 levels run on the lazy (Row) backend with the binary-tree finder,
+/// wherever the source-size tier puts strategy 6: L13 at tier 0, L10 at the
+/// <= 16 KiB tier (where L11 is already btopt, an optimal level on the
+/// HashChain backend).
+#[test]
+fn driver_btlazy2_levels_search_the_binary_tree_on_the_row_backend() {
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+    driver.reset(CompressionLevel::Level(13));
+    let mut space = driver.get_next_space();
+    space[..12].copy_from_slice(b"abcabcabcabc");
+    space.truncate(12);
+    driver.commit_space(space);
+    driver.skip_matching_with_hint(None);
+    assert_eq!(
+        driver.active_backend(),
+        super::super::strategy::BackendTag::Row
+    );
+    assert!(driver.row_matcher().uses_binary_tree());
+
+    driver.set_source_size_hint(1 << 12);
+    driver.reset(CompressionLevel::Level(10));
+    let mut space = driver.get_next_space();
+    space[..12].copy_from_slice(b"abcabcabcabc");
+    space.truncate(12);
+    driver.commit_space(space);
+    driver.skip_matching_with_hint(None);
+    assert_eq!(
+        driver.active_backend(),
+        super::super::strategy::BackendTag::Row
+    );
+    assert!(driver.row_matcher().uses_binary_tree());
+
+    driver.set_source_size_hint(1 << 12);
+    driver.reset(CompressionLevel::Level(11));
+    assert_eq!(
+        driver.active_backend(),
+        super::super::strategy::BackendTag::HashChain,
+        "L11 on a <= 16 KiB source is btopt (optimal parser)"
+    );
+}
+
 #[test]
 fn row_matches_roundtrip_multi_block_pattern() {
     let pattern = [7, 13, 44, 184, 19, 96, 171, 109, 141, 251];
@@ -2255,10 +2295,11 @@ fn driver_best_to_fastest_releases_oversized_hc_tables() {
 fn driver_better_to_best_resizes_hc_tables() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
 
-    // The lazy band runs on the Row backend now, so the HC resize path is
-    // exercised across two BT levels whose native `HcConfig` widths differ:
-    // L13 (hash_log 22, chain_log 22) -> L15 (hash_log 23, chain_log 23).
-    driver.reset(CompressionLevel::Level(13));
+    // The lazy band (btlazy2 included) runs on the Row backend, so the HC
+    // resize path is exercised across two optimal levels whose native
+    // `HcConfig` widths differ: L16 (hash_log 22, chain_log 22) -> L20
+    // (hash_log 23, chain_log 25).
+    driver.reset(CompressionLevel::Level(16));
     assert_eq!(driver.window_size(), (1u64 << 22));
 
     let mut space = driver.get_next_space();
@@ -2271,9 +2312,9 @@ fn driver_better_to_best_resizes_hc_tables() {
     let better_hash_len = hc.table.hash_table.len();
     let better_chain_len = hc.table.chain_table.len();
 
-    // Switch to L15 — must resize to larger tables.
-    driver.reset(CompressionLevel::Level(15));
-    assert_eq!(driver.window_size(), (1u64 << 22));
+    // Switch to L20 — must resize to larger tables.
+    driver.reset(CompressionLevel::Level(20));
+    assert_eq!(driver.window_size(), (1u64 << 25));
 
     // Feed data to trigger ensure_tables with new sizes.
     let mut space = driver.get_next_space();
@@ -2285,13 +2326,13 @@ fn driver_better_to_best_resizes_hc_tables() {
     let hc = driver.hc_matcher();
     assert!(
         hc.table.hash_table.len() > better_hash_len,
-        "L15 hash_table ({}) should be larger than L13 ({})",
+        "L20 hash_table ({}) should be larger than L16 ({})",
         hc.table.hash_table.len(),
         better_hash_len
     );
     assert!(
         hc.table.chain_table.len() > better_chain_len,
-        "L15 chain_table ({}) should be larger than L13 ({})",
+        "L20 chain_table ({}) should be larger than L16 ({})",
         hc.table.chain_table.len(),
         better_chain_len
     );
@@ -5109,10 +5150,13 @@ fn upper_lazy_band_params_match_default_table() {
     ];
     for (level, wlog, hlog, clog, sd) in expected {
         let params = resolve_level_params(CompressionLevel::Level(level), None);
-        let hc = params.hc.unwrap();
-        assert_eq!(hc.search_depth, sd, "L{level}: search_depth");
+        // btlazy2 runs on the lazy (Row) backend: the tree geometry lives in
+        // its `RowConfig` (`hash_bits` / `chain_log`), with the tree flag set.
+        let row = params.row.unwrap();
+        assert!(row.bt, "L{level}: binary-tree finder");
+        assert_eq!(row.search_depth, sd, "L{level}: search_depth");
         assert_eq!(params.window_log, wlog, "L{level}: window_log");
-        assert_eq!(hc.hash_log, hlog, "L{level}: hash_log");
-        assert_eq!(hc.chain_log, clog, "L{level}: chain_log");
+        assert_eq!(row.hash_bits, hlog, "L{level}: hash_log");
+        assert_eq!(row.chain_log, clog, "L{level}: chain_log");
     }
 }

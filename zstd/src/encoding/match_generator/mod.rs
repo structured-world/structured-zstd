@@ -522,7 +522,7 @@ impl MatchGeneratorDriver {
     /// (`SearchMethod::BinaryTree`); only the lazy chain has a borrowed scan
     /// so far, so BT/optimal stay on the owned path.
     pub(crate) fn borrowed_supported(&self) -> bool {
-        use super::strategy::{BackendTag, SearchMethod, StrategyTag};
+        use super::strategy::{BackendTag, SearchMethod};
         match self.active_backend() {
             BackendTag::Simple | BackendTag::Dfast | BackendTag::Row => true,
             // The HashChain backend covers two searches: the lazy CHAIN parser
@@ -536,11 +536,7 @@ impl MatchGeneratorDriver {
             // both diverged from owned and fell outside the ffi ratio bound.
             // Search-aware (not just strategy_tag) so optimal BT can never be
             // staged on the borrowed path even via an internal caller.
-            BackendTag::HashChain => match self.search {
-                SearchMethod::HashChain => true,
-                SearchMethod::BinaryTree => matches!(self.strategy_tag, StrategyTag::Btlazy2),
-                _ => false,
-            },
+            BackendTag::HashChain => matches!(self.search, SearchMethod::HashChain),
         }
     }
 
@@ -1055,8 +1051,9 @@ impl Matcher for MatchGeneratorDriver {
                 SearchMethod::DoubleFast => {
                     params.dfast.get_or_insert(DFAST_L3);
                 }
-                SearchMethod::RowHash => {
-                    params.row.get_or_insert(ROW_CONFIG);
+                SearchMethod::RowHash | SearchMethod::BinaryTreeLazy => {
+                    let row = params.row.get_or_insert(ROW_CONFIG);
+                    row.bt = matches!(search, SearchMethod::BinaryTreeLazy);
                 }
                 SearchMethod::HashChain | SearchMethod::BinaryTree => {
                     params.hc.get_or_insert(HC_CONFIG);
@@ -1790,33 +1787,10 @@ impl Matcher for MatchGeneratorDriver {
                     super::strategy::SearchMethod::HashChain => self
                         .hc_matcher_mut()
                         .start_matching_lazy_borrowed(block_start, block_end, &mut handle_sequence),
-                    super::strategy::SearchMethod::BinaryTree => {
-                        // Run the SAME BT dispatch as the owned BinaryTree arm
-                        // below — every BT body reads its range via
-                        // current_block_range() and bytes via live_history()
-                        // (borrowed-aware), so the staged block is scanned in
-                        // place. The table was already staged by
-                        // `set_borrowed_block` (the HashChain arm at the top of
-                        // this file calls `table.stage_borrowed_block` with the
-                        // same range, and `borrowed_pending` is set only there),
-                        // so no re-stage is needed here.
-                        // Only btlazy2 reaches the borrowed BinaryTree scan:
-                        // `borrowed_supported()` keeps the optimal parsers
-                        // (BtOpt/BtUltra/BtUltra2) on the owned path, and
-                        // `set_borrowed_block` asserts that predicate before any
-                        // range is staged, so an optimal strategy_tag can never
-                        // arrive here.
-                        match self.strategy_tag {
-                            StrategyTag::Btlazy2 => self
-                                .hc_matcher_mut()
-                                .start_matching_btlazy2(&mut handle_sequence),
-                            other => unreachable!(
-                                "borrowed BinaryTree scan is only supported for Btlazy2, got {other:?}"
-                            ),
-                        }
-                    }
+                    // `borrowed_supported()` keeps the optimal parsers on the
+                    // owned path and `set_borrowed_block` asserts it.
                     other => {
-                        unreachable!("HashChain backend with unexpected search {other:?}")
+                        unreachable!("HashChain backend with unexpected borrowed search {other:?}")
                     }
                 },
             }
@@ -1840,15 +1814,12 @@ impl Matcher for MatchGeneratorDriver {
                 self.dfast_matcher_mut()
                     .start_matching(&mut handle_sequence);
             }
-            SearchMethod::RowHash => {
-                // Greedy parse (depth 0) = upstream zstd-greedy entry (default
-                // `ip + 1` start, greedy repcode commit); lazy / lazy2 use
-                // the `pick_lazy_match` lookahead entry (reads `lazy_depth`).
-                // Both bare entries dispatch on `row_log` internally into the
-                // const-`ROW_LOG` hot loop (upstream zstd per-rowLog variant table).
-                // Greedy is the same upstream `lazy_generic` body at depth 0
-                // (`lazy_depth == 0`: a repcode hit is stored without a
-                // search, no lookahead); lazy / lazy2 read `lazy_depth` 1 / 2.
+            SearchMethod::RowHash | SearchMethod::BinaryTreeLazy => {
+                // One upstream `lazy_generic` body for greedy (depth 0: a
+                // repcode hit is stored without a search, no lookahead), lazy
+                // / lazy2 (`lazy_depth` 1 / 2) and btlazy2 (depth 2 over the
+                // binary-tree finder); the finder (rows / chain / tree) was
+                // resolved at `configure`.
                 self.row_matcher_mut().start_matching(&mut handle_sequence);
             }
             SearchMethod::HashChain => {
@@ -1858,9 +1829,6 @@ impl Matcher for MatchGeneratorDriver {
                     .start_matching_lazy(&mut handle_sequence);
             }
             SearchMethod::BinaryTree => match self.strategy_tag {
-                StrategyTag::Btlazy2 => self
-                    .hc_matcher_mut()
-                    .start_matching_btlazy2(&mut handle_sequence),
                 StrategyTag::BtOpt => self.compress_block::<strategy::BtOpt>(&mut handle_sequence),
                 StrategyTag::BtUltra => {
                     self.compress_block::<strategy::BtUltra>(&mut handle_sequence)
@@ -1869,7 +1837,7 @@ impl Matcher for MatchGeneratorDriver {
                     self.compress_block::<strategy::BtUltra2>(&mut handle_sequence)
                 }
                 _ => unreachable!(
-                    "SearchMethod::BinaryTree requires a BT strategy tag (Btlazy2/BtOpt/BtUltra/BtUltra2)"
+                    "SearchMethod::BinaryTree requires an optimal strategy tag (BtOpt/BtUltra/BtUltra2)"
                 ),
             },
         }

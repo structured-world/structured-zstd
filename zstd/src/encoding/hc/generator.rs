@@ -1042,10 +1042,7 @@ impl HcMatchGenerator {
         let is_btultra2 = tag == StrategyTag::BtUltra2;
         let uses_bt = matches!(
             tag,
-            StrategyTag::Btlazy2
-                | StrategyTag::BtOpt
-                | StrategyTag::BtUltra
-                | StrategyTag::BtUltra2
+            StrategyTag::BtOpt | StrategyTag::BtUltra | StrategyTag::BtUltra2
         );
         // btultra and btultra2 both run the mls=3 hash3 short-match probe
         // (clevels.h minMatch 3). The `is_btultra2` flag below stays
@@ -1189,7 +1186,7 @@ impl HcMatchGenerator {
             StrategyTag::Fast | StrategyTag::Dfast | StrategyTag::Greedy | StrategyTag::Lazy => {
                 self.start_matching_lazy(&mut handle_sequence)
             }
-            StrategyTag::Btlazy2 => self.start_matching_btlazy2(&mut handle_sequence),
+            StrategyTag::Btlazy2 => unreachable!("btlazy2 runs on the lazy (Row) backend"),
             StrategyTag::BtOpt => {
                 self.start_matching_optimal::<strategy::BtOpt>(&mut handle_sequence)
             }

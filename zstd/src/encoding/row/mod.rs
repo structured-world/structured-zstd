@@ -70,6 +70,26 @@ const fn zstd_bitmix(mut val: u64, len: u64) -> u64 {
 /// defeat stale tags, which the position floor rejects here anyway.
 pub(crate) const ROW_HASH_SALT: u64 = zstd_bitmix(0, 8) ^ zstd_bitmix(0, 4);
 
+/// Upstream `ZSTD_WINDOW_START_INDEX`: the binary tree stores a position
+/// as `abs + 2`, so `0` is "no node" and `1` ([`BT_UNSORTED_MARK`]) the
+/// not-yet-sorted mark of a lazily inserted node.
+const BT_IDX_BASE: usize = 2;
+/// Upstream `ZSTD_DUBT_UNSORTED_MARK`.
+const BT_UNSORTED_MARK: u32 = 1;
+/// A tree link "pointer" whose write is discarded (upstream `dummy32`).
+const BT_DISCARD: usize = usize::MAX;
+
+/// The match finder the lazy parse searches (upstream `searchMethod_e`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LazyFinder {
+    /// `ZSTD_RowFindBestMatch`: the SIMD-tagged rows.
+    Rows,
+    /// `ZSTD_HcFindBestMatch`: the hash chain (window of 2^14 or less).
+    Chain,
+    /// `ZSTD_BtFindBestMatch`: the lazily-sorted binary tree (btlazy2).
+    Tree,
+}
+
 /// Per-parse view of the live history: raw base pointer + length + absolute
 /// start, hoisted ONCE per block so the hot loops read no `Option` branch
 /// and no `Vec` header per access. Valid for the whole parse: the history
@@ -79,23 +99,58 @@ struct RowScan {
     base: *const u8,
     len: usize,
     hist_start: usize,
-    /// Frame-constant search parameters hoisted with the view so the hot
+    /// Block-constant search parameters hoisted with the view so the hot
     /// loops never re-read them through `&mut self`: the salt of the live
-    /// row hash, the match-distance bound, the dictionary prefix start
-    /// (0 without a dictionary) and whether a dictionary is attached (no
-    /// distance bound, upstream `isDictionary`).
+    /// row hash, the match-distance bound (upstream `maxDist`), the lowest
+    /// valid match index (upstream `window.lowLimit`), the prefix start
+    /// (upstream `dictLimit`: the dictionary lies below it), whether the
+    /// dictionary is still valid for this block (upstream `loadedDictEnd !=
+    /// 0`: no distance bound on the search) and whether it is attached
+    /// (upstream `dictMatchState`, its own tables probed after the prefix).
     salt: u64,
     search_window: usize,
+    low_limit: usize,
     prefix_start: usize,
     dict_frame: bool,
     attached: bool,
-    /// Search through the hash-chain finder instead of the row table.
-    use_chain: bool,
+    finder: LazyFinder,
+}
+
+impl RowScan {
+    /// Upstream `ZSTD_getLowestMatchIndex`: the whole history down to
+    /// `lowLimit` while a dictionary is valid, else at most `maxDist` back.
+    #[inline(always)]
+    fn window_low(&self, pos: usize) -> usize {
+        if self.dict_frame {
+            self.low_limit
+        } else {
+            self.low_limit.max(pos.saturating_sub(self.search_window))
+        }
+    }
 }
 
 /// Upstream zstd `ZSTD_highbit32(offBase)` term of the lazy gain formula:
 /// `offBase` is `offset + 3` for a real offset and 1 for repcode 1
 /// (`off == 0` here), whose highbit is 0.
+/// Upstream `ZSTD_highbit32` (`val != 0`).
+#[inline(always)]
+fn highbit32(val: u32) -> i64 {
+    debug_assert!(val != 0);
+    i64::from(31 - val.leading_zeros())
+}
+
+/// Upstream `offBase` of the best match so far in the binary-tree walks:
+/// `999999999` (the lazy parse's "no match yet" value) before the first
+/// accepted match, else `offset + 3` (`OFFSET_TO_OFFBASE`).
+#[inline(always)]
+fn bt_best_offbase(best_len: usize, best_off: usize) -> u32 {
+    if best_len == 0 {
+        999_999_999
+    } else {
+        (best_off + 3) as u32
+    }
+}
+
 #[inline(always)]
 fn offbase_highbit(off: usize) -> i64 {
     if off == 0 {
@@ -127,7 +182,9 @@ pub(crate) struct RowDictTables {
     pub(crate) tags: Vec<u8>,
     /// Hash-chain form of the same index (upstream CDict `hashTable` /
     /// `chainTable`) when the dictionary's cParams resolve to the chain
-    /// finder; concat-indexed positions, `ROW_EMPTY_SLOT` = empty.
+    /// finder (concat-indexed positions, `ROW_EMPTY_SLOT` = empty), or its
+    /// sorted binary tree when they resolve to btlazy2 (`concat +
+    /// BT_IDX_BASE`, 0 = none).
     pub(crate) hc_hash: Vec<u32>,
     pub(crate) hc_chain: Vec<u32>,
     /// Geometry the index was built with (the CDict's cParams): `hash_log`
@@ -137,6 +194,7 @@ pub(crate) struct RowDictTables {
     pub(crate) chain_log: usize,
     pub(crate) row_log: usize,
     pub(crate) use_row: bool,
+    pub(crate) use_bt: bool,
 }
 use super::match_table::helpers::{
     INCOMPRESSIBLE_SKIP_STEP, best_len_offset_candidate, extend_backwards_shared,
@@ -352,11 +410,7 @@ macro_rules! row_find_best_match {
         debug_assert_eq!($rl, $m.row_log);
         debug_assert!(row_base + row_entries <= $m.row_positions.len());
         let head = unsafe { *$m.row_heads.get_unchecked($row) } as usize;
-        let window_low = if $ctx.attached {
-            hist_start
-        } else {
-            hist_start.max($abs_pos.saturating_sub($ctx.search_window))
-        };
+        let window_low = $ctx.window_low($abs_pos);
         let budget = $m.search_depth.min(row_entries);
         let mut attempts = budget;
         let mut ml = 3usize;
@@ -479,6 +533,7 @@ macro_rules! row_find_best_match {
         // CDict's `searchLog`).
         if ml < limit
             && attempts > 0
+            && $ctx.attached
             && let Some(dict) = $m.dict.table()
             && dict.use_row
         {
@@ -574,7 +629,9 @@ macro_rules! row_find_best_match {
 macro_rules! lazy_search_at {
     ($m:expr, $ctx:ident, $p:expr, $ntu:ident, $skip:ident, $cache:ident, $rl:expr, $use_mask:literal, $maskmac:ident, $cpl:path) => {{
         let p = $p;
-        if $ctx.use_chain {
+        if $ctx.finder == LazyFinder::Tree {
+            dubt_find_best_match!($m, $ctx, p, $ntu, $cpl)
+        } else if $ctx.finder == LazyFinder::Chain {
             hc_find_best_match!($m, $ctx, p, $ntu, $skip, $cpl)
         } else {
             let (row, tag) = if $skip {
@@ -643,11 +700,7 @@ macro_rules! hc_find_best_match {
             }
             $ntu = p;
         }
-        let window_low = if $ctx.attached {
-            hist_start
-        } else {
-            hist_start.max(p.saturating_sub($ctx.search_window))
-        };
+        let window_low = $ctx.window_low(p);
         let min_chain = p.saturating_sub(chain_mask + 1);
         let mut attempts = $m.search_depth;
         let mut ml = 3usize;
@@ -692,8 +745,10 @@ macro_rules! hc_find_best_match {
         // `dictSize - chainSize`.
         if ml < limit
             && attempts > 0
+            && $ctx.attached
             && let Some(dict) = $m.dict.table()
             && !dict.use_row
+            && !dict.use_bt
         {
             let dict_end = $m.dict.region_len();
             let dchain_mask = (1usize << dict.chain_log) - 1;
@@ -735,6 +790,321 @@ macro_rules! hc_find_best_match {
             }
         }
         (ml, best_off)
+    }};
+}
+
+/// Upstream zstd `ZSTD_updateDUBT`: link every position of `[$from, $to)`
+/// into its hash bucket as an UNSORTED tree node (the bucket head becomes
+/// the node's next-candidate link, its other link the sort mark); the next
+/// search of that bucket sorts them in one batch (`dubt_insert1!`).
+macro_rules! dubt_update {
+    ($m:expr, $ctx:ident, $from:expr, $to:expr) => {{
+        let bt_mask = (1usize << ($m.hc_chain_log - 1)) - 1;
+        let mut idx = $from;
+        while idx < $to {
+            let h = $m.hc_hash_at($ctx, idx);
+            let ci = idx + BT_IDX_BASE;
+            let node = 2 * (ci & bt_mask);
+            $m.hc_chain[node] = $m.hc_hash[h];
+            $m.hc_chain[node + 1] = BT_UNSORTED_MARK;
+            $m.hc_hash[h] = ci as u32;
+            idx += 1;
+        }
+    }};
+}
+
+/// Upstream zstd `ZSTD_insertDUBT1`: sort one linked-but-unsorted node
+/// `$curr` (tree index) into the sorted tree below it, at most
+/// `$nb_compares` compares, never past `$bt_low`; the sort walk is bounded
+/// by the plain window distance (upstream reads `lowLimit` / `maxDist` here,
+/// not the dictionary rule). A node whose match runs to the block end is
+/// dropped from the tree (upstream: "no way to know if inf or sup").
+macro_rules! dubt_insert1 {
+    ($m:expr, $ctx:ident, $curr:expr, $nb_compares:expr, $bt_low:expr, $cpl:path) => {{
+        let bt_mask = (1usize << ($m.hc_chain_log - 1)) - 1;
+        let hist_start = $ctx.hist_start;
+        let curr: usize = $curr;
+        let cur_abs = curr - BT_IDX_BASE;
+        debug_assert!(cur_abs >= $ctx.low_limit);
+        let cur_idx = cur_abs - hist_start;
+        // SAFETY: `cur_abs` was linked by `dubt_update!` from a searched
+        // position of this or an earlier block, so it lies in the live
+        // history at least 9 bytes before the block end; every compare
+        // below stops at `iend_rem`.
+        let ip = unsafe { $ctx.base.add(cur_idx) };
+        let iend_rem = $ctx.len - cur_idx;
+        let window_low = $ctx
+            .low_limit
+            .max(cur_abs.saturating_sub($ctx.search_window))
+            + BT_IDX_BASE;
+        let mut smaller_ptr = 2 * (curr & bt_mask);
+        let mut larger_ptr = smaller_ptr + 1;
+        let mut match_index = $m.hc_chain[smaller_ptr] as usize;
+        let mut common_smaller = 0usize;
+        let mut common_larger = 0usize;
+        let mut nb = $nb_compares;
+        while nb > 0 && match_index > window_low {
+            let next_ptr = 2 * (match_index & bt_mask);
+            let mut ml = common_smaller.min(common_larger);
+            let m_idx = match_index - BT_IDX_BASE - hist_start;
+            // SAFETY: `m_idx < cur_idx` (an older node above the window
+            // floor); the reads stop at `iend_rem`.
+            let (smaller, at_end) = unsafe {
+                let mptr = $ctx.base.add(m_idx);
+                ml += $cpl(mptr.add(ml), ip.add(ml), iend_rem - ml);
+                if ml == iend_rem {
+                    (false, true)
+                } else {
+                    (*mptr.add(ml) < *ip.add(ml), false)
+                }
+            };
+            if at_end {
+                break;
+            }
+            if smaller {
+                $m.hc_chain[smaller_ptr] = match_index as u32;
+                common_smaller = ml;
+                if match_index <= $bt_low {
+                    smaller_ptr = BT_DISCARD;
+                    break;
+                }
+                smaller_ptr = next_ptr + 1;
+                match_index = $m.hc_chain[next_ptr + 1] as usize;
+            } else {
+                $m.hc_chain[larger_ptr] = match_index as u32;
+                common_larger = ml;
+                if match_index <= $bt_low {
+                    larger_ptr = BT_DISCARD;
+                    break;
+                }
+                larger_ptr = next_ptr;
+                match_index = $m.hc_chain[next_ptr] as usize;
+            }
+            nb -= 1;
+        }
+        if smaller_ptr != BT_DISCARD {
+            $m.hc_chain[smaller_ptr] = 0;
+        }
+        if larger_ptr != BT_DISCARD {
+            $m.hc_chain[larger_ptr] = 0;
+        }
+    }};
+}
+
+/// Upstream zstd `ZSTD_BtFindBestMatch` (`ZSTD_updateDUBT` +
+/// `ZSTD_DUBT_findBestMatch`, plus `ZSTD_DUBT_findBetterDictMatch` over an
+/// attached dictionary's sorted tree): a position inside the skipped area
+/// (`ip < nextToUpdate`) is not searched; else the gap `[$ntu, p)` is linked
+/// unsorted, the bucket's unsorted nodes are sorted in one batch, the tree
+/// is walked for the longest match (a longer match replaces the best one
+/// only past the upstream offset-cost margin), `p` is inserted on the way,
+/// and `nextToUpdate` jumps past the longest match seen (`matchEndIdx - 8`).
+/// Evaluates to `(ml, offset)`; `ml < 4` means nothing found.
+macro_rules! dubt_find_best_match {
+    ($m:expr, $ctx:ident, $p:expr, $ntu:ident, $cpl:path) => {{
+        let p = $p;
+        if p < $ntu {
+            (0usize, 0usize)
+        } else {
+            dubt_update!($m, $ctx, $ntu, p);
+            let hist_start = $ctx.hist_start;
+            let bt_mask = (1usize << ($m.hc_chain_log - 1)) - 1;
+            let cur_idx = p - hist_start;
+            // SAFETY: the parse searches only positions >= 8 bytes before
+            // the block end.
+            let ip = unsafe { $ctx.base.add(cur_idx) };
+            let limit = $ctx.len - cur_idx;
+            let h = $m.hc_hash_at($ctx, p);
+            let curr = p + BT_IDX_BASE;
+            let window_low = $ctx.window_low(p) + BT_IDX_BASE;
+            let bt_low = curr.saturating_sub(bt_mask);
+            let unsort_limit = bt_low.max(window_low);
+            let mut match_index = $m.hc_hash[h] as usize;
+            let mut next_candidate = 2 * (match_index & bt_mask);
+            let mut unsorted_mark = next_candidate + 1;
+            let mut nb_compares = $m.search_depth;
+            let mut nb_candidates = nb_compares;
+            let mut previous_candidate = 0usize;
+            // Reach the end of the unsorted candidate list, reversing it
+            // through the sort-mark slots.
+            while match_index > unsort_limit
+                && $m.hc_chain[unsorted_mark] == BT_UNSORTED_MARK
+                && nb_candidates > 1
+            {
+                $m.hc_chain[unsorted_mark] = previous_candidate as u32;
+                previous_candidate = match_index;
+                match_index = $m.hc_chain[next_candidate] as usize;
+                next_candidate = 2 * (match_index & bt_mask);
+                unsorted_mark = next_candidate + 1;
+                nb_candidates -= 1;
+            }
+            // Nullify the last candidate if it is still unsorted (upstream:
+            // costs a little ratio, buys speed).
+            if match_index > unsort_limit && $m.hc_chain[unsorted_mark] == BT_UNSORTED_MARK {
+                $m.hc_chain[next_candidate] = 0;
+                $m.hc_chain[unsorted_mark] = 0;
+            }
+            // Batch-sort the stacked candidates, oldest first.
+            match_index = previous_candidate;
+            while match_index != 0 {
+                let next_idx = $m.hc_chain[2 * (match_index & bt_mask) + 1] as usize;
+                dubt_insert1!($m, $ctx, match_index, nb_candidates, unsort_limit, $cpl);
+                match_index = next_idx;
+                nb_candidates += 1;
+            }
+            // Find the longest match, inserting `p` on the way.
+            let mut common_smaller = 0usize;
+            let mut common_larger = 0usize;
+            let mut smaller_ptr = 2 * (curr & bt_mask);
+            let mut larger_ptr = smaller_ptr + 1;
+            let mut match_end_idx = curr + 8 + 1;
+            let mut best_len = 0usize;
+            let mut best_off = 0usize;
+            match_index = $m.hc_hash[h] as usize;
+            $m.hc_hash[h] = curr as u32;
+            while nb_compares > 0 && match_index > window_low {
+                let next_ptr = 2 * (match_index & bt_mask);
+                let mut ml = common_smaller.min(common_larger);
+                let m_idx = match_index - BT_IDX_BASE - hist_start;
+                // SAFETY: `m_idx < cur_idx` (an older node above the window
+                // floor); the reads stop at `limit`.
+                let (smaller, at_end) = unsafe {
+                    let mptr = $ctx.base.add(m_idx);
+                    ml += $cpl(mptr.add(ml), ip.add(ml), limit - ml);
+                    if ml == limit {
+                        (false, true)
+                    } else {
+                        (*mptr.add(ml) < *ip.add(ml), false)
+                    }
+                };
+                if ml > best_len {
+                    if ml > match_end_idx - match_index {
+                        match_end_idx = match_index + ml;
+                    }
+                    if 4 * (ml as i64 - best_len as i64)
+                        > highbit32((curr - match_index + 1) as u32)
+                            - highbit32(bt_best_offbase(best_len, best_off))
+                    {
+                        best_len = ml;
+                        best_off = curr - match_index;
+                    }
+                    if at_end {
+                        // Upstream: no further compares, the dictionary
+                        // tree is not probed either.
+                        nb_compares = 0;
+                        break;
+                    }
+                }
+                if at_end {
+                    break;
+                }
+                if smaller {
+                    $m.hc_chain[smaller_ptr] = match_index as u32;
+                    common_smaller = ml;
+                    if match_index <= bt_low {
+                        smaller_ptr = BT_DISCARD;
+                        break;
+                    }
+                    smaller_ptr = next_ptr + 1;
+                    match_index = $m.hc_chain[next_ptr + 1] as usize;
+                } else {
+                    $m.hc_chain[larger_ptr] = match_index as u32;
+                    common_larger = ml;
+                    if match_index <= bt_low {
+                        larger_ptr = BT_DISCARD;
+                        break;
+                    }
+                    larger_ptr = next_ptr;
+                    match_index = $m.hc_chain[next_ptr] as usize;
+                }
+                nb_compares -= 1;
+            }
+            if smaller_ptr != BT_DISCARD {
+                $m.hc_chain[smaller_ptr] = 0;
+            }
+            if larger_ptr != BT_DISCARD {
+                $m.hc_chain[larger_ptr] = 0;
+            }
+            // Attached dictionary (upstream `dictMatchState`): walk the
+            // CDict's sorted tree with the compares left, entered through
+            // its hash table at its `hashLog`; the offset-cost margin reads
+            // `offBase + 1` there.
+            if $ctx.attached
+                && nb_compares > 0
+                && let Some(dict) = $m.dict.table()
+                && dict.use_bt
+            {
+                let dict_end = $m.dict.region_len();
+                let dbt_mask = (1usize << (dict.chain_log - 1)) - 1;
+                let dhigh = dict_end + BT_IDX_BASE;
+                let dlow = BT_IDX_BASE;
+                let dbt_low = if dbt_mask >= dhigh - dlow {
+                    dlow
+                } else {
+                    dhigh - dbt_mask
+                };
+                // SAFETY: `cur_idx + 8 <= $ctx.len`.
+                let dh = unsafe {
+                    RowMatchGenerator::key_hash_raw(
+                        $ctx.base,
+                        $ctx.len,
+                        cur_idx,
+                        $m.row_hash_mls,
+                        dict.hash_log,
+                        0,
+                    )
+                } as usize;
+                let mut dmi = dict.hc_hash[dh] as usize;
+                let mut common_smaller = 0usize;
+                let mut common_larger = 0usize;
+                while nb_compares > 0 && dmi > dlow {
+                    let next_ptr = 2 * (dmi & dbt_mask);
+                    let mut ml = common_smaller.min(common_larger);
+                    let d_concat = dmi - BT_IDX_BASE;
+                    debug_assert!(d_concat < dict_end);
+                    // SAFETY: the dictionary occupies concat `[0, dict_end)`
+                    // below the prefix; the reads stop at `limit`.
+                    let (smaller, at_end) = unsafe {
+                        let mptr = $ctx.base.add(d_concat);
+                        ml += $cpl(mptr.add(ml), ip.add(ml), limit - ml);
+                        if ml == limit {
+                            (false, true)
+                        } else {
+                            (*mptr.add(ml) < *ip.add(ml), false)
+                        }
+                    };
+                    if ml > best_len {
+                        let dist = p - (hist_start + d_concat);
+                        if 4 * (ml as i64 - best_len as i64)
+                            > highbit32((dist + 1) as u32)
+                                - highbit32(bt_best_offbase(best_len, best_off) + 1)
+                        {
+                            best_len = ml;
+                            best_off = dist;
+                        }
+                        if at_end {
+                            break;
+                        }
+                    }
+                    if at_end {
+                        break;
+                    }
+                    if dmi <= dbt_low {
+                        break;
+                    }
+                    if smaller {
+                        common_smaller = ml;
+                        dmi = dict.hc_chain[next_ptr + 1] as usize;
+                    } else {
+                        common_larger = ml;
+                        dmi = dict.hc_chain[next_ptr] as usize;
+                    }
+                    nb_compares -= 1;
+                }
+            }
+            $ntu = match_end_idx - 8 - BT_IDX_BASE;
+            (best_len, best_off)
+        }
     }};
 }
 
@@ -810,34 +1180,36 @@ macro_rules! lazy_parse_body {
             if current_len == 0 {
                 break 'parse;
             }
+            let block_end = current_abs_start + current_len;
+            $m.enter_block(current_abs_start, block_end);
             let scan = $m.scan_ctx();
             let hist_start = scan.hist_start;
             let depth = $m.lazy_depth;
-            let block_end = current_abs_start + current_len;
             // Upstream `ilimit`: `iend - 8 - ZSTD_ROW_HASH_CACHE_SIZE` for the
-            // row search, `iend - 8` for the hash chain.
-            let ilimit = block_end.saturating_sub(if scan.use_chain {
-                LAZY_HC_ILIMIT_MARGIN
-            } else {
+            // row search, `iend - 8` for the hash chain and the binary tree.
+            let ilimit = block_end.saturating_sub(if scan.finder == LazyFinder::Rows {
                 LAZY_ROW_ILIMIT_MARGIN
+            } else {
+                LAZY_HC_ILIMIT_MARGIN
             });
             let mut anchor = current_abs_start;
             // Upstream skips the first byte of a frame: `ip += (dictAndPrefixLength
             // == 0)` on a plain / attached-dictionary frame (nothing precedes it),
             // `ip += (ip == prefixStart)` on a copied-dictionary frame (upstream
             // `extDict`, the dictionary being the segment below the prefix).
-            let first_byte = match $m.dict_plan {
-                Some(plan) if !plan.attach => scan.prefix_start,
-                _ => hist_start,
+            let first_byte = if scan.dict_frame && !scan.attached {
+                scan.prefix_start
+            } else {
+                hist_start
             };
             let mut ip = current_abs_start + usize::from(current_abs_start == first_byte);
             // Upstream `nextToUpdate`: resume where the previous block
             // stopped indexing (a lazy block leaves its last <= 16 bytes,
-            // now readable with the full 8-byte key; the other parses set
-            // it to their block end). Bounded to the live history: a
-            // cursor the floor moved past restarts at the floor, exactly
-            // upstream's `nextToUpdate < lowLimit` clamp.
-            let mut next_to_update = $m.lazy_next_to_update.clamp(hist_start, current_abs_start);
+            // now readable with the full 8-byte key; the tree leaves it past
+            // the longest match seen). A cursor the window floor moved past
+            // restarts at the floor (upstream's `nextToUpdate < lowLimit`
+            // clamp).
+            let mut next_to_update = $m.lazy_next_to_update.max(scan.low_limit);
             // Upstream `ZSTD_buildSeqStore` "limited update after a very long
             // match" (zstd_compress.c:3296): a block starting more than 384
             // positions past the cursor indexes at most the last 192 + 384 of
@@ -849,7 +1221,9 @@ macro_rules! lazy_parse_body {
             let mut lazy_skipping = false;
             // Upstream `ZSTD_row_fillHashCache(ms, base, rowLog, mls, nextToUpdate, ilimit)`.
             let mut hash_cache = [(ROW_CACHE_NONE, 0u8); ROW_HASH_CACHE_SIZE];
-            row_cache_fill!($m, scan, hash_cache, $rl, next_to_update);
+            if scan.finder == LazyFinder::Rows {
+                row_cache_fill!($m, scan, hash_cache, $rl, next_to_update);
+            }
             // Upstream `rep[0..2]` entering the block: carried from the
             // previous lazy block, else the frame / dictionary history.
             // Repcodes reaching below the window are disabled for the block
@@ -863,10 +1237,11 @@ macro_rules! lazy_parse_body {
             // below the window are disabled for the whole block (`maxRep`,
             // remembered in `offset_saved`). Dictionary frame (upstream
             // `extDict` / `dictMatchState`): no block-start clamp; every rep
-            // probe checks the window floor at its own position and
-            // `ZSTD_index_overlap_check` (a source in the last 3 bytes below
-            // the frame's prefix, straddling the dictionary boundary, is not
-            // taken).
+            // probe checks the window floor at its own position (the
+            // attached dictionary has none: its reps reach the dictionary
+            // start) and `ZSTD_index_overlap_check` (a source in the last 3
+            // bytes below the frame's prefix, straddling the dictionary
+            // boundary, is not taken).
             let dict_frame = scan.dict_frame;
             let attached = scan.attached;
             let prefix_start = scan.prefix_start;
@@ -886,7 +1261,7 @@ macro_rules! lazy_parse_body {
                 let floor = if attached {
                     hist_start
                 } else {
-                    hist_start.max(pos.saturating_sub(search_window))
+                    scan.window_low(pos)
                 };
                 cand >= floor && !(cand < prefix_start && cand + 3 >= prefix_start)
             };
@@ -895,7 +1270,9 @@ macro_rules! lazy_parse_body {
             let mut offset_saved_1 = 0usize;
             let mut offset_saved_2 = 0usize;
             if !dict_frame {
-                let max_rep = ip - hist_start.max(ip.saturating_sub(search_window));
+                // Upstream `ZSTD_getLowestPrefixIndex`: the prefix start or
+                // `maxDist` back, whichever is nearer.
+                let max_rep = ip - prefix_start.max(ip.saturating_sub(search_window));
                 if offset_2 > max_rep {
                     offset_saved_2 = offset_2;
                     offset_2 = 0;
@@ -1063,7 +1440,7 @@ macro_rules! lazy_parse_body {
                     // the dictionary start for a dictionary match).
                     let concat = $m.live_history();
                     let m_start = if start - off >= prefix_start {
-                        prefix_start.max(hist_start)
+                        prefix_start
                     } else {
                         hist_start
                     };
@@ -1094,8 +1471,10 @@ macro_rules! lazy_parse_body {
                 anchor = start + match_length;
                 ip = anchor;
                 if lazy_skipping {
-                    // A match ends lazy skipping; the cache is stale, refill it.
-                    row_cache_fill!($m, scan, hash_cache, $rl, next_to_update);
+                    // A match ends lazy skipping; the row cache is stale, refill it.
+                    if scan.finder == LazyFinder::Rows {
+                        row_cache_fill!($m, scan, hash_cache, $rl, next_to_update);
+                    }
                     lazy_skipping = false;
                 }
 
@@ -1752,16 +2131,30 @@ pub(crate) struct RowMatchGenerator {
     pub(crate) history_start: usize,
     pub(crate) history_abs_start: usize,
     pub(crate) offset_hist: [u32; 3],
-    /// Upstream `ZSTD_resolveRowMatchFinderMode`: with a window of 2^14 or
-    /// less the greedy/lazy parse searches a hash chain (`ZSTD_HcFindBestMatch`)
-    /// instead of rows. Resolved in `configure` from `max_window_size`.
-    use_chain: bool,
-    /// Hash-chain tables (upstream `hashTable` / `chainTable`, `hashLog` /
-    /// `chainLog` wide) used when `use_chain`; absolute positions,
-    /// `ROW_EMPTY_SLOT` = empty.
+    /// The finder the lazy parse searches: rows, the hash chain (upstream
+    /// `ZSTD_resolveRowMatchFinderMode`: a window of 2^14 or less) or the
+    /// binary tree (btlazy2). Resolved in `configure`.
+    finder: LazyFinder,
+    /// Hash-chain / binary-tree tables (upstream `hashTable` / `chainTable`,
+    /// `hashLog` / `chainLog` wide) used by the chain and tree finders. The
+    /// chain holds absolute positions with `ROW_EMPTY_SLOT` = empty; the tree
+    /// holds `abs + BT_IDX_BASE` with 0 = none (`hc_layout` records which).
     hc_chain_log: usize,
     hc_hash: Vec<u32>,
     hc_chain: Vec<u32>,
+    hc_layout: LazyFinder,
+    /// Upstream `ms->loadedDictEnd` (absolute): the dictionary end while the
+    /// dictionary is still valid for the block being parsed (its whole
+    /// content may be matched, no distance bound), 0 otherwise.
+    loaded_dict_end: usize,
+    /// Upstream `window.lowLimit` (absolute): the lowest index a match may
+    /// reach; raised as the window slides (`ZSTD_window_enforceMaxDist`).
+    low_limit: usize,
+    /// Upstream `window.dictLimit` (absolute): the prefix start, the
+    /// dictionary (copied: `extDict`) lying below it; equals the frame start
+    /// on a plain frame and is raised with `low_limit` once the window has
+    /// slid past the dictionary.
+    prefix_low: usize,
     /// Salt XORed into the live row hash: a fresh context's
     /// [`ROW_HASH_SALT`], or 0 after a dictionary's tables were copied in
     /// (upstream `ZSTD_resetCCtx_byCopyingCDict` inherits the CDict's salt,
@@ -1856,10 +2249,14 @@ impl RowMatchGenerator {
             history_start: 0,
             history_abs_start: 0,
             offset_hist: [1, 4, 8],
-            use_chain: false,
+            finder: LazyFinder::Rows,
             hc_chain_log: ROW_HASH_BITS,
             hc_hash: Vec::new(),
             hc_chain: Vec::new(),
+            hc_layout: LazyFinder::Chain,
+            loaded_dict_end: 0,
+            low_limit: 0,
+            prefix_low: 0,
             hash_salt: ROW_HASH_SALT,
             dict_plan: None,
             search_window: 0,
@@ -1892,8 +2289,12 @@ impl RowMatchGenerator {
             + self.row_heads.capacity()
             + self.row_positions.capacity() * u32_sz
             + self.row_tags.capacity()
+            + (self.hc_hash.capacity() + self.hc_chain.capacity()) * u32_sz
             + self.dict.table().map_or(0, |t| {
-                t.heads.capacity() + t.positions.capacity() * u32_sz + t.tags.capacity()
+                t.heads.capacity()
+                    + t.positions.capacity() * u32_sz
+                    + t.tags.capacity()
+                    + (t.hc_hash.capacity() + t.hc_chain.capacity()) * u32_sz
             })
     }
 
@@ -1910,24 +2311,42 @@ impl RowMatchGenerator {
     /// `ZSTD_resolveRowMatchFinderMode`) instead of rows.
     #[cfg(test)]
     pub(crate) fn uses_hash_chain(&self) -> bool {
-        self.use_chain
+        self.finder == LazyFinder::Chain
     }
 
-    /// Hash-chain table width (`chainLog`) applied by `configure`.
+    /// Whether the parse searches the binary tree (btlazy2).
+    #[cfg(test)]
+    pub(crate) fn uses_binary_tree(&self) -> bool {
+        self.finder == LazyFinder::Tree
+    }
+
+    /// Hash-chain / tree table width (`chainLog`) applied by `configure`.
     #[cfg(test)]
     pub(crate) fn hc_chain_log(&self) -> usize {
         self.hc_chain_log
     }
 
-    /// Absolute start of the frame's own prefix on a dictionary frame
-    /// (upstream `prefixLowestIndex` / `dictLimit`; the dictionary lies
-    /// below it), else 0 so the boundary rules never fire.
-    #[inline(always)]
-    fn dict_prefix_start(&self) -> usize {
-        if self.dict_plan.is_some() {
-            self.history_abs_start + self.dict.region_len()
-        } else {
-            0
+    /// Upstream `ZSTD_checkDictValidity` + `ZSTD_window_enforceMaxDist`,
+    /// run before every parsed block: a dictionary reaching further back than
+    /// the window from the block end is dropped for good (`loadedDictEnd =
+    /// 0`, the attached tables are no longer probed), and once the block
+    /// start is more than a window past the dictionary end the window floor
+    /// rises to `block_start - maxDist`, taking the prefix start with it (a
+    /// copied dictionary is then out of reach and the frame is upstream's
+    /// plain `noDict`).
+    fn enter_block(&mut self, block_start: usize, block_end: usize) {
+        if self.loaded_dict_end != 0 && block_end > self.loaded_dict_end + self.search_window {
+            self.loaded_dict_end = 0;
+        }
+        if block_start > self.search_window + self.loaded_dict_end {
+            let new_low = block_start - self.search_window;
+            if self.low_limit < new_low {
+                self.low_limit = new_low;
+            }
+            if self.prefix_low < self.low_limit {
+                self.prefix_low = self.low_limit;
+            }
+            self.loaded_dict_end = 0;
         }
     }
 
@@ -1963,14 +2382,25 @@ impl RowMatchGenerator {
         // sharing the 4-byte key) and a sane upper bound.
         self.mls = config.mls.clamp(ROW_HASH_KEY_LEN, 7);
         self.row_hash_mls = self.mls.clamp(4, 6) as u32;
-        // Upstream `ZSTD_resolveRowMatchFinderMode`: rows only above a 2^14
-        // window; the window is source-size-adjusted, so inputs of 16 KiB or
-        // less search the hash chain. A dictionary frame inherits the CDict's
-        // decision (`ZSTD_resetCCtx_usingCDict`: "cdict overrides"), and a
-        // copied dictionary brings the CDict's salt (0) with its tables.
-        self.use_chain = match self.dict_plan {
-            Some(plan) => !plan.use_row,
-            None => self.max_window_size <= (1usize << 14),
+        // A btlazy2 level (its own or the CDict's strategy) searches the
+        // binary tree. Otherwise upstream `ZSTD_resolveRowMatchFinderMode`:
+        // rows only above a 2^14 window; the window is source-size-adjusted,
+        // so inputs of 16 KiB or less search the hash chain. A dictionary
+        // frame inherits the CDict's decision (`ZSTD_resetCCtx_usingCDict`:
+        // "cdict overrides"), and a copied dictionary brings the CDict's
+        // salt (0) with its tables.
+        self.finder = if config.bt {
+            LazyFinder::Tree
+        } else {
+            let rows = match self.dict_plan {
+                Some(plan) => plan.use_row,
+                None => self.max_window_size > (1usize << 14),
+            };
+            if rows {
+                LazyFinder::Rows
+            } else {
+                LazyFinder::Chain
+            }
         };
         self.hash_salt = match self.dict_plan {
             Some(plan) if !plan.attach => 0,
@@ -2033,13 +2463,19 @@ impl RowMatchGenerator {
             self.row_heads.fill(0);
             self.row_positions.fill(ROW_EMPTY_SLOT);
             self.row_tags.fill(0);
-            self.hc_hash.fill(ROW_EMPTY_SLOT);
-            self.hc_chain.fill(ROW_EMPTY_SLOT);
+            let empty = self.hc_empty_slot();
+            self.hc_hash.fill(empty);
+            self.hc_chain.fill(empty);
         }
         // Nothing of the previous frame is indexed for the new one, and the
-        // lazy reps restart from the frame's initial history.
+        // lazy reps restart from the frame's initial history. The window
+        // starts at the frame start with no dictionary (a dictionary frame
+        // primes these right after).
         self.lazy_next_to_update = self.history_abs_start;
         self.lazy_reps = None;
+        self.loaded_dict_end = 0;
+        self.low_limit = self.history_abs_start;
+        self.prefix_low = self.history_abs_start;
         // Block buffers are returned to the caller's pool per block in
         // `add_data`, so there is nothing window-side to recycle here.
         self.chunk_lens.clear();
@@ -2077,7 +2513,9 @@ impl RowMatchGenerator {
         // once per ~4 GiB of stream, and one rebase always suffices because the
         // live window is far smaller than u32::MAX. `check_stream_abs_headroom`
         // above already guards the 32-bit-target `usize` overflow separately.
-        if self.history_abs_start + self.window_size + data.len() >= u32::MAX as usize - 1 {
+        if self.history_abs_start + self.window_size + data.len()
+            >= u32::MAX as usize - 1 - BT_IDX_BASE
+        {
             self.rebase_positions();
         }
         if self.window_size + data.len() > self.max_window_size {
@@ -2142,14 +2580,9 @@ impl RowMatchGenerator {
         if delta == 0 {
             return;
         }
-        for slot in self
-            .row_positions
-            .iter_mut()
-            .chain(self.hc_hash.iter_mut())
-            .chain(self.hc_chain.iter_mut())
-        {
+        let rebase_abs = |slot: &mut u32| {
             if *slot == ROW_EMPTY_SLOT {
-                continue;
+                return;
             }
             let abs = *slot as usize;
             *slot = if abs < delta {
@@ -2157,8 +2590,35 @@ impl RowMatchGenerator {
             } else {
                 (abs - delta) as u32
             };
+        };
+        self.row_positions.iter_mut().for_each(rebase_abs);
+        if self.hc_layout == LazyFinder::Tree {
+            // Tree indices are `abs + BT_IDX_BASE`; 0 (none) and the unsorted
+            // mark are kept (upstream `ZSTD_reduceTable_btlazy2`).
+            let rebase_tree = |slot: &mut u32| {
+                let v = *slot as usize;
+                if v < BT_IDX_BASE {
+                    return;
+                }
+                let abs = v - BT_IDX_BASE;
+                *slot = if abs < delta {
+                    0
+                } else {
+                    (abs - delta + BT_IDX_BASE) as u32
+                };
+            };
+            self.hc_hash.iter_mut().for_each(rebase_tree);
+            self.hc_chain.iter_mut().for_each(rebase_tree);
+        } else {
+            self.hc_hash.iter_mut().for_each(rebase_abs);
+            self.hc_chain.iter_mut().for_each(rebase_abs);
         }
         self.lazy_next_to_update = self.lazy_next_to_update.saturating_sub(delta);
+        self.low_limit = self.low_limit.saturating_sub(delta);
+        self.prefix_low = self.prefix_low.saturating_sub(delta);
+        if self.loaded_dict_end != 0 {
+            self.loaded_dict_end = self.loaded_dict_end.saturating_sub(delta);
+        }
         self.history_abs_start -= delta;
     }
 
@@ -2323,19 +2783,34 @@ impl RowMatchGenerator {
             self.row_tags.clear();
             self.row_tags.resize(total, 0);
         }
-        if self.use_chain {
-            // Hash-chain mode: `hashTable` is `1 << hashLog` wide (the full
-            // row hash width, no tag bits), `chainTable` `1 << chainLog`.
+        if self.finder != LazyFinder::Rows {
+            // Chain / tree mode: `hashTable` is `1 << hashLog` wide (the full
+            // row hash width, no tag bits), `chainTable` `1 << chainLog` (the
+            // tree: two links per node over `chainLog - 1` bits). The two
+            // finders use different empty conventions, so tables laid out for
+            // the other one are refilled.
             let hash_len = 1usize << (self.row_hash_log + self.row_log);
             let chain_len = 1usize << self.hc_chain_log;
-            if self.hc_hash.len() != hash_len {
+            let empty = self.hc_empty_slot();
+            let relayout = self.hc_layout != self.finder;
+            if self.hc_hash.len() != hash_len || relayout {
                 self.hc_hash.clear();
-                self.hc_hash.resize(hash_len, ROW_EMPTY_SLOT);
+                self.hc_hash.resize(hash_len, empty);
             }
-            if self.hc_chain.len() != chain_len {
+            if self.hc_chain.len() != chain_len || relayout {
                 self.hc_chain.clear();
-                self.hc_chain.resize(chain_len, ROW_EMPTY_SLOT);
+                self.hc_chain.resize(chain_len, empty);
             }
+            self.hc_layout = self.finder;
+        }
+    }
+
+    /// The empty-slot value of the chain / tree tables for the active finder.
+    fn hc_empty_slot(&self) -> u32 {
+        if self.finder == LazyFinder::Tree {
+            0
+        } else {
+            ROW_EMPTY_SLOT
         }
     }
 
@@ -2401,6 +2876,11 @@ impl RowMatchGenerator {
         self.borrowed_input = Some((buffer.as_ptr(), buffer.len()));
         self.borrowed_block = None;
         self.history_abs_start = 0;
+        // The window bounds follow the coordinate origin (no dictionary on
+        // the borrowed path).
+        self.low_limit = 0;
+        self.prefix_low = 0;
+        self.loaded_dict_end = 0;
     }
 
     pub(crate) fn clear_borrowed_window(&mut self) {
@@ -2500,16 +2980,18 @@ impl RowMatchGenerator {
     #[inline(always)]
     fn scan_ctx(&self) -> RowScan {
         let history = self.live_history();
+        let dict_frame = self.loaded_dict_end != 0;
         RowScan {
             base: history.as_ptr(),
             len: history.len(),
             hist_start: self.history_abs_start,
             salt: self.hash_salt,
             search_window: self.search_window,
-            prefix_start: self.dict_prefix_start(),
-            dict_frame: self.dict_plan.is_some(),
-            attached: self.dict_plan.is_some_and(|p| p.attach),
-            use_chain: self.use_chain,
+            low_limit: self.low_limit,
+            prefix_start: self.prefix_low,
+            dict_frame,
+            attached: dict_frame && self.dict_plan.is_some_and(|p| p.attach),
+            finder: self.finder,
         }
     }
 
@@ -2971,9 +3453,263 @@ impl RowMatchGenerator {
         }
     }
 
-    /// Mark the attached dict row index fully built (CDict cache).
+    /// The whole dictionary is committed: finish its index and mark it built
+    /// (CDict cache). The binary tree is built here rather than per slice
+    /// because upstream sorts it in ONE pass over the whole dictionary
+    /// (`ZSTD_updateTree`), each node compared against bytes up to the
+    /// dictionary END; a per-slice build would compare against the slice
+    /// end and link the tree differently. A copied dictionary also leaves
+    /// `nextToUpdate` at the dictionary end, as `ZSTD_loadDictionaryContent`
+    /// does: its last 8 positions are never indexed (their keys would read
+    /// into the source, which upstream's non-contiguous window cannot).
     pub(crate) fn mark_dict_primed(&mut self) {
+        if let Some(plan) = self.dict_plan {
+            let concat_len = self.history.len() - self.history_start;
+            if self.finder == LazyFinder::Tree {
+                if plan.attach {
+                    self.prime_dict_tree(plan, concat_len);
+                } else {
+                    self.build_live_dict_tree(concat_len);
+                }
+            }
+            if !plan.attach {
+                self.lazy_next_to_update = self.history_abs_start + concat_len;
+            }
+        }
         self.dict.mark_primed();
+    }
+
+    /// Upstream zstd `ZSTD_insertBt1`: insert the position at `content[pos]`
+    /// (tree index `pos + index_base`) into the sorted tree, comparing
+    /// against at most `nb_compares` nodes down to `window_low` (a tree
+    /// index). Returns how many positions the tree update may skip
+    /// (`forward`, at least 1): past the longest match seen minus 8, more
+    /// after a very long match.
+    ///
+    /// # Safety
+    /// `content` must point to `content_len` readable bytes with `pos + 8 <=
+    /// content_len`; every tree index in `hash` / `bt` above `window_low`
+    /// must map to a position below `pos`; `hash.len() == 1 << hash_log`,
+    /// `bt.len() == 1 << chain_log`.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn insert_bt1_sorted(
+        hash: &mut [u32],
+        bt: &mut [u32],
+        content: *const u8,
+        content_len: usize,
+        pos: usize,
+        index_base: usize,
+        window_low: usize,
+        hash_log: usize,
+        chain_log: usize,
+        nb_compares: usize,
+        mls: u32,
+    ) -> usize {
+        use crate::encoding::fastpath::scalar::common_prefix_len_ptr;
+        let bt_mask = (1usize << (chain_log - 1)) - 1;
+        // SAFETY: `pos + 8 <= content_len` (caller contract).
+        let h = unsafe { Self::key_hash_raw(content, content_len, pos, mls, hash_log, 0) } as usize;
+        let curr = pos + index_base;
+        let mut match_index = hash[h] as usize;
+        // SAFETY: `pos < content_len`.
+        let ip = unsafe { content.add(pos) };
+        let iend_rem = content_len - pos;
+        let bt_low = curr.saturating_sub(bt_mask);
+        let mut smaller_ptr = 2 * (curr & bt_mask);
+        let mut larger_ptr = smaller_ptr + 1;
+        let mut match_end_idx = curr + 8 + 1;
+        let mut best_len = 8usize;
+        let mut nb = nb_compares;
+        let mut common_smaller = 0usize;
+        let mut common_larger = 0usize;
+        hash[h] = curr as u32;
+        while nb > 0 && match_index >= window_low {
+            let next_ptr = 2 * (match_index & bt_mask);
+            let mut ml = common_smaller.min(common_larger);
+            let m_off = match_index - index_base;
+            // SAFETY: `m_off < pos` (caller contract); the reads stop at
+            // `iend_rem`.
+            let (smaller, at_end) = unsafe {
+                let mptr = content.add(m_off);
+                ml += common_prefix_len_ptr(mptr.add(ml), ip.add(ml), iend_rem - ml);
+                if ml == iend_rem {
+                    (false, true)
+                } else {
+                    (*mptr.add(ml) < *ip.add(ml), false)
+                }
+            };
+            if ml > best_len {
+                best_len = ml;
+                if ml > match_end_idx - match_index {
+                    match_end_idx = match_index + ml;
+                }
+            }
+            if at_end {
+                break;
+            }
+            if smaller {
+                bt[smaller_ptr] = match_index as u32;
+                common_smaller = ml;
+                if match_index <= bt_low {
+                    smaller_ptr = BT_DISCARD;
+                    break;
+                }
+                smaller_ptr = next_ptr + 1;
+                match_index = bt[next_ptr + 1] as usize;
+            } else {
+                bt[larger_ptr] = match_index as u32;
+                common_larger = ml;
+                if match_index <= bt_low {
+                    larger_ptr = BT_DISCARD;
+                    break;
+                }
+                larger_ptr = next_ptr;
+                match_index = bt[next_ptr] as usize;
+            }
+            nb -= 1;
+        }
+        if smaller_ptr != BT_DISCARD {
+            bt[smaller_ptr] = 0;
+        }
+        if larger_ptr != BT_DISCARD {
+            bt[larger_ptr] = 0;
+        }
+        let positions = if best_len > 384 {
+            192.min(best_len - 384)
+        } else {
+            0
+        };
+        positions.max(match_end_idx - (curr + 8))
+    }
+
+    /// Upstream zstd `ZSTD_updateTree` over a dictionary of `concat_len`
+    /// bytes at the front of the live history: every position up to
+    /// `concat_len - 8` is inserted sorted (skipping past long matches as
+    /// `ZSTD_insertBt1` directs), the tree indexed `position + index_base`
+    /// with the tree's first index as the window floor.
+    ///
+    /// # Safety
+    /// `hash.len() == 1 << hash_log`, `bt.len() == 1 << chain_log`, both
+    /// holding only indices below `concat_len + index_base` (or none).
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn update_dict_tree(
+        hash: &mut [u32],
+        bt: &mut [u32],
+        content: *const u8,
+        concat_len: usize,
+        index_base: usize,
+        hash_log: usize,
+        chain_log: usize,
+        nb_compares: usize,
+        mls: u32,
+    ) {
+        let target = concat_len.saturating_sub(8);
+        let mut idx = 0usize;
+        while idx < target {
+            // SAFETY: `idx + 8 <= concat_len`; the tree holds only earlier
+            // dictionary positions (this loop's own inserts).
+            let forward = unsafe {
+                Self::insert_bt1_sorted(
+                    hash,
+                    bt,
+                    content,
+                    concat_len,
+                    idx,
+                    index_base,
+                    index_base,
+                    hash_log,
+                    chain_log,
+                    nb_compares,
+                    mls,
+                )
+            };
+            idx += forward.max(1);
+        }
+    }
+
+    /// COPY-mode tree: the dictionary's sorted tree built straight into the
+    /// live tables (upstream `ZSTD_resetCCtx_byCopyingCDict` copies the
+    /// CDict's tree, built with the same cParams the frame now runs).
+    fn build_live_dict_tree(&mut self, concat_len: usize) {
+        self.ensure_tables();
+        let hash_log = self.row_hash_log + self.row_log;
+        let chain_log = self.hc_chain_log;
+        let nb_compares = self.search_depth;
+        let mls = self.row_hash_mls;
+        let index_base = self.history_abs_start + BT_IDX_BASE;
+        let base = self.history.as_ptr();
+        let history_start = self.history_start;
+        // SAFETY: `concat_len` bytes of dictionary follow `history_start`;
+        // the live tables were just sized to the logs and hold nothing of
+        // this frame yet (the tree convention's 0 = none).
+        unsafe {
+            Self::update_dict_tree(
+                &mut self.hc_hash,
+                &mut self.hc_chain,
+                base.add(history_start),
+                concat_len,
+                index_base,
+                hash_log,
+                chain_log,
+                nb_compares,
+                mls,
+            );
+        }
+    }
+
+    /// ATTACH-mode tree: the CDict's sorted tree (its `hashLog` /
+    /// `chainLog` / `searchLog` / `minMatch`) over the dictionary, probed by
+    /// the search as `dictMatchState`. Skipped when the cached tree for this
+    /// dictionary is already primed.
+    fn prime_dict_tree(&mut self, plan: RowDictPlan, concat_len: usize) {
+        let cd = plan.cdict;
+        let hash_log = cd.hash_log as usize;
+        let chain_log = cd.chain_log as usize;
+        let row_log = (cd.search_log as usize).clamp(4, 6);
+        let nb_compares = 1usize << cd.search_log;
+        let mls = cd.min_match.clamp(4, 6);
+        if self.dict.table().is_some_and(|d| {
+            d.hash_log != hash_log || d.chain_log != chain_log || d.row_log != row_log || !d.use_bt
+        }) {
+            self.dict.invalidate();
+        }
+        self.dict.set_region_len(concat_len);
+        if self.dict.is_primed() {
+            return;
+        }
+        let base = self.history.as_ptr();
+        let history_start = self.history_start;
+        let dict = self.dict.table_mut_or_init(|| RowDictTables {
+            heads: Vec::new(),
+            positions: Vec::new(),
+            tags: Vec::new(),
+            hc_hash: alloc::vec![0u32; 1usize << hash_log],
+            hc_chain: alloc::vec![0u32; 1usize << chain_log],
+            hash_log,
+            chain_log,
+            row_log,
+            use_row: false,
+            use_bt: true,
+        });
+        // A cached tree of the right shape that was not marked primed was
+        // built for another dictionary of the same length: rebuild it.
+        dict.hc_hash.fill(0);
+        dict.hc_chain.fill(0);
+        // SAFETY: `concat_len` bytes of dictionary follow `history_start`;
+        // the tables are freshly cleared.
+        unsafe {
+            Self::update_dict_tree(
+                &mut dict.hc_hash,
+                &mut dict.hc_chain,
+                base.add(history_start),
+                concat_len,
+                BT_IDX_BASE,
+                hash_log,
+                chain_log,
+                nb_compares,
+                mls,
+            );
+        }
     }
 
     /// Drop the cached dict row index (next frame carries no dict, or eviction /
@@ -3003,18 +3739,37 @@ impl RowMatchGenerator {
         };
         let concat_len = self.history.len() - self.history_start;
         let indexable_end = concat_len.saturating_sub(8);
+        let hist_start = self.history_abs_start;
+        // Upstream window after the dictionary load: `loadedDictEnd` and the
+        // prefix start (`dictLimit`) at the dictionary end; `lowLimit` at the
+        // dictionary start when it is copied (the `extDict` segment below the
+        // prefix) and at the prefix start when it is attached (the dictionary
+        // is outside the window, reached through its own tables).
+        self.loaded_dict_end = hist_start + concat_len;
+        self.prefix_low = hist_start + concat_len;
+        self.low_limit = if plan.attach {
+            self.prefix_low
+        } else {
+            hist_start
+        };
+        if self.finder == LazyFinder::Tree {
+            // The tree is sorted in one pass over the whole dictionary in
+            // `mark_dict_primed`.
+            self.dict.set_region_len(concat_len);
+            return;
+        }
         if plan.attach {
             self.prime_dict_tables(plan, concat_len, indexable_end);
         } else {
             // COPY: the dictionary is the frame's `extDict` segment
             // (`prefixStart` = its end) even though it lives in the live
-            // tables.
+            // tables. The index cursor carries across the dictionary's
+            // slices; `mark_dict_primed` moves it to the dictionary end.
             self.dict.set_region_len(concat_len);
-            let hist_start = self.history_abs_start;
             let from = self.lazy_next_to_update.max(hist_start) - hist_start;
             if from < indexable_end {
                 let scan = self.scan_ctx();
-                if self.use_chain {
+                if self.finder == LazyFinder::Chain {
                     let chain_mask = (1usize << self.hc_chain_log) - 1;
                     for idx in from..indexable_end {
                         let h = self.hc_hash_at(scan, hist_start + idx);
@@ -3063,6 +3818,7 @@ impl RowMatchGenerator {
                 || d.chain_log != chain_log
                 || d.row_log != row_log
                 || d.use_row != use_row
+                || d.use_bt
         }) {
             self.dict.invalidate();
         }
@@ -3103,6 +3859,7 @@ impl RowMatchGenerator {
                 chain_log,
                 row_log,
                 use_row,
+                use_bt: false,
             }
         });
         // SAFETY: `concat + 8 <= concat_len` for every indexed position
