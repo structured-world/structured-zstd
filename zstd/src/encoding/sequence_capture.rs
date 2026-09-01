@@ -194,6 +194,12 @@ impl Matcher for CapturingMatcher {
         self.inner.set_source_size_hint(size);
     }
 
+    fn set_dictionary_size_hint(&mut self, size: usize) {
+        // Forwarded so the frame's cParams derive from the dictionary exactly
+        // as in production (`resolve_level_params_with_dict`).
+        self.inner.set_dictionary_size_hint(size);
+    }
+
     fn prime_with_dictionary(&mut self, dict_content: &[u8], offset_hist: [u32; 3]) {
         self.inner.prime_with_dictionary(dict_content, offset_hist);
     }
@@ -394,6 +400,13 @@ fn compress_and_collect_sequences_impl(
     // assumes streaming sizing, which would diverge from libzstd's
     // `ZSTD_generateSequences` (which receives `srcSize` directly).
     compressor.set_source_size_hint(input.len() as u64);
+    // Full blocks only: upstream's `ZSTD_generateSequences` runs
+    // `ZSTD_compress2` in sequence-collecting mode, where every block is
+    // written raw (`cSize = blockSize + 3`) so the `savings >= 3` gate of
+    // `ZSTD_optimalBlockSize` never opens and the pre-splitter never cuts.
+    // Matching that keeps both streams' block boundaries (and therefore
+    // block-entry parse state) aligned for the comparison.
+    compressor.set_pre_split_disabled(true);
     compressor.compress();
     // `Rc::try_unwrap` succeeds because the inner `CapturingMatcher`
     // is dropped when `compressor` goes out of scope at the end of the

@@ -51,6 +51,10 @@ pub(crate) struct RowConfig {
     /// 4 bytes (an internal detail), so this only tunes the acceptance
     /// floor, not the candidate hash distribution.
     pub(crate) mls: usize,
+    /// Upstream `cParams.chainLog`: the hash-chain table the greedy/lazy
+    /// parse searches instead of rows when the window is 2^14 or smaller
+    /// (upstream `ZSTD_resolveRowMatchFinderMode`).
+    pub(crate) chain_log: usize,
 }
 
 // Only used as the default HashChain config when the test-only parse×search
@@ -86,6 +90,7 @@ pub(crate) const ROW_CONFIG: RowConfig = RowConfig {
     search_depth: ROW_SEARCH_DEPTH,
     target_len: ROW_TARGET_LEN,
     mls: ROW_MIN_MATCH_LEN,
+    chain_log: ROW_HASH_BITS,
 };
 
 // Level-5 greedy is the ONLY strategy routed to the Row backend
@@ -110,6 +115,7 @@ pub(crate) const ROW_L5: RowConfig = RowConfig {
     search_depth: 8,
     target_len: 2,
     mls: ROW_MIN_MATCH_LEN,
+    chain_log: 18,
 };
 
 /// Per-level Double-Fast hash sizing, mirroring the upstream zstd `clevels.h` columns
@@ -205,42 +211,28 @@ impl LevelParams {
         }
     }
 
-    /// Cheap fingerprint pre-splitter level (the C-like `blockSplitterLevel`):
-    /// the EFFECTIVE upstream `ZSTD_splitBlock` level that
-    /// `ZSTD_optimalBlockSize` dispatches, i.e. `splitLevels[strategy] - 2`
-    /// (clamped at 0), NOT the raw `splitLevels[]` value. `split_level == 0`
-    /// routes to the cheap from-borders heuristic; `1..=4` to byChunks with
-    /// internal sampling level `split_level - 1`. See the body for the
-    /// per-strategy tier table and why the raw-table mapping was wrong.
+    /// Cheap fingerprint pre-splitter level: the `ZSTD_splitBlock` level
+    /// upstream `ZSTD_optimalBlockSize` (zstd_compress.c:4552) dispatches by
+    /// default, `splitLevels[strategy] = {0,0,1,2,2,3,3,4,4,4}` indexed by
+    /// the upstream strategy ordinal. Only an EXPLICIT `blockSplitterLevel`
+    /// (2..=6) is shifted down by 2 there; the default table is used as is.
+    /// `0` routes to the from-borders heuristic; `1..=4` to byChunks with
+    /// sampling tier `level - 1` (rates 43 / 11 / 5 / 1).
     pub(crate) fn pre_split(&self) -> Option<u8> {
         use crate::encoding::strategy::StrategyTag;
-        // Effective upstream `ZSTD_splitBlock` level = `splitLevels[strat] - 2`
-        // (clamped at 0). Upstream `splitLevels[] = {0,0,1,2,2,3,3,4,4,4}` then
-        // subtracts 2 before dispatch, so the byChunks sampling tier is two
-        // steps coarser than the raw table: greedy/lazy(d1)=0 (from-borders),
-        // lazy2/btlazy2=1 (byChunks rate 43), btopt+=2 (byChunks rate 11).
-        // An earlier version mirrored the RAW table AND bumped lazy2 to the
-        // rate-1 full scan (split 4) to dodge a periodic-input phantom-split —
-        // that ran the pre-splitter at up to 43x upstream's sampling cost
-        // (~87% of L9 encode time on the decode corpus). Per the drop-in
-        // contract ratio only needs to stay <= upstream, so matching upstream's
-        // sampling tier (and accepting upstream's identical over-split on
-        // periodic input) is the dominant large-input encode-speed win.
         Some(match self.strategy_tag {
-            // splitLevels 0/1 -> 0: upstream does not pre-split fast/dfast at
-            // all; from-borders is the cheapest stand-in and rarely splits.
-            StrategyTag::Fast | StrategyTag::Dfast => 0,
-            // greedy / lazy(depth 1): splitLevels 2 -> 0 (from-borders).
-            StrategyTag::Greedy => 0,
+            StrategyTag::Fast => 0,
+            StrategyTag::Dfast => 1,
+            StrategyTag::Greedy => 2,
             StrategyTag::Lazy => {
                 if self.lazy_depth >= 2 {
-                    1 // lazy2: splitLevels 3 -> 1 (byChunks rate 43)
+                    3 // lazy2
                 } else {
-                    0 // lazy depth 1: splitLevels 2 -> 0 (from-borders)
+                    2 // lazy
                 }
             }
-            StrategyTag::Btlazy2 => 1, // splitLevels 3 -> 1 (byChunks rate 43)
-            StrategyTag::BtOpt | StrategyTag::BtUltra | StrategyTag::BtUltra2 => 2,
+            StrategyTag::Btlazy2 => 3,
+            StrategyTag::BtOpt | StrategyTag::BtUltra | StrategyTag::BtUltra2 => 4,
         })
     }
 }
@@ -332,11 +324,13 @@ pub(crate) fn apply_param_overrides(
         SearchMethod::RowHash => {
             if let Some(row) = params.row.as_mut() {
                 // Row hash-table width override (mirrors dfast `long_hash_log`
-                // / hc `hash_log`). Row has no separate chain table — the
-                // per-row depth comes from `search_log` below — so only
-                // `hash_log` maps here; `chain_log` has no Row analogue.
+                // / hc `hash_log`); `chain_log` sizes the hash chain the same
+                // backend searches on a <= 2^14 window.
                 if let Some(hash_log) = ov.hash_log {
                     row.hash_bits = hash_log as usize;
+                }
+                if let Some(chain_log) = ov.chain_log {
+                    row.chain_log = chain_log as usize;
                 }
                 if let Some(search_log) = ov.search_log {
                     // Upstream zstd: rowLog = clamp(searchLog, 4, 6);
@@ -471,12 +465,6 @@ pub(crate) const MAX_FAST_ATTACH_DICT_REGION: usize = 1 << 24;
 /// fast-loop levels (L3 / Default / L0) carry the dual-probe.
 pub(crate) const DFAST_ATTACH_DICT_CUTOFF_LOG: u8 = 14;
 
-/// `ZSTD_dictMatchState` attach cutoff for the Row (greedy/lazy) strategy is
-/// 32 KiB (`2^15`, upstream zstd `attachDictSizeCutoffs`): small / unknown-size inputs
-/// ATTACH the dict into the separate immutable row index (bounded dual-probe in
-/// `row_candidate_rl`), larger known-size inputs dense-COPY into the live rows.
-pub(crate) const ROW_ATTACH_DICT_CUTOFF_LOG: u8 = 15;
-
 /// 32 KiB (`2^15`, upstream zstd `attachDictSizeCutoffs[ZSTD_lazy2]`): small /
 /// unknown-size inputs ATTACH the dict as a separate hash-chain dms (the dual
 /// search in `find_best_match` walks the live input chain + the dms), larger
@@ -585,6 +573,7 @@ fn level_params_from_cparams(cp: crate::encoding::cparams::CParams) -> LevelPara
         search_depth,
         target_len,
         mls: cp.min_match as usize,
+        chain_log: cp.chain_log as usize,
     };
     let bt = |tag| LevelParams {
         strategy_tag: tag,
@@ -815,15 +804,16 @@ pub fn estimated_bt_strategy_extra_bytes(strategy_ordinal: u32, window_log: u32)
 /// 3. [`adjust_params_for_source_size`] caps `window_log` to
 ///    ~`ceil_log2(source_size)` (upstream `ZSTD_adjustCParams_internal`).
 ///
-/// THEN, in the matcher `reset`, the greedy/lazy band falls back from
-/// `RowHash` to `SearchMethod::HashChain` when the resolved `window_log <= 14`
-/// — exactly upstream's `ZSTD_resolveRowMatchFinderMode` (the Row match-finder
-/// is used for greedy/lazy/lazy2 ONLY when `windowLog > 14`). Net effect for
-/// the SAME level:
+/// THEN, inside the Row backend, the greedy/lazy band searches a hash chain
+/// instead of rows when the resolved `window_log <= 14`
+/// (`RowMatchGenerator::use_chain`) — exactly upstream's
+/// `ZSTD_resolveRowMatchFinderMode` (the Row match-finder is used for
+/// greedy/lazy/lazy2 ONLY when `windowLog > 14`); the parse itself is the
+/// same `lazy_generic` body either way. Net effect for the SAME level:
 ///
-/// * small input (e.g. a 10 KiB fixture → `window_log` 14) → **HashChain**
+/// * small input (e.g. a 10 KiB fixture → `window_log` 14) → hash chain
 ///   (`ZSTD_HcFindBestMatch`, scalar chain walk);
-/// * large input (e.g. 1 MiB → `window_log` 20) → **RowHash** (the SIMD-tag
+/// * large input (e.g. 1 MiB → `window_log` 20) → rows (the SIMD-tag
 ///   row match-finder).
 ///
 /// A dictionary does NOT change the match-finder: it only downsizes the
@@ -868,8 +858,15 @@ pub(crate) fn resolve_level_params(
     // never re-derives parameters from a parallel hand-tuned path. Named presets
     // map to their numeric level; the cParams source clamps out-of-range levels
     // (>22 to 22, negatives to MIN_CLEVEL) itself.
-    let numeric: i32 = match level {
-        CompressionLevel::Uncompressed => unreachable!("handled above"),
+    let numeric = numeric_level(level);
+    let src = source_size.unwrap_or(crate::encoding::cparams::CONTENTSIZE_UNKNOWN);
+    level_params_from_cparams(crate::encoding::cparams::get_cparams(numeric, src, 0))
+}
+
+/// The upstream numeric level a preset maps to.
+fn numeric_level(level: CompressionLevel) -> i32 {
+    match level {
+        CompressionLevel::Uncompressed => unreachable!("raw frames resolve no cParams"),
         // Fastest = upstream level 1 (fast strategy, smallest real-compression
         // tables).
         CompressionLevel::Fastest => 1,
@@ -884,9 +881,70 @@ pub(crate) fn resolve_level_params(
         // wins rather than on a hair-thin margin.
         CompressionLevel::Best => 13,
         CompressionLevel::Level(n) => n,
+    }
+}
+
+/// How a greedy / lazy frame compressed with a dictionary takes its
+/// match-finder from the dictionary's own cParams (upstream
+/// `ZSTD_resetCCtx_usingCDict`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RowDictPlan {
+    /// `ZSTD_shouldAttachDict`: the dictionary tables are searched in place
+    /// (`dictMatchState`) instead of being copied into the frame's tables.
+    pub(crate) attach: bool,
+    /// The CDict's `useRowMatchFinder`, inherited by the frame.
+    pub(crate) use_row: bool,
+    /// The CDict's cParams: the geometry (`hash_log`, `chain_log`,
+    /// `search_log` → row width) and key width its tables were built with.
+    pub(crate) cdict: crate::encoding::cparams::CParams,
+}
+
+/// [`resolve_level_params`] for a frame that compresses with a dictionary of
+/// `dict_size` bytes. Upstream builds the CDict with
+/// `ZSTD_getCParams(level, UNKNOWN, dictSize, createCDict)` and the frame
+/// then runs the CDict's strategy / widths / search depth / match-finder:
+/// re-adjusted to the source when the dictionary is attached
+/// (`ZSTD_resetCCtx_byAttachingCDict`), verbatim when it is copied
+/// (`ZSTD_resetCCtx_byCopyingCDict`); only the frame's own `windowLog` is
+/// kept. Levels outside the greedy / lazy band, and dictionaries whose
+/// cParams leave that band, keep the plain level params (no plan).
+pub(crate) fn resolve_level_params_with_dict(
+    level: CompressionLevel,
+    source_size: Option<u64>,
+    dict_size: usize,
+) -> (LevelParams, Option<RowDictPlan>) {
+    use crate::encoding::cparams::{
+        CONTENTSIZE_UNKNOWN, attach_cparams, copy_cparams, get_cdict_cparams, should_attach_dict,
+        uses_row_match_finder,
     };
-    let src = source_size.unwrap_or(crate::encoding::cparams::CONTENTSIZE_UNKNOWN);
-    level_params_from_cparams(crate::encoding::cparams::get_cparams(numeric, src, 0))
+    let base = resolve_level_params(level, source_size);
+    if dict_size == 0 || base.backend() != crate::encoding::strategy::BackendTag::Row {
+        return (base, None);
+    }
+    let cdict = get_cdict_cparams(numeric_level(level), dict_size);
+    if !(3..=5).contains(&cdict.strategy) {
+        return (base, None);
+    }
+    let use_row = uses_row_match_finder(&cdict);
+    let attach = should_attach_dict(&cdict, source_size);
+    let window_log = u32::from(base.window_log);
+    let frame = if attach {
+        attach_cparams(
+            cdict,
+            source_size.unwrap_or(CONTENTSIZE_UNKNOWN),
+            window_log,
+        )
+    } else {
+        copy_cparams(cdict, window_log)
+    };
+    (
+        level_params_from_cparams(frame),
+        Some(RowDictPlan {
+            attach,
+            use_row,
+            cdict,
+        }),
+    )
 }
 
 /// The cheap fingerprint pre-splitter level for a compression level (the

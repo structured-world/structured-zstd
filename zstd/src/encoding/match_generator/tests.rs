@@ -321,8 +321,11 @@ fn driver_level5_greedy_tail_rep_only_reachable() {
     // implicit anchor, no further because anchor itself is the
     // current `abs_pos`).
     let first: &[u8] = b"ABCDABCDABCDABCD"; // 16 bytes — strict period 4
-    let second: &[u8] = b"ABCDA"; // 5 bytes — exact GREEDY_MIN_LOOKAHEAD
-    let mut driver = MatchGeneratorDriver::new(16, 2);
+    // The parse never searches the last 16 bytes of a block (upstream
+    // `lazy_generic` `ilimit`), so the slice carries the period-4 rep past
+    // that tail: the rep probe at the first position finds offset 4.
+    let second: &[u8] = b"ABCDABCDABCDABCDABCDA"; // 21 bytes
+    let mut driver = MatchGeneratorDriver::new(32, 2);
     driver.reset(CompressionLevel::Level(5));
 
     let mut first_space = driver.get_next_space();
@@ -1794,14 +1797,17 @@ fn driver_chain_log_override_survives_row_to_hc_fallback() {
     space.truncate(12);
     driver.commit_space(space);
     driver.skip_matching_with_hint(None);
-    // The override (10) is below the window cap (14), so the resolved HC chain
-    // table must reflect it — NOT the upstream zstd `hashLog - 1` (18, clamped to the
-    // window 14). Pre-fix this resolved to 14.
+    // The override (10) is below the window cap (14), so the resolved chain
+    // table must reflect it — NOT the level's `chainLog`.
+    assert!(
+        driver.row_matcher().uses_hash_chain(),
+        "windowLog <= 14 searches the hash chain"
+    );
     assert_eq!(
-        driver.hc_matcher().table.chain_log,
+        driver.row_matcher().hc_chain_log(),
         chain_log_override as usize,
-        "explicit chain_log override must survive the Row->HC fallback, got {}",
-        driver.hc_matcher().table.chain_log
+        "explicit chain_log override must reach the hash chain, got {}",
+        driver.row_matcher().hc_chain_log()
     );
 }
 
@@ -1853,8 +1859,12 @@ fn driver_small_source_hint_shrinks_row_hash_tables() {
     assert_eq!(driver.window_size(), 1 << MIN_WINDOW_LOG);
     assert_eq!(
         driver.active_backend(),
-        super::super::strategy::BackendTag::HashChain,
-        "windowLog <= 14 must fall back to the upstream zstd hash-chain matchfinder",
+        super::super::strategy::BackendTag::Row,
+        "greedy/lazy stay on the Row backend; it switches the finder itself",
+    );
+    assert!(
+        driver.row_matcher().uses_hash_chain(),
+        "windowLog <= 14 must search the upstream zstd hash chain",
     );
 }
 
@@ -1922,9 +1932,11 @@ fn row_short_block_emits_literals_only() {
     );
     assert_eq!(reconstructed, b"abcde");
 
-    // Then feed a clearly matchable block and ensure the Triple arm is reachable.
+    // Then feed a clearly matchable block and ensure the Triple arm is
+    // reachable. The block must exceed the 16-byte tail the lazy parse never
+    // searches (upstream zstd `lazy_generic` `ilimit`).
     saw_triple = false;
-    matcher.add_data(b"abcdeabcde".to_vec(), |_| {});
+    matcher.add_data(b"abcdeabcdeabcdeabcde-padding-past-ilimit".to_vec(), |_| {});
     matcher.start_matching(|seq| {
         if let Sequence::Triple { .. } = seq {
             saw_triple = true;
@@ -1968,7 +1980,10 @@ fn row_backfills_previous_block_tail_for_cross_boundary_match() {
 
     let mut first_block = alloc::vec![0xA5; 64];
     first_block.extend_from_slice(b"XYZ");
-    let second_block = b"XYZXYZtail".to_vec();
+    // Long enough for the lazy parse to search: upstream zstd
+    // `lazy_generic` stops 16 bytes before the block end, so a block shorter
+    // than that is emitted as literals regardless of history.
+    let second_block = b"XYZXYZtail-padding-past-ilimit".to_vec();
 
     let replay_sequence = |decoded: &mut Vec<u8>, seq: Sequence<'_>| match seq {
         Sequence::Literals { literals } => decoded.extend_from_slice(literals),
@@ -2811,12 +2826,13 @@ fn row_prime_with_dictionary_preserves_history_for_first_full_block() {
     let mut driver = MatchGeneratorDriver::new(8, 1);
     // Level(5) is the greedy Row backend (LEVEL_TABLE row 5: Greedy / RowHash).
     // Level(4) now routes to Dfast, so this test must use Level(5) to actually
-    // exercise `RowMatchGenerator`'s dictionary priming. The 16-byte dict +
-    // 16-byte block lets the whole block match the primed dict (offset = dict
-    // length = 16).
+    // exercise `RowMatchGenerator`'s dictionary priming. The 40-byte dict +
+    // 40-byte block lets the whole block match the primed dict (offset = dict
+    // length = 40); the block exceeds the 16-byte tail the parse never
+    // searches (upstream `lazy_generic` `ilimit`).
     driver.reset(CompressionLevel::Level(5));
 
-    let payload = b"abcdefghijklmnop";
+    let payload = b"abcdefghijklmnopqrstuvwxyz0123456789ABCD";
     driver.prime_with_dictionary(payload, [1, 4, 8]);
 
     let mut space = driver.get_next_space();
@@ -3152,13 +3168,15 @@ fn row_hash_and_row_extracts_high_bits() {
 
     let idx = pos - matcher.history_abs_start;
     let concat = matcher.live_history();
-    // Mirror `row_key_value`: an mls-wide masked key when 8 lookahead bytes
-    // exist, the 4-byte key in the tail. `idx = 8` on a 16-byte history has
-    // exactly 8 bytes left, so the wide arm applies here.
-    let key_len = matcher.mls.min(6);
-    let value = u64::from_le_bytes(concat[idx..idx + 8].try_into().unwrap())
-        & ((1u64 << (key_len * 8)) - 1);
-    let hash = crate::encoding::fastpath::hash_mix_u64_with_kernel(matcher.hash_kernel, value);
+    // Mirror upstream `ZSTD_hash5PtrS` (the row levels hash a 5-byte key;
+    // `ROW_CONFIG` carries `mls = ROW_MIN_MATCH_LEN = 5`): the 8-byte read
+    // shifted so the key fills the top 40 bits, times `prime5bytes`, XOR the
+    // fresh-context salt, top `hashLog + 8` bits. `idx = 8` on a 16-byte
+    // history has exactly 8 bytes left, so the wide arm applies here.
+    assert_eq!(matcher.mls.min(6), 5, "test mirrors the 5-byte key hash");
+    let value = u64::from_le_bytes(concat[idx..idx + 8].try_into().unwrap());
+    let hash = ((value << 24).wrapping_mul(crate::encoding::row::ROW_HASH_PRIME5))
+        ^ crate::encoding::row::ROW_HASH_SALT;
     let total_bits = matcher.row_hash_log + ROW_TAG_BITS;
     let combined = hash >> (u64::BITS as usize - total_bits);
     let expected_row =

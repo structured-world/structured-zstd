@@ -110,6 +110,11 @@ pub struct FrameCompressor<
     /// time, so without `hash` no checksum is emitted regardless. Set via
     /// [`Self::set_content_checksum`].
     content_checksum: bool,
+    /// Diagnostic: skip the block pre-splitter and cut full blocks only
+    /// (upstream's block structure under `ZSTD_generateSequences`, whose
+    /// sequence-collecting mode never accrues the savings the splitter
+    /// requires). Set via [`Self::set_pre_split_disabled`]; default `false`.
+    pre_split_disabled: bool,
     /// Whether to record `Frame_Content_Size` in the frame header when the
     /// total size is known (semantics of upstream `ZSTD_c_contentSizeFlag`).
     /// Default `true`, matching upstream. With the flag off the header
@@ -642,7 +647,25 @@ pub(crate) fn optimal_block_size(
     block_size_max: usize,
     savings: i64,
 ) -> usize {
-    let Some(split_level) = crate::encoding::levels::config::level_pre_split(level) else {
+    optimal_block_size_with(
+        crate::encoding::levels::config::level_pre_split(level),
+        block,
+        remaining_src_size,
+        block_size_max,
+        savings,
+    )
+}
+
+/// [`optimal_block_size`] with the pre-split level already resolved
+/// (`None` = never split, only full blocks).
+pub(crate) fn optimal_block_size_with(
+    pre_split: Option<usize>,
+    block: &[u8],
+    remaining_src_size: usize,
+    block_size_max: usize,
+    savings: i64,
+) -> usize {
+    let Some(split_level) = pre_split else {
         return remaining_src_size.min(block_size_max);
     };
     if remaining_src_size < MAX_BLOCK_SIZE as usize || block_size_max < MAX_BLOCK_SIZE as usize {
@@ -990,6 +1013,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             },
             magicless: false,
             content_checksum: false,
+            pre_split_disabled: false,
             content_size_flag: true,
             dict_id_flag: true,
             target_block_size: None,
@@ -1334,16 +1358,16 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             // splitter actually runs) — so non-pre-split levels, the first
             // block, and the trailing partial block pay nothing. See
             // `warm_presplit_window`.
+            let pre_split = self.pre_split_level();
             if savings >= 3
                 && input.len() - start >= MAX_BLOCK_SIZE as usize
                 && block_capacity >= MAX_BLOCK_SIZE as usize
-                && crate::encoding::levels::config::level_pre_split(self.compression_level)
-                    .is_some()
+                && pre_split.is_some()
             {
                 warm_presplit_window(&input[start..start + MAX_BLOCK_SIZE as usize]);
             }
-            let block_len = optimal_block_size(
-                self.compression_level,
+            let block_len = optimal_block_size_with(
+                pre_split,
                 &input[start..],
                 input.len() - start,
                 block_capacity,
@@ -1407,6 +1431,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             compression_level,
             magicless: false,
             content_checksum: false,
+            pre_split_disabled: false,
             content_size_flag: true,
             dict_id_flag: true,
             target_block_size: None,
@@ -1512,6 +1537,24 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// history is primed separately and does not inflate the hinted size or
     /// advertised frame window.
     /// Must be called before [`compress`](Self::compress).
+    /// Diagnostic switch: cut full blocks only, never pre-split. Used by
+    /// the sequence capture so its block structure matches upstream's
+    /// `ZSTD_generateSequences` (see `pre_split_disabled`).
+    #[cfg(feature = "bench_internals")]
+    pub fn set_pre_split_disabled(&mut self, disabled: bool) {
+        self.pre_split_disabled = disabled;
+    }
+
+    /// The pre-split level the block loops apply: the level's tier unless
+    /// the diagnostic switch is on.
+    fn pre_split_level(&self) -> Option<usize> {
+        if self.pre_split_disabled {
+            None
+        } else {
+            crate::encoding::levels::config::level_pre_split(self.compression_level)
+        }
+    }
+
     pub fn set_source_size_hint(&mut self, size: u64) {
         self.source_size_hint = Some(size);
     }
@@ -1906,8 +1949,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             if !matches!(self.compression_level, CompressionLevel::Uncompressed)
                 && uncompressed_data.len() == block_capacity
             {
-                let block_len = optimal_block_size(
-                    self.compression_level,
+                let block_len = optimal_block_size_with(
+                    self.pre_split_level(),
                     &uncompressed_data,
                     remaining_for_split,
                     block_capacity,
