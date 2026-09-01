@@ -524,6 +524,14 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         if use_dictionary_state && let Some(dict) = self.dictionary.as_ref() {
             self.state.matcher.set_dictionary_size_hint(dict.sizes());
         }
+        // The matcher resolves the frame from the LAST hint it was handed, so
+        // re-forward the authoritative size (`pledge.or(advisory)`, the same
+        // value the gates below read) right before the reset: without this a
+        // pledge followed by a different advisory hint (or vice versa) left
+        // the matcher and the frame gates on different size tiers.
+        if let Some(size) = self.pledged_content_size.or(self.source_size_hint) {
+            self.state.matcher.set_source_size_hint(size);
+        }
         self.state.matcher.reset(self.compression_level);
         // Seed the repeat-offset history from the dictionary (upstream zstd
         // `ZSTD_compress_insertDictionary`), or the default rep codes otherwise.

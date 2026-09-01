@@ -2006,6 +2006,34 @@ fn driver_no_dictionary_reset_drops_the_attached_tables() {
     );
 }
 
+/// Regression: a Dfast attach-mode dictionary table primed for an
+/// unknown-size frame (attach at the FULL live widths) must not be
+/// re-borrowed by a frame past the 16 KiB attach cutoff whose live widths
+/// happen to be the same: that frame runs COPY mode (dict merged into the
+/// live tables), and searching the stale attached table instead defeats the
+/// cutoff. (A hinted small attach frame is already safe: its source-capped
+/// live widths differ, and `set_hash_bits` drops the cache on any change.)
+#[test]
+fn driver_dfast_attach_table_is_dropped_when_the_next_frame_copies() {
+    let dict: Vec<u8> = (0..20 * 1024u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+    driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
+    driver.reset(CompressionLevel::Level(3));
+    driver.prime_with_dictionary(&dict, [1, 4, 8]);
+    assert!(driver.dfast_matcher().dict_table_bits().is_some());
+    // Same dictionary, 100 KiB source: past the attach cutoff, copy mode.
+    driver.set_source_size_hint(100 * 1024);
+    driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dict.len()));
+    driver.reset(CompressionLevel::Level(3));
+    assert!(
+        !driver.dictionary_is_resident(),
+        "a copy-mode frame must not re-borrow the attached table"
+    );
+    assert!(driver.dfast_matcher().dict_table_bits().is_none());
+}
+
 /// Regression: the "cdict overrides" rule holds for every dictionary
 /// backend, not only the lazy band: a 4 KiB CDict resolves L2 to the fast
 /// strategy (Simple backend) and a `BtUltra2` strategy override must not

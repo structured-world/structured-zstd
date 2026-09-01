@@ -1346,6 +1346,21 @@ impl Matcher for MatchGeneratorDriver {
                     );
                     (cd.hash_log as usize, cd.chain_log as usize)
                 }));
+                // A copy-mode frame (source past the attach cutoff, or a
+                // dictionary too large to tag) merges the dictionary into the
+                // live tables; a resident attach-mode table must not be
+                // re-borrowed under it (same decision as the prime dispatch).
+                // The width-change invalidation in `set_hash_bits` does not
+                // cover an unhinted attach frame followed by a large hinted
+                // one whose live widths coincide at the level's full widths.
+                let dfast_attach_next = dict_hint.is_some_and(|sizes| {
+                    sizes.content <= crate::encoding::dfast::DFAST_ATTACH_DICT_MAX_LEN
+                }) && self
+                    .reset_size_log
+                    .is_none_or(|log| log <= DFAST_ATTACH_DICT_CUTOFF_LOG);
+                if dict_hint.is_some() && !dfast_attach_next {
+                    dfast.invalidate_dict_cache();
+                }
                 // Dfast holds no per-block input Vecs (history owns the
                 // bytes and `add_data` returns each Vec eagerly), so
                 // `reset` takes no `reuse_space` callback.

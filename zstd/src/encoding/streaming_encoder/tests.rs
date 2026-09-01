@@ -192,6 +192,25 @@ fn streaming_encoder_pre_splits_full_blocks_like_the_frame_compressor() {
     }
 }
 
+/// Regression: the matcher and the frame gates resolve from the SAME size
+/// (`pledged_content_size.or(source_size_hint)`), whatever order the setters
+/// ran in. A 4 KiB pledge followed by a 1 MiB advisory hint left the matcher
+/// on the 1 MiB backend while the gates synchronized to the 4 KiB strategy.
+#[test]
+fn streaming_encoder_matcher_and_gates_resolve_from_one_size() {
+    let mut enc = StreamingEncoder::new(Vec::new(), CompressionLevel::Level(13));
+    enc.set_pledged_content_size(4096).unwrap();
+    enc.set_source_size_hint(1 << 20).unwrap();
+    enc.write_all(&[0u8; 4096]).unwrap();
+    assert_eq!(
+        enc.state.matcher.active_backend(),
+        enc.state.strategy_tag.backend(),
+        "matcher backend must match the synchronized strategy ({:?})",
+        enc.state.strategy_tag,
+    );
+    enc.finish().unwrap();
+}
+
 /// Regression: a streamed periodic input at the btlazy2 levels round-trips.
 /// The pre-splitter cuts short mid-stream blocks out of full 128 KiB
 /// buffers; the binary-tree lazy backend must accept those short committed
