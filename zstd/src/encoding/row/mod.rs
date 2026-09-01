@@ -869,6 +869,14 @@ macro_rules! lazy_parse_body {
             // cursor the floor moved past restarts at the floor, exactly
             // upstream's `nextToUpdate < lowLimit` clamp.
             let mut next_to_update = $m.lazy_next_to_update.clamp(hist_start, current_abs_start);
+            // Upstream `ZSTD_buildSeqStore` "limited update after a very long
+            // match" (zstd_compress.c:3296): a block starting more than 384
+            // positions past the cursor indexes at most the last 192 + 384 of
+            // the gap.
+            if current_abs_start > next_to_update + 384 {
+                next_to_update =
+                    current_abs_start - (current_abs_start - next_to_update - 384).min(192);
+            }
             let mut lazy_skipping = false;
             // Upstream `ZSTD_row_fillHashCache(ms, base, rowLog, mls, nextToUpdate, ilimit)`.
             let mut hash_cache = [(ROW_CACHE_NONE, 0u8); ROW_HASH_CACHE_SIZE];
@@ -1876,12 +1884,10 @@ impl RowMatchGenerator {
     }
 
     pub(crate) fn set_hash_bits(&mut self, bits: usize) {
-        // Deliberate deviation from upstream zstd hashLog 21-23 on L9-12: the
-        // 20-bit cap keeps the row table L2/L3-resident. Measured on the
-        // 1 MiB corpus at L10 (tight pair, flat control): the honest
-        // 21-bit table cost +26.8% wall for a 19-byte output delta — our
-        // lazy-band ratio already beats the upstream zstd with the capped width.
-        let clamped = bits.clamp(self.row_log + 1, ROW_HASH_BITS);
+        // The level's (source-size-adjusted) hashLog as upstream applies it:
+        // a narrower table changes row assignment and eviction, and with it
+        // the candidate set every search sees.
+        let clamped = bits.max(self.row_log + 1);
         let row_hash_log = clamped.saturating_sub(self.row_log);
         if self.row_hash_log != row_hash_log {
             self.row_hash_log = row_hash_log;
