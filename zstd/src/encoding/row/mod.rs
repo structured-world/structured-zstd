@@ -516,6 +516,9 @@ macro_rules! greedy_parse_body {
                 $m.insert_position::<$rl>(current_abs_start + pos);
                 pos += 1;
             }
+            // Every position up to the block end is indexed; a following
+            // lazy block resumes its gap fill from there.
+            $m.lazy_next_to_update = current_abs_start + current_len;
 
             if literals_start < current_len {
                 // Trailing literals of the current block. Read via
@@ -859,14 +862,13 @@ macro_rules! lazy_parse_body {
             let mut anchor = current_abs_start;
             // `ip += (dictAndPrefixLength == 0)`: nothing precedes the first byte.
             let mut ip = current_abs_start + usize::from(current_abs_start == hist_start);
-            // Upstream `nextToUpdate`: resume where the previous lazy block
-            // stopped indexing (its last <= 16 bytes, now readable with the
-            // full 8-byte key); a stale cursor (another parse ran in
-            // between, or the floor moved past it) restarts at the 3 bytes
-            // preceding the block, the widest key overlap that still hashes.
-            let mut next_to_update = $m
-                .lazy_next_to_update
-                .clamp($m.backfill_start(current_abs_start), current_abs_start);
+            // Upstream `nextToUpdate`: resume where the previous block
+            // stopped indexing (a lazy block leaves its last <= 16 bytes,
+            // now readable with the full 8-byte key; the other parses set
+            // it to their block end). Bounded to the live history: a
+            // cursor the floor moved past restarts at the floor, exactly
+            // upstream's `nextToUpdate < lowLimit` clamp.
+            let mut next_to_update = $m.lazy_next_to_update.clamp(hist_start, current_abs_start);
             let mut lazy_skipping = false;
             // Upstream `ZSTD_row_fillHashCache(ms, base, rowLog, mls, nextToUpdate, ilimit)`.
             let mut hash_cache = [(ROW_CACHE_NONE, 0u8); ROW_HASH_CACHE_SIZE];
@@ -2149,6 +2151,10 @@ impl RowMatchGenerator {
                 // per block × 800 = ~104M inserts.
             }
         }
+        // A following lazy block gap-fills from here: the skipped block's
+        // last `ROW_HASH_KEY_LEN - 1` bytes, the same tail the next call's
+        // `backfill_start` insert covers.
+        self.lazy_next_to_update = current_abs_end.saturating_sub(ROW_HASH_KEY_LEN - 1);
     }
     /// Upstream zstd-parity greedy parse for `lazy_depth == 0` (level 5).
     ///
