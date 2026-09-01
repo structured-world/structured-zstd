@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783938033597,
+  "lastUpdate": 1788303250174,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI (x86_64-gnu)": [
@@ -2651,6 +2651,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.129,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "ac08d193734ba76ae2b1c20e53efa0f0846d43fe",
+          "message": "perf(row): port the lazy parse, row/chain search and dictionary plan from upstream; match upstream CDict fill for the fast dict scan (#467)\n\n* perf(compress): inline the row search into the lazy parse monolith\n\nThe lazy row parse called an out-of-line per-tier #[target_feature] search\nmethod (`find_best_<tier>`) at both probe sites (current position + the\nlazy_decide lookahead). A #[target_feature] fn cannot inline across the call\nboundary, so every position paid call + argument-marshalling overhead — a\nlarge share of the ~2.24x instruction-count gap vs C on the lazy band, whose\nZSTD_searchMax is FORCE_INLINE_TEMPLATE into ZSTD_compressBlock_lazy_generic.\n\nSplice the rep + row-probe body (row_best_match!) inline at both sites instead,\nexactly as the greedy monolith already does, so each lazy tier kernel is one\ntarget_feature function with no per-position search call. Removed the now-unused\ngen_row_find_monolith standalone-method generator. Byte-identical (841 lib + 59\nffi incl cross-validation). Measuring decodecorpus instruction count + speed.\n\n* perf(encode): match upstream CDict fill for the fast dict table\n\nThe fast dictMatchState hash table was filled every-position last-wins\n(nearest occurrence per bucket). Upstream `ZSTD_fillHashTableForCDict`\nuses a step-3 policy: the step position overwrites its slot, the two\nintermediate positions fill an empty slot only, so a bucket resolves to a\ndifferent occurrence. Our fill diverged from that set, so the fast parse\npicked different (often nearer, shorter) dict matches than the reference,\nfragmenting long dictionary matches into several short ones and inflating\nthe offset stream.\n\nReplicate the upstream fill exactly and size the dict table to the CDict\ncParams hash-log (dict-and-window log off a minSrcSize source) rather than\nthe source-window-sized main table. The two hash-logs are now independent,\nso the kernel's main==dict hash-log equality assert is dropped (the kernel\nalready hashes dict lookups with the dict table's own hash-log).\n\nsmall-4k-log-lines compress-dict fast band: rust 56-58 B -> 44-51 B every\nlevel (level_1 now matches the reference at 44 B; the level_-2 outsider\n58 -> 50); several fast levels now match or beat it. Zero regressions on\nthe dict fixture set; round-trip and the full lib+ffi suite stay green.\n\n* perf(encode): step the fast dict scan by upstream stepSize\n\nThe fast dict-attach kernels are 2-cursor ports of upstream\n`ZSTD_compressBlock_fast_dictMatchState_generic`, but they received the\nshared level step_size, which carries a `+1` only the 4-cursor no-dict\npipeline needs (its `step_size >= 2` invariant). So the dict scan advanced\none position MORE than upstream (`stepSize = targetLength + !targetLength`),\nskipping candidate positions and coarsening the parse; the extra skip\ninflated the dict frame on the negative-level band.\n\nUndo the `+1` inside both dict kernels (flat + borrowed) so the scan steps\nexactly like the reference. small-4k-log-lines compress-dict is now\nbyte-exact with the reference across the ENTIRE fast band (level_-7..2):\nthe level_-2 outsider 50 B -> 44 B, and every fast level matches. No\nregression elsewhere (small-10k-random keeps its pre-existing 10254 B; that\nis a separate match-finding gap, not stepping). The borrowed kernel's\nmain==dict hash-log equality assert is also dropped: it already hashes main\nand dict lookups with their own independent hash-logs, so the CDict-geometry\ndict table (narrower than the source-window main table) is handled correctly.\n\nFull lib + ffi suite green.\n\n* perf(encode): add the no-match step accelerator to the fast dict scan\n\nThe fast dict-attach kernels stepped by a constant `step_size`, so an\nincompressible stretch probed every position at that fixed cadence. Upstream\n`ZSTD_compressBlock_fast_dictMatchState_generic` ramps the step: `step`/\n`nextStep` reset once per found match, and the inner search loop bumps `step`\nby 1 every `kStepIncr` bytes of fruitless scanning, so no-match regions skip\nahead instead of probing linearly.\n\nPort it to both dict kernels (flat + borrowed). The dict path's `kStepIncr`\nis `1 << kSearchStrength` (256) — DOUBLE the no-dict / extDict value\n(`1 << (kSearchStrength - 1)` = 128), so the dict scan ramps half as often;\nadd a dedicated `K_STEP_INCR_DICT` for it.\n\nByte-neutral on the match-dense fixtures (small-4k-log-lines stays byte-exact\nwith the reference; small-10k-random unchanged): the ramp only fires on long\nno-match runs, where it saves work. Full lib + ffi suite green.\n\n* perf(row): port the lazy parse and row search from upstream lazy_generic\n\nThe Row lazy body is now ZSTD_compressBlock_lazy_generic (row-hash search)\nand ZSTD_RowFindBestMatch: forward-only match lengths gated by the 4-byte\ncompare at the current best length, newest-first row walk stopping at the\nwindow floor, repcode 1 probed one byte ahead, gain-weighted depth-1/depth-2\nlookahead with every position searched once, catch-up on the chosen match\nonly, immediate-repcode loop after each stored sequence, kSearchStrength 8\nmiss acceleration with lazy skipping past step 8, and the 16-byte ilimit\ntail. Replaces the length-heuristic parse that back-extended every\ncandidate, probed three reps per position and re-searched the depth-2\nposition: on z000033 L11 it executed 2.1x upstream's instructions per\ncompress (perf stat, i9) for a 5% smaller output.\n\n* perf(row): add the upstream row hash cache to the lazy parse\n\nMirrors ZSTD_row_fillHashCache / ZSTD_row_nextCachedHash: the parse hashes\nROW_HASH_CACHE_SIZE (8) positions ahead and prefetches each row's heads,\ntags and positions lines while consuming cached hashes for the gap indexing\nand the search, refilling at block start, at the 384-gap skip and when a\nmatch ends lazy skipping. The gap indexing moves into the parse monolith.\nRow prefetch also covers the heads byte and the second positions line\n(upstream ZSTD_row_prefetch).\n\n* perf(row): upstream-shape row hash and hoisted scan context in the lazy parse\n\nRow hash is now ZSTD_hashPtrSalted's shape (key shifted to the top of the\n64-bit read, one prime multiply, precomputed shift per mls) instead of the\nkernel-dispatched crc32 mix, applied identically in the probe, the hash\ncache and the dictionary fill. The lazy parse hoists the live history to a\nraw base + length once per block (RowScan) so hashing, rep probes and the\ncandidate walk read no Option branch or Vec header per access, and the row\ntable reads in the search use the ensure_tables bound instead of per-access\nchecks.\n\n* bench(compare_ffi): compress the FFI arm one-shot with ZSTD_compress2\n\nThe FFI arm used ZSTD_compressStream2, which buffers blockSizeMax (128 KB)\nand runs ZSTD_compress_frameChunk per 128 KB even when handed the whole\ninput; ZSTD_optimalBlockSize never splits a remainder below 128 KB, so the\nreference emitted at most two blocks per 128 KB (14 on the 1 MB corpus)\nwhile the one-shot ZSTD_compress2 path that compress_independent_frame\nmirrors keeps pre-splitting (~90 blocks, ~5% smaller output, 7x the\nentropy work). Pairing our one-shot encoder with streaming C misstated\nboth the time and the size comparison.\n\n* fix(encode): pre-split at upstream's default splitLevels tier per strategy\n\nZSTD_optimalBlockSize subtracts 2 only from an EXPLICIT blockSplitterLevel;\nthe default path passes splitLevels[strategy] = {0,0,1,2,2,3,3,4,4,4} to\nZSTD_splitBlock as is. The table here had the -2 applied to the default,\nso dfast / greedy / lazy ran the from-borders heuristic (14 blocks on the\n1 MB corpus vs upstream's 94) and lazy2 / btlazy2 / btopt sampled two\ntiers coarser: z000033 L3 523341 vs 498911 and L6 508691 vs 484957 bytes\nagainst ZSTD_compress2. Tiers now match upstream: on the periodic 512 KB\nlog stream every level is byte-identical to the reference (L7 189 B,\nL8 / L15 528 B), asserted by the new ffi-bench parity test; the old lib\ntest that pinned the lazy2 tier below 2x the lazy frame encoded a\nguarantee upstream does not give and is reduced to the round-trip.\n\n* fix(row): upstream-exact row hash, salt, slot-0 rule and cross-block nextToUpdate\n\nRow assignment now matches a fresh upstream context bit for bit: the\nZSTD_hash4/5/6 multipliers per key width, the fresh-CCtx hash salt\n(ZSTD_advanceHashSalt over zero entropy) XORed before the reduction, slot\n0 of a row never written and never walked (ZSTD_row_nextIndex / the\nmatchPos == 0 skip, so a row holds row_entries - 1 candidates and evicts\nin upstream's order), and the lazy parse carries nextToUpdate across\nblocks so a block's unindexed tail is hashed by the next block with the\nfull 8-byte key instead of a per-block 3-byte backfill and a 4-byte-key\ntail fill. With the pre-split tiers already aligned these were the\nremaining sources of the per-block byte deltas against ZSTD_compress2.\n\n* fix(row): carry the lazy parse repcodes across blocks as upstream does\n\nZSTD_compressBlock_lazy_generic enters a block with rep[0..2] exactly as\nthe previous block's offset_1 / offset_2 left them (a window-disabled rep\nit never used is handed back). The parse loaded them from the block\nencoder's offset_hist instead, which diverges from upstream's parse-side\nreps whenever a searched offset equal to a rep is encoded as a repcode\n(no rotation) where upstream stores it raw and rotates; the first search\nof the next block then probed a different rep. Sequence streams on the\n1 MB corpus now agree with the reference through the whole first block;\nthis removes the block-entry divergence.\n\n* bench(sequences): capture our sequences with the pre-splitter off\n\nZSTD_generateSequences runs ZSTD_compress2 in sequence-collecting mode,\nwhere every block is written raw (cSize = blockSize + 3), so the\nsavings >= 3 gate of ZSTD_optimalBlockSize never opens and upstream's\nstream is cut into full 128 KB blocks only. The capture pre-split as in\nproduction, so on inputs over 128 KB every block boundary after the first\nproduced RUST_ONLY / FFI_ONLY rows and a different block-entry parse state\non our side. A bench_internals diagnostic switch on FrameCompressor cuts\nfull blocks only for the capture; production block sizing is unchanged.\n\n* bench(sequences): print the absolute input position of every diverging row\n\nRows were only numbered by sequence index; the byte offset a divergence\nsits at is what a prefix-based reproduction needs.\n\n* fix(row): resume the lazy gap fill from the carried nextToUpdate\n\nThe carried cursor was clamped to the 3 bytes before the block start, so\nthe previous block's last 16 bytes (never searched, hence never indexed\nby that block) were skipped instead of indexed by the next block's first\nsearch; every cross-block match into that tail was lost (first\ndivergence on the corpus: pos 131405, offset 347 into the block-0 tail).\nThe cursor is now bounded to the live history only; the greedy and\nskip parses hand the lazy parse their own end cursor so nothing is\nindexed twice.\n\n* fix(row): size the row table by the level's hashLog as upstream does\n\nset_hash_bits capped the row table at 20 bits, one below upstream's\nsource-size-adjusted hashLog (21) on the 1 MB corpus. A narrower table\nfolds twice as many keys per row, so rows evict older candidates sooner\nand every search past the first block sees a different candidate set\n(rows near capacity lost the match upstream still holds). With the table\nat upstream's width the lazy sequence stream on the corpus prefix is\nidentical to ZSTD_generateSequences at L11 (27360 / 27360).\n\n* feat(row): hash-chain finder, dictionary plan and greedy on the shared lazy parse\n\nThe greedy / lazy band now runs ONE parse (the upstream lazy_generic port)\nover two match-finders: rows above a 2^14 window, the ZSTD_HcFindBestMatch\nhash chain at or below it (ZSTD_resolveRowMatchFinderMode), chosen inside\nthe Row backend instead of rerouting small windows to the old HashChain\nlazy parser. Greedy (L5) is the same body at depth 0; the separate greedy\nkernels are gone.\n\nDictionary frames follow ZSTD_resetCCtx_usingCDict: the CDict's cParams\n(get_cdict_cparams: tier row by dictSize + 498, createCDict adjust) give\nthe frame its strategy, widths, search depth and finder; sources up to the\nstrategy cutoff attach (separate dictionary tables with the CDict geometry,\nunsalted, probed as dictMatchState by both finders with the shared\nattempt budget), larger ones copy (dictionary indexed into the live tables,\nsalt 0, nextToUpdate = dictSize - 8, upstream's extDict rules: first prefix\nbyte skipped, per-probe rep window + index overlap check, catch-up bounded\nby the segment start, head-gated dictionary candidates, lazy skipping one\nstretch later). The hash-chain ilimit is iend - 8.\n\nSequence streams now match ZSTD_generateSequences: z000033 L5/6/8/11/12\nwithout dictionary, L5/6/8 with a raw dictionary (copy mode), and the\n16 KB / 4 KB / 1 KB fixtures with and without dictionary (attach mode).\nKnown gaps: a dictionary whose cParams leave the greedy/lazy band (L11 with\na 4 KB dictionary resolves to btlazy2) keeps the plain level params; one\nL11 divergence remains on the 16 KB fixture with a dictionary.\n\n* perf(row): hoist the frame's search bounds into the scan view\n\nThe dictionary-plan checks (prefix start, distance bound, attach flag,\nsalt) were read back through the matcher on every search and rep probe,\nwhere the optimizer cannot hoist them across the table writes; they are\nframe constants, so RowScan carries them and the hot loops read locals.\nByte-identical (sequence parity re-checked with and without dictionary).\n\n* perf(row): fold the plain-frame rep check into the block clamp\n\nWithout a dictionary the rep probe only needs the non-zero check: the\nblock-start clamp keeps carried reps in-window and searched offsets are\nin-window by construction (upstream noDict shape). The chain-vs-row\nchoice moves into the scan view with the other frame constants.\nByte-identical (sequence parity re-checked with and without dictionary).\n\n* chore: satisfy clippy 1.98 lints\n\nneedless_late_init, chunks_exact_to_as_chunks, manual_clear and\nbyte_char_slices, all raised by the latest stable toolchain the CI\nfollows.\n\n* chore: satisfy clippy 1.98 lints\n\nneedless_late_init, chunks_exact_to_as_chunks, manual_clear and\nbyte_char_slices, all raised by the latest stable toolchain the CI\nfollows.\n\n* test(encode): pin the fast dict fill to one stride pass over the whole dictionary\n\nA dictionary primed in slices must build the same table as a single\npass (the stride-3 phase carries across the slice seam) and take the\nCDict geometry of the whole dictionary, not of the first slice. Both\ntests fail before the fix.\n\n* fix(encode): keep the fast dict fill phase and geometry across dictionary slices\n\nThe fill resumes at the first unprocessed stride position instead of one\npast the slice's hashable end, so a group cut by the slice seam is\ncompleted by the next slice as upstream's single pass would; the dict\ntable is sized from the whole dictionary's length (the CDict geometry)\nrather than the slice that allocates it, and a retained table of another\nwidth is rebuilt.\n\n* feat(row): btlazy2 on the lazy backend with the upstream binary tree and dictionary window rules\n\nbtlazy2 (strategy 6, levels 13-15 at tier 0, 9-10 at the 16 KiB tier)\nran the optimal parser's BT collector under an ad-hoc greedy loop, which\nsurfaced 3-byte matches and diverged from upstream. It now runs the same\nlazy2 parse as the other lazy levels over a third finder, the port of\nZSTD_BtFindBestMatch: ZSTD_updateDUBT links the gap unsorted,\nZSTD_DUBT_findBestMatch sorts a bucket's nodes in one batch and walks the\ntree with upstream's offset-cost margin, nextToUpdate jumps past the\nlongest match seen, and ZSTD_DUBT_findBetterDictMatch walks an attached\ndictionary's sorted tree (ZSTD_updateTree / ZSTD_insertBt1 over the whole\ndictionary, in one pass as upstream). A copied dictionary's tree is built\ninto the live tables. The old HashChain-backend btlazy2 body is deleted.\n\nThe window follows upstream per block: loadedDictEnd / lowLimit /\ndictLimit with ZSTD_checkDictValidity and ZSTD_window_enforceMaxDist, so a\ndictionary is matched without distance bound only while it is valid, an\nattached one stops being probed and a copied one falls out of reach as\nthe window slides past it, and the search floors of all three finders\n(ZSTD_getLowestMatchIndex, the distance-only sort floor of\nZSTD_insertDUBT1) read the same state. A copied dictionary also leaves\nnextToUpdate at the dictionary end (ZSTD_loadDictionaryContent), so its\nlast 8 positions are not indexed.\n\nThe dictionary plan now covers CDict strategy 6. Sequence parity with\nZSTD_generateSequences: z000033 L13-15 100% (was divergent), L5-12 and\nthe dictionary cases unchanged at 100%, btlazy2 with a dictionary in both\nattach and copy mode 100%.\n\n* test(row): pin absolute dictionary chain indices, borrowed-frame floors and CDict geometry under overrides\n\nThree review findings, each failing before its fix: a copied hash-chain\ndictionary re-indexed on a reused compressor (snapshot miss) must match\na cold compressor's frame; the same input compressed twice on one\ncompressor through the borrowed one-shot path must give identical\ndecodable frames; a dictionary frame under search_log / min_match\noverrides must still find its dictionary matches.\n\n* fix(row): absolute dictionary chain indices, borrowed-frame floor, CDict geometry under overrides, uninitialised FFI bench output\n\n- a copied hash-chain dictionary is indexed at absolute positions (the\n  slot and the stored index were relative, so a reused matcher whose\n  floor sat past its previous frames never matched the dictionary again)\n- the borrowed one-shot path keeps the coordinate floor instead of\n  zeroing it; reset advances the floor past the borrowed extent, so a\n  previous frame's chain / tree entries can neither resurface as\n  offset-0 self-matches nor point past the searched position\n- a dictionary frame keeps the CDict's finder geometry under public\n  parameter overrides (upstream \"cdict overrides\"); only windowLog is\n  the caller's\n- the FFI bench arm reserves compressBound uninitialised instead of\n  zero-filling it per timed iteration\n\n* chore: gate the level-form block-size probe to tests and bench_internals\n\nThe frame loop resolves the pre-split tier itself; CI's default-feature\nclippy flagged the level-form helper as unused.\n\n* perf(row): one lazy monolith per finder; hoist the FFI bench output buffer\n\nThe finder (rows / chain / tree) becomes a const parameter of the lazy\nmonolith: each tier now carries one parse per finder (rows per row_log,\nthe chain and the tree once) instead of all three finders inlined into\nevery row_log parse, and the per-search finder branch folds away. The\nsimd128 wasm payload drops 1,078,189 -> 1,018,647 bytes, back under the\n1 MiB CI budget.\n\nThe FFI bench arm compresses into one buffer reserved once per sample\n(the C dst contract): no per-iteration alloc / memset, and no heap churn\nthat perturbed the Rust arm's small-frame samples.\n\n* fix(encode): CDict strategy for optimal dictionaries, effective pre-split tier, Fast CDict hashLog, lazy-backend table sizing\n\n- a dictionary whose CDict cParams resolve to an optimal strategy makes\n  the frame run it (upstream ZSTD_resetCCtx_usingCDict), so a small\n  dictionary on a btlazy2 level is indexed by the finder that searches\n  it instead of rows the tree never reads\n- the pre-split tier (upstream splitLevels) follows the effective\n  strategy: a strategy override, a source-size promotion or the CDict's\n  strategy, recorded in CompressState next to the strategy tag\n- the Fast dictionary table takes the CDict's hashLog, not the\n  source-capped main width\n- CompressionLevel::Best is level 13 everywhere (bridge, from_level,\n  docs); the lazy backend allocates only the active finder's tables and\n  the workspace estimate counts the chain / tree hash table; the wasm\n  size budget is 1.25 MiB\n\n* fix(encode): take the CDict strategy whatever backend the plain level resolved to\n\nA dictionary frame runs the CDict's cParams unconditionally upstream\n(ZSTD_resetCCtx_usingCDict); resolving the plan only when the plain\nlevel's source-size tier already sat on the lazy backend left a frame on\nthe wrong search algorithm whenever the two tiers disagreed: L4 on a\n1 MiB source (dfast) with a 4 KiB dictionary (greedy CDict) ran dfast,\nL13 on a 4 KiB source (btopt) with a 300 KiB dictionary (btlazy2) ran\nbtopt. z000033 + 4 KiB raw dictionary at L4: 15 % -> 100 % sequence\nparity; L1 / L2 11 % / 8 % -> 57 % / 55 % (the rest is the fast\ndictionary paths).\n\nCarries the regression test (both tier mismatches) and reshapes the\ndict_builder round-trip test onto a payload the dictionary genuinely\ncovers: on its previous payload upstream too compresses smaller without\nthe dictionary.\n\n* perf(dfast): tag the attached dictionary slots as upstream's short cache\n\nThe dfast dictMatchState tables now pack the hash tag next to the index\n(ZSTD_SHORT_CACHE_TAG_BITS, ZSTD_writeTaggedIndex / comparePackedTags),\nso a colliding slot is rejected on the tag without loading the\ndictionary bytes. With the CDict-sized tables a frame now runs (12 / 11\nbits for a 1.3 KiB dictionary) most slots are occupied and every\nuntagged collision on incompressible input was a cache miss into the\ndictionary: compress-dict/level_3_dfast/small-10k-random had gone 73.6\n-> 117 us once the frame took the CDict geometry. Dictionaries past the\n24-bit index field take the copy path. Sequence streams unchanged.\n\n* fix(encode): CDict geometry for attached dfast tables, effective strategy on planned dictionary frames, btlazy2 out of the optimal estimate\n\n- the dfast dictionary tables take the CDict's hashLog / chainLog and\n  the probes hash at those widths (upstream dictCParams), instead of the\n  source-capped live widths that indexed a large dictionary into a tiny\n  table on a small source\n- the frame state (literal gates, pre-split tier) records the CDict's\n  strategy when a lazy-band dictionary plan makes the matcher ignore a\n  public strategy override\n- estimated_bt_strategy_extra_bytes charges the optimal-parser scratch\n  to strategies 7..=9 only: btlazy2's tree lives in the lazy backend\n\nCarries the regression tests for the first two.\n\n* fix(encode): dictionary frames follow the CDict on every backend\n\n- a public strategy / finder override is ignored on any dictionary frame\n  (upstream \"cdict overrides\": only windowLog is the caller's), not only\n  on the lazy band; the frame state records the CDict strategy for every\n  backend family\n- the CDict cParams tier is keyed by the serialized dictionary size\n  (ZSTD_createCDict dictSize), retained as Dictionary::serialized_len;\n  the matcher hint carries both sizes (DictionarySizes) so the content\n  length still drives the dictionary tables and attach cutoffs\n- the hash-chain / binary-tree widths of a dictionary frame are the\n  CDict's as resolved (verbatim in copy mode, source-adjusted in attach\n  mode, where the dms owns the dict-sized tables); the dict-tier resizing\n  block that overwrote them with 8 MiB tables on a 4 KiB attached source\n  is removed together with cdict_table_logs\n- the Fast / Dfast dictionary-table geometry setters drop a resident\n  table of another geometry so a level change with unchanged live widths\n  re-primes instead of probing the previous level's table\n\nRegression tests: dictionary_frame_keeps_a_fast_cdict_strategy_under_a_\nstrategy_override, driver_dictionary_frame_ignores_a_strategy_override_on_\na_fast_cdict, dictionary_cdict_tier_follows_the_serialized_dictionary_size,\ndriver_dfast_dictionary_tables_follow_the_cdict_geometry_across_levels\n(each failed before its fix); driver_fast_dictionary_table_follows_the_\ncdict_geometry_across_levels pins the Fast contract.\n\nPart of #323\nPart of #178\n\n* fix(encode): pre-split full blocks on the streaming encoder\n\nThe streaming encoder emitted every full 128 KiB buffer as one block; the\nframe compressor's reader path (and upstream ZSTD_compress_frameChunk,\nstreaming included) cuts a full block at the pre-splitter's boundary once\nthe frame has saved enough, carrying the suffix into the next block. The\nstreamed frame, which is what the CLI writes, was 5.8 % larger than the\none-shot frame on decodecorpus z000033 at level 6 (512,625 vs 484,728\nbytes; the libzstd CLI writes 491,854).\n\n- cut a full pending buffer with optimal_block_size_with at the frame's\n  effective pre-split tier, tracking upstream's `savings` (consumed minus\n  produced, block headers included); a full final buffer is cut the same\n  way and its suffix becomes the last block\n- a drain failure while emitting a cut prefix restores the whole pending\n  buffer (prefix + suffix), so no input is lost\n- resolve the streaming frame's effective strategy / pre-split tier through\n  the same size- and dictionary-adaptive path as the frame compressor\n  (shared frame_compressor::{sync_effective_strategy, resolve_frame_params});\n  the strategy override keeps its lazy depth for the tier\n\nRegression test streaming_encoder_pre_splits_full_blocks_like_the_frame_\ncompressor (block stream identical to the reader path at L6 / L16) failed\nbefore the fix.\n\nPart of #178\n\n* fix(encode): keep dictionary-frame gates on the CDict parameters\n\n- set_parameters resolves the dictionary's CDict tier only when the frame\n  will prime it (not for Uncompressed, whose level has no numeric value:\n  it panicked with a dictionary attached)\n- the raw-literals gate (ZSTD_literalsCompressionIsDisabled) drops a\n  target_length override on a dictionary frame, where the matcher runs the\n  CDict's targetLength; the streaming encoder now resolves the same gate\n  at frame start from its own target_length override\n- README / BENCHMARKS: the Best preset is level 13, as numeric_level maps\n  it (the docs said 11)\n\nRegression tests: set_parameters_uncompressed_with_a_dictionary_attached_\ndoes_not_resolve_a_cdict, dictionary_frame_literal_gate_ignores_a_target_\nlength_override (both failed before the fix),\nstreaming_encoder_literal_gate_follows_the_effective_target_length.\n\nPart of #178\n\n* perf(encode): keep the coarse block pre-split tiers\n\nThe effective-strategy pre-split tier introduced with the lazy parse used\nupstream's default `splitLevels` table as is (greedy/lazy rate 11,\nlazy2/btlazy2 rate 5, optimal band rate 1). On periodic input that\nover-splits every block, exactly as upstream does: the 100 MiB repeated\nlog stream went from 8,944 to 140,625 bytes at L8-L10 (upstream's size)\nand 3.6x slower, low-entropy 1 MiB from 148 to 155 bytes; on real data\nthe finer tiers bought 170 bytes of 483 KiB at L8-L12 while costing time\n(btopt rate-1 scan: L17 low-entropy 1.75x). The drop-in contract is ratio\n<= upstream, not upstream's block boundaries, so the tiers two steps\ncoarser (from-borders up to lazy, rate 43 for lazy2/btlazy2, rate 11 for\nthe optimal band) stay; `pre_split_for` documents the deviation.\n\nPart of #178\n\n* test(levels): pin resolved level params to ZSTD_getCParams over a size grid\n\nEvery (level -7..22, source size 1 KiB..100 MiB) cell: strategy / backend,\nwindow, hash and chain logs, search depth, targetLength and minMatch of the\nparams the encoder runs equal upstream's cParams for that size tier.\n\n* perf(encode): upstream pre-split tiers up to lazy, coarse above\n\nMeasured per strategy on the i9 (decodecorpus vs the periodic 100 MiB\nstream): the borders tier on dfast/greedy/lazy compresses mixed data\n4.6-4.9 % WORSE than upstream (this was the long-standing greedy L5 ratio\noffender), so those follow upstream's `splitLevels` (dfast rate 43,\ngreedy/lazy rate 11); the lazy2/btlazy2 rate-5 and optimal rate-1 tiers\nstay two steps coarser (rate 43 / 11): on the periodic stream they match\nupstream's over-split (140,625 vs 9,742 bytes, 3.6x the time) and on\nmixed data buy under 0.1 %.\n\nPart of #178\n\n* perf(encode): keep the block sizer out of the frame loop\n\noptimal_block_size_with inlined into the per-block frame loop shifted the\ncode layout around run_fast_kernel_block and cost the Fast levels 17-24 %\non 1 MiB+ inputs on x86 (i9: the kernel's instruction stream is\nbyte-identical to the previous shape, the caller grew). One call per block\nis noise; mark it inline(never) so the loop stays compact.\n\nPart of #178\n\n* fix(encode): dictionary attach caches and geometry hold across resets\n\n- the serialized dictionary size moves off the public Dictionary struct\n  (its all-pub fields are externally constructible; a new field broke that)\n  into EncoderDictionary: exact on the from_bytes / set_dictionary_from_bytes\n  / C ABI paths, content-length fallback on from_dictionary (documented)\n- the Fast / Dfast dictionary-geometry setters also drop a resident table\n  when the next frame carries no dictionary, so a reused matcher cannot\n  re-borrow dict tables under a frame whose header declares none\n- a dictionary whose content exceeds the tagged attach tables' 2^24\n  position range resolves the COPY geometry (CDict verbatim table logs)\n  instead of source-capped attach widths it would then be copied into\n\nRegression tests: driver_no_dictionary_reset_drops_the_attached_tables and\noversized_attach_dictionary_resolves_the_copy_geometry (both failed before\ntheir fixes).\n\nPart of #178\n\n* fix(encode): raise the valid-data floor when the lazy window evicts\n\nThe Row backend's eviction (add_data / trim_to_window) advanced\nhistory_abs_start without raising low_limit, so the distance-only window\nfloor (pos - search_window) could trail the eviction by up to a block and\nthe DUBT walks dereferenced evicted positions that were still inside the\nadvertised window: an out-of-bounds read, crashing (index underflow with\ndebug assertions, SIGSEGV without) on any input a block past the window at\nthe btlazy2 levels — the streaming CLI at L13-L15 on a repetitive stream\nlarger than the window, and the one-shot reader path equally. Raise\nlow_limit (and prefix_low) past everything eviction drops, exactly\nupstream's window.lowLimit semantics; the DUBT sort keeps a debug\nassertion that a sorted node's bytes are resident.\n\nRegression test streaming_periodic_btlazy2_roundtrips (6 MiB periodic\nstream, past the L15 window) failed before the fix with the underflow.\n\nPart of #178\n\n* fix(encode): one size for the streaming reset, no attach reborrow in copy mode\n\n- the streaming encoder re-forwards the authoritative size\n  (pledge.or(advisory hint)) to the matcher right before the reset, so a\n  pledge followed by a different advisory hint (or vice versa) cannot leave\n  the matcher and the frame gates on different size tiers\n- the driver drops a resident Dfast attach table when the next dictionary\n  frame is copy-mode: the width-change invalidation did not cover an\n  unhinted attach frame followed by a large hinted one whose live widths\n  coincide at the level's full widths\n- README backend map updated to the Row-backend lazy band (greedy..btlazy2\n  on the shared lazy_generic parse; rows / chain / lazily-sorted tree)\n\nRegression tests: streaming_encoder_matcher_and_gates_resolve_from_one_size\nand driver_dfast_attach_table_is_dropped_when_the_next_frame_copies (both\nfailed before their fixes).\n\nPart of #178\n\n* fix(encode): release inactive lazy tables, rebase the borrowed cursor\n\n- a rows-level reset on a reused compressor coming back from a btlazy2\n  level (same Row storage, no backend swap) now releases the chain / tree\n  tables the rows finder never reads (tens of MiB retained otherwise)\n- registering a borrowed window applies the same u32 headroom guard as\n  add_data: the borrowed reuse path advances the coordinate floor per frame\n  without committing, so after ~4 GiB of cumulative reused frames every\n  stored position wrapped u32 and matching silently degraded; rebase the\n  origin before the frame's positions are stored\n- a synthesized btlazy2 override already hashes at minMatch 5 (ROW_L5\n  carries ROW_MIN_MATCH_LEN); documented at the synthesis site\n\nRegression tests: driver_rows_reset_releases_the_tree_tables and\nborrowed_window_rebases_before_the_u32_cursor_wraps (both failed before\ntheir fixes).\n\nPart of #178\n\n* fix(encode): 32-bit-safe u32 headroom check on the borrowed window\n\nThe borrowed-window rebase guard summed history_abs_start + buffer.len()\nin usize, which itself overflows on a 32-bit target exactly where the\nguard must fire (caught by the i686 CI run of\nborrowed_window_rebases_before_the_u32_cursor_wraps). Do the comparison\nin u64.\n\n* fix(encode): recompute the raw-literals gate per frame\n\nset_parameters computed literal_compression_disabled once, so attaching\nor clearing a dictionary afterwards left it stale: a dictionary frame\nemitted raw literals for a target_length override the matcher had dropped\n(the CDict's targetLength applies there), and the inverse ordering lost\nthe override on the plain frame. Persist the target_length override and\nrecompute the gate in prepare_frame next to the strategy sync.\n\nRegression test literal_gate_follows_dictionary_attach_and_clear (both\norderings) failed before the fix.\n\n* fix(levels): keep the full search-log budget for the chain and tree\n\nAn explicit search_log override stored 1 << min(searchLog, rowLog) as the\ncompare budget, silently capping e.g. search_log(7) on btlazy2 to 64\ncompares. Upstream's nbAttempts is the full 1 << searchLog for the chain\nand tree walks; only the row probe bounds its budget by the row size, and\nit does so at the search site. Store the full depth.\n\nRegression test search_log_override_keeps_the_full_depth_for_chain_and_tree\nfailed before the fix.",
+          "timestamp": "2026-09-02T01:04:10+03:00",
+          "tree_id": "f25764e682a8ba403452ebc5a8eb0fe59b7f2a4e",
+          "url": "https://github.com/structured-world/structured-zstd/commit/ac08d193734ba76ae2b1c20e53efa0f0846d43fe"
+        },
+        "date": 1788303239086,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.086,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.085,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 210.638,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 204.197,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 0.622,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.373,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.909,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.994,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.946,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 2.043,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.028,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.173,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.028,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.173,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.008,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 11.313,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.724,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.137,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.189,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.553,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.153,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.725,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.251,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.026,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.172,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.027,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.167,
             "unit": "ms"
           }
         ]
