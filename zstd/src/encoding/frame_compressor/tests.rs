@@ -2884,6 +2884,34 @@ fn pre_split_tier_follows_the_effective_strategy() {
     );
 }
 
+/// Regression: on a dictionary frame the matcher runs the CDict's strategy
+/// and ignores a public strategy override ("cdict overrides"), so the frame
+/// state the literal gates and the block splitter read must record the
+/// CDict's strategy too, not the override.
+#[test]
+fn dictionary_frame_state_records_the_cdict_strategy_not_the_override() {
+    use crate::encoding::strategy::StrategyTag;
+    use crate::encoding::{CompressionParameters, Strategy};
+    let dict_raw = noise_bytes(20 * 1024, 5);
+    let payload = noise_bytes(16 * 1024, 9);
+    let mut enc: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(6));
+    enc.set_dictionary(
+        crate::decoding::Dictionary::from_raw_content(0xD1C7_0013, dict_raw).unwrap(),
+    )
+    .unwrap();
+    let params = CompressionParameters::builder(super::CompressionLevel::Level(6))
+        .strategy(Strategy::Btultra2)
+        .build()
+        .expect("valid override");
+    enc.set_parameters(&params);
+    enc.set_source_size_hint(payload.len() as u64);
+    // The 20 KiB CDict resolves L6 to lazy; the override must not leak into
+    // the frame state the block loop reads.
+    let _ = enc.compress_independent_frame(&payload);
+    assert_eq!(enc.state.strategy_tag, StrategyTag::Lazy);
+    assert_eq!(enc.state.pre_split, Some(2));
+}
+
 /// Regression: the borrowed (in-place) one-shot path must keep the
 /// coordinate floor above every position a previous frame indexed. Zeroing
 /// the floor per borrowed frame left the chain / tree tables holding the

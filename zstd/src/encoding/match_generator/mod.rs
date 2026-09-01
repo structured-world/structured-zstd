@@ -1386,6 +1386,16 @@ impl Matcher for MatchGeneratorDriver {
                 };
                 resolved_table_bits = long_bits;
                 dfast.set_hash_bits(long_bits, short_bits);
+                // The attached dictionary tables take the CDict's geometry
+                // (upstream hashes the dictMatchState tables with
+                // `dictCParams`), not the source-capped live widths.
+                dfast.set_dict_table_bits(dict_hint.filter(|&s| s > 0).map(|dict_size| {
+                    let cd = crate::encoding::cparams::get_cdict_cparams(
+                        crate::encoding::levels::config::numeric_level(level),
+                        dict_size,
+                    );
+                    (cd.hash_log as usize, cd.chain_log as usize)
+                }));
                 // Dfast holds no per-block input Vecs (history owns the
                 // bytes and `add_data` returns each Vec eagerly), so
                 // `reset` takes no `reuse_space` callback.

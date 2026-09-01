@@ -1798,6 +1798,38 @@ fn dictionary_frame_takes_the_cdict_strategy_across_backend_families() {
     );
 }
 
+/// Regression: the Dfast attached dictionary tables take the CDict's
+/// `hashLog` / `chainLog` (upstream hashes the dictMatchState tables with
+/// `dictCParams`), not the live tables' source-capped widths: a 1 KiB
+/// source caps the live tables at 11 / 10 bits while a 20 KiB dictionary's
+/// CDict tables are 16 / 15 bits.
+#[test]
+fn driver_dfast_dictionary_tables_take_the_cdict_geometry() {
+    let dict: Vec<u8> = (0..20 * 1024u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+    driver.set_source_size_hint(1024);
+    driver.set_dictionary_size_hint(dict.len());
+    driver.reset(CompressionLevel::Level(3));
+    driver.prime_with_dictionary(&dict, [1, 4, 8]);
+    let cd = crate::encoding::cparams::get_cdict_cparams(3, dict.len());
+    let live = driver.dfast_matcher().live_table_bits();
+    let built = driver
+        .dfast_matcher()
+        .dict_table_bits()
+        .expect("attached dictionary tables");
+    assert_eq!(
+        built,
+        (cd.hash_log as usize, cd.chain_log as usize),
+        "dict tables must have the CDict geometry"
+    );
+    assert!(
+        live.0 < built.0,
+        "the source-capped live tables are narrower ({live:?} vs {built:?})"
+    );
+}
+
 /// Regression: the Fast dictionary table takes the CDict's `hashLog`
 /// (upstream `ZSTD_createCDict` sizes it from the dictionary), not the
 /// source-capped main table's: a 1 KiB source caps the main table at

@@ -1074,11 +1074,8 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         // size-adaptively (same `resolve_level_params` path `prepare_frame`
         // uses) so a hint already set here yields the same strategy the matcher
         // will run, not the bare level-only mapping.
-        let params = crate::encoding::levels::config::resolve_level_params(
-            self.compression_level,
-            self.source_size_hint,
-        );
-        self.sync_effective_strategy(&params);
+        let (params, planned) = self.resolve_frame_params(self.source_size_hint, true);
+        self.sync_effective_strategy(&params, !planned);
         self.state.huf_optimal_search =
             huf_search_enabled(self.state.strategy_tag, self.source_size_hint);
         // C `ZSTD_literalsCompressionIsDisabled` (ps_auto): raw literals iff the
@@ -1557,13 +1554,43 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         }
     }
 
+    /// The level params the matcher's reset resolves for the next frame
+    /// (dictionary-aware when a dictionary will be used) and whether a
+    /// lazy-band dictionary plan applies (the matcher then runs the CDict's
+    /// strategy and ignores a strategy override).
+    fn resolve_frame_params(
+        &self,
+        hint: Option<u64>,
+        with_dictionary: bool,
+    ) -> (crate::encoding::levels::config::LevelParams, bool) {
+        match self.dictionary.as_ref().filter(|_| with_dictionary) {
+            Some(dict) if !dict.inner.dict_content.is_empty() => {
+                let (params, plan) =
+                    crate::encoding::levels::config::resolve_level_params_with_dict(
+                        self.compression_level,
+                        hint,
+                        dict.inner.dict_content.len(),
+                    );
+                (params, plan.is_some())
+            }
+            _ => (
+                crate::encoding::levels::config::resolve_level_params(self.compression_level, hint),
+                false,
+            ),
+        }
+    }
+
     /// Record the strategy the matcher actually runs for the next frame (a
-    /// public-parameter override, else the size- and dictionary-adaptive
-    /// resolution in `params`) and its pre-split tier: the literal gates and
-    /// the block splitter read these, and upstream indexes `splitLevels` by
-    /// the effective strategy too.
-    fn sync_effective_strategy(&mut self, params: &crate::encoding::levels::config::LevelParams) {
-        match self.strategy_override {
+    /// public-parameter override when the matcher honours one, else the
+    /// size- and dictionary-adaptive resolution in `params`) and its
+    /// pre-split tier: the literal gates and the block splitter read these,
+    /// and upstream indexes `splitLevels` by the effective strategy too.
+    fn sync_effective_strategy(
+        &mut self,
+        params: &crate::encoding::levels::config::LevelParams,
+        override_applies: bool,
+    ) {
+        match self.strategy_override.filter(|_| override_applies) {
             Some((tag, lazy_depth)) => {
                 self.state.strategy_tag = tag;
                 self.state.pre_split = Some(crate::encoding::levels::config::pre_split_for(
@@ -1749,22 +1776,10 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // frame runs, costing a few bytes on small literal sections).
         // A dictionary frame runs the CDict's strategy (upstream
         // `ZSTD_resetCCtx_usingCDict`), so resolve through the same
-        // dictionary-aware path the matcher's reset took.
-        let params = match self.dictionary.as_ref().filter(|_| use_dictionary_state) {
-            Some(dict) if !dict.inner.dict_content.is_empty() => {
-                crate::encoding::levels::config::resolve_level_params_with_dict(
-                    self.compression_level,
-                    initial_size_hint,
-                    dict.inner.dict_content.len(),
-                )
-                .0
-            }
-            _ => crate::encoding::levels::config::resolve_level_params(
-                self.compression_level,
-                initial_size_hint,
-            ),
-        };
-        self.sync_effective_strategy(&params);
+        // dictionary-aware path the matcher's reset took; a lazy-band CDict
+        // plan also makes the matcher ignore a strategy override.
+        let (params, planned) = self.resolve_frame_params(initial_size_hint, use_dictionary_state);
+        self.sync_effective_strategy(&params, !planned);
         // `initial_size_hint` (captured before the `.take()` above) — by here
         // `self.source_size_hint` is None.
         self.state.huf_optimal_search =

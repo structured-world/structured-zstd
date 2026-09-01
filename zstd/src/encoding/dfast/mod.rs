@@ -130,6 +130,10 @@ pub(crate) struct DfastMatchGenerator {
     /// `is_attached()` activates the dual-probe kernel; `region_len()` is the
     /// dict/input boundary (`dict_end`, a concat index).
     pub(crate) dict: DictAttach<DfastDictTables>,
+    /// The attached dictionary tables' widths for the next dictionary frame
+    /// (the CDict's `hashLog` / `chainLog`), set by the driver; `None` uses
+    /// the live widths.
+    dict_table_bits: Option<(usize, usize)>,
     /// CPU kernel for the `common_prefix_len` / repcode byte-compares,
     /// resolved once at construction so the per-byte match-finder scans skip
     /// the `select_kernel()` `OnceLock` atomic on every call.
@@ -166,6 +170,11 @@ pub(crate) struct DfastMatchGenerator {
 pub(crate) struct DfastDictTables {
     pub(crate) long: alloc::vec::Vec<u32>,
     pub(crate) short: alloc::vec::Vec<u32>,
+    /// The tables' own widths (the CDict's `hashLog` / `chainLog`, upstream
+    /// `dictCParams`), independent of the source-capped live tables: the
+    /// probes hash the position at these widths.
+    pub(crate) long_bits: usize,
+    pub(crate) short_bits: usize,
 }
 
 /// Upstream `ZSTD_SHORT_CACHE_TAG_BITS`: the low bits of a dictionary slot
@@ -208,6 +217,7 @@ impl DfastMatchGenerator {
             long_hash_bits: DFAST_HASH_BITS,
             short_hash_bits: DFAST_HASH_BITS - DFAST_SHORT_HASH_BITS_DELTA,
             dict: DictAttach::new(),
+            dict_table_bits: None,
             kernel: select_kernel(),
             borrowed_input: None,
             borrowed_block: None,
@@ -743,6 +753,30 @@ impl DfastMatchGenerator {
         self.dict.invalidate();
     }
 
+    /// The attached dictionary tables' `(long, short)` widths for the next
+    /// dictionary frame: the CDict's `hashLog` / `chainLog`; `None` uses the
+    /// live widths.
+    pub(crate) fn set_dict_table_bits(&mut self, bits: Option<(usize, usize)>) {
+        self.dict_table_bits = bits;
+    }
+
+    /// `(long, short)` bit widths of the attached dictionary tables. Test-only.
+    #[cfg(test)]
+    pub(crate) fn dict_table_bits(&self) -> Option<(usize, usize)> {
+        self.dict.table().map(|d| {
+            (
+                d.long.len().trailing_zeros() as usize,
+                d.short.len().trailing_zeros() as usize,
+            )
+        })
+    }
+
+    /// `(long, short)` bit widths of the live tables. Test-only.
+    #[cfg(test)]
+    pub(crate) fn live_table_bits(&self) -> (usize, usize) {
+        (self.long_hash_bits, self.short_hash_bits)
+    }
+
     /// Build the immutable dict long+short tables over the contiguous-history
     /// concat range `[start_concat, end_concat)` (the dictionary bytes at the
     /// front of history). Mirrors [`Self::insert_positions`]' hash + lookahead
@@ -760,8 +794,20 @@ impl DfastMatchGenerator {
         }
         let history_start = self.history_start;
         let concat_len = self.history.len() - history_start;
-        let long_bits = self.long_hash_bits;
-        let short_bits = self.short_hash_bits;
+        // The CDict's geometry when the driver resolved one (upstream sizes
+        // and hashes the dictMatchState tables with `dictCParams`), else the
+        // live widths. A retained table of another width is rebuilt.
+        let (long_bits, short_bits) = self
+            .dict_table_bits
+            .unwrap_or((self.long_hash_bits, self.short_hash_bits));
+        if self
+            .dict
+            .table()
+            .is_some_and(|d| d.long_bits != long_bits || d.short_bits != short_bits)
+        {
+            self.dict.invalidate();
+            self.dict.set_region_len(end_concat);
+        }
         // Lookahead-safe cutoffs within the concat: long needs 8 readable
         // bytes, short needs 5 (upstream zstd `mls = 5` for the short hash).
         let long_safe_end = concat_len.saturating_sub(7).min(end_concat);
@@ -778,6 +824,8 @@ impl DfastMatchGenerator {
         let dict = self.dict.table_mut_or_init(|| DfastDictTables {
             long: alloc::vec![DFAST_EMPTY_SLOT; 1usize << long_bits],
             short: alloc::vec![DFAST_EMPTY_SLOT; 1usize << short_bits],
+            long_bits,
+            short_bits,
         });
         let short_shift = 64 - short_bits;
         let long_shift = 64 - long_bits;
@@ -1892,16 +1940,30 @@ macro_rules! start_matching_fast_loop_body {
         // no-dict and dictMatchState loops as separate functions for the same
         // reason). `$use_dict == true` is dispatched only when the table is
         // present, so the `expect` never fires.
-        let (dict_long_ptr, dict_short_ptr, dict_end): (*const u32, *const u32, usize) =
-            if $use_dict {
-                let d = $self
-                    .dict
-                    .table()
-                    .expect("USE_DICT kernel dispatched without a dict table");
-                (d.long.as_ptr(), d.short.as_ptr(), $self.dict.region_len())
-            } else {
-                (core::ptr::null(), core::ptr::null(), 0)
-            };
+        // The dictionary tables have their own widths (the CDict's), so the
+        // probes below hash the position at `dict_*_shift`, not the live
+        // tables' shifts.
+        let (dict_long_ptr, dict_short_ptr, dict_end, dict_long_shift, dict_short_shift): (
+            *const u32,
+            *const u32,
+            usize,
+            usize,
+            usize,
+        ) = if $use_dict {
+            let d = $self
+                .dict
+                .table()
+                .expect("USE_DICT kernel dispatched without a dict table");
+            (
+                d.long.as_ptr(),
+                d.short.as_ptr(),
+                $self.dict.region_len(),
+                64 - d.long_bits,
+                64 - d.short_bits,
+            )
+        } else {
+            (core::ptr::null(), core::ptr::null(), 0, 64, 64)
+        };
 
         // Advertised window cap = `1 << window_log`. Owned mode evicts, so
         // `history_abs_start` already bounds candidates to the live window;
@@ -2321,12 +2383,14 @@ macro_rules! start_matching_fast_loop_body {
                 if $use_dict {
                     // SAFETY: when `use_dict`, `dict_long_ptr` is non-null and
                     // sized `1 << long_hash_bits`; `hl0_idx < 1 << long_hash_bits`.
-                    let dl = unsafe { *dict_long_ptr.add(hl0_idx) };
+                    let dmix0 = v8_0.wrapping_mul(PRIME);
+                    // SAFETY: `dmix0 >> dict_long_shift < 1 << long_bits`, the
+                    // dict long table's length.
+                    let dl = unsafe { *dict_long_ptr.add((dmix0 >> dict_long_shift) as usize) };
                     // Tag check first (upstream `dictTagsMatchL`): a
                     // colliding slot never loads the dictionary bytes.
                     if dl != DFAST_EMPTY_SLOT
-                        && (dl & DFAST_DICT_TAG_MASK)
-                            == dfast_dict_tag(v8_0.wrapping_mul(PRIME), long_shift)
+                        && (dl & DFAST_DICT_TAG_MASK) == dfast_dict_tag(dmix0, dict_long_shift)
                     {
                         let dp = ((dl >> DFAST_DICT_TAG_BITS) as usize) - 1;
                         // Dict long slots were only written for positions with
@@ -2528,10 +2592,14 @@ macro_rules! start_matching_fast_loop_body {
                             if !live_l1_hit && $use_dict {
                                 // SAFETY: `use_dict` ⇒ `dict_long_ptr` non-null,
                                 // sized `1 << long_hash_bits`; `hl1_idx` is in range.
-                                let dl1 = unsafe { *dict_long_ptr.add(hl1_idx) };
+                                let dmix1 = v8_1.wrapping_mul(PRIME);
+                                // SAFETY: the index is below the dict long table's length.
+                                let dl1 = unsafe {
+                                    *dict_long_ptr.add((dmix1 >> dict_long_shift) as usize)
+                                };
                                 if dl1 != DFAST_EMPTY_SLOT
                                     && (dl1 & DFAST_DICT_TAG_MASK)
-                                        == dfast_dict_tag(v8_1.wrapping_mul(PRIME), long_shift)
+                                        == dfast_dict_tag(dmix1, dict_long_shift)
                                 {
                                     let dp1 = ((dl1 >> DFAST_DICT_TAG_BITS) as usize) - 1;
                                     if dp1 < dict_end {
@@ -2628,10 +2696,11 @@ macro_rules! start_matching_fast_loop_body {
                 if $use_dict {
                     // SAFETY: `use_dict` ⇒ `dict_short_ptr` non-null, sized
                     // `1 << short_hash_bits`; `hs0_idx < 1 << short_hash_bits`.
-                    let ds = unsafe { *dict_short_ptr.add(hs0_idx) };
+                    let dsmix0 = (v8_0 << 24).wrapping_mul(PRIME);
+                    // SAFETY: the index is below the dict short table's length.
+                    let ds = unsafe { *dict_short_ptr.add((dsmix0 >> dict_short_shift) as usize) };
                     if ds != DFAST_EMPTY_SLOT
-                        && (ds & DFAST_DICT_TAG_MASK)
-                            == dfast_dict_tag((v8_0 << 24).wrapping_mul(PRIME), short_shift)
+                        && (ds & DFAST_DICT_TAG_MASK) == dfast_dict_tag(dsmix0, dict_short_shift)
                     {
                         let dp = ((ds >> DFAST_DICT_TAG_BITS) as usize) - 1;
                         if dp < dict_end {
