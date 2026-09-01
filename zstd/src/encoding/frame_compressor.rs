@@ -194,6 +194,11 @@ pub struct FrameCompressor<
     /// A public-parameter strategy override: its tag and lazy depth (the
     /// collapsed `Lazy` tag needs the depth for the pre-split tier).
     strategy_override: Option<(crate::encoding::strategy::StrategyTag, u8)>,
+    /// Public `target_length` override (#27), persisted so the raw-literals
+    /// gate can be recomputed per frame: a dictionary attached or cleared
+    /// after `set_parameters` flips whether the override applies (the
+    /// matcher drops it on a dictionary frame).
+    target_length_override: Option<u32>,
 }
 
 #[derive(Clone, Default)]
@@ -1143,6 +1148,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             #[cfg(feature = "lsm")]
             block_decompressed_sizes: alloc::vec::Vec::new(),
             strategy_override: None,
+            target_length_override: None,
         }
     }
 
@@ -1172,6 +1178,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
         self.compression_level = params.level();
         let overrides = params.overrides();
         self.strategy_override = overrides.strategy.map(|s| (s.tag(), s.lazy_depth()));
+        self.target_length_override = overrides.target_length;
         // Keep `state.strategy_tag` consistent immediately so the borrowed
         // one-shot eligibility gate (`borrowed_eligible`) and literal gates
         // are correct even before the next `compress()` re-sync. Resolve it
@@ -1551,6 +1558,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             #[cfg(feature = "lsm")]
             block_decompressed_sizes: alloc::vec::Vec::new(),
             strategy_override: None,
+            target_length_override: None,
         }
     }
 
@@ -1856,6 +1864,17 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // `self.source_size_hint` is None.
         self.state.huf_optimal_search =
             huf_search_enabled(self.state.strategy_tag, initial_size_hint);
+        // The raw-literals gate is dictionary-aware too: attaching or
+        // clearing a dictionary AFTER `set_parameters` flips whether the
+        // `target_length` override applies (the matcher drops it on a
+        // dictionary frame, which runs the CDict's targetLength), so the
+        // gate set there is recomputed per frame from the persisted
+        // override.
+        self.state.literal_compression_disabled = literal_compression_disabled(
+            self.state.strategy_tag,
+            self.compression_level,
+            self.target_length_override.filter(|_| !planned),
+        );
         let cached_entropy = if use_dictionary_state {
             self.dictionary_entropy_cache.as_ref()
         } else {
@@ -2566,6 +2585,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         );
         // Drop sticky overrides so the level switch yields plain geometry.
         self.strategy_override = None;
+        self.target_length_override = None;
         self.state.matcher.clear_param_overrides();
         old
     }

@@ -2935,6 +2935,49 @@ fn dictionary_frame_keeps_a_fast_cdict_strategy_under_a_strategy_override() {
     assert_eq!(enc.state.pre_split, Some(0));
 }
 
+/// Regression: the raw-literals gate is recomputed when the dictionary
+/// state changes AFTER `set_parameters`. A positive `target_length` on a
+/// fast level disables literal compression on a plain frame, but a
+/// dictionary frame runs the CDict's targetLength (0 at level 1) and must
+/// compress literals; the inverse (parameters set while a dictionary was
+/// attached, then `clear_dictionary`) must re-enable the override.
+#[test]
+fn literal_gate_follows_dictionary_attach_and_clear() {
+    use crate::encoding::CompressionParameters;
+    let dict_raw = noise_bytes(4 * 1024, 5);
+    let payload = noise_bytes(2048, 9);
+    let params = CompressionParameters::builder(super::CompressionLevel::Level(1))
+        .target_length(8)
+        .build()
+        .expect("valid override");
+    // set_parameters THEN attach: the dictionary frame ignores the override.
+    let mut enc: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(1));
+    enc.set_parameters(&params);
+    assert!(enc.state.literal_compression_disabled);
+    enc.set_dictionary(
+        crate::decoding::Dictionary::from_raw_content(0xD1C7_0019, dict_raw.clone()).unwrap(),
+    )
+    .unwrap();
+    let _ = enc.compress_independent_frame(&payload);
+    assert!(
+        !enc.state.literal_compression_disabled,
+        "a dictionary frame keeps the CDict targetLength: literals stay compressed"
+    );
+    // Attach THEN set_parameters THEN clear: the plain frame honours it again.
+    let mut enc: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(1));
+    enc.set_dictionary(
+        crate::decoding::Dictionary::from_raw_content(0xD1C7_001A, dict_raw).unwrap(),
+    )
+    .unwrap();
+    enc.set_parameters(&params);
+    enc.clear_dictionary();
+    let _ = enc.compress_independent_frame(&payload);
+    assert!(
+        enc.state.literal_compression_disabled,
+        "without the dictionary the target_length override applies again"
+    );
+}
+
 /// Regression: parameters whose level is `Uncompressed` may be set while a
 /// dictionary is attached (uncompressed mode ignores the dictionary, as
 /// `prepare_frame` does); the immediate strategy sync must not resolve the
