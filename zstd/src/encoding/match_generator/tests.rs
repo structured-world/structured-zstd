@@ -1772,6 +1772,56 @@ fn driver_huge_source_hint_with_dict_does_not_overflow_hc_reserve() {
     driver.skip_matching_with_hint(None);
 }
 
+/// Regression: a dictionary frame takes its finder geometry from the CDict
+/// (upstream `ZSTD_resetCCtx_byAttachingCDict`: "cdict overrides"), so
+/// public `search_log` / `min_match` overrides must not reshape the live
+/// search away from the tables the dictionary was indexed with; only the
+/// window override survives. A 20 KiB dictionary on a 16 KiB source is
+/// attached with the row finder at the CDict's `rowLog` 4 and key width 4;
+/// an override to 6 / 6 would probe rows of another width with another key
+/// and lose every dictionary match.
+#[test]
+fn driver_dictionary_frame_ignores_finder_overrides() {
+    let ov = super::super::parameters::ParamOverrides {
+        search_log: Some(6),
+        min_match: Some(6),
+        ..Default::default()
+    };
+    let dict: Vec<u8> = (0..20 * 1024u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+    driver.set_source_size_hint(1 << 14);
+    driver.set_dictionary_size_hint(dict.len());
+    driver.set_param_overrides(Some(ov));
+    driver.reset(CompressionLevel::Level(6));
+    driver.prime_with_dictionary(&dict, [1, 4, 8]);
+    assert_eq!(
+        driver.active_backend(),
+        super::super::strategy::BackendTag::Row
+    );
+    // A block made of two dictionary slices: every match must come from the
+    // dictionary, through the geometry it was indexed with.
+    let mut block = dict[1000..1064].to_vec();
+    block.extend_from_slice(&dict[5000..5064]);
+    let mut space = driver.get_next_space();
+    space.clear();
+    space.extend_from_slice(&block);
+    driver.commit_space(space);
+    let mut dict_matches = 0usize;
+    driver.start_matching(|seq| {
+        if let Sequence::Triple { offset, .. } = seq
+            && offset > block.len()
+        {
+            dict_matches += 1;
+        }
+    });
+    assert!(
+        dict_matches >= 2,
+        "the attached dictionary must be found through the CDict geometry (got {dict_matches})"
+    );
+}
+
 #[test]
 fn driver_chain_log_override_survives_row_to_hc_fallback() {
     // Regression: when a RowHash level is forced onto the HashChain backend

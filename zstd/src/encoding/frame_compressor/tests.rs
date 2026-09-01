@@ -2721,3 +2721,110 @@ fn dict_compress_bt_level_tiny_source_round_trips_through_prime_dms_bt() {
         .expect("dict BT-level frame should round-trip");
     assert_eq!(decoded, data);
 }
+
+/// Pseudo-random bytes (no self-repeats), so a match into them can only
+/// come from the dictionary or a verbatim copy.
+fn noise_bytes(len: usize, seed: u32) -> Vec<u8> {
+    let mut x = seed;
+    (0..len)
+        .map(|_| {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (x >> 24) as u8
+        })
+        .collect()
+}
+
+/// Regression: a COPIED dictionary (source above the 32 KiB attach cutoff)
+/// whose CDict cParams select the hash-chain finder (a 4 KiB dictionary
+/// resolves to a window of 2^14 or less) must be indexed at ABSOLUTE
+/// positions. On a reused compressor whose primed snapshot does not fit the
+/// next frame (a larger source, so another window) the dictionary is
+/// re-indexed with the coordinate floor past the previous frame; relative
+/// indices then fall below the window floor and the dictionary silently
+/// stops matching. The warm frame must equal a cold compressor's and stay
+/// smaller than the dictionary-less frame.
+#[test]
+fn reused_compressor_copied_chain_dictionary_frame_is_byte_identical() {
+    let dict_raw = noise_bytes(4096, 7);
+    // Noise with dictionary slices sprinkled in: only the dictionary can
+    // supply those matches.
+    let make_payload = |target: usize, seed: u32| {
+        let mut payload = Vec::with_capacity(target);
+        let mut i = 0usize;
+        while payload.len() < target {
+            payload.extend_from_slice(&noise_bytes(200, seed + i as u32));
+            let at = (i * 613) % (dict_raw.len() - 64);
+            payload.extend_from_slice(&dict_raw[at..at + 64]);
+            i += 1;
+        }
+        payload
+    };
+    let first = make_payload(100 * 1024, 100);
+    let second = make_payload(200 * 1024, 5000);
+    let dict_id = 0xD1C7_0011;
+    let dict = || {
+        crate::decoding::Dictionary::from_raw_content(dict_id, dict_raw.clone())
+            .expect("raw-content dictionary")
+    };
+    let level = super::CompressionLevel::Level(6);
+    let mut warm: FrameCompressor = FrameCompressor::new(level);
+    warm.set_dictionary(dict()).expect("dict attach");
+    let _ = warm.compress_independent_frame(&first);
+    let warm_frame = warm.compress_independent_frame(&second);
+    let mut cold: FrameCompressor = FrameCompressor::new(level);
+    cold.set_dictionary(dict()).expect("dict attach");
+    let cold_frame = cold.compress_independent_frame(&second);
+    assert_eq!(
+        warm_frame, cold_frame,
+        "a reused compressor must index the copied dictionary at absolute positions"
+    );
+    let mut plain: FrameCompressor = FrameCompressor::new(level);
+    let no_dict = plain.compress_independent_frame(&second);
+    assert!(
+        cold_frame.len() < no_dict.len(),
+        "the copied dictionary must supply matches ({} vs {} without it)",
+        cold_frame.len(),
+        no_dict.len()
+    );
+    for frame in [&warm_frame, &cold_frame] {
+        let mut decoder = FrameDecoder::new();
+        decoder.add_dict(dict()).unwrap();
+        let mut decoded = Vec::with_capacity(second.len());
+        decoder.decode_all_to_vec(frame, &mut decoded).unwrap();
+        assert_eq!(decoded, second);
+    }
+}
+
+/// Regression: the borrowed (in-place) one-shot path must keep the
+/// coordinate floor above every position a previous frame indexed. Zeroing
+/// the floor per borrowed frame left the chain / tree tables holding the
+/// previous frame's positions as if they were this frame's: a stale entry
+/// at the current position was accepted as a match of offset 0 (a corrupt
+/// frame), a later one read past the input. Compressing the same input
+/// twice on one compressor must give the same decodable frame.
+#[test]
+fn reused_compressor_borrowed_chain_frames_are_byte_identical() {
+    let payload: Vec<u8> = (0..10 * 1024usize)
+        .flat_map(|i| format!("row={i} val={}\n", (i * 7919) % 1000).into_bytes())
+        .take(10 * 1024)
+        .collect();
+    // 10 KiB one-shot: window 2^14, so the lazy backend searches the chain.
+    let mut enc: FrameCompressor = FrameCompressor::new(super::CompressionLevel::Level(6));
+    let frame1 = enc.compress_independent_frame(&payload);
+    let frame2 = enc.compress_independent_frame(&payload);
+    let frame3 = enc.compress_independent_frame(&payload);
+    assert_eq!(
+        frame1, frame2,
+        "second borrowed frame must not see stale positions"
+    );
+    assert_eq!(
+        frame1, frame3,
+        "third borrowed frame must not see stale positions"
+    );
+    for frame in [&frame1, &frame2, &frame3] {
+        let mut decoder = FrameDecoder::new();
+        let mut decoded = Vec::with_capacity(payload.len());
+        decoder.decode_all_to_vec(frame, &mut decoded).unwrap();
+        assert_eq!(decoded, payload);
+    }
+}
