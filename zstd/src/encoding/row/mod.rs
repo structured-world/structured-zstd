@@ -79,6 +79,16 @@ struct RowScan {
     base: *const u8,
     len: usize,
     hist_start: usize,
+    /// Frame-constant search parameters hoisted with the view so the hot
+    /// loops never re-read them through `&mut self`: the salt of the live
+    /// row hash, the match-distance bound, the dictionary prefix start
+    /// (0 without a dictionary) and whether a dictionary is attached (no
+    /// distance bound, upstream `isDictionary`).
+    salt: u64,
+    search_window: usize,
+    prefix_start: usize,
+    dict_frame: bool,
+    attached: bool,
 }
 
 /// Upstream zstd `ZSTD_highbit32(offBase)` term of the lazy gain formula:
@@ -340,7 +350,11 @@ macro_rules! row_find_best_match {
         debug_assert_eq!($rl, $m.row_log);
         debug_assert!(row_base + row_entries <= $m.row_positions.len());
         let head = unsafe { *$m.row_heads.get_unchecked($row) } as usize;
-        let window_low = $m.window_floor($abs_pos);
+        let window_low = if $ctx.attached {
+            hist_start
+        } else {
+            hist_start.max($abs_pos.saturating_sub($ctx.search_window))
+        };
         let budget = $m.search_depth.min(row_entries);
         let mut attempts = budget;
         let mut ml = 3usize;
@@ -429,7 +443,7 @@ macro_rules! row_find_best_match {
         // A copied dictionary is upstream's `extDict` segment: its candidates
         // are gated at the match head (`MEM_read32(match) == MEM_read32(ip)`)
         // instead of at the current best length.
-        let prefix_start = $m.dict_prefix_start();
+        let prefix_start = $ctx.prefix_start;
         for &raw in &buf[..n] {
             let cand_idx = raw as usize - hist_start;
             // SAFETY: `cand_idx < cur_idx`; the gate reads 4 bytes at
@@ -627,14 +641,18 @@ macro_rules! hc_find_best_match {
             }
             $ntu = p;
         }
-        let window_low = $m.window_floor(p);
+        let window_low = if $ctx.attached {
+            hist_start
+        } else {
+            hist_start.max(p.saturating_sub($ctx.search_window))
+        };
         let min_chain = p.saturating_sub(chain_mask + 1);
         let mut attempts = $m.search_depth;
         let mut ml = 3usize;
         let mut best_off = 0usize;
         // A copied dictionary is upstream's `extDict` segment: its candidates
         // are gated at the match head instead of at the current best length.
-        let prefix_start = $m.dict_prefix_start();
+        let prefix_start = $ctx.prefix_start;
         let mut match_index = $m.hc_hash[$m.hc_hash_at($ctx, p)];
         while match_index != ROW_EMPTY_SLOT && (match_index as usize) >= window_low && attempts > 0
         {
@@ -807,7 +825,7 @@ macro_rules! lazy_parse_body {
             // `ip += (ip == prefixStart)` on a copied-dictionary frame (upstream
             // `extDict`, the dictionary being the segment below the prefix).
             let first_byte = match $m.dict_plan {
-                Some(plan) if !plan.attach => $m.dict_prefix_start(),
+                Some(plan) if !plan.attach => scan.prefix_start,
                 _ => hist_start,
             };
             let mut ip = current_abs_start + usize::from(current_abs_start == first_byte);
@@ -847,10 +865,10 @@ macro_rules! lazy_parse_body {
             // `ZSTD_index_overlap_check` (a source in the last 3 bytes below
             // the frame's prefix, straddling the dictionary boundary, is not
             // taken).
-            let dict_frame = $m.dict_plan.is_some();
-            let attached = $m.dict_plan.is_some_and(|p| p.attach);
-            let prefix_start = $m.dict_prefix_start();
-            let search_window = $m.search_window;
+            let dict_frame = scan.dict_frame;
+            let attached = scan.attached;
+            let prefix_start = scan.prefix_start;
+            let search_window = scan.search_window;
             let rep_ok = |pos: usize, off: usize| -> bool {
                 if off == 0 || off > pos {
                     return false;
@@ -868,7 +886,7 @@ macro_rules! lazy_parse_body {
             let mut offset_saved_1 = 0usize;
             let mut offset_saved_2 = 0usize;
             if !dict_frame {
-                let max_rep = ip - $m.window_floor(ip);
+                let max_rep = ip - hist_start.max(ip.saturating_sub(search_window));
                 if offset_2 > max_rep {
                     offset_saved_2 = offset_2;
                     offset_2 = 0;
@@ -1892,20 +1910,6 @@ impl RowMatchGenerator {
         self.hc_chain_log
     }
 
-    /// Lowest position a search at `abs_pos` may match (upstream
-    /// `lowLimit`): `curr - maxDistance` within the live history, or the
-    /// history floor itself with an attached dictionary (upstream
-    /// `isDictionary ? lowestValid : withinMaxDistance`).
-    #[inline(always)]
-    fn window_floor(&self, abs_pos: usize) -> usize {
-        if self.dict_plan.is_some_and(|p| p.attach) {
-            self.history_abs_start
-        } else {
-            self.history_abs_start
-                .max(abs_pos.saturating_sub(self.search_window))
-        }
-    }
-
     /// Absolute start of the frame's own prefix on a dictionary frame
     /// (upstream `prefixLowestIndex` / `dictLimit`; the dictionary lies
     /// below it), else 0 so the boundary rules never fire.
@@ -2491,6 +2495,11 @@ impl RowMatchGenerator {
             base: history.as_ptr(),
             len: history.len(),
             hist_start: self.history_abs_start,
+            salt: self.hash_salt,
+            search_window: self.search_window,
+            prefix_start: self.dict_prefix_start(),
+            dict_frame: self.dict_plan.is_some(),
+            attached: self.dict_plan.is_some_and(|p| p.attach),
         }
     }
 
@@ -2511,7 +2520,7 @@ impl RowMatchGenerator {
                 idx,
                 self.row_hash_mls,
                 total_bits,
-                self.hash_salt,
+                ctx.salt,
             )
         };
         let row_mask = (1usize << self.row_hash_log) - 1;
