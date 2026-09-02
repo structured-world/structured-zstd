@@ -47,8 +47,9 @@ dict_builder = ["structured-zstd/dict_builder"]
 bench_internals = ["structured-zstd/bench_internals"]
 copy_shape_stats = ["structured-zstd/copy_shape_stats"]
 # The `dhat-heap` example swaps in the dhat global allocator; keep it opt-in so
-# the timing benches do not pick up the profiling allocator.
-dhat-heap = ["structured-zstd/dhat-heap"]
+# the timing benches do not pick up the profiling allocator. The allocator swap
+# lives entirely in this crate's example, so nothing is forwarded to the codec.
+dhat-heap = []
 
 [[bench]]
 name = "decode_all"

@@ -566,11 +566,11 @@ unsafe fn single_op_copy_16(src: *const u8, dst: *mut u8, len: usize) {
     // dispatch above):
     //   • aarch64+neon + kernel_neon                   → arm above returns
     //   • aarch64+neon, NO kernel_neon                 → reaches here
-    //   • std + x86 + kernel_sse2 + runtime-SSE2 tag   → arm above returns
-    //   • std + x86 + kernel_sse2 + Scalar tag         → reaches here
-    //   • std + x86, NO kernel_sse2                    → reaches here
-    //   • no-std + x86 + target_feature sse2+kernel_sse2 → arm above returns
-    //   • no-std + x86, kernel_sse2 off (or no sse2)   → reaches here
+    //   • std + x86 + kernel_sse + runtime-SSE2 tag   → arm above returns
+    //   • std + x86 + kernel_sse + Scalar tag         → reaches here
+    //   • std + x86, NO kernel_sse                    → reaches here
+    //   • no-std + x86 + target_feature sse2+kernel_sse → arm above returns
+    //   • no-std + x86, kernel_sse off (or no sse2)   → reaches here
     //   • wasm32 + simd128 + kernel_simd128            → arm above returns
     //   • wasm32, NO simd128 (or kernel off)           → reaches here
     //   • any other arch (riscv64, …)                  → reaches here
@@ -710,7 +710,7 @@ unsafe fn copy_scalar(mut src: *const u8, mut dst: *mut u8, len: usize) {
     any(target_arch = "x86", target_arch = "x86_64")
 ))]
 #[derive(Clone, Copy)]
-// `avx512f` / `avx2` are unread in a `kernel_sse2`-only trim (their dispatch
+// `avx512f` / `avx2` are unread in a `kernel_sse`-only trim (their dispatch
 // arms are cfg-gated out), so the fields are intentionally dead there.
 #[allow(dead_code)]
 struct X86Caps {
@@ -798,13 +798,13 @@ fn detect_x86_caps() -> X86Caps {
     })
 }
 
-// Gated on `kernel_sse2` so a `kernel_scalar`-only trim prunes the SSE2
+// Gated on `kernel_sse` so a `kernel_scalar`-only trim prunes the SSE2
 // helper at the source level, not just via dead-code elimination.
 // `#[allow(dead_code)]` is still required for one combo the feature gate
 // can't express: std builds reach this through runtime `detect_x86_caps`,
 // so the helper must compile even when no compile-time `target_feature =
 // "sse2"` selects it — leaving it caller-less in a no-std-without-sse2
-// build that still enables `kernel_sse2`.
+// build that still enables `kernel_sse`.
 #[cfg(all(
     any(target_arch = "x86", target_arch = "x86_64"),
     feature = "kernel_sse"

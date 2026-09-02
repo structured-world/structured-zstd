@@ -142,17 +142,22 @@ ldm = ["hash"]
 # `fse_encoder::default_*_table` for the implementation split. On
 # targets with atomic pointer support this feature is a no-op.
 critical-section = ["dep:critical-section"]
-bench_internals = []
-fuzz_exports = []
 std = []
-# Dev-only: route the `encode_loop_reuse_z000033` profiling example through
-# the `dhat` heap profiler (per-allocation-site call-stack attribution) so a
-# reused-compressor run shows which Rust sites allocate, and how many times —
-# the per-frame allocation churn that libc-frame-pointer-broken flamegraphs
-# can't attribute. Off by default (the profiler adds large overhead); enable
-# only for the example. Writes `dhat-heap.json` (view at the dhat viewer or
-# parse for `total_blocks` per site).
-dhat-heap = []
+
+# ---------------------------------------------------------------------------
+# Internal features. NOT part of the public API: they widen the crate's
+# surface or add diagnostics for this repository's own benches, fuzz targets
+# and examples. They carry no stability guarantee and can change or disappear
+# in any release, so downstream crates should not enable them. Excluded from
+# the docs.rs feature set above for the same reason.
+# ---------------------------------------------------------------------------
+
+# Widens the API surface so the benches in `ffi-bench` can reach internals.
+# CI enforces that the parity benches do NOT enable it, since the wider
+# surface would bias a Rust-vs-C comparison.
+bench_internals = []
+# Widens the API surface for the fuzz targets.
+fuzz_exports = []
 # Diagnostic-only: atomic histograms of the match/literal copy shape on the
 # decode path (call counts + size buckets + requested-vs-overshoot byte
 # totals). Off in every shipping / bench build (zero codegen impact). Enabled
