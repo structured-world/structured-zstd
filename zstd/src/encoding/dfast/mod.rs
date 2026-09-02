@@ -636,6 +636,19 @@ impl DfastMatchGenerator {
         (appended, eof)
     }
 
+    /// Size `history` for a whole frame in one allocation instead of letting
+    /// the per-block `reserve` walk a doubling chain. Clamped to the eviction
+    /// ceiling, which is the largest the buffer ever grows anyway.
+    pub(crate) fn reserve_for_frame(&mut self, bytes: usize) {
+        let ceiling = self.max_window_size
+            + (self.max_window_size >> 2)
+            + crate::common::MAX_BLOCK_SIZE as usize;
+        let target = bytes.min(ceiling);
+        if target > self.history.len() && self.history.capacity() < target {
+            self.history.reserve_exact(target - self.history.len());
+        }
+    }
+
     /// Bytes read but not yet claimed by a block: the pre-split pass picks the
     /// block boundary inside this slice.
     pub(crate) fn uncommitted(&self) -> &[u8] {

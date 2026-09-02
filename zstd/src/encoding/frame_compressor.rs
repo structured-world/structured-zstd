@@ -2062,6 +2062,15 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         let mut pending_input: Vec<u8> = Vec::new();
         let mut reached_eof = false;
         let mut savings = 0i64;
+        // One allocation for the whole frame's ingest buffer when the size is
+        // pledged, instead of a doubling chain of reallocations as the blocks
+        // arrive. The matcher clamps this to its eviction ceiling, so a huge or
+        // wrong hint cannot over-reserve.
+        if let Some(hint) = initial_size_hint {
+            self.state
+                .matcher
+                .reserve_for_frame(hint.min(usize::MAX as u64) as usize);
+        }
         // Compress block by block
         loop {
             // Read up to one upstream zstd block. When the pre-block splitter keeps a

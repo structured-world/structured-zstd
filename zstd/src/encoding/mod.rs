@@ -437,6 +437,12 @@ pub trait Matcher {
     /// Claim `len` bytes from the head of
     /// [`uncommitted_input`](Self::uncommitted_input) as the next block.
     fn commit_filled(&mut self, _len: usize) {}
+    /// Size the ingest buffer for a frame of `bytes` up front, so filling it
+    /// block by block doesn't walk a doubling chain of reallocations. Clamped
+    /// internally to the buffer's eviction ceiling, so an over-long or absent
+    /// hint can never reserve more than a bounded window. No-op unless
+    /// [`fill_in_place`](Self::fill_in_place) is implemented.
+    fn reserve_for_frame(&mut self, _bytes: usize) {}
     /// Just process the data in the last committed space for future matching.
     fn skip_matching(&mut self);
     /// Hint-aware skip path used internally to thread a precomputed block

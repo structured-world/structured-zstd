@@ -1627,6 +1627,15 @@ impl Matcher for MatchGeneratorDriver {
         }
     }
 
+    fn reserve_for_frame(&mut self, bytes: usize) {
+        match &mut self.storage {
+            MatcherStorage::Dfast(m) => m.reserve_for_frame(bytes),
+            MatcherStorage::Row(m) => m.reserve_for_frame(bytes),
+            MatcherStorage::HashChain(m) => m.table.reserve_for_frame(bytes),
+            MatcherStorage::Simple(_) => {}
+        }
+    }
+
     /// Bytes read by [`Self::fill_in_place`] that no block has claimed yet.
     fn uncommitted_input(&self) -> &[u8] {
         match &self.storage {
