@@ -716,12 +716,11 @@ fn bt_optimal_all_kernel_tiers_emit_identical_sequences() {
     // and assumes the tier's target_feature is present. Scalar is always safe;
     // the SIMD tiers gate on runtime detection so the test stays valid on any
     // x86 box (including a CI runner without AVX2).
-    // The SIMD entries below are feature-gated, so a build with the kernels
-    // compiled out leaves just this one push. Keep the incremental shape
-    // rather than special-casing the scalar-only build.
-    #[allow(clippy::vec_init_then_push)]
-    let mut tiers = Vec::new();
-    tiers.push(FastpathKernel::Scalar);
+    // Seeded with the always-present scalar tier; the SIMD entries below are
+    // feature-gated, so `mut` goes unused in a build with every kernel
+    // compiled out.
+    #[allow(unused_mut)]
+    let mut tiers = alloc::vec![FastpathKernel::Scalar];
     #[cfg(feature = "kernel_sse")]
     if std::is_x86_feature_detected!("sse2") {
         tiers.push(FastpathKernel::Sse2);
