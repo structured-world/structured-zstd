@@ -74,7 +74,10 @@ Override individual compression knobs (the drop-in equivalent of C zstd's
 `ZSTD_CCtx_setParameter`). Every knob left unset inherits the base level's
 default, so a parameter set that overrides nothing reproduces plain
 level-based compression. Long-distance matching is off at every level preset
-and is activated only here:
+and is activated only here; it also needs the (default-on) `hash` feature,
+since the LDM match finder hashes each window with XXH64. Without `hash` the
+builder still accepts `enable_long_distance_matching(true)` and the frame is
+still valid, but no long-distance matches are produced:
 
 ```rust
 use structured_zstd::encoding::{
@@ -155,20 +158,32 @@ in pure Rust:
 | Feature | Default | What it enables |
 |---------|---------|-----------------|
 | `std` | ✅ | Runtime CPU detection, `std::io` adapters |
-| `hash` | ✅ | XXH64 content checksums |
+| `hash` | ✅ | XXH64 content checksums **and long-distance matching** (LDM hashes each window with XXH64) |
 | `kernel_sse2`, `kernel_bmi2`, `kernel_avx2` | ✅ | x86 SIMD decode kernels, selected at runtime |
 | `kernel_neon`, `kernel_sve` | ✅ | aarch64 SIMD decode kernels |
-| `kernel_simd128` | ✅ | WebAssembly SIMD decode kernel |
+| `kernel_simd128` | ✅ | WebAssembly SIMD kernel — decode, plus the wasm encoder fastpath |
 | `kernel_vbmi2` | ❌ | AVX-512 decode kernel (see note below) |
 | `kernel_scalar` | ✅ | Marker for the always-compiled scalar fallback |
 | `dict_builder` | ❌ | Pure-Rust COVER / FastCOVER dictionary training |
 | `lsm` | ❌ | [Storage-format extensions](#storage-format-extensions) |
 
 With `std` the SIMD tier is picked at runtime; on `no_std` it comes from the
-target's `target_feature` set at compile time. A scalar-only build
-(`--no-default-features`, optionally `--features kernel_scalar`) compiles out
-the per-tier dispatch and intrinsics entirely — these features control the
-crate's own explicit SIMD; the compiler's autovectorizer is unaffected.
+target's `target_feature` set at compile time. These `kernel_*` flags gate the
+**decoder** kernels: turning them off (`--no-default-features`, optionally
+`--features kernel_scalar`) compiles the per-tier decode dispatch and its
+intrinsics out entirely.
+
+The encoder fastpath has its own tier selection and is not gated by the
+`kernel_*` flags (except `kernel_simd128`, which gates the wasm encoder
+kernel): with `std` it detects SSE4.2 / AVX2+BMI2 / NEON+CRC at runtime, and
+on `no_std` it reads the target's compile-time `target_feature` set. So a
+build that drops the `kernel_*` flags but keeps `std`, or a `no_std` build for
+a target tuned with `-C target-feature=+avx2,+bmi2,+sse4.2`, still runs the
+crate's explicit encoder SIMD. A stock `no_std` target (no extra
+`target-feature`) resolves to the scalar encoder kernel.
+
+In every case these features control only the crate's own explicit SIMD; the
+compiler's autovectorizer is unaffected.
 
 <details>
 <summary>Why AVX-512 is off by default</summary>
