@@ -2255,6 +2255,17 @@ macro_rules! start_matching_fast_loop_body {
             // at entry guarantees the sum stays inside `u32` for the whole
             // block, which is what makes the narrowing cast safe here.
             let packed_bias = (($current_abs_start - position_base) as u32) + 1;
+            // Unpacking runs the other way: a slot holds `abs - position_base +
+            // 1`, and candidates are addressed by concat index, so subtracting
+            // this constant turns a slot straight into an index without ever
+            // forming the absolute position. The floor test comes for free with
+            // it — a slot below the live history underflows this subtraction,
+            // which is exactly the `cand_pos >= history_abs_start` it replaces.
+            debug_assert!(
+                history_abs_start >= position_base,
+                "slot packing base must not lead live history",
+            );
+            let unpack_sub = history_abs_start - position_base;
             debug_assert_eq!(
                 block_len, $current_len,
                 "fast loop expects the scanned block to end live history",
@@ -2327,16 +2338,14 @@ macro_rules! start_matching_fast_loop_body {
             let inner_exit: InnerExit = 'inner: loop {
                 let abs_ip0 = $current_abs_start + ip0;
                 let abs_ip1 = $current_abs_start + ip1;
+                // Concat index of the cursor: the coordinate candidates are
+                // compared and addressed in.
+                let idx0 = ip0 + block_bias;
                 // Per-position candidate window-low bound (see `advertised_window`
                 // above). `$borrowed` is const, so owned collapses to
                 // `history_abs_start` (byte-identical) and borrowed-in-window
                 // saturates to 0 (== history_abs_start, also byte-identical);
                 // only borrowed-over-window gains the `abs_ip - window` cap.
-                let wlow0 = if $borrowed {
-                    abs_ip0.saturating_sub(advertised_window)
-                } else {
-                    history_abs_start
-                };
                 let wlow1 = if $borrowed {
                     abs_ip1.saturating_sub(advertised_window)
                 } else {
@@ -2518,9 +2527,14 @@ macro_rules! start_matching_fast_loop_body {
                 // hottest instruction (~13% self-time on z000033) behind the
                 // mask — a stall the predictor cannot hide.
                 if idxl0 != DFAST_EMPTY_SLOT {
-                    let cand_pos = position_base + ((idxl0 as usize) - 1);
-                    if cand_pos >= wlow0 && cand_pos < abs_ip0 {
-                        let cand_idx = cand_pos - history_abs_start;
+                    let raw_l0 = (idxl0 as usize) - 1;
+                    // `checked_sub` IS the window floor: a slot pointing below
+                    // live history has no concat index. The upper bound stays a
+                    // comparison, and the borrowed window adds its own floor.
+                    if let Some(cand_idx) = raw_l0.checked_sub(unpack_sub)
+                        && cand_idx < idx0
+                        && (!$borrowed || cand_idx + advertised_window >= idx0)
+                    {
                         // SAFETY: the bounds above make `cand_idx` a valid
                         // in-window concat index, so the 8-byte load stays in
                         // live history (same buffer/length bounds as `v8_0`).
@@ -2560,7 +2574,7 @@ macro_rules! start_matching_fast_loop_body {
                             let cand = extend_backwards_shared(
                                 concat,
                                 history_abs_start,
-                                cand_pos,
+                                history_abs_start + cand_idx,
                                 abs_ip0,
                                 match_len,
                                 ip0 - literals_start,
@@ -2668,9 +2682,12 @@ macro_rules! start_matching_fast_loop_body {
                 // 4-byte candidate load past them. A branchless mask would tie
                 // the load address to the mask, serialising it.
                 if idxs0 != DFAST_EMPTY_SLOT {
-                    let cand_pos_s = position_base + ((idxs0 as usize) - 1);
-                    if cand_pos_s >= wlow0 && cand_pos_s < abs_ip0 {
-                        let cand_idx_s = cand_pos_s - history_abs_start;
+                    let raw_s0 = (idxs0 as usize) - 1;
+                    // Same unpack-into-index shape as the long probe above.
+                    if let Some(cand_idx_s) = raw_s0.checked_sub(unpack_sub)
+                        && cand_idx_s < idx0
+                        && (!$borrowed || cand_idx_s + advertised_window >= idx0)
+                    {
                         let cand4 = unsafe {
                             (history_base_ptr.add(history_start_offset + cand_idx_s) as *const u32)
                                 .read_unaligned()
@@ -2705,7 +2722,7 @@ macro_rules! start_matching_fast_loop_body {
                             let short_cand = extend_backwards_shared(
                                 concat,
                                 history_abs_start,
-                                cand_pos_s,
+                                history_abs_start + cand_idx_s,
                                 abs_ip0,
                                 s_match_len,
                                 ip0 - literals_start,
