@@ -159,28 +159,31 @@ in pure Rust:
 |---------|---------|-----------------|
 | `std` | ✅ | Runtime CPU detection, `std::io` adapters |
 | `hash` | ✅ | XXH64 content checksums **and long-distance matching** (LDM hashes each window with XXH64) |
-| `kernel_sse2`, `kernel_bmi2`, `kernel_avx2` | ✅ | x86 SIMD decode kernels, selected at runtime |
-| `kernel_neon`, `kernel_sve` | ✅ | aarch64 SIMD decode kernels |
-| `kernel_simd128` | ✅ | WebAssembly SIMD kernel — decode, plus the wasm encoder fastpath |
+| `kernel_sse`, `kernel_bmi2`, `kernel_avx2` | ✅ | x86 SIMD kernels (`kernel_sse` covers both the SSE2 and SSE4.2 tiers) |
+| `kernel_neon`, `kernel_sve` | ✅ | aarch64 SIMD kernels |
+| `kernel_simd128` | ✅ | WebAssembly SIMD kernel (needs `-C target-feature=+simd128`) |
 | `kernel_vbmi2` | ❌ | AVX-512 decode kernel (see note below) |
 | `kernel_scalar` | ✅ | Marker for the always-compiled scalar fallback |
 | `dict_builder` | ❌ | Pure-Rust COVER / FastCOVER dictionary training |
 | `lsm` | ❌ | [Storage-format extensions](#storage-format-extensions) |
 
-With `std` the SIMD tier is picked at runtime; on `no_std` it comes from the
-target's `target_feature` set at compile time. These `kernel_*` flags gate the
-**decoder** kernels: turning them off (`--no-default-features`, optionally
-`--features kernel_scalar`) compiles the per-tier decode dispatch and its
-intrinsics out entirely.
+Each flag gates that tier in **both** the decoder and the encoder, so
+`--no-default-features` (optionally with `--features kernel_scalar`) compiles
+every per-tier dispatch and all explicit SIMD intrinsics out of the crate.
 
-The encoder fastpath has its own tier selection and is not gated by the
-`kernel_*` flags (except `kernel_simd128`, which gates the wasm encoder
-kernel): with `std` it detects SSE4.2 / AVX2+BMI2 / NEON+CRC at runtime, and
-on `no_std` it reads the target's compile-time `target_feature` set. So a
-build that drops the `kernel_*` flags but keeps `std`, or a `no_std` build for
-a target tuned with `-C target-feature=+avx2,+bmi2,+sse4.2`, still runs the
-crate's explicit encoder SIMD. A stock `no_std` target (no extra
-`target-feature`) resolves to the scalar encoder kernel.
+On x86 and aarch64 with `std`, the tier is picked at runtime from CPU
+detection; on `no_std` it comes from the target's `target_feature` set at
+compile time. x86 has two 128-bit tiers under `kernel_sse`: SSE4.2 when
+available, otherwise a plain-SSE2 tier, so pre-SSE4.2 CPUs still get vector
+match compares instead of dropping to scalar.
+
+**WebAssembly is compile-time only**, with or without `std`: wasm has no
+runtime feature detection, so both the decoder kernels and the encoder
+fastpath additionally require `target_feature = "simd128"`. Building for
+`wasm32` with default features and no extra flags therefore stays scalar —
+pass `-C target-feature=+simd128` to get the SIMD tier. (The npm package
+sidesteps this by shipping separately compiled scalar and `+simd128`
+payloads and picking one at load time.)
 
 In every case these features control only the crate's own explicit SIMD; the
 compiler's autovectorizer is unaffected.

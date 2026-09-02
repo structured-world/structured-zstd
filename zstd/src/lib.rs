@@ -16,24 +16,30 @@
 //!
 //! # CPU kernel features
 //!
-//! The decode hot paths ship per-CPU-tier SIMD kernels. With `std` the tier
-//! is chosen at runtime (CPU-feature detection, cached on first use); on
-//! `no_std` it is chosen at compile time from `cfg(target_feature)`.
+//! Both the decode and the encode hot paths ship per-CPU-tier SIMD kernels.
+//! On x86 and aarch64 with `std` the tier is chosen at runtime (CPU-feature
+//! detection, cached on first use); on `no_std` it is chosen at compile time
+//! from `cfg(target_feature)`. WebAssembly is compile-time only either way:
+//! its kernels additionally require `target_feature = "simd128"`, so a wasm
+//! build without `-C target-feature=+simd128` stays scalar.
+//!
 //! Each tier is gated by a cargo feature, all enabled by default (a universal
 //! binary that picks the best available tier per the above): `kernel_scalar`,
 //! `kernel_sse`, `kernel_bmi2`, `kernel_avx2`, `kernel_vbmi2` (x86) and
 //! `kernel_neon`, `kernel_sve` (aarch64). The chain mirrors the ISA
 //! dependency (`kernel_avx2` implies `kernel_bmi2` implies `kernel_sse`;
-//! `kernel_sve` implies `kernel_neon`). The scalar kernel is always compiled,
-//! so any subset is valid; a flag is inert on architectures it doesn't apply
-//! to. Constrained targets can shrink the binary by trimming tiers, e.g.
-//! `--no-default-features --features kernel_scalar` compiles out the per-tier
-//! SIMD kernel dispatch, its BMI2/AVX2/VBMI2/NEON trampolines, and the
-//! explicit SSE2/NEON intrinsics in the small fixed-size copy primitives —
-//! all of which are gated on the matching `kernel_*` feature. The `kernel_*`
-//! features control the crate's own explicit SIMD; they do not constrain the
-//! compiler's autovectorizer, which may still emit vector instructions from
-//! ordinary scalar code regardless of the enabled tiers.
+//! `kernel_sve` implies `kernel_neon`). `kernel_sse` covers two x86 tiers:
+//! SSE4.2 where the CPU has it, and a plain-SSE2 tier otherwise, so a
+//! pre-SSE4.2 CPU still gets vector match compares. The scalar kernel is
+//! always compiled, so any subset is valid; a flag is inert on architectures
+//! it doesn't apply to. Constrained targets can shrink the binary by trimming
+//! tiers: `--no-default-features --features kernel_scalar` compiles out every
+//! per-tier dispatch, the BMI2/AVX2/VBMI2/NEON trampolines, and the explicit
+//! SSE2/NEON intrinsics in both the copy primitives and the encoder
+//! match-finder. The `kernel_*` features control the crate's own explicit
+//! SIMD; they do not constrain the compiler's autovectorizer, which may still
+//! emit vector instructions from ordinary scalar code regardless of the
+//! enabled tiers.
 //!
 //! The packaged README is included below for the docs.rs landing page; the
 //! API anchors above link straight into the per-module documentation.
