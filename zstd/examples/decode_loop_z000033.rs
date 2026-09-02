@@ -6,7 +6,7 @@
 //! arg only.
 //!
 //! Build: cargo build --profile flamegraph -p structured-zstd \
-//!          --example decode_loop_z000033 --features dict_builder
+//!          --example decode_loop_z000033 --features dict-builder
 //! Run:   perf record -F 999 -g --call-graph dwarf,16384 -- \
 //!          target/flamegraph/examples/decode_loop_z000033 3 50000
 

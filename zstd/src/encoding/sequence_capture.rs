@@ -1,6 +1,6 @@
 //! Bench-only sequence-stream capture for FFI-parity audits.
 //!
-//! Exposed under the `bench_internals` feature so the regular crate API
+//! Exposed under the `bench-internals` feature so the regular crate API
 //! surface stays unaffected. The single public entry point —
 //! [`compress_and_collect_sequences`] — drives the production
 //! [`FrameCompressor`] pipeline at the requested `CompressionLevel` and
@@ -262,7 +262,7 @@ pub fn compress_and_collect_sequences(input: &[u8], level: CompressionLevel) -> 
 
 /// Raw-content dictionary variant: attaches `raw_content` via
 /// [`crate::decoding::Dictionary::from_raw_content`] + `set_dictionary`, the
-/// exact path the `dict_builder` raw-dict tests use. Lets the dict-ratio audit
+/// exact path the `dict-builder` raw-dict tests use. Lets the dict-ratio audit
 /// reproduce a raw-content (non-serialized) dictionary scenario.
 pub fn compress_and_collect_sequences_with_raw_content(
     input: &[u8],

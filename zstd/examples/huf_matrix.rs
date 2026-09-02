@@ -4,7 +4,7 @@
 //! size and speed of each against C. Run on the bench host for timing.
 //!
 //! Build/run: `cargo run --release -p ffi-bench --example huf_matrix
-//!             --features bench_internals`
+//!             --features bench-internals`
 
 use std::time::Instant;
 

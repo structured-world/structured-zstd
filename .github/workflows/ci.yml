@@ -84,29 +84,29 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
-        run: cargo clippy -p structured-zstd --features hash,std,dict_builder -- -D warnings
+        run: cargo clippy -p structured-zstd --features hash,std,dict-builder -- -D warnings
       - name: Clippy (testing facade)
-        run: cargo clippy -p structured-zstd --features hash,std,dict_builder,bench_internals -- -D warnings
+        run: cargo clippy -p structured-zstd --features hash,std,dict-builder,bench-internals -- -D warnings
       - name: Clippy (ffi-bench targets)
         # The libzstd-linking benches/tests/examples live in `ffi-bench`.
         # Lint them with the features their `required-features` gate on so the
         # whole surface compiles clean.
-        run: cargo clippy -p ffi-bench --all-targets --features bench_internals,hash,copy_shape_stats -- -D warnings
-      - name: Gate — compare_ffi/memory must not pull bench_internals
+        run: cargo clippy -p ffi-bench --all-targets --features bench-internals,hash,copy-shape-stats -- -D warnings
+      - name: Gate — compare_ffi/memory must not pull bench-internals
         # Rationale: both `compare_ffi` (timing) and `compare_ffi_memory`
         # (peak alloc) benchmark structured-zstd against libzstd. If
-        # `bench_internals` widens our crate's public API surface
+        # `bench-internals` widens our crate's public API surface
         # (visibility changes for `BitReaderReversed` etc.), the Rust
         # side ships compiled differently than what a real downstream
         # consumer uses — biasing every cross-side comparison. These benches
-        # live in `ffi-bench`; keep bench_internals off the crate's default
+        # live in `ffi-bench`; keep bench-internals off the crate's default
         # features, off its structured-zstd dependency, and off both benches'
         # required-features so a `cargo bench --bench compare_ffi` (the CI
         # bench-build) never links it.
         #
         # tomllib (Python 3.11+ stdlib) handles both single-line and
         # multi-line TOML arrays, so a future array reformat can't sneak
-        # bench_internals past the gate.
+        # bench-internals past the gate.
         run: |
           python3 - <<'PY'
           import sys, tomllib
@@ -114,17 +114,17 @@ jobs:
               cargo = tomllib.load(f)
           errors = []
           dep = cargo.get("dependencies", {}).get("structured-zstd", {})
-          if "bench_internals" in dep.get("features", []):
-              errors.append("structured-zstd dependency must NOT enable bench_internals")
-          if "bench_internals" in cargo.get("features", {}).get("default", []):
-              errors.append("ffi-bench default features must NOT include bench_internals")
+          if "bench-internals" in dep.get("features", []):
+              errors.append("structured-zstd dependency must NOT enable bench-internals")
+          if "bench-internals" in cargo.get("features", {}).get("default", []):
+              errors.append("ffi-bench default features must NOT include bench-internals")
           benches = {
               bench.get("name"): bench.get("required-features", [])
               for bench in cargo.get("bench", [])
           }
           for name in ("compare_ffi", "compare_ffi_memory"):
-              if "bench_internals" in benches.get(name, []):
-                  errors.append(f"{name} must NOT require bench_internals — would bias Rust-vs-FFI parity")
+              if "bench-internals" in benches.get(name, []):
+                  errors.append(f"{name} must NOT require bench-internals — would bias Rust-vs-FFI parity")
           if errors:
               for e in errors:
                   print(f"::error::{e}")
@@ -331,15 +331,15 @@ jobs:
           prefix-key: ${{ runner.os }}-cargo
       - name: Test
         working-directory: zstd
-        run: cargo nextest run --profile ci -p structured-zstd --features hash,std,dict_builder
+        run: cargo nextest run --profile ci -p structured-zstd --features hash,std,dict-builder
       - name: Doc tests
-        run: cargo test --doc -p structured-zstd --features hash,std,dict_builder
+        run: cargo test --doc -p structured-zstd --features hash,std,dict-builder
       - name: FFI parity + cross-validation tests
         # The libzstd-linking parity / cross-validation / corpus tests live in
-        # `ffi-bench`; `bench_internals` activates the white-box-facade targets
+        # `ffi-bench`; `bench-internals` activates the white-box-facade targets
         # gated behind it. Corpus fixtures resolve from the manifest dir, so no
         # working-directory is needed.
-        run: cargo nextest run --profile ci -p ffi-bench --features bench_internals
+        run: cargo nextest run --profile ci -p ffi-bench --features bench-internals
 
   cross-i686:
     needs: lint
@@ -358,7 +358,7 @@ jobs:
           prefix-key: cross-i686
       - name: Test (i686)
         working-directory: zstd
-        run: cargo nextest run --profile ci -p structured-zstd --features hash,std,dict_builder --target i686-unknown-linux-gnu
+        run: cargo nextest run --profile ci -p structured-zstd --features hash,std,dict-builder --target i686-unknown-linux-gnu
 
   msrv:
     needs: lint
@@ -375,7 +375,7 @@ jobs:
           prefix-key: msrv
       - name: Test (MSRV)
         working-directory: zstd
-        run: cargo nextest run --profile ci -p structured-zstd --features hash,std,dict_builder
+        run: cargo nextest run --profile ci -p structured-zstd --features hash,std,dict-builder
 
   no-std:
     # Build-only smoke test that the crate compiles under no_std + alloc.
@@ -407,12 +407,12 @@ jobs:
       # Embedded-minimal kernel trim: scalar kernel only, all SIMD tiers and
       # their dispatch trampolines compiled out. Guards the kernel_* feature
       # gating so a future change can't silently break the trimmed build.
-      - name: Clippy (embedded — kernel_scalar only)
+      - name: Clippy (embedded — kernel-scalar only)
         working-directory: zstd
-        run: cargo clippy -p structured-zstd --no-default-features --features kernel_scalar,hash -- -D warnings
-      - name: Clippy (embedded_minimal — kernel_scalar + std)
+        run: cargo clippy -p structured-zstd --no-default-features --features kernel-scalar,hash -- -D warnings
+      - name: Clippy (embedded_minimal — kernel-scalar + std)
         working-directory: zstd
-        run: cargo clippy -p structured-zstd --no-default-features --features kernel_scalar,std,hash -- -D warnings
+        run: cargo clippy -p structured-zstd --no-default-features --features kernel-scalar,std,hash -- -D warnings
 
   wasm:
     # #347 / #348: the wasm32 simd128 kernel tier + the npm package
@@ -438,9 +438,9 @@ jobs:
         with:
           prefix-key: wasm
       - name: Clippy (wasm32 simd128)
-        run: cargo clippy -p structured-zstd -p structured-zstd-wasm --target wasm32-unknown-unknown --no-default-features --features kernel_simd128 --config 'target.wasm32-unknown-unknown.rustflags=["-C","target-feature=+simd128"]' -- -D warnings
+        run: cargo clippy -p structured-zstd -p structured-zstd-wasm --target wasm32-unknown-unknown --no-default-features --features kernel-simd128 --config 'target.wasm32-unknown-unknown.rustflags=["-C","target-feature=+simd128"]' -- -D warnings
       - name: Clippy (wasm32 scalar)
-        run: cargo clippy -p structured-zstd -p structured-zstd-wasm --target wasm32-unknown-unknown --no-default-features --features kernel_simd128 -- -D warnings
+        run: cargo clippy -p structured-zstd -p structured-zstd-wasm --target wasm32-unknown-unknown --no-default-features --features kernel-simd128 -- -D warnings
       - name: Install wasm-pack
         uses: taiki-e/install-action@v2
         with:
@@ -624,7 +624,7 @@ jobs:
           components: llvm-tools-preview
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-llvm-cov
-      - run: cargo llvm-cov -p structured-zstd --features hash,std,dict_builder --lcov --output-path lcov.info
+      - run: cargo llvm-cov -p structured-zstd --features hash,std,dict-builder --lcov --output-path lcov.info
         working-directory: zstd
       - uses: codecov/codecov-action@v7
         with:
@@ -911,8 +911,8 @@ jobs:
           # Built from the `ffi-bench` crate (holds the libzstd-linking
           # targets). Selecting ONLY these two benches activates no
           # `required-features`, so structured-zstd compiles WITHOUT
-          # `bench_internals` / instrumentation — the parity benches see the
-          # same Rust build a real consumer gets. `dict_builder` is on via the
+          # `bench-internals` / instrumentation — the parity benches see the
+          # same Rust build a real consumer gets. `dict-builder` is on via the
           # crate's base dependency on structured-zstd.
           cargo bench --bench compare_ffi --bench compare_ffi_memory \
             -p ffi-bench \

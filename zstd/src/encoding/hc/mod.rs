@@ -709,7 +709,7 @@ impl HcMatcher {
         #[cfg(all(
             target_arch = "aarch64",
             target_endian = "little",
-            feature = "kernel_neon"
+            feature = "kernel-neon"
         ))]
         unsafe {
             self.for_each_repcode_candidate_with_reps_neon(
@@ -726,7 +726,7 @@ impl HcMatcher {
         {
             use crate::encoding::fastpath::FastpathKernel;
             match table.kernel {
-                #[cfg(feature = "kernel_avx2")]
+                #[cfg(feature = "kernel-avx2")]
                 FastpathKernel::Avx2Bmi2 => unsafe {
                     self.for_each_repcode_candidate_with_reps_avx2_bmi2(
                         table,
@@ -738,7 +738,7 @@ impl HcMatcher {
                         f,
                     )
                 },
-                #[cfg(feature = "kernel_sse")]
+                #[cfg(feature = "kernel-sse")]
                 FastpathKernel::Sse2 | FastpathKernel::Sse42 => unsafe {
                     self.for_each_repcode_candidate_with_reps_sse42(
                         table,
@@ -765,7 +765,7 @@ impl HcMatcher {
             all(
                 target_arch = "aarch64",
                 target_endian = "little",
-                feature = "kernel_neon"
+                feature = "kernel-neon"
             ),
             target_arch = "x86",
             target_arch = "x86_64"
@@ -791,7 +791,7 @@ impl HcMatcher {
     #[cfg(all(
         target_arch = "aarch64",
         target_endian = "little",
-        feature = "kernel_neon"
+        feature = "kernel-neon"
     ))]
     #[target_feature(enable = "neon")]
     #[allow(clippy::too_many_arguments)]
@@ -824,7 +824,7 @@ impl HcMatcher {
     /// Caller must be running on x86/x86_64 with SSE2 available.
     #[cfg(all(
         any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel_sse"
+        feature = "kernel-sse"
     ))]
     #[target_feature(enable = "sse2")]
     #[allow(clippy::too_many_arguments)]
@@ -857,7 +857,7 @@ impl HcMatcher {
     /// Caller must be running on x86/x86_64 with AVX2 + BMI2 available.
     #[cfg(all(
         any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel_avx2"
+        feature = "kernel-avx2"
     ))]
     #[target_feature(enable = "avx2,bmi2")]
     #[allow(clippy::too_many_arguments)]
@@ -888,7 +888,7 @@ impl HcMatcher {
     #[cfg(not(all(
         target_arch = "aarch64",
         target_endian = "little",
-        feature = "kernel_neon"
+        feature = "kernel-neon"
     )))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn for_each_repcode_candidate_with_reps_scalar(

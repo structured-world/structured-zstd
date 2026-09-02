@@ -3,7 +3,7 @@
 //! (level, srcSize, dictSize). This locks the cparam tier table + adjust logic
 //! to the reference so the encoder sizes its tables and picks its strategy the
 //! same way upstream does.
-#![cfg(feature = "bench_internals")]
+#![cfg(feature = "bench-internals")]
 use zstd::zstd_safe::zstd_sys;
 
 fn reference_cparams(level: i32, src: u64, dict: usize) -> (u32, u32, u32, u32, u32, u32, u32) {

@@ -4,7 +4,7 @@
 //! Our side is captured through the `structured_zstd::testing` facade
 //! (pure Rust); the C reference is produced here via the `zstd` bindings,
 //! so the library crate never links them.
-#![cfg(feature = "bench_internals")]
+#![cfg(feature = "bench-internals")]
 
 use structured_zstd::testing::collect_level22_sequences;
 

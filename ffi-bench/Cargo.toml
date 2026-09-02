@@ -18,16 +18,16 @@ autoexamples = false
 path = "src/lib.rs"
 
 [dependencies]
-# Base features only — `dict_builder` is the one runtime feature the
+# Base features only — `dict-builder` is the one runtime feature the
 # `compare_ffi` / `compare_ffi_memory` parity benches build against (matching
 # what those benches measured when they lived in the library crate). The
-# API-widening `bench_internals` and the instrumentation features
-# (`hash`, `copy_shape_stats`) are NOT here: pulling them unconditionally
+# API-widening `bench-internals` and the instrumentation features
+# (`hash`, `copy-shape-stats`) are NOT here: pulling them unconditionally
 # would compile the Rust side differently than a real downstream consumer and
 # bias every Rust-vs-libzstd comparison. Targets that genuinely need them opt
 # in per-target via `required-features` below, so a bench built in isolation
 # (`cargo bench --bench compare_ffi`) never links them.
-structured-zstd = { version = "0.0", path = "../zstd", features = ["dict_builder"] }
+structured-zstd = { version = "0.0", path = "../zstd", features = ["dict-builder"] }
 zstd = { version = "0.13.3", features = ["zdict_builder", "experimental"] }
 criterion = "0.8"
 rand = "0.10"
@@ -43,9 +43,9 @@ zrip = "0.8"
 # that target is built and keeps it OFF the parity benches.
 default = []
 hash = ["structured-zstd/hash"]
-dict_builder = ["structured-zstd/dict_builder"]
-bench_internals = ["structured-zstd/bench_internals"]
-copy_shape_stats = ["structured-zstd/copy_shape_stats"]
+dict-builder = ["structured-zstd/dict-builder"]
+bench-internals = ["structured-zstd/bench-internals"]
+copy-shape-stats = ["structured-zstd/copy-shape-stats"]
 # The `dhat-heap` example swaps in the dhat global allocator; keep it opt-in so
 # the timing benches do not pick up the profiling allocator. The allocator swap
 # lives entirely in this crate's example, so nothing is forwarded to the codec.
@@ -80,13 +80,13 @@ harness = false
 name = "compare_ffi_sequences"
 path = "../zstd/benches/compare_ffi_sequences.rs"
 harness = false
-required-features = ["bench_internals"]
+required-features = ["bench-internals"]
 
 [[bench]]
 name = "bitstream"
 path = "../zstd/benches/bitstream.rs"
 harness = false
-required-features = ["bench_internals"]
+required-features = ["bench-internals"]
 
 [[bench]]
 name = "dict_builder_fastcover"
@@ -102,12 +102,12 @@ harness = false
 name = "wildcopy_candidates"
 path = "../zstd/benches/wildcopy_candidates.rs"
 harness = false
-required-features = ["bench_internals"]
+required-features = ["bench-internals"]
 
 [[test]]
 name = "frame_compressor_ffi"
 path = "tests/frame_compressor_ffi.rs"
-required-features = ["bench_internals"]
+required-features = ["bench-internals"]
 
 [[test]]
 name = "fuzz_interop"
@@ -116,22 +116,22 @@ path = "tests/fuzz_interop.rs"
 [[test]]
 name = "match_generator_ffi"
 path = "tests/match_generator_ffi.rs"
-required-features = ["bench_internals"]
+required-features = ["bench-internals"]
 
 [[test]]
 name = "streaming_encoder_ffi"
 path = "tests/streaming_encoder_ffi.rs"
-required-features = ["bench_internals"]
+required-features = ["bench-internals"]
 
 [[test]]
 name = "huff0_ffi"
 path = "tests/huff0_ffi.rs"
-required-features = ["bench_internals"]
+required-features = ["bench-internals"]
 
 [[test]]
 name = "dictionary_ffi"
 path = "tests/dictionary_ffi.rs"
-required-features = ["bench_internals"]
+required-features = ["bench-internals"]
 
 [[test]]
 name = "encode_corpus_ffi"
@@ -140,7 +140,7 @@ path = "tests/encode_corpus_ffi.rs"
 [[test]]
 name = "block_splitter_parity"
 path = "../zstd/tests/block_splitter_parity.rs"
-required-features = ["bench_internals"]
+required-features = ["bench-internals"]
 
 [[test]]
 name = "corpus_level22_gap"
@@ -170,7 +170,7 @@ path = "../zstd/examples/alloc_audit_fresh.rs"
 [[example]]
 name = "huf_matrix"
 path = "../zstd/examples/huf_matrix.rs"
-required-features = ["bench_internals"]
+required-features = ["bench-internals"]
 
 [[example]]
 name = "c_decode_loop_z000033"
@@ -179,7 +179,7 @@ path = "../zstd/examples/c_decode_loop_z000033.rs"
 [[example]]
 name = "copy_shape"
 path = "../zstd/examples/copy_shape.rs"
-required-features = ["copy_shape_stats"]
+required-features = ["copy-shape-stats"]
 
 [[example]]
 name = "cparams_check"
@@ -244,12 +244,12 @@ path = "../zstd/examples/trace_fast_kernel.rs"
 [[test]]
 name = "zz_cparams"
 path = "tests/zz_cparams.rs"
-required-features = ["bench_internals"]
+required-features = ["bench-internals"]
 
 [[example]]
 name = "dict_matrix"
 path = "../zstd/examples/dict_matrix.rs"
-required-features = ["dict_builder"]
+required-features = ["dict-builder"]
 
 [[example]]
 name = "interop_small"

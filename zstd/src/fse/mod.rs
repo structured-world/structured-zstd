@@ -23,7 +23,7 @@ pub mod fse_encoder;
 /// Encodes the data with a table built from that data
 /// Decodes the result again by first decoding the table and then the data
 /// Asserts that the decoded data equals the input
-#[cfg(any(test, feature = "fuzz_exports"))]
+#[cfg(any(test, feature = "fuzz-exports"))]
 pub fn round_trip(data: &[u8]) {
     use crate::bit_io::{BitReaderReversed, BitWriter};
     use fse_encoder::FSEEncoder;
@@ -95,7 +95,7 @@ pub fn round_trip(data: &[u8]) {
     assert_eq!(br.bits_remaining(), 0);
 }
 
-#[cfg(any(test, feature = "fuzz_exports"))]
+#[cfg(any(test, feature = "fuzz-exports"))]
 fn check_tables(dec_table: &fse_decoder::FSETable, enc_table: &fse_encoder::FSETable) {
     // Per-symbol `Vec<State>` storage was dropped in #110 — the encoder now
     // holds only `nextStateTable` (upstream zstd parity) and per-symbol

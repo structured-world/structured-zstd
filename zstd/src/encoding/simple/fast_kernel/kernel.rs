@@ -14,7 +14,7 @@ use crate::encoding::Sequence;
 
 /// Per-iteration diagnostic tracing of the Fast kernel inner loop.
 ///
-/// Compile-time gated by `--features kernel_trace`; runtime-gated by
+/// Compile-time gated by `--features kernel-trace`; runtime-gated by
 /// `STRUCTURED_ZSTD_KERNEL_TRACE` env var (any non-empty value).
 /// Production builds carry ZERO cost — the macro expands to a no-op
 /// when the feature is off, so the hot loop never even sees the
@@ -23,7 +23,7 @@ use crate::encoding::Sequence;
 /// Used by `examples/trace_fast_kernel.rs` to diff our kernel's
 /// state against upstream zstd `zstd_fast.c:266-348` reasoning at every iter
 /// in the first block of decodecorpus-z000033 (issue #220 ratio gap).
-#[cfg(feature = "kernel_trace")]
+#[cfg(feature = "kernel-trace")]
 macro_rules! ktrace {
     ($($arg:tt)*) => {
         if crate::encoding::simple::fast_kernel::kernel::kernel_trace_enabled() {
@@ -31,12 +31,12 @@ macro_rules! ktrace {
         }
     };
 }
-#[cfg(not(feature = "kernel_trace"))]
+#[cfg(not(feature = "kernel-trace"))]
 macro_rules! ktrace {
     ($($arg:tt)*) => {};
 }
 
-#[cfg(feature = "kernel_trace")]
+#[cfg(feature = "kernel-trace")]
 pub(crate) fn kernel_trace_enabled() -> bool {
     use core::sync::atomic::{AtomicU8, Ordering};
     static CACHED: AtomicU8 = AtomicU8::new(0); // 0=unknown, 1=off, 2=on
@@ -1833,7 +1833,7 @@ macro_rules! fast_dict_borrowed_wrapper {
 fast_dict_borrowed_wrapper!(
     #[cfg(all(
         any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel_avx2"
+        feature = "kernel-avx2"
     ))]
     #[target_feature(enable = "avx2,bmi2")]
     cbfd_borrowed_avx2_bmi2,
@@ -1843,7 +1843,7 @@ fast_dict_borrowed_wrapper!(
 fast_dict_borrowed_wrapper!(
     #[cfg(all(
         any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel_sse"
+        feature = "kernel-sse"
     ))]
     #[target_feature(enable = "sse2")]
     cbfd_borrowed_sse42,
@@ -1854,7 +1854,7 @@ fast_dict_borrowed_wrapper!(
     #[cfg(all(
         target_arch = "aarch64",
         target_endian = "little",
-        feature = "kernel_neon"
+        feature = "kernel-neon"
     ))]
     #[target_feature(enable = "neon")]
     cbfd_borrowed_neon,
@@ -1865,7 +1865,7 @@ fast_dict_borrowed_wrapper!(
     #[cfg(all(
         target_arch = "wasm32",
         target_feature = "simd128",
-        feature = "kernel_simd128"
+        feature = "kernel-simd128"
     ))]
     #[target_feature(enable = "simd128")]
     cbfd_borrowed_simd128,
@@ -1921,7 +1921,7 @@ pub(crate) fn compress_block_fast_dict_borrowed<const MLS: u32, const USE_CMOV: 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         match kernel {
-            #[cfg(feature = "kernel_avx2")]
+            #[cfg(feature = "kernel-avx2")]
             FastpathKernel::Avx2Bmi2 => unsafe {
                 cbfd_borrowed_avx2_bmi2::<MLS, USE_CMOV>(
                     inp,
@@ -1936,7 +1936,7 @@ pub(crate) fn compress_block_fast_dict_borrowed<const MLS: u32, const USE_CMOV: 
                     handle_sequence,
                 )
             },
-            #[cfg(feature = "kernel_sse")]
+            #[cfg(feature = "kernel-sse")]
             FastpathKernel::Sse2 | FastpathKernel::Sse42 => unsafe {
                 cbfd_borrowed_sse42::<MLS, USE_CMOV>(
                     inp,
@@ -1960,7 +1960,7 @@ pub(crate) fn compress_block_fast_dict_borrowed<const MLS: u32, const USE_CMOV: 
     #[cfg(all(
         target_arch = "aarch64",
         target_endian = "little",
-        feature = "kernel_neon"
+        feature = "kernel-neon"
     ))]
     {
         match kernel {
@@ -1987,7 +1987,7 @@ pub(crate) fn compress_block_fast_dict_borrowed<const MLS: u32, const USE_CMOV: 
     #[cfg(all(
         target_arch = "wasm32",
         target_feature = "simd128",
-        feature = "kernel_simd128"
+        feature = "kernel-simd128"
     ))]
     {
         match kernel {
@@ -2017,12 +2017,12 @@ pub(crate) fn compress_block_fast_dict_borrowed<const MLS: u32, const USE_CMOV: 
         all(
             target_arch = "aarch64",
             target_endian = "little",
-            feature = "kernel_neon"
+            feature = "kernel-neon"
         ),
         all(
             target_arch = "wasm32",
             target_feature = "simd128",
-            feature = "kernel_simd128"
+            feature = "kernel-simd128"
         )
     )))]
     {

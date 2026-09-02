@@ -12,7 +12,7 @@
 
 - **Production-grade decoder** — complete [RFC 8878](https://www.rfc-editor.org/rfc/rfc8878) implementation: dictionary-backed streams, raw / RLE / compressed blocks, the full frame format, optional content checksums, runtime-dispatched SIMD kernels (SSE2 / BMI2 / AVX2 / NEON, opt-in AVX-512).
 - **Full-range encoder** — every C-zstd level (`-131072..=22`) produces valid frames decodable by this crate and by upstream C zstd; named presets, per-knob parameter overrides, long-distance matching, streaming via `std::io::Write`.
-- **Dictionaries end to end** — compress and decompress with the same dictionary format C zstd consumes; reusable parsed handles; pure-Rust COVER / FastCOVER training behind the `dict_builder` feature.
+- **Dictionaries end to end** — compress and decompress with the same dictionary format C zstd consumes; reusable parsed handles; pure-Rust COVER / FastCOVER training behind the `dict-builder` feature.
 - **Wire-compatible both ways** — frames interoperate with C zstd in either direction; interop is enforced in CI against the reference implementation.
 - **`no_std` ready** — the decoder builds with `--no-default-features` for embedded and sandboxed targets.
 - **WebAssembly / npm** — the same codec as an npm package with automatic SIMD selection; no native addons, no postinstall scripts.
@@ -145,7 +145,7 @@ Compression takes the same dictionary format through
 `FrameCompressor::set_dictionary_from_bytes` / `EncoderDictionary::from_bytes`
 (one parse, reusable across frames).
 
-Behind the `dict_builder` feature, the `dictionary` module trains dictionaries
+Behind the `dict-builder` feature, the `dictionary` module trains dictionaries
 in pure Rust:
 
 - COVER (`create_raw_dict_from_source`) and FastCOVER (`create_fastcover_raw_dict_from_source`) raw dictionaries
@@ -159,25 +159,25 @@ in pure Rust:
 | `std` | ✅ | Runtime CPU detection, `std::io` adapters |
 | `hash` | ✅ | XXH64 content checksums |
 | `ldm` | ✅ | Long-distance matching (implies `hash`: LDM hashes each window with XXH64) |
-| `kernel_sse`, `kernel_bmi2`, `kernel_avx2` | ✅ | x86 SIMD kernels (`kernel_sse` covers both the SSE2 and SSE4.2 tiers) |
-| `kernel_neon`, `kernel_sve` | ✅ | aarch64 SIMD kernels |
-| `kernel_simd128` | ✅ | WebAssembly SIMD kernel (needs `-C target-feature=+simd128`) |
-| `kernel_vbmi2` | ❌ | AVX-512 decode kernel (see note below) |
-| `kernel_scalar` | ✅ | Marker for the always-compiled scalar fallback |
-| `dict_builder` | ❌ | Pure-Rust COVER / FastCOVER dictionary training |
+| `kernel-sse`, `kernel-bmi2`, `kernel-avx2` | ✅ | x86 SIMD kernels (`kernel-sse` covers both the SSE2 and SSE4.2 tiers) |
+| `kernel-neon`, `kernel-sve` | ✅ | aarch64 SIMD kernels |
+| `kernel-simd128` | ✅ | WebAssembly SIMD kernel (needs `-C target-feature=+simd128`) |
+| `kernel-vbmi2` | ❌ | AVX-512 decode kernel (see note below) |
+| `kernel-scalar` | ✅ | Marker for the always-compiled scalar fallback |
+| `dict-builder` | ❌ | Pure-Rust COVER / FastCOVER dictionary training |
 | `lsm` | ❌ | [Storage-format extensions](#storage-format-extensions) |
 
-Each flag gates its tier wherever that tier exists. `kernel_sse`,
-`kernel_bmi2`, `kernel_avx2`, `kernel_neon` and `kernel_simd128` cover both
-the decoder and the encoder; `kernel_vbmi2` and `kernel_sve` are decoder-only
-(the encoder has no AVX-512 or SVE tier), and `kernel_scalar` gates nothing,
+Each flag gates its tier wherever that tier exists. `kernel-sse`,
+`kernel-bmi2`, `kernel-avx2`, `kernel-neon` and `kernel-simd128` cover both
+the decoder and the encoder; `kernel-vbmi2` and `kernel-sve` are decoder-only
+(the encoder has no AVX-512 or SVE tier), and `kernel-scalar` gates nothing,
 since the scalar path is the mandatory fallback and always compiled. So
-`--no-default-features` (optionally with `--features kernel_scalar`) compiles
+`--no-default-features` (optionally with `--features kernel-scalar`) compiles
 every per-tier dispatch and all explicit SIMD intrinsics out of the crate.
 
 On x86 and aarch64 with `std`, the tier is picked at runtime from CPU
 detection; on `no_std` it comes from the target's `target_feature` set at
-compile time. x86 has two 128-bit tiers under `kernel_sse`: SSE4.2 when
+compile time. x86 has two 128-bit tiers under `kernel-sse`: SSE4.2 when
 available, otherwise a plain-SSE2 tier, so pre-SSE4.2 CPUs still get vector
 match compares instead of dropping to scalar.
 
@@ -195,12 +195,12 @@ compiler's autovectorizer is unaffected.
 <details>
 <summary>Why AVX-512 is off by default</summary>
 
-On AVX-512 hosts the `kernel_vbmi2` tier measures slower than `kernel_avx2`
+On AVX-512 hosts the `kernel-vbmi2` tier measures slower than `kernel-avx2`
 for this decode workload: AVX-512's license-based frequency downclocking
 stalls the surrounding bursty, memory-bound code and the heavier kernel never
 amortizes. By default runtime dispatch is therefore capped at AVX2, and
 AVX-512 hosts use the (faster) AVX2 tier. Opt in with
-`--features kernel_vbmi2` for a sustained AVX-512 workload that genuinely
+`--features kernel-vbmi2` for a sustained AVX-512 workload that genuinely
 benefits.
 
 </details>

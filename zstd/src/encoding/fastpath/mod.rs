@@ -64,26 +64,26 @@ pub(crate) mod scalar;
 #[cfg(all(
     target_arch = "aarch64",
     target_endian = "little",
-    feature = "kernel_neon"
+    feature = "kernel-neon"
 ))]
 pub(crate) mod neon;
 
 #[cfg(all(
     any(target_arch = "x86", target_arch = "x86_64"),
-    feature = "kernel_sse"
+    feature = "kernel-sse"
 ))]
 pub(crate) mod sse42;
 
 #[cfg(all(
     any(target_arch = "x86", target_arch = "x86_64"),
-    feature = "kernel_avx2"
+    feature = "kernel-avx2"
 ))]
 pub(crate) mod avx2_bmi2;
 
 #[cfg(all(
     target_arch = "wasm32",
     target_feature = "simd128",
-    feature = "kernel_simd128"
+    feature = "kernel-simd128"
 ))]
 pub(crate) mod simd128;
 
@@ -97,7 +97,7 @@ pub(crate) enum FastpathKernel {
     #[cfg(all(
         target_arch = "aarch64",
         target_endian = "little",
-        feature = "kernel_neon"
+        feature = "kernel-neon"
     ))]
     Neon,
     /// SSE2-only x86 tier: the 128-bit prefix-compare kernel plus the SSE2
@@ -105,25 +105,25 @@ pub(crate) enum FastpathKernel {
     /// otherwise fall all the way back to [`FastpathKernel::Scalar`].
     #[cfg(all(
         any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel_sse"
+        feature = "kernel-sse"
     ))]
     Sse2,
     /// SSE4.2 x86 tier: same 128-bit kernel as [`FastpathKernel::Sse2`], but
     /// the price set uses the SSE4.1 `min_epu32` compare.
     #[cfg(all(
         any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel_sse"
+        feature = "kernel-sse"
     ))]
     Sse42,
     #[cfg(all(
         any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel_avx2"
+        feature = "kernel-avx2"
     ))]
     Avx2Bmi2,
     #[cfg(all(
         target_arch = "wasm32",
         target_feature = "simd128",
-        feature = "kernel_simd128"
+        feature = "kernel-simd128"
     ))]
     Simd128,
 }
@@ -154,7 +154,7 @@ pub(crate) fn select_kernel() -> FastpathKernel {
     all(
         target_arch = "wasm32",
         target_feature = "simd128",
-        feature = "kernel_simd128"
+        feature = "kernel-simd128"
     ),
     allow(unreachable_code)
 )]
@@ -168,7 +168,7 @@ fn detect_kernel_uncached() -> FastpathKernel {
     #[cfg(all(
         feature = "std",
         any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel_avx2"
+        feature = "kernel-avx2"
     ))]
     {
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi2") {
@@ -178,7 +178,7 @@ fn detect_kernel_uncached() -> FastpathKernel {
     #[cfg(all(
         feature = "std",
         any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel_sse"
+        feature = "kernel-sse"
     ))]
     {
         if std::is_x86_feature_detected!("sse4.2") {
@@ -192,7 +192,7 @@ fn detect_kernel_uncached() -> FastpathKernel {
         feature = "std",
         target_arch = "aarch64",
         target_endian = "little",
-        feature = "kernel_neon"
+        feature = "kernel-neon"
     ))]
     {
         if std::arch::is_aarch64_feature_detected!("neon") {
@@ -203,7 +203,7 @@ fn detect_kernel_uncached() -> FastpathKernel {
     #[cfg(all(
         not(feature = "std"),
         any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel_avx2"
+        feature = "kernel-avx2"
     ))]
     {
         if cfg!(target_feature = "avx2") && cfg!(target_feature = "bmi2") {
@@ -213,7 +213,7 @@ fn detect_kernel_uncached() -> FastpathKernel {
     #[cfg(all(
         not(feature = "std"),
         any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel_sse"
+        feature = "kernel-sse"
     ))]
     {
         if cfg!(target_feature = "sse4.2") {
@@ -227,7 +227,7 @@ fn detect_kernel_uncached() -> FastpathKernel {
         not(feature = "std"),
         target_arch = "aarch64",
         target_endian = "little",
-        feature = "kernel_neon"
+        feature = "kernel-neon"
     ))]
     {
         if cfg!(target_feature = "neon") {
@@ -241,7 +241,7 @@ fn detect_kernel_uncached() -> FastpathKernel {
     #[cfg(all(
         target_arch = "wasm32",
         target_feature = "simd128",
-        feature = "kernel_simd128"
+        feature = "kernel-simd128"
     ))]
     {
         return FastpathKernel::Simd128;
@@ -287,27 +287,27 @@ pub(crate) unsafe fn dispatch_common_prefix_len_ptr_with_kernel(
         #[cfg(all(
             target_arch = "aarch64",
             target_endian = "little",
-            feature = "kernel_neon"
+            feature = "kernel-neon"
         ))]
         FastpathKernel::Neon => unsafe { neon::common_prefix_len_ptr(lhs, rhs, max) },
         // Both x86 tiers share this kernel: it is SSE2 throughout, and only
         // the optimal parser's price set differs between them.
         #[cfg(all(
             any(target_arch = "x86", target_arch = "x86_64"),
-            feature = "kernel_sse"
+            feature = "kernel-sse"
         ))]
         FastpathKernel::Sse2 | FastpathKernel::Sse42 => unsafe {
             sse42::common_prefix_len_ptr(lhs, rhs, max)
         },
         #[cfg(all(
             any(target_arch = "x86", target_arch = "x86_64"),
-            feature = "kernel_avx2"
+            feature = "kernel-avx2"
         ))]
         FastpathKernel::Avx2Bmi2 => unsafe { avx2_bmi2::common_prefix_len_ptr(lhs, rhs, max) },
         #[cfg(all(
             target_arch = "wasm32",
             target_feature = "simd128",
-            feature = "kernel_simd128"
+            feature = "kernel-simd128"
         ))]
         FastpathKernel::Simd128 => unsafe { simd128::common_prefix_len_ptr(lhs, rhs, max) },
     }

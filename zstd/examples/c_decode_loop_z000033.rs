@@ -5,7 +5,7 @@
 //! (steady state, no per-iter context alloc).
 //!
 //! Build: cargo build --profile flamegraph -p structured-zstd \
-//!          --example c_decode_loop_z000033 --features dict_builder
+//!          --example c_decode_loop_z000033 --features dict-builder
 //! Run:   perf record -F 999 -g --call-graph dwarf,16384 -- \
 //!          target/flamegraph/examples/c_decode_loop_z000033 3 20000
 

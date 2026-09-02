@@ -74,7 +74,7 @@ fn copy_scalar_copies_requested_bytes() {
 
 #[cfg(all(
     feature = "std",
-    feature = "kernel_sse",
+    feature = "kernel-sse",
     any(target_arch = "x86", target_arch = "x86_64")
 ))]
 #[test]
@@ -90,7 +90,7 @@ fn copy_sse2_copies_full_chunk_when_available() {
 
 #[cfg(all(
     feature = "std",
-    feature = "kernel_avx2",
+    feature = "kernel-avx2",
     any(target_arch = "x86", target_arch = "x86_64")
 ))]
 #[test]
@@ -109,7 +109,7 @@ fn copy_avx2_copies_full_chunk_when_available() {
 /// (`v0` + `v1` load/store pair) with no residual tail.
 #[cfg(all(
     feature = "std",
-    feature = "kernel_avx2",
+    feature = "kernel-avx2",
     any(target_arch = "x86", target_arch = "x86_64")
 ))]
 #[test]
@@ -130,7 +130,7 @@ fn copy_avx2_copies_full_unroll2_iteration() {
 /// the correct source offset.
 #[cfg(all(
     feature = "std",
-    feature = "kernel_avx2",
+    feature = "kernel-avx2",
     any(target_arch = "x86", target_arch = "x86_64")
 ))]
 #[test]
@@ -149,7 +149,7 @@ fn copy_avx2_copies_unroll2_loop_plus_residual_tail() {
 
 #[cfg(all(
     feature = "std",
-    feature = "kernel_vbmi2",
+    feature = "kernel-vbmi2",
     any(target_arch = "x86", target_arch = "x86_64")
 ))]
 #[test]

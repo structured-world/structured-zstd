@@ -24,7 +24,7 @@ tracing-indicatif = { version = "0.3.14" }
 console = { version = "0.16.3" }
 tracing-subscriber = { version = "0.3.23" }
 # Keep a version requirement for `cargo package` while allowing any 0.0.x fork release.
-structured-zstd = { version = "0.0", path = "../zstd", features = ["std", "dict_builder"] }
+structured-zstd = { version = "0.0", path = "../zstd", features = ["std", "dict-builder"] }
 
 [dev-dependencies]
 criterion = "0.8"

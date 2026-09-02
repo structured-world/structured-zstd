@@ -1,6 +1,6 @@
 // `format!` is used by ungated tests (e.g. the btlazy2 dict-reuse
 // byte-identity test), so the import must not be feature-gated — under
-// default features (no `dict_builder`) the gated form left `format!`
+// default features (no `dict-builder`) the gated form left `format!`
 // unresolved when the test module is compiled.
 use alloc::format;
 use alloc::vec;
@@ -202,7 +202,7 @@ fn dictionary_compression_sets_required_dict_id_and_roundtrips() {
     assert_eq!(decoded, data);
 }
 
-#[cfg(all(feature = "dict_builder", feature = "std"))]
+#[cfg(all(feature = "dict-builder", feature = "std"))]
 #[test]
 fn dictionary_compression_roundtrips_with_dict_builder_dictionary() {
     use std::io::Cursor;
@@ -220,10 +220,10 @@ fn dictionary_compression_roundtrips_with_dict_builder_dictionary() {
         &mut raw_dict,
         4096,
     )
-    .expect("dict_builder training should succeed");
+    .expect("dict-builder training should succeed");
     assert!(
         !raw_dict.is_empty(),
-        "dict_builder produced an empty dictionary"
+        "dict-builder produced an empty dictionary"
     );
 
     let dict_id = 0xD1C7_0008;
@@ -258,7 +258,7 @@ fn dictionary_compression_roundtrips_with_dict_builder_dictionary() {
     let mut compressor = FrameCompressor::new(super::CompressionLevel::Fastest);
     compressor
         .set_dictionary(encoder_dict)
-        .expect("valid dict_builder dictionary should attach");
+        .expect("valid dict-builder dictionary should attach");
     compressor.set_source(payload.as_slice());
     compressor.set_drain(&mut with_dict);
     compressor.compress();

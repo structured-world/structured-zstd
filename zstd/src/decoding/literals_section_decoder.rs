@@ -4,20 +4,20 @@
 use super::super::blocks::literals_section::{LiteralsSection, LiteralsSectionType};
 use super::scratch::HuffmanScratch;
 use crate::bit_io::BitReaderReversed;
-#[cfg(all(target_arch = "x86_64", feature = "kernel_avx2"))]
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
 use crate::cpu_kernel::Avx2Kernel;
-#[cfg(all(target_arch = "x86_64", feature = "kernel_bmi2"))]
+#[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
 use crate::cpu_kernel::Bmi2Kernel;
 #[cfg(all(
     target_arch = "x86_64",
     any(
-        feature = "kernel_bmi2",
-        feature = "kernel_avx2",
-        feature = "kernel_vbmi2"
+        feature = "kernel-bmi2",
+        feature = "kernel-avx2",
+        feature = "kernel-vbmi2"
     )
 ))]
 use crate::cpu_kernel::CpuKernelTag;
-#[cfg(all(target_arch = "x86_64", feature = "kernel_vbmi2"))]
+#[cfg(all(target_arch = "x86_64", feature = "kernel-vbmi2"))]
 use crate::cpu_kernel::Vbmi2Kernel;
 use crate::cpu_kernel::{CpuKernel, ScalarKernel, detect_cpu_kernel};
 use crate::decoding::dictionary::Dictionary;
@@ -158,15 +158,15 @@ fn decompress_literals(
     // into the generic caller, and the inlined-intrinsic win
     // evaporates into a function-call trampoline per mask op.
     match detect_cpu_kernel() {
-        #[cfg(all(target_arch = "x86_64", feature = "kernel_vbmi2"))]
+        #[cfg(all(target_arch = "x86_64", feature = "kernel-vbmi2"))]
         CpuKernelTag::Vbmi2 => unsafe {
             decompress_literals_vbmi2(section, scratch, dict, source, target)
         },
-        #[cfg(all(target_arch = "x86_64", feature = "kernel_avx2"))]
+        #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
         CpuKernelTag::Avx2 => unsafe {
             decompress_literals_avx2(section, scratch, dict, source, target)
         },
-        #[cfg(all(target_arch = "x86_64", feature = "kernel_bmi2"))]
+        #[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
         CpuKernelTag::Bmi2 => unsafe {
             decompress_literals_bmi2(section, scratch, dict, source, target)
         },
@@ -174,7 +174,7 @@ fn decompress_literals(
     }
 }
 
-#[cfg(all(target_arch = "x86_64", feature = "kernel_avx2"))]
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
 #[target_feature(enable = "bmi2,avx2")]
 unsafe fn decompress_literals_avx2(
     section: &LiteralsSection,
@@ -186,7 +186,7 @@ unsafe fn decompress_literals_avx2(
     decompress_literals_impl::<Avx2Kernel>(section, scratch, dict, source, target)
 }
 
-#[cfg(all(target_arch = "x86_64", feature = "kernel_bmi2"))]
+#[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
 #[target_feature(enable = "bmi2")]
 unsafe fn decompress_literals_bmi2(
     section: &LiteralsSection,
@@ -198,7 +198,7 @@ unsafe fn decompress_literals_bmi2(
     decompress_literals_impl::<Bmi2Kernel>(section, scratch, dict, source, target)
 }
 
-#[cfg(all(target_arch = "x86_64", feature = "kernel_vbmi2"))]
+#[cfg(all(target_arch = "x86_64", feature = "kernel-vbmi2"))]
 #[target_feature(enable = "avx512vbmi2,avx512f,avx512vl,avx512bw,bmi2,avx2")]
 unsafe fn decompress_literals_vbmi2(
     section: &LiteralsSection,

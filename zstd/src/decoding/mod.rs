@@ -393,19 +393,19 @@ pub(crate) mod scratch;
 // helpers with no remaining callers; they should be cleaned up in
 // a follow-up PR once the per-kernel monolithic shape is fully
 // settled.
-#[cfg(all(target_arch = "x86_64", feature = "kernel_avx2"))]
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
 pub(crate) mod seq_decoder_avx2;
-#[cfg(all(target_arch = "x86_64", feature = "kernel_bmi2"))]
+#[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
 pub(crate) mod seq_decoder_bmi2;
 pub(crate) mod seq_decoder_scalar;
-#[cfg(all(target_arch = "x86_64", feature = "kernel_vbmi2"))]
+#[cfg(all(target_arch = "x86_64", feature = "kernel-vbmi2"))]
 pub(crate) mod seq_decoder_vbmi2;
 pub(crate) mod sequence_execution;
 pub(crate) mod sequence_section_decoder;
 pub(crate) mod simd_copy;
 /// Diagnostic-only re-export of the copy-shape histogram counters. Public
-/// only when the `copy_shape_stats` feature is on (off in shipping builds).
-#[cfg(feature = "copy_shape_stats")]
+/// only when the `copy-shape-stats` feature is on (off in shipping builds).
+#[cfg(feature = "copy-shape-stats")]
 pub use simd_copy::shape_stats;
 // `UserSliceBackend` is the compile-time-monomorphised backend that
 // writes directly into the caller's `&mut [u8]` output slice, used
@@ -416,7 +416,7 @@ pub use simd_copy::shape_stats;
 // backend to the caller's slice for the call duration.
 pub(crate) mod user_slice_buf;
 
-#[cfg(feature = "bench_internals")]
+#[cfg(feature = "bench-internals")]
 pub(crate) use self::simd_copy::copy_bytes_overshooting_for_bench;
 
 #[cfg(test)]

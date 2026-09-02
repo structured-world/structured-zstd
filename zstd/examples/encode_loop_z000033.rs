@@ -19,8 +19,8 @@
 //! allocation, unlike the pure-noise output realloc which we elide.
 //!
 //! Build: `cargo build --profile flamegraph -p structured-zstd
-//!          --example encode_loop_z000033 --features dict_builder`
-//! Run:   `cargo flamegraph --example encode_loop_z000033 --features dict_builder
+//!          --example encode_loop_z000033 --features dict-builder`
+//! Run:   `cargo flamegraph --example encode_loop_z000033 --features dict-builder
 //!          --profile flamegraph -- <level> <iters> <corpus_path>`
 
 use std::env;

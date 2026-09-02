@@ -4,7 +4,7 @@
 //! on-wire header / first-block-type the encoder chose). Moved out of the
 //! library crate so it never links the C bindings; the header/block
 //! introspection goes through the `structured_zstd::testing` facade.
-#![cfg(feature = "bench_internals")]
+#![cfg(feature = "bench-internals")]
 
 use structured_zstd::encoding::{CompressionLevel, FrameCompressor, compress_to_vec};
 use structured_zstd::testing::{BlockType, first_block_type, frame_header_info};

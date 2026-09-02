@@ -2,7 +2,7 @@
 //! incrementally through `StreamingEncoder` must decode through the C `zstd`
 //! bindings. Moved out of the library crate so it never links the C side;
 //! header introspection goes through the `structured_zstd::testing` facade.
-#![cfg(feature = "bench_internals")]
+#![cfg(feature = "bench-internals")]
 
 use std::io::Write;
 

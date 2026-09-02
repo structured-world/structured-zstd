@@ -146,14 +146,14 @@ impl<'t> HuffmanDecoder<'t> {
 
     /// Decode the symbol the internal state (cursor) is pointed at and return the
     /// decoded literal.
-    #[cfg(feature = "fuzz_exports")]
+    #[cfg(feature = "fuzz-exports")]
     #[inline(always)]
     fn decode_symbol(&mut self) -> u8 {
         self.table.packed_decode[self.state as usize] as u8
     }
 
     /// Fuzz-only shim for reading the symbol at the current state.
-    #[cfg(feature = "fuzz_exports")]
+    #[cfg(feature = "fuzz-exports")]
     #[inline(always)]
     pub fn fuzz_decode_symbol(&mut self) -> u8 {
         self.decode_symbol()
@@ -178,7 +178,7 @@ impl<'t> HuffmanDecoder<'t> {
 
     /// Advance the internal cursor to the next symbol. After this, you can call `decode_symbol`
     /// to read from the new position.
-    #[cfg(feature = "fuzz_exports")]
+    #[cfg(feature = "fuzz-exports")]
     #[inline(always)]
     fn next_state<K: crate::cpu_kernel::CpuKernel>(
         &mut self,
@@ -195,7 +195,7 @@ impl<'t> HuffmanDecoder<'t> {
     }
 
     /// Fuzz-only shim for advancing to the next decoding state.
-    #[cfg(feature = "fuzz_exports")]
+    #[cfg(feature = "fuzz-exports")]
     #[inline(always)]
     pub fn fuzz_next_state<K: crate::cpu_kernel::CpuKernel>(
         &mut self,

@@ -12,28 +12,28 @@ fn select_kernel_returns_supported_variant() {
         #[cfg(all(
             target_arch = "aarch64",
             target_endian = "little",
-            feature = "kernel_neon"
+            feature = "kernel-neon"
         ))]
         FastpathKernel::Neon => {}
         #[cfg(all(
             any(target_arch = "x86", target_arch = "x86_64"),
-            feature = "kernel_sse"
+            feature = "kernel-sse"
         ))]
         FastpathKernel::Sse2 => {}
         #[cfg(all(
             any(target_arch = "x86", target_arch = "x86_64"),
-            feature = "kernel_sse"
+            feature = "kernel-sse"
         ))]
         FastpathKernel::Sse42 => {}
         #[cfg(all(
             any(target_arch = "x86", target_arch = "x86_64"),
-            feature = "kernel_avx2"
+            feature = "kernel-avx2"
         ))]
         FastpathKernel::Avx2Bmi2 => {}
         #[cfg(all(
             target_arch = "wasm32",
             target_feature = "simd128",
-            feature = "kernel_simd128"
+            feature = "kernel-simd128"
         ))]
         FastpathKernel::Simd128 => {}
     }
@@ -46,7 +46,7 @@ fn select_kernel_returns_supported_variant() {
 #[cfg(all(
     target_arch = "aarch64",
     target_endian = "little",
-    feature = "kernel_neon"
+    feature = "kernel-neon"
 ))]
 #[test]
 fn aarch64_picks_neon_without_requiring_crc() {
@@ -59,7 +59,7 @@ fn aarch64_picks_neon_without_requiring_crc() {
 #[cfg(all(
     target_arch = "aarch64",
     target_endian = "little",
-    not(feature = "kernel_neon")
+    not(feature = "kernel-neon")
 ))]
 #[test]
 fn aarch64_falls_back_to_scalar_without_the_neon_feature() {

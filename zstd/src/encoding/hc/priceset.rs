@@ -21,7 +21,7 @@ use super::super::opt::types::HcOptimalNode;
 /// loop. AVX2 lacks an unsigned `cmplt`, so derive `nc < np` from
 /// `min_epu32`: `nc <= np` iff `min(nc,np) == nc`, then exclude equality.
 /// Returns a bitmask (bit `k` set => lane `k` improves). Compiled on every
-/// x86 target (same as the avx2 collect kernel); the cargo `kernel_avx2`
+/// x86 target (same as the avx2 collect kernel); the cargo `kernel-avx2`
 /// feature only gates the runtime dispatch, not compilation.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
@@ -87,7 +87,7 @@ fn priceset_next_cost(
         all(
             target_arch = "wasm32",
             target_feature = "simd128",
-            feature = "kernel_simd128"
+            feature = "kernel-simd128"
         )
     ),
     allow(dead_code)
@@ -155,7 +155,7 @@ pub(crate) fn priceset_range_nonabort_scalar(
         all(
             target_arch = "wasm32",
             target_feature = "simd128",
-            feature = "kernel_simd128"
+            feature = "kernel-simd128"
         )
     )),
     allow(dead_code)
@@ -628,7 +628,7 @@ pub(crate) unsafe fn priceset_range_nonabort_sse2(
 #[cfg(all(
     target_arch = "wasm32",
     target_feature = "simd128",
-    feature = "kernel_simd128"
+    feature = "kernel-simd128"
 ))]
 #[target_feature(enable = "simd128")]
 #[inline]
@@ -657,7 +657,7 @@ unsafe fn priceset_cached_prices4_simd128(cells: &[[u32; 2]], stamp: u32) -> Opt
 #[cfg(all(
     target_arch = "wasm32",
     target_feature = "simd128",
-    feature = "kernel_simd128"
+    feature = "kernel-simd128"
 ))]
 #[target_feature(enable = "simd128")]
 #[inline]
@@ -671,7 +671,7 @@ unsafe fn priceset_improved_mask4_simd128(next_cost: &[u32; 4], node_price: &[u3
 #[cfg(all(
     target_arch = "wasm32",
     target_feature = "simd128",
-    feature = "kernel_simd128"
+    feature = "kernel-simd128"
 ))]
 #[target_feature(enable = "simd128")]
 #[inline]

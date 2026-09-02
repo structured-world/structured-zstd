@@ -249,11 +249,11 @@ pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBacken
     literals_buffer: &[u8],
     dict: Option<&'fse crate::decoding::dictionary::Dictionary>,
 ) -> Result<(), DecompressBlockError> {
-    #[cfg(all(target_arch = "aarch64", feature = "kernel_neon"))]
+    #[cfg(all(target_arch = "aarch64", feature = "kernel-neon"))]
     use crate::cpu_kernel::NeonKernel;
     #[cfg(all(
         target_arch = "aarch64",
-        feature = "kernel_sve",
+        feature = "kernel-sve",
         any(feature = "std", target_feature = "sve"),
     ))]
     use crate::cpu_kernel::SveKernel;
@@ -271,7 +271,7 @@ pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBacken
                 dict,
             )
         }
-        #[cfg(all(target_arch = "x86_64", feature = "kernel_sse"))]
+        #[cfg(all(target_arch = "x86_64", feature = "kernel-sse"))]
         CpuKernelTag::Sse2 => {
             // SSE2 has no FSE-relevant divergence (no `_bzhi_u64`); the
             // mask_lower_bits hot op is identical to Scalar. SSE2's only
@@ -288,7 +288,7 @@ pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBacken
                 dict,
             )
         }
-        #[cfg(all(target_arch = "x86_64", feature = "kernel_bmi2"))]
+        #[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
         CpuKernelTag::Bmi2 => {
             // SAFETY: `detect_cpu_kernel()` only returns Bmi2 when
             // `is_x86_feature_detected!("bmi2")` confirmed BMI2 is
@@ -308,7 +308,7 @@ pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBacken
                 )
             }
         }
-        #[cfg(all(target_arch = "x86_64", feature = "kernel_avx2"))]
+        #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
         CpuKernelTag::Avx2 => {
             // SAFETY: detect confirmed BMI2 + AVX2.
             unsafe {
@@ -323,7 +323,7 @@ pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBacken
                 )
             }
         }
-        #[cfg(all(target_arch = "x86_64", feature = "kernel_vbmi2"))]
+        #[cfg(all(target_arch = "x86_64", feature = "kernel-vbmi2"))]
         CpuKernelTag::Vbmi2 => {
             // SAFETY: detect confirmed AVX-512 VBMI2 + AVX2 + BMI2
             // (see `select_x86_kernel` precedence rules).
@@ -339,7 +339,7 @@ pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBacken
                 )
             }
         }
-        #[cfg(all(target_arch = "aarch64", feature = "kernel_neon"))]
+        #[cfg(all(target_arch = "aarch64", feature = "kernel-neon"))]
         CpuKernelTag::Neon => decode_and_execute_sequences_impl::<B, NeonKernel>(
             section,
             source,
@@ -351,7 +351,7 @@ pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBacken
         ),
         #[cfg(all(
             target_arch = "aarch64",
-            feature = "kernel_sve",
+            feature = "kernel-sve",
             any(feature = "std", target_feature = "sve"),
         ))]
         CpuKernelTag::Sve => decode_and_execute_sequences_impl::<B, SveKernel>(

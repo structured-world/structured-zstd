@@ -2,7 +2,7 @@
 //! Companion to `cparams_check` for sweeping a whole level band.
 //!
 //! Run: `cargo run --release -p ffi-bench --example cparams_range
-//!       --features dict_builder -- [src_size]` (0 / omitted = unbounded).
+//!       --features dict-builder -- [src_size]` (0 / omitted = unbounded).
 use zstd::zstd_safe::zstd_sys;
 
 fn main() {

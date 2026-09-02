@@ -65,7 +65,7 @@ fn mask_lower_bits(value: u64, n: u8) -> u64 {
 // `extract_triple_pext` directly via that path. Gating with
 // `#[cfg(test)]` keeps the helper available for the tests while
 // avoiding a `dead_code` warning under `-D warnings`.
-#[cfg(all(test, feature = "std", target_arch = "x86_64", feature = "kernel_bmi2"))]
+#[cfg(all(test, feature = "std", target_arch = "x86_64", feature = "kernel-bmi2"))]
 #[inline(always)]
 fn try_extract_triple_with_pext(all_three: u64, n1: u8, n2: u8, n3: u8) -> Option<(u64, u64, u64)> {
     if !triple_extract_dispatch().use_pext {
@@ -74,10 +74,10 @@ fn try_extract_triple_with_pext(all_three: u64, n1: u8, n2: u8, n3: u8) -> Optio
 
     Some(unsafe { extract_triple_pext(all_three, n1, n2, n3) })
 }
-#[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel_bmi2"))]
+#[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel-bmi2"))]
 use std::arch::is_x86_feature_detected;
 
-#[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel_bmi2"))]
+#[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel-bmi2"))]
 #[inline]
 fn scalar_extract_triple(all_three: u64, n1: u8, n2: u8, n3: u8) -> (u64, u64, u64) {
     let val3 = all_three & super::BIT_MASK[n3 as usize];
@@ -86,7 +86,7 @@ fn scalar_extract_triple(all_three: u64, n1: u8, n2: u8, n3: u8) -> (u64, u64, u
     (val1, val2, val3)
 }
 
-#[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel_bmi2"))]
+#[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel-bmi2"))]
 #[inline]
 fn next_test_value(state: &mut u64) -> u64 {
     let mut x = *state;
@@ -278,7 +278,7 @@ fn get_bits_triple_matches_individual() {
 /// `peek_bits_bmi2` MUST produce the same value as scalar `peek_bits`
 /// on every BMI2-capable CPU. Without parity the bmi2 fast-path
 /// chain (when wired) would silently corrupt FSE state.
-#[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel_bmi2"))]
+#[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel-bmi2"))]
 #[test]
 fn peek_bits_bmi2_matches_scalar() {
     if !is_x86_feature_detected!("bmi2") {
@@ -304,7 +304,7 @@ fn peek_bits_bmi2_matches_scalar() {
 /// `peek_bits_triple_bmi2` MUST produce the same triple as the
 /// scalar variant for every width combination the FSE/HUF decoders
 /// can reach.
-#[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel_bmi2"))]
+#[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel-bmi2"))]
 #[test]
 fn peek_bits_triple_bmi2_matches_scalar() {
     if !is_x86_feature_detected!("bmi2") {
@@ -336,7 +336,7 @@ fn peek_bits_triple_bmi2_matches_scalar() {
     }
 }
 
-#[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel_bmi2"))]
+#[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel-bmi2"))]
 #[test]
 fn should_use_pext_policy_table() {
     let cases = [
@@ -350,7 +350,7 @@ fn should_use_pext_policy_table() {
     }
 }
 
-#[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel_bmi2"))]
+#[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel-bmi2"))]
 #[test]
 fn bmi2_triple_extract_matches_scalar_reference() {
     if !is_x86_feature_detected!("bmi2") {

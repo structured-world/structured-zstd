@@ -3,7 +3,7 @@
 //! table work is not amortised over many bytes). Pure encoder, no FFI.
 //!
 //! Usage: encode_small [level] [iters]   (defaults: level 3, 2_000_000 iters)
-//! Profile on the i9: cargo flamegraph --example encode_small --features dict_builder -- 3 2000000
+//! Profile on the i9: cargo flamegraph --example encode_small --features dict-builder -- 3 2000000
 
 use structured_zstd::encoding::{CompressionLevel, compress_slice_to_vec};
 

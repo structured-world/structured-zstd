@@ -1392,7 +1392,7 @@ impl MatchTable {
         #[cfg(all(
             target_arch = "aarch64",
             target_endian = "little",
-            feature = "kernel_neon"
+            feature = "kernel-neon"
         ))]
         unsafe {
             self.bt_insert_step_no_rebase_neon(abs_pos, current_abs_end, target_abs)
@@ -1401,11 +1401,11 @@ impl MatchTable {
         {
             use crate::encoding::fastpath::FastpathKernel;
             match self.kernel {
-                #[cfg(feature = "kernel_avx2")]
+                #[cfg(feature = "kernel-avx2")]
                 FastpathKernel::Avx2Bmi2 => unsafe {
                     self.bt_insert_step_no_rebase_avx2_bmi2(abs_pos, current_abs_end, target_abs)
                 },
-                #[cfg(feature = "kernel_sse")]
+                #[cfg(feature = "kernel-sse")]
                 FastpathKernel::Sse2 | FastpathKernel::Sse42 => unsafe {
                     self.bt_insert_step_no_rebase_sse42(abs_pos, current_abs_end, target_abs)
                 },
@@ -1419,7 +1419,7 @@ impl MatchTable {
         #[cfg(all(
             target_arch = "wasm32",
             target_feature = "simd128",
-            feature = "kernel_simd128"
+            feature = "kernel-simd128"
         ))]
         // SAFETY: the `cfg` above establishes `simd128` at compile time, which
         // is exactly the umbrella the callee declares.
@@ -1430,14 +1430,14 @@ impl MatchTable {
             all(
                 target_arch = "aarch64",
                 target_endian = "little",
-                feature = "kernel_neon"
+                feature = "kernel-neon"
             ),
             target_arch = "x86",
             target_arch = "x86_64",
             all(
                 target_arch = "wasm32",
                 target_feature = "simd128",
-                feature = "kernel_simd128"
+                feature = "kernel-simd128"
             )
         )))]
         {
@@ -1452,7 +1452,7 @@ impl MatchTable {
     #[cfg(all(
         target_arch = "aarch64",
         target_endian = "little",
-        feature = "kernel_neon"
+        feature = "kernel-neon"
     ))]
     #[target_feature(enable = "neon")]
     pub(crate) unsafe fn bt_insert_step_no_rebase_neon(
@@ -1478,7 +1478,7 @@ impl MatchTable {
     /// x86/x86_64 with SSE2.
     #[cfg(all(
         any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel_sse"
+        feature = "kernel-sse"
     ))]
     #[target_feature(enable = "sse2")]
     pub(crate) unsafe fn bt_insert_step_no_rebase_sse42(
@@ -1504,7 +1504,7 @@ impl MatchTable {
     /// x86/x86_64 with AVX2 + BMI2.
     #[cfg(all(
         any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel_avx2"
+        feature = "kernel-avx2"
     ))]
     #[target_feature(enable = "avx2,bmi2")]
     pub(crate) unsafe fn bt_insert_step_no_rebase_avx2_bmi2(
@@ -1531,7 +1531,7 @@ impl MatchTable {
     #[cfg(all(
         target_arch = "wasm32",
         target_feature = "simd128",
-        feature = "kernel_simd128"
+        feature = "kernel-simd128"
     ))]
     #[target_feature(enable = "simd128")]
     pub(crate) unsafe fn bt_insert_step_no_rebase_simd128(
@@ -1553,11 +1553,11 @@ impl MatchTable {
 
     /// Scalar fallback BT walker step. Compiled unless the NEON tier covers
     /// this target, i.e. on every non-AArch64 target and on AArch64 when
-    /// `kernel_neon` is off.
+    /// `kernel-neon` is off.
     #[cfg(not(all(
         target_arch = "aarch64",
         target_endian = "little",
-        feature = "kernel_neon"
+        feature = "kernel-neon"
     )))]
     pub(crate) fn bt_insert_step_no_rebase_scalar(
         &mut self,
@@ -1598,7 +1598,7 @@ impl MatchTable {
         #[cfg(all(
             target_arch = "aarch64",
             target_endian = "little",
-            feature = "kernel_neon"
+            feature = "kernel-neon"
         ))]
         unsafe {
             self.bt_insert_and_collect_matches_neon(
@@ -1617,7 +1617,7 @@ impl MatchTable {
         {
             use crate::encoding::fastpath::FastpathKernel;
             match self.kernel {
-                #[cfg(feature = "kernel_avx2")]
+                #[cfg(feature = "kernel-avx2")]
                 FastpathKernel::Avx2Bmi2 => unsafe {
                     self.bt_insert_and_collect_matches_avx2_bmi2(
                         abs_pos,
@@ -1631,7 +1631,7 @@ impl MatchTable {
                         use_hash3,
                     )
                 },
-                #[cfg(feature = "kernel_sse")]
+                #[cfg(feature = "kernel-sse")]
                 FastpathKernel::Sse2 | FastpathKernel::Sse42 => unsafe {
                     self.bt_insert_and_collect_matches_sse42(
                         abs_pos,
@@ -1663,7 +1663,7 @@ impl MatchTable {
         #[cfg(all(
             target_arch = "wasm32",
             target_feature = "simd128",
-            feature = "kernel_simd128"
+            feature = "kernel-simd128"
         ))]
         // SAFETY: the `cfg` above establishes `simd128` at compile time, which
         // is exactly the umbrella the callee declares.
@@ -1684,14 +1684,14 @@ impl MatchTable {
             all(
                 target_arch = "aarch64",
                 target_endian = "little",
-                feature = "kernel_neon"
+                feature = "kernel-neon"
             ),
             target_arch = "x86",
             target_arch = "x86_64",
             all(
                 target_arch = "wasm32",
                 target_feature = "simd128",
-                feature = "kernel_simd128"
+                feature = "kernel-simd128"
             )
         )))]
         {
@@ -1716,7 +1716,7 @@ impl MatchTable {
     #[cfg(all(
         target_arch = "aarch64",
         target_endian = "little",
-        feature = "kernel_neon"
+        feature = "kernel-neon"
     ))]
     #[target_feature(enable = "neon")]
     #[allow(clippy::too_many_arguments)]
@@ -1756,7 +1756,7 @@ impl MatchTable {
     /// x86/x86_64 with SSE2.
     #[cfg(all(
         any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel_sse"
+        feature = "kernel-sse"
     ))]
     #[target_feature(enable = "sse2")]
     #[allow(clippy::too_many_arguments)]
@@ -1796,7 +1796,7 @@ impl MatchTable {
     /// x86/x86_64 with AVX2 + BMI2.
     #[cfg(all(
         any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel_avx2"
+        feature = "kernel-avx2"
     ))]
     #[target_feature(enable = "avx2,bmi2")]
     #[allow(clippy::too_many_arguments)]
@@ -1837,7 +1837,7 @@ impl MatchTable {
     #[cfg(all(
         target_arch = "wasm32",
         target_feature = "simd128",
-        feature = "kernel_simd128"
+        feature = "kernel-simd128"
     ))]
     #[target_feature(enable = "simd128")]
     #[allow(clippy::too_many_arguments)]
@@ -1876,7 +1876,7 @@ impl MatchTable {
     #[cfg(not(all(
         target_arch = "aarch64",
         target_endian = "little",
-        feature = "kernel_neon"
+        feature = "kernel-neon"
     )))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn bt_insert_and_collect_matches_scalar(
@@ -1935,7 +1935,7 @@ impl MatchTable {
         #[cfg(all(
             target_arch = "aarch64",
             target_endian = "little",
-            feature = "kernel_neon"
+            feature = "kernel-neon"
         ))]
         unsafe {
             self.bt_update_tree_until_neon(abs_pos, current_abs_end)
@@ -1944,11 +1944,11 @@ impl MatchTable {
         {
             use crate::encoding::fastpath::FastpathKernel;
             match self.kernel {
-                #[cfg(feature = "kernel_avx2")]
+                #[cfg(feature = "kernel-avx2")]
                 FastpathKernel::Avx2Bmi2 => unsafe {
                     self.bt_update_tree_until_avx2_bmi2(abs_pos, current_abs_end)
                 },
-                #[cfg(feature = "kernel_sse")]
+                #[cfg(feature = "kernel-sse")]
                 FastpathKernel::Sse2 | FastpathKernel::Sse42 => unsafe {
                     self.bt_update_tree_until_sse42(abs_pos, current_abs_end)
                 },
@@ -1961,7 +1961,7 @@ impl MatchTable {
             all(
                 target_arch = "aarch64",
                 target_endian = "little",
-                feature = "kernel_neon"
+                feature = "kernel-neon"
             ),
             target_arch = "x86",
             target_arch = "x86_64"
@@ -1980,7 +1980,7 @@ impl MatchTable {
     #[cfg(all(
         target_arch = "aarch64",
         target_endian = "little",
-        feature = "kernel_neon"
+        feature = "kernel-neon"
     ))]
     #[target_feature(enable = "neon")]
     pub(crate) unsafe fn bt_update_tree_until_neon(
@@ -2019,7 +2019,7 @@ impl MatchTable {
     /// x86/x86_64 with SSE2.
     #[cfg(all(
         any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel_sse"
+        feature = "kernel-sse"
     ))]
     #[target_feature(enable = "sse2")]
     pub(crate) unsafe fn bt_update_tree_until_sse42(
@@ -2058,7 +2058,7 @@ impl MatchTable {
     /// x86/x86_64 with AVX2 + BMI2.
     #[cfg(all(
         any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel_avx2"
+        feature = "kernel-avx2"
     ))]
     #[target_feature(enable = "avx2,bmi2")]
     pub(crate) unsafe fn bt_update_tree_until_avx2_bmi2(
@@ -2095,7 +2095,7 @@ impl MatchTable {
     #[cfg(not(all(
         target_arch = "aarch64",
         target_endian = "little",
-        feature = "kernel_neon"
+        feature = "kernel-neon"
     )))]
     pub(crate) fn bt_update_tree_until_scalar(&mut self, abs_pos: usize, current_abs_end: usize) {
         if self.skip_insert_until_abs < self.history_abs_start {
@@ -2478,7 +2478,7 @@ impl MatchTable {
         #[cfg(all(
             target_arch = "aarch64",
             target_endian = "little",
-            feature = "kernel_neon"
+            feature = "kernel-neon"
         ))]
         unsafe {
             self.hash3_candidate_neon(abs_pos, current_abs_end, min_match_len)
@@ -2487,11 +2487,11 @@ impl MatchTable {
         {
             use crate::encoding::fastpath::FastpathKernel;
             match self.kernel {
-                #[cfg(feature = "kernel_avx2")]
+                #[cfg(feature = "kernel-avx2")]
                 FastpathKernel::Avx2Bmi2 => unsafe {
                     self.hash3_candidate_avx2_bmi2(abs_pos, current_abs_end, min_match_len)
                 },
-                #[cfg(feature = "kernel_sse")]
+                #[cfg(feature = "kernel-sse")]
                 FastpathKernel::Sse2 | FastpathKernel::Sse42 => unsafe {
                     self.hash3_candidate_sse42(abs_pos, current_abs_end, min_match_len)
                 },
@@ -2504,7 +2504,7 @@ impl MatchTable {
             all(
                 target_arch = "aarch64",
                 target_endian = "little",
-                feature = "kernel_neon"
+                feature = "kernel-neon"
             ),
             target_arch = "x86",
             target_arch = "x86_64"
@@ -2521,7 +2521,7 @@ impl MatchTable {
     #[cfg(all(
         target_arch = "aarch64",
         target_endian = "little",
-        feature = "kernel_neon"
+        feature = "kernel-neon"
     ))]
     #[target_feature(enable = "neon")]
     pub(crate) unsafe fn hash3_candidate_neon(
@@ -2545,7 +2545,7 @@ impl MatchTable {
     /// x86/x86_64 with SSE2.
     #[cfg(all(
         any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel_sse"
+        feature = "kernel-sse"
     ))]
     #[target_feature(enable = "sse2")]
     pub(crate) unsafe fn hash3_candidate_sse42(
@@ -2569,7 +2569,7 @@ impl MatchTable {
     /// x86/x86_64 with AVX2 + BMI2.
     #[cfg(all(
         any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel_avx2"
+        feature = "kernel-avx2"
     ))]
     #[target_feature(enable = "avx2,bmi2")]
     pub(crate) unsafe fn hash3_candidate_avx2_bmi2(
@@ -2592,7 +2592,7 @@ impl MatchTable {
     #[cfg(not(all(
         target_arch = "aarch64",
         target_endian = "little",
-        feature = "kernel_neon"
+        feature = "kernel-neon"
     )))]
     pub(crate) fn hash3_candidate_scalar(
         &self,

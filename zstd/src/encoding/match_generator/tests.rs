@@ -721,15 +721,15 @@ fn bt_optimal_all_kernel_tiers_emit_identical_sequences() {
     // compiled out.
     #[allow(unused_mut)]
     let mut tiers = alloc::vec![FastpathKernel::Scalar];
-    #[cfg(feature = "kernel_sse")]
+    #[cfg(feature = "kernel-sse")]
     if std::is_x86_feature_detected!("sse2") {
         tiers.push(FastpathKernel::Sse2);
     }
-    #[cfg(feature = "kernel_sse")]
+    #[cfg(feature = "kernel-sse")]
     if std::is_x86_feature_detected!("sse4.2") {
         tiers.push(FastpathKernel::Sse42);
     }
-    #[cfg(feature = "kernel_avx2")]
+    #[cfg(feature = "kernel-avx2")]
     if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi2") {
         tiers.push(FastpathKernel::Avx2Bmi2);
     }

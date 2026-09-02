@@ -89,7 +89,7 @@ pub(crate) mod frame_compressor;
 pub mod frame_emit_info;
 mod levels;
 pub(crate) mod parameters;
-#[cfg(feature = "bench_internals")]
+#[cfg(feature = "bench-internals")]
 pub mod sequence_capture;
 mod streaming_encoder;
 pub use frame_compressor::{EncoderDictionary, FrameCompressor};

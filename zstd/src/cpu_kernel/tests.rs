@@ -23,15 +23,15 @@ fn scalar_mask_lower_bits_mid_keeps_low_n_bits() {
     );
 }
 
-// Gated on `std` AND `kernel_avx2`: the `is_x86_feature_detected!`
+// Gated on `std` AND `kernel-avx2`: the `is_x86_feature_detected!`
 // guard below is a no-op under `--no-default-features` (no std,
 // no runtime feature detection), so the test body would call
 // `Avx2Kernel::mask_lower_bits` unconditionally and SIGILL on any
 // non-BMI2 CPU — hence `feature = "std"`. `Avx2Kernel` itself is
-// `#[cfg(feature = "kernel_avx2")]`, so the test must also require
-// that feature or a `std`-only trimmed build (`kernel_avx2` off)
+// `#[cfg(feature = "kernel-avx2")]`, so the test must also require
+// that feature or a `std`-only trimmed build (`kernel-avx2` off)
 // fails to compile against the undefined type.
-#[cfg(all(target_arch = "x86_64", feature = "std", feature = "kernel_avx2"))]
+#[cfg(all(target_arch = "x86_64", feature = "std", feature = "kernel-avx2"))]
 #[test]
 fn avx2_mask_lower_bits_matches_scalar_on_bmi2_hw() {
     // Only run when BMI2 actually available — otherwise constructing
@@ -55,7 +55,7 @@ fn avx2_mask_lower_bits_matches_scalar_on_bmi2_hw() {
 /// previously selected as `Vbmi2`, which would SIGILL on the
 /// first AVX2-mixed VBMI2 kernel invocation. The selection must
 /// fall through to Scalar (or a non-AVX tier) in that case.
-#[cfg(all(target_arch = "x86_64", feature = "kernel_vbmi2"))]
+#[cfg(all(target_arch = "x86_64", feature = "kernel-vbmi2"))]
 #[test]
 fn select_x86_kernel_vbmi2_without_avx2_does_not_pick_vbmi2() {
     let tag = select_x86_kernel(
@@ -71,7 +71,7 @@ fn select_x86_kernel_vbmi2_without_avx2_does_not_pick_vbmi2() {
 }
 
 /// Sanity: when every flag is present the selector returns Vbmi2.
-#[cfg(all(target_arch = "x86_64", feature = "kernel_vbmi2"))]
+#[cfg(all(target_arch = "x86_64", feature = "kernel-vbmi2"))]
 #[test]
 fn select_x86_kernel_full_x86_v4_picks_vbmi2() {
     let tag = select_x86_kernel(true, true, true, true, true, true, true);
@@ -79,7 +79,7 @@ fn select_x86_kernel_full_x86_v4_picks_vbmi2() {
 }
 
 /// Sanity: AVX2 + BMI2 without AVX-512 → Avx2.
-#[cfg(all(target_arch = "x86_64", feature = "kernel_avx2"))]
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
 #[test]
 fn select_x86_kernel_avx2_baseline_picks_avx2() {
     let tag = select_x86_kernel(false, false, false, false, true, true, true);
@@ -87,7 +87,7 @@ fn select_x86_kernel_avx2_baseline_picks_avx2() {
 }
 
 /// SSE2-only (no BMI2/AVX2) → Sse2, the x86_64 floor above Scalar.
-#[cfg(all(target_arch = "x86_64", feature = "kernel_sse"))]
+#[cfg(all(target_arch = "x86_64", feature = "kernel-sse"))]
 #[test]
 fn select_x86_kernel_sse2_only_picks_sse2() {
     let tag = select_x86_kernel(false, false, false, false, false, false, true);
@@ -136,19 +136,19 @@ fn every_kernel_tag_maps_to_its_lowercase_name() {
     // CPU resolves to, so map each constructible tag directly to cover
     // every branch on this build's feature set.
     assert_eq!(CpuKernelTag::Scalar.name(), "scalar");
-    #[cfg(all(target_arch = "x86_64", feature = "kernel_sse"))]
+    #[cfg(all(target_arch = "x86_64", feature = "kernel-sse"))]
     assert_eq!(CpuKernelTag::Sse2.name(), "sse2");
-    #[cfg(all(target_arch = "x86_64", feature = "kernel_bmi2"))]
+    #[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
     assert_eq!(CpuKernelTag::Bmi2.name(), "bmi2");
-    #[cfg(all(target_arch = "x86_64", feature = "kernel_avx2"))]
+    #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
     assert_eq!(CpuKernelTag::Avx2.name(), "avx2");
-    #[cfg(all(target_arch = "x86_64", feature = "kernel_vbmi2"))]
+    #[cfg(all(target_arch = "x86_64", feature = "kernel-vbmi2"))]
     assert_eq!(CpuKernelTag::Vbmi2.name(), "vbmi2");
-    #[cfg(all(target_arch = "aarch64", feature = "kernel_neon"))]
+    #[cfg(all(target_arch = "aarch64", feature = "kernel-neon"))]
     assert_eq!(CpuKernelTag::Neon.name(), "neon");
     #[cfg(all(
         target_arch = "aarch64",
-        feature = "kernel_sve",
+        feature = "kernel-sve",
         any(feature = "std", target_feature = "sve"),
     ))]
     assert_eq!(CpuKernelTag::Sve.name(), "sve");

@@ -1,4 +1,4 @@
-#[cfg(feature = "kernel_avx2")]
+#[cfg(feature = "kernel-avx2")]
 use super::row_tag_match_mask_avx2;
 use super::{row_tag_match_mask_scalar, row_tag_match_mask_sse2};
 
@@ -29,7 +29,7 @@ fn simd_tag_mask_matches_scalar() {
                     let got = unsafe { row_tag_match_mask_sse2(&tags, tag) };
                     assert_eq!(got, expected, "sse2 width={width} tag={tag}");
                 }
-                #[cfg(feature = "kernel_avx2")]
+                #[cfg(feature = "kernel-avx2")]
                 if std::arch::is_x86_feature_detected!("avx2") {
                     let got = unsafe { row_tag_match_mask_avx2(&tags, tag) };
                     assert_eq!(got, expected, "avx2 width={width} tag={tag}");

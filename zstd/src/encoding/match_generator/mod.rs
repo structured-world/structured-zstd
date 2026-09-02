@@ -1929,7 +1929,7 @@ pub(crate) enum HcBackend {
     Bt(alloc::boxed::Box<super::bt::BtMatcher>),
 }
 
-#[cfg(feature = "bench_internals")]
+#[cfg(feature = "bench-internals")]
 pub(crate) fn level22_block_ranges(data: &[u8]) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     let mut cursor = 0usize;
@@ -1958,7 +1958,7 @@ pub(crate) fn level22_block_ranges(data: &[u8]) -> Vec<(usize, usize)> {
     ranges
 }
 
-#[cfg(feature = "bench_internals")]
+#[cfg(feature = "bench-internals")]
 fn merge_block_delimiters(sequences: Vec<(usize, usize, usize)>) -> Vec<(usize, usize, usize)> {
     let mut out = Vec::with_capacity(sequences.len());
     let mut pending_lits = 0usize;
@@ -1981,7 +1981,7 @@ fn merge_block_delimiters(sequences: Vec<(usize, usize, usize)>) -> Vec<(usize, 
 /// with block-delimiter pseudo-sequences merged into the following
 /// triple's literal run. Pure Rust; the C-conformance comparison that
 /// consumes it lives in the `ffi-bench` crate.
-#[cfg(feature = "bench_internals")]
+#[cfg(feature = "bench-internals")]
 pub(crate) fn collect_level22_sequences(data: &[u8]) -> Vec<(usize, usize, usize)> {
     merge_block_delimiters(collect_level22_sequences_with_delimiters(data))
         .into_iter()
@@ -1989,7 +1989,7 @@ pub(crate) fn collect_level22_sequences(data: &[u8]) -> Vec<(usize, usize, usize
         .collect()
 }
 
-#[cfg(feature = "bench_internals")]
+#[cfg(feature = "bench-internals")]
 fn collect_level22_sequences_with_delimiters(data: &[u8]) -> Vec<(usize, usize, usize)> {
     let mut driver = MatchGeneratorDriver::new(super::cost_model::HC_BLOCKSIZE_MAX, 1);
     driver.set_source_size_hint(data.len() as u64);

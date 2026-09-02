@@ -3,7 +3,7 @@
 //! frame emits must be accepted by the C `zstd` HUF reader. The encoder-side
 //! captures come through the `structured_zstd::testing` facade (pure Rust); the
 //! C readers are linked only here, never in the library crate.
-#![cfg(feature = "bench_internals")]
+#![cfg(feature = "bench-internals")]
 
 use structured_zstd::encoding::{CompressionLevel, compress_to_vec};
 use structured_zstd::testing::{huf_encode4x, huf_weight_description};

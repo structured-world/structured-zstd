@@ -1211,7 +1211,7 @@ impl HcMatchGenerator {
         #[cfg(all(
             target_arch = "aarch64",
             target_endian = "little",
-            feature = "kernel_neon"
+            feature = "kernel-neon"
         ))]
         unsafe {
             run_main_loop!(build_optimal_plan_impl_neon);
@@ -1220,11 +1220,11 @@ impl HcMatchGenerator {
         {
             use crate::encoding::fastpath::FastpathKernel;
             match self.table.kernel {
-                #[cfg(feature = "kernel_avx2")]
+                #[cfg(feature = "kernel-avx2")]
                 FastpathKernel::Avx2Bmi2 => run_main_loop!(build_optimal_plan_impl_avx2_bmi2),
-                #[cfg(feature = "kernel_sse")]
+                #[cfg(feature = "kernel-sse")]
                 FastpathKernel::Sse2 => run_main_loop!(build_optimal_plan_impl_sse2),
-                #[cfg(feature = "kernel_sse")]
+                #[cfg(feature = "kernel-sse")]
                 FastpathKernel::Sse42 => run_main_loop!(build_optimal_plan_impl_sse42),
                 FastpathKernel::Scalar => run_main_loop!(build_optimal_plan_impl_scalar),
             }
@@ -1232,7 +1232,7 @@ impl HcMatchGenerator {
         #[cfg(all(
             target_arch = "wasm32",
             target_feature = "simd128",
-            feature = "kernel_simd128"
+            feature = "kernel-simd128"
         ))]
         unsafe {
             run_main_loop!(build_optimal_plan_impl_simd128);
@@ -1241,14 +1241,14 @@ impl HcMatchGenerator {
             all(
                 target_arch = "aarch64",
                 target_endian = "little",
-                feature = "kernel_neon"
+                feature = "kernel-neon"
             ),
             target_arch = "x86",
             target_arch = "x86_64",
             all(
                 target_arch = "wasm32",
                 target_feature = "simd128",
-                feature = "kernel_simd128"
+                feature = "kernel-simd128"
             )
         )))]
         {
@@ -1426,7 +1426,7 @@ impl HcMatchGenerator {
         #[cfg(all(
             target_arch = "aarch64",
             target_endian = "little",
-            feature = "kernel_neon"
+            feature = "kernel-neon"
         ))]
         unsafe {
             run_seed_loop!(build_optimal_plan_impl_neon);
@@ -1435,11 +1435,11 @@ impl HcMatchGenerator {
         {
             use crate::encoding::fastpath::FastpathKernel;
             match self.table.kernel {
-                #[cfg(feature = "kernel_avx2")]
+                #[cfg(feature = "kernel-avx2")]
                 FastpathKernel::Avx2Bmi2 => run_seed_loop!(build_optimal_plan_impl_avx2_bmi2),
-                #[cfg(feature = "kernel_sse")]
+                #[cfg(feature = "kernel-sse")]
                 FastpathKernel::Sse2 => run_seed_loop!(build_optimal_plan_impl_sse2),
-                #[cfg(feature = "kernel_sse")]
+                #[cfg(feature = "kernel-sse")]
                 FastpathKernel::Sse42 => run_seed_loop!(build_optimal_plan_impl_sse42),
                 FastpathKernel::Scalar => run_seed_loop!(build_optimal_plan_impl_scalar),
             }
@@ -1447,7 +1447,7 @@ impl HcMatchGenerator {
         #[cfg(all(
             target_arch = "wasm32",
             target_feature = "simd128",
-            feature = "kernel_simd128"
+            feature = "kernel-simd128"
         ))]
         unsafe {
             run_seed_loop!(build_optimal_plan_impl_simd128);
@@ -1456,14 +1456,14 @@ impl HcMatchGenerator {
             all(
                 target_arch = "aarch64",
                 target_endian = "little",
-                feature = "kernel_neon"
+                feature = "kernel-neon"
             ),
             target_arch = "x86",
             target_arch = "x86_64",
             all(
                 target_arch = "wasm32",
                 target_feature = "simd128",
-                feature = "kernel_simd128"
+                feature = "kernel-simd128"
             )
         )))]
         {
@@ -1530,7 +1530,7 @@ impl HcMatchGenerator {
     #[cfg(all(
         target_arch = "aarch64",
         target_endian = "little",
-        feature = "kernel_neon"
+        feature = "kernel-neon"
     ))]
     #[target_feature(enable = "neon")]
     #[allow(clippy::too_many_arguments)]
@@ -1569,7 +1569,7 @@ impl HcMatchGenerator {
     // this tier needs more than the SSE2 vector ops the fastpath module uses.
     #[cfg(all(
         any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel_sse"
+        feature = "kernel-sse"
     ))]
     #[target_feature(enable = "sse4.2")]
     #[allow(clippy::too_many_arguments)]
@@ -1608,7 +1608,7 @@ impl HcMatchGenerator {
     /// the SSE2 unsigned-compare emulation.
     #[cfg(all(
         any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel_sse"
+        feature = "kernel-sse"
     ))]
     #[target_feature(enable = "sse2")]
     #[allow(clippy::too_many_arguments)]
@@ -1644,7 +1644,7 @@ impl HcMatchGenerator {
 
     #[cfg(all(
         any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel_avx2"
+        feature = "kernel-avx2"
     ))]
     #[target_feature(enable = "avx2,bmi2")]
     #[allow(clippy::too_many_arguments)]
@@ -1681,7 +1681,7 @@ impl HcMatchGenerator {
     #[cfg(not(all(
         target_arch = "aarch64",
         target_endian = "little",
-        feature = "kernel_neon"
+        feature = "kernel-neon"
     )))]
     // Body macros wrap callees in `unsafe { }` for the NEON/AVX/SSE
     // variants where callees are `unsafe fn`. The scalar wrappers route
@@ -1694,7 +1694,7 @@ impl HcMatchGenerator {
         all(
             target_arch = "wasm32",
             target_feature = "simd128",
-            feature = "kernel_simd128"
+            feature = "kernel-simd128"
         ),
         allow(dead_code)
     )]
@@ -1734,7 +1734,7 @@ impl HcMatchGenerator {
     #[cfg(all(
         target_arch = "wasm32",
         target_feature = "simd128",
-        feature = "kernel_simd128"
+        feature = "kernel-simd128"
     ))]
     #[target_feature(enable = "simd128")]
     // With `+simd128` in the wasm baseline the shared body macro's `unsafe`
@@ -1857,7 +1857,7 @@ impl HcMatchGenerator {
         #[cfg(all(
             target_arch = "aarch64",
             target_endian = "little",
-            feature = "kernel_neon"
+            feature = "kernel-neon"
         ))]
         unsafe {
             self.collect_optimal_candidates_initialized_neon::<S>(
@@ -1872,7 +1872,7 @@ impl HcMatchGenerator {
         {
             use crate::encoding::fastpath::FastpathKernel;
             match self.table.kernel {
-                #[cfg(feature = "kernel_avx2")]
+                #[cfg(feature = "kernel-avx2")]
                 FastpathKernel::Avx2Bmi2 => unsafe {
                     self.collect_optimal_candidates_initialized_avx2_bmi2::<S>(
                         abs_pos,
@@ -1882,7 +1882,7 @@ impl HcMatchGenerator {
                         out,
                     )
                 },
-                #[cfg(feature = "kernel_sse")]
+                #[cfg(feature = "kernel-sse")]
                 FastpathKernel::Sse2 => unsafe {
                     self.collect_optimal_candidates_initialized_sse2::<S>(
                         abs_pos,
@@ -1892,7 +1892,7 @@ impl HcMatchGenerator {
                         out,
                     )
                 },
-                #[cfg(feature = "kernel_sse")]
+                #[cfg(feature = "kernel-sse")]
                 FastpathKernel::Sse42 => unsafe {
                     self.collect_optimal_candidates_initialized_sse42::<S>(
                         abs_pos,
@@ -1916,7 +1916,7 @@ impl HcMatchGenerator {
         #[cfg(all(
             target_arch = "wasm32",
             target_feature = "simd128",
-            feature = "kernel_simd128"
+            feature = "kernel-simd128"
         ))]
         // SAFETY: the `cfg` above establishes `simd128` at compile time, which
         // is exactly the umbrella the callee declares.
@@ -1933,14 +1933,14 @@ impl HcMatchGenerator {
             all(
                 target_arch = "aarch64",
                 target_endian = "little",
-                feature = "kernel_neon"
+                feature = "kernel-neon"
             ),
             target_arch = "x86",
             target_arch = "x86_64",
             all(
                 target_arch = "wasm32",
                 target_feature = "simd128",
-                feature = "kernel_simd128"
+                feature = "kernel-simd128"
             )
         )))]
         {
@@ -1962,7 +1962,7 @@ impl HcMatchGenerator {
     #[cfg(all(
         target_arch = "aarch64",
         target_endian = "little",
-        feature = "kernel_neon"
+        feature = "kernel-neon"
     ))]
     #[target_feature(enable = "neon")]
     unsafe fn collect_optimal_candidates_initialized_neon<
@@ -1991,7 +1991,7 @@ impl HcMatchGenerator {
 
     #[cfg(all(
         any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel_sse"
+        feature = "kernel-sse"
     ))]
     #[target_feature(enable = "sse4.2")]
     unsafe fn collect_optimal_candidates_initialized_sse42<
@@ -2026,7 +2026,7 @@ impl HcMatchGenerator {
     /// x86/x86_64 with SSE2.
     #[cfg(all(
         any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel_sse"
+        feature = "kernel-sse"
     ))]
     #[target_feature(enable = "sse2")]
     unsafe fn collect_optimal_candidates_initialized_sse2<
@@ -2055,7 +2055,7 @@ impl HcMatchGenerator {
 
     #[cfg(all(
         any(target_arch = "x86", target_arch = "x86_64"),
-        feature = "kernel_avx2"
+        feature = "kernel-avx2"
     ))]
     #[target_feature(enable = "avx2,bmi2")]
     unsafe fn collect_optimal_candidates_initialized_avx2_bmi2<
@@ -2091,7 +2091,7 @@ impl HcMatchGenerator {
     #[cfg(all(
         target_arch = "wasm32",
         target_feature = "simd128",
-        feature = "kernel_simd128"
+        feature = "kernel-simd128"
     ))]
     #[target_feature(enable = "simd128")]
     unsafe fn collect_optimal_candidates_initialized_simd128<
@@ -2121,7 +2121,7 @@ impl HcMatchGenerator {
     #[cfg(not(all(
         target_arch = "aarch64",
         target_endian = "little",
-        feature = "kernel_neon"
+        feature = "kernel-neon"
     )))]
     // Macro emits `unsafe { }` wrappers for NEON/AVX/SSE variants; scalar
     // callees are safe so the blocks are redundant here only.

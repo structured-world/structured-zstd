@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 // (compiler `private_interfaces` warning). External reachability is
 // gated by `crate::fse` module visibility: `pub(crate) mod fse` in
 // the default build keeps everything crate-internal; under
-// `feature = "fuzz_exports"` the module becomes `pub mod fse` and
+// `feature = "fuzz-exports"` the module becomes `pub mod fse` and
 // the struct becomes externally accessible — which is exactly what
 // the fuzz harness needs.
 pub struct FSEDecoderImpl<'table, E: FseEntry, const CAP: usize> {
@@ -62,12 +62,12 @@ impl<'t, E: FseEntry, const CAP: usize> FSEDecoderImpl<'t, E, CAP> {
         // Defense-in-depth internal-invariant guard: in normal builds
         // `crate::fse` is not externally reachable, but malformed
         // tables can still arise from internal misuse, future
-        // `feature = "fuzz_exports"`. Validate up-front that
+        // `feature = "fuzz-exports"`. Validate up-front that
         // `decode.len() == 1 << accuracy_log` and surface a typed
         // `InvalidTableShape` error (distinct from
         // `TableIsUninitialized` to keep error triage unambiguous).
         // Without this, `read_entry`'s unchecked indexing (the
-        // `cfg(not(fuzz_exports))` arm) could hit UB on a malformed
+        // `cfg(not(fuzz-exports))` arm) could hit UB on a malformed
         // table in release builds. `checked_shl` covers the
         // pathological case where `accuracy_log >= usize::BITS`.
         // Branch cost is a single per-call check; the per-sequence
@@ -93,7 +93,7 @@ impl<'t, E: FseEntry, const CAP: usize> FSEDecoderImpl<'t, E, CAP> {
         // `build_decoding_table` ensures the table is sized exactly
         // `1 << accuracy_log` entries. The bounds check that the
         // checked indexing would emit is provably redundant. Under
-        // `feature = "fuzz_exports"` `read_entry` falls back to the
+        // `feature = "fuzz-exports"` `read_entry` falls back to the
         // bounds-checked path — see comment on `read_entry`.
         self.state = self.read_entry(new_state as usize);
 
@@ -117,7 +117,7 @@ impl<'t, E: FseEntry, const CAP: usize> FSEDecoderImpl<'t, E, CAP> {
     // loop, HUF weights decode) batch their refills and use
     // `update_state_fast`; the only remaining caller is the test/fuzz
     // `round_trip` helper, which wants the bounds-checked path.
-    #[cfg(any(test, feature = "fuzz_exports"))]
+    #[cfg(any(test, feature = "fuzz-exports"))]
     pub fn update_state<K: CpuKernel>(&mut self, bits: &mut BitReaderReversed<'_, K>) {
         // Public-API safety guard: `FSEDecoder::new` builds a decoder
         // with a zero-default `state` (Entry { new_state: 0, num_bits:
@@ -157,20 +157,20 @@ impl<'t, E: FseEntry, const CAP: usize> FSEDecoderImpl<'t, E, CAP> {
         self.state = self.read_entry(next_state);
     }
 
-    /// Read `decode[idx]` — bounds-checked under `fuzz_exports`, unchecked
+    /// Read `decode[idx]` — bounds-checked under `fuzz-exports`, unchecked
     /// otherwise. The call sites all hold the FSE invariant `idx <
     /// decode.len()` by construction (`init_state` reads
     /// `accuracy_log` bits, `update_state*` derive `next_state` from
     /// `Entry.new_state + add` where `calc_baseline_and_numbits`
     /// guarantees `new_state + (1 << num_bits) - 1 < table_size`).
-    /// Under `fuzz_exports` external code can construct a mis-shaped
+    /// Under `fuzz-exports` external code can construct a mis-shaped
     /// table that violates the invariant — fall back to checked
     /// indexing so a fuzz harness sees a panic rather than UB, even
     /// when the fuzz binary is built in release mode (which makes
     /// `debug_assert!` a no-op and is the default for `cargo fuzz`).
     #[inline(always)]
     fn read_entry(&self, idx: usize) -> E {
-        #[cfg(feature = "fuzz_exports")]
+        #[cfg(feature = "fuzz-exports")]
         {
             // Bound on the LIVE span (`decode_len`, not `CAP`) first: the tail is
             // `MaybeUninit` and reading it would be UB, so a mis-shaped fuzz table
@@ -179,7 +179,7 @@ impl<'t, E: FseEntry, const CAP: usize> FSEDecoderImpl<'t, E, CAP> {
             // initialised every entry in `[0, decode_len)`.
             unsafe { self.table.decode[..self.table.decode_len][idx].assume_init() }
         }
-        #[cfg(not(feature = "fuzz_exports"))]
+        #[cfg(not(feature = "fuzz-exports"))]
         // SAFETY: `idx` is invariant-bounded by the FSE table-build /
         // state-transition contract to `< decode_len`, and the build wrote
         // every entry in `[0, decode_len)`, so the read is in-bounds AND
@@ -228,7 +228,7 @@ impl<'t, E: FseEntry, const CAP: usize> FSEDecoderImpl<'t, E, CAP> {
         // Therefore `next_state < self.table.decode.len()` and the indexed read
         // is in bounds; LLVM cannot prove this invariant on its own because it
         // spans the table-build and decode call sites. Under
-        // `feature = "fuzz_exports"` `read_entry` falls back to bounds-checked
+        // `feature = "fuzz-exports"` `read_entry` falls back to bounds-checked
         // indexing — see comment on `read_entry`.
         self.state = self.read_entry(next_state);
     }

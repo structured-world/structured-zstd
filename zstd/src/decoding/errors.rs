@@ -1406,7 +1406,7 @@ pub enum FSEDecoderError {
     TableIsUninitialized,
     /// Externally constructed `FSETable` violates the
     /// `decode.len() == 1 << accuracy_log` shape invariant. Only
-    /// reachable under `feature = "fuzz_exports"`, where fuzz
+    /// reachable under `feature = "fuzz-exports"`, where fuzz
     /// harnesses can set the `FSETable.decode` / `accuracy_log`
     /// fields directly and skip `build_decoding_table`.
     InvalidTableShape {

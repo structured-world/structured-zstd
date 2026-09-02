@@ -85,11 +85,11 @@ pub(crate) unsafe fn exec_sequence_bounded_copy(
 /// `exec_sequence_inline_avx2` remains the unit-tested reference spec for
 /// this body. Returns `Result<(), ExecuteSequencesError>`.
 //
-// Gated on `kernel_avx2` (implied by `kernel_vbmi2`) so the macro is absent
+// Gated on `kernel-avx2` (implied by `kernel-vbmi2`) so the macro is absent
 // when its only consumers (`seq_decoder_avx2` / `seq_decoder_vbmi2`) are
 // compiled out — otherwise the `--no-default-features` build sees an unused
 // macro and trips `-D warnings`.
-#[cfg(all(target_arch = "x86_64", feature = "kernel_avx2"))]
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
 macro_rules! exec_sequence_avx2_inline {
     ($buffer:expr, $lit_src:expr, $lit_length:expr, $offset:expr, $match_length:expr) => {{
         use crate::decoding::buffer_backend::sequence_output_fits;
@@ -161,7 +161,7 @@ macro_rules! exec_sequence_avx2_inline {
         }
     }};
 }
-#[cfg(all(target_arch = "x86_64", feature = "kernel_avx2"))]
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
 pub(crate) use exec_sequence_avx2_inline;
 
 /// SSE2 twin of [`exec_sequence_avx2_inline`] for the BMI2 tier (which has
@@ -171,10 +171,10 @@ pub(crate) use exec_sequence_avx2_inline;
 /// remains the unit-tested reference spec. Usable from any fn carrying
 /// `target_feature(bmi2)`; baseline SSE2 needs no feature gate on x86_64.
 //
-// Gated on `kernel_bmi2` so the macro is absent when its only consumer
+// Gated on `kernel-bmi2` so the macro is absent when its only consumer
 // (`seq_decoder_bmi2`) is compiled out, keeping `--no-default-features`
 // (`-D warnings`) free of an unused-macro error.
-#[cfg(all(target_arch = "x86_64", feature = "kernel_bmi2"))]
+#[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
 macro_rules! exec_sequence_sse2_inline {
     ($buffer:expr, $lit_src:expr, $lit_length:expr, $offset:expr, $match_length:expr) => {{
         use crate::decoding::buffer_backend::sequence_output_fits;
@@ -239,7 +239,7 @@ macro_rules! exec_sequence_sse2_inline {
         }
     }};
 }
-#[cfg(all(target_arch = "x86_64", feature = "kernel_bmi2"))]
+#[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
 pub(crate) use exec_sequence_sse2_inline;
 
 // x86_64 only: SSE2 is the architectural baseline there (every x86_64

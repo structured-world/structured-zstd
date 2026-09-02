@@ -9,7 +9,7 @@
 #![cfg(all(
     target_arch = "wasm32",
     target_feature = "simd128",
-    feature = "kernel_simd128"
+    feature = "kernel-simd128"
 ))]
 
 use core::arch::wasm32::{i8x16_bitmask, u8x16_eq, v128, v128_load};
