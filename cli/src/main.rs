@@ -65,10 +65,40 @@ struct Options {
     /// Long-distance matching (`--long`), enabled on the encoder via the
     /// compression-parameters API.
     long: bool,
+    /// Pledged input size from `--stream-size` / `--size-hint`. Used when the
+    /// input is not a regular file whose length we can stat, which is exactly
+    /// the case upstream documents these for.
+    size_hint: Option<u64>,
 }
 
 /// Upstream `zstd --maxdict` default (110 KiB).
 const DEFAULT_MAX_DICT: usize = 112_640;
+
+/// Parse a size written the way upstream accepts it: a plain count, or one
+/// suffixed `KB`/`MB`/`GB` (also spelled `K`/`M`/`G`, any case). Upstream uses
+/// powers of two for these, despite the decimal-looking names.
+fn parse_size(text: &str) -> color_eyre::Result<u64> {
+    let trimmed = text.trim();
+    let upper = trimmed.to_ascii_uppercase();
+    let (digits, shift) = match upper.as_str() {
+        s if s.ends_with("KB") => (&trimmed[..trimmed.len() - 2], 10),
+        s if s.ends_with("MB") => (&trimmed[..trimmed.len() - 2], 20),
+        s if s.ends_with("GB") => (&trimmed[..trimmed.len() - 2], 30),
+        s if s.ends_with('K') => (&trimmed[..trimmed.len() - 1], 10),
+        s if s.ends_with('M') => (&trimmed[..trimmed.len() - 1], 20),
+        s if s.ends_with('G') => (&trimmed[..trimmed.len() - 1], 30),
+        _ => (trimmed, 0),
+    };
+    let value: u64 = digits
+        .trim()
+        .parse()
+        .map_err(|_| eyre!("expected a size, got `{text}`"))?;
+    // `checked_shl` then `checked_mul` would be the same test twice: a shift
+    // that fits still has to fit as a product. One checked multiply says it.
+    value
+        .checked_mul(1u64 << shift)
+        .ok_or_else(|| eyre!("size `{text}` does not fit in 64 bits"))
+}
 
 /// Outcome of argument parsing: either run with `Options`, or a terminal
 /// message already handled (help / version).
@@ -146,6 +176,7 @@ fn parse_args(
         bench_end: 0,
         bench_secs: 1.0,
         long: false,
+        size_hint: None,
     };
     let mut ultra = false;
     let mut iter = args.iter().enumerate().peekable();
@@ -192,6 +223,30 @@ fn parse_args(
                     print_help();
                     return Ok(Parsed::Handled);
                 }
+                // Flags that steer HOW the work is done, not what comes out:
+                // thread counts, memory ceilings, IO strategy, progress
+                // display, matcher hints. We are single-threaded and pick our
+                // own limits, so accepting them yields the same valid stream.
+                // Upstream takes them, so a script that passes them must not
+                // fail here — that is the whole drop-in contract.
+                "single-thread"
+                | "adapt"
+                | "progress"
+                | "no-progress"
+                | "check"
+                | "sparse"
+                | "no-sparse"
+                | "asyncio"
+                | "no-asyncio"
+                | "mmap-dict"
+                | "no-mmap-dict"
+                | "pass-through"
+                | "no-pass-through"
+                | "compress-literals"
+                | "no-compress-literals"
+                | "row-match-finder"
+                | "no-row-match-finder"
+                | "exclude-compressed" => {}
                 _ => {
                     if long == "fast" {
                         // `--fast` is the level -1 alias.
@@ -209,6 +264,46 @@ fn parse_args(
                         opts.max_dict = v.parse::<usize>().wrap_err("invalid --maxdict size")?;
                     } else if let Some(v) = long.strip_prefix("dictID=") {
                         opts.dict_id = Some(v.parse::<u32>().wrap_err("invalid --dictID")?);
+                    } else if let Some(v) = long
+                        .strip_prefix("stream-size=")
+                        .or_else(|| long.strip_prefix("size-hint="))
+                    {
+                        // Real information, so it is threaded through rather
+                        // than ignored: the encoder sizes its window and tables
+                        // from the pledged size.
+                        opts.size_hint =
+                            Some(parse_size(v).wrap_err("invalid --stream-size / --size-hint")?);
+                    } else if let Some(v) = long
+                        .strip_prefix("memory=")
+                        .or_else(|| long.strip_prefix("memlimit="))
+                        .or_else(|| long.strip_prefix("memlimit-decompress="))
+                    {
+                        // Accepted for compatibility: our decoder derives its
+                        // own window ceiling from the frame header, which is
+                        // what this flag guards against. Validated so a typo
+                        // still fails.
+                        let _ = parse_size(v).wrap_err("invalid memory limit")?;
+                    } else if let Some(v) = long.strip_prefix("auto-threads=") {
+                        // Single-threaded: the choice has no effect, but a bad
+                        // value is still a bad command line.
+                        if v != "physical" && v != "logical" {
+                            bail!("--auto-threads must be `physical` or `logical`, got `{v}`");
+                        }
+                    } else if let Some(v) = long.strip_prefix("target-compressed-block-size=") {
+                        let _ = parse_size(v).wrap_err("invalid --target-compressed-block-size")?;
+                    } else if let Some(v) = long.strip_prefix("threads=") {
+                        let _ = v.parse::<u32>().wrap_err("invalid --threads")?;
+                    } else if let Some(v) = long.strip_prefix("format=") {
+                        // Anything but zstd would hand back a file the caller
+                        // did not ask for, so it fails rather than silently
+                        // producing a `.zst` under a `.gz` name.
+                        if v != "zstd" {
+                            bail!("--format={v} is not supported; this build only writes zstd");
+                        }
+                    } else if long == "rsyncable" || long.starts_with("patch-from=") {
+                        // Both change the emitted frame, so silence would be a
+                        // wrong answer rather than a slower one.
+                        bail!("--{long} is not implemented");
                     } else if long == "long" {
                         opts.long = true;
                     } else if let Some(v) = long.strip_prefix("long=") {
@@ -275,9 +370,14 @@ fn parse_args(
                 // `-S` (benchmark each file separately) is the default here;
                 // `-q`/`-v` verbosity are accepted no-ops.
                 'q' | 'v' | 'S' => {}
-                'B' => {
-                    // `-B[N]` benchmark block size: accepted (the encoder uses
-                    // its fixed block size); consume any attached value.
+                'B' | 'T' | 'M' => {
+                    // `-B[N]` benchmark block size, `-T[N]` thread count,
+                    // `-M[N]` decompression memory ceiling. All three steer how
+                    // the work is done, not what comes out: we use a fixed
+                    // block size, run single-threaded, and bound the window
+                    // from the frame header. Upstream accepts them, so a script
+                    // that passes them must not fail here. Consume any attached
+                    // value.
                     ci = chars.len();
                     continue;
                 }
@@ -377,8 +477,16 @@ fn print_help() {
          \x20 -f, --force          overwrite output / allow stdout to terminal\n\
          \x20 -k, --keep           keep (do not delete) source files\n\
          \x20 --rm                 remove source files after success\n\
+         \x20 --stream-size=N      pledge the size of a streamed input\n\
+         \x20 --size-hint=N        same, as an estimate\n\
          \x20 -V, --version        print version\n\
          \x20 -h, --help           print this help\n\
+         \n\
+         Accepted for compatibility, with no effect here: -T/--single-thread/\n\
+         --auto-threads (single-threaded), -M/--memory (the window is bounded\n\
+         from the frame header), -B, --adapt, --[no-]progress, --[no-]check,\n\
+         --[no-]sparse, --[no-]asyncio, --[no-]mmap-dict, --[no-]pass-through,\n\
+         --[no-]compress-literals, --[no-]row-match-finder.\n\
          \n\
          With no FILE, or when FILE is `-`, read stdin / write stdout."
     );
@@ -704,12 +812,14 @@ fn process_stdin_stdout(opts: &Options, dict: Option<&[u8]>) -> color_eyre::Resu
     let stdin = io::stdin();
     let reader = stdin.lock();
     // `-o` redirects stdin's (de)compressed output to a file, unless `-c`
-    // explicitly forces stdout. stdin has no declared size, so no size hint.
+    // explicitly forces stdout. stdin has no length to stat, which is exactly
+    // why upstream offers `--stream-size` / `--size-hint`: pass whatever the
+    // caller pledged.
     if let Some(output) = &opts.output
         && !opts.to_stdout
         && matches!(opts.mode, Mode::Compress | Mode::Decompress)
     {
-        return write_stream_to_file(opts, reader, output, None, dict);
+        return write_stream_to_file(opts, reader, output, opts.size_hint, dict);
     }
     match opts.mode {
         Mode::Compress => {
@@ -720,7 +830,7 @@ fn process_stdin_stdout(opts: &Options, dict: Option<&[u8]>) -> color_eyre::Resu
                 opts.level,
                 opts.store,
                 dict,
-                None,
+                opts.size_hint,
                 opts.long,
             )
         }

@@ -209,10 +209,85 @@ fn decompress_suffix_stripping() {
         bench_end: 0,
         bench_secs: 1.0,
         long: false,
+        size_hint: None,
     };
     assert_eq!(
         derive_output_path(&opts, Path::new("archive.tar.zst")).unwrap(),
         PathBuf::from("archive.tar")
     );
     assert!(derive_output_path(&opts, Path::new("noext")).is_err());
+}
+
+/// Upstream accepts a set of flags that only steer *how* the work is done —
+/// thread count, memory ceiling, progress display, size hints. We are
+/// single-threaded and derive our own limits, so the result is the same valid
+/// zstd stream either way. Rejecting them would break the drop-in contract for
+/// no benefit: a script that says `zstd -T4 -M512 file` must not fail here.
+#[test]
+fn performance_only_flags_are_accepted() {
+    for args in [
+        &["-T4", "f"][..],
+        &["-T0", "f"][..],
+        &["--single-thread", "f"][..],
+        &["--auto-threads=logical", "f"][..],
+        &["-M512", "f"][..],
+        &["--memory=512MB", "f"][..],
+        &["--memlimit=512MB", "f"][..],
+        &["--adapt", "f"][..],
+        &["--progress", "f"][..],
+        &["--no-progress", "f"][..],
+        &["--check", "f"][..],
+        &["--no-sparse", "f"][..],
+        &["--sparse", "f"][..],
+        &["--no-asyncio", "f"][..],
+        &["--no-mmap-dict", "f"][..],
+        &["--compress-literals", "f"][..],
+        &["--no-row-match-finder", "f"][..],
+    ] {
+        let parsed = parse(args);
+        assert!(
+            parsed.is_ok(),
+            "upstream accepts {args:?}; we must too: {:?}",
+            parsed.err()
+        );
+    }
+}
+
+/// A hint about the input size is real information, so it is threaded through
+/// rather than ignored: the encoder sizes its window and tables from it.
+#[test]
+fn size_hints_reach_the_encoder() {
+    assert_eq!(
+        parse(&["--stream-size=4096", "f"]).unwrap().size_hint,
+        Some(4096)
+    );
+    assert_eq!(
+        parse(&["--size-hint=8192", "f"]).unwrap().size_hint,
+        Some(8192)
+    );
+}
+
+/// The other half of the contract: a flag that would change the OUTPUT, and
+/// that we do not implement, must fail loudly. Silently ignoring these would
+/// hand back a file the caller did not ask for — a `.gz` request answered with
+/// a zstd frame, or a patch built against no reference at all.
+#[test]
+fn unimplemented_output_changing_flags_are_rejected() {
+    for args in [
+        &["--format=gzip", "f"][..],
+        &["--format=xz", "f"][..],
+        &["--patch-from=ref", "f"][..],
+        &["--rsyncable", "f"][..],
+    ] {
+        assert!(
+            parse(args).is_err(),
+            "{args:?} changes the output and is not implemented; it must not be silently accepted"
+        );
+    }
+}
+
+/// `--format=zstd` is the default and names what we actually produce.
+#[test]
+fn explicit_zstd_format_is_accepted() {
+    assert!(parse(&["--format=zstd", "f"]).is_ok());
 }

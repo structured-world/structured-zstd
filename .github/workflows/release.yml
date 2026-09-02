@@ -19,6 +19,12 @@ jobs:
       - run: cargo publish -p structured-zstd
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+      # The CLI depends on the library by version as well as by path, so it can
+      # only be published once the release above is in the index — cargo waits
+      # for that itself. Keeping both in one job preserves that ordering.
+      - run: cargo publish -p structured-zstd-cli
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
 
   publish-npm:
     # Publish @structured-world/structured-zstd (wasm) via npm OIDC trusted

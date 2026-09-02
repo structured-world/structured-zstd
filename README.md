@@ -38,6 +38,36 @@ cargo add structured-zstd --no-default-features
 
 Release notes for every version live in [`zstd/CHANGELOG.md`](https://github.com/structured-world/structured-zstd/blob/main/zstd/CHANGELOG.md) (maintained by [release-plz](https://release-plz.dev/)).
 
+## Command-line tool
+
+```bash
+cargo install structured-zstd-cli
+```
+
+This installs a `structured-zstd` binary that speaks the upstream `zstd`
+command line: levels (`-1`..`-19`, `--ultra` for `-20`..`-22`, `--fast[=N]`),
+`-d`, `-c`, `-o`, `-t`, `-l`, `-D`, `--train`, `-b`, and the usual
+`-f`/`-k`/`--rm` file handling. Flags that only steer how the work is done
+(`-T`, `-M`, `--adapt`, `--[no-]progress`, …) are accepted and ignored; flags
+that would change the output (`--format=gzip`, `--patch-from`, `--rsyncable`)
+fail rather than quietly producing something else.
+
+It is deliberately **not** installed as `zstd`, so it never shadows the system
+tool. It does dispatch on the name it is invoked under, so linking it as the
+familiar names works:
+
+```bash
+ln -s "$(command -v structured-zstd)" ~/.local/bin/unzstd    # defaults to -d
+ln -s "$(command -v structured-zstd)" ~/.local/bin/zstdcat   # defaults to -d -c
+```
+
+Distributions should register it with their alternatives mechanism rather than
+overwriting `/usr/bin/zstd`, e.g.
+
+```bash
+update-alternatives --install /usr/bin/zstd zstd /usr/bin/structured-zstd 100
+```
+
 ## Usage
 
 ### Compression

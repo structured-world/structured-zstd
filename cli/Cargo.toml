@@ -2,7 +2,6 @@
 [package]
 name = "structured-zstd-cli"
 version = "0.8.2"
-publish = false
 rust-version = "1.92"
 authors = ["Moritz Borcherding <moritz.borcherding@web.de>"]
 edition = "2024"
@@ -14,6 +13,20 @@ readme = "../README.md"
 keywords = ["zstd", "zstandard", "decompression"]
 categories = ["compression"]
 
+# Deliberately NOT named `zstd`: `cargo install` drops binaries into a
+# directory that usually precedes `/usr/bin` on `PATH`, so shipping that name
+# would shadow the system zstd for every user who installs this. Distributions
+# point `zstd` at whichever implementation the admin chose, through their
+# alternatives mechanism; the binary keeps its own name and is a candidate for
+# that link, not a squatter on it.
+#
+# The `argv[0]` dispatch is unaffected: it reads the invoked name, so an
+# alternatives link or a plain symlink called `unzstd` / `zstdcat` selects the
+# matching default mode.
+[[bin]]
+name = "structured-zstd"
+path = "src/main.rs"
+
 [dependencies]
 # Used for the command line binary only
 clap = { version = "4.6.0", features = ["derive"]}
@@ -23,8 +36,16 @@ indicatif = { version = "0.18.4" }
 tracing-indicatif = { version = "0.3.14" }
 console = { version = "0.16.3" }
 tracing-subscriber = { version = "0.3.23" }
-# Keep a version requirement for `cargo package` while allowing any 0.0.x fork release.
-structured-zstd = { version = "0.0", path = "../zstd", features = ["std", "dict-builder"] }
+# Two-component requirement, i.e. `>=0.0, <0.1`: any fork release satisfies it.
+# `cargo package` resolves it against crates.io and picks the newest match, so
+# publishing this crate requires a library release that carries the features
+# below — `dict-builder` was spelled `dict_builder` up to 0.0.49, so the CLI
+# can only be published alongside or after the first release with the renamed
+# features. The release job publishes the library first for that reason.
+structured-zstd = { version = "0.0", path = "../zstd", features = [
+    "std",
+    "dict-builder",
+] }
 
 [dev-dependencies]
 criterion = "0.8"
