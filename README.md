@@ -54,10 +54,16 @@ in nothing extra.
 The binary speaks the upstream `zstd`
 command line: levels (`-1`..`-19`, `--ultra` for `-20`..`-22`, `--fast[=N]`),
 `-d`, `-c`, `-o`, `-t`, `-l`, `-D`, `--train`, `-b`, and the usual
-`-f`/`-k`/`--rm` file handling. Flags that only steer how the work is done
-(`-T`, `-M`, `--adapt`, `--[no-]progress`, …) are accepted and ignored; flags
-that would change the output (`--format=gzip`, `--patch-from`, `--rsyncable`)
-fail rather than quietly producing something else.
+`-f`/`-k`/`--rm` file handling.
+
+Flags that only steer how the work is done (`-T`, `-B`, `--adapt`,
+`--[no-]progress`, …) are accepted and ignored — their values are still
+validated, so a typo is an error rather than silence. Flags that would change
+the result are refused instead: `--format=` for anything but zstd,
+`--patch-from`, `--rsyncable`, `--no-check`, and the not-yet-implemented
+`--pass-through` / `--exclude-compressed`. `-M` is treated as the safety
+promise it is: a limit at or above the 128 MiB decompression window this build
+enforces is already kept, and a tighter one is refused rather than ignored.
 
 It is deliberately **not** installed as `zstd`, so it never shadows the system
 tool. It does dispatch on the name it is invoked under, so linking it as the

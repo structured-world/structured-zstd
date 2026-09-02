@@ -35,6 +35,15 @@ mod streaming_decoder;
 
 pub use dictionary::{Dictionary, DictionaryHandle};
 pub use frame_decoder::{BlockDecodingStrategy, ContentChecksum, FrameDecoder};
+
+/// Largest window a frame may declare before this decoder refuses it.
+///
+/// The bound is what makes decoding untrusted input safe: a frame header can
+/// ask for a window far larger than the data behind it, and honouring that
+/// would let a few bytes of input demand gigabytes of memory. Callers that
+/// impose their own ceiling can compare against this one to see which is the
+/// stricter, and tools can report the bound they actually enforce.
+pub use crate::common::MAXIMUM_ALLOWED_WINDOW_SIZE;
 #[cfg(feature = "lsm")]
 pub use frame_decoder::{PartialDecode, ResumeInput, ResumeState};
 pub use streaming_decoder::StreamingDecoder;

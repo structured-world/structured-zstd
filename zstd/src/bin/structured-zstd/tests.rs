@@ -209,6 +209,7 @@ fn decompress_suffix_stripping() {
         bench_end: 0,
         bench_secs: 1.0,
         long: false,
+        pledged_size: None,
         size_hint: None,
     };
     assert_eq!(
@@ -253,18 +254,24 @@ fn performance_only_flags_are_accepted() {
     }
 }
 
-/// A hint about the input size is real information, so it is threaded through
-/// rather than ignored: the encoder sizes its window and tables from it.
+/// Sizes are accepted in the shapes upstream takes, suffixes included, and a
+/// malformed one is an error rather than a silent zero.
 #[test]
-fn size_hints_reach_the_encoder() {
+fn size_arguments_parse_upstream_spellings() {
     assert_eq!(
-        parse(&["--stream-size=4096", "f"]).unwrap().size_hint,
+        parse(&["--stream-size=4096", "f"]).unwrap().pledged_size,
         Some(4096)
     );
     assert_eq!(
-        parse(&["--size-hint=8192", "f"]).unwrap().size_hint,
-        Some(8192)
+        parse(&["--stream-size=4KB", "f"]).unwrap().pledged_size,
+        Some(4096)
     );
+    assert_eq!(
+        parse(&["--size-hint=1M", "f"]).unwrap().size_hint,
+        Some(1 << 20)
+    );
+    assert!(parse(&["--stream-size=abc", "f"]).is_err());
+    assert!(parse(&["--size-hint=", "f"]).is_err());
 }
 
 /// The other half of the contract: a flag that would change the OUTPUT, and
@@ -290,4 +297,95 @@ fn unimplemented_output_changing_flags_are_rejected() {
 #[test]
 fn explicit_zstd_format_is_accepted() {
     assert!(parse(&["--format=zstd", "f"]).is_ok());
+}
+
+/// `--stream-size` and `--size-hint` are not synonyms: the first pledges the
+/// exact length, which lands in the frame header and must match, while the
+/// second is an estimate used only to size the encoder. Feeding an estimate to
+/// the pledge would make a wrong guess fail the compression outright, so they
+/// are parsed into separate fields.
+#[test]
+fn stream_size_pledges_and_size_hint_only_advises() {
+    let pledged = parse(&["--stream-size=4096", "f"]).unwrap();
+    assert_eq!(pledged.pledged_size, Some(4096));
+    assert_eq!(pledged.size_hint, None);
+
+    let advisory = parse(&["--size-hint=8192", "f"]).unwrap();
+    assert_eq!(advisory.size_hint, Some(8192));
+    assert_eq!(advisory.pledged_size, None);
+}
+
+/// `-M` is a safety promise, not a hint: it caps how much memory decompressing
+/// an untrusted frame may demand. This build enforces a fixed 128 MiB window
+/// ceiling, so a limit at or above that is already honoured — and one BELOW it
+/// is a promise we cannot keep, which must be refused rather than accepted and
+/// ignored.
+#[test]
+fn memory_limit_is_honoured_or_refused_never_ignored() {
+    // At or above our own ceiling: we are the stricter of the two.
+    assert!(parse(&["-d", "-M256", "f"]).is_ok());
+    assert!(parse(&["-d", "--memory=128MB", "f"]).is_ok());
+    // Below it: refuse rather than pretend.
+    let err = match parse(&["-d", "-M8", "f"]) {
+        Ok(_) => panic!("a limit below our own ceiling must be refused"),
+        Err(err) => err.to_string(),
+    };
+    assert!(
+        err.contains("128"),
+        "the refusal should name the ceiling we do enforce, got: {err}"
+    );
+}
+
+/// Flags whose whole purpose is to change which files are touched, or what
+/// happens to input that is not compressed, cannot be accepted as no-ops: the
+/// caller would get compression where they asked for a skip, or an error where
+/// they asked for a copy.
+#[test]
+fn unimplemented_behaviour_flags_are_rejected() {
+    for args in [
+        &["--exclude-compressed", "f"][..],
+        &["-d", "--pass-through", "f"][..],
+    ] {
+        assert!(
+            parse(args).is_err(),
+            "{args:?} changes which files are processed and is not implemented"
+        );
+    }
+}
+
+/// `--adapt` also comes parameterised upstream (`--adapt=min=1,max=9`).
+/// Accepting the bare form but choking on the documented one would fail a
+/// script for a reason that has nothing to do with what we support.
+#[test]
+fn parameterised_adapt_is_accepted() {
+    assert!(parse(&["--adapt", "f"]).is_ok());
+    assert!(parse(&["--adapt=min=1,max=9", "f"]).is_ok());
+}
+
+/// The help text promises that `-f` is what allows output to a terminal, and
+/// upstream refuses without it. Writing a compressed frame into an interactive
+/// terminal corrupts the session and loses the data, so the guard has to exist
+/// rather than just be advertised.
+#[test]
+fn binary_output_to_a_terminal_needs_force() {
+    // Not a terminal: always fine, `-f` or not.
+    assert!(guard_binary_stdout(false, false).is_ok());
+    assert!(guard_binary_stdout(false, true).is_ok());
+    // A terminal: refused, unless forced.
+    assert!(guard_binary_stdout(true, false).is_err());
+    assert!(guard_binary_stdout(true, true).is_ok());
+}
+
+/// Ignoring what a flag *does* is not the same as ignoring what it *says*: a
+/// typo in an attached value is still a broken command line, and swallowing it
+/// hides the mistake instead of reporting it.
+#[test]
+fn attached_short_option_values_are_validated() {
+    // Well-formed values are accepted and have no effect.
+    assert!(parse(&["-T4", "f"]).is_ok());
+    assert!(parse(&["-B128", "f"]).is_ok());
+    // Malformed ones are errors, not silence.
+    assert!(parse(&["-Tinvalid", "f"]).is_err());
+    assert!(parse(&["-Binvalid", "f"]).is_err());
+    assert!(parse(&["-Minvalid", "f"]).is_err());
 }

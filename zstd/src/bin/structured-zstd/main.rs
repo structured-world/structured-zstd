@@ -10,7 +10,7 @@ mod progress;
 use progress::{ProgressMonitor, fmt_size};
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, ErrorKind, Read, Write};
+use std::io::{self, BufReader, ErrorKind, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use structured_zstd::encoding::CompressionLevel;
@@ -109,9 +109,13 @@ struct Options {
     /// Long-distance matching (`--long`), enabled on the encoder via the
     /// compression-parameters API.
     long: bool,
-    /// Pledged input size from `--stream-size` / `--size-hint`. Used when the
-    /// input is not a regular file whose length we can stat, which is exactly
-    /// the case upstream documents these for.
+    /// Exact input length from `--stream-size`. Recorded in the frame header,
+    /// so the stream must actually be this long — a wrong value is an error,
+    /// not a worse ratio.
+    pledged_size: Option<u64>,
+    /// Estimated input length from `--size-hint`. Steers the encoder's window
+    /// and table sizing only; being wrong costs ratio, never correctness, so
+    /// it must NOT reach the header.
     size_hint: Option<u64>,
 }
 
@@ -142,6 +146,43 @@ fn parse_size(text: &str) -> Result<u64> {
     value
         .checked_mul(1u64 << shift)
         .ok_or_else(|| eyre!("size `{text}` does not fit in 64 bits"))
+}
+
+/// Check a requested decompression memory ceiling against the one this build
+/// actually enforces.
+///
+/// `-M` is a safety promise about untrusted input, not a performance hint, so
+/// it is either kept or refused. The decoder rejects any frame whose window
+/// exceeds a fixed ceiling, which makes a request at or above that ceiling
+/// already satisfied — we are the stricter of the two. A request BELOW it is a
+/// promise this build cannot make, and saying nothing would leave the caller
+/// believing a bound that is not there.
+fn check_memory_limit(requested: u64) -> Result<()> {
+    const ENFORCED: u64 = structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE;
+    if requested < ENFORCED {
+        bail!(
+            "requested memory limit {requested} B is below the {} MiB decompression \
+             window ceiling this build enforces; it cannot be tightened further",
+            ENFORCED / (1 << 20),
+        );
+    }
+    Ok(())
+}
+
+/// Refuse to write binary output into an interactive terminal unless forced.
+///
+/// A compressed frame painted into a terminal scrambles the session and the
+/// data is lost either way, so upstream requires `-f` for it and so do we. The
+/// decision is a pure function of the two inputs, which is what makes it
+/// testable: the caller supplies whether stdout is a terminal.
+fn guard_binary_stdout(stdout_is_terminal: bool, force: bool) -> Result<()> {
+    if stdout_is_terminal && !force {
+        bail!(
+            "refusing to write compressed data to a terminal; \
+             redirect the output, use -o FILE, or pass -f to force it"
+        );
+    }
+    Ok(())
 }
 
 /// Outcome of argument parsing: either run with `Options`, or a terminal
@@ -207,6 +248,7 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
         bench_end: 0,
         bench_secs: 1.0,
         long: false,
+        pledged_size: None,
         size_hint: None,
     };
     let mut ultra = false;
@@ -271,13 +313,19 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
                 | "no-asyncio"
                 | "mmap-dict"
                 | "no-mmap-dict"
-                | "pass-through"
                 | "no-pass-through"
                 | "compress-literals"
                 | "no-compress-literals"
                 | "row-match-finder"
-                | "no-row-match-finder"
-                | "exclude-compressed" => {}
+                | "no-row-match-finder" => {}
+                // These decide WHICH files are processed, or what happens to
+                // input that is not compressed. Accepting them without doing
+                // the work would compress a file the caller asked to skip, or
+                // fail on one they asked to copy through — a wrong answer, not
+                // a slower one.
+                "pass-through" | "exclude-compressed" => {
+                    bail!("--{long} is not implemented");
+                }
                 _ => {
                     if long == "fast" {
                         // `--fast` is the level -1 alias.
@@ -295,25 +343,25 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
                         opts.max_dict = v.parse::<usize>().wrap_err("invalid --maxdict size")?;
                     } else if let Some(v) = long.strip_prefix("dictID=") {
                         opts.dict_id = Some(v.parse::<u32>().wrap_err("invalid --dictID")?);
-                    } else if let Some(v) = long
-                        .strip_prefix("stream-size=")
-                        .or_else(|| long.strip_prefix("size-hint="))
-                    {
-                        // Real information, so it is threaded through rather
-                        // than ignored: the encoder sizes its window and tables
-                        // from the pledged size.
-                        opts.size_hint =
-                            Some(parse_size(v).wrap_err("invalid --stream-size / --size-hint")?);
+                    } else if let Some(v) = long.strip_prefix("stream-size=") {
+                        // An exact pledge: it goes into the frame header, so a
+                        // stream of a different length is an error.
+                        opts.pledged_size = Some(parse_size(v).wrap_err("invalid --stream-size")?);
+                    } else if let Some(v) = long.strip_prefix("size-hint=") {
+                        // An estimate: it sizes the encoder and nothing else,
+                        // so a wrong guess costs ratio rather than failing.
+                        opts.size_hint = Some(parse_size(v).wrap_err("invalid --size-hint")?);
                     } else if let Some(v) = long
                         .strip_prefix("memory=")
                         .or_else(|| long.strip_prefix("memlimit="))
                         .or_else(|| long.strip_prefix("memlimit-decompress="))
                     {
-                        // Accepted for compatibility: our decoder derives its
-                        // own window ceiling from the frame header, which is
-                        // what this flag guards against. Validated so a typo
-                        // still fails.
-                        let _ = parse_size(v).wrap_err("invalid memory limit")?;
+                        check_memory_limit(parse_size(v).wrap_err("invalid memory limit")?)?;
+                    } else if long.starts_with("adapt=") {
+                        // Parameterised form (`--adapt=min=1,max=9`). We do not
+                        // vary the level, so the bounds change nothing; failing
+                        // on the documented spelling while accepting the bare
+                        // one would be an arbitrary difference.
                     } else if let Some(v) = long.strip_prefix("auto-threads=") {
                         // Single-threaded: the choice has no effect, but a bad
                         // value is still a bad command line.
@@ -401,14 +449,33 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
                 // `-S` (benchmark each file separately) is the default here;
                 // `-q`/`-v` verbosity are accepted no-ops.
                 'q' | 'v' | 'S' => {}
-                'B' | 'T' | 'M' => {
-                    // `-B[N]` benchmark block size, `-T[N]` thread count,
-                    // `-M[N]` decompression memory ceiling. All three steer how
-                    // the work is done, not what comes out: we use a fixed
-                    // block size, run single-threaded, and bound the window
-                    // from the frame header. Upstream accepts them, so a script
-                    // that passes them must not fail here. Consume any attached
-                    // value.
+                'B' | 'T' => {
+                    // `-B[N]` job / block size, `-T[N]` thread count. Both
+                    // steer how the work is done, not what comes out: we use a
+                    // fixed block size and run single-threaded. Upstream
+                    // accepts them, so a script that passes them must not fail
+                    // here — but the VALUE is still parsed: ignoring what a
+                    // flag does is not a reason to ignore what it says, and a
+                    // typo is a broken command line either way.
+                    let rest: String = chars[ci + 1..].iter().collect();
+                    if !rest.is_empty() {
+                        parse_size(&rest).wrap_err_with(|| format!("invalid -{c} value"))?;
+                    }
+                    ci = chars.len();
+                    continue;
+                }
+                'M' => {
+                    // `-M[N]` is a decompression memory ceiling in MiB — a
+                    // safety promise, so it is checked against the one this
+                    // build enforces rather than swallowed.
+                    let rest: String = chars[ci + 1..].iter().collect();
+                    if !rest.is_empty() {
+                        let mib = parse_size(&rest).wrap_err("invalid -M memory limit")?;
+                        check_memory_limit(
+                            mib.checked_mul(1 << 20)
+                                .ok_or_else(|| eyre!("-M value `{rest}` is out of range"))?,
+                        )?;
+                    }
                     ci = chars.len();
                     continue;
                 }
@@ -514,10 +581,14 @@ fn print_help() {
          \x20 -h, --help           print this help\n\
          \n\
          Accepted for compatibility, with no effect here: -T/--single-thread/\n\
-         --auto-threads (single-threaded), -M/--memory (the window is bounded\n\
-         from the frame header), -B, --adapt, --[no-]progress, --[no-]check,\n\
-         --[no-]sparse, --[no-]asyncio, --[no-]mmap-dict, --[no-]pass-through,\n\
-         --[no-]compress-literals, --[no-]row-match-finder.\n\
+         --auto-threads (single-threaded), -B, --adapt, --[no-]progress,\n\
+         --check, --[no-]sparse, --[no-]asyncio, --[no-]mmap-dict,\n\
+         --no-pass-through, --[no-]compress-literals, --[no-]row-match-finder.\n\
+         \n\
+         Rejected rather than ignored, because they would change the result:\n\
+         --no-check, --no-content-size, --no-dictID, --format= (other than\n\
+         zstd), --patch-from, --rsyncable, --pass-through,\n\
+         --exclude-compressed, and -M/--memory below the enforced ceiling.\n\
          \n\
          With no FILE, or when FILE is `-`, read stdin / write stdout."
     );
@@ -614,7 +685,9 @@ fn run_benchmark(opts: &Options, dict: Option<&[u8]>) -> Result<()> {
                 level,
                 opts.store,
                 dict,
+                // The benchmark holds the whole input, so the length is exact.
                 Some(data.len() as u64),
+                None,
                 opts.long,
             )?;
             best_compress = best_compress.min(t.elapsed().as_secs_f64());
@@ -850,17 +923,19 @@ fn process_stdin_stdout(opts: &Options, dict: Option<&[u8]>) -> Result<()> {
         && !opts.to_stdout
         && matches!(opts.mode, Mode::Compress | Mode::Decompress)
     {
-        return write_stream_to_file(opts, reader, output, opts.size_hint, dict);
+        return write_stream_to_file(opts, reader, output, opts.pledged_size, dict);
     }
     match opts.mode {
         Mode::Compress => {
             let stdout = io::stdout();
+            guard_binary_stdout(stdout.is_terminal(), opts.force)?;
             compress_stream(
                 reader,
                 stdout.lock(),
                 opts.level,
                 opts.store,
                 dict,
+                opts.pledged_size,
                 opts.size_hint,
                 opts.long,
             )
@@ -892,12 +967,21 @@ fn run_stream_core<R: Read, W: Write>(
     opts: &Options,
     reader: R,
     writer: W,
-    size_hint: Option<u64>,
+    // Exact length when the caller knows it (a stat'd file, or
+    // `--stream-size`); `--size-hint` travels separately in `opts`.
+    pledged_size: Option<u64>,
     dict: Option<&[u8]>,
 ) -> Result<()> {
     match opts.mode {
         Mode::Compress => compress_stream(
-            reader, writer, opts.level, opts.store, dict, size_hint, opts.long,
+            reader,
+            writer,
+            opts.level,
+            opts.store,
+            dict,
+            pledged_size,
+            opts.size_hint,
+            opts.long,
         ),
         Mode::Decompress => decompress_stream(reader, writer, dict),
         Mode::Test | Mode::List | Mode::Train => {
@@ -979,6 +1063,11 @@ fn process_file(opts: &Options, input: &Path, dict: Option<&[u8]>) -> Result<()>
     // returning rather than short-circuiting past it.
     if opts.to_stdout {
         let stdout = io::stdout();
+        // Only compression produces binary; `-d` to a terminal is text the
+        // user asked for, which upstream also allows.
+        if matches!(opts.mode, Mode::Compress) {
+            guard_binary_stdout(stdout.is_terminal(), opts.force)?;
+        }
         let mut out = stdout.lock();
         run_stream_core(opts, &mut reader, &mut out, Some(source_size as u64), dict)?;
         return remove_source_if_requested(opts, input);
@@ -1000,6 +1089,9 @@ fn compress_stream<R: Read, W: Write>(
     level: i32,
     store: bool,
     dict: Option<&[u8]>,
+    // `pledged_size` is the exact length and lands in the frame header;
+    // `size_hint` is only an estimate and steers the encoder's geometry.
+    pledged_size: Option<u64>,
     size_hint: Option<u64>,
     long: bool,
 ) -> Result<()> {
@@ -1026,13 +1118,21 @@ fn compress_stream<R: Read, W: Write>(
             .set_parameters(&params)
             .wrap_err("failed to enable long-distance matching")?;
     }
-    if let Some(size) = size_hint {
-        // The size is known (a regular file), so pledge it: the frame records
-        // Frame_Content_Size (decoders can pre-allocate, `zstd -l` reports it)
-        // and the matcher sizes its tables to the source. stdin keeps it unset.
+    if let Some(size) = pledged_size {
+        // The size is known exactly (a regular file, or `--stream-size`), so
+        // pledge it: the frame records Frame_Content_Size (decoders can
+        // pre-allocate, `zstd -l` reports it) and the matcher sizes its tables
+        // to the source. A stream that then differs in length is an error.
         encoder
             .set_pledged_content_size(size)
             .wrap_err("failed to set pledged content size")?;
+    } else if let Some(size) = size_hint {
+        // Only an estimate (`--size-hint`): it steers the encoder's geometry
+        // and must NOT reach the header, or a wrong guess would turn a
+        // successful compression into a failure.
+        encoder
+            .set_source_size_hint(size)
+            .wrap_err("failed to set source size hint")?;
     }
     if let Some(raw) = dict {
         encoder
