@@ -36,10 +36,17 @@ autoexamples = false
 # `cargo add structured-zstd` and `cargo install structured-zstd` name the same
 # thing. It carries no dependencies of its own — argument parsing, progress
 # display and its error type are written against `std` — so `required-features`
-# names only the library capabilities it calls into, both of which are in
-# `default`. That is what makes `cargo install structured-zstd` work with no
-# flags while a library consumer's dependency graph stays untouched: a
-# `no_std` build simply does not select this target.
+# names only library capabilities, all of which are in `default`. That is what
+# makes `cargo install structured-zstd` work with no flags while a library
+# consumer's dependency graph stays untouched: a `no_std` build simply does not
+# select this target.
+#
+# The list is what the parser ADVERTISES, not the minimum that links: `-t` must
+# actually verify checksums (which needs `hash`, pulled in by `ldm`) and
+# `--long` must actually do long-distance matching, or a custom
+# `--no-default-features` install would answer `OK` for a frame whose checksum
+# is corrupt. A tool that reports success without doing the check is worse than
+# one that refuses to build.
 #
 # Deliberately NOT named `zstd`: `cargo install` writes into a directory that
 # usually precedes `/usr/bin` on `PATH`, so that name would shadow the system
@@ -49,7 +56,7 @@ autoexamples = false
 [[bin]]
 name = "structured-zstd"
 path = "src/bin/structured-zstd/main.rs"
-required-features = ["std", "dict-builder"]
+required-features = ["std", "dict-builder", "ldm"]
 
 # docs.rs builds the crate with the public feature set so feature-gated
 # items (e.g. the `dictionary` module behind `dict-builder`) appear in the

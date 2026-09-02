@@ -322,9 +322,13 @@ fn stream_size_pledges_and_size_hint_only_advises() {
 /// ignored.
 #[test]
 fn memory_limit_is_honoured_or_refused_never_ignored() {
-    // At or above our own ceiling: we are the stricter of the two.
+    // Comfortably above the window plus the decoder's auxiliary buffers.
     assert!(parse(&["-d", "-M256", "f"]).is_ok());
-    assert!(parse(&["-d", "--memory=128MB", "f"]).is_ok());
+    // Exactly the window is NOT enough: the decoder also holds literal, block,
+    // sequence and entropy-table buffers, so a promise of 128 MiB flat is one
+    // we would break.
+    assert!(parse(&["-d", "--memory=128MB", "f"]).is_err());
+    assert!(parse(&["-d", "--memory=160MB", "f"]).is_ok());
     // Below it: refuse rather than pretend.
     let err = match parse(&["-d", "-M8", "f"]) {
         Ok(_) => panic!("a limit below our own ceiling must be refused"),
@@ -388,4 +392,51 @@ fn attached_short_option_values_are_validated() {
     assert!(parse(&["-Tinvalid", "f"]).is_err());
     assert!(parse(&["-Binvalid", "f"]).is_err());
     assert!(parse(&["-Minvalid", "f"]).is_err());
+}
+
+/// Ignoring what `--adapt` does is not a licence to ignore what it says. The
+/// documented form is `min=`/`max=` numbers; anything else is a broken command
+/// line and has to be reported, not swallowed.
+#[test]
+fn adapt_parameters_are_validated() {
+    assert!(parse(&["--adapt", "f"]).is_ok());
+    assert!(parse(&["--adapt=min=1", "f"]).is_ok());
+    assert!(parse(&["--adapt=min=1,max=9", "f"]).is_ok());
+    assert!(parse(&["--adapt=max=9,min=1", "f"]).is_ok());
+
+    assert!(parse(&["--adapt=", "f"]).is_err(), "empty parameter list");
+    assert!(parse(&["--adapt=garbage", "f"]).is_err(), "not a key=value");
+    assert!(parse(&["--adapt=nim=1", "f"]).is_err(), "misspelled key");
+    assert!(parse(&["--adapt=min=x", "f"]).is_err(), "non-numeric value");
+    assert!(
+        parse(&["--adapt=min=1,", "f"]).is_err(),
+        "trailing separator"
+    );
+}
+
+/// `-t` exists to answer one question: is this frame intact? Answering "OK"
+/// for a frame whose stored checksum disagrees with the data is the one
+/// failure this mode cannot have — the caller would keep a corrupt archive on
+/// the strength of it. The decoder computes the digest by default but does not
+/// compare it, so verification has to be asked for explicitly.
+#[test]
+fn corrupted_checksum_is_reported_not_passed() {
+    // Built through the tool's own compression path, which turns the content
+    // checksum on the way the reference command does — the library default
+    // omits it, and a frame without one has nothing to verify.
+    let payload = b"payload whose checksum will be corrupted";
+    let mut frame = Vec::new();
+    compress_stream(&payload[..], &mut frame, 3, false, None, None, None, false)
+        .expect("compressing the fixture must succeed");
+    // The trailing four bytes are the frame's XXH64 check field.
+    let last = frame.len() - 1;
+    frame[last] ^= 0xFF;
+
+    let err = decompress_stream(frame.as_slice(), io::sink(), None)
+        .expect_err("a corrupted checksum must fail the decode");
+    let text = err.to_string();
+    assert!(
+        text.to_ascii_lowercase().contains("checksum"),
+        "the failure should name the checksum, got: {text}"
+    );
 }

@@ -158,13 +158,47 @@ fn parse_size(text: &str) -> Result<u64> {
 /// promise this build cannot make, and saying nothing would leave the caller
 /// believing a bound that is not there.
 fn check_memory_limit(requested: u64) -> Result<()> {
-    const ENFORCED: u64 = structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE;
-    if requested < ENFORCED {
+    /// Window ceiling the decoder refuses to exceed.
+    const WINDOW: u64 = structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE;
+    /// What the decoder holds BESIDES the window, rounded well up: the literal
+    /// and block buffers (a block is capped at 128 KiB each), the sequence
+    /// storage, the Huffman and FSE tables, and the tool's own I/O buffers.
+    /// Counted because the promise is about total memory, not about one
+    /// allocation: a limit equal to the window alone is one we would break.
+    const AUXILIARY: u64 = 1 << 20;
+    let floor = WINDOW + AUXILIARY;
+    if requested < floor {
         bail!(
-            "requested memory limit {requested} B is below the {} MiB decompression \
-             window ceiling this build enforces; it cannot be tightened further",
-            ENFORCED / (1 << 20),
+            "requested memory limit {requested} B is below what decompression can need \
+             here: a {} MiB window plus about {} MiB of literal, block, sequence and \
+             table buffers. This build cannot be tightened below that.",
+            WINDOW / (1 << 20),
+            AUXILIARY / (1 << 20),
         );
+    }
+    Ok(())
+}
+
+/// Validate the parameter list of `--adapt=min=N,max=N`.
+///
+/// The bounds have no effect here — the level does not vary — but a command
+/// line that misspells a key or passes a non-number is broken whether or not
+/// this build acts on it, and reporting that is the whole difference between
+/// ignoring a flag and hiding a mistake.
+fn parse_adapt_params(params: &str) -> Result<()> {
+    if params.is_empty() {
+        bail!("--adapt= needs parameters, e.g. --adapt=min=1,max=9");
+    }
+    for field in params.split(',') {
+        let (key, value) = field
+            .split_once('=')
+            .ok_or_else(|| eyre!("--adapt parameter `{field}` is not `key=value`"))?;
+        if key != "min" && key != "max" {
+            bail!("--adapt has no `{key}` parameter; expected `min` or `max`");
+        }
+        value
+            .parse::<i32>()
+            .map_err(|_| eyre!("--adapt {key} must be a number, got `{value}`"))?;
     }
     Ok(())
 }
@@ -357,11 +391,13 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
                         .or_else(|| long.strip_prefix("memlimit-decompress="))
                     {
                         check_memory_limit(parse_size(v).wrap_err("invalid memory limit")?)?;
-                    } else if long.starts_with("adapt=") {
+                    } else if let Some(params) = long.strip_prefix("adapt=") {
                         // Parameterised form (`--adapt=min=1,max=9`). We do not
-                        // vary the level, so the bounds change nothing; failing
-                        // on the documented spelling while accepting the bare
-                        // one would be an arbitrary difference.
+                        // vary the level, so the bounds change nothing — but a
+                        // misspelled key or a non-numeric bound is still a
+                        // broken command line, and the contract is that ignored
+                        // options validate what they are given.
+                        parse_adapt_params(params)?;
                     } else if let Some(v) = long.strip_prefix("auto-threads=") {
                         // Single-threaded: the choice has no effect, but a bad
                         // value is still a bad command line.
@@ -1150,14 +1186,25 @@ fn decompress_stream<R: Read, W: Write>(
     mut writer: W,
     dict: Option<&[u8]>,
 ) -> Result<()> {
-    let mut decoder = match dict {
-        Some(raw) => {
-            structured_zstd::decoding::StreamingDecoder::new_with_dictionary_bytes(reader, raw)
-                .map_err(|err| eyre!("failed to init dictionary decoder: {err:?}"))?
-        }
-        None => structured_zstd::decoding::StreamingDecoder::new(reader)
-            .map_err(|err| eyre!("invalid zstd frame: {err:?}"))?,
-    };
+    use structured_zstd::decoding::{ContentChecksum, FrameDecoder, StreamingDecoder};
+
+    // The library computes the digest but does not compare it, leaving the
+    // decision to the caller. For a command-line tool that decision is made:
+    // upstream validates by default, and `-t` exists to answer exactly this
+    // question, so a frame whose stored checksum disagrees with its data has
+    // to fail rather than decode quietly. Set before `init`, which is why the
+    // decoder is built here instead of by the plain constructors.
+    let mut frame_decoder = FrameDecoder::new();
+    frame_decoder.set_content_checksum(ContentChecksum::Verify);
+    if let Some(raw) = dict {
+        let handle = structured_zstd::decoding::DictionaryHandle::decode_dict(raw)
+            .map_err(|err| eyre!("failed to load dictionary for decompression: {err:?}"))?;
+        frame_decoder
+            .add_dict_handle(handle)
+            .map_err(|err| eyre!("failed to attach dictionary: {err:?}"))?;
+    }
+    let mut decoder = StreamingDecoder::new_with_decoder(reader, frame_decoder)
+        .map_err(|err| eyre!("invalid zstd frame: {err:?}"))?;
     io::copy(&mut decoder, &mut writer).wrap_err("streaming decompression failed")?;
     Ok(())
 }
