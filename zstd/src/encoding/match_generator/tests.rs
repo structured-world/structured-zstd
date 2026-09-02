@@ -2020,6 +2020,39 @@ fn driver_no_dictionary_reset_drops_the_attached_tables() {
 /// the chain / tree tables — they are tens of MiB at the btlazy2 levels and
 /// the rows finder never reads them.
 #[test]
+fn driver_rows_frame_releases_the_tree_buffer_capacity() {
+    // Coming back from a btlazy2 level, the row frame must not keep the tree
+    // tables' allocation resident: reporting a zero length while holding tens
+    // of MiB of capacity is the same leak in a different accounting column.
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+    driver.set_source_size_hint(1 << 20);
+    driver.reset(CompressionLevel::Level(15));
+    let mut space = driver.get_next_space();
+    space[..12].copy_from_slice(b"abcabcabcabc");
+    space.truncate(12);
+    driver.commit_space(space);
+    driver.skip_matching_with_hint(None);
+    let tree_capacity = driver.row_matcher().tables_capacity();
+    assert!(
+        tree_capacity > 0,
+        "fixture precondition: the tree tables are allocated at L15"
+    );
+
+    driver.set_source_size_hint(1 << 20);
+    driver.reset(CompressionLevel::Level(5));
+    let mut space = driver.get_next_space();
+    space[..12].copy_from_slice(b"abcabcabcabc");
+    space.truncate(12);
+    driver.commit_space(space);
+    driver.skip_matching_with_hint(None);
+    assert!(
+        driver.row_matcher().tables_capacity() < tree_capacity,
+        "a rows frame must hand back the oversized tree buffer, kept {} of {tree_capacity}",
+        driver.row_matcher().tables_capacity()
+    );
+}
+
+#[test]
 fn driver_rows_reset_releases_the_tree_tables() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
     driver.set_source_size_hint(1 << 20);

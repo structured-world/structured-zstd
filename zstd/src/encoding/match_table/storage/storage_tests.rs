@@ -340,6 +340,30 @@ fn reserve_for_frame_takes_the_request_as_given() {
 }
 
 #[test]
+fn ensure_tables_releases_the_buffer_when_the_layout_shrinks() {
+    // A reused compressor moving from a large-log level to a small one must
+    // not keep the biggest allocation it ever used: `clear` + `resize` alone
+    // would shrink the length and leave the capacity resident for every later
+    // frame.
+    let mut t = new_table(1 << 20);
+    t.hash_log = 20;
+    t.chain_log = 20;
+    t.hash3_log = 0;
+    t.ensure_tables();
+    let large = t.tables.capacity();
+    assert!(large >= 2 << 20, "fixture precondition: a large layout");
+
+    t.hash_log = 10;
+    t.chain_log = 10;
+    t.ensure_tables();
+    assert!(
+        t.tables.capacity() < large / 2,
+        "a smaller layout must release the oversized buffer, kept {} of {large}",
+        t.tables.capacity()
+    );
+}
+
+#[test]
 fn clone_from_replaces_the_uncommitted_count_with_the_sources() {
     // `clone_from` is the primed-dictionary restore path: it overwrites the
     // history buffer wholesale, so a count describing the OLD buffer must not

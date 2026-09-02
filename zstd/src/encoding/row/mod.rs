@@ -3152,8 +3152,16 @@ impl RowMatchGenerator {
             // targets (musl) amplified into the dominant per-frame cost.
             self.row_heads.clear();
             self.row_heads.resize(row_count, 0);
-            self.tables.clear();
-            self.tables.resize(total, ROW_EMPTY_SLOT);
+            if self.tables.capacity() > super::match_table::storage::oversized_capacity(total) {
+                // Coming down from the chain / tree finder (or a wider row
+                // layout): `clear` + `resize` would keep that allocation —
+                // tens of MiB at the btlazy2 levels — resident for every later
+                // row frame, which is what the separate vectors released.
+                self.tables = alloc::vec![ROW_EMPTY_SLOT; total];
+            } else {
+                self.tables.clear();
+                self.tables.resize(total, ROW_EMPTY_SLOT);
+            }
             self.hc_split = 0;
             self.row_tags.clear();
             self.row_tags.resize(total, 0);
@@ -3173,8 +3181,16 @@ impl RowMatchGenerator {
             // width change on either therefore rewrites both, which costs the
             // same fill the separate vectors paid and saves an allocation.
             if self.hc_split != hash_len || self.tables.len() != hash_len + chain_len || relayout {
-                self.tables.clear();
-                self.tables.resize(hash_len + chain_len, empty);
+                let total = hash_len + chain_len;
+                if self.tables.capacity() > super::match_table::storage::oversized_capacity(total) {
+                    // Same release rule as the row branch: a level downgrade
+                    // must not pin the widest tables this compressor ever
+                    // used.
+                    self.tables = alloc::vec![empty; total];
+                } else {
+                    self.tables.clear();
+                    self.tables.resize(total, empty);
+                }
                 self.hc_split = hash_len;
             }
             self.hc_layout = self.finder;
@@ -3186,6 +3202,13 @@ impl RowMatchGenerator {
             // buffer, so nothing to release here beyond the split marker.
             self.hc_split = 0;
         }
+    }
+
+    /// Capacity of the shared table buffer, to check that a level downgrade
+    /// hands the oversized allocation back. Test-only.
+    #[cfg(test)]
+    pub(crate) fn tables_capacity(&self) -> usize {
+        self.tables.capacity()
     }
 
     /// Combined length of the chain / tree tables. Test-only.
