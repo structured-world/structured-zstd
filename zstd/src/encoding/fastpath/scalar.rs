@@ -66,17 +66,22 @@ pub(crate) unsafe fn common_prefix_len_ptr(lhs: *const u8, rhs: *const u8, max: 
 /// callers pick the per-kernel implementation by symbol resolution rather
 /// than through a branching dispatcher inside the hot loop.
 ///
-/// Unused on little-endian aarch64: there the scalar BT collect-matches
-/// walker itself is compiled out (`MatchTable::bt_insert_and_collect_matches_scalar`
-/// is gated on `not(aarch64)`), since NEON is baseline on that target and the
-/// scalar walker can never be selected.
+/// Unused on little-endian aarch64 when the NEON tier is compiled in: the
+/// scalar BT collect-matches walker is then compiled out itself
+/// (`MatchTable::bt_insert_and_collect_matches_scalar` is gated on not having
+/// that combination), since NEON is baseline there and the scalar walker can
+/// never be selected. With `kernel-neon` off it becomes the live path again.
 ///
 /// # Safety
 /// Caller-side BT-walk invariants ensure
 /// `candidate_idx + tail_limit ≤ concat.len()` and
 /// `current_idx + tail_limit ≤ concat.len()`.
 #[cfg_attr(
-    all(target_arch = "aarch64", target_endian = "little"),
+    all(
+        target_arch = "aarch64",
+        target_endian = "little",
+        feature = "kernel-neon"
+    ),
     allow(dead_code)
 )]
 #[inline(always)]
