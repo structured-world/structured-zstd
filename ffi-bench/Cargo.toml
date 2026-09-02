@@ -222,6 +222,10 @@ name = "ffi_compress_z000033"
 path = "../zstd/examples/ffi_compress_z000033.rs"
 
 [[example]]
+name = "ffi_encode_loop_z000033"
+path = "../zstd/examples/ffi_encode_loop_z000033.rs"
+
+[[example]]
 name = "ffi_loop_dict"
 path = "../zstd/examples/ffi_loop_dict.rs"
 
