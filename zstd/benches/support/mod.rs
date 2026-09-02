@@ -536,9 +536,15 @@ fn load_decode_corpus_scenario() -> Scenario {
     //      binary (invoked directly via `STRUCTURED_ZSTD_BENCH_BIN`,
     //      bypassing cargo) can still locate the fixture even though
     //      `CARGO_MANIFEST_DIR` is not in its environment.
-    //   2. `CARGO_MANIFEST_DIR/decodecorpus_files/z000033` — local
-    //      `cargo bench` runs, where cargo injects the manifest dir.
-    //   3. Synthetic 1 MiB fallback — packaged sources / hand-run
+    //   2. `CARGO_MANIFEST_DIR/decodecorpus_files/z000033` — a `cargo bench`
+    //      run whose manifest dir already owns the fixture.
+    //   3. `CARGO_MANIFEST_DIR/../zstd/decodecorpus_files/z000033` — these
+    //      bench targets belong to the `ffi-bench` crate (they link the C
+    //      bindings) while their sources and the fixture live under `zstd/`,
+    //      so a local `cargo bench -p ffi-bench` gets a manifest dir with no
+    //      fixture under it and would otherwise fall through to the synthetic
+    //      corpus without the operator noticing.
+    //   4. Synthetic 1 MiB fallback — packaged sources / hand-run
     //      binaries with no fixture access.
     let candidate_paths: Vec<std::path::PathBuf> = {
         let mut paths = Vec::new();
@@ -549,7 +555,9 @@ fn load_decode_corpus_scenario() -> Scenario {
             }
         }
         if let Ok(manifest_dir) = env::var("CARGO_MANIFEST_DIR") {
-            paths.push(Path::new(&manifest_dir).join("decodecorpus_files/z000033"));
+            let dir = Path::new(&manifest_dir);
+            paths.push(dir.join("decodecorpus_files/z000033"));
+            paths.push(dir.join("../zstd/decodecorpus_files/z000033"));
         }
         paths
     };
