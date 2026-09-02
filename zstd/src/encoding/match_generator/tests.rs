@@ -718,9 +718,15 @@ fn bt_optimal_all_kernel_tiers_emit_identical_sequences() {
     // x86 box (including a CI runner without AVX2).
     let mut tiers = Vec::new();
     tiers.push(FastpathKernel::Scalar);
+    #[cfg(feature = "kernel_sse")]
+    if std::is_x86_feature_detected!("sse2") {
+        tiers.push(FastpathKernel::Sse2);
+    }
+    #[cfg(feature = "kernel_sse")]
     if std::is_x86_feature_detected!("sse4.2") {
         tiers.push(FastpathKernel::Sse42);
     }
+    #[cfg(feature = "kernel_avx2")]
     if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi2") {
         tiers.push(FastpathKernel::Avx2Bmi2);
     }

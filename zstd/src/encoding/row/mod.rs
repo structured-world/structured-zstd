@@ -2194,7 +2194,8 @@ fn row_tag_match_mask_scalar(tags: &[u8], tag: u8) -> u64 {
 #[cfg(all(
     test,
     feature = "std",
-    any(target_arch = "x86", target_arch = "x86_64")
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "kernel_sse"
 ))]
 #[target_feature(enable = "sse2")]
 unsafe fn row_tag_match_mask_sse2(tags: &[u8], tag: u8) -> u64 {
@@ -2206,7 +2207,8 @@ unsafe fn row_tag_match_mask_sse2(tags: &[u8], tag: u8) -> u64 {
 #[cfg(all(
     test,
     feature = "std",
-    any(target_arch = "x86", target_arch = "x86_64")
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "kernel_avx2"
 ))]
 #[target_feature(enable = "avx2")]
 unsafe fn row_tag_match_mask_avx2(tags: &[u8], tag: u8) -> u64 {
