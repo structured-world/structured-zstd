@@ -1135,7 +1135,7 @@ impl HcMatchGenerator {
     /// the BT backend owns an `ldm_producer` slot; on the HC (lazy)
     /// backend the producer is dropped because there is no optimal-parser
     /// candidate buffer to seed. Call after [`Self::reset`].
-    #[cfg(feature = "hash")]
+    #[cfg(feature = "ldm")]
     pub(crate) fn set_ldm_producer(&mut self, producer: Option<crate::encoding::ldm::LdmProducer>) {
         if let HcBackend::Bt(bt) = &mut self.backend {
             bt.ldm_producer = producer;
@@ -1147,7 +1147,7 @@ impl HcMatchGenerator {
     /// is not dict-primed; its hash table is empty at capture), so it is not
     /// retained in the snapshot — the working frame's freshly-reset producer is
     /// reinstated on restore instead.
-    #[cfg(feature = "hash")]
+    #[cfg(feature = "ldm")]
     pub(crate) fn take_ldm_producer(&mut self) -> Option<crate::encoding::ldm::LdmProducer> {
         if let HcBackend::Bt(bt) = &mut self.backend {
             bt.ldm_producer.take()

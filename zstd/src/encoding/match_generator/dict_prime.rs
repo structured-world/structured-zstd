@@ -383,7 +383,7 @@ impl MatchGeneratorDriver {
                 // with the same params the snapshot key pins, and empty (no
                 // input processed yet), so it is equivalent to the producer
                 // the snapshot was captured with.
-                #[cfg(feature = "hash")]
+                #[cfg(feature = "ldm")]
                 {
                     let fresh_ldm = if let MatcherStorage::HashChain(hc) = live {
                         hc.take_ldm_producer()
@@ -447,7 +447,7 @@ impl MatchGeneratorDriver {
             // dict-primed; its hash table is empty at capture), so it is not
             // retained either — `restore` reinstates the frame's freshly-reset
             // producer. Take it out so the clone does not duplicate its table.
-            #[cfg(feature = "hash")]
+            #[cfg(feature = "ldm")]
             let ldm_producer = hc.take_ldm_producer();
             // Clone the dict-state-only storage (live tables now empty Vecs,
             // LDM producer detached).
@@ -459,7 +459,7 @@ impl MatchGeneratorDriver {
             hc.table.hash_table = hash_table;
             hc.table.chain_table = chain_table;
             hc.table.hash3_table = hash3_table;
-            #[cfg(feature = "hash")]
+            #[cfg(feature = "ldm")]
             hc.set_ldm_producer(ldm_producer);
             self.primed = Some((snapshot, self.dictionary_retained_budget, key));
         } else {

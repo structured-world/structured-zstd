@@ -1454,7 +1454,7 @@ impl Matcher for MatchGeneratorDriver {
         // producer. Built AFTER `hc.reset()` because `BtMatcher::reset`
         // clears an existing producer's table but does not null the
         // slot — installing here gives the new frame a fresh producer.
-        #[cfg(feature = "hash")]
+        #[cfg(feature = "ldm")]
         {
             // Resolve the derived LDM params first (immutable borrow of the
             // overrides), then reuse the existing producer's allocation below.

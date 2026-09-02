@@ -20,7 +20,7 @@
 use alloc::vec::Vec;
 
 use super::cost_model::{HC_MAX_LIT, HcOptState, HcOptimalCostProfile};
-#[cfg(feature = "hash")]
+#[cfg(feature = "ldm")]
 use super::ldm::LdmProducer;
 use super::opt::ldm::{HcOptLdmState, HcRawSeq, HcRawSeqStore};
 use super::opt::types::{HcOptimalNode, HcOptimalPlanBuffers, HcOptimalSequence, MatchCandidate};
@@ -94,7 +94,7 @@ pub(crate) struct BtMatcher {
     /// `twox-hash` dependency; under `default-features = false`
     /// the field disappears and the `prepare_ldm_candidates`
     /// body shrinks to the legacy `ldm_sequences.clear()` stub.
-    #[cfg(feature = "hash")]
+    #[cfg(feature = "ldm")]
     pub(crate) ldm_producer: Option<LdmProducer>,
 }
 
@@ -171,7 +171,7 @@ impl BtMatcher {
             opt_lit_price_stamp: 0,
             opt_ml_price_stamp: 0,
             ldm_sequences: Vec::new(),
-            #[cfg(feature = "hash")]
+            #[cfg(feature = "ldm")]
             ldm_producer: None,
         }
     }
@@ -189,9 +189,9 @@ impl BtMatcher {
             + self.opt_price_arena.len() * core::mem::size_of::<[u32; 2]>()
             + self.ldm_sequences.capacity() * core::mem::size_of::<HcRawSeq>();
         // The LDM producer is only present under the `hash` feature.
-        #[cfg(feature = "hash")]
+        #[cfg(feature = "ldm")]
         let ldm = self.ldm_producer.as_ref().map_or(0, |p| p.heap_size());
-        #[cfg(not(feature = "hash"))]
+        #[cfg(not(feature = "ldm"))]
         let ldm = 0;
         scratch + ldm
     }
@@ -218,7 +218,7 @@ impl BtMatcher {
         self.opt_lit_price_generation = [0; HC_MAX_LIT + 1];
         self.opt_lit_price_stamp = 0;
         self.ldm_sequences.clear();
-        #[cfg(feature = "hash")]
+        #[cfg(feature = "ldm")]
         if let Some(producer) = self.ldm_producer.as_mut() {
             producer.clear();
         }
@@ -430,7 +430,7 @@ impl BtMatcher {
         current_len: usize,
     ) {
         self.ldm_sequences.clear();
-        #[cfg(feature = "hash")]
+        #[cfg(feature = "ldm")]
         if let Some(producer) = self.ldm_producer.as_mut() {
             debug_assert!(current_abs_start >= history_abs_start);
             // MatchTable invariant: `live_history.len() ==
@@ -460,7 +460,7 @@ impl BtMatcher {
                 &mut self.ldm_sequences,
             );
         }
-        #[cfg(not(feature = "hash"))]
+        #[cfg(not(feature = "ldm"))]
         {
             // Under `default-features = false` (no `hash`),
             // `LdmProducer` is not compiled — `live_history` /

@@ -43,7 +43,7 @@ autoexamples = false
 # `#[cfg_attr(docsrs, doc(cfg(...)))]` annotations that render feature
 # badges on each item.
 [package.metadata.docs.rs]
-features = ["std", "hash", "dict_builder", "lsm"]
+features = ["std", "hash", "ldm", "dict_builder", "lsm"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
@@ -79,6 +79,7 @@ rand = "0.10"
 [features]
 default = [
     "hash",
+    "ldm",
     "std",
     "kernel_scalar",
     "kernel_sse",
@@ -129,6 +130,14 @@ kernel_sve = ["kernel_neon"]
 kernel_simd128 = []
 dict_builder = ["std", "dep:fastrand"]
 hash = ["dep:twox-hash"]
+# Long-distance matching in the encoder. Implies `hash`: the LDM match finder
+# hashes each `min_match_length` window with XXH64. Without it the parameter
+# builder still accepts `enable_long_distance_matching(true)` and the frame
+# stays valid, but no long-distance matches are produced.
+#
+# Not to be confused with `lsm` below (storage-format extensions) — the names
+# differ by one letter and mean unrelated things.
+ldm = ["hash"]
 # Opt-in cache for FSE default tables on no-atomic targets. See
 # `fse_encoder::default_*_table` for the implementation split. On
 # targets with atomic pointer support this feature is a no-op.

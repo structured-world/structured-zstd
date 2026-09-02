@@ -74,10 +74,9 @@ Override individual compression knobs (the drop-in equivalent of C zstd's
 `ZSTD_CCtx_setParameter`). Every knob left unset inherits the base level's
 default, so a parameter set that overrides nothing reproduces plain
 level-based compression. Long-distance matching is off at every level preset
-and is activated only here; it also needs the (default-on) `hash` feature,
-since the LDM match finder hashes each window with XXH64. Without `hash` the
-builder still accepts `enable_long_distance_matching(true)` and the frame is
-still valid, but no long-distance matches are produced:
+and is activated only here; it also needs the (default-on) `ldm` feature.
+Without it the builder still accepts `enable_long_distance_matching(true)` and
+the frame is still valid, but no long-distance matches are produced:
 
 ```rust
 use structured_zstd::encoding::{
@@ -158,7 +157,8 @@ in pure Rust:
 | Feature | Default | What it enables |
 |---------|---------|-----------------|
 | `std` | ✅ | Runtime CPU detection, `std::io` adapters |
-| `hash` | ✅ | XXH64 content checksums **and long-distance matching** (LDM hashes each window with XXH64) |
+| `hash` | ✅ | XXH64 content checksums |
+| `ldm` | ✅ | Long-distance matching (implies `hash`: LDM hashes each window with XXH64) |
 | `kernel_sse`, `kernel_bmi2`, `kernel_avx2` | ✅ | x86 SIMD kernels (`kernel_sse` covers both the SSE2 and SSE4.2 tiers) |
 | `kernel_neon`, `kernel_sve` | ✅ | aarch64 SIMD kernels |
 | `kernel_simd128` | ✅ | WebAssembly SIMD kernel (needs `-C target-feature=+simd128`) |
