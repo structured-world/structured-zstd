@@ -1767,7 +1767,7 @@ impl HcMatchGenerator {
             stats,
             out,
             buffers,
-            collect_optimal_candidates_initialized_scalar,
+            collect_optimal_candidates_initialized_simd128,
             crate::encoding::hc::priceset::priceset_range_nonabort_simd128,
         )
     }
