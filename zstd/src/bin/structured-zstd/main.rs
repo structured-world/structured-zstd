@@ -13,12 +13,56 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 
-use color_eyre::eyre::{WrapErr, bail, eyre};
 use structured_zstd::encoding::CompressionLevel;
-use tracing::info;
-use tracing_indicatif::IndicatifLayer;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
+
+/// Error type for the tool: a boxed message, which is all a command-line
+/// program does with an error — print it and exit non-zero. Written against
+/// `std` rather than an error library so the tool adds no dependency to the
+/// crate that hosts it.
+type Error = Box<dyn std::error::Error + Send + Sync>;
+
+/// The tool's result alias, shadowing `std::result::Result`'s second parameter.
+type Result<T, E = Error> = core::result::Result<T, E>;
+
+/// Build an [`Error`] from a format string.
+macro_rules! eyre {
+    ($($arg:tt)*) => {
+        <$crate::Error as From<String>>::from(format!($($arg)*))
+    };
+}
+
+/// Return early with a formatted [`Error`].
+macro_rules! bail {
+    ($($arg:tt)*) => {
+        return Err(eyre!($($arg)*))
+    };
+}
+
+/// Attach context to an error, the way `wrap_err` does: the message, then the
+/// cause. Kept under the same names so every call site reads unchanged.
+trait WrapErr<T> {
+    /// Prefix the error with `msg`.
+    fn wrap_err(self, msg: impl core::fmt::Display) -> Result<T>;
+    /// Prefix the error with a message built only when there is an error.
+    fn wrap_err_with<D: core::fmt::Display, F: FnOnce() -> D>(self, msg: F) -> Result<T>;
+}
+
+impl<T, E: core::fmt::Display> WrapErr<T> for core::result::Result<T, E> {
+    fn wrap_err(self, msg: impl core::fmt::Display) -> Result<T> {
+        self.map_err(|source| eyre!("{msg}: {source}"))
+    }
+
+    fn wrap_err_with<D: core::fmt::Display, F: FnOnce() -> D>(self, msg: F) -> Result<T> {
+        self.map_err(|source| eyre!("{}: {source}", msg()))
+    }
+}
+/// Status line to stderr. A tool this size does not need a tracing subscriber
+/// to say "file -> file.zst"; keeping it a macro preserves every call site.
+macro_rules! info {
+    ($($arg:tt)*) => {
+        eprintln!($($arg)*)
+    };
+}
 
 const ZSTD_SUFFIX: &str = ".zst";
 
@@ -77,7 +121,7 @@ const DEFAULT_MAX_DICT: usize = 112_640;
 /// Parse a size written the way upstream accepts it: a plain count, or one
 /// suffixed `KB`/`MB`/`GB` (also spelled `K`/`M`/`G`, any case). Upstream uses
 /// powers of two for these, despite the decimal-looking names.
-fn parse_size(text: &str) -> color_eyre::Result<u64> {
+fn parse_size(text: &str) -> Result<u64> {
     let trimmed = text.trim();
     let upper = trimmed.to_ascii_uppercase();
     let (digits, shift) = match upper.as_str() {
@@ -107,7 +151,7 @@ enum Parsed {
     Handled,
 }
 
-fn main() -> color_eyre::Result<()> {
+fn main() -> Result<()> {
     let raw: Vec<String> = std::env::args().collect();
     let prog = raw.first().map(String::as_str).unwrap_or("zstd");
     let (default_mode, argv0_stdout) = program_mode(prog);
@@ -118,18 +162,9 @@ fn main() -> color_eyre::Result<()> {
         Parsed::Handled => return Ok(()),
     };
 
-    // Logging (with indicatif progress integration) goes to stderr so it never
-    // contaminates a `-c` stdout data stream.
-    let indicatif_layer = IndicatifLayer::new();
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(indicatif_layer.get_stderr_writer())
-                .without_time(),
-        )
-        .with(indicatif_layer)
-        .init();
-
+    // Status goes to stderr through `info!` below, so it never contaminates a
+    // `-c` stdout data stream. No subscriber to install: the macro writes
+    // there directly.
     run(options)
 }
 
@@ -153,11 +188,7 @@ fn program_mode(prog: &str) -> (Mode, bool) {
 /// Manual upstream-style parse: bare `-N` is a level, short flags combine
 /// (`-dc`), `-o`/`-D` take a value, `--long-opts` are matched whole. `clap`'s
 /// derive cannot model bare numeric levels, so we parse argv directly.
-fn parse_args(
-    args: &[String],
-    default_mode: Mode,
-    argv0_stdout: bool,
-) -> color_eyre::Result<Parsed> {
+fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result<Parsed> {
     let mut opts = Options {
         mode: default_mode,
         level: CompressionLevel::DEFAULT_LEVEL,
@@ -436,7 +467,7 @@ fn parse_args(
     Ok(Parsed::Run(opts))
 }
 
-fn validate_level(level: i32) -> color_eyre::Result<()> {
+fn validate_level(level: i32) -> Result<()> {
     let (min, max) = (CompressionLevel::MIN_LEVEL, CompressionLevel::MAX_LEVEL);
     if !(min..=max).contains(&level) {
         bail!("compression level {level} out of range [{min}, {max}]");
@@ -492,7 +523,7 @@ fn print_help() {
     );
 }
 
-fn run(opts: Options) -> color_eyre::Result<()> {
+fn run(opts: Options) -> Result<()> {
     let dict_bytes = match &opts.dict {
         Some(path) => Some(
             fs::read(path)
@@ -544,7 +575,7 @@ fn run(opts: Options) -> color_eyre::Result<()> {
 /// requested level range, reporting ratio and best-of throughput. A simplified
 /// `zstd -b#` (per-level row); honours `-D` so dictionary throughput can be
 /// measured. Time-budgeted per level rather than fixed-iteration.
-fn run_benchmark(opts: &Options, dict: Option<&[u8]>) -> color_eyre::Result<()> {
+fn run_benchmark(opts: &Options, dict: Option<&[u8]>) -> Result<()> {
     use std::time::Instant;
 
     if opts.inputs.is_empty() || opts.inputs.iter().any(|i| i == "-") {
@@ -626,7 +657,7 @@ fn run_benchmark(opts: &Options, dict: Option<&[u8]>) -> color_eyre::Result<()> 
 /// `--train`: build a FastCOVER dictionary from the concatenated sample files
 /// and write it to `-o` (default `dictionary`). Mirrors upstream
 /// `zstd --train FILEs -o dict --maxdict=N [--dictID=N]`.
-fn train_dictionary(opts: &Options) -> color_eyre::Result<()> {
+fn train_dictionary(opts: &Options) -> Result<()> {
     use structured_zstd::dictionary::{
         FastCoverOptions, FinalizeOptions, create_fastcover_dict_from_source,
     };
@@ -671,7 +702,7 @@ fn train_dictionary(opts: &Options) -> color_eyre::Result<()> {
 /// Read into `buf` until it is full or EOF, returning the number of bytes read.
 /// Unlike a single `read`, this fills as much as the source has, so a header
 /// parse sees the whole header even when the OS hands back short reads.
-fn read_filling<R: Read>(reader: &mut R, buf: &mut [u8]) -> color_eyre::Result<usize> {
+fn read_filling<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<usize> {
     let mut filled = 0;
     while filled < buf.len() {
         match reader.read(&mut buf[filled..]) {
@@ -701,7 +732,7 @@ const MAX_FRAME_HEADER_LEN: usize = 18;
 /// Reads each frame header, then walks the 3-byte block headers by `seek`ing
 /// past every block body, so peak memory stays O(1) regardless of archive size
 /// (a multi-GB file is never loaded whole).
-fn list_file(path: &Path) -> color_eyre::Result<()> {
+fn list_file(path: &Path) -> Result<()> {
     use std::io::{Seek, SeekFrom};
     use structured_zstd::decoding::{FrameContentSize, read_frame_header_info};
 
@@ -808,7 +839,7 @@ fn list_file(path: &Path) -> color_eyre::Result<()> {
 }
 
 /// stdin → stdout (or → `-o` file) for a `-` input or no inputs.
-fn process_stdin_stdout(opts: &Options, dict: Option<&[u8]>) -> color_eyre::Result<()> {
+fn process_stdin_stdout(opts: &Options, dict: Option<&[u8]>) -> Result<()> {
     let stdin = io::stdin();
     let reader = stdin.lock();
     // `-o` redirects stdin's (de)compressed output to a file, unless `-c`
@@ -849,7 +880,7 @@ fn process_stdin_stdout(opts: &Options, dict: Option<&[u8]>) -> color_eyre::Resu
 
 /// Remove the source file after a successful (de)compression when `--rm` is set
 /// (and `-k` was not). A no-op otherwise.
-fn remove_source_if_requested(opts: &Options, input: &Path) -> color_eyre::Result<()> {
+fn remove_source_if_requested(opts: &Options, input: &Path) -> Result<()> {
     if opts.remove_source && !opts.keep {
         fs::remove_file(input).wrap_err("failed to remove source file after success")?;
     }
@@ -863,7 +894,7 @@ fn run_stream_core<R: Read, W: Write>(
     writer: W,
     size_hint: Option<u64>,
     dict: Option<&[u8]>,
-) -> color_eyre::Result<()> {
+) -> Result<()> {
     match opts.mode {
         Mode::Compress => compress_stream(
             reader, writer, opts.level, opts.store, dict, size_hint, opts.long,
@@ -884,13 +915,13 @@ fn write_stream_to_file<R: Read>(
     output: &Path,
     size_hint: Option<u64>,
     dict: Option<&[u8]>,
-) -> color_eyre::Result<()> {
+) -> Result<()> {
     ensure_regular_output_destination(output)?;
     if output.exists() && !opts.force {
         bail!("{} already exists; use -f to overwrite", output.display());
     }
     let (temp_path, temp_file) = create_temporary_output_file(output)?;
-    let result: color_eyre::Result<()> = (|| {
+    let result: Result<()> = (|| {
         let mut sink = temp_file;
         run_stream_core(opts, &mut reader, &mut sink, size_hint, dict)?;
         sink.flush().wrap_err("failed to flush output")?;
@@ -904,7 +935,7 @@ fn write_stream_to_file<R: Read>(
 }
 
 /// Resolve the output path for a file input under the current mode.
-fn derive_output_path(opts: &Options, input: &Path) -> color_eyre::Result<PathBuf> {
+fn derive_output_path(opts: &Options, input: &Path) -> Result<PathBuf> {
     if let Some(out) = &opts.output {
         return Ok(out.clone());
     }
@@ -926,7 +957,7 @@ fn derive_output_path(opts: &Options, input: &Path) -> color_eyre::Result<PathBu
     }
 }
 
-fn process_file(opts: &Options, input: &Path, dict: Option<&[u8]>) -> color_eyre::Result<()> {
+fn process_file(opts: &Options, input: &Path, dict: Option<&[u8]>) -> Result<()> {
     let source = File::open(input)
         .wrap_err_with(|| format!("failed to open input file {}", input.display()))?;
     let source_size: usize = source
@@ -971,7 +1002,7 @@ fn compress_stream<R: Read, W: Write>(
     dict: Option<&[u8]>,
     size_hint: Option<u64>,
     long: bool,
-) -> color_eyre::Result<()> {
+) -> Result<()> {
     let compression_level = if store {
         CompressionLevel::Uncompressed
     } else {
@@ -1018,7 +1049,7 @@ fn decompress_stream<R: Read, W: Write>(
     reader: R,
     mut writer: W,
     dict: Option<&[u8]>,
-) -> color_eyre::Result<()> {
+) -> Result<()> {
     let mut decoder = match dict {
         Some(raw) => {
             structured_zstd::decoding::StreamingDecoder::new_with_dictionary_bytes(reader, raw)
@@ -1036,7 +1067,7 @@ fn decompress_stream<R: Read, W: Write>(
 // from the original CLI; shared by compress and decompress.
 // ---------------------------------------------------------------------------
 
-fn ensure_distinct_paths(input: &Path, output: &Path) -> color_eyre::Result<()> {
+fn ensure_distinct_paths(input: &Path, output: &Path) -> Result<()> {
     let canonical_input = match fs::canonicalize(input) {
         Ok(path) => path,
         Err(err) if err.kind() == ErrorKind::NotFound => {
@@ -1058,7 +1089,7 @@ fn ensure_distinct_paths(input: &Path, output: &Path) -> color_eyre::Result<()> 
     Ok(())
 }
 
-fn paths_point_to_same_file(input: &Path, output: &Path) -> color_eyre::Result<bool> {
+fn paths_point_to_same_file(input: &Path, output: &Path) -> Result<bool> {
     let input_metadata = fs::metadata(input).wrap_err("failed to inspect input file metadata")?;
     let output_metadata =
         fs::metadata(output).wrap_err("failed to inspect existing output file metadata")?;
@@ -1088,14 +1119,14 @@ fn paths_point_to_same_file(input: &Path, output: &Path) -> color_eyre::Result<b
 }
 
 #[cfg(windows)]
-fn create_temporary_output_path(output: &Path) -> color_eyre::Result<PathBuf> {
+fn create_temporary_output_path(output: &Path) -> Result<PathBuf> {
     let (path, file) = create_temporary_output_file(output)?;
     drop(file);
     fs::remove_file(&path).wrap_err("failed to reserve temporary output path")?;
     Ok(path)
 }
 
-fn create_temporary_output_file(output: &Path) -> color_eyre::Result<(PathBuf, File)> {
+fn create_temporary_output_file(output: &Path) -> Result<(PathBuf, File)> {
     let parent = output.parent().unwrap_or_else(|| Path::new("."));
     let file_name = output
         .file_name()
@@ -1122,7 +1153,7 @@ fn create_temporary_output_file(output: &Path) -> color_eyre::Result<(PathBuf, F
     Err(eyre!("failed to allocate unique temporary output file"))
 }
 
-fn replace_output_file(temporary_output_path: &Path, output: &Path) -> color_eyre::Result<()> {
+fn replace_output_file(temporary_output_path: &Path, output: &Path) -> Result<()> {
     let output_kind = match output_destination_kind(output).inspect_err(|_err| {
         let _ = fs::remove_file(temporary_output_path);
     })? {
@@ -1195,7 +1226,7 @@ fn replace_output_file(temporary_output_path: &Path, output: &Path) -> color_eyr
     }
 }
 
-fn output_destination_kind(output: &Path) -> color_eyre::Result<Option<std::fs::FileType>> {
+fn output_destination_kind(output: &Path) -> Result<Option<std::fs::FileType>> {
     match fs::symlink_metadata(output) {
         Ok(metadata) => Ok(Some(metadata.file_type())),
         Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
@@ -1203,7 +1234,7 @@ fn output_destination_kind(output: &Path) -> color_eyre::Result<Option<std::fs::
     }
 }
 
-fn ensure_regular_output_destination(output: &Path) -> color_eyre::Result<()> {
+fn ensure_regular_output_destination(output: &Path) -> Result<()> {
     if output_destination_kind(output)?.is_some_and(|kind| !kind.is_file()) {
         return Err(eyre!(
             "output path exists and is not a regular file: {output:?}"

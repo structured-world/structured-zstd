@@ -40,11 +40,18 @@ Release notes for every version live in [`zstd/CHANGELOG.md`](https://github.com
 
 ## Command-line tool
 
+The tool ships from this same crate, so one name covers both uses:
+
 ```bash
-cargo install structured-zstd-cli
+cargo add structured-zstd        # the library
+cargo install structured-zstd    # the `structured-zstd` binary
 ```
 
-This installs a `structured-zstd` binary that speaks the upstream `zstd`
+It carries no dependencies of its own — argument parsing, progress display and
+error reporting are written against `std` — so depending on the library pulls
+in nothing extra.
+
+The binary speaks the upstream `zstd`
 command line: levels (`-1`..`-19`, `--ultra` for `-20`..`-22`, `--fast[=N]`),
 `-d`, `-c`, `-o`, `-t`, `-l`, `-D`, `--train`, `-b`, and the usual
 `-f`/`-k`/`--rm` file handling. Flags that only steer how the work is done

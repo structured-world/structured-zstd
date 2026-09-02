@@ -1,6 +1,6 @@
 use super::*;
 
-fn parse(args: &[&str]) -> color_eyre::Result<Options> {
+fn parse(args: &[&str]) -> Result<Options> {
     let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     match parse_args(&owned, Mode::Compress, false)? {
         Parsed::Run(opts) => Ok(opts),

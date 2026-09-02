@@ -1,16 +1,25 @@
-// ! Utilities for displaying a progress monitor to track compression/decompression/whatever else
+//! Progress display for the command-line tool.
 //!
-//! This implementation relies heavily on the `indicatif` crate, see <https://docs.rs/indicatif>cargo hack check --feature-powerset --exclude-features rustc-dep-of-std
+//! Written against `std` alone. A progress bar is a few dozen lines of
+//! formatting, and the crates that provide one are the reason a tool would
+//! otherwise drag an argument parser, a terminal library and a tracing
+//! subscriber into a compression library's dependency graph.
 
-use std::{fmt::Write, io::Read, time::Duration};
+use std::{
+    fmt::Write as _,
+    io::{IsTerminal, Read, Write as _},
+    time::{Duration, Instant},
+};
 
-use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
-use tracing::info;
+/// Redraw at most this often. The work between reads is measured in
+/// microseconds, so repainting per read would cost more than the compression.
+const REDRAW_INTERVAL: Duration = Duration::from_millis(125);
+
+/// Width of the drawn bar, in characters.
+const BAR_WIDTH: usize = 32;
 
 /// A generic wrapper around a reader that keeps track of how many bytes have been read
 /// from the total.
-///
-/// This wrapper has a lock on standard out for the lifetime of the monitor
 pub struct ProgressMonitor<R: Read> {
     /// The total amount that the reader will read
     pub total: usize,
@@ -18,39 +27,85 @@ pub struct ProgressMonitor<R: Read> {
     pub read: usize,
     /// The internal reader
     reader: R,
-    progress_bar: ProgressBar,
+    started: Instant,
+    last_draw: Instant,
+    /// Only draw when stderr is a terminal: piped output must stay clean.
+    interactive: bool,
+    finished: bool,
 }
 
 impl<R: Read> ProgressMonitor<R> {
     /// Create a new progress monitor, initialized with zero bytes read
     pub fn new(reader: R, size: usize) -> Self {
-        // https://docs.rs/indicatif/latest/indicatif/index.html#templates
-        let style = ProgressStyle::with_template(
-            "{wide_bar} {binary_bytes}/{binary_total_bytes}  \n[est. {eta} remaining]",
-        )
-        .unwrap();
-        let progress_bar = ProgressBar::new(size as u64).with_style(style);
-        // The default is 20hz, this reduces rendering overhead
-        progress_bar.set_draw_target(ProgressDrawTarget::stderr_with_hz(8));
+        let now = Instant::now();
         Self {
             reader,
             total: size,
             read: 0,
-            progress_bar,
+            started: now,
+            last_draw: now,
+            interactive: std::io::stderr().is_terminal(),
+            finished: false,
         }
     }
 
+    /// Repaint the bar in place, throttled to [`REDRAW_INTERVAL`].
+    fn draw(&mut self, force: bool) {
+        if !self.interactive {
+            return;
+        }
+        let now = Instant::now();
+        if !force && now.duration_since(self.last_draw) < REDRAW_INTERVAL {
+            return;
+        }
+        self.last_draw = now;
+        let fraction = if self.total == 0 {
+            0.0
+        } else {
+            (self.read as f64 / self.total as f64).clamp(0.0, 1.0)
+        };
+        let filled = (fraction * BAR_WIDTH as f64).round() as usize;
+        let mut line = String::with_capacity(BAR_WIDTH + 48);
+        line.push('\r');
+        line.push('[');
+        for i in 0..BAR_WIDTH {
+            line.push(if i < filled { '#' } else { '-' });
+        }
+        let _ = write!(
+            &mut line,
+            "] {}/{}",
+            fmt_size(self.read as f64),
+            fmt_size(self.total as f64)
+        );
+        let mut err = std::io::stderr().lock();
+        let _ = err.write_all(line.as_bytes());
+        let _ = err.flush();
+    }
+
     /// This function is called whenever a new read is made, and is responsible for updating the UI
-    fn update(&mut self, delta: u64) {
-        self.progress_bar.inc(delta);
-        if self.total == self.read && !self.progress_bar.is_finished() {
-            self.progress_bar.finish_and_clear();
-            info!(
-                "processed {} in {} ({}/s avg)",
+    fn update(&mut self) {
+        if self.total == self.read && !self.finished {
+            self.finished = true;
+            // Clear the bar's line before the summary, or the leftovers of the
+            // longer bar line trail after it.
+            if self.interactive {
+                let mut err = std::io::stderr().lock();
+                let _ = write!(err, "\r{:width$}\r", "", width = BAR_WIDTH + 48);
+                let _ = err.flush();
+            }
+            let elapsed = self.started.elapsed();
+            let rate = if elapsed.as_secs_f64() > 0.0 {
+                fmt_size(self.total as f64 / elapsed.as_secs_f64())
+            } else {
+                fmt_size(self.total as f64)
+            };
+            eprintln!(
+                "processed {} in {} ({rate}/s avg)",
                 fmt_size(self.total as f64),
-                fmt_duration(self.progress_bar.elapsed()),
-                fmt_size(self.total as f64 / self.progress_bar.elapsed().as_secs_f64())
+                fmt_duration(elapsed),
             );
+        } else {
+            self.draw(false);
         }
     }
 }
@@ -61,7 +116,7 @@ impl<R: Read> Read for ProgressMonitor<R> {
         // along the way
         let out = self.reader.read(buf)?;
         self.read += out;
-        self.update(out as u64);
+        self.update();
         Ok(out)
     }
 }

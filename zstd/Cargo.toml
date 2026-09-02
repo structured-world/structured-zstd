@@ -32,6 +32,25 @@ autobenches = false
 autotests = false
 autoexamples = false
 
+# The command-line tool ships from this crate rather than a second package, so
+# `cargo add structured-zstd` and `cargo install structured-zstd` name the same
+# thing. It carries no dependencies of its own — argument parsing, progress
+# display and its error type are written against `std` — so `required-features`
+# names only the library capabilities it calls into, both of which are in
+# `default`. That is what makes `cargo install structured-zstd` work with no
+# flags while a library consumer's dependency graph stays untouched: a
+# `no_std` build simply does not select this target.
+#
+# Deliberately NOT named `zstd`: `cargo install` writes into a directory that
+# usually precedes `/usr/bin` on `PATH`, so that name would shadow the system
+# tool for everyone who installs this. It dispatches on `argv[0]`, so an
+# alternatives entry or a `unzstd` / `zstdcat` symlink still selects the
+# matching default mode.
+[[bin]]
+name = "structured-zstd"
+path = "src/bin/structured-zstd/main.rs"
+required-features = ["std", "dict-builder"]
+
 # docs.rs builds the crate with the public feature set so feature-gated
 # items (e.g. the `dictionary` module behind `dict-builder`) appear in the
 # published documentation. We list the public features explicitly rather
@@ -69,6 +88,7 @@ compiler_builtins = { version = "0.1.2", optional = true }
 core = { version = "1.0.0", optional = true, package = "rustc-std-workspace-core" }
 alloc = { version = "1.0.0", optional = true, package = "rustc-std-workspace-alloc" }
 
+
 [dev-dependencies]
 # This library imports zero C bindings. The `zstd` (libzstd) cross-checks,
 # the criterion benches, the `dhat` profiling examples, and the FFI parity
@@ -96,6 +116,12 @@ default = [
     "kernel-neon",
     "kernel-sve",
     "kernel-simd128",
+    # Present in `default` so the bundled command-line tool, whose `--train`
+    # needs it, builds from a plain `cargo install structured-zstd`. It adds
+    # one small dependency (`fastrand`) and no transitive ones; a build that
+    # does not want it turns default features off, as `no_std` builds already
+    # do.
+    "dict-builder",
 ]
 # Per-CPU-tier kernel selection, covering the decoder and the encoder. The
 # default build enables every kernel except `kernel-vbmi2`; with `std`,
