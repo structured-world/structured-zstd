@@ -2647,17 +2647,11 @@ impl RowMatchGenerator {
             self.window_size,
             capacity,
         );
-        // Sizing only — the eviction, dict retire and floor updates run on
-        // commit, keyed on the length actually claimed rather than this worst
-        // case (`capacity` would retire a still-valid dict on a short block).
-        if self.window_size + capacity > self.max_window_size {
-            let target = self.max_window_size
-                + (self.max_window_size >> 2)
-                + crate::common::MAX_BLOCK_SIZE as usize;
-            if target > self.history.len() && self.history.capacity() < target {
-                self.history.reserve_exact(target - self.history.len());
-            }
-        }
+        // The eviction, dict retire, floor updates AND the eviction ceiling all
+        // run on commit, keyed on the length a block actually claims. Sizing the
+        // ceiling here off `capacity` (a whole read buffer, not a block) would
+        // trip it on the first fill and fault in the full window+window/4 mirror
+        // for frames that never evict.
         self.history.reserve(capacity);
         let before = self.history.len();
         let (appended, eof) = fill(&mut self.history);
@@ -2695,6 +2689,14 @@ impl RowMatchGenerator {
         }
         if self.window_size + len > self.max_window_size {
             self.dict.invalidate();
+            // Same one-time ceiling as `add_data`: once eviction starts, grow
+            // the mirror linearly to (window + window/4 + one block).
+            let target = self.max_window_size
+                + (self.max_window_size >> 2)
+                + crate::common::MAX_BLOCK_SIZE as usize;
+            if target > self.history.len() && self.history.capacity() < target {
+                self.history.reserve_exact(target - self.history.len());
+            }
         }
         while self.window_size + len > self.max_window_size {
             let removed_len = self.chunk_lens.pop_front().unwrap();
@@ -3109,8 +3111,11 @@ impl RowMatchGenerator {
         // ~1.25x-window capacity on long streams. The drain memmoves the live
         // window, so a quarter-window trigger bounds the write amplification
         // (~4x the eviction stride) while closing most of the peak gap.
+        // Compare against the COMMITTED length: with in-place ingest
+        // `history.len()` also counts bytes no block has claimed yet, which
+        // would push this trigger later than on the staged path.
         if self.history_start >= (self.max_window_size >> 2)
-            || self.history_start * 2 >= self.history.len()
+            || self.history_start * 2 >= self.history.len() - self.uncommitted_len
         {
             self.history.drain(..self.history_start);
             self.history_start = 0;

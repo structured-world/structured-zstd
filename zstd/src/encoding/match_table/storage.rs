@@ -938,16 +938,10 @@ impl MatchTable {
         fill: impl FnOnce(&mut Vec<u8>) -> (usize, bool),
     ) -> (usize, bool) {
         check_stream_abs_headroom(self.history_abs_start, self.window_size, capacity);
-        // Sizing only; the window bookkeeping happens on commit, keyed on the
-        // length actually claimed rather than this worst case.
-        if self.window_size + capacity > self.max_window_size {
-            let target = self.max_window_size
-                + (self.max_window_size >> 2)
-                + crate::common::MAX_BLOCK_SIZE as usize;
-            if target > self.history.len() && self.history.capacity() < target {
-                self.history.reserve_exact(target - self.history.len());
-            }
-        }
+        // The eviction ceiling is applied in `commit_block`, keyed on the length
+        // a block actually claims. Sizing it here off `capacity` (a whole read
+        // buffer, not a block) would trip the ceiling on the very first fill and
+        // fault in the full window+window/4 mirror for frames that never evict.
         self.history.reserve(capacity);
         let before = self.history.len();
         let (appended, eof) = fill(&mut self.history);
@@ -978,6 +972,17 @@ impl MatchTable {
             "commit_block: {len} exceeds the {} uncommitted bytes",
             self.uncommitted().len(),
         );
+        if self.window_size + len > self.max_window_size {
+            // Same one-time ceiling as `add_data`, applied at the same point in
+            // the sequence: once eviction starts, grow the mirror linearly to
+            // (window + window/4 + one block) instead of doubling.
+            let target = self.max_window_size
+                + (self.max_window_size >> 2)
+                + crate::common::MAX_BLOCK_SIZE as usize;
+            if target > self.history.len() && self.history.capacity() < target {
+                self.history.reserve_exact(target - self.history.len());
+            }
+        }
         while self.window_size + len > self.max_window_size {
             let removed_len = self.chunk_lens.pop_front().unwrap();
             self.window_size -= removed_len;
@@ -1051,8 +1056,11 @@ impl MatchTable {
         // Drain the dead prefix at a quarter window (paired with the eviction
         // reserve in `add_data`) so the mirror stays near `window + window/4`
         // rather than doubling to ~2x window on long streams.
+        // Compare against the COMMITTED length: with in-place ingest
+        // `history.len()` also counts bytes no block has claimed yet, which
+        // would push this trigger later than on the staged path.
         if self.history_start >= (self.max_window_size >> 2)
-            || self.history_start * 2 >= self.history.len()
+            || self.history_start * 2 >= self.history.len() - self.uncommitted_len
         {
             self.history.drain(..self.history_start);
             self.history_start = 0;

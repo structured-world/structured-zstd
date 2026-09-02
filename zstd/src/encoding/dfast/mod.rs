@@ -617,19 +617,11 @@ impl DfastMatchGenerator {
         fill: impl FnOnce(&mut Vec<u8>) -> (usize, bool),
     ) -> (usize, bool) {
         check_stream_abs_headroom(self.history_abs_start, self.window_size, capacity);
-        // Same one-time ceiling as `add_data`: once eviction is in play, grow
-        // linearly to window + window/4 + one block rather than doubling.
-        // Sizing only — the dict attach is dropped in `commit_block`, keyed on
-        // the length actually claimed, since `capacity` is a worst case and
-        // would retire a still-valid dictionary on a short block.
-        if self.window_size + capacity > self.max_window_size {
-            let target = self.max_window_size
-                + (self.max_window_size >> 2)
-                + crate::common::MAX_BLOCK_SIZE as usize;
-            if target > self.history.len() && self.history.capacity() < target {
-                self.history.reserve_exact(target - self.history.len());
-            }
-        }
+        // The eviction ceiling and the dict retire both run in `commit_block`,
+        // keyed on the length a block actually claims. Sizing the ceiling here
+        // off `capacity` (a whole read buffer, not a block) would trip it on the
+        // first fill and fault in the full window+window/4 mirror for frames
+        // that never evict.
         self.history.reserve(capacity);
 
         let before = self.history.len();
@@ -668,6 +660,14 @@ impl DfastMatchGenerator {
             // indices (primed at `history_start == 0`) stop addressing the dict
             // bytes — drop the attach, exactly as `add_data` does.
             self.dict.invalidate();
+            // Same one-time ceiling as `add_data`: once eviction starts, grow
+            // linearly to window + window/4 + one block rather than doubling.
+            let target = self.max_window_size
+                + (self.max_window_size >> 2)
+                + crate::common::MAX_BLOCK_SIZE as usize;
+            if target > self.history.len() && self.history.capacity() < target {
+                self.history.reserve_exact(target - self.history.len());
+            }
         }
         while self.window_size + len > self.max_window_size {
             let removed_len = self.window_blocks.pop_front().unwrap();
