@@ -15,6 +15,49 @@ use crate::{
 };
 use alloc::vec::Vec;
 
+/// Where this block's bytes live before the matcher takes ownership of them.
+///
+/// The owned block loop used to always stage a block in a scratch `Vec` that
+/// the matcher then copied into its history. Backends implementing
+/// [`Matcher::fill_in_place`](crate::encoding::Matcher::fill_in_place) instead
+/// read straight into that history, so the bytes are already in place and only
+/// need claiming — [`BlockInput::InPlace`] carries just the length.
+pub(crate) enum BlockInput {
+    /// Bytes staged in a caller-owned buffer, handed to the matcher on commit.
+    Staged(Vec<u8>),
+    /// Bytes already at the head of the matcher's uncommitted region; the
+    /// payload is the block length.
+    InPlace(usize),
+}
+
+impl BlockInput {
+    fn len(&self) -> usize {
+        match self {
+            BlockInput::Staged(v) => v.len(),
+            BlockInput::InPlace(n) => *n,
+        }
+    }
+
+    /// Borrow the block's bytes before they are committed. Shared borrow of
+    /// `matcher` for the in-place case, so this composes with the other
+    /// read-only matcher queries the classification below performs.
+    fn bytes<'a, M: Matcher>(&'a self, matcher: &'a M) -> &'a [u8] {
+        match self {
+            BlockInput::Staged(v) => v,
+            BlockInput::InPlace(n) => &matcher.uncommitted_input()[..*n],
+        }
+    }
+
+    /// Hand the block to the matcher: move the staged buffer in, or claim the
+    /// already-resident bytes.
+    fn commit<M: Matcher>(self, matcher: &mut M) {
+        match self {
+            BlockInput::Staged(v) => matcher.commit_space(v),
+            BlockInput::InPlace(n) => matcher.commit_filled(n),
+        }
+    }
+}
+
 /// Compresses a single block using the shared compressed-block pipeline.
 ///
 /// Used by all compressed levels (Fastest, Default, Better, Best, and numeric levels). The actual
@@ -26,8 +69,9 @@ use alloc::vec::Vec;
 ///   the start of this block
 /// - `last_block`: Whether or not this block is going to be the last block in the frame
 ///   (needed because this info is written into the block header)
-/// - `uncompressed_data`: A block's worth of uncompressed data, taken from the
-///   larger input
+/// - `uncompressed_data`: A block's worth of uncompressed data, either staged
+///   in a caller-owned buffer or already sitting in the matcher's history (see
+///   [`BlockInput`])
 /// - `output`: As `uncompressed_data` is compressed, it's appended to `output`.
 // Mirrors the per-block sidecar plumbing of its borrowed sibling
 // (`compress_block_encoded_borrowed`): the lsm decompressed-size and
@@ -40,7 +84,7 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
     state: &mut CompressState<M>,
     compression_level: CompressionLevel,
     last_block: bool,
-    uncompressed_data: Vec<u8>,
+    uncompressed_data: BlockInput,
     output: &mut Vec<u8>,
     // When a dictionary is primed, an "incompressible-looking" block can
     // still compress well by matching the dictionary content, so the
@@ -57,20 +101,42 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
     #[cfg(all(feature = "lsm", feature = "hash"))] block_checksums: Option<&mut Vec<u32>>,
 ) -> BlockType {
     let block_size = uncompressed_data.len() as u32;
+    // Classify the block while the bytes are still uncommitted. Every query
+    // here is read-only, so the `InPlace` borrow of the matcher's history
+    // coexists with the `window_size()` / `block_samples_match_dict()` probes.
+    let bytes = uncompressed_data.bytes(&state.matcher);
+    let rle_byte_opt = bytes
+        .first()
+        .copied()
+        .filter(|f| bytes.iter().all(|x| x == f));
+    let dict_rejects_raw = dict_active && state.matcher.block_samples_match_dict(bytes);
+    let raw_fast_path = !dict_rejects_raw
+        // Evaluation order matters: the dict-match guard is cheap (a constant
+        // `true` for the conservative backends — HC / Row / BT — and a small
+        // table probe for Fast), whereas `should_emit_raw_fast_path` runs a
+        // WHOLE-BLOCK incompressibility scan on the dict path. When a primed
+        // dictionary forces the raw-skip off anyway, this short-circuit skips
+        // that scan entirely instead of computing it and throwing it away.
+        && should_emit_raw_fast_path(
+            compression_level,
+            state.matcher.window_size(),
+            bytes,
+            dict_active,
+        );
+    #[cfg(all(feature = "lsm", feature = "hash"))]
+    let precomputed_checksum = crate::encoding::frame_compressor::xxh64_block_low32(bytes);
+
     // First check to see if run length encoding can be used for the entire block
-    if uncompressed_data.iter().all(|x| uncompressed_data[0].eq(x)) {
-        let rle_byte = uncompressed_data[0];
+    if let Some(rle_byte) = rle_byte_opt {
         #[cfg(feature = "lsm")]
         if let Some(sink) = block_decompressed_sizes {
             sink.push(block_size);
         }
         #[cfg(all(feature = "lsm", feature = "hash"))]
         if let Some(sink) = block_checksums {
-            sink.push(crate::encoding::frame_compressor::xxh64_block_low32(
-                &uncompressed_data,
-            ));
+            sink.push(precomputed_checksum);
         }
-        state.matcher.commit_space(uncompressed_data);
+        uncompressed_data.commit(&mut state.matcher);
         state.matcher.skip_matching_with_hint(Some(false));
         let header = BlockHeader {
             last_block,
@@ -81,32 +147,16 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         header.serialize(output);
         output.push(rle_byte);
         BlockType::RLE
-    } else if !(dict_active && state.matcher.block_samples_match_dict(&uncompressed_data))
-        // Evaluation order matters: the dict-match guard is cheap (a constant
-        // `true` for the conservative backends — HC / Row / BT — and a small
-        // table probe for Fast), whereas `should_emit_raw_fast_path` runs a
-        // WHOLE-BLOCK incompressibility scan on the dict path. When a primed
-        // dictionary forces the raw-skip off anyway (guard is `false`), this
-        // short-circuit skips that scan entirely instead of computing it and
-        // throwing the result away. Boolean result is unchanged (AND commutes).
-        && should_emit_raw_fast_path(
-            compression_level,
-            state.matcher.window_size(),
-            &uncompressed_data,
-            dict_active,
-        )
-    {
+    } else if raw_fast_path {
         #[cfg(feature = "lsm")]
         if let Some(sink) = block_decompressed_sizes {
             sink.push(block_size);
         }
         #[cfg(all(feature = "lsm", feature = "hash"))]
         if let Some(sink) = block_checksums {
-            sink.push(crate::encoding::frame_compressor::xxh64_block_low32(
-                &uncompressed_data,
-            ));
+            sink.push(precomputed_checksum);
         }
-        state.matcher.commit_space(uncompressed_data);
+        uncompressed_data.commit(&mut state.matcher);
         state.matcher.skip_matching_with_hint(Some(true));
         let header = BlockHeader {
             last_block,
@@ -119,7 +169,7 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
     } else {
         // Compress as a standard compressed block
         let uncompressed_len = uncompressed_data.len();
-        state.matcher.commit_space(uncompressed_data);
+        uncompressed_data.commit(&mut state.matcher);
         if matches!(compression_level, CompressionLevel::Level(16..=22))
             && state.matcher.window_size() >= (1 << 17)
         {

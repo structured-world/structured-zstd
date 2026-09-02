@@ -590,6 +590,90 @@ impl DfastMatchGenerator {
         reuse_space(data);
     }
 
+    /// Phase 1 of in-place ingest: let `fill` write STRAIGHT into the tail of
+    /// `history`, with room reserved for `capacity` more bytes. Returns
+    /// `(appended, eof)` from `fill`.
+    ///
+    /// The bytes land in the buffer but are NOT yet part of the window: the
+    /// block boundary is only chosen afterwards, by the pre-split pass looking
+    /// at [`Self::uncommitted`]. Whatever the splitter leaves over simply stays
+    /// in `history` and becomes the head of the next block, so a carried
+    /// suffix costs no copy at all — the old shape had to stage the read in a
+    /// scratch `Vec`, copy it into `history`, and copy any split remainder back
+    /// out into a pending buffer.
+    ///
+    /// Call [`Self::commit_block`] once the length is known.
+    pub(crate) fn fill_uncommitted(
+        &mut self,
+        capacity: usize,
+        fill: impl FnOnce(&mut Vec<u8>) -> (usize, bool),
+    ) -> (usize, bool) {
+        check_stream_abs_headroom(self.history_abs_start, self.window_size, capacity);
+        // Same one-time ceiling as `add_data`: once eviction is in play, grow
+        // linearly to window + window/4 + one block rather than doubling.
+        // Sizing only — the dict attach is dropped in `commit_block`, keyed on
+        // the length actually claimed, since `capacity` is a worst case and
+        // would retire a still-valid dictionary on a short block.
+        if self.window_size + capacity > self.max_window_size {
+            let target = self.max_window_size
+                + (self.max_window_size >> 2)
+                + crate::common::MAX_BLOCK_SIZE as usize;
+            if target > self.history.len() && self.history.capacity() < target {
+                self.history.reserve_exact(target - self.history.len());
+            }
+        }
+        // Compact before the fill, so the drain never has to move bytes the
+        // fill just wrote. Its quarter-window trigger therefore lags by at most
+        // one block, which the ceiling above already leaves room for.
+        self.compact_history();
+        self.history.reserve(capacity);
+
+        let before = self.history.len();
+        let (appended, eof) = fill(&mut self.history);
+        debug_assert_eq!(
+            self.history.len(),
+            before + appended,
+            "fill_uncommitted: fill reported {appended} bytes but grew history by {}",
+            self.history.len() - before,
+        );
+        (appended, eof)
+    }
+
+    /// Bytes read but not yet claimed by a block: the pre-split pass picks the
+    /// block boundary inside this slice.
+    pub(crate) fn uncommitted(&self) -> &[u8] {
+        &self.history[self.history_start + self.window_size..]
+    }
+
+    /// Phase 2 of in-place ingest: claim `len` bytes from the head of
+    /// [`Self::uncommitted`] as the next block, running the window bookkeeping
+    /// `add_data` would have done. Any remainder stays put for the next block.
+    pub(crate) fn commit_block(&mut self, len: usize) {
+        if len == 0 {
+            return;
+        }
+        assert!(len <= self.max_window_size);
+        debug_assert!(
+            len <= self.uncommitted().len(),
+            "commit_block: {len} exceeds the {} uncommitted bytes",
+            self.uncommitted().len(),
+        );
+        if self.window_size + len > self.max_window_size {
+            // Eviction advances `history_start`, so the dict tables' concat
+            // indices (primed at `history_start == 0`) stop addressing the dict
+            // bytes — drop the attach, exactly as `add_data` does.
+            self.dict.invalidate();
+        }
+        while self.window_size + len > self.max_window_size {
+            let removed_len = self.window_blocks.pop_front().unwrap();
+            self.window_size -= removed_len;
+            self.history_start += removed_len;
+            self.history_abs_start += removed_len;
+        }
+        self.window_size += len;
+        self.window_blocks.push_back(len);
+    }
+
     /// Trim retained blocks until the window fits `max_window_size`.
     ///
     /// Unlike `MatchGenerator::trim_to_window`,

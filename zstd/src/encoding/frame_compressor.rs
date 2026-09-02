@@ -2076,56 +2076,117 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             // `reserve_exact`-grew it to `block_capacity` every block; on a
             // heavily pre-split frame that churned one block-sized allocation
             // per split (~12 MB over ~90 splits on a 1 MiB corpus input).
-            let mut uncompressed_data = self.state.matcher.get_next_space();
-            uncompressed_data.clear();
-            uncompressed_data.extend_from_slice(&pending_input);
-            pending_input.clear();
-            if !reached_eof {
-                // Remaining-bytes expectation for the reader source's sizing
-                // (`None` = unknown, or an inexact hint already met by prior
-                // blocks). The slice source appends directly and ignores it.
-                let size_hint_remaining = match initial_size_hint {
-                    Some(hint) if hint > total_uncompressed => Some(hint - total_uncompressed),
-                    _ => None,
-                };
-                let (appended, eof) =
-                    source.fill_block(&mut uncompressed_data, block_capacity, size_hint_remaining);
-                total_uncompressed += appended as u64;
-                reached_eof = eof;
+            // Remaining-bytes expectation for the reader source's sizing
+            // (`None` = unknown, or an inexact hint already met by prior
+            // blocks). The slice source appends directly and ignores it.
+            let size_hint_remaining = match initial_size_hint {
+                Some(hint) if hint > total_uncompressed => Some(hint - total_uncompressed),
+                _ => None,
+            };
+            // Preferred shape: read straight into the matcher's history, so
+            // neither this block nor a pre-split remainder is ever copied. The
+            // leftover from the previous iteration is already sitting there as
+            // uncommitted bytes, which is why there is no `pending_input`
+            // top-up on this path.
+            let in_place = if reached_eof {
+                // Nothing left to read; the carried remainder is already in the
+                // matcher, so just re-inspect it.
+                self.state
+                    .matcher
+                    .fill_in_place(0, &mut |_buf| (0, true))
+                    .map(|_| 0usize)
+            } else {
+                let carried = self.state.matcher.uncommitted_input().len();
+                let want = block_capacity.saturating_sub(carried);
+                self.state
+                    .matcher
+                    .fill_in_place(want, &mut |buf| {
+                        source.fill_block(buf, buf.len() + want, size_hint_remaining)
+                    })
+                    .map(|(appended, eof)| {
+                        total_uncompressed += appended as u64;
+                        reached_eof = eof;
+                        appended
+                    })
+            };
+
+            let mut uncompressed_data;
+            if in_place.is_some() {
+                // Bytes live in the matcher; nothing staged here.
+                uncompressed_data = Vec::new();
+            } else {
+                uncompressed_data = self.state.matcher.get_next_space();
+                uncompressed_data.clear();
+                uncompressed_data.extend_from_slice(&pending_input);
+                pending_input.clear();
+                if !reached_eof {
+                    let (appended, eof) = source.fill_block(
+                        &mut uncompressed_data,
+                        block_capacity,
+                        size_hint_remaining,
+                    );
+                    total_uncompressed += appended as u64;
+                    reached_eof = eof;
+                }
             }
+            // Unified view of this iteration's candidate bytes, whichever path
+            // produced them. Length only — the bytes themselves are read back
+            // through the matcher on the in-place path.
+            let available = if in_place.is_some() {
+                self.state.matcher.uncommitted_input().len()
+            } else {
+                uncompressed_data.len()
+            };
             let mut last_block = reached_eof;
             let remaining_for_split = if reached_eof {
-                uncompressed_data.len()
+                available
             } else {
                 block_capacity
             };
+            // Length this block will actually claim. The pre-split pass may
+            // shorten it; on the in-place path the remainder simply stays
+            // uncommitted in the matcher and heads the next block, so there is
+            // no suffix copy at all.
+            let mut block_len = available;
             if !matches!(self.compression_level, CompressionLevel::Uncompressed)
-                && uncompressed_data.len() == block_capacity
+                && available == block_capacity
             {
-                let block_len = optimal_block_size_with(
-                    self.pre_split_level(),
-                    &uncompressed_data,
-                    remaining_for_split,
-                    block_capacity,
-                    savings,
-                );
-                if block_len < uncompressed_data.len() {
-                    // Carry the kept suffix into the reusable `pending_input`
-                    // buffer (cleared, capacity retained) instead of allocating
-                    // a fresh Vec via `split_off`. Next iteration copies it back
-                    // into a pooled block buffer. The block currently being
-                    // compressed is truncated to the chosen split length.
-                    pending_input.clear();
-                    pending_input.extend_from_slice(&uncompressed_data[block_len..]);
-                    uncompressed_data.truncate(block_len);
+                let split_at = {
+                    let bytes: &[u8] = if in_place.is_some() {
+                        self.state.matcher.uncommitted_input()
+                    } else {
+                        &uncompressed_data
+                    };
+                    optimal_block_size_with(
+                        self.pre_split_level(),
+                        bytes,
+                        remaining_for_split,
+                        block_capacity,
+                        savings,
+                    )
+                };
+                if split_at < available {
+                    block_len = split_at;
                     last_block = false;
+                    if in_place.is_none() {
+                        // Staged path keeps its carry buffer: copy the kept
+                        // suffix out and truncate the block being compressed.
+                        pending_input.clear();
+                        pending_input.extend_from_slice(&uncompressed_data[block_len..]);
+                        uncompressed_data.truncate(block_len);
+                    }
                 }
             }
             // As we read, hash that data too (skipped when the content
             // checksum is disabled).
             #[cfg(feature = "hash")]
             if self.content_checksum {
-                self.hasher.write(&uncompressed_data);
+                if in_place.is_some() {
+                    let bytes = &self.state.matcher.uncommitted_input()[..block_len];
+                    self.hasher.write(bytes);
+                } else {
+                    self.hasher.write(&uncompressed_data);
+                }
             }
             // Per-physical-block XXH64 (low 32 bits) for the optional
             // per-block checksum sidecar. Hashing happens INSIDE the
@@ -2138,8 +2199,15 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             // observed so far (see `reserve_for_next_block`); with no usable
             // size hint, ensure one block's worst case and let the doubling
             // growth policy amortize across blocks.
-            let emitted =
-                total_uncompressed - uncompressed_data.len() as u64 - pending_input.len() as u64;
+            // Bytes already emitted as blocks: everything read so far minus what
+            // this block will claim and minus whatever stays buffered for the
+            // next one (the staged carry, or the in-place uncommitted tail).
+            let buffered_after = if in_place.is_some() {
+                (available - block_len) as u64
+            } else {
+                pending_input.len() as u64
+            };
+            let emitted = total_uncompressed - block_len as u64 - buffered_after;
             match initial_size_hint {
                 Some(hint) if hint >= total_uncompressed => {
                     // An advisory hint (streaming path) is only trusted up to
@@ -2163,11 +2231,11 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                     );
                 }
                 _ => {
-                    out.reserve(uncompressed_data.len() + 3 + 16);
+                    out.reserve(block_len + 3 + 16);
                 }
             }
             // Special handling is needed for compression of a totally empty file
-            if uncompressed_data.is_empty() {
+            if block_len == 0 {
                 let header = BlockHeader {
                     last_block: true,
                     block_type: crate::blocks::block::BlockType::Raw,
@@ -2185,6 +2253,10 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
 
             match self.compression_level {
                 CompressionLevel::Uncompressed => {
+                    // `Uncompressed` never takes the in-place path: it is
+                    // excluded from `borrowed_eligible` and its raw blocks are
+                    // emitted straight from the staged buffer.
+                    debug_assert!(in_place.is_none(), "Uncompressed uses the staged path");
                     let header = BlockHeader {
                         last_block,
                         block_type: crate::blocks::block::BlockType::Raw,
@@ -2208,7 +2280,6 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 | CompressionLevel::Best
                 | CompressionLevel::Level(_) => {
                     let before_len = out.len();
-                    let block_len = uncompressed_data.len();
                     // A primed dictionary makes "incompressible-looking"
                     // blocks matchable against the dict, so the raw-fast-
                     // path inside must be bypassed (it skips matching).
@@ -2219,11 +2290,16 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                     // enabled for it. (This arm is already non-Uncompressed.)
                     let dict_active = self.dictionary.is_some()
                         && self.state.matcher.supports_dictionary_priming();
+                    let block_input = if in_place.is_some() {
+                        crate::encoding::levels::BlockInput::InPlace(block_len)
+                    } else {
+                        crate::encoding::levels::BlockInput::Staged(uncompressed_data)
+                    };
                     compress_block_encoded(
                         &mut self.state,
                         self.compression_level,
                         last_block,
-                        uncompressed_data,
+                        block_input,
                         out,
                         dict_active,
                         #[cfg(feature = "lsm")]

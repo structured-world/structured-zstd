@@ -1602,6 +1602,42 @@ impl Matcher for MatchGeneratorDriver {
         }
     }
 
+    /// Read the next block STRAIGHT into the backend's history buffer, so the
+    /// owned block loop does not stage it in a scratch `Vec` and copy it in.
+    ///
+    /// Returns `None` when the active backend has no in-place ingest yet, in
+    /// which case the caller keeps the staged-copy path. Only Dfast implements
+    /// it so far; the other backends are mechanical follow-ups.
+    ///
+    /// On `Some`, the bytes are in the buffer but not yet part of the window:
+    /// the caller picks the block boundary from
+    /// [`Self::uncommitted_input`] and then calls [`Self::commit_filled`].
+    fn fill_in_place(
+        &mut self,
+        capacity: usize,
+        fill: &mut dyn FnMut(&mut Vec<u8>) -> (usize, bool),
+    ) -> Option<(usize, bool)> {
+        match &mut self.storage {
+            MatcherStorage::Dfast(m) => Some(m.fill_uncommitted(capacity, fill)),
+            _ => None,
+        }
+    }
+
+    /// Bytes read by [`Self::fill_in_place`] that no block has claimed yet.
+    fn uncommitted_input(&self) -> &[u8] {
+        match &self.storage {
+            MatcherStorage::Dfast(m) => m.uncommitted(),
+            _ => &[],
+        }
+    }
+
+    /// Claim `len` bytes of [`Self::uncommitted_input`] as the next block.
+    fn commit_filled(&mut self, len: usize) {
+        if let MatcherStorage::Dfast(m) = &mut self.storage {
+            m.commit_block(len);
+        }
+    }
+
     fn commit_space(&mut self, space: Vec<u8>) {
         let mut evicted_bytes = 0usize;
         // Split borrows manually so the `add_data` closures can write
