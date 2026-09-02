@@ -1145,8 +1145,8 @@ impl Matcher for MatchGeneratorDriver {
                 }
                 MatcherStorage::Row(m) => {
                     m.row_heads = Vec::new();
-                    m.row_positions = Vec::new();
                     m.row_tags = Vec::new();
+                    m.release_tables();
                     m.reset();
                 }
                 MatcherStorage::HashChain(m) => {

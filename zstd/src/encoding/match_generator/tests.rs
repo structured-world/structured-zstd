@@ -2425,7 +2425,7 @@ fn row_skip_matching_with_incompressible_hint_uses_sparse_prefix() {
     dense.add_data(data.clone(), |_| {});
     dense.skip_matching_with_hint(Some(false));
     let dense_slots = dense
-        .row_positions
+        .row_positions()
         .iter()
         .filter(|&&pos| pos != ROW_EMPTY_SLOT)
         .count();
@@ -2435,7 +2435,7 @@ fn row_skip_matching_with_incompressible_hint_uses_sparse_prefix() {
     sparse.add_data(data, |_| {});
     sparse.skip_matching_with_hint(Some(true));
     let sparse_slots = sparse
-        .row_positions
+        .row_positions()
         .iter()
         .filter(|&&pos| pos != ROW_EMPTY_SLOT)
         .count();
@@ -2468,7 +2468,7 @@ fn row_skip_matching_with_none_hint_leaves_interior_empty() {
     none_hint.add_data(data.clone(), |_| {});
     none_hint.skip_matching_with_hint(None);
     let none_slots = none_hint
-        .row_positions
+        .row_positions()
         .iter()
         .filter(|&&pos| pos != ROW_EMPTY_SLOT)
         .count();
@@ -2480,7 +2480,7 @@ fn row_skip_matching_with_none_hint_leaves_interior_empty() {
     dense.add_data(data, |_| {});
     dense.skip_matching_with_hint(Some(false));
     let dense_slots = dense
-        .row_positions
+        .row_positions()
         .iter()
         .filter(|&&pos| pos != ROW_EMPTY_SLOT)
         .count();
