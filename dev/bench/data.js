@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788363091752,
+  "lastUpdate": 1788383853578,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI (x86_64-gnu)": [
@@ -3059,6 +3059,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.106,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "fe45d4455045bb953764f54697176c128ff3ad7c",
+          "message": "perf(encoder): read owned blocks straight into the matcher history (#477)\n\n* docs(readme): restructure for scannability, refresh discovery metadata\n\n- README: lead with a Highlights list; move the SIMD kernel-feature prose\n  out of Quick start into a Feature flags table (AVX-512 rationale folded\n  into a details block); break the storage-extensions and performance\n  paragraphs into bullets; drop the finished encoder-rewrite notice;\n  embedded doctest code blocks unchanged\n- Cargo.toml: description now covers the full encoder, streaming, no_std\n  and WebAssembly; keywords swap pure-rust for no-std; categories add\n  no-std, wasm and encoding; homepage points at the public benchmark\n  dashboard\n\nCloses #472\n\n* docs(readme): correct level range, npm dependency claim, resume window contract\n\n- state the encoder level range as -131072..=22 (the full negative fast\n  range is supported, matching the C API minimum)\n- the npm package carries a runtime dependency (wasm-feature-detect); the\n  accurate claim is no native addons / no postinstall scripts\n- resumable-decoding bullet now notes that ResumeState does not carry the\n  match window and the resuming call supplies it via ResumeInput::window_prime\n\n* docs(readme): scope SIMD flags to the decoder, note LDM needs hash\n\n- The `hash` feature also gates long-distance matching (the LDM match\n  finder hashes each window with XXH64), not only content checksums.\n  Without it the builder still accepts `enable_long_distance_matching`\n  and the frame stays valid, but no long-distance matches are produced;\n  say so in the feature table and beside the LDM example.\n- The `kernel_*` flags gate the decoder kernels only. The encoder\n  fastpath picks its tier independently: at runtime under `std`, from\n  the target's `target_feature` set under `no_std`. So dropping the\n  flags while keeping `std`, or building `no_std` for a target tuned\n  with `+avx2,+bmi2,+sse4.2`, still runs explicit encoder SIMD.\n  `kernel_simd128` is the one flag that also gates an encoder path\n  (wasm), which the table now says.\n\nPart of #472\n\n* refactor(encoder): drop the dead per-tier hash mix\n\n`hash_mix_u64` had five per-tier implementations and no production caller:\nthe only references in the workspace were two unit tests. Match hashing\nruns through `MatchTable::hash_value_with_mls` / `hash_value8_with_mls`,\nwhich mirror upstream `ZSTD_hash4/5/6/8`. The module-level\n`allow(dead_code)` (added as scaffolding, with a note to drop it once\nconsumers came online) is why this never surfaced.\n\nThree comments described the dead code inaccurately:\n\n- sse42 called it a mirror of an upstream \"CRC-folded hash mix\". Upstream\n  has no such thing: `crc32` does not appear anywhere in `lib/compress/`\n  on 1.5.7 or on dev, and `ZSTD_hash4/5/6/8` are plain multiplications.\n- neon claimed its mix matched the x86 kernels. It cannot: `__crc32d` is\n  CRC-32 (poly 0x04C11DB7) while `_mm_crc32_u64` is CRC-32C (Castagnoli).\n- simd128 claimed bit-identity with every other tier, while the scalar\n  mix is a bare multiply.\n\nRemoving it drops the CRC requirement that only that function had, so each\ntier now declares what it actually executes:\n\n- sse42 -> SSE2 (its three live intrinsics are all SSE2)\n- avx2_bmi2 -> avx2,bmi2 (was avx2,bmi2,sse4.2)\n- neon -> the aarch64 NEON baseline, no optional `crc` extension\n\nThe runtime probes shrink accordingly, and the NEON tier stops falling\nback to scalar on aarch64 parts without `crc`.\n\nAlso removed alongside: `dispatch_count_match_from_indices` and the\nper-tier `KERNEL_TAG` constants (both unreferenced workspace-wide), and\nthe module-level `allow(dead_code)` from the fastpath, scalar and simd128\nmodules so this cannot accumulate silently again. Two items that are\ngenuinely unreachable per target keep a scoped `allow` with the reason:\nthe scalar BT probe on aarch64 (its walker is compiled out there) and the\nsimd128 BT probe (the BT walker has no wasm wrapper yet).\n\nRenamed `Row::hash_kernel` to `cpl_kernel`: it feeds\n`common_prefix_len_with_kernel`, not the mix its name and doc claimed.\n\nCompressed output is unchanged; dead code cannot affect it. Verified on\naarch64, x86_64, thumbv7em-none-eabihf and wasm32 (+simd128).\n\nPart of #474\n\n* perf(encoder): wire the wasm simd128 tier into the BT walker\n\nThe simd128 tier had a `count_match_from_indices` that nothing called: the\nBT walker only had neon / sse2 / avx2 / scalar wrappers, so a wasm build\nran the BT walk through the scalar probe. Add the missing simd128 arm to\nall three dispatchers (`bt_insert_step_no_rebase`,\n`bt_insert_and_collect_matches`, `collect_optimal_candidates_initialized`)\nso the wasm tier reaches its own vector probe.\n\nMeasured, interleaved A/B on the bench host (one process loading both\npayloads, alternating samples, 25 per arm, load < 0.3), compress at the BT\nlevels:\n\n  decodecorpus-z000033  L19 +0.22%   L22 +0.06%\n  small-4k-log-lines    L19 -0.23%   L22 -0.03%\n  low-entropy-1m        L19 +0.01%   L22 +0.15%\n  large-log-stream-4m   L19 -0.14%   L22 -0.26%\n\nEncoded bytes identical on every fixture and level, so the wiring is\ncorrect; the throughput effect is nil, including on the long-match\nfixtures where a vector prefix compare was expected to pay. The payload\ngrows 1574 bytes (1023318 -> 1024892, budget 1.25 MiB).\n\nPart of #474\n\n* docs(encoder): record why the BT vector probe barely fires\n\nInstrumented the BT-path prefix compare over decodecorpus-z000033 to\nexplain the flat A/B on the wasm tier wiring. At both L19 and L22 the\nleading 8-byte word probe resolves 87.45% of calls; only 12.55% reach the\nvector loop, and those average 1.6 (L19) to 4.6 (L22) 16-byte iterations.\nA short buffer (`max < 16`) accounts for 0.05%, so the early exit is\ndriven by the data, not by the buffer bound.\n\nThat is the whole explanation for the flat measurement: the vector cannot\nmatter much when 87% of compares end before it starts. Noted at the probe\nso the next person does not re-run the same experiment, along with the\nimplication that the lever on this path is cutting the number of candidate\ncompares, not widening the survivors.\n\nAlso drops two stale references to the removed hash mix from the module\nheader and the wasm dispatch comment.\n\nPart of #474\n\n* feat(encoder): gate encoder SIMD on the kernel features, add an SSE2 tier\n\nThe `kernel_*` features gated only the decoder: `fastpath::select_kernel`\npicked SSE4.2 / AVX2+BMI2 / NEON on its own, so `--no-default-features`\nstill executed encoder SIMD. Every encoder tier (module, enum variant,\ndispatch arm, tag-mask macro, per-tier wrapper) now sits behind the same\nfeature as its decoder counterpart, and a build with no kernel features\nemits no explicit encoder SIMD: `nm` counts 99 avx2/sse42 symbols with the\ndefault features and 0 without.\n\nThe x86 tier turned out not to be a single tier. Its prefix-compare kernel\nis plain SSE2, but the optimal parser's price set calls\n`priceset_range_nonabort_sse41`, whose `_mm_min_epu32` is SSE4.1. Rather\nthan keep probing the whole tier on SSE4.2, split it:\n\n- `Sse42`: unchanged, SSE4.1 price set.\n- `Sse2`: new. Same 128-bit prefix-compare kernel plus an SSE2 price set,\n  for x86 CPUs without SSE4.2. These previously fell all the way back to\n  the scalar kernel despite having usable SSE2.\n\nSSE2 has no unsigned 32-bit compare, so the new improve-mask biases both\noperands by 0x8000_0000 and uses the signed compare, which yields the same\nmask in one compare instead of min/eq/andnot. The cached-price loader was\nalready SSE2-only, so both tiers share it.\n\nThe NEON tier no longer requires the optional `crc` extension (that was\nthe removed hash mix); AArch64 parts without `crc` now get NEON instead of\nscalar. AArch64 with the tier compiled out newly resolves to the scalar\nkernel, a configuration that previously could not build at all.\n\nTests: the price-set tier test now covers the SSE2 helpers, plus a new\ncase pinning the compare as unsigned above `i32::MAX` across every tier,\nwhich is exactly where a signed compare would invert the result and where\nruntime dispatch on a modern host would never reach the SSE2 path.\n\nBREAKING CHANGE: the `kernel_sse2` feature is renamed to `kernel_sse`, and\nit now gates encoder SIMD as well as decoder SIMD. A build that disables\nthe kernel features loses encoder SIMD it previously kept.\n\nPart of #474\n\n* test(encoder): gate the per-tier test helpers on their kernel features\n\nThe tier-comparison and tag-mask tests referenced SIMD helpers\nunconditionally, so a build with those kernels compiled out failed to\nbuild its test targets even though the library itself was fine. Gate each\nhelper and its call site on the same feature as the tier it exercises, and\nadd the new SSE2 tier to the list the match-generator test cross-checks\nagainst scalar.\n\nFound by running the feature matrix on x86; an aarch64 host does not\ncompile these paths, so the breakage was invisible locally.\n\nPart of #474\n\n* test(encoder): silence the scalar-only tier-list lint\n\nWith every SIMD kernel compiled out the tier list is a single push, which\nclippy flags as vec-init-then-push. The incremental shape is what the\nfeature gates need, so allow the lint at that binding with the reason.\n\nPart of #474\n\n* test(encoder): seed the tier list instead of pushing into an empty vec\n\nAllowing vec-init-then-push on the binding did not take, since the lint\nfires on the statement pair. Seed the vec with the always-present scalar\ntier instead, and allow unused_mut for the build where every SIMD entry\nbelow is compiled out.\n\nPart of #474\n\n* docs: correct the SIMD selection story for wasm and the encoder\n\nTwo things were wrong in the same paragraph. The claim that `std` means\nruntime tier selection does not hold on wasm32: there is no runtime feature\ndetection there, and both the decoder kernels and the encoder fastpath also\nrequire `target_feature = \"simd128\"`, so a default-feature wasm build with\nno extra flags silently stays scalar. The npm package only appears to pick\nat runtime because it ships separately compiled scalar and `+simd128`\npayloads. Document the `-C target-feature=+simd128` requirement.\n\nThe rest of the paragraph described the pre-gating world: the `kernel_*`\nflags now cover the encoder too, x86 has two 128-bit tiers under\n`kernel_sse`, and the NEON tier no longer wants the `crc` extension. Update\nthe table and the crate-level docs to match, including the rename.\n\nPart of #474\n\n* feat(encoder): give long-distance matching its own feature\n\nLDM was gated on `hash`, because its match finder hashes each window with\nXXH64. That made the flag mean two unrelated things: a `--no-default-features`\nbuild dropping `hash` for the checksum also silently lost long-distance\nmatching, while `enable_long_distance_matching(true)` kept being accepted and\nthe frame kept being valid, just without any long-distance matches.\n\nSplit it out as `ldm = [\"hash\"]`, default-on, and move the LDM-specific gates\n(the module, the producer slot and its plumbing, the dict-snapshot handoff,\nthe strategy-ordinal helper) onto it. `hash` now means the checksum only, and\n`hash` without `ldm` is a build that could not be expressed before.\n\nThe name sits one letter away from the unrelated `lsm` feature, so the\nmanifest says so at both entries.\n\nPart of #474\n\n* chore(deps): drop the empty dhat-heap feature, mark the internal ones\n\n`structured-zstd/dhat-heap` gated no code at all — the dhat allocator swap\nlives entirely in the `ffi-bench` example — so the feature and the forward\nfrom `ffi-bench` are both removed; the example keeps its own flag.\n\nThe remaining bench / fuzz / diagnostic features are real but not public\nAPI. Group them under a header saying so, since they show up in the\ncrates.io feature list where a consumer could reasonably mistake them for\nsupported knobs.\n\nStale `kernel_sse2` spellings left by the rename are updated to\n`kernel_sse`.\n\nPart of #474\n\n* fix(encoder): gate the wasm optimal-parser SIMD on kernel_simd128\n\nThe optimal parser's wasm path checked only `target_feature = \"simd128\"`,\nnever the cargo feature, in eleven `cfg`s across `hc/optimal.rs` and\n`hc/priceset.rs`. So a `wasm32` build with `-C target-feature=+simd128` but\n`--no-default-features` still compiled and selected\n`build_optimal_plan_impl_simd128` and its `v128` price-set helpers at levels\n16-22, which is exactly the guarantee the previous commit strengthened.\n\nMeasured on a `+simd128 --no-default-features --features std,hash` build:\n`nm` counted 18 simd128 symbols before, 0 after; adding `kernel_simd128`\nback brings the 18 return.\n\nAlso corrects two feature-doc claims: `kernel_vbmi2` and `kernel_sve` are\ndecoder-only (the encoder has no AVX-512 or SVE tier), and `kernel_vbmi2`\nis the one kernel feature that is off by default.\n\nPart of #474\n\n* refactor(deps): rename the snake_case features to kebab-case\n\nCargo's own convention is kebab-case, and the manifest was mixed:\n`critical-section` and `rustc-dep-of-std` already used it while the kernel,\ndict and bench features did not. Rename the remaining twelve across the\nworkspace — the library, the four dependent crates, the fuzz manifest, CI,\nand the `--features` lines in example doc comments.\n\n`zdict_builder` (a feature of the `zstd` crate) and the\n`dict_builder_fastcover` bench target keep their names; so do Rust\nidentifiers such as `kernel_trace_enabled` and the\n`select_x86_kernel_*` test names.\n\nBREAKING CHANGE: every snake_case feature is renamed to its kebab-case\nspelling: `dict_builder` to `dict-builder`, `kernel_sse` to `kernel-sse`,\nand likewise for `kernel_scalar`, `kernel_bmi2`, `kernel_avx2`,\n`kernel_vbmi2`, `kernel_neon`, `kernel_sve`, `kernel_simd128`,\n`bench_internals`, `fuzz_exports`, `copy_shape_stats` and `kernel_trace`.\n\nPart of #474\n\n* test(bench): find the decode corpus from the ffi-bench manifest dir\n\nThe bench targets belong to `ffi-bench` (they link the C bindings) while\ntheir sources and `decodecorpus_files/z000033` live under `zstd/`. The\nlookup only tried `CARGO_MANIFEST_DIR/decodecorpus_files/z000033`, which\nfor a local `cargo bench -p ffi-bench` resolves under `ffi-bench/` where\nthe fixture does not exist — so the run silently substituted the synthetic\n1 MiB corpus and reported it as `decodecorpus-synthetic-1m`.\n\nCI is unaffected: it passes `STRUCTURED_ZSTD_BENCH_CORPUS_PATH` explicitly.\nThis only fixes the local path, where the substitution is easy to miss and\nmeans benching different data than intended.\n\nAdds the `../zstd/decodecorpus_files/z000033` sibling candidate.\n\nPart of #474\n\n* fix(encoder): use the simd128 candidate collector in the wasm DP wrapper\n\n`build_optimal_plan_impl_simd128` passed\n`collect_optimal_candidates_initialized_scalar` to the body macro, so a\nwasm build at levels 16-22 ran the simd128 price set over scalar BT\ncandidate collection. The simd128 collector added earlier in this branch\nwas reachable only through the `#[cfg(test)]` shim, which is why nothing\nfailed.\n\nPass the simd128 collector, matching what the native tiers do. Confirmed\non a `+simd128 --features kernel-simd128` build: `nm` now finds the\ncollector's monomorphisations in the archive.\n\nPart of #474\n\n* refactor(encoder): rename the sse42 fastpath module to sse2\n\nThe module holds only SSE2 intrinsics — `_mm_cmpeq_epi8`, `_mm_loadu_si128`,\n`_mm_movemask_epi8` — and its functions were lowered to\n`target_feature(enable = \"sse2\")` when the dead CRC hash mix went away. The\n`sse42` name dated from that mix and had been describing the wrong ISA ever\nsince, which is exactly the kind of name this branch has been removing\nelsewhere.\n\nRenames the file, the module path, `Sse42Tags`, and the nine per-tier\nwrappers that compile under the SSE2 umbrella\n(`bt_insert_step_no_rebase`, `bt_insert_and_collect_matches`,\n`bt_update_tree_until`, `hash3_candidate`, `row_probe`, `lazy`,\n`for_each_repcode_candidate_with_reps`, `start_matching_fast_loop`,\n`cbfd_borrowed`).\n\n`build_optimal_plan_impl_sse42` and\n`collect_optimal_candidates_initialized_sse42` keep their names: those do\nneed SSE4.2, since the price set calls `priceset_range_nonabort_sse41`.\n`FastpathKernel::Sse42` likewise still names the real SSE4.2 tier.\n\nPart of #474\n\n* refactor(encoder): scope the scalar BT-probe dead-code allow to the NEON tier\n\nThe allow claimed the probe is unused on every little-endian aarch64\nbuild. That stopped being true once the tiers were gated: with\n`kernel-neon` off, the scalar walker is compiled back in and this probe is\nthe live path. Narrow the attribute and its documentation to the case that\nactually holds.\n\nPart of #474\n\n* ci(wasm): build the scalar check with kernel-scalar\n\nThe step named \"wasm32 scalar\" passed `--features kernel-simd128`. It did\nbuild scalar code, since the wasm kernels also need\n`target_feature = \"simd128\"` and that step sets no rustflags, but it never\nexercised a `kernel-scalar` build, so a scalar-only compile or dispatch\nregression could pass CI unseen.\n\nPoint it at `kernel-scalar` and keep the old invocation as its own step:\n\"feature on, target feature off\" is exactly the combination where a\nmissing cargo-feature gate hides, which this branch already had to fix\nonce in the optimal parser.\n\nAlso updates the LDM comments that still described `hash` gating after the\ncfgs moved to `ldm`, and corrects the `start_matching_optimal` reference to\n`hc/optimal.rs` (verified with ast-grep: the definition is at\n`hc/optimal.rs:1001` and the `prepare_ldm_candidates` call at `:1044`).\n\nPart of #474\n\n* test(bench): add a C-side encode loop for instruction-count comparison\n\n`encode_loop_z000033` profiles our encoder in isolation, but there was no\nstructurally identical C counterpart, so a `perf stat` comparison mixed in\nharness differences. This mirrors it: same read-once, allocate-once,\ncompress-N-times shape through `ZSTD_compress`.\n\nPart of #474\n\n* test(bench): add a one-shot slice encode loop for profiling\n\n`encode_loop_z000033` drives `FrameCompressor::compress` from a `Read`\nsource, which takes the owned block loop and copies the input into the\nmatcher history. `compare_ffi` instead times\n`compress_independent_frame_into`, which is borrowed-eligible for the\nDfast/Row/Fast backends and scans the caller's slice in place.\n\nProfiling the former to explain the latter attributes a per-frame copy the\nmeasured path never performs, so keep a binary for each shape.\n\nPart of #474\n\n* perf(encoder): read owned blocks straight into the matcher history\n\nThe owned block loop staged every block in a scratch `Vec`, which the\nmatcher then copied into its `history`, and copied any pre-split remainder\nback out into a carry buffer. On a streaming `compress()` that copy was\n6.35% of runtime (150M of 2362M cycles on decodecorpus-z000033 L3), against\n0.68% for the equivalent C run.\n\nRead into the history buffer instead. The block length is only known after\nthe bytes are read (the pre-split pass needs to see them), so ingest is now\ntwo-phase: `fill_in_place` appends into the history tail without touching\nthe window, the splitter picks a boundary inside `uncommitted_input`, and\n`commit_filled` claims that prefix. Whatever the splitter leaves over stays\nwhere it is and heads the next block, so the carry costs nothing either —\n`pending_input` is unused on this path.\n\n`Matcher` gains the three hooks with defaults that keep the staged path, so\nexternal implementations are unaffected and the other three backends stay\non the old route until they get the same treatment. `compress_block_encoded`\ntakes a `BlockInput` describing where the bytes are; classification (RLE\ndetect, raw fast path, per-block checksum) happens before the commit, where\na shared borrow of the matcher is still available.\n\nOutput is byte-identical: all 168 scenario/level pairs in `compare_ffi`\nreport the same `rust_bytes` as before.\n\nPart of #474\n\n* test(bench): add an owned-path digest example\n\nPrints length plus an FNV digest of the reader-path frame per level, so a\nchange to the owned block loop can be shown byte-identical without a\ncriterion run. The compare_ffi REPORT lines only cover the one-shot\nborrowed path.\n\nPart of #474\n\n* perf(encoder): extend in-place block ingest to Row and HashChain\n\nAdds the two-phase ingest to `RowMatchGenerator` and `MatchTable` (which\nHashChain owns), so three of the four backends now read the block straight\ninto their history instead of staging a copy. Simple keeps the staged path:\nit parks the block in a `pending` slot the kernel consumes later, so its\nbytes do not reach `history` at commit time and the shape does not apply\nas written.\n\nUncommitted bytes are tracked in an explicit `uncommitted_len` rather than\nderived from `window_size`: a primed dictionary also lives in `history`, so\n`history_start + window_size` is not the committed end on a dict frame,\nand deriving it there retired dictionaries mid-frame.\n\nEvery reader of the committed region now stops at that boundary —\n`live_history`, `get_last_space`, the Dfast owned scan descriptor and the\nlast-committed-block pointer. Without it a scan could forward-count into\nthe next block's bytes, which the staged path never had in the buffer.\n\nVerified byte-identical on the one-shot path (all 168 compare_ffi\nscenario/level pairs) and on the reader path for levels 1, 2, 5, 6, 9, 12,\n13, 16, 19 and 22. Levels 3 and 4 (Dfast) still differ from the staged\noutput in 5 bytes of 293823 at equal frame length and equal block\nboundaries — the sequences inside two blocks differ. Not yet root-caused;\ntracked as follow-up before this lands.\n\nPart of #474\n\n* fix(dfast): bound hash inserts and the drain trigger to committed bytes\n\nWith in-place ingest the history buffer also holds bytes no block has\nclaimed yet. Two readers still measured against the raw buffer length:\n\n- `scan_source` reported those bytes as readable, so the insert guard it\n  feeds admitted hash positions inside the next block's data, seeding the\n  tables with candidates the staged path never had.\n- `compact_history`'s drain trigger compared `history_start` against the\n  full buffer length, firing later than on the staged path.\n\nBoth now measure the committed length, matching `owned_scan_descriptor`.\nLevels 3 and 4 were the only ones affected; encoder output across levels\n1-22 is now byte-identical to the staged path on the corpus fixture and\non a 600 KB prefix (previously 5 bytes of 293823 differed, at equal frame\nlength and equal block boundaries).\n\n* perf(encoder): apply the eviction ceiling on commit, not on fill\n\n`fill_uncommitted` sized the one-time eviction ceiling off the read\nbuffer's capacity rather than a block length, so `window_size + capacity\n> max_window_size` held on the very first fill and reserved the full\nwindow + window/4 mirror for frames that never evict at all. Every fresh\nframe then faulted that mirror in.\n\nMeasured on the i9 at level 13 (1 MB corpus, 10 iters): page-faults\n14,561 -> 47,367 and cycles 1.523G -> 1.703G against the staged path.\nThe ceiling now runs in `commit_block`, at the same point in the\nsequence as `add_data` and keyed on the length a block actually claims.\n\nThe drain trigger in Row and the match-table storage gets the same\ncommitted-length bound the dfast one already has.\n\nOutput stays byte-identical across levels 1-22 on the corpus fixture.\n\n* perf(encoder): size the ingest buffer once per frame\n\nThe per-block `reserve` grew the in-place ingest buffer along a doubling\nchain, so a 1 MB frame walked four allocations. With a fresh compressor\nper frame that churn fragments the allocator arena: peak RSS was\nunchanged (23 MB) yet minor faults tripled (14.5K -> 47.4K) and landed in\nthe table allocation rather than the buffer itself.\n\nA pledged content size now sizes the buffer up front, clamped to the\neviction ceiling so an over-long or absent hint cannot over-reserve.\n\n* perf(encoder): reserve a block of slack with the frame\n\nThe final top-up asks for a whole block's room even when only a tail of\nthe frame remains, so reserving exactly the pledged size still forced one\nreallocation (and one copy of the frame) per frame. Reserve the pledged\nsize plus a block, still clamped to the eviction ceiling.\n\n* fix(encoder): keep Uncompressed frames off the in-place ingest path\n\n`fill_in_place` dispatches on the matcher, not on the level, so the\nstaged-path assumption for `Uncompressed` held only because the built-in\ndriver resolves that level to a backend without in-place ingest. An\nexternal `M: Matcher` that implements the hook broke it: debug builds hit\nthe assert, release builds emitted an empty Raw block while the payload\nstayed uncommitted in the matcher, losing the frame's data.\n\nThe gate is now on the level, at the ingest site. Carries a regression\ntest with a matcher that does implement in-place ingest.\n\n* fix(encoder): carry the uncommitted count through reset and clone_from\n\nTwo paths left the in-place ingest count describing a buffer that no\nlonger existed. Every bound is `history.len() - uncommitted_len`, so a\nstale count silently truncates the live window or underflows.\n\n- `reset` cleared history but kept the count. Bytes an abandoned frame\n  ingested without claiming are now dropped for Dfast, Row and the match\n  table, before the floor advance that would otherwise count them.\n- `clone_from` (the primed-dictionary restore) overwrote history from the\n  snapshot without adopting the source's count, unlike `clone`.\n\nCarries regression tests for both, which panicked on subtract-with-overflow\nbefore the fix.\n\n* fix(encoder): drop stale uncommitted bytes and harden the block claim\n\nCompanion to the tests in the previous commit. Two paths left the\nin-place ingest count describing a buffer that no longer existed, and\nevery bound is `history.len() - uncommitted_len`, so a stale count\nsilently truncates the live window or underflows.\n\n- `reset` cleared history but kept the count. Bytes an abandoned frame\n  ingested without claiming are now dropped for Dfast, Row and the match\n  table, before the floor advance that would otherwise count them.\n- `clone_from` (the primed-dictionary restore) overwrote history from the\n  snapshot without adopting the source's count, unlike `clone`.\n\nAlso here: the per-block claim check becomes a hard assert (it runs once\nper block, and a release-mode wrap surfaces as a panic far from the\ncause), the wasm `simd128` tier gains its tree-update and HC3 probe\nvariants so a simd128 build no longer drives a SIMD insert step from a\nscalar walk, and the row SSE probe's SAFETY note now names SSE2, which is\nwhat it actually requires.\n\n* perf(encoder): hash each block once, and only when a sink collects it\n\nThe compressed branch discarded the checksum taken from the pre-commit\nview and hashed the block a second time from the committed copy, though\nboth cover the same bytes. It now reuses the single pass, and that pass\nis skipped entirely when no sink collects checksums, which is the common\ncase for a whole-block hash.\n\nAlso: the owned-path digest example walks every level 1-22 rather than a\nsample of twelve, and the benchmark quick-start selects the package that\nowns `compare_ffi`, so the documented command actually runs.\n\n* perf(dfast): derive literal lengths at the emit sites\n\n* perf(dfast): scan the block through one cursor base like upstream\n\n* perf(dfast): gate the rep probe in block coordinates\n\nContinues folding the fast loop onto one coordinate system. The rep probe\nheld two absolute-position checks (`rep1 <= abs_ip1` and the candidate\nagainst the window floor) that together say one thing about the index:\nthe back-reference lands at or after the start of live history. In block\ncoordinates that is a single `rep1 <= idx1`, and the borrowed floor\nbecomes `rep1 <= advertised_window`; both const branches fold.\n\nSlot packing loses its `position_base` term the same way: it is a\nper-block constant, so the per-position work is one add.\n\n* fix(encoder): retire the dictionary budget on in-place commits\n\nThree defects from review, with the regression tests that proved them.\n\n`commit_filled` skipped the eviction accounting `commit_space` runs, so a\ndictionary-backed frame fed from a reader kept its inflated\n`max_window_size` after the dictionary bytes were evicted. The backend\nthen admitted matches older than the window the frame header reports:\nthe new test compresses periodic data through a 1 KiB window and the\ndecoder rejected the result with `OffsetTooBig { offset: 4096, buf_len:\n2048 }`.\n\nReaching that test first needed a block-sizing fix: upstream sizes a\nblock as `MIN(maxBlockSize, windowSize)`, we always asked for the full\n128 KiB, and the matcher asserts on a block wider than its window. This\nchanges block boundaries for frames whose window is smaller than the\nblock size, which previously could not run at all.\n\nThe stream-headroom guard counted only the top-up, not the bytes the\ningest buffer already carried (and the EOF re-inspection passes a\ncapacity of zero), so a commit could walk past the slack the unchecked\nabsolute-position lookahead relies on. All three backends now count both.\n\nAlso from review: the whole-block checksum is skipped for the post-split\npath, whose helper records a checksum per emitted partition, and the\nclone_from test now stages bytes in the source instead of asserting\nagainst an empty one.\n\nInterop coverage grew to match: the C codec roundtrip now runs the whole\nlevel ladder in both directions, plus a level x LDM x dictionary matrix\nthat asserts LDM actually changes the output.\n\n* perf(dfast): unpack slots straight into concat indices\n\n* perf(dfast): drop the checked_sub form from the candidate gates\n\n* perf(dfast): RESULT unpacking slots into indices loses, keep the position gate\n\nMeasured on the i9, `encode_loop_z000033 3 40` on the corpus, interleaved\nwith a flat c_ffi control arm (899-920M cycles throughout):\n\n  position gate (kept)   1.963G / 1.966G cycles, 4.217G instructions\n  index gate, checked    2.036G / 2.040G cycles, 4.296G instructions  +3.7%\n  index gate, compares   1.977G / 1.975G cycles, 4.239G instructions  +0.6%\n\nThe idea was that unpacking a slot straight into a concat index would take\nthe absolute position off the hot path. It does not pay: the emit paths\nstill need the absolute position, so nothing is freed, and the rebase\nconstant is added work on every candidate.\n\nBetween the two index forms, `checked_sub` cost the most — not the\ninstruction, which is a subtract plus a flag test, but the `if let\nSome(..)` around it, which reorders the branch and the register\nallocation. Two bare comparisons recover most of that.\n\nKept from this line of work (all measured wins, all byte-identical): the\nblock-relative cursor, the per-block packing constant, and the rep probe\nin block coordinates. Level 3 stands at 2.15x the C reference, down from\n2.44x.\n\n* fix(encoder): reserve the ingest buffer only for a pledged size\n\nTwo review findings on the frame-sized reservation.\n\nAn advisory `set_source_size_hint` is an estimate, not a promise, so a\ncompressor with a large window and a tiny reader could be asked to\nallocate hundreds of MiB before reading a byte. The reservation is now\ngated on the hint being exact; an inexact one keeps the doubling growth,\nwhich is bounded by what actually arrives.\n\nThe block-sized slack was the format maximum rather than the block the\nframe will really cut, so a 1 KiB-window frame reserved ~129 KiB for a\n1 KiB payload. The caller derives the slack from the active block\ncapacity and the backends take the request as given, with a test that\npins the reservation to the request.",
+          "timestamp": "2026-09-02T23:35:17+03:00",
+          "tree_id": "75cd2310a7d00a129214966b21347e9108508905",
+          "url": "https://github.com/structured-world/structured-zstd/commit/fe45d4455045bb953764f54697176c128ff3ad7c"
+        },
+        "date": 1788383842326,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.067,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.064,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 172.689,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 166.521,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 0.874,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.348,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.485,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.692,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.455,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.732,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.026,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.129,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.026,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.13,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.008,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 11.559,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 5.958,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.135,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.228,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.547,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.148,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.73,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.253,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.027,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.172,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.027,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.167,
             "unit": "ms"
           }
         ]
