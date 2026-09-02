@@ -3152,7 +3152,7 @@ impl RowMatchGenerator {
             // targets (musl) amplified into the dominant per-frame cost.
             self.row_heads.clear();
             self.row_heads.resize(row_count, 0);
-            if self.tables.capacity() > super::match_table::storage::oversized_capacity(total) {
+            if super::match_table::storage::capacity_is_oversized(self.tables.capacity(), total) {
                 // Coming down from the chain / tree finder (or a wider row
                 // layout): `clear` + `resize` would keep that allocation —
                 // tens of MiB at the btlazy2 levels — resident for every later
@@ -3182,7 +3182,8 @@ impl RowMatchGenerator {
             // same fill the separate vectors paid and saves an allocation.
             if self.hc_split != hash_len || self.tables.len() != hash_len + chain_len || relayout {
                 let total = hash_len + chain_len;
-                if self.tables.capacity() > super::match_table::storage::oversized_capacity(total) {
+                if super::match_table::storage::capacity_is_oversized(self.tables.capacity(), total)
+                {
                     // Same release rule as the row branch: a level downgrade
                     // must not pin the widest tables this compressor ever
                     // used.

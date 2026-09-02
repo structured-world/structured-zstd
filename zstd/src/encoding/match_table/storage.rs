@@ -72,8 +72,8 @@ pub(crate) const MAX_PRIMED_WINDOW_SIZE: usize =
 /// lets every downstream `abs_pos + N` site stay raw and keeps i686
 /// streams correct. New match-finder backends with their own
 /// `add_data` path must route through this helper.
-/// Capacity above which a table buffer counts as oversized for a layout of
-/// `wanted` slots and is handed back rather than re-used.
+/// Whether a table buffer of `capacity` slots is too big to keep for a layout
+/// of `wanted` slots, and should be handed back rather than re-used.
 ///
 /// Re-using the allocation is the whole point of holding the tables in one
 /// buffer, so a small overshoot is kept: levels within a factor of two of each
@@ -81,12 +81,13 @@ pub(crate) const MAX_PRIMED_WINDOW_SIZE: usize =
 /// that, a compressor that once ran a large level would pin its biggest
 /// allocation for the rest of its life. Upstream applies the same hysteresis
 /// to its workspace (`workspaceOversizedDuration`).
-/// `saturating_mul`: a table wider than half the address space cannot exist,
-/// and clamping the threshold at the maximum is the meaningful answer for one
-/// that somehow did — every capacity compares below it.
+///
+/// Phrased as a halving rather than `wanted * 2` so no arithmetic can leave
+/// the type: a doubling would need a clamp, and a clamp here fails open —
+/// `usize::MAX` compares above every capacity, silently disabling the release.
 #[inline]
-pub(crate) fn oversized_capacity(wanted: usize) -> usize {
-    wanted.saturating_mul(2)
+pub(crate) fn capacity_is_oversized(capacity: usize, wanted: usize) -> bool {
+    capacity / 2 > wanted
 }
 
 #[inline]
@@ -658,7 +659,7 @@ impl MatchTable {
         // re-lays out all three. That costs the same fill the separate vectors
         // paid for the region that changed, and saves two allocations.
         if self.chain_off != hash_size || self.hash3_off != hash_size + chain_size {
-            if self.tables.capacity() > oversized_capacity(total) {
+            if capacity_is_oversized(self.tables.capacity(), total) {
                 // Levelling down: `clear` + `resize` would keep the largest
                 // allocation this compressor ever made resident for every
                 // later frame, so hand the buffer back instead.
