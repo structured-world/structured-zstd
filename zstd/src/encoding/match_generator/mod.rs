@@ -1145,8 +1145,8 @@ impl Matcher for MatchGeneratorDriver {
                 }
                 MatcherStorage::Row(m) => {
                     m.row_heads = Vec::new();
-                    m.row_positions = Vec::new();
                     m.row_tags = Vec::new();
+                    m.release_tables();
                     m.reset();
                 }
                 MatcherStorage::HashChain(m) => {
@@ -1157,9 +1157,9 @@ impl Matcher for MatchGeneratorDriver {
                     // otherwise stay pinned across the backend switch,
                     // even though no future caller of this backend will
                     // touch them.
-                    m.table.hash_table = Vec::new();
-                    m.table.chain_table = Vec::new();
-                    m.table.hash3_table = Vec::new();
+                    m.table.tables = Vec::new();
+                    m.table.chain_off = 0;
+                    m.table.hash3_off = 0;
                     let vec_pool = &mut self.vec_pool;
                     m.reset(|mut data| {
                         data.resize(data.capacity(), 0);

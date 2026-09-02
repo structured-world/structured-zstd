@@ -450,7 +450,7 @@ macro_rules! row_find_best_match {
         // by the `ensure_tables` sizing (`row` is masked to `row_hash_log`
         // bits, `row_log == $rl`), the same argument as `insert_at`.
         debug_assert_eq!($rl, $m.row_log);
-        debug_assert!(row_base + row_entries <= $m.row_positions.len());
+        debug_assert!(row_base + row_entries <= $m.row_positions().len());
         let head = unsafe { *$m.row_heads.get_unchecked($row) } as usize;
         let window_low = $ctx.window_low($abs_pos);
         let budget = $m.search_depth.min(row_entries);
@@ -511,7 +511,7 @@ macro_rules! row_find_best_match {
                     continue;
                 }
                 // SAFETY: `slot < row_entries`; see the table-indexing note.
-                let raw = unsafe { *$m.row_positions.get_unchecked(row_base + slot) };
+                let raw = unsafe { *$m.row_positions().get_unchecked(row_base + slot) };
                 // Newest-first order: the first empty / below-floor entry ends
                 // the walk (upstream `if (matchIndex < lowLimit) break`).
                 if raw == ROW_EMPTY_SLOT || (raw as usize) < window_low {
@@ -733,8 +733,11 @@ macro_rules! hc_find_best_match {
             let mut idx = $ntu;
             while idx < p {
                 let h = $m.hc_hash_at($ctx, idx);
-                $m.hc_chain[idx & chain_mask] = $m.hc_hash[h];
-                $m.hc_hash[h] = idx as u32;
+                // Split per iteration so the hash helper can borrow again on
+                // the next one; the two halves come from one buffer.
+                let (hash, chain) = $m.hc_tables_mut();
+                chain[idx & chain_mask] = hash[h];
+                hash[h] = idx as u32;
                 idx += 1;
                 if $skip {
                     break;
@@ -750,7 +753,11 @@ macro_rules! hc_find_best_match {
         // A copied dictionary is upstream's `extDict` segment: its candidates
         // are gated at the match head instead of at the current best length.
         let prefix_start = $ctx.prefix_start;
-        let mut match_index = $m.hc_hash[$m.hc_hash_at($ctx, p)];
+        // Shared views of the two halves for the walk below, which only reads
+        // them; taken once so the chain hop is a plain index.
+        let hc_hash = $m.hc_hash();
+        let hc_chain = $m.hc_chain();
+        let mut match_index = hc_hash[$m.hc_hash_at($ctx, p)];
         while match_index != ROW_EMPTY_SLOT && (match_index as usize) >= window_low && attempts > 0
         {
             let cand = match_index as usize;
@@ -780,7 +787,7 @@ macro_rules! hc_find_best_match {
             if cand <= min_chain {
                 break;
             }
-            match_index = $m.hc_chain[cand & chain_mask];
+            match_index = hc_chain[cand & chain_mask];
             attempts -= 1;
         }
         // Attached dictionary (upstream `dictMatchState`): the CDict's own
@@ -850,9 +857,13 @@ macro_rules! dubt_update {
             let h = $m.hc_hash_at($ctx, idx);
             let ci = idx + BT_IDX_BASE;
             let node = 2 * (ci & bt_mask);
-            $m.hc_chain[node] = $m.hc_hash[h];
-            $m.hc_chain[node + 1] = BT_UNSORTED_MARK;
-            $m.hc_hash[h] = ci as u32;
+            // Both tables live in one buffer, so take the two halves together;
+            // the split ends with the iteration, leaving `hc_hash_at` free to
+            // borrow again on the next one.
+            let (hash, chain) = $m.hc_tables_mut();
+            chain[node] = hash[h];
+            chain[node + 1] = BT_UNSORTED_MARK;
+            hash[h] = ci as u32;
             idx += 1;
         }
     }};
@@ -865,8 +876,12 @@ macro_rules! dubt_update {
 /// not the dictionary rule). A node whose match runs to the block end is
 /// dropped from the tree (upstream: "no way to know if inf or sup").
 macro_rules! dubt_insert1 {
-    ($m:expr, $ctx:ident, $curr:expr, $nb_compares:expr, $bt_low:expr, $cpl:path) => {{
-        let bt_mask = (1usize << ($m.hc_chain_log - 1)) - 1;
+    // Takes the mask and the link table from the caller rather than the
+    // matcher: the caller already holds a mutable borrow of the shared table
+    // buffer, so reaching back through `$m` here would not borrow-check.
+    ($bt_mask:expr, $hc_chain:ident, $ctx:ident, $curr:expr, $nb_compares:expr, $bt_low:expr, $cpl:path) => {{
+        let bt_mask = $bt_mask;
+        let hc_chain = &mut *$hc_chain;
         let hist_start = $ctx.hist_start;
         let curr: usize = $curr;
         let cur_abs = curr - BT_IDX_BASE;
@@ -890,7 +905,7 @@ macro_rules! dubt_insert1 {
             + BT_IDX_BASE;
         let mut smaller_ptr = 2 * (curr & bt_mask);
         let mut larger_ptr = smaller_ptr + 1;
-        let mut match_index = $m.hc_chain[smaller_ptr] as usize;
+        let mut match_index = hc_chain[smaller_ptr] as usize;
         let mut common_smaller = 0usize;
         let mut common_larger = 0usize;
         let mut nb = $nb_compares;
@@ -915,31 +930,31 @@ macro_rules! dubt_insert1 {
                 break;
             }
             if smaller {
-                $m.hc_chain[smaller_ptr] = match_index as u32;
+                hc_chain[smaller_ptr] = match_index as u32;
                 common_smaller = ml;
                 if match_index <= $bt_low {
                     smaller_ptr = BT_DISCARD;
                     break;
                 }
                 smaller_ptr = next_ptr + 1;
-                match_index = $m.hc_chain[next_ptr + 1] as usize;
+                match_index = hc_chain[next_ptr + 1] as usize;
             } else {
-                $m.hc_chain[larger_ptr] = match_index as u32;
+                hc_chain[larger_ptr] = match_index as u32;
                 common_larger = ml;
                 if match_index <= $bt_low {
                     larger_ptr = BT_DISCARD;
                     break;
                 }
                 larger_ptr = next_ptr;
-                match_index = $m.hc_chain[next_ptr] as usize;
+                match_index = hc_chain[next_ptr] as usize;
             }
             nb -= 1;
         }
         if smaller_ptr != BT_DISCARD {
-            $m.hc_chain[smaller_ptr] = 0;
+            hc_chain[smaller_ptr] = 0;
         }
         if larger_ptr != BT_DISCARD {
-            $m.hc_chain[larger_ptr] = 0;
+            hc_chain[larger_ptr] = 0;
         }
     }};
 }
@@ -972,36 +987,49 @@ macro_rules! dubt_find_best_match {
             let window_low = $ctx.window_low(p) + BT_IDX_BASE;
             let bt_low = curr.saturating_sub(bt_mask);
             let unsort_limit = bt_low.max(window_low);
-            let mut match_index = $m.hc_hash[h] as usize;
+            // Take the two halves of the shared buffer once for the whole
+            // walk: every access below is an index into them, and re-deriving
+            // the split per access would put a load in the hot tree loop.
+            let search_depth = $m.search_depth;
+            let (hc_hash, hc_chain) = $m.hc_tables_mut();
+            let mut match_index = hc_hash[h] as usize;
             let mut next_candidate = 2 * (match_index & bt_mask);
             let mut unsorted_mark = next_candidate + 1;
-            let mut nb_compares = $m.search_depth;
+            let mut nb_compares = search_depth;
             let mut nb_candidates = nb_compares;
             let mut previous_candidate = 0usize;
             // Reach the end of the unsorted candidate list, reversing it
             // through the sort-mark slots.
             while match_index > unsort_limit
-                && $m.hc_chain[unsorted_mark] == BT_UNSORTED_MARK
+                && hc_chain[unsorted_mark] == BT_UNSORTED_MARK
                 && nb_candidates > 1
             {
-                $m.hc_chain[unsorted_mark] = previous_candidate as u32;
+                hc_chain[unsorted_mark] = previous_candidate as u32;
                 previous_candidate = match_index;
-                match_index = $m.hc_chain[next_candidate] as usize;
+                match_index = hc_chain[next_candidate] as usize;
                 next_candidate = 2 * (match_index & bt_mask);
                 unsorted_mark = next_candidate + 1;
                 nb_candidates -= 1;
             }
             // Nullify the last candidate if it is still unsorted (upstream:
             // costs a little ratio, buys speed).
-            if match_index > unsort_limit && $m.hc_chain[unsorted_mark] == BT_UNSORTED_MARK {
-                $m.hc_chain[next_candidate] = 0;
-                $m.hc_chain[unsorted_mark] = 0;
+            if match_index > unsort_limit && hc_chain[unsorted_mark] == BT_UNSORTED_MARK {
+                hc_chain[next_candidate] = 0;
+                hc_chain[unsorted_mark] = 0;
             }
             // Batch-sort the stacked candidates, oldest first.
             match_index = previous_candidate;
             while match_index != 0 {
-                let next_idx = $m.hc_chain[2 * (match_index & bt_mask) + 1] as usize;
-                dubt_insert1!($m, $ctx, match_index, nb_candidates, unsort_limit, $cpl);
+                let next_idx = hc_chain[2 * (match_index & bt_mask) + 1] as usize;
+                dubt_insert1!(
+                    bt_mask,
+                    hc_chain,
+                    $ctx,
+                    match_index,
+                    nb_candidates,
+                    unsort_limit,
+                    $cpl
+                );
                 match_index = next_idx;
                 nb_candidates += 1;
             }
@@ -1013,8 +1041,8 @@ macro_rules! dubt_find_best_match {
             let mut match_end_idx = curr + 8 + 1;
             let mut best_len = 0usize;
             let mut best_off = 0usize;
-            match_index = $m.hc_hash[h] as usize;
-            $m.hc_hash[h] = curr as u32;
+            match_index = hc_hash[h] as usize;
+            hc_hash[h] = curr as u32;
             while nb_compares > 0 && match_index > window_low {
                 // Tree nodes hold only earlier positions.
                 debug_assert!(match_index < curr, "tree walk reached a future node");
@@ -1054,31 +1082,31 @@ macro_rules! dubt_find_best_match {
                     break;
                 }
                 if smaller {
-                    $m.hc_chain[smaller_ptr] = match_index as u32;
+                    hc_chain[smaller_ptr] = match_index as u32;
                     common_smaller = ml;
                     if match_index <= bt_low {
                         smaller_ptr = BT_DISCARD;
                         break;
                     }
                     smaller_ptr = next_ptr + 1;
-                    match_index = $m.hc_chain[next_ptr + 1] as usize;
+                    match_index = hc_chain[next_ptr + 1] as usize;
                 } else {
-                    $m.hc_chain[larger_ptr] = match_index as u32;
+                    hc_chain[larger_ptr] = match_index as u32;
                     common_larger = ml;
                     if match_index <= bt_low {
                         larger_ptr = BT_DISCARD;
                         break;
                     }
                     larger_ptr = next_ptr;
-                    match_index = $m.hc_chain[next_ptr] as usize;
+                    match_index = hc_chain[next_ptr] as usize;
                 }
                 nb_compares -= 1;
             }
             if smaller_ptr != BT_DISCARD {
-                $m.hc_chain[smaller_ptr] = 0;
+                hc_chain[smaller_ptr] = 0;
             }
             if larger_ptr != BT_DISCARD {
-                $m.hc_chain[larger_ptr] = 0;
+                hc_chain[larger_ptr] = 0;
             }
             // Attached dictionary (upstream `dictMatchState`): walk the
             // CDict's sorted tree with the compares left, entered through
@@ -1956,7 +1984,7 @@ macro_rules! row_probe_body {
                 let Some(slot) = slot_opt else { break };
                 attempts += 1;
                 let idx = row_base + slot;
-                let raw_pos = $m.row_positions[idx];
+                let raw_pos = $m.row_positions()[idx];
                 if raw_pos == ROW_EMPTY_SLOT {
                     continue;
                 }
@@ -2260,8 +2288,6 @@ pub(crate) struct RowMatchGenerator {
     /// chain holds absolute positions with `ROW_EMPTY_SLOT` = empty; the tree
     /// holds `abs + BT_IDX_BASE` with 0 = none (`hc_layout` records which).
     hc_chain_log: usize,
-    hc_hash: Vec<u32>,
-    hc_chain: Vec<u32>,
     hc_layout: LazyFinder,
     /// Upstream `ms->loadedDictEnd` (absolute): the dictionary end while the
     /// dictionary is still valid for the block being parsed (its whole
@@ -2319,6 +2345,19 @@ pub(crate) struct RowMatchGenerator {
     /// compare, resolved once per matcher so the rep probe skips the
     /// `select_kernel()` atomic on every input byte.
     pub(crate) cpl_kernel: crate::encoding::fastpath::FastpathKernel,
+    /// Single backing allocation for every `u32` index table this matcher
+    /// owns (the cwksp analog the dfast backend already uses for its long /
+    /// short pair). The row finder and the chain / tree finder are mutually
+    /// exclusive, so one buffer serves both: in row mode it holds the row
+    /// positions, in chain / tree mode the hash table followed by the chain
+    /// table at `hc_split`. One allocation per compressor instead of three
+    /// keeps the allocator seeing a single size class, which is what decides
+    /// whether the tables keep their pages between frames.
+    pub(crate) tables: Vec<u32>,
+    /// Start of the chain / tree table inside [`Self::tables`]; the hash table
+    /// occupies everything before it. Zero in row mode, where the whole buffer
+    /// is row positions.
+    hc_split: usize,
     pub(crate) row_heads: Vec<u8>,
     // Absolute match positions, one per row slot. Stored as `u32` (not
     // `usize`): this is the largest match-finder array, and `u32` halves its
@@ -2329,7 +2368,6 @@ pub(crate) struct RowMatchGenerator {
     // origin down to the oldest live byte before that happens (see
     // [`Self::rebase_positions`]), keeping positions representable without
     // capping frame length.
-    pub(crate) row_positions: Vec<u32>,
     pub(crate) row_tags: Vec<u8>,
     /// Cached tag-match SIMD kernel; CPU features are fixed per process, so
     /// resolve once instead of querying per `row_candidate` call. On
@@ -2379,8 +2417,8 @@ impl RowMatchGenerator {
             offset_hist: [1, 4, 8],
             finder: LazyFinder::Rows,
             hc_chain_log: ROW_HASH_BITS,
-            hc_hash: Vec::new(),
-            hc_chain: Vec::new(),
+            tables: Vec::new(),
+            hc_split: 0,
             hc_layout: LazyFinder::Chain,
             loaded_dict_end: 0,
             low_limit: 0,
@@ -2399,7 +2437,6 @@ impl RowMatchGenerator {
             lazy_depth: 1,
             cpl_kernel: crate::encoding::fastpath::select_kernel(),
             row_heads: Vec::new(),
-            row_positions: Vec::new(),
             row_tags: Vec::new(),
             tag_kernel: crate::encoding::fastpath::select_kernel(),
             dict: DictAttach::new(),
@@ -2416,9 +2453,10 @@ impl RowMatchGenerator {
         self.chunk_lens.capacity() * core::mem::size_of::<usize>()
             + self.history.capacity()
             + self.row_heads.capacity()
-            + self.row_positions.capacity() * u32_sz
             + self.row_tags.capacity()
-            + (self.hc_hash.capacity() + self.hc_chain.capacity()) * u32_sz
+            // One buffer for whichever finder is live: row positions, or the
+            // chain / tree hash and link tables.
+            + self.tables.capacity() * u32_sz
             + self.dict.table().map_or(0, |t| {
                 t.heads.capacity()
                     + t.positions.capacity() * u32_sz
@@ -2488,7 +2526,8 @@ impl RowMatchGenerator {
         if self.row_hash_log != row_hash_log {
             self.row_hash_log = row_hash_log;
             self.row_heads.clear();
-            self.row_positions.clear();
+            self.tables.clear();
+            self.hc_split = 0;
             self.row_tags.clear();
             // NOTE: do NOT invalidate the dict here. `set_hash_bits` is called
             // twice per frame during level setup (once from `configure` with
@@ -2592,7 +2631,7 @@ impl RowMatchGenerator {
         // `set_borrowed_window` after this reset.
         self.borrowed_input = None;
         self.borrowed_block = None;
-        let tables_allocated = !self.row_positions.is_empty() || !self.hc_hash.is_empty();
+        let tables_allocated = !self.tables.is_empty();
         if next_floor <= REBASE_RESET_FLOOR_CEILING && tables_allocated {
             self.history_abs_start = next_floor;
         } else {
@@ -2602,11 +2641,15 @@ impl RowMatchGenerator {
             // by `rebase_positions` in `add_data`).
             self.history_abs_start = 0;
             self.row_heads.fill(0);
-            self.row_positions.fill(ROW_EMPTY_SLOT);
             self.row_tags.fill(0);
-            let empty = self.hc_empty_slot();
-            self.hc_hash.fill(empty);
-            self.hc_chain.fill(empty);
+            // The shared buffer holds whichever finder's tables are live, so
+            // it takes that finder's empty sentinel.
+            let empty = if self.hc_split == 0 {
+                ROW_EMPTY_SLOT
+            } else {
+                self.hc_empty_slot()
+            };
+            self.tables.fill(empty);
         }
         // Nothing of the previous frame is indexed for the new one, and the
         // lazy reps restart from the frame's initial history. The window
@@ -2863,27 +2906,26 @@ impl RowMatchGenerator {
                 (abs - delta) as u32
             };
         };
-        self.row_positions.iter_mut().for_each(rebase_abs);
-        if self.hc_layout == LazyFinder::Tree {
-            // Tree indices are `abs + BT_IDX_BASE`; 0 (none) and the unsorted
-            // mark are kept (upstream `ZSTD_reduceTable_btlazy2`).
-            let rebase_tree = |slot: &mut u32| {
-                let v = *slot as usize;
-                if v < BT_IDX_BASE {
-                    return;
-                }
-                let abs = v - BT_IDX_BASE;
-                *slot = if abs < delta {
-                    0
-                } else {
-                    (abs - delta + BT_IDX_BASE) as u32
-                };
+        // Tree indices are `abs + BT_IDX_BASE`; 0 (none) and the unsorted
+        // mark are kept (upstream `ZSTD_reduceTable_btlazy2`).
+        let rebase_tree = |slot: &mut u32| {
+            let v = *slot as usize;
+            if v < BT_IDX_BASE {
+                return;
+            }
+            let abs = v - BT_IDX_BASE;
+            *slot = if abs < delta {
+                0
+            } else {
+                (abs - delta + BT_IDX_BASE) as u32
             };
-            self.hc_hash.iter_mut().for_each(rebase_tree);
-            self.hc_chain.iter_mut().for_each(rebase_tree);
+        };
+        // One buffer, one pass: it holds row positions, or the chain / tree
+        // pair, and only the tree encodes its slots differently.
+        if self.hc_split != 0 && self.hc_layout == LazyFinder::Tree {
+            self.tables.iter_mut().for_each(rebase_tree);
         } else {
-            self.hc_hash.iter_mut().for_each(rebase_abs);
-            self.hc_chain.iter_mut().for_each(rebase_abs);
+            self.tables.iter_mut().for_each(rebase_abs);
         }
         self.lazy_next_to_update = self.lazy_next_to_update.saturating_sub(delta);
         self.low_limit = self.low_limit.saturating_sub(delta);
@@ -3043,6 +3085,51 @@ impl RowMatchGenerator {
     ///
     /// `pick_lazy_match` is intentionally not called here — depth == 0
     /// means "no lookahead", emit the first viable hit.
+    /// Drop the shared table allocation, for the backend switch that wants the
+    /// footprint gone before building the replacement variant.
+    pub(crate) fn release_tables(&mut self) {
+        self.tables = Vec::new();
+        self.hc_split = 0;
+    }
+
+    /// Row positions: in row mode the whole `u32` buffer is the position table.
+    #[inline(always)]
+    pub(crate) fn row_positions(&self) -> &[u32] {
+        &self.tables
+    }
+
+    /// Mutable row positions; see [`Self::row_positions`].
+    #[inline(always)]
+    pub(crate) fn row_positions_mut(&mut self) -> &mut [u32] {
+        &mut self.tables
+    }
+
+    /// Chain / tree hash table: the region before [`Self::hc_split`].
+    #[inline(always)]
+    pub(crate) fn hc_hash(&self) -> &[u32] {
+        &self.tables[..self.hc_split]
+    }
+
+    /// Chain / tree link table: the region from [`Self::hc_split`] on, and
+    /// empty in row mode — a zero split means the buffer holds row positions,
+    /// not a hash table of length zero (the hash is never smaller than two
+    /// slots), so the tail must not be reported as chain links.
+    #[inline(always)]
+    pub(crate) fn hc_chain(&self) -> &[u32] {
+        if self.hc_split == 0 {
+            &[]
+        } else {
+            &self.tables[self.hc_split..]
+        }
+    }
+
+    /// Both chain / tree tables at once, for the walkers that read the hash
+    /// head and write links in the same step.
+    #[inline(always)]
+    pub(crate) fn hc_tables_mut(&mut self) -> (&mut [u32], &mut [u32]) {
+        self.tables.split_at_mut(self.hc_split)
+    }
+
     pub(crate) fn ensure_tables(&mut self) {
         let row_count = 1usize << self.row_hash_log;
         let row_entries = 1usize << self.row_log;
@@ -3055,9 +3142,8 @@ impl RowMatchGenerator {
         };
         if total == 0 {
             self.row_heads = Vec::new();
-            self.row_positions = Vec::new();
             self.row_tags = Vec::new();
-        } else if self.row_positions.len() != total {
+        } else if self.tables.len() != total || self.hc_split != 0 {
             // Resize in place: `set_hash_bits` width changes `clear()` the
             // vecs but keep their capacity. The previous `vec![..]` form
             // re-allocated all three tables on every width change — three
@@ -3066,8 +3152,17 @@ impl RowMatchGenerator {
             // targets (musl) amplified into the dominant per-frame cost.
             self.row_heads.clear();
             self.row_heads.resize(row_count, 0);
-            self.row_positions.clear();
-            self.row_positions.resize(total, ROW_EMPTY_SLOT);
+            if super::match_table::storage::capacity_is_oversized(self.tables.capacity(), total) {
+                // Coming down from the chain / tree finder (or a wider row
+                // layout): `clear` + `resize` would keep that allocation —
+                // tens of MiB at the btlazy2 levels — resident for every later
+                // row frame, which is what the separate vectors released.
+                self.tables = alloc::vec![ROW_EMPTY_SLOT; total];
+            } else {
+                self.tables.clear();
+                self.tables.resize(total, ROW_EMPTY_SLOT);
+            }
+            self.hc_split = 0;
             self.row_tags.clear();
             self.row_tags.resize(total, 0);
         }
@@ -3081,29 +3176,46 @@ impl RowMatchGenerator {
             let chain_len = 1usize << self.hc_chain_log;
             let empty = self.hc_empty_slot();
             let relayout = self.hc_layout != self.finder;
-            if self.hc_hash.len() != hash_len || relayout {
-                self.hc_hash.clear();
-                self.hc_hash.resize(hash_len, empty);
-            }
-            if self.hc_chain.len() != chain_len || relayout {
-                self.hc_chain.clear();
-                self.hc_chain.resize(chain_len, empty);
+            // Both tables share the one buffer, so they are sized together:
+            // the hash occupies `[0, hash_len)` and the chain the rest. A
+            // width change on either therefore rewrites both, which costs the
+            // same fill the separate vectors paid and saves an allocation.
+            if self.hc_split != hash_len || self.tables.len() != hash_len + chain_len || relayout {
+                let total = hash_len + chain_len;
+                if super::match_table::storage::capacity_is_oversized(self.tables.capacity(), total)
+                {
+                    // Same release rule as the row branch: a level downgrade
+                    // must not pin the widest tables this compressor ever
+                    // used.
+                    self.tables = alloc::vec![empty; total];
+                } else {
+                    self.tables.clear();
+                    self.tables.resize(total, empty);
+                }
+                self.hc_split = hash_len;
             }
             self.hc_layout = self.finder;
         } else {
             // Rows mode never reads the chain / tree tables; a reused
             // compressor coming back from a btlazy2 level (same Row storage,
             // no backend swap) must not retain them (tens of MiB) alongside
-            // the live row tables.
-            self.hc_hash = Vec::new();
-            self.hc_chain = Vec::new();
+            // the live row tables. The row branch above re-sizes the shared
+            // buffer, so nothing to release here beyond the split marker.
+            self.hc_split = 0;
         }
+    }
+
+    /// Capacity of the shared table buffer, to check that a level downgrade
+    /// hands the oversized allocation back. Test-only.
+    #[cfg(test)]
+    pub(crate) fn tables_capacity(&self) -> usize {
+        self.tables.capacity()
     }
 
     /// Combined length of the chain / tree tables. Test-only.
     #[cfg(test)]
     pub(crate) fn hc_tables_len(&self) -> usize {
-        self.hc_hash.len() + self.hc_chain.len()
+        self.hc_hash().len() + self.hc_chain().len()
     }
 
     /// The absolute coordinate floor. Test-only.
@@ -3762,7 +3874,7 @@ impl RowMatchGenerator {
                 _mm_prefetch(self.row_heads.as_ptr().add(row).cast(), _MM_HINT_T0);
                 _mm_prefetch(self.row_tags.as_ptr().add(row_base).cast(), _MM_HINT_T0);
                 _mm_prefetch(
-                    self.row_positions.as_ptr().add(row_base).cast(),
+                    self.row_positions().as_ptr().add(row_base).cast(),
                     _MM_HINT_T0,
                 );
                 // Upstream zstd `ZSTD_row_prefetch` (zstd_lazy.c:816): rows of
@@ -3770,7 +3882,7 @@ impl RowMatchGenerator {
                 // second line is fetched too.
                 if ROW_LOG >= 5 {
                     _mm_prefetch(
-                        self.row_positions.as_ptr().add(row_base + 16).cast(),
+                        self.row_positions().as_ptr().add(row_base + 16).cast(),
                         _MM_HINT_T0,
                     );
                 }
@@ -3802,7 +3914,7 @@ impl RowMatchGenerator {
         // index pairs are provably in bounds; per-byte hot path on
         // fast/dfast/row levels saves ~6 instructions and 3 branches.
         debug_assert!(row < self.row_heads.len());
-        debug_assert!(row_base + row_entries <= self.row_positions.len());
+        debug_assert!(row_base + row_entries <= self.row_positions().len());
         unsafe {
             let head = *self.row_heads.get_unchecked(row) as usize;
             // Upstream `ZSTD_row_nextIndex`: slot 0 is never written (it
@@ -3817,7 +3929,7 @@ impl RowMatchGenerator {
             // `abs_pos < u32::MAX` holds: `add_data` caps a Row frame's
             // absolute cursor below `u32::MAX`, so the cast is lossless and
             // never collides with the `ROW_EMPTY_SLOT == u32::MAX` sentinel.
-            *self.row_positions.get_unchecked_mut(row_base + next) = abs_pos as u32;
+            *self.row_positions_mut().get_unchecked_mut(row_base + next) = abs_pos as u32;
         }
     }
 
@@ -4011,9 +4123,10 @@ impl RowMatchGenerator {
         // the live tables were just sized to the logs and hold nothing of
         // this frame yet (the tree convention's 0 = none).
         unsafe {
+            let (hc_hash, hc_chain) = self.tables.split_at_mut(self.hc_split);
             Self::update_dict_tree(
-                &mut self.hc_hash,
-                &mut self.hc_chain,
+                hc_hash,
+                hc_chain,
                 base.add(history_start),
                 concat_len,
                 index_base,
@@ -4144,8 +4257,10 @@ impl RowMatchGenerator {
                     for idx in from..indexable_end {
                         let abs = hist_start + idx;
                         let h = self.hc_hash_at(scan, abs);
-                        self.hc_chain[abs & chain_mask] = self.hc_hash[h];
-                        self.hc_hash[h] = abs as u32;
+                        // One buffer: take both halves for this link write.
+                        let (hash, chain) = self.hc_tables_mut();
+                        chain[abs & chain_mask] = hash[h];
+                        hash[h] = abs as u32;
                     }
                 } else {
                     match self.row_log {

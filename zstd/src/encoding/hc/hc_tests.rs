@@ -129,10 +129,10 @@ fn hash_chain_candidate_forward_ties_keep_first_visited() {
     let probe_hash = t.hash_position(&concat[abs_pos..]);
     // Hand-wire the chain head + link so the walk surfaces pos 9 first
     // (offset 18) then pos 18 (offset 9). `stored = pos + 1`.
-    t.hash_table[probe_hash] = 9 + 1;
+    t.hash_table_mut()[probe_hash] = 9 + 1;
     let chain_mask = (1usize << t.chain_log) - 1;
-    t.chain_table[9 & chain_mask] = 18 + 1;
-    t.chain_table[18 & chain_mask] = HC_EMPTY;
+    t.chain_table_mut()[9 & chain_mask] = 18 + 1;
+    t.chain_table_mut()[18 & chain_mask] = HC_EMPTY;
 
     let hc = HcMatcher::new(2, 16, 64);
     let cand = hc.hash_chain_candidate::<false>(t.live_history(), false, &t, abs_pos);

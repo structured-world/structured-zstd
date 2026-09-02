@@ -131,7 +131,7 @@ macro_rules! bt_insert_step_no_rebase_body {
             // SAFETY: prefetch is a hint that never faults; `hash` indexes
             // `hash_table` directly below, so it is in bounds.
             unsafe {
-                _mm_prefetch($table.hash_table.as_ptr().add(hash).cast(), _MM_HINT_T0);
+                _mm_prefetch($table.hash_table().as_ptr().add(hash).cast(), _MM_HINT_T0);
             }
             // Prefetch the NEXT position's bucket too. The optimal-parser DP
             // advances one position per iteration, so this miss is issued a
@@ -150,7 +150,7 @@ macro_rules! bt_insert_step_no_rebase_body {
                 // harmless no-op hint.
                 unsafe {
                     _mm_prefetch(
-                        $table.hash_table.as_ptr().add(hash_next).cast(),
+                        $table.hash_table().as_ptr().add(hash_next).cast(),
                         _MM_HINT_T0,
                     );
                 }
@@ -170,8 +170,8 @@ macro_rules! bt_insert_step_no_rebase_body {
         // Hoist the BT pointer-pair base out of `self` once — see the
         // collect-matches body for the full rationale (per-step Vec reload +
         // bounds check through `&mut self` vs the upstream zstd's raw `U32*` walk).
-        let chain_ptr = $table.chain_table.as_mut_ptr();
-        debug_assert_eq!($table.chain_table.len(), 2 << $table.bt_log());
+        let chain_ptr = $table.chain_table_mut().as_mut_ptr();
+        debug_assert_eq!($table.chain_table().len(), 2 << $table.bt_log());
         let window_low = $table.window_low_abs_for_target($target_abs);
         // `abs_pos + 9` is safe in raw form: `MatchTable::add_data` caps
         // total input at `usize::MAX - STREAM_ABS_HEADROOM` (where
@@ -189,8 +189,8 @@ macro_rules! bt_insert_step_no_rebase_body {
         let pair_idx = $table.bt_pair_index_for_abs($abs_pos);
         let mut smaller_slot = pair_idx;
         let mut larger_slot = pair_idx + 1;
-        let mut match_stored = $table.hash_table[hash];
-        $table.hash_table[hash] = stored;
+        let mut match_stored = $table.hash_table()[hash];
+        $table.hash_table_mut()[hash] = stored;
 
         while compares_left > 0 {
             if match_stored == $crate::encoding::match_table::storage::HC_EMPTY {
@@ -335,7 +335,7 @@ macro_rules! hash3_candidate_body {
             3,
         );
         let entry = $table
-            .hash3_table
+            .hash3_table()
             .get(hash3)
             .copied()
             .unwrap_or($crate::encoding::match_table::storage::HC_EMPTY);
@@ -590,7 +590,7 @@ macro_rules! bt_insert_and_collect_matches_body {
                                 3,
                             );
                         let entry = $table
-                            .hash3_table
+                            .hash3_table()
                             .get(hh)
                             .copied()
                             .unwrap_or($crate::encoding::match_table::storage::HC_EMPTY);
@@ -670,7 +670,7 @@ macro_rules! bt_insert_and_collect_matches_body {
             // SAFETY: prefetch is a hint that never faults; `hash` indexes
             // `hash_table` directly below, so it is in bounds.
             unsafe {
-                _mm_prefetch($table.hash_table.as_ptr().add(hash).cast(), _MM_HINT_T0);
+                _mm_prefetch($table.hash_table().as_ptr().add(hash).cast(), _MM_HINT_T0);
             }
             // Prefetch the NEXT position's bucket too. The optimal-parser DP
             // advances one position per iteration, so this miss is issued a
@@ -689,7 +689,7 @@ macro_rules! bt_insert_and_collect_matches_body {
                 // harmless no-op hint.
                 unsafe {
                     _mm_prefetch(
-                        $table.hash_table.as_ptr().add(hash_next).cast(),
+                        $table.hash_table().as_ptr().add(hash_next).cast(),
                         _MM_HINT_T0,
                     );
                 }
@@ -711,8 +711,8 @@ macro_rules! bt_insert_and_collect_matches_body {
         // `chain_table`. Indices are in bounds by the BT invariants:
         // `bt_pair_index_for_abs` returns `2*(abs & bt_mask) (+1)` ≤
         // `chain_table.len()-1`, and the slots only ever hold those values.
-        let chain_ptr = $table.chain_table.as_mut_ptr();
-        debug_assert_eq!($table.chain_table.len(), 2 << $table.bt_log());
+        let chain_ptr = $table.chain_table_mut().as_mut_ptr();
+        debug_assert_eq!($table.chain_table().len(), 2 << $table.bt_log());
         // See `bt_insert_step_no_rebase_body!`: saturating is needed for the
         // first BT walk of a fresh frame where `abs_pos < bt_mask`.
         let bt_low = $abs_pos.saturating_sub(bt_mask);
@@ -761,8 +761,8 @@ macro_rules! bt_insert_and_collect_matches_body {
         let pair_idx = $table.bt_pair_index_for_abs($abs_pos);
         let mut smaller_slot = pair_idx;
         let mut larger_slot = pair_idx + 1;
-        let mut match_stored = $table.hash_table[hash];
-        $table.hash_table[hash] = stored;
+        let mut match_stored = $table.hash_table()[hash];
+        $table.hash_table_mut()[hash] = stored;
         // Upstream zstd semantics: `bestLength` starts at `lengthToBeat - 1`; rep/hash3
         // probing may raise it; BT then only reports strictly longer matches.
         // `min_match_len >= HC_FORMAT_MINMATCH (3)` by configure invariant,
@@ -1111,11 +1111,12 @@ impl HcMatchGenerator {
             }
             _ => {}
         }
-        if resize && !self.table.hash_table.is_empty() {
-            // Force reallocation on next ensure_tables() call.
-            self.table.hash_table.clear();
-            self.table.hash3_table.clear();
-            self.table.chain_table.clear();
+        if resize && !self.table.tables.is_empty() {
+            // Force reallocation on next ensure_tables() call. The seams go
+            // with the buffer, so `ensure_tables` sees a fresh layout.
+            self.table.tables.clear();
+            self.table.chain_off = 0;
+            self.table.hash3_off = 0;
         }
     }
 

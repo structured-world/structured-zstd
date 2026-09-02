@@ -2020,6 +2020,39 @@ fn driver_no_dictionary_reset_drops_the_attached_tables() {
 /// the chain / tree tables — they are tens of MiB at the btlazy2 levels and
 /// the rows finder never reads them.
 #[test]
+fn driver_rows_frame_releases_the_tree_buffer_capacity() {
+    // Coming back from a btlazy2 level, the row frame must not keep the tree
+    // tables' allocation resident: reporting a zero length while holding tens
+    // of MiB of capacity is the same leak in a different accounting column.
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+    driver.set_source_size_hint(1 << 20);
+    driver.reset(CompressionLevel::Level(15));
+    let mut space = driver.get_next_space();
+    space[..12].copy_from_slice(b"abcabcabcabc");
+    space.truncate(12);
+    driver.commit_space(space);
+    driver.skip_matching_with_hint(None);
+    let tree_capacity = driver.row_matcher().tables_capacity();
+    assert!(
+        tree_capacity > 0,
+        "fixture precondition: the tree tables are allocated at L15"
+    );
+
+    driver.set_source_size_hint(1 << 20);
+    driver.reset(CompressionLevel::Level(5));
+    let mut space = driver.get_next_space();
+    space[..12].copy_from_slice(b"abcabcabcabc");
+    space.truncate(12);
+    driver.commit_space(space);
+    driver.skip_matching_with_hint(None);
+    assert!(
+        driver.row_matcher().tables_capacity() < tree_capacity,
+        "a rows frame must hand back the oversized tree buffer, kept {} of {tree_capacity}",
+        driver.row_matcher().tables_capacity()
+    );
+}
+
+#[test]
 fn driver_rows_reset_releases_the_tree_tables() {
     let mut driver = MatchGeneratorDriver::new(32, 2);
     driver.set_source_size_hint(1 << 20);
@@ -2425,7 +2458,7 @@ fn row_skip_matching_with_incompressible_hint_uses_sparse_prefix() {
     dense.add_data(data.clone(), |_| {});
     dense.skip_matching_with_hint(Some(false));
     let dense_slots = dense
-        .row_positions
+        .row_positions()
         .iter()
         .filter(|&&pos| pos != ROW_EMPTY_SLOT)
         .count();
@@ -2435,7 +2468,7 @@ fn row_skip_matching_with_incompressible_hint_uses_sparse_prefix() {
     sparse.add_data(data, |_| {});
     sparse.skip_matching_with_hint(Some(true));
     let sparse_slots = sparse
-        .row_positions
+        .row_positions()
         .iter()
         .filter(|&&pos| pos != ROW_EMPTY_SLOT)
         .count();
@@ -2468,7 +2501,7 @@ fn row_skip_matching_with_none_hint_leaves_interior_empty() {
     none_hint.add_data(data.clone(), |_| {});
     none_hint.skip_matching_with_hint(None);
     let none_slots = none_hint
-        .row_positions
+        .row_positions()
         .iter()
         .filter(|&&pos| pos != ROW_EMPTY_SLOT)
         .count();
@@ -2480,7 +2513,7 @@ fn row_skip_matching_with_none_hint_leaves_interior_empty() {
     dense.add_data(data, |_| {});
     dense.skip_matching_with_hint(Some(false));
     let dense_slots = dense
-        .row_positions
+        .row_positions()
         .iter()
         .filter(|&&pos| pos != ROW_EMPTY_SLOT)
         .count();
@@ -2654,8 +2687,8 @@ fn driver_better_to_best_resizes_hc_tables() {
     driver.skip_matching_with_hint(None);
 
     let hc = driver.hc_matcher();
-    let better_hash_len = hc.table.hash_table.len();
-    let better_chain_len = hc.table.chain_table.len();
+    let better_hash_len = hc.table.hash_table().len();
+    let better_chain_len = hc.table.chain_table().len();
 
     // Switch to L20 — must resize to larger tables.
     driver.reset(CompressionLevel::Level(20));
@@ -2670,15 +2703,15 @@ fn driver_better_to_best_resizes_hc_tables() {
 
     let hc = driver.hc_matcher();
     assert!(
-        hc.table.hash_table.len() > better_hash_len,
+        hc.table.hash_table().len() > better_hash_len,
         "L20 hash_table ({}) should be larger than L16 ({})",
-        hc.table.hash_table.len(),
+        hc.table.hash_table().len(),
         better_hash_len
     );
     assert!(
-        hc.table.chain_table.len() > better_chain_len,
+        hc.table.chain_table().len() > better_chain_len,
         "L20 chain_table ({}) should be larger than L16 ({})",
-        hc.table.chain_table.len(),
+        hc.table.chain_table().len(),
         better_chain_len
     );
 }
@@ -3664,7 +3697,7 @@ fn hc_reset_advances_floor_past_prior_frame_entries() {
     hc.table.insert_positions(0, 6);
     let prev_end = hc.table.history_abs_end();
     assert_eq!(prev_end, 10);
-    assert!(hc.table.hash_table.iter().any(|&v| v != HC_EMPTY));
+    assert!(hc.table.hash_table().iter().any(|&v| v != HC_EMPTY));
 
     hc.reset(|_| {});
 
@@ -3674,7 +3707,7 @@ fn hc_reset_advances_floor_past_prior_frame_entries() {
     // to an absolute position strictly below `history_abs_start` and is
     // rejected by the `window_low` guard before any byte is read.
     assert_eq!(hc.table.history_abs_start, prev_end);
-    for &slot in hc.table.hash_table.iter() {
+    for &slot in hc.table.hash_table().iter() {
         if let Some(candidate_abs) =
             MatchTable::stored_abs_position_fast(slot, hc.table.position_base, hc.table.index_shift)
         {
@@ -3692,8 +3725,8 @@ fn hc_reset_full_zeroes_when_floor_would_cross_ceiling() {
     let mut hc = HcMatchGenerator::new(32);
     hc.table.add_data(b"abcdeabcde".to_vec(), |_| {});
     hc.table.ensure_tables();
-    hc.table.hash_table.fill(123);
-    hc.table.chain_table.fill(456);
+    hc.table.hash_table_mut().fill(123);
+    hc.table.chain_table_mut().fill(456);
     // Push the would-be floor (`history_abs_end`) past the ceiling so
     // `reset` takes the bounded fallback: rewind to the origin and zero
     // the tables, keeping the absolute cursor from climbing toward
@@ -3704,8 +3737,8 @@ fn hc_reset_full_zeroes_when_floor_would_cross_ceiling() {
 
     assert_eq!(hc.table.history_abs_start, 0);
     assert_eq!(hc.table.position_base, 0);
-    assert!(hc.table.hash_table.iter().all(|&v| v == HC_EMPTY));
-    assert!(hc.table.chain_table.iter().all(|&v| v == HC_EMPTY));
+    assert!(hc.table.hash_table().iter().all(|&v| v == HC_EMPTY));
+    assert!(hc.table.chain_table().iter().all(|&v| v == HC_EMPTY));
 }
 
 #[test]
@@ -3854,7 +3887,7 @@ fn hc_sparse_skip_matching_does_not_reinsert_sparse_tail_positions() {
         .expect("overlap position should be representable as relative position");
     let chain_idx = rel as usize & ((1 << matcher.table.chain_log) - 1);
     assert_ne!(
-        matcher.table.chain_table[chain_idx],
+        matcher.table.chain_table()[chain_idx],
         rel + 1,
         "sparse-grid tail positions must not be reinserted (self-loop chain entry)"
     );
@@ -3877,13 +3910,13 @@ fn hc_insert_position_no_rebase_returns_when_relative_pos_unavailable() {
     hc.table.history_abs_start = 0;
     hc.table.position_base = 1;
     hc.table.ensure_tables();
-    let before_hash = hc.table.hash_table.clone();
-    let before_chain = hc.table.chain_table.clone();
+    let before_hash = hc.table.hash_table().to_vec();
+    let before_chain = hc.table.chain_table().to_vec();
 
     hc.table.insert_position_no_rebase(0);
 
-    assert_eq!(hc.table.hash_table, before_hash);
-    assert_eq!(hc.table.chain_table, before_chain);
+    assert_eq!(hc.table.hash_table(), before_hash);
+    assert_eq!(hc.table.chain_table(), before_chain);
 }
 
 #[test]
@@ -4194,7 +4227,7 @@ fn hc_rebases_positions_after_u32_boundary() {
     assert!(
         matcher
             .table
-            .hash_table
+            .hash_table()
             .iter()
             .any(|entry| *entry != HC_EMPTY),
         "HC hash table should still be populated after crossing u32 boundary"
@@ -4257,8 +4290,7 @@ fn hc_rebase_rebuilds_only_inserted_prefix() {
     expected.table.ensure_tables();
     expected.table.history_abs_start = history_abs_start;
     expected.table.position_base = expected.table.history_abs_start;
-    expected.table.hash_table.fill(HC_EMPTY);
-    expected.table.chain_table.fill(HC_EMPTY);
+    expected.table.tables.fill(HC_EMPTY);
     for pos in expected.table.history_abs_start..abs_pos {
         expected.table.insert_position_no_rebase(pos);
     }
@@ -4270,11 +4302,13 @@ fn hc_rebase_rebuilds_only_inserted_prefix() {
         "rebase should still anchor to the oldest live absolute position"
     );
     assert_eq!(
-        matcher.table.hash_table, expected.table.hash_table,
+        matcher.table.hash_table(),
+        expected.table.hash_table(),
         "rebase must rebuild only positions already inserted before abs_pos"
     );
     assert_eq!(
-        matcher.table.chain_table, expected.table.chain_table,
+        matcher.table.chain_table(),
+        expected.table.chain_table(),
         "future positions must not be pre-seeded into HC chains during rebase"
     );
 }

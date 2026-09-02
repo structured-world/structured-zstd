@@ -239,7 +239,7 @@ impl HcMatcher {
         // lazy hot path.
         let hash = table.hash_position(&concat[current_idx..]);
         let chain_mask = (1usize << table.chain_log) - 1;
-        let mut cur = table.hash_table[hash];
+        let mut cur = table.hash_table()[hash];
         // Cap loop at MAX_HC_SEARCH_DEPTH so a misconfigured
         // `search_depth > MAX_HC_SEARCH_DEPTH` (BT modes set it from the
         // upstream zstd config, which can exceed our cap) cannot run forever.
@@ -296,7 +296,7 @@ impl HcMatcher {
         // per-find load count. `candidate_rel & chain_mask` is always
         // `< chain_table.len()` (the table is `1 << chain_log` and
         // `chain_mask == len - 1`), so the raw read is in-bounds.
-        let chain_ptr: *const u32 = table.chain_table.as_ptr();
+        let chain_ptr: *const u32 = table.chain_table().as_ptr();
         while steps < max_chain_steps {
             if cur == HC_EMPTY {
                 break;

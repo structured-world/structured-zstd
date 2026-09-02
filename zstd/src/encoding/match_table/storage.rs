@@ -72,6 +72,24 @@ pub(crate) const MAX_PRIMED_WINDOW_SIZE: usize =
 /// lets every downstream `abs_pos + N` site stay raw and keeps i686
 /// streams correct. New match-finder backends with their own
 /// `add_data` path must route through this helper.
+/// Whether a table buffer of `capacity` slots is too big to keep for a layout
+/// of `wanted` slots, and should be handed back rather than re-used.
+///
+/// Re-using the allocation is the whole point of holding the tables in one
+/// buffer, so a small overshoot is kept: levels within a factor of two of each
+/// other trade the same buffer back and forth instead of churning it. Past
+/// that, a compressor that once ran a large level would pin its biggest
+/// allocation for the rest of its life. Upstream applies the same hysteresis
+/// to its workspace (`workspaceOversizedDuration`).
+///
+/// Phrased as a halving rather than `wanted * 2` so no arithmetic can leave
+/// the type: a doubling would need a clamp, and a clamp here fails open —
+/// `usize::MAX` compares above every capacity, silently disabling the release.
+#[inline]
+pub(crate) fn capacity_is_oversized(capacity: usize, wanted: usize) -> bool {
+    capacity / 2 > wanted
+}
+
 #[inline]
 pub(crate) fn check_stream_abs_headroom(
     history_abs_start: usize,
@@ -209,9 +227,19 @@ pub(crate) struct MatchTable {
     pub(crate) position_base: usize,
     pub(crate) index_shift: usize,
     pub(crate) offset_hist: [u32; 3],
-    pub(crate) hash_table: Vec<u32>,
-    pub(crate) hash3_table: Vec<u32>,
-    pub(crate) chain_table: Vec<u32>,
+    /// Single backing allocation for all three `u32` index tables (the cwksp
+    /// analog the dfast backend already uses for its long / short pair, and
+    /// the Row backend for its finder tables). Laid out as
+    /// `[hash | chain | hash3]`; the two offsets below mark the seams. One
+    /// allocation per compressor instead of three keeps the allocator seeing a
+    /// single size class, which is what decides whether the tables keep their
+    /// pages between frames rather than being handed back and faulted in again.
+    pub(crate) tables: Vec<u32>,
+    /// Start of the chain table inside [`Self::tables`] (== hash table length).
+    pub(crate) chain_off: usize,
+    /// Start of the hash3 table inside [`Self::tables`]; equals the buffer
+    /// length when hash3 is disabled.
+    pub(crate) hash3_off: usize,
     pub(crate) hash_log: usize,
     pub(crate) chain_log: usize,
     pub(crate) hash3_log: usize,
@@ -297,9 +325,9 @@ impl Clone for MatchTable {
             position_base: self.position_base,
             index_shift: self.index_shift,
             offset_hist: self.offset_hist,
-            hash_table: self.hash_table.clone(),
-            hash3_table: self.hash3_table.clone(),
-            chain_table: self.chain_table.clone(),
+            tables: self.tables.clone(),
+            chain_off: self.chain_off,
+            hash3_off: self.hash3_off,
             hash_log: self.hash_log,
             chain_log: self.chain_log,
             hash3_log: self.hash3_log,
@@ -326,9 +354,7 @@ impl Clone for MatchTable {
         // `clone_from` keep capacity and overwrite in place).
         self.chunk_lens.clone_from(&source.chunk_lens);
         self.history.clone_from(&source.history);
-        self.hash_table.clone_from(&source.hash_table);
-        self.hash3_table.clone_from(&source.hash3_table);
-        self.chain_table.clone_from(&source.chain_table);
+        self.tables.clone_from(&source.tables);
         self.dms.clone_from(&source.dms);
         // Scalars / Copy fields.
         self.max_window_size = source.max_window_size;
@@ -341,6 +367,10 @@ impl Clone for MatchTable {
         self.position_base = source.position_base;
         self.index_shift = source.index_shift;
         self.offset_hist = source.offset_hist;
+        // Seams of the table buffer copied just above; they describe it, so
+        // they travel with it exactly like the uncommitted count does.
+        self.chain_off = source.chain_off;
+        self.hash3_off = source.hash3_off;
         self.hash_log = source.hash_log;
         self.chain_log = source.chain_log;
         self.hash3_log = source.hash3_log;
@@ -464,9 +494,9 @@ impl MatchTable {
             position_base: 0,
             index_shift: 0,
             offset_hist: [1, 4, 8],
-            hash_table: Vec::new(),
-            hash3_table: Vec::new(),
-            chain_table: Vec::new(),
+            tables: Vec::new(),
+            chain_off: 0,
+            hash3_off: 0,
             hash_log: HC_HASH_LOG,
             chain_log: HC_CHAIN_LOG,
             hash3_log: HC3_HASH_LOG,
@@ -559,7 +589,7 @@ impl MatchTable {
         let Some(relative_pos) = self.relative_position(abs_pos) else {
             return;
         };
-        self.hash3_table[hash3] = relative_pos + 1;
+        self.hash3_table_mut()[hash3] = relative_pos + 1;
     }
 
     /// Insert a position into the main hash / chain table without
@@ -597,12 +627,16 @@ impl MatchTable {
         // `< chain_table.len() == 1 << chain_log`. Both indices are
         // provably in bounds, so the elided bounds checks save ~4
         // instructions per call on this per-byte-of-input hot path.
-        debug_assert!(hash < self.hash_table.len());
-        debug_assert!(chain_idx < self.chain_table.len());
+        debug_assert!(hash < self.chain_off);
+        debug_assert!(chain_idx < self.hash3_off - self.chain_off);
+        // Both regions come from the one buffer; the split ends with this
+        // statement, so it costs the same two base pointers the separate
+        // vectors did.
+        let (hash_tbl, chain_tbl) = self.hash_and_chain_mut();
         unsafe {
-            let prev = *self.hash_table.get_unchecked(hash);
-            *self.chain_table.get_unchecked_mut(chain_idx) = prev;
-            *self.hash_table.get_unchecked_mut(hash) = stored;
+            let prev = *hash_tbl.get_unchecked(hash);
+            *chain_tbl.get_unchecked_mut(chain_idx) = prev;
+            *hash_tbl.get_unchecked_mut(hash) = stored;
         }
     }
 
@@ -614,23 +648,76 @@ impl MatchTable {
     /// level change would index out of bounds (UB) on the next encode.
     pub(crate) fn ensure_tables(&mut self) {
         let hash_size = 1 << self.hash_log;
-        if self.hash_table.len() != hash_size {
-            self.hash_table = alloc::vec![HC_EMPTY; hash_size];
-        }
-
         let chain_size = 1 << self.chain_log;
-        if self.chain_table.len() != chain_size {
-            self.chain_table = alloc::vec![HC_EMPTY; chain_size];
-        }
-
         let hash3_size = if self.hash3_log == 0 {
             0
         } else {
             1 << self.hash3_log
         };
-        if self.hash3_table.len() != hash3_size {
-            self.hash3_table = alloc::vec![HC_EMPTY; hash3_size];
+        let total = hash_size + chain_size + hash3_size;
+        // The three regions share one buffer, so a width change on any of them
+        // re-lays out all three. That costs the same fill the separate vectors
+        // paid for the region that changed, and saves two allocations.
+        if self.chain_off != hash_size || self.hash3_off != hash_size + chain_size {
+            if capacity_is_oversized(self.tables.capacity(), total) {
+                // Levelling down: `clear` + `resize` would keep the largest
+                // allocation this compressor ever made resident for every
+                // later frame, so hand the buffer back instead.
+                self.tables = alloc::vec![HC_EMPTY; total];
+            } else {
+                self.tables.clear();
+                self.tables.resize(total, HC_EMPTY);
+            }
+            self.chain_off = hash_size;
+            self.hash3_off = hash_size + chain_size;
+        } else if self.tables.len() != total {
+            self.tables.resize(total, HC_EMPTY);
         }
+    }
+
+    /// Hash table: the first region of the shared buffer.
+    #[inline(always)]
+    pub(crate) fn hash_table(&self) -> &[u32] {
+        &self.tables[..self.chain_off]
+    }
+
+    /// Mutable hash table; see [`Self::hash_table`].
+    #[inline(always)]
+    pub(crate) fn hash_table_mut(&mut self) -> &mut [u32] {
+        &mut self.tables[..self.chain_off]
+    }
+
+    /// Chain table: the region between the hash and hash3 seams.
+    #[inline(always)]
+    pub(crate) fn chain_table(&self) -> &[u32] {
+        &self.tables[self.chain_off..self.hash3_off]
+    }
+
+    /// Mutable chain table; see [`Self::chain_table`].
+    #[inline(always)]
+    pub(crate) fn chain_table_mut(&mut self) -> &mut [u32] {
+        &mut self.tables[self.chain_off..self.hash3_off]
+    }
+
+    /// HC3 side table: the tail region, empty when hash3 is disabled.
+    #[inline(always)]
+    pub(crate) fn hash3_table(&self) -> &[u32] {
+        &self.tables[self.hash3_off..]
+    }
+
+    /// Mutable HC3 side table; see [`Self::hash3_table`].
+    #[inline(always)]
+    pub(crate) fn hash3_table_mut(&mut self) -> &mut [u32] {
+        &mut self.tables[self.hash3_off..]
+    }
+
+    /// Hash and chain tables at once, for the walkers that read a head and
+    /// write a link in the same step.
+    #[inline(always)]
+    pub(crate) fn hash_and_chain_mut(&mut self) -> (&mut [u32], &mut [u32]) {
+        let (hash, rest) = self.tables.split_at_mut(self.chain_off);
+        let chain_len = self.hash3_off - self.chain_off;
+        (hash, &mut rest[..chain_len])
     }
 
     /// Unaligned little-endian `u32` load. Hot helper for every
@@ -897,9 +984,8 @@ impl MatchTable {
         let usize_sz = core::mem::size_of::<usize>();
         self.chunk_lens.capacity() * usize_sz
             + self.history.capacity()
-            + (self.hash_table.capacity()
-                + self.hash3_table.capacity()
-                + self.chain_table.capacity())
+            // One buffer for the hash, chain and hash3 regions together.
+            + (self.tables.capacity())
                 * u32_sz
             + self.dms.table().map_or(0, |t| {
                 (t.hash_table.capacity() + t.chain_table.capacity()) * u32_sz
@@ -1408,9 +1494,7 @@ impl MatchTable {
                 self.history_abs_start = 0;
                 self.position_base = 0;
                 self.index_shift = 0;
-                self.hash_table.fill(HC_EMPTY);
-                self.hash3_table.fill(HC_EMPTY);
-                self.chain_table.fill(HC_EMPTY);
+                self.tables.fill(HC_EMPTY);
                 self.skip_insert_until_abs = region;
                 self.next_to_update3 = region;
                 self.dictionary_limit_abs = Some(region);
@@ -1471,9 +1555,7 @@ impl MatchTable {
             self.position_base = 0;
             self.index_shift = 0;
             self.next_to_update3 = 0;
-            self.hash_table.fill(HC_EMPTY);
-            self.hash3_table.fill(HC_EMPTY);
-            self.chain_table.fill(HC_EMPTY);
+            self.tables.fill(HC_EMPTY);
         }
     }
 
@@ -1484,9 +1566,8 @@ impl MatchTable {
     /// dominated tiny dict frames. `Vec::fill` on an unallocated (empty) table
     /// is a no-op, so the unconditional fills are safe before `ensure_tables`.
     pub(crate) fn clear_chain_hash_tables(&mut self) {
-        self.hash_table.fill(HC_EMPTY);
-        self.hash3_table.fill(HC_EMPTY);
-        self.chain_table.fill(HC_EMPTY);
+        // One buffer holds all three regions, so one fill clears them.
+        self.tables.fill(HC_EMPTY);
     }
 
     /// Upstream zstd parity: `ZSTD_compressBlock_btopt_generic` starts its main
@@ -2456,10 +2537,13 @@ impl MatchTable {
             let live = self.live_history();
             (live.as_ptr(), live.len())
         };
-        let hash_ptr = self.hash_table.as_mut_ptr();
-        let chain_ptr = self.chain_table.as_mut_ptr();
-        debug_assert!(self.hash_table.len() == 1usize << hash_log);
-        debug_assert!(self.chain_table.len() == 1usize << self.chain_log);
+        debug_assert!(self.chain_off == 1usize << hash_log);
+        debug_assert!(self.hash3_off - self.chain_off == 1usize << self.chain_log);
+        // Base pointers into the one buffer, hoisted before the loop below.
+        // SAFETY: `chain_off` is in bounds (one past the hash region is the
+        // first chain slot), asserted just above.
+        let hash_ptr = self.tables.as_mut_ptr();
+        let chain_ptr = unsafe { hash_ptr.add(self.chain_off) };
         // The last `< 4` bytes of the live window can't be hashed. Compute
         // the hashable upper bound once instead of branching per position: a
         // position `pos` is hashable iff `pos - history_abs_start + 4 <=
@@ -2832,9 +2916,8 @@ impl MatchTable {
         self.position_base = self.history_abs_start;
         self.index_shift = 0;
         self.allow_zero_relative_position = true;
-        self.hash_table.fill(HC_EMPTY);
-        self.hash3_table.fill(HC_EMPTY);
-        self.chain_table.fill(HC_EMPTY);
+        // One buffer holds all three regions, so one fill clears them.
+        self.tables.fill(HC_EMPTY);
     }
 
     /// HC-side history replay after [`begin_rebase`]. Re-inserts every
