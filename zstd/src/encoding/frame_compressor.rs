@@ -625,7 +625,7 @@ pub(crate) fn xxh64_block_low32(data: &[u8]) -> u32 {
 /// through. Caller is responsible for passing exactly
 /// `MAX_BLOCK_SIZE` bytes (per upstream zstd `ZSTD_splitBlock` contract —
 /// "@blockSize must be == 128 KB" in `zstd_preSplit.h`).
-#[cfg(feature = "bench_internals")]
+#[cfg(feature = "bench-internals")]
 pub(crate) fn block_splitter_decision_for_bench(block: &[u8], split_level: usize) -> usize {
     assert_eq!(
         block.len(),
@@ -671,8 +671,8 @@ fn warm_presplit_window(window: &[u8]) {
 
 /// [`optimal_block_size_with`] at a level's default pre-split tier; the
 /// frame loop resolves the tier itself, so only tests and the
-/// `bench_internals` block-boundary probe read this form.
-#[cfg(any(test, feature = "bench_internals"))]
+/// `bench-internals` block-boundary probe read this form.
+#[cfg(any(test, feature = "bench-internals"))]
 pub(crate) fn optimal_block_size(
     level: CompressionLevel,
     block: &[u8],
@@ -1644,7 +1644,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// Diagnostic switch: cut full blocks only, never pre-split. Used by
     /// the sequence capture so its block structure matches upstream's
     /// `ZSTD_generateSequences` (see `pre_split_disabled`).
-    #[cfg(feature = "bench_internals")]
+    #[cfg(feature = "bench-internals")]
     pub fn set_pre_split_disabled(&mut self, disabled: bool) {
         self.pre_split_disabled = disabled;
     }

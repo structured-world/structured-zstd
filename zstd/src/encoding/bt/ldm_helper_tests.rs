@@ -50,7 +50,7 @@ fn store(size: usize) -> HcRawSeqStore {
 /// panic on the `history[block_start..block_end]` slice access
 /// inside `generate_into`.
 #[test]
-#[cfg(feature = "hash")]
+#[cfg(feature = "ldm")]
 fn prepare_ldm_candidates_translates_absolute_positions_to_slice_indices() {
     use crate::encoding::ldm::{LdmProducer, params::LdmParams};
 

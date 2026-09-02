@@ -1,25 +1,25 @@
 // SIMD-intrinsic imports are split per tier and gated on the matching
 // `kernel_*` feature so a tier-trimmed build pulls in only the intrinsics
-// its enabled helpers use (a `kernel_scalar`-only trim imports none).
-#[cfg(all(target_arch = "x86", feature = "kernel_sse2"))]
+// its enabled helpers use (a `kernel-scalar`-only trim imports none).
+#[cfg(all(target_arch = "x86", feature = "kernel-sse"))]
 use core::arch::x86::{__m128i, _mm_loadu_si128, _mm_storeu_si128};
-#[cfg(all(target_arch = "x86", feature = "kernel_avx2"))]
+#[cfg(all(target_arch = "x86", feature = "kernel-avx2"))]
 use core::arch::x86::{__m256i, _mm256_loadu_si256, _mm256_storeu_si256};
-#[cfg(all(target_arch = "x86", feature = "kernel_vbmi2"))]
+#[cfg(all(target_arch = "x86", feature = "kernel-vbmi2"))]
 use core::arch::x86::{__m512i, _mm512_loadu_si512, _mm512_storeu_si512};
-#[cfg(all(target_arch = "x86_64", feature = "kernel_sse2"))]
+#[cfg(all(target_arch = "x86_64", feature = "kernel-sse"))]
 use core::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_storeu_si128};
-#[cfg(all(target_arch = "x86_64", feature = "kernel_avx2"))]
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
 use core::arch::x86_64::{__m256i, _mm256_loadu_si256, _mm256_storeu_si256};
-#[cfg(all(target_arch = "x86_64", feature = "kernel_vbmi2"))]
+#[cfg(all(target_arch = "x86_64", feature = "kernel-vbmi2"))]
 use core::arch::x86_64::{__m512i, _mm512_loadu_si512, _mm512_storeu_si512};
 // Only the 32-bit x86 `detect_x86_caps` body queries CPU features at
 // runtime; the x86_64 body derives them from `detect_cpu_kernel()`.
-#[cfg(all(feature = "std", feature = "kernel_sse2", target_arch = "x86"))]
+#[cfg(all(feature = "std", feature = "kernel-sse", target_arch = "x86"))]
 use std::arch::is_x86_feature_detected;
 #[cfg(all(
     feature = "std",
-    feature = "kernel_sse2",
+    feature = "kernel-sse",
     any(target_arch = "x86", target_arch = "x86_64")
 ))]
 use std::sync::OnceLock;
@@ -27,25 +27,25 @@ use std::sync::OnceLock;
 #[cfg(all(
     target_arch = "aarch64",
     target_feature = "neon",
-    feature = "kernel_neon"
+    feature = "kernel-neon"
 ))]
 use core::arch::aarch64::{uint8x16_t, vld1q_u8, vst1q_u8};
 
 #[cfg(all(
     target_arch = "wasm32",
     target_feature = "simd128",
-    feature = "kernel_simd128"
+    feature = "kernel-simd128"
 ))]
 use core::arch::wasm32::{v128, v128_load, v128_store};
 
 /// Diagnostic-only copy-shape histogram. Compiled out unless the
-/// `copy_shape_stats` feature is on, so production / bench builds carry
+/// `copy-shape-stats` feature is on, so production / bench builds carry
 /// zero cost. Buckets mirror the dispatch thresholds in
 /// [`copy_bytes_overshooting`] so the captured distribution lines up with
 /// which code path each call took. Counts are deterministic from the
 /// compressed input (same on every CPU tier); only per-call timing is
 /// architecture-specific.
-#[cfg(feature = "copy_shape_stats")]
+#[cfg(feature = "copy-shape-stats")]
 pub mod shape_stats {
     use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -211,7 +211,7 @@ pub(crate) unsafe fn copy_bytes_overshooting(
         return;
     }
 
-    #[cfg(feature = "copy_shape_stats")]
+    #[cfg(feature = "copy-shape-stats")]
     shape_stats::record(copy_at_least);
 
     let min_buffer_size = core::cmp::min(src.1, dst.1);
@@ -329,23 +329,23 @@ pub(crate) unsafe fn copy_bytes_overshooting(
     #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
     {
         // Bound only when at least the SSE2 tier is enabled (the lowest x86
-        // SIMD kernel; every higher tier implies it). A `kernel_scalar` trim
+        // SIMD kernel; every higher tier implies it). A `kernel-scalar` trim
         // drops the binding along with all three dispatch arms below.
-        #[cfg(feature = "kernel_sse2")]
+        #[cfg(feature = "kernel-sse")]
         let caps = detect_x86_caps();
         // Each call site is gated on its `kernel_*` feature so it disappears
         // alongside the cfg-gated helper def in a tier-trimmed build. `caps.*`
         // is already false when the feature is off (see `detect_x86_caps`), so
         // this only prunes already-dead branches.
-        #[cfg(feature = "kernel_vbmi2")]
+        #[cfg(feature = "kernel-vbmi2")]
         if caps.avx512f {
             try_chunk_kernel!(64, copy_avx512);
         }
-        #[cfg(feature = "kernel_avx2")]
+        #[cfg(feature = "kernel-avx2")]
         if caps.avx2 {
             try_chunk_kernel!(32, copy_avx2);
         }
-        #[cfg(feature = "kernel_sse2")]
+        #[cfg(feature = "kernel-sse")]
         if caps.sse2 {
             try_chunk_kernel!(16, copy_sse2);
         }
@@ -359,25 +359,25 @@ pub(crate) unsafe fn copy_bytes_overshooting(
         // (e.g. `-C target-cpu=skylake-avx512`) is the `Avx2` tier and uses
         // the 32B copy. Using bare `avx512f` here would diverge — no_std
         // would emit 64B copies where std emits 32B on the same CPU.
-        #[cfg(all(target_feature = "avx512vbmi2", feature = "kernel_vbmi2"))]
+        #[cfg(all(target_feature = "avx512vbmi2", feature = "kernel-vbmi2"))]
         try_chunk_kernel!(64, copy_avx512);
-        #[cfg(all(target_feature = "avx2", feature = "kernel_avx2"))]
+        #[cfg(all(target_feature = "avx2", feature = "kernel-avx2"))]
         try_chunk_kernel!(32, copy_avx2);
-        #[cfg(all(target_feature = "sse2", feature = "kernel_sse2"))]
+        #[cfg(all(target_feature = "sse2", feature = "kernel-sse"))]
         try_chunk_kernel!(16, copy_sse2);
     }
 
     #[cfg(all(
         target_arch = "aarch64",
         target_feature = "neon",
-        feature = "kernel_neon"
+        feature = "kernel-neon"
     ))]
     try_chunk_kernel!(16, copy_neon);
 
     #[cfg(all(
         target_arch = "wasm32",
         target_feature = "simd128",
-        feature = "kernel_simd128"
+        feature = "kernel-simd128"
     ))]
     try_chunk_kernel!(16, copy_simd128);
 
@@ -425,7 +425,7 @@ pub(crate) unsafe fn copy_bytes_overshooting(
 /// lands; remove if the layered-chain experiment ends up not retained.
 #[cfg(all(
     any(target_arch = "x86", target_arch = "x86_64"),
-    feature = "kernel_avx2"
+    feature = "kernel-avx2"
 ))]
 #[target_feature(enable = "avx2")]
 #[allow(dead_code)]
@@ -516,7 +516,7 @@ unsafe fn single_op_copy_16(src: *const u8, dst: *mut u8, len: usize) {
     #[cfg(all(
         target_arch = "aarch64",
         target_feature = "neon",
-        feature = "kernel_neon"
+        feature = "kernel-neon"
     ))]
     unsafe {
         let v: uint8x16_t = vld1q_u8(src);
@@ -526,7 +526,7 @@ unsafe fn single_op_copy_16(src: *const u8, dst: *mut u8, len: usize) {
     #[cfg(all(
         target_arch = "wasm32",
         target_feature = "simd128",
-        feature = "kernel_simd128"
+        feature = "kernel-simd128"
     ))]
     unsafe {
         let v: v128 = v128_load(src.cast::<v128>());
@@ -535,7 +535,7 @@ unsafe fn single_op_copy_16(src: *const u8, dst: *mut u8, len: usize) {
     }
     #[cfg(all(
         feature = "std",
-        feature = "kernel_sse2",
+        feature = "kernel-sse",
         any(target_arch = "x86", target_arch = "x86_64")
     ))]
     unsafe {
@@ -548,7 +548,7 @@ unsafe fn single_op_copy_16(src: *const u8, dst: *mut u8, len: usize) {
         not(feature = "std"),
         any(target_arch = "x86", target_arch = "x86_64"),
         target_feature = "sse2",
-        feature = "kernel_sse2"
+        feature = "kernel-sse"
     ))]
     unsafe {
         copy_sse2(src, dst, 16);
@@ -561,17 +561,17 @@ unsafe fn single_op_copy_16(src: *const u8, dst: *mut u8, len: usize) {
     // Reachability matrix (kept here so any future arch arm slotted
     // between the existing arms knows it must terminate with `return`
     // or its code will be silently dead). The explicit-SIMD arms are
-    // gated on the matching `kernel_*` feature so a `kernel_scalar` trim
+    // gated on the matching `kernel_*` feature so a `kernel-scalar` trim
     // falls through to the portable path (matching the chunked-copy
     // dispatch above):
-    //   • aarch64+neon + kernel_neon                   → arm above returns
-    //   • aarch64+neon, NO kernel_neon                 → reaches here
-    //   • std + x86 + kernel_sse2 + runtime-SSE2 tag   → arm above returns
-    //   • std + x86 + kernel_sse2 + Scalar tag         → reaches here
-    //   • std + x86, NO kernel_sse2                    → reaches here
-    //   • no-std + x86 + target_feature sse2+kernel_sse2 → arm above returns
-    //   • no-std + x86, kernel_sse2 off (or no sse2)   → reaches here
-    //   • wasm32 + simd128 + kernel_simd128            → arm above returns
+    //   • aarch64+neon + kernel-neon                   → arm above returns
+    //   • aarch64+neon, NO kernel-neon                 → reaches here
+    //   • std + x86 + kernel-sse + runtime-SSE2 tag   → arm above returns
+    //   • std + x86 + kernel-sse + Scalar tag         → reaches here
+    //   • std + x86, NO kernel-sse                    → reaches here
+    //   • no-std + x86 + target_feature sse2+kernel-sse → arm above returns
+    //   • no-std + x86, kernel-sse off (or no sse2)   → reaches here
+    //   • wasm32 + simd128 + kernel-simd128            → arm above returns
     //   • wasm32, NO simd128 (or kernel off)           → reaches here
     //   • any other arch (riscv64, …)                  → reaches here
     // Anything new MUST `return` from its own arm before this comment.
@@ -603,7 +603,7 @@ fn debug_assert_eq_copy(_src: (*const u8, usize), _dst: (*mut u8, usize), _len: 
 /// source and destination pointers must be valid for reads/writes of at least
 /// `copy_at_least` bytes, support any rounded-up overshoot implied by the
 /// active copy strategy when capacities permit it, and must not overlap.
-#[cfg(feature = "bench_internals")]
+#[cfg(feature = "bench-internals")]
 #[inline(always)]
 pub(crate) unsafe fn copy_bytes_overshooting_for_bench(
     src: (*const u8, usize),
@@ -624,7 +624,7 @@ pub(crate) unsafe fn copy_bytes_overshooting_for_bench(
 pub(crate) fn active_chunk_size_for_tests() -> usize {
     #[cfg(all(
         feature = "std",
-        feature = "kernel_sse2",
+        feature = "kernel-sse",
         any(target_arch = "x86", target_arch = "x86_64")
     ))]
     {
@@ -632,11 +632,11 @@ pub(crate) fn active_chunk_size_for_tests() -> usize {
         // Mirror the dispatcher: a tier is selectable only when BOTH its
         // kernel_* feature is on AND the CPU exposes it, so a tier-trimmed
         // build reports the chunk the dispatcher can actually pick.
-        #[cfg(feature = "kernel_vbmi2")]
+        #[cfg(feature = "kernel-vbmi2")]
         if caps.avx512f {
             return 64;
         }
-        #[cfg(feature = "kernel_avx2")]
+        #[cfg(feature = "kernel-avx2")]
         if caps.avx2 {
             return 32;
         }
@@ -649,12 +649,12 @@ pub(crate) fn active_chunk_size_for_tests() -> usize {
     // gate), otherwise a tier-trimmed build would size test scenarios for a
     // chunk the dispatcher can never select — masking tier-gating
     // regressions. The 64B arm keys off `avx512vbmi2` (not bare `avx512f`),
-    // matching the dispatcher's `kernel_vbmi2` 64B copy.
+    // matching the dispatcher's `kernel-vbmi2` 64B copy.
     #[cfg(all(
         not(feature = "std"),
         any(target_arch = "x86", target_arch = "x86_64"),
         target_feature = "avx512vbmi2",
-        feature = "kernel_vbmi2"
+        feature = "kernel-vbmi2"
     ))]
     {
         return 64;
@@ -663,7 +663,7 @@ pub(crate) fn active_chunk_size_for_tests() -> usize {
         not(feature = "std"),
         any(target_arch = "x86", target_arch = "x86_64"),
         target_feature = "avx2",
-        feature = "kernel_avx2"
+        feature = "kernel-avx2"
     ))]
     {
         return 32;
@@ -672,7 +672,7 @@ pub(crate) fn active_chunk_size_for_tests() -> usize {
         not(feature = "std"),
         any(target_arch = "x86", target_arch = "x86_64"),
         target_feature = "sse2",
-        feature = "kernel_sse2"
+        feature = "kernel-sse"
     ))]
     {
         return 16;
@@ -680,7 +680,7 @@ pub(crate) fn active_chunk_size_for_tests() -> usize {
     #[cfg(all(
         target_arch = "aarch64",
         target_feature = "neon",
-        feature = "kernel_neon"
+        feature = "kernel-neon"
     ))]
     {
         return 16;
@@ -706,11 +706,11 @@ unsafe fn copy_scalar(mut src: *const u8, mut dst: *mut u8, len: usize) {
 
 #[cfg(all(
     feature = "std",
-    feature = "kernel_sse2",
+    feature = "kernel-sse",
     any(target_arch = "x86", target_arch = "x86_64")
 ))]
 #[derive(Clone, Copy)]
-// `avx512f` / `avx2` are unread in a `kernel_sse2`-only trim (their dispatch
+// `avx512f` / `avx2` are unread in a `kernel-sse`-only trim (their dispatch
 // arms are cfg-gated out), so the fields are intentionally dead there.
 #[allow(dead_code)]
 struct X86Caps {
@@ -738,7 +738,7 @@ struct X86Caps {
 /// the SSE2 / AVX2 copy path there.
 #[cfg(all(
     feature = "std",
-    feature = "kernel_sse2",
+    feature = "kernel-sse",
     any(target_arch = "x86", target_arch = "x86_64")
 ))]
 #[inline(always)]
@@ -749,25 +749,25 @@ fn detect_x86_caps() -> X86Caps {
         {
             use crate::cpu_kernel::{CpuKernelTag, detect_cpu_kernel};
             match detect_cpu_kernel() {
-                #[cfg(feature = "kernel_vbmi2")]
+                #[cfg(feature = "kernel-vbmi2")]
                 CpuKernelTag::Vbmi2 => X86Caps {
                     avx512f: true,
                     avx2: true,
                     sse2: true,
                 },
-                #[cfg(feature = "kernel_avx2")]
+                #[cfg(feature = "kernel-avx2")]
                 CpuKernelTag::Avx2 => X86Caps {
                     avx512f: false,
                     avx2: true,
                     sse2: true,
                 },
-                #[cfg(feature = "kernel_bmi2")]
+                #[cfg(feature = "kernel-bmi2")]
                 CpuKernelTag::Bmi2 => X86Caps {
                     avx512f: false,
                     avx2: false,
                     sse2: true,
                 },
-                #[cfg(feature = "kernel_sse2")]
+                #[cfg(feature = "kernel-sse")]
                 CpuKernelTag::Sse2 => X86Caps {
                     avx512f: false,
                     avx2: false,
@@ -785,29 +785,29 @@ fn detect_x86_caps() -> X86Caps {
             // Mirror the x86_64 tag ladder above: each tier is reported only
             // when BOTH its `kernel_*` feature is enabled AND the CPU exposes
             // it at runtime, so a tier-trimmed build (e.g.
-            // `--features kernel_scalar`) never selects a SIMD chunk on 32-bit
+            // `--features kernel-scalar`) never selects a SIMD chunk on 32-bit
             // x86. `avx512f` follows the `Vbmi2` tag exactly — it is set on
             // `avx512vbmi2` (not bare `avx512f`), matching the rule that an
             // AVX-512F-but-not-VBMI2 CPU stays on the 32B (AVX2) copy.
             X86Caps {
-                avx512f: cfg!(feature = "kernel_vbmi2") && is_x86_feature_detected!("avx512vbmi2"),
-                avx2: cfg!(feature = "kernel_avx2") && is_x86_feature_detected!("avx2"),
-                sse2: cfg!(feature = "kernel_sse2") && is_x86_feature_detected!("sse2"),
+                avx512f: cfg!(feature = "kernel-vbmi2") && is_x86_feature_detected!("avx512vbmi2"),
+                avx2: cfg!(feature = "kernel-avx2") && is_x86_feature_detected!("avx2"),
+                sse2: cfg!(feature = "kernel-sse") && is_x86_feature_detected!("sse2"),
             }
         }
     })
 }
 
-// Gated on `kernel_sse2` so a `kernel_scalar`-only trim prunes the SSE2
+// Gated on `kernel-sse` so a `kernel-scalar`-only trim prunes the SSE2
 // helper at the source level, not just via dead-code elimination.
 // `#[allow(dead_code)]` is still required for one combo the feature gate
 // can't express: std builds reach this through runtime `detect_x86_caps`,
 // so the helper must compile even when no compile-time `target_feature =
 // "sse2"` selects it — leaving it caller-less in a no-std-without-sse2
-// build that still enables `kernel_sse2`.
+// build that still enables `kernel-sse`.
 #[cfg(all(
     any(target_arch = "x86", target_arch = "x86_64"),
-    feature = "kernel_sse2"
+    feature = "kernel-sse"
 ))]
 #[target_feature(enable = "sse2")]
 #[allow(dead_code)]
@@ -842,7 +842,7 @@ unsafe fn copy_sse2(mut src: *const u8, mut dst: *mut u8, len: usize) {
 // (criterion micro) and end-to-end via `benches/compare_ffi.rs`.
 #[cfg(all(
     any(target_arch = "x86", target_arch = "x86_64"),
-    feature = "kernel_avx2"
+    feature = "kernel-avx2"
 ))]
 #[target_feature(enable = "avx2")]
 #[allow(dead_code)]
@@ -877,7 +877,7 @@ unsafe fn copy_avx2(mut src: *const u8, mut dst: *mut u8, len: usize) {
 // no-std builds without `target_feature=+avx512f`, live elsewhere.
 #[cfg(all(
     any(target_arch = "x86", target_arch = "x86_64"),
-    feature = "kernel_vbmi2"
+    feature = "kernel-vbmi2"
 ))]
 #[target_feature(enable = "avx512f")]
 #[allow(dead_code)]
@@ -896,7 +896,7 @@ unsafe fn copy_avx512(mut src: *const u8, mut dst: *mut u8, len: usize) {
 #[cfg(all(
     target_arch = "aarch64",
     target_feature = "neon",
-    feature = "kernel_neon"
+    feature = "kernel-neon"
 ))]
 #[inline(always)]
 unsafe fn copy_neon(mut src: *const u8, mut dst: *mut u8, len: usize) {
@@ -920,7 +920,7 @@ unsafe fn copy_neon(mut src: *const u8, mut dst: *mut u8, len: usize) {
 #[cfg(all(
     target_arch = "wasm32",
     target_feature = "simd128",
-    feature = "kernel_simd128"
+    feature = "kernel-simd128"
 ))]
 #[inline(always)]
 unsafe fn copy_simd128(mut src: *const u8, mut dst: *mut u8, len: usize) {
@@ -953,7 +953,7 @@ unsafe fn copy_simd128(mut src: *const u8, mut dst: *mut u8, len: usize) {
 #[cfg(all(
     any(target_arch = "x86", target_arch = "x86_64"),
     target_feature = "avx2",
-    feature = "kernel_avx2"
+    feature = "kernel-avx2"
 ))]
 #[inline]
 unsafe fn copy_exact_inline_avx2(src: *const u8, dst: *mut u8, len: usize) {
@@ -1023,7 +1023,7 @@ unsafe fn copy_exact_inline_avx2(src: *const u8, dst: *mut u8, len: usize) {
     target_arch = "x86",
     target_feature = "sse2",
     not(target_feature = "avx2"),
-    feature = "kernel_sse2"
+    feature = "kernel-sse"
 ))]
 #[inline]
 unsafe fn copy_exact_inline_sse2(src: *const u8, dst: *mut u8, len: usize) {
@@ -1072,7 +1072,7 @@ unsafe fn copy_exact_inline_sse2(src: *const u8, dst: *mut u8, len: usize) {
 #[cfg(all(
     target_arch = "aarch64",
     target_feature = "neon",
-    feature = "kernel_neon"
+    feature = "kernel-neon"
 ))]
 #[inline]
 unsafe fn copy_exact_inline_neon(src: *const u8, dst: *mut u8, len: usize) {
@@ -1131,7 +1131,7 @@ pub(crate) unsafe fn copy_exact_medium(src: *const u8, dst: *mut u8, len: usize)
     #[cfg(all(
         any(target_arch = "x86", target_arch = "x86_64"),
         target_feature = "avx2",
-        feature = "kernel_avx2"
+        feature = "kernel-avx2"
     ))]
     unsafe {
         copy_exact_inline_avx2(src, dst, len)
@@ -1141,7 +1141,7 @@ pub(crate) unsafe fn copy_exact_medium(src: *const u8, dst: *mut u8, len: usize)
         target_arch = "x86",
         target_feature = "sse2",
         not(target_feature = "avx2"),
-        feature = "kernel_sse2"
+        feature = "kernel-sse"
     ))]
     unsafe {
         copy_exact_inline_sse2(src, dst, len)
@@ -1150,7 +1150,7 @@ pub(crate) unsafe fn copy_exact_medium(src: *const u8, dst: *mut u8, len: usize)
     #[cfg(all(
         target_arch = "aarch64",
         target_feature = "neon",
-        feature = "kernel_neon"
+        feature = "kernel-neon"
     ))]
     unsafe {
         copy_exact_inline_neon(src, dst, len)
@@ -1160,18 +1160,18 @@ pub(crate) unsafe fn copy_exact_medium(src: *const u8, dst: *mut u8, len: usize)
         all(
             any(target_arch = "x86", target_arch = "x86_64"),
             target_feature = "avx2",
-            feature = "kernel_avx2"
+            feature = "kernel-avx2"
         ),
         all(
             target_arch = "x86",
             target_feature = "sse2",
             not(target_feature = "avx2"),
-            feature = "kernel_sse2"
+            feature = "kernel-sse"
         ),
         all(
             target_arch = "aarch64",
             target_feature = "neon",
-            feature = "kernel_neon"
+            feature = "kernel-neon"
         )
     )))]
     unsafe {

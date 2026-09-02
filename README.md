@@ -1,12 +1,22 @@
 # structured-zstd
 
-**Pure-Rust Zstandard codec with a production-grade decoder, dictionary handle reuse, and an actively-improved encoder. Builds with plain `cargo` — no cmake, no system zstd, no FFI. `no_std` ready for embedded.**
+**Pure-Rust [Zstandard](https://facebook.github.io/zstd/) (zstd) compression and decompression.** All 22 standard levels plus the negative ultra-fast range, streaming, dictionaries, `no_std` support and a WebAssembly build — with plain `cargo`: no cmake, no system zstd, no FFI.
 
 [![CI](https://github.com/structured-world/structured-zstd/actions/workflows/ci.yml/badge.svg)](https://github.com/structured-world/structured-zstd/actions/workflows/ci.yml)
 [![Crates.io](https://img.shields.io/crates/v/structured-zstd.svg)](https://crates.io/crates/structured-zstd)
 [![docs.rs](https://docs.rs/structured-zstd/badge.svg)](https://docs.rs/structured-zstd)
 [![npm downloads](https://img.shields.io/npm/dw/%40structured-world%2Fstructured-zstd?label=npm%20downloads)](https://www.npmjs.com/package/@structured-world/structured-zstd)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
+## Highlights
+
+- **Production-grade decoder** — complete [RFC 8878](https://www.rfc-editor.org/rfc/rfc8878) implementation: dictionary-backed streams, raw / RLE / compressed blocks, the full frame format, optional content checksums, runtime-dispatched SIMD kernels (SSE2 / BMI2 / AVX2 / NEON, opt-in AVX-512).
+- **Full-range encoder** — every C-zstd level (`-131072..=22`) produces valid frames decodable by this crate and by upstream C zstd; named presets, per-knob parameter overrides, long-distance matching, streaming via `std::io::Write`.
+- **Dictionaries end to end** — compress and decompress with the same dictionary format C zstd consumes; reusable parsed handles; pure-Rust COVER / FastCOVER training behind the `dict-builder` feature.
+- **Wire-compatible both ways** — frames interoperate with C zstd in either direction; interop is enforced in CI against the reference implementation.
+- **`no_std` ready** — the decoder builds with `--no-default-features` for embedded and sandboxed targets.
+- **WebAssembly / npm** — the same codec as an npm package with automatic SIMD selection; no native addons, no postinstall scripts.
+- **Continuously benchmarked** — a public [dashboard](https://structured-world.github.io/structured-zstd/dev/bench/) tracks speed and ratio against C zstd on every merge.
 
 ## Quick start
 
@@ -26,86 +36,7 @@ For `no_std` builds disable the default features:
 cargo add structured-zstd --no-default-features
 ```
 
-The decoder ships per-CPU-tier SIMD kernels, each behind a cargo feature
-(the tier is picked at runtime with `std`, or at compile time from
-`target_feature` on `no_std`): `kernel_scalar`, `kernel_sse2`,
-`kernel_bmi2`, `kernel_avx2`, `kernel_vbmi2` (x86) and `kernel_neon`,
-`kernel_sve` (aarch64). All are on by default **except `kernel_vbmi2`**
-(AVX-512): on AVX-512 hosts that tier is measurably slower than `kernel_avx2`
-for this decode workload — AVX-512's license-based frequency downclocking
-stalls the surrounding (bursty, memory-bound) code, and the heavier kernel
-never amortizes — so by default the runtime dispatch is capped at AVX2 and
-AVX-512 hosts fall back to the (faster) AVX2 tier. The kernel is still shipped
-and can be opted in with `--features kernel_vbmi2` for a sustained AVX-512
-workload that genuinely benefits. The scalar kernel is always compiled (it is the
-mandatory fallback), so `kernel_scalar` is a marker that gates no code;
-disabling the SIMD tiers is what trims the binary. A scalar-only build —
-`--no-default-features` (or, equivalently, naming the marker explicitly) —
-compiles out the per-tier SIMD kernel dispatch, its BMI2/AVX2/VBMI2/NEON
-trampolines, and the explicit SSE2/NEON intrinsics in the small fixed-size
-copy primitives — all gated on the matching `kernel_*` feature. These features
-control the crate's own explicit SIMD only; the compiler's autovectorizer may
-still emit vector instructions from ordinary scalar code regardless:
-
-```bash
-cargo add structured-zstd --no-default-features --features kernel_scalar
-```
-
 Release notes for every version live in [`zstd/CHANGELOG.md`](https://github.com/structured-world/structured-zstd/blob/main/zstd/CHANGELOG.md) (maintained by [release-plz](https://release-plz.dev/)).
-
-## Status
-
-### Decoder — production-ready
-
-Complete [RFC 8878](https://www.rfc-editor.org/rfc/rfc8878) implementation, including dictionary-backed streams, raw / RLE / compressed blocks, and the full Zstandard frame format with optional content checksums.
-
-### Encoder — full level range, active parity work
-
-All standard compression levels are wired and produce valid Zstandard frames decodable by both this crate and upstream C zstd:
-
-- **Named presets:** `Fastest` (≈1), `Default` (≈3), `Better` (≈7), `Best` (≈13)
-- **Numeric levels:** `0..=22` and negative ultra-fast levels via `CompressionLevel::from_level(n)` — C zstd-compatible numbering
-- **Fine-grained parameters:** override individual knobs (`windowLog`, `hashLog`, `chainLog`, `searchLog`, `minMatch`, `targetLength`, `strategy`) and activate **long-distance matching** via `CompressionParameters::builder(...)`, the drop-in equivalent of C zstd's `ZSTD_CCtx_setParameter` surface
-- **Streaming encoder** via `std::io::Write`
-- **Dictionary compression** with the same dictionary format C zstd consumes
-- **Frame Content Size** — `FrameCompressor` writes FCS automatically; `StreamingEncoder` requires `set_pledged_content_size()` before the first write
-- **Content checksums** opt-in
-
-The encoder is undergoing an architectural rewrite — see [#111](https://github.com/structured-world/structured-zstd/issues/111) for the roadmap.
-
-### Dictionary training
-
-Behind the `dict_builder` feature flag, the `dictionary` module can:
-
-- build raw dictionaries with COVER (`create_raw_dict_from_source`)
-- build raw dictionaries with FastCOVER (`create_fastcover_raw_dict_from_source`)
-- finalize raw content into the full zstd dictionary format (`finalize_raw_dict`)
-- train + finalize in one pure-Rust flow (`create_fastcover_dict_from_source`)
-
-<details>
-<summary>Internal: compression strategy backends</summary>
-
-| Level range | Strategy | Backend |
-|-------------|----------|---------|
-| 1-2         | `Fast`     | `Simple` matcher |
-| 3-4         | `Dfast`    | `Dfast` two-tier hash |
-| 5-12        | `Greedy` / `Lazy` / `Lazy2` | `Row` lazy parse (`lazy_depth=0/1/2`): row match-finder above a 2^14 window, hash chain at or below it |
-| 13-15       | `Btlazy2`  | `Row` lazy parse over the lazily-sorted binary tree |
-| 16-17       | `BtOpt`    | `HashChain` candidates + `btopt` price parser |
-| 18          | `BtUltra`  | `HashChain` candidates + `btultra` price parser |
-| 19-22       | `BtUltra2` | `HashChain` candidates + `btultra2` dual-profile parse |
-
-The level → strategy column matches upstream zstd `ZSTD_defaultCParameters[0]` at `zstd/lib/compress/clevels.h:25-50` (srcSize > 256 KiB tier); smaller sources shift the row per upstream's size tiers. The whole greedy..btlazy2 band runs upstream's `ZSTD_compressBlock_lazy_generic` parse on the `Row` backend over the three upstream match finders (rows / hash chain per `ZSTD_resolveRowMatchFinderMode`, lazily-sorted binary tree for `btlazy2`).
-
-</details>
-
-## Performance
-
-Per-merge benchmarks publish to GitHub Pages: **[structured-world.github.io/structured-zstd/dev/bench](https://structured-world.github.io/structured-zstd/dev/bench/)**.
-
-The CI matrix covers `x86_64-linux-gnu`, `i686-linux-gnu`, and `x86_64-musl`; the dashboard exposes per-target / stage / scenario / level filtering. The encoder architecture rewrite ([#111](https://github.com/structured-world/structured-zstd/issues/111)) is the active surface for compression-side work; the public benchmark report tracks the delta vs upstream C zstd over time. A dedicated dashboard section also tracks the WebAssembly build (`simd128` + `scalar`) against the most popular npm wasm zstd, [`@bokuweb/zstd-wasm`](https://www.npmjs.com/package/@bokuweb/zstd-wasm), over time.
-
-See [BENCHMARKS.md](https://github.com/structured-world/structured-zstd/blob/main/BENCHMARKS.md) for the methodology — small payloads, entropy extremes, a `100 MiB` large-stream scenario, repository corpus fixtures, and optional local Silesia corpora.
 
 ## Usage
 
@@ -133,13 +64,19 @@ encoder.finish()?;
 # Ok::<(), std::io::Error>(())
 ```
 
-#### Fine-grained parameters
+- **Named presets:** `Fastest` (≈1), `Default` (≈3), `Better` (≈7), `Best` (≈13)
+- **Frame Content Size:** `FrameCompressor` writes FCS automatically; `StreamingEncoder` requires `set_pledged_content_size()` before the first write
+- **Content checksums:** opt-in via `set_content_checksum(true)`
+
+### Fine-grained parameters
 
 Override individual compression knobs (the drop-in equivalent of C zstd's
 `ZSTD_CCtx_setParameter`). Every knob left unset inherits the base level's
 default, so a parameter set that overrides nothing reproduces plain
 level-based compression. Long-distance matching is off at every level preset
-and is activated only here:
+and is activated only here; it also needs the (default-on) `ldm` feature.
+Without it the builder still accepts `enable_long_distance_matching(true)` and
+the frame is still valid, but no long-distance matches are produced:
 
 ```rust
 use structured_zstd::encoding::{
@@ -174,7 +111,7 @@ let mut result = Vec::new();
 decoder.read_to_end(&mut result).unwrap();
 ```
 
-### Dictionary-backed decompression
+### Dictionaries
 
 ```rust,no_run
 use structured_zstd::decoding::{DictionaryHandle, FrameDecoder, StreamingDecoder};
@@ -204,47 +141,93 @@ let mut sink = Vec::new();
 stream.read_to_end(&mut sink).unwrap();
 ```
 
-## Storage-format extensions
+Compression takes the same dictionary format through
+`FrameCompressor::set_dictionary_from_bytes` / `EncoderDictionary::from_bytes`
+(one parse, reusable across frames).
 
-Behind the `lsm` Cargo feature (default **off**), `structured-zstd`
-exposes a typed `SkippableFrame` API
-(`structured_zstd::skippable`) for storage-format authors who need
-to interleave application metadata with zstd data, plus a
-block-subset partial decoder: `FrameDecoder::decode_blocks_partial(src,
-start_block, end_block, resume, emit_resume)` decodes only the inner
-blocks covering a requested range (skipping the trailing ones) and
-preserves the clean prefix on a corrupt block, while
-`FrameEmitInfo::decompressed_byte_range(block_index)` returns the
-decompressed byte range of a given block, so a range query can locate
-which inner blocks cover a target byte window. For incremental /
-resumable decoding, pass `emit_resume = true` to capture a `ResumeState`
-(cross-block entropy tables + repcode history + next-block coordinates)
-in `PartialDecode::resume_state`, then feed it back via the `resume`
-argument (`ResumeInput { window_prime, state }`) to continue from a later
-block WITHOUT re-decompressing the prefix — even across a dropped (cold)
-decoder. Enable on the command line:
+Behind the `dict-builder` feature, the `dictionary` module trains dictionaries
+in pure Rust:
 
-```bash
-cargo add structured-zstd --features lsm
-```
+- COVER (`create_raw_dict_from_source`) and FastCOVER (`create_fastcover_raw_dict_from_source`) raw dictionaries
+- `finalize_raw_dict` to produce the full zstd dictionary format
+- `create_fastcover_dict_from_source` for train + finalize in one call
 
-or in `Cargo.toml`:
+## Feature flags
 
-```toml
-[dependencies]
-structured-zstd = { version = "0", features = ["lsm"] }
-```
+| Feature | Default | What it enables |
+|---------|---------|-----------------|
+| `std` | ✅ | Runtime CPU detection, `std::io` adapters |
+| `hash` | ✅ | XXH64 content checksums |
+| `ldm` | ✅ | Long-distance matching (implies `hash`: LDM hashes each window with XXH64) |
+| `kernel-sse`, `kernel-bmi2`, `kernel-avx2` | ✅ | x86 SIMD kernels (`kernel-sse` covers both the SSE2 and SSE4.2 tiers) |
+| `kernel-neon`, `kernel-sve` | ✅ | aarch64 SIMD kernels |
+| `kernel-simd128` | ✅ | WebAssembly SIMD kernel (needs `-C target-feature=+simd128`) |
+| `kernel-vbmi2` | ❌ | AVX-512 decode kernel (see note below) |
+| `kernel-scalar` | ✅ | Marker for the always-compiled scalar fallback |
+| `dict-builder` | ❌ | Pure-Rust COVER / FastCOVER dictionary training |
+| `lsm` | ❌ | [Storage-format extensions](#storage-format-extensions) |
 
-The ecosystem registry of allocated skippable-frame magic variants
-and the allocation policy live in
-[docs/SKIPPABLE_MAGIC_ALLOCATIONS.md](https://github.com/structured-world/structured-zstd/blob/main/docs/SKIPPABLE_MAGIC_ALLOCATIONS.md).
-<!-- Absolute URL is intentional: this README is embedded into the
-crate's rustdoc via `#![doc = include_str!("../README.md")]` in
-zstd/src/lib.rs, where relative paths resolve under docs.rs and 404.
-The registry is also the canonical single source of truth on
-upstream `main`, so the link target is correct for forks too —
-fork consumers should point readers at the upstream registry
-rather than maintain divergent copies. -->
+Each flag gates its tier wherever that tier exists. `kernel-sse`,
+`kernel-bmi2`, `kernel-avx2`, `kernel-neon` and `kernel-simd128` cover both
+the decoder and the encoder; `kernel-vbmi2` and `kernel-sve` are decoder-only
+(the encoder has no AVX-512 or SVE tier), and `kernel-scalar` gates nothing,
+since the scalar path is the mandatory fallback and always compiled. So
+`--no-default-features` (optionally with `--features kernel-scalar`) compiles
+every per-tier dispatch and all explicit SIMD intrinsics out of the crate.
+
+On x86 and aarch64 with `std`, the tier is picked at runtime from CPU
+detection; on `no_std` it comes from the target's `target_feature` set at
+compile time. x86 has two 128-bit tiers under `kernel-sse`: SSE4.2 when
+available, otherwise a plain-SSE2 tier, so pre-SSE4.2 CPUs still get vector
+match compares instead of dropping to scalar.
+
+**WebAssembly is compile-time only**, with or without `std`: wasm has no
+runtime feature detection, so both the decoder kernels and the encoder
+fastpath additionally require `target_feature = "simd128"`. Building for
+`wasm32` with default features and no extra flags therefore stays scalar —
+pass `-C target-feature=+simd128` to get the SIMD tier. (The npm package
+sidesteps this by shipping separately compiled scalar and `+simd128`
+payloads and picking one at load time.)
+
+In every case these features control only the crate's own explicit SIMD; the
+compiler's autovectorizer is unaffected.
+
+<details>
+<summary>Why AVX-512 is off by default</summary>
+
+On AVX-512 hosts the `kernel-vbmi2` tier measures slower than `kernel-avx2`
+for this decode workload: AVX-512's license-based frequency downclocking
+stalls the surrounding bursty, memory-bound code and the heavier kernel never
+amortizes. By default runtime dispatch is therefore capped at AVX2, and
+AVX-512 hosts use the (faster) AVX2 tier. Opt in with
+`--features kernel-vbmi2` for a sustained AVX-512 workload that genuinely
+benefits.
+
+</details>
+
+## Performance
+
+- Per-merge benchmarks publish to a public dashboard: **[structured-world.github.io/structured-zstd/dev/bench](https://structured-world.github.io/structured-zstd/dev/bench/)** — speed and ratio against upstream C zstd over time.
+- The CI matrix covers `x86_64-linux-gnu`, `i686-linux-gnu` and `x86_64-musl`, with per-target / stage / scenario / level filtering on the dashboard.
+- A dedicated section tracks the WebAssembly build (`simd128` + scalar) against the most popular npm wasm zstd, [`@bokuweb/zstd-wasm`](https://www.npmjs.com/package/@bokuweb/zstd-wasm).
+- Methodology in [BENCHMARKS.md](https://github.com/structured-world/structured-zstd/blob/main/BENCHMARKS.md): small payloads, entropy extremes, a `100 MiB` large-stream scenario, repository corpus fixtures, optional local Silesia corpora.
+
+<details>
+<summary>Internal: compression strategy backends</summary>
+
+| Level range | Strategy | Backend |
+|-------------|----------|---------|
+| 1-2         | `Fast`     | `Simple` matcher |
+| 3-4         | `Dfast`    | `Dfast` two-tier hash |
+| 5-12        | `Greedy` / `Lazy` / `Lazy2` | `Row` lazy parse (`lazy_depth=0/1/2`): row match-finder above a 2^14 window, hash chain at or below it |
+| 13-15       | `Btlazy2`  | `Row` lazy parse over the lazily-sorted binary tree |
+| 16-17       | `BtOpt`    | `HashChain` candidates + `btopt` price parser |
+| 18          | `BtUltra`  | `HashChain` candidates + `btultra` price parser |
+| 19-22       | `BtUltra2` | `HashChain` candidates + `btultra2` dual-profile parse |
+
+The level → strategy column matches upstream zstd `ZSTD_defaultCParameters[0]` at `zstd/lib/compress/clevels.h:25-50` (srcSize > 256 KiB tier); smaller sources shift the row per upstream's size tiers. The whole greedy..btlazy2 band runs upstream's `ZSTD_compressBlock_lazy_generic` parse on the `Row` backend over the three upstream match finders (rows / hash chain per `ZSTD_resolveRowMatchFinderMode`, lazily-sorted binary tree for `btlazy2`).
+
+</details>
 
 ## WebAssembly / npm
 
@@ -268,6 +251,32 @@ with native zstd. Source lives in
 [`zstd-wasm/`](https://github.com/structured-world/structured-zstd/tree/main/zstd-wasm);
 see the
 [package README](https://github.com/structured-world/structured-zstd/blob/main/zstd-wasm/npm/README.md).
+
+## Storage-format extensions
+
+Behind the `lsm` feature (default **off**), the crate adds building blocks for
+storage-format authors:
+
+- **Skippable frames** — a typed `SkippableFrame` API (`structured_zstd::skippable`) for interleaving application metadata with zstd data.
+- **Block-subset partial decode** — `FrameDecoder::decode_blocks_partial` decodes only the inner blocks covering a requested range (skipping the trailing ones) and preserves the clean prefix on a corrupt block.
+- **Block-to-byte-range lookup** — `FrameEmitInfo::decompressed_byte_range(block_index)` maps a block to its decompressed byte range, so a range query can locate which blocks cover a target byte window.
+- **Resumable decoding** — request a `ResumeState` (cross-block entropy tables + repcode history + next-block coordinates) from a partial decode, then feed it back to continue from a later block, even across a dropped decoder. The state does not carry the match window: the resuming call also supplies the tail of the already-decompressed output (the last `min(window_size, resume_offset)` bytes) via `ResumeInput::window_prime`.
+
+```toml
+[dependencies]
+structured-zstd = { version = "0", features = ["lsm"] }
+```
+
+The ecosystem registry of allocated skippable-frame magic variants
+and the allocation policy live in
+[docs/SKIPPABLE_MAGIC_ALLOCATIONS.md](https://github.com/structured-world/structured-zstd/blob/main/docs/SKIPPABLE_MAGIC_ALLOCATIONS.md).
+<!-- Absolute URL is intentional: this README is embedded into the
+crate's rustdoc via `#![doc = include_str!("../README.md")]` in
+zstd/src/lib.rs, where relative paths resolve under docs.rs and 404.
+The registry is also the canonical single source of truth on
+upstream `main`, so the link target is correct for forks too —
+fork consumers should point readers at the upstream registry
+rather than maintain divergent copies. -->
 
 ## Project relationship
 

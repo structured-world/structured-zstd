@@ -21,7 +21,7 @@ use super::super::opt::types::HcOptimalNode;
 /// loop. AVX2 lacks an unsigned `cmplt`, so derive `nc < np` from
 /// `min_epu32`: `nc <= np` iff `min(nc,np) == nc`, then exclude equality.
 /// Returns a bitmask (bit `k` set => lane `k` improves). Compiled on every
-/// x86 target (same as the avx2 collect kernel); the cargo `kernel_avx2`
+/// x86 target (same as the avx2 collect kernel); the cargo `kernel-avx2`
 /// feature only gates the runtime dispatch, not compilation.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[target_feature(enable = "avx2")]
@@ -84,7 +84,11 @@ fn priceset_next_cost(
 #[cfg_attr(
     any(
         all(target_arch = "aarch64", target_endian = "little"),
-        all(target_arch = "wasm32", target_feature = "simd128")
+        all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel-simd128"
+        )
     ),
     allow(dead_code)
 )]
@@ -148,7 +152,11 @@ pub(crate) fn priceset_range_nonabort_scalar(
         target_arch = "x86",
         target_arch = "x86_64",
         all(target_arch = "aarch64", target_endian = "little"),
-        all(target_arch = "wasm32", target_feature = "simd128")
+        all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel-simd128"
+        )
     )),
     allow(dead_code)
 )]
@@ -438,10 +446,12 @@ pub(crate) unsafe fn priceset_range_nonabort_neon(
 /// loads of `[price, gen]` pairs, `shuffle_epi32(0xD8)` groups prices then gens
 /// within each, `unpacklo/hi_epi64` separates them. `Some(prices)` only when
 /// all 4 generations equal `stamp`.
+/// Every intrinsic in the body is SSE2, so this one helper serves both x86
+/// tiers; only the improved-mask helper differs between them.
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#[target_feature(enable = "sse4.2")]
+#[target_feature(enable = "sse2")]
 #[inline]
-unsafe fn priceset_cached_prices4_sse41(cells: &[[u32; 2]], stamp: u32) -> Option<[u32; 4]> {
+unsafe fn priceset_cached_prices4_sse2(cells: &[[u32; 2]], stamp: u32) -> Option<[u32; 4]> {
     #[cfg(target_arch = "x86")]
     use core::arch::x86::{
         __m128i, _mm_castsi128_ps, _mm_cmpeq_epi32, _mm_loadu_si128, _mm_movemask_ps,
@@ -469,6 +479,31 @@ unsafe fn priceset_cached_prices4_sse41(cells: &[[u32; 2]], stamp: u32) -> Optio
     let mut out = [0u32; 4];
     unsafe { _mm_storeu_si128(out.as_mut_ptr() as *mut __m128i, prices) };
     Some(out)
+}
+
+/// SSE2 4-lane `next_cost < node_price` bitmask. SSE2 has no unsigned 32-bit
+/// compare, so bias both operands by `0x8000_0000`: that maps the unsigned
+/// order onto the signed one `_mm_cmplt_epi32` implements, giving the same
+/// mask as the SSE4.1 `min_epu32` form in one compare instead of three ops.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "sse2")]
+#[inline]
+unsafe fn priceset_improved_mask4_sse2(next_cost: &[u32; 4], node_price: &[u32]) -> u8 {
+    #[cfg(target_arch = "x86")]
+    use core::arch::x86::{
+        __m128i, _mm_castsi128_ps, _mm_cmplt_epi32, _mm_loadu_si128, _mm_movemask_ps,
+        _mm_set1_epi32, _mm_xor_si128,
+    };
+    #[cfg(target_arch = "x86_64")]
+    use core::arch::x86_64::{
+        __m128i, _mm_castsi128_ps, _mm_cmplt_epi32, _mm_loadu_si128, _mm_movemask_ps,
+        _mm_set1_epi32, _mm_xor_si128,
+    };
+    let nc = unsafe { _mm_loadu_si128(next_cost.as_ptr() as *const __m128i) };
+    let np = unsafe { _mm_loadu_si128(node_price.as_ptr() as *const __m128i) };
+    let bias = _mm_set1_epi32(i32::MIN);
+    let lt = _mm_cmplt_epi32(_mm_xor_si128(nc, bias), _mm_xor_si128(np, bias));
+    (_mm_movemask_ps(_mm_castsi128_ps(lt)) as u8) & 0x0F
 }
 
 /// SSE4.1 4-lane `next_cost < node_price` bitmask (unsigned compare via
@@ -533,9 +568,56 @@ pub(crate) unsafe fn priceset_range_nonabort_sse41(
         off,
         reps,
         last_pos,
-        // SAFETY: both closures run inside this fn's sse4.2 target_feature umbrella.
-        |cells, stamp| unsafe { priceset_cached_prices4_sse41(cells, stamp) },
+        // SAFETY: both closures run inside this fn's sse4.2 target_feature
+        // umbrella, which covers the SSE2 loader and the SSE4.1 mask.
+        |cells, stamp| unsafe { priceset_cached_prices4_sse2(cells, stamp) },
         |nc, np| unsafe { priceset_improved_mask4_sse41(nc, np) },
+    )
+}
+
+/// SSE2 price-set range update, for x86 CPUs that lack SSE4.1/4.2. Same
+/// 4-lane shape as the SSE4.1 entry point, with the unsigned compare emulated
+/// via the signed-bias trick.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[target_feature(enable = "sse2")]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn priceset_range_nonabort_sse2(
+    node_prices: &mut [u32],
+    nodes: &mut [HcOptimalNode],
+    ml_cache: &mut [[u32; 2]],
+    ml_stamp: u32,
+    profile: HcOptimalCostProfile,
+    stats: &HcOptState,
+    pos: usize,
+    start: usize,
+    max: usize,
+    ll0_price: u32,
+    off_price: u32,
+    base_cost: u32,
+    off: u32,
+    reps: [u32; 3],
+    last_pos: usize,
+) -> usize {
+    priceset_range_vec::<4>(
+        node_prices,
+        nodes,
+        ml_cache,
+        ml_stamp,
+        profile,
+        stats,
+        pos,
+        start,
+        max,
+        ll0_price,
+        off_price,
+        base_cost,
+        off,
+        reps,
+        last_pos,
+        // SAFETY: both closures run inside this fn's sse2 target_feature umbrella.
+        |cells, stamp| unsafe { priceset_cached_prices4_sse2(cells, stamp) },
+        |nc, np| unsafe { priceset_improved_mask4_sse2(nc, np) },
     )
 }
 
@@ -543,7 +625,11 @@ pub(crate) unsafe fn priceset_range_nonabort_sse41(
 /// `u32x4_shuffle` selects the price (even) and gen (odd) lanes across the two
 /// loaded vectors natively. `Some(prices)` only when all 4 gens equal `stamp`
 /// (`u32x4_all_true` of the equality vector).
-#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "simd128",
+    feature = "kernel-simd128"
+))]
 #[target_feature(enable = "simd128")]
 #[inline]
 unsafe fn priceset_cached_prices4_simd128(cells: &[[u32; 2]], stamp: u32) -> Option<[u32; 4]> {
@@ -568,7 +654,11 @@ unsafe fn priceset_cached_prices4_simd128(cells: &[[u32; 2]], stamp: u32) -> Opt
 
 /// wasm `simd128` 4-lane `next_cost < node_price` bitmask. wasm has a native
 /// unsigned compare (`u32x4_lt`) and `u32x4_bitmask` to pack the lanes.
-#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "simd128",
+    feature = "kernel-simd128"
+))]
 #[target_feature(enable = "simd128")]
 #[inline]
 unsafe fn priceset_improved_mask4_simd128(next_cost: &[u32; 4], node_price: &[u32]) -> u8 {
@@ -578,7 +668,11 @@ unsafe fn priceset_improved_mask4_simd128(next_cost: &[u32; 4], node_price: &[u3
     u32x4_bitmask(u32x4_lt(nc, np))
 }
 
-#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "simd128",
+    feature = "kernel-simd128"
+))]
 #[target_feature(enable = "simd128")]
 #[inline]
 #[allow(clippy::too_many_arguments)]

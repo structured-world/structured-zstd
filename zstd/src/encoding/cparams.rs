@@ -329,7 +329,7 @@ fn get_cparams_mode(
 /// matching upstream exactly. The C-reference comparison surface (`zz_cparams`
 /// validates it byte-for-byte against C `ZSTD_getCParams`); the encoder sizes
 /// its own tables from [`default_cparams`] + [`create_cdict_table_logs`].
-#[cfg(feature = "bench_internals")]
+#[cfg(feature = "bench-internals")]
 pub(crate) fn get_cparams_public(
     compression_level: i32,
     src_size_hint: u64,

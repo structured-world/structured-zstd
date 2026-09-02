@@ -4,7 +4,7 @@
 //! `CompressionLevel::Fastest` (Level 1 → Fast strategy), prints the
 //! kernel inner-loop trace from `compress_block_fast` to stderr.
 //!
-//! Build: `cargo build --release --features kernel_trace --example trace_fast_kernel`
+//! Build: `cargo build --release --features kernel-trace --example trace_fast_kernel`
 //! Run:   `STRUCTURED_ZSTD_KERNEL_TRACE=1 ./target/release/examples/trace_fast_kernel > /dev/null 2> trace.log`
 //!
 //! The trace records every outer-iter state, every hash-table put, and

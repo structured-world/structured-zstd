@@ -611,7 +611,7 @@ pub fn create_fastcover_dict_from_source<R: io::Read, W: io::Write>(
 /// `finalized_dictionary` and compare to `original_payload`. The
 /// C-decoder roundtrip that consumes this lives in the `ffi-bench` crate;
 /// this side stays pure Rust.
-#[cfg(feature = "bench_internals")]
+#[cfg(feature = "bench-internals")]
 pub(crate) fn dict_roundtrip_fixture() -> (
     alloc::vec::Vec<u8>,
     alloc::vec::Vec<u8>,

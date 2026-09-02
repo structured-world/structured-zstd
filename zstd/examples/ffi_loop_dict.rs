@@ -6,7 +6,7 @@
 //! the per-function TIME graph can be compared directly against ours.
 //!
 //! Build: cargo build --profile flamegraph -p structured-zstd
-//!          --example ffi_loop_dict --features dict_builder
+//!          --example ffi_loop_dict --features dict-builder
 //! Run:   ./target/flamegraph/examples/ffi_loop_dict <level> <iters> logs<N> <dict_path>
 
 use std::env;

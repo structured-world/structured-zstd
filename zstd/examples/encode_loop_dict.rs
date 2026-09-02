@@ -20,8 +20,8 @@
 //! one-time setup the fresh-per-iter bench shape folds in.
 //!
 //! Build: `cargo build --profile flamegraph -p structured-zstd
-//!          --example encode_loop_dict --features dict_builder`
-//! Run:   `cargo flamegraph --example encode_loop_dict --features dict_builder
+//!          --example encode_loop_dict --features dict-builder`
+//! Run:   `cargo flamegraph --example encode_loop_dict --features dict-builder
 //!          --profile flamegraph -- <level> <iters> <input> [dict_path]`
 //!
 //! `<input>` is either `logs<N>` (N bytes of the bench `repeated_log_lines`

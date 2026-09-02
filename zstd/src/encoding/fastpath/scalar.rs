@@ -6,10 +6,6 @@
 //! No `#[target_feature]` attributes here: every function uses portable Rust
 //! and must compile on any supported target.
 
-#![allow(dead_code)]
-
-pub(crate) const KERNEL_TAG: &str = "scalar";
-
 /// Position of the first mismatching byte inside an 8-byte XOR diff. On
 /// little-endian targets the low byte corresponds to the lowest address, so
 /// `trailing_zeros / 8` is the index of the first non-equal byte.
@@ -23,18 +19,6 @@ pub(crate) const fn mismatch_byte_index(diff: usize) -> usize {
 #[cfg(target_endian = "big")]
 pub(crate) const fn mismatch_byte_index(diff: usize) -> usize {
     diff.leading_zeros() as usize / 8
-}
-
-/// Multiplicative hash constant (Knuth golden ratio for 64-bit). Shared across
-/// every variant — upstream zstd parity matches the C zstd value.
-pub(crate) const HASH_MIX_PRIME: u64 = 0x9E37_79B1_85EB_CA87;
-
-/// Pure scalar `hash_mix_u64` — single multiplication. Used by
-/// `FastpathKernel::Scalar` and as the fallback when no CRC instruction is
-/// available.
-#[inline(always)]
-pub(crate) fn hash_mix_u64(value: u64) -> u64 {
-    value.wrapping_mul(HASH_MIX_PRIME)
 }
 
 /// Scalar prefix-length scan starting from `off` until `max`, using
@@ -78,15 +62,28 @@ pub(crate) unsafe fn common_prefix_len_ptr(lhs: *const u8, rhs: *const u8, max: 
     unsafe { common_prefix_len_scalar_ptr(lhs, rhs, 0, max) }
 }
 
-/// `count_match_from_indices` mirror for the scalar variant — kept here so
-/// the variant module is a complete unit and BT-walk callers (Week 3a) can
-/// pick the per-kernel implementation by symbol resolution rather than by a
-/// branching dispatcher inside the hot loop.
+/// `count_match_from_indices` mirror for the scalar variant, so BT-walk
+/// callers pick the per-kernel implementation by symbol resolution rather
+/// than through a branching dispatcher inside the hot loop.
+///
+/// Unused on little-endian aarch64 when the NEON tier is compiled in: the
+/// scalar BT collect-matches walker is then compiled out itself
+/// (`MatchTable::bt_insert_and_collect_matches_scalar` is gated on not having
+/// that combination), since NEON is baseline there and the scalar walker can
+/// never be selected. With `kernel-neon` off it becomes the live path again.
 ///
 /// # Safety
 /// Caller-side BT-walk invariants ensure
 /// `candidate_idx + tail_limit ≤ concat.len()` and
 /// `current_idx + tail_limit ≤ concat.len()`.
+#[cfg_attr(
+    all(
+        target_arch = "aarch64",
+        target_endian = "little",
+        feature = "kernel-neon"
+    ),
+    allow(dead_code)
+)]
 #[inline(always)]
 pub(crate) unsafe fn count_match_from_indices(
     concat: &[u8],

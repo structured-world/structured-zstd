@@ -8,14 +8,14 @@ authors = [
 ]
 edition = "2024"
 license = "Apache-2.0"
-homepage = "https://github.com/structured-world/structured-zstd"
+homepage = "https://structured-world.github.io/structured-zstd/dev/bench/"
 repository = "https://github.com/structured-world/structured-zstd"
-description = "Pure Rust zstd implementation — managed fork of ruzstd. Dictionary decompression, no FFI."
+description = "Pure-Rust Zstandard (zstd) compression and decompression: all levels, streaming, dictionaries, no_std and WebAssembly ready — no FFI, no cmake"
 exclude = ["fuzz_decodecorpus/*", "decodecorpus_files/*", "dict_tests/files/**"]
 # Package metadata points at a crate-local symlink so the packaged crate and repo root README stay in sync.
 readme = "README.md"
-keywords = ["zstd", "zstandard", "decompression", "compression", "pure-rust"]
-categories = ["compression"]
+keywords = ["zstd", "zstandard", "decompression", "compression", "no-std"]
+categories = ["compression", "no-std", "wasm", "encoding"]
 # The C-binding benches, conformance tests, and FFI diagnostic examples live in
 # the non-published `ffi-bench` crate so this library never depends on the C
 # `zstd` bindings. Auto-discovery is disabled because those source files still
@@ -33,17 +33,17 @@ autotests = false
 autoexamples = false
 
 # docs.rs builds the crate with the public feature set so feature-gated
-# items (e.g. the `dictionary` module behind `dict_builder`) appear in the
+# items (e.g. the `dictionary` module behind `dict-builder`) appear in the
 # published documentation. We list the public features explicitly rather
 # than using `all-features = true` because the manifest also exposes
 # `rustc-dep-of-std` (libstd-build-only — swaps in `rustc-std-workspace-*`
-# crates), `bench_internals` (widens the API surface for benches), and
-# `fuzz_exports` (widens it for fuzz targets); none of these should appear
+# crates), `bench-internals` (widens the API surface for benches), and
+# `fuzz-exports` (widens it for fuzz targets); none of these should appear
 # on docs.rs. The `--cfg docsrs` flag activates the
 # `#[cfg_attr(docsrs, doc(cfg(...)))]` annotations that render feature
 # badges on each item.
 [package.metadata.docs.rs]
-features = ["std", "hash", "dict_builder", "lsm"]
+features = ["std", "hash", "ldm", "dict-builder", "lsm"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
@@ -79,83 +79,103 @@ rand = "0.10"
 [features]
 default = [
     "hash",
+    "ldm",
     "std",
-    "kernel_scalar",
-    "kernel_sse2",
-    "kernel_bmi2",
-    "kernel_avx2",
-    # `kernel_vbmi2` (AVX-512) is intentionally OFF by default: on AVX-512
+    "kernel-scalar",
+    "kernel-sse",
+    "kernel-bmi2",
+    "kernel-avx2",
+    # `kernel-vbmi2` (AVX-512) is intentionally OFF by default: on AVX-512
     # hosts the runtime dispatch otherwise selects the VBMI2 decode tier, which
     # the dashboard's AVX-512 runner measured far SLOWER than the AVX2 tier
     # (AVX-512 license-based frequency downclocking stalls the whole decode,
     # and the bursty/memory-bound decode never amortizes the heavier kernel).
     # With it off, AVX-512 hosts fall back to the AVX2 tier (faster there). The
-    # kernel is kept and can be opted in via `--features kernel_vbmi2` for a
+    # kernel is kept and can be opted in via `--features kernel-vbmi2` for a
     # sustained-AVX-512 workload that genuinely benefits.
-    "kernel_neon",
-    "kernel_sve",
-    "kernel_simd128",
+    "kernel-neon",
+    "kernel-sve",
+    "kernel-simd128",
 ]
-# Per-CPU-tier decode kernel selection. The default build enables every
-# kernel; with `std`, `detect_cpu_kernel()` picks the best tier at runtime
-# (CPU-feature detection) — a universal binary that adapts to any CPU. On
+# Per-CPU-tier kernel selection, covering the decoder and the encoder. The
+# default build enables every kernel except `kernel-vbmi2`; with `std`,
+# `detect_cpu_kernel()` (decode) and `fastpath::select_kernel()` (encode) pick
+# the best tier at runtime — a universal binary that adapts to any CPU. On
 # `no_std` the tier is fixed at compile time from `target_feature`, baking
-# the chosen ISA into the build. Constrained targets can trim the SIMD trampolines + their
+# the chosen ISA into the build; on wasm it is always compile-time, since the
+# kernels there additionally require `target_feature = "simd128"`.
+# Constrained targets can trim the SIMD trampolines + their
 # dispatch arms by disabling the tiers they don't need; the scalar kernel
 # is always compiled as the fallback, so the lowest enabled tier always has
 # a backstop. Each feature only affects builds for its architecture (a
-# `kernel_avx2` flag is inert on aarch64, `kernel_neon` inert on x86), so
-# the all-on default is safe everywhere. The implication chain mirrors the
+# `kernel-avx2` flag is inert on aarch64, `kernel-neon` inert on x86), so
+# the all-on default is safe everywhere. `kernel-vbmi2` and `kernel-sve` are
+# decoder-only: the encoder has no AVX-512 or SVE tier. `kernel-sse` covers
+# two encoder tiers, SSE4.2 and a plain-SSE2 fallback for CPUs without it.
+# The implication chain mirrors the
 # real ISA dependency: AVX2 implies BMI2 implies SSE2; SVE implies NEON.
-# `kernel_scalar` is a marker only: the scalar kernel is compiled
+# `kernel-scalar` is a marker only: the scalar kernel is compiled
 # unconditionally (it is the mandatory fallback), so this flag gates no code.
 # It exists so the scalar tier can be named explicitly in a feature set; a
 # scalar-only build is equivalently `--no-default-features` (no SIMD tier
-# enabled) or `--no-default-features --features kernel_scalar`.
-kernel_scalar = []
-kernel_sse2 = []
-kernel_bmi2 = ["kernel_sse2"]
-kernel_avx2 = ["kernel_bmi2"]
-kernel_vbmi2 = ["kernel_avx2"]
-kernel_neon = []
-kernel_sve = ["kernel_neon"]
+# enabled) or `--no-default-features --features kernel-scalar`.
+kernel-scalar = []
+kernel-sse = []
+kernel-bmi2 = ["kernel-sse"]
+kernel-avx2 = ["kernel-bmi2"]
+kernel-vbmi2 = ["kernel-avx2"]
+kernel-neon = []
+kernel-sve = ["kernel-neon"]
 # WebAssembly fixed-128-bit SIMD tier (`simd128`). Inert on non-wasm targets
-# the same way `kernel_neon` is inert on x86. wasm has no runtime CPU
+# the same way `kernel-neon` is inert on x86. wasm has no runtime CPU
 # detection, so the tier is chosen at compile time from `target_feature =
 # "simd128"`; consumers build with `-C target-feature=+simd128`. Covers the
 # two 128-bit-class kernels that port directly (row tag-scan, match-copy);
 # the 256-bit (AVX2/VBMI2) and scalar-bit-manip (BMI2) kernels have no
 # simd128 equivalent and stay scalar on wasm.
-kernel_simd128 = []
-dict_builder = ["std", "dep:fastrand"]
+kernel-simd128 = []
+dict-builder = ["std", "dep:fastrand"]
 hash = ["dep:twox-hash"]
+# Long-distance matching in the encoder. Implies `hash`: the LDM match finder
+# hashes each `min_match_length` window with XXH64. Without it the parameter
+# builder still accepts `enable_long_distance_matching(true)` and the frame
+# stays valid, but no long-distance matches are produced.
+#
+# Not to be confused with `lsm` below (storage-format extensions) — the names
+# differ by one letter and mean unrelated things.
+ldm = ["hash"]
 # Opt-in cache for FSE default tables on no-atomic targets. See
 # `fse_encoder::default_*_table` for the implementation split. On
 # targets with atomic pointer support this feature is a no-op.
 critical-section = ["dep:critical-section"]
-bench_internals = []
-fuzz_exports = []
 std = []
-# Dev-only: route the `encode_loop_reuse_z000033` profiling example through
-# the `dhat` heap profiler (per-allocation-site call-stack attribution) so a
-# reused-compressor run shows which Rust sites allocate, and how many times —
-# the per-frame allocation churn that libc-frame-pointer-broken flamegraphs
-# can't attribute. Off by default (the profiler adds large overhead); enable
-# only for the example. Writes `dhat-heap.json` (view at the dhat viewer or
-# parse for `total_blocks` per site).
-dhat-heap = []
+
+# ---------------------------------------------------------------------------
+# Internal features. NOT part of the public API: they widen the crate's
+# surface or add diagnostics for this repository's own benches, fuzz targets
+# and examples. They carry no stability guarantee and can change or disappear
+# in any release, so downstream crates should not enable them. Excluded from
+# the docs.rs feature set above for the same reason.
+# ---------------------------------------------------------------------------
+
+# Widens the API surface so the benches in `ffi-bench` can reach internals.
+# CI enforces that the parity benches do NOT enable it, since the wider
+# surface would bias a Rust-vs-C comparison.
+bench-internals = []
+# Widens the API surface for the fuzz targets.
+fuzz-exports = []
 # Diagnostic-only: atomic histograms of the match/literal copy shape on the
 # decode path (call counts + size buckets + requested-vs-overshoot byte
 # totals). Off in every shipping / bench build (zero codegen impact). Enabled
 # by the `copy_shape` example to capture the copy-call distribution, which is
 # deterministic from the compressed input and therefore architecture-
 # independent (only the per-call timing is CPU-tier specific).
-copy_shape_stats = ["std"]
+copy-shape-stats = ["std"]
 # Diagnostic tracing of the Fast kernel's inner loop — per-iteration state
 # dumps gated at compile time so production builds carry zero cost. Runtime
 # activation via `STRUCTURED_ZSTD_KERNEL_TRACE=1` env var. Used by the
 # `trace_fast_kernel` example for #220 ratio-divergence investigation.
-kernel_trace = ["std"]
+kernel-trace = ["std"]
 # Opt-in storage-format extensions: typed Rust APIs that downstream
 # storage / wire-format consumers (lsm-tree, future graph stores) can
 # layer on top of the spec-mandated zstd decoder behaviour. Default

@@ -2,7 +2,7 @@
 //! compress with a finalized FastCOVER dictionary must decode through the C
 //! `zstd` dictionary decoder. The dictionary build + compression happen in the
 //! `structured_zstd::testing` facade (pure Rust); only the C decode lives here.
-#![cfg(all(feature = "bench_internals", feature = "dict_builder"))]
+#![cfg(all(feature = "bench-internals", feature = "dict-builder"))]
 
 use structured_zstd::testing::dict_roundtrip_fixture;
 

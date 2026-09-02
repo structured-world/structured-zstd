@@ -67,7 +67,7 @@ impl Dictionary {
 
     /// Build a dictionary from raw content bytes (without entropy table sections).
     ///
-    /// This is primarily intended for dictionaries produced by the `dict_builder`
+    /// This is primarily intended for dictionaries produced by the `dict-builder`
     /// module, which currently emits raw-content dictionaries.
     pub fn from_raw_content(
         id: u32,

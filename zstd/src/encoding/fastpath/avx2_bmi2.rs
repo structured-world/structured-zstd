@@ -1,13 +1,12 @@
 //! x86/x86_64 AVX2 + BMI2 fastpath variant. Functions are marked
 //! `#[target_feature(enable = "avx2,bmi2")]` so 256-bit vector intrinsics
-//! (`_mm256_*`), BMI2 bit-manipulation (`_pext_u64`, `_bzhi_u64`), and SSE2/4.2
-//! intrinsics all inline natively inside this module's hot loop.
+//! (`_mm256_*`) and BMI2 bit-manipulation (`_pext_u64`, `_bzhi_u64`) inline
+//! natively inside this module's hot loop.
 //!
 //! Selected at runtime when both feature sets are present (Haswell and newer
 //! x86 CPUs, ~2013+).
 
 #![cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-#![allow(dead_code)]
 
 #[cfg(target_arch = "x86")]
 use core::arch::x86::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
@@ -15,33 +14,6 @@ use core::arch::x86::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_mov
 use core::arch::x86_64::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
 
 use super::scalar;
-
-pub(crate) const KERNEL_TAG: &str = "avx2_bmi2";
-
-/// AVX2+BMI2 variant of `hash_mix_u64`. AVX2 itself doesn't include the
-/// CRC32 instruction (`_mm_crc32_u64` lives under SSE4.2); every shipping
-/// AVX2 CPU also has SSE4.2 in hardware, but Rust's `target_feature`
-/// machinery does not propagate that implication, so the attribute must
-/// list `sse4.2` explicitly and the dispatcher must gate AVX2 kernel
-/// selection on `sse4.2` being reported as well.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,bmi2,sse4.2")]
-#[inline]
-pub(crate) unsafe fn hash_mix_u64(value: u64) -> u64 {
-    let crc = unsafe {
-        #[cfg(target_arch = "x86_64")]
-        use core::arch::x86_64::_mm_crc32_u64;
-        _mm_crc32_u64(0, value)
-    };
-    ((crc << 32) ^ value.rotate_left(13)).wrapping_mul(scalar::HASH_MIX_PRIME)
-}
-
-#[cfg(target_arch = "x86")]
-#[target_feature(enable = "avx2,bmi2")]
-#[inline]
-pub(crate) unsafe fn hash_mix_u64(value: u64) -> u64 {
-    scalar::hash_mix_u64(value)
-}
 
 /// 32-byte AVX2 vector prefix-length probe.
 ///

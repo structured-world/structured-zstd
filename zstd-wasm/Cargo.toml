@@ -37,7 +37,7 @@ wasm-bindgen = "0.2"
 # `hash` enables XXH64 content-checksum support (the `ContentChecksum` modes +
 # encoder toggle exposed below). twox-hash is `no_std`, so this adds the
 # checksum code without pulling `std`.
-structured-zstd = { version = "0", path = "../zstd", default-features = false, features = ["kernel_simd128", "hash"] }
+structured-zstd = { version = "0", path = "../zstd", default-features = false, features = ["kernel-simd128", "hash"] }
 
 # Size-tuned wasm-pack release profile: optimise for size + a wasm-opt -Oz
 # post-pass, since payload bytes are the budget for a published wasm module.

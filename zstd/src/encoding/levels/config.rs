@@ -395,7 +395,7 @@ pub(crate) fn apply_param_overrides(
 /// Map the resolved runtime strategy to the upstream zstd LDM strategy ordinal
 /// (1..=9) that [`crate::encoding::ldm::params::LdmParams::adjust_for`] expects.
 /// The collapsed `Lazy` tag splits on `lazy_depth` (lazy = 4, lazy2 = 5).
-#[cfg(feature = "hash")]
+#[cfg(feature = "ldm")]
 pub(crate) fn ldm_strategy_ordinal(
     tag: crate::encoding::strategy::StrategyTag,
     lazy_depth: u8,

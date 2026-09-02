@@ -465,7 +465,7 @@ impl<B: BufferBackend> DecodeBuffer<B> {
             // succeeds: on `OutputBufferOverflow` the repeat never runs, so
             // counting it here would inflate the diagnostic with match
             // traffic that was never materialised.
-            #[cfg(feature = "copy_shape_stats")]
+            #[cfg(feature = "copy-shape-stats")]
             crate::decoding::simd_copy::shape_stats::record_repeat(
                 offset,
                 match_length,

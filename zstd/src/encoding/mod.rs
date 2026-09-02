@@ -66,20 +66,17 @@ pub(crate) mod bt;
 pub(crate) mod cost_model;
 pub(crate) mod dfast;
 pub(crate) mod hc;
-// LDM uses `twox_hash::XxHash64` (per-window XXH64 over the
-// `min_match_length` byte slice, upstream zstd `zstd_ldm.c:315`). The
-// `twox-hash` dependency is gated behind the `hash` feature so
 pub(crate) mod lazy_parse;
-// `default-features = false` builds (no_std, embedded) don't pull
-// it in. `BtMatcher::ldm_producer` and the `cfg(feature = "hash")`
-// blocks inside `BtMatcher::prepare_ldm_candidates` /
+// LDM hashes each `min_match_length` window with XXH64 (upstream zstd
+// `zstd_ldm.c:315`), so the `ldm` feature implies `hash` and the
+// `twox-hash` dependency it pulls in. `BtMatcher::ldm_producer` and the
+// `cfg(feature = "ldm")` blocks inside `BtMatcher::prepare_ldm_candidates` /
 // `BtMatcher::reset` carry the same gate; the call site in
-// `match_generator.rs::start_matching_optimal` invokes
-// `prepare_ldm_candidates` unconditionally because the
-// gating is internal to the method body (under
-// `not(feature = "hash")` the method shrinks to the legacy
+// `hc::optimal::HcMatchGenerator::start_matching_optimal` invokes
+// `prepare_ldm_candidates` unconditionally because the gating is internal to
+// the method body (without the feature it shrinks to an
 // `ldm_sequences.clear()` stub).
-#[cfg(feature = "hash")]
+#[cfg(feature = "ldm")]
 pub(crate) mod ldm;
 pub(crate) mod match_table;
 pub(crate) mod opt;
@@ -92,7 +89,7 @@ pub(crate) mod frame_compressor;
 pub mod frame_emit_info;
 mod levels;
 pub(crate) mod parameters;
-#[cfg(feature = "bench_internals")]
+#[cfg(feature = "bench-internals")]
 pub mod sequence_capture;
 mod streaming_encoder;
 pub use frame_compressor::{EncoderDictionary, FrameCompressor};

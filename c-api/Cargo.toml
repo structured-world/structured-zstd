@@ -42,9 +42,9 @@ crate-type = ["cdylib", "staticlib"]
 # giving the dependency a distinct crate name in this crate.
 # Default features pull in std + hash (checksums/LDM) + the per-CPU kernel
 # tiers — the C ABI is a host library, so std is always available here.
-# `dict_builder` adds the dictionary-training surface backing the ZDICT_* C API.
+# `dict-builder` adds the dictionary-training surface backing the ZDICT_* C API.
 # The version requirement accompanies the path so `cargo package` can verify
 # this manifest (release-plz packages the workspace; a bare `path` dependency
 # fails its "all dependencies must have a version requirement" check even for
 # publish = false members).
-codec = { path = "../zstd", version = "0.0", package = "structured-zstd", features = ["dict_builder"] }
+codec = { path = "../zstd", version = "0.0", package = "structured-zstd", features = ["dict-builder"] }

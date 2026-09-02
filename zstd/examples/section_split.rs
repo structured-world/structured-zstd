@@ -4,7 +4,7 @@
 //! sequence streams are byte-identical (see compare_ffi_sequences) but the
 //! final size differs, this localizes the gap to literals vs sequences.
 //!
-//! Build: cargo build --release -p ffi-bench --example section_split --features dict_builder
+//! Build: cargo build --release -p ffi-bench --example section_split --features dict-builder
 //! Run:   ./target/release/examples/section_split [corpus] [level]
 
 use std::env;

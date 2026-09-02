@@ -42,15 +42,6 @@ use super::opt::ldm::HcRawSeq;
 use super::opt::types::{HcCandidateQuery, MatchCandidate};
 use super::row::RowMatchGenerator;
 use super::simple::fast_matcher::{FAST_LEVEL_1_HASH_LOG, FAST_LEVEL_1_MLS, FastKernelMatcher};
-#[cfg(all(
-    test,
-    feature = "std",
-    target_arch = "aarch64",
-    target_endian = "little"
-))]
-use std::arch::is_aarch64_feature_detected;
-#[cfg(all(test, feature = "std", target_arch = "x86_64"))]
-use std::arch::is_x86_feature_detected;
 
 pub(crate) const DFAST_MIN_MATCH_LEN: usize = 5;
 // Bytes the dfast short hash reads (upstream zstd `mls = 5`). Seeding / lookahead
@@ -119,8 +110,6 @@ pub(crate) const ROW_TARGET_LEN: usize = 48;
 pub(crate) const ROW_TAG_BITS: usize = 8;
 pub(crate) const ROW_EMPTY_SLOT: u32 = u32::MAX;
 pub(crate) const ROW_HASH_KEY_LEN: usize = 4;
-// HASH_MIX_PRIME now lives in `crate::encoding::fastpath::scalar`; the four
-// per-CPU `hash_mix_u64` variants share it via that module.
 // HC_PRIME3BYTES / HC_PRIME4BYTES moved to match_table::storage
 // alongside the hash helpers in Phase 1e Stage A. Only the test
 // module references the constants directly (production code goes
@@ -1465,7 +1454,7 @@ impl Matcher for MatchGeneratorDriver {
         // producer. Built AFTER `hc.reset()` because `BtMatcher::reset`
         // clears an existing producer's table but does not null the
         // slot — installing here gives the new frame a fresh producer.
-        #[cfg(feature = "hash")]
+        #[cfg(feature = "ldm")]
         {
             // Resolve the derived LDM params first (immutable borrow of the
             // overrides), then reuse the existing producer's allocation below.
@@ -1940,7 +1929,7 @@ pub(crate) enum HcBackend {
     Bt(alloc::boxed::Box<super::bt::BtMatcher>),
 }
 
-#[cfg(feature = "bench_internals")]
+#[cfg(feature = "bench-internals")]
 pub(crate) fn level22_block_ranges(data: &[u8]) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     let mut cursor = 0usize;
@@ -1969,7 +1958,7 @@ pub(crate) fn level22_block_ranges(data: &[u8]) -> Vec<(usize, usize)> {
     ranges
 }
 
-#[cfg(feature = "bench_internals")]
+#[cfg(feature = "bench-internals")]
 fn merge_block_delimiters(sequences: Vec<(usize, usize, usize)>) -> Vec<(usize, usize, usize)> {
     let mut out = Vec::with_capacity(sequences.len());
     let mut pending_lits = 0usize;
@@ -1992,7 +1981,7 @@ fn merge_block_delimiters(sequences: Vec<(usize, usize, usize)>) -> Vec<(usize, 
 /// with block-delimiter pseudo-sequences merged into the following
 /// triple's literal run. Pure Rust; the C-conformance comparison that
 /// consumes it lives in the `ffi-bench` crate.
-#[cfg(feature = "bench_internals")]
+#[cfg(feature = "bench-internals")]
 pub(crate) fn collect_level22_sequences(data: &[u8]) -> Vec<(usize, usize, usize)> {
     merge_block_delimiters(collect_level22_sequences_with_delimiters(data))
         .into_iter()
@@ -2000,7 +1989,7 @@ pub(crate) fn collect_level22_sequences(data: &[u8]) -> Vec<(usize, usize, usize
         .collect()
 }
 
-#[cfg(feature = "bench_internals")]
+#[cfg(feature = "bench-internals")]
 fn collect_level22_sequences_with_delimiters(data: &[u8]) -> Vec<(usize, usize, usize)> {
     let mut driver = MatchGeneratorDriver::new(super::cost_model::HC_BLOCKSIZE_MAX, 1);
     driver.set_source_size_hint(data.len() as u64);

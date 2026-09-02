@@ -12,7 +12,7 @@ pub mod huff0_encoder;
 /// Encodes the data with a table built from that data
 /// Decodes the result again by first decoding the table and then the data
 /// Asserts that the decoded data equals the input
-#[cfg(any(test, feature = "fuzz_exports"))]
+#[cfg(any(test, feature = "fuzz-exports"))]
 pub fn round_trip(data: &[u8]) {
     use crate::bit_io::{BitReaderReversed, BitWriter};
     use alloc::vec::Vec;

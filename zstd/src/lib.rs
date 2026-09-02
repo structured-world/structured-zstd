@@ -8,7 +8,7 @@
 //!   [`decoding::DictionaryHandle`]).
 //! * [`encoding`] — frame compressor, streaming encoder, named and numeric
 //!   compression levels ([`encoding::CompressionLevel`]).
-//! * [`dictionary`] (feature `dict_builder`) — COVER / FastCOVER training
+//! * [`dictionary`] (feature `dict-builder`) — COVER / FastCOVER training
 //!   plus raw-to-finalized dictionary helpers.
 //!
 //! No FFI, no cmake, no system zstd. `no_std` builds are supported by
@@ -16,24 +16,36 @@
 //!
 //! # CPU kernel features
 //!
-//! The decode hot paths ship per-CPU-tier SIMD kernels. With `std` the tier
-//! is chosen at runtime (CPU-feature detection, cached on first use); on
-//! `no_std` it is chosen at compile time from `cfg(target_feature)`.
-//! Each tier is gated by a cargo feature, all enabled by default (a universal
-//! binary that picks the best available tier per the above): `kernel_scalar`,
-//! `kernel_sse2`, `kernel_bmi2`, `kernel_avx2`, `kernel_vbmi2` (x86) and
-//! `kernel_neon`, `kernel_sve` (aarch64). The chain mirrors the ISA
-//! dependency (`kernel_avx2` implies `kernel_bmi2` implies `kernel_sse2`;
-//! `kernel_sve` implies `kernel_neon`). The scalar kernel is always compiled,
-//! so any subset is valid; a flag is inert on architectures it doesn't apply
-//! to. Constrained targets can shrink the binary by trimming tiers, e.g.
-//! `--no-default-features --features kernel_scalar` compiles out the per-tier
-//! SIMD kernel dispatch, its BMI2/AVX2/VBMI2/NEON trampolines, and the
-//! explicit SSE2/NEON intrinsics in the small fixed-size copy primitives —
-//! all of which are gated on the matching `kernel_*` feature. The `kernel_*`
-//! features control the crate's own explicit SIMD; they do not constrain the
-//! compiler's autovectorizer, which may still emit vector instructions from
-//! ordinary scalar code regardless of the enabled tiers.
+//! Both the decode and the encode hot paths ship per-CPU-tier SIMD kernels.
+//! On x86 and aarch64 with `std` the tier is chosen at runtime (CPU-feature
+//! detection, cached on first use); on `no_std` it is chosen at compile time
+//! from `cfg(target_feature)`. WebAssembly is compile-time only either way:
+//! its kernels additionally require `target_feature = "simd128"`, so a wasm
+//! build without `-C target-feature=+simd128` stays scalar.
+//!
+//! Each tier is gated by a cargo feature: `kernel-scalar`, `kernel-sse`,
+//! `kernel-bmi2`, `kernel-avx2`, `kernel-vbmi2` (x86) and `kernel-neon`,
+//! `kernel-sve` (aarch64). All are on by default except `kernel-vbmi2`, which
+//! is opt-in because the AVX-512 decode tier measures slower than AVX2 on the
+//! bursty decode path, so the default build is a universal binary that picks
+//! the best available tier per the above. `kernel-scalar` gates no code: the
+//! scalar path is the mandatory fallback and is always compiled, so the flag
+//! exists only to name that tier explicitly in a feature set. `kernel-vbmi2`
+//! and `kernel-sve` are decoder-only; the encoder has no AVX-512 or SVE tier.
+//! The chain mirrors the ISA
+//! dependency (`kernel-avx2` implies `kernel-bmi2` implies `kernel-sse`;
+//! `kernel-sve` implies `kernel-neon`). `kernel-sse` covers two x86 tiers:
+//! SSE4.2 where the CPU has it, and a plain-SSE2 tier otherwise, so a
+//! pre-SSE4.2 CPU still gets vector match compares. Any subset is valid, and a
+//! flag is inert on architectures it doesn't apply to. Constrained targets can
+//! shrink the binary by trimming
+//! tiers: `--no-default-features --features kernel-scalar` compiles out every
+//! per-tier dispatch, the BMI2/AVX2/VBMI2/NEON trampolines, and the explicit
+//! SSE2/NEON intrinsics in both the copy primitives and the encoder
+//! match-finder. The `kernel_*` features control the crate's own explicit
+//! SIMD; they do not constrain the compiler's autovectorizer, which may still
+//! emit vector instructions from ordinary scalar code regardless of the
+//! enabled tiers.
 //!
 //! The packaged README is included below for the docs.rs landing page; the
 //! API anchors above link straight into the per-module documentation.
@@ -71,8 +83,8 @@ mod common;
 pub use common::MIN_TARGET_BLOCK_SIZE;
 mod cpu_kernel;
 pub mod decoding;
-#[cfg(feature = "dict_builder")]
-#[cfg_attr(docsrs, doc(cfg(feature = "dict_builder")))]
+#[cfg(feature = "dict-builder")]
+#[cfg_attr(docsrs, doc(cfg(feature = "dict-builder")))]
 pub mod dictionary;
 pub mod encoding;
 mod histogram;
@@ -83,17 +95,17 @@ pub mod skippable;
 
 pub(crate) mod blocks;
 
-#[cfg(feature = "fuzz_exports")]
+#[cfg(feature = "fuzz-exports")]
 pub mod fse;
-#[cfg(feature = "fuzz_exports")]
+#[cfg(feature = "fuzz-exports")]
 pub mod huff0;
 
 // `pub fn init_state<K: CpuKernel>` and friends inside the
-// fuzz_exports-public `huff0` module name `crate::cpu_kernel::CpuKernel`
+// fuzz-exports-public `huff0` module name `crate::cpu_kernel::CpuKernel`
 // in their signatures. Without a publicly-reachable path to `CpuKernel`
 // the bound triggers `private_bounds` / `private_interfaces`. Re-export
 // under the same feature gate so the fuzz harness build is clean.
-#[cfg(feature = "fuzz_exports")]
+#[cfg(feature = "fuzz-exports")]
 pub use crate::cpu_kernel::{CpuKernel, ScalarKernel};
 
 /// Name of the active CPU kernel tier (entropy / sequence hot paths) for this
@@ -101,9 +113,9 @@ pub use crate::cpu_kernel::{CpuKernel, ScalarKernel};
 /// [`cpu_kernel::active_cpu_kernel_name`].
 pub use crate::cpu_kernel::active_cpu_kernel_name;
 
-#[cfg(not(feature = "fuzz_exports"))]
+#[cfg(not(feature = "fuzz-exports"))]
 pub(crate) mod fse;
-#[cfg(not(feature = "fuzz_exports"))]
+#[cfg(not(feature = "fuzz-exports"))]
 pub(crate) mod huff0;
 
 #[cfg(feature = "std")]
@@ -123,10 +135,10 @@ mod tests;
 
 /// Re-exports of internal types used by benchmarks.
 ///
-/// Gated behind the `bench_internals` feature so normal builds do not
+/// Gated behind the `bench-internals` feature so normal builds do not
 /// widen the public API surface. Not part of the stable API; items may
 /// change or disappear without notice.
-#[cfg(feature = "bench_internals")]
+#[cfg(feature = "bench-internals")]
 #[doc(hidden)]
 pub mod testing {
     /// Compression parameters selected for `(level, srcSize, dictSize)` →
@@ -225,7 +237,7 @@ pub mod testing {
     /// compressed_frame, original_payload)`. Facade for the `ffi-bench`
     /// conformance test that decodes `compressed_frame` against the dictionary
     /// through the C decoder and compares to `original_payload`.
-    #[cfg(feature = "dict_builder")]
+    #[cfg(feature = "dict-builder")]
     pub fn dict_roundtrip_fixture() -> (
         alloc::vec::Vec<u8>,
         alloc::vec::Vec<u8>,

@@ -38,12 +38,12 @@ use std::sync::OnceLock;
 /// existing decoder / encoder types.
 // Public (rather than `pub(crate)`) because `BitReaderReversed` is
 // generic over `K: CpuKernel = ScalarKernel` and is re-exported via
-// the `bench_internals`-gated `testing` module; under that feature
+// the `bench-internals`-gated `testing` module; under that feature
 // the visibility of every type that appears in `BitReaderReversed`'s
 // bounds (the trait + the default kernel) must match the type's own
 // visibility, otherwise rustc rejects with `private_bounds` /
 // `private_interfaces`. The trait surface stays narrow on stable
-// crate users: nothing outside `bench_internals` constructs a
+// crate users: nothing outside `bench-internals` constructs a
 // non-Scalar kernel directly.
 pub trait CpuKernel: Copy + 'static {
     /// Mask the low `n` bits of `value`, returning the remaining
@@ -95,11 +95,11 @@ impl CpuKernel for ScalarKernel {
 /// the Avx2 kernel. Treated as a stepping stone between Sse2 and
 /// Avx2 on hardware that has BMI2 but not AVX2 (rare in practice but
 /// matches upstream zstd's gating).
-#[cfg(all(target_arch = "x86_64", feature = "kernel_bmi2"))]
+#[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
 #[derive(Copy, Clone, Default)]
 pub(crate) struct Bmi2Kernel;
 
-#[cfg(all(target_arch = "x86_64", feature = "kernel_bmi2"))]
+#[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
 impl CpuKernel for Bmi2Kernel {
     #[inline(always)]
     fn mask_lower_bits(value: u64, n: u8) -> u64 {
@@ -116,11 +116,11 @@ impl CpuKernel for Bmi2Kernel {
 /// x86 case — most CPUs released since 2013 (Haswell) have AVX2+BMI2.
 /// Uses `_bzhi_u64` for mask ops; future trait methods will use AVX2
 /// 256-bit moves for `copy_chunk` and pext for HUF burst.
-#[cfg(all(target_arch = "x86_64", feature = "kernel_avx2"))]
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
 #[derive(Copy, Clone, Default)]
 pub(crate) struct Avx2Kernel;
 
-#[cfg(all(target_arch = "x86_64", feature = "kernel_avx2"))]
+#[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
 impl CpuKernel for Avx2Kernel {
     #[inline(always)]
     fn mask_lower_bits(value: u64, n: u8) -> u64 {
@@ -134,11 +134,11 @@ impl CpuKernel for Avx2Kernel {
 /// has the AVX-512 VBMI2 family available — VBMI2 unlocks a faster
 /// HUF burst inner loop (VPSHUFB-based table lookup); BMI2 mask_lower
 /// bits stays identical to Avx2 kernel.
-#[cfg(all(target_arch = "x86_64", feature = "kernel_vbmi2"))]
+#[cfg(all(target_arch = "x86_64", feature = "kernel-vbmi2"))]
 #[derive(Copy, Clone, Default)]
 pub(crate) struct Vbmi2Kernel;
 
-#[cfg(all(target_arch = "x86_64", feature = "kernel_vbmi2"))]
+#[cfg(all(target_arch = "x86_64", feature = "kernel-vbmi2"))]
 impl CpuKernel for Vbmi2Kernel {
     #[inline(always)]
     fn mask_lower_bits(value: u64, n: u8) -> u64 {
@@ -156,12 +156,12 @@ impl CpuKernel for Vbmi2Kernel {
 /// The struct + trait impl land first so the dispatch wiring can be
 /// added incrementally without churning the CpuKernel surface; until
 /// the dispatch arm uses it the type is reachable only as a phantom.
-#[cfg(all(target_arch = "aarch64", feature = "kernel_neon"))]
+#[cfg(all(target_arch = "aarch64", feature = "kernel-neon"))]
 #[allow(dead_code)]
 #[derive(Copy, Clone, Default)]
 pub(crate) struct NeonKernel;
 
-#[cfg(all(target_arch = "aarch64", feature = "kernel_neon"))]
+#[cfg(all(target_arch = "aarch64", feature = "kernel-neon"))]
 impl CpuKernel for NeonKernel {
     #[inline(always)]
     fn mask_lower_bits(value: u64, n: u8) -> u64 {
@@ -178,12 +178,12 @@ impl CpuKernel for NeonKernel {
 /// support. Mask op identical to NEON / Scalar.
 ///
 /// `#[allow(dead_code)]`: same scaffolding rationale as `NeonKernel`.
-#[cfg(all(target_arch = "aarch64", feature = "kernel_sve"))]
+#[cfg(all(target_arch = "aarch64", feature = "kernel-sve"))]
 #[allow(dead_code)]
 #[derive(Copy, Clone, Default)]
 pub(crate) struct SveKernel;
 
-#[cfg(all(target_arch = "aarch64", feature = "kernel_sve"))]
+#[cfg(all(target_arch = "aarch64", feature = "kernel-sve"))]
 impl CpuKernel for SveKernel {
     #[inline(always)]
     fn mask_lower_bits(value: u64, n: u8) -> u64 {
@@ -197,7 +197,7 @@ impl CpuKernel for SveKernel {
 /// same shared body. With `#[inline]` LLVM inlines the call into
 /// any caller that itself has BMI2 in scope; outside that scope the
 /// target_feature boundary is preserved.
-#[cfg(all(target_arch = "x86_64", feature = "kernel_bmi2"))]
+#[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
 #[target_feature(enable = "bmi2")]
 #[inline]
 unsafe fn mask_lower_bits_bmi2_impl(value: u64, n: u8) -> u64 {
@@ -235,19 +235,19 @@ const fn select_x86_kernel(
     has_avx2: bool,
     has_sse2: bool,
 ) -> CpuKernelTag {
-    #[cfg(feature = "kernel_vbmi2")]
+    #[cfg(feature = "kernel-vbmi2")]
     if has_avx512vbmi2 && has_avx512f && has_avx512vl && has_avx512bw && has_bmi2 && has_avx2 {
         return CpuKernelTag::Vbmi2;
     }
-    #[cfg(feature = "kernel_avx2")]
+    #[cfg(feature = "kernel-avx2")]
     if has_avx2 && has_bmi2 {
         return CpuKernelTag::Avx2;
     }
-    #[cfg(feature = "kernel_bmi2")]
+    #[cfg(feature = "kernel-bmi2")]
     if has_bmi2 {
         return CpuKernelTag::Bmi2;
     }
-    #[cfg(feature = "kernel_sse2")]
+    #[cfg(feature = "kernel-sse")]
     if has_sse2 {
         return CpuKernelTag::Sse2;
     }
@@ -265,15 +265,15 @@ const fn select_x86_kernel(
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CpuKernelTag {
     Scalar,
-    #[cfg(all(target_arch = "x86_64", feature = "kernel_sse2"))]
+    #[cfg(all(target_arch = "x86_64", feature = "kernel-sse"))]
     Sse2,
-    #[cfg(all(target_arch = "x86_64", feature = "kernel_bmi2"))]
+    #[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
     Bmi2,
-    #[cfg(all(target_arch = "x86_64", feature = "kernel_avx2"))]
+    #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
     Avx2,
-    #[cfg(all(target_arch = "x86_64", feature = "kernel_vbmi2"))]
+    #[cfg(all(target_arch = "x86_64", feature = "kernel-vbmi2"))]
     Vbmi2,
-    #[cfg(all(target_arch = "aarch64", feature = "kernel_neon"))]
+    #[cfg(all(target_arch = "aarch64", feature = "kernel-neon"))]
     Neon,
     // Both constructors of `Sve` need a reachable feature: runtime
     // detection via `std::arch::is_aarch64_feature_detected!` (so
@@ -282,7 +282,7 @@ pub(crate) enum CpuKernelTag {
     // `match` arm referencing it warns as dead.
     #[cfg(all(
         target_arch = "aarch64",
-        feature = "kernel_sve",
+        feature = "kernel-sve",
         any(feature = "std", target_feature = "sve"),
     ))]
     Sve,
@@ -308,24 +308,24 @@ fn detect_cpu_kernel_uncached() -> CpuKernelTag {
         // (and its CPUID/cache traffic) for tiers the build disabled — the
         // matching `select_x86_kernel` rung is `#[cfg]`-ed out anyway.
         return select_x86_kernel(
-            cfg!(feature = "kernel_vbmi2") && is_x86_feature_detected!("avx512vbmi2"),
-            cfg!(feature = "kernel_vbmi2") && is_x86_feature_detected!("avx512f"),
-            cfg!(feature = "kernel_vbmi2") && is_x86_feature_detected!("avx512vl"),
-            cfg!(feature = "kernel_vbmi2") && is_x86_feature_detected!("avx512bw"),
-            cfg!(feature = "kernel_bmi2") && is_x86_feature_detected!("bmi2"),
-            cfg!(feature = "kernel_avx2") && is_x86_feature_detected!("avx2"),
-            cfg!(feature = "kernel_sse2") && is_x86_feature_detected!("sse2"),
+            cfg!(feature = "kernel-vbmi2") && is_x86_feature_detected!("avx512vbmi2"),
+            cfg!(feature = "kernel-vbmi2") && is_x86_feature_detected!("avx512f"),
+            cfg!(feature = "kernel-vbmi2") && is_x86_feature_detected!("avx512vl"),
+            cfg!(feature = "kernel-vbmi2") && is_x86_feature_detected!("avx512bw"),
+            cfg!(feature = "kernel-bmi2") && is_x86_feature_detected!("bmi2"),
+            cfg!(feature = "kernel-avx2") && is_x86_feature_detected!("avx2"),
+            cfg!(feature = "kernel-sse") && is_x86_feature_detected!("sse2"),
         );
     }
     #[cfg(target_arch = "aarch64")]
     {
-        #[cfg(any(feature = "kernel_sve", feature = "kernel_neon"))]
+        #[cfg(any(feature = "kernel-sve", feature = "kernel-neon"))]
         use std::arch::is_aarch64_feature_detected;
-        #[cfg(feature = "kernel_sve")]
+        #[cfg(feature = "kernel-sve")]
         if is_aarch64_feature_detected!("sve") {
             return CpuKernelTag::Sve;
         }
-        #[cfg(feature = "kernel_neon")]
+        #[cfg(feature = "kernel-neon")]
         if is_aarch64_feature_detected!("neon") {
             return CpuKernelTag::Neon;
         }
@@ -359,11 +359,11 @@ pub(crate) fn detect_cpu_kernel() -> CpuKernelTag {
     }
     #[cfg(target_arch = "aarch64")]
     {
-        #[cfg(all(feature = "kernel_sve", target_feature = "sve"))]
+        #[cfg(all(feature = "kernel-sve", target_feature = "sve"))]
         {
             return CpuKernelTag::Sve;
         }
-        #[cfg(all(feature = "kernel_neon", target_feature = "neon"))]
+        #[cfg(all(feature = "kernel-neon", target_feature = "neon"))]
         {
             return CpuKernelTag::Neon;
         }
@@ -380,19 +380,19 @@ impl CpuKernelTag {
     pub(crate) fn name(self) -> &'static str {
         match self {
             CpuKernelTag::Scalar => "scalar",
-            #[cfg(all(target_arch = "x86_64", feature = "kernel_sse2"))]
+            #[cfg(all(target_arch = "x86_64", feature = "kernel-sse"))]
             CpuKernelTag::Sse2 => "sse2",
-            #[cfg(all(target_arch = "x86_64", feature = "kernel_bmi2"))]
+            #[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
             CpuKernelTag::Bmi2 => "bmi2",
-            #[cfg(all(target_arch = "x86_64", feature = "kernel_avx2"))]
+            #[cfg(all(target_arch = "x86_64", feature = "kernel-avx2"))]
             CpuKernelTag::Avx2 => "avx2",
-            #[cfg(all(target_arch = "x86_64", feature = "kernel_vbmi2"))]
+            #[cfg(all(target_arch = "x86_64", feature = "kernel-vbmi2"))]
             CpuKernelTag::Vbmi2 => "vbmi2",
-            #[cfg(all(target_arch = "aarch64", feature = "kernel_neon"))]
+            #[cfg(all(target_arch = "aarch64", feature = "kernel-neon"))]
             CpuKernelTag::Neon => "neon",
             #[cfg(all(
                 target_arch = "aarch64",
-                feature = "kernel_sve",
+                feature = "kernel-sve",
                 any(feature = "std", target_feature = "sve"),
             ))]
             CpuKernelTag::Sve => "sve",

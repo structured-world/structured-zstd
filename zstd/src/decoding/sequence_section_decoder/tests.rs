@@ -411,7 +411,7 @@ mod init_sequence_stream_tests {
     /// selector prefers the avx2 tier on any CPU that has BMI2, so this
     /// tier never runs through the normal dispatch on CI hardware; call it
     /// directly (guarded on the same feature it requires).
-    #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel_bmi2"))]
+    #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel-bmi2"))]
     #[test]
     fn bmi2_tier_runs_preamble() {
         if !std::is_x86_feature_detected!("bmi2") {
@@ -441,7 +441,7 @@ mod init_sequence_stream_tests {
     /// production path on AVX2 hardware, so this is usually also covered by
     /// the normal decode tests; the explicit call keeps the preamble
     /// covered even on a runner that lacks AVX2.
-    #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel_avx2"))]
+    #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel-avx2"))]
     #[test]
     fn avx2_tier_runs_preamble() {
         if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi2")) {
@@ -470,7 +470,7 @@ mod init_sequence_stream_tests {
     /// Drive the VBMI2 monolith preamble directly. Requires AVX-512 VBMI2,
     /// which most CI runners lack; the test self-skips there, so this tier
     /// is only covered on AVX-512 hardware.
-    #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel_vbmi2"))]
+    #[cfg(all(feature = "std", target_arch = "x86_64", feature = "kernel-vbmi2"))]
     #[test]
     fn vbmi2_tier_runs_preamble() {
         // Mirror the production dispatch gate: the unsafe monolith is annotated

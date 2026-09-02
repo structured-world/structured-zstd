@@ -256,7 +256,7 @@ pub(crate) trait RowTags: Copy {
     all(
         target_arch = "wasm32",
         target_feature = "simd128",
-        feature = "kernel_simd128"
+        feature = "kernel-simd128"
     ),
     allow(dead_code)
 )]
@@ -275,11 +275,17 @@ impl RowTags for ScalarTags {
     }
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "kernel-sse"
+))]
 #[derive(Copy, Clone)]
-struct Sse42Tags;
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-impl RowTags for Sse42Tags {
+struct Sse2Tags;
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "kernel-sse"
+))]
+impl RowTags for Sse2Tags {
     #[inline]
     unsafe fn probe<const ROW_LOG: usize>(
         matcher: &RowMatchGenerator,
@@ -288,14 +294,20 @@ impl RowTags for Sse42Tags {
         hash: Option<(usize, u8)>,
     ) -> Option<MatchCandidate> {
         // SAFETY: dispatched only when `tag_kernel == Sse42` (SSE4.2 confirmed).
-        unsafe { matcher.row_probe_sse42::<ROW_LOG>(abs_pos, lit_len, hash) }
+        unsafe { matcher.row_probe_sse2::<ROW_LOG>(abs_pos, lit_len, hash) }
     }
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "kernel-avx2"
+))]
 #[derive(Copy, Clone)]
 struct Avx2Bmi2Tags;
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "kernel-avx2"
+))]
 impl RowTags for Avx2Bmi2Tags {
     #[inline]
     unsafe fn probe<const ROW_LOG: usize>(
@@ -309,10 +321,18 @@ impl RowTags for Avx2Bmi2Tags {
     }
 }
 
-#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[cfg(all(
+    target_arch = "aarch64",
+    target_endian = "little",
+    feature = "kernel-neon"
+))]
 #[derive(Copy, Clone)]
 struct NeonTags;
-#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[cfg(all(
+    target_arch = "aarch64",
+    target_endian = "little",
+    feature = "kernel-neon"
+))]
 impl RowTags for NeonTags {
     #[inline]
     unsafe fn probe<const ROW_LOG: usize>(
@@ -333,14 +353,14 @@ impl RowTags for NeonTags {
 #[cfg(all(
     target_arch = "wasm32",
     target_feature = "simd128",
-    feature = "kernel_simd128"
+    feature = "kernel-simd128"
 ))]
 #[derive(Copy, Clone)]
 struct Simd128Tags;
 #[cfg(all(
     target_arch = "wasm32",
     target_feature = "simd128",
-    feature = "kernel_simd128"
+    feature = "kernel-simd128"
 ))]
 impl RowTags for Simd128Tags {
     #[inline]
@@ -368,7 +388,7 @@ macro_rules! dispatch_tag_kernel {
         #[cfg(all(
             target_arch = "wasm32",
             target_feature = "simd128",
-            feature = "kernel_simd128"
+            feature = "kernel-simd128"
         ))]
         {
             $self.$k_method::<Simd128Tags>($($arg),*)
@@ -376,15 +396,27 @@ macro_rules! dispatch_tag_kernel {
         #[cfg(not(all(
             target_arch = "wasm32",
             target_feature = "simd128",
-            feature = "kernel_simd128"
+            feature = "kernel-simd128"
         )))]
         {
             match $self.tag_kernel {
-                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                #[cfg(all(
+                    any(target_arch = "x86", target_arch = "x86_64"),
+                    feature = "kernel-avx2"
+                ))]
                 FastpathKernel::Avx2Bmi2 => $self.$k_method::<Avx2Bmi2Tags>($($arg),*),
-                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-                FastpathKernel::Sse42 => $self.$k_method::<Sse42Tags>($($arg),*),
-                #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+                #[cfg(all(
+                    any(target_arch = "x86", target_arch = "x86_64"),
+                    feature = "kernel-sse"
+                ))]
+                FastpathKernel::Sse2 | FastpathKernel::Sse42 => {
+                    $self.$k_method::<Sse2Tags>($($arg),*)
+                }
+                #[cfg(all(
+                    target_arch = "aarch64",
+                    target_endian = "little",
+                    feature = "kernel-neon"
+                ))]
                 FastpathKernel::Neon => $self.$k_method::<NeonTags>($($arg),*),
                 FastpathKernel::Scalar => $self.$k_method::<ScalarTags>($($arg),*),
             }
@@ -1583,7 +1615,7 @@ macro_rules! gen_lazy_monolith {
             all(
                 target_arch = "wasm32",
                 target_feature = "simd128",
-                feature = "kernel_simd128"
+                feature = "kernel-simd128"
             ),
             allow(dead_code)
         )]
@@ -1652,7 +1684,10 @@ macro_rules! row_tag_mask_scalar {
     }};
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "kernel-sse"
+))]
 macro_rules! row_tag_mask_sse2 {
     ($tags:expr, $tag:expr) => {{
         #[cfg(target_arch = "x86")]
@@ -1677,7 +1712,10 @@ macro_rules! row_tag_mask_sse2 {
     }};
 }
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "kernel-avx2"
+))]
 macro_rules! row_tag_mask_avx2 {
     ($tags:expr, $tag:expr) => {{
         #[cfg(target_arch = "x86")]
@@ -1713,7 +1751,11 @@ macro_rules! row_tag_mask_avx2 {
     }};
 }
 
-#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[cfg(all(
+    target_arch = "aarch64",
+    target_endian = "little",
+    feature = "kernel-neon"
+))]
 macro_rules! row_tag_mask_neon {
     ($tags:expr, $tag:expr) => {{
         use core::arch::aarch64::{
@@ -1755,7 +1797,7 @@ macro_rules! row_tag_mask_neon {
 #[cfg(all(
     target_arch = "wasm32",
     target_feature = "simd128",
-    feature = "kernel_simd128"
+    feature = "kernel-simd128"
 ))]
 macro_rules! row_tag_mask_simd128 {
     ($tags:expr, $tag:expr) => {{
@@ -2106,7 +2148,7 @@ macro_rules! gen_row_probe {
             all(
                 target_arch = "wasm32",
                 target_feature = "simd128",
-                feature = "kernel_simd128"
+                feature = "kernel-simd128"
             ),
             allow(dead_code)
         )]
@@ -2128,7 +2170,21 @@ macro_rules! gen_row_probe {
 // in the per-kernel `row_probe_*` methods); these fns just give the tests a
 // callable handle to assert SIMD == scalar. Gated to the same cfg as the test
 // module so they carry no weight in production builds.
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(
+        all(
+            feature = "std",
+            any(target_arch = "x86", target_arch = "x86_64"),
+            feature = "kernel-sse"
+        ),
+        all(
+            target_arch = "aarch64",
+            target_endian = "little",
+            feature = "kernel-neon"
+        )
+    )
+))]
 fn row_tag_match_mask_scalar(tags: &[u8], tag: u8) -> u64 {
     row_tag_mask_scalar!(tags, tag)
 }
@@ -2138,7 +2194,8 @@ fn row_tag_match_mask_scalar(tags: &[u8], tag: u8) -> u64 {
 #[cfg(all(
     test,
     feature = "std",
-    any(target_arch = "x86", target_arch = "x86_64")
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "kernel-sse"
 ))]
 #[target_feature(enable = "sse2")]
 unsafe fn row_tag_match_mask_sse2(tags: &[u8], tag: u8) -> u64 {
@@ -2150,7 +2207,8 @@ unsafe fn row_tag_match_mask_sse2(tags: &[u8], tag: u8) -> u64 {
 #[cfg(all(
     test,
     feature = "std",
-    any(target_arch = "x86", target_arch = "x86_64")
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "kernel-avx2"
 ))]
 #[target_feature(enable = "avx2")]
 unsafe fn row_tag_match_mask_avx2(tags: &[u8], tag: u8) -> u64 {
@@ -2160,7 +2218,12 @@ unsafe fn row_tag_match_mask_avx2(tags: &[u8], tag: u8) -> u64 {
 /// # Safety
 /// Caller must ensure NEON is available (baseline on aarch64; checked by
 /// `RowTagKernel::detect`).
-#[cfg(all(test, target_arch = "aarch64", target_endian = "little"))]
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    target_endian = "little",
+    feature = "kernel-neon"
+))]
 #[target_feature(enable = "neon")]
 unsafe fn row_tag_match_mask_neon(tags: &[u8], tag: u8) -> u64 {
     row_tag_mask_neon!(tags, tag)
@@ -2246,8 +2309,10 @@ pub(crate) struct RowMatchGenerator {
     /// upstream's parse-side reps legitimately differ.
     lazy_reps: Option<[usize; 2]>,
     pub(crate) lazy_depth: u8,
-    /// Cached fastpath kernel for `hash_mix_u64`; see Dfast for rationale.
-    pub(crate) hash_kernel: crate::encoding::fastpath::FastpathKernel,
+    /// Cached fastpath kernel for the per-candidate `common_prefix_len`
+    /// compare, resolved once per matcher so the rep probe skips the
+    /// `select_kernel()` atomic on every input byte.
+    pub(crate) cpl_kernel: crate::encoding::fastpath::FastpathKernel,
     pub(crate) row_heads: Vec<u8>,
     // Absolute match positions, one per row slot. Stored as `u32` (not
     // `usize`): this is the largest match-finder array, and `u32` halves its
@@ -2268,7 +2333,7 @@ pub(crate) struct RowMatchGenerator {
         all(
             target_arch = "wasm32",
             target_feature = "simd128",
-            feature = "kernel_simd128"
+            feature = "kernel-simd128"
         ),
         allow(dead_code)
     )]
@@ -2325,7 +2390,7 @@ impl RowMatchGenerator {
             lazy_next_to_update: 0,
             lazy_reps: None,
             lazy_depth: 1,
-            hash_kernel: crate::encoding::fastpath::select_kernel(),
+            cpl_kernel: crate::encoding::fastpath::select_kernel(),
             row_heads: Vec::new(),
             row_positions: Vec::new(),
             row_tags: Vec::new(),
@@ -3225,7 +3290,7 @@ impl RowMatchGenerator {
         lit_len: usize,
     ) -> Option<MatchCandidate> {
         repcode_candidate_shared(
-            self.hash_kernel,
+            self.cpl_kernel,
             self.live_history(),
             self.history_abs_start,
             self.offset_hist,
@@ -3247,7 +3312,7 @@ impl RowMatchGenerator {
         #[cfg(all(
             target_arch = "wasm32",
             target_feature = "simd128",
-            feature = "kernel_simd128"
+            feature = "kernel-simd128"
         ))]
         {
             // SAFETY: simd128 is a compile-time feature here; no runtime gate.
@@ -3256,19 +3321,29 @@ impl RowMatchGenerator {
         #[cfg(not(all(
             target_arch = "wasm32",
             target_feature = "simd128",
-            feature = "kernel_simd128"
+            feature = "kernel-simd128"
         )))]
         {
             match self.tag_kernel {
-                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                #[cfg(all(
+                    any(target_arch = "x86", target_arch = "x86_64"),
+                    feature = "kernel-avx2"
+                ))]
                 FastpathKernel::Avx2Bmi2 => unsafe {
                     dispatch_lazy!(self.lazy_avx2bmi2::<Avx2Bmi2Tags>(handle_sequence))
                 },
-                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-                FastpathKernel::Sse42 => unsafe {
-                    dispatch_lazy!(self.lazy_sse42::<Sse42Tags>(handle_sequence))
+                #[cfg(all(
+                    any(target_arch = "x86", target_arch = "x86_64"),
+                    feature = "kernel-sse"
+                ))]
+                FastpathKernel::Sse2 | FastpathKernel::Sse42 => unsafe {
+                    dispatch_lazy!(self.lazy_sse2::<Sse2Tags>(handle_sequence))
                 },
-                #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+                #[cfg(all(
+                    target_arch = "aarch64",
+                    target_endian = "little",
+                    feature = "kernel-neon"
+                ))]
                 FastpathKernel::Neon => unsafe {
                     dispatch_lazy!(self.lazy_neon::<NeonTags>(handle_sequence))
                 },
@@ -3287,15 +3362,21 @@ impl RowMatchGenerator {
         row_tag_mask_scalar,
         crate::encoding::fastpath::scalar::common_prefix_len_ptr
     );
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-sse"
+    ))]
     gen_lazy_monolith!(
-        lazy_sse42,
+        lazy_sse2,
         true,
         row_tag_mask_sse2,
-        crate::encoding::fastpath::sse42::common_prefix_len_ptr,
-        "sse4.2"
+        crate::encoding::fastpath::sse2::common_prefix_len_ptr,
+        "sse2"
     );
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-avx2"
+    ))]
     gen_lazy_monolith!(
         lazy_avx2bmi2,
         true,
@@ -3303,7 +3384,11 @@ impl RowMatchGenerator {
         crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr,
         "avx2,bmi2"
     );
-    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_endian = "little",
+        feature = "kernel-neon"
+    ))]
     gen_lazy_monolith!(
         lazy_neon,
         true,
@@ -3314,7 +3399,7 @@ impl RowMatchGenerator {
     #[cfg(all(
         target_arch = "wasm32",
         target_feature = "simd128",
-        feature = "kernel_simd128"
+        feature = "kernel-simd128"
     ))]
     gen_lazy_monolith!(
         lazy_simd128,
@@ -3418,7 +3503,8 @@ impl RowMatchGenerator {
     // Each tier pairs its tag-match mask macro with the matching
     // `fastpath::<tier>::common_prefix_len_ptr` so BOTH inline under the tier's
     // `#[target_feature]` umbrella (the cpl features must be a subset of the
-    // probe's: SSE4.2 ⊇ the SSE2 mask intrinsics, AVX2+BMI2 ⊇ the AVX2 mask).
+    // probe's: the SSE2 umbrella covers the 128-bit mask intrinsics,
+    // AVX2+BMI2 ⊇ the AVX2 mask).
     // Scalar uses the on-the-fly per-slot byte compare (`use_mask = false`).
     gen_row_probe!(
         row_probe_scalar,
@@ -3426,15 +3512,21 @@ impl RowMatchGenerator {
         row_tag_mask_scalar,
         crate::encoding::fastpath::scalar::common_prefix_len_ptr
     );
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-sse"
+    ))]
     gen_row_probe!(
-        row_probe_sse42,
+        row_probe_sse2,
         true,
         row_tag_mask_sse2,
-        crate::encoding::fastpath::sse42::common_prefix_len_ptr,
-        "sse4.2"
+        crate::encoding::fastpath::sse2::common_prefix_len_ptr,
+        "sse2"
     );
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-avx2"
+    ))]
     gen_row_probe!(
         row_probe_avx2bmi2,
         true,
@@ -3442,7 +3534,11 @@ impl RowMatchGenerator {
         crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr,
         "avx2,bmi2"
     );
-    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_endian = "little",
+        feature = "kernel-neon"
+    ))]
     gen_row_probe!(
         row_probe_neon,
         true,
@@ -3457,7 +3553,7 @@ impl RowMatchGenerator {
     #[cfg(all(
         target_arch = "wasm32",
         target_feature = "simd128",
-        feature = "kernel_simd128"
+        feature = "kernel-simd128"
     ))]
     gen_row_probe!(
         row_probe_simd128,
@@ -4061,9 +4157,15 @@ impl RowMatchGenerator {
 #[cfg(all(
     test,
     feature = "std",
-    any(target_arch = "x86", target_arch = "x86_64")
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "kernel-sse"
 ))]
 mod tag_mask_tests;
 
-#[cfg(all(test, target_arch = "aarch64", target_endian = "little"))]
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    target_endian = "little",
+    feature = "kernel-neon"
+))]
 mod neon_tag_mask_tests;

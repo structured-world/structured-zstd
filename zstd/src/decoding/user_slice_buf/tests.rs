@@ -146,7 +146,7 @@ fn try_extend_zero_length_succeeds_and_leaves_tail_unchanged() {
     // `regenerated_size` near `usize::MAX`. Constructing such a
     // `&[u8]` from safe Rust is not expressible — `from_raw_parts`
     // with a forged length is UB. The wrap branch is exercised
-    // only from the fuzz harness under `feature = "fuzz_exports"`
+    // only from the fuzz harness under `feature = "fuzz-exports"`
     // (which routes a controlled `len` through `try_*`) and from
     // the real malformed-frame decode path that the harness
     // emulates.

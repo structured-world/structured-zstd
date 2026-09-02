@@ -2887,7 +2887,11 @@ impl DfastMatchGenerator {
                 }
             };
         }
-        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        #[cfg(all(
+            target_arch = "aarch64",
+            target_endian = "little",
+            feature = "kernel-neon"
+        ))]
         unsafe {
             dispatch_dict!(start_matching_fast_loop_neon)
         }
@@ -2898,29 +2902,37 @@ impl DfastMatchGenerator {
             // not a per-block `select_kernel()` — the cache only helps if the
             // hot path actually reads it. Mirrors the Row backend.
             match self.kernel {
+                #[cfg(feature = "kernel-avx2")]
                 FastpathKernel::Avx2Bmi2 => unsafe {
                     dispatch_dict!(start_matching_fast_loop_avx2_bmi2)
                 },
-                FastpathKernel::Sse42 => unsafe { dispatch_dict!(start_matching_fast_loop_sse42) },
+                #[cfg(feature = "kernel-sse")]
+                FastpathKernel::Sse2 | FastpathKernel::Sse42 => unsafe {
+                    dispatch_dict!(start_matching_fast_loop_sse2)
+                },
                 FastpathKernel::Scalar => dispatch_dict!(start_matching_fast_loop_scalar),
             }
         }
         #[cfg(all(
             target_arch = "wasm32",
             target_feature = "simd128",
-            feature = "kernel_simd128"
+            feature = "kernel-simd128"
         ))]
         unsafe {
             dispatch_dict!(start_matching_fast_loop_simd128)
         }
         #[cfg(not(any(
-            all(target_arch = "aarch64", target_endian = "little"),
+            all(
+                target_arch = "aarch64",
+                target_endian = "little",
+                feature = "kernel-neon"
+            ),
             target_arch = "x86",
             target_arch = "x86_64",
             all(
                 target_arch = "wasm32",
                 target_feature = "simd128",
-                feature = "kernel_simd128"
+                feature = "kernel-simd128"
             )
         )))]
         {
@@ -2928,7 +2940,11 @@ impl DfastMatchGenerator {
         }
     }
 
-    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_endian = "little",
+        feature = "kernel-neon"
+    ))]
     #[target_feature(enable = "neon")]
     unsafe fn start_matching_fast_loop_neon<const USE_DICT: bool, const BORROWED: bool>(
         &mut self,
@@ -2947,9 +2963,12 @@ impl DfastMatchGenerator {
         )
     }
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[target_feature(enable = "sse4.2")]
-    unsafe fn start_matching_fast_loop_sse42<const USE_DICT: bool, const BORROWED: bool>(
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-sse"
+    ))]
+    #[target_feature(enable = "sse2")]
+    unsafe fn start_matching_fast_loop_sse2<const USE_DICT: bool, const BORROWED: bool>(
         &mut self,
         current_abs_start: usize,
         current_len: usize,
@@ -2960,13 +2979,16 @@ impl DfastMatchGenerator {
             current_abs_start,
             current_len,
             handle_sequence,
-            crate::encoding::fastpath::sse42::common_prefix_len_ptr,
+            crate::encoding::fastpath::sse2::common_prefix_len_ptr,
             USE_DICT,
             BORROWED
         )
     }
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-avx2"
+    ))]
     #[target_feature(enable = "avx2,bmi2")]
     unsafe fn start_matching_fast_loop_avx2_bmi2<const USE_DICT: bool, const BORROWED: bool>(
         &mut self,
@@ -2988,7 +3010,7 @@ impl DfastMatchGenerator {
     #[cfg(all(
         target_arch = "wasm32",
         target_feature = "simd128",
-        feature = "kernel_simd128"
+        feature = "kernel-simd128"
     ))]
     #[target_feature(enable = "simd128")]
     unsafe fn start_matching_fast_loop_simd128<const USE_DICT: bool, const BORROWED: bool>(
@@ -3009,11 +3031,15 @@ impl DfastMatchGenerator {
     }
 
     #[cfg(not(any(
-        all(target_arch = "aarch64", target_endian = "little"),
+        all(
+            target_arch = "aarch64",
+            target_endian = "little",
+            feature = "kernel-neon"
+        ),
         all(
             target_arch = "wasm32",
             target_feature = "simd128",
-            feature = "kernel_simd128"
+            feature = "kernel-simd128"
         )
     )))]
     #[allow(unused_unsafe)]

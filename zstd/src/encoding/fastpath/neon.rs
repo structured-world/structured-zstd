@@ -8,35 +8,10 @@
 //! ABI rules.
 
 #![cfg(all(target_arch = "aarch64", target_endian = "little"))]
-#![allow(dead_code)]
 
-use core::arch::aarch64::{
-    __crc32d, uint8x16_t, vceqq_u8, vgetq_lane_u64, vld1q_u8, vreinterpretq_u64_u8,
-};
+use core::arch::aarch64::{uint8x16_t, vceqq_u8, vgetq_lane_u64, vld1q_u8, vreinterpretq_u64_u8};
 
 use super::scalar;
-
-pub(crate) const KERNEL_TAG: &str = "neon";
-
-/// AArch64 `crc32d`-accelerated `hash_mix_u64`. Routes a full 64-bit lane
-/// through the CRC unit and folds the result back with a rotated copy of the
-/// source so the upper bits stay well-distributed for hash-table indexing.
-///
-/// The `crc` AArch64 extension is **optional** and NOT implied by the NEON
-/// baseline. Callers must therefore confirm both `neon` and `crc` are
-/// reported by the runtime feature detector (or compile-time `cfg!` in
-/// `no_std`) before reaching this function — the dispatcher in
-/// `fastpath::detect_kernel_uncached` enforces that gate. Calling this on a
-/// CPU without the CRC extension would trap with an illegal instruction.
-#[target_feature(enable = "crc")]
-#[inline]
-pub(crate) unsafe fn hash_mix_u64(value: u64) -> u64 {
-    let crc = __crc32d(0, value) as u64;
-    // Match the x86 SSE4.2/AVX2 kernels so the per-arch hash mixers stay
-    // consistent (different rotate counts on the same input would hide bugs
-    // in cross-kernel hash assertions).
-    ((crc << 32) ^ value.rotate_left(13)).wrapping_mul(scalar::HASH_MIX_PRIME)
-}
 
 /// 16-byte NEON vector prefix-length probe. Returns the number of leading
 /// equal bytes that fit in whole 16-byte chunks; the caller (or the wrapper
@@ -80,10 +55,17 @@ pub(crate) unsafe fn prefix_len_simd(lhs: *const u8, rhs: *const u8, max: usize)
 #[inline]
 pub(crate) unsafe fn common_prefix_len_ptr(lhs: *const u8, rhs: *const u8, max: usize) -> usize {
     // Leading scalar word probe (mirrors upstream C `ZSTD_count`'s first
-    // `MEM_readST` check): a prefix that diverges within the first 8 bytes — the
-    // common case on BT-tree node compares, where each node extends the seed by
-    // only a short run — returns on one 8-byte read + count-trailing-zeros,
-    // skipping the vector load. Longer matches fall through to the vector loop.
+    // `MEM_readST` check): a prefix that diverges within the first 8 bytes
+    // returns on one 8-byte read + count-trailing-zeros, skipping the vector
+    // load. Longer matches fall through to the vector loop.
+    //
+    // This probe, not the vector loop, carries the BT path: instrumented over
+    // decodecorpus-z000033, 87.45% of calls return here at both L19 and L22,
+    // and the 12.55% that reach the vector average only 1.6 (L19) to 4.6 (L22)
+    // 16-byte iterations. Widening the vector therefore buys almost nothing on
+    // this path (measured: a wasm tier wired to its own vector probe came out
+    // within noise of the scalar one); the lever is cutting the number of
+    // candidate compares, not the bytes-per-iteration of the survivors.
     let chunk = core::mem::size_of::<usize>();
     if chunk <= max {
         let lhs_word = unsafe { core::ptr::read_unaligned(lhs.cast::<usize>()) };

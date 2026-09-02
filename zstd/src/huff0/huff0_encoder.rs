@@ -451,16 +451,16 @@ impl Clone for HuffmanTable {
     }
 }
 
-/// Measurement-only toggle (gated behind `bench_internals`): when set, every
+/// Measurement-only toggle (gated behind `bench-internals`): when set, every
 /// [`HuffmanTable::build_from_counts`] takes the cheap single-build path
 /// instead of the #167 table-log search, so a bench harness can A/B the search
 /// on/off from a single build. Never set in shipping code.
-#[cfg(feature = "bench_internals")]
+#[cfg(feature = "bench-internals")]
 pub static FORCE_CHEAP_HUF: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
 /// Set the [`FORCE_CHEAP_HUF`] measurement toggle.
-#[cfg(feature = "bench_internals")]
+#[cfg(feature = "bench-internals")]
 pub fn set_force_cheap_huf(on: bool) {
     FORCE_CHEAP_HUF.store(on, core::sync::atomic::Ordering::Relaxed);
 }
@@ -505,8 +505,8 @@ impl HuffmanTable {
         // Measurement-only: force the cheap single-build path (the upstream
         // non-optimalDepth path) so a bench harness can compare #167 on/off
         // ratio and speed across levels from one build. Off in every shipping
-        // build (gated behind `bench_internals`).
-        #[cfg(feature = "bench_internals")]
+        // build (gated behind `bench-internals`).
+        #[cfg(feature = "bench-internals")]
         if FORCE_CHEAP_HUF.load(core::sync::atomic::Ordering::Relaxed) {
             return Self::build_from_weights(&build_limited_weights(
                 counts,
@@ -1471,7 +1471,7 @@ fn redistribute_weights(weights: &mut [usize], max_num_bits: usize) {
 /// per-symbol weights. Returns `(description, weights)`. The C-conformance
 /// check that feeds this through `HUF_readStats` lives in the `ffi-bench`
 /// crate; this side stays pure Rust.
-#[cfg(feature = "bench_internals")]
+#[cfg(feature = "bench-internals")]
 pub(crate) fn huf_weight_description_for_test(data: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let table = HuffmanTable::build_from_data(data);
     let mut weights = {
@@ -1493,7 +1493,7 @@ pub(crate) fn huf_weight_description_for_test(data: &[u8]) -> (Vec<u8>, Vec<u8>)
 /// followed by the coded streams) our encoder emits for `data`. The
 /// C-conformance check that decodes it via `HUF_decompress4X_hufOnly_wksp`
 /// lives in the `ffi-bench` crate.
-#[cfg(feature = "bench_internals")]
+#[cfg(feature = "bench-internals")]
 pub(crate) fn huf_encode4x_for_test(data: &[u8]) -> Vec<u8> {
     let table = HuffmanTable::build_from_data(data);
     let mut encoded = Vec::new();

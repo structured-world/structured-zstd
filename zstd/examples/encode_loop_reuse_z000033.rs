@@ -14,8 +14,8 @@
 //! amortized (the shape a real caller that reuses one compressor sees).
 //!
 //! Build: `cargo build --profile flamegraph -p structured-zstd
-//!          --example encode_loop_reuse_z000033 --features dict_builder`
-//! Run:   `cargo flamegraph --example encode_loop_reuse_z000033 --features dict_builder
+//!          --example encode_loop_reuse_z000033 --features dict-builder`
+//! Run:   `cargo flamegraph --example encode_loop_reuse_z000033 --features dict-builder
 //!          --profile flamegraph -- <level> <iters> <corpus_path>`
 
 use std::env;

@@ -6,7 +6,7 @@
 //!
 //! Build/run (feature gates the atomic counters):
 //!   cargo run --release -p structured-zstd \
-//!     --features "copy_shape_stats dict_builder" \
+//!     --features "copy-shape-stats dict-builder" \
 //!     --example copy_shape -- 18
 //!
 //! Arg 1 = compression level (default 18). Arg 2 = iters (default 1).

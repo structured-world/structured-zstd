@@ -14,7 +14,7 @@ zstd = "0.5.1+zstd.1.4.4"
 
 [dependencies.structured-zstd]
 path = ".."
-features = ["fuzz_exports"]
+features = ["fuzz-exports"]
 [dependencies.libfuzzer-sys]
 git = "https://github.com/rust-fuzz/libfuzzer-sys.git"
 

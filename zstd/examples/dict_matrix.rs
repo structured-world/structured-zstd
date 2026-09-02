@@ -4,7 +4,7 @@
 //! the bench host for timing.
 //!
 //! Build/run: `cargo run --release -p ffi-bench --example dict_matrix
-//!             --features dict_builder`
+//!             --features dict-builder`
 
 use std::time::Instant;
 
