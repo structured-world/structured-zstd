@@ -321,6 +321,21 @@ fn reset_clears_uncommitted_bytes_left_by_an_abandoned_fill() {
 }
 
 #[test]
+fn reserve_for_frame_takes_the_request_as_given() {
+    // The caller sizes the slack off the ACTIVE block capacity, which a small
+    // window shrinks below the format maximum. Adding a fixed 128 KiB here
+    // would dwarf a small hinted frame's whole buffer.
+    let mut t = new_table(1 << 20);
+    t.reserve_for_frame(1024);
+    assert!(t.history.capacity() >= 1024, "the request must be honoured");
+    assert!(
+        t.history.capacity() < 64 * 1024,
+        "reservation must not add a format-maximum block on top: got {}",
+        t.history.capacity()
+    );
+}
+
+#[test]
 fn clone_from_replaces_the_uncommitted_count_with_the_sources() {
     // `clone_from` is the primed-dictionary restore path: it overwrites the
     // history buffer wholesale, so a count describing the OLD buffer must not

@@ -657,12 +657,10 @@ impl DfastMatchGenerator {
         let ceiling = self.max_window_size
             + (self.max_window_size >> 2)
             + crate::common::MAX_BLOCK_SIZE as usize;
-        // One block of slack: the last fill asks for a whole block's room even
-        // when only a tail remains, so a bare `bytes` reserve would still
-        // reallocate (and copy the frame) on the final top-up.
-        let target = bytes
-            .saturating_add(crate::common::MAX_BLOCK_SIZE as usize)
-            .min(ceiling);
+        // `bytes` already carries the caller's block-sized slack, sized off the
+        // active block capacity — adding the format maximum here would reserve
+        // ~128 KiB for a frame whose window (and therefore block) is 1 KiB.
+        let target = bytes.min(ceiling);
         if target > self.history.len() && self.history.capacity() < target {
             self.history.reserve_exact(target - self.history.len());
         }

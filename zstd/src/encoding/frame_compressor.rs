@@ -2075,12 +2075,21 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         let mut savings = 0i64;
         // One allocation for the whole frame's ingest buffer when the size is
         // pledged, instead of a doubling chain of reallocations as the blocks
-        // arrive. The matcher clamps this to its eviction ceiling, so a huge or
-        // wrong hint cannot over-reserve.
-        if let Some(hint) = initial_size_hint {
-            self.state
-                .matcher
-                .reserve_for_frame(hint.min(usize::MAX as u64) as usize);
+        // arrive. Only a PLEDGED size is sized on: an advisory hint may be a
+        // wild overestimate, and reserving it up front would let a compressor
+        // with a large window and a tiny reader allocate hundreds of MiB before
+        // reading a byte. Inexact hints keep the doubling growth, which is
+        // bounded by what actually arrives. The slack is one block, so the
+        // final top-up (which asks for a whole block even when only a tail
+        // remains) does not reallocate; sized off the ACTIVE block capacity,
+        // since a small window shrinks the block below the format maximum.
+        if hint_is_exact && let Some(hint) = initial_size_hint {
+            // `saturating_add`: a caller may pledge `u64::MAX`, and clamping a
+            // reservation request at the address-space limit is the meaningful
+            // answer — the matcher caps it at its eviction ceiling anyway.
+            let target =
+                (hint.min(usize::MAX as u64) as usize).saturating_add(self.block_capacity());
+            self.state.matcher.reserve_for_frame(target);
         }
         // Compress block by block
         loop {
