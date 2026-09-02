@@ -55,10 +55,17 @@ pub(crate) unsafe fn prefix_len_simd(lhs: *const u8, rhs: *const u8, max: usize)
 #[inline]
 pub(crate) unsafe fn common_prefix_len_ptr(lhs: *const u8, rhs: *const u8, max: usize) -> usize {
     // Leading scalar word probe (mirrors upstream C `ZSTD_count`'s first
-    // `MEM_readST` check): a prefix that diverges within the first 8 bytes — the
-    // common case on BT-tree node compares, where each node extends the seed by
-    // only a short run — returns on one 8-byte read + count-trailing-zeros,
-    // skipping the vector load. Longer matches fall through to the vector loop.
+    // `MEM_readST` check): a prefix that diverges within the first 8 bytes
+    // returns on one 8-byte read + count-trailing-zeros, skipping the vector
+    // load. Longer matches fall through to the vector loop.
+    //
+    // This probe, not the vector loop, carries the BT path: instrumented over
+    // decodecorpus-z000033, 87.45% of calls return here at both L19 and L22,
+    // and the 12.55% that reach the vector average only 1.6 (L19) to 4.6 (L22)
+    // 16-byte iterations. Widening the vector therefore buys almost nothing on
+    // this path (measured: a wasm tier wired to its own vector probe came out
+    // within noise of the scalar one); the lever is cutting the number of
+    // candidate compares, not the bytes-per-iteration of the survivors.
     let chunk = core::mem::size_of::<usize>();
     if chunk <= max {
         let lhs_word = unsafe { core::ptr::read_unaligned(lhs.cast::<usize>()) };

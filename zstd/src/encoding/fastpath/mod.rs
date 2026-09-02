@@ -34,8 +34,7 @@
 //! - `neon` (aarch64 only): NEON is part of the AArch64 baseline ISA but Rust
 //!   still flags intrinsics like `vld1q_u8` with `#[target_feature(enable =
 //!   "neon")]`, so we still need the umbrella attribute to let them inline.
-//! - `sse42` (x86_64): SSE4.2 baseline for modern x86 CPUs (post-2008). Enables
-//!   `_mm_crc32_*` hash mixing.
+//! - `sse42` (x86_64): 128-bit SSE2 vector ops, the x86_64 baseline.
 //! - `avx2_bmi2` (x86_64): adds AVX2 (32-byte vectors) and BMI2 (`pext`,
 //!   `pdep`, `bzhi`) — common on Haswell+ (2013+).
 //!
@@ -176,8 +175,7 @@ fn detect_kernel_uncached() -> FastpathKernel {
 
     // wasm SIMD is a compile-time feature (no runtime detection), so the
     // `+simd128` payload selects the SIMD kernel and the scalar payload never
-    // compiles the variant. `hash_mix_u64` routes through the scalar mixer
-    // (wasm has no CRC), so there's no extra feature to gate on here.
+    // compiles the variant.
     #[cfg(all(
         target_arch = "wasm32",
         target_feature = "simd128",
