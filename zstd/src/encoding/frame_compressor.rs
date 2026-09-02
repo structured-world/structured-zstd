@@ -2097,7 +2097,15 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             // leftover from the previous iteration is already sitting there as
             // uncommitted bytes, which is why there is no `pending_input`
             // top-up on this path.
-            let in_place = if reached_eof {
+            // `Uncompressed` emits Raw blocks straight from the staged buffer,
+            // so it stays on the staged path whatever the matcher supports. The
+            // gate is on the LEVEL, not the backend: `fill_in_place` dispatches
+            // on the matcher, and an external `M: Matcher` that implements it
+            // would otherwise leave the payload sitting uncommitted while an
+            // empty Raw block goes out.
+            let in_place = if matches!(self.compression_level, CompressionLevel::Uncompressed) {
+                None
+            } else if reached_eof {
                 // Nothing left to read; the carried remainder is already in the
                 // matcher, so just re-inspect it.
                 self.state
@@ -2262,10 +2270,8 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
 
             match self.compression_level {
                 CompressionLevel::Uncompressed => {
-                    // `Uncompressed` never takes the in-place path: it is
-                    // excluded from `borrowed_eligible` and its raw blocks are
-                    // emitted straight from the staged buffer.
-                    debug_assert!(in_place.is_none(), "Uncompressed uses the staged path");
+                    // Always the staged buffer here — the ingest above refuses
+                    // the in-place path for this level.
                     let header = BlockHeader {
                         last_block,
                         block_type: crate::blocks::block::BlockType::Raw,

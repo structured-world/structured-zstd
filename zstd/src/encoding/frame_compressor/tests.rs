@@ -3106,3 +3106,93 @@ fn reused_compressor_borrowed_chain_frames_are_byte_identical() {
         assert_eq!(decoded, payload);
     }
 }
+
+/// A matcher that DOES implement in-place ingest, unlike the built-in driver's
+/// Simple backend. `Uncompressed` frames must still round-trip: the level, not
+/// the backend, decides whether the staged path is required.
+struct InPlaceMatcher {
+    buffer: Vec<u8>,
+    committed: usize,
+    window_size: u64,
+}
+
+impl InPlaceMatcher {
+    fn new(window_size: u64) -> Self {
+        Self {
+            buffer: Vec::new(),
+            committed: 0,
+            window_size,
+        }
+    }
+}
+
+impl Matcher for InPlaceMatcher {
+    fn get_next_space(&mut self) -> Vec<u8> {
+        vec![0; self.window_size as usize]
+    }
+
+    fn get_last_space(&mut self) -> &[u8] {
+        &self.buffer[..self.committed]
+    }
+
+    fn commit_space(&mut self, space: Vec<u8>) {
+        self.buffer = space;
+        self.committed = self.buffer.len();
+    }
+
+    fn fill_in_place(
+        &mut self,
+        capacity: usize,
+        fill: &mut dyn FnMut(&mut Vec<u8>) -> (usize, bool),
+    ) -> Option<(usize, bool)> {
+        self.buffer.reserve(capacity);
+        Some(fill(&mut self.buffer))
+    }
+
+    fn uncommitted_input(&self) -> &[u8] {
+        &self.buffer[self.committed..]
+    }
+
+    fn commit_filled(&mut self, len: usize) {
+        self.committed += len;
+    }
+
+    fn skip_matching(&mut self) {}
+
+    fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
+        handle_sequence(Sequence::Literals {
+            literals: &self.buffer[..self.committed],
+        });
+    }
+
+    fn reset(&mut self, _level: super::CompressionLevel) {
+        self.buffer.clear();
+        self.committed = 0;
+    }
+
+    fn window_size(&self) -> u64 {
+        self.window_size
+    }
+}
+
+#[test]
+fn uncompressed_level_keeps_the_payload_with_an_in_place_matcher() {
+    let data = generate_data(0x5eed, 4096);
+    let mut out = Vec::new();
+    let mut compressor: FrameCompressor<&[u8], &mut Vec<u8>, InPlaceMatcher> =
+        FrameCompressor::new_with_matcher(
+            InPlaceMatcher::new(1 << 20),
+            super::CompressionLevel::Uncompressed,
+        );
+    compressor.set_source(&data[..]);
+    compressor.set_drain(&mut out);
+    compressor.compress();
+
+    let mut decoder = FrameDecoder::new();
+    let mut decoded = Vec::with_capacity(data.len());
+    decoder.decode_all_to_vec(&out, &mut decoded).unwrap();
+    assert_eq!(
+        decoded, data,
+        "Uncompressed frames must carry their payload even when the matcher supports in-place ingest"
+    );
+}
