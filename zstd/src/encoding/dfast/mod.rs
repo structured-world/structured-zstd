@@ -68,6 +68,12 @@ pub(crate) struct DfastMatchGenerator {
     /// storage lives once, in `history`.
     pub(crate) window_blocks: VecDeque<usize>,
     pub(crate) window_size: usize,
+    /// Bytes at the tail of `history` that have been read but not yet claimed
+    /// by a block (in-place ingest, see `fill_uncommitted`). Zero on the staged
+    /// path. Tracked explicitly rather than derived from `window_size`, because
+    /// a primed dictionary also lives in `history` and the two do not sum to
+    /// `history.len()`.
+    pub(crate) uncommitted_len: usize,
     // We keep a contiguous searchable history to avoid rebuilding and reseeding
     // the matcher state from disjoint block buffers on every block.
     pub(crate) history: Vec<u8>,
@@ -208,6 +214,7 @@ impl DfastMatchGenerator {
             max_window_size,
             window_blocks: VecDeque::new(),
             window_size: 0,
+            uncommitted_len: 0,
             history: Vec::new(),
             history_start: 0,
             history_abs_start: 0,
@@ -504,7 +511,8 @@ impl DfastMatchGenerator {
             };
         }
         let last_len = self.window_blocks.back().copied().unwrap_or(0);
-        &self.history[self.history.len() - last_len..]
+        &self.history[self.history.len() - self.uncommitted_len - last_len
+            ..self.history.len() - self.uncommitted_len]
     }
 
     pub(crate) fn add_data(&mut self, data: Vec<u8>, mut reuse_space: impl FnMut(Vec<u8>)) {
@@ -636,13 +644,14 @@ impl DfastMatchGenerator {
             "fill_uncommitted: fill reported {appended} bytes but grew history by {}",
             self.history.len() - before,
         );
+        self.uncommitted_len += appended;
         (appended, eof)
     }
 
     /// Bytes read but not yet claimed by a block: the pre-split pass picks the
     /// block boundary inside this slice.
     pub(crate) fn uncommitted(&self) -> &[u8] {
-        &self.history[self.history_start + self.window_size..]
+        &self.history[self.history.len() - self.uncommitted_len..]
     }
 
     /// Phase 2 of in-place ingest: claim `len` bytes from the head of
@@ -672,6 +681,7 @@ impl DfastMatchGenerator {
         }
         self.window_size += len;
         self.window_blocks.push_back(len);
+        self.uncommitted_len -= len;
     }
 
     /// Trim retained blocks until the window fits `max_window_size`.
@@ -1507,8 +1517,10 @@ impl DfastMatchGenerator {
             )
         } else {
             let last_len = self.window_blocks.back().copied().unwrap_or(0);
-            let off = self.history.len() - last_len;
-            // SAFETY: `off + last_len == history.len()`, in bounds.
+            // Measure back from the COMMITTED end: in-place ingest can leave
+            // unclaimed bytes past it.
+            let off = self.history.len() - self.uncommitted_len - last_len;
+            // SAFETY: `off + last_len` is the committed end, in bounds.
             (unsafe { self.history.as_ptr().add(off) }, last_len)
         }
     }
@@ -1643,7 +1655,11 @@ impl DfastMatchGenerator {
     }
 
     pub(crate) fn live_history(&self) -> &[u8] {
-        &self.history[self.history_start..]
+        // Stop at the committed end, not at `history.len()`: in-place ingest
+        // may have already read the next block's bytes into the tail, and a
+        // scan must not see past the block it is compressing (a forward match
+        // count would otherwise run into bytes the staged path did not have).
+        &self.history[self.history_start..self.history.len() - self.uncommitted_len]
     }
 
     pub(crate) fn history_abs_end(&self) -> usize {

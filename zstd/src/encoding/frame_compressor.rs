@@ -2310,7 +2310,16 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                     savings += block_len as i64 - (out.len() - before_len) as i64;
                 }
             }
-            if last_block && pending_input.is_empty() {
+            // The in-place path carries its remainder as uncommitted bytes in
+            // the matcher rather than in `pending_input`, so the staged
+            // emptiness test alone would exit while a split leftover still
+            // needs a block.
+            let carry_left = if in_place.is_some() {
+                available - block_len
+            } else {
+                pending_input.len()
+            };
+            if last_block && carry_left == 0 {
                 break;
             }
         }

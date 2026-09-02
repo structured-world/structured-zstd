@@ -1605,9 +1605,11 @@ impl Matcher for MatchGeneratorDriver {
     /// Read the next block STRAIGHT into the backend's history buffer, so the
     /// owned block loop does not stage it in a scratch `Vec` and copy it in.
     ///
-    /// Returns `None` when the active backend has no in-place ingest yet, in
-    /// which case the caller keeps the staged-copy path. Only Dfast implements
-    /// it so far; the other backends are mechanical follow-ups.
+    /// Returns `None` when the active backend has no in-place ingest, in which
+    /// case the caller keeps the staged-copy path. Dfast, Row and HashChain
+    /// implement it; Simple stages the block in a `pending` slot that the
+    /// kernel consumes, so its bytes do not reach `history` until match time
+    /// and the two-phase shape does not apply to it as written.
     ///
     /// On `Some`, the bytes are in the buffer but not yet part of the window:
     /// the caller picks the block boundary from
@@ -1619,7 +1621,9 @@ impl Matcher for MatchGeneratorDriver {
     ) -> Option<(usize, bool)> {
         match &mut self.storage {
             MatcherStorage::Dfast(m) => Some(m.fill_uncommitted(capacity, fill)),
-            _ => None,
+            MatcherStorage::Row(m) => Some(m.fill_uncommitted(capacity, fill)),
+            MatcherStorage::HashChain(m) => Some(m.table.fill_uncommitted(capacity, fill)),
+            MatcherStorage::Simple(_) => None,
         }
     }
 
@@ -1627,14 +1631,19 @@ impl Matcher for MatchGeneratorDriver {
     fn uncommitted_input(&self) -> &[u8] {
         match &self.storage {
             MatcherStorage::Dfast(m) => m.uncommitted(),
-            _ => &[],
+            MatcherStorage::Row(m) => m.uncommitted(),
+            MatcherStorage::HashChain(m) => m.table.uncommitted(),
+            MatcherStorage::Simple(_) => &[],
         }
     }
 
     /// Claim `len` bytes of [`Self::uncommitted_input`] as the next block.
     fn commit_filled(&mut self, len: usize) {
-        if let MatcherStorage::Dfast(m) = &mut self.storage {
-            m.commit_block(len);
+        match &mut self.storage {
+            MatcherStorage::Dfast(m) => m.commit_block(len),
+            MatcherStorage::Row(m) => m.commit_block(len),
+            MatcherStorage::HashChain(m) => m.table.commit_block(len),
+            MatcherStorage::Simple(_) => {}
         }
     }
 

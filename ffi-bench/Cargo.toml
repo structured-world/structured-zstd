@@ -275,3 +275,7 @@ path = "examples/ratio_parity.rs"
 [[example]]
 name = "periodic_presplit"
 path = "examples/periodic_presplit.rs"
+
+[[example]]
+name = "owned_check"
+path = "../zstd/examples/owned_check.rs"

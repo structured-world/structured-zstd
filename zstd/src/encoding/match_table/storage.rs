@@ -199,6 +199,10 @@ pub(crate) struct MatchTable {
     /// so the live region is never duplicated.
     pub(crate) chunk_lens: VecDeque<usize>,
     pub(crate) window_size: usize,
+    /// Bytes at the tail of `history` read but not yet claimed by a block
+    /// (in-place ingest). Zero on the staged path. Explicit rather than derived
+    /// from `window_size`, since a primed dictionary also lives in `history`.
+    pub(crate) uncommitted_len: usize,
     pub(crate) history: Vec<u8>,
     pub(crate) history_start: usize,
     pub(crate) history_abs_start: usize,
@@ -286,6 +290,7 @@ impl Clone for MatchTable {
             max_window_size: self.max_window_size,
             chunk_lens: self.chunk_lens.clone(),
             window_size: self.window_size,
+            uncommitted_len: self.uncommitted_len,
             history: self.history.clone(),
             history_start: self.history_start,
             history_abs_start: self.history_abs_start,
@@ -449,6 +454,7 @@ impl MatchTable {
             max_window_size,
             chunk_lens: VecDeque::new(),
             window_size: 0,
+            uncommitted_len: 0,
             history: Vec::new(),
             history_start: 0,
             history_abs_start: 0,
@@ -917,6 +923,77 @@ impl MatchTable {
         }
     }
 
+    /// Phase 1 of in-place ingest: `fill` writes the next block STRAIGHT into
+    /// the tail of `history`, instead of a scratch `Vec` that [`Self::add_data`]
+    /// then copies in. Room for `capacity` more bytes is reserved first.
+    ///
+    /// The bytes are readable through [`Self::uncommitted`] but are not part of
+    /// the window until [`Self::commit_block`] claims them — the block boundary
+    /// is chosen after the read, by the pre-split pass. Anything left over stays
+    /// put and becomes the head of the next block, so a carried split remainder
+    /// costs no copy.
+    pub(crate) fn fill_uncommitted(
+        &mut self,
+        capacity: usize,
+        fill: impl FnOnce(&mut Vec<u8>) -> (usize, bool),
+    ) -> (usize, bool) {
+        check_stream_abs_headroom(self.history_abs_start, self.window_size, capacity);
+        // Sizing only; the window bookkeeping happens on commit, keyed on the
+        // length actually claimed rather than this worst case.
+        if self.window_size + capacity > self.max_window_size {
+            let target = self.max_window_size
+                + (self.max_window_size >> 2)
+                + crate::common::MAX_BLOCK_SIZE as usize;
+            if target > self.history.len() && self.history.capacity() < target {
+                self.history.reserve_exact(target - self.history.len());
+            }
+        }
+        self.history.reserve(capacity);
+        let before = self.history.len();
+        let (appended, eof) = fill(&mut self.history);
+        debug_assert_eq!(
+            self.history.len(),
+            before + appended,
+            "fill_uncommitted: fill reported {appended} bytes but grew history by {}",
+            self.history.len() - before,
+        );
+        self.uncommitted_len += appended;
+        (appended, eof)
+    }
+
+    /// Bytes read but not yet claimed by a block.
+    pub(crate) fn uncommitted(&self) -> &[u8] {
+        &self.history[self.history.len() - self.uncommitted_len..]
+    }
+
+    /// Phase 2 of in-place ingest: claim `len` bytes from the head of
+    /// [`Self::uncommitted`] as the next block.
+    pub(crate) fn commit_block(&mut self, len: usize) {
+        if len == 0 {
+            return;
+        }
+        assert!(len <= self.max_window_size);
+        debug_assert!(
+            len <= self.uncommitted().len(),
+            "commit_block: {len} exceeds the {} uncommitted bytes",
+            self.uncommitted().len(),
+        );
+        while self.window_size + len > self.max_window_size {
+            let removed_len = self.chunk_lens.pop_front().unwrap();
+            self.window_size -= removed_len;
+            self.history_start += removed_len;
+            self.history_abs_start += removed_len;
+        }
+        // Same position in the sequence as `add_data`: compact AFTER the
+        // eviction that raised `history_start`, so the drain trigger sees the
+        // same state and the buffer evolves identically.
+        self.compact_history();
+        self.next_to_update3 = self.next_to_update3.max(self.history_abs_start);
+        self.window_size += len;
+        self.chunk_lens.push_back(len);
+        self.uncommitted_len -= len;
+    }
+
     pub(crate) fn add_data(&mut self, data: Vec<u8>, mut reuse_space: impl FnMut(Vec<u8>)) {
         assert!(data.len() <= self.max_window_size);
         check_stream_abs_headroom(self.history_abs_start, self.window_size, data.len());
@@ -1002,7 +1079,10 @@ impl MatchTable {
             // `end <= total` in bounds.
             return unsafe { core::slice::from_raw_parts(ptr, end) };
         }
-        &self.history[self.history_start..]
+        // Stop at the committed end, not at `history.len()`: in-place ingest
+        // may have already read the next block's bytes into the tail, and a
+        // scan must not see past the block it is compressing.
+        &self.history[self.history_start..self.history.len() - self.uncommitted_len]
     }
 
     /// Absolute position one past the end of the live history.
@@ -1023,7 +1103,8 @@ impl MatchTable {
             };
         }
         let last = *self.chunk_lens.back().unwrap();
-        &self.history[self.history.len() - last..]
+        &self.history[self.history.len() - self.uncommitted_len - last
+            ..self.history.len() - self.uncommitted_len]
     }
 
     /// Register the borrowed input window. Zeroes `history_abs_start` so
