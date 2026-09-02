@@ -1229,7 +1229,11 @@ impl HcMatchGenerator {
                 FastpathKernel::Scalar => run_main_loop!(build_optimal_plan_impl_scalar),
             }
         }
-        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        #[cfg(all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel_simd128"
+        ))]
         unsafe {
             run_main_loop!(build_optimal_plan_impl_simd128);
         }
@@ -1241,7 +1245,11 @@ impl HcMatchGenerator {
             ),
             target_arch = "x86",
             target_arch = "x86_64",
-            all(target_arch = "wasm32", target_feature = "simd128")
+            all(
+                target_arch = "wasm32",
+                target_feature = "simd128",
+                feature = "kernel_simd128"
+            )
         )))]
         {
             run_main_loop!(build_optimal_plan_impl_scalar);
@@ -1436,7 +1444,11 @@ impl HcMatchGenerator {
                 FastpathKernel::Scalar => run_seed_loop!(build_optimal_plan_impl_scalar),
             }
         }
-        #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+        #[cfg(all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel_simd128"
+        ))]
         unsafe {
             run_seed_loop!(build_optimal_plan_impl_simd128);
         }
@@ -1448,7 +1460,11 @@ impl HcMatchGenerator {
             ),
             target_arch = "x86",
             target_arch = "x86_64",
-            all(target_arch = "wasm32", target_feature = "simd128")
+            all(
+                target_arch = "wasm32",
+                target_feature = "simd128",
+                feature = "kernel_simd128"
+            )
         )))]
         {
             run_seed_loop!(build_optimal_plan_impl_scalar);
@@ -1675,7 +1691,11 @@ impl HcMatchGenerator {
     // portable fallback; on wasm+simd128 the simd128 wrapper is selected, so
     // this is cfg-dead there.
     #[cfg_attr(
-        all(target_arch = "wasm32", target_feature = "simd128"),
+        all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel_simd128"
+        ),
         allow(dead_code)
     )]
     #[allow(clippy::too_many_arguments)]
@@ -1711,7 +1731,11 @@ impl HcMatchGenerator {
 
     /// wasm `simd128`-umbrella DP body: scalar candidate collection (no wasm
     /// collect kernel) but the simd128 4-lane price-set.
-    #[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel_simd128"
+    ))]
     #[target_feature(enable = "simd128")]
     // With `+simd128` in the wasm baseline the shared body macro's `unsafe`
     // blocks (needed by the safe scalar wrapper) are redundant inside this

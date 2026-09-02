@@ -97,16 +97,22 @@ default = [
     "kernel_sve",
     "kernel_simd128",
 ]
-# Per-CPU-tier decode kernel selection. The default build enables every
-# kernel; with `std`, `detect_cpu_kernel()` picks the best tier at runtime
-# (CPU-feature detection) — a universal binary that adapts to any CPU. On
+# Per-CPU-tier kernel selection, covering the decoder and the encoder. The
+# default build enables every kernel except `kernel_vbmi2`; with `std`,
+# `detect_cpu_kernel()` (decode) and `fastpath::select_kernel()` (encode) pick
+# the best tier at runtime — a universal binary that adapts to any CPU. On
 # `no_std` the tier is fixed at compile time from `target_feature`, baking
-# the chosen ISA into the build. Constrained targets can trim the SIMD trampolines + their
+# the chosen ISA into the build; on wasm it is always compile-time, since the
+# kernels there additionally require `target_feature = "simd128"`.
+# Constrained targets can trim the SIMD trampolines + their
 # dispatch arms by disabling the tiers they don't need; the scalar kernel
 # is always compiled as the fallback, so the lowest enabled tier always has
 # a backstop. Each feature only affects builds for its architecture (a
 # `kernel_avx2` flag is inert on aarch64, `kernel_neon` inert on x86), so
-# the all-on default is safe everywhere. The implication chain mirrors the
+# the all-on default is safe everywhere. `kernel_vbmi2` and `kernel_sve` are
+# decoder-only: the encoder has no AVX-512 or SVE tier. `kernel_sse` covers
+# two encoder tiers, SSE4.2 and a plain-SSE2 fallback for CPUs without it.
+# The implication chain mirrors the
 # real ISA dependency: AVX2 implies BMI2 implies SSE2; SVE implies NEON.
 # `kernel_scalar` is a marker only: the scalar kernel is compiled
 # unconditionally (it is the mandatory fallback), so this flag gates no code.

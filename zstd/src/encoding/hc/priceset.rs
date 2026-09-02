@@ -84,7 +84,11 @@ fn priceset_next_cost(
 #[cfg_attr(
     any(
         all(target_arch = "aarch64", target_endian = "little"),
-        all(target_arch = "wasm32", target_feature = "simd128")
+        all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel_simd128"
+        )
     ),
     allow(dead_code)
 )]
@@ -148,7 +152,11 @@ pub(crate) fn priceset_range_nonabort_scalar(
         target_arch = "x86",
         target_arch = "x86_64",
         all(target_arch = "aarch64", target_endian = "little"),
-        all(target_arch = "wasm32", target_feature = "simd128")
+        all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel_simd128"
+        )
     )),
     allow(dead_code)
 )]
@@ -617,7 +625,11 @@ pub(crate) unsafe fn priceset_range_nonabort_sse2(
 /// `u32x4_shuffle` selects the price (even) and gen (odd) lanes across the two
 /// loaded vectors natively. `Some(prices)` only when all 4 gens equal `stamp`
 /// (`u32x4_all_true` of the equality vector).
-#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "simd128",
+    feature = "kernel_simd128"
+))]
 #[target_feature(enable = "simd128")]
 #[inline]
 unsafe fn priceset_cached_prices4_simd128(cells: &[[u32; 2]], stamp: u32) -> Option<[u32; 4]> {
@@ -642,7 +654,11 @@ unsafe fn priceset_cached_prices4_simd128(cells: &[[u32; 2]], stamp: u32) -> Opt
 
 /// wasm `simd128` 4-lane `next_cost < node_price` bitmask. wasm has a native
 /// unsigned compare (`u32x4_lt`) and `u32x4_bitmask` to pack the lanes.
-#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "simd128",
+    feature = "kernel_simd128"
+))]
 #[target_feature(enable = "simd128")]
 #[inline]
 unsafe fn priceset_improved_mask4_simd128(next_cost: &[u32; 4], node_price: &[u32]) -> u8 {
@@ -652,7 +668,11 @@ unsafe fn priceset_improved_mask4_simd128(next_cost: &[u32; 4], node_price: &[u3
     u32x4_bitmask(u32x4_lt(nc, np))
 }
 
-#[cfg(all(target_arch = "wasm32", target_feature = "simd128"))]
+#[cfg(all(
+    target_arch = "wasm32",
+    target_feature = "simd128",
+    feature = "kernel_simd128"
+))]
 #[target_feature(enable = "simd128")]
 #[inline]
 #[allow(clippy::too_many_arguments)]

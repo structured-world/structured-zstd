@@ -23,16 +23,22 @@
 //! its kernels additionally require `target_feature = "simd128"`, so a wasm
 //! build without `-C target-feature=+simd128` stays scalar.
 //!
-//! Each tier is gated by a cargo feature, all enabled by default (a universal
-//! binary that picks the best available tier per the above): `kernel_scalar`,
-//! `kernel_sse`, `kernel_bmi2`, `kernel_avx2`, `kernel_vbmi2` (x86) and
-//! `kernel_neon`, `kernel_sve` (aarch64). The chain mirrors the ISA
+//! Each tier is gated by a cargo feature: `kernel_scalar`, `kernel_sse`,
+//! `kernel_bmi2`, `kernel_avx2`, `kernel_vbmi2` (x86) and `kernel_neon`,
+//! `kernel_sve` (aarch64). All are on by default except `kernel_vbmi2`, which
+//! is opt-in because the AVX-512 decode tier measures slower than AVX2 on the
+//! bursty decode path, so the default build is a universal binary that picks
+//! the best available tier per the above. `kernel_scalar` gates no code: the
+//! scalar path is the mandatory fallback and is always compiled, so the flag
+//! exists only to name that tier explicitly in a feature set. `kernel_vbmi2`
+//! and `kernel_sve` are decoder-only; the encoder has no AVX-512 or SVE tier.
+//! The chain mirrors the ISA
 //! dependency (`kernel_avx2` implies `kernel_bmi2` implies `kernel_sse`;
 //! `kernel_sve` implies `kernel_neon`). `kernel_sse` covers two x86 tiers:
 //! SSE4.2 where the CPU has it, and a plain-SSE2 tier otherwise, so a
-//! pre-SSE4.2 CPU still gets vector match compares. The scalar kernel is
-//! always compiled, so any subset is valid; a flag is inert on architectures
-//! it doesn't apply to. Constrained targets can shrink the binary by trimming
+//! pre-SSE4.2 CPU still gets vector match compares. Any subset is valid, and a
+//! flag is inert on architectures it doesn't apply to. Constrained targets can
+//! shrink the binary by trimming
 //! tiers: `--no-default-features --features kernel_scalar` compiles out every
 //! per-tier dispatch, the BMI2/AVX2/VBMI2/NEON trampolines, and the explicit
 //! SSE2/NEON intrinsics in both the copy primitives and the encoder

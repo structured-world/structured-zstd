@@ -167,7 +167,11 @@ in pure Rust:
 | `dict_builder` | ❌ | Pure-Rust COVER / FastCOVER dictionary training |
 | `lsm` | ❌ | [Storage-format extensions](#storage-format-extensions) |
 
-Each flag gates that tier in **both** the decoder and the encoder, so
+Each flag gates its tier wherever that tier exists. `kernel_sse`,
+`kernel_bmi2`, `kernel_avx2`, `kernel_neon` and `kernel_simd128` cover both
+the decoder and the encoder; `kernel_vbmi2` and `kernel_sve` are decoder-only
+(the encoder has no AVX-512 or SVE tier), and `kernel_scalar` gates nothing,
+since the scalar path is the mandatory fallback and always compiled. So
 `--no-default-features` (optionally with `--features kernel_scalar`) compiles
 every per-tier dispatch and all explicit SIMD intrinsics out of the crate.
 
