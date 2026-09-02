@@ -2301,8 +2301,11 @@ macro_rules! start_matching_fast_loop_body {
                 } else {
                     history_abs_start
                 };
-                let lit_len_ip0 = ip0 - literals_start;
-                let lit_len_ip1 = ip1 - literals_start;
+                // Literal lengths are derived at the emit sites rather than
+                // carried: both inputs are live there anyway, and the loop is
+                // register-saturated, so two values held across every scanned
+                // position for the benefit of the rare match path cost more
+                // than the subtraction does.
                 let packed_curr = ((abs_ip0 - position_base) as u32) + 1;
 
                 let concat_idx0 = abs_ip0 - history_abs_start;
@@ -2346,7 +2349,7 @@ macro_rules! start_matching_fast_loop_body {
                 // peek at ip+1, 4-byte gate. Upstream zstd's hot path checks ONLY
                 // `offset_1` here (full 3-rep walk lives in lazy/btopt).
                 // Since the peek is at `ip+1` with `pos >= literals_start`,
-                // `lit_len_ip1 >= 1`, so `offset_hist[0]` is the upstream zstd's
+                // the literal length at `ip1` is >= 1, so `offset_hist[0]` is the upstream zstd's
                 // `offset_1`. The `repcode_candidate_shared` helper we used
                 // before walked all three offsets + did a full SIMD
                 // `common_prefix_len` per probe, paying ~3× the work for
@@ -2416,7 +2419,7 @@ macro_rules! start_matching_fast_loop_body {
                                     cand_pos_r,
                                     abs_ip1,
                                     match_len,
-                                    lit_len_ip1,
+                                    ip1 - literals_start,
                                 );
                                 break 'inner InnerExit::Committed(rep_cand, 0, abs_ip0);
                             }
@@ -2508,7 +2511,7 @@ macro_rules! start_matching_fast_loop_body {
                                 cand_pos,
                                 abs_ip0,
                                 match_len,
-                                lit_len_ip0,
+                                ip0 - literals_start,
                             );
                             // Upstream zstd `_match_found` (zstd_double_fast.c:287):
                             // `if (step < 4) hashLong[hl1] = ip1`. Insert the
@@ -2595,7 +2598,7 @@ macro_rules! start_matching_fast_loop_body {
                                     cand_pos,
                                     abs_ip0,
                                     match_len,
-                                    lit_len_ip0,
+                                    ip0 - literals_start,
                                 );
                                 break 'inner InnerExit::Committed(cand, 3, abs_ip0);
                             }
@@ -2654,7 +2657,7 @@ macro_rules! start_matching_fast_loop_body {
                                 cand_pos_s,
                                 abs_ip0,
                                 s_match_len,
-                                lit_len_ip0,
+                                ip0 - literals_start,
                             );
 
                             // Enforce the hash-search floor BEFORE
@@ -2719,7 +2722,7 @@ macro_rules! start_matching_fast_loop_body {
                                                 cand_pos_l1,
                                                 abs_ip1,
                                                 l1_match_len,
-                                                lit_len_ip1,
+                                                ip1 - literals_start,
                                             );
                                             // Long-hash hits start at 8
                                             // bytes (`MEM_read64` gate
@@ -2804,7 +2807,7 @@ macro_rules! start_matching_fast_loop_body {
                                                     cand_pos,
                                                     abs_ip1,
                                                     dl1_match_len,
-                                                    lit_len_ip1,
+                                                    ip1 - literals_start,
                                                 );
                                                 retry_upgraded = true;
                                             }
@@ -2900,7 +2903,7 @@ macro_rules! start_matching_fast_loop_body {
                                     cand_pos,
                                     abs_ip0,
                                     s_match_len,
-                                    lit_len_ip0,
+                                    ip0 - literals_start,
                                 );
                                 if dcand.match_len >= DFAST_MIN_MATCH_LEN {
                                     break 'inner InnerExit::Committed(dcand, 4, abs_ip0);
