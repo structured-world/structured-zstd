@@ -247,7 +247,7 @@ const fn select_x86_kernel(
     if has_bmi2 {
         return CpuKernelTag::Bmi2;
     }
-    #[cfg(feature = "kernel_sse2")]
+    #[cfg(feature = "kernel_sse")]
     if has_sse2 {
         return CpuKernelTag::Sse2;
     }
@@ -265,7 +265,7 @@ const fn select_x86_kernel(
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum CpuKernelTag {
     Scalar,
-    #[cfg(all(target_arch = "x86_64", feature = "kernel_sse2"))]
+    #[cfg(all(target_arch = "x86_64", feature = "kernel_sse"))]
     Sse2,
     #[cfg(all(target_arch = "x86_64", feature = "kernel_bmi2"))]
     Bmi2,
@@ -314,7 +314,7 @@ fn detect_cpu_kernel_uncached() -> CpuKernelTag {
             cfg!(feature = "kernel_vbmi2") && is_x86_feature_detected!("avx512bw"),
             cfg!(feature = "kernel_bmi2") && is_x86_feature_detected!("bmi2"),
             cfg!(feature = "kernel_avx2") && is_x86_feature_detected!("avx2"),
-            cfg!(feature = "kernel_sse2") && is_x86_feature_detected!("sse2"),
+            cfg!(feature = "kernel_sse") && is_x86_feature_detected!("sse2"),
         );
     }
     #[cfg(target_arch = "aarch64")]
@@ -380,7 +380,7 @@ impl CpuKernelTag {
     pub(crate) fn name(self) -> &'static str {
         match self {
             CpuKernelTag::Scalar => "scalar",
-            #[cfg(all(target_arch = "x86_64", feature = "kernel_sse2"))]
+            #[cfg(all(target_arch = "x86_64", feature = "kernel_sse"))]
             CpuKernelTag::Sse2 => "sse2",
             #[cfg(all(target_arch = "x86_64", feature = "kernel_bmi2"))]
             CpuKernelTag::Bmi2 => "bmi2",

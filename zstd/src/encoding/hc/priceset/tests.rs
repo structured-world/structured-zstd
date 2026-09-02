@@ -49,13 +49,21 @@ fn priceset_tier_helpers_match_scalar() {
     }
     #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
     {
-        if std::is_x86_feature_detected!("sse4.2") {
+        if std::is_x86_feature_detected!("sse2") {
             unsafe {
                 assert_eq!(
-                    priceset_cached_prices4_sse41(&warm, S),
+                    priceset_cached_prices4_sse2(&warm, S),
                     scalar_deint::<4>(&warm, S)
                 );
-                assert_eq!(priceset_cached_prices4_sse41(&cold, S), None);
+                assert_eq!(priceset_cached_prices4_sse2(&cold, S), None);
+                assert_eq!(
+                    priceset_improved_mask4_sse2(&nc4, &np4),
+                    scalar_mask::<4>(&nc4, &np4)
+                );
+            }
+        }
+        if std::is_x86_feature_detected!("sse4.2") {
+            unsafe {
                 assert_eq!(
                     priceset_improved_mask4_sse41(&nc4, &np4),
                     scalar_mask::<4>(&nc4, &np4)
@@ -88,6 +96,81 @@ fn priceset_tier_helpers_match_scalar() {
                     scalar_mask::<8>(&nc8, &np8)
                 );
             }
+        }
+    }
+}
+
+/// The improve-mask compare is UNSIGNED. Values above `i32::MAX` are the case
+/// that separates it from a plain signed compare: as `i32` they read negative,
+/// so a signed compare inverts the answer. The SSE2 tier has no
+/// `_mm_min_epu32` and emulates the unsigned order by biasing both operands,
+/// which is exactly what this pins down; the other tiers get the same input so
+/// a future retune cannot silently make one of them signed.
+#[cfg(test)]
+#[test]
+fn priceset_improve_mask_is_unsigned_above_i32_max() {
+    fn scalar_mask<const W: usize>(nc: &[u32; W], np: &[u32]) -> u8 {
+        let mut m = 0u8;
+        for k in 0..W {
+            if nc[k] < np[k] {
+                m |= 1 << k;
+            }
+        }
+        m
+    }
+
+    // Lane 0: high < higher, both above i32::MAX (signed would agree here).
+    // Lane 1: small < high  -> unsigned true, signed FALSE (high reads < 0).
+    // Lane 2: high vs small -> unsigned false, signed TRUE.
+    // Lane 3: equal at the very top -> false either way.
+    let nc4: [u32; 4] = [0x8000_0000, 0x0000_0001, 0xFFFF_FFFF, 0xFFFF_FFFF];
+    let np4: [u32; 4] = [0x8000_0001, 0x8000_0000, 0x0000_0002, 0xFFFF_FFFF];
+    let expected = scalar_mask::<4>(&nc4, &np4);
+    assert_eq!(expected, 0b0011, "unsigned reference mask");
+
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    unsafe {
+        assert_eq!(priceset_improved_mask4_neon(&nc4, &np4), expected);
+    }
+    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+    {
+        if std::is_x86_feature_detected!("sse2") {
+            assert_eq!(
+                unsafe { priceset_improved_mask4_sse2(&nc4, &np4) },
+                expected
+            );
+        }
+        if std::is_x86_feature_detected!("sse4.2") {
+            assert_eq!(
+                unsafe { priceset_improved_mask4_sse41(&nc4, &np4) },
+                expected
+            );
+        }
+        if std::is_x86_feature_detected!("avx2") {
+            let nc8: [u32; 8] = [
+                0x8000_0000,
+                0x0000_0001,
+                0xFFFF_FFFF,
+                0xFFFF_FFFF,
+                0x7FFF_FFFF,
+                0x8000_0000,
+                0,
+                0xFFFF_FFFE,
+            ];
+            let np8: [u32; 8] = [
+                0x8000_0001,
+                0x8000_0000,
+                0x0000_0002,
+                0xFFFF_FFFF,
+                0x8000_0000,
+                0x7FFF_FFFF,
+                0xFFFF_FFFF,
+                0xFFFF_FFFF,
+            ];
+            assert_eq!(
+                unsafe { priceset_improved_mask8_avx2(&nc8, &np8) },
+                scalar_mask::<8>(&nc8, &np8)
+            );
         }
     }
 }

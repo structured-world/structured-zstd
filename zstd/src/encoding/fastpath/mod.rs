@@ -61,13 +61,23 @@
 
 pub(crate) mod scalar;
 
-#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[cfg(all(
+    target_arch = "aarch64",
+    target_endian = "little",
+    feature = "kernel_neon"
+))]
 pub(crate) mod neon;
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "kernel_sse"
+))]
 pub(crate) mod sse42;
 
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(all(
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "kernel_avx2"
+))]
 pub(crate) mod avx2_bmi2;
 
 #[cfg(all(
@@ -84,11 +94,31 @@ pub(crate) mod simd128;
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub(crate) enum FastpathKernel {
     Scalar,
-    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_endian = "little",
+        feature = "kernel_neon"
+    ))]
     Neon,
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    /// SSE2-only x86 tier: the 128-bit prefix-compare kernel plus the SSE2
+    /// price-set path. Selected on x86 CPUs without SSE4.2, which would
+    /// otherwise fall all the way back to [`FastpathKernel::Scalar`].
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel_sse"
+    ))]
+    Sse2,
+    /// SSE4.2 x86 tier: same 128-bit kernel as [`FastpathKernel::Sse2`], but
+    /// the price set uses the SSE4.1 `min_epu32` compare.
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel_sse"
+    ))]
     Sse42,
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel_avx2"
+    ))]
     Avx2Bmi2,
     #[cfg(all(
         target_arch = "wasm32",
@@ -129,46 +159,78 @@ pub(crate) fn select_kernel() -> FastpathKernel {
     allow(unreachable_code)
 )]
 fn detect_kernel_uncached() -> FastpathKernel {
-    // Every kernel here uses only the vector ops named by its own tier:
-    // 256-bit `_mm256_*` plus BMI2 bit-manipulation for the AVX2 tier,
-    // 128-bit `_mm_*` for the SSE2 tier, and the NEON baseline on AArch64.
-    // No tier reaches for an ISA extension outside that umbrella, so the
-    // probes below test exactly what the selected kernel executes.
-    #[cfg(all(feature = "std", any(target_arch = "x86", target_arch = "x86_64")))]
+    // Each probe covers everything its tier executes, which is more than the
+    // vector ops in this module's own submodules: the `Sse42` tier's
+    // optimal-parser body calls `priceset::priceset_range_nonabort_sse41`
+    // (`_mm_min_epu32`, SSE4.1). A CPU with SSE2 but no SSE4.2 therefore takes
+    // the `Sse2` tier, which pairs the same 128-bit prefix-compare kernel with
+    // the SSE2 price set, rather than dropping to the scalar kernel.
+    #[cfg(all(
+        feature = "std",
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel_avx2"
+    ))]
     {
         if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("bmi2") {
             return FastpathKernel::Avx2Bmi2;
         }
-        if std::is_x86_feature_detected!("sse2") {
+    }
+    #[cfg(all(
+        feature = "std",
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel_sse"
+    ))]
+    {
+        if std::is_x86_feature_detected!("sse4.2") {
             return FastpathKernel::Sse42;
         }
+        if std::is_x86_feature_detected!("sse2") {
+            return FastpathKernel::Sse2;
+        }
     }
-    #[cfg(all(feature = "std", target_arch = "aarch64", target_endian = "little"))]
+    #[cfg(all(
+        feature = "std",
+        target_arch = "aarch64",
+        target_endian = "little",
+        feature = "kernel_neon"
+    ))]
     {
         if std::arch::is_aarch64_feature_detected!("neon") {
             return FastpathKernel::Neon;
         }
     }
 
-    #[cfg(all(not(feature = "std"), any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(all(
+        not(feature = "std"),
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel_avx2"
+    ))]
     {
-        if cfg!(target_feature = "avx2")
-            && cfg!(target_feature = "bmi2")
-            && cfg!(target_feature = "sse4.2")
-        {
+        if cfg!(target_feature = "avx2") && cfg!(target_feature = "bmi2") {
             return FastpathKernel::Avx2Bmi2;
         }
+    }
+    #[cfg(all(
+        not(feature = "std"),
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel_sse"
+    ))]
+    {
         if cfg!(target_feature = "sse4.2") {
             return FastpathKernel::Sse42;
+        }
+        if cfg!(target_feature = "sse2") {
+            return FastpathKernel::Sse2;
         }
     }
     #[cfg(all(
         not(feature = "std"),
         target_arch = "aarch64",
-        target_endian = "little"
+        target_endian = "little",
+        feature = "kernel_neon"
     ))]
     {
-        if cfg!(target_feature = "neon") && cfg!(target_feature = "crc") {
+        if cfg!(target_feature = "neon") {
             return FastpathKernel::Neon;
         }
     }
@@ -222,11 +284,25 @@ pub(crate) unsafe fn dispatch_common_prefix_len_ptr_with_kernel(
 ) -> usize {
     match kernel {
         FastpathKernel::Scalar => unsafe { scalar::common_prefix_len_ptr(lhs, rhs, max) },
-        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        #[cfg(all(
+            target_arch = "aarch64",
+            target_endian = "little",
+            feature = "kernel_neon"
+        ))]
         FastpathKernel::Neon => unsafe { neon::common_prefix_len_ptr(lhs, rhs, max) },
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        FastpathKernel::Sse42 => unsafe { sse42::common_prefix_len_ptr(lhs, rhs, max) },
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        // Both x86 tiers share this kernel: it is SSE2 throughout, and only
+        // the optimal parser's price set differs between them.
+        #[cfg(all(
+            any(target_arch = "x86", target_arch = "x86_64"),
+            feature = "kernel_sse"
+        ))]
+        FastpathKernel::Sse2 | FastpathKernel::Sse42 => unsafe {
+            sse42::common_prefix_len_ptr(lhs, rhs, max)
+        },
+        #[cfg(all(
+            any(target_arch = "x86", target_arch = "x86_64"),
+            feature = "kernel_avx2"
+        ))]
         FastpathKernel::Avx2Bmi2 => unsafe { avx2_bmi2::common_prefix_len_ptr(lhs, rhs, max) },
         #[cfg(all(
             target_arch = "wasm32",

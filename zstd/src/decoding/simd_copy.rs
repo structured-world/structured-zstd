@@ -1,13 +1,13 @@
 // SIMD-intrinsic imports are split per tier and gated on the matching
 // `kernel_*` feature so a tier-trimmed build pulls in only the intrinsics
 // its enabled helpers use (a `kernel_scalar`-only trim imports none).
-#[cfg(all(target_arch = "x86", feature = "kernel_sse2"))]
+#[cfg(all(target_arch = "x86", feature = "kernel_sse"))]
 use core::arch::x86::{__m128i, _mm_loadu_si128, _mm_storeu_si128};
 #[cfg(all(target_arch = "x86", feature = "kernel_avx2"))]
 use core::arch::x86::{__m256i, _mm256_loadu_si256, _mm256_storeu_si256};
 #[cfg(all(target_arch = "x86", feature = "kernel_vbmi2"))]
 use core::arch::x86::{__m512i, _mm512_loadu_si512, _mm512_storeu_si512};
-#[cfg(all(target_arch = "x86_64", feature = "kernel_sse2"))]
+#[cfg(all(target_arch = "x86_64", feature = "kernel_sse"))]
 use core::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_storeu_si128};
 #[cfg(all(target_arch = "x86_64", feature = "kernel_avx2"))]
 use core::arch::x86_64::{__m256i, _mm256_loadu_si256, _mm256_storeu_si256};
@@ -15,11 +15,11 @@ use core::arch::x86_64::{__m256i, _mm256_loadu_si256, _mm256_storeu_si256};
 use core::arch::x86_64::{__m512i, _mm512_loadu_si512, _mm512_storeu_si512};
 // Only the 32-bit x86 `detect_x86_caps` body queries CPU features at
 // runtime; the x86_64 body derives them from `detect_cpu_kernel()`.
-#[cfg(all(feature = "std", feature = "kernel_sse2", target_arch = "x86"))]
+#[cfg(all(feature = "std", feature = "kernel_sse", target_arch = "x86"))]
 use std::arch::is_x86_feature_detected;
 #[cfg(all(
     feature = "std",
-    feature = "kernel_sse2",
+    feature = "kernel_sse",
     any(target_arch = "x86", target_arch = "x86_64")
 ))]
 use std::sync::OnceLock;
@@ -331,7 +331,7 @@ pub(crate) unsafe fn copy_bytes_overshooting(
         // Bound only when at least the SSE2 tier is enabled (the lowest x86
         // SIMD kernel; every higher tier implies it). A `kernel_scalar` trim
         // drops the binding along with all three dispatch arms below.
-        #[cfg(feature = "kernel_sse2")]
+        #[cfg(feature = "kernel_sse")]
         let caps = detect_x86_caps();
         // Each call site is gated on its `kernel_*` feature so it disappears
         // alongside the cfg-gated helper def in a tier-trimmed build. `caps.*`
@@ -345,7 +345,7 @@ pub(crate) unsafe fn copy_bytes_overshooting(
         if caps.avx2 {
             try_chunk_kernel!(32, copy_avx2);
         }
-        #[cfg(feature = "kernel_sse2")]
+        #[cfg(feature = "kernel_sse")]
         if caps.sse2 {
             try_chunk_kernel!(16, copy_sse2);
         }
@@ -363,7 +363,7 @@ pub(crate) unsafe fn copy_bytes_overshooting(
         try_chunk_kernel!(64, copy_avx512);
         #[cfg(all(target_feature = "avx2", feature = "kernel_avx2"))]
         try_chunk_kernel!(32, copy_avx2);
-        #[cfg(all(target_feature = "sse2", feature = "kernel_sse2"))]
+        #[cfg(all(target_feature = "sse2", feature = "kernel_sse"))]
         try_chunk_kernel!(16, copy_sse2);
     }
 
@@ -535,7 +535,7 @@ unsafe fn single_op_copy_16(src: *const u8, dst: *mut u8, len: usize) {
     }
     #[cfg(all(
         feature = "std",
-        feature = "kernel_sse2",
+        feature = "kernel_sse",
         any(target_arch = "x86", target_arch = "x86_64")
     ))]
     unsafe {
@@ -548,7 +548,7 @@ unsafe fn single_op_copy_16(src: *const u8, dst: *mut u8, len: usize) {
         not(feature = "std"),
         any(target_arch = "x86", target_arch = "x86_64"),
         target_feature = "sse2",
-        feature = "kernel_sse2"
+        feature = "kernel_sse"
     ))]
     unsafe {
         copy_sse2(src, dst, 16);
@@ -624,7 +624,7 @@ pub(crate) unsafe fn copy_bytes_overshooting_for_bench(
 pub(crate) fn active_chunk_size_for_tests() -> usize {
     #[cfg(all(
         feature = "std",
-        feature = "kernel_sse2",
+        feature = "kernel_sse",
         any(target_arch = "x86", target_arch = "x86_64")
     ))]
     {
@@ -672,7 +672,7 @@ pub(crate) fn active_chunk_size_for_tests() -> usize {
         not(feature = "std"),
         any(target_arch = "x86", target_arch = "x86_64"),
         target_feature = "sse2",
-        feature = "kernel_sse2"
+        feature = "kernel_sse"
     ))]
     {
         return 16;
@@ -706,7 +706,7 @@ unsafe fn copy_scalar(mut src: *const u8, mut dst: *mut u8, len: usize) {
 
 #[cfg(all(
     feature = "std",
-    feature = "kernel_sse2",
+    feature = "kernel_sse",
     any(target_arch = "x86", target_arch = "x86_64")
 ))]
 #[derive(Clone, Copy)]
@@ -738,7 +738,7 @@ struct X86Caps {
 /// the SSE2 / AVX2 copy path there.
 #[cfg(all(
     feature = "std",
-    feature = "kernel_sse2",
+    feature = "kernel_sse",
     any(target_arch = "x86", target_arch = "x86_64")
 ))]
 #[inline(always)]
@@ -767,7 +767,7 @@ fn detect_x86_caps() -> X86Caps {
                     avx2: false,
                     sse2: true,
                 },
-                #[cfg(feature = "kernel_sse2")]
+                #[cfg(feature = "kernel_sse")]
                 CpuKernelTag::Sse2 => X86Caps {
                     avx512f: false,
                     avx2: false,
@@ -792,7 +792,7 @@ fn detect_x86_caps() -> X86Caps {
             X86Caps {
                 avx512f: cfg!(feature = "kernel_vbmi2") && is_x86_feature_detected!("avx512vbmi2"),
                 avx2: cfg!(feature = "kernel_avx2") && is_x86_feature_detected!("avx2"),
-                sse2: cfg!(feature = "kernel_sse2") && is_x86_feature_detected!("sse2"),
+                sse2: cfg!(feature = "kernel_sse") && is_x86_feature_detected!("sse2"),
             }
         }
     })
@@ -807,7 +807,7 @@ fn detect_x86_caps() -> X86Caps {
 // build that still enables `kernel_sse2`.
 #[cfg(all(
     any(target_arch = "x86", target_arch = "x86_64"),
-    feature = "kernel_sse2"
+    feature = "kernel_sse"
 ))]
 #[target_feature(enable = "sse2")]
 #[allow(dead_code)]
@@ -1023,7 +1023,7 @@ unsafe fn copy_exact_inline_avx2(src: *const u8, dst: *mut u8, len: usize) {
     target_arch = "x86",
     target_feature = "sse2",
     not(target_feature = "avx2"),
-    feature = "kernel_sse2"
+    feature = "kernel_sse"
 ))]
 #[inline]
 unsafe fn copy_exact_inline_sse2(src: *const u8, dst: *mut u8, len: usize) {
@@ -1141,7 +1141,7 @@ pub(crate) unsafe fn copy_exact_medium(src: *const u8, dst: *mut u8, len: usize)
         target_arch = "x86",
         target_feature = "sse2",
         not(target_feature = "avx2"),
-        feature = "kernel_sse2"
+        feature = "kernel_sse"
     ))]
     unsafe {
         copy_exact_inline_sse2(src, dst, len)
@@ -1166,7 +1166,7 @@ pub(crate) unsafe fn copy_exact_medium(src: *const u8, dst: *mut u8, len: usize)
             target_arch = "x86",
             target_feature = "sse2",
             not(target_feature = "avx2"),
-            feature = "kernel_sse2"
+            feature = "kernel_sse"
         ),
         all(
             target_arch = "aarch64",

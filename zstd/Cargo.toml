@@ -81,7 +81,7 @@ default = [
     "hash",
     "std",
     "kernel_scalar",
-    "kernel_sse2",
+    "kernel_sse",
     "kernel_bmi2",
     "kernel_avx2",
     # `kernel_vbmi2` (AVX-512) is intentionally OFF by default: on AVX-512
@@ -113,8 +113,8 @@ default = [
 # scalar-only build is equivalently `--no-default-features` (no SIMD tier
 # enabled) or `--no-default-features --features kernel_scalar`.
 kernel_scalar = []
-kernel_sse2 = []
-kernel_bmi2 = ["kernel_sse2"]
+kernel_sse = []
+kernel_bmi2 = ["kernel_sse"]
 kernel_avx2 = ["kernel_bmi2"]
 kernel_vbmi2 = ["kernel_avx2"]
 kernel_neon = []

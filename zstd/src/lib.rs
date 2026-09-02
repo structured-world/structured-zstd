@@ -21,9 +21,9 @@
 //! `no_std` it is chosen at compile time from `cfg(target_feature)`.
 //! Each tier is gated by a cargo feature, all enabled by default (a universal
 //! binary that picks the best available tier per the above): `kernel_scalar`,
-//! `kernel_sse2`, `kernel_bmi2`, `kernel_avx2`, `kernel_vbmi2` (x86) and
+//! `kernel_sse`, `kernel_bmi2`, `kernel_avx2`, `kernel_vbmi2` (x86) and
 //! `kernel_neon`, `kernel_sve` (aarch64). The chain mirrors the ISA
-//! dependency (`kernel_avx2` implies `kernel_bmi2` implies `kernel_sse2`;
+//! dependency (`kernel_avx2` implies `kernel_bmi2` implies `kernel_sse`;
 //! `kernel_sve` implies `kernel_neon`). The scalar kernel is always compiled,
 //! so any subset is valid; a flag is inert on architectures it doesn't apply
 //! to. Constrained targets can shrink the binary by trimming tiers, e.g.

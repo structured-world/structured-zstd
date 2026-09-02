@@ -271,7 +271,7 @@ pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBacken
                 dict,
             )
         }
-        #[cfg(all(target_arch = "x86_64", feature = "kernel_sse2"))]
+        #[cfg(all(target_arch = "x86_64", feature = "kernel_sse"))]
         CpuKernelTag::Sse2 => {
             // SSE2 has no FSE-relevant divergence (no `_bzhi_u64`); the
             // mask_lower_bits hot op is identical to Scalar. SSE2's only

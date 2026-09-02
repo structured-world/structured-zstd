@@ -9,11 +9,26 @@ fn select_kernel_returns_supported_variant() {
     // for this target.
     match k {
         FastpathKernel::Scalar => {}
-        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        #[cfg(all(
+            target_arch = "aarch64",
+            target_endian = "little",
+            feature = "kernel_neon"
+        ))]
         FastpathKernel::Neon => {}
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        #[cfg(all(
+            any(target_arch = "x86", target_arch = "x86_64"),
+            feature = "kernel_sse"
+        ))]
+        FastpathKernel::Sse2 => {}
+        #[cfg(all(
+            any(target_arch = "x86", target_arch = "x86_64"),
+            feature = "kernel_sse"
+        ))]
         FastpathKernel::Sse42 => {}
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        #[cfg(all(
+            any(target_arch = "x86", target_arch = "x86_64"),
+            feature = "kernel_avx2"
+        ))]
         FastpathKernel::Avx2Bmi2 => {}
         #[cfg(all(
             target_arch = "wasm32",
@@ -24,22 +39,29 @@ fn select_kernel_returns_supported_variant() {
     }
 }
 
-#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+/// NEON is the AArch64 baseline and the tier uses nothing beyond it, so the
+/// dispatcher must pick it unconditionally. It used to also require the
+/// optional `crc` extension, for a hash mix that no longer exists; a CPU
+/// without `crc` dropping to the scalar kernel would be a regression.
+#[cfg(all(
+    target_arch = "aarch64",
+    target_endian = "little",
+    feature = "kernel_neon"
+))]
 #[test]
-fn aarch64_picks_neon_when_crc_available() {
-    // The dispatcher gates the NEON kernel on both `neon` (baseline)
-    // and the optional `crc` extension. Mirror that runtime/compile-time
-    // gate so the test stays accurate on AArch64 CPUs (or CI runners)
-    // where `crc` is not reported.
-    #[cfg(feature = "std")]
-    let crc_available = std::arch::is_aarch64_feature_detected!("crc");
-    #[cfg(not(feature = "std"))]
-    let crc_available = cfg!(target_feature = "crc");
+fn aarch64_picks_neon_without_requiring_crc() {
+    assert_eq!(detect_kernel_uncached(), FastpathKernel::Neon);
+}
 
-    let expected = if crc_available {
-        FastpathKernel::Neon
-    } else {
-        FastpathKernel::Scalar
-    };
-    assert_eq!(detect_kernel_uncached(), expected);
+/// With the NEON tier compiled out there is nothing else on AArch64, so the
+/// dispatcher must fall back to the scalar kernel rather than name a variant
+/// that no longer exists.
+#[cfg(all(
+    target_arch = "aarch64",
+    target_endian = "little",
+    not(feature = "kernel_neon")
+))]
+#[test]
+fn aarch64_falls_back_to_scalar_without_the_neon_feature() {
+    assert_eq!(detect_kernel_uncached(), FastpathKernel::Scalar);
 }

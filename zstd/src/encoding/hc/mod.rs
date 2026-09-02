@@ -706,7 +706,11 @@ impl HcMatcher {
     ) {
         // SAFETY: each branch verifies the target_feature requirement of
         // the callee (same shape as the BT walk dispatchers).
-        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        #[cfg(all(
+            target_arch = "aarch64",
+            target_endian = "little",
+            feature = "kernel_neon"
+        ))]
         unsafe {
             self.for_each_repcode_candidate_with_reps_neon(
                 table,
@@ -722,6 +726,7 @@ impl HcMatcher {
         {
             use crate::encoding::fastpath::FastpathKernel;
             match table.kernel {
+                #[cfg(feature = "kernel_avx2")]
                 FastpathKernel::Avx2Bmi2 => unsafe {
                     self.for_each_repcode_candidate_with_reps_avx2_bmi2(
                         table,
@@ -733,7 +738,8 @@ impl HcMatcher {
                         f,
                     )
                 },
-                FastpathKernel::Sse42 => unsafe {
+                #[cfg(feature = "kernel_sse")]
+                FastpathKernel::Sse2 | FastpathKernel::Sse42 => unsafe {
                     self.for_each_repcode_candidate_with_reps_sse42(
                         table,
                         abs_pos,
@@ -756,7 +762,11 @@ impl HcMatcher {
             }
         }
         #[cfg(not(any(
-            all(target_arch = "aarch64", target_endian = "little"),
+            all(
+                target_arch = "aarch64",
+                target_endian = "little",
+                feature = "kernel_neon"
+            ),
             target_arch = "x86",
             target_arch = "x86_64"
         )))]
@@ -778,7 +788,11 @@ impl HcMatcher {
     /// # Safety
     /// Caller must be running on an AArch64 target with NEON
     /// available (baseline on AArch64).
-    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_endian = "little",
+        feature = "kernel_neon"
+    ))]
     #[target_feature(enable = "neon")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn for_each_repcode_candidate_with_reps_neon(
@@ -804,12 +818,15 @@ impl HcMatcher {
         )
     }
 
-    /// SSE4.2 umbrella variant.
+    /// SSE2 umbrella variant.
     ///
     /// # Safety
-    /// Caller must be running on x86/x86_64 with SSE4.2 available.
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[target_feature(enable = "sse4.2")]
+    /// Caller must be running on x86/x86_64 with SSE2 available.
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel_sse"
+    ))]
+    #[target_feature(enable = "sse2")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn for_each_repcode_candidate_with_reps_sse42(
         &self,
@@ -838,7 +855,10 @@ impl HcMatcher {
     ///
     /// # Safety
     /// Caller must be running on x86/x86_64 with AVX2 + BMI2 available.
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel_avx2"
+    ))]
     #[target_feature(enable = "avx2,bmi2")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn for_each_repcode_candidate_with_reps_avx2_bmi2(
@@ -864,8 +884,12 @@ impl HcMatcher {
         )
     }
 
-    /// Scalar fallback used on non-AArch64 targets.
-    #[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+    /// Scalar fallback, compiled unless the NEON tier covers this target.
+    #[cfg(not(all(
+        target_arch = "aarch64",
+        target_endian = "little",
+        feature = "kernel_neon"
+    )))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn for_each_repcode_candidate_with_reps_scalar(
         &self,

@@ -74,7 +74,7 @@ fn copy_scalar_copies_requested_bytes() {
 
 #[cfg(all(
     feature = "std",
-    feature = "kernel_sse2",
+    feature = "kernel_sse",
     any(target_arch = "x86", target_arch = "x86_64")
 ))]
 #[test]

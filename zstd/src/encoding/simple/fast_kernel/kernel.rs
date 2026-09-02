@@ -1831,21 +1831,31 @@ macro_rules! fast_dict_borrowed_wrapper {
 }
 
 fast_dict_borrowed_wrapper!(
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel_avx2"
+    ))]
     #[target_feature(enable = "avx2,bmi2")]
     cbfd_borrowed_avx2_bmi2,
     crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr
 );
 
 fast_dict_borrowed_wrapper!(
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[target_feature(enable = "sse4.2")]
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel_sse"
+    ))]
+    #[target_feature(enable = "sse2")]
     cbfd_borrowed_sse42,
     crate::encoding::fastpath::sse42::common_prefix_len_ptr
 );
 
 fast_dict_borrowed_wrapper!(
-    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_endian = "little",
+        feature = "kernel_neon"
+    ))]
     #[target_feature(enable = "neon")]
     cbfd_borrowed_neon,
     crate::encoding::fastpath::neon::common_prefix_len_ptr
@@ -1911,6 +1921,7 @@ pub(crate) fn compress_block_fast_dict_borrowed<const MLS: u32, const USE_CMOV: 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     {
         match kernel {
+            #[cfg(feature = "kernel_avx2")]
             FastpathKernel::Avx2Bmi2 => unsafe {
                 cbfd_borrowed_avx2_bmi2::<MLS, USE_CMOV>(
                     inp,
@@ -1925,7 +1936,8 @@ pub(crate) fn compress_block_fast_dict_borrowed<const MLS: u32, const USE_CMOV: 
                     handle_sequence,
                 )
             },
-            FastpathKernel::Sse42 => unsafe {
+            #[cfg(feature = "kernel_sse")]
+            FastpathKernel::Sse2 | FastpathKernel::Sse42 => unsafe {
                 cbfd_borrowed_sse42::<MLS, USE_CMOV>(
                     inp,
                     dict,
@@ -1945,7 +1957,11 @@ pub(crate) fn compress_block_fast_dict_borrowed<const MLS: u32, const USE_CMOV: 
             }
         }
     }
-    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_endian = "little",
+        feature = "kernel_neon"
+    ))]
     {
         match kernel {
             FastpathKernel::Neon => unsafe {
@@ -1998,7 +2014,11 @@ pub(crate) fn compress_block_fast_dict_borrowed<const MLS: u32, const USE_CMOV: 
     #[cfg(not(any(
         target_arch = "x86",
         target_arch = "x86_64",
-        all(target_arch = "aarch64", target_endian = "little"),
+        all(
+            target_arch = "aarch64",
+            target_endian = "little",
+            feature = "kernel_neon"
+        ),
         all(
             target_arch = "wasm32",
             target_feature = "simd128",

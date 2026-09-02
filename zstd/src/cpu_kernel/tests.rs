@@ -87,7 +87,7 @@ fn select_x86_kernel_avx2_baseline_picks_avx2() {
 }
 
 /// SSE2-only (no BMI2/AVX2) → Sse2, the x86_64 floor above Scalar.
-#[cfg(all(target_arch = "x86_64", feature = "kernel_sse2"))]
+#[cfg(all(target_arch = "x86_64", feature = "kernel_sse"))]
 #[test]
 fn select_x86_kernel_sse2_only_picks_sse2() {
     let tag = select_x86_kernel(false, false, false, false, false, false, true);
@@ -136,7 +136,7 @@ fn every_kernel_tag_maps_to_its_lowercase_name() {
     // CPU resolves to, so map each constructible tag directly to cover
     // every branch on this build's feature set.
     assert_eq!(CpuKernelTag::Scalar.name(), "scalar");
-    #[cfg(all(target_arch = "x86_64", feature = "kernel_sse2"))]
+    #[cfg(all(target_arch = "x86_64", feature = "kernel_sse"))]
     assert_eq!(CpuKernelTag::Sse2.name(), "sse2");
     #[cfg(all(target_arch = "x86_64", feature = "kernel_bmi2"))]
     assert_eq!(CpuKernelTag::Bmi2.name(), "bmi2");

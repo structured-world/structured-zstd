@@ -2887,7 +2887,11 @@ impl DfastMatchGenerator {
                 }
             };
         }
-        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        #[cfg(all(
+            target_arch = "aarch64",
+            target_endian = "little",
+            feature = "kernel_neon"
+        ))]
         unsafe {
             dispatch_dict!(start_matching_fast_loop_neon)
         }
@@ -2898,10 +2902,14 @@ impl DfastMatchGenerator {
             // not a per-block `select_kernel()` — the cache only helps if the
             // hot path actually reads it. Mirrors the Row backend.
             match self.kernel {
+                #[cfg(feature = "kernel_avx2")]
                 FastpathKernel::Avx2Bmi2 => unsafe {
                     dispatch_dict!(start_matching_fast_loop_avx2_bmi2)
                 },
-                FastpathKernel::Sse42 => unsafe { dispatch_dict!(start_matching_fast_loop_sse42) },
+                #[cfg(feature = "kernel_sse")]
+                FastpathKernel::Sse2 | FastpathKernel::Sse42 => unsafe {
+                    dispatch_dict!(start_matching_fast_loop_sse42)
+                },
                 FastpathKernel::Scalar => dispatch_dict!(start_matching_fast_loop_scalar),
             }
         }
@@ -2914,7 +2922,11 @@ impl DfastMatchGenerator {
             dispatch_dict!(start_matching_fast_loop_simd128)
         }
         #[cfg(not(any(
-            all(target_arch = "aarch64", target_endian = "little"),
+            all(
+                target_arch = "aarch64",
+                target_endian = "little",
+                feature = "kernel_neon"
+            ),
             target_arch = "x86",
             target_arch = "x86_64",
             all(
@@ -2928,7 +2940,11 @@ impl DfastMatchGenerator {
         }
     }
 
-    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_endian = "little",
+        feature = "kernel_neon"
+    ))]
     #[target_feature(enable = "neon")]
     unsafe fn start_matching_fast_loop_neon<const USE_DICT: bool, const BORROWED: bool>(
         &mut self,
@@ -2947,8 +2963,11 @@ impl DfastMatchGenerator {
         )
     }
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    #[target_feature(enable = "sse4.2")]
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel_sse"
+    ))]
+    #[target_feature(enable = "sse2")]
     unsafe fn start_matching_fast_loop_sse42<const USE_DICT: bool, const BORROWED: bool>(
         &mut self,
         current_abs_start: usize,
@@ -2966,7 +2985,10 @@ impl DfastMatchGenerator {
         )
     }
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel_avx2"
+    ))]
     #[target_feature(enable = "avx2,bmi2")]
     unsafe fn start_matching_fast_loop_avx2_bmi2<const USE_DICT: bool, const BORROWED: bool>(
         &mut self,
@@ -3009,7 +3031,11 @@ impl DfastMatchGenerator {
     }
 
     #[cfg(not(any(
-        all(target_arch = "aarch64", target_endian = "little"),
+        all(
+            target_arch = "aarch64",
+            target_endian = "little",
+            feature = "kernel_neon"
+        ),
         all(
             target_arch = "wasm32",
             target_feature = "simd128",
