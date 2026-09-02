@@ -89,11 +89,11 @@ pub(crate) struct BtMatcher {
     /// consumes the field, it does not construct it. See
     /// [`super::ldm::LdmProducer`].
     ///
-    /// Gated behind the `hash` feature because the producer's
-    /// per-window XXH64 hashing depends on the optional
-    /// `twox-hash` dependency; under `default-features = false`
-    /// the field disappears and the `prepare_ldm_candidates`
-    /// body shrinks to the legacy `ldm_sequences.clear()` stub.
+    /// Gated behind the `ldm` feature (which implies `hash`, since the
+    /// producer's per-window XXH64 hashing needs the optional `twox-hash`
+    /// dependency). Without it the field disappears and the
+    /// `prepare_ldm_candidates` body shrinks to an `ldm_sequences.clear()`
+    /// stub.
     #[cfg(feature = "ldm")]
     pub(crate) ldm_producer: Option<LdmProducer>,
 }
@@ -188,7 +188,7 @@ impl BtMatcher {
                 * core::mem::size_of::<HcOptimalSequence>()
             + self.opt_price_arena.len() * core::mem::size_of::<[u32; 2]>()
             + self.ldm_sequences.capacity() * core::mem::size_of::<HcRawSeq>();
-        // The LDM producer is only present under the `hash` feature.
+        // The LDM producer is only present under the `ldm` feature.
         #[cfg(feature = "ldm")]
         let ldm = self.ldm_producer.as_ref().map_or(0, |p| p.heap_size());
         #[cfg(not(feature = "ldm"))]
@@ -462,9 +462,8 @@ impl BtMatcher {
         }
         #[cfg(not(feature = "ldm"))]
         {
-            // Under `default-features = false` (no `hash`),
-            // `LdmProducer` is not compiled — `live_history` /
-            // `history_abs_start` / `current_abs_start` /
+            // Without the `ldm` feature `LdmProducer` is not compiled, so
+            // `live_history` / `history_abs_start` / `current_abs_start` /
             // `current_len` would otherwise be unused.
             let _ = (
                 live_history,

@@ -72,7 +72,7 @@ pub(crate) mod lazy_parse;
 // `twox-hash` dependency it pulls in. `BtMatcher::ldm_producer` and the
 // `cfg(feature = "ldm")` blocks inside `BtMatcher::prepare_ldm_candidates` /
 // `BtMatcher::reset` carry the same gate; the call site in
-// `match_generator.rs::start_matching_optimal` invokes
+// `hc::optimal::HcMatchGenerator::start_matching_optimal` invokes
 // `prepare_ldm_candidates` unconditionally because the gating is internal to
 // the method body (without the feature it shrinks to an
 // `ldm_sequences.clear()` stub).

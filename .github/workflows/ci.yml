@@ -440,6 +440,11 @@ jobs:
       - name: Clippy (wasm32 simd128)
         run: cargo clippy -p structured-zstd -p structured-zstd-wasm --target wasm32-unknown-unknown --no-default-features --features kernel-simd128 --config 'target.wasm32-unknown-unknown.rustflags=["-C","target-feature=+simd128"]' -- -D warnings
       - name: Clippy (wasm32 scalar)
+        run: cargo clippy -p structured-zstd -p structured-zstd-wasm --target wasm32-unknown-unknown --no-default-features --features kernel-scalar -- -D warnings
+      # The wasm kernels need BOTH `kernel-simd128` and `target_feature =
+      # "simd128"`. This combination (feature on, target feature off) is the one
+      # where a missing cargo-feature gate would go unnoticed, so keep it built.
+      - name: Clippy (wasm32 simd128 feature without +simd128)
         run: cargo clippy -p structured-zstd -p structured-zstd-wasm --target wasm32-unknown-unknown --no-default-features --features kernel-simd128 -- -D warnings
       - name: Install wasm-pack
         uses: taiki-e/install-action@v2
