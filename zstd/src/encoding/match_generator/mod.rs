@@ -1602,6 +1602,88 @@ impl Matcher for MatchGeneratorDriver {
         }
     }
 
+    /// Read the next block STRAIGHT into the backend's history buffer, so the
+    /// owned block loop does not stage it in a scratch `Vec` and copy it in.
+    ///
+    /// Returns `None` when the active backend has no in-place ingest, in which
+    /// case the caller keeps the staged-copy path. Dfast, Row and HashChain
+    /// implement it; Simple stages the block in a `pending` slot that the
+    /// kernel consumes, so its bytes do not reach `history` until match time
+    /// and the two-phase shape does not apply to it as written.
+    ///
+    /// On `Some`, the bytes are in the buffer but not yet part of the window:
+    /// the caller picks the block boundary from
+    /// [`Self::uncommitted_input`] and then calls [`Self::commit_filled`].
+    fn fill_in_place(
+        &mut self,
+        capacity: usize,
+        fill: &mut dyn FnMut(&mut Vec<u8>) -> (usize, bool),
+    ) -> Option<(usize, bool)> {
+        match &mut self.storage {
+            MatcherStorage::Dfast(m) => Some(m.fill_uncommitted(capacity, fill)),
+            MatcherStorage::Row(m) => Some(m.fill_uncommitted(capacity, fill)),
+            MatcherStorage::HashChain(m) => Some(m.table.fill_uncommitted(capacity, fill)),
+            MatcherStorage::Simple(_) => None,
+        }
+    }
+
+    fn reserve_for_frame(&mut self, bytes: usize) {
+        match &mut self.storage {
+            MatcherStorage::Dfast(m) => m.reserve_for_frame(bytes),
+            MatcherStorage::Row(m) => m.reserve_for_frame(bytes),
+            MatcherStorage::HashChain(m) => m.table.reserve_for_frame(bytes),
+            MatcherStorage::Simple(_) => {}
+        }
+    }
+
+    /// Bytes read by [`Self::fill_in_place`] that no block has claimed yet.
+    fn uncommitted_input(&self) -> &[u8] {
+        match &self.storage {
+            MatcherStorage::Dfast(m) => m.uncommitted(),
+            MatcherStorage::Row(m) => m.uncommitted(),
+            MatcherStorage::HashChain(m) => m.table.uncommitted(),
+            MatcherStorage::Simple(_) => &[],
+        }
+    }
+
+    /// Claim `len` bytes of [`Self::uncommitted_input`] as the next block.
+    ///
+    /// Runs the same eviction accounting as [`Self::commit_space`]: a
+    /// dictionary inflates `max_window_size` so the primed bytes stay
+    /// reachable, and once eviction carries them out of the window that
+    /// inflation has to be retired. Skipping it leaves the backend admitting
+    /// matches older than the window the frame header reports, which encodes
+    /// an offset no decoder can resolve.
+    fn commit_filled(&mut self, len: usize) {
+        // Same derivation as `commit_space`: the eviction loop decrements
+        // `window_size` per evicted block before the commit adds `len`, so
+        // `evicted = pre + len - post`.
+        let pre = match &self.storage {
+            MatcherStorage::Dfast(m) => m.window_size,
+            MatcherStorage::Row(m) => m.window_size,
+            MatcherStorage::HashChain(m) => m.table.window_size,
+            MatcherStorage::Simple(_) => 0,
+        };
+        match &mut self.storage {
+            MatcherStorage::Dfast(m) => m.commit_block(len),
+            MatcherStorage::Row(m) => m.commit_block(len),
+            MatcherStorage::HashChain(m) => m.table.commit_block(len),
+            MatcherStorage::Simple(_) => return,
+        }
+        let post = match &self.storage {
+            MatcherStorage::Dfast(m) => m.window_size,
+            MatcherStorage::Row(m) => m.window_size,
+            MatcherStorage::HashChain(m) => m.table.window_size,
+            MatcherStorage::Simple(_) => 0,
+        };
+        // `saturating_sub` floors the no-eviction case at 0; `pre + len` are
+        // byte counts bounded by the window, so the sum cannot overflow.
+        let evicted_bytes = (pre + len).saturating_sub(post);
+        if self.retire_dictionary_budget(evicted_bytes) {
+            self.trim_after_budget_retire();
+        }
+    }
+
     fn commit_space(&mut self, space: Vec<u8>) {
         let mut evicted_bytes = 0usize;
         // Split borrows manually so the `add_data` closures can write

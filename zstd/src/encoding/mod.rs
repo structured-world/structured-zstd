@@ -407,6 +407,42 @@ pub trait Matcher {
     fn get_last_space(&mut self) -> &[u8];
     /// Commit a space to the matcher so it can be matched against
     fn commit_space(&mut self, space: alloc::vec::Vec<u8>);
+    /// Read the next block straight into the matcher's own history buffer,
+    /// skipping the scratch buffer that [`commit_space`](Self::commit_space)
+    /// otherwise has to copy in.
+    ///
+    /// `fill` is handed the history buffer with room reserved for `capacity`
+    /// more bytes and returns `(appended, eof)`. The bytes are readable through
+    /// [`uncommitted_input`](Self::uncommitted_input) but are NOT yet part of
+    /// the match window: the caller chooses the block boundary (the pre-split
+    /// pass needs the bytes to decide) and then calls
+    /// [`commit_filled`](Self::commit_filled). Whatever is left over stays in
+    /// the buffer and becomes the head of the next block, so a carried split
+    /// remainder costs no copy.
+    ///
+    /// Returns `None` if this matcher has no in-place ingest, which is the
+    /// default: the caller then keeps the staged-copy path.
+    fn fill_in_place(
+        &mut self,
+        _capacity: usize,
+        _fill: &mut dyn FnMut(&mut alloc::vec::Vec<u8>) -> (usize, bool),
+    ) -> Option<(usize, bool)> {
+        None
+    }
+    /// Bytes ingested by [`fill_in_place`](Self::fill_in_place) that no block
+    /// has claimed yet. Empty unless that hook is implemented.
+    fn uncommitted_input(&self) -> &[u8] {
+        &[]
+    }
+    /// Claim `len` bytes from the head of
+    /// [`uncommitted_input`](Self::uncommitted_input) as the next block.
+    fn commit_filled(&mut self, _len: usize) {}
+    /// Size the ingest buffer for a frame of `bytes` up front, so filling it
+    /// block by block doesn't walk a doubling chain of reallocations. Clamped
+    /// internally to the buffer's eviction ceiling, so an over-long or absent
+    /// hint can never reserve more than a bounded window. No-op unless
+    /// [`fill_in_place`](Self::fill_in_place) is implemented.
+    fn reserve_for_frame(&mut self, _bytes: usize) {}
     /// Just process the data in the last committed space for future matching.
     fn skip_matching(&mut self);
     /// Hint-aware skip path used internally to thread a precomputed block

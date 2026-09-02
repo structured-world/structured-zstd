@@ -222,6 +222,15 @@ name = "ffi_compress_z000033"
 path = "../zstd/examples/ffi_compress_z000033.rs"
 
 [[example]]
+name = "ffi_encode_loop_z000033"
+path = "../zstd/examples/ffi_encode_loop_z000033.rs"
+
+[[example]]
+name = "encode_loop_oneshot_z000033"
+path = "../zstd/examples/encode_loop_oneshot_z000033.rs"
+required-features = ["dict-builder"]
+
+[[example]]
 name = "ffi_loop_dict"
 path = "../zstd/examples/ffi_loop_dict.rs"
 
@@ -266,3 +275,7 @@ path = "examples/ratio_parity.rs"
 [[example]]
 name = "periodic_presplit"
 path = "examples/periodic_presplit.rs"
+
+[[example]]
+name = "owned_check"
+path = "../zstd/examples/owned_check.rs"

@@ -293,7 +293,9 @@ impl RowTags for Sse2Tags {
         lit_len: usize,
         hash: Option<(usize, u8)>,
     ) -> Option<MatchCandidate> {
-        // SAFETY: dispatched only when `tag_kernel == Sse42` (SSE4.2 confirmed).
+        // SAFETY: dispatched for `tag_kernel` of `Sse2` or `Sse42`; both confirm
+        // SSE2, which is the whole requirement of `row_probe_sse2`. Do NOT widen
+        // this probe to an SSE4.x intrinsic — the `Sse2` tier would fault.
         unsafe { matcher.row_probe_sse2::<ROW_LOG>(abs_pos, lit_len, hash) }
     }
 }
@@ -2241,6 +2243,10 @@ pub(crate) struct RowMatchGenerator {
     /// pre-split frame ballooned the window to many times the live byte count.
     pub(crate) chunk_lens: VecDeque<usize>,
     pub(crate) window_size: usize,
+    /// Bytes at the tail of `history` read but not yet claimed by a block
+    /// (in-place ingest). Zero on the staged path. Explicit rather than derived
+    /// from `window_size`, since a primed dictionary also lives in `history`.
+    pub(crate) uncommitted_len: usize,
     pub(crate) history: Vec<u8>,
     pub(crate) history_start: usize,
     pub(crate) history_abs_start: usize,
@@ -2366,6 +2372,7 @@ impl RowMatchGenerator {
             max_window_size,
             chunk_lens: VecDeque::new(),
             window_size: 0,
+            uncommitted_len: 0,
             history: Vec::new(),
             history_start: 0,
             history_abs_start: 0,
@@ -2563,6 +2570,13 @@ impl RowMatchGenerator {
         // TAGS can still produce the occasional false mask hit whose
         // candidate then fails the window check; the upstream zstd's tag table
         // persists across frames with the same behaviour.
+        // Bytes an abandoned frame ingested but never claimed are not part of
+        // the next frame, and they must not count towards the floor advance.
+        // Dropped first because every tail-relative bound subtracts this count
+        // from the buffer length and would underflow once history is cleared.
+        self.history
+            .truncate(self.history.len() - self.uncommitted_len);
+        self.uncommitted_len = 0;
         // Past everything the previous frame indexed: its owned history, or
         // the extent of its borrowed input.
         let next_floor = self.history_abs_start
@@ -2622,7 +2636,118 @@ impl RowMatchGenerator {
             };
         }
         let last = *self.chunk_lens.back().unwrap();
-        &self.history[self.history.len() - last..]
+        &self.history[self.history.len() - self.uncommitted_len - last
+            ..self.history.len() - self.uncommitted_len]
+    }
+
+    /// Phase 1 of in-place ingest: `fill` writes the next block STRAIGHT into
+    /// the tail of `history` rather than into a scratch `Vec` that
+    /// [`Self::add_data`] then copies in. See `MatchTable::fill_uncommitted`
+    /// for the two-phase rationale; the bytes only join the window once
+    /// [`Self::commit_block`] claims them, so the pre-split remainder stays
+    /// where it is and heads the next block at no copy cost.
+    pub(crate) fn fill_uncommitted(
+        &mut self,
+        capacity: usize,
+        fill: impl FnOnce(&mut Vec<u8>) -> (usize, bool),
+    ) -> (usize, bool) {
+        // Count the bytes already carried, not just this top-up: `capacity` is
+        // `block_capacity - carried` (and zero on the EOF re-inspection), yet
+        // the carried suffix still becomes window on the next commit.
+        super::match_table::storage::check_stream_abs_headroom(
+            self.history_abs_start,
+            self.window_size,
+            capacity + self.uncommitted_len,
+        );
+        // The eviction, dict retire, floor updates AND the eviction ceiling all
+        // run on commit, keyed on the length a block actually claims. Sizing the
+        // ceiling here off `capacity` (a whole read buffer, not a block) would
+        // trip it on the first fill and fault in the full window+window/4 mirror
+        // for frames that never evict.
+        self.history.reserve(capacity);
+        let before = self.history.len();
+        let (appended, eof) = fill(&mut self.history);
+        debug_assert_eq!(
+            self.history.len(),
+            before + appended,
+            "fill_uncommitted: fill reported {appended} bytes but grew history by {}",
+            self.history.len() - before,
+        );
+        self.uncommitted_len += appended;
+        (appended, eof)
+    }
+
+    /// Size `history` for a whole frame in one allocation instead of letting
+    /// the per-block `reserve` walk a doubling chain. Clamped to the eviction
+    /// ceiling, which is the largest the buffer ever grows anyway.
+    pub(crate) fn reserve_for_frame(&mut self, bytes: usize) {
+        let ceiling = self.max_window_size
+            + (self.max_window_size >> 2)
+            + crate::common::MAX_BLOCK_SIZE as usize;
+        // `bytes` already carries the caller's block-sized slack, sized off the
+        // active block capacity — adding the format maximum here would reserve
+        // ~128 KiB for a frame whose window (and therefore block) is 1 KiB.
+        let target = bytes.min(ceiling);
+        if target > self.history.len() && self.history.capacity() < target {
+            self.history.reserve_exact(target - self.history.len());
+        }
+    }
+
+    /// Bytes read but not yet claimed by a block.
+    pub(crate) fn uncommitted(&self) -> &[u8] {
+        &self.history[self.history.len() - self.uncommitted_len..]
+    }
+
+    /// Phase 2 of in-place ingest: claim `len` bytes from the head of
+    /// [`Self::uncommitted`] as the next block, running the same coordinate
+    /// rebase, eviction, dict retire and valid-data floor updates
+    /// [`Self::add_data`] performs.
+    pub(crate) fn commit_block(&mut self, len: usize) {
+        if len == 0 {
+            return;
+        }
+        assert!(len <= self.max_window_size);
+        // Hard assert, like the window check above: this runs once per block,
+        // and an over-long claim would wrap `uncommitted_len` in release and
+        // surface as a panic far from the cause.
+        assert!(
+            len <= self.uncommitted().len(),
+            "commit_block: {len} exceeds the {} uncommitted bytes",
+            self.uncommitted().len(),
+        );
+        if self.history_abs_start + self.window_size + len >= u32::MAX as usize - 1 - BT_IDX_BASE {
+            self.rebase_positions();
+        }
+        if self.window_size + len > self.max_window_size {
+            self.dict.invalidate();
+            // Same one-time ceiling as `add_data`: once eviction starts, grow
+            // the mirror linearly to (window + window/4 + one block).
+            let target = self.max_window_size
+                + (self.max_window_size >> 2)
+                + crate::common::MAX_BLOCK_SIZE as usize;
+            if target > self.history.len() && self.history.capacity() < target {
+                self.history.reserve_exact(target - self.history.len());
+            }
+        }
+        while self.window_size + len > self.max_window_size {
+            let removed_len = self.chunk_lens.pop_front().unwrap();
+            self.window_size -= removed_len;
+            self.history_start += removed_len;
+            self.history_abs_start += removed_len;
+        }
+        if self.low_limit < self.history_abs_start {
+            self.low_limit = self.history_abs_start;
+        }
+        if self.prefix_low < self.low_limit {
+            self.prefix_low = self.low_limit;
+        }
+        // Same position in the sequence as `add_data`: compact AFTER the
+        // eviction that raised `history_start`, so the drain trigger sees the
+        // same state and the buffer evolves identically.
+        self.compact_history();
+        self.window_size += len;
+        self.chunk_lens.push_back(len);
+        self.uncommitted_len -= len;
     }
 
     pub(crate) fn add_data(&mut self, data: Vec<u8>, mut reuse_space: impl FnMut(Vec<u8>)) {
@@ -3017,8 +3142,11 @@ impl RowMatchGenerator {
         // ~1.25x-window capacity on long streams. The drain memmoves the live
         // window, so a quarter-window trigger bounds the write amplification
         // (~4x the eviction stride) while closing most of the peak gap.
+        // Compare against the COMMITTED length: with in-place ingest
+        // `history.len()` also counts bytes no block has claimed yet, which
+        // would push this trigger later than on the staged path.
         if self.history_start >= (self.max_window_size >> 2)
-            || self.history_start * 2 >= self.history.len()
+            || self.history_start * 2 >= self.history.len() - self.uncommitted_len
         {
             self.history.drain(..self.history_start);
             self.history_start = 0;
@@ -3043,7 +3171,10 @@ impl RowMatchGenerator {
             // in bounds.
             return unsafe { core::slice::from_raw_parts(ptr, end) };
         }
-        &self.history[self.history_start..]
+        // Stop at the committed end, not at `history.len()`: in-place ingest
+        // may have already read the next block's bytes into the tail, and a
+        // scan must not see past the block it is compressing.
+        &self.history[self.history_start..self.history.len() - self.uncommitted_len]
     }
 
     fn history_abs_end(&self) -> usize {

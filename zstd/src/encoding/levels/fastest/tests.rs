@@ -76,7 +76,7 @@ fn rle_branch_passes_compressible_hint_to_skip_matching() {
         &mut state,
         CompressionLevel::Fastest,
         true,
-        vec![0xAB; 1024],
+        super::BlockInput::Staged(vec![0xAB; 1024]),
         &mut output,
         false,
         #[cfg(feature = "lsm")]
@@ -126,7 +126,7 @@ fn raw_fast_path_emits_raw_block_and_passes_incompressible_hint() {
         &mut state,
         CompressionLevel::Fastest,
         true,
-        block.clone(),
+        super::BlockInput::Staged(block.clone()),
         &mut output,
         false,
         #[cfg(feature = "lsm")]

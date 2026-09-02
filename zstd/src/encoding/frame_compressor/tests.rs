@@ -3106,3 +3106,138 @@ fn reused_compressor_borrowed_chain_frames_are_byte_identical() {
         assert_eq!(decoded, payload);
     }
 }
+
+/// A matcher that DOES implement in-place ingest, unlike the built-in driver's
+/// Simple backend. `Uncompressed` frames must still round-trip: the level, not
+/// the backend, decides whether the staged path is required.
+struct InPlaceMatcher {
+    buffer: Vec<u8>,
+    committed: usize,
+    window_size: u64,
+}
+
+impl InPlaceMatcher {
+    fn new(window_size: u64) -> Self {
+        Self {
+            buffer: Vec::new(),
+            committed: 0,
+            window_size,
+        }
+    }
+}
+
+impl Matcher for InPlaceMatcher {
+    fn get_next_space(&mut self) -> Vec<u8> {
+        vec![0; self.window_size as usize]
+    }
+
+    fn get_last_space(&mut self) -> &[u8] {
+        &self.buffer[..self.committed]
+    }
+
+    fn commit_space(&mut self, space: Vec<u8>) {
+        self.buffer = space;
+        self.committed = self.buffer.len();
+    }
+
+    fn fill_in_place(
+        &mut self,
+        capacity: usize,
+        fill: &mut dyn FnMut(&mut Vec<u8>) -> (usize, bool),
+    ) -> Option<(usize, bool)> {
+        self.buffer.reserve(capacity);
+        Some(fill(&mut self.buffer))
+    }
+
+    fn uncommitted_input(&self) -> &[u8] {
+        &self.buffer[self.committed..]
+    }
+
+    fn commit_filled(&mut self, len: usize) {
+        self.committed += len;
+    }
+
+    fn skip_matching(&mut self) {}
+
+    fn start_matching(&mut self, mut handle_sequence: impl for<'a> FnMut(Sequence<'a>)) {
+        handle_sequence(Sequence::Literals {
+            literals: &self.buffer[..self.committed],
+        });
+    }
+
+    fn reset(&mut self, _level: super::CompressionLevel) {
+        self.buffer.clear();
+        self.committed = 0;
+    }
+
+    fn window_size(&self) -> u64 {
+        self.window_size
+    }
+}
+
+#[test]
+fn uncompressed_level_keeps_the_payload_with_an_in_place_matcher() {
+    let data = generate_data(0x5eed, 4096);
+    let mut out = Vec::new();
+    let mut compressor: FrameCompressor<&[u8], &mut Vec<u8>, InPlaceMatcher> =
+        FrameCompressor::new_with_matcher(
+            InPlaceMatcher::new(1 << 20),
+            super::CompressionLevel::Uncompressed,
+        );
+    compressor.set_source(&data[..]);
+    compressor.set_drain(&mut out);
+    compressor.compress();
+
+    let mut decoder = FrameDecoder::new();
+    let mut decoded = Vec::with_capacity(data.len());
+    decoder.decode_all_to_vec(&out, &mut decoded).unwrap();
+    assert_eq!(
+        decoded, data,
+        "Uncompressed frames must carry their payload even when the matcher supports in-place ingest"
+    );
+}
+
+#[test]
+fn dictionary_frame_outgrowing_its_window_stays_decodable() {
+    // A dictionary inflates `max_window_size` so the primed bytes stay
+    // reachable. Once the frame outgrows the advertised window and those bytes
+    // are evicted, that inflation has to be retired, or the matcher keeps
+    // admitting matches older than the window the frame header declares and
+    // emits an offset no decoder can resolve.
+    let dict_raw = include_bytes!("../../../dict_tests/dictionary");
+    let dict_for_encoder = crate::decoding::Dictionary::decode_dict(dict_raw).unwrap();
+    let dict_for_decoder = crate::decoding::Dictionary::decode_dict(dict_raw).unwrap();
+
+    // Repeats on a 4 KiB period, four times the 1 KiB window below, so every
+    // match the matcher can find beyond the window is one the decoder cannot
+    // resolve. Far past the window overall, so eviction runs many times over.
+    let period = generate_data(0xd1c7, 4 * 1024);
+    let mut data = Vec::with_capacity(256 * 1024);
+    while data.len() < 256 * 1024 {
+        data.extend_from_slice(&period);
+    }
+
+    let mut out = Vec::new();
+    // Level 3 is Dfast, which reads blocks in place and has no borrowed
+    // dictionary scan, so this exercises the in-place commit path.
+    let params = crate::encoding::CompressionParameters::builder(super::CompressionLevel::Level(3))
+        .window_log(10)
+        .build()
+        .expect("parameters within bounds");
+    let mut compressor = FrameCompressor::new(super::CompressionLevel::Level(3));
+    compressor.set_parameters(&params);
+    compressor
+        .set_dictionary(dict_for_encoder)
+        .expect("valid dictionary should attach");
+    compressor.set_source(data.as_slice());
+    compressor.set_drain(&mut out);
+    compressor.compress();
+
+    let mut decoder = FrameDecoder::new();
+    decoder.add_dict(dict_for_decoder).unwrap();
+    let mut decoded = Vec::with_capacity(data.len());
+    decoder
+        .decode_all_to_vec(&out, &mut decoded)
+        .expect("frame must stay within the window it advertises");
+    assert_eq!(decoded, data);
+}

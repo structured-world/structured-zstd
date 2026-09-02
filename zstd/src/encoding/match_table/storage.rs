@@ -199,6 +199,10 @@ pub(crate) struct MatchTable {
     /// so the live region is never duplicated.
     pub(crate) chunk_lens: VecDeque<usize>,
     pub(crate) window_size: usize,
+    /// Bytes at the tail of `history` read but not yet claimed by a block
+    /// (in-place ingest). Zero on the staged path. Explicit rather than derived
+    /// from `window_size`, since a primed dictionary also lives in `history`.
+    pub(crate) uncommitted_len: usize,
     pub(crate) history: Vec<u8>,
     pub(crate) history_start: usize,
     pub(crate) history_abs_start: usize,
@@ -286,6 +290,7 @@ impl Clone for MatchTable {
             max_window_size: self.max_window_size,
             chunk_lens: self.chunk_lens.clone(),
             window_size: self.window_size,
+            uncommitted_len: self.uncommitted_len,
             history: self.history.clone(),
             history_start: self.history_start,
             history_abs_start: self.history_abs_start,
@@ -328,6 +333,9 @@ impl Clone for MatchTable {
         // Scalars / Copy fields.
         self.max_window_size = source.max_window_size;
         self.window_size = source.window_size;
+        // Describes the buffer just overwritten above, so it travels with it:
+        // every bound is `history.len() - uncommitted_len`.
+        self.uncommitted_len = source.uncommitted_len;
         self.history_start = source.history_start;
         self.history_abs_start = source.history_abs_start;
         self.position_base = source.position_base;
@@ -449,6 +457,7 @@ impl MatchTable {
             max_window_size,
             chunk_lens: VecDeque::new(),
             window_size: 0,
+            uncommitted_len: 0,
             history: Vec::new(),
             history_start: 0,
             history_abs_start: 0,
@@ -917,6 +926,110 @@ impl MatchTable {
         }
     }
 
+    /// Phase 1 of in-place ingest: `fill` writes the next block STRAIGHT into
+    /// the tail of `history`, instead of a scratch `Vec` that [`Self::add_data`]
+    /// then copies in. Room for `capacity` more bytes is reserved first.
+    ///
+    /// The bytes are readable through [`Self::uncommitted`] but are not part of
+    /// the window until [`Self::commit_block`] claims them — the block boundary
+    /// is chosen after the read, by the pre-split pass. Anything left over stays
+    /// put and becomes the head of the next block, so a carried split remainder
+    /// costs no copy.
+    pub(crate) fn fill_uncommitted(
+        &mut self,
+        capacity: usize,
+        fill: impl FnOnce(&mut Vec<u8>) -> (usize, bool),
+    ) -> (usize, bool) {
+        // Count the bytes already carried, not just this top-up: `capacity` is
+        // `block_capacity - carried` (and zero on the EOF re-inspection), yet
+        // the carried suffix still becomes window on the next commit. Guarding
+        // on the top-up alone lets that commit walk past the headroom the
+        // unchecked `abs_pos + N` lookahead relies on.
+        check_stream_abs_headroom(
+            self.history_abs_start,
+            self.window_size,
+            capacity + self.uncommitted_len,
+        );
+        // The eviction ceiling is applied in `commit_block`, keyed on the length
+        // a block actually claims. Sizing it here off `capacity` (a whole read
+        // buffer, not a block) would trip the ceiling on the very first fill and
+        // fault in the full window+window/4 mirror for frames that never evict.
+        self.history.reserve(capacity);
+        let before = self.history.len();
+        let (appended, eof) = fill(&mut self.history);
+        debug_assert_eq!(
+            self.history.len(),
+            before + appended,
+            "fill_uncommitted: fill reported {appended} bytes but grew history by {}",
+            self.history.len() - before,
+        );
+        self.uncommitted_len += appended;
+        (appended, eof)
+    }
+
+    /// Size `history` for a whole frame in one allocation instead of letting
+    /// the per-block `reserve` walk a doubling chain. Clamped to the eviction
+    /// ceiling, which is the largest the buffer ever grows anyway.
+    pub(crate) fn reserve_for_frame(&mut self, bytes: usize) {
+        let ceiling = self.max_window_size
+            + (self.max_window_size >> 2)
+            + crate::common::MAX_BLOCK_SIZE as usize;
+        // `bytes` already carries the caller's block-sized slack, sized off the
+        // active block capacity — adding the format maximum here would reserve
+        // ~128 KiB for a frame whose window (and therefore block) is 1 KiB.
+        let target = bytes.min(ceiling);
+        if target > self.history.len() && self.history.capacity() < target {
+            self.history.reserve_exact(target - self.history.len());
+        }
+    }
+
+    /// Bytes read but not yet claimed by a block.
+    pub(crate) fn uncommitted(&self) -> &[u8] {
+        &self.history[self.history.len() - self.uncommitted_len..]
+    }
+
+    /// Phase 2 of in-place ingest: claim `len` bytes from the head of
+    /// [`Self::uncommitted`] as the next block.
+    pub(crate) fn commit_block(&mut self, len: usize) {
+        if len == 0 {
+            return;
+        }
+        assert!(len <= self.max_window_size);
+        // Hard assert, like the window check above: this runs once per block,
+        // and an over-long claim would wrap `uncommitted_len` in release and
+        // surface as a panic far from the cause.
+        assert!(
+            len <= self.uncommitted().len(),
+            "commit_block: {len} exceeds the {} uncommitted bytes",
+            self.uncommitted().len(),
+        );
+        if self.window_size + len > self.max_window_size {
+            // Same one-time ceiling as `add_data`, applied at the same point in
+            // the sequence: once eviction starts, grow the mirror linearly to
+            // (window + window/4 + one block) instead of doubling.
+            let target = self.max_window_size
+                + (self.max_window_size >> 2)
+                + crate::common::MAX_BLOCK_SIZE as usize;
+            if target > self.history.len() && self.history.capacity() < target {
+                self.history.reserve_exact(target - self.history.len());
+            }
+        }
+        while self.window_size + len > self.max_window_size {
+            let removed_len = self.chunk_lens.pop_front().unwrap();
+            self.window_size -= removed_len;
+            self.history_start += removed_len;
+            self.history_abs_start += removed_len;
+        }
+        // Same position in the sequence as `add_data`: compact AFTER the
+        // eviction that raised `history_start`, so the drain trigger sees the
+        // same state and the buffer evolves identically.
+        self.compact_history();
+        self.next_to_update3 = self.next_to_update3.max(self.history_abs_start);
+        self.window_size += len;
+        self.chunk_lens.push_back(len);
+        self.uncommitted_len -= len;
+    }
+
     pub(crate) fn add_data(&mut self, data: Vec<u8>, mut reuse_space: impl FnMut(Vec<u8>)) {
         assert!(data.len() <= self.max_window_size);
         check_stream_abs_headroom(self.history_abs_start, self.window_size, data.len());
@@ -974,8 +1087,11 @@ impl MatchTable {
         // Drain the dead prefix at a quarter window (paired with the eviction
         // reserve in `add_data`) so the mirror stays near `window + window/4`
         // rather than doubling to ~2x window on long streams.
+        // Compare against the COMMITTED length: with in-place ingest
+        // `history.len()` also counts bytes no block has claimed yet, which
+        // would push this trigger later than on the staged path.
         if self.history_start >= (self.max_window_size >> 2)
-            || self.history_start * 2 >= self.history.len()
+            || self.history_start * 2 >= self.history.len() - self.uncommitted_len
         {
             self.history.drain(..self.history_start);
             self.history_start = 0;
@@ -1002,7 +1118,10 @@ impl MatchTable {
             // `end <= total` in bounds.
             return unsafe { core::slice::from_raw_parts(ptr, end) };
         }
-        &self.history[self.history_start..]
+        // Stop at the committed end, not at `history.len()`: in-place ingest
+        // may have already read the next block's bytes into the tail, and a
+        // scan must not see past the block it is compressing.
+        &self.history[self.history_start..self.history.len() - self.uncommitted_len]
     }
 
     /// Absolute position one past the end of the live history.
@@ -1023,7 +1142,8 @@ impl MatchTable {
             };
         }
         let last = *self.chunk_lens.back().unwrap();
-        &self.history[self.history.len() - last..]
+        &self.history[self.history.len() - self.uncommitted_len - last
+            ..self.history.len() - self.uncommitted_len]
     }
 
     /// Register the borrowed input window. Zeroes `history_abs_start` so
@@ -1196,6 +1316,11 @@ impl MatchTable {
     /// `_reuse_space` is retained only for caller signature compatibility
     /// and is intentionally unused.
     pub(crate) fn reset(&mut self, _reuse_space: impl FnMut(Vec<u8>)) {
+        // Bytes an abandoned frame ingested but never claimed are not part of
+        // the next frame. Drop them FIRST: every tail-relative bound below
+        // (and `history_abs_end`) subtracts this count from the buffer length,
+        // so leaving it set underflows once the history is cleared.
+        self.uncommitted_len = 0;
         // Snapshot the previous frame's one-past-the-end absolute
         // position before clearing the history that `history_abs_end`
         // reads. Every stale table entry points strictly below this.
@@ -1957,11 +2082,24 @@ impl MatchTable {
                 }
             }
         }
+        #[cfg(all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel-simd128"
+        ))]
+        unsafe {
+            self.bt_update_tree_until_simd128(abs_pos, current_abs_end)
+        }
         #[cfg(not(any(
             all(
                 target_arch = "aarch64",
                 target_endian = "little",
                 feature = "kernel-neon"
+            ),
+            all(
+                target_arch = "wasm32",
+                target_feature = "simd128",
+                feature = "kernel-simd128"
             ),
             target_arch = "x86",
             target_arch = "x86_64"
@@ -1969,6 +2107,44 @@ impl MatchTable {
         {
             self.bt_update_tree_until_scalar(abs_pos, current_abs_end)
         }
+    }
+
+    /// WebAssembly `simd128` umbrella variant: the per-iteration
+    /// `bt_insert_step_no_rebase_simd128` inlines into the body because both
+    /// share the `target_feature = "simd128"` umbrella, so the tree walk runs
+    /// the same tier as the insert step it drives.
+    ///
+    /// # Safety
+    /// wasm32 with `simd128` enabled at compile time.
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel-simd128"
+    ))]
+    #[target_feature(enable = "simd128")]
+    pub(crate) unsafe fn bt_update_tree_until_simd128(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+    ) {
+        if self.skip_insert_until_abs < self.history_abs_start {
+            self.skip_insert_until_abs = self.history_abs_start;
+        }
+        let mut update_abs = self.skip_insert_until_abs;
+        let is_btultra2 = self.is_btultra2;
+        while update_abs < abs_pos {
+            if !self.can_skip_rebase_check_at(update_abs, abs_pos, is_btultra2) {
+                self.maybe_rebase_positions(update_abs);
+            }
+            let forward = unsafe {
+                self.bt_insert_step_no_rebase_simd128(update_abs, current_abs_end, abs_pos)
+            };
+            // Upstream zstd `ZSTD_updateTree`: no clamp to the target, so a long
+            // match's covered positions stay out of the tree exactly as C leaves
+            // them.
+            update_abs += forward.max(1);
+        }
+        self.skip_insert_until_abs = abs_pos;
     }
 
     /// NEON-umbrella variant: per-iteration `bt_insert_step_no_rebase_neon`
@@ -2499,11 +2675,24 @@ impl MatchTable {
                 }
             }
         }
+        #[cfg(all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel-simd128"
+        ))]
+        unsafe {
+            self.hash3_candidate_simd128(abs_pos, current_abs_end, min_match_len)
+        }
         #[cfg(not(any(
             all(
                 target_arch = "aarch64",
                 target_endian = "little",
                 feature = "kernel-neon"
+            ),
+            all(
+                target_arch = "wasm32",
+                target_feature = "simd128",
+                feature = "kernel-simd128"
             ),
             target_arch = "x86",
             target_arch = "x86_64"
@@ -2511,6 +2700,31 @@ impl MatchTable {
         {
             self.hash3_candidate_scalar(abs_pos, current_abs_end, min_match_len)
         }
+    }
+
+    /// WebAssembly `simd128` umbrella HC3 probe.
+    ///
+    /// # Safety
+    /// wasm32 with `simd128` enabled at compile time. Body inlines via macro.
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel-simd128"
+    ))]
+    #[target_feature(enable = "simd128")]
+    pub(crate) unsafe fn hash3_candidate_simd128(
+        &self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        min_match_len: usize,
+    ) -> Option<MatchCandidate> {
+        super::super::hc::generator::hash3_candidate_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            min_match_len,
+            crate::encoding::fastpath::simd128::common_prefix_len_ptr,
+        )
     }
 
     /// NEON umbrella HC3 probe.

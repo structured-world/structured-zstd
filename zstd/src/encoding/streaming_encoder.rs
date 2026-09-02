@@ -857,7 +857,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                         &mut self.state,
                         self.compression_level,
                         last_block,
-                        block,
+                        crate::encoding::levels::BlockInput::Staged(block),
                         &mut encoded,
                         dict_active,
                         // No FrameEmitInfo on the streaming encoder path — it

@@ -300,3 +300,64 @@ fn emit_optimal_plan_skips_oversized_plan_item_and_emits_trailing_literals() {
         "trailing-literals path must emit the full window when plan skipped everything"
     );
 }
+
+#[test]
+fn reset_clears_uncommitted_bytes_left_by_an_abandoned_fill() {
+    let mut t = new_table(64);
+    // A frame that ingests bytes but never claims them (an interrupted
+    // encode) leaves them uncommitted. Reset must return the buffer to a
+    // clean state, or the tail-relative bounds underflow on the next frame.
+    t.fill_uncommitted(8, |buf| {
+        buf.extend_from_slice(b"abcdefgh");
+        (8, true)
+    });
+    assert_eq!(t.uncommitted().len(), 8, "fill must stage the bytes");
+    t.reset(|_| {});
+    assert!(
+        t.uncommitted().is_empty(),
+        "reset must drop bytes no block claimed"
+    );
+    assert!(t.live_history().is_empty(), "reset must clear the window");
+}
+
+#[test]
+fn reserve_for_frame_takes_the_request_as_given() {
+    // The caller sizes the slack off the ACTIVE block capacity, which a small
+    // window shrinks below the format maximum. Adding a fixed 128 KiB here
+    // would dwarf a small hinted frame's whole buffer.
+    let mut t = new_table(1 << 20);
+    t.reserve_for_frame(1024);
+    assert!(t.history.capacity() >= 1024, "the request must be honoured");
+    assert!(
+        t.history.capacity() < 64 * 1024,
+        "reservation must not add a format-maximum block on top: got {}",
+        t.history.capacity()
+    );
+}
+
+#[test]
+fn clone_from_replaces_the_uncommitted_count_with_the_sources() {
+    // `clone_from` is the primed-dictionary restore path: it overwrites the
+    // history buffer wholesale, so a count describing the OLD buffer must not
+    // survive. Every bound is `history.len() - uncommitted_len`, so a stale
+    // count silently truncates the window or underflows.
+    // Both sides carry bytes, and different amounts of them: a destination
+    // that merely cleared its own count would pass against an empty source
+    // without ever adopting the source's.
+    let mut source = new_table(64);
+    source.fill_uncommitted(4, |buf| {
+        buf.extend_from_slice(b"wxyz");
+        (4, true)
+    });
+    let mut dest = new_table(64);
+    dest.fill_uncommitted(8, |buf| {
+        buf.extend_from_slice(b"abcdefgh");
+        (8, true)
+    });
+    dest.clone_from(&source);
+    assert_eq!(
+        dest.uncommitted(),
+        b"wxyz",
+        "clone_from must adopt the source's uncommitted count"
+    );
+}

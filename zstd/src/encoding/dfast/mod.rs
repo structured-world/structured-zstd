@@ -68,6 +68,12 @@ pub(crate) struct DfastMatchGenerator {
     /// storage lives once, in `history`.
     pub(crate) window_blocks: VecDeque<usize>,
     pub(crate) window_size: usize,
+    /// Bytes at the tail of `history` that have been read but not yet claimed
+    /// by a block (in-place ingest, see `fill_uncommitted`). Zero on the staged
+    /// path. Tracked explicitly rather than derived from `window_size`, because
+    /// a primed dictionary also lives in `history` and the two do not sum to
+    /// `history.len()`.
+    pub(crate) uncommitted_len: usize,
     // We keep a contiguous searchable history to avoid rebuilding and reseeding
     // the matcher state from disjoint block buffers on every block.
     pub(crate) history: Vec<u8>,
@@ -208,6 +214,7 @@ impl DfastMatchGenerator {
             max_window_size,
             window_blocks: VecDeque::new(),
             window_size: 0,
+            uncommitted_len: 0,
             history: Vec::new(),
             history_start: 0,
             history_abs_start: 0,
@@ -394,6 +401,13 @@ impl DfastMatchGenerator {
         // `position_base` is left untouched so stale slots still decode to
         // their (now sub-floor) absolute positions; `ensure_room_for` /
         // `reduce` keep the `u32` packing bounded as the cursor climbs.
+        // Bytes an abandoned frame ingested but never claimed are not part of
+        // the next frame, and they must not count towards the floor advance.
+        // Dropped first because every tail-relative bound subtracts this count
+        // from the buffer length and would underflow once history is cleared.
+        self.history
+            .truncate(self.history.len() - self.uncommitted_len);
+        self.uncommitted_len = 0;
         let next_floor = self.history_abs_start + (self.history.len() - self.history_start);
         self.offset_hist = [1, 4, 8];
         // Re-borrow: an attach-mode reused dict frame keeps its bytes resident at
@@ -504,7 +518,8 @@ impl DfastMatchGenerator {
             };
         }
         let last_len = self.window_blocks.back().copied().unwrap_or(0);
-        &self.history[self.history.len() - last_len..]
+        &self.history[self.history.len() - self.uncommitted_len - last_len
+            ..self.history.len() - self.uncommitted_len]
     }
 
     pub(crate) fn add_data(&mut self, data: Vec<u8>, mut reuse_space: impl FnMut(Vec<u8>)) {
@@ -588,6 +603,118 @@ impl DfastMatchGenerator {
         // the pool grows on first add instead of waiting for window
         // overflow.
         reuse_space(data);
+    }
+
+    /// Phase 1 of in-place ingest: let `fill` write STRAIGHT into the tail of
+    /// `history`, with room reserved for `capacity` more bytes. Returns
+    /// `(appended, eof)` from `fill`.
+    ///
+    /// The bytes land in the buffer but are NOT yet part of the window: the
+    /// block boundary is only chosen afterwards, by the pre-split pass looking
+    /// at [`Self::uncommitted`]. Whatever the splitter leaves over simply stays
+    /// in `history` and becomes the head of the next block, so a carried
+    /// suffix costs no copy at all — the old shape had to stage the read in a
+    /// scratch `Vec`, copy it into `history`, and copy any split remainder back
+    /// out into a pending buffer.
+    ///
+    /// Call [`Self::commit_block`] once the length is known.
+    pub(crate) fn fill_uncommitted(
+        &mut self,
+        capacity: usize,
+        fill: impl FnOnce(&mut Vec<u8>) -> (usize, bool),
+    ) -> (usize, bool) {
+        // Count the bytes already carried, not just this top-up: `capacity` is
+        // `block_capacity - carried` (and zero on the EOF re-inspection), yet
+        // the carried suffix still becomes window on the next commit.
+        check_stream_abs_headroom(
+            self.history_abs_start,
+            self.window_size,
+            capacity + self.uncommitted_len,
+        );
+        // The eviction ceiling and the dict retire both run in `commit_block`,
+        // keyed on the length a block actually claims. Sizing the ceiling here
+        // off `capacity` (a whole read buffer, not a block) would trip it on the
+        // first fill and fault in the full window+window/4 mirror for frames
+        // that never evict.
+        self.history.reserve(capacity);
+
+        let before = self.history.len();
+        let (appended, eof) = fill(&mut self.history);
+        debug_assert_eq!(
+            self.history.len(),
+            before + appended,
+            "fill_uncommitted: fill reported {appended} bytes but grew history by {}",
+            self.history.len() - before,
+        );
+        self.uncommitted_len += appended;
+        (appended, eof)
+    }
+
+    /// Size `history` for a whole frame in one allocation instead of letting
+    /// the per-block `reserve` walk a doubling chain. Clamped to the eviction
+    /// ceiling, which is the largest the buffer ever grows anyway.
+    pub(crate) fn reserve_for_frame(&mut self, bytes: usize) {
+        let ceiling = self.max_window_size
+            + (self.max_window_size >> 2)
+            + crate::common::MAX_BLOCK_SIZE as usize;
+        // `bytes` already carries the caller's block-sized slack, sized off the
+        // active block capacity — adding the format maximum here would reserve
+        // ~128 KiB for a frame whose window (and therefore block) is 1 KiB.
+        let target = bytes.min(ceiling);
+        if target > self.history.len() && self.history.capacity() < target {
+            self.history.reserve_exact(target - self.history.len());
+        }
+    }
+
+    /// Bytes read but not yet claimed by a block: the pre-split pass picks the
+    /// block boundary inside this slice.
+    pub(crate) fn uncommitted(&self) -> &[u8] {
+        &self.history[self.history.len() - self.uncommitted_len..]
+    }
+
+    /// Phase 2 of in-place ingest: claim `len` bytes from the head of
+    /// [`Self::uncommitted`] as the next block, running the window bookkeeping
+    /// `add_data` would have done. Any remainder stays put for the next block.
+    pub(crate) fn commit_block(&mut self, len: usize) {
+        if len == 0 {
+            return;
+        }
+        assert!(len <= self.max_window_size);
+        // Hard assert, like the window check above: this runs once per block,
+        // and an over-long claim would wrap `uncommitted_len` in release and
+        // surface as a panic far from the cause.
+        assert!(
+            len <= self.uncommitted().len(),
+            "commit_block: {len} exceeds the {} uncommitted bytes",
+            self.uncommitted().len(),
+        );
+        if self.window_size + len > self.max_window_size {
+            // Eviction advances `history_start`, so the dict tables' concat
+            // indices (primed at `history_start == 0`) stop addressing the dict
+            // bytes — drop the attach, exactly as `add_data` does.
+            self.dict.invalidate();
+            // Same one-time ceiling as `add_data`: once eviction starts, grow
+            // linearly to window + window/4 + one block rather than doubling.
+            let target = self.max_window_size
+                + (self.max_window_size >> 2)
+                + crate::common::MAX_BLOCK_SIZE as usize;
+            if target > self.history.len() && self.history.capacity() < target {
+                self.history.reserve_exact(target - self.history.len());
+            }
+        }
+        while self.window_size + len > self.max_window_size {
+            let removed_len = self.window_blocks.pop_front().unwrap();
+            self.window_size -= removed_len;
+            self.history_start += removed_len;
+            self.history_abs_start += removed_len;
+        }
+        // Same position in the sequence as `add_data`: compact AFTER the
+        // eviction that raised `history_start`, so the drain trigger sees the
+        // same state and the buffer evolves identically.
+        self.compact_history();
+        self.window_size += len;
+        self.window_blocks.push_back(len);
+        self.uncommitted_len -= len;
     }
 
     /// Trim retained blocks until the window fits `max_window_size`.
@@ -1366,7 +1493,10 @@ impl DfastMatchGenerator {
             start_offset,
             self.history_abs_start,
             self.position_base,
-            self.history.len() - start_offset,
+            // Committed bytes only, as in `owned_scan_descriptor`: with in-place
+            // ingest the next block's bytes already sit past the end, and the
+            // hash-insert guard fed from here must not admit positions in them.
+            self.history.len() - self.uncommitted_len - start_offset,
         )
     }
 
@@ -1400,7 +1530,10 @@ impl DfastMatchGenerator {
             start_offset,
             self.history_abs_start,
             self.position_base,
-            self.history.len() - start_offset,
+            // Committed bytes only: in-place ingest can have the next block's
+            // bytes already sitting past the end, and a forward match count
+            // must not reach into them.
+            self.history.len() - self.uncommitted_len - start_offset,
         )
     }
 
@@ -1423,8 +1556,10 @@ impl DfastMatchGenerator {
             )
         } else {
             let last_len = self.window_blocks.back().copied().unwrap_or(0);
-            let off = self.history.len() - last_len;
-            // SAFETY: `off + last_len == history.len()`, in bounds.
+            // Measure back from the COMMITTED end: in-place ingest can leave
+            // unclaimed bytes past it.
+            let off = self.history.len() - self.uncommitted_len - last_len;
+            // SAFETY: `off + last_len` is the committed end, in bounds.
             (unsafe { self.history.as_ptr().add(off) }, last_len)
         }
     }
@@ -1550,8 +1685,12 @@ impl DfastMatchGenerator {
         // Drain the dead prefix at a quarter window (paired with the one-time
         // `reserve_exact` in `add_data`) so the buffer stays near
         // `window + window/4` instead of doubling to ~2x window on long streams.
+        // Compare against the COMMITTED length: with in-place ingest
+        // `history.len()` also counts bytes no block has claimed yet, which
+        // would push this trigger later than on the staged path and change
+        // when the buffer is drained.
         if self.history_start >= (self.max_window_size >> 2)
-            || self.history_start * 2 >= self.history.len()
+            || self.history_start * 2 >= self.history.len() - self.uncommitted_len
         {
             self.history.drain(..self.history_start);
             self.history_start = 0;
@@ -1559,7 +1698,11 @@ impl DfastMatchGenerator {
     }
 
     pub(crate) fn live_history(&self) -> &[u8] {
-        &self.history[self.history_start..]
+        // Stop at the committed end, not at `history.len()`: in-place ingest
+        // may have already read the next block's bytes into the tail, and a
+        // scan must not see past the block it is compressing (a forward match
+        // count would otherwise run into bytes the staged path did not have).
+        &self.history[self.history_start..self.history.len() - self.uncommitted_len]
     }
 
     pub(crate) fn history_abs_end(&self) -> usize {
@@ -2080,6 +2223,40 @@ macro_rules! start_matching_fast_loop_body {
                 };
             let short_hash_ptr = $self.short_mut_ptr();
             let long_hash_ptr = $self.long_mut_ptr();
+            // Block-relative cursor base, the shape upstream zstd scans with:
+            // it walks `ip` against a single `base`, while our positions carry
+            // three coordinate systems (block-relative `ip`, absolute, and the
+            // history-concat index). Reads keyed off `ip` alone let the whole
+            // concat axis stay out of the loop; the bias is a per-block
+            // constant because both ends are re-snapshotted by the outer loop.
+            //
+            // SAFETY: `$current_abs_start >= history_abs_start` (the block is
+            // part of live history), and `history_start_offset + bias` is the
+            // block's first byte, in bounds of the buffer.
+            let block_bias = $current_abs_start - history_abs_start;
+            let block_ptr = unsafe { history_base_ptr.add(history_start_offset + block_bias) };
+            // Readable bytes from the block's start. Equals `$current_len`
+            // whenever the block ends the live history, which is the only
+            // shape the fast loop runs in; asserted rather than assumed
+            // because a mismatch would silently change match lengths.
+            //
+            // The forward-scan budgets below subtract from this with plain
+            // arithmetic, not `saturating_sub`: entry needs `pos + 8 <=
+            // block_len` and the advance breaks out the moment `ip1 + 8`
+            // passes it, so `ip1 + 8 <= block_len` holds on every iteration
+            // and `ip0 < ip1`. A clamp there would only hide a broken guard.
+            let block_len = concat_len - block_bias;
+            // Slot payload for a block-relative cursor: packing a position is
+            // `(abs - position_base) + 1`, and `abs = $current_abs_start + ip`,
+            // so the whole `position_base` term collapses into a per-block
+            // constant and the per-position work is one add. `ensure_room_for`
+            // at entry guarantees the sum stays inside `u32` for the whole
+            // block, which is what makes the narrowing cast safe here.
+            let packed_bias = (($current_abs_start - position_base) as u32) + 1;
+            debug_assert_eq!(
+                block_len, $current_len,
+                "fast loop expects the scanned block to end live history",
+            );
 
             // Pre-compute long hash at ip0 ONCE per outer iter.
             // `concat_idx = ($current_abs_start + ip0) - history_abs_start`
@@ -2163,12 +2340,13 @@ macro_rules! start_matching_fast_loop_body {
                 } else {
                     history_abs_start
                 };
-                let lit_len_ip0 = ip0 - literals_start;
-                let lit_len_ip1 = ip1 - literals_start;
-                let packed_curr = ((abs_ip0 - position_base) as u32) + 1;
+                // Literal lengths are derived at the emit sites rather than
+                // carried: both inputs are live there anyway, and the loop is
+                // register-saturated, so two values held across every scanned
+                // position for the benefit of the rare match path cost more
+                // than the subtraction does.
+                let packed_curr = (ip0 as u32) + packed_bias;
 
-                let concat_idx0 = abs_ip0 - history_abs_start;
-                let concat_idx1 = abs_ip1 - history_abs_start;
 
                 // Load 8 bytes at ip0 for both short (low 4) and long
                 // probe equality checks. We already used `v8_at_ip0` to
@@ -2177,7 +2355,7 @@ macro_rules! start_matching_fast_loop_body {
                 // `read_unaligned` is from the same offset the
                 // probe-eq below will use.
                 let v8_0 = unsafe {
-                    (history_base_ptr.add(history_start_offset + concat_idx0) as *const u64)
+                    (block_ptr.add(ip0) as *const u64)
                         .read_unaligned()
                 };
                 // `v4_0` (low 4 bytes) is the cheap 4-byte equality-gate key
@@ -2208,15 +2386,28 @@ macro_rules! start_matching_fast_loop_body {
                 // peek at ip+1, 4-byte gate. Upstream zstd's hot path checks ONLY
                 // `offset_1` here (full 3-rep walk lives in lazy/btopt).
                 // Since the peek is at `ip+1` with `pos >= literals_start`,
-                // `lit_len_ip1 >= 1`, so `offset_hist[0]` is the upstream zstd's
+                // the literal length at `ip1` is >= 1, so `offset_hist[0]` is the upstream zstd's
                 // `offset_1`. The `repcode_candidate_shared` helper we used
                 // before walked all three offsets + did a full SIMD
                 // `common_prefix_len` per probe, paying ~3× the work for
                 // rep2/rep3 hits that the dfast fast path never benefits
                 // from (those wins live in the lazy/btopt strategies).
                 let rep1 = $self.offset_hist[0] as usize;
-                if rep1 != 0 && rep1 <= abs_ip1 {
-                    let cand_pos_r = abs_ip1 - rep1;
+                // Gate in concat coordinates. `abs_ip1 - rep1 >= history_abs_start`
+                // and `rep1 <= abs_ip1` say exactly one thing about the index:
+                // the back-reference lands at or after the start of live
+                // history, i.e. `rep1 <= idx1`. For a borrowed window the floor
+                // is instead `abs_ip1 - advertised_window`, which is the same
+                // statement as `rep1 <= advertised_window` (and when the window
+                // exceeds the position the original floor clamps to zero, which
+                // that comparison also admits). Both const branches fold.
+                let idx1 = ip1 + block_bias;
+                let rep_in_window = if $borrowed {
+                    rep1 <= idx1 && rep1 <= advertised_window
+                } else {
+                    rep1 <= idx1
+                };
+                if rep1 != 0 && rep_in_window {
                     // Window-low bound ONLY (upstream zstd `zstd_double_fast.c:190`
                     // gates the rep on nothing but `offset_1 > 0` and the 4-byte
                     // equality at `ip+1-offset_1`, i.e. the candidate is in the
@@ -2225,25 +2416,25 @@ macro_rules! start_matching_fast_loop_body {
                     // `literals_start ≈ ip`, so any back-reference (cand before
                     // the literal cursor) failed it — collapsing the rep path and
                     // forcing the long-hash to mint creeping offsets.
-                    if cand_pos_r >= wlow1 {
-                        let cand_idx_r = cand_pos_r - history_abs_start;
+                    {
+                        let cand_idx_r = idx1 - rep1;
                         // 4-byte gate; full forward count only if it passes.
                         let cand4 = unsafe {
                             (history_base_ptr.add(history_start_offset + cand_idx_r) as *const u32)
                                 .read_unaligned()
                         };
                         let cur4 = unsafe {
-                            (history_base_ptr.add(history_start_offset + concat_idx1) as *const u32)
+                            (block_ptr.add(ip1) as *const u32)
                                 .read_unaligned()
                         };
                         if cand4 == cur4 {
                             let mut match_len = 4usize;
-                            let max_fwd = concat_len.saturating_sub(concat_idx1 + 4);
+                            let max_fwd = block_len - (ip1 + 4);
                             unsafe {
                                 let lhs =
                                     history_base_ptr.add(history_start_offset + cand_idx_r + 4);
                                 let rhs =
-                                    history_base_ptr.add(history_start_offset + concat_idx1 + 4);
+                                    block_ptr.add(ip1 + 4);
                                 let ext = $cpl(
                                     lhs, rhs, max_fwd,
                                 );
@@ -2275,10 +2466,10 @@ macro_rules! start_matching_fast_loop_body {
                                 let rep_cand = extend_backwards_shared(
                                     concat,
                                     history_abs_start,
-                                    cand_pos_r,
+                                    history_abs_start + cand_idx_r,
                                     abs_ip1,
                                     match_len,
-                                    lit_len_ip1,
+                                    ip1 - literals_start,
                                 );
                                 break 'inner InnerExit::Committed(rep_cand, 0, abs_ip0);
                             }
@@ -2288,7 +2479,7 @@ macro_rules! start_matching_fast_loop_body {
 
                 // Precompute hl1 (upstream zstd `_search_next_long` carry, line 197).
                 let v8_1 = unsafe {
-                    (history_base_ptr.add(history_start_offset + concat_idx1) as *const u64)
+                    (block_ptr.add(ip1) as *const u64)
                         .read_unaligned()
                 };
                 let hl1_idx = (v8_1.wrapping_mul(PRIME) >> long_shift) as usize;
@@ -2325,6 +2516,13 @@ macro_rules! start_matching_fast_loop_body {
                 // hottest instruction (~13% self-time on z000033) behind the
                 // mask — a stall the predictor cannot hide.
                 if idxl0 != DFAST_EMPTY_SLOT {
+                    // Gate on the absolute position rather than unpacking the
+                    // slot straight into a concat index: the index form was
+                    // measured on the bench host and lost either way it was
+                    // written (`checked_sub` +3.7% cycles, two plain compares
+                    // +0.6%), because the emit paths need the absolute position
+                    // anyway, so it buys no register back and only adds the
+                    // rebase constant.
                     let cand_pos = position_base + ((idxl0 as usize) - 1);
                     if cand_pos >= wlow0 && cand_pos < abs_ip0 {
                         let cand_idx = cand_pos - history_abs_start;
@@ -2339,14 +2537,14 @@ macro_rules! start_matching_fast_loop_body {
                             {
                             // 8 bytes match; count forward + extend back.
                             let mut match_len = 8usize;
-                            let max_fwd = concat_len.saturating_sub(concat_idx0 + 8);
+                            let max_fwd = block_len - (ip0 + 8);
                             // SAFETY: both ptrs at the same buffer; offsets
                             // verified above. `max_fwd` caps the scan to
                             // the live region.
                             unsafe {
                                 let lhs = history_base_ptr.add(history_start_offset + cand_idx + 8);
                                 let rhs =
-                                    history_base_ptr.add(history_start_offset + concat_idx0 + 8);
+                                    block_ptr.add(ip0 +8);
                                 let ext = $cpl(
                                     lhs, rhs, max_fwd,
                                 );
@@ -2367,10 +2565,10 @@ macro_rules! start_matching_fast_loop_body {
                             let cand = extend_backwards_shared(
                                 concat,
                                 history_abs_start,
-                                cand_pos,
+                                history_abs_start + cand_idx,
                                 abs_ip0,
                                 match_len,
-                                lit_len_ip0,
+                                ip0 - literals_start,
                             );
                             // Upstream zstd `_match_found` (zstd_double_fast.c:287):
                             // `if (step < 4) hashLong[hl1] = ip1`. Insert the
@@ -2378,7 +2576,7 @@ macro_rules! start_matching_fast_loop_body {
                             // match — safe only while `step < 4` (then `ip1` is
                             // below the post-match cursor `ip + mLength`).
                             if step < 4 {
-                                let packed_ip1 = ((abs_ip1 - position_base) as u32) + 1;
+                                let packed_ip1 = (ip1 as u32) + packed_bias;
                                 unsafe {
                                     *long_hash_ptr.add(hl1_idx) = packed_ip1;
                                 }
@@ -2425,13 +2623,12 @@ macro_rules! start_matching_fast_loop_body {
                             };
                             if dcand_v8 == v8_0 {
                                 let mut match_len = 8usize;
-                                let max_fwd = concat_len.saturating_sub(concat_idx0 + 8);
+                                let max_fwd = block_len - (ip0 + 8);
                                 // SAFETY: both ptrs in the same buffer; `max_fwd`
                                 // caps the scan to the live region.
                                 unsafe {
                                     let lhs = history_base_ptr.add(history_start_offset + dp + 8);
-                                    let rhs = history_base_ptr
-                                        .add(history_start_offset + concat_idx0 + 8);
+                                    let rhs = block_ptr.add(ip0 + 8);
                                     let ext =
                                         $cpl(
                                             lhs, rhs, max_fwd,
@@ -2457,7 +2654,7 @@ macro_rules! start_matching_fast_loop_body {
                                     cand_pos,
                                     abs_ip0,
                                     match_len,
-                                    lit_len_ip0,
+                                    ip0 - literals_start,
                                 );
                                 break 'inner InnerExit::Committed(cand, 3, abs_ip0);
                             }
@@ -2476,6 +2673,7 @@ macro_rules! start_matching_fast_loop_body {
                 // 4-byte candidate load past them. A branchless mask would tie
                 // the load address to the mask, serialising it.
                 if idxs0 != DFAST_EMPTY_SLOT {
+                    // Absolute-position gate, as in the long probe above.
                     let cand_pos_s = position_base + ((idxs0 as usize) - 1);
                     if cand_pos_s >= wlow0 && cand_pos_s < abs_ip0 {
                         let cand_idx_s = cand_pos_s - history_abs_start;
@@ -2487,12 +2685,12 @@ macro_rules! start_matching_fast_loop_body {
                             {
                             // Short hit: count forward from byte 4 onwards.
                             let mut s_match_len = 4usize;
-                            let max_fwd = concat_len.saturating_sub(concat_idx0 + 4);
+                            let max_fwd = block_len - (ip0 + 4);
                             unsafe {
                                 let lhs =
                                     history_base_ptr.add(history_start_offset + cand_idx_s + 4);
                                 let rhs =
-                                    history_base_ptr.add(history_start_offset + concat_idx0 + 4);
+                                    block_ptr.add(ip0 +4);
                                 let ext = $cpl(
                                     lhs, rhs, max_fwd,
                                 );
@@ -2513,10 +2711,10 @@ macro_rules! start_matching_fast_loop_body {
                             let short_cand = extend_backwards_shared(
                                 concat,
                                 history_abs_start,
-                                cand_pos_s,
+                                history_abs_start + cand_idx_s,
                                 abs_ip0,
                                 s_match_len,
-                                lit_len_ip0,
+                                ip0 - literals_start,
                             );
 
                             // Enforce the hash-search floor BEFORE
@@ -2551,12 +2749,11 @@ macro_rules! start_matching_fast_loop_body {
                                     if cand_v8_l1 == v8_1 {
                                         live_l1_hit = true;
                                         let mut l1_match_len = 8usize;
-                                        let max_fwd_l1 = concat_len.saturating_sub(concat_idx1 + 8);
+                                        let max_fwd_l1 = block_len - (ip1 + 8);
                                         unsafe {
                                             let lhs = history_base_ptr
                                                 .add(history_start_offset + cand_idx_l1 + 8);
-                                            let rhs = history_base_ptr
-                                                .add(history_start_offset + concat_idx1 + 8);
+                                            let rhs = block_ptr.add(ip1 + 8);
                                             let ext = $cpl(
                                                 lhs, rhs, max_fwd_l1,
                                             );
@@ -2581,7 +2778,7 @@ macro_rules! start_matching_fast_loop_body {
                                                 cand_pos_l1,
                                                 abs_ip1,
                                                 l1_match_len,
-                                                lit_len_ip1,
+                                                ip1 - literals_start,
                                             );
                                             // Long-hash hits start at 8
                                             // bytes (`MEM_read64` gate
@@ -2632,15 +2829,13 @@ macro_rules! start_matching_fast_loop_body {
                                         };
                                         if dcand_v8_l1 == v8_1 {
                                             let mut dl1_match_len = 8usize;
-                                            let max_fwd =
-                                                concat_len.saturating_sub(concat_idx1 + 8);
+                                            let max_fwd = block_len - (ip1 + 8);
                                             // SAFETY: same buffer; `max_fwd` caps
                                             // the scan to the live region.
                                             unsafe {
                                                 let lhs = history_base_ptr
                                                     .add(history_start_offset + dp1 + 8);
-                                                let rhs = history_base_ptr
-                                                    .add(history_start_offset + concat_idx1 + 8);
+                                                let rhs = block_ptr.add(ip1 + 8);
                                                 let ext = $cpl(
                                                     lhs, rhs, max_fwd,
                                                 );
@@ -2666,7 +2861,7 @@ macro_rules! start_matching_fast_loop_body {
                                                     cand_pos,
                                                     abs_ip1,
                                                     dl1_match_len,
-                                                    lit_len_ip1,
+                                                    ip1 - literals_start,
                                                 );
                                                 retry_upgraded = true;
                                             }
@@ -2678,7 +2873,7 @@ macro_rules! start_matching_fast_loop_body {
                                 // Upstream zstd `_match_found` (zstd_double_fast.c:287):
                                 // `if (step < 4) hashLong[hl1] = ip1`.
                                 if step < 4 {
-                                    let packed_ip1 = ((abs_ip1 - position_base) as u32) + 1;
+                                    let packed_ip1 = (ip1 as u32) + packed_bias;
                                     unsafe {
                                         *long_hash_ptr.add(hl1_idx) = packed_ip1;
                                     }
@@ -2732,11 +2927,10 @@ macro_rules! start_matching_fast_loop_body {
                             };
                             if dcand4 == v4_0 as u32 {
                                 let mut s_match_len = 4usize;
-                                let max_fwd = concat_len.saturating_sub(concat_idx0 + 4);
+                                let max_fwd = block_len - (ip0 + 4);
                                 unsafe {
                                     let lhs = history_base_ptr.add(history_start_offset + dp + 4);
-                                    let rhs = history_base_ptr
-                                        .add(history_start_offset + concat_idx0 + 4);
+                                    let rhs = block_ptr.add(ip0 + 4);
                                     let ext =
                                         $cpl(
                                             lhs, rhs, max_fwd,
@@ -2762,7 +2956,7 @@ macro_rules! start_matching_fast_loop_body {
                                     cand_pos,
                                     abs_ip0,
                                     s_match_len,
-                                    lit_len_ip0,
+                                    ip0 - literals_start,
                                 );
                                 if dcand.match_len >= DFAST_MIN_MATCH_LEN {
                                     break 'inner InnerExit::Committed(dcand, 4, abs_ip0);
