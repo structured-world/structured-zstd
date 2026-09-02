@@ -79,7 +79,7 @@ Follow-up implementation issue: [#108](https://github.com/structured-world/struc
 Run the full Criterion matrix:
 
 ```bash
-cargo bench --bench compare_ffi -p structured-zstd --features dict-builder -- --output-format bencher
+cargo bench --bench compare_ffi -p ffi-bench -- --output-format bencher
 ```
 
 Generate the CI-style JSON and markdown report locally:

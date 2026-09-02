@@ -10,7 +10,7 @@ fn main() {
         .nth(1)
         .unwrap_or_else(|| "zstd/decodecorpus_files/z000033".to_string());
     let data = fs::read(&corpus).expect("read corpus");
-    for level in [1i32, 2, 3, 4, 5, 6, 9, 12, 13, 16, 19, 22] {
+    for level in 1i32..=22 {
         let mut out = Vec::new();
         let mut fc: FrameCompressor<&[u8], &mut Vec<u8>> =
             FrameCompressor::new(CompressionLevel::Level(level));

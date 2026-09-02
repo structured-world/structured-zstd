@@ -123,8 +123,14 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
             bytes,
             dict_active,
         );
+    // Hashed once, from the pre-commit view, and reused by whichever branch
+    // wins — the compressed branch covers the same bytes as the RLE and raw
+    // ones. Skipped entirely when nothing collects checksums, which is the
+    // common case: this is a whole-block pass.
     #[cfg(all(feature = "lsm", feature = "hash"))]
-    let precomputed_checksum = crate::encoding::frame_compressor::xxh64_block_low32(bytes);
+    let precomputed_checksum = block_checksums
+        .as_ref()
+        .map(|_| crate::encoding::frame_compressor::xxh64_block_low32(bytes));
 
     // First check to see if run length encoding can be used for the entire block
     if let Some(rle_byte) = rle_byte_opt {
@@ -134,7 +140,7 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         }
         #[cfg(all(feature = "lsm", feature = "hash"))]
         if let Some(sink) = block_checksums {
-            sink.push(precomputed_checksum);
+            sink.push(precomputed_checksum.expect("checksum is hashed whenever a sink exists"));
         }
         uncompressed_data.commit(&mut state.matcher);
         state.matcher.skip_matching_with_hint(Some(false));
@@ -154,7 +160,7 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         }
         #[cfg(all(feature = "lsm", feature = "hash"))]
         if let Some(sink) = block_checksums {
-            sink.push(precomputed_checksum);
+            sink.push(precomputed_checksum.expect("checksum is hashed whenever a sink exists"));
         }
         uncompressed_data.commit(&mut state.matcher);
         state.matcher.skip_matching_with_hint(Some(true));
@@ -168,7 +174,6 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         BlockType::Raw
     } else {
         // Compress as a standard compressed block
-        let uncompressed_len = uncompressed_data.len();
         uncompressed_data.commit(&mut state.matcher);
         if matches!(compression_level, CompressionLevel::Level(16..=22))
             && state.matcher.window_size() >= (1 << 17)
@@ -198,16 +203,11 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         }
         #[cfg(all(feature = "lsm", feature = "hash"))]
         if let Some(sink) = block_checksums {
-            // Pull the just-committed input back from the matcher so we can
-            // hash the same bytes the decoder will see for this single block.
-            let space = state.matcher.get_last_space();
-            let start = space.len() - uncompressed_len;
-            sink.push(crate::encoding::frame_compressor::xxh64_block_low32(
-                &space[start..],
-            ));
+            // The pre-commit view covers exactly the bytes the decoder will see
+            // for this block, so the hash taken above stands — no second pass
+            // over the committed copy.
+            sink.push(precomputed_checksum.expect("checksum is hashed whenever a sink exists"));
         }
-        #[cfg(not(all(feature = "lsm", feature = "hash")))]
-        let _ = uncompressed_len;
 
         // Keep rollback snapshots for the oversize fallback path below:
         // `compress_block` can mutate entropy/history state before we know
