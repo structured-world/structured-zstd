@@ -2241,6 +2241,13 @@ macro_rules! start_matching_fast_loop_body {
             // passes it, so `ip1 + 8 <= block_len` holds on every iteration
             // and `ip0 < ip1`. A clamp there would only hide a broken guard.
             let block_len = concat_len - block_bias;
+            // Slot payload for a block-relative cursor: packing a position is
+            // `(abs - position_base) + 1`, and `abs = $current_abs_start + ip`,
+            // so the whole `position_base` term collapses into a per-block
+            // constant and the per-position work is one add. `ensure_room_for`
+            // at entry guarantees the sum stays inside `u32` for the whole
+            // block, which is what makes the narrowing cast safe here.
+            let packed_bias = (($current_abs_start - position_base) as u32) + 1;
             debug_assert_eq!(
                 block_len, $current_len,
                 "fast loop expects the scanned block to end live history",
@@ -2333,7 +2340,7 @@ macro_rules! start_matching_fast_loop_body {
                 // register-saturated, so two values held across every scanned
                 // position for the benefit of the rare match path cost more
                 // than the subtraction does.
-                let packed_curr = ((abs_ip0 - position_base) as u32) + 1;
+                let packed_curr = (ip0 as u32) + packed_bias;
 
 
                 // Load 8 bytes at ip0 for both short (low 4) and long
@@ -2381,8 +2388,21 @@ macro_rules! start_matching_fast_loop_body {
                 // rep2/rep3 hits that the dfast fast path never benefits
                 // from (those wins live in the lazy/btopt strategies).
                 let rep1 = $self.offset_hist[0] as usize;
-                if rep1 != 0 && rep1 <= abs_ip1 {
-                    let cand_pos_r = abs_ip1 - rep1;
+                // Gate in concat coordinates. `abs_ip1 - rep1 >= history_abs_start`
+                // and `rep1 <= abs_ip1` say exactly one thing about the index:
+                // the back-reference lands at or after the start of live
+                // history, i.e. `rep1 <= idx1`. For a borrowed window the floor
+                // is instead `abs_ip1 - advertised_window`, which is the same
+                // statement as `rep1 <= advertised_window` (and when the window
+                // exceeds the position the original floor clamps to zero, which
+                // that comparison also admits). Both const branches fold.
+                let idx1 = ip1 + block_bias;
+                let rep_in_window = if $borrowed {
+                    rep1 <= idx1 && rep1 <= advertised_window
+                } else {
+                    rep1 <= idx1
+                };
+                if rep1 != 0 && rep_in_window {
                     // Window-low bound ONLY (upstream zstd `zstd_double_fast.c:190`
                     // gates the rep on nothing but `offset_1 > 0` and the 4-byte
                     // equality at `ip+1-offset_1`, i.e. the candidate is in the
@@ -2391,8 +2411,8 @@ macro_rules! start_matching_fast_loop_body {
                     // `literals_start ≈ ip`, so any back-reference (cand before
                     // the literal cursor) failed it — collapsing the rep path and
                     // forcing the long-hash to mint creeping offsets.
-                    if cand_pos_r >= wlow1 {
-                        let cand_idx_r = cand_pos_r - history_abs_start;
+                    {
+                        let cand_idx_r = idx1 - rep1;
                         // 4-byte gate; full forward count only if it passes.
                         let cand4 = unsafe {
                             (history_base_ptr.add(history_start_offset + cand_idx_r) as *const u32)
@@ -2441,7 +2461,7 @@ macro_rules! start_matching_fast_loop_body {
                                 let rep_cand = extend_backwards_shared(
                                     concat,
                                     history_abs_start,
-                                    cand_pos_r,
+                                    history_abs_start + cand_idx_r,
                                     abs_ip1,
                                     match_len,
                                     ip1 - literals_start,
@@ -2544,7 +2564,7 @@ macro_rules! start_matching_fast_loop_body {
                             // match — safe only while `step < 4` (then `ip1` is
                             // below the post-match cursor `ip + mLength`).
                             if step < 4 {
-                                let packed_ip1 = ((abs_ip1 - position_base) as u32) + 1;
+                                let packed_ip1 = (ip1 as u32) + packed_bias;
                                 unsafe {
                                     *long_hash_ptr.add(hl1_idx) = packed_ip1;
                                 }
@@ -2840,7 +2860,7 @@ macro_rules! start_matching_fast_loop_body {
                                 // Upstream zstd `_match_found` (zstd_double_fast.c:287):
                                 // `if (step < 4) hashLong[hl1] = ip1`.
                                 if step < 4 {
-                                    let packed_ip1 = ((abs_ip1 - position_base) as u32) + 1;
+                                    let packed_ip1 = (ip1 as u32) + packed_bias;
                                     unsafe {
                                         *long_hash_ptr.add(hl1_idx) = packed_ip1;
                                     }
