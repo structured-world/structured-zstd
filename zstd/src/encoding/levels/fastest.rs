@@ -125,11 +125,19 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         );
     // Hashed once, from the pre-commit view, and reused by whichever branch
     // wins — the compressed branch covers the same bytes as the RLE and raw
-    // ones. Skipped entirely when nothing collects checksums, which is the
-    // common case: this is a whole-block pass.
+    // ones. This is a whole-block pass, so it is skipped whenever nothing will
+    // consume it: when no sink collects checksums (the common case), and when
+    // the block is headed for the post-split helper, which emits several
+    // physical blocks and records a checksum per partition of its own.
+    #[cfg(all(feature = "lsm", feature = "hash"))]
+    let post_split_path = rle_byte_opt.is_none()
+        && !raw_fast_path
+        && matches!(compression_level, CompressionLevel::Level(16..=22))
+        && state.matcher.window_size() >= (1 << 17);
     #[cfg(all(feature = "lsm", feature = "hash"))]
     let precomputed_checksum = block_checksums
         .as_ref()
+        .filter(|_| !post_split_path)
         .map(|_| crate::encoding::frame_compressor::xxh64_block_low32(bytes));
 
     // First check to see if run length encoding can be used for the entire block

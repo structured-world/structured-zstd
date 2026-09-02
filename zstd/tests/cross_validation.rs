@@ -499,3 +499,156 @@ fn cross_ffi_compress_rust_decompress_rle_mode_tables() {
         }
     }
 }
+
+/// Every level, both directions, on inputs that exercise different matcher
+/// paths. The per-level tests above cover a handful of levels each and the
+/// `ffi→rust` direction is otherwise almost entirely `Fastest`, so a change to
+/// one strategy's matcher could ship without any level-matched interop check.
+/// Byte-identity against an earlier build proves we did not change; this proves
+/// the two implementations still agree.
+#[test]
+fn cross_every_level_roundtrips_through_the_c_codec_both_ways() {
+    // Random resists matching, the repeating pattern feeds the match finders,
+    // and the small alphabet drives the entropy stage.
+    let random = generate_data(0xA11CE, 200 * 1024);
+    let repetitive: Vec<u8> = generate_data(0xB0B, 4096)
+        .iter()
+        .cycle()
+        .take(200 * 1024)
+        .copied()
+        .collect();
+    let low_entropy = generate_huffman_friendly(0xC0FFEE, 200 * 1024, 12);
+    let fixtures: [(&str, &[u8]); 3] = [
+        ("random", &random),
+        ("repetitive", &repetitive),
+        ("low-entropy", &low_entropy),
+    ];
+
+    for (name, data) in fixtures {
+        for level in 1i32..=22 {
+            let ours = compress_to_vec(data, CompressionLevel::from_level(level));
+            let theirs_decoded = zstd::decode_all(ours.as_slice())
+                .unwrap_or_else(|e| panic!("C decoder rejected our level {level} {name}: {e}"));
+            assert_eq!(
+                data, theirs_decoded,
+                "rust→ffi mismatch at level {level} on {name}"
+            );
+
+            let theirs = zstd::encode_all(data, level).unwrap();
+            let mut decoder = StreamingDecoder::new(theirs.as_slice()).unwrap();
+            let mut ours_decoded = Vec::with_capacity(data.len());
+            decoder
+                .read_to_end(&mut ours_decoded)
+                .unwrap_or_else(|e| panic!("our decoder rejected C level {level} {name}: {e}"));
+            assert_eq!(
+                data, ours_decoded,
+                "ffi→rust mismatch at level {level} on {name}"
+            );
+        }
+    }
+}
+
+/// The same ladder crossed with the two features that change what the matcher
+/// is allowed to reference: long-distance matching (which admits matches far
+/// outside the ordinary window) and a dictionary (which seeds the window with
+/// bytes the frame never contains). Both alter the offsets we emit, so both
+/// need the level-matched interop check the plain ladder gives.
+#[test]
+fn cross_every_level_with_ldm_and_dictionary_roundtrips_both_ways() {
+    // Long-range repeats: the pattern recurs at a distance only LDM reaches,
+    // and the dictionary bytes are drawn from the same alphabet so dictionary
+    // matches actually fire.
+    let period = generate_huffman_friendly(0x5EED, 64 * 1024, 24);
+    let data: Vec<u8> = period.iter().cycle().take(1024 * 1024).copied().collect();
+    let dict_raw = include_bytes!("../dict_tests/dictionary");
+
+    // Guards against the LDM arm silently degenerating into the plain one: if
+    // the flag ever stopped reaching the encoder, every pair below would match
+    // and this matrix would be testing the same thing twice.
+    let mut sizes: Vec<usize> = Vec::new();
+    let mut plain_idx = 0usize;
+    let mut ldm_changed_something = false;
+
+    for ldm in [false, true] {
+        for level in 1i32..=22 {
+            for with_dict in [false, true] {
+                let label = format!("level {level}, ldm={ldm}, dict={with_dict}");
+
+                // Ours → C.
+                let mut compressor: FrameCompressor<&[u8], &mut Vec<u8>> =
+                    FrameCompressor::new(CompressionLevel::from_level(level));
+                if ldm {
+                    let params = structured_zstd::encoding::CompressionParameters::builder(
+                        CompressionLevel::from_level(level),
+                    )
+                    .enable_long_distance_matching(true)
+                    .build()
+                    .expect("parameters within bounds");
+                    compressor.set_parameters(&params);
+                }
+                if with_dict {
+                    compressor
+                        .set_dictionary_from_bytes(dict_raw)
+                        .expect("dictionary bytes should parse");
+                }
+                let mut ours = Vec::new();
+                compressor.set_source(data.as_slice());
+                compressor.set_drain(&mut ours);
+                compressor.compress();
+
+                let theirs_decoded = if with_dict {
+                    let mut d = zstd::bulk::Decompressor::with_dictionary(dict_raw).unwrap();
+                    d.decompress(ours.as_slice(), data.len())
+                        .unwrap_or_else(|e| panic!("C decoder rejected our output at {label}: {e}"))
+                } else {
+                    zstd::decode_all(ours.as_slice())
+                        .unwrap_or_else(|e| panic!("C decoder rejected our output at {label}: {e}"))
+                };
+                assert_eq!(data, theirs_decoded, "rust→ffi mismatch at {label}");
+                if ldm {
+                    // Same traversal order as the plain pass, so the counter
+                    // lines the two up entry for entry.
+                    ldm_changed_something |= ours.len() != sizes[plain_idx];
+                    plain_idx += 1;
+                } else {
+                    sizes.push(ours.len());
+                }
+
+                // C → ours.
+                let mut c_enc = if with_dict {
+                    zstd::bulk::Compressor::with_dictionary(level, dict_raw).unwrap()
+                } else {
+                    zstd::bulk::Compressor::new(level).unwrap()
+                };
+                if ldm {
+                    c_enc
+                        .set_parameter(zstd::zstd_safe::CParameter::EnableLongDistanceMatching(
+                            true,
+                        ))
+                        .unwrap();
+                }
+                let theirs = c_enc.compress(data.as_slice()).unwrap();
+
+                let mut decoder = structured_zstd::decoding::FrameDecoder::new();
+                if with_dict {
+                    decoder
+                        .add_dict(
+                            structured_zstd::decoding::Dictionary::decode_dict(dict_raw).unwrap(),
+                        )
+                        .unwrap();
+                }
+                let mut ours_decoded = Vec::with_capacity(data.len());
+                decoder
+                    .decode_all_to_vec(theirs.as_slice(), &mut ours_decoded)
+                    .unwrap_or_else(|e| panic!("our decoder rejected C output at {label}: {e:?}"));
+                assert_eq!(data, ours_decoded, "ffi→rust mismatch at {label}");
+            }
+        }
+    }
+
+    assert!(
+        ldm_changed_something,
+        "long-distance matching never changed the output, so the LDM half of \
+         this matrix was not exercising anything"
+    );
+}

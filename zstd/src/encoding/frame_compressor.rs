@@ -1623,8 +1623,19 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     /// The active block-size cap: the configured target, or the format's
     /// 128 KiB block ceiling.
     fn block_capacity(&self) -> usize {
-        self.target_block_size
-            .map_or(crate::common::MAX_BLOCK_SIZE as usize, |t| t as usize)
+        let requested = self
+            .target_block_size
+            .map_or(crate::common::MAX_BLOCK_SIZE as usize, |t| t as usize);
+        // Upstream zstd sizes a block as `MIN(maxBlockSize, windowSize)`
+        // (`ZSTD_compress.c`). A block wider than the window can never be
+        // held by the matcher, which asserts on it, so a small `window_log`
+        // must shrink the block rather than overrun the window.
+        let window = self.state.matcher.window_size() as usize;
+        if window == 0 {
+            requested
+        } else {
+            requested.min(window)
+        }
     }
 
     /// Before calling [FrameCompressor::compress] you need to set the source.

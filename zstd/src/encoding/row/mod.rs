@@ -2651,10 +2651,13 @@ impl RowMatchGenerator {
         capacity: usize,
         fill: impl FnOnce(&mut Vec<u8>) -> (usize, bool),
     ) -> (usize, bool) {
+        // Count the bytes already carried, not just this top-up: `capacity` is
+        // `block_capacity - carried` (and zero on the EOF re-inspection), yet
+        // the carried suffix still becomes window on the next commit.
         super::match_table::storage::check_stream_abs_headroom(
             self.history_abs_start,
             self.window_size,
-            capacity,
+            capacity + self.uncommitted_len,
         );
         // The eviction, dict retire, floor updates AND the eviction ceiling all
         // run on commit, keyed on the length a block actually claims. Sizing the

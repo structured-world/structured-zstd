@@ -1647,12 +1647,40 @@ impl Matcher for MatchGeneratorDriver {
     }
 
     /// Claim `len` bytes of [`Self::uncommitted_input`] as the next block.
+    ///
+    /// Runs the same eviction accounting as [`Self::commit_space`]: a
+    /// dictionary inflates `max_window_size` so the primed bytes stay
+    /// reachable, and once eviction carries them out of the window that
+    /// inflation has to be retired. Skipping it leaves the backend admitting
+    /// matches older than the window the frame header reports, which encodes
+    /// an offset no decoder can resolve.
     fn commit_filled(&mut self, len: usize) {
+        // Same derivation as `commit_space`: the eviction loop decrements
+        // `window_size` per evicted block before the commit adds `len`, so
+        // `evicted = pre + len - post`.
+        let pre = match &self.storage {
+            MatcherStorage::Dfast(m) => m.window_size,
+            MatcherStorage::Row(m) => m.window_size,
+            MatcherStorage::HashChain(m) => m.table.window_size,
+            MatcherStorage::Simple(_) => 0,
+        };
         match &mut self.storage {
             MatcherStorage::Dfast(m) => m.commit_block(len),
             MatcherStorage::Row(m) => m.commit_block(len),
             MatcherStorage::HashChain(m) => m.table.commit_block(len),
-            MatcherStorage::Simple(_) => {}
+            MatcherStorage::Simple(_) => return,
+        }
+        let post = match &self.storage {
+            MatcherStorage::Dfast(m) => m.window_size,
+            MatcherStorage::Row(m) => m.window_size,
+            MatcherStorage::HashChain(m) => m.table.window_size,
+            MatcherStorage::Simple(_) => 0,
+        };
+        // `saturating_sub` floors the no-eviction case at 0; `pre + len` are
+        // byte counts bounded by the window, so the sum cannot overflow.
+        let evicted_bytes = (pre + len).saturating_sub(post);
+        if self.retire_dictionary_budget(evicted_bytes) {
+            self.trim_after_budget_retire();
         }
     }
 

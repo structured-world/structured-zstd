@@ -326,15 +326,23 @@ fn clone_from_replaces_the_uncommitted_count_with_the_sources() {
     // history buffer wholesale, so a count describing the OLD buffer must not
     // survive. Every bound is `history.len() - uncommitted_len`, so a stale
     // count silently truncates the window or underflows.
-    let source = new_table(64);
+    // Both sides carry bytes, and different amounts of them: a destination
+    // that merely cleared its own count would pass against an empty source
+    // without ever adopting the source's.
+    let mut source = new_table(64);
+    source.fill_uncommitted(4, |buf| {
+        buf.extend_from_slice(b"wxyz");
+        (4, true)
+    });
     let mut dest = new_table(64);
     dest.fill_uncommitted(8, |buf| {
         buf.extend_from_slice(b"abcdefgh");
         (8, true)
     });
     dest.clone_from(&source);
-    assert!(
-        dest.uncommitted().is_empty(),
+    assert_eq!(
+        dest.uncommitted(),
+        b"wxyz",
         "clone_from must adopt the source's uncommitted count"
     );
 }

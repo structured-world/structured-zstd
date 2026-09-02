@@ -940,7 +940,16 @@ impl MatchTable {
         capacity: usize,
         fill: impl FnOnce(&mut Vec<u8>) -> (usize, bool),
     ) -> (usize, bool) {
-        check_stream_abs_headroom(self.history_abs_start, self.window_size, capacity);
+        // Count the bytes already carried, not just this top-up: `capacity` is
+        // `block_capacity - carried` (and zero on the EOF re-inspection), yet
+        // the carried suffix still becomes window on the next commit. Guarding
+        // on the top-up alone lets that commit walk past the headroom the
+        // unchecked `abs_pos + N` lookahead relies on.
+        check_stream_abs_headroom(
+            self.history_abs_start,
+            self.window_size,
+            capacity + self.uncommitted_len,
+        );
         // The eviction ceiling is applied in `commit_block`, keyed on the length
         // a block actually claims. Sizing it here off `capacity` (a whole read
         // buffer, not a block) would trip the ceiling on the very first fill and

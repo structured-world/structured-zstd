@@ -623,7 +623,14 @@ impl DfastMatchGenerator {
         capacity: usize,
         fill: impl FnOnce(&mut Vec<u8>) -> (usize, bool),
     ) -> (usize, bool) {
-        check_stream_abs_headroom(self.history_abs_start, self.window_size, capacity);
+        // Count the bytes already carried, not just this top-up: `capacity` is
+        // `block_capacity - carried` (and zero on the EOF re-inspection), yet
+        // the carried suffix still becomes window on the next commit.
+        check_stream_abs_headroom(
+            self.history_abs_start,
+            self.window_size,
+            capacity + self.uncommitted_len,
+        );
         // The eviction ceiling and the dict retire both run in `commit_block`,
         // keyed on the length a block actually claims. Sizing the ceiling here
         // off `capacity` (a whole read buffer, not a block) would trip it on the
