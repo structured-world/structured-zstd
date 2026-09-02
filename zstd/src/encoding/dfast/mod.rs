@@ -1494,7 +1494,10 @@ impl DfastMatchGenerator {
             start_offset,
             self.history_abs_start,
             self.position_base,
-            self.history.len() - start_offset,
+            // Committed bytes only: in-place ingest can have the next block's
+            // bytes already sitting past the end, and a forward match count
+            // must not reach into them.
+            self.history.len() - self.uncommitted_len - start_offset,
         )
     }
 
