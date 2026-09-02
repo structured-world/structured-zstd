@@ -630,10 +630,6 @@ impl DfastMatchGenerator {
                 self.history.reserve_exact(target - self.history.len());
             }
         }
-        // Compact before the fill, so the drain never has to move bytes the
-        // fill just wrote. Its quarter-window trigger therefore lags by at most
-        // one block, which the ceiling above already leaves room for.
-        self.compact_history();
         self.history.reserve(capacity);
 
         let before = self.history.len();
@@ -679,6 +675,10 @@ impl DfastMatchGenerator {
             self.history_start += removed_len;
             self.history_abs_start += removed_len;
         }
+        // Same position in the sequence as `add_data`: compact AFTER the
+        // eviction that raised `history_start`, so the drain trigger sees the
+        // same state and the buffer evolves identically.
+        self.compact_history();
         self.window_size += len;
         self.window_blocks.push_back(len);
         self.uncommitted_len -= len;
@@ -1460,7 +1460,10 @@ impl DfastMatchGenerator {
             start_offset,
             self.history_abs_start,
             self.position_base,
-            self.history.len() - start_offset,
+            // Committed bytes only, as in `owned_scan_descriptor`: with in-place
+            // ingest the next block's bytes already sit past the end, and the
+            // hash-insert guard fed from here must not admit positions in them.
+            self.history.len() - self.uncommitted_len - start_offset,
         )
     }
 
@@ -1649,8 +1652,12 @@ impl DfastMatchGenerator {
         // Drain the dead prefix at a quarter window (paired with the one-time
         // `reserve_exact` in `add_data`) so the buffer stays near
         // `window + window/4` instead of doubling to ~2x window on long streams.
+        // Compare against the COMMITTED length: with in-place ingest
+        // `history.len()` also counts bytes no block has claimed yet, which
+        // would push this trigger later than on the staged path and change
+        // when the buffer is drained.
         if self.history_start >= (self.max_window_size >> 2)
-            || self.history_start * 2 >= self.history.len()
+            || self.history_start * 2 >= self.history.len() - self.uncommitted_len
         {
             self.history.drain(..self.history_start);
             self.history_start = 0;
