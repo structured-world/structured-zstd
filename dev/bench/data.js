@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788303250174,
+  "lastUpdate": 1788363091752,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI (x86_64-gnu)": [
@@ -2855,6 +2855,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.167,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "3b37ed6f16210408eb12dd4158234f652bd9e159",
+          "message": "feat(encoder)!: gate encoder SIMD on the kernel features, drop the dead hash mix (#473)\n\n* docs(readme): restructure for scannability, refresh discovery metadata\n\n- README: lead with a Highlights list; move the SIMD kernel-feature prose\n  out of Quick start into a Feature flags table (AVX-512 rationale folded\n  into a details block); break the storage-extensions and performance\n  paragraphs into bullets; drop the finished encoder-rewrite notice;\n  embedded doctest code blocks unchanged\n- Cargo.toml: description now covers the full encoder, streaming, no_std\n  and WebAssembly; keywords swap pure-rust for no-std; categories add\n  no-std, wasm and encoding; homepage points at the public benchmark\n  dashboard\n\nCloses #472\n\n* docs(readme): correct level range, npm dependency claim, resume window contract\n\n- state the encoder level range as -131072..=22 (the full negative fast\n  range is supported, matching the C API minimum)\n- the npm package carries a runtime dependency (wasm-feature-detect); the\n  accurate claim is no native addons / no postinstall scripts\n- resumable-decoding bullet now notes that ResumeState does not carry the\n  match window and the resuming call supplies it via ResumeInput::window_prime\n\n* docs(readme): scope SIMD flags to the decoder, note LDM needs hash\n\n- The `hash` feature also gates long-distance matching (the LDM match\n  finder hashes each window with XXH64), not only content checksums.\n  Without it the builder still accepts `enable_long_distance_matching`\n  and the frame stays valid, but no long-distance matches are produced;\n  say so in the feature table and beside the LDM example.\n- The `kernel_*` flags gate the decoder kernels only. The encoder\n  fastpath picks its tier independently: at runtime under `std`, from\n  the target's `target_feature` set under `no_std`. So dropping the\n  flags while keeping `std`, or building `no_std` for a target tuned\n  with `+avx2,+bmi2,+sse4.2`, still runs explicit encoder SIMD.\n  `kernel_simd128` is the one flag that also gates an encoder path\n  (wasm), which the table now says.\n\nPart of #472\n\n* refactor(encoder): drop the dead per-tier hash mix\n\n`hash_mix_u64` had five per-tier implementations and no production caller:\nthe only references in the workspace were two unit tests. Match hashing\nruns through `MatchTable::hash_value_with_mls` / `hash_value8_with_mls`,\nwhich mirror upstream `ZSTD_hash4/5/6/8`. The module-level\n`allow(dead_code)` (added as scaffolding, with a note to drop it once\nconsumers came online) is why this never surfaced.\n\nThree comments described the dead code inaccurately:\n\n- sse42 called it a mirror of an upstream \"CRC-folded hash mix\". Upstream\n  has no such thing: `crc32` does not appear anywhere in `lib/compress/`\n  on 1.5.7 or on dev, and `ZSTD_hash4/5/6/8` are plain multiplications.\n- neon claimed its mix matched the x86 kernels. It cannot: `__crc32d` is\n  CRC-32 (poly 0x04C11DB7) while `_mm_crc32_u64` is CRC-32C (Castagnoli).\n- simd128 claimed bit-identity with every other tier, while the scalar\n  mix is a bare multiply.\n\nRemoving it drops the CRC requirement that only that function had, so each\ntier now declares what it actually executes:\n\n- sse42 -> SSE2 (its three live intrinsics are all SSE2)\n- avx2_bmi2 -> avx2,bmi2 (was avx2,bmi2,sse4.2)\n- neon -> the aarch64 NEON baseline, no optional `crc` extension\n\nThe runtime probes shrink accordingly, and the NEON tier stops falling\nback to scalar on aarch64 parts without `crc`.\n\nAlso removed alongside: `dispatch_count_match_from_indices` and the\nper-tier `KERNEL_TAG` constants (both unreferenced workspace-wide), and\nthe module-level `allow(dead_code)` from the fastpath, scalar and simd128\nmodules so this cannot accumulate silently again. Two items that are\ngenuinely unreachable per target keep a scoped `allow` with the reason:\nthe scalar BT probe on aarch64 (its walker is compiled out there) and the\nsimd128 BT probe (the BT walker has no wasm wrapper yet).\n\nRenamed `Row::hash_kernel` to `cpl_kernel`: it feeds\n`common_prefix_len_with_kernel`, not the mix its name and doc claimed.\n\nCompressed output is unchanged; dead code cannot affect it. Verified on\naarch64, x86_64, thumbv7em-none-eabihf and wasm32 (+simd128).\n\nPart of #474\n\n* perf(encoder): wire the wasm simd128 tier into the BT walker\n\nThe simd128 tier had a `count_match_from_indices` that nothing called: the\nBT walker only had neon / sse2 / avx2 / scalar wrappers, so a wasm build\nran the BT walk through the scalar probe. Add the missing simd128 arm to\nall three dispatchers (`bt_insert_step_no_rebase`,\n`bt_insert_and_collect_matches`, `collect_optimal_candidates_initialized`)\nso the wasm tier reaches its own vector probe.\n\nMeasured, interleaved A/B on the bench host (one process loading both\npayloads, alternating samples, 25 per arm, load < 0.3), compress at the BT\nlevels:\n\n  decodecorpus-z000033  L19 +0.22%   L22 +0.06%\n  small-4k-log-lines    L19 -0.23%   L22 -0.03%\n  low-entropy-1m        L19 +0.01%   L22 +0.15%\n  large-log-stream-4m   L19 -0.14%   L22 -0.26%\n\nEncoded bytes identical on every fixture and level, so the wiring is\ncorrect; the throughput effect is nil, including on the long-match\nfixtures where a vector prefix compare was expected to pay. The payload\ngrows 1574 bytes (1023318 -> 1024892, budget 1.25 MiB).\n\nPart of #474\n\n* docs(encoder): record why the BT vector probe barely fires\n\nInstrumented the BT-path prefix compare over decodecorpus-z000033 to\nexplain the flat A/B on the wasm tier wiring. At both L19 and L22 the\nleading 8-byte word probe resolves 87.45% of calls; only 12.55% reach the\nvector loop, and those average 1.6 (L19) to 4.6 (L22) 16-byte iterations.\nA short buffer (`max < 16`) accounts for 0.05%, so the early exit is\ndriven by the data, not by the buffer bound.\n\nThat is the whole explanation for the flat measurement: the vector cannot\nmatter much when 87% of compares end before it starts. Noted at the probe\nso the next person does not re-run the same experiment, along with the\nimplication that the lever on this path is cutting the number of candidate\ncompares, not widening the survivors.\n\nAlso drops two stale references to the removed hash mix from the module\nheader and the wasm dispatch comment.\n\nPart of #474\n\n* feat(encoder): gate encoder SIMD on the kernel features, add an SSE2 tier\n\nThe `kernel_*` features gated only the decoder: `fastpath::select_kernel`\npicked SSE4.2 / AVX2+BMI2 / NEON on its own, so `--no-default-features`\nstill executed encoder SIMD. Every encoder tier (module, enum variant,\ndispatch arm, tag-mask macro, per-tier wrapper) now sits behind the same\nfeature as its decoder counterpart, and a build with no kernel features\nemits no explicit encoder SIMD: `nm` counts 99 avx2/sse42 symbols with the\ndefault features and 0 without.\n\nThe x86 tier turned out not to be a single tier. Its prefix-compare kernel\nis plain SSE2, but the optimal parser's price set calls\n`priceset_range_nonabort_sse41`, whose `_mm_min_epu32` is SSE4.1. Rather\nthan keep probing the whole tier on SSE4.2, split it:\n\n- `Sse42`: unchanged, SSE4.1 price set.\n- `Sse2`: new. Same 128-bit prefix-compare kernel plus an SSE2 price set,\n  for x86 CPUs without SSE4.2. These previously fell all the way back to\n  the scalar kernel despite having usable SSE2.\n\nSSE2 has no unsigned 32-bit compare, so the new improve-mask biases both\noperands by 0x8000_0000 and uses the signed compare, which yields the same\nmask in one compare instead of min/eq/andnot. The cached-price loader was\nalready SSE2-only, so both tiers share it.\n\nThe NEON tier no longer requires the optional `crc` extension (that was\nthe removed hash mix); AArch64 parts without `crc` now get NEON instead of\nscalar. AArch64 with the tier compiled out newly resolves to the scalar\nkernel, a configuration that previously could not build at all.\n\nTests: the price-set tier test now covers the SSE2 helpers, plus a new\ncase pinning the compare as unsigned above `i32::MAX` across every tier,\nwhich is exactly where a signed compare would invert the result and where\nruntime dispatch on a modern host would never reach the SSE2 path.\n\nBREAKING CHANGE: the `kernel_sse2` feature is renamed to `kernel_sse`, and\nit now gates encoder SIMD as well as decoder SIMD. A build that disables\nthe kernel features loses encoder SIMD it previously kept.\n\nPart of #474\n\n* test(encoder): gate the per-tier test helpers on their kernel features\n\nThe tier-comparison and tag-mask tests referenced SIMD helpers\nunconditionally, so a build with those kernels compiled out failed to\nbuild its test targets even though the library itself was fine. Gate each\nhelper and its call site on the same feature as the tier it exercises, and\nadd the new SSE2 tier to the list the match-generator test cross-checks\nagainst scalar.\n\nFound by running the feature matrix on x86; an aarch64 host does not\ncompile these paths, so the breakage was invisible locally.\n\nPart of #474\n\n* test(encoder): silence the scalar-only tier-list lint\n\nWith every SIMD kernel compiled out the tier list is a single push, which\nclippy flags as vec-init-then-push. The incremental shape is what the\nfeature gates need, so allow the lint at that binding with the reason.\n\nPart of #474\n\n* test(encoder): seed the tier list instead of pushing into an empty vec\n\nAllowing vec-init-then-push on the binding did not take, since the lint\nfires on the statement pair. Seed the vec with the always-present scalar\ntier instead, and allow unused_mut for the build where every SIMD entry\nbelow is compiled out.\n\nPart of #474\n\n* docs: correct the SIMD selection story for wasm and the encoder\n\nTwo things were wrong in the same paragraph. The claim that `std` means\nruntime tier selection does not hold on wasm32: there is no runtime feature\ndetection there, and both the decoder kernels and the encoder fastpath also\nrequire `target_feature = \"simd128\"`, so a default-feature wasm build with\nno extra flags silently stays scalar. The npm package only appears to pick\nat runtime because it ships separately compiled scalar and `+simd128`\npayloads. Document the `-C target-feature=+simd128` requirement.\n\nThe rest of the paragraph described the pre-gating world: the `kernel_*`\nflags now cover the encoder too, x86 has two 128-bit tiers under\n`kernel_sse`, and the NEON tier no longer wants the `crc` extension. Update\nthe table and the crate-level docs to match, including the rename.\n\nPart of #474\n\n* feat(encoder): give long-distance matching its own feature\n\nLDM was gated on `hash`, because its match finder hashes each window with\nXXH64. That made the flag mean two unrelated things: a `--no-default-features`\nbuild dropping `hash` for the checksum also silently lost long-distance\nmatching, while `enable_long_distance_matching(true)` kept being accepted and\nthe frame kept being valid, just without any long-distance matches.\n\nSplit it out as `ldm = [\"hash\"]`, default-on, and move the LDM-specific gates\n(the module, the producer slot and its plumbing, the dict-snapshot handoff,\nthe strategy-ordinal helper) onto it. `hash` now means the checksum only, and\n`hash` without `ldm` is a build that could not be expressed before.\n\nThe name sits one letter away from the unrelated `lsm` feature, so the\nmanifest says so at both entries.\n\nPart of #474\n\n* chore(deps): drop the empty dhat-heap feature, mark the internal ones\n\n`structured-zstd/dhat-heap` gated no code at all — the dhat allocator swap\nlives entirely in the `ffi-bench` example — so the feature and the forward\nfrom `ffi-bench` are both removed; the example keeps its own flag.\n\nThe remaining bench / fuzz / diagnostic features are real but not public\nAPI. Group them under a header saying so, since they show up in the\ncrates.io feature list where a consumer could reasonably mistake them for\nsupported knobs.\n\nStale `kernel_sse2` spellings left by the rename are updated to\n`kernel_sse`.\n\nPart of #474\n\n* fix(encoder): gate the wasm optimal-parser SIMD on kernel_simd128\n\nThe optimal parser's wasm path checked only `target_feature = \"simd128\"`,\nnever the cargo feature, in eleven `cfg`s across `hc/optimal.rs` and\n`hc/priceset.rs`. So a `wasm32` build with `-C target-feature=+simd128` but\n`--no-default-features` still compiled and selected\n`build_optimal_plan_impl_simd128` and its `v128` price-set helpers at levels\n16-22, which is exactly the guarantee the previous commit strengthened.\n\nMeasured on a `+simd128 --no-default-features --features std,hash` build:\n`nm` counted 18 simd128 symbols before, 0 after; adding `kernel_simd128`\nback brings the 18 return.\n\nAlso corrects two feature-doc claims: `kernel_vbmi2` and `kernel_sve` are\ndecoder-only (the encoder has no AVX-512 or SVE tier), and `kernel_vbmi2`\nis the one kernel feature that is off by default.\n\nPart of #474\n\n* refactor(deps): rename the snake_case features to kebab-case\n\nCargo's own convention is kebab-case, and the manifest was mixed:\n`critical-section` and `rustc-dep-of-std` already used it while the kernel,\ndict and bench features did not. Rename the remaining twelve across the\nworkspace — the library, the four dependent crates, the fuzz manifest, CI,\nand the `--features` lines in example doc comments.\n\n`zdict_builder` (a feature of the `zstd` crate) and the\n`dict_builder_fastcover` bench target keep their names; so do Rust\nidentifiers such as `kernel_trace_enabled` and the\n`select_x86_kernel_*` test names.\n\nBREAKING CHANGE: every snake_case feature is renamed to its kebab-case\nspelling: `dict_builder` to `dict-builder`, `kernel_sse` to `kernel-sse`,\nand likewise for `kernel_scalar`, `kernel_bmi2`, `kernel_avx2`,\n`kernel_vbmi2`, `kernel_neon`, `kernel_sve`, `kernel_simd128`,\n`bench_internals`, `fuzz_exports`, `copy_shape_stats` and `kernel_trace`.\n\nPart of #474\n\n* test(bench): find the decode corpus from the ffi-bench manifest dir\n\nThe bench targets belong to `ffi-bench` (they link the C bindings) while\ntheir sources and `decodecorpus_files/z000033` live under `zstd/`. The\nlookup only tried `CARGO_MANIFEST_DIR/decodecorpus_files/z000033`, which\nfor a local `cargo bench -p ffi-bench` resolves under `ffi-bench/` where\nthe fixture does not exist — so the run silently substituted the synthetic\n1 MiB corpus and reported it as `decodecorpus-synthetic-1m`.\n\nCI is unaffected: it passes `STRUCTURED_ZSTD_BENCH_CORPUS_PATH` explicitly.\nThis only fixes the local path, where the substitution is easy to miss and\nmeans benching different data than intended.\n\nAdds the `../zstd/decodecorpus_files/z000033` sibling candidate.\n\nPart of #474\n\n* fix(encoder): use the simd128 candidate collector in the wasm DP wrapper\n\n`build_optimal_plan_impl_simd128` passed\n`collect_optimal_candidates_initialized_scalar` to the body macro, so a\nwasm build at levels 16-22 ran the simd128 price set over scalar BT\ncandidate collection. The simd128 collector added earlier in this branch\nwas reachable only through the `#[cfg(test)]` shim, which is why nothing\nfailed.\n\nPass the simd128 collector, matching what the native tiers do. Confirmed\non a `+simd128 --features kernel-simd128` build: `nm` now finds the\ncollector's monomorphisations in the archive.\n\nPart of #474\n\n* refactor(encoder): rename the sse42 fastpath module to sse2\n\nThe module holds only SSE2 intrinsics — `_mm_cmpeq_epi8`, `_mm_loadu_si128`,\n`_mm_movemask_epi8` — and its functions were lowered to\n`target_feature(enable = \"sse2\")` when the dead CRC hash mix went away. The\n`sse42` name dated from that mix and had been describing the wrong ISA ever\nsince, which is exactly the kind of name this branch has been removing\nelsewhere.\n\nRenames the file, the module path, `Sse42Tags`, and the nine per-tier\nwrappers that compile under the SSE2 umbrella\n(`bt_insert_step_no_rebase`, `bt_insert_and_collect_matches`,\n`bt_update_tree_until`, `hash3_candidate`, `row_probe`, `lazy`,\n`for_each_repcode_candidate_with_reps`, `start_matching_fast_loop`,\n`cbfd_borrowed`).\n\n`build_optimal_plan_impl_sse42` and\n`collect_optimal_candidates_initialized_sse42` keep their names: those do\nneed SSE4.2, since the price set calls `priceset_range_nonabort_sse41`.\n`FastpathKernel::Sse42` likewise still names the real SSE4.2 tier.\n\nPart of #474\n\n* refactor(encoder): scope the scalar BT-probe dead-code allow to the NEON tier\n\nThe allow claimed the probe is unused on every little-endian aarch64\nbuild. That stopped being true once the tiers were gated: with\n`kernel-neon` off, the scalar walker is compiled back in and this probe is\nthe live path. Narrow the attribute and its documentation to the case that\nactually holds.\n\nPart of #474\n\n* ci(wasm): build the scalar check with kernel-scalar\n\nThe step named \"wasm32 scalar\" passed `--features kernel-simd128`. It did\nbuild scalar code, since the wasm kernels also need\n`target_feature = \"simd128\"` and that step sets no rustflags, but it never\nexercised a `kernel-scalar` build, so a scalar-only compile or dispatch\nregression could pass CI unseen.\n\nPoint it at `kernel-scalar` and keep the old invocation as its own step:\n\"feature on, target feature off\" is exactly the combination where a\nmissing cargo-feature gate hides, which this branch already had to fix\nonce in the optimal parser.\n\nAlso updates the LDM comments that still described `hash` gating after the\ncfgs moved to `ldm`, and corrects the `start_matching_optimal` reference to\n`hc/optimal.rs` (verified with ast-grep: the definition is at\n`hc/optimal.rs:1001` and the `prepare_ldm_candidates` call at `:1044`).\n\nPart of #474",
+          "timestamp": "2026-09-02T17:48:10+03:00",
+          "tree_id": "6e04e5f33db0c11643730f5da441248d514f5029",
+          "url": "https://github.com/structured-world/structured-zstd/commit/3b37ed6f16210408eb12dd4158234f652bd9e159"
+        },
+        "date": 1788363076877,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.069,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.066,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 190.641,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 186.036,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 0.871,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.351,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.365,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.653,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.383,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.681,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.026,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.126,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.026,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.126,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.006,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.005,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 7.386,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 3.523,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.099,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.1,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.001,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.088,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 0.895,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.206,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 0.965,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.021,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.107,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.021,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.106,
             "unit": "ms"
           }
         ]
