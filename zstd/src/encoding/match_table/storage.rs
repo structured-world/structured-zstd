@@ -962,7 +962,12 @@ impl MatchTable {
         let ceiling = self.max_window_size
             + (self.max_window_size >> 2)
             + crate::common::MAX_BLOCK_SIZE as usize;
-        let target = bytes.min(ceiling);
+        // One block of slack: the last fill asks for a whole block's room even
+        // when only a tail remains, so a bare `bytes` reserve would still
+        // reallocate (and copy the frame) on the final top-up.
+        let target = bytes
+            .saturating_add(crate::common::MAX_BLOCK_SIZE as usize)
+            .min(ceiling);
         if target > self.history.len() && self.history.capacity() < target {
             self.history.reserve_exact(target - self.history.len());
         }
