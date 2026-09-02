@@ -333,6 +333,9 @@ impl Clone for MatchTable {
         // Scalars / Copy fields.
         self.max_window_size = source.max_window_size;
         self.window_size = source.window_size;
+        // Describes the buffer just overwritten above, so it travels with it:
+        // every bound is `history.len() - uncommitted_len`.
+        self.uncommitted_len = source.uncommitted_len;
         self.history_start = source.history_start;
         self.history_abs_start = source.history_abs_start;
         self.position_base = source.position_base;
@@ -985,7 +988,10 @@ impl MatchTable {
             return;
         }
         assert!(len <= self.max_window_size);
-        debug_assert!(
+        // Hard assert, like the window check above: this runs once per block,
+        // and an over-long claim would wrap `uncommitted_len` in release and
+        // surface as a panic far from the cause.
+        assert!(
             len <= self.uncommitted().len(),
             "commit_block: {len} exceeds the {} uncommitted bytes",
             self.uncommitted().len(),
@@ -1303,6 +1309,11 @@ impl MatchTable {
     /// `_reuse_space` is retained only for caller signature compatibility
     /// and is intentionally unused.
     pub(crate) fn reset(&mut self, _reuse_space: impl FnMut(Vec<u8>)) {
+        // Bytes an abandoned frame ingested but never claimed are not part of
+        // the next frame. Drop them FIRST: every tail-relative bound below
+        // (and `history_abs_end`) subtracts this count from the buffer length,
+        // so leaving it set underflows once the history is cleared.
+        self.uncommitted_len = 0;
         // Snapshot the previous frame's one-past-the-end absolute
         // position before clearing the history that `history_abs_end`
         // reads. Every stale table entry points strictly below this.
@@ -2064,11 +2075,24 @@ impl MatchTable {
                 }
             }
         }
+        #[cfg(all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel-simd128"
+        ))]
+        unsafe {
+            self.bt_update_tree_until_simd128(abs_pos, current_abs_end)
+        }
         #[cfg(not(any(
             all(
                 target_arch = "aarch64",
                 target_endian = "little",
                 feature = "kernel-neon"
+            ),
+            all(
+                target_arch = "wasm32",
+                target_feature = "simd128",
+                feature = "kernel-simd128"
             ),
             target_arch = "x86",
             target_arch = "x86_64"
@@ -2076,6 +2100,44 @@ impl MatchTable {
         {
             self.bt_update_tree_until_scalar(abs_pos, current_abs_end)
         }
+    }
+
+    /// WebAssembly `simd128` umbrella variant: the per-iteration
+    /// `bt_insert_step_no_rebase_simd128` inlines into the body because both
+    /// share the `target_feature = "simd128"` umbrella, so the tree walk runs
+    /// the same tier as the insert step it drives.
+    ///
+    /// # Safety
+    /// wasm32 with `simd128` enabled at compile time.
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel-simd128"
+    ))]
+    #[target_feature(enable = "simd128")]
+    pub(crate) unsafe fn bt_update_tree_until_simd128(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+    ) {
+        if self.skip_insert_until_abs < self.history_abs_start {
+            self.skip_insert_until_abs = self.history_abs_start;
+        }
+        let mut update_abs = self.skip_insert_until_abs;
+        let is_btultra2 = self.is_btultra2;
+        while update_abs < abs_pos {
+            if !self.can_skip_rebase_check_at(update_abs, abs_pos, is_btultra2) {
+                self.maybe_rebase_positions(update_abs);
+            }
+            let forward = unsafe {
+                self.bt_insert_step_no_rebase_simd128(update_abs, current_abs_end, abs_pos)
+            };
+            // Upstream zstd `ZSTD_updateTree`: no clamp to the target, so a long
+            // match's covered positions stay out of the tree exactly as C leaves
+            // them.
+            update_abs += forward.max(1);
+        }
+        self.skip_insert_until_abs = abs_pos;
     }
 
     /// NEON-umbrella variant: per-iteration `bt_insert_step_no_rebase_neon`
@@ -2606,11 +2668,24 @@ impl MatchTable {
                 }
             }
         }
+        #[cfg(all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel-simd128"
+        ))]
+        unsafe {
+            self.hash3_candidate_simd128(abs_pos, current_abs_end, min_match_len)
+        }
         #[cfg(not(any(
             all(
                 target_arch = "aarch64",
                 target_endian = "little",
                 feature = "kernel-neon"
+            ),
+            all(
+                target_arch = "wasm32",
+                target_feature = "simd128",
+                feature = "kernel-simd128"
             ),
             target_arch = "x86",
             target_arch = "x86_64"
@@ -2618,6 +2693,31 @@ impl MatchTable {
         {
             self.hash3_candidate_scalar(abs_pos, current_abs_end, min_match_len)
         }
+    }
+
+    /// WebAssembly `simd128` umbrella HC3 probe.
+    ///
+    /// # Safety
+    /// wasm32 with `simd128` enabled at compile time. Body inlines via macro.
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel-simd128"
+    ))]
+    #[target_feature(enable = "simd128")]
+    pub(crate) unsafe fn hash3_candidate_simd128(
+        &self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        min_match_len: usize,
+    ) -> Option<MatchCandidate> {
+        super::super::hc::generator::hash3_candidate_body!(
+            self,
+            abs_pos,
+            current_abs_end,
+            min_match_len,
+            crate::encoding::fastpath::simd128::common_prefix_len_ptr,
+        )
     }
 
     /// NEON umbrella HC3 probe.

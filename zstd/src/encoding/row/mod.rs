@@ -293,7 +293,9 @@ impl RowTags for Sse2Tags {
         lit_len: usize,
         hash: Option<(usize, u8)>,
     ) -> Option<MatchCandidate> {
-        // SAFETY: dispatched only when `tag_kernel == Sse42` (SSE4.2 confirmed).
+        // SAFETY: dispatched for `tag_kernel` of `Sse2` or `Sse42`; both confirm
+        // SSE2, which is the whole requirement of `row_probe_sse2`. Do NOT widen
+        // this probe to an SSE4.x intrinsic — the `Sse2` tier would fault.
         unsafe { matcher.row_probe_sse2::<ROW_LOG>(abs_pos, lit_len, hash) }
     }
 }
@@ -2568,6 +2570,13 @@ impl RowMatchGenerator {
         // TAGS can still produce the occasional false mask hit whose
         // candidate then fails the window check; the upstream zstd's tag table
         // persists across frames with the same behaviour.
+        // Bytes an abandoned frame ingested but never claimed are not part of
+        // the next frame, and they must not count towards the floor advance.
+        // Dropped first because every tail-relative bound subtracts this count
+        // from the buffer length and would underflow once history is cleared.
+        self.history
+            .truncate(self.history.len() - self.uncommitted_len);
+        self.uncommitted_len = 0;
         // Past everything the previous frame indexed: its owned history, or
         // the extent of its borrowed input.
         let next_floor = self.history_abs_start
@@ -2697,7 +2706,10 @@ impl RowMatchGenerator {
             return;
         }
         assert!(len <= self.max_window_size);
-        debug_assert!(
+        // Hard assert, like the window check above: this runs once per block,
+        // and an over-long claim would wrap `uncommitted_len` in release and
+        // surface as a panic far from the cause.
+        assert!(
             len <= self.uncommitted().len(),
             "commit_block: {len} exceeds the {} uncommitted bytes",
             self.uncommitted().len(),

@@ -401,6 +401,13 @@ impl DfastMatchGenerator {
         // `position_base` is left untouched so stale slots still decode to
         // their (now sub-floor) absolute positions; `ensure_room_for` /
         // `reduce` keep the `u32` packing bounded as the cursor climbs.
+        // Bytes an abandoned frame ingested but never claimed are not part of
+        // the next frame, and they must not count towards the floor advance.
+        // Dropped first because every tail-relative bound subtracts this count
+        // from the buffer length and would underflow once history is cleared.
+        self.history
+            .truncate(self.history.len() - self.uncommitted_len);
+        self.uncommitted_len = 0;
         let next_floor = self.history_abs_start + (self.history.len() - self.history_start);
         self.offset_hist = [1, 4, 8];
         // Re-borrow: an attach-mode reused dict frame keeps its bytes resident at
@@ -668,7 +675,10 @@ impl DfastMatchGenerator {
             return;
         }
         assert!(len <= self.max_window_size);
-        debug_assert!(
+        // Hard assert, like the window check above: this runs once per block,
+        // and an over-long claim would wrap `uncommitted_len` in release and
+        // surface as a panic far from the cause.
+        assert!(
             len <= self.uncommitted().len(),
             "commit_block: {len} exceeds the {} uncommitted bytes",
             self.uncommitted().len(),
