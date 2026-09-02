@@ -3590,41 +3590,6 @@ fn row_repcode_returns_none_when_position_too_close_to_history_end() {
     assert!(matcher.repcode_candidate(4, 1).is_none());
 }
 
-#[cfg(all(feature = "std", target_arch = "x86_64"))]
-#[test]
-fn hash_mix_sse42_path_is_available_and_matches_accelerated_impl_when_supported() {
-    use crate::encoding::fastpath::{self, FastpathKernel};
-    if !is_x86_feature_detected!("sse4.2") {
-        return;
-    }
-    let v = 0x0123_4567_89AB_CDEFu64;
-    // SAFETY: feature check above guarantees SSE4.2 is available.
-    let accelerated = unsafe { fastpath::sse42::hash_mix_u64(v) };
-    // Dispatcher must resolve to SSE4.2 (or better) and produce the same mix.
-    let dispatched = fastpath::dispatch_hash_mix_u64(v);
-    let kernel = fastpath::select_kernel();
-    if kernel == FastpathKernel::Sse42 {
-        assert_eq!(dispatched, accelerated);
-    } else {
-        // AVX2 kernel uses the same CRC32 instruction under the hood.
-        assert_eq!(dispatched, accelerated, "AVX2/SSE4.2 share CRC32 mix");
-    }
-}
-
-#[cfg(all(feature = "std", target_arch = "aarch64", target_endian = "little"))]
-#[test]
-fn hash_mix_crc_path_is_available_and_matches_accelerated_impl_when_supported() {
-    use crate::encoding::fastpath;
-    if !is_aarch64_feature_detected!("crc") {
-        return;
-    }
-    let v = 0x0123_4567_89AB_CDEFu64;
-    // SAFETY: feature check above guarantees CRC32 is available.
-    let accelerated = unsafe { fastpath::neon::hash_mix_u64(v) };
-    let dispatched = fastpath::dispatch_hash_mix_u64(v);
-    assert_eq!(dispatched, accelerated);
-}
-
 #[test]
 fn hc_hash3_position_matches_hash3_formula() {
     let bytes = *b"abcd";

@@ -42,15 +42,6 @@ use super::opt::ldm::HcRawSeq;
 use super::opt::types::{HcCandidateQuery, MatchCandidate};
 use super::row::RowMatchGenerator;
 use super::simple::fast_matcher::{FAST_LEVEL_1_HASH_LOG, FAST_LEVEL_1_MLS, FastKernelMatcher};
-#[cfg(all(
-    test,
-    feature = "std",
-    target_arch = "aarch64",
-    target_endian = "little"
-))]
-use std::arch::is_aarch64_feature_detected;
-#[cfg(all(test, feature = "std", target_arch = "x86_64"))]
-use std::arch::is_x86_feature_detected;
 
 pub(crate) const DFAST_MIN_MATCH_LEN: usize = 5;
 // Bytes the dfast short hash reads (upstream zstd `mls = 5`). Seeding / lookahead
@@ -119,8 +110,6 @@ pub(crate) const ROW_TARGET_LEN: usize = 48;
 pub(crate) const ROW_TAG_BITS: usize = 8;
 pub(crate) const ROW_EMPTY_SLOT: u32 = u32::MAX;
 pub(crate) const ROW_HASH_KEY_LEN: usize = 4;
-// HASH_MIX_PRIME now lives in `crate::encoding::fastpath::scalar`; the four
-// per-CPU `hash_mix_u64` variants share it via that module.
 // HC_PRIME3BYTES / HC_PRIME4BYTES moved to match_table::storage
 // alongside the hash helpers in Phase 1e Stage A. Only the test
 // module references the constants directly (production code goes

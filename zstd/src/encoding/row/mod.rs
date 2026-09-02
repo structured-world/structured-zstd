@@ -2246,8 +2246,10 @@ pub(crate) struct RowMatchGenerator {
     /// upstream's parse-side reps legitimately differ.
     lazy_reps: Option<[usize; 2]>,
     pub(crate) lazy_depth: u8,
-    /// Cached fastpath kernel for `hash_mix_u64`; see Dfast for rationale.
-    pub(crate) hash_kernel: crate::encoding::fastpath::FastpathKernel,
+    /// Cached fastpath kernel for the per-candidate `common_prefix_len`
+    /// compare, resolved once per matcher so the rep probe skips the
+    /// `select_kernel()` atomic on every input byte.
+    pub(crate) cpl_kernel: crate::encoding::fastpath::FastpathKernel,
     pub(crate) row_heads: Vec<u8>,
     // Absolute match positions, one per row slot. Stored as `u32` (not
     // `usize`): this is the largest match-finder array, and `u32` halves its
@@ -2325,7 +2327,7 @@ impl RowMatchGenerator {
             lazy_next_to_update: 0,
             lazy_reps: None,
             lazy_depth: 1,
-            hash_kernel: crate::encoding::fastpath::select_kernel(),
+            cpl_kernel: crate::encoding::fastpath::select_kernel(),
             row_heads: Vec::new(),
             row_positions: Vec::new(),
             row_tags: Vec::new(),
@@ -3225,7 +3227,7 @@ impl RowMatchGenerator {
         lit_len: usize,
     ) -> Option<MatchCandidate> {
         repcode_candidate_shared(
-            self.hash_kernel,
+            self.cpl_kernel,
             self.live_history(),
             self.history_abs_start,
             self.offset_hist,

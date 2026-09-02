@@ -4,29 +4,17 @@
 //! intrinsics inline into the caller's loop instead of crossing the
 //! target_feature ABI barrier as a non-inlinable call.
 //!
-//! wasm has no CRC instruction, so `hash_mix_u64` falls back to the portable
-//! scalar mixer (a single 64-bit mix has no SIMD speedup anyway); the win here
-//! is the vectorized `common_prefix_len` match-length scan.
+//! The win here is the vectorized `common_prefix_len` match-length scan.
 
 #![cfg(all(
     target_arch = "wasm32",
     target_feature = "simd128",
     feature = "kernel_simd128"
 ))]
-#![allow(dead_code)]
 
 use core::arch::wasm32::{i8x16_bitmask, u8x16_eq, v128, v128_load};
 
 use super::scalar;
-
-pub(crate) const KERNEL_TAG: &str = "simd128";
-
-/// wasm has no CRC unit; route the single-lane mix through the portable scalar
-/// mixer so it stays bit-identical with every other tier's `hash_mix_u64`.
-#[inline]
-pub(crate) fn hash_mix_u64(value: u64) -> u64 {
-    scalar::hash_mix_u64(value)
-}
 
 /// 16-byte `v128` prefix-length probe. Returns the number of leading equal
 /// bytes in whole 16-byte chunks; the caller handles the scalar tail.
@@ -85,13 +73,20 @@ pub(crate) unsafe fn common_prefix_len_ptr(lhs: *const u8, rhs: *const u8, max: 
     unsafe { scalar::common_prefix_len_scalar_ptr(lhs, rhs, off, max) }
 }
 
-/// `simd128` variant of `count_match_from_indices` — the BT-walk match-length
+/// `simd128` variant of `count_match_from_indices`, the BT-walk match-length
 /// probe entry point. Same invariants as the scalar variant, under the
 /// `simd128` umbrella.
+///
+/// Currently unreferenced: the BT collect-matches walker in
+/// `MatchTable` only has neon / sse2 / avx2 / scalar wrappers, so a wasm
+/// build runs the BT walk through the scalar probe and never reaches this
+/// one. Kept because wiring the wasm tier into that walker is a pending
+/// optimisation, not because the code is obsolete.
 ///
 /// # Safety
 /// BT walk invariants: `candidate_idx + tail_limit <= concat.len()` and
 /// `current_idx + tail_limit <= concat.len()`.
+#[allow(dead_code)]
 #[target_feature(enable = "simd128")]
 #[inline]
 pub(crate) unsafe fn count_match_from_indices(
