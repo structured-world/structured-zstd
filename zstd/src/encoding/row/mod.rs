@@ -3850,7 +3850,7 @@ impl RowMatchGenerator {
                 _mm_prefetch(self.row_heads.as_ptr().add(row).cast(), _MM_HINT_T0);
                 _mm_prefetch(self.row_tags.as_ptr().add(row_base).cast(), _MM_HINT_T0);
                 _mm_prefetch(
-                    self.row_positions.as_ptr().add(row_base).cast(),
+                    self.row_positions().as_ptr().add(row_base).cast(),
                     _MM_HINT_T0,
                 );
                 // Upstream zstd `ZSTD_row_prefetch` (zstd_lazy.c:816): rows of
@@ -3858,7 +3858,7 @@ impl RowMatchGenerator {
                 // second line is fetched too.
                 if ROW_LOG >= 5 {
                     _mm_prefetch(
-                        self.row_positions.as_ptr().add(row_base + 16).cast(),
+                        self.row_positions().as_ptr().add(row_base + 16).cast(),
                         _MM_HINT_T0,
                     );
                 }
