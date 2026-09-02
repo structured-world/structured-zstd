@@ -2218,6 +2218,33 @@ macro_rules! start_matching_fast_loop_body {
                 };
             let short_hash_ptr = $self.short_mut_ptr();
             let long_hash_ptr = $self.long_mut_ptr();
+            // Block-relative cursor base, the shape upstream zstd scans with:
+            // it walks `ip` against a single `base`, while our positions carry
+            // three coordinate systems (block-relative `ip`, absolute, and the
+            // history-concat index). Reads keyed off `ip` alone let the whole
+            // concat axis stay out of the loop; the bias is a per-block
+            // constant because both ends are re-snapshotted by the outer loop.
+            //
+            // SAFETY: `$current_abs_start >= history_abs_start` (the block is
+            // part of live history), and `history_start_offset + bias` is the
+            // block's first byte, in bounds of the buffer.
+            let block_bias = $current_abs_start - history_abs_start;
+            let block_ptr = unsafe { history_base_ptr.add(history_start_offset + block_bias) };
+            // Readable bytes from the block's start. Equals `$current_len`
+            // whenever the block ends the live history, which is the only
+            // shape the fast loop runs in; asserted rather than assumed
+            // because a mismatch would silently change match lengths.
+            //
+            // The forward-scan budgets below subtract from this with plain
+            // arithmetic, not `saturating_sub`: entry needs `pos + 8 <=
+            // block_len` and the advance breaks out the moment `ip1 + 8`
+            // passes it, so `ip1 + 8 <= block_len` holds on every iteration
+            // and `ip0 < ip1`. A clamp there would only hide a broken guard.
+            let block_len = concat_len - block_bias;
+            debug_assert_eq!(
+                block_len, $current_len,
+                "fast loop expects the scanned block to end live history",
+            );
 
             // Pre-compute long hash at ip0 ONCE per outer iter.
             // `concat_idx = ($current_abs_start + ip0) - history_abs_start`
@@ -2308,8 +2335,6 @@ macro_rules! start_matching_fast_loop_body {
                 // than the subtraction does.
                 let packed_curr = ((abs_ip0 - position_base) as u32) + 1;
 
-                let concat_idx0 = abs_ip0 - history_abs_start;
-                let concat_idx1 = abs_ip1 - history_abs_start;
 
                 // Load 8 bytes at ip0 for both short (low 4) and long
                 // probe equality checks. We already used `v8_at_ip0` to
@@ -2318,7 +2343,7 @@ macro_rules! start_matching_fast_loop_body {
                 // `read_unaligned` is from the same offset the
                 // probe-eq below will use.
                 let v8_0 = unsafe {
-                    (history_base_ptr.add(history_start_offset + concat_idx0) as *const u64)
+                    (block_ptr.add(ip0) as *const u64)
                         .read_unaligned()
                 };
                 // `v4_0` (low 4 bytes) is the cheap 4-byte equality-gate key
@@ -2374,17 +2399,17 @@ macro_rules! start_matching_fast_loop_body {
                                 .read_unaligned()
                         };
                         let cur4 = unsafe {
-                            (history_base_ptr.add(history_start_offset + concat_idx1) as *const u32)
+                            (block_ptr.add(ip1) as *const u32)
                                 .read_unaligned()
                         };
                         if cand4 == cur4 {
                             let mut match_len = 4usize;
-                            let max_fwd = concat_len.saturating_sub(concat_idx1 + 4);
+                            let max_fwd = block_len - (ip1 + 4);
                             unsafe {
                                 let lhs =
                                     history_base_ptr.add(history_start_offset + cand_idx_r + 4);
                                 let rhs =
-                                    history_base_ptr.add(history_start_offset + concat_idx1 + 4);
+                                    block_ptr.add(ip1 + 4);
                                 let ext = $cpl(
                                     lhs, rhs, max_fwd,
                                 );
@@ -2429,7 +2454,7 @@ macro_rules! start_matching_fast_loop_body {
 
                 // Precompute hl1 (upstream zstd `_search_next_long` carry, line 197).
                 let v8_1 = unsafe {
-                    (history_base_ptr.add(history_start_offset + concat_idx1) as *const u64)
+                    (block_ptr.add(ip1) as *const u64)
                         .read_unaligned()
                 };
                 let hl1_idx = (v8_1.wrapping_mul(PRIME) >> long_shift) as usize;
@@ -2480,14 +2505,14 @@ macro_rules! start_matching_fast_loop_body {
                             {
                             // 8 bytes match; count forward + extend back.
                             let mut match_len = 8usize;
-                            let max_fwd = concat_len.saturating_sub(concat_idx0 + 8);
+                            let max_fwd = block_len - (ip0 + 8);
                             // SAFETY: both ptrs at the same buffer; offsets
                             // verified above. `max_fwd` caps the scan to
                             // the live region.
                             unsafe {
                                 let lhs = history_base_ptr.add(history_start_offset + cand_idx + 8);
                                 let rhs =
-                                    history_base_ptr.add(history_start_offset + concat_idx0 + 8);
+                                    block_ptr.add(ip0 +8);
                                 let ext = $cpl(
                                     lhs, rhs, max_fwd,
                                 );
@@ -2566,13 +2591,12 @@ macro_rules! start_matching_fast_loop_body {
                             };
                             if dcand_v8 == v8_0 {
                                 let mut match_len = 8usize;
-                                let max_fwd = concat_len.saturating_sub(concat_idx0 + 8);
+                                let max_fwd = block_len - (ip0 + 8);
                                 // SAFETY: both ptrs in the same buffer; `max_fwd`
                                 // caps the scan to the live region.
                                 unsafe {
                                     let lhs = history_base_ptr.add(history_start_offset + dp + 8);
-                                    let rhs = history_base_ptr
-                                        .add(history_start_offset + concat_idx0 + 8);
+                                    let rhs = block_ptr.add(ip0 + 8);
                                     let ext =
                                         $cpl(
                                             lhs, rhs, max_fwd,
@@ -2628,12 +2652,12 @@ macro_rules! start_matching_fast_loop_body {
                             {
                             // Short hit: count forward from byte 4 onwards.
                             let mut s_match_len = 4usize;
-                            let max_fwd = concat_len.saturating_sub(concat_idx0 + 4);
+                            let max_fwd = block_len - (ip0 + 4);
                             unsafe {
                                 let lhs =
                                     history_base_ptr.add(history_start_offset + cand_idx_s + 4);
                                 let rhs =
-                                    history_base_ptr.add(history_start_offset + concat_idx0 + 4);
+                                    block_ptr.add(ip0 +4);
                                 let ext = $cpl(
                                     lhs, rhs, max_fwd,
                                 );
@@ -2692,12 +2716,11 @@ macro_rules! start_matching_fast_loop_body {
                                     if cand_v8_l1 == v8_1 {
                                         live_l1_hit = true;
                                         let mut l1_match_len = 8usize;
-                                        let max_fwd_l1 = concat_len.saturating_sub(concat_idx1 + 8);
+                                        let max_fwd_l1 = block_len - (ip1 + 8);
                                         unsafe {
                                             let lhs = history_base_ptr
                                                 .add(history_start_offset + cand_idx_l1 + 8);
-                                            let rhs = history_base_ptr
-                                                .add(history_start_offset + concat_idx1 + 8);
+                                            let rhs = block_ptr.add(ip1 + 8);
                                             let ext = $cpl(
                                                 lhs, rhs, max_fwd_l1,
                                             );
@@ -2773,15 +2796,13 @@ macro_rules! start_matching_fast_loop_body {
                                         };
                                         if dcand_v8_l1 == v8_1 {
                                             let mut dl1_match_len = 8usize;
-                                            let max_fwd =
-                                                concat_len.saturating_sub(concat_idx1 + 8);
+                                            let max_fwd = block_len - (ip1 + 8);
                                             // SAFETY: same buffer; `max_fwd` caps
                                             // the scan to the live region.
                                             unsafe {
                                                 let lhs = history_base_ptr
                                                     .add(history_start_offset + dp1 + 8);
-                                                let rhs = history_base_ptr
-                                                    .add(history_start_offset + concat_idx1 + 8);
+                                                let rhs = block_ptr.add(ip1 + 8);
                                                 let ext = $cpl(
                                                     lhs, rhs, max_fwd,
                                                 );
@@ -2873,11 +2894,10 @@ macro_rules! start_matching_fast_loop_body {
                             };
                             if dcand4 == v4_0 as u32 {
                                 let mut s_match_len = 4usize;
-                                let max_fwd = concat_len.saturating_sub(concat_idx0 + 4);
+                                let max_fwd = block_len - (ip0 + 4);
                                 unsafe {
                                     let lhs = history_base_ptr.add(history_start_offset + dp + 4);
-                                    let rhs = history_base_ptr
-                                        .add(history_start_offset + concat_idx0 + 4);
+                                    let rhs = block_ptr.add(ip0 + 4);
                                     let ext =
                                         $cpl(
                                             lhs, rhs, max_fwd,
