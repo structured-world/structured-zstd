@@ -2528,13 +2528,16 @@ macro_rules! start_matching_fast_loop_body {
                 // mask — a stall the predictor cannot hide.
                 if idxl0 != DFAST_EMPTY_SLOT {
                     let raw_l0 = (idxl0 as usize) - 1;
-                    // `checked_sub` IS the window floor: a slot pointing below
-                    // live history has no concat index. The upper bound stays a
-                    // comparison, and the borrowed window adds its own floor.
-                    if let Some(cand_idx) = raw_l0.checked_sub(unpack_sub)
-                        && cand_idx < idx0
-                        && (!$borrowed || cand_idx + advertised_window >= idx0)
+                    // Plain comparison, not `checked_sub`: the borrow-flag form
+                    // measured +3.7% cycles here, the optimizer lays two bare
+                    // compares out better. The first IS the window floor (a slot
+                    // below live history has no concat index); borrowed adds its
+                    // own.
+                    if raw_l0 >= unpack_sub
+                        && raw_l0 - unpack_sub < idx0
+                        && (!$borrowed || (raw_l0 - unpack_sub) + advertised_window >= idx0)
                     {
+                        let cand_idx = raw_l0 - unpack_sub;
                         // SAFETY: the bounds above make `cand_idx` a valid
                         // in-window concat index, so the 8-byte load stays in
                         // live history (same buffer/length bounds as `v8_0`).
@@ -2684,10 +2687,11 @@ macro_rules! start_matching_fast_loop_body {
                 if idxs0 != DFAST_EMPTY_SLOT {
                     let raw_s0 = (idxs0 as usize) - 1;
                     // Same unpack-into-index shape as the long probe above.
-                    if let Some(cand_idx_s) = raw_s0.checked_sub(unpack_sub)
-                        && cand_idx_s < idx0
-                        && (!$borrowed || cand_idx_s + advertised_window >= idx0)
+                    if raw_s0 >= unpack_sub
+                        && raw_s0 - unpack_sub < idx0
+                        && (!$borrowed || (raw_s0 - unpack_sub) + advertised_window >= idx0)
                     {
+                        let cand_idx_s = raw_s0 - unpack_sub;
                         let cand4 = unsafe {
                             (history_base_ptr.add(history_start_offset + cand_idx_s) as *const u32)
                                 .read_unaligned()
