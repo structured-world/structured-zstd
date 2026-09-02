@@ -893,13 +893,13 @@ macro_rules! collect_optimal_candidates_initialized_body {
         // a future caller may pre-allocate hash3 storage without
         // wiring the BtUltra2 path through.
         let use_hash3: bool = <$strategy_ty as crate::encoding::strategy::Strategy>::USE_HASH3;
-        debug_assert!(!$self.table.hash_table.is_empty());
-        debug_assert!($self.table.hash3_log == 0 || !$self.table.hash3_table.is_empty());
+        debug_assert!(!$self.table.hash_table().is_empty());
+        debug_assert!($self.table.hash3_log == 0 || !$self.table.hash3_table().is_empty());
         debug_assert!(
             !use_hash3 || $self.table.hash3_log != 0,
             "Strategy::USE_HASH3 = true but runtime hash3_log is 0 — call configure() first",
         );
-        debug_assert!(!$self.table.chain_table.is_empty());
+        debug_assert!(!$self.table.chain_table().is_empty());
         let min_match_len = HC_OPT_MIN_MATCH_LEN;
         let reps = $query.reps;
         let lit_len = $query.lit_len;

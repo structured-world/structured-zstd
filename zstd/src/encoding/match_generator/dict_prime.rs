@@ -440,9 +440,12 @@ impl MatchGeneratorDriver {
             let MatcherStorage::HashChain(hc) = &mut self.storage else {
                 unreachable!("bt_decoupled implies HashChain storage");
             };
-            let hash_table = core::mem::take(&mut hc.table.hash_table);
-            let chain_table = core::mem::take(&mut hc.table.chain_table);
-            let hash3_table = core::mem::take(&mut hc.table.hash3_table);
+            // One buffer holds all three regions now; its seams describe it,
+            // so they are taken with it — a snapshot left holding non-zero
+            // seams over an empty buffer would index out of bounds.
+            let tables = core::mem::take(&mut hc.table.tables);
+            let chain_off = core::mem::take(&mut hc.table.chain_off);
+            let hash3_off = core::mem::take(&mut hc.table.hash3_off);
             // The LDM producer carries no dictionary state (LDM is not
             // dict-primed; its hash table is empty at capture), so it is not
             // retained either — `restore` reinstates the frame's freshly-reset
@@ -456,9 +459,9 @@ impl MatchGeneratorDriver {
             let MatcherStorage::HashChain(hc) = &mut self.storage else {
                 unreachable!("storage variant is stable across the take/put");
             };
-            hc.table.hash_table = hash_table;
-            hc.table.chain_table = chain_table;
-            hc.table.hash3_table = hash3_table;
+            hc.table.tables = tables;
+            hc.table.chain_off = chain_off;
+            hc.table.hash3_off = hash3_off;
             #[cfg(feature = "ldm")]
             hc.set_ldm_producer(ldm_producer);
             self.primed = Some((snapshot, self.dictionary_retained_budget, key));

@@ -125,10 +125,10 @@ fn replay_history_for_rebase_bt_walks_inserted_prefix() {
     // into the hash table (via `hash_table[hash] = stored`) so the
     // ground-truth observation is "some hash slots are no longer
     // HC_EMPTY".
-    assert!(t.hash_table.iter().all(|&v| v == HC_EMPTY));
+    assert!(t.hash_table().iter().all(|&v| v == HC_EMPTY));
     t.replay_history_for_rebase_bt(0, 32);
     assert!(
-        t.hash_table.iter().any(|&v| v != HC_EMPTY),
+        t.hash_table().iter().any(|&v| v != HC_EMPTY),
         "BT replay must populate hash table"
     );
 }
@@ -136,9 +136,13 @@ fn replay_history_for_rebase_bt_walks_inserted_prefix() {
 #[test]
 fn begin_rebase_clears_index_tables_and_resets_base() {
     let mut t = new_table(32);
-    t.hash_table = vec![7; 16];
-    t.chain_table = vec![9; 16];
-    t.hash3_table = vec![5; 16];
+    // The three regions share one buffer; seed it through the seams so each
+    // region carries a distinct non-empty marker.
+    t.tables = vec![7; 48];
+    t.chain_off = 16;
+    t.hash3_off = 32;
+    t.chain_table_mut().fill(9);
+    t.hash3_table_mut().fill(5);
     t.history_abs_start = 50;
     t.position_base = 0;
     t.index_shift = 4;
@@ -149,9 +153,9 @@ fn begin_rebase_clears_index_tables_and_resets_base() {
     assert_eq!(t.position_base, 50);
     assert_eq!(t.index_shift, 0);
     assert!(t.allow_zero_relative_position);
-    assert!(t.hash_table.iter().all(|&v| v == HC_EMPTY));
-    assert!(t.chain_table.iter().all(|&v| v == HC_EMPTY));
-    assert!(t.hash3_table.iter().all(|&v| v == HC_EMPTY));
+    assert!(t.hash_table().iter().all(|&v| v == HC_EMPTY));
+    assert!(t.chain_table().iter().all(|&v| v == HC_EMPTY));
+    assert!(t.hash3_table().iter().all(|&v| v == HC_EMPTY));
 }
 
 /// Regression: `rebase_positions_cold` must replay the HC3 side
@@ -182,14 +186,14 @@ fn rebase_positions_cold_rebuilds_hash3_for_btultra2() {
     // positions up to the would-be rebase point.
     t.update_hash3_until(20);
     assert!(
-        t.hash3_table.iter().any(|&v| v != HC_EMPTY),
+        t.hash3_table().iter().any(|&v| v != HC_EMPTY),
         "fixture precondition: hash3 must be non-empty before rebase"
     );
 
     t.rebase_positions_cold(20);
 
     assert!(
-        t.hash3_table.iter().any(|&v| v != HC_EMPTY),
+        t.hash3_table().iter().any(|&v| v != HC_EMPTY),
         "rebase must repopulate the HC3 side table — \
              btultra2 short-match selection depends on it"
     );
@@ -204,7 +208,7 @@ fn insert_positions_with_step_zero_step_is_noop() {
     let next_to_update3_before = t.next_to_update3;
     // step=0 must early-return without touching anything.
     t.insert_positions_with_step(0, 16, 0);
-    assert!(t.hash_table.iter().all(|&v| v == HC_EMPTY));
+    assert!(t.hash_table().iter().all(|&v| v == HC_EMPTY));
     assert_eq!(t.next_to_update3, next_to_update3_before);
 }
 
@@ -220,7 +224,7 @@ fn insert_positions_with_step_saturating_step_breaks_loop() {
     t.insert_positions_with_step(0, 16, usize::MAX);
     // Exactly one position should have been inserted before the
     // loop terminated — observe that only one slot is non-empty.
-    let non_empty = t.hash_table.iter().filter(|&&v| v != HC_EMPTY).count();
+    let non_empty = t.hash_table().iter().filter(|&&v| v != HC_EMPTY).count();
     assert!(
         non_empty <= 1,
         "step=usize::MAX must break after the first insert"
