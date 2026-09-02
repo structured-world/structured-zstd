@@ -740,7 +740,7 @@ impl HcMatcher {
                 },
                 #[cfg(feature = "kernel-sse")]
                 FastpathKernel::Sse2 | FastpathKernel::Sse42 => unsafe {
-                    self.for_each_repcode_candidate_with_reps_sse42(
+                    self.for_each_repcode_candidate_with_reps_sse2(
                         table,
                         abs_pos,
                         lit_len,
@@ -828,7 +828,7 @@ impl HcMatcher {
     ))]
     #[target_feature(enable = "sse2")]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) unsafe fn for_each_repcode_candidate_with_reps_sse42(
+    pub(crate) unsafe fn for_each_repcode_candidate_with_reps_sse2(
         &self,
         table: &MatchTable,
         abs_pos: usize,
@@ -847,7 +847,7 @@ impl HcMatcher {
             current_abs_end,
             min_match_len,
             f,
-            crate::encoding::fastpath::sse42::common_prefix_len_ptr,
+            crate::encoding::fastpath::sse2::common_prefix_len_ptr,
         )
     }
 

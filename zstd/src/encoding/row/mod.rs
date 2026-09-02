@@ -280,12 +280,12 @@ impl RowTags for ScalarTags {
     feature = "kernel-sse"
 ))]
 #[derive(Copy, Clone)]
-struct Sse42Tags;
+struct Sse2Tags;
 #[cfg(all(
     any(target_arch = "x86", target_arch = "x86_64"),
     feature = "kernel-sse"
 ))]
-impl RowTags for Sse42Tags {
+impl RowTags for Sse2Tags {
     #[inline]
     unsafe fn probe<const ROW_LOG: usize>(
         matcher: &RowMatchGenerator,
@@ -294,7 +294,7 @@ impl RowTags for Sse42Tags {
         hash: Option<(usize, u8)>,
     ) -> Option<MatchCandidate> {
         // SAFETY: dispatched only when `tag_kernel == Sse42` (SSE4.2 confirmed).
-        unsafe { matcher.row_probe_sse42::<ROW_LOG>(abs_pos, lit_len, hash) }
+        unsafe { matcher.row_probe_sse2::<ROW_LOG>(abs_pos, lit_len, hash) }
     }
 }
 
@@ -410,7 +410,7 @@ macro_rules! dispatch_tag_kernel {
                     feature = "kernel-sse"
                 ))]
                 FastpathKernel::Sse2 | FastpathKernel::Sse42 => {
-                    $self.$k_method::<Sse42Tags>($($arg),*)
+                    $self.$k_method::<Sse2Tags>($($arg),*)
                 }
                 #[cfg(all(
                     target_arch = "aarch64",
@@ -3337,7 +3337,7 @@ impl RowMatchGenerator {
                     feature = "kernel-sse"
                 ))]
                 FastpathKernel::Sse2 | FastpathKernel::Sse42 => unsafe {
-                    dispatch_lazy!(self.lazy_sse42::<Sse42Tags>(handle_sequence))
+                    dispatch_lazy!(self.lazy_sse2::<Sse2Tags>(handle_sequence))
                 },
                 #[cfg(all(
                     target_arch = "aarch64",
@@ -3367,10 +3367,10 @@ impl RowMatchGenerator {
         feature = "kernel-sse"
     ))]
     gen_lazy_monolith!(
-        lazy_sse42,
+        lazy_sse2,
         true,
         row_tag_mask_sse2,
-        crate::encoding::fastpath::sse42::common_prefix_len_ptr,
+        crate::encoding::fastpath::sse2::common_prefix_len_ptr,
         "sse2"
     );
     #[cfg(all(
@@ -3517,10 +3517,10 @@ impl RowMatchGenerator {
         feature = "kernel-sse"
     ))]
     gen_row_probe!(
-        row_probe_sse42,
+        row_probe_sse2,
         true,
         row_tag_mask_sse2,
-        crate::encoding::fastpath::sse42::common_prefix_len_ptr,
+        crate::encoding::fastpath::sse2::common_prefix_len_ptr,
         "sse2"
     );
     #[cfg(all(

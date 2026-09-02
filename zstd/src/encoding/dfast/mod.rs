@@ -2908,7 +2908,7 @@ impl DfastMatchGenerator {
                 },
                 #[cfg(feature = "kernel-sse")]
                 FastpathKernel::Sse2 | FastpathKernel::Sse42 => unsafe {
-                    dispatch_dict!(start_matching_fast_loop_sse42)
+                    dispatch_dict!(start_matching_fast_loop_sse2)
                 },
                 FastpathKernel::Scalar => dispatch_dict!(start_matching_fast_loop_scalar),
             }
@@ -2968,7 +2968,7 @@ impl DfastMatchGenerator {
         feature = "kernel-sse"
     ))]
     #[target_feature(enable = "sse2")]
-    unsafe fn start_matching_fast_loop_sse42<const USE_DICT: bool, const BORROWED: bool>(
+    unsafe fn start_matching_fast_loop_sse2<const USE_DICT: bool, const BORROWED: bool>(
         &mut self,
         current_abs_start: usize,
         current_len: usize,
@@ -2979,7 +2979,7 @@ impl DfastMatchGenerator {
             current_abs_start,
             current_len,
             handle_sequence,
-            crate::encoding::fastpath::sse42::common_prefix_len_ptr,
+            crate::encoding::fastpath::sse2::common_prefix_len_ptr,
             USE_DICT,
             BORROWED
         )

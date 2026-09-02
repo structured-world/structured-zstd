@@ -21,7 +21,7 @@
 //!
 //! # Strategy
 //!
-//! Each architecture-specific submodule (`neon`, `avx2_bmi2`, `sse42`,
+//! Each architecture-specific submodule (`neon`, `avx2_bmi2`, `sse2`,
 //! `scalar`) holds a duplicate of the hot encode path, with every function in
 //! the chain marked with the same `#[target_feature]`. Inside the module
 //! everything inlines freely. The single ABI boundary is the dispatcher entry
@@ -34,7 +34,9 @@
 //! - `neon` (aarch64 only): NEON is part of the AArch64 baseline ISA but Rust
 //!   still flags intrinsics like `vld1q_u8` with `#[target_feature(enable =
 //!   "neon")]`, so we still need the umbrella attribute to let them inline.
-//! - `sse42` (x86_64): 128-bit SSE2 vector ops, the x86_64 baseline.
+//! - `sse2` (x86/x86_64): 128-bit SSE2 vector ops, the x86_64 baseline.
+//!   Shared by both x86 tiers — they differ only in the optimal parser's
+//!   price set, where the SSE4.2 tier can use `_mm_min_epu32`.
 //! - `avx2_bmi2` (x86_64): adds AVX2 (32-byte vectors) and BMI2 (`pext`,
 //!   `pdep`, `bzhi`) — common on Haswell+ (2013+).
 //!
@@ -72,7 +74,7 @@ pub(crate) mod neon;
     any(target_arch = "x86", target_arch = "x86_64"),
     feature = "kernel-sse"
 ))]
-pub(crate) mod sse42;
+pub(crate) mod sse2;
 
 #[cfg(all(
     any(target_arch = "x86", target_arch = "x86_64"),
@@ -297,7 +299,7 @@ pub(crate) unsafe fn dispatch_common_prefix_len_ptr_with_kernel(
             feature = "kernel-sse"
         ))]
         FastpathKernel::Sse2 | FastpathKernel::Sse42 => unsafe {
-            sse42::common_prefix_len_ptr(lhs, rhs, max)
+            sse2::common_prefix_len_ptr(lhs, rhs, max)
         },
         #[cfg(all(
             any(target_arch = "x86", target_arch = "x86_64"),

@@ -1846,8 +1846,8 @@ fast_dict_borrowed_wrapper!(
         feature = "kernel-sse"
     ))]
     #[target_feature(enable = "sse2")]
-    cbfd_borrowed_sse42,
-    crate::encoding::fastpath::sse42::common_prefix_len_ptr
+    cbfd_borrowed_sse2,
+    crate::encoding::fastpath::sse2::common_prefix_len_ptr
 );
 
 fast_dict_borrowed_wrapper!(
@@ -1938,7 +1938,7 @@ pub(crate) fn compress_block_fast_dict_borrowed<const MLS: u32, const USE_CMOV: 
             },
             #[cfg(feature = "kernel-sse")]
             FastpathKernel::Sse2 | FastpathKernel::Sse42 => unsafe {
-                cbfd_borrowed_sse42::<MLS, USE_CMOV>(
+                cbfd_borrowed_sse2::<MLS, USE_CMOV>(
                     inp,
                     dict,
                     block_start,

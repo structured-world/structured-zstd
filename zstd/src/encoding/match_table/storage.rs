@@ -1407,7 +1407,7 @@ impl MatchTable {
                 },
                 #[cfg(feature = "kernel-sse")]
                 FastpathKernel::Sse2 | FastpathKernel::Sse42 => unsafe {
-                    self.bt_insert_step_no_rebase_sse42(abs_pos, current_abs_end, target_abs)
+                    self.bt_insert_step_no_rebase_sse2(abs_pos, current_abs_end, target_abs)
                 },
                 FastpathKernel::Scalar => {
                     self.bt_insert_step_no_rebase_scalar(abs_pos, current_abs_end, target_abs)
@@ -1481,7 +1481,7 @@ impl MatchTable {
         feature = "kernel-sse"
     ))]
     #[target_feature(enable = "sse2")]
-    pub(crate) unsafe fn bt_insert_step_no_rebase_sse42(
+    pub(crate) unsafe fn bt_insert_step_no_rebase_sse2(
         &mut self,
         abs_pos: usize,
         current_abs_end: usize,
@@ -1494,7 +1494,7 @@ impl MatchTable {
             abs_pos,
             current_abs_end,
             target_abs,
-            crate::encoding::fastpath::sse42::count_match_from_indices
+            crate::encoding::fastpath::sse2::count_match_from_indices
         )
     }
 
@@ -1633,7 +1633,7 @@ impl MatchTable {
                 },
                 #[cfg(feature = "kernel-sse")]
                 FastpathKernel::Sse2 | FastpathKernel::Sse42 => unsafe {
-                    self.bt_insert_and_collect_matches_sse42(
+                    self.bt_insert_and_collect_matches_sse2(
                         abs_pos,
                         current_abs_end,
                         profile,
@@ -1760,7 +1760,7 @@ impl MatchTable {
     ))]
     #[target_feature(enable = "sse2")]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) unsafe fn bt_insert_and_collect_matches_sse42(
+    pub(crate) unsafe fn bt_insert_and_collect_matches_sse2(
         &mut self,
         abs_pos: usize,
         current_abs_end: usize,
@@ -1785,8 +1785,8 @@ impl MatchTable {
             reps,
             lit_len,
             use_hash3,
-            crate::encoding::fastpath::sse42::common_prefix_len_ptr,
-            crate::encoding::fastpath::sse42::count_match_from_indices,
+            crate::encoding::fastpath::sse2::common_prefix_len_ptr,
+            crate::encoding::fastpath::sse2::count_match_from_indices,
         )
     }
 
@@ -1950,7 +1950,7 @@ impl MatchTable {
                 },
                 #[cfg(feature = "kernel-sse")]
                 FastpathKernel::Sse2 | FastpathKernel::Sse42 => unsafe {
-                    self.bt_update_tree_until_sse42(abs_pos, current_abs_end)
+                    self.bt_update_tree_until_sse2(abs_pos, current_abs_end)
                 },
                 FastpathKernel::Scalar => {
                     self.bt_update_tree_until_scalar(abs_pos, current_abs_end)
@@ -2022,7 +2022,7 @@ impl MatchTable {
         feature = "kernel-sse"
     ))]
     #[target_feature(enable = "sse2")]
-    pub(crate) unsafe fn bt_update_tree_until_sse42(
+    pub(crate) unsafe fn bt_update_tree_until_sse2(
         &mut self,
         abs_pos: usize,
         current_abs_end: usize,
@@ -2036,9 +2036,8 @@ impl MatchTable {
             if !self.can_skip_rebase_check_at(update_abs, abs_pos, is_btultra2) {
                 self.maybe_rebase_positions(update_abs);
             }
-            let forward = unsafe {
-                self.bt_insert_step_no_rebase_sse42(update_abs, current_abs_end, abs_pos)
-            };
+            let forward =
+                unsafe { self.bt_insert_step_no_rebase_sse2(update_abs, current_abs_end, abs_pos) };
             // Upstream zstd `ZSTD_updateTree`: `idx += ZSTD_insertBt1(...)` with
             // NO clamp to the target. The insert step's `forward` skips the
             // positions a long match already covers, so letting it overshoot
@@ -2493,7 +2492,7 @@ impl MatchTable {
                 },
                 #[cfg(feature = "kernel-sse")]
                 FastpathKernel::Sse2 | FastpathKernel::Sse42 => unsafe {
-                    self.hash3_candidate_sse42(abs_pos, current_abs_end, min_match_len)
+                    self.hash3_candidate_sse2(abs_pos, current_abs_end, min_match_len)
                 },
                 FastpathKernel::Scalar => {
                     self.hash3_candidate_scalar(abs_pos, current_abs_end, min_match_len)
@@ -2548,7 +2547,7 @@ impl MatchTable {
         feature = "kernel-sse"
     ))]
     #[target_feature(enable = "sse2")]
-    pub(crate) unsafe fn hash3_candidate_sse42(
+    pub(crate) unsafe fn hash3_candidate_sse2(
         &self,
         abs_pos: usize,
         current_abs_end: usize,
@@ -2559,7 +2558,7 @@ impl MatchTable {
             abs_pos,
             current_abs_end,
             min_match_len,
-            crate::encoding::fastpath::sse42::common_prefix_len_ptr,
+            crate::encoding::fastpath::sse2::common_prefix_len_ptr,
         )
     }
 

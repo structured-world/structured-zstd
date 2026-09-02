@@ -2012,9 +2012,9 @@ impl HcMatchGenerator {
             profile,
             query,
             out,
-            bt_insert_step_no_rebase_sse42,
-            crate::encoding::fastpath::sse42::common_prefix_len_ptr,
-            crate::encoding::fastpath::sse42::count_match_from_indices,
+            bt_insert_step_no_rebase_sse2,
+            crate::encoding::fastpath::sse2::common_prefix_len_ptr,
+            crate::encoding::fastpath::sse2::count_match_from_indices,
         )
     }
 
@@ -2047,9 +2047,9 @@ impl HcMatchGenerator {
             profile,
             query,
             out,
-            bt_insert_step_no_rebase_sse42,
-            crate::encoding::fastpath::sse42::common_prefix_len_ptr,
-            crate::encoding::fastpath::sse42::count_match_from_indices,
+            bt_insert_step_no_rebase_sse2,
+            crate::encoding::fastpath::sse2::common_prefix_len_ptr,
+            crate::encoding::fastpath::sse2::count_match_from_indices,
         )
     }
 
