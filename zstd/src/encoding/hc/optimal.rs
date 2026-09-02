@@ -1791,10 +1791,33 @@ impl HcMatchGenerator {
                 ),
             }
         }
+        // wasm resolves `simd128` at compile time (no runtime detection), so
+        // the tier comes from `cfg`, not from `self.table.kernel`.
+        #[cfg(all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel_simd128"
+        ))]
+        // SAFETY: the `cfg` above establishes `simd128` at compile time, which
+        // is exactly the umbrella the callee declares.
+        unsafe {
+            self.collect_optimal_candidates_initialized_simd128::<S>(
+                abs_pos,
+                current_abs_end,
+                profile,
+                query,
+                out,
+            )
+        }
         #[cfg(not(any(
             all(target_arch = "aarch64", target_endian = "little"),
             target_arch = "x86",
-            target_arch = "x86_64"
+            target_arch = "x86_64",
+            all(
+                target_arch = "wasm32",
+                target_feature = "simd128",
+                feature = "kernel_simd128"
+            )
         )))]
         {
             self.collect_optimal_candidates_initialized_scalar::<S>(
@@ -1887,6 +1910,42 @@ impl HcMatchGenerator {
             bt_insert_step_no_rebase_avx2_bmi2,
             crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr,
             crate::encoding::fastpath::avx2_bmi2::count_match_from_indices,
+        )
+    }
+
+    /// WebAssembly `simd128` umbrella variant: the BT step, the match-length
+    /// probe and the prefix compare all share the `simd128` umbrella so the
+    /// per-position pipeline stays one inline sequence.
+    ///
+    /// # Safety
+    /// wasm32 with `simd128` enabled at compile time.
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel_simd128"
+    ))]
+    #[target_feature(enable = "simd128")]
+    unsafe fn collect_optimal_candidates_initialized_simd128<
+        S: crate::encoding::strategy::Strategy,
+    >(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        profile: HcOptimalCostProfile,
+        query: HcCandidateQuery,
+        out: &mut Vec<MatchCandidate>,
+    ) {
+        collect_optimal_candidates_initialized_body!(
+            self,
+            S,
+            abs_pos,
+            current_abs_end,
+            profile,
+            query,
+            out,
+            bt_insert_step_no_rebase_simd128,
+            crate::encoding::fastpath::simd128::common_prefix_len_ptr,
+            crate::encoding::fastpath::simd128::count_match_from_indices,
         )
     }
 

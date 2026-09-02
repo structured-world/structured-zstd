@@ -77,16 +77,9 @@ pub(crate) unsafe fn common_prefix_len_ptr(lhs: *const u8, rhs: *const u8, max: 
 /// probe entry point. Same invariants as the scalar variant, under the
 /// `simd128` umbrella.
 ///
-/// Currently unreferenced: the BT collect-matches walker in
-/// `MatchTable` only has neon / sse2 / avx2 / scalar wrappers, so a wasm
-/// build runs the BT walk through the scalar probe and never reaches this
-/// one. Kept because wiring the wasm tier into that walker is a pending
-/// optimisation, not because the code is obsolete.
-///
 /// # Safety
 /// BT walk invariants: `candidate_idx + tail_limit <= concat.len()` and
 /// `current_idx + tail_limit <= concat.len()`.
-#[allow(dead_code)]
 #[target_feature(enable = "simd128")]
 #[inline]
 pub(crate) unsafe fn count_match_from_indices(

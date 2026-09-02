@@ -1408,10 +1408,27 @@ impl MatchTable {
                 }
             }
         }
+        // wasm has no runtime CPU detection: `simd128` is resolved at compile
+        // time, so the tier is picked by `cfg` rather than by `self.kernel`.
+        #[cfg(all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel_simd128"
+        ))]
+        // SAFETY: the `cfg` above establishes `simd128` at compile time, which
+        // is exactly the umbrella the callee declares.
+        unsafe {
+            self.bt_insert_step_no_rebase_simd128(abs_pos, current_abs_end, target_abs)
+        }
         #[cfg(not(any(
             all(target_arch = "aarch64", target_endian = "little"),
             target_arch = "x86",
-            target_arch = "x86_64"
+            target_arch = "x86_64",
+            all(
+                target_arch = "wasm32",
+                target_feature = "simd128",
+                feature = "kernel_simd128"
+            )
         )))]
         {
             self.bt_insert_step_no_rebase_scalar(abs_pos, current_abs_end, target_abs)
@@ -1484,6 +1501,33 @@ impl MatchTable {
             current_abs_end,
             target_abs,
             crate::encoding::fastpath::avx2_bmi2::count_match_from_indices
+        )
+    }
+
+    /// WebAssembly `simd128` umbrella BT walker step.
+    ///
+    /// # Safety
+    /// wasm32 with `simd128` enabled at compile time.
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel_simd128"
+    ))]
+    #[target_feature(enable = "simd128")]
+    pub(crate) unsafe fn bt_insert_step_no_rebase_simd128(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        target_abs: usize,
+    ) -> usize {
+        let search_depth = self.search_depth;
+        super::super::hc::generator::bt_insert_step_no_rebase_body!(
+            self,
+            search_depth,
+            abs_pos,
+            current_abs_end,
+            target_abs,
+            crate::encoding::fastpath::simd128::count_match_from_indices
         )
     }
 
@@ -1582,10 +1626,37 @@ impl MatchTable {
                 ),
             }
         }
+        // wasm resolves `simd128` at compile time (no runtime detection), so
+        // the tier comes from `cfg`, not from `self.kernel`.
+        #[cfg(all(
+            target_arch = "wasm32",
+            target_feature = "simd128",
+            feature = "kernel_simd128"
+        ))]
+        // SAFETY: the `cfg` above establishes `simd128` at compile time, which
+        // is exactly the umbrella the callee declares.
+        unsafe {
+            self.bt_insert_and_collect_matches_simd128(
+                abs_pos,
+                current_abs_end,
+                profile,
+                min_match_len,
+                best_len_for_skip,
+                out,
+                reps,
+                lit_len,
+                use_hash3,
+            )
+        }
         #[cfg(not(any(
             all(target_arch = "aarch64", target_endian = "little"),
             target_arch = "x86",
-            target_arch = "x86_64"
+            target_arch = "x86_64",
+            all(
+                target_arch = "wasm32",
+                target_feature = "simd128",
+                feature = "kernel_simd128"
+            )
         )))]
         {
             self.bt_insert_and_collect_matches_scalar(
@@ -1710,6 +1781,47 @@ impl MatchTable {
             use_hash3,
             crate::encoding::fastpath::avx2_bmi2::common_prefix_len_ptr,
             crate::encoding::fastpath::avx2_bmi2::count_match_from_indices,
+        )
+    }
+
+    /// WebAssembly `simd128` umbrella BT collect-matches walker.
+    ///
+    /// # Safety
+    /// wasm32 with `simd128` enabled at compile time.
+    #[cfg(all(
+        target_arch = "wasm32",
+        target_feature = "simd128",
+        feature = "kernel_simd128"
+    ))]
+    #[target_feature(enable = "simd128")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn bt_insert_and_collect_matches_simd128(
+        &mut self,
+        abs_pos: usize,
+        current_abs_end: usize,
+        profile: &HcOptimalCostProfile,
+        min_match_len: usize,
+        best_len_for_skip: &mut usize,
+        out: &mut Vec<MatchCandidate>,
+        reps: [u32; 3],
+        lit_len: usize,
+        use_hash3: bool,
+    ) {
+        let search_depth = self.search_depth;
+        super::super::hc::generator::bt_insert_and_collect_matches_body!(
+            self,
+            search_depth,
+            abs_pos,
+            current_abs_end,
+            profile,
+            min_match_len,
+            best_len_for_skip,
+            out,
+            reps,
+            lit_len,
+            use_hash3,
+            crate::encoding::fastpath::simd128::common_prefix_len_ptr,
+            crate::encoding::fastpath::simd128::count_match_from_indices,
         )
     }
 
