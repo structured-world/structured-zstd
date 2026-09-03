@@ -194,11 +194,12 @@ fn parse_memory_limit(text: &str) -> Result<u64> {
 /// promise this build cannot make, and saying nothing would leave the caller
 /// believing a bound that is not there.
 ///
-/// `dictionary_bytes` is the size of the `-D` file, counted twice: the blob is
-/// held for the length of the run and its content is copied again into the
-/// parsed dictionary. A large one can break the promise on its own, so it is
-/// weighed once the file has been read rather than assumed away.
-fn check_memory_limit(requested: u64, dictionary_bytes: u64) -> Result<()> {
+/// `whole_file_bytes` is what this run holds in full rather than streams,
+/// counted twice because each such buffer exists in two forms at once: the `-D`
+/// dictionary as read and again as parsed, a benchmark's input and its
+/// round-tripped copy. Either can break the promise on its own, so it is
+/// weighed from the file sizes before anything is loaded.
+fn check_memory_limit(requested: u64, whole_file_bytes: u64) -> Result<()> {
     /// Window ceiling the decoder refuses to exceed.
     const WINDOW: u64 = structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE;
     /// What the decoder holds BESIDES the window, rounded well up: the literal
@@ -207,19 +208,19 @@ fn check_memory_limit(requested: u64, dictionary_bytes: u64) -> Result<()> {
     /// Counted because the promise is about total memory, not about one
     /// allocation: a limit equal to the window alone is one we would break.
     const AUXILIARY: u64 = 1 << 20;
-    // Plain arithmetic: the dictionary was read into memory, so its size is a
-    // real allocation and nowhere near half of `u64`.
-    let dictionary = dictionary_bytes * 2;
-    let floor = WINDOW + AUXILIARY + dictionary;
+    // Plain arithmetic: these are file sizes on their way into memory, so they
+    // are real allocations and nowhere near half of `u64`.
+    let buffers = whole_file_bytes * 2;
+    let floor = WINDOW + AUXILIARY + buffers;
     if requested < floor {
-        if dictionary > 0 {
+        if buffers > 0 {
             bail!(
                 "requested memory limit {requested} B does not cover this run: a {} MiB \
                  window, about {} MiB of literal, block, sequence and table buffers, and \
-                 {} MiB for the dictionary, which is held as read and again as parsed.",
+                 {} MiB of whole-file buffers, each of which is held in two forms at once.",
                 WINDOW / (1 << 20),
                 AUXILIARY / (1 << 20),
-                dictionary / (1 << 20),
+                buffers / (1 << 20),
             );
         }
         bail!(
@@ -634,6 +635,12 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
                     // `-M[N]` is a decompression memory ceiling — a safety
                     // promise, so it is checked against the one this build
                     // enforces rather than swallowed.
+                    //
+                    // A bare `-M` sets no ceiling, which is what upstream does
+                    // with it: the value is attached or it is nothing, and the
+                    // next argument stays a filename (`zstd -d -M 8 f.zst`
+                    // reads `8` as a file). Erroring here would refuse a
+                    // command line the reference tool accepts.
                     let rest: String = chars[ci + 1..].iter().collect();
                     if !rest.is_empty() {
                         opts.memory_limit =
@@ -895,6 +902,23 @@ fn run_benchmark(opts: &Options, dict: Option<&[u8]>) -> Result<()> {
     if opts.inputs.is_empty() || opts.inputs.iter().any(|i| i == "-") {
         bail!("-b requires one or more regular input files to benchmark");
     }
+    // Benchmarking is the one path that holds whole files: the inputs
+    // concatenated, and a decompressed copy of them per pass. That dwarfs the
+    // decoder's own workspace, so a ceiling that ignored it would be kept in
+    // the small and broken in the large. Weighed from the directory entries,
+    // before a byte is read.
+    if let Some(limit) = opts.memory_limit {
+        let mut total = 0u64;
+        for input in &opts.inputs {
+            total += fs::metadata(input)
+                .wrap_err_with(|| format!("failed to inspect {input}"))?
+                .len();
+        }
+        // The input and the round-tripped copy; the compressed form is smaller
+        // than either on anything worth benchmarking.
+        check_memory_limit(limit, total)?;
+    }
+
     let mut data = Vec::new();
     for input in &opts.inputs {
         data.extend_from_slice(
@@ -1088,6 +1112,11 @@ fn list_file(path: &Path) -> Result<()> {
         bail!("{}: not a zstd frame: empty file", path.display());
     }
     let mut offset = 0u64;
+    // `Frames` counts every frame in the file and `Skips` says how many of them
+    // were skippable, which is how the reference tool fills these columns:
+    // zstd 1.5.7 prints `Frames 3, Skips 1` for an archive of two data frames
+    // around one metadata frame. Reporting 2 and 1 for that file would read as
+    // four frames to anyone adding the columns up.
     let mut frames = 0u64;
     let mut data_frames = 0u64;
     let mut skips = 0u64;

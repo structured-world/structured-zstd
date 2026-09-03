@@ -801,8 +801,8 @@ fn the_memory_limit_counts_the_dictionary_it_was_given() {
     let err = check_memory_limit(generous, 120 * (1 << 20))
         .expect_err("a dictionary this size does not fit under the requested limit");
     assert!(
-        err.to_string().contains("dictionary"),
-        "the refusal should say the dictionary is what does not fit, got: {err}"
+        err.to_string().contains("whole-file buffers"),
+        "the refusal should say what does not fit, got: {err}"
     );
 }
 
@@ -838,10 +838,42 @@ fn an_oversized_dictionary_is_refused_before_it_is_read() {
         .expect_err("a dictionary that does not fit the limit must be refused")
         .to_string();
     assert!(
-        err.contains("memory limit") && err.contains("dictionary"),
-        "the refusal must name the limit, not report a read that should never \
-         have been attempted: {err}"
+        err.contains("memory limit"),
+        "the refusal must be the limit, not a read that should never have been \
+         attempted: {err}"
     );
+}
+
+/// Benchmarking holds the whole input and a decompressed copy of it, which is
+/// the largest thing the run allocates by far. A ceiling that weighs the
+/// decoder's window and ignores those buffers is a promise kept in the small
+/// and broken in the large.
+#[test]
+fn the_memory_limit_counts_what_a_benchmark_holds() {
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("szstd-benchmem-{}.bin", std::process::id()));
+    fs::write(&path, vec![0u8; 64 * 1024]).unwrap();
+
+    let mut opts = parse(&["-b3", "f"]).unwrap();
+    opts.inputs = vec![path.display().to_string()];
+    // 64 KiB in and 64 KiB back out, against a limit with 32 KiB of headroom
+    // above the decoder's own floor.
+    opts.memory_limit =
+        Some(structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE + (1 << 20) + 32 * 1024);
+    let refused = run_benchmark(&opts, None);
+
+    opts.memory_limit = Some(300 * (1 << 20));
+    let accepted = run_benchmark(&opts, None);
+    let _ = fs::remove_file(&path);
+
+    let err = refused
+        .expect_err("a benchmark that cannot fit its own buffers must be refused")
+        .to_string();
+    assert!(
+        err.contains("memory limit"),
+        "the refusal must be the limit: {err}"
+    );
+    accepted.expect("a limit that covers the buffers must let the benchmark run");
 }
 
 /// Flags whose whole purpose is to change which files are touched, or what
