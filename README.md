@@ -67,6 +67,12 @@ decompression window plus the decoder's buffers is kept, a tighter one is
 refused rather than ignored, and it is refused outright with `--train`, which
 it says nothing about.
 
+`--train` and `--train-fastcover` both train with FastCOVER, the algorithm
+upstream also defaults to. `--train-cover` and `--train-legacy` name algorithms
+this build does not have, so they are refused rather than quietly served by
+FastCOVER. `-D` takes a dictionary produced by `--train`; raw-content
+dictionaries are not supported yet and say so.
+
 It is deliberately **not** installed as `zstd`, so it never shadows the system
 tool. It does dispatch on the name it is invoked under, so linking it as the
 familiar names works:

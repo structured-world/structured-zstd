@@ -245,6 +245,26 @@ fn finalize_raw_dict_pads_to_minimum_content_size() {
     assert_eq!(parsed.dict_content.last(), Some(&b'x'));
 }
 
+/// A corpus of one repeated byte carries no symbol distribution to describe, so
+/// the serializer substitutes a synthetic alphabet. That substitute has to be
+/// one the Huffman table description can actually express: a flat alphabet
+/// wider than 128 symbols has neither an FSE nor a direct representation, and
+/// training on such a corpus must not take the process down with it.
+#[test]
+fn training_on_a_single_repeated_byte_does_not_crash() {
+    let sample = vec![7u8; 4096];
+    let mut out = Vec::new();
+    create_fastcover_dict_from_source(
+        Cursor::new(sample.as_slice()),
+        &mut out,
+        4096,
+        &FastCoverOptions::default(),
+        FinalizeOptions { dict_id: Some(1) },
+    )
+    .expect("a uniform corpus must train or fail, never panic");
+    Dictionary::decode_dict(out.as_slice()).expect("the trained dictionary must parse back");
+}
+
 #[test]
 fn finalize_raw_dict_rejects_zero_dict_id() {
     let sample = training_data();

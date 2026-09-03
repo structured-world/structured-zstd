@@ -37,6 +37,32 @@ fn list_file_walks_multi_frame_archive_by_seeking() {
     result.expect("list_file must walk both frames without error");
 }
 
+/// Skippable frames sit inside ordinary archives — seekable-zstd puts its index
+/// in one, and callers attach their own metadata the same way. Listing has to
+/// walk past them like any decoder does, or `-l` refuses files the reference
+/// tool lists without complaint.
+#[test]
+fn list_file_walks_past_skippable_frames() {
+    use structured_zstd::encoding::{CompressionLevel, compress_slice_to_vec};
+
+    let mut archive = compress_slice_to_vec(b"first frame", CompressionLevel::Default);
+    // Magic 0x184D2A50 (little-endian) + a 4-byte length + that many bytes.
+    archive.extend_from_slice(&0x184D_2A50_u32.to_le_bytes());
+    archive.extend_from_slice(&4_u32.to_le_bytes());
+    archive.extend_from_slice(b"meta");
+    archive.extend_from_slice(&compress_slice_to_vec(
+        b"second frame",
+        CompressionLevel::Default,
+    ));
+
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("szstd-list-skip-{}.zst", std::process::id()));
+    fs::write(&path, &archive).unwrap();
+    let result = list_file(&path);
+    let _ = fs::remove_file(&path);
+    result.expect("a skippable frame between two frames must not fail the listing");
+}
+
 #[test]
 fn argv0_unzstd_defaults_to_decompress() {
     assert_eq!(program_mode("unzstd"), (Mode::Decompress, false));
@@ -128,6 +154,89 @@ fn long_flag_enables_ldm() {
     assert!(!parse(&["-19", "in.txt"]).unwrap().long);
 }
 
+/// `--long=N` names the window the caller wants — the match distance the
+/// encoder may reach back over, and with it the memory a decoder will need.
+/// Enabling long-distance matching while dropping the N reaches back only as
+/// far as the level would have anyway, so the matches the flag was typed for
+/// are the ones it does not find.
+#[test]
+fn long_window_log_reaches_the_encoder() {
+    use structured_zstd::decoding::read_frame_header_info;
+
+    let opts = parse(&["--long=27", "in.txt"]).unwrap();
+    assert_eq!(
+        opts.long_window_log,
+        Some(27),
+        "the value must survive parsing"
+    );
+
+    let mut frame = Vec::new();
+    compress_stream(
+        &b"payload"[..],
+        &mut frame,
+        3,
+        false,
+        None,
+        None,
+        None,
+        true,
+        Some(27),
+    )
+    .expect("compressing with an explicit window log must succeed");
+    let info = read_frame_header_info(&frame, false).expect("the frame header must parse");
+    assert_eq!(
+        info.window_size,
+        1 << 27,
+        "the frame has to declare the window the caller asked for"
+    );
+}
+
+/// Training writes a file like any other output, so it answers to `-f` like any
+/// other output. Without the gate `--train -o existing` replaces the file with
+/// no warning, and naming a sample as the destination destroys the sample.
+#[test]
+fn training_refuses_to_overwrite_without_force() {
+    let dir = std::env::temp_dir();
+    let sample = dir.join(format!("szstd-train-sample-{}.bin", std::process::id()));
+    let existing = dir.join(format!("szstd-train-out-{}.bin", std::process::id()));
+    fs::write(&sample, vec![7u8; 4096]).unwrap();
+    fs::write(&existing, b"precious").unwrap();
+
+    let mut opts = parse(&["--train", "s"]).unwrap();
+    opts.inputs = vec![sample.display().to_string()];
+    opts.output = Some(existing.clone());
+    let refused = train_dictionary(&opts);
+
+    let survived = fs::read(&existing).unwrap_or_default();
+    let _ = fs::remove_file(&sample);
+    let _ = fs::remove_file(&existing);
+    refused.expect_err("an existing dictionary must not be replaced without -f");
+    assert_eq!(survived, b"precious", "the existing file must be untouched");
+}
+
+/// The trainer flags name algorithms, and the algorithm decides what the
+/// dictionary contains. Only FastCOVER is implemented here, so the flags that
+/// ask for COVER or the legacy trainer have to say no — running FastCOVER under
+/// their name returns a dictionary the caller did not ask for.
+#[test]
+fn unimplemented_trainers_are_refused_not_substituted() {
+    assert_eq!(parse(&["--train", "s1"]).unwrap().mode, Mode::Train);
+    assert_eq!(
+        parse(&["--train-fastcover", "s1"]).unwrap().mode,
+        Mode::Train
+    );
+    assert!(parse(&["--train-cover", "s1"]).is_err());
+    assert!(parse(&["--train-legacy", "s1"]).is_err());
+}
+
+/// The window log has a supported range; a value outside it has to fail rather
+/// than be quietly replaced by a working one, or the caller believes in a
+/// window the frame does not have.
+#[test]
+fn out_of_range_long_window_log_is_refused() {
+    assert!(parse(&["--long=99", "in.txt"]).is_err());
+}
+
 #[test]
 fn benchmark_flags_parse_level_range() {
     let opts = parse(&["-b3", "-e7", "in.txt"]).unwrap();
@@ -209,6 +318,7 @@ fn decompress_suffix_stripping() {
         bench_end: 0,
         bench_secs: 1.0,
         long: false,
+        long_window_log: None,
         pledged_size: None,
         size_hint: None,
     };
@@ -425,8 +535,18 @@ fn corrupted_checksum_is_reported_not_passed() {
     // omits it, and a frame without one has nothing to verify.
     let payload = b"payload whose checksum will be corrupted";
     let mut frame = Vec::new();
-    compress_stream(&payload[..], &mut frame, 3, false, None, None, None, false)
-        .expect("compressing the fixture must succeed");
+    compress_stream(
+        &payload[..],
+        &mut frame,
+        3,
+        false,
+        None,
+        None,
+        None,
+        false,
+        None,
+    )
+    .expect("compressing the fixture must succeed");
     // The trailing four bytes are the frame's XXH64 check field.
     let last = frame.len() - 1;
     frame[last] ^= 0xFF;
@@ -498,4 +618,80 @@ fn memory_limit_is_refused_for_training() {
     assert!(parse(&["--train", "--memory=256MB", "s1", "s2"]).is_err());
     // Still fine for the modes it does describe.
     assert!(parse(&["-d", "-M256", "f"]).is_ok());
+}
+
+/// Concatenating frames is a documented property of the format: `cat a.zst
+/// b.zst` decodes to `a` followed by `b`, which is how `tar` archives and
+/// append-style logs are built. Stopping at the first frame loses the rest
+/// silently, and makes `-t` answer for a prefix of what it was handed.
+#[test]
+fn concatenated_frames_are_all_decoded() {
+    let mut stream = Vec::new();
+    for payload in [&b"first frame payload"[..], &b"second frame payload"[..]] {
+        compress_stream(
+            payload,
+            &mut stream,
+            3,
+            false,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .expect("compressing a fixture frame must succeed");
+    }
+
+    let mut out = Vec::new();
+    decompress_stream(stream.as_slice(), &mut out, None).expect("both frames must decode");
+    assert_eq!(
+        out, b"first frame payloadsecond frame payload",
+        "every frame in the stream has to reach the output"
+    );
+}
+
+/// Skippable frames carry caller metadata inside an otherwise ordinary stream;
+/// the format says a decoder steps over them. Failing on one would reject
+/// archives the reference tool reads without complaint.
+#[test]
+fn skippable_frames_are_stepped_over() {
+    let mut stream = Vec::new();
+    compress_stream(
+        &b"payload"[..],
+        &mut stream,
+        3,
+        false,
+        None,
+        None,
+        None,
+        false,
+        None,
+    )
+    .expect("compressing the fixture must succeed");
+    // Magic 0x184D2A50 (little-endian) + a 4-byte length + that many bytes.
+    stream.extend_from_slice(&0x184D_2A50_u32.to_le_bytes());
+    stream.extend_from_slice(&4_u32.to_le_bytes());
+    stream.extend_from_slice(b"meta");
+    // A frame after it, so the skip has to land on the right byte rather than
+    // merely being tolerated at the end of the stream.
+    compress_stream(
+        &b" and more"[..],
+        &mut stream,
+        3,
+        false,
+        None,
+        None,
+        None,
+        false,
+        None,
+    )
+    .expect("compressing the trailing fixture must succeed");
+
+    let mut out = Vec::new();
+    decompress_stream(stream.as_slice(), &mut out, None)
+        .expect("a skippable frame must not fail the decode");
+    assert_eq!(
+        out, b"payload and more",
+        "skippable content is stepped over, not emitted"
+    );
 }

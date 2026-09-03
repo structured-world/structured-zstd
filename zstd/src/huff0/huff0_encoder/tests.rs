@@ -560,6 +560,22 @@ fn cached_encoded_weight_description_is_reused_for_write_table() {
     assert_eq!(&encoded[1..], cached.as_slice());
 }
 
+/// A perfectly flat alphabet wider than 128 symbols gives every symbol the same
+/// weight, which FSE cannot represent (an RLE weight stream) while the direct
+/// nibble form runs out of header byte at 128 symbols. Such a table has no
+/// description to write, and callers are expected to ask before writing one.
+#[test]
+fn flat_wide_alphabet_has_no_writeable_description() {
+    // Every one of the 256 symbols exactly once: all code lengths are 8, so all
+    // weights are equal.
+    let alphabet: Vec<u8> = (0u8..=255).collect();
+    let table = HuffmanTable::build_from_data(&alphabet);
+    assert!(
+        table.writeable_table_description_size().is_none(),
+        "a table this wide and this flat has no representation to write"
+    );
+}
+
 #[cfg(feature = "std")]
 #[test]
 fn write_table_raw_path_initializes_none_cache() {

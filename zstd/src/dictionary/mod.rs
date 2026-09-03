@@ -299,10 +299,22 @@ fn serialize_huffman_table(sample_data: &[u8], raw_content: &[u8]) -> io::Result
     };
     let mut stats = bounded_huffman_stats(source);
     if stats.len() < 2 || stats.iter().all(|b| *b == stats[0]) {
-        stats = (0u8..=255).collect();
+        // A corpus with no distribution to measure gets a synthetic one. It
+        // stops at 128 symbols because a perfectly flat alphabet gives every
+        // symbol the same weight: FSE cannot encode that (an RLE weight
+        // stream), and the direct nibble form addresses at most 128 symbols, so
+        // a full 0..=255 alphabet would have no description at all.
+        stats = (0u8..128).collect();
     }
 
-    let table = HuffmanEncoderTable::build_from_data(stats.as_slice());
+    let mut table = HuffmanEncoderTable::build_from_data(stats.as_slice());
+    if table.writeable_table_description_size().is_none() {
+        // Sampled real data can land on the same shape: a flat alphabet wider
+        // than 128 symbols. Fall back to the synthetic narrow one, which always
+        // has a description.
+        stats = (0u8..128).collect();
+        table = HuffmanEncoderTable::build_from_data(stats.as_slice());
+    }
     let mut writer = BitWriter::new();
     let mut encoder = HuffmanEncoder::new(&table, &mut writer);
     encoder.encode(&[stats[0]], true);

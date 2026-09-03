@@ -33,7 +33,7 @@ pub mod errors;
 mod frame_decoder;
 mod streaming_decoder;
 
-pub use dictionary::{Dictionary, DictionaryHandle};
+pub use dictionary::{Dictionary, DictionaryHandle, MAGIC_NUM as DICTIONARY_MAGIC};
 pub use frame_decoder::{BlockDecodingStrategy, ContentChecksum, FrameDecoder};
 
 /// Largest window a frame may declare before this decoder refuses it.

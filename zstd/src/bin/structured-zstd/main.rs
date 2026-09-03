@@ -10,7 +10,7 @@ mod progress;
 use progress::{ProgressMonitor, fmt_size};
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, ErrorKind, IsTerminal, Read, Write};
+use std::io::{self, BufRead, BufReader, ErrorKind, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use structured_zstd::encoding::CompressionLevel;
@@ -109,6 +109,9 @@ struct Options {
     /// Long-distance matching (`--long`), enabled on the encoder via the
     /// compression-parameters API.
     long: bool,
+    /// Back-reference window from `--long=N`. Bare `--long` leaves it unset, so
+    /// the level's own window applies.
+    long_window_log: Option<u32>,
     /// Exact input length from `--stream-size`. Recorded in the frame header,
     /// so the stream must actually be this long — a wrong value is an error,
     /// not a worse ratio.
@@ -174,6 +177,24 @@ fn check_memory_limit(requested: u64) -> Result<()> {
              table buffers. This build cannot be tightened below that.",
             WINDOW / (1 << 20),
             AUXILIARY / (1 << 20),
+        );
+    }
+    Ok(())
+}
+
+/// Check a `--long=N` window log against the range the encoder supports.
+///
+/// Validated at parse time rather than at the first frame, so a wrong value is
+/// reported before any file is opened or any output is written.
+fn check_window_log(log: u32) -> Result<()> {
+    use structured_zstd::encoding::CParameter;
+
+    let bounds = CParameter::WindowLog.bounds();
+    if !bounds.contains(i64::from(log)) {
+        bail!(
+            "--long window log {log} is outside the supported range {}..={}",
+            bounds.lower_bound,
+            bounds.upper_bound,
         );
     }
     Ok(())
@@ -282,6 +303,7 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
         bench_end: 0,
         bench_secs: 1.0,
         long: false,
+        long_window_log: None,
         pledged_size: None,
         size_hint: None,
     };
@@ -307,8 +329,16 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
                 "decompress" | "uncompress" => opts.mode = Mode::Decompress,
                 "test" => opts.mode = Mode::Test,
                 "list" => opts.mode = Mode::List,
-                "train" | "train-fastcover" | "train-cover" | "train-legacy" => {
-                    opts.mode = Mode::Train
+                // Plain `--train` selects the same default upstream does,
+                // FastCOVER, so the two spellings agree.
+                "train" | "train-fastcover" => opts.mode = Mode::Train,
+                // The other trainers produce different dictionaries. Accepting
+                // the flag and running FastCOVER anyway would hand back a
+                // dictionary the caller did not ask for, with nothing to say so.
+                "train-cover" | "train-legacy" => {
+                    bail!(
+                        "--{long} is not implemented; --train / --train-fastcover trains with FastCOVER"
+                    )
                 }
                 // `-c` and `-o` name competing destinations, so each clears the
                 // other and the later one on the command line wins, as upstream
@@ -436,13 +466,15 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
                     } else if long == "long" {
                         opts.long = true;
                     } else if let Some(v) = long.strip_prefix("long=") {
-                        // `--long=N`: the window-log hint must be numeric (it is
-                        // accepted but the encoder derives the LDM window from the
-                        // level). Reject `--long=` / `--long=abc` instead of
-                        // treating them as a silent no-op. Exact-match so
-                        // `--longer` is an unknown option.
-                        let _ = v.parse::<u32>().wrap_err("invalid --long window log")?;
+                        // `--long=N` names the back-reference window, so the N is
+                        // carried through to the encoder rather than dropped.
+                        // Reject `--long=` / `--long=abc` instead of treating
+                        // them as a silent no-op. Exact-match so `--longer` is an
+                        // unknown option.
+                        let log: u32 = v.parse().wrap_err("invalid --long window log")?;
+                        check_window_log(log)?;
                         opts.long = true;
+                        opts.long_window_log = Some(log);
                     } else {
                         bail!("unknown option: --{long}");
                     }
@@ -652,7 +684,8 @@ fn print_help() {
          --no-check, --no-content-size, --no-dictID, --format= (other than\n\
          zstd), --patch-from, --rsyncable, --pass-through,\n\
          --exclude-compressed, --[no-]compress-literals, -M/--memory below\n\
-         the enforced ceiling, and -M with --train.\n\
+         the enforced ceiling, -M with --train, and --train-cover /\n\
+         --train-legacy (--train and --train-fastcover train with FastCOVER).\n\
          \n\
          With no FILE, or when FILE is `-`, read stdin / write stdout."
     );
@@ -660,10 +693,23 @@ fn print_help() {
 
 fn run(opts: Options) -> Result<()> {
     let dict_bytes = match &opts.dict {
-        Some(path) => Some(
-            fs::read(path)
-                .wrap_err_with(|| format!("failed to read dictionary file {}", path.display()))?,
-        ),
+        Some(path) => {
+            let bytes = fs::read(path)
+                .wrap_err_with(|| format!("failed to read dictionary file {}", path.display()))?;
+            // A blob without the dictionary magic is a raw-content dictionary,
+            // which upstream accepts and this build does not yet: every frame
+            // here carries a dictionary ID, and a raw dictionary has none. Say
+            // that plainly instead of surfacing a magic-number mismatch, which
+            // reads like a corrupt file rather than a missing feature.
+            if !bytes.starts_with(&structured_zstd::decoding::DICTIONARY_MAGIC) {
+                bail!(
+                    "{}: raw-content dictionaries are not supported yet; \
+                     use a dictionary produced by --train",
+                    path.display()
+                );
+            }
+            Some(bytes)
+        }
         None => None,
     };
     let dict = dict_bytes.as_deref();
@@ -753,6 +799,7 @@ fn run_benchmark(opts: &Options, dict: Option<&[u8]>) -> Result<()> {
                 Some(data.len() as u64),
                 None,
                 opts.long,
+                opts.long_window_log,
             )?;
             best_compress = best_compress.min(t.elapsed().as_secs_f64());
             if start.elapsed().as_secs_f64() >= opts.bench_secs {
@@ -825,8 +872,25 @@ fn train_dictionary(opts: &Options) -> Result<()> {
     )
     .map_err(|err| eyre!("dictionary training failed: {err}"))?;
 
-    fs::write(&output, &dict)
-        .wrap_err_with(|| format!("failed to write dictionary {}", output.display()))?;
+    // A trained dictionary is an output file like any other, so it answers to
+    // the same rules: no clobbering without `-f`, and written through a
+    // temporary that is renamed into place, so an interrupted run leaves the
+    // previous dictionary intact rather than a half-written one.
+    ensure_regular_output_destination(&output)?;
+    if output.exists() && !opts.force {
+        bail!("{} already exists; use -f to overwrite", output.display());
+    }
+    let (temp_path, mut temp_file) = create_temporary_output_file(&output)?;
+    let written = temp_file
+        .write_all(&dict)
+        .and_then(|()| temp_file.flush())
+        .wrap_err_with(|| format!("failed to write dictionary {}", output.display()));
+    if let Err(err) = written {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err);
+    }
+    drop(temp_file);
+    replace_output_file(&temp_path, &output)?;
     info!(
         "trained {} ({}) from {} sample file(s)",
         output.display(),
@@ -854,7 +918,7 @@ fn read_filling<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<usize> {
 
 /// Column header for `--list`, matching upstream's `zstd -l` layout.
 fn print_list_header() {
-    println!("Frames  Compressed  Uncompressed  Ratio  Check  DictID  Filename");
+    println!("Frames  Skips  Compressed  Uncompressed  Ratio  Check  DictID  Filename");
 }
 
 /// Largest possible zstd frame header: 4-byte magic + 1-byte descriptor + up to
@@ -871,6 +935,7 @@ const MAX_FRAME_HEADER_LEN: usize = 18;
 /// (a multi-GB file is never loaded whole).
 fn list_file(path: &Path) -> Result<()> {
     use std::io::{Seek, SeekFrom};
+    use structured_zstd::decoding::errors::ReadFrameHeaderError;
     use structured_zstd::decoding::{FrameContentSize, read_frame_header_info};
 
     let mut file =
@@ -886,6 +951,8 @@ fn list_file(path: &Path) -> Result<()> {
     }
     let mut offset = 0u64;
     let mut frames = 0u64;
+    let mut data_frames = 0u64;
+    let mut skips = 0u64;
     let mut decompressed = Some(0u64);
     let mut check = false;
     let mut dict_id = None;
@@ -896,8 +963,24 @@ fn list_file(path: &Path) -> Result<()> {
         file.seek(SeekFrom::Start(offset))?;
         let mut header_buf = [0u8; MAX_FRAME_HEADER_LEN];
         let header_read = read_filling(&mut file, &mut header_buf)?;
-        let info = read_frame_header_info(&header_buf[..header_read], false)
-            .map_err(|err| eyre!("{}: not a zstd frame: {err:?}", path.display()))?;
+        let info = match read_frame_header_info(&header_buf[..header_read], false) {
+            Ok(info) => info,
+            // Metadata frames sit inside ordinary archives (a seekable-zstd
+            // index is one), so the walk steps over them: 4-byte magic +
+            // 4-byte length + the payload.
+            Err(ReadFrameHeaderError::SkipFrame { length, .. }) => {
+                offset = offset
+                    .checked_add(8 + u64::from(length))
+                    .filter(|end| *end <= compressed)
+                    .ok_or_else(|| eyre!("{}: truncated skippable frame", path.display()))?;
+                // Upstream counts a skippable frame in both columns: `Frames`
+                // is every frame in the file, `Skips` the metadata ones.
+                skips += 1;
+                frames += 1;
+                continue;
+            }
+            Err(err) => bail!("{}: not a zstd frame: {err:?}", path.display()),
+        };
 
         // The frame's Block_Maximum_Size bounds every block (RFC 8878 §3.1.1.2).
         let block_size_max = info.window_size.min(128 * 1024);
@@ -947,9 +1030,12 @@ fn list_file(path: &Path) -> Result<()> {
             FrameContentSize::Unknown => decompressed = None,
         }
         check |= info.content_checksum;
-        if frames == 0 {
+        // The reported dictionary is the first DATA frame's; a leading metadata
+        // frame counts towards `frames` but carries no header to read it from.
+        if data_frames == 0 {
             dict_id = info.dictionary_id;
         }
+        data_frames += 1;
         frames += 1;
         offset = frame_end;
     }
@@ -963,7 +1049,7 @@ fn list_file(path: &Path) -> Result<()> {
         None => "--".to_string(),
     };
     println!(
-        "{frames:>6}  {:>10}  {:>12}  {ratio:>5}  {:>5}  {:>6}  {}",
+        "{frames:>6}  {skips:>5}  {:>10}  {:>12}  {ratio:>5}  {:>5}  {:>6}  {}",
         fmt_size(compressed as f64),
         decompressed_str,
         if check { "XXH64" } else { "None" },
@@ -1002,6 +1088,7 @@ fn process_stdin_stdout(opts: &Options, dict: Option<&[u8]>) -> Result<()> {
                 opts.pledged_size,
                 opts.size_hint,
                 opts.long,
+                opts.long_window_log,
             )
         }
         Mode::Decompress => {
@@ -1050,6 +1137,7 @@ fn run_stream_core<R: Read, W: Write>(
             pledged_size,
             opts.size_hint,
             opts.long,
+            opts.long_window_log,
         ),
         Mode::Decompress => decompress_stream(reader, writer, dict),
         Mode::Test | Mode::List | Mode::Train => {
@@ -1162,6 +1250,7 @@ fn compress_stream<R: Read, W: Write>(
     pledged_size: Option<u64>,
     size_hint: Option<u64>,
     long: bool,
+    long_window_log: Option<u32>,
 ) -> Result<()> {
     let compression_level = if store {
         CompressionLevel::Uncompressed
@@ -1178,8 +1267,15 @@ fn compress_stream<R: Read, W: Write>(
     // Long-distance matching (`--long`) is a per-knob override applied via the
     // compression-parameters API; skip it for `--store` (raw frames don't match).
     if long && !store {
-        let params = structured_zstd::encoding::CompressionParameters::builder(compression_level)
-            .enable_long_distance_matching(true)
+        let mut builder =
+            structured_zstd::encoding::CompressionParameters::builder(compression_level)
+                .enable_long_distance_matching(true);
+        // `--long=N` asked for a specific back-reference distance; without it
+        // the level's own window stands.
+        if let Some(log) = long_window_log {
+            builder = builder.window_log(log);
+        }
+        let params = builder
             .build()
             .map_err(|err| eyre!("failed to build LDM parameters: {err:?}"))?;
         encoder
@@ -1213,34 +1309,83 @@ fn compress_stream<R: Read, W: Write>(
 }
 
 /// Streaming decompression core (file, stdout, or sink), optionally dict-primed.
+///
+/// A zstd stream is a sequence of frames: `cat a.zst b.zst` is a valid archive
+/// that decodes to `a` then `b`, and skippable frames may sit between them. The
+/// decoder's `Read` ends at the first frame, so the loop below re-initialises it
+/// on whatever follows until the source is exhausted. The library's
+/// `read_to_end` walks frames too, but only by buffering the whole stream in
+/// memory, which a command-line tool handed a multi-gigabyte archive cannot do.
 fn decompress_stream<R: Read, W: Write>(
     reader: R,
     mut writer: W,
     dict: Option<&[u8]>,
 ) -> Result<()> {
-    // The dictionary constructors FORCE the supplied dictionary, which the
-    // registration path does not: a frame may legitimately omit the optional
-    // dictionary ID, and then nothing would select it. So build through them,
-    // and reach the decoder afterwards for the checksum mode.
-    let mut decoder = match dict {
-        Some(raw) => {
-            structured_zstd::decoding::StreamingDecoder::new_with_dictionary_bytes(reader, raw)
-                .map_err(|err| eyre!("failed to init dictionary decoder: {err:?}"))?
-        }
-        None => structured_zstd::decoding::StreamingDecoder::new(reader)
-            .map_err(|err| eyre!("invalid zstd frame: {err:?}"))?,
+    use structured_zstd::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
+
+    // Decoded once rather than per frame: every frame in the stream is primed
+    // with the same dictionary.
+    let handle = match dict {
+        Some(raw) => Some(
+            structured_zstd::decoding::DictionaryHandle::decode_dict(raw)
+                .map_err(|err| eyre!("failed to parse dictionary: {err:?}"))?,
+        ),
+        None => None,
     };
-    // The library computes the digest but does not compare it, leaving the
-    // decision to the caller. For a command-line tool that decision is made:
-    // upstream validates by default, and `-t` exists to answer exactly this
-    // question, so a frame whose stored checksum disagrees with its data has
-    // to fail rather than decode quietly. Read at the end of the frame, so
-    // setting it after construction is in time.
-    decoder
-        .decoder_mut()
-        .set_content_checksum(structured_zstd::decoding::ContentChecksum::Verify);
-    io::copy(&mut decoder, &mut writer).wrap_err("streaming decompression failed")?;
-    Ok(())
+    // Buffered so the end of the stream can be told from the start of another
+    // frame without consuming the bytes that answer the question.
+    let mut source = BufReader::new(reader);
+    loop {
+        if source
+            .fill_buf()
+            .wrap_err("failed to read the compressed stream")?
+            .is_empty()
+        {
+            return Ok(());
+        }
+        // Borrowed, not moved: a frame that turns out to be skippable leaves
+        // the reader with us to step over it and carry on.
+        let built = match &handle {
+            // The dictionary constructors FORCE the supplied dictionary, which
+            // the registration path does not: a frame may legitimately omit the
+            // optional dictionary ID, and then nothing would select it.
+            Some(h) => structured_zstd::decoding::StreamingDecoder::new_with_dictionary_handle(
+                &mut source,
+                h,
+            ),
+            None => structured_zstd::decoding::StreamingDecoder::new(&mut source),
+        };
+        let mut decoder = match built {
+            Ok(decoder) => decoder,
+            Err(FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::SkipFrame {
+                length,
+                ..
+            })) => {
+                // Metadata a decoder is required to step over. The header is
+                // already consumed, so only the payload is left to discard.
+                let skipped = io::copy(
+                    &mut source.by_ref().take(u64::from(length)),
+                    &mut io::sink(),
+                )
+                .wrap_err("failed to skip a skippable frame")?;
+                if skipped != u64::from(length) {
+                    bail!("skippable frame is truncated: {skipped} of {length} bytes");
+                }
+                continue;
+            }
+            Err(err) => bail!("invalid zstd frame: {err:?}"),
+        };
+        // The library computes the digest but does not compare it, leaving the
+        // decision to the caller. For a command-line tool that decision is
+        // made: upstream validates by default, and `-t` exists to answer
+        // exactly this question, so a frame whose stored checksum disagrees
+        // with its data has to fail rather than decode quietly. Read at the end
+        // of the frame, so setting it after construction is in time.
+        decoder
+            .decoder_mut()
+            .set_content_checksum(structured_zstd::decoding::ContentChecksum::Verify);
+        io::copy(&mut decoder, &mut writer).wrap_err("streaming decompression failed")?;
+    }
 }
 
 // ---------------------------------------------------------------------------
