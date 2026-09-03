@@ -2400,6 +2400,13 @@ macro_rules! start_matching_fast_loop_body {
                 Tail(usize),
             }
 
+            // The only field read left inside the search loop, and it cannot
+            // change while that loop runs: `offset_hist` is written by
+            // `emit_candidate`, which the outer arm reaches only after a match
+            // has broken out. Left in place it was reloaded per position — the
+            // table stores go through raw pointers derived from the same
+            // `$self`, so nothing lets the optimizer prove they miss this field.
+            let rep1 = $self.offset_hist[0] as usize;
             let inner_exit: InnerExit = 'inner: loop {
                 let abs_ip0 = $current_abs_start + ip0;
                 let abs_ip1 = $current_abs_start + ip1;
@@ -2470,7 +2477,6 @@ macro_rules! start_matching_fast_loop_body {
                 // `common_prefix_len` per probe, paying ~3× the work for
                 // rep2/rep3 hits that the dfast fast path never benefits
                 // from (those wins live in the lazy/btopt strategies).
-                let rep1 = $self.offset_hist[0] as usize;
                 // Gate in concat coordinates. `abs_ip1 - rep1 >= history_abs_start`
                 // and `rep1 <= abs_ip1` say exactly one thing about the index:
                 // the back-reference lands at or after the start of live
