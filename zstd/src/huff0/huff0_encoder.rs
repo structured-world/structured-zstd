@@ -416,8 +416,13 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
 }
 
 pub struct HuffmanTable {
-    /// Index is the symbol, values are the bitstring in the lower bits of the u32 and the amount of bits in the u8
-    codes: Vec<(u32, u8)>,
+    /// Index is the symbol, values are the bitstring in the lower bits of the
+    /// u32 and the amount of bits in the u8. Held inline, like the reference's
+    /// `HUF_CElt CTable[HUF_CTABLE_SIZE_ST(255)]`: a table is built once per
+    /// block and again per split candidate, so owning the codes on the heap
+    /// meant an allocation on every one of those. The live alphabet is
+    /// [`Self::len`] entries.
+    codes: [(u32, u8); MAX_HUFFMAN_ALPHABET],
     /// Upstream zstd-format packed Huffman codes (`HUF_CElt`): one `u64` per
     /// symbol where the bottom 8 bits hold `nb_bits` and the top
     /// `(64 - nb_bits)` bits hold `value` left-shifted to the high
@@ -425,7 +430,11 @@ pub struct HuffmanTable {
     /// dual-container [`super::huf_cstream::HufCStream`] can index
     /// symbols with a single u64 load (no per-symbol shift+combine).
     /// See `huf_compress.c:208-221` for the upstream zstd format.
-    packed_codes: Vec<u64>,
+    packed_codes: [u64; MAX_HUFFMAN_ALPHABET],
+    /// Symbols the table covers — the live prefix of [`Self::codes`] and
+    /// [`Self::packed_codes`]. The arrays are always the format's widest
+    /// alphabet; this says how much of them a given table uses.
+    len: usize,
     /// Active Huffman table-log (1..=12). Stored explicitly so
     /// `encode4x_reference` can dispatch to the correct `kUnroll`
     /// template instantiation without re-scanning `codes`.
@@ -441,15 +450,15 @@ pub struct HuffmanTable {
     cached_encoded_weight_description: CachedDescription,
 }
 
-/// Manual impl so `clone_from` reuses the destination's existing `Vec`
-/// buffers; the derived version falls back to `*self = source.clone()`,
-/// re-allocating both code containers on every per-frame entropy seed and
-/// per-block rollback snapshot.
+/// Manual impl so `clone_from` writes into the destination in place rather
+/// than replacing it wholesale, which is what the per-frame entropy seed and
+/// the per-block rollback snapshot want.
 impl Clone for HuffmanTable {
     fn clone(&self) -> Self {
         Self {
-            codes: self.codes.clone(),
-            packed_codes: self.packed_codes.clone(),
+            codes: self.codes,
+            packed_codes: self.packed_codes,
+            len: self.len,
             table_log: self.table_log,
             #[cfg(feature = "std")]
             cached_encoded_weight_description: self.cached_encoded_weight_description.clone(),
@@ -457,8 +466,11 @@ impl Clone for HuffmanTable {
     }
 
     fn clone_from(&mut self, source: &Self) {
-        self.codes.clone_from(&source.codes);
-        self.packed_codes.clone_from(&source.packed_codes);
+        // Only the live prefix carries meaning; the tail beyond `len` is never
+        // read, so copying it would be work for nothing.
+        self.codes[..source.len].copy_from_slice(&source.codes[..source.len]);
+        self.packed_codes[..source.len].copy_from_slice(&source.packed_codes[..source.len]);
+        self.len = source.len;
         self.table_log = source.table_log;
         #[cfg(feature = "std")]
         {
@@ -483,12 +495,22 @@ pub fn set_force_cheap_huf(on: bool) {
 }
 
 impl HuffmanTable {
-    /// Heap bytes this table holds: the per-symbol code table and the packed
-    /// dual-container codes. The lazily-built weight-description cache is a
-    /// transient and not counted.
+    /// Heap bytes this table holds. Both code containers are fixed-size and
+    /// inline, as the reference's `HUF_CElt CTable[…]` is, so the owner's
+    /// `size_of` accounts for them and they contribute nothing here. What can
+    /// hold heap is the weight description, once something has asked for it.
     pub fn heap_size(&self) -> usize {
-        self.codes.capacity() * core::mem::size_of::<(u32, u8)>()
-            + self.packed_codes.capacity() * core::mem::size_of::<u64>()
+        #[cfg(feature = "std")]
+        {
+            self.cached_encoded_weight_description
+                .get()
+                .and_then(|cached| cached.as_ref())
+                .map_or(0, alloc::vec::Vec::capacity)
+        }
+        #[cfg(not(feature = "std"))]
+        {
+            0
+        }
     }
 
     pub fn build_from_data(data: &[u8]) -> Self {
@@ -524,8 +546,7 @@ impl HuffmanTable {
             // srcSize, maxSV, minus=1) (huf_compress.c:1286), height-limit to it,
             // not the raw natural height (11) which can cost a few bytes vs C.
             build_limited_weights_into(counts, cheap_huf_table_log(counts), scratch);
-            let spare = scratch.spare_table.take();
-            Self::build_from_weights_reusing(&scratch.weights, spare)
+            Self::build_from_weights(&scratch.weights)
         }
     }
 
@@ -678,7 +699,9 @@ impl HuffmanTable {
     pub(crate) fn estimate_compressed_size(&self, data: &[u8]) -> Option<usize> {
         let mut bits = 0usize;
         for &symbol in data {
-            let (_, num_bits) = *self.codes.get(symbol as usize)?;
+            // Bounded by the live alphabet: a symbol the table does not cover
+            // has no code, which is what `None` says here.
+            let (_, num_bits) = *self.codes[..self.len].get(symbol as usize)?;
             if num_bits == 0 {
                 return None;
             }
@@ -699,7 +722,7 @@ impl HuffmanTable {
             if let Some(fse_description) = self.cached_encoded_weight_description() {
                 return Some(fse_description.len() + 1);
             }
-            let raw_weights_len = self.codes.len().saturating_sub(1);
+            let raw_weights_len = self.len.saturating_sub(1);
             if raw_weights_len <= 128 {
                 Some(raw_weights_len.div_ceil(2) + 1)
             } else {
@@ -741,11 +764,12 @@ impl HuffmanTable {
     /// once per built table, which is once per block and once per split
     /// candidate, so a `Vec` here was an allocation on that whole path.
     fn weights_into<'b>(&self, buf: &'b mut [u8; MAX_HUFFMAN_ALPHABET]) -> &'b [u8] {
-        let max = *self.codes.iter().map(|(_, nb)| nb).max().unwrap();
-        for (slot, &(_, nb)) in buf.iter_mut().zip(self.codes.iter()) {
+        let live = &self.codes[..self.len];
+        let max = *live.iter().map(|(_, nb)| nb).max().unwrap();
+        for (slot, &(_, nb)) in buf.iter_mut().zip(live.iter()) {
             *slot = if nb == 0 { 0 } else { max - nb + 1 };
         }
-        &buf[..self.codes.len()]
+        &buf[..self.len]
     }
 
     #[cfg(feature = "std")]
@@ -768,8 +792,7 @@ impl HuffmanTable {
 
     /// Estimates encoded payload size in bytes directly from per-symbol counts.
     pub(crate) fn estimate_compressed_size_from_counts(&self, counts: &[usize]) -> usize {
-        let bits = self
-            .codes
+        let bits = self.codes[..self.len]
             .iter()
             .zip(counts.iter())
             .map(|(&(_, bits), &count)| bits as usize * count)
@@ -778,14 +801,6 @@ impl HuffmanTable {
     }
 
     pub fn build_from_weights(weights: &[usize]) -> Self {
-        Self::build_from_weights_reusing(weights, None)
-    }
-
-    /// [`Self::build_from_weights`] filling a discarded table's buffers instead
-    /// of taking new ones. A table is built per block and, where the splitter
-    /// probes, per split candidate; most are measured and thrown away, so
-    /// handing the last one back turns two allocations per build into none.
-    pub(crate) fn build_from_weights_reusing(weights: &[usize], spare: Option<Self>) -> Self {
         let weight_sum = weights
             .iter()
             .copied()
@@ -796,28 +811,13 @@ impl HuffmanTable {
             panic!("This is an internal error");
         }
         let table_log = highest_bit_set(weight_sum) - 1;
-        let mut table = match spare {
-            Some(mut spare) => {
-                // Both buffers are overwritten in full below, so the recycled
-                // contents do not survive; only their allocations do.
-                spare.codes.clear();
-                spare.codes.resize(weights.len(), (0, 0));
-                spare.packed_codes.clear();
-                spare.packed_codes.resize(weights.len(), 0u64);
-                spare.table_log = table_log as u32;
-                #[cfg(feature = "std")]
-                {
-                    spare.cached_encoded_weight_description = CachedDescription::new();
-                }
-                spare
-            }
-            None => HuffmanTable {
-                codes: alloc::vec![(0, 0); weights.len()],
-                packed_codes: alloc::vec![0u64; weights.len()],
-                table_log: table_log as u32,
-                #[cfg(feature = "std")]
-                cached_encoded_weight_description: CachedDescription::new(),
-            },
+        let mut table = HuffmanTable {
+            codes: [(0, 0); MAX_HUFFMAN_ALPHABET],
+            packed_codes: [0u64; MAX_HUFFMAN_ALPHABET],
+            len: weights.len(),
+            table_log: table_log as u32,
+            #[cfg(feature = "std")]
+            cached_encoded_weight_description: CachedDescription::new(),
         };
         let mut nb_per_rank = [0u16; 13];
         for &weight in weights {
@@ -852,7 +852,7 @@ impl HuffmanTable {
     /// `huf_compress.c:208-221` for the layout.
     #[inline(always)]
     pub(crate) fn packed_codes(&self) -> &[u64] {
-        &self.packed_codes
+        &self.packed_codes[..self.len]
     }
 
     /// Active Huffman table-log (1..=12) — drives the `kUnroll`
@@ -863,11 +863,14 @@ impl HuffmanTable {
     }
 
     pub fn can_encode(&self, other: &Self) -> Option<usize> {
-        if other.codes.len() > self.codes.len() {
+        if other.len > self.len {
             return None;
         }
         let mut sum = 0;
-        for ((_, other_num_bits), (_, self_num_bits)) in other.codes.iter().zip(self.codes.iter()) {
+        for ((_, other_num_bits), (_, self_num_bits)) in other.codes[..other.len]
+            .iter()
+            .zip(self.codes[..self.len].iter())
+        {
             if *other_num_bits != 0 && *self_num_bits == 0 {
                 return None;
             }
@@ -1292,16 +1295,6 @@ pub(crate) struct WeightScratch {
     leaves: Vec<HuffNode>,
     work: Vec<HuffNode>,
     weights: Vec<usize>,
-    /// The last table the caller built and threw away, handed back so the next
-    /// build fills its buffers instead of taking new ones.
-    spare_table: Option<HuffmanTable>,
-}
-
-impl WeightScratch {
-    /// Park a table the caller is done with, for the next build to fill.
-    pub(crate) fn recycle(&mut self, table: HuffmanTable) {
-        self.spare_table = Some(table);
-    }
 }
 
 /// [`build_limited_weights`] filling caller-owned scratch. The weights land in

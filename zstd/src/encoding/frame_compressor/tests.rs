@@ -539,25 +539,34 @@ fn heap_size_counts_active_and_spare_huffman_tables() {
     let active = crate::huff0::huff0_encoder::HuffmanTable::build_from_data(
         b"abacabadabacabaeabacabadabacaba",
     );
-    let active_bytes = active.heap_size();
-    assert!(active_bytes > 0, "built table must own heap buffers");
+    // A built table owns no heap: its code containers are fixed-size and
+    // inline, so what a table costs is its `size_of`, not an allocation the
+    // owner has to remember to count.
+    assert_eq!(
+        active.heap_size(),
+        0,
+        "a freshly built table holds nothing on the heap"
+    );
     compressor.state.last_huff_table = Some(active);
     assert_eq!(
         compressor.heap_size(),
-        base + active_bytes,
-        "heap_size must include the active last_huff_table"
+        base,
+        "installing a table adds no heap to the compressor"
     );
 
-    let spare = crate::huff0::huff0_encoder::HuffmanTable::build_from_data(
+    // The one thing a table can put on the heap is its weight description,
+    // and only once something asks for it — so `heap_size` still has to
+    // report that rather than answering zero unconditionally.
+    let described = crate::huff0::huff0_encoder::HuffmanTable::build_from_data(
         b"the quick brown fox jumps over the lazy dog",
     );
-    let spare_bytes = spare.heap_size();
-    assert!(spare_bytes > 0, "built table must own heap buffers");
-    compressor.state.huff_table_spare = Some(spare);
+    let _ = described.writeable_table_description_size();
+    let described_bytes = described.heap_size();
+    compressor.state.huff_table_spare = Some(described);
     assert_eq!(
         compressor.heap_size(),
-        base + active_bytes + spare_bytes,
-        "heap_size must include the parked huff_table_spare"
+        base + described_bytes,
+        "heap_size must include whatever the parked table put on the heap"
     );
 }
 

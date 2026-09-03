@@ -852,9 +852,6 @@ fn estimate_literals_section_bytes(
 
     let Some(new_desc) = new_table.writeable_table_description_size() else {
         *last_huff = None;
-        // Nothing downstream reads this table; hand its buffers to the next
-        // build rather than dropping them.
-        weight_scratch.recycle(new_table);
         return uncompressed_literals_header_bytes(literals.len()) + literals.len();
     };
     // For lit_size ≥ 256, upstream zstd `compress_literals` calls `encoder.encode4x`
@@ -915,17 +912,11 @@ fn estimate_literals_section_bytes(
     let huf_section_size = total - compressed_header; // tree_desc + payload, no lhSize
     if use_raw_literal_fallback(huf_section_size, literals.len(), strategy) {
         *last_huff = None;
-        weight_scratch.recycle(new_table);
         return raw_section_bytes;
     }
 
     if use_new {
-        // The table this displaces is the one to recycle; the new one is kept.
-        if let Some(displaced) = last_huff.replace(new_table) {
-            weight_scratch.recycle(displaced);
-        }
-    } else {
-        weight_scratch.recycle(new_table);
+        *last_huff = Some(new_table);
     }
     total
 }
@@ -2381,7 +2372,6 @@ fn compress_literals(
     let Some(new_table_description_size) = new_encoder_table.writeable_table_description_size()
     else {
         raw_literals(literals, writer);
-        weight_scratch.recycle(new_encoder_table);
         return HuffmanTableUpdate::Cleared;
     };
     // Shared with the splitter cost estimator
@@ -2462,15 +2452,10 @@ fn compress_literals(
     if use_raw_literal_fallback(huf_section_size, literals.len(), strategy) {
         writer.reset_to(reset_idx);
         raw_literals(literals, writer);
-        // The section goes out raw, so the table just built is dead; hand its
-        // buffers to the next build instead of dropping them.
-        weight_scratch.recycle(new_encoder_table);
         HuffmanTableUpdate::Cleared
     } else if new_table {
         HuffmanTableUpdate::New(new_encoder_table)
     } else {
-        // The previous table was kept, so this one is dead — same as above.
-        weight_scratch.recycle(new_encoder_table);
         HuffmanTableUpdate::Reused
     }
 }
