@@ -252,14 +252,18 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         }
     }
 
-    pub(super) fn weights(&self) -> Vec<u8> {
-        self.table.weights()
-    }
-
-    /// [`Self::weights`] into a caller's buffer; see
+    /// Per-symbol weights into a caller's buffer; see
     /// [`HuffmanTable::weights_into`].
     fn weights_into<'b>(&self, buf: &'b mut [u8; MAX_HUFFMAN_ALPHABET]) -> &'b [u8] {
         self.table.weights_into(buf)
+    }
+
+    /// Owning form of [`Self::weights_into`], for tests that want the weights
+    /// as a value. Production paths use the buffer form: this allocates.
+    #[cfg(test)]
+    pub(super) fn weights(&self) -> Vec<u8> {
+        let mut buf = [0u8; MAX_HUFFMAN_ALPHABET];
+        self.weights_into(&mut buf).to_vec()
     }
 
     fn write_table(&mut self) {
@@ -724,12 +728,15 @@ impl HuffmanTable {
         self.try_table_description_size()
     }
 
+    /// Owning form of [`Self::weights_into`], for tests that want the weights
+    /// as a value. Production paths use the buffer form: this allocates.
+    #[cfg(test)]
     fn weights(&self) -> Vec<u8> {
         let mut buf = [0u8; MAX_HUFFMAN_ALPHABET];
         self.weights_into(&mut buf).to_vec()
     }
 
-    /// [`Self::weights`] written into a caller's buffer. The alphabet is at
+    /// Per-symbol weights written into a caller's buffer. The alphabet is at
     /// most 256 symbols, so a stack buffer covers every table — and this runs
     /// once per built table, which is once per block and once per split
     /// candidate, so a `Vec` here was an allocation on that whole path.
@@ -1579,12 +1586,8 @@ fn redistribute_weights(weights: &mut [usize], max_num_bits: usize) {
 #[cfg(feature = "bench-internals")]
 pub(crate) fn huf_weight_description_for_test(data: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let table = HuffmanTable::build_from_data(data);
-    let mut weights = {
-        let mut out = Vec::new();
-        let mut writer = BitWriter::from(&mut out);
-        let encoder = HuffmanEncoder::new(&table, &mut writer);
-        encoder.weights()
-    };
+    let mut buf = [0u8; MAX_HUFFMAN_ALPHABET];
+    let mut weights = table.weights_into(&mut buf).to_vec();
     weights.pop();
     let encoded = HuffmanEncoder::<Vec<u8>>::encode_weight_description(&weights)
         .expect("expected FSE weights");
