@@ -1018,9 +1018,13 @@ fn run(opts: Options) -> Result<()> {
     // blob rather than the parsed forms, since its own memory ceiling has to be
     // weighed before anything is built from them.
     if opts.bench {
-        return run_benchmark(&opts, dict_bytes.as_deref());
+        return run_benchmark(&opts, dict_bytes);
     }
     let dicts = Dictionaries::prepare(dict_bytes.as_deref(), compresses(&opts), decodes(&opts))?;
+    // Everything from here on primes from the parsed form, so the blob it was
+    // parsed out of is released rather than held for the length of the run
+    // beside the thing that replaced it.
+    drop(dict_bytes);
 
     // `--train` builds a dictionary from the sample files rather than
     // (de)compressing them; handle it before the streaming flow.
@@ -1151,7 +1155,7 @@ fn run(opts: Options) -> Result<()> {
 /// requested level range, reporting ratio and best-of throughput. A simplified
 /// `zstd -b#` (per-level row); honours `-D` so dictionary throughput can be
 /// measured. Time-budgeted per level rather than fixed-iteration.
-fn run_benchmark(opts: &Options, dict: Option<&[u8]>) -> Result<()> {
+fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
     if opts.inputs.is_empty() {
         bail!("-b requires one or more regular input files to benchmark");
     }
@@ -1194,20 +1198,27 @@ fn run_benchmark(opts: &Options, dict: Option<&[u8]>) -> Result<()> {
             .and_then(|frame| inputs.checked_mul(2)?.checked_add(frame))
             .ok_or_else(|| eyre!("the inputs add up to more than any machine can address"))?;
         check_memory_limit(limit, buffers, 1)?;
-        // The dictionary is held alongside them for the whole run, and is
-        // counted with them rather than on its own: two allocations that each
-        // clear the ceiling separately can still exceed it together.
-        if let Some(bytes) = dict {
-            let total = buffers
-                .checked_add(bytes.len() as u64)
+        // The dictionary is held alongside them, and more than once: a
+        // benchmark measures both directions, so the blob is parsed into an
+        // encoder's tables and a decoder's, and the blob itself is still there
+        // while they are built from it. All of it is counted with the buffers
+        // rather than on its own, since allocations that each clear the ceiling
+        // separately can still exceed it together.
+        if let Some(bytes) = &dict {
+            let total = (bytes.len() as u64)
+                .checked_mul(3)
+                .and_then(|dictionaries| buffers.checked_add(dictionaries))
                 .ok_or_else(|| eyre!("the inputs add up to more than any machine can address"))?;
             check_memory_limit(limit, total, 1)?;
         }
     }
 
     // Both directions are measured in turn, so both forms are wanted — parsed
-    // here, once, rather than inside the timed loops below.
-    let dicts = &Dictionaries::prepare(dict, true, true)?;
+    // here, once, rather than inside the timed loops below. The blob is then
+    // done with: it is released before the measuring starts rather than held
+    // beside the two forms parsed out of it for the rest of the run.
+    let dicts = &Dictionaries::prepare(dict.as_deref(), true, true)?;
+    drop(dict);
 
     if opts.bench_separately {
         for input in &opts.inputs {

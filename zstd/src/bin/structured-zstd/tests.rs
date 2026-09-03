@@ -2008,6 +2008,38 @@ fn the_memory_limit_counts_the_compressed_benchmark_buffer() {
     );
 }
 
+/// A benchmark holds the dictionary more than once: it measures both
+/// directions, so the blob is parsed into an encoder's tables and a decoder's,
+/// and the blob itself is still there while they are built from it. Counting it
+/// once admits a run that then takes three times what it was allowed.
+#[test]
+fn the_memory_limit_counts_every_copy_of_the_dictionary() {
+    let dir = std::env::temp_dir();
+    let input = dir.join(format!("szstd-dictcopies-{}.bin", std::process::id()));
+    fs::write(&input, vec![0u8; 32 * 1024]).unwrap();
+    let dictionary = vec![0u8; 32 * 1024];
+
+    let buffers = structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE
+        + (1 << 20)
+        + 2 * 32 * 1024
+        + structured_zstd::encoding::compress_bound(32 * 1024) as u64;
+
+    let mut opts = parse(&["-b3", "f"]).unwrap();
+    opts.inputs = vec![input.clone()];
+
+    // Room for the buffers and two dictionaries: still one short.
+    opts.memory_limit = Some(buffers + 2 * 32 * 1024);
+    let refused = run_benchmark(&opts, Some(dictionary.clone()));
+
+    // Room for all three: accepted.
+    opts.memory_limit = Some(buffers + 3 * 32 * 1024);
+    let accepted = run_benchmark(&opts, Some(dictionary));
+    let _ = fs::remove_file(&input);
+
+    refused.expect_err("two dictionaries' worth of room does not cover three");
+    accepted.expect("three does");
+}
+
 /// The dictionary and the benchmark's buffers are held at the same time, so a
 /// ceiling that clears each of them separately still lets the pair through.
 /// Checking them apart is arithmetic that answers the wrong question.
@@ -2028,7 +2060,7 @@ fn the_memory_limit_counts_the_dictionary_and_the_benchmark_together() {
             + 2 * 32 * 1024
             + structured_zstd::encoding::compress_bound(32 * 1024) as u64,
     );
-    let refused = run_benchmark(&opts, Some(&dictionary));
+    let refused = run_benchmark(&opts, Some(dictionary));
     let alone = run_benchmark(&opts, None);
     let _ = fs::remove_file(&input);
 

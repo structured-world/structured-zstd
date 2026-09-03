@@ -3256,3 +3256,29 @@ fn dictionary_frame_outgrowing_its_window_stays_decodable() {
         .expect("frame must stay within the window it advertises");
     assert_eq!(decoded, data);
 }
+
+/// A prepared dictionary is attached by value, so every frame it primes clones
+/// it. Owning its parsed tables outright makes that a copy of the whole
+/// dictionary per frame — paid on the path where one dictionary serves many
+/// small frames, which is the reason to prepare one at all, and counted by
+/// nobody weighing how much memory a run holds. Shared, the clone is a handle.
+#[test]
+fn a_prepared_dictionary_is_shared_by_its_clones_not_copied() {
+    use crate::encoding::EncoderDictionary;
+
+    let content = vec![7u8; 64 * 1024];
+    let prepared = EncoderDictionary::from_serialized_or_raw_content(&content)
+        .expect("raw content dictionary");
+    let alongside = prepared.clone();
+
+    assert_eq!(
+        prepared.inner.dict_content.as_ptr(),
+        alongside.inner.dict_content.as_ptr(),
+        "a clone must point at the same content, not a copy of it"
+    );
+    assert_eq!(
+        prepared.inner.dict_content.len(),
+        alongside.inner.dict_content.len(),
+        "and see the whole of it"
+    );
+}

@@ -29,9 +29,13 @@ use crate::io::{Read, Write};
 /// [`set_dictionary_from_bytes`](FrameCompressor::set_dictionary_from_bytes))
 /// from ever reaching the decode side — the encoder/decoder dictionary split
 /// mirrors C zstd's `CDict` / `DDict`.
+/// Cloning one is a handle, not a copy: it is attached to a compressor by
+/// value, so a dictionary serving many frames would otherwise have its parsed
+/// tables and content duplicated for each of them — on exactly the path where
+/// one dictionary is prepared once precisely to be used again and again.
 #[derive(Clone)]
 pub struct EncoderDictionary {
-    pub(crate) inner: crate::decoding::Dictionary,
+    pub(crate) inner: crate::decoding::dictionary::SharedDictionary,
     /// Size of the serialized dictionary this was built from (header, entropy
     /// tables, repeat offsets and content); the CDict cParams tier key
     /// (upstream `ZSTD_createCDict(dictBuffer, dictSize, level)`). Falls back
@@ -51,7 +55,7 @@ impl EncoderDictionary {
     pub fn from_dictionary(dictionary: crate::decoding::Dictionary) -> Self {
         Self {
             serialized_len: dictionary.dict_content.len(),
-            inner: dictionary,
+            inner: crate::decoding::dictionary::SharedDictionary::new(dictionary),
         }
     }
 
@@ -63,7 +67,9 @@ impl EncoderDictionary {
         raw_dictionary: &[u8],
     ) -> Result<Self, crate::decoding::errors::DictionaryDecodeError> {
         Ok(Self {
-            inner: crate::decoding::Dictionary::decode_dict_for_encoding(raw_dictionary)?,
+            inner: crate::decoding::dictionary::SharedDictionary::new(
+                crate::decoding::Dictionary::decode_dict_for_encoding(raw_dictionary)?,
+            ),
             serialized_len: raw_dictionary.len(),
         })
     }
@@ -82,7 +88,9 @@ impl EncoderDictionary {
         raw_dictionary: &[u8],
     ) -> Result<Self, crate::decoding::errors::DictionaryDecodeError> {
         Ok(Self {
-            inner: crate::decoding::Dictionary::from_serialized_or_raw_content(raw_dictionary)?,
+            inner: crate::decoding::dictionary::SharedDictionary::new(
+                crate::decoding::Dictionary::from_serialized_or_raw_content(raw_dictionary)?,
+            ),
             serialized_len: raw_dictionary.len(),
         })
     }

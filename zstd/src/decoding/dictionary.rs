@@ -48,10 +48,14 @@ pub struct Dictionary {
     pub offset_hist: [u32; 3],
 }
 
+/// A parsed dictionary held by however many users need it at once.
+///
+/// Both sides prime frame after frame from one dictionary, so what they hold is
+/// shared rather than copied: `Arc` where atomics exist, `Rc` where they do not.
 #[cfg(target_has_atomic = "ptr")]
-type SharedDictionary = Arc<Dictionary>;
+pub(crate) type SharedDictionary = Arc<Dictionary>;
 #[cfg(not(target_has_atomic = "ptr"))]
-type SharedDictionary = Rc<Dictionary>;
+pub(crate) type SharedDictionary = Rc<Dictionary>;
 
 /// Shared pre-parsed dictionary handle for repeated decoding.
 ///
