@@ -1070,8 +1070,21 @@ impl Matcher for MatchGeneratorDriver {
             // windowLog is kept. Reshaping the live search would probe the
             // dictionary's tables with another geometry / key width than they
             // were indexed with.
+            //
+            // The window still answers to the source, as it does for every
+            // other frame: `ZSTD_adjustCParams_internal` caps it by the source
+            // and dictionary extent, and a window neither can fill only makes
+            // decoders reserve memory the frame never uses. Capped here rather
+            // than through the full adjuster, which would reshape the search.
             if let Some(window_log) = ov.window_log {
-                params.window_log = window_log;
+                params.window_log = match hint {
+                    Some(src) => crate::encoding::cparams::adjusted_window_log(
+                        u32::from(window_log),
+                        src,
+                        dict_hint.map_or(0, |sizes| sizes.content),
+                    ) as u8,
+                    None => window_log,
+                };
             }
         } else if let Some(ov) = self.param_overrides
             && !ov.is_empty()

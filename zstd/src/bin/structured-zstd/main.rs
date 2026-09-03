@@ -616,10 +616,16 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
                     // accepts them, so a script that passes them must not fail
                     // here — but the VALUE is still parsed: ignoring what a
                     // flag does is not a reason to ignore what it says, and a
-                    // typo is a broken command line either way.
+                    // typo is a broken command line either way. A size takes a
+                    // size suffix; a thread count is a plain count, the way
+                    // `--threads=` reads it.
                     let rest: String = chars[ci + 1..].iter().collect();
                     if !rest.is_empty() {
-                        parse_size(&rest).wrap_err_with(|| format!("invalid -{c} value"))?;
+                        if c == 'B' {
+                            parse_size(&rest).wrap_err("invalid -B value")?;
+                        } else {
+                            rest.parse::<u32>().wrap_err("invalid -T thread count")?;
+                        }
                     }
                     ci = chars.len();
                     continue;
@@ -977,16 +983,24 @@ fn train_dictionary(opts: &Options) -> Result<()> {
     if opts.inputs.is_empty() {
         bail!("--train requires one or more sample files");
     }
+    let output = opts
+        .output
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("dictionary"));
+    // Settled before the corpus is read: whether this run may write at all is
+    // knowable now, and a command that is going to be refused should not first
+    // load every sample and spend minutes training a dictionary to throw away.
+    ensure_regular_output_destination(&output)?;
+    if output.exists() && !opts.force {
+        bail!("{} already exists; use -f to overwrite", output.display());
+    }
+
     let mut corpus = Vec::new();
     for input in &opts.inputs {
         let bytes =
             fs::read(input).wrap_err_with(|| format!("failed to read training sample {input}"))?;
         corpus.extend_from_slice(&bytes);
     }
-    let output = opts
-        .output
-        .clone()
-        .unwrap_or_else(|| PathBuf::from("dictionary"));
 
     let mut dict = Vec::new();
     create_fastcover_dict_from_source(
@@ -1000,14 +1014,10 @@ fn train_dictionary(opts: &Options) -> Result<()> {
     )
     .map_err(|err| eyre!("dictionary training failed: {err}"))?;
 
-    // A trained dictionary is an output file like any other, so it answers to
-    // the same rules: no clobbering without `-f`, and written through a
-    // temporary that is renamed into place, so an interrupted run leaves the
-    // previous dictionary intact rather than a half-written one.
-    ensure_regular_output_destination(&output)?;
-    if output.exists() && !opts.force {
-        bail!("{} already exists; use -f to overwrite", output.display());
-    }
+    // A trained dictionary is an output file like any other, so it is written
+    // through a temporary that is renamed into place: an interrupted run
+    // leaves the previous dictionary intact rather than a half-written one.
+    // The overwrite gate ran before the corpus was read.
     let (temp_path, mut temp_file) = create_temporary_output_file(&output)?;
     let written = temp_file
         .write_all(&dict)
@@ -1351,14 +1361,14 @@ fn process_file(opts: &Options, input: &Path, dict: Option<&[u8]>) -> Result<()>
     let source = File::open(input)
         .wrap_err_with(|| format!("failed to open input file {}", input.display()))?;
     let metadata = source.metadata()?;
-    let source_size: usize = metadata
-        .len()
-        .try_into()
-        .wrap_err("input file too large for this platform")?;
+    // Kept as the `u64` the filesystem reports: the work streams, so a file
+    // only has to fit the window, and narrowing to a pointer would refuse
+    // 4 GiB archives on 32-bit targets for no reason the work has.
+    let source_size = metadata.len();
     // Only a regular file's length says how many bytes will be read. A FIFO,
     // a device or a socket reports something unrelated (commonly zero), and
     // pledging that turns a perfectly good stream into a length mismatch.
-    let pledged_size = metadata.is_file().then_some(source_size as u64);
+    let pledged_size = metadata.is_file().then_some(source_size);
     let mut reader = ProgressMonitor::new(BufReader::new(source), source_size);
 
     // Test mode: decompress into the void, report integrity.

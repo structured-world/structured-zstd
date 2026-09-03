@@ -128,6 +128,20 @@ fn a_new_output_inherits_the_source_permissions() {
     );
 }
 
+/// Both directions stream, so a file only has to fit the window, never memory.
+/// Measuring its length in `usize` puts a 4 GiB ceiling on 32-bit targets that
+/// has nothing to do with what the work needs — the progress counter would be
+/// deciding which archives the tool can open.
+#[test]
+fn a_file_length_is_not_narrowed_to_the_pointer_width() {
+    let huge = u64::from(u32::MAX) + 1;
+    let monitor = ProgressMonitor::new(&b""[..], huge);
+    assert_eq!(
+        monitor.total, huge,
+        "a length larger than a 32-bit pointer must survive"
+    );
+}
+
 /// `--stream-size` exists precisely for inputs whose length cannot be stat'd.
 /// A named FIFO is one of those, so the per-file size being unavailable is the
 /// moment the option matters most — dropping it there leaves the pledge
@@ -370,6 +384,15 @@ fn training_refuses_to_overwrite_without_force() {
     fs::write(&sample, vec![7u8; 4096]).unwrap();
     fs::write(&existing, b"precious").unwrap();
 
+    // Unreadable, so the answer says which step ran first: a command that
+    // cannot write its result should be refused before it spends the memory
+    // and minutes of building one.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&sample, fs::Permissions::from_mode(0o000)).unwrap();
+    }
+
     let mut opts = parse(&["--train", "s"]).unwrap();
     opts.inputs = vec![sample.display().to_string()];
     opts.output = Some(existing.clone());
@@ -378,7 +401,13 @@ fn training_refuses_to_overwrite_without_force() {
     let survived = fs::read(&existing).unwrap_or_default();
     let _ = fs::remove_file(&sample);
     let _ = fs::remove_file(&existing);
-    refused.expect_err("an existing dictionary must not be replaced without -f");
+    let err = refused
+        .expect_err("an existing dictionary must not be replaced without -f")
+        .to_string();
+    assert!(
+        err.contains("already exists"),
+        "the refusal must be the destination, before any sample is read: {err}"
+    );
     assert_eq!(survived, b"precious", "the existing file must be untouched");
 }
 
@@ -428,6 +457,33 @@ fn an_explicit_window_is_capped_by_a_known_source_size() {
         "a {}-byte frame must not declare a {} byte window",
         payload.len(),
         info.window_size
+    );
+
+    // A dictionary frame runs the dictionary's own search geometry, but its
+    // window is still a statement about memory and answers to the same source.
+    let raw = include_bytes!("../../../dict_tests/dictionary");
+    let mut dict_frame = Vec::new();
+    compress_stream(
+        &payload[..],
+        &mut dict_frame,
+        &FrameSettings {
+            level: 19,
+            long: true,
+            long_window_log: Some(27),
+            pledged_size: Some(payload.len() as u64),
+            ..FrameSettings::default()
+        },
+        Some(&raw[..]),
+    )
+    .expect("compressing with a dictionary must succeed");
+
+    let dict_info =
+        read_frame_header_info(&dict_frame, false).expect("the frame header must parse");
+    assert!(
+        dict_info.window_size <= 1 << 20,
+        "a {}-byte dictionary frame must not declare a {} byte window",
+        payload.len(),
+        dict_info.window_size
     );
 }
 
@@ -840,6 +896,12 @@ fn attached_short_option_values_are_validated() {
     assert!(parse(&["-Tinvalid", "f"]).is_err());
     assert!(parse(&["-Binvalid", "f"]).is_err());
     assert!(parse(&["-Minvalid", "f"]).is_err());
+    // A thread count is a count. Sizes suffixes belong to `-B`, which is a
+    // size, and `--threads=` already refuses them — the short spelling has to
+    // agree with the long one.
+    assert!(parse(&["-B4K", "f"]).is_ok());
+    assert!(parse(&["-T4K", "f"]).is_err());
+    assert!(parse(&["--threads=4K", "f"]).is_err());
 }
 
 /// Ignoring what `--adapt` does is not a licence to ignore what it says. The

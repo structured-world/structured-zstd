@@ -21,10 +21,13 @@ const BAR_WIDTH: usize = 32;
 /// A generic wrapper around a reader that keeps track of how many bytes have been read
 /// from the total.
 pub struct ProgressMonitor<R: Read> {
-    /// The total amount that the reader will read
-    pub total: usize,
+    /// The total amount that the reader will read. Counted in `u64` rather
+    /// than `usize`: both directions stream, so a file has to fit the window,
+    /// never memory, and a 32-bit counter would refuse archives the work
+    /// itself handles fine.
+    pub total: u64,
     /// Amount read so far
-    pub read: usize,
+    pub read: u64,
     /// The internal reader
     reader: R,
     started: Instant,
@@ -36,7 +39,7 @@ pub struct ProgressMonitor<R: Read> {
 
 impl<R: Read> ProgressMonitor<R> {
     /// Create a new progress monitor, initialized with zero bytes read
-    pub fn new(reader: R, size: usize) -> Self {
+    pub fn new(reader: R, size: u64) -> Self {
         let now = Instant::now();
         Self {
             reader,
@@ -115,7 +118,9 @@ impl<R: Read> Read for ProgressMonitor<R> {
         // Fall back on the internally stored reader, but filch the number of bytes read
         // along the way
         let out = self.reader.read(buf)?;
-        self.read += out;
+        // One read is bounded by the buffer, so only the running total needs
+        // the wider type.
+        self.read += out as u64;
         self.update();
         Ok(out)
     }
