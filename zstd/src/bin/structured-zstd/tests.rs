@@ -814,7 +814,7 @@ fn the_benchmark_input_is_the_size_it_was_counted_at() {
     fs::write(&first, vec![1u8; 8000]).unwrap();
     fs::write(&second, vec![2u8; 1000]).unwrap();
 
-    let combined = read_inputs_into_one_buffer(&[first.clone(), second.clone()]);
+    let combined = read_inputs_bounded(&[first.clone(), second.clone()], &[8000, 1000]);
 
     let _ = fs::remove_file(&first);
     let _ = fs::remove_file(&second);
@@ -869,6 +869,67 @@ fn group_access_survives_only_when_it_means_the_same_group() {
         output_mode_for_sources(&[(0o644, 100), (0o600, 100)], 100),
         0o600,
         "and the strictest sample still decides every bit"
+    );
+}
+
+/// Set-user-ID and set-group-ID say who a program runs AS, which has nothing to
+/// do with who may read the bytes an output carries — and everything to do with
+/// privilege. Copying them from a source hands them to a file with a different
+/// owner: a privileged run over an attacker's `04755` archive would write a
+/// root-owned `04755` file. The reference command carries neither, and neither
+/// does this one.
+#[cfg(unix)]
+#[test]
+fn an_output_never_carries_the_privilege_bits_of_its_source() {
+    assert_eq!(
+        output_mode_for_sources(&[(0o4755, 100)], 100),
+        0o755,
+        "set-user-ID is not a permission to copy"
+    );
+    assert_eq!(
+        output_mode_for_sources(&[(0o2755, 100)], 100),
+        0o755,
+        "nor is set-group-ID"
+    );
+    assert_eq!(
+        output_mode_for_sources(&[(0o6644, 100)], 100),
+        0o644,
+        "and the ordinary bits below them are unaffected"
+    );
+}
+
+/// The same, through the whole run: the mode is applied after the bytes are
+/// written, so an overwrite re-applies it once the kernel's own stripping of
+/// those bits on write has already happened.
+#[cfg(unix)]
+#[test]
+fn compressing_a_setuid_file_does_not_produce_a_setuid_archive() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir();
+    let source = dir.join(format!("szstd-suid-{}", std::process::id()));
+    let archive = dir.join(format!("szstd-suid-out-{}", std::process::id()));
+    fs::write(&source, vec![1u8; 4096]).unwrap();
+    fs::write(&archive, b"an output that already exists").unwrap();
+    if fs::set_permissions(&source, fs::Permissions::from_mode(0o4755)).is_err() {
+        let _ = fs::remove_file(&source);
+        let _ = fs::remove_file(&archive);
+        return;
+    }
+
+    let mut opts = parse(&["-3", "-f", "s"]).unwrap();
+    opts.inputs = vec![source.clone()];
+    opts.output = Some(archive.clone());
+    let compressed = process_file(&opts, &source, &no_dict());
+    let mode = fs::metadata(&archive).map(|m| m.permissions().mode() & 0o7777);
+
+    let _ = fs::remove_file(&source);
+    let _ = fs::remove_file(&archive);
+    compressed.expect("compressing must succeed");
+    assert_eq!(
+        mode.expect("the archive must exist") & 0o6000,
+        0,
+        "no archive carries set-user-ID or set-group-ID"
     );
 }
 
@@ -2121,6 +2182,63 @@ fn benchmarking_refuses_the_stdin_marker() {
     let _ = fs::remove_dir(&dir);
     let err = refused
         .expect_err("the marker means stdin, which a benchmark cannot measure")
+        .to_string();
+    assert!(
+        err.contains("stdin"),
+        "the refusal must say what is wrong with it: {err}"
+    );
+}
+
+/// The buffer is sized from what the directory entries claim, and the ceiling
+/// was weighed against that same figure — so the read has to stop there. A file
+/// that grows between the two, or one whose length underreports what it will
+/// yield, would otherwise grow the buffer past the size a caller approved, on
+/// the one path that exists to hold whole files.
+#[test]
+fn the_benchmark_read_stops_at_the_size_it_was_weighed_against() {
+    let dir = std::env::temp_dir();
+    let input = dir.join(format!("szstd-grew-{}", std::process::id()));
+    fs::write(&input, vec![1u8; 4096]).unwrap();
+
+    // Read the sizes, then grow the file before the bytes are taken — the same
+    // window a writer would use.
+    let sizes: Vec<u64> = vec![4096];
+    fs::write(&input, vec![1u8; 16384]).unwrap();
+    let read = read_inputs_bounded(std::slice::from_ref(&input), &sizes);
+    let _ = fs::remove_file(&input);
+
+    let err = read
+        .expect_err("a file that grew past its weighed size must not be read past it")
+        .to_string();
+    assert!(
+        err.contains("grew"),
+        "the refusal must say what changed under it: {err}"
+    );
+}
+
+/// Training is the third mode that takes named inputs, and `-` is stdin in all
+/// of them. It reads every sample whole and rewinds nothing, so a stream is no
+/// more usable here than for a benchmark or a listing.
+#[test]
+fn training_refuses_the_stdin_marker() {
+    let dir = std::env::temp_dir().join(format!("szstd-traindash-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let dash = dir.join("-");
+    fs::write(&dash, vec![3u8; 8192]).unwrap();
+
+    let mut opts = parse(&["--train", "-f", "s"]).unwrap();
+    opts.inputs = vec![PathBuf::from("-")];
+    opts.output = Some(dir.join("out.dict"));
+    let previous = std::env::current_dir().unwrap();
+    std::env::set_current_dir(&dir).unwrap();
+    let refused = train_dictionary(&opts);
+    std::env::set_current_dir(previous).unwrap();
+
+    let _ = fs::remove_file(&dash);
+    let _ = fs::remove_file(dir.join("out.dict"));
+    let _ = fs::remove_dir(&dir);
+    let err = refused
+        .expect_err("the marker means stdin, which training cannot read")
         .to_string();
     assert!(
         err.contains("stdin"),

@@ -1227,6 +1227,10 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
     // be weighed against. Settled before any of them is opened.
     let mut sum = 0u64;
     let mut largest = 0u64;
+    // Kept, not just summed: these are the lengths the ceiling below is weighed
+    // against, and the read is bounded by the same ones — so what was approved
+    // and what is taken cannot be two different figures.
+    let mut sizes = Vec::with_capacity(opts.inputs.len());
     for input in &opts.inputs {
         let metadata = fs::metadata(input)
             .wrap_err_with(|| format!("failed to inspect {}", input.display()))?;
@@ -1237,6 +1241,7 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
             .checked_add(metadata.len())
             .ok_or_else(|| eyre!("the inputs add up to more than any machine can address"))?;
         largest = largest.max(metadata.len());
+        sizes.push(metadata.len());
     }
 
     // Those whole-file buffers dwarf the decoder's own workspace, so a ceiling
@@ -1311,15 +1316,15 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
     drop(dict);
 
     if opts.bench_separately {
-        for input in &opts.inputs {
+        for (input, size) in opts.inputs.iter().zip(&sizes) {
             let data =
-                fs::read(input).wrap_err_with(|| format!("failed to read {}", input.display()))?;
+                read_inputs_bounded(std::slice::from_ref(input), std::slice::from_ref(size))?;
             benchmark_one(opts, dicts, &input.display().to_string(), &data)?;
         }
         return Ok(());
     }
 
-    let data = read_inputs_into_one_buffer(&opts.inputs)?;
+    let data = read_inputs_bounded(&opts.inputs, &sizes)?;
     let label = opts
         .inputs
         .iter()
@@ -1329,31 +1334,46 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
     benchmark_one(opts, dicts, &label, &data)
 }
 
-/// Read every input end to end into one buffer, taking no more room than they
-/// add up to.
+/// Read every input into one buffer, taking no more room — and no more bytes —
+/// than the `sizes` it was weighed against.
 ///
 /// The `-M` ceiling counts three copies of this buffer, so it has to be the size
 /// it was counted at: appending file by file leaves a `Vec` holding up to twice
 /// the bytes it needs, and reading each file into its own buffer first holds the
-/// largest one twice over. The room is taken once, from the sizes the ceiling
-/// was weighed against, and each file is read straight into it.
-fn read_inputs_into_one_buffer(inputs: &[PathBuf]) -> Result<Vec<u8>> {
+/// largest one twice over. The room is taken once, from those same sizes, and
+/// each file is read straight into it and no further than its own — a file that
+/// grew since is an error rather than a buffer past what was approved.
+///
+/// `sizes` are the lengths the ceiling saw, in the order of `inputs`; passing
+/// the pair keeps the figure that was checked and the figure that is read the
+/// same one.
+fn read_inputs_bounded(inputs: &[PathBuf], sizes: &[u64]) -> Result<Vec<u8>> {
     let mut total = 0usize;
-    for input in inputs {
-        let size = fs::metadata(input)
-            .wrap_err_with(|| format!("failed to inspect {}", input.display()))?
-            .len();
-        total = usize::try_from(size)
+    for size in sizes {
+        total = usize::try_from(*size)
             .ok()
             .and_then(|size| total.checked_add(size))
             .ok_or_else(|| eyre!("the inputs add up to more than this machine can hold"))?;
     }
     let mut data = Vec::with_capacity(total);
-    for input in inputs {
-        let mut file = File::open(input)
+    for (input, size) in inputs.iter().zip(sizes) {
+        let file = File::open(input)
             .wrap_err_with(|| format!("failed to open input file {}", input.display()))?;
-        file.read_to_end(&mut data)
+        let before = data.len();
+        // One byte past the size that was weighed: reading it means the file
+        // holds more than the ceiling was told, so the buffer would grow past
+        // what a caller approved. A length that underreports its content — a
+        // file being written, or one whose directory entry is not a byte count
+        // at all — stops here rather than filling memory nobody agreed to.
+        file.take(size + 1)
+            .read_to_end(&mut data)
             .wrap_err_with(|| format!("failed to read {}", input.display()))?;
+        if (data.len() - before) as u64 > *size {
+            bail!(
+                "{} grew while it was being read; run again",
+                input.display()
+            );
+        }
     }
     Ok(data)
 }
@@ -1449,6 +1469,14 @@ fn train_dictionary(opts: &Options) -> Result<()> {
         FastCoverOptions, FinalizeOptions, create_fastcover_dict_from_slice,
     };
 
+    if opts.inputs.iter().any(|input| input == Path::new("-")) {
+        // The third mode that takes named inputs, and `-` is stdin in all of
+        // them: training reads every sample whole and rewinds nothing, so a
+        // stream is no more usable here than for `-b` or `-l`. Answered before
+        // the stat below, or the marker would name a file whenever one happens
+        // to sit in the working directory under that name.
+        bail!("--train cannot read stdin; name the sample files (`./-` for one called `-`)");
+    }
     if opts.inputs.is_empty() {
         bail!("--train requires one or more sample files");
     }
@@ -1650,7 +1678,12 @@ fn strictest_sample_permissions(
 /// it says.
 #[cfg(unix)]
 fn output_mode_for_sources(sources: &[(u32, u32)], output_gid: u32) -> u32 {
-    let mut mode = 0o7777;
+    // Only the bits that say who may read, write and run the file. Set-user-ID
+    // and set-group-ID say who a program runs AS, which is not a permission the
+    // bytes carry and not one to hand to a file with a different owner: a
+    // privileged run over someone else's `04755` archive would otherwise write
+    // a root-owned `04755` file. The reference command carries neither.
+    let mut mode = 0o0777;
     let mut group = None;
     let mut one_group = true;
     for (source_mode, source_gid) in sources {
