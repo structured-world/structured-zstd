@@ -684,7 +684,7 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
     // is why this waits for the whole command line. The `-D` dictionary is
     // weighed on top in `run`, once its size is known.
     if let Some(limit) = opts.memory_limit
-        && matches!(opts.mode, Mode::Decompress | Mode::Test)
+        && decodes(&opts)
     {
         check_memory_limit(limit, 0)?;
     }
@@ -711,13 +711,27 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
     } else {
         opts.level
     };
-    if opts.long && matches!(opts.mode, Mode::Compress) && long_level < MIN_LONG_LEVEL {
+    if opts.long && compresses(&opts) && long_level < MIN_LONG_LEVEL {
         bail!(
             "--long needs level {MIN_LONG_LEVEL} or above, where long-distance \
              matching runs; at level {long_level} it would only widen the window",
         );
     }
     Ok(Parsed::Run(opts))
+}
+
+/// Whether this run will decode anything, and so whether `-M` binds it.
+///
+/// Not the same question as the mode: benchmarking keeps `Mode::Compress` and
+/// still decompresses at every level it measures.
+fn decodes(opts: &Options) -> bool {
+    opts.bench || matches!(opts.mode, Mode::Decompress | Mode::Test)
+}
+
+/// Whether this run will compress anything, and so whether the encoder's own
+/// flags have to hold. Benchmarking compresses whatever mode was asked for.
+fn compresses(opts: &Options) -> bool {
+    opts.bench || matches!(opts.mode, Mode::Compress)
 }
 
 fn validate_level(level: i32) -> Result<()> {
@@ -789,23 +803,42 @@ fn print_help() {
     );
 }
 
-fn run(opts: Options) -> Result<()> {
-    let dict_bytes = match &opts.dict {
-        Some(path) => Some(
-            fs::read(path)
-                .wrap_err_with(|| format!("failed to read dictionary file {}", path.display()))?,
-        ),
-        None => None,
+/// Read the `-D` dictionary, if there is one, without breaking `-M` to do it.
+///
+/// The limit was already weighed against what decoding alone needs; the
+/// dictionary is the other half of that promise. Its size comes from the
+/// directory entry, so an oversized one is refused before it is read rather
+/// than after the allocation the limit was supposed to prevent. The read is
+/// then bounded by that same size, and a file that grew in between is an error
+/// rather than a silent truncation, which would corrupt the dictionary.
+fn load_dictionary(opts: &Options) -> Result<Option<Vec<u8>>> {
+    let Some(path) = &opts.dict else {
+        return Ok(None);
     };
-    // `-M` was checked against what decoding alone needs once the mode was
-    // known. The dictionary is the other half of that promise and its size is
-    // only known now, so the same limit is weighed against it here — on the
-    // decoding runs the limit describes.
-    if let (Some(limit), Some(bytes)) = (opts.memory_limit, dict_bytes.as_ref())
-        && matches!(opts.mode, Mode::Decompress | Mode::Test)
+    let size = fs::metadata(path)
+        .wrap_err_with(|| format!("failed to inspect dictionary file {}", path.display()))?
+        .len();
+    if let Some(limit) = opts.memory_limit
+        && decodes(opts)
     {
-        check_memory_limit(limit, bytes.len() as u64)?;
+        check_memory_limit(limit, size)?;
     }
+
+    let file = File::open(path)
+        .wrap_err_with(|| format!("failed to open dictionary file {}", path.display()))?;
+    let mut bytes = Vec::with_capacity(size as usize);
+    // One byte past the size the check cleared: reading it means the file grew.
+    file.take(size + 1)
+        .read_to_end(&mut bytes)
+        .wrap_err_with(|| format!("failed to read dictionary file {}", path.display()))?;
+    if bytes.len() as u64 > size {
+        bail!("{} grew while it was being read; run again", path.display());
+    }
+    Ok(Some(bytes))
+}
+
+fn run(opts: Options) -> Result<()> {
+    let dict_bytes = load_dictionary(&opts)?;
     let dict = dict_bytes.as_deref();
 
     // `-b` benchmarks compression/decompression across levels instead of

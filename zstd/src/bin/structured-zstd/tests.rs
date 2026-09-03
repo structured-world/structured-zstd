@@ -454,6 +454,10 @@ fn long_is_refused_at_levels_that_cannot_run_it() {
     assert!(parse(&["-b3", "-e19", "--long", "in.txt"]).is_err());
     // And a benchmark range is what counts, not a level that was also typed.
     assert!(parse(&["-16", "-b3", "--long", "in.txt"]).is_err());
+    // Benchmarking compresses whatever mode was asked for, so `-d` does not
+    // excuse the flag from naming levels that can run it.
+    assert!(parse(&["-d", "-b3", "--long", "in.txt"]).is_err());
+    assert!(parse(&["-d", "-b16", "--long", "in.txt"]).is_ok());
 }
 
 /// The window log has a supported range; a value outside it has to fail rather
@@ -721,6 +725,10 @@ fn the_memory_limit_only_binds_the_paths_that_decode() {
     assert!(parse(&["--train", "-M256", "s1", "s2"]).is_ok());
     // A mode flag after the limit still decides: the check waits for it.
     assert!(parse(&["--memory=8", "-d", "f"]).is_err());
+    // Benchmarking decompresses at every level it measures, so it decodes and
+    // the ceiling binds there too, whatever the mode field says.
+    assert!(parse(&["-b3", "-M8", "f"]).is_err());
+    assert!(parse(&["-b3", "-M256", "f"]).is_ok());
 }
 
 /// `-M` promises a bound on what decompression will take, and a dictionary is
@@ -739,6 +747,44 @@ fn the_memory_limit_counts_the_dictionary_it_was_given() {
     assert!(
         err.to_string().contains("dictionary"),
         "the refusal should say the dictionary is what does not fit, got: {err}"
+    );
+}
+
+/// A memory limit is a promise about what the process will allocate, so a
+/// dictionary that breaks it has to be refused BEFORE it is read. Loading the
+/// whole file and then reporting that it does not fit performs exactly the
+/// allocation the caller asked to be spared.
+#[test]
+fn an_oversized_dictionary_is_refused_before_it_is_read() {
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("szstd-bigdict-{}.bin", std::process::id()));
+    // 8 KiB of dictionary is counted twice, so a limit with only 4 KiB of
+    // headroom above the decoder's own floor cannot cover it.
+    fs::write(&path, vec![0u8; 8 * 1024]).unwrap();
+
+    // Unreadable, so the answer says which step ran first: refusing on the
+    // size means the limit was weighed before the file was opened, while a
+    // read error means the contents were reached for regardless.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    }
+
+    let mut opts = parse(&["-d", "f"]).unwrap();
+    opts.dict = Some(path.clone());
+    opts.memory_limit =
+        Some(structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE + (1 << 20) + 4096);
+    let refused = load_dictionary(&opts);
+    let _ = fs::remove_file(&path);
+
+    let err = refused
+        .expect_err("a dictionary that does not fit the limit must be refused")
+        .to_string();
+    assert!(
+        err.contains("memory limit") && err.contains("dictionary"),
+        "the refusal must name the limit, not report a read that should never \
+         have been attempted: {err}"
     );
 }
 
