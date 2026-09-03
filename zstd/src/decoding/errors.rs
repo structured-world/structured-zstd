@@ -693,6 +693,21 @@ pub enum FrameDecoderError {
     /// [`ResumeState`]: crate::decoding::ResumeState
     #[cfg(feature = "lsm")]
     ResumeFrameMismatch,
+    /// A resume was attempted while a dictionary that carries no ID was
+    /// applied, on either the emitting or the resuming side.
+    ///
+    /// The frame key tells dictionaries apart by the ID the decoder recorded,
+    /// and a raw-content dictionary has none — every one of them is ID 0. Two
+    /// different raw dictionaries therefore key alike, so a snapshot captured
+    /// under one would be restored under the other: foreign entropy and repcode
+    /// state, and output that is wrong with nothing to say so. A dictionary that
+    /// cannot be told from another cannot carry a resume across, so it is
+    /// refused. Give the dictionary an ID (a serialized dictionary carries one,
+    /// or supply a non-zero one to
+    /// [`Dictionary::from_raw_content`](crate::decoding::Dictionary::from_raw_content))
+    /// to make it resumable.
+    #[cfg(feature = "lsm")]
+    ResumeUnidentifiedDictionary,
 }
 
 #[cfg(feature = "std")]
@@ -871,6 +886,13 @@ impl core::fmt::Display for FrameDecoderError {
                 write!(
                     f,
                     "resume state was captured from a frame with a different decode shape than the current frame"
+                )
+            }
+            #[cfg(feature = "lsm")]
+            FrameDecoderError::ResumeUnidentifiedDictionary => {
+                write!(
+                    f,
+                    "a dictionary with no ID cannot be told from another one, so it cannot carry a resume state across frames"
                 )
             }
         }

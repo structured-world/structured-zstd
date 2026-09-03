@@ -1048,9 +1048,14 @@ fn run(opts: Options) -> Result<()> {
     // written will need to be read back, so an `-o` pointing at it destroys the
     // key to the archive it is producing. Checked here rather than in the
     // per-input scan below, which sees neither stdin nor `-`.
+    //
+    // Compression only. Decompressing has already finished with the dictionary
+    // by the time anything is written, and what it writes is plaintext that
+    // never needed it — the reference command permits that, and refusing would
+    // break a working script to protect nothing.
     if let (Some(output), Some(dict)) = (&opts.output, &opts.dict)
         && !opts.to_stdout
-        && matches!(opts.mode, Mode::Compress | Mode::Decompress)
+        && opts.mode == Mode::Compress
         && names_the_same_file(output, dict)?
     {
         bail!(
@@ -1080,8 +1085,10 @@ fn run(opts: Options) -> Result<()> {
             let output = derive_output_path(&opts, input)?;
             // Compared as files rather than as spellings: `foo.zst`,
             // `./foo.zst` and `dir/../dir/foo.zst` name one file, and a match
-            // on the string alone would miss two of the three.
+            // on the string alone would miss two of the three. Compression
+            // only, for the reason given at the `-o` check above.
             if let Some(dict) = &opts.dict
+                && opts.mode == Mode::Compress
                 && names_the_same_file(&output, dict)?
             {
                 bail!(
@@ -1390,8 +1397,12 @@ fn train_dictionary(opts: &Options) -> Result<()> {
     // from. A dictionary carries stretches of its corpus verbatim, so training
     // on private samples and leaving the result at whatever the umask allows
     // hands those stretches to everyone; with several samples the strictest
-    // decides, since the bytes of each are in there.
-    if let Some(permissions) = strictest_sample_permissions(&opts.inputs)?
+    // decides, since the bytes of each are in there. Applied to the temporary
+    // file so the dictionary is never briefly readable under the old mode, and
+    // handed to the replace below so a `-f` retrain over a permissive name does
+    // not restore it.
+    let sample_permissions = strictest_sample_permissions(&opts.inputs)?;
+    if let Some(permissions) = sample_permissions.clone()
         && let Err(err) = fs::set_permissions(&temp_path, permissions)
     {
         let _ = fs::remove_file(&temp_path);
@@ -1406,7 +1417,7 @@ fn train_dictionary(opts: &Options) -> Result<()> {
         return Err(err);
     }
     drop(temp_file);
-    replace_output_file(&temp_path, &output)?;
+    replace_output_file(&temp_path, &output, sample_permissions)?;
     info!(
         "trained {} ({}) from {} sample file(s)",
         output.display(),
@@ -1790,12 +1801,12 @@ fn write_stream_to_file<R: Read>(
         bail!("{} already exists; use -f to overwrite", output.display());
     }
     let (temp_path, temp_file) = create_temporary_output_file(output)?;
-    // A new file starts as private as its source: an archive of a 0600 secret
-    // must not arrive at whatever the umask allows. An existing destination
-    // keeps its own permissions instead, applied in `replace_output_file` —
-    // between the two rules, nothing this tool writes is more readable than
-    // what it was written from or over.
-    if let Some(permissions) = source_permissions
+    // The output is as private as its source, whether it is created or replaced:
+    // an archive of a 0600 secret must not arrive at whatever the umask allows,
+    // and must not take a world-readable mode from the name it lands on either.
+    // The reference command applies the source's mode in both directions. Only a
+    // source with no mode of its own — stdin — leaves the destination's alone.
+    if let Some(permissions) = source_permissions.clone()
         && let Err(err) = fs::set_permissions(&temp_path, permissions)
     {
         let _ = fs::remove_file(&temp_path);
@@ -1811,7 +1822,7 @@ fn write_stream_to_file<R: Read>(
         let _ = fs::remove_file(&temp_path);
         return Err(err);
     }
-    replace_output_file(&temp_path, output)
+    replace_output_file(&temp_path, output, source_permissions)
 }
 
 /// Resolve the output path for a file input under the current mode.
@@ -2216,7 +2227,20 @@ fn create_temporary_output_file(output: &Path) -> Result<(PathBuf, File)> {
     Err(eyre!("failed to allocate unique temporary output file"))
 }
 
-fn replace_output_file(temporary_output_path: &Path, output: &Path) -> Result<()> {
+/// Move the finished temporary file into place.
+///
+/// `source_permissions` is the mode the content asks for — the file it came
+/// from, or the strictest of the samples a dictionary was trained on. When
+/// there is one it decides, replacing whatever the destination happened to
+/// carry: an archive of a private file is private even if it lands on a
+/// world-readable name, which is what the reference command does in both
+/// directions. Only when the content names no mode of its own (stdin has no
+/// file to take one from) does the destination keep the permissions it had.
+fn replace_output_file(
+    temporary_output_path: &Path,
+    output: &Path,
+    source_permissions: Option<fs::Permissions>,
+) -> Result<()> {
     let output_kind = match output_destination_kind(output).inspect_err(|_err| {
         let _ = fs::remove_file(temporary_output_path);
     })? {
@@ -2237,15 +2261,18 @@ fn replace_output_file(temporary_output_path: &Path, output: &Path) -> Result<()
             "output path exists and is not a regular file: {output:?}"
         ));
     }
-    let original_permissions = fs::metadata(output)
-        .wrap_err("failed to read existing output file metadata")
-        .inspect_err(|_err| {
-            let _ = fs::remove_file(temporary_output_path);
-        })?
-        .permissions();
+    let original_permissions = match source_permissions {
+        Some(permissions) => permissions,
+        None => fs::metadata(output)
+            .wrap_err("failed to read existing output file metadata")
+            .inspect_err(|_err| {
+                let _ = fs::remove_file(temporary_output_path);
+            })?
+            .permissions(),
+    };
     if let Err(err) = fs::set_permissions(temporary_output_path, original_permissions.clone()) {
         let _ = fs::remove_file(temporary_output_path);
-        return Err(err).wrap_err("failed to apply existing output permissions to temporary file");
+        return Err(err).wrap_err("failed to apply the output's permissions to temporary file");
     }
 
     #[cfg(not(windows))]

@@ -291,6 +291,40 @@ fn an_input_that_is_the_dictionary_is_not_removed() {
     assert_eq!(survived.len(), 8192, "the dictionary must still be there");
 }
 
+/// Decompressing is the other direction, and there the dictionary has already
+/// done its work by the time anything is written: the plaintext does not need
+/// it, and the destination is replaced only once decoding has finished. The
+/// reference command allows it, so refusing would break a script for no gain.
+#[test]
+fn decompressing_over_the_dictionary_is_allowed() {
+    use structured_zstd::encoding::{CompressionLevel, compress_slice_to_vec};
+
+    let dir = std::env::temp_dir();
+    let dictionary = dir.join(format!("szstd-dover-{}", std::process::id()));
+    let archive = dir.join(format!("szstd-dover-{}.zst", std::process::id()));
+    fs::write(&dictionary, vec![2u8; 4096]).unwrap();
+    fs::write(
+        &archive,
+        compress_slice_to_vec(b"decoded payload", CompressionLevel::Default),
+    )
+    .unwrap();
+
+    let mut opts = parse(&["-d", "-f", "a"]).unwrap();
+    opts.inputs = vec![archive.clone()];
+    opts.dict = Some(dictionary.clone());
+    opts.output = Some(dictionary.clone());
+    let decoded = run(opts);
+
+    let written = fs::read(&dictionary).unwrap_or_default();
+    let _ = fs::remove_file(&dictionary);
+    let _ = fs::remove_file(&archive);
+    decoded.expect("the plaintext does not need the dictionary it replaced");
+    assert_eq!(
+        written, b"decoded payload",
+        "the output is the decoded content"
+    );
+}
+
 /// The scan that keeps an output off the dictionary walks the named inputs, and
 /// stdin is not one of them: `-f -D dict -o dict` never reached it, so the
 /// dictionary was loaded and then replaced by a frame that needs it. The result
@@ -701,6 +735,61 @@ fn a_trained_dictionary_is_no_more_readable_than_its_samples() {
         mode.expect("the dictionary must exist"),
         0o600,
         "the strictest sample decides: the dictionary holds bytes from it"
+    );
+}
+
+/// Replacing an existing file is where a permission rule is easiest to lose:
+/// the destination's own mode is restored over the one the source asked for.
+/// A `-f` retrain over a world-readable dictionary would publish the corpus it
+/// was told to keep private, and compressing a private file over an existing
+/// archive would do the same — the reference command applies the source's mode
+/// either way.
+#[cfg(unix)]
+#[test]
+fn replacing_a_file_does_not_restore_its_old_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir();
+    let sample = dir.join(format!("szstd-replace-sample-{}", std::process::id()));
+    let dictionary = dir.join(format!("szstd-replace-dict-{}", std::process::id()));
+    let corpus: Vec<u8> = (0..40_000u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+        .collect();
+    fs::write(&sample, &corpus).unwrap();
+    fs::write(&dictionary, b"the dictionary that was here before").unwrap();
+    fs::set_permissions(&sample, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::set_permissions(&dictionary, fs::Permissions::from_mode(0o644)).unwrap();
+
+    let mut opts = parse(&["--train", "-f", "s"]).unwrap();
+    opts.inputs = vec![sample.clone()];
+    opts.output = Some(dictionary.clone());
+    let trained = train_dictionary(&opts);
+    let dictionary_mode = fs::metadata(&dictionary).map(|m| m.permissions().mode() & 0o777);
+
+    // The same rule for an ordinary archive written over one that exists.
+    let archive = dir.join(format!("szstd-replace-arch-{}", std::process::id()));
+    fs::write(&archive, b"the archive that was here before").unwrap();
+    fs::set_permissions(&archive, fs::Permissions::from_mode(0o644)).unwrap();
+    let mut opts = parse(&["-3", "-f", "s"]).unwrap();
+    opts.inputs = vec![sample.clone()];
+    opts.output = Some(archive.clone());
+    let compressed = process_file(&opts, &sample, &no_dict());
+    let archive_mode = fs::metadata(&archive).map(|m| m.permissions().mode() & 0o777);
+
+    let _ = fs::remove_file(&sample);
+    let _ = fs::remove_file(&dictionary);
+    let _ = fs::remove_file(&archive);
+    trained.expect("training must succeed");
+    compressed.expect("compressing must succeed");
+    assert_eq!(
+        dictionary_mode.expect("the dictionary must exist"),
+        0o600,
+        "the retrained dictionary holds the private sample's bytes"
+    );
+    assert_eq!(
+        archive_mode.expect("the archive must exist"),
+        0o600,
+        "the archive holds the private file's bytes"
     );
 }
 
