@@ -1941,6 +1941,19 @@ impl FrameDecoder {
             state.decoder_scratch.set_compute_hash(compute_hash);
         }
 
+        // A dictionary that carries no ID cannot be told from another one, and
+        // the frame key records only that ID: two different raw-content
+        // dictionaries key alike, so a snapshot would be restored under the
+        // wrong one — and one taken here could later be. Both directions are
+        // refused, and refused HERE, before a block is read or a buffer
+        // reserved. An answer that does not depend on the blocks must not be
+        // given after decoding them: it would discard the output they produced
+        // and leave the source and the decoder somewhere the caller cannot
+        // retry from.
+        if (resume.is_some() || emit_resume) && state.using_dict == Some(0) {
+            return Err(err::ResumeUnidentifiedDictionary);
+        }
+
         // Mirror `decode_blocks`: pre-reserve the backing buffer to the
         // FCS-capped window so multi-block frames don't pay repeated grow
         // steps. The RAW frame window stays separately bound — the resume
@@ -1957,13 +1970,6 @@ impl FrameDecoder {
         // start is the resume state's block index (the passed `start_block` is
         // ignored in resume mode, per the doc).
         let effective_start = if let Some(r) = resume {
-            // A dictionary that carries no ID cannot be told from another one,
-            // and the key below records only that ID: two different raw-content
-            // dictionaries key alike, so the snapshot would be restored under
-            // the wrong one. Refused before the shape is even compared.
-            if state.using_dict == Some(0) {
-                return Err(err::ResumeUnidentifiedDictionary);
-            }
             // Reject a snapshot captured from a different frame shape BEFORE
             // touching any decoder state: restoring entropy/repcode tables that
             // belong to another frame would silently produce byte-wrong output.
@@ -2166,13 +2172,6 @@ impl FrameDecoder {
         // Suppress the snapshot on the terminal block: `block_counter` is then
         // one past the last block (EOF), for which there is no next-block source
         // position to resume from. A resume needs a real following block.
-        // A snapshot taken under a dictionary with no ID could not be matched
-        // back to it, only to any other such dictionary, so none is produced:
-        // refusing to emit it is refusing to create the thing that would be
-        // restored under the wrong dictionary later.
-        if emit_resume && !state.frame_finished && state.using_dict == Some(0) {
-            return Err(err::ResumeUnidentifiedDictionary);
-        }
         let resume_state = if emit_resume && !state.frame_finished {
             let dict_ref = if state.using_dict.is_some() {
                 state.active_dict.as_ref().map(|h| h.as_dict())

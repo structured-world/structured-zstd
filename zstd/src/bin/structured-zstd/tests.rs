@@ -780,34 +780,58 @@ fn group_access_survives_only_when_it_means_the_same_group() {
     // One owner, one group, and the dictionary lands in it: the bits mean what
     // they did on the samples, so they stand.
     assert_eq!(
-        dictionary_mode(&[(0o640, 100), (0o640, 100)], 100),
+        output_mode_for_sources(&[(0o640, 100), (0o640, 100)], 100),
         0o640,
         "one group throughout, and the dictionary is in it"
     );
     // Same bits, different groups: `0640` on one sample admits a group that the
     // other's `0640` does not, and the dictionary can only be in one of them.
     assert_eq!(
-        dictionary_mode(&[(0o640, 100), (0o640, 200)], 100),
+        output_mode_for_sources(&[(0o640, 100), (0o640, 200)], 100),
         0o600,
         "two groups cannot both be meant"
     );
     // One group among the samples, but the dictionary was created in another —
     // a setgid directory does exactly this.
     assert_eq!(
-        dictionary_mode(&[(0o640, 100), (0o640, 100)], 200),
+        output_mode_for_sources(&[(0o640, 100), (0o640, 100)], 200),
         0o600,
         "the dictionary's own group is not the samples'"
     );
     // The world names no principal, so those bits are the plain intersection.
     assert_eq!(
-        dictionary_mode(&[(0o644, 100), (0o644, 200)], 300),
+        output_mode_for_sources(&[(0o644, 100), (0o644, 200)], 300),
         0o604,
         "world access survives what group access cannot"
     );
     assert_eq!(
-        dictionary_mode(&[(0o644, 100), (0o600, 100)], 100),
+        output_mode_for_sources(&[(0o644, 100), (0o600, 100)], 100),
         0o600,
         "and the strictest sample still decides every bit"
+    );
+}
+
+/// The rule is not the trainer's: an archive carries its source's bytes just as
+/// a dictionary carries its samples', and a `0640` source in group A compressed
+/// into a setgid directory of group B would hand group B what it could not read.
+/// One source is the same question as many, so it takes the same answer.
+#[cfg(unix)]
+#[test]
+fn an_archive_keeps_group_access_only_when_it_means_the_same_group() {
+    assert_eq!(
+        output_mode_for_sources(&[(0o640, 100)], 100),
+        0o640,
+        "the archive is in the source's group, so the bits mean what they did"
+    );
+    assert_eq!(
+        output_mode_for_sources(&[(0o640, 100)], 200),
+        0o600,
+        "a setgid directory put it in another group, which those bits never meant"
+    );
+    assert_eq!(
+        output_mode_for_sources(&[(0o644, 100)], 200),
+        0o604,
+        "world access is nobody's group, so it survives"
     );
 }
 
@@ -1749,6 +1773,17 @@ fn memory_limit_is_honoured_or_refused_never_ignored() {
     assert!(parse(&["-d", "-M1M", "f"]).is_err());
     assert!(parse(&["-d", "-M128MB", "f"]).is_err());
     assert!(parse(&["-d", "-M256MB", "f"]).is_ok());
+    // Zero is the parameter's way of saying "the default ceiling", which is the
+    // one this build already enforces — so it asks for nothing and is refused
+    // by nothing. Read as a limit of zero bytes it would fail every run, which
+    // turns an explicit request for the default into an error.
+    let zero = parse(&["-d", "-M0", "f"]).expect("zero asks for the default ceiling");
+    assert_eq!(
+        zero.memory_limit, None,
+        "and is recorded as no custom limit at all"
+    );
+    let zero_long = parse(&["-d", "--memory=0", "f"]).expect("the long spelling too");
+    assert_eq!(zero_long.memory_limit, None);
     // The long spelling has the same default unit as the short one.
     assert!(parse(&["-d", "--memory=256", "f"]).is_ok());
     assert!(parse(&["-d", "--memory=8", "f"]).is_err());
@@ -2005,6 +2040,36 @@ fn the_memory_limit_counts_the_compressed_benchmark_buffer() {
     assert!(
         err.contains("memory limit"),
         "the refusal must be the limit: {err}"
+    );
+}
+
+/// Every other path reads `-` as stdin, and a benchmark cannot: it needs an
+/// input with an end and a length to weigh. Statting it instead means the
+/// marker names a file when one happens to sit in the working directory under
+/// that name, and stdin everywhere else in the same command line.
+#[test]
+fn benchmarking_refuses_the_stdin_marker() {
+    let dir = std::env::temp_dir().join(format!("szstd-dash-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let dash = dir.join("-");
+    fs::write(&dash, vec![1u8; 4096]).unwrap();
+
+    let mut opts = parse(&["-b3", "f"]).unwrap();
+    // Exactly as the command line spells it, with the file there to be found.
+    opts.inputs = vec![PathBuf::from("-")];
+    let previous = std::env::current_dir().unwrap();
+    std::env::set_current_dir(&dir).unwrap();
+    let refused = run_benchmark(&opts, None);
+    std::env::set_current_dir(previous).unwrap();
+
+    let _ = fs::remove_file(&dash);
+    let _ = fs::remove_dir(&dir);
+    let err = refused
+        .expect_err("the marker means stdin, which a benchmark cannot measure")
+        .to_string();
+    assert!(
+        err.contains("stdin"),
+        "the refusal must say what is wrong with it: {err}"
     );
 }
 

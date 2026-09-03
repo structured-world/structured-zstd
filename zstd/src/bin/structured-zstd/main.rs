@@ -171,21 +171,28 @@ fn parse_size(text: &str) -> Result<u64> {
         .ok_or_else(|| eyre!("size `{text}` does not fit in 64 bits"))
 }
 
-/// Parse a `-M` / `--memory` value into bytes.
+/// Parse a `-M` / `--memory` value into bytes, or `None` for "the default".
 ///
 /// The default unit is MiB, as upstream documents, so `-M256` is 256 MiB. A
 /// suffix means what it says and is not multiplied again: `-M1M` is one
 /// mebibyte, a limit far below what decompression needs, and has to be refused
 /// as such rather than read as a terabyte that trivially passes.
-fn parse_memory_limit(text: &str) -> Result<u64> {
+///
+/// Zero asks for no custom ceiling at all: the parameter contract says "value 0
+/// means use default maximum windowLog" (`zstd.h`, `ZSTD_d_windowLogMax`), and
+/// the default is what this build enforces anyway. Read as a limit of zero
+/// bytes it would refuse every run, turning an explicit request for the default
+/// into an error.
+fn parse_memory_limit(text: &str) -> Result<Option<u64>> {
     let value = parse_size(text)?;
-    if text.trim().ends_with(|c: char| c.is_ascii_digit()) {
+    let bytes = if text.trim().ends_with(|c: char| c.is_ascii_digit()) {
         value
             .checked_mul(1 << 20)
-            .ok_or_else(|| eyre!("memory limit `{text}` MiB does not fit in 64 bits"))
+            .ok_or_else(|| eyre!("memory limit `{text}` MiB does not fit in 64 bits"))?
     } else {
-        Ok(value)
-    }
+        value
+    };
+    Ok((bytes != 0).then_some(bytes))
 }
 
 /// Check a requested decompression memory ceiling against the one this build
@@ -544,7 +551,7 @@ fn parse_args(
                         // ceiling describes decoding, and a later flag can
                         // still decide this run does none.
                         opts.memory_limit =
-                            Some(parse_memory_limit(v).wrap_err("invalid memory limit")?);
+                            parse_memory_limit(v).wrap_err("invalid memory limit")?;
                     } else if let Some(params) = long.strip_prefix("adapt=") {
                         // Parameterised form (`--adapt=min=1,max=9`). We do not
                         // vary the level, so the bounds change nothing — but a
@@ -688,7 +695,7 @@ fn parse_args(
                     let rest: String = chars[ci + 1..].iter().collect();
                     if !rest.is_empty() {
                         opts.memory_limit =
-                            Some(parse_memory_limit(&rest).wrap_err("invalid -M memory limit")?);
+                            parse_memory_limit(&rest).wrap_err("invalid -M memory limit")?;
                     }
                     ci = chars.len();
                     continue;
@@ -1159,6 +1166,15 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
     if opts.inputs.is_empty() {
         bail!("-b requires one or more regular input files to benchmark");
     }
+    // `-` is stdin everywhere else in this tool, and a benchmark cannot measure
+    // it: the whole input is held and read again per pass, which a stream
+    // affords neither. Answered before the stat below, or the marker would name
+    // a file whenever one happens to sit in the working directory under that
+    // name — and stdin whenever one does not. A file really called `-` is still
+    // reachable, spelled `./-`.
+    if opts.inputs.iter().any(|input| input == Path::new("-")) {
+        bail!("-b cannot benchmark stdin; name a file (`./-` for one called `-`)");
+    }
     // Benchmarking is the one path that holds whole files, so it needs inputs
     // with an end and a length that means something. A FIFO would block on the
     // read that never returns, a character device would grow the buffer until
@@ -1520,34 +1536,38 @@ fn strictest_sample_permissions(
     let output_gid = fs::metadata(destination)
         .wrap_err_with(|| format!("failed to inspect {}", destination.display()))?
         .gid();
-    Ok(Some(fs::Permissions::from_mode(dictionary_mode(
+    Ok(Some(fs::Permissions::from_mode(output_mode_for_sources(
         &samples_by_group,
         output_gid,
     ))))
 }
 
-/// The mode a file built from all of `samples` may carry, given the group it
+/// The mode a file built from all of `sources` may carry, given the group it
 /// will itself belong to.
 ///
-/// Each sample contributes its mode and the group those bits admit. The
-/// intersection of the modes is where it starts, since no sample's bytes may be
-/// reachable through the dictionary by anyone who could not reach that sample.
-/// Bits alone do not say WHO they let in, though: `0640` on two samples of
+/// An output carries its sources' bytes — an archive its file's, a dictionary
+/// stretches of every sample's — so nobody may reach it who could not reach
+/// them. Each source contributes its mode and the group those bits admit, and
+/// the intersection of the modes is where the answer starts.
+///
+/// Bits alone do not say WHO they let in, though: `0640` on two sources of
 /// different groups admits two different sets of people, and a file belongs to
-/// one group. So the group bits survive only when every sample names one group
-/// and the file is in it. The owner's bits stand — every sample was read, so
-/// this user was entitled to its bytes — and the world's name no one in
-/// particular, so their intersection means what it says.
+/// one group — which is not even necessarily theirs, since a setgid directory
+/// gives the file its own. So the group bits survive only when every source
+/// names one group and the file is in it. The owner's bits stand, because every
+/// source was read to build this and so this user was entitled to its bytes,
+/// and the world's name no one in particular, so their intersection means what
+/// it says.
 #[cfg(unix)]
-fn dictionary_mode(samples: &[(u32, u32)], output_gid: u32) -> u32 {
+fn output_mode_for_sources(sources: &[(u32, u32)], output_gid: u32) -> u32 {
     let mut mode = 0o7777;
     let mut group = None;
     let mut one_group = true;
-    for (sample_mode, sample_gid) in samples {
-        mode &= *sample_mode;
+    for (source_mode, source_gid) in sources {
+        mode &= *source_mode;
         match group {
-            None => group = Some(*sample_gid),
-            Some(seen) => one_group &= seen == *sample_gid,
+            None => group = Some(*source_gid),
+            Some(seen) => one_group &= seen == *source_gid,
         }
     }
     if !one_group || group != Some(output_gid) {
@@ -1562,6 +1582,36 @@ fn strictest_sample_permissions(
     _destination: &Path,
 ) -> Result<Option<fs::Permissions>> {
     Ok(None)
+}
+
+/// The mode an output built from one source may carry, by the same rule the
+/// trainer applies to its samples: an archive holds its source's bytes, so
+/// nobody may read it who could not read that source.
+#[cfg(unix)]
+fn permissions_from_source(
+    source: &fs::Metadata,
+    destination: &Path,
+) -> Result<Option<fs::Permissions>> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let output_gid = fs::metadata(destination)
+        .wrap_err_with(|| format!("failed to inspect {}", destination.display()))?
+        .gid();
+    Ok(Some(fs::Permissions::from_mode(output_mode_for_sources(
+        &[(source.permissions().mode(), source.gid())],
+        output_gid,
+    ))))
+}
+
+/// Elsewhere `Permissions` says only whether a file is read-only, which answers
+/// a different question than who may read it, so the source's own is carried
+/// over unchanged and the platform decides the rest.
+#[cfg(not(unix))]
+fn permissions_from_source(
+    source: &fs::Metadata,
+    _destination: &Path,
+) -> Result<Option<fs::Permissions>> {
+    Ok(Some(source.permissions()))
 }
 
 /// Read into `buf` until it is full or EOF, returning the number of bytes read.
@@ -1902,7 +1952,7 @@ fn write_stream_to_file<R: Read>(
     output: &Path,
     size_hint: Option<u64>,
     dicts: &Dictionaries,
-    source_permissions: Option<fs::Permissions>,
+    source: Option<&fs::Metadata>,
 ) -> Result<()> {
     ensure_regular_output_destination(output)?;
     if output.exists() && !opts.force {
@@ -1914,6 +1964,14 @@ fn write_stream_to_file<R: Read>(
     // and must not take a world-readable mode from the name it lands on either.
     // The reference command applies the source's mode in both directions. Only a
     // source with no mode of its own — stdin — leaves the destination's alone.
+    // Asked of the temporary file, since that is the one renamed into place and
+    // so the one whose own group the mode's group bits would admit.
+    let source_permissions = match source {
+        Some(metadata) => permissions_from_source(metadata, &temp_path).inspect_err(|_err| {
+            let _ = fs::remove_file(&temp_path);
+        })?,
+        None => None,
+    };
     if let Some(permissions) = source_permissions.clone()
         && let Err(err) = fs::set_permissions(&temp_path, permissions)
     {
@@ -1997,14 +2055,7 @@ fn process_file(opts: &Options, input: &Path, dicts: &Dictionaries) -> Result<()
 
     let output = derive_output_path(opts, input)?;
     ensure_distinct_paths(input, &output)?;
-    write_stream_to_file(
-        opts,
-        reader,
-        &output,
-        pledged_size,
-        dicts,
-        Some(metadata.permissions()),
-    )?;
+    write_stream_to_file(opts, reader, &output, pledged_size, dicts, Some(&metadata))?;
 
     info!("{} -> {}", input.display(), output.display());
     remove_source_if_requested(opts, input)

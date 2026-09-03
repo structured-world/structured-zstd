@@ -2250,13 +2250,22 @@ fn resume_rejects_a_dictionary_that_carries_no_identity() {
 
     // No such snapshot is produced in the first place: refusing to emit it is
     // refusing to create the thing that would later be restored under whichever
-    // raw dictionary happened to be applied.
+    // raw dictionary happened to be applied. Refused before any of it is
+    // decoded, too — the answer does not depend on the blocks, and an error
+    // raised after them would swallow the output they produced and leave the
+    // source and the decoder somewhere the caller cannot retry from.
     let mut src = compressed.as_slice();
     let mut dec = FrameDecoder::new();
     dec.reset_with_dict_handle(&mut src, &first).unwrap();
+    let before = src.len();
     let emitted = dec
         .decode_blocks_partial(&mut src, 0, n, None, true)
         .expect_err("a dictionary with no identity must not produce a resume state");
+    assert_eq!(
+        src.len(),
+        before,
+        "and nothing may be read before the refusal"
+    );
     assert!(
         matches!(
             emitted,
