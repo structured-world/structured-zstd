@@ -738,6 +738,79 @@ fn a_trained_dictionary_is_no_more_readable_than_its_samples() {
     );
 }
 
+/// The `-M` ceiling for a benchmark counts three copies of the input, so the
+/// buffers holding them have to be the size they were counted at. A `Vec` grown
+/// by appending carries up to twice the bytes it holds, and reading each file
+/// into its own buffer first holds the largest one twice over — a run admitted
+/// as fitting could then take far more than it was allowed. Read straight into
+/// one buffer of the size the files add up to.
+#[test]
+fn the_benchmark_input_is_the_size_it_was_counted_at() {
+    let dir = std::env::temp_dir();
+    let first = dir.join(format!("szstd-benchcap-a-{}", std::process::id()));
+    let second = dir.join(format!("szstd-benchcap-b-{}", std::process::id()));
+    // Sizes where appending would double past the total rather than land on it.
+    fs::write(&first, vec![1u8; 8000]).unwrap();
+    fs::write(&second, vec![2u8; 1000]).unwrap();
+
+    let combined = read_inputs_into_one_buffer(&[first.clone(), second.clone()]);
+
+    let _ = fs::remove_file(&first);
+    let _ = fs::remove_file(&second);
+    let combined = combined.expect("both files must be read");
+    assert_eq!(combined.len(), 9_000, "the whole of both files");
+    assert_eq!(
+        combined.capacity(),
+        9_000,
+        "and no more memory than that was taken to hold them"
+    );
+    assert_eq!(combined[7999], 1, "the first file's bytes come first");
+    assert_eq!(combined[8000], 2, "the second file's follow");
+}
+
+/// Permission bits alone do not say who they let in. Two samples at `0640` may
+/// belong to different groups, and the dictionary belongs to whichever group the
+/// directory it was created in gave it — so keeping the group bits would open
+/// corpus fragments to a group that could not read the sample they came from.
+/// The owner's bits are safe (every sample was read, so this user was entitled
+/// to its bytes) and the world's name nobody, so only the group's are at stake.
+#[cfg(unix)]
+#[test]
+fn group_access_survives_only_when_it_means_the_same_group() {
+    // One owner, one group, and the dictionary lands in it: the bits mean what
+    // they did on the samples, so they stand.
+    assert_eq!(
+        dictionary_mode(&[(0o640, 100), (0o640, 100)], 100),
+        0o640,
+        "one group throughout, and the dictionary is in it"
+    );
+    // Same bits, different groups: `0640` on one sample admits a group that the
+    // other's `0640` does not, and the dictionary can only be in one of them.
+    assert_eq!(
+        dictionary_mode(&[(0o640, 100), (0o640, 200)], 100),
+        0o600,
+        "two groups cannot both be meant"
+    );
+    // One group among the samples, but the dictionary was created in another —
+    // a setgid directory does exactly this.
+    assert_eq!(
+        dictionary_mode(&[(0o640, 100), (0o640, 100)], 200),
+        0o600,
+        "the dictionary's own group is not the samples'"
+    );
+    // The world names no principal, so those bits are the plain intersection.
+    assert_eq!(
+        dictionary_mode(&[(0o644, 100), (0o644, 200)], 300),
+        0o604,
+        "world access survives what group access cannot"
+    );
+    assert_eq!(
+        dictionary_mode(&[(0o644, 100), (0o600, 100)], 100),
+        0o600,
+        "and the strictest sample still decides every bit"
+    );
+}
+
 /// Replacing an existing file is where a permission rule is easiest to lose:
 /// the destination's own mode is restored over the one the source asked for.
 /// A `-f` retrain over a world-readable dictionary would publish the corpus it
@@ -1806,10 +1879,16 @@ fn separate_benchmarking_measures_one_file_at_a_time() {
 
     // Measured one at a time, only one file is in memory at once — so a limit
     // that fits a single file is enough, while the concatenation needs both.
+    // Sized the way the run sizes its buffers: the file, its frame, and the
+    // decoded copy.
     let mut opts = parse(&["-b3", "-S", "f"]).unwrap();
     opts.inputs = vec![one.clone(), two.clone()];
-    opts.memory_limit =
-        Some(structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE + (1 << 20) + 96 * 1024);
+    opts.memory_limit = Some(
+        structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE
+            + (1 << 20)
+            + 2 * 32 * 1024
+            + structured_zstd::encoding::compress_bound(32 * 1024) as u64,
+    );
     let separately = run_benchmark(&opts, None);
 
     opts.bench_separately = false;
@@ -1941,9 +2020,14 @@ fn the_memory_limit_counts_the_dictionary_and_the_benchmark_together() {
 
     let mut opts = parse(&["-b3", "f"]).unwrap();
     opts.inputs = vec![input.clone()];
-    // Room for either buffer alone (2 x 32 KiB), not for both.
-    opts.memory_limit =
-        Some(structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE + (1 << 20) + 96 * 1024);
+    // Room for exactly what the benchmark holds — the input, its frame and the
+    // decoded copy — and so none to spare for a dictionary beside them.
+    opts.memory_limit = Some(
+        structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE
+            + (1 << 20)
+            + 2 * 32 * 1024
+            + structured_zstd::encoding::compress_bound(32 * 1024) as u64,
+    );
     let refused = run_benchmark(&opts, Some(&dictionary));
     let alone = run_benchmark(&opts, None);
     let _ = fs::remove_file(&input);

@@ -228,10 +228,19 @@ fn check_memory_limit(requested: u64, whole_file_bytes: u64, copies: u64) -> Res
     };
     if requested < floor {
         if floor > WINDOW + AUXILIARY {
+            // A caller that holds one thing in several forms says how many, and
+            // the count is worth naming: it is usually the surprise. One that
+            // has already added its buffers up passes 1, and then the count
+            // says nothing worth reading.
+            let held = if copies == 1 {
+                String::new()
+            } else {
+                format!(", each held in {copies} forms at once")
+            };
             bail!(
                 "requested memory limit {requested} B does not cover this run: a {} MiB \
                  window, about {} MiB of literal, block, sequence and table buffers, and \
-                 {} MiB of whole-file buffers, each held in {copies} forms at once.",
+                 {} MiB of whole-file buffers{held}.",
                 WINDOW / (1 << 20),
                 AUXILIARY / (1 << 20),
                 (floor - WINDOW - AUXILIARY) / (1 << 20),
@@ -1171,19 +1180,28 @@ fn run_benchmark(opts: &Options, dict: Option<&[u8]>) -> Result<()> {
         // With `-S` only one input is in memory at a time, so the largest file
         // is what has to fit rather than their sum.
         let inputs = if opts.bench_separately { largest } else { sum };
-        // Three forms of the input at once: the bytes themselves, the frame
-        // they compress to, and the decompressed copy each pass builds. The
-        // frame is no smaller than the input when the input does not compress,
-        // which is exactly the case a ceiling has to survive.
-        check_memory_limit(limit, inputs, 3)?;
+        // Three buffers exist at once: the input, the frame it compresses to,
+        // and the decoded copy. Each is allocated at the size named here and
+        // never grows past it, so this is what the run actually holds rather
+        // than a lower bound on it. The frame's is `compress_bound`, which is
+        // the input plus the framing an incompressible input still pays — the
+        // case a ceiling has to survive.
+        let frame = usize::try_from(inputs)
+            .map(structured_zstd::encoding::compress_bound)
+            .map(|bound| bound as u64)
+            .ok();
+        let buffers = frame
+            .and_then(|frame| inputs.checked_mul(2)?.checked_add(frame))
+            .ok_or_else(|| eyre!("the inputs add up to more than any machine can address"))?;
+        check_memory_limit(limit, buffers, 1)?;
         // The dictionary is held alongside them for the whole run, and is
         // counted with them rather than on its own: two allocations that each
         // clear the ceiling separately can still exceed it together.
         if let Some(bytes) = dict {
-            let total = inputs
+            let total = buffers
                 .checked_add(bytes.len() as u64)
                 .ok_or_else(|| eyre!("the inputs add up to more than any machine can address"))?;
-            check_memory_limit(limit, total, 3)?;
+            check_memory_limit(limit, total, 1)?;
         }
     }
 
@@ -1200,12 +1218,7 @@ fn run_benchmark(opts: &Options, dict: Option<&[u8]>) -> Result<()> {
         return Ok(());
     }
 
-    let mut data = Vec::new();
-    for input in &opts.inputs {
-        data.extend_from_slice(
-            &fs::read(input).wrap_err_with(|| format!("failed to read {}", input.display()))?,
-        );
-    }
+    let data = read_inputs_into_one_buffer(&opts.inputs)?;
     let label = opts
         .inputs
         .iter()
@@ -1213,6 +1226,35 @@ fn run_benchmark(opts: &Options, dict: Option<&[u8]>) -> Result<()> {
         .collect::<Vec<_>>()
         .join(", ");
     benchmark_one(opts, dicts, &label, &data)
+}
+
+/// Read every input end to end into one buffer, taking no more room than they
+/// add up to.
+///
+/// The `-M` ceiling counts three copies of this buffer, so it has to be the size
+/// it was counted at: appending file by file leaves a `Vec` holding up to twice
+/// the bytes it needs, and reading each file into its own buffer first holds the
+/// largest one twice over. The room is taken once, from the sizes the ceiling
+/// was weighed against, and each file is read straight into it.
+fn read_inputs_into_one_buffer(inputs: &[PathBuf]) -> Result<Vec<u8>> {
+    let mut total = 0usize;
+    for input in inputs {
+        let size = fs::metadata(input)
+            .wrap_err_with(|| format!("failed to inspect {}", input.display()))?
+            .len();
+        total = usize::try_from(size)
+            .ok()
+            .and_then(|size| total.checked_add(size))
+            .ok_or_else(|| eyre!("the inputs add up to more than this machine can hold"))?;
+    }
+    let mut data = Vec::with_capacity(total);
+    for input in inputs {
+        let mut file = File::open(input)
+            .wrap_err_with(|| format!("failed to open input file {}", input.display()))?;
+        file.read_to_end(&mut data)
+            .wrap_err_with(|| format!("failed to read {}", input.display()))?;
+    }
+    Ok(data)
 }
 
 /// Measure one benchmark subject: the whole input as one stream, or a single
@@ -1233,9 +1275,16 @@ fn benchmark_one(opts: &Options, dicts: &Dictionaries, label: &str, data: &[u8])
         opts.bench_end,
     );
 
+    // The two buffers the measurement fills, sized once from what they will
+    // hold: the frame can be no larger than `compress_bound` says, and the
+    // decoded copy is exactly the input again. That keeps them the size the `-M`
+    // ceiling counted them at instead of the doubled capacity a growing `Vec`
+    // ends up with — and it keeps the growth out of the timed sections, which
+    // would otherwise be reported as compression and decompression speed.
+    let mut compressed = Vec::with_capacity(structured_zstd::encoding::compress_bound(data.len()));
+    let mut decoded = Vec::with_capacity(data.len());
     for level in opts.bench_start..=opts.bench_end {
         validate_level(level)?;
-        let mut compressed = Vec::new();
         let mut best_compress = f64::MAX;
         let start = Instant::now();
         loop {
@@ -1263,9 +1312,9 @@ fn benchmark_one(opts: &Options, dicts: &Dictionaries, label: &str, data: &[u8])
         let mut best_decompress = f64::MAX;
         let start = Instant::now();
         loop {
-            let mut out = Vec::new();
+            decoded.clear();
             let t = Instant::now();
-            decompress_stream(compressed.as_slice(), &mut out, dicts)?;
+            decompress_stream(compressed.as_slice(), &mut decoded, dicts)?;
             best_decompress = best_decompress.min(t.elapsed().as_secs_f64());
             if start.elapsed().as_secs_f64() >= opts.bench_secs {
                 break;
@@ -1401,7 +1450,9 @@ fn train_dictionary(opts: &Options) -> Result<()> {
     // file so the dictionary is never briefly readable under the old mode, and
     // handed to the replace below so a `-f` retrain over a permissive name does
     // not restore it.
-    let sample_permissions = strictest_sample_permissions(&opts.inputs)?;
+    // Asked of the temporary file, which is the one that gets renamed into
+    // place: it is where the group the dictionary will belong to is decided.
+    let sample_permissions = strictest_sample_permissions(&opts.inputs, &temp_path)?;
     if let Some(permissions) = sample_permissions.clone()
         && let Err(err) = fs::set_permissions(&temp_path, permissions)
     {
@@ -1437,22 +1488,68 @@ fn train_dictionary(opts: &Options) -> Result<()> {
 /// than unreadable, so nothing is applied and the platform's own inheritance
 /// stands.
 #[cfg(unix)]
-fn strictest_sample_permissions(samples: &[PathBuf]) -> Result<Option<fs::Permissions>> {
-    use std::os::unix::fs::PermissionsExt;
+fn strictest_sample_permissions(
+    samples: &[PathBuf],
+    destination: &Path,
+) -> Result<Option<fs::Permissions>> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-    let mut mode: Option<u32> = None;
+    let mut samples_by_group = Vec::with_capacity(samples.len());
     for sample in samples {
-        let sample_mode = fs::metadata(sample)
-            .wrap_err_with(|| format!("failed to inspect {}", sample.display()))?
-            .permissions()
-            .mode();
-        mode = Some(mode.map_or(sample_mode, |so_far| so_far & sample_mode));
+        let metadata = fs::metadata(sample)
+            .wrap_err_with(|| format!("failed to inspect {}", sample.display()))?;
+        samples_by_group.push((metadata.permissions().mode(), metadata.gid()));
     }
-    Ok(mode.map(fs::Permissions::from_mode))
+    if samples_by_group.is_empty() {
+        return Ok(None);
+    }
+    // The group the file itself is in, which is the one its group bits would
+    // admit. It is the process's, or the directory's when that is setgid, so it
+    // is read from the file rather than assumed.
+    let output_gid = fs::metadata(destination)
+        .wrap_err_with(|| format!("failed to inspect {}", destination.display()))?
+        .gid();
+    Ok(Some(fs::Permissions::from_mode(dictionary_mode(
+        &samples_by_group,
+        output_gid,
+    ))))
+}
+
+/// The mode a file built from all of `samples` may carry, given the group it
+/// will itself belong to.
+///
+/// Each sample contributes its mode and the group those bits admit. The
+/// intersection of the modes is where it starts, since no sample's bytes may be
+/// reachable through the dictionary by anyone who could not reach that sample.
+/// Bits alone do not say WHO they let in, though: `0640` on two samples of
+/// different groups admits two different sets of people, and a file belongs to
+/// one group. So the group bits survive only when every sample names one group
+/// and the file is in it. The owner's bits stand — every sample was read, so
+/// this user was entitled to its bytes — and the world's name no one in
+/// particular, so their intersection means what it says.
+#[cfg(unix)]
+fn dictionary_mode(samples: &[(u32, u32)], output_gid: u32) -> u32 {
+    let mut mode = 0o7777;
+    let mut group = None;
+    let mut one_group = true;
+    for (sample_mode, sample_gid) in samples {
+        mode &= *sample_mode;
+        match group {
+            None => group = Some(*sample_gid),
+            Some(seen) => one_group &= seen == *sample_gid,
+        }
+    }
+    if !one_group || group != Some(output_gid) {
+        mode &= !0o070;
+    }
+    mode
 }
 
 #[cfg(not(unix))]
-fn strictest_sample_permissions(_samples: &[PathBuf]) -> Result<Option<fs::Permissions>> {
+fn strictest_sample_permissions(
+    _samples: &[PathBuf],
+    _destination: &Path,
+) -> Result<Option<fs::Permissions>> {
     Ok(None)
 }
 
