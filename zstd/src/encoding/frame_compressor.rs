@@ -2127,7 +2127,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // block even when only a tail remains) does not reallocate; sized off
         // the ACTIVE block capacity, since a small window shrinks the block
         // below the format maximum.
-        if let Some(hint) = initial_size_hint {
+        if hint_is_exact && let Some(hint) = initial_size_hint {
             // `saturating_add`: a caller may pledge `u64::MAX`, and clamping a
             // reservation request at the address-space limit is the meaningful
             // answer — the matcher caps it at its eviction ceiling anyway.
