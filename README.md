@@ -60,15 +60,19 @@ Flags that only steer how the work is done (`-T`, `-B`, `--adapt`,
 `--[no-]progress`, …) are accepted and ignored — their values are still
 validated, so a typo is an error rather than silence.
 `--target-compressed-block-size` does take effect: it bounds what goes into a
-block, so blocks flush sooner. `--long=N` is capped at 27, since a larger
-window would produce frames this build's decoder refuses. Flags that would change
-the result are refused instead: `--format=` for anything but zstd,
-`--patch-from`, `--rsyncable`, `--no-check`, `--[no-]compress-literals`, and
-the not-yet-implemented `--pass-through` / `--exclude-compressed`. `-M` is
-treated as the safety promise it is: a limit covering the 128 MiB
-decompression window plus the decoder's buffers is kept, a tighter one is
-refused rather than ignored, and it is refused outright with `--train`, which
-it says nothing about.
+block, so blocks flush sooner. `--long` means `--long=27`, as upstream
+documents, and is capped there: a larger window would produce frames this
+build's decoder refuses. A window is never declared larger than the source can
+fill, so a small file compressed with `--long` does not ask its decoders to
+reserve 128 MiB.
+
+Flags that would change the result are refused instead: `--format=` for
+anything but zstd, `--patch-from`, `--rsyncable`, `--no-check`,
+`--[no-]compress-literals`, and the not-yet-implemented `--pass-through` /
+`--exclude-compressed`. `-M` is treated as the safety promise it is: a limit
+covering the 128 MiB decompression window, the decoder's buffers and the `-D`
+dictionary is kept, a tighter one is refused rather than ignored, and it is
+refused outright with `--train`, which it says nothing about.
 
 `--train` and `--train-fastcover` both train with FastCOVER, the algorithm
 upstream also defaults to. `--train-cover` and `--train-legacy` name algorithms

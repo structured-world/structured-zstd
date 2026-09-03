@@ -1083,14 +1083,17 @@ impl Matcher for MatchGeneratorDriver {
             // synthesized that backend's DEFAULT config (FAST_L1 /
             // HC_OVERRIDE_DEFAULT) with full-size table logs AFTER that cap
             // ran. Re-apply the hint cap so a tiny hinted frame doesn't
-            // allocate the new backend's full-size tables. An explicit
-            // `window_log` override is the user's hard request and must
-            // survive the re-cap, so restore it afterwards.
+            // allocate the new backend's full-size tables.
+            //
+            // The cap covers an explicit `window_log` too, as
+            // `ZSTD_adjustCParams_internal` does upstream: the window is a
+            // promise about the memory decoding will need, and a source that
+            // cannot fill it makes that promise for nothing — every decoder
+            // opening the frame would reserve the whole declared window to
+            // read a few bytes. The override still raises the window as far as
+            // the source can use.
             if let Some(hint_size) = hint {
                 params = adjust_params_for_source_size(params, hint_size);
-                if let Some(window_log) = ov.window_log {
-                    params.window_log = window_log;
-                }
             }
         }
         // A dictionary frame's hash-chain / binary-tree widths are the CDict's

@@ -112,6 +112,10 @@ struct Options {
     /// Back-reference window from `--long=N`. Bare `--long` leaves it unset, so
     /// the level's own window applies.
     long_window_log: Option<u32>,
+    /// Decompression memory ceiling from `-M` / `--memory`, in bytes. Kept
+    /// rather than checked and dropped, so the `-D` dictionary can be weighed
+    /// against it once its size is known.
+    memory_limit: Option<u64>,
     /// Block-size target from `--target-compressed-block-size`. A soft target,
     /// as upstream documents it: it bounds what goes into a block, so blocks
     /// flush sooner and stay near the requested size.
@@ -128,6 +132,9 @@ struct Options {
 
 /// Upstream `zstd --maxdict` default (110 KiB).
 const DEFAULT_MAX_DICT: usize = 112_640;
+
+/// Window log a bare `--long` selects, as upstream documents (128 MiB).
+const DEFAULT_LONG_WINDOW_LOG: u32 = 27;
 
 /// Parse a size written the way upstream accepts it: a plain count, or one
 /// suffixed `KB`/`MB`/`GB` (also spelled `K`/`M`/`G`, any case). Upstream uses
@@ -181,7 +188,12 @@ fn parse_memory_limit(text: &str) -> Result<u64> {
 /// already satisfied — we are the stricter of the two. A request BELOW it is a
 /// promise this build cannot make, and saying nothing would leave the caller
 /// believing a bound that is not there.
-fn check_memory_limit(requested: u64) -> Result<()> {
+///
+/// `dictionary_bytes` is the size of the `-D` file, counted twice: the blob is
+/// held for the length of the run and its content is copied again into the
+/// parsed dictionary. A large one can break the promise on its own, so it is
+/// weighed once the file has been read rather than assumed away.
+fn check_memory_limit(requested: u64, dictionary_bytes: u64) -> Result<()> {
     /// Window ceiling the decoder refuses to exceed.
     const WINDOW: u64 = structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE;
     /// What the decoder holds BESIDES the window, rounded well up: the literal
@@ -190,8 +202,21 @@ fn check_memory_limit(requested: u64) -> Result<()> {
     /// Counted because the promise is about total memory, not about one
     /// allocation: a limit equal to the window alone is one we would break.
     const AUXILIARY: u64 = 1 << 20;
-    let floor = WINDOW + AUXILIARY;
+    // Plain arithmetic: the dictionary was read into memory, so its size is a
+    // real allocation and nowhere near half of `u64`.
+    let dictionary = dictionary_bytes * 2;
+    let floor = WINDOW + AUXILIARY + dictionary;
     if requested < floor {
+        if dictionary > 0 {
+            bail!(
+                "requested memory limit {requested} B does not cover this run: a {} MiB \
+                 window, about {} MiB of literal, block, sequence and table buffers, and \
+                 {} MiB for the dictionary, which is held as read and again as parsed.",
+                WINDOW / (1 << 20),
+                AUXILIARY / (1 << 20),
+                dictionary / (1 << 20),
+            );
+        }
         bail!(
             "requested memory limit {requested} B is below what decompression can need \
              here: a {} MiB window plus about {} MiB of literal, block, sequence and \
@@ -333,14 +358,12 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
         bench_secs: 1.0,
         long: false,
         long_window_log: None,
+        memory_limit: None,
         target_block_size: None,
         pledged_size: None,
         size_hint: None,
     };
     let mut ultra = false;
-    // `--train` may appear after `-M`, so the conflict is settled once the
-    // whole command line is known rather than at the flag itself.
-    let mut memory_limit_given = false;
     let mut iter = args.iter().enumerate().peekable();
     let mut positional_only = false;
 
@@ -443,6 +466,11 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
                         // sign into a positive level. Exact-match the prefix so a
                         // typo like `--faster` falls through to unknown-option.
                         let n = v.parse::<u32>().wrap_err("invalid --fast level")?;
+                        // Zero would negate to level 0, which is the ordinary
+                        // default rather than a fast one.
+                        if n == 0 {
+                            bail!("--fast level must be at least 1, got 0");
+                        }
                         opts.level = -i32::try_from(n).wrap_err("--fast level too large")?;
                     } else if let Some(path) = long.strip_prefix("use-dict=") {
                         opts.dict = Some(PathBuf::from(path));
@@ -463,10 +491,11 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
                         .or_else(|| long.strip_prefix("memlimit="))
                         .or_else(|| long.strip_prefix("memlimit-decompress="))
                     {
-                        check_memory_limit(
-                            parse_memory_limit(v).wrap_err("invalid memory limit")?,
-                        )?;
-                        memory_limit_given = true;
+                        let limit = parse_memory_limit(v).wrap_err("invalid memory limit")?;
+                        // Checked here against what decoding alone needs, and
+                        // again in `run` once the `-D` file's size is known.
+                        check_memory_limit(limit, 0)?;
+                        opts.memory_limit = Some(limit);
                     } else if let Some(params) = long.strip_prefix("adapt=") {
                         // Parameterised form (`--adapt=min=1,max=9`). We do not
                         // vary the level, so the bounds change nothing — but a
@@ -500,7 +529,11 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
                         // wrong answer rather than a slower one.
                         bail!("--{long} is not implemented");
                     } else if long == "long" {
+                        // Bare `--long` is `--long=27` upstream. The window is
+                        // the point of the flag, so leaving the level's own one
+                        // would reach back nowhere near the asked-for distance.
                         opts.long = true;
+                        opts.long_window_log = Some(DEFAULT_LONG_WINDOW_LOG);
                     } else if let Some(v) = long.strip_prefix("long=") {
                         // `--long=N` names the back-reference window, so the N is
                         // carried through to the encoder rather than dropped.
@@ -592,10 +625,10 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
                     // enforces rather than swallowed.
                     let rest: String = chars[ci + 1..].iter().collect();
                     if !rest.is_empty() {
-                        check_memory_limit(
-                            parse_memory_limit(&rest).wrap_err("invalid -M memory limit")?,
-                        )?;
-                        memory_limit_given = true;
+                        let limit =
+                            parse_memory_limit(&rest).wrap_err("invalid -M memory limit")?;
+                        check_memory_limit(limit, 0)?;
+                        opts.memory_limit = Some(limit);
                     }
                     ci = chars.len();
                     continue;
@@ -645,7 +678,9 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
     // `-M` bounds decompression. Training loads every sample into memory
     // instead, a path the limit says nothing about, so accepting it here would
     // imply a bound over the one thing it does not cover.
-    if memory_limit_given && opts.mode == Mode::Train {
+    // `--train` may appear after `-M`, so the conflict is settled once the
+    // whole command line is known rather than at the flag itself.
+    if opts.memory_limit.is_some() && opts.mode == Mode::Train {
         bail!("--memory / -M bounds decompression and does not apply to --train");
     }
     if !ultra && opts.level > 19 {
@@ -715,8 +750,9 @@ fn print_help() {
          --no-pass-through, --[no-]row-match-finder.\n\
          \n\
          --target-compressed-block-size=N bounds what goes into each block, so\n\
-         blocks flush sooner and stay near N. --long=N is capped at 27: above\n\
-         that the frame would declare a window this build refuses to decode.\n\
+         blocks flush sooner and stay near N. --long is --long=27 and capped\n\
+         there: above it the frame would declare a window this build refuses\n\
+         to decode. A new output file keeps its source's permissions.\n\
          \n\
          Rejected rather than ignored, because they would change the result:\n\
          --no-check, --no-content-size, --no-dictID, --format= (other than\n\
@@ -737,6 +773,12 @@ fn run(opts: Options) -> Result<()> {
         ),
         None => None,
     };
+    // `-M` was checked at parse time against what decoding alone needs. The
+    // dictionary is the other half of the promise, and its size is only known
+    // now, so the same limit is weighed against it here.
+    if let (Some(limit), Some(bytes)) = (opts.memory_limit, dict_bytes.as_ref()) {
+        check_memory_limit(limit, bytes.len() as u64)?;
+    }
     let dict = dict_bytes.as_deref();
 
     // `-b` benchmarks compression/decompression across levels instead of
@@ -1111,7 +1153,8 @@ fn process_stdin_stdout(opts: &Options, dict: Option<&[u8]>) -> Result<()> {
         && !opts.to_stdout
         && matches!(opts.mode, Mode::Compress | Mode::Decompress)
     {
-        return write_stream_to_file(opts, reader, output, opts.pledged_size, dict);
+        // stdin has no file to take permissions from, so the umask decides.
+        return write_stream_to_file(opts, reader, output, opts.pledged_size, dict, None);
     }
     match opts.mode {
         Mode::Compress => {
@@ -1186,12 +1229,24 @@ fn write_stream_to_file<R: Read>(
     output: &Path,
     size_hint: Option<u64>,
     dict: Option<&[u8]>,
+    source_permissions: Option<fs::Permissions>,
 ) -> Result<()> {
     ensure_regular_output_destination(output)?;
     if output.exists() && !opts.force {
         bail!("{} already exists; use -f to overwrite", output.display());
     }
     let (temp_path, temp_file) = create_temporary_output_file(output)?;
+    // A new file starts as private as its source: an archive of a 0600 secret
+    // must not arrive at whatever the umask allows. An existing destination
+    // keeps its own permissions instead, applied in `replace_output_file` —
+    // between the two rules, nothing this tool writes is more readable than
+    // what it was written from or over.
+    if let Some(permissions) = source_permissions
+        && let Err(err) = fs::set_permissions(&temp_path, permissions)
+    {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err).wrap_err("failed to apply the source's permissions to the output");
+    }
     let result: Result<()> = (|| {
         let mut sink = temp_file;
         run_stream_core(opts, &mut reader, &mut sink, size_hint, dict)?;
@@ -1213,14 +1268,17 @@ fn derive_output_path(opts: &Options, input: &Path) -> Result<PathBuf> {
     match opts.mode {
         Mode::Compress => Ok(add_extension(input, ZSTD_SUFFIX)),
         Mode::Decompress => {
-            let name = input.to_string_lossy();
-            match name.strip_suffix(ZSTD_SUFFIX) {
-                Some(stripped) => Ok(PathBuf::from(stripped)),
-                None => bail!(
+            // Drop the extension as a path component rather than as text: a
+            // path is bytes, and rebuilding it from a lossy string renames the
+            // file it decompresses, with different inputs colliding on one
+            // replacement-character name.
+            if input.extension() != Some(ZSTD_SUFFIX.trim_start_matches('.').as_ref()) {
+                bail!(
                     "{}: unknown suffix (expected {ZSTD_SUFFIX}); use -o to set the output",
                     input.display()
-                ),
+                );
             }
+            Ok(input.with_extension(""))
         }
         Mode::Test | Mode::List | Mode::Train => {
             unreachable!("test / list / train modes never write an output file")
@@ -1231,11 +1289,15 @@ fn derive_output_path(opts: &Options, input: &Path) -> Result<PathBuf> {
 fn process_file(opts: &Options, input: &Path, dict: Option<&[u8]>) -> Result<()> {
     let source = File::open(input)
         .wrap_err_with(|| format!("failed to open input file {}", input.display()))?;
-    let source_size: usize = source
-        .metadata()?
+    let metadata = source.metadata()?;
+    let source_size: usize = metadata
         .len()
         .try_into()
         .wrap_err("input file too large for this platform")?;
+    // Only a regular file's length says how many bytes will be read. A FIFO,
+    // a device or a socket reports something unrelated (commonly zero), and
+    // pledging that turns a perfectly good stream into a length mismatch.
+    let pledged_size = metadata.is_file().then_some(source_size as u64);
     let mut reader = ProgressMonitor::new(BufReader::new(source), source_size);
 
     // Test mode: decompress into the void, report integrity.
@@ -1256,13 +1318,20 @@ fn process_file(opts: &Options, input: &Path, dict: Option<&[u8]>) -> Result<()>
             guard_binary_stdout(stdout.is_terminal(), opts.force)?;
         }
         let mut out = stdout.lock();
-        run_stream_core(opts, &mut reader, &mut out, Some(source_size as u64), dict)?;
+        run_stream_core(opts, &mut reader, &mut out, pledged_size, dict)?;
         return remove_source_if_requested(opts, input);
     }
 
     let output = derive_output_path(opts, input)?;
     ensure_distinct_paths(input, &output)?;
-    write_stream_to_file(opts, reader, &output, Some(source_size as u64), dict)?;
+    write_stream_to_file(
+        opts,
+        reader,
+        &output,
+        pledged_size,
+        dict,
+        Some(metadata.permissions()),
+    )?;
 
     info!("{} -> {}", input.display(), output.display());
     remove_source_if_requested(opts, input)

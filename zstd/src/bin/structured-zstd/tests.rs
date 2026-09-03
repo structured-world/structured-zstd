@@ -98,6 +98,36 @@ fn target_block_size_reaches_the_encoder() {
     );
 }
 
+/// Compressing does not publish anything: an archive of a private file stays
+/// as private as the file was. Creating the output at whatever the umask says
+/// hands a 0600 secret to every user on the machine, which is why upstream
+/// applies the source's permissions to what it writes.
+#[cfg(unix)]
+#[test]
+fn a_new_output_inherits_the_source_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir();
+    let input = dir.join(format!("szstd-perm-{}.txt", std::process::id()));
+    fs::write(&input, b"secret payload").unwrap();
+    fs::set_permissions(&input, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let mut opts = parse(&["-3", "f"]).unwrap();
+    opts.inputs = vec![input.display().to_string()];
+    let result = process_file(&opts, &input, None);
+
+    let output = PathBuf::from(format!("{}.zst", input.display()));
+    let mode = fs::metadata(&output).map(|m| m.permissions().mode() & 0o777);
+    let _ = fs::remove_file(&input);
+    let _ = fs::remove_file(&output);
+    result.expect("compressing must succeed");
+    assert_eq!(
+        mode.expect("the archive must exist"),
+        0o600,
+        "the archive must be no more readable than the file it came from"
+    );
+}
+
 /// An empty file holds no frame, so there is nothing to test and nothing to
 /// decode. Answering `OK` for it says the archive checked out when it was never
 /// an archive; upstream calls it an unexpected end of file.
@@ -197,6 +227,10 @@ fn levels_above_19_require_ultra() {
 fn fast_flag_maps_to_negative_level() {
     assert_eq!(parse(&["--fast"]).unwrap().level, -1);
     assert_eq!(parse(&["--fast=5"]).unwrap().level, -5);
+    // `--fast=0` negates to level 0, which means the ordinary default — the
+    // opposite of what the flag was asked for. Upstream calls it an incorrect
+    // parameter rather than quietly compressing at another level.
+    assert!(parse(&["--fast=0"]).is_err());
 }
 
 #[test]
@@ -255,6 +289,13 @@ fn long_flag_enables_ldm() {
     assert!(parse(&["-19", "--long", "in.txt"]).unwrap().long);
     assert!(parse(&["--long=27", "in.txt"]).unwrap().long);
     assert!(!parse(&["-19", "in.txt"]).unwrap().long);
+    // Bare `--long` is `--long=27` upstream, and the window is the point of the
+    // flag: keeping the level's own window would reach back nowhere near the
+    // distance the caller asked for.
+    assert_eq!(
+        parse(&["--long", "in.txt"]).unwrap().long_window_log,
+        Some(27)
+    );
 }
 
 /// `--long=N` names the window the caller wants — the match distance the
@@ -330,6 +371,40 @@ fn unimplemented_trainers_are_refused_not_substituted() {
     );
     assert!(parse(&["--train-cover", "s1"]).is_err());
     assert!(parse(&["--train-legacy", "s1"]).is_err());
+}
+
+/// A window is a promise about how much memory decoding will need, so it is
+/// bounded by how much data there is: upstream compresses a 24-byte file with
+/// `--long=27` into a frame declaring 24 bytes, not 128 MiB. Declaring the
+/// asked-for window regardless makes every small `--long` frame demand the
+/// whole ceiling from every decoder that opens it.
+#[test]
+fn an_explicit_window_is_capped_by_a_known_source_size() {
+    use structured_zstd::decoding::read_frame_header_info;
+
+    let payload = b"hello world hello world";
+    let mut frame = Vec::new();
+    compress_stream(
+        &payload[..],
+        &mut frame,
+        &FrameSettings {
+            level: 3,
+            long: true,
+            long_window_log: Some(27),
+            pledged_size: Some(payload.len() as u64),
+            ..FrameSettings::default()
+        },
+        None,
+    )
+    .expect("compressing must succeed");
+
+    let info = read_frame_header_info(&frame, false).expect("the frame header must parse");
+    assert!(
+        info.window_size <= 1 << 20,
+        "a {}-byte frame must not declare a {} byte window",
+        payload.len(),
+        info.window_size
+    );
 }
 
 /// The window log has a supported range; a value outside it has to fail rather
@@ -427,6 +502,7 @@ fn decompress_suffix_stripping() {
         bench_secs: 1.0,
         long: false,
         long_window_log: None,
+        memory_limit: None,
         target_block_size: None,
         pledged_size: None,
         size_hint: None,
@@ -436,6 +512,22 @@ fn decompress_suffix_stripping() {
         PathBuf::from("archive.tar")
     );
     assert!(derive_output_path(&opts, Path::new("noext")).is_err());
+
+    // A path is bytes, not text. Rebuilding it through a lossy conversion
+    // renames what it decompresses — and two different inputs can end up
+    // fighting over one replacement-character name.
+    #[cfg(unix)]
+    {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let input = PathBuf::from(OsStr::from_bytes(b"\xff\xfename.zst"));
+        assert_eq!(
+            derive_output_path(&opts, &input).unwrap(),
+            PathBuf::from(OsStr::from_bytes(b"\xff\xfename")),
+            "the original bytes have to survive the suffix strip"
+        );
+    }
 }
 
 /// Upstream accepts a set of flags that only steer *how* the work is done —
@@ -565,6 +657,25 @@ fn memory_limit_is_honoured_or_refused_never_ignored() {
     // The long spelling has the same default unit as the short one.
     assert!(parse(&["-d", "--memory=256", "f"]).is_ok());
     assert!(parse(&["-d", "--memory=8", "f"]).is_err());
+}
+
+/// `-M` promises a bound on what decompression will take, and a dictionary is
+/// part of that: it is read whole and then parsed into the decoder, so a large
+/// one adds well past the window the limit was checked against. Accepting a
+/// limit the dictionary alone will break makes the flag a decoration.
+#[test]
+fn the_memory_limit_counts_the_dictionary_it_was_given() {
+    // A limit that clears the decoder's own floor with room to spare.
+    let generous = 300 * (1 << 20);
+    check_memory_limit(generous, 0).expect("no dictionary, comfortably above the floor");
+    check_memory_limit(generous, 4096).expect("a small dictionary still fits");
+    // The same limit, against a dictionary that eats the headroom.
+    let err = check_memory_limit(generous, 120 * (1 << 20))
+        .expect_err("a dictionary this size does not fit under the requested limit");
+    assert!(
+        err.to_string().contains("dictionary"),
+        "the refusal should say the dictionary is what does not fit, got: {err}"
+    );
 }
 
 /// Flags whose whole purpose is to change which files are touched, or what
