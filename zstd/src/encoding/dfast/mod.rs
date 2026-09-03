@@ -2402,6 +2402,12 @@ macro_rules! start_matching_fast_loop_body {
 
             let inner_exit: InnerExit = 'inner: loop {
                 let abs_ip0 = $current_abs_start + ip0;
+                // `abs_ip1` and `wlow1` are bound here even though every reader
+                // of either is a match path. Spelling them out at those readers
+                // instead — which removes two values from the loop's live set
+                // and 0.8% of its instructions — measured 2.7% worse in cycles
+                // across three interleaved alternations of the two binaries.
+                let abs_ip1 = $current_abs_start + ip1;
                 // Per-position candidate window-low bound (see `advertised_window`
                 // above). `$borrowed` is const, so owned collapses to
                 // `history_abs_start` (byte-identical) and borrowed-in-window
@@ -2412,12 +2418,11 @@ macro_rules! start_matching_fast_loop_body {
                 } else {
                     history_abs_start
                 };
-                // The `ip1` counterparts of both are spelled out where they are
-                // read instead of bound here. Every one of their readers is a
-                // match path, and the loop is register-saturated, so holding two
-                // more values across every scanned position for the benefit of
-                // the rare path costs more than recomputing them there — the same
-                // trade the literal lengths below are subject to.
+                let wlow1 = if $borrowed {
+                    abs_ip1.saturating_sub(advertised_window)
+                } else {
+                    history_abs_start
+                };
                 // Literal lengths are derived at the emit sites rather than
                 // carried: both inputs are live there anyway, and the loop is
                 // register-saturated, so two values held across every scanned
@@ -2552,7 +2557,7 @@ macro_rules! start_matching_fast_loop_body {
                                     concat,
                                     history_abs_start,
                                     history_abs_start + cand_idx_r,
-                                    $current_abs_start + ip1,
+                                    abs_ip1,
                                     match_len,
                                     ip1 - literals_start,
                                 );
@@ -2831,12 +2836,6 @@ macro_rules! start_matching_fast_loop_body {
                             let mut retry_upgraded = false;
                             let mut live_l1_hit = false;
                             if idxl1 != DFAST_EMPTY_SLOT {
-                                let abs_ip1 = $current_abs_start + ip1;
-                                let wlow1 = if $borrowed {
-                                    abs_ip1.saturating_sub(advertised_window)
-                                } else {
-                                    history_abs_start
-                                };
                                 let cand_pos_l1 = position_base + (idxl1 as usize) - 1;
                                 if cand_pos_l1 >= wlow1 && cand_pos_l1 < abs_ip1 {
                                     let cand_idx_l1 = cand_pos_l1 - history_abs_start;
@@ -2958,7 +2957,7 @@ macro_rules! start_matching_fast_loop_body {
                                                     concat,
                                                     history_abs_start,
                                                     cand_pos,
-                                                    $current_abs_start + ip1,
+                                                    abs_ip1,
                                                     dl1_match_len,
                                                     ip1 - literals_start,
                                                 );
