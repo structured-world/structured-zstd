@@ -940,12 +940,12 @@ impl<M: Matcher> CompressState<M> {
         }
     }
 
-    /// Keeps a table rather than dropping it. The dictionary seed wants one
-    /// spare to `clone_from` into, once per frame; every further table a block
-    /// displaces goes to the weight builder, which takes one per block and per
-    /// split candidate. Overwriting the single spare dropped the previous table
-    /// on every block, and the build that followed had to create and zero a new
-    /// one.
+    /// Keeps a table's buffers rather than dropping them. The dictionary seed
+    /// wants one spare to `clone_from` into, once per frame; every further
+    /// table a block displaces goes to the weight builder instead, which takes
+    /// one per block and per split candidate. Overwriting the single spare
+    /// dropped the previous table on every block, so the builds that followed
+    /// allocated their buffers again.
     #[inline]
     fn park_huff_table(&mut self, table: crate::huff0::huff0_encoder::HuffmanTable) {
         if self.huff_table_spare.is_none() {

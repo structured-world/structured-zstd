@@ -193,8 +193,7 @@ fn weights() {
                 sum
             );
 
-            let built = HuffmanTable::build_from_weights(&weights);
-            let codes = built.live_codes();
+            let codes = HuffmanTable::build_from_weights(&weights).codes;
             for (code, num_bits) in codes.iter().copied() {
                 for (code2, num_bits2) in codes.iter().copied() {
                     if num_bits == 0 || num_bits2 == 0 || (code, num_bits) == (code2, num_bits2) {
@@ -243,12 +242,12 @@ fn counts() {
 #[test]
 fn from_data() {
     let counts = &[3, 0, 4, 1, 2];
-    let table = HuffmanTable::build_from_counts(counts);
+    let table = HuffmanTable::build_from_counts(counts).codes;
 
     let data = &[0, 2, 4, 4, 0, 3, 2, 2, 0, 2];
-    let table2 = HuffmanTable::build_from_data(data);
+    let table2 = HuffmanTable::build_from_data(data).codes;
 
-    assert_eq!(table.live_codes(), table2.live_codes());
+    assert_eq!(table, table2);
 }
 
 /// `cheap_desc_size_proxy` is the cheap analytic estimate used inside
