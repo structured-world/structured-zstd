@@ -3295,6 +3295,38 @@ fn a_prepared_dictionary_is_shared_by_its_clones_not_copied() {
 /// bounded twice: the same hint has already sized the window and the tables,
 /// and the reservation is clamped to the eviction ceiling the buffer reaches
 /// anyway.
+/// A size hint given to the streaming entry point is advisory: the reader may
+/// deliver far less than promised. Sizing the ingest buffer from it must not
+/// let a wrong number turn into an allocation the data never justifies —
+/// the window may be overridden up to a gibibyte, and twice that is the
+/// buffer's own ceiling, so an unchecked reservation on a near-empty stream
+/// would ask for memory no such stream needs.
+#[test]
+fn an_overstated_hint_does_not_reserve_what_the_stream_never_delivers() {
+    use crate::encoding::CompressionParameters;
+
+    let params = CompressionParameters::builder(super::CompressionLevel::Level(1))
+        .window_log(30)
+        .build()
+        .expect("window log 30 is within the public bounds");
+
+    let mut output: Vec<u8> = Vec::new();
+    let mut compressor = FrameCompressor::new(super::CompressionLevel::Level(1));
+    compressor.set_parameters(&params);
+    // Promised gibibytes, delivers ten bytes.
+    compressor.set_source_size_hint(4 * 1024 * 1024 * 1024);
+    compressor.set_source(&b"0123456789"[..]);
+    compressor.set_drain(&mut output);
+    compressor.compress();
+
+    let capacity = compressor.state.matcher.ingest_capacity();
+    assert!(
+        capacity <= 64 * 1024 * 1024,
+        "a hint the stream did not honour must not reserve unbounded memory: \
+         {capacity} bytes held for ten"
+    );
+}
+
 #[test]
 fn the_ingest_buffer_is_sized_from_the_hint_not_grown_into() {
     // One level per backend that keeps an ingest buffer: 1 is the Fast

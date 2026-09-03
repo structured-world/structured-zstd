@@ -2127,12 +2127,30 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // block even when only a tail remains) does not reallocate; sized off
         // the ACTIVE block capacity, since a small window shrinks the block
         // below the format maximum.
-        if hint_is_exact && let Some(hint) = initial_size_hint {
+        if let Some(hint) = initial_size_hint {
             // `saturating_add`: a caller may pledge `u64::MAX`, and clamping a
             // reservation request at the address-space limit is the meaningful
             // answer — the matcher caps it at its eviction ceiling anyway.
-            let target =
+            let mut target =
                 (hint.min(usize::MAX as u64) as usize).saturating_add(self.block_capacity());
+            if !hint_is_exact {
+                // An advisory number is a claim about data that has not arrived,
+                // so it is trusted only as far as the frame's own configuration
+                // makes plausible: the window this LEVEL would choose, never an
+                // overridden one. Overriding the window is itself a claim about
+                // the data — one only the data can confirm — and taking it here
+                // let a caller who promised gibibytes and delivered ten bytes
+                // reserve two of them. Beyond this bound the buffer grows as it
+                // did before, which costs a few reallocations on frames already
+                // large enough for that to be noise.
+                let level_window = crate::encoding::levels::config::resolve_level_params(
+                    self.compression_level,
+                    initial_size_hint,
+                )
+                .window_log;
+                let plausible = (1usize << level_window).saturating_add(self.block_capacity());
+                target = target.min(plausible);
+            }
             self.state.matcher.reserve_for_frame(target);
         }
         // Compress block by block
