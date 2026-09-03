@@ -1,11 +1,33 @@
 use super::*;
 
 fn parse(args: &[&str]) -> Result<Options> {
-    let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    let owned: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
     match parse_args(&owned, Mode::Compress, false)? {
         Parsed::Run(opts) => Ok(opts),
         Parsed::Handled => bail!("parse handled (help/version) unexpectedly"),
     }
+}
+
+/// A filename is bytes, and on Unix those bytes need not be UTF-8. Reading the
+/// command line as text rejects such a name before any of the byte-preserving
+/// path handling can run — and does it by panicking, which is not an answer.
+#[cfg(unix)]
+#[test]
+fn a_non_utf8_argument_survives_parsing() {
+    use std::ffi::{OsStr, OsString};
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = OsStr::from_bytes(b"weird\xffname.zst");
+    let args: Vec<OsString> = vec![OsString::from("-d"), name.to_os_string()];
+    let opts = match parse_args(&args, Mode::Compress, false).expect("parsing must not fail") {
+        Parsed::Run(opts) => opts,
+        Parsed::Handled => panic!("unexpected help/version"),
+    };
+    assert_eq!(
+        opts.inputs,
+        vec![PathBuf::from(name)],
+        "the argument's bytes must reach the input list unchanged"
+    );
 }
 
 #[test]
@@ -113,7 +135,7 @@ fn a_new_output_inherits_the_source_permissions() {
     fs::set_permissions(&input, fs::Permissions::from_mode(0o600)).unwrap();
 
     let mut opts = parse(&["-3", "f"]).unwrap();
-    opts.inputs = vec![input.display().to_string()];
+    opts.inputs = vec![input.clone()];
     let result = process_file(&opts, &input, None);
 
     let output = PathBuf::from(format!("{}.zst", input.display()));
@@ -163,6 +185,64 @@ fn an_explicit_stream_size_survives_an_unstattable_input() {
         info.content_size,
         FrameContentSize::Known(payload.len() as u64),
         "the pledged size must reach the frame even when the input cannot be stat'd"
+    );
+}
+
+/// A serialized dictionary selects its compression-parameter tier by the size
+/// of the whole blob, entropy tables included, not by the content inside it.
+/// Parsing the blob and handing over only the content picks a different tier
+/// for dictionaries near a boundary, so `-D` would compress differently from
+/// the same dictionary given to the library directly.
+#[test]
+fn a_serialized_dictionary_keeps_the_size_its_tier_is_chosen_by() {
+    use structured_zstd::encoding::{CompressionLevel, StreamingEncoder};
+
+    // Sized so the two lengths fall on opposite sides of a tier boundary: the
+    // content alone selects the 16 KiB row, the whole blob does not. Built
+    // from the fixture's own header so it stays a valid dictionary.
+    let fixture = include_bytes!("../../../dict_tests/dictionary");
+    let content_len = structured_zstd::decoding::Dictionary::decode_dict(fixture)
+        .expect("the fixture must parse")
+        .dict_content
+        .len();
+    let header = &fixture[..fixture.len() - content_len];
+    assert!(
+        header.len() > 100,
+        "the header has to be what puts the blob over the boundary"
+    );
+    let mut raw = header.to_vec();
+    raw.extend_from_slice(&fixture[fixture.len() - content_len..][..16 * 1024 - 498 - 100]);
+    assert!(16 * 1024 - 498 - 100 + 498 <= 16 * 1024 && raw.len() + 498 > 16 * 1024);
+
+    let payload: Vec<u8> = (0..40_000u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+        .collect();
+
+    let mut through_cli = Vec::new();
+    compress_stream(
+        payload.as_slice(),
+        &mut through_cli,
+        &FrameSettings {
+            level: 11,
+            pledged_size: Some(payload.len() as u64),
+            ..FrameSettings::default()
+        },
+        Some(&raw[..]),
+    )
+    .expect("compressing with the dictionary must succeed");
+
+    let mut through_library = StreamingEncoder::new(Vec::new(), CompressionLevel::Level(11));
+    through_library.set_content_checksum(true).unwrap();
+    through_library
+        .set_pledged_content_size(payload.len() as u64)
+        .unwrap();
+    through_library.set_dictionary_from_bytes(&raw[..]).unwrap();
+    through_library.write_all(&payload).unwrap();
+    let expected = through_library.finish().unwrap();
+
+    assert_eq!(
+        through_cli, expected,
+        "`-D` must compress exactly as the same dictionary handed to the library does"
     );
 }
 
@@ -251,7 +331,7 @@ fn bare_numeric_flag_is_a_level() {
     let opts = parse(&["-19", "in.txt"]).unwrap();
     assert_eq!(opts.level, 19);
     assert_eq!(opts.mode, Mode::Compress);
-    assert_eq!(opts.inputs, vec!["in.txt".to_string()]);
+    assert_eq!(opts.inputs, vec![PathBuf::from("in.txt")]);
 }
 
 #[test]
@@ -259,6 +339,11 @@ fn levels_above_19_require_ultra() {
     assert!(parse(&["-22", "in.txt"]).is_err());
     let opts = parse(&["--ultra", "-22", "in.txt"]).unwrap();
     assert_eq!(opts.level, 22);
+    // Benchmarking compresses the range `-b`/`-e` name, so that is the range
+    // the gate has to read: `-b20` runs an ultra level as surely as `-20` does.
+    assert!(parse(&["-b20", "in.txt"]).is_err());
+    assert!(parse(&["-b3", "-e22", "in.txt"]).is_err());
+    assert!(parse(&["--ultra", "-b20", "in.txt"]).is_ok());
 }
 
 #[test]
@@ -394,7 +479,7 @@ fn training_refuses_to_overwrite_without_force() {
     }
 
     let mut opts = parse(&["--train", "s"]).unwrap();
-    opts.inputs = vec![sample.display().to_string()];
+    opts.inputs = vec![sample.clone()];
     opts.output = Some(existing.clone());
     let refused = train_dictionary(&opts);
 
@@ -544,13 +629,13 @@ fn benchmark_flags_parse_level_range() {
 #[test]
 fn dash_is_a_stdin_input() {
     let opts = parse(&["-d", "-"]).unwrap();
-    assert_eq!(opts.inputs, vec!["-".to_string()]);
+    assert_eq!(opts.inputs, vec![PathBuf::from("-")]);
 }
 
 #[test]
 fn double_dash_forces_positional() {
     let opts = parse(&["--", "-weird-name.txt"]).unwrap();
-    assert_eq!(opts.inputs, vec!["-weird-name.txt".to_string()]);
+    assert_eq!(opts.inputs, vec![PathBuf::from("-weird-name.txt")]);
 }
 
 #[test]
@@ -602,13 +687,14 @@ fn decompress_suffix_stripping() {
         force: false,
         keep: false,
         remove_source: false,
-        inputs: vec!["archive.tar.zst".to_string()],
+        inputs: vec![PathBuf::from("archive.tar.zst")],
         max_dict: DEFAULT_MAX_DICT,
         dict_id: None,
         bench: false,
         bench_start: 3,
         bench_end: 0,
         bench_secs: 1.0,
+        bench_separately: false,
         long: false,
         long_window_log: None,
         memory_limit: None,
@@ -855,7 +941,7 @@ fn the_memory_limit_counts_what_a_benchmark_holds() {
     fs::write(&path, vec![0u8; 64 * 1024]).unwrap();
 
     let mut opts = parse(&["-b3", "f"]).unwrap();
-    opts.inputs = vec![path.display().to_string()];
+    opts.inputs = vec![path.clone()];
     // 64 KiB in and 64 KiB back out, against a limit with 32 KiB of headroom
     // above the decoder's own floor.
     opts.memory_limit =
@@ -874,6 +960,67 @@ fn the_memory_limit_counts_what_a_benchmark_holds() {
         "the refusal must be the limit: {err}"
     );
     accepted.expect("a limit that covers the buffers must let the benchmark run");
+}
+
+/// `-S` benchmarks each file on its own, which is the whole point of it: one
+/// row per file instead of one row for the concatenation, so heterogeneous
+/// inputs can be compared. Accepting the flag and still measuring the combined
+/// stream reports a ratio and a throughput that describe neither file.
+#[test]
+fn separate_benchmarking_measures_one_file_at_a_time() {
+    let dir = std::env::temp_dir();
+    let one = dir.join(format!("szstd-sep1-{}.bin", std::process::id()));
+    let two = dir.join(format!("szstd-sep2-{}.bin", std::process::id()));
+    fs::write(&one, vec![b'a'; 32 * 1024]).unwrap();
+    fs::write(&two, vec![b'b'; 32 * 1024]).unwrap();
+
+    assert!(parse(&["-b3", "-S", "f"]).unwrap().bench_separately);
+    assert!(!parse(&["-b3", "f"]).unwrap().bench_separately);
+
+    // Measured one at a time, only one file is in memory at once — so a limit
+    // that fits a single file is enough, while the concatenation needs both.
+    let mut opts = parse(&["-b3", "-S", "f"]).unwrap();
+    opts.inputs = vec![one.clone(), two.clone()];
+    opts.memory_limit =
+        Some(structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE + (1 << 20) + 96 * 1024);
+    let separately = run_benchmark(&opts, None);
+
+    opts.bench_separately = false;
+    let together = run_benchmark(&opts, None);
+    let _ = fs::remove_file(&one);
+    let _ = fs::remove_file(&two);
+
+    separately.expect("one file at a time fits under this limit");
+    together.expect_err("both files at once do not");
+}
+
+/// The dictionary and the benchmark's buffers are held at the same time, so a
+/// ceiling that clears each of them separately still lets the pair through.
+/// Checking them apart is arithmetic that answers the wrong question.
+#[test]
+fn the_memory_limit_counts_the_dictionary_and_the_benchmark_together() {
+    let dir = std::env::temp_dir();
+    let input = dir.join(format!("szstd-bothmem-{}.bin", std::process::id()));
+    fs::write(&input, vec![0u8; 32 * 1024]).unwrap();
+    let dictionary = vec![0u8; 32 * 1024];
+
+    let mut opts = parse(&["-b3", "f"]).unwrap();
+    opts.inputs = vec![input.clone()];
+    // Room for either buffer alone (2 x 32 KiB), not for both.
+    opts.memory_limit =
+        Some(structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE + (1 << 20) + 96 * 1024);
+    let refused = run_benchmark(&opts, Some(&dictionary));
+    let alone = run_benchmark(&opts, None);
+    let _ = fs::remove_file(&input);
+
+    alone.expect("the input alone fits under this limit");
+    let err = refused
+        .expect_err("the input and the dictionary together do not fit")
+        .to_string();
+    assert!(
+        err.contains("memory limit"),
+        "the refusal must be the limit: {err}"
+    );
 }
 
 /// Flags whose whole purpose is to change which files are touched, or what
@@ -1003,7 +1150,7 @@ fn rm_keeps_the_source_when_output_went_to_stdout() {
     fs::write(&path, b"payload").unwrap();
 
     let mut opts = parse(&["--rm", "-c", "f"]).unwrap();
-    opts.inputs = vec![path.display().to_string()];
+    opts.inputs = vec![path.clone()];
     let result = remove_source_if_requested(&opts, &path);
 
     let survived = path.exists();

@@ -68,6 +68,25 @@ impl EncoderDictionary {
         })
     }
 
+    /// Load whichever kind of dictionary `raw_dictionary` holds, the way
+    /// `zstd -D` does: a serialized blob is parsed, anything else is taken as
+    /// raw content (see
+    /// [`Dictionary::from_serialized_or_raw_content`](crate::decoding::Dictionary::from_serialized_or_raw_content)).
+    ///
+    /// Either way the blob's own length is what the compression-parameter tier
+    /// is chosen by, which is why this exists rather than parsing and calling
+    /// [`Self::from_dictionary`]: that keys the tier on the content length, and
+    /// for a serialized dictionary the entropy tables in between can put the
+    /// two on opposite sides of a boundary.
+    pub fn from_serialized_or_raw_content(
+        raw_dictionary: &[u8],
+    ) -> Result<Self, crate::decoding::errors::DictionaryDecodeError> {
+        Ok(Self {
+            inner: crate::decoding::Dictionary::from_serialized_or_raw_content(raw_dictionary)?,
+            serialized_len: raw_dictionary.len(),
+        })
+    }
+
     /// The content and serialized sizes the encoder's matcher is hinted with.
     pub(crate) fn sizes(&self) -> crate::encoding::DictionarySizes {
         crate::encoding::DictionarySizes {

@@ -94,8 +94,9 @@ struct Options {
     /// by upstream's default when not `-k`/stdout, but we keep the input unless
     /// `--rm` is given — safer default for a young tool).
     remove_source: bool,
-    /// Positional inputs; empty or a lone `-` means stdin.
-    inputs: Vec<String>,
+    /// Positional inputs; empty or a lone `-` means stdin. Held as paths
+    /// rather than text: a filename is bytes and need not be UTF-8.
+    inputs: Vec<PathBuf>,
     /// Target dictionary size for `--train` (`--maxdict`, upstream default 112640).
     max_dict: usize,
     /// Explicit dictionary ID for `--train` (`--dictID`).
@@ -106,6 +107,9 @@ struct Options {
     bench_end: i32,
     /// Per-level benchmark time budget in seconds (`-i`, default 1).
     bench_secs: f64,
+    /// Measure each input on its own (`-S`) instead of as one stream, so the
+    /// reported ratio and throughput describe a file rather than a mixture.
+    bench_separately: bool,
     /// Long-distance matching (`--long`), enabled on the encoder via the
     /// compression-parameters API.
     long: bool,
@@ -308,9 +312,14 @@ enum Parsed {
 }
 
 fn main() -> Result<()> {
-    let raw: Vec<String> = std::env::args().collect();
-    let prog = raw.first().map(String::as_str).unwrap_or("zstd");
-    let (default_mode, argv0_stdout) = program_mode(prog);
+    // `args_os`, not `args`: the latter panics on an argument that is not
+    // UTF-8, which on Unix is a legitimate filename rather than a mistake.
+    let raw: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let prog = raw
+        .first()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "zstd".to_string());
+    let (default_mode, argv0_stdout) = program_mode(&prog);
 
     let parsed = parse_args(&raw[1..], default_mode, argv0_stdout)?;
     let options = match parsed {
@@ -344,7 +353,11 @@ fn program_mode(prog: &str) -> (Mode, bool) {
 /// Manual upstream-style parse: bare `-N` is a level, short flags combine
 /// (`-dc`), `-o`/`-D` take a value, `--long-opts` are matched whole. `clap`'s
 /// derive cannot model bare numeric levels, so we parse argv directly.
-fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result<Parsed> {
+fn parse_args(
+    args: &[std::ffi::OsString],
+    default_mode: Mode,
+    argv0_stdout: bool,
+) -> Result<Parsed> {
     let mut opts = Options {
         mode: default_mode,
         level: CompressionLevel::DEFAULT_LEVEL,
@@ -362,6 +375,7 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
         bench_start: CompressionLevel::DEFAULT_LEVEL,
         bench_end: 0,
         bench_secs: 1.0,
+        bench_separately: false,
         long: false,
         long_window_log: None,
         memory_limit: None,
@@ -373,9 +387,15 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
     let mut iter = args.iter().enumerate().peekable();
     let mut positional_only = false;
 
-    while let Some((idx, arg)) = iter.next() {
+    while let Some((idx, arg_os)) = iter.next() {
+        // Option spellings and their numeric values are text; a filename is
+        // bytes. Matching happens on a lossy view, while anything kept as a
+        // path keeps the argument itself, so a name that is not UTF-8 reaches
+        // the filesystem as it was given.
+        let arg = arg_os.to_string_lossy();
+        let arg = arg.as_ref();
         if positional_only || arg == "-" || !arg.starts_with('-') {
-            opts.inputs.push(arg.clone());
+            opts.inputs.push(PathBuf::from(arg_os));
             continue;
         }
         if arg == "--" {
@@ -607,9 +627,10 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
                 }
                 'f' => opts.force = true,
                 'k' => opts.keep = true,
-                // `-S` (benchmark each file separately) is the default here;
-                // `-q`/`-v` verbosity are accepted no-ops.
-                'q' | 'v' | 'S' => {}
+                // `-S` measures each input on its own; `-q`/`-v` verbosity are
+                // accepted no-ops.
+                'S' => opts.bench_separately = true,
+                'q' | 'v' => {}
                 'B' | 'T' => {
                     // `-B[N]` job / block size, `-T[N]` thread count. Both
                     // steer how the work is done, not what comes out: we use a
@@ -659,19 +680,23 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
                 }
                 'D' | 'o' => {
                     // Value is the rest of this token, or the next argument.
+                    // Taken from the argument itself when it is a whole one, so
+                    // a path that is not UTF-8 survives; an attached value goes
+                    // through the lossy view, which is the one place a name
+                    // like `-Dweird\xff` cannot be kept byte-for-byte.
                     let rest: String = chars[ci + 1..].iter().collect();
                     let value = if rest.is_empty() {
                         iter.next()
-                            .map(|(_, v)| v.clone())
+                            .map(|(_, v)| PathBuf::from(v))
                             .ok_or_else(|| eyre!("option -{c} requires a value"))?
                     } else {
-                        rest
+                        PathBuf::from(rest)
                     };
                     if c == 'D' {
-                        opts.dict = Some(PathBuf::from(value));
+                        opts.dict = Some(value);
                     } else {
                         // Clears `-c`, so the later of the two wins.
-                        opts.output = Some(PathBuf::from(value));
+                        opts.output = Some(value);
                         opts.to_stdout = false;
                     }
                     ci = chars.len();
@@ -701,9 +726,6 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
     {
         check_memory_limit(limit, 0)?;
     }
-    if !ultra && opts.level > 19 {
-        bail!("level {} requires --ultra (levels 20-22)", opts.level);
-    }
     validate_level(opts.level)?;
     // `-o` names a single output, so it can't fan out over multiple inputs —
     // except `--train`, where many sample files legitimately feed one dictionary.
@@ -712,6 +734,19 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
     }
     if opts.bench && opts.bench_end < opts.bench_start {
         opts.bench_end = opts.bench_start;
+    }
+    // The levels 20-22 are expensive enough that upstream asks for them by
+    // name. Benchmarking compresses the range `-b`/`-e` give rather than the
+    // level `-N` set, so the gate reads the range's top when there is one —
+    // `-b20` reaches an ultra level as surely as `-20` does.
+    let highest_level = if opts.bench {
+        opts.bench_start.max(opts.bench_end)
+    } else {
+        opts.level
+    };
+    validate_level(highest_level)?;
+    if !ultra && highest_level > 19 {
+        bail!("level {highest_level} requires --ultra (levels 20-22)");
     }
     // Long-distance matching runs on the optimal parser here, so below it the
     // flag would widen the window and never run the matcher it names. Settled
@@ -897,8 +932,6 @@ fn run(opts: Options) -> Result<()> {
 /// `zstd -b#` (per-level row); honours `-D` so dictionary throughput can be
 /// measured. Time-budgeted per level rather than fixed-iteration.
 fn run_benchmark(opts: &Options, dict: Option<&[u8]>) -> Result<()> {
-    use std::time::Instant;
-
     if opts.inputs.is_empty() || opts.inputs.iter().any(|i| i == "-") {
         bail!("-b requires one or more regular input files to benchmark");
     }
@@ -908,31 +941,64 @@ fn run_benchmark(opts: &Options, dict: Option<&[u8]>) -> Result<()> {
     // the small and broken in the large. Weighed from the directory entries,
     // before a byte is read.
     if let Some(limit) = opts.memory_limit {
-        let mut total = 0u64;
+        // The dictionary is held for the whole run alongside these buffers, so
+        // it is counted here rather than checked on its own: two allocations
+        // that each clear the ceiling separately can still exceed it together.
+        // With `-S` only one input is in memory at a time, so the largest file
+        // is what has to fit rather than their sum.
+        let dictionary = dict.map_or(0, |bytes| bytes.len() as u64);
+        let mut sum = 0u64;
+        let mut largest = 0u64;
         for input in &opts.inputs {
-            total += fs::metadata(input)
-                .wrap_err_with(|| format!("failed to inspect {input}"))?
+            let len = fs::metadata(input)
+                .wrap_err_with(|| format!("failed to inspect {}", input.display()))?
                 .len();
+            sum += len;
+            largest = largest.max(len);
         }
         // The input and the round-tripped copy; the compressed form is smaller
         // than either on anything worth benchmarking.
-        check_memory_limit(limit, total)?;
+        let inputs = if opts.bench_separately { largest } else { sum };
+        check_memory_limit(limit, dictionary + inputs)?;
+    }
+
+    if opts.bench_separately {
+        for input in &opts.inputs {
+            let data =
+                fs::read(input).wrap_err_with(|| format!("failed to read {}", input.display()))?;
+            benchmark_one(opts, dict, &input.display().to_string(), &data)?;
+        }
+        return Ok(());
     }
 
     let mut data = Vec::new();
     for input in &opts.inputs {
         data.extend_from_slice(
-            &fs::read(input).wrap_err_with(|| format!("failed to read {input}"))?,
+            &fs::read(input).wrap_err_with(|| format!("failed to read {}", input.display()))?,
         );
     }
+    let label = opts
+        .inputs
+        .iter()
+        .map(|input| input.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    benchmark_one(opts, dict, &label, &data)
+}
+
+/// Measure one benchmark subject: the whole input as one stream, or a single
+/// file under `-S`. Split out so the two modes differ only in what they hand
+/// over, not in how the measurement is taken.
+fn benchmark_one(opts: &Options, dict: Option<&[u8]>, label: &str, data: &[u8]) -> Result<()> {
+    use std::time::Instant;
+
     if data.is_empty() {
-        bail!("-b: input is empty");
+        bail!("-b: {label} is empty");
     }
     // Per-level time budget; best (fastest) pass wins, like upstream's -i loop.
     let mb = data.len() as f64 / 1e6;
     println!(
-        "benchmarking {} ({})  levels {}..={}",
-        opts.inputs.join(", "),
+        "benchmarking {label} ({})  levels {}..={}",
         fmt_size(data.len() as f64),
         opts.bench_start,
         opts.bench_end,
@@ -947,7 +1013,7 @@ fn run_benchmark(opts: &Options, dict: Option<&[u8]>) -> Result<()> {
             compressed.clear();
             let t = Instant::now();
             compress_stream(
-                data.as_slice(),
+                data,
                 &mut compressed,
                 &FrameSettings {
                     level,
@@ -1021,8 +1087,8 @@ fn train_dictionary(opts: &Options) -> Result<()> {
 
     let mut corpus = Vec::new();
     for input in &opts.inputs {
-        let bytes =
-            fs::read(input).wrap_err_with(|| format!("failed to read training sample {input}"))?;
+        let bytes = fs::read(input)
+            .wrap_err_with(|| format!("failed to read training sample {}", input.display()))?;
         corpus.extend_from_slice(&bytes);
     }
 
@@ -1546,13 +1612,15 @@ fn compress_stream<R: Read, W: Write>(
     }
     if let Some(raw) = dict {
         // Whatever `-D` was pointed at: a trained dictionary, or any file at
-        // all, taken as raw content the way upstream does.
-        let parsed = structured_zstd::decoding::Dictionary::from_serialized_or_raw_content(raw)
-            .map_err(|err| eyre!("invalid dictionary: {err:?}"))?;
+        // all, taken as raw content the way upstream does. Loaded through the
+        // constructor that keeps the blob's own length, since that is what the
+        // compression-parameter tier is chosen by — parsing first and handing
+        // over the content would key it on the wrong size.
+        let parsed =
+            structured_zstd::encoding::EncoderDictionary::from_serialized_or_raw_content(raw)
+                .map_err(|err| eyre!("invalid dictionary: {err:?}"))?;
         encoder
-            .set_encoder_dictionary(
-                structured_zstd::encoding::EncoderDictionary::from_dictionary(parsed),
-            )
+            .set_encoder_dictionary(parsed)
             .wrap_err("failed to load dictionary for compression")?;
     }
     io::copy(&mut reader, &mut encoder).wrap_err("streaming compression failed")?;
