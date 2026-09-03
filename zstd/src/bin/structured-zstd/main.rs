@@ -136,6 +136,11 @@ const DEFAULT_MAX_DICT: usize = 112_640;
 /// Window log a bare `--long` selects, as upstream documents (128 MiB).
 const DEFAULT_LONG_WINDOW_LOG: u32 = 27;
 
+/// Lowest level whose matcher actually runs long-distance matching. Below it
+/// the encoder uses a strategy that carries no long-distance producer, so
+/// `--long` would be a wider window and nothing else.
+const MIN_LONG_LEVEL: i32 = 16;
+
 /// Parse a size written the way upstream accepts it: a plain count, or one
 /// suffixed `KB`/`MB`/`GB` (also spelled `K`/`M`/`G`, any case). Upstream uses
 /// powers of two for these, despite the decimal-looking names.
@@ -687,6 +692,16 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
         bail!("level {} requires --ultra (levels 20-22)", opts.level);
     }
     validate_level(opts.level)?;
+    // Long-distance matching runs on the optimal parser here, so below it the
+    // flag would widen the window and never run the matcher it names. Settled
+    // after the whole command line, since the level may follow the flag.
+    if opts.long && opts.mode == Mode::Compress && opts.level < MIN_LONG_LEVEL {
+        bail!(
+            "--long needs level {MIN_LONG_LEVEL} or above, where long-distance \
+             matching runs; at level {} it would only widen the window",
+            opts.level,
+        );
+    }
     // `-o` names a single output, so it can't fan out over multiple inputs —
     // except `--train`, where many sample files legitimately feed one dictionary.
     if opts.mode != Mode::Train && !opts.bench && opts.output.is_some() && opts.inputs.len() > 1 {
@@ -750,9 +765,10 @@ fn print_help() {
          --no-pass-through, --[no-]row-match-finder.\n\
          \n\
          --target-compressed-block-size=N bounds what goes into each block, so\n\
-         blocks flush sooner and stay near N. --long is --long=27 and capped\n\
-         there: above it the frame would declare a window this build refuses\n\
-         to decode. A new output file keeps its source's permissions.\n\
+         blocks flush sooner and stay near N. --long is --long=27, capped\n\
+         there (above it the frame would declare a window this build refuses\n\
+         to decode) and available from level 16 up, where long-distance\n\
+         matching runs. A new output file keeps its source's permissions.\n\
          \n\
          Rejected rather than ignored, because they would change the result:\n\
          --no-check, --no-content-size, --no-dictID, --format= (other than\n\
@@ -1198,8 +1214,9 @@ fn run_stream_core<R: Read, W: Write>(
     opts: &Options,
     reader: R,
     writer: W,
-    // Exact length when the caller knows it (a stat'd file, or
-    // `--stream-size`); `--size-hint` travels separately in `opts`.
+    // Exact length of THIS input when it has one to stat; `--stream-size`
+    // stands in when it does not, which is what that option is for.
+    // `--size-hint` travels separately in `opts`.
     pledged_size: Option<u64>,
     dict: Option<&[u8]>,
 ) -> Result<()> {
@@ -1208,7 +1225,7 @@ fn run_stream_core<R: Read, W: Write>(
             reader,
             writer,
             &FrameSettings {
-                pledged_size,
+                pledged_size: pledged_size.or(opts.pledged_size),
                 ..FrameSettings::from_options(opts)
             },
             dict,

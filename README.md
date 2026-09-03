@@ -62,9 +62,11 @@ validated, so a typo is an error rather than silence.
 `--target-compressed-block-size` does take effect: it bounds what goes into a
 block, so blocks flush sooner. `--long` means `--long=27`, as upstream
 documents, and is capped there: a larger window would produce frames this
-build's decoder refuses. A window is never declared larger than the source can
-fill, so a small file compressed with `--long` does not ask its decoders to
-reserve 128 MiB.
+build's decoder refuses. It needs level 16 or above, where long-distance
+matching actually runs — below that it is refused rather than accepted as a
+wider window and nothing else. A window is never declared larger than the
+source can fill, so a small file compressed with `--long` does not ask its
+decoders to reserve 128 MiB.
 
 Flags that would change the result are refused instead: `--format=` for
 anything but zstd, `--patch-from`, `--rsyncable`, `--no-check`,

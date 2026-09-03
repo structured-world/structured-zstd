@@ -128,6 +128,30 @@ fn a_new_output_inherits_the_source_permissions() {
     );
 }
 
+/// `--stream-size` exists precisely for inputs whose length cannot be stat'd.
+/// A named FIFO is one of those, so the per-file size being unavailable is the
+/// moment the option matters most — dropping it there leaves the pledge
+/// unrecorded for exactly the inputs it was written for.
+#[test]
+fn an_explicit_stream_size_survives_an_unstattable_input() {
+    use structured_zstd::decoding::{FrameContentSize, read_frame_header_info};
+
+    let payload = b"hello world hello world";
+    let mut opts = parse(&["-3", "f"]).unwrap();
+    opts.pledged_size = Some(payload.len() as u64);
+
+    let mut frame = Vec::new();
+    // `None` is what a FIFO or device yields: no reliable size from metadata.
+    run_stream_core(&opts, &payload[..], &mut frame, None, None).expect("compressing must succeed");
+
+    let info = read_frame_header_info(&frame, false).expect("the frame header must parse");
+    assert_eq!(
+        info.content_size,
+        FrameContentSize::Known(payload.len() as u64),
+        "the pledged size must reach the frame even when the input cannot be stat'd"
+    );
+}
+
 /// An empty file holds no frame, so there is nothing to test and nothing to
 /// decode. Answering `OK` for it says the archive checked out when it was never
 /// an archive; upstream calls it an unexpected end of file.
@@ -287,13 +311,13 @@ fn list_mode_parses() {
 #[test]
 fn long_flag_enables_ldm() {
     assert!(parse(&["-19", "--long", "in.txt"]).unwrap().long);
-    assert!(parse(&["--long=27", "in.txt"]).unwrap().long);
+    assert!(parse(&["-19", "--long=27", "in.txt"]).unwrap().long);
     assert!(!parse(&["-19", "in.txt"]).unwrap().long);
     // Bare `--long` is `--long=27` upstream, and the window is the point of the
     // flag: keeping the level's own window would reach back nowhere near the
     // distance the caller asked for.
     assert_eq!(
-        parse(&["--long", "in.txt"]).unwrap().long_window_log,
+        parse(&["-19", "--long", "in.txt"]).unwrap().long_window_log,
         Some(27)
     );
 }
@@ -307,7 +331,7 @@ fn long_flag_enables_ldm() {
 fn long_window_log_reaches_the_encoder() {
     use structured_zstd::decoding::read_frame_header_info;
 
-    let opts = parse(&["--long=27", "in.txt"]).unwrap();
+    let opts = parse(&["-19", "--long=27", "in.txt"]).unwrap();
     assert_eq!(
         opts.long_window_log,
         Some(27),
@@ -319,7 +343,7 @@ fn long_window_log_reaches_the_encoder() {
         &b"payload"[..],
         &mut frame,
         &FrameSettings {
-            level: 3,
+            level: 19,
             long: true,
             long_window_log: Some(27),
             ..FrameSettings::default()
@@ -388,7 +412,7 @@ fn an_explicit_window_is_capped_by_a_known_source_size() {
         &payload[..],
         &mut frame,
         &FrameSettings {
-            level: 3,
+            level: 19,
             long: true,
             long_window_log: Some(27),
             pledged_size: Some(payload.len() as u64),
@@ -407,17 +431,32 @@ fn an_explicit_window_is_capped_by_a_known_source_size() {
     );
 }
 
+/// Long-distance matching lives on the optimal parser here, so the levels below
+/// it can widen the window and still never run the matcher the flag names.
+/// Taking `--long` at those levels would report success for work that did not
+/// happen, and hand back a file compressed the ordinary way.
+#[test]
+fn long_is_refused_at_levels_that_cannot_run_it() {
+    assert!(parse(&["-3", "--long", "in.txt"]).is_err());
+    assert!(parse(&["--long", "-15", "in.txt"]).is_err());
+    // From the optimal parser up, the matcher is there to run.
+    assert!(parse(&["-16", "--long", "in.txt"]).is_ok());
+    assert!(parse(&["--ultra", "-22", "--long=27", "in.txt"]).is_ok());
+    // Decompression takes the flag as the window hint it is; nothing to run.
+    assert!(parse(&["-d", "--long", "in.txt.zst"]).is_ok());
+}
+
 /// The window log has a supported range; a value outside it has to fail rather
 /// than be quietly replaced by a working one, or the caller believes in a
 /// window the frame does not have.
 #[test]
 fn out_of_range_long_window_log_is_refused() {
-    assert!(parse(&["--long=99", "in.txt"]).is_err());
+    assert!(parse(&["-19", "--long=99", "in.txt"]).is_err());
     // The encoder would accept up to 30, but this build's decoder refuses any
     // frame declaring a window above 128 MiB — so those levels only produce
     // files it cannot read back. Refuse them at the flag instead.
-    assert!(parse(&["--long=27", "in.txt"]).is_ok());
-    assert!(parse(&["--long=28", "in.txt"]).is_err());
+    assert!(parse(&["-19", "--long=27", "in.txt"]).is_ok());
+    assert!(parse(&["-19", "--long=28", "in.txt"]).is_err());
 }
 
 #[test]
@@ -455,7 +494,7 @@ fn fast_and_long_match_exactly_not_by_prefix() {
     // Exact options succeed.
     assert_eq!(parse(&["--fast"]).unwrap().level, -1);
     assert_eq!(parse(&["--fast=5"]).unwrap().level, -5);
-    assert!(parse(&["--long"]).unwrap().long);
+    assert!(parse(&["-19", "--long"]).unwrap().long);
     // Typos must NOT be silently accepted as `--fast`/`--long`; they fall
     // through to the unknown-option path.
     assert!(parse(&["--faster"]).is_err());
@@ -464,9 +503,9 @@ fn fast_and_long_match_exactly_not_by_prefix() {
     // `--fast=-5` must not flip into a positive level, and `--long=` /
     // `--long=abc` must not be accepted as a no-op.
     assert!(parse(&["--fast=-5"]).is_err());
-    assert!(parse(&["--long="]).is_err());
-    assert!(parse(&["--long=abc"]).is_err());
-    assert!(parse(&["--long=27"]).unwrap().long);
+    assert!(parse(&["-19", "--long="]).is_err());
+    assert!(parse(&["-19", "--long=abc"]).is_err());
+    assert!(parse(&["-19", "--long=27"]).unwrap().long);
 }
 
 #[test]
