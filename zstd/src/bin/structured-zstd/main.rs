@@ -1605,6 +1605,14 @@ fn ensure_distinct_paths(input: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Whether two different paths name one file, as a hard link does.
+///
+/// Only answers for the identity the platform lets us read. Unix compares the
+/// device and inode. Windows would need the volume serial and file index, which
+/// std exposes only on nightly (`windows_by_handle`) and which no dependency
+/// here can reach, so hard links go unnoticed there — the caller's canonical
+/// path comparison still catches the same path by another name, which is the
+/// case that actually comes up.
 fn paths_point_to_same_file(input: &Path, output: &Path) -> Result<bool> {
     let input_metadata = fs::metadata(input).wrap_err("failed to inspect input file metadata")?;
     let output_metadata =
@@ -1617,16 +1625,7 @@ fn paths_point_to_same_file(input: &Path, output: &Path) -> Result<bool> {
             && input_metadata.ino() == output_metadata.ino())
     }
 
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        Ok(
-            input_metadata.volume_serial_number() == output_metadata.volume_serial_number()
-                && input_metadata.file_index() == output_metadata.file_index(),
-        )
-    }
-
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(not(unix))]
     {
         let _ = input_metadata;
         let _ = output_metadata;
