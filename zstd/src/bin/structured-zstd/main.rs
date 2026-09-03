@@ -995,7 +995,10 @@ fn run(opts: Options) -> Result<()> {
     // so writing over it destroys the key to what was just produced. `-f`
     // permits overwriting the output, not destroying either, so everything the
     // run reads is checked before the first byte is written.
-    if !opts.to_stdout {
+    //
+    // Only for the modes that write one. Testing decodes into a sink and names
+    // no destination, so asking what it would produce has no answer.
+    if !opts.to_stdout && matches!(opts.mode, Mode::Compress | Mode::Decompress) {
         for input in &opts.inputs {
             if input == Path::new("-") {
                 continue;

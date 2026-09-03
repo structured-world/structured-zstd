@@ -183,6 +183,26 @@ fn an_output_may_not_land_on_another_input() {
     );
 }
 
+/// That scan derives the output each input would produce, and testing produces
+/// none: `-t archive.zst` names no destination and has no suffix rule to apply.
+/// Running the scan for it asks for a path that does not exist, and the whole
+/// integrity check dies before a byte is decoded.
+#[test]
+fn testing_an_archive_does_not_ask_for_an_output_path() {
+    let dir = std::env::temp_dir();
+    let archive = dir.join(format!("szstd-testmode-{}.zst", std::process::id()));
+    use structured_zstd::encoding::{CompressionLevel, compress_slice_to_vec};
+    let frame = compress_slice_to_vec(b"payload to verify", CompressionLevel::Default);
+    fs::write(&archive, &frame).unwrap();
+
+    let mut opts = parse(&["-t", "a"]).unwrap();
+    opts.inputs = vec![archive.clone()];
+    let tested = run(opts);
+
+    let _ = fs::remove_file(&archive);
+    tested.expect("a sound archive must test OK");
+}
+
 /// Training writes its result over the samples' own directory, and the default
 /// destination is a plain `dictionary`. If a sample carries that name, the run
 /// reads it and then replaces it — the corpus loses a file to the dictionary
