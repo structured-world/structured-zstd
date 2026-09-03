@@ -444,6 +444,16 @@ fn long_is_refused_at_levels_that_cannot_run_it() {
     assert!(parse(&["--ultra", "-22", "--long=27", "in.txt"]).is_ok());
     // Decompression takes the flag as the window hint it is; nothing to run.
     assert!(parse(&["-d", "--long", "in.txt.zst"]).is_ok());
+    // Benchmarking compresses the levels `-b`/`-e` name, not the one `-N` set,
+    // so those are the levels the flag has to be true of.
+    assert!(parse(&["-b16", "--long", "in.txt"]).is_ok());
+    assert!(parse(&["-b16", "-e19", "--long", "in.txt"]).is_ok());
+    assert!(parse(&["-b3", "--long", "in.txt"]).is_err());
+    // The whole range runs with the flag, so a range that starts below the
+    // matcher is refused even when it ends above it.
+    assert!(parse(&["-b3", "-e19", "--long", "in.txt"]).is_err());
+    // And a benchmark range is what counts, not a level that was also typed.
+    assert!(parse(&["-16", "-b3", "--long", "in.txt"]).is_err());
 }
 
 /// The window log has a supported range; a value outside it has to fail rather
@@ -696,6 +706,21 @@ fn memory_limit_is_honoured_or_refused_never_ignored() {
     // The long spelling has the same default unit as the short one.
     assert!(parse(&["-d", "--memory=256", "f"]).is_ok());
     assert!(parse(&["-d", "--memory=8", "f"]).is_err());
+    // `-t` decodes too, so the ceiling applies there as well.
+    assert!(parse(&["-t", "--memory=8", "f"]).is_err());
+}
+
+/// The ceiling describes decompression. Compressing, listing or training
+/// creates no decoder, so a limit that decoding could not keep says nothing
+/// about those runs — upstream accepts it there, and refusing would fail
+/// commands that never allocate what the limit is about.
+#[test]
+fn the_memory_limit_only_binds_the_paths_that_decode() {
+    assert!(parse(&["--memory=8", "f"]).is_ok());
+    assert!(parse(&["-l", "--memory=8", "f"]).is_ok());
+    assert!(parse(&["--train", "-M256", "s1", "s2"]).is_ok());
+    // A mode flag after the limit still decides: the check waits for it.
+    assert!(parse(&["--memory=8", "-d", "f"]).is_err());
 }
 
 /// `-M` promises a bound on what decompression will take, and a dictionary is
@@ -872,18 +897,6 @@ fn stdout_and_output_follow_last_option_wins() {
 fn literal_mode_flags_are_rejected_until_wired() {
     assert!(parse(&["--compress-literals", "f"]).is_err());
     assert!(parse(&["--no-compress-literals", "f"]).is_err());
-}
-
-/// `--memory` bounds decompression. Dictionary training loads every sample
-/// into memory instead, so the flag says nothing about what `--train` will
-/// actually use — accepting it there would imply a bound over the one path it
-/// does not cover.
-#[test]
-fn memory_limit_is_refused_for_training() {
-    assert!(parse(&["--train", "-M256", "s1", "s2"]).is_err());
-    assert!(parse(&["--train", "--memory=256MB", "s1", "s2"]).is_err());
-    // Still fine for the modes it does describe.
-    assert!(parse(&["-d", "-M256", "f"]).is_ok());
 }
 
 /// Concatenating frames is a documented property of the format: `cat a.zst

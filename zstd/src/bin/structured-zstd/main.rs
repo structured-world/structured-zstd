@@ -496,11 +496,11 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
                         .or_else(|| long.strip_prefix("memlimit="))
                         .or_else(|| long.strip_prefix("memlimit-decompress="))
                     {
-                        let limit = parse_memory_limit(v).wrap_err("invalid memory limit")?;
-                        // Checked here against what decoding alone needs, and
-                        // again in `run` once the `-D` file's size is known.
-                        check_memory_limit(limit, 0)?;
-                        opts.memory_limit = Some(limit);
+                        // Recorded now, checked once the mode is final: the
+                        // ceiling describes decoding, and a later flag can
+                        // still decide this run does none.
+                        opts.memory_limit =
+                            Some(parse_memory_limit(v).wrap_err("invalid memory limit")?);
                     } else if let Some(params) = long.strip_prefix("adapt=") {
                         // Parameterised form (`--adapt=min=1,max=9`). We do not
                         // vary the level, so the bounds change nothing — but a
@@ -630,10 +630,8 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
                     // enforces rather than swallowed.
                     let rest: String = chars[ci + 1..].iter().collect();
                     if !rest.is_empty() {
-                        let limit =
-                            parse_memory_limit(&rest).wrap_err("invalid -M memory limit")?;
-                        check_memory_limit(limit, 0)?;
-                        opts.memory_limit = Some(limit);
+                        opts.memory_limit =
+                            Some(parse_memory_limit(&rest).wrap_err("invalid -M memory limit")?);
                     }
                     ci = chars.len();
                     continue;
@@ -680,28 +678,20 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
         let _ = idx;
     }
 
-    // `-M` bounds decompression. Training loads every sample into memory
-    // instead, a path the limit says nothing about, so accepting it here would
-    // imply a bound over the one thing it does not cover.
-    // `--train` may appear after `-M`, so the conflict is settled once the
-    // whole command line is known rather than at the flag itself.
-    if opts.memory_limit.is_some() && opts.mode == Mode::Train {
-        bail!("--memory / -M bounds decompression and does not apply to --train");
+    // `-M` bounds decompression, so it is weighed only on the runs that decode.
+    // Compressing, listing or training allocates no decoder, and upstream takes
+    // the flag there without complaint. A mode flag may follow the limit, which
+    // is why this waits for the whole command line. The `-D` dictionary is
+    // weighed on top in `run`, once its size is known.
+    if let Some(limit) = opts.memory_limit
+        && matches!(opts.mode, Mode::Decompress | Mode::Test)
+    {
+        check_memory_limit(limit, 0)?;
     }
     if !ultra && opts.level > 19 {
         bail!("level {} requires --ultra (levels 20-22)", opts.level);
     }
     validate_level(opts.level)?;
-    // Long-distance matching runs on the optimal parser here, so below it the
-    // flag would widen the window and never run the matcher it names. Settled
-    // after the whole command line, since the level may follow the flag.
-    if opts.long && opts.mode == Mode::Compress && opts.level < MIN_LONG_LEVEL {
-        bail!(
-            "--long needs level {MIN_LONG_LEVEL} or above, where long-distance \
-             matching runs; at level {} it would only widen the window",
-            opts.level,
-        );
-    }
     // `-o` names a single output, so it can't fan out over multiple inputs —
     // except `--train`, where many sample files legitimately feed one dictionary.
     if opts.mode != Mode::Train && !opts.bench && opts.output.is_some() && opts.inputs.len() > 1 {
@@ -709,6 +699,23 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
     }
     if opts.bench && opts.bench_end < opts.bench_start {
         opts.bench_end = opts.bench_start;
+    }
+    // Long-distance matching runs on the optimal parser here, so below it the
+    // flag would widen the window and never run the matcher it names. Settled
+    // after the whole command line, since the level may follow the flag — and
+    // read from the benchmark range when there is one, because those are the
+    // levels that will actually compress. The whole range runs with the flag,
+    // so its lowest level is the one that has to carry the matcher.
+    let long_level = if opts.bench {
+        opts.bench_start.min(opts.bench_end)
+    } else {
+        opts.level
+    };
+    if opts.long && matches!(opts.mode, Mode::Compress) && long_level < MIN_LONG_LEVEL {
+        bail!(
+            "--long needs level {MIN_LONG_LEVEL} or above, where long-distance \
+             matching runs; at level {long_level} it would only widen the window",
+        );
     }
     Ok(Parsed::Run(opts))
 }
@@ -774,8 +781,9 @@ fn print_help() {
          --no-check, --no-content-size, --no-dictID, --format= (other than\n\
          zstd), --patch-from, --rsyncable, --pass-through,\n\
          --exclude-compressed, --[no-]compress-literals, -M/--memory below\n\
-         the enforced ceiling, -M with --train, and --train-cover /\n\
-         --train-legacy (--train and --train-fastcover train with FastCOVER).\n\
+         the enforced ceiling when decoding, --long below level 16, and\n\
+         --train-cover / --train-legacy (--train and --train-fastcover train\n\
+         with FastCOVER).\n\
          \n\
          With no FILE, or when FILE is `-`, read stdin / write stdout."
     );
@@ -789,10 +797,13 @@ fn run(opts: Options) -> Result<()> {
         ),
         None => None,
     };
-    // `-M` was checked at parse time against what decoding alone needs. The
-    // dictionary is the other half of the promise, and its size is only known
-    // now, so the same limit is weighed against it here.
-    if let (Some(limit), Some(bytes)) = (opts.memory_limit, dict_bytes.as_ref()) {
+    // `-M` was checked against what decoding alone needs once the mode was
+    // known. The dictionary is the other half of that promise and its size is
+    // only known now, so the same limit is weighed against it here — on the
+    // decoding runs the limit describes.
+    if let (Some(limit), Some(bytes)) = (opts.memory_limit, dict_bytes.as_ref())
+        && matches!(opts.mode, Mode::Decompress | Mode::Test)
+    {
         check_memory_limit(limit, bytes.len() as u64)?;
     }
     let dict = dict_bytes.as_deref();

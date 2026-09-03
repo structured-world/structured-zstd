@@ -71,10 +71,11 @@ decoders to reserve 128 MiB.
 Flags that would change the result are refused instead: `--format=` for
 anything but zstd, `--patch-from`, `--rsyncable`, `--no-check`,
 `--[no-]compress-literals`, and the not-yet-implemented `--pass-through` /
-`--exclude-compressed`. `-M` is treated as the safety promise it is: a limit
-covering the 128 MiB decompression window, the decoder's buffers and the `-D`
-dictionary is kept, a tighter one is refused rather than ignored, and it is
-refused outright with `--train`, which it says nothing about.
+`--exclude-compressed`. `-M` is treated as the safety promise it is: on the
+runs that decode, a limit covering the 128 MiB window, the decoder's buffers
+and the `-D` dictionary is kept and a tighter one is refused rather than
+ignored. Compressing, listing and training allocate no decoder, so the flag is
+accepted there and describes nothing, as upstream has it.
 
 `--train` and `--train-fastcover` both train with FastCOVER, the algorithm
 upstream also defaults to. `--train-cover` and `--train-legacy` name algorithms
