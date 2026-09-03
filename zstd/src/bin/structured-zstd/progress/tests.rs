@@ -27,3 +27,19 @@ fn human_readable_duration() {
         "1h 20m 30s"
     );
 }
+
+/// The seconds are shown rounded, and a value that rounds up to a full minute
+/// belongs in the minutes: printed as it stands it reads `1m 60s`, a duration
+/// no clock shows. The carry runs all the way up, so 59m 59.6s is an hour.
+#[test]
+fn rounded_seconds_carry_into_the_next_minute() {
+    assert_eq!(&fmt_duration(Duration::from_millis(119_500)), "2m");
+    // Under a minute the seconds carry a decimal, so the carry is what that
+    // decimal rounds to: 59.96 shown to one place is a minute.
+    assert_eq!(&fmt_duration(Duration::from_millis(59_960)), "1m");
+    assert_eq!(
+        &fmt_duration(Duration::from_millis(3_599_600)),
+        "1h",
+        "the carry runs past the minutes as well"
+    );
+}

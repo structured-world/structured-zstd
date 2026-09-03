@@ -167,9 +167,33 @@ fn fmt_duration(duration: Duration) -> String {
     let as_secs = duration.as_secs_f64();
     let as_min = (as_secs / 60.0).floor() as usize;
     // When displayed in long form, the value shown
-    let secs_portion: f64 = as_secs % 60.0;
-    let min_portion: usize = ((as_secs - secs_portion) as usize / 60) % 60;
-    let hr_portion: usize = ((as_min - min_portion) / 60) % 60;
+    let mut secs_portion: f64 = as_secs % 60.0;
+    let mut min_portion: usize = ((as_secs - secs_portion) as usize / 60) % 60;
+    let mut hr_portion: usize = ((as_min - min_portion) / 60) % 60;
+
+    // The seconds are shown rounded, and rounding can reach a full minute:
+    // 1m 59.5s printed as it stands reads `1m 60s`, which is no duration. What
+    // counts is the value as it will be WRITTEN, at the precision the branches
+    // below pick from the same two thresholds — 59.5s keeps its decimal and is
+    // not a minute, while 59.96s shown to one place is. The carry happens
+    // before anything is written, so it runs up through the minutes as well:
+    // 59m 59.6s is an hour.
+    let shown_decimals = if as_secs > 60.0 {
+        0
+    } else if secs_portion > 4.0 {
+        1
+    } else {
+        2
+    };
+    let scale = 10f64.powi(shown_decimals);
+    if (secs_portion * scale).round() / scale >= 60.0 {
+        secs_portion = 0.0;
+        min_portion += 1;
+        if min_portion == 60 {
+            min_portion = 0;
+            hr_portion += 1;
+        }
+    }
 
     let mut output = String::with_capacity(8);
     if hr_portion > 0 {

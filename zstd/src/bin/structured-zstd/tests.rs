@@ -358,6 +358,37 @@ fn training_refuses_samples_that_are_not_regular_files() {
     );
 }
 
+/// The dictionary is read whole, and its size is taken from the directory entry
+/// to bound that read. A FIFO reports zero there, so it clears the memory limit
+/// and then blocks in `File::open` until someone opens the other end — the run
+/// hangs before it has told anyone what it is waiting for.
+#[cfg(unix)]
+#[test]
+fn a_dictionary_has_to_be_a_regular_file() {
+    let dir = std::env::temp_dir();
+    let fifo = dir.join(format!("szstd-dictfifo-{}", std::process::id()));
+    let _ = fs::remove_file(&fifo);
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !made {
+        return;
+    }
+
+    let mut opts = parse(&["-d", "a"]).unwrap();
+    opts.dict = Some(fifo.clone());
+    let refused = load_dictionary(&opts);
+    let _ = fs::remove_file(&fifo);
+
+    let err = refused.expect_err("a FIFO is not a dictionary").to_string();
+    assert!(
+        err.contains("regular file"),
+        "the refusal must name what is wrong with the dictionary: {err}"
+    );
+}
+
 /// Compressing does not publish anything: an archive of a private file stays
 /// as private as the file was. Creating the output at whatever the umask says
 /// hands a 0600 secret to every user on the machine, which is why upstream

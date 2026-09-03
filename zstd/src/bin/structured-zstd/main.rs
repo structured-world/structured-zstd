@@ -922,9 +922,16 @@ fn load_dictionary(opts: &Options) -> Result<Option<Vec<u8>>> {
     if !opts.bench && matches!(opts.mode, Mode::List | Mode::Train) {
         return Ok(None);
     }
-    let size = fs::metadata(path)
-        .wrap_err_with(|| format!("failed to inspect dictionary file {}", path.display()))?
-        .len();
+    let metadata = fs::metadata(path)
+        .wrap_err_with(|| format!("failed to inspect dictionary file {}", path.display()))?;
+    // The size below is what bounds the read, and only a regular file's is the
+    // number of bytes there are to read. A FIFO reports zero, which clears any
+    // memory limit and then blocks in `File::open` until a writer turns up: the
+    // run stops with nothing said about what it is waiting for.
+    if !metadata.is_file() {
+        bail!("-D needs a regular file: {} is not one", path.display());
+    }
+    let size = metadata.len();
     if let Some(limit) = opts.memory_limit
         && decodes(opts)
     {
