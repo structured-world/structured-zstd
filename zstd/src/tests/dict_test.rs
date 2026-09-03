@@ -827,3 +827,57 @@ fn fast_copy_mode_dict_reachable_for_full_block() {
     assert_eq!(written, input.len());
     assert_eq!(&output, &input, "copy-mode dict frame must round-trip");
 }
+
+/// A raw-content dictionary is a plain byte blob with no header and therefore
+/// no identifier: any file can serve as one, which is how `zstd -D` is
+/// routinely used. Frames built with it record no dictionary ID, so the decoder
+/// can only be told about it explicitly — the id-bearing registration path
+/// never applies. Refusing the zero id on the forced path shut that whole
+/// upstream-supported mode out.
+#[test]
+fn raw_content_dictionary_without_an_id_round_trips_when_supplied() {
+    use crate::decoding::FrameDecoder;
+    use crate::decoding::dictionary::{Dictionary, DictionaryHandle};
+    use crate::encoding::{CompressionLevel, FrameCompressor};
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    let content: Vec<u8> = b"tenant=demo region=eu table=orders payload="
+        .iter()
+        .copied()
+        .cycle()
+        .take(2048)
+        .collect();
+    let mut input = Vec::new();
+    while input.len() < 8192 {
+        input.extend_from_slice(&content);
+    }
+
+    let mut compressor: FrameCompressor = FrameCompressor::new(CompressionLevel::Default);
+    compressor
+        .set_dictionary(
+            Dictionary::from_raw_content(0, content.clone())
+                .expect("a raw dictionary carries no id"),
+        )
+        .expect("a raw dictionary must attach for encoding");
+    let frame = compressor.compress_independent_frame(&input);
+
+    // No dictionary ID is recorded, so nothing in the frame points back here.
+    let info = crate::decoding::read_frame_header_info(frame.as_slice(), false)
+        .expect("the frame header must parse");
+    assert_eq!(
+        info.dictionary_id, None,
+        "a dictionary with no id must not put one in the header"
+    );
+
+    let handle = DictionaryHandle::from_dictionary(
+        Dictionary::from_raw_content(0, content).expect("a raw dictionary carries no id"),
+    );
+    let mut output = vec![0u8; input.len()];
+    let mut decoder = FrameDecoder::new();
+    let written = decoder
+        .decode_all_with_dict_handle(frame.as_slice(), &mut output, &handle)
+        .expect("the supplied raw dictionary must decode the frame");
+    assert_eq!(written, input.len());
+    assert_eq!(&output, &input);
+}

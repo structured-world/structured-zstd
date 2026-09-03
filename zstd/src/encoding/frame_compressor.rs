@@ -2392,7 +2392,13 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             single_segment,
             content_checksum: cfg!(feature = "hash") && self.content_checksum,
             dictionary_id: if prep.use_dictionary_state && self.dict_id_flag {
-                self.dictionary.as_ref().map(|dict| dict.inner.id as u64)
+                // Id 0 is a raw-content dictionary: RFC 8878 spells "no
+                // dictionary ID" as an absent field, not as a stored zero.
+                self.dictionary
+                    .as_ref()
+                    .map(|dict| dict.inner.id)
+                    .filter(|id| *id != 0)
+                    .map(u64::from)
             } else {
                 None
             },
@@ -2774,10 +2780,10 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         &mut self,
         enc: EncoderDictionary,
     ) -> Result<Option<EncoderDictionary>, crate::decoding::errors::DictionaryDecodeError> {
+        // A zero id is not an error here: it marks a raw-content dictionary,
+        // which has no header to carry one. The frame then records no
+        // dictionary ID, so the decoder has to be handed the same bytes.
         let dictionary = &enc.inner;
-        if dictionary.id == 0 {
-            return Err(crate::decoding::errors::DictionaryDecodeError::ZeroDictionaryId);
-        }
         if let Some(index) = dictionary.offset_hist.iter().position(|&rep| rep == 0) {
             return Err(
                 crate::decoding::errors::DictionaryDecodeError::ZeroRepeatOffsetInDictionary {

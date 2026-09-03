@@ -356,10 +356,10 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                 "dictionary must be attached before the first write",
             ));
         }
+        // A zero id marks a raw-content dictionary, which carries no header to
+        // hold one; the frame then records no dictionary ID and the decoder
+        // must be given the same bytes explicitly.
         let inner = &dict.inner;
-        if inner.id == 0 {
-            return Err(invalid_input_error("dictionary has a zero ID"));
-        }
         if inner.offset_hist.contains(&0) {
             return Err(invalid_input_error(
                 "dictionary carries a zero repeat offset",

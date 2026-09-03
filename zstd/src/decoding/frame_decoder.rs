@@ -1193,9 +1193,22 @@ impl FrameDecoder {
     fn validate_registered_dictionary(dict: &Dictionary) -> Result<(), FrameDecoderError> {
         use crate::decoding::errors::DictionaryDecodeError as dict_err;
 
+        // Registration keys the dictionary by its ID, so a zero one has no
+        // slot to occupy and no frame could ever select it.
         if dict.id == 0 {
             return Err(FrameDecoderError::from(dict_err::ZeroDictionaryId));
         }
+        Self::validate_dictionary_content(dict)
+    }
+
+    /// Checks a dictionary can be used at all, whatever route it arrived by.
+    ///
+    /// Separate from [`Self::validate_registered_dictionary`] because a
+    /// dictionary supplied explicitly needs no ID: a raw-content dictionary
+    /// has no header to carry one, and the frames built with it record none.
+    fn validate_dictionary_content(dict: &Dictionary) -> Result<(), FrameDecoderError> {
+        use crate::decoding::errors::DictionaryDecodeError as dict_err;
+
         if let Some(index) = dict.offset_hist.iter().position(|&rep| rep == 0) {
             return Err(FrameDecoderError::from(
                 dict_err::ZeroRepeatOffsetInDictionary { index: index as u8 },
@@ -1391,7 +1404,7 @@ impl FrameDecoder {
         // is a parallel entry point so it needs its own call.
         #[cfg(all(feature = "lsm", feature = "hash"))]
         self.computed_block_checksums.clear();
-        Self::validate_registered_dictionary(dict.as_dict())?;
+        Self::validate_dictionary_content(dict.as_dict())?;
         let magicless = self.magicless;
         // Scope the &mut borrow of `self.state` to the header parse
         // alone, so the subsequent `validate_expectations(&self, ...)`
@@ -1449,7 +1462,7 @@ impl FrameDecoder {
         use FrameDecoderError as err;
         #[cfg(all(feature = "lsm", feature = "hash"))]
         self.computed_block_checksums.clear();
-        Self::validate_registered_dictionary(dict.as_dict())?;
+        Self::validate_dictionary_content(dict.as_dict())?;
         let magicless = self.magicless;
         let (frame_header, header_size) = frame::read_frame_header_from_slice(input, magicless)?;
         match &mut self.state {

@@ -69,13 +69,18 @@ impl Dictionary {
     ///
     /// This is primarily intended for dictionaries produced by the `dict-builder`
     /// module, which currently emits raw-content dictionaries.
+    ///
+    /// An `id` of 0 means the dictionary is unidentified, which is what any
+    /// plain file used as a dictionary is: frames built with it record no
+    /// dictionary ID, so it can only ever be supplied explicitly, never
+    /// resolved from a frame header. Registration by ID
+    /// ([`FrameDecoder::add_dict`](crate::decoding::FrameDecoder::add_dict))
+    /// still requires a non-zero one, since the ID is the key it is stored
+    /// under.
     pub fn from_raw_content(
         id: u32,
         dict_content: Vec<u8>,
     ) -> Result<Dictionary, DictionaryDecodeError> {
-        if id == 0 {
-            return Err(DictionaryDecodeError::ZeroDictionaryId);
-        }
         if dict_content.is_empty() {
             return Err(DictionaryDecodeError::DictionaryTooSmall { got: 0, need: 1 });
         }
@@ -94,6 +99,20 @@ impl Dictionary {
     /// checked against the frame's `dict_id`.
     pub fn decode_dict(raw: &[u8]) -> Result<Dictionary, DictionaryDecodeError> {
         Self::decode_dict_inner(raw, true)
+    }
+
+    /// Loads whichever kind of dictionary `raw` holds, the way `zstd -D` does:
+    /// a blob starting with [`MAGIC_NUM`] is a serialized dictionary with
+    /// entropy tables and an ID, and anything else is taken as raw content,
+    /// which is why any file can be handed to `-D`. A raw-content dictionary
+    /// has no ID, so it must be supplied explicitly on both sides — see
+    /// [`Self::from_raw_content`].
+    pub fn from_serialized_or_raw_content(raw: &[u8]) -> Result<Dictionary, DictionaryDecodeError> {
+        if raw.starts_with(&MAGIC_NUM) {
+            Self::decode_dict(raw)
+        } else {
+            Self::from_raw_content(0, raw.to_vec())
+        }
     }
 
     /// Parse a dictionary for ENCODER use: builds the entropy

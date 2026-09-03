@@ -693,23 +693,10 @@ fn print_help() {
 
 fn run(opts: Options) -> Result<()> {
     let dict_bytes = match &opts.dict {
-        Some(path) => {
-            let bytes = fs::read(path)
-                .wrap_err_with(|| format!("failed to read dictionary file {}", path.display()))?;
-            // A blob without the dictionary magic is a raw-content dictionary,
-            // which upstream accepts and this build does not yet: every frame
-            // here carries a dictionary ID, and a raw dictionary has none. Say
-            // that plainly instead of surfacing a magic-number mismatch, which
-            // reads like a corrupt file rather than a missing feature.
-            if !bytes.starts_with(&structured_zstd::decoding::DICTIONARY_MAGIC) {
-                bail!(
-                    "{}: raw-content dictionaries are not supported yet; \
-                     use a dictionary produced by --train",
-                    path.display()
-                );
-            }
-            Some(bytes)
-        }
+        Some(path) => Some(
+            fs::read(path)
+                .wrap_err_with(|| format!("failed to read dictionary file {}", path.display()))?,
+        ),
         None => None,
     };
     let dict = dict_bytes.as_deref();
@@ -1299,8 +1286,14 @@ fn compress_stream<R: Read, W: Write>(
             .wrap_err("failed to set source size hint")?;
     }
     if let Some(raw) = dict {
+        // Whatever `-D` was pointed at: a trained dictionary, or any file at
+        // all, taken as raw content the way upstream does.
+        let parsed = structured_zstd::decoding::Dictionary::from_serialized_or_raw_content(raw)
+            .map_err(|err| eyre!("invalid dictionary: {err:?}"))?;
         encoder
-            .set_dictionary_from_bytes(raw)
+            .set_encoder_dictionary(
+                structured_zstd::encoding::EncoderDictionary::from_dictionary(parsed),
+            )
             .wrap_err("failed to load dictionary for compression")?;
     }
     io::copy(&mut reader, &mut encoder).wrap_err("streaming compression failed")?;
@@ -1327,8 +1320,10 @@ fn decompress_stream<R: Read, W: Write>(
     // with the same dictionary.
     let handle = match dict {
         Some(raw) => Some(
-            structured_zstd::decoding::DictionaryHandle::decode_dict(raw)
-                .map_err(|err| eyre!("failed to parse dictionary: {err:?}"))?,
+            structured_zstd::decoding::DictionaryHandle::from_dictionary(
+                structured_zstd::decoding::Dictionary::from_serialized_or_raw_content(raw)
+                    .map_err(|err| eyre!("failed to parse dictionary: {err:?}"))?,
+            ),
         ),
         None => None,
     };

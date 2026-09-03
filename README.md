@@ -70,8 +70,9 @@ it says nothing about.
 `--train` and `--train-fastcover` both train with FastCOVER, the algorithm
 upstream also defaults to. `--train-cover` and `--train-legacy` name algorithms
 this build does not have, so they are refused rather than quietly served by
-FastCOVER. `-D` takes a dictionary produced by `--train`; raw-content
-dictionaries are not supported yet and say so.
+FastCOVER. `-D` takes either a dictionary produced by `--train` or any file at
+all, which is then used as raw content the way upstream does — such a
+dictionary has no ID, so the same bytes must be supplied when decoding.
 
 It is deliberately **not** installed as `zstd`, so it never shadows the system
 tool. It does dispatch on the name it is invoked under, so linking it as the

@@ -1141,9 +1141,13 @@ fn set_dictionary_from_bytes_matches_full_decode_byte_for_byte() {
     );
 }
 
+/// A dictionary with no ID is a raw-content one: the blob has no header to
+/// carry an ID, and the frames built from it record none, so the decoder has to
+/// be given the same bytes. It attaches like any other dictionary — what it
+/// cannot do is be looked up by ID, which the registration path still enforces.
 #[test]
-fn set_dictionary_rejects_zero_dictionary_id() {
-    let invalid = crate::decoding::Dictionary {
+fn set_dictionary_accepts_a_dictionary_without_an_id() {
+    let raw_content = crate::decoding::Dictionary {
         id: 0,
         fse: crate::decoding::scratch::FSEScratch::new(),
         huf: crate::decoding::scratch::HuffmanScratch::new(),
@@ -1156,11 +1160,22 @@ fn set_dictionary_rejects_zero_dictionary_id() {
         Vec<u8>,
         crate::encoding::match_generator::MatchGeneratorDriver,
     > = FrameCompressor::new(super::CompressionLevel::Fastest);
-    let result = compressor.set_dictionary(invalid);
-    assert!(matches!(
-        result,
-        Err(crate::decoding::errors::DictionaryDecodeError::ZeroDictionaryId)
-    ));
+    compressor
+        .set_dictionary(raw_content)
+        .expect("a dictionary without an id must attach");
+
+    let mut decoder = crate::decoding::FrameDecoder::new();
+    let registered = decoder.add_dict(crate::decoding::Dictionary {
+        id: 0,
+        fse: crate::decoding::scratch::FSEScratch::new(),
+        huf: crate::decoding::scratch::HuffmanScratch::new(),
+        dict_content: vec![1, 2, 3],
+        offset_hist: [1, 4, 8],
+    });
+    assert!(
+        registered.is_err(),
+        "registration keys on the id, so a zero one still has no slot"
+    );
 }
 
 #[test]
