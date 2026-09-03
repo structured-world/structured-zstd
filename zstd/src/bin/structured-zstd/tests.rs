@@ -1,5 +1,17 @@
 use super::*;
 
+/// What a run with no `-D` carries: the codecs take their dictionary already
+/// parsed, and "no dictionary" is a prepared set holding neither side.
+fn no_dict() -> Dictionaries {
+    Dictionaries::default()
+}
+
+/// The same blob a `-D` run would hand the codecs, parsed for both directions
+/// so one helper serves a compressing test and a decoding one alike.
+fn prepared_dict(raw: &[u8]) -> Dictionaries {
+    Dictionaries::prepare(Some(raw), true, true).expect("the fixture dictionary must parse")
+}
+
 fn parse(args: &[&str]) -> Result<Options> {
     let owned: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
     match parse_args(&owned, Mode::Compress, false)? {
@@ -130,7 +142,13 @@ fn target_block_size_reaches_the_encoder() {
         level: 3,
         ..FrameSettings::default()
     };
-    compress_stream(payload.as_slice(), &mut default_geometry, &level_only, None).unwrap();
+    compress_stream(
+        payload.as_slice(),
+        &mut default_geometry,
+        &level_only,
+        &no_dict(),
+    )
+    .unwrap();
     let mut small_blocks = Vec::new();
     compress_stream(
         payload.as_slice(),
@@ -139,7 +157,7 @@ fn target_block_size_reaches_the_encoder() {
             target_block_size: Some(4096),
             ..level_only
         },
-        None,
+        &no_dict(),
     )
     .unwrap();
 
@@ -181,6 +199,34 @@ fn an_output_may_not_land_on_another_input() {
         survived, b"second input, would be destroyed",
         "the second input must still be there"
     );
+}
+
+/// `--rm` deletes an input once its output is safely written, but an input that
+/// is also the `-D` dictionary is the one file the output cannot be read back
+/// without. Deleting it leaves an archive nothing can open.
+#[test]
+fn an_input_that_is_the_dictionary_is_not_removed() {
+    let dir = std::env::temp_dir();
+    let sample = dir.join(format!("szstd-rmdict-{}", std::process::id()));
+    let archive = PathBuf::from(format!("{}.zst", sample.display()));
+    fs::write(&sample, vec![3u8; 8192]).unwrap();
+
+    let mut opts = parse(&["--rm", "-f", "a"]).unwrap();
+    opts.inputs = vec![sample.clone()];
+    opts.dict = Some(sample.clone());
+    let refused = run(opts);
+
+    let survived = fs::read(&sample).unwrap_or_default();
+    let _ = fs::remove_file(&sample);
+    let _ = fs::remove_file(&archive);
+    let err = refused
+        .expect_err("the dictionary must not be deleted as a source")
+        .to_string();
+    assert!(
+        err.contains("dictionary"),
+        "the refusal must name the collision: {err}"
+    );
+    assert_eq!(survived.len(), 8192, "the dictionary must still be there");
 }
 
 /// That scan derives the output each input would produce, and testing produces
@@ -228,6 +274,59 @@ fn training_refuses_to_write_over_its_own_sample() {
         "the refusal must name the collision: {err}"
     );
     assert_eq!(survived.len(), 4096, "the sample must still be there");
+}
+
+/// A dictionary cannot be smaller than its own header plus the offset history
+/// the format requires, so `--maxdict=1` can only fail. Discovering that after
+/// reading the corpus spends the whole input's I/O and memory on a command that
+/// was never going to produce anything — the test names a sample that cannot be
+/// read, so only a check made first can be what answers.
+#[test]
+fn an_impossible_dictionary_size_is_refused_before_the_samples_are_read() {
+    let missing = std::env::temp_dir().join(format!("szstd-nosuch-{}", std::process::id()));
+    let _ = fs::remove_file(&missing);
+
+    let mut opts = parse(&["--train", "--maxdict=1", "-o", "d", "s"]).unwrap();
+    opts.inputs = vec![missing];
+    opts.output = Some(std::env::temp_dir().join(format!("szstd-nodict-{}", std::process::id())));
+    let err = train_dictionary(&opts)
+        .expect_err("one byte cannot hold a dictionary")
+        .to_string();
+
+    assert!(
+        err.contains("--maxdict"),
+        "the size must be what is refused, before the unreadable sample: {err}"
+    );
+}
+
+/// `-c` and `-o` clear one another, so `--train -o wanted.dict -c` leaves no
+/// destination at all and the default `dictionary` stands in — the run writes a
+/// file nobody named, and with `-f` over whatever was there. The reference
+/// command fails on this pair too; it must not silently write somewhere else.
+#[test]
+fn training_to_stdout_is_refused_rather_than_redirected() {
+    let dir = std::env::temp_dir();
+    let sample = dir.join(format!("szstd-trainstdout-{}", std::process::id()));
+    fs::write(&sample, vec![9u8; 4096]).unwrap();
+
+    let mut opts = parse(&["--train", "-f", "-o", "wanted.dict", "-c", "s"]).unwrap();
+    assert!(opts.to_stdout, "-c is the later flag, so it wins");
+    assert!(opts.output.is_none(), "and it cleared the -o");
+    opts.inputs = vec![sample.clone()];
+    let refused = train_dictionary(&opts);
+
+    let _ = fs::remove_file(&sample);
+    let err = refused
+        .expect_err("a dictionary cannot be trained to stdout here")
+        .to_string();
+    assert!(
+        err.contains("stdout"),
+        "the refusal must name what cannot be done: {err}"
+    );
+    assert!(
+        !PathBuf::from("dictionary").exists(),
+        "and nothing may be written to the default name"
+    );
 }
 
 /// The same refusal, for a sample that is the output under another spelling.
@@ -405,7 +504,7 @@ fn a_new_output_inherits_the_source_permissions() {
 
     let mut opts = parse(&["-3", "f"]).unwrap();
     opts.inputs = vec![input.clone()];
-    let result = process_file(&opts, &input, None);
+    let result = process_file(&opts, &input, &no_dict());
 
     let output = PathBuf::from(format!("{}.zst", input.display()));
     let mode = fs::metadata(&output).map(|m| m.permissions().mode() & 0o777);
@@ -519,7 +618,8 @@ fn an_explicit_stream_size_survives_an_unstattable_input() {
 
     let mut frame = Vec::new();
     // `None` is what a FIFO or device yields: no reliable size from metadata.
-    run_stream_core(&opts, &payload[..], &mut frame, None, None).expect("compressing must succeed");
+    run_stream_core(&opts, &payload[..], &mut frame, None, &no_dict())
+        .expect("compressing must succeed");
 
     let info = read_frame_header_info(&frame, false).expect("the frame header must parse");
     assert_eq!(
@@ -568,7 +668,7 @@ fn a_serialized_dictionary_keeps_the_size_its_tier_is_chosen_by() {
             pledged_size: Some(payload.len() as u64),
             ..FrameSettings::default()
         },
-        Some(&raw[..]),
+        &prepared_dict(&raw),
     )
     .expect("compressing with the dictionary must succeed");
 
@@ -605,7 +705,7 @@ fn zero_means_unset_where_the_api_says_it_does() {
             target_block_size: Some(0),
             ..FrameSettings::default()
         },
-        None,
+        &no_dict(),
     )
     .expect("compressing must succeed");
     let mut untargeted = Vec::new();
@@ -616,7 +716,7 @@ fn zero_means_unset_where_the_api_says_it_does() {
             level: 3,
             ..FrameSettings::default()
         },
-        None,
+        &no_dict(),
     )
     .expect("compressing must succeed");
     assert_eq!(
@@ -634,7 +734,7 @@ fn zero_means_unset_where_the_api_says_it_does() {
             size_hint: Some(0),
             ..FrameSettings::default()
         },
-        None,
+        &no_dict(),
     )
     .expect("compressing must succeed");
     assert_eq!(
@@ -652,7 +752,7 @@ fn zero_means_unset_where_the_api_says_it_does() {
             level: 3,
             ..FrameSettings::default()
         },
-        Some(&[]),
+        &prepared_dict(&[]),
     )
     .expect("an empty dictionary is no dictionary, not a broken one");
     assert_eq!(without, untargeted, "and produces the same frame");
@@ -663,7 +763,7 @@ fn zero_means_unset_where_the_api_says_it_does() {
 /// an archive; upstream calls it an unexpected end of file.
 #[test]
 fn an_empty_stream_is_not_a_valid_archive() {
-    decompress_stream(&b""[..], io::sink(), None)
+    decompress_stream(&b""[..], io::sink(), &no_dict())
         .expect_err("an empty input carries no frame to decode");
 }
 
@@ -874,7 +974,7 @@ fn long_window_log_reaches_the_encoder() {
             long_window_log: Some(27),
             ..FrameSettings::default()
         },
-        None,
+        &no_dict(),
     )
     .expect("compressing with an explicit window log must succeed");
     let info = read_frame_header_info(&frame, false).expect("the frame header must parse");
@@ -959,7 +1059,7 @@ fn an_explicit_window_is_capped_by_a_known_source_size() {
             pledged_size: Some(payload.len() as u64),
             ..FrameSettings::default()
         },
-        None,
+        &no_dict(),
     )
     .expect("compressing must succeed");
 
@@ -985,7 +1085,7 @@ fn an_explicit_window_is_capped_by_a_known_source_size() {
             pledged_size: Some(payload.len() as u64),
             ..FrameSettings::default()
         },
-        Some(&raw[..]),
+        &prepared_dict(raw),
     )
     .expect("compressing with a dictionary must succeed");
 
@@ -1682,14 +1782,14 @@ fn corrupted_checksum_is_reported_not_passed() {
             level: 3,
             ..FrameSettings::default()
         },
-        None,
+        &no_dict(),
     )
     .expect("compressing the fixture must succeed");
     // The trailing four bytes are the frame's XXH64 check field.
     let last = frame.len() - 1;
     frame[last] ^= 0xFF;
 
-    let err = decompress_stream(frame.as_slice(), io::sink(), None)
+    let err = decompress_stream(frame.as_slice(), io::sink(), &no_dict())
         .expect_err("a corrupted checksum must fail the decode");
     let text = err.to_string();
     assert!(
@@ -1761,13 +1861,13 @@ fn concatenated_frames_are_all_decoded() {
                 level: 3,
                 ..FrameSettings::default()
             },
-            None,
+            &no_dict(),
         )
         .expect("compressing a fixture frame must succeed");
     }
 
     let mut out = Vec::new();
-    decompress_stream(stream.as_slice(), &mut out, None).expect("both frames must decode");
+    decompress_stream(stream.as_slice(), &mut out, &no_dict()).expect("both frames must decode");
     assert_eq!(
         out, b"first frame payloadsecond frame payload",
         "every frame in the stream has to reach the output"
@@ -1784,7 +1884,7 @@ fn skippable_frames_are_stepped_over() {
         level: 3,
         ..FrameSettings::default()
     };
-    compress_stream(&b"payload"[..], &mut stream, &level_only, None)
+    compress_stream(&b"payload"[..], &mut stream, &level_only, &no_dict())
         .expect("compressing the fixture must succeed");
     // Magic 0x184D2A50 (little-endian) + a 4-byte length + that many bytes.
     stream.extend_from_slice(&0x184D_2A50_u32.to_le_bytes());
@@ -1792,11 +1892,11 @@ fn skippable_frames_are_stepped_over() {
     stream.extend_from_slice(b"meta");
     // A frame after it, so the skip has to land on the right byte rather than
     // merely being tolerated at the end of the stream.
-    compress_stream(&b" and more"[..], &mut stream, &level_only, None)
+    compress_stream(&b" and more"[..], &mut stream, &level_only, &no_dict())
         .expect("compressing the trailing fixture must succeed");
 
     let mut out = Vec::new();
-    decompress_stream(stream.as_slice(), &mut out, None)
+    decompress_stream(stream.as_slice(), &mut out, &no_dict())
         .expect("a skippable frame must not fail the decode");
     assert_eq!(
         out, b"payload and more",

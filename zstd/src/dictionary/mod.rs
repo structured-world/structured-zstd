@@ -61,6 +61,15 @@ use std::{
 const MAX_TRAINING_PREALLOC_BYTES: usize = 8 * 1024 * 1024;
 const MAX_HUFFMAN_STATS_BYTES: usize = 64 * 1024;
 
+/// Smallest size a trained dictionary can occupy, whatever it was trained on.
+///
+/// The magic number, the dictionary ID, the three repeat offsets and the
+/// shortest content the writers emit are unconditional; a real dictionary is
+/// larger still, since the entropy tables between them are never empty. Use it
+/// to reject an impossible `dict_size` before spending the corpus: the training
+/// entry points can only discover the true bound once those tables are built.
+pub const MIN_TRAINED_DICT_SIZE: usize = DICT_MAGIC_NUM.len() + 4 + 12 + 8;
+
 /// Tuning knobs for pure-Rust FastCOVER training.
 #[derive(Debug, Clone)]
 pub struct FastCoverOptions {

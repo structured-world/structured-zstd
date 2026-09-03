@@ -952,15 +952,66 @@ fn load_dictionary(opts: &Options) -> Result<Option<Vec<u8>>> {
     Ok(Some(bytes))
 }
 
+/// The `-D` dictionary in the forms the two codecs take, parsed once per run.
+///
+/// Each side turns the blob into its own tables, and priming happens per frame
+/// — under `-b`, per timed iteration. Parsing there would put the dictionary's
+/// own setup inside the measurement and report it as throughput, which for a
+/// large dictionary over a small input is most of what the number would be.
+/// So the blob is parsed here, once, and every frame attaches what came out.
+#[derive(Default)]
+struct Dictionaries {
+    encoder: Option<structured_zstd::encoding::EncoderDictionary>,
+    decoder: Option<structured_zstd::decoding::DictionaryHandle>,
+}
+
+impl Dictionaries {
+    /// Parse the blob into the forms this run will use, and no others: a run
+    /// that only compresses has no use for the decoder's tables. `-b` asks for
+    /// both, since it measures the two directions in turn.
+    ///
+    /// An empty file is no dictionary rather than a broken one — loading a
+    /// zero-size dictionary returns to no-dictionary mode — so `-D` on an empty
+    /// file compresses plainly instead of failing.
+    fn prepare(raw: Option<&[u8]>, for_compression: bool, for_decoding: bool) -> Result<Self> {
+        let Some(raw) = raw.filter(|raw| !raw.is_empty()) else {
+            return Ok(Self::default());
+        };
+        let mut prepared = Self::default();
+        if for_compression {
+            // Through the constructor that keeps the blob's own length, since
+            // that is what the compression-parameter tier is chosen by —
+            // parsing first and handing over the content would key it on the
+            // wrong size. Whatever `-D` was pointed at: a trained dictionary,
+            // or any file at all, taken as raw content the way upstream does.
+            prepared.encoder = Some(
+                structured_zstd::encoding::EncoderDictionary::from_serialized_or_raw_content(raw)
+                    .map_err(|err| eyre!("invalid dictionary: {err:?}"))?,
+            );
+        }
+        if for_decoding {
+            prepared.decoder = Some(
+                structured_zstd::decoding::DictionaryHandle::from_dictionary(
+                    structured_zstd::decoding::Dictionary::from_serialized_or_raw_content(raw)
+                        .map_err(|err| eyre!("failed to parse dictionary: {err:?}"))?,
+                ),
+            );
+        }
+        Ok(prepared)
+    }
+}
+
 fn run(opts: Options) -> Result<()> {
     let dict_bytes = load_dictionary(&opts)?;
-    let dict = dict_bytes.as_deref();
 
     // `-b` benchmarks compression/decompression across levels instead of
-    // producing output files; handle it before the streaming flow.
+    // producing output files; handle it before the streaming flow. It takes the
+    // blob rather than the parsed forms, since its own memory ceiling has to be
+    // weighed before anything is built from them.
     if opts.bench {
-        return run_benchmark(&opts, dict);
+        return run_benchmark(&opts, dict_bytes.as_deref());
     }
+    let dicts = Dictionaries::prepare(dict_bytes.as_deref(), compresses(&opts), decodes(&opts))?;
 
     // `--train` builds a dictionary from the sample files rather than
     // (de)compressing them; handle it before the streaming flow.
@@ -993,7 +1044,7 @@ fn run(opts: Options) -> Result<()> {
     }
 
     if opts.inputs.is_empty() {
-        return process_stdin_stdout(&opts, dict);
+        return process_stdin_stdout(&opts, &dicts);
     }
     // The inputs are processed one after another, so an output derived from an
     // early one can land on a file still waiting its turn: `-f foo foo.zst`
@@ -1023,6 +1074,22 @@ fn run(opts: Options) -> Result<()> {
                     dict.display(),
                 );
             }
+            // `--rm` deletes an input once its output is written, and an input
+            // that is itself the dictionary is the one file that output cannot
+            // be read back without: `--rm -D data data` would leave an archive
+            // nothing can open. Removing the source is a convenience, so it
+            // yields to the file that gives the result meaning.
+            if let Some(dict) = &opts.dict
+                && opts.remove_source
+                && !opts.keep
+                && names_the_same_file(input, dict)?
+            {
+                bail!(
+                    "--rm would delete {}, which is also the dictionary {} needed to read the result",
+                    input.display(),
+                    dict.display(),
+                );
+            }
             for other in &opts.inputs {
                 if other != Path::new("-") && names_the_same_file(&output, other)? {
                     bail!(
@@ -1036,9 +1103,9 @@ fn run(opts: Options) -> Result<()> {
     }
     for input in &opts.inputs {
         if input == Path::new("-") {
-            process_stdin_stdout(&opts, dict)?;
+            process_stdin_stdout(&opts, &dicts)?;
         } else {
-            process_file(&opts, input, dict)?;
+            process_file(&opts, input, &dicts)?;
         }
     }
     Ok(())
@@ -1093,11 +1160,15 @@ fn run_benchmark(opts: &Options, dict: Option<&[u8]>) -> Result<()> {
         }
     }
 
+    // Both directions are measured in turn, so both forms are wanted — parsed
+    // here, once, rather than inside the timed loops below.
+    let dicts = &Dictionaries::prepare(dict, true, true)?;
+
     if opts.bench_separately {
         for input in &opts.inputs {
             let data =
                 fs::read(input).wrap_err_with(|| format!("failed to read {}", input.display()))?;
-            benchmark_one(opts, dict, &input.display().to_string(), &data)?;
+            benchmark_one(opts, dicts, &input.display().to_string(), &data)?;
         }
         return Ok(());
     }
@@ -1114,13 +1185,13 @@ fn run_benchmark(opts: &Options, dict: Option<&[u8]>) -> Result<()> {
         .map(|input| input.display().to_string())
         .collect::<Vec<_>>()
         .join(", ");
-    benchmark_one(opts, dict, &label, &data)
+    benchmark_one(opts, dicts, &label, &data)
 }
 
 /// Measure one benchmark subject: the whole input as one stream, or a single
 /// file under `-S`. Split out so the two modes differ only in what they hand
 /// over, not in how the measurement is taken.
-fn benchmark_one(opts: &Options, dict: Option<&[u8]>, label: &str, data: &[u8]) -> Result<()> {
+fn benchmark_one(opts: &Options, dicts: &Dictionaries, label: &str, data: &[u8]) -> Result<()> {
     use std::time::Instant;
 
     if data.is_empty() {
@@ -1154,7 +1225,7 @@ fn benchmark_one(opts: &Options, dict: Option<&[u8]>, label: &str, data: &[u8]) 
                     size_hint: None,
                     ..FrameSettings::from_options(opts)
                 },
-                dict,
+                dicts,
             )?;
             best_compress = best_compress.min(t.elapsed().as_secs_f64());
             if start.elapsed().as_secs_f64() >= opts.bench_secs {
@@ -1167,7 +1238,7 @@ fn benchmark_one(opts: &Options, dict: Option<&[u8]>, label: &str, data: &[u8]) 
         loop {
             let mut out = Vec::new();
             let t = Instant::now();
-            decompress_stream(compressed.as_slice(), &mut out, dict)?;
+            decompress_stream(compressed.as_slice(), &mut out, dicts)?;
             best_decompress = best_decompress.min(t.elapsed().as_secs_f64());
             if start.elapsed().as_secs_f64() >= opts.bench_secs {
                 break;
@@ -1203,6 +1274,26 @@ fn train_dictionary(opts: &Options) -> Result<()> {
 
     if opts.inputs.is_empty() {
         bail!("--train requires one or more sample files");
+    }
+    // `-c` and `-o` clear one another, so this pair leaves no destination and
+    // the default below would stand in: the run would write a file nobody
+    // named, and with `-f` over whatever was already there. The reference
+    // command fails on the combination as well, so refuse it rather than
+    // choose a destination on the caller's behalf.
+    if opts.to_stdout {
+        bail!("--train cannot write to stdout; name the dictionary with -o");
+    }
+    // A dictionary cannot be smaller than its own header and the offset history
+    // the format requires, so a size below that can only fail — and finding out
+    // inside the trainer means every sample has been read and concatenated
+    // first. The real bound is higher and depends on the entropy tables the
+    // corpus produces, which is why the trainer still checks; this only settles
+    // the part that is knowable without reading anything.
+    if opts.max_dict < structured_zstd::dictionary::MIN_TRAINED_DICT_SIZE {
+        bail!(
+            "--maxdict must be at least {} bytes; a dictionary cannot be smaller than its header",
+            structured_zstd::dictionary::MIN_TRAINED_DICT_SIZE
+        );
     }
     let output = opts
         .output
@@ -1473,7 +1564,7 @@ fn list_file(path: &Path) -> Result<()> {
 }
 
 /// stdin → stdout (or → `-o` file) for a `-` input or no inputs.
-fn process_stdin_stdout(opts: &Options, dict: Option<&[u8]>) -> Result<()> {
+fn process_stdin_stdout(opts: &Options, dicts: &Dictionaries) -> Result<()> {
     let stdin = io::stdin();
     let reader = stdin.lock();
     // `-o` redirects stdin's (de)compressed output to a file, unless `-c`
@@ -1485,7 +1576,7 @@ fn process_stdin_stdout(opts: &Options, dict: Option<&[u8]>) -> Result<()> {
         && matches!(opts.mode, Mode::Compress | Mode::Decompress)
     {
         // stdin has no file to take permissions from, so the umask decides.
-        return write_stream_to_file(opts, reader, output, opts.pledged_size, dict, None);
+        return write_stream_to_file(opts, reader, output, opts.pledged_size, dicts, None);
     }
     match opts.mode {
         Mode::Compress => {
@@ -1495,14 +1586,14 @@ fn process_stdin_stdout(opts: &Options, dict: Option<&[u8]>) -> Result<()> {
                 reader,
                 stdout.lock(),
                 &FrameSettings::from_options(opts),
-                dict,
+                dicts,
             )
         }
         Mode::Decompress => {
             let stdout = io::stdout();
-            decompress_stream(reader, stdout.lock(), dict)
+            decompress_stream(reader, stdout.lock(), dicts)
         }
-        Mode::Test => decompress_stream(reader, io::sink(), dict).map(|_| {
+        Mode::Test => decompress_stream(reader, io::sink(), dicts).map(|_| {
             info!("stdin: OK");
         }),
         Mode::List | Mode::Train => {
@@ -1533,7 +1624,7 @@ fn run_stream_core<R: Read, W: Write>(
     // stands in when it does not, which is what that option is for.
     // `--size-hint` travels separately in `opts`.
     pledged_size: Option<u64>,
-    dict: Option<&[u8]>,
+    dicts: &Dictionaries,
 ) -> Result<()> {
     match opts.mode {
         Mode::Compress => compress_stream(
@@ -1543,9 +1634,9 @@ fn run_stream_core<R: Read, W: Write>(
                 pledged_size: pledged_size.or(opts.pledged_size),
                 ..FrameSettings::from_options(opts)
             },
-            dict,
+            dicts,
         ),
-        Mode::Decompress => decompress_stream(reader, writer, dict),
+        Mode::Decompress => decompress_stream(reader, writer, dicts),
         Mode::Test | Mode::List | Mode::Train => {
             unreachable!("test / list / train modes never stream to a writer here")
         }
@@ -1560,7 +1651,7 @@ fn write_stream_to_file<R: Read>(
     mut reader: R,
     output: &Path,
     size_hint: Option<u64>,
-    dict: Option<&[u8]>,
+    dicts: &Dictionaries,
     source_permissions: Option<fs::Permissions>,
 ) -> Result<()> {
     ensure_regular_output_destination(output)?;
@@ -1581,7 +1672,7 @@ fn write_stream_to_file<R: Read>(
     }
     let result: Result<()> = (|| {
         let mut sink = temp_file;
-        run_stream_core(opts, &mut reader, &mut sink, size_hint, dict)?;
+        run_stream_core(opts, &mut reader, &mut sink, size_hint, dicts)?;
         sink.flush().wrap_err("failed to flush output")?;
         Ok(())
     })();
@@ -1618,7 +1709,7 @@ fn derive_output_path(opts: &Options, input: &Path) -> Result<PathBuf> {
     }
 }
 
-fn process_file(opts: &Options, input: &Path, dict: Option<&[u8]>) -> Result<()> {
+fn process_file(opts: &Options, input: &Path, dicts: &Dictionaries) -> Result<()> {
     let source = File::open(input)
         .wrap_err_with(|| format!("failed to open input file {}", input.display()))?;
     let metadata = source.metadata()?;
@@ -1634,7 +1725,7 @@ fn process_file(opts: &Options, input: &Path, dict: Option<&[u8]>) -> Result<()>
 
     // Test mode: decompress into the void, report integrity.
     if opts.mode == Mode::Test {
-        decompress_stream(&mut reader, io::sink(), dict)?;
+        decompress_stream(&mut reader, io::sink(), dicts)?;
         info!("{}: OK", input.display());
         return Ok(());
     }
@@ -1650,7 +1741,7 @@ fn process_file(opts: &Options, input: &Path, dict: Option<&[u8]>) -> Result<()>
             guard_binary_stdout(stdout.is_terminal(), opts.force)?;
         }
         let mut out = stdout.lock();
-        run_stream_core(opts, &mut reader, &mut out, pledged_size, dict)?;
+        run_stream_core(opts, &mut reader, &mut out, pledged_size, dicts)?;
         return remove_source_if_requested(opts, input);
     }
 
@@ -1661,7 +1752,7 @@ fn process_file(opts: &Options, input: &Path, dict: Option<&[u8]>) -> Result<()>
         reader,
         &output,
         pledged_size,
-        dict,
+        dicts,
         Some(metadata.permissions()),
     )?;
 
@@ -1712,7 +1803,7 @@ fn compress_stream<R: Read, W: Write>(
     mut reader: R,
     writer: W,
     settings: &FrameSettings,
-    dict: Option<&[u8]>,
+    dicts: &Dictionaries,
 ) -> Result<()> {
     let &FrameSettings {
         level,
@@ -1780,20 +1871,12 @@ fn compress_stream<R: Read, W: Write>(
             .set_source_size_hint(size)
             .wrap_err("failed to set source size hint")?;
     }
-    // An empty file is no dictionary rather than a broken one: loading a
-    // zero-size dictionary returns to no-dictionary mode, so `-D` on an empty
-    // file compresses plainly instead of failing before the input is read.
-    if let Some(raw) = dict.filter(|raw| !raw.is_empty()) {
-        // Whatever `-D` was pointed at: a trained dictionary, or any file at
-        // all, taken as raw content the way upstream does. Loaded through the
-        // constructor that keeps the blob's own length, since that is what the
-        // compression-parameter tier is chosen by — parsing first and handing
-        // over the content would key it on the wrong size.
-        let parsed =
-            structured_zstd::encoding::EncoderDictionary::from_serialized_or_raw_content(raw)
-                .map_err(|err| eyre!("invalid dictionary: {err:?}"))?;
+    // Parsed once for the whole run; the encoder takes ownership of what it is
+    // primed with, so each frame gets a copy of those tables rather than
+    // building them again from the blob.
+    if let Some(prepared) = &dicts.encoder {
         encoder
-            .set_encoder_dictionary(parsed)
+            .set_encoder_dictionary(prepared.clone())
             .wrap_err("failed to load dictionary for compression")?;
     }
     io::copy(&mut reader, &mut encoder).wrap_err("streaming compression failed")?;
@@ -1812,22 +1895,14 @@ fn compress_stream<R: Read, W: Write>(
 fn decompress_stream<R: Read, W: Write>(
     reader: R,
     mut writer: W,
-    dict: Option<&[u8]>,
+    dicts: &Dictionaries,
 ) -> Result<()> {
     use structured_zstd::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
 
-    // Decoded once rather than per frame: every frame in the stream is primed
-    // with the same dictionary. An empty file is no dictionary rather than a
-    // broken one, the same way it is on the compressing side.
-    let handle = match dict.filter(|raw| !raw.is_empty()) {
-        Some(raw) => Some(
-            structured_zstd::decoding::DictionaryHandle::from_dictionary(
-                structured_zstd::decoding::Dictionary::from_serialized_or_raw_content(raw)
-                    .map_err(|err| eyre!("failed to parse dictionary: {err:?}"))?,
-            ),
-        ),
-        None => None,
-    };
+    // Parsed once for the whole run rather than per stream or per frame: every
+    // frame here is primed with the same dictionary, and the handle is shared,
+    // so priming costs a reference rather than a rebuild.
+    let handle = dicts.decoder.as_ref();
     // Buffered so the end of the stream can be told from the start of another
     // frame without consuming the bytes that answer the question.
     let mut source = BufReader::new(reader);
