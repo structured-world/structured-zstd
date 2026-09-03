@@ -150,6 +150,23 @@ fn a_new_output_inherits_the_source_permissions() {
     );
 }
 
+/// The summary is printed when the reader is done, and "done" is the reader
+/// saying so — not the byte count matching a number from a directory entry. A
+/// FIFO reports zero, a file can shrink after it was measured, and in both
+/// cases a monitor that waits for the two to meet waits forever.
+#[test]
+fn progress_finishes_when_the_reader_does_not_when_the_count_matches() {
+    // A reader with more bytes than the total it was created with.
+    let mut monitor = ProgressMonitor::new(&b"bytes that were not counted"[..], 0);
+    let mut sink = Vec::new();
+    io::copy(&mut monitor, &mut sink).expect("copying must succeed");
+    assert!(
+        monitor.finished,
+        "the reader reached its end, so the monitor has to be finished too"
+    );
+    assert_eq!(monitor.read, sink.len() as u64, "and count what it read");
+}
+
 /// Both directions stream, so a file only has to fit the window, never memory.
 /// Measuring its length in `usize` puts a 4 GiB ceiling on 32-bit targets that
 /// has nothing to do with what the work needs — the progress counter would be
@@ -881,10 +898,10 @@ fn the_memory_limit_only_binds_the_paths_that_decode() {
 fn the_memory_limit_counts_the_dictionary_it_was_given() {
     // A limit that clears the decoder's own floor with room to spare.
     let generous = 300 * (1 << 20);
-    check_memory_limit(generous, 0).expect("no dictionary, comfortably above the floor");
-    check_memory_limit(generous, 4096).expect("a small dictionary still fits");
+    check_memory_limit(generous, 0, 2).expect("no dictionary, comfortably above the floor");
+    check_memory_limit(generous, 4096, 2).expect("a small dictionary still fits");
     // The same limit, against a dictionary that eats the headroom.
-    let err = check_memory_limit(generous, 120 * (1 << 20))
+    let err = check_memory_limit(generous, 120 * (1 << 20), 2)
         .expect_err("a dictionary this size does not fit under the requested limit");
     assert!(
         err.to_string().contains("whole-file buffers"),
@@ -992,6 +1009,84 @@ fn separate_benchmarking_measures_one_file_at_a_time() {
 
     separately.expect("one file at a time fits under this limit");
     together.expect_err("both files at once do not");
+}
+
+/// Benchmarking reads its inputs whole, so it needs files with an end and a
+/// length that means something. A FIFO blocks on a read that never returns and
+/// a character device grows the buffer until the allocator gives up; neither
+/// reports a size the memory ceiling could be weighed against.
+#[cfg(unix)]
+#[test]
+fn benchmarking_refuses_inputs_that_are_not_regular_files() {
+    let dir = std::env::temp_dir();
+    let fifo = dir.join(format!("szstd-benchfifo-{}", std::process::id()));
+    let _ = fs::remove_file(&fifo);
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !made {
+        return;
+    }
+
+    let mut opts = parse(&["-b3", "f"]).unwrap();
+    opts.inputs = vec![fifo.clone()];
+    let refused = run_benchmark(&opts, None);
+    let _ = fs::remove_file(&fifo);
+
+    let err = refused
+        .expect_err("a FIFO is not something to benchmark")
+        .to_string();
+    assert!(
+        err.contains("regular files"),
+        "the refusal must name what is wrong with the input: {err}"
+    );
+}
+
+/// A size that is not an allocation — a sparse file's apparent length — can be
+/// enormous, and the accounting must answer it rather than panic on the
+/// arithmetic or wrap into a number that accepts a limit it cannot keep.
+#[test]
+fn the_memory_accounting_answers_absurd_sizes_instead_of_overflowing() {
+    let err = check_memory_limit(u64::MAX, u64::MAX, 2)
+        .expect_err("a size that large cannot fit under any limit");
+    assert!(
+        err.to_string().contains("memory limit"),
+        "the refusal must be the limit, not an arithmetic accident: {err}"
+    );
+    // Just under the doubling boundary, which the naive multiply wraps through.
+    assert!(check_memory_limit(u64::MAX, u64::MAX / 2 + 1, 2).is_err());
+}
+
+/// Benchmarking holds the input, its compressed form and the decompressed copy
+/// at once. On incompressible input the compressed form is no smaller than the
+/// input, so a ceiling that counts two buffers is exceeded by a third.
+#[test]
+fn the_memory_limit_counts_the_compressed_benchmark_buffer() {
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("szstd-incompressible-{}.bin", std::process::id()));
+    // Counter bytes: nothing to match, so the frame is no smaller than the input.
+    let payload: Vec<u8> = (0..64u32 * 1024)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+        .collect();
+    fs::write(&path, &payload).unwrap();
+
+    let mut opts = parse(&["-b3", "f"]).unwrap();
+    opts.inputs = vec![path.clone()];
+    // Room for two 64 KiB buffers above the decoder's floor, not for three.
+    opts.memory_limit =
+        Some(structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE + (1 << 20) + 160 * 1024);
+    let refused = run_benchmark(&opts, None);
+    let _ = fs::remove_file(&path);
+
+    let err = refused
+        .expect_err("three buffers do not fit a limit sized for two")
+        .to_string();
+    assert!(
+        err.contains("memory limit"),
+        "the refusal must be the limit: {err}"
+    );
 }
 
 /// The dictionary and the benchmark's buffers are held at the same time, so a

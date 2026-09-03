@@ -28,13 +28,15 @@ pub struct ProgressMonitor<R: Read> {
     pub total: u64,
     /// Amount read so far
     pub read: u64,
+    /// Whether the summary has been printed, which happens once the reader
+    /// says it is done.
+    pub finished: bool,
     /// The internal reader
     reader: R,
     started: Instant,
     last_draw: Instant,
     /// Only draw when stderr is a terminal: piped output must stay clean.
     interactive: bool,
-    finished: bool,
 }
 
 impl<R: Read> ProgressMonitor<R> {
@@ -85,9 +87,17 @@ impl<R: Read> ProgressMonitor<R> {
         let _ = err.flush();
     }
 
-    /// This function is called whenever a new read is made, and is responsible for updating the UI
-    fn update(&mut self) {
-        if self.total == self.read && !self.finished {
+    /// Called after each read, with what that read returned.
+    ///
+    /// The end of the work is the reader saying it has no more, not the byte
+    /// count meeting a number from a directory entry: a FIFO reports zero, and
+    /// a file can shrink after it was measured. Waiting for the two to meet
+    /// leaves the bar redrawing and the summary unprinted. A known total that
+    /// is reached still finishes right away, so a regular file's summary
+    /// arrives with its last byte rather than a read later.
+    fn update(&mut self, last_read: usize) {
+        let done = last_read == 0 || (self.total > 0 && self.read >= self.total);
+        if done && !self.finished {
             self.finished = true;
             // Clear the bar's line before the summary, or the leftovers of the
             // longer bar line trail after it.
@@ -96,15 +106,17 @@ impl<R: Read> ProgressMonitor<R> {
                 let _ = write!(err, "\r{:width$}\r", "", width = BAR_WIDTH + 48);
                 let _ = err.flush();
             }
+            // Reported from what was actually read: the declared total can be
+            // zero for a stream, or stale for a file that changed size.
             let elapsed = self.started.elapsed();
             let rate = if elapsed.as_secs_f64() > 0.0 {
-                fmt_size(self.total as f64 / elapsed.as_secs_f64())
+                fmt_size(self.read as f64 / elapsed.as_secs_f64())
             } else {
-                fmt_size(self.total as f64)
+                fmt_size(self.read as f64)
             };
             eprintln!(
                 "processed {} in {} ({rate}/s avg)",
-                fmt_size(self.total as f64),
+                fmt_size(self.read as f64),
                 fmt_duration(elapsed),
             );
         } else {
@@ -121,7 +133,7 @@ impl<R: Read> Read for ProgressMonitor<R> {
         // One read is bounded by the buffer, so only the running total needs
         // the wider type.
         self.read += out as u64;
-        self.update();
+        self.update(out);
         Ok(out)
     }
 }

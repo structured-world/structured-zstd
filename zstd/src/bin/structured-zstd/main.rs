@@ -198,12 +198,12 @@ fn parse_memory_limit(text: &str) -> Result<u64> {
 /// promise this build cannot make, and saying nothing would leave the caller
 /// believing a bound that is not there.
 ///
-/// `whole_file_bytes` is what this run holds in full rather than streams,
-/// counted twice because each such buffer exists in two forms at once: the `-D`
-/// dictionary as read and again as parsed, a benchmark's input and its
-/// round-tripped copy. Either can break the promise on its own, so it is
-/// weighed from the file sizes before anything is loaded.
-fn check_memory_limit(requested: u64, whole_file_bytes: u64) -> Result<()> {
+/// `whole_file_bytes` is what this run holds in full rather than streams, and
+/// `copies` is how many forms of it exist at once: the `-D` dictionary is held
+/// as read and again as parsed, a benchmark holds its input, the compressed
+/// frame and the decompressed copy. Any of them can break the promise alone, so
+/// they are weighed from the file sizes before anything is loaded.
+fn check_memory_limit(requested: u64, whole_file_bytes: u64, copies: u64) -> Result<()> {
     /// Window ceiling the decoder refuses to exceed.
     const WINDOW: u64 = structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE;
     /// What the decoder holds BESIDES the window, rounded well up: the literal
@@ -212,19 +212,29 @@ fn check_memory_limit(requested: u64, whole_file_bytes: u64) -> Result<()> {
     /// Counted because the promise is about total memory, not about one
     /// allocation: a limit equal to the window alone is one we would break.
     const AUXILIARY: u64 = 1 << 20;
-    // Plain arithmetic: these are file sizes on their way into memory, so they
-    // are real allocations and nowhere near half of `u64`.
-    let buffers = whole_file_bytes * 2;
-    let floor = WINDOW + AUXILIARY + buffers;
+    // A size here is what a directory entry claims, not what was allocated, and
+    // a sparse file can claim more than memory could ever hold. Arithmetic that
+    // leaves the type is therefore a real input, not a theoretical one: a
+    // wrapped total would accept a limit nothing could keep. Nothing that
+    // overflows fits under any limit, so the failure is the ordinary refusal.
+    let buffers = whole_file_bytes
+        .checked_mul(copies)
+        .and_then(|buffers| buffers.checked_add(WINDOW + AUXILIARY));
+    let Some(floor) = buffers else {
+        bail!(
+            "requested memory limit {requested} B cannot cover this run: the files it \
+             would hold add up to more than any machine can address."
+        );
+    };
     if requested < floor {
-        if buffers > 0 {
+        if floor > WINDOW + AUXILIARY {
             bail!(
                 "requested memory limit {requested} B does not cover this run: a {} MiB \
                  window, about {} MiB of literal, block, sequence and table buffers, and \
-                 {} MiB of whole-file buffers, each of which is held in two forms at once.",
+                 {} MiB of whole-file buffers, each held in {copies} forms at once.",
                 WINDOW / (1 << 20),
                 AUXILIARY / (1 << 20),
-                buffers / (1 << 20),
+                (floor - WINDOW - AUXILIARY) / (1 << 20),
             );
         }
         bail!(
@@ -724,7 +734,7 @@ fn parse_args(
     if let Some(limit) = opts.memory_limit
         && decodes(&opts)
     {
-        check_memory_limit(limit, 0)?;
+        check_memory_limit(limit, 0, 0)?;
     }
     validate_level(opts.level)?;
     // `-o` names a single output, so it can't fan out over multiple inputs —
@@ -869,7 +879,8 @@ fn load_dictionary(opts: &Options) -> Result<Option<Vec<u8>>> {
     if let Some(limit) = opts.memory_limit
         && decodes(opts)
     {
-        check_memory_limit(limit, size)?;
+        // As read and again as parsed.
+        check_memory_limit(limit, size, 2)?;
     }
 
     let file = File::open(path)
@@ -932,34 +943,48 @@ fn run(opts: Options) -> Result<()> {
 /// `zstd -b#` (per-level row); honours `-D` so dictionary throughput can be
 /// measured. Time-budgeted per level rather than fixed-iteration.
 fn run_benchmark(opts: &Options, dict: Option<&[u8]>) -> Result<()> {
-    if opts.inputs.is_empty() || opts.inputs.iter().any(|i| i == "-") {
+    if opts.inputs.is_empty() {
         bail!("-b requires one or more regular input files to benchmark");
     }
-    // Benchmarking is the one path that holds whole files: the inputs
-    // concatenated, and a decompressed copy of them per pass. That dwarfs the
-    // decoder's own workspace, so a ceiling that ignored it would be kept in
-    // the small and broken in the large. Weighed from the directory entries,
-    // before a byte is read.
+    // Benchmarking is the one path that holds whole files, so it needs inputs
+    // with an end and a length that means something. A FIFO would block on the
+    // read that never returns, a character device would grow the buffer until
+    // the allocator gave up, and neither reports a size the ceiling below could
+    // be weighed against. Settled before any of them is opened.
+    let mut sum = 0u64;
+    let mut largest = 0u64;
+    for input in &opts.inputs {
+        let metadata = fs::metadata(input)
+            .wrap_err_with(|| format!("failed to inspect {}", input.display()))?;
+        if !metadata.is_file() {
+            bail!("-b needs regular files: {} is not one", input.display());
+        }
+        sum = sum
+            .checked_add(metadata.len())
+            .ok_or_else(|| eyre!("the inputs add up to more than any machine can address"))?;
+        largest = largest.max(metadata.len());
+    }
+
+    // Those whole-file buffers dwarf the decoder's own workspace, so a ceiling
+    // that ignored them would be kept in the small and broken in the large.
     if let Some(limit) = opts.memory_limit {
-        // The dictionary is held for the whole run alongside these buffers, so
-        // it is counted here rather than checked on its own: two allocations
-        // that each clear the ceiling separately can still exceed it together.
         // With `-S` only one input is in memory at a time, so the largest file
         // is what has to fit rather than their sum.
-        let dictionary = dict.map_or(0, |bytes| bytes.len() as u64);
-        let mut sum = 0u64;
-        let mut largest = 0u64;
-        for input in &opts.inputs {
-            let len = fs::metadata(input)
-                .wrap_err_with(|| format!("failed to inspect {}", input.display()))?
-                .len();
-            sum += len;
-            largest = largest.max(len);
-        }
-        // The input and the round-tripped copy; the compressed form is smaller
-        // than either on anything worth benchmarking.
         let inputs = if opts.bench_separately { largest } else { sum };
-        check_memory_limit(limit, dictionary + inputs)?;
+        // Three forms of the input at once: the bytes themselves, the frame
+        // they compress to, and the decompressed copy each pass builds. The
+        // frame is no smaller than the input when the input does not compress,
+        // which is exactly the case a ceiling has to survive.
+        check_memory_limit(limit, inputs, 3)?;
+        // The dictionary is held alongside them for the whole run, and is
+        // counted with them rather than on its own: two allocations that each
+        // clear the ceiling separately can still exceed it together.
+        if let Some(bytes) = dict {
+            let total = inputs
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| eyre!("the inputs add up to more than any machine can address"))?;
+            check_memory_limit(limit, total, 3)?;
+        }
     }
 
     if opts.bench_separately {
