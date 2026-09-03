@@ -571,7 +571,8 @@ impl HuffmanTable {
             // srcSize, maxSV, minus=1) (huf_compress.c:1286), height-limit to it,
             // not the raw natural height (11) which can cost a few bytes vs C.
             build_limited_weights_into(counts, cheap_huf_table_log(counts), scratch);
-            Self::build_from_weights(&scratch.weights)
+            let spare = scratch.spare_table.take();
+            Self::build_from_weights_reusing(&scratch.weights, spare)
         }
     }
 
@@ -827,6 +828,17 @@ impl HuffmanTable {
     }
 
     pub fn build_from_weights(weights: &[usize]) -> Self {
+        Self::build_from_weights_reusing(weights, None)
+    }
+
+    /// [`Self::build_from_weights`] writing into a table the caller is done
+    /// with. The code arrays are the format's widest alphabet, so creating one
+    /// zeroes four kibibytes however few symbols the table covers — measured at
+    /// about 4% of level 3 when every build paid it. The reference does not:
+    /// its tables live in block states that persist and are re-initialised only
+    /// up to the alphabet in hand. Reusing a table does the same here, and only
+    /// the live prefix is cleared.
+    pub(crate) fn build_from_weights_reusing(weights: &[usize], spare: Option<Self>) -> Self {
         let weight_sum = weights
             .iter()
             .copied()
@@ -837,15 +849,31 @@ impl HuffmanTable {
             panic!("This is an internal error");
         }
         let table_log = highest_bit_set(weight_sum) - 1;
-        let mut table = HuffmanTable {
-            codes: alloc::boxed::Box::new(HuffmanCodes {
-                codes: [(0, 0); MAX_HUFFMAN_ALPHABET],
-                packed: [0u64; MAX_HUFFMAN_ALPHABET],
-            }),
-            len: weights.len(),
-            table_log: table_log as u32,
-            #[cfg(feature = "std")]
-            cached_encoded_weight_description: CachedDescription::new(),
+        let mut table = match spare {
+            Some(mut spare) => {
+                // Only the alphabet in hand is read afterwards, so only it is
+                // cleared: the fill below writes the symbols that carry a
+                // weight and leaves zero to mean "no code" for the rest.
+                spare.codes.codes[..weights.len()].fill((0, 0));
+                spare.codes.packed[..weights.len()].fill(0);
+                spare.len = weights.len();
+                spare.table_log = table_log as u32;
+                #[cfg(feature = "std")]
+                {
+                    spare.cached_encoded_weight_description = CachedDescription::new();
+                }
+                spare
+            }
+            None => HuffmanTable {
+                codes: alloc::boxed::Box::new(HuffmanCodes {
+                    codes: [(0, 0); MAX_HUFFMAN_ALPHABET],
+                    packed: [0u64; MAX_HUFFMAN_ALPHABET],
+                }),
+                len: weights.len(),
+                table_log: table_log as u32,
+                #[cfg(feature = "std")]
+                cached_encoded_weight_description: CachedDescription::new(),
+            },
         };
         let mut nb_per_rank = [0u16; 13];
         for &weight in weights {
@@ -1329,6 +1357,16 @@ pub(crate) struct WeightScratch {
     leaves: Vec<HuffNode>,
     work: Vec<HuffNode>,
     weights: Vec<usize>,
+    /// A table the caller has finished with, handed back so the next build
+    /// writes into it instead of creating and zeroing a new one.
+    spare_table: Option<HuffmanTable>,
+}
+
+impl WeightScratch {
+    /// Park a table the caller is done with, for the next build to fill.
+    pub(crate) fn recycle(&mut self, table: HuffmanTable) {
+        self.spare_table = Some(table);
+    }
 }
 
 /// [`build_limited_weights`] filling caller-owned scratch. The weights land in

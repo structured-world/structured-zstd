@@ -927,7 +927,7 @@ impl<M: Matcher> CompressState<M> {
     #[inline]
     pub(crate) fn clear_huff_table(&mut self) {
         if let Some(table) = self.last_huff_table.take() {
-            self.huff_table_spare = Some(table);
+            self.park_huff_table(table);
         }
     }
 
@@ -936,7 +936,22 @@ impl<M: Matcher> CompressState<M> {
     #[inline]
     pub(crate) fn replace_huff_table(&mut self, table: crate::huff0::huff0_encoder::HuffmanTable) {
         if let Some(old) = self.last_huff_table.replace(table) {
-            self.huff_table_spare = Some(old);
+            self.park_huff_table(old);
+        }
+    }
+
+    /// Keeps a table rather than dropping it. The dictionary seed wants one
+    /// spare to `clone_from` into, once per frame; every further table a block
+    /// displaces goes to the weight builder, which takes one per block and per
+    /// split candidate. Overwriting the single spare dropped the previous table
+    /// on every block, and the build that followed had to create and zero a new
+    /// one.
+    #[inline]
+    fn park_huff_table(&mut self, table: crate::huff0::huff0_encoder::HuffmanTable) {
+        if self.huff_table_spare.is_none() {
+            self.huff_table_spare = Some(table);
+        } else {
+            self.huff_weights.recycle(table);
         }
     }
 }
