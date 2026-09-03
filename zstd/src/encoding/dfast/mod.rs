@@ -2595,48 +2595,46 @@ macro_rules! start_matching_fast_loop_body {
                 // Long match check at ip0 with idxl0. 8-byte equality
                 // gate (`MEM_read64`) — if it passes, candidate is real.
                 //
-                // Validity selects the ADDRESS rather than guarding the load,
-                // which is upstream's `ZSTD_selectAddr` shape
-                // (`zstd_double_fast.c:203`): an out-of-window candidate reads a
-                // harmless stand-in, the 8-byte compare runs unconditionally, and
-                // the only branch left is the one taken when those eight bytes
-                // agree — which is rare, hence predictable. Upstream's comment
-                // records the gate itself as "(somewhat) unpredictable".
+                // Branchy validity rather than a branchless `in_long` mask: the
+                // slot-populated / in-window / before-cursor checks are highly
+                // predictable once the table is warm, so the branch predictor
+                // speculates the hot 8-byte candidate load past them. A
+                // branchless mask instead makes the load ADDRESS depend on the
+                // mask (`cand_idx &= -(in_long)`), serialising the loop's single
+                // hottest instruction (~13% self-time on z000033) behind the
+                // mask — a stall the predictor cannot hide.
                 //
-                // The stand-in is `block_ptr`, not a dedicated dummy buffer:
-                // eight bytes are always readable there (the loop runs only while
-                // `ip1 + 8 <= block_len`) and it is already live, so the select
-                // costs no register. Should those eight bytes happen to equal
-                // `v8_0`, `in_long` still rejects them.
-                {
-                    // Wrapping throughout: an empty or stale slot makes these
-                    // meaningless, and they are never dereferenced in that case.
-                    // `wrapping_add` on a pointer stays defined until it is read.
-                    let cand_pos = position_base
-                        .wrapping_add(idxl0 as usize)
-                        .wrapping_sub(1);
-                    let in_long = (idxl0 != DFAST_EMPTY_SLOT) & (cand_pos >= wlow0);
-                    let cand_idx = cand_pos.wrapping_sub(history_abs_start);
-                    let probe_ptr = if in_long {
-                        history_base_ptr.wrapping_add(history_start_offset.wrapping_add(cand_idx))
-                    } else {
-                        block_ptr
-                    };
-                    // SAFETY: `in_long` picked either an in-window concat index —
-                    // same buffer and length bounds as `v8_0` — or `block_ptr`,
-                    // which has eight readable bytes for as long as this loop runs.
-                    let cand_v8 = unsafe { (probe_ptr as *const u64).read_unaligned() };
-                    if (cand_v8 == v8_0) & in_long {
-                        {
-                            // Every slot this loop reads was written at a strictly
-                            // earlier position — `idxs0` is loaded before this
-                            // iteration's store, and `idxl0` is carried from the
-                            // previous one — so the upper bound the gate used to
-                            // spend a compare on holds by construction.
-                            debug_assert!(
-                                cand_pos < abs_ip0,
-                                "long candidate {cand_pos} at or past the cursor {abs_ip0}",
-                            );
+                // Upstream disagrees and selects the ADDRESS instead
+                // (`ZSTD_selectAddr`, `zstd_double_fast.c:203`): a rejected
+                // candidate reads a stand-in, the compare runs unconditionally,
+                // and its comment calls the gate "(somewhat) unpredictable".
+                // Ported here — cmov between the candidate and `block_ptr`, so
+                // not even a register spent on the stand-in — that shape measured
+                // 2.0% worse in cycles across three interleaved alternations
+                // (962-972 vs 979-994, no overlap). The gate is predictable in
+                // OUR table, so branching skips the load rather than waiting on a
+                // cmov to address it.
+                if idxl0 != DFAST_EMPTY_SLOT {
+                    let cand_pos = position_base + ((idxl0 as usize) - 1);
+                    // Window floor only. Every slot this loop reads was written
+                    // at a strictly earlier position — `idxs0` is loaded before
+                    // this iteration's store, and `idxl0` is carried from the
+                    // previous one — so the upper bound the gate used to spend a
+                    // compare on holds by construction and is asserted instead.
+                    debug_assert!(
+                        cand_pos < abs_ip0,
+                        "long candidate {cand_pos} at or past the cursor {abs_ip0}",
+                    );
+                    if cand_pos >= wlow0 {
+                        let cand_idx = cand_pos - history_abs_start;
+                        // SAFETY: the bounds above make `cand_idx` a valid
+                        // in-window concat index, so the 8-byte load stays in
+                        // live history (same buffer/length bounds as `v8_0`).
+                        let cand_v8 = unsafe {
+                            (history_base_ptr.add(history_start_offset + cand_idx) as *const u64)
+                                .read_unaligned()
+                        };
+                        if cand_v8 == v8_0 {
                             {
                             // 8 bytes match; count forward + extend back.
                             let mut match_len = 8usize;
