@@ -30,6 +30,37 @@ fn a_non_utf8_argument_survives_parsing() {
     );
 }
 
+/// A path attached to its option — `-Dname`, `-oname`, `--use-dict=name` — is
+/// the same bytes as one given separately, and has to survive the same way.
+/// Deriving it from the lossy view of the whole argument aims the command at a
+/// replacement-character filename that is not the one asked for.
+#[cfg(unix)]
+#[test]
+fn attached_path_options_keep_their_bytes() {
+    use std::ffi::{OsStr, OsString};
+    use std::os::unix::ffi::OsStrExt;
+
+    let name = OsStr::from_bytes(b"weird\xffname");
+    let expected = PathBuf::from(name);
+
+    let attached = |flag: &[u8]| -> Options {
+        let mut arg = flag.to_vec();
+        arg.extend_from_slice(name.as_bytes());
+        let args = vec![OsString::from(OsStr::from_bytes(&arg)), OsString::from("f")];
+        match parse_args(&args, Mode::Compress, false).expect("parsing must not fail") {
+            Parsed::Run(opts) => opts,
+            Parsed::Handled => panic!("unexpected help/version"),
+        }
+    };
+
+    assert_eq!(attached(b"-D").dict.as_deref(), Some(expected.as_path()));
+    assert_eq!(attached(b"-o").output.as_deref(), Some(expected.as_path()));
+    assert_eq!(
+        attached(b"--use-dict=").dict.as_deref(),
+        Some(expected.as_path())
+    );
+}
+
 #[test]
 fn extension_added() {
     assert_eq!(
@@ -631,6 +662,17 @@ fn out_of_range_long_window_log_is_refused() {
     assert!(parse(&["-19", "--long=28", "in.txt"]).is_err());
 }
 
+/// A benchmark range is two levels, and both of them run. Checking only the
+/// top lets `-b-200000` through parsing, so the files are stat'd and read whole
+/// before the first level is rejected — work for a command that was never going
+/// to run.
+#[test]
+fn a_benchmark_range_is_validated_at_both_ends() {
+    assert!(parse(&["-b-200000", "in.txt"]).is_err());
+    assert!(parse(&["-b3", "-e200000", "in.txt"]).is_err());
+    assert!(parse(&["-b1", "-e19", "in.txt"]).is_ok());
+}
+
 #[test]
 fn benchmark_flags_parse_level_range() {
     let opts = parse(&["-b3", "-e7", "in.txt"]).unwrap();
@@ -1038,6 +1080,36 @@ fn benchmarking_refuses_inputs_that_are_not_regular_files() {
     let err = refused
         .expect_err("a FIFO is not something to benchmark")
         .to_string();
+    assert!(
+        err.contains("regular files"),
+        "the refusal must name what is wrong with the input: {err}"
+    );
+}
+
+/// Listing walks frame headers by seeking, so it needs a file that can seek.
+/// Opening a FIFO instead blocks until a writer appears — the command hangs
+/// where it should have said what was wrong with the argument.
+#[cfg(unix)]
+#[test]
+fn listing_refuses_inputs_that_are_not_regular_files() {
+    let dir = std::env::temp_dir();
+    let fifo = dir.join(format!("szstd-listfifo-{}", std::process::id()));
+    let _ = fs::remove_file(&fifo);
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !made {
+        return;
+    }
+
+    let mut opts = parse(&["-l", "f"]).unwrap();
+    opts.inputs = vec![fifo.clone()];
+    let refused = run(opts);
+    let _ = fs::remove_file(&fifo);
+
+    let err = refused.expect_err("a FIFO cannot be listed").to_string();
     assert!(
         err.contains("regular files"),
         "the refusal must name what is wrong with the input: {err}"

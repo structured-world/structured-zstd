@@ -508,8 +508,8 @@ fn parse_args(
                             bail!("--fast level must be at least 1, got 0");
                         }
                         opts.level = -i32::try_from(n).wrap_err("--fast level too large")?;
-                    } else if let Some(path) = long.strip_prefix("use-dict=") {
-                        opts.dict = Some(PathBuf::from(path));
+                    } else if long.starts_with("use-dict=") {
+                        opts.dict = Some(attached_path(arg_os, "--use-dict=".len()));
                     } else if let Some(v) = long.strip_prefix("maxdict=") {
                         opts.max_dict = v.parse::<usize>().wrap_err("invalid --maxdict size")?;
                     } else if let Some(v) = long.strip_prefix("dictID=") {
@@ -690,17 +690,16 @@ fn parse_args(
                 }
                 'D' | 'o' => {
                     // Value is the rest of this token, or the next argument.
-                    // Taken from the argument itself when it is a whole one, so
-                    // a path that is not UTF-8 survives; an attached value goes
-                    // through the lossy view, which is the one place a name
-                    // like `-Dweird\xff` cannot be kept byte-for-byte.
-                    let rest: String = chars[ci + 1..].iter().collect();
-                    let value = if rest.is_empty() {
+                    // Either way it comes off the original argument, so a path
+                    // that is not UTF-8 reaches the filesystem as given. The
+                    // flags scanned so far are all ASCII, one byte each, so the
+                    // value starts at `ci + 2`: the leading `-` plus them.
+                    let value = if ci + 1 == chars.len() {
                         iter.next()
                             .map(|(_, v)| PathBuf::from(v))
                             .ok_or_else(|| eyre!("option -{c} requires a value"))?
                     } else {
-                        PathBuf::from(rest)
+                        attached_path(arg_os, ci + 2)
                     };
                     if c == 'D' {
                         opts.dict = Some(value);
@@ -749,11 +748,18 @@ fn parse_args(
     // name. Benchmarking compresses the range `-b`/`-e` give rather than the
     // level `-N` set, so the gate reads the range's top when there is one —
     // `-b20` reaches an ultra level as surely as `-20` does.
-    let highest_level = if opts.bench {
-        opts.bench_start.max(opts.bench_end)
+    let (lowest_level, highest_level) = if opts.bench {
+        (
+            opts.bench_start.min(opts.bench_end),
+            opts.bench_start.max(opts.bench_end),
+        )
     } else {
-        opts.level
+        (opts.level, opts.level)
     };
+    // Both ends run, so both are checked here rather than at the level that
+    // reaches them: a range starting below the scale would otherwise stat and
+    // read every input before the first pass refused it.
+    validate_level(lowest_level)?;
     validate_level(highest_level)?;
     if !ultra && highest_level > 19 {
         bail!("level {highest_level} requires --ultra (levels 20-22)");
@@ -776,6 +782,27 @@ fn parse_args(
         );
     }
     Ok(Parsed::Run(opts))
+}
+
+/// The part of `arg` from byte `at`, as the bytes it was given in.
+///
+/// An attached path — `-Dname`, `--use-dict=name` — is the same filename as one
+/// passed separately and has to survive the same way, so it comes off the
+/// original argument rather than off the lossy view the option spelling was
+/// matched against. `at` must land after ASCII only, which every option
+/// spelling is: a lossy conversion replaces non-ASCII sequences alone, so a
+/// prefix that matched there is byte-for-byte the same at the front of `arg`.
+fn attached_path(arg: &std::ffi::OsStr, at: usize) -> PathBuf {
+    let bytes = arg.as_encoded_bytes();
+    debug_assert!(
+        bytes[..at].is_ascii(),
+        "the split point must follow ASCII, or it is not a boundary"
+    );
+    // SAFETY: `bytes` came from an `OsStr` and is split at the end of an ASCII
+    // run, so the remainder is a valid encoded `OsStr` — exactly the
+    // precondition `from_encoded_bytes_unchecked` documents.
+    let rest = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(&bytes[at..]) };
+    PathBuf::from(rest)
 }
 
 /// Whether this run will decode anything, and so whether `-M` binds it.
@@ -915,12 +942,23 @@ fn run(opts: Options) -> Result<()> {
     // `--list` walks frame headers without decoding; it needs a seekable file
     // (not a stream), so it is handled separately from the (de)compress flow.
     if opts.mode == Mode::List {
-        if opts.inputs.is_empty() || opts.inputs.iter().any(|i| i == "-") {
+        if opts.inputs.is_empty() {
             bail!("--list requires regular files (cannot list stdin)");
+        }
+        // The walk seeks between frame headers, so it needs a file that can
+        // seek. Settled for every input before any is opened: opening a FIFO
+        // blocks until a writer appears, and the failure would then arrive
+        // from the seek rather than from the thing that was wrong.
+        for input in &opts.inputs {
+            let metadata = fs::metadata(input)
+                .wrap_err_with(|| format!("failed to inspect {}", input.display()))?;
+            if !metadata.is_file() {
+                bail!("--list needs regular files: {} is not one", input.display());
+            }
         }
         print_list_header();
         for input in &opts.inputs {
-            list_file(Path::new(input))?;
+            list_file(input)?;
         }
         return Ok(());
     }
