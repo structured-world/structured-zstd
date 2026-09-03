@@ -1078,11 +1078,15 @@ fn run(opts: Options) -> Result<()> {
             // that is itself the dictionary is the one file that output cannot
             // be read back without: `--rm -D data data` would leave an archive
             // nothing can open. Removing the source is a convenience, so it
-            // yields to the file that gives the result meaning.
+            // yields to the file that gives the result meaning. Both files are
+            // there to be compared, so identity is asked of the filesystem as
+            // well: a hard link is a second name for one file, and no amount of
+            // resolving either name tells them apart.
             if let Some(dict) = &opts.dict
                 && opts.remove_source
                 && !opts.keep
-                && names_the_same_file(input, dict)?
+                && (names_the_same_file(input, dict)?
+                    || (dict.exists() && paths_point_to_same_file(input, dict)?))
             {
                 bail!(
                     "--rm would delete {}, which is also the dictionary {} needed to read the result",
@@ -1411,14 +1415,42 @@ fn print_list_header() {
 /// Window_Descriptor (RFC 8878 §3.1.1.1).
 const MAX_FRAME_HEADER_LEN: usize = 18;
 
-/// Print one `--list` row: walk every frame in the file (no body decode),
-/// summing compressed + declared content sizes. Decompressed size is `--` when
-/// any frame omits the Frame_Content_Size field.
+/// What one `--list` row says about an archive.
+struct ArchiveSummary {
+    frames: u64,
+    skips: u64,
+    compressed: u64,
+    /// `None` when any frame omits its Frame_Content_Size, since the total is
+    /// then unknowable without decoding.
+    decompressed: Option<u64>,
+    /// Whether any data frame carries a content checksum.
+    ///
+    /// That is the question the reference tool's `Check` column answers, not
+    /// whether every frame carries one: zstd 1.5.7 prints `XXH64` for an
+    /// archive of one checksummed and one unchecked frame — in either order —
+    /// and `None` only when no frame has one. Reporting a mixed state here
+    /// would say something true about the archive in a column scripts read as
+    /// upstream's, so the answer stays the one they parse. Verification is
+    /// per frame regardless: `-t` and `-d` compare every checksum that is
+    /// there, so a frame without one is unchecked whatever this column says.
+    check: bool,
+    /// The dictionary the archive needs, and `None` both when it needs none and
+    /// when its frames name different ones — an archive with no single answer
+    /// has no id to print, and claiming the first frame's would send the reader
+    /// after a dictionary that decodes only part of it.
+    dict_id: Option<u32>,
+    /// Whether the data frames named one dictionary between them. False makes
+    /// the id above absent rather than wrong.
+    dict_ids_agree: bool,
+}
+
+/// Walk every frame in the file (no body decode), summing compressed and
+/// declared content sizes.
 ///
 /// Reads each frame header, then walks the 3-byte block headers by `seek`ing
 /// past every block body, so peak memory stays O(1) regardless of archive size
 /// (a multi-GB file is never loaded whole).
-fn list_file(path: &Path) -> Result<()> {
+fn summarize_archive(path: &Path) -> Result<ArchiveSummary> {
     use std::io::{Seek, SeekFrom};
     use structured_zstd::decoding::errors::ReadFrameHeaderError;
     use structured_zstd::decoding::{FrameContentSize, read_frame_header_info};
@@ -1446,6 +1478,7 @@ fn list_file(path: &Path) -> Result<()> {
     let mut decompressed = Some(0u64);
     let mut check = false;
     let mut dict_id = None;
+    let mut dict_ids_agree = true;
 
     while offset < compressed {
         // Read just enough for the frame header (a short read near EOF is fine —
@@ -1531,17 +1564,50 @@ fn list_file(path: &Path) -> Result<()> {
             }
             FrameContentSize::Unknown => decompressed = None,
         }
+        // Any frame carrying one makes the archive checksummed, which is what
+        // the reference tool reports for a mixed file as well.
         check |= info.content_checksum;
-        // The reported dictionary is the first DATA frame's; a leading metadata
-        // frame counts towards `frames` but carries no header to read it from.
+        // The first DATA frame sets the id; a leading metadata frame counts
+        // towards `frames` but carries no header to read one from. Every later
+        // frame has to agree, because one id is what the column can say: an
+        // archive whose frames name different dictionaries needs more than one
+        // to be read, and the first frame's alone would decode only its own
+        // part.
         if data_frames == 0 {
             dict_id = info.dictionary_id;
+        } else if dict_id != info.dictionary_id {
+            dict_ids_agree = false;
         }
         data_frames += 1;
         frames += 1;
         offset = frame_end;
     }
 
+    Ok(ArchiveSummary {
+        frames,
+        skips,
+        compressed,
+        decompressed,
+        check,
+        dict_id: dict_ids_agree.then_some(dict_id).flatten(),
+        dict_ids_agree,
+    })
+}
+
+/// Print one `--list` row, in the reference tool's `zstd -l` layout.
+///
+/// Decompressed size is `--` when any frame omits its Frame_Content_Size.
+fn list_file(path: &Path) -> Result<()> {
+    let summary = summarize_archive(path)?;
+    let ArchiveSummary {
+        frames,
+        skips,
+        compressed,
+        decompressed,
+        check,
+        dict_id,
+        dict_ids_agree,
+    } = summary;
     let ratio = match decompressed {
         Some(d) if d > 0 => format!("{:.3}", d as f64 / compressed as f64),
         _ => "--".to_string(),
@@ -1550,6 +1616,15 @@ fn list_file(path: &Path) -> Result<()> {
         Some(d) => fmt_size(d as f64),
         None => "--".to_string(),
     };
+    // The column holds one id, so an archive built from several dictionaries
+    // has nothing to put there — said out loud rather than left to the `0`,
+    // which on its own reads as "no dictionary needed".
+    if !dict_ids_agree {
+        info!(
+            "{}: frames use different dictionaries; no single dictionary ID applies",
+            path.display()
+        );
+    }
     println!(
         "{frames:>6}  {skips:>5}  {:>10}  {:>12}  {ratio:>5}  {:>5}  {:>6}  {}",
         fmt_size(compressed as f64),
@@ -1996,15 +2071,20 @@ fn ensure_distinct_paths(input: &Path, output: &Path) -> Result<()> {
 
 /// Whether two paths name the same file, for a path that may not exist yet.
 ///
-/// The preflight compares a derived OUTPUT against files the run reads, and
-/// that output is usually still to be created — `canonicalize` would fail on
-/// it. So each side is resolved as its canonical directory plus its own file
-/// name: the directory exists in both cases, and resolving it collapses `.`,
-/// `..` and symlinked components, which a string comparison cannot. A path
-/// whose directory cannot be resolved names nothing this run could collide
-/// with, so it simply does not match.
+/// A path that is there is resolved whole, so a symlink counts as the file it
+/// points at: `dict-link -> data` and `data` are one file, and a guard that
+/// read the link's own name would let the pair through. The preflight also
+/// compares a derived OUTPUT, which is usually still to be created and which
+/// `canonicalize` therefore cannot resolve; that side falls back to its
+/// canonical directory plus its own file name, which still collapses `.`, `..`
+/// and any symlinked directory above it. A path whose directory cannot be
+/// resolved either names nothing this run could collide with, so it simply does
+/// not match.
 fn names_the_same_file(left: &Path, right: &Path) -> Result<bool> {
     fn resolved(path: &Path) -> Option<PathBuf> {
+        if let Ok(whole) = fs::canonicalize(path) {
+            return Some(whole);
+        }
         let parent = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty());

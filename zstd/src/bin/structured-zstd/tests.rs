@@ -102,6 +102,68 @@ fn list_file_walks_multi_frame_archive_by_seeking() {
     result.expect("list_file must walk both frames without error");
 }
 
+/// The `DictID` column holds one id, and a concatenated archive can need more
+/// than one. Printing the first frame's then sends the reader after a
+/// dictionary that decodes only the start of the file — and when the first
+/// frame needs none, it says no dictionary is needed at all. The reference tool
+/// answers the same way: it warns and shows 0 for such a file.
+#[test]
+fn an_archive_built_from_two_dictionaries_names_neither() {
+    use structured_zstd::encoding::{CompressionLevel, EncoderDictionary, StreamingEncoder};
+
+    /// One frame primed with a dictionary carrying `id`.
+    fn frame_with_dictionary(id: u32, payload: &[u8]) -> Vec<u8> {
+        use structured_zstd::dictionary::{
+            FastCoverOptions, FinalizeOptions, create_fastcover_dict_from_slice,
+        };
+        // Trained rather than assembled: a serialized dictionary carries
+        // entropy tables, and the id the frame header records lives in its
+        // header alongside them.
+        let corpus: Vec<u8> = (0..40_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+            .collect();
+        let mut blob = Vec::new();
+        create_fastcover_dict_from_slice(
+            corpus.as_slice(),
+            &mut blob,
+            8 * 1024,
+            &FastCoverOptions::default(),
+            FinalizeOptions { dict_id: Some(id) },
+        )
+        .expect("training the fixture dictionary must succeed");
+        let mut out = Vec::new();
+        let mut encoder = StreamingEncoder::new(&mut out, CompressionLevel::Default);
+        encoder
+            .set_encoder_dictionary(
+                EncoderDictionary::from_serialized_or_raw_content(&blob)
+                    .expect("the fixture dictionary must parse"),
+            )
+            .expect("attaching before the first write must work");
+        std::io::Write::write_all(&mut encoder, payload).unwrap();
+        encoder.finish().unwrap();
+        out
+    }
+
+    let mut archive = frame_with_dictionary(111, b"first frame payload");
+    archive.extend_from_slice(&frame_with_dictionary(222, b"second frame payload"));
+
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("szstd-mixdict-{}.zst", std::process::id()));
+    fs::write(&path, &archive).unwrap();
+    let summary = summarize_archive(&path);
+    let _ = fs::remove_file(&path);
+
+    let summary = summary.expect("both frames must be walked");
+    assert!(
+        !summary.dict_ids_agree,
+        "the frames name different dictionaries"
+    );
+    assert_eq!(
+        summary.dict_id, None,
+        "so no single id can be reported for the archive"
+    );
+}
+
 /// `--target-compressed-block-size` is what a caller reaches for when they need
 /// bounded latency or block-level processing: smaller blocks flush sooner.
 /// Validating the number and then compressing with the default geometry gives
@@ -226,6 +288,61 @@ fn an_input_that_is_the_dictionary_is_not_removed() {
         err.contains("dictionary"),
         "the refusal must name the collision: {err}"
     );
+    assert_eq!(survived.len(), 8192, "the dictionary must still be there");
+}
+
+/// The same collision reached through a symlink. Resolving only the directory
+/// leaves the last component as written, so `dict-link -> data` and `data` read
+/// as two files; `--rm -D dict-link data` then deletes `data`, the link dangles,
+/// and the archive it just made can never be opened again.
+#[cfg(unix)]
+#[test]
+fn a_symlink_to_the_input_is_still_the_dictionary() {
+    let dir = std::env::temp_dir();
+    let sample = dir.join(format!("szstd-symdict-{}", std::process::id()));
+    let link = dir.join(format!("szstd-symdict-link-{}", std::process::id()));
+    let archive = PathBuf::from(format!("{}.zst", sample.display()));
+    let _ = fs::remove_file(&link);
+    fs::write(&sample, vec![5u8; 8192]).unwrap();
+    std::os::unix::fs::symlink(&sample, &link).unwrap();
+
+    let mut opts = parse(&["--rm", "-f", "a"]).unwrap();
+    opts.inputs = vec![sample.clone()];
+    opts.dict = Some(link.clone());
+    let refused = run(opts);
+
+    let survived = fs::read(&sample).unwrap_or_default();
+    let _ = fs::remove_file(&sample);
+    let _ = fs::remove_file(&link);
+    let _ = fs::remove_file(&archive);
+    refused.expect_err("a link to the input is the dictionary just the same");
+    assert_eq!(survived.len(), 8192, "the dictionary must still be there");
+}
+
+/// And the same collision with no name to resolve at all: a hard link is a
+/// second name for one file, so canonical paths differ while the bytes are the
+/// same. Deleting the input still empties the dictionary.
+#[cfg(unix)]
+#[test]
+fn a_hard_link_to_the_input_is_still_the_dictionary() {
+    let dir = std::env::temp_dir();
+    let sample = dir.join(format!("szstd-harddict-{}", std::process::id()));
+    let link = dir.join(format!("szstd-harddict-link-{}", std::process::id()));
+    let archive = PathBuf::from(format!("{}.zst", sample.display()));
+    let _ = fs::remove_file(&link);
+    fs::write(&sample, vec![6u8; 8192]).unwrap();
+    fs::hard_link(&sample, &link).unwrap();
+
+    let mut opts = parse(&["--rm", "-f", "a"]).unwrap();
+    opts.inputs = vec![sample.clone()];
+    opts.dict = Some(link.clone());
+    let refused = run(opts);
+
+    let survived = fs::read(&link).unwrap_or_default();
+    let _ = fs::remove_file(&sample);
+    let _ = fs::remove_file(&link);
+    let _ = fs::remove_file(&archive);
+    refused.expect_err("another name for the input is the dictionary just the same");
     assert_eq!(survived.len(), 8192, "the dictionary must still be there");
 }
 

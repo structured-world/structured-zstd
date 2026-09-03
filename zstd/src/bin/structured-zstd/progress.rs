@@ -169,7 +169,11 @@ fn fmt_duration(duration: Duration) -> String {
     // When displayed in long form, the value shown
     let mut secs_portion: f64 = as_secs % 60.0;
     let mut min_portion: usize = ((as_secs - secs_portion) as usize / 60) % 60;
-    let mut hr_portion: usize = ((as_min - min_portion) / 60) % 60;
+    // Counted on rather than wrapped: hours are the largest unit here, so a
+    // sixtieth of one is still an hour and not the start of something bigger.
+    // Wrapping them leaves a two-day run with no hours, no minutes and no
+    // seconds to print — an empty summary.
+    let mut hr_portion: usize = (as_min - min_portion) / 60;
 
     // The seconds are shown rounded, and rounding can reach a full minute:
     // 1m 59.5s printed as it stands reads `1m 60s`, which is no duration. What

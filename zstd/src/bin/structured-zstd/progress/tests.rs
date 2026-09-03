@@ -28,6 +28,18 @@ fn human_readable_duration() {
     );
 }
 
+/// Hours are the largest unit this prints, so they count on rather than wrap.
+/// Wrapping them at 60 leaves a two-and-a-half-day run with nothing at all to
+/// show: no hours, no minutes, no seconds, an empty summary.
+#[test]
+fn hours_do_not_wrap() {
+    assert_eq!(&fmt_duration(Duration::from_secs(60 * 60 * 60)), "60h");
+    assert_eq!(
+        &fmt_duration(Duration::from_secs(61 * 60 * 60 + 5 * 60)),
+        "61h 5m"
+    );
+}
+
 /// The seconds are shown rounded, and a value that rounds up to a full minute
 /// belongs in the minutes: printed as it stands it reads `1m 60s`, a duration
 /// no clock shows. The carry runs all the way up, so 59m 59.6s is an hour.
