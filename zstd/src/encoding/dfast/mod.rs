@@ -2574,24 +2574,22 @@ macro_rules! start_matching_fast_loop_body {
                 };
                 let hl1_idx = (v8_1.wrapping_mul(PRIME) >> long_shift) as usize;
 
-                // Prefetch the RANDOM-ACCESS hash-table slots the loop is about
-                // to read, while there is work to hide the latency behind. The
-                // match-find loop is memory-latency bound on these table loads
-                // (perf --call-graph dwarf annotate: ~21% self-time across the
-                // long/short slot reads), and the hardware prefetcher cannot
-                // predict a hash-indexed address. `hl1_idx`'s slot is loaded
-                // ~100 instructions below (the `_search_next_long` retry at
-                // `ip1`); the next inner iteration's short-hash slot is keyed on
-                // these same `v8_1` bytes (this `ip1` becomes the next `ip0`).
-                // Unlike the upstream zstd's input `PREFETCH_L1(ip + 256)` — which only
-                // warms the sequential input the HW prefetcher already covers —
-                // these target the loads that actually stall.
+                // Prefetch the RANDOM-ACCESS long slot the loop is about to
+                // read, while there is work to hide the latency behind. The
+                // hardware prefetcher cannot predict a hash-indexed address, and
+                // this slot is loaded unconditionally a few dozen instructions
+                // below. Upstream instead prefetches the sequential input
+                // (`PREFETCH_L1(ip1 + 64)`), which the hardware already covers,
+                // and only inside its step-growth branch.
+                //
+                // The short slot is NOT prefetched. Its address needs a hash of
+                // the same `v8_1` bytes that the next iteration hashes again as
+                // its own `hs0_idx`, so warming it meant computing that hash
+                // twice per position and throwing the first away.
+                // SAFETY: `hl1_idx < 1 << long_hash_bits`, the long table's
+                // length, so the prefetched address is inside it.
                 unsafe {
-                    let hs1_idx = ((v8_1 << 24).wrapping_mul(PRIME) >> short_shift) as usize;
                     crate::decoding::prefetch::prefetch_l1_at(long_hash_ptr.add(hl1_idx) as *const u8);
-                    crate::decoding::prefetch::prefetch_l1_at(
-                        short_hash_ptr.add(hs1_idx) as *const u8,
-                    );
                 }
 
                 // Long match check at ip0 with idxl0. 8-byte equality
