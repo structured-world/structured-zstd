@@ -3339,6 +3339,27 @@ fn a_frame_far_larger_than_its_window_still_round_trips() {
     );
 }
 
+/// Raw frames are emitted straight from the staged buffer and never consult the
+/// match finder, so sizing its history for them holds memory the frame has no
+/// use for — a window's worth per frame, and a fresh compressor takes and
+/// returns it every time.
+#[test]
+fn a_raw_frame_reserves_no_matcher_history() {
+    let data = vec![0u8; 10];
+    let mut output: Vec<u8> = Vec::new();
+    let mut compressor = FrameCompressor::new(super::CompressionLevel::Uncompressed);
+    compressor.set_source_size_hint(data.len() as u64);
+    compressor.set_source(data.as_slice());
+    compressor.set_drain(&mut output);
+    compressor.compress();
+
+    assert_eq!(
+        compressor.state.matcher.ingest_capacity(),
+        0,
+        "a raw frame reads no history, so none should have been taken for it"
+    );
+}
+
 /// A dictionary is primed into the ingest buffer before the frame is sized, so
 /// a reservation counted from the frame alone leaves the dictionary's own bytes
 /// to be grown into afterwards — the doubling chain again, on exactly the path

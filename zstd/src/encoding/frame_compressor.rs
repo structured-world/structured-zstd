@@ -2127,7 +2127,13 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // block even when only a tail remains) does not reallocate; sized off
         // the ACTIVE block capacity, since a small window shrinks the block
         // below the format maximum.
-        if let Some(hint) = initial_size_hint {
+        // Raw frames are excluded: they emit straight from the staged buffer
+        // and never consult the match finder (the `in_place` gate below keeps
+        // them off it whatever the backend supports), so sizing its history for
+        // them holds a window's worth of memory the frame has no use for.
+        if let Some(hint) = initial_size_hint
+            && !matches!(self.compression_level, CompressionLevel::Uncompressed)
+        {
             // `saturating_add`: a caller may pledge `u64::MAX`, and clamping a
             // reservation request at the address-space limit is the meaningful
             // answer — the matcher caps it at its eviction ceiling anyway.
