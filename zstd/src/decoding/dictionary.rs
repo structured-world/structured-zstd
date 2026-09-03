@@ -16,7 +16,14 @@ use crate::decoding::scratch::HuffmanScratch;
 #[derive(Clone)]
 pub struct Dictionary {
     /// A 4 byte value used by decoders to check if they can use
-    /// the correct dictionary. This value must not be zero.
+    /// the correct dictionary.
+    ///
+    /// Zero means unidentified: a raw-content dictionary has no header to
+    /// carry an ID, and the frames built from it record none, so it can only
+    /// be supplied explicitly and never resolved from a frame header.
+    /// Registration by ID
+    /// ([`FrameDecoder::add_dict`](crate::decoding::FrameDecoder::add_dict))
+    /// therefore still requires a non-zero one.
     pub id: u32,
     /// A dictionary can contain an entropy table, either FSE or
     /// Huffman.
@@ -41,10 +48,14 @@ pub struct Dictionary {
     pub offset_hist: [u32; 3],
 }
 
+/// A parsed dictionary held by however many users need it at once.
+///
+/// Both sides prime frame after frame from one dictionary, so what they hold is
+/// shared rather than copied: `Arc` where atomics exist, `Rc` where they do not.
 #[cfg(target_has_atomic = "ptr")]
-type SharedDictionary = Arc<Dictionary>;
+pub(crate) type SharedDictionary = Arc<Dictionary>;
 #[cfg(not(target_has_atomic = "ptr"))]
-type SharedDictionary = Rc<Dictionary>;
+pub(crate) type SharedDictionary = Rc<Dictionary>;
 
 /// Shared pre-parsed dictionary handle for repeated decoding.
 ///
@@ -69,13 +80,18 @@ impl Dictionary {
     ///
     /// This is primarily intended for dictionaries produced by the `dict-builder`
     /// module, which currently emits raw-content dictionaries.
+    ///
+    /// An `id` of 0 means the dictionary is unidentified, which is what any
+    /// plain file used as a dictionary is: frames built with it record no
+    /// dictionary ID, so it can only ever be supplied explicitly, never
+    /// resolved from a frame header. Registration by ID
+    /// ([`FrameDecoder::add_dict`](crate::decoding::FrameDecoder::add_dict))
+    /// still requires a non-zero one, since the ID is the key it is stored
+    /// under.
     pub fn from_raw_content(
         id: u32,
         dict_content: Vec<u8>,
     ) -> Result<Dictionary, DictionaryDecodeError> {
-        if id == 0 {
-            return Err(DictionaryDecodeError::ZeroDictionaryId);
-        }
         if dict_content.is_empty() {
             return Err(DictionaryDecodeError::DictionaryTooSmall { got: 0, need: 1 });
         }
@@ -94,6 +110,20 @@ impl Dictionary {
     /// checked against the frame's `dict_id`.
     pub fn decode_dict(raw: &[u8]) -> Result<Dictionary, DictionaryDecodeError> {
         Self::decode_dict_inner(raw, true)
+    }
+
+    /// Loads whichever kind of dictionary `raw` holds, the way `zstd -D` does:
+    /// a blob starting with [`MAGIC_NUM`] is a serialized dictionary with
+    /// entropy tables and an ID, and anything else is taken as raw content,
+    /// which is why any file can be handed to `-D`. A raw-content dictionary
+    /// has no ID, so it must be supplied explicitly on both sides — see
+    /// [`Self::from_raw_content`].
+    pub fn from_serialized_or_raw_content(raw: &[u8]) -> Result<Dictionary, DictionaryDecodeError> {
+        if raw.starts_with(&MAGIC_NUM) {
+            Self::decode_dict(raw)
+        } else {
+            Self::from_raw_content(0, raw.to_vec())
+        }
     }
 
     /// Parse a dictionary for ENCODER use: builds the entropy

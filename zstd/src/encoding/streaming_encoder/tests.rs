@@ -1018,3 +1018,55 @@ fn streaming_encoder_uncompressed_with_dictionary_omits_dict_id() {
     decoder.read_to_end(&mut decoded).unwrap();
     assert_eq!(decoded, payload);
 }
+
+/// A raw-content dictionary has no ID, and RFC 8878 spells that as an absent
+/// field rather than a stored zero. Writing the zero would advertise dictionary
+/// 0 to every decoder that resolves by ID, while the bytes the frame actually
+/// needs are only available to a caller who was told about them separately.
+#[test]
+fn raw_dictionary_leaves_the_id_out_of_the_streaming_header() {
+    use crate::decoding::Dictionary;
+    use crate::encoding::EncoderDictionary;
+
+    let content: Vec<u8> = b"tenant=demo region=eu table=orders payload="
+        .iter()
+        .copied()
+        .cycle()
+        .take(2048)
+        .collect();
+    let mut payload = Vec::new();
+    while payload.len() < 8192 {
+        payload.extend_from_slice(&content);
+    }
+
+    let mut encoder = StreamingEncoder::new(Vec::new(), CompressionLevel::Default);
+    encoder
+        .set_encoder_dictionary(EncoderDictionary::from_dictionary(
+            Dictionary::from_raw_content(0, content.clone()).expect("a raw dictionary has no id"),
+        ))
+        .expect("a raw dictionary must attach");
+    encoder.write_all(&payload).unwrap();
+    let compressed = encoder.finish().unwrap();
+
+    // Read the descriptor byte itself: a parsed header reports a stored zero as
+    // "no dictionary" either way, so only the Dictionary_ID_flag (bits 0-1 of
+    // the byte after the 4-byte magic) shows whether the field was written.
+    assert_eq!(
+        compressed[4] & 0b11,
+        0,
+        "a dictionary with no id must leave the Dictionary_ID field out, \
+         not store a zero in it"
+    );
+
+    // The frame still needs those bytes, so it decodes only when they are given.
+    let mut decoder = StreamingDecoder::new_with_dictionary_handle(
+        compressed.as_slice(),
+        &crate::decoding::DictionaryHandle::from_dictionary(
+            Dictionary::from_raw_content(0, content).expect("a raw dictionary has no id"),
+        ),
+    )
+    .unwrap();
+    let mut decoded = Vec::new();
+    decoder.read_to_end(&mut decoded).unwrap();
+    assert_eq!(decoded, payload);
+}

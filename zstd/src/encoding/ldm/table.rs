@@ -163,6 +163,27 @@ impl LdmHashTable {
         }
     }
 
+    /// The same heap [`Self::heap_size`] would report, for a table not built
+    /// yet — so a caller budgeting memory for a compression can weigh one
+    /// without allocating it. Kept beside its measured twin so the two evolve
+    /// together.
+    ///
+    /// Saturating throughout: `hash_log` reaches 30, so the entries alone
+    /// outgrow what a 32-bit `usize` counts. A figure that wrapped would
+    /// understate the memory it exists to bound — telling a caller a run fits
+    /// when it cannot — where one pinned at the maximum only refuses too much.
+    pub(crate) fn estimated_workspace_bytes(hash_log: u32, bucket_size_log: u32) -> usize {
+        let effective_bucket_log = bucket_size_log.min(hash_log);
+        let bucket_count = 1usize
+            .checked_shl(hash_log - effective_bucket_log)
+            .unwrap_or(usize::MAX);
+        1usize
+            .checked_shl(hash_log)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(core::mem::size_of::<LdmEntry>())
+            .saturating_add(bucket_count)
+    }
+
     /// Heap bytes held by the entry array and the per-bucket offset array.
     pub(crate) fn heap_size(&self) -> usize {
         self.entries.capacity() * core::mem::size_of::<LdmEntry>() + self.bucket_offsets.capacity()

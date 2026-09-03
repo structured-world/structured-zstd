@@ -16,6 +16,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: rust-lang/crates-io-auth-action@v1
         id: auth
+      # One crate carries both the library and the `structured-zstd` binary,
+      # so this single publish ships the tool too.
       - run: cargo publish -p structured-zstd
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

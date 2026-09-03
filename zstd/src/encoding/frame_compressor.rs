@@ -29,9 +29,13 @@ use crate::io::{Read, Write};
 /// [`set_dictionary_from_bytes`](FrameCompressor::set_dictionary_from_bytes))
 /// from ever reaching the decode side — the encoder/decoder dictionary split
 /// mirrors C zstd's `CDict` / `DDict`.
+/// Cloning one is a handle, not a copy: it is attached to a compressor by
+/// value, so a dictionary serving many frames would otherwise have its parsed
+/// tables and content duplicated for each of them — on exactly the path where
+/// one dictionary is prepared once precisely to be used again and again.
 #[derive(Clone)]
 pub struct EncoderDictionary {
-    pub(crate) inner: crate::decoding::Dictionary,
+    pub(crate) inner: crate::decoding::dictionary::SharedDictionary,
     /// Size of the serialized dictionary this was built from (header, entropy
     /// tables, repeat offsets and content); the CDict cParams tier key
     /// (upstream `ZSTD_createCDict(dictBuffer, dictSize, level)`). Falls back
@@ -51,7 +55,7 @@ impl EncoderDictionary {
     pub fn from_dictionary(dictionary: crate::decoding::Dictionary) -> Self {
         Self {
             serialized_len: dictionary.dict_content.len(),
-            inner: dictionary,
+            inner: crate::decoding::dictionary::SharedDictionary::new(dictionary),
         }
     }
 
@@ -63,7 +67,38 @@ impl EncoderDictionary {
         raw_dictionary: &[u8],
     ) -> Result<Self, crate::decoding::errors::DictionaryDecodeError> {
         Ok(Self {
-            inner: crate::decoding::Dictionary::decode_dict_for_encoding(raw_dictionary)?,
+            inner: crate::decoding::dictionary::SharedDictionary::new(
+                crate::decoding::Dictionary::decode_dict_for_encoding(raw_dictionary)?,
+            ),
+            serialized_len: raw_dictionary.len(),
+        })
+    }
+
+    /// Load whichever kind of dictionary `raw_dictionary` holds, the way
+    /// `zstd -D` does: a serialized blob is parsed, anything else is taken as
+    /// raw content (see
+    /// [`Dictionary::from_serialized_or_raw_content`](crate::decoding::Dictionary::from_serialized_or_raw_content)).
+    ///
+    /// Either way the blob's own length is what the compression-parameter tier
+    /// is chosen by, which is why this exists rather than parsing and calling
+    /// [`Self::from_dictionary`]: that keys the tier on the content length, and
+    /// for a serialized dictionary the entropy tables in between can put the
+    /// two on opposite sides of a boundary.
+    pub fn from_serialized_or_raw_content(
+        raw_dictionary: &[u8],
+    ) -> Result<Self, crate::decoding::errors::DictionaryDecodeError> {
+        // Parsed for the encoder, which reads the entropy probabilities, the
+        // content and the offsets and never the decode lookup tables: routing a
+        // serialized blob through the full parser builds those tables for
+        // nothing. The emitted frame is identical either way — only the wasted
+        // build is dropped (see `Dictionary::decode_dict_for_encoding`).
+        if raw_dictionary.starts_with(&crate::decoding::DICTIONARY_MAGIC) {
+            return Self::from_bytes(raw_dictionary);
+        }
+        Ok(Self {
+            inner: crate::decoding::dictionary::SharedDictionary::new(
+                crate::decoding::Dictionary::from_raw_content(0, raw_dictionary.to_vec())?,
+            ),
             serialized_len: raw_dictionary.len(),
         })
     }
@@ -78,11 +113,10 @@ impl EncoderDictionary {
 
     /// The dictionary id.
     ///
-    /// A dictionary attached for encoding always has a non-zero id (the
-    /// `set_dictionary*` / `set_encoder_dictionary` attach path rejects a
-    /// zero id). This getter, however, reflects the wrapped dictionary as-is:
-    /// an `EncoderDictionary` built via [`Self::from_dictionary`] from a raw
-    /// `Dictionary` with `id == 0` reports `0` here until it is attached.
+    /// Zero is a raw-content dictionary, which has no header to carry an id.
+    /// Such a dictionary attaches like any other; what changes is the frame,
+    /// which omits the `Dictionary_ID` field rather than storing a zero, so a
+    /// decoder has to be handed the same bytes explicitly.
     pub fn id(&self) -> u32 {
         self.inner.id
     }
@@ -2392,7 +2426,13 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             single_segment,
             content_checksum: cfg!(feature = "hash") && self.content_checksum,
             dictionary_id: if prep.use_dictionary_state && self.dict_id_flag {
-                self.dictionary.as_ref().map(|dict| dict.inner.id as u64)
+                // Id 0 is a raw-content dictionary: RFC 8878 spells "no
+                // dictionary ID" as an absent field, not as a stored zero.
+                self.dictionary
+                    .as_ref()
+                    .map(|dict| dict.inner.id)
+                    .filter(|id| *id != 0)
+                    .map(u64::from)
             } else {
                 None
             },
@@ -2774,10 +2814,10 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         &mut self,
         enc: EncoderDictionary,
     ) -> Result<Option<EncoderDictionary>, crate::decoding::errors::DictionaryDecodeError> {
+        // A zero id is not an error here: it marks a raw-content dictionary,
+        // which has no header to carry one. The frame then records no
+        // dictionary ID, so the decoder has to be handed the same bytes.
         let dictionary = &enc.inner;
-        if dictionary.id == 0 {
-            return Err(crate::decoding::errors::DictionaryDecodeError::ZeroDictionaryId);
-        }
         if let Some(index) = dictionary.offset_hist.iter().position(|&rep| rep == 0) {
             return Err(
                 crate::decoding::errors::DictionaryDecodeError::ZeroRepeatOffsetInDictionary {

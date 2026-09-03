@@ -10,10 +10,6 @@ changelog_update = true
 git_tag_name = "v{{ version }}"
 publish = false
 
-[[package]]
-name = "structured-zstd-cli"
-release = false
-
 # npm-only crate: published to npm (@structured-world/structured-zstd) by the
 # release.yml `publish-npm` job, never to crates.io and with no git release of
 # its own. release-plz may still bump its version on dependency updates; that

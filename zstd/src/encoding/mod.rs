@@ -97,6 +97,8 @@ pub use frame_compressor::{EncoderDictionary, FrameCompressor};
 pub use frame_emit_info::{BlockType, FrameBlock, FrameEmitInfo};
 pub use levels::config::{
     estimated_bt_strategy_extra_bytes, estimated_compression_workspace_bytes,
+    estimated_compression_workspace_bytes_for_run,
+    estimated_compression_workspace_bytes_for_source,
 };
 pub use match_generator::MatchGeneratorDriver;
 pub use parameters::{

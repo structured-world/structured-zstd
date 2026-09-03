@@ -38,6 +38,68 @@ cargo add structured-zstd --no-default-features
 
 Release notes for every version live in [`zstd/CHANGELOG.md`](https://github.com/structured-world/structured-zstd/blob/main/zstd/CHANGELOG.md) (maintained by [release-plz](https://release-plz.dev/)).
 
+## Command-line tool
+
+The tool ships from this same crate, so one name covers both uses:
+
+```bash
+cargo add structured-zstd        # the library
+cargo install structured-zstd    # the `structured-zstd` binary
+```
+
+It carries no dependencies of its own — argument parsing, progress display and
+error reporting are written against `std` — so depending on the library pulls
+in nothing extra.
+
+The binary speaks the upstream `zstd`
+command line: levels (`-1`..`-19`, `--ultra` for `-20`..`-22`, `--fast[=N]`),
+`-d`, `-c`, `-o`, `-t`, `-l`, `-D`, `--train`, `-b`, and the usual
+`-f`/`-k`/`--rm` file handling.
+
+Flags that only steer how the work is done (`-T`, `-B`, `--adapt`,
+`--[no-]progress`, …) are accepted and ignored — their values are still
+validated, so a typo is an error rather than silence.
+`--target-compressed-block-size` does take effect: it bounds what goes into a
+block, so blocks flush sooner. `--long` means `--long=27`, as upstream
+documents, and is capped there: a larger window would produce frames this
+build's decoder refuses. It needs level 16 or above, where long-distance
+matching actually runs — below that it is refused rather than accepted as a
+wider window and nothing else. A window is never declared larger than the
+source can fill, so a small file compressed with `--long` does not ask its
+decoders to reserve 128 MiB.
+
+Flags that would change the result are refused instead: `--format=` for
+anything but zstd, `--patch-from`, `--rsyncable`, `--no-check`,
+`--[no-]compress-literals`, and the not-yet-implemented `--pass-through` /
+`--exclude-compressed`. `-M` is treated as the safety promise it is: on the
+runs that decode, a limit covering the 128 MiB window, the decoder's buffers
+and the `-D` dictionary is kept and a tighter one is refused rather than
+ignored. Compressing, listing and training allocate no decoder, so the flag is
+accepted there and describes nothing, as upstream has it.
+
+`--train` and `--train-fastcover` both train with FastCOVER, the algorithm
+upstream also defaults to. `--train-cover` and `--train-legacy` name algorithms
+this build does not have, so they are refused rather than quietly served by
+FastCOVER. `-D` takes either a dictionary produced by `--train` or any file at
+all, which is then used as raw content the way upstream does — such a
+dictionary has no ID, so the same bytes must be supplied when decoding.
+
+It is deliberately **not** installed as `zstd`, so it never shadows the system
+tool. It does dispatch on the name it is invoked under, so linking it as the
+familiar names works:
+
+```bash
+ln -s "$(command -v structured-zstd)" ~/.local/bin/unzstd    # defaults to -d
+ln -s "$(command -v structured-zstd)" ~/.local/bin/zstdcat   # defaults to -d -c
+```
+
+Distributions should register it with their alternatives mechanism rather than
+overwriting `/usr/bin/zstd`, e.g.
+
+```bash
+update-alternatives --install /usr/bin/zstd zstd /usr/bin/structured-zstd 100
+```
+
 ## Usage
 
 ### Compression

@@ -158,6 +158,28 @@ fn cdict_indices_are_tagged(cp: &CParams) -> bool {
     cp.strategy <= 2
 }
 
+/// The window-resize half of `ZSTD_adjustCParams_internal`: a window wider than
+/// the source and dictionary can fill only makes decoders reserve memory the
+/// frame never uses, so it comes down to what the data needs.
+///
+/// Split out because a dictionary frame runs the CDict's own search geometry
+/// and must not be reshaped, while its window still answers to the source size
+/// the way every other frame's does.
+pub(crate) fn adjusted_window_log(window_log: u32, src_size: u64, dict_size: usize) -> u32 {
+    let max_window_resize: u64 = 1u64 << (WINDOWLOG_MAX - 1);
+    if src_size > max_window_resize || (dict_size as u64) > max_window_resize {
+        return window_log;
+    }
+    let t_size = (src_size as u32).wrapping_add(dict_size as u32);
+    let hash_size_min: u32 = 1 << HASHLOG_MIN;
+    let src_log = if t_size < hash_size_min {
+        HASHLOG_MIN
+    } else {
+        highbit32(t_size.wrapping_sub(1)) + 1
+    };
+    window_log.min(src_log)
+}
+
 /// `ZSTD_adjustCParams_internal` (zstd_compress.c): down-size `cp` for the
 /// given `(src_size, dict_size, mode)`. `src_size == CONTENTSIZE_UNKNOWN`
 /// means unknown; `src_size == 0` means literally zero. The row-match-finder
@@ -170,7 +192,6 @@ pub(crate) fn adjust_cparams(
     create_cdict: bool,
 ) -> CParams {
     const MIN_SRC_SIZE: u64 = 513; // (1<<9) + 1
-    let max_window_resize: u64 = 1u64 << (WINDOWLOG_MAX - 1);
 
     // `ZSTD_cpm_createCDict`: an unknown source assumes a `minSrcSize` source so
     // the dictionary's prepared tables down-size deterministically. The other
@@ -180,19 +201,7 @@ pub(crate) fn adjust_cparams(
         src_size = MIN_SRC_SIZE;
     }
 
-    // resize windowLog if input is small enough, to use less memory.
-    if src_size <= max_window_resize && (dict_size as u64) <= max_window_resize {
-        let t_size = (src_size as u32).wrapping_add(dict_size as u32);
-        let hash_size_min: u32 = 1 << HASHLOG_MIN;
-        let src_log = if t_size < hash_size_min {
-            HASHLOG_MIN
-        } else {
-            highbit32(t_size.wrapping_sub(1)) + 1
-        };
-        if cp.window_log > src_log {
-            cp.window_log = src_log;
-        }
-    }
+    cp.window_log = adjusted_window_log(cp.window_log, src_size, dict_size);
 
     if src_size != CONTENTSIZE_UNKNOWN {
         let daw = dict_and_window_log(cp.window_log, src_size, dict_size as u64);

@@ -61,6 +61,15 @@ use std::{
 const MAX_TRAINING_PREALLOC_BYTES: usize = 8 * 1024 * 1024;
 const MAX_HUFFMAN_STATS_BYTES: usize = 64 * 1024;
 
+/// Smallest size a trained dictionary can occupy, whatever it was trained on.
+///
+/// The magic number, the dictionary ID, the three repeat offsets and the
+/// shortest content the writers emit are unconditional; a real dictionary is
+/// larger still, since the entropy tables between them are never empty. Use it
+/// to reject an impossible `dict_size` before spending the corpus: the training
+/// entry points can only discover the true bound once those tables are built.
+pub const MIN_TRAINED_DICT_SIZE: usize = DICT_MAGIC_NUM.len() + 4 + 12 + 8;
+
 /// Tuning knobs for pure-Rust FastCOVER training.
 #[derive(Debug, Clone)]
 pub struct FastCoverOptions {
@@ -278,6 +287,17 @@ pub fn create_raw_dict_from_source<R: io::Read, W: io::Write>(
     Ok(())
 }
 
+/// The `i`th of [`MAX_HUFFMAN_STATS_BYTES`] samples spread evenly over `len`
+/// bytes.
+///
+/// Computed in 64 bits: `i * len` reaches 2^48 for an addressable corpus, which
+/// a 32-bit `usize` cannot hold — the product overflows for any corpus past
+/// 64 KiB there, and the multiply panics rather than sampling. The quotient is
+/// always below `len`, so the narrowing back is exact.
+fn strided_index(i: usize, len: usize) -> usize {
+    ((i as u64 * len as u64) / MAX_HUFFMAN_STATS_BYTES as u64) as usize
+}
+
 fn serialize_huffman_table(sample_data: &[u8], raw_content: &[u8]) -> io::Result<Vec<u8>> {
     fn bounded_huffman_stats(data: &[u8]) -> Vec<u8> {
         if data.len() <= MAX_HUFFMAN_STATS_BYTES {
@@ -286,8 +306,7 @@ fn serialize_huffman_table(sample_data: &[u8], raw_content: &[u8]) -> io::Result
 
         let mut stats = Vec::with_capacity(MAX_HUFFMAN_STATS_BYTES);
         for i in 0..MAX_HUFFMAN_STATS_BYTES {
-            let idx = i * data.len() / MAX_HUFFMAN_STATS_BYTES;
-            stats.push(data[idx]);
+            stats.push(data[strided_index(i, data.len())]);
         }
         stats
     }
@@ -299,10 +318,22 @@ fn serialize_huffman_table(sample_data: &[u8], raw_content: &[u8]) -> io::Result
     };
     let mut stats = bounded_huffman_stats(source);
     if stats.len() < 2 || stats.iter().all(|b| *b == stats[0]) {
-        stats = (0u8..=255).collect();
+        // A corpus with no distribution to measure gets a synthetic one. It
+        // stops at 128 symbols because a perfectly flat alphabet gives every
+        // symbol the same weight: FSE cannot encode that (an RLE weight
+        // stream), and the direct nibble form addresses at most 128 symbols, so
+        // a full 0..=255 alphabet would have no description at all.
+        stats = (0u8..128).collect();
     }
 
-    let table = HuffmanEncoderTable::build_from_data(stats.as_slice());
+    let mut table = HuffmanEncoderTable::build_from_data(stats.as_slice());
+    if table.writeable_table_description_size().is_none() {
+        // Sampled real data can land on the same shape: a flat alphabet wider
+        // than 128 symbols. Fall back to the synthetic narrow one, which always
+        // has a description.
+        stats = (0u8..128).collect();
+        table = HuffmanEncoderTable::build_from_data(stats.as_slice());
+    }
     let mut writer = BitWriter::new();
     let mut encoder = HuffmanEncoder::new(&table, &mut writer);
     encoder.encode(&[stats[0]], true);
@@ -335,7 +366,7 @@ fn bounded_fse_symbols(data: &[u8], max_symbol: u8) -> Vec<u8> {
 
     let mut out = Vec::with_capacity(MAX_HUFFMAN_STATS_BYTES);
     for i in 0..MAX_HUFFMAN_STATS_BYTES {
-        let idx = i * data.len() / MAX_HUFFMAN_STATS_BYTES;
+        let idx = strided_index(i, data.len());
         out.push((u16::from(data[idx]) % modulo) as u8);
     }
     out
@@ -589,17 +620,32 @@ pub fn create_fastcover_dict_from_source<R: io::Read, W: io::Write>(
 ) -> io::Result<FastCoverTuned> {
     let mut sample = Vec::new();
     source.read_to_end(&mut sample)?;
+    create_fastcover_dict_from_slice(sample.as_slice(), output, dict_size, fastcover, finalize)
+}
+
+/// Train and finalize a FastCOVER dictionary from a corpus already in memory.
+///
+/// The same work as [`create_fastcover_dict_from_source`] for a caller that
+/// holds the bytes: the corpus is the largest allocation training makes, and
+/// handing it over as a slice keeps it to one copy rather than buffering it a
+/// second time inside.
+pub fn create_fastcover_dict_from_slice<W: io::Write>(
+    sample: &[u8],
+    output: &mut W,
+    dict_size: usize,
+    fastcover: &FastCoverOptions,
+    finalize: FinalizeOptions,
+) -> io::Result<FastCoverTuned> {
     if sample.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "source stream is empty",
         ));
     }
-    let content_budget = finalized_content_budget(sample.as_slice(), sample.as_slice(), dict_size)?;
-    let (raw_dict, tuned) =
-        train_fastcover_raw_from_slice(sample.as_slice(), content_budget, fastcover)?;
+    let content_budget = finalized_content_budget(sample, sample, dict_size)?;
+    let (raw_dict, tuned) = train_fastcover_raw_from_slice(sample, content_budget, fastcover)?;
 
-    let finalized = finalize_raw_dict(raw_dict.as_slice(), sample.as_slice(), dict_size, finalize)?;
+    let finalized = finalize_raw_dict(raw_dict.as_slice(), sample, dict_size, finalize)?;
     output.write_all(finalized.as_slice())?;
     Ok(tuned)
 }

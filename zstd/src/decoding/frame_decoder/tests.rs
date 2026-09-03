@@ -2228,6 +2228,84 @@ fn resume_rejects_state_with_different_active_dictionary() {
 
 #[cfg(feature = "lsm")]
 #[test]
+fn resume_rejects_a_dictionary_that_carries_no_identity() {
+    // The guard tells dictionaries apart by the id the decoder recorded, and a
+    // raw-content dictionary has none: every one of them is id 0. Two different
+    // raw dictionaries therefore key alike, and a snapshot captured under one
+    // would be restored under the other — foreign entropy and repcode state,
+    // and bytes that are wrong with nothing to say so. A dictionary that cannot
+    // be told from another cannot carry a resume across, so the snapshot is
+    // refused rather than trusted.
+    let (compressed, full, info) = multi_block_fixture();
+    let nblocks = info.blocks.len() as u32;
+    let n = (nblocks / 2).max(1);
+    let output_offset = info.decompressed_byte_range(n as usize).unwrap().start as usize;
+
+    let first = crate::decoding::DictionaryHandle::from_dictionary(
+        crate::decoding::Dictionary::from_raw_content(0, alloc::vec![7u8; 4096]).expect("raw dict"),
+    );
+    let second = crate::decoding::DictionaryHandle::from_dictionary(
+        crate::decoding::Dictionary::from_raw_content(0, alloc::vec![9u8; 4096]).expect("raw dict"),
+    );
+
+    // No such snapshot is produced in the first place: refusing to emit it is
+    // refusing to create the thing that would later be restored under whichever
+    // raw dictionary happened to be applied. Refused before any of it is
+    // decoded, too — the answer does not depend on the blocks, and an error
+    // raised after them would swallow the output they produced and leave the
+    // source and the decoder somewhere the caller cannot retry from.
+    let mut src = compressed.as_slice();
+    let mut dec = FrameDecoder::new();
+    dec.reset_with_dict_handle(&mut src, &first).unwrap();
+    let before = src.len();
+    let emitted = dec
+        .decode_blocks_partial(&mut src, 0, n, None, true)
+        .expect_err("a dictionary with no identity must not produce a resume state");
+    assert_eq!(
+        src.len(),
+        before,
+        "and nothing may be read before the refusal"
+    );
+    assert!(
+        matches!(
+            emitted,
+            crate::decoding::errors::FrameDecoderError::ResumeUnidentifiedDictionary
+        ),
+        "expected ResumeUnidentifiedDictionary, got {emitted:?}"
+    );
+
+    // And the resuming side refuses too, so a snapshot from anywhere else
+    // cannot be restored under one either.
+    let captured = emit_resume_state_at(&compressed, n);
+    let mut header_src = compressed.as_slice();
+    let mut dec = FrameDecoder::new();
+    dec.reset_with_dict_handle(&mut header_src, &second)
+        .unwrap();
+    let off = info.blocks[n as usize].offset_in_frame as usize;
+    let mut block_src = &compressed[off..];
+    let err = dec
+        .decode_blocks_partial(
+            &mut block_src,
+            n,
+            u32::MAX,
+            Some(super::ResumeInput {
+                window_prime: &full[..output_offset],
+                state: &captured,
+            }),
+            false,
+        )
+        .expect_err("a dictionary with no identity must not carry a resume across");
+    assert!(
+        matches!(
+            err,
+            crate::decoding::errors::FrameDecoderError::ResumeUnidentifiedDictionary
+        ),
+        "expected ResumeUnidentifiedDictionary, got {err:?}"
+    );
+}
+
+#[cfg(feature = "lsm")]
+#[test]
 fn resume_invalid_range_does_not_mutate_decoder_state() {
     // An inverted effective range must be rejected WITHOUT priming the
     // decoder: no entropy restore, no window prime, no cursor advance. As

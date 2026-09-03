@@ -1193,9 +1193,22 @@ impl FrameDecoder {
     fn validate_registered_dictionary(dict: &Dictionary) -> Result<(), FrameDecoderError> {
         use crate::decoding::errors::DictionaryDecodeError as dict_err;
 
+        // Registration keys the dictionary by its ID, so a zero one has no
+        // slot to occupy and no frame could ever select it.
         if dict.id == 0 {
             return Err(FrameDecoderError::from(dict_err::ZeroDictionaryId));
         }
+        Self::validate_dictionary_content(dict)
+    }
+
+    /// Checks a dictionary can be used at all, whatever route it arrived by.
+    ///
+    /// Separate from [`Self::validate_registered_dictionary`] because a
+    /// dictionary supplied explicitly needs no ID: a raw-content dictionary
+    /// has no header to carry one, and the frames built with it record none.
+    fn validate_dictionary_content(dict: &Dictionary) -> Result<(), FrameDecoderError> {
+        use crate::decoding::errors::DictionaryDecodeError as dict_err;
+
         if let Some(index) = dict.offset_hist.iter().position(|&rep| rep == 0) {
             return Err(FrameDecoderError::from(
                 dict_err::ZeroRepeatOffsetInDictionary { index: index as u8 },
@@ -1391,7 +1404,7 @@ impl FrameDecoder {
         // is a parallel entry point so it needs its own call.
         #[cfg(all(feature = "lsm", feature = "hash"))]
         self.computed_block_checksums.clear();
-        Self::validate_registered_dictionary(dict.as_dict())?;
+        Self::validate_dictionary_content(dict.as_dict())?;
         let magicless = self.magicless;
         // Scope the &mut borrow of `self.state` to the header parse
         // alone, so the subsequent `validate_expectations(&self, ...)`
@@ -1449,7 +1462,7 @@ impl FrameDecoder {
         use FrameDecoderError as err;
         #[cfg(all(feature = "lsm", feature = "hash"))]
         self.computed_block_checksums.clear();
-        Self::validate_registered_dictionary(dict.as_dict())?;
+        Self::validate_dictionary_content(dict.as_dict())?;
         let magicless = self.magicless;
         let (frame_header, header_size) = frame::read_frame_header_from_slice(input, magicless)?;
         match &mut self.state {
@@ -1926,6 +1939,19 @@ impl FrameDecoder {
             let compute_hash = checksum_mode != ContentChecksum::None
                 && state.frame_header.descriptor.content_checksum_flag();
             state.decoder_scratch.set_compute_hash(compute_hash);
+        }
+
+        // A dictionary that carries no ID cannot be told from another one, and
+        // the frame key records only that ID: two different raw-content
+        // dictionaries key alike, so a snapshot would be restored under the
+        // wrong one — and one taken here could later be. Both directions are
+        // refused, and refused HERE, before a block is read or a buffer
+        // reserved. An answer that does not depend on the blocks must not be
+        // given after decoding them: it would discard the output they produced
+        // and leave the source and the decoder somewhere the caller cannot
+        // retry from.
+        if (resume.is_some() || emit_resume) && state.using_dict == Some(0) {
+            return Err(err::ResumeUnidentifiedDictionary);
         }
 
         // Mirror `decode_blocks`: pre-reserve the backing buffer to the

@@ -1070,8 +1070,39 @@ impl Matcher for MatchGeneratorDriver {
             // windowLog is kept. Reshaping the live search would probe the
             // dictionary's tables with another geometry / key width than they
             // were indexed with.
+            //
+            // The window still answers to the source, as it does for every
+            // other frame: `ZSTD_adjustCParams_internal` caps it by the source
+            // and dictionary extent, and a window neither can fill only makes
+            // decoders reserve memory the frame never uses. Capped here rather
+            // than through the full adjuster, which would reshape the search.
             if let Some(window_log) = ov.window_log {
-                params.window_log = window_log;
+                params.window_log = match hint {
+                    // The source caps the window even here, and even with an
+                    // explicit request: the reference command declares 2 KiB
+                    // for `--ultra -22 --long=27 -D dict` on a 2 KiB file, and
+                    // a window the content cannot fill only makes every decoder
+                    // reserve memory the frame never uses. The floor that
+                    // travels with the cap in `adjust_cparams` applies too, or
+                    // a hint of a few dozen bytes asks for a window smaller
+                    // than the format's smallest.
+                    //
+                    // The dictionary's own size is NOT part of that cap: the
+                    // reference declares the same 2 KiB whether the dictionary
+                    // is 4 KiB or 256 KiB, because a small window does not put
+                    // the dictionary out of reach — sequences may reference it
+                    // at offsets beyond the window while the output so far is
+                    // within it (RFC 8878, Dictionary_Content). Counting it
+                    // made our frames ask decoders for up to 256x what the
+                    // reference asks.
+                    Some(src) => (crate::encoding::cparams::adjusted_window_log(
+                        u32::from(window_log),
+                        src,
+                        0,
+                    ) as u8)
+                        .max(MIN_WINDOW_LOG),
+                    None => window_log,
+                };
             }
         } else if let Some(ov) = self.param_overrides
             && !ov.is_empty()
@@ -1083,14 +1114,17 @@ impl Matcher for MatchGeneratorDriver {
             // synthesized that backend's DEFAULT config (FAST_L1 /
             // HC_OVERRIDE_DEFAULT) with full-size table logs AFTER that cap
             // ran. Re-apply the hint cap so a tiny hinted frame doesn't
-            // allocate the new backend's full-size tables. An explicit
-            // `window_log` override is the user's hard request and must
-            // survive the re-cap, so restore it afterwards.
+            // allocate the new backend's full-size tables.
+            //
+            // The cap covers an explicit `window_log` too, as
+            // `ZSTD_adjustCParams_internal` does upstream: the window is a
+            // promise about the memory decoding will need, and a source that
+            // cannot fill it makes that promise for nothing — every decoder
+            // opening the frame would reserve the whole declared window to
+            // read a few bytes. The override still raises the window as far as
+            // the source can use.
             if let Some(hint_size) = hint {
                 params = adjust_params_for_source_size(params, hint_size);
-                if let Some(window_log) = ov.window_log {
-                    params.window_log = window_log;
-                }
             }
         }
         // A dictionary frame's hash-chain / binary-tree widths are the CDict's

@@ -536,6 +536,13 @@ pub(crate) fn hc_hash_bits_for_window(max_window_size: usize) -> usize {
 /// Smallest window_log the encoder will use regardless of source size.
 pub(crate) const MIN_WINDOW_LOG: u8 = 10;
 
+/// Largest window_log the public parameter API accepts
+/// ([`CParameter::WindowLog`](crate::encoding::CParameter)'s upper bound), and
+/// so the largest a workspace estimate can be asked to describe. The estimate
+/// answers for whatever it is given, and shifting by more than the width of a
+/// `usize` is undefined, so a request beyond this is answered with this.
+pub(crate) const MAX_ESTIMATED_WINDOW_LOG: u8 = 30;
+
 /// Translate a verbatim upstream `ZSTD_defaultCParameters[tier][level]` row
 /// (`cparams::CParams`) into our resolved [`LevelParams`], reproducing
 /// upstream's cParams -> matcher-config derivation so the encoder follows C's
@@ -718,9 +725,99 @@ pub(crate) fn adjust_params_for_source_size(mut params: LevelParams, src_size: u
 /// resolves at frame start, so the estimate tracks the real allocations;
 /// it is an upper-bound style budget figure, not an exact accounting.
 pub fn estimated_compression_workspace_bytes(level: CompressionLevel) -> usize {
+    estimated_compression_workspace_bytes_for_source(level, None)
+}
+
+/// The same estimate for a source whose size is known.
+///
+/// The window and the match-finder tables are capped by the source, so a level
+/// that would reserve hundreds of MiB for an arbitrary stream reserves a
+/// fraction of that for a small one — and a caller budgeting memory for a
+/// compression it is about to run knows which. `None` is the arbitrary-stream
+/// figure that [`estimated_compression_workspace_bytes`] reports.
+pub fn estimated_compression_workspace_bytes_for_source(
+    level: CompressionLevel,
+    src_size_hint: Option<u64>,
+) -> usize {
+    estimated_compression_workspace_bytes_for_run(level, src_size_hint, None, false, None)
+}
+
+/// The same estimate for a run whose window, long-distance matching and
+/// dictionary are what the caller has actually asked for.
+///
+/// A `window_log` override enlarges the history the frame keeps, and
+/// long-distance matching adds a hash table of its own on top — neither of them
+/// visible in the level's own preset. A dictionary goes further than adding to
+/// the figure: it *decides* it. The frame runs the dictionary's own compression
+/// parameters, so a small source compressed against a large dictionary builds
+/// tables sized for the dictionary, which at the higher levels is the
+/// difference between tens of KiB and hundreds of MiB. `None`, `false` and
+/// `None` give the preset, which is what
+/// [`estimated_compression_workspace_bytes_for_source`] reports.
+///
+/// `dictionary` is what a caller weighing a run before it parses the blob can
+/// answer with [`DictionarySizes::raw_content`] on the blob's own length: the
+/// content of a trained dictionary is smaller than the blob it came in, and
+/// overstating it can only move the estimate toward the copy-mode geometry,
+/// which is the larger of the two.
+///
+/// [`DictionarySizes::raw_content`]: crate::encoding::DictionarySizes::raw_content
+pub fn estimated_compression_workspace_bytes_for_run(
+    level: CompressionLevel,
+    src_size_hint: Option<u64>,
+    window_log: Option<u8>,
+    long_distance_matching: bool,
+    dictionary: Option<crate::encoding::DictionarySizes>,
+) -> usize {
     use crate::encoding::strategy::StrategyTag;
-    let params = resolve_level_params(level, None);
-    let window = 1usize << params.window_log;
+    let mut params = match dictionary.filter(|sizes| sizes.content != 0) {
+        Some(sizes) => resolve_level_params_with_dict(level, src_size_hint, sizes).0,
+        None => resolve_level_params(level, src_size_hint),
+    };
+    // The override is what the frame will keep, but never below the floor the
+    // format sets or above what the source can fill — the same two bounds the
+    // encoder applies to it.
+    if let Some(requested) = window_log {
+        // Bounded to what the encoder itself accepts before anything shifts by
+        // it. This answers for whatever it is asked, and a shift past the width
+        // of the type is undefined rather than merely large: the largest window
+        // there is, is the honest answer to a request beyond it.
+        let requested = requested.min(MAX_ESTIMATED_WINDOW_LOG);
+        let capped = match src_size_hint {
+            Some(src) => {
+                crate::encoding::cparams::adjusted_window_log(u32::from(requested), src, 0) as u8
+            }
+            None => requested,
+        };
+        params.window_log = capped.clamp(MIN_WINDOW_LOG, MAX_ESTIMATED_WINDOW_LOG);
+    }
+    // The long-distance matcher's own table, sized from the window it searches
+    // (upstream `ZSTD_ldm_adjustParameters`). Only the `ldm` build has one.
+    #[cfg(feature = "ldm")]
+    let ldm = if long_distance_matching {
+        let strategy = ldm_strategy_ordinal(params.strategy_tag, params.lazy_depth);
+        let ldm_params = crate::encoding::ldm::params::LdmParams::adjust_for(
+            u32::from(params.window_log),
+            strategy,
+        );
+        crate::encoding::ldm::table::LdmHashTable::estimated_workspace_bytes(
+            ldm_params.hash_log,
+            ldm_params.bucket_size_log,
+        )
+    } else {
+        0
+    };
+    #[cfg(not(feature = "ldm"))]
+    let ldm = {
+        let _ = long_distance_matching;
+        0
+    };
+    // A 30-bit window is a gibibyte, which a 32-bit `usize` cannot count: the
+    // widest window is more memory than such a machine has, so the figure is
+    // pinned rather than wrapped.
+    let window = 1usize
+        .checked_shl(u32::from(params.window_log))
+        .unwrap_or(usize::MAX);
     // Mirror `configure()`: the HC3 short-match side table exists only on
     // the btultra/btultra2 tags (minMatch 3), capped by the window log; the
     // BT pointer-pair layout fits inside the `4 << chain_log` chain term
@@ -774,7 +871,14 @@ pub fn estimated_compression_workspace_bytes(level: CompressionLevel) -> usize {
     // Block staging: literal + sequence buffers plus the compressed-block
     // scratch, each bounded by the 128 KiB block size.
     let staging = 3 * (128 * 1024);
-    window + tables + bt + staging
+    // Saturating: the parts are each bounded, but their sum at the widest
+    // window is more than a 32-bit `usize` counts, and a total that wrapped
+    // would report a run as fitting a limit it cannot.
+    window
+        .saturating_add(tables)
+        .saturating_add(bt)
+        .saturating_add(staging)
+        .saturating_add(ldm)
 }
 
 /// Extra steady-state workspace the optimal strategies (ordinals 7..=9,
