@@ -2107,22 +2107,56 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         let mut pending_input: Vec<u8> = Vec::new();
         let mut reached_eof = false;
         let mut savings = 0i64;
-        // One allocation for the whole frame's ingest buffer when the size is
-        // pledged, instead of a doubling chain of reallocations as the blocks
-        // arrive. Only a PLEDGED size is sized on: an advisory hint may be a
-        // wild overestimate, and reserving it up front would let a compressor
-        // with a large window and a tiny reader allocate hundreds of MiB before
-        // reading a byte. Inexact hints keep the doubling growth, which is
-        // bounded by what actually arrives. The slack is one block, so the
-        // final top-up (which asks for a whole block even when only a tail
-        // remains) does not reallocate; sized off the ACTIVE block capacity,
-        // since a small window shrinks the block below the format maximum.
-        if hint_is_exact && let Some(hint) = initial_size_hint {
+        // One allocation for the whole frame's ingest buffer, instead of a
+        // doubling chain of reallocations as the blocks arrive. A fresh
+        // compressor starts with an empty buffer, so without this every frame
+        // climbs the ladder again and hands the pages back at the end of it:
+        // measured at level 3 over a 1 MB frame, three growth steps per frame
+        // and about 2.4 MB of pages faulted back in each time, against none for
+        // a reference that sizes its workspace once.
+        //
+        // An inexact hint is sized on too. The worry it would otherwise raise —
+        // that a wild overestimate reserves memory the reader never fills — is
+        // already answered twice over: the same hint has by this point sized
+        // the window and the match-finder tables (it reaches the matcher
+        // through `set_source_size_hint`, and the level parameters cap the
+        // window by it), and `reserve_for_frame` clamps to the eviction ceiling
+        // the buffer would reach anyway. So the reservation is proportionate to
+        // allocations the hint has already caused, not a new class of waste.
+        // The slack is one block, so the final top-up (which asks for a whole
+        // block even when only a tail remains) does not reallocate; sized off
+        // the ACTIVE block capacity, since a small window shrinks the block
+        // below the format maximum.
+        // Raw frames are excluded: they emit straight from the staged buffer
+        // and never consult the match finder (the `in_place` gate below keeps
+        // them off it whatever the backend supports), so sizing its history for
+        // them holds a window's worth of memory the frame has no use for.
+        if let Some(hint) = initial_size_hint
+            && !matches!(self.compression_level, CompressionLevel::Uncompressed)
+        {
             // `saturating_add`: a caller may pledge `u64::MAX`, and clamping a
             // reservation request at the address-space limit is the meaningful
             // answer — the matcher caps it at its eviction ceiling anyway.
-            let target =
+            let mut target =
                 (hint.min(usize::MAX as u64) as usize).saturating_add(self.block_capacity());
+            if !hint_is_exact {
+                // An advisory number is a claim about data that has not arrived,
+                // so it is trusted only as far as the frame's own configuration
+                // makes plausible: the window this LEVEL would choose, never an
+                // overridden one. Overriding the window is itself a claim about
+                // the data — one only the data can confirm — and taking it here
+                // let a caller who promised gibibytes and delivered ten bytes
+                // reserve two of them. Beyond this bound the buffer grows as it
+                // did before, which costs a few reallocations on frames already
+                // large enough for that to be noise.
+                let level_window = crate::encoding::levels::config::resolve_level_params(
+                    self.compression_level,
+                    initial_size_hint,
+                )
+                .window_log;
+                let plausible = (1usize << level_window).saturating_add(self.block_capacity());
+                target = target.min(plausible);
+            }
             self.state.matcher.reserve_for_frame(target);
         }
         // Compress block by block

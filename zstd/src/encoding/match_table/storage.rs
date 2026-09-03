@@ -457,9 +457,14 @@ macro_rules! build_dms {
             ),
             None => (alloc::vec::Vec::new(), alloc::vec::Vec::new()),
         };
+        // Reserved to the final width before filling: these come back empty
+        // from a fresh matcher, and `resize` alone would climb a doubling chain
+        // to reach it, allocating and discarding the intermediate steps.
         hash_table.clear();
+        hash_table.reserve_exact(1usize << dms_hash_log);
         hash_table.resize(1usize << dms_hash_log, 0u32);
         chain_table.clear();
+        chain_table.reserve_exact($per_pos * region);
         chain_table.resize($per_pos * region, 0u32);
         {
             let $concat = $self.live_history();
@@ -665,7 +670,11 @@ impl MatchTable {
                 // later frame, so hand the buffer back instead.
                 self.tables = alloc::vec![HC_EMPTY; total];
             } else {
+                // Reserved to the final width first: from an empty buffer
+                // `resize` walks a doubling chain whose steps the frame throws
+                // away, and a fresh matcher starts empty on every frame.
                 self.tables.clear();
+                self.tables.reserve_exact(total);
                 self.tables.resize(total, HC_EMPTY);
             }
             self.chain_off = hash_size;
@@ -1063,8 +1072,11 @@ impl MatchTable {
         // `bytes` already carries the caller's block-sized slack, sized off the
         // active block capacity — adding the format maximum here would reserve
         // ~128 KiB for a frame whose window (and therefore block) is 1 KiB.
-        let target = bytes.min(ceiling);
-        if target > self.history.len() && self.history.capacity() < target {
+        // Counted on top of what the buffer already holds: a dictionary is
+        // primed into it before this runs, so sizing to the frame alone would
+        // leave the dictionary's bytes to be grown into afterwards.
+        let target = self.history.len().saturating_add(bytes).min(ceiling);
+        if self.history.capacity() < target {
             self.history.reserve_exact(target - self.history.len());
         }
     }
