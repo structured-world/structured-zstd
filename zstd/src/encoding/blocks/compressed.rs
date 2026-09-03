@@ -2381,6 +2381,7 @@ fn compress_literals(
     let Some(new_table_description_size) = new_encoder_table.writeable_table_description_size()
     else {
         raw_literals(literals, writer);
+        weight_scratch.recycle(new_encoder_table);
         return HuffmanTableUpdate::Cleared;
     };
     // Shared with the splitter cost estimator
@@ -2461,10 +2462,15 @@ fn compress_literals(
     if use_raw_literal_fallback(huf_section_size, literals.len(), strategy) {
         writer.reset_to(reset_idx);
         raw_literals(literals, writer);
+        // The section goes out raw, so the table just built is dead; hand its
+        // buffers to the next build instead of dropping them.
+        weight_scratch.recycle(new_encoder_table);
         HuffmanTableUpdate::Cleared
     } else if new_table {
         HuffmanTableUpdate::New(new_encoder_table)
     } else {
+        // The previous table was kept, so this one is dead — same as above.
+        weight_scratch.recycle(new_encoder_table);
         HuffmanTableUpdate::Reused
     }
 }
