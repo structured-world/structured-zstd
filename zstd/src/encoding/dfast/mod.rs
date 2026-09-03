@@ -2400,16 +2400,8 @@ macro_rules! start_matching_fast_loop_body {
                 Tail(usize),
             }
 
-            // The only field read left inside the search loop, and it cannot
-            // change while that loop runs: `offset_hist` is written by
-            // `emit_candidate`, which the outer arm reaches only after a match
-            // has broken out. Left in place it was reloaded per position — the
-            // table stores go through raw pointers derived from the same
-            // `$self`, so nothing lets the optimizer prove they miss this field.
-            let rep1 = $self.offset_hist[0] as usize;
             let inner_exit: InnerExit = 'inner: loop {
                 let abs_ip0 = $current_abs_start + ip0;
-                let abs_ip1 = $current_abs_start + ip1;
                 // Per-position candidate window-low bound (see `advertised_window`
                 // above). `$borrowed` is const, so owned collapses to
                 // `history_abs_start` (byte-identical) and borrowed-in-window
@@ -2420,11 +2412,12 @@ macro_rules! start_matching_fast_loop_body {
                 } else {
                     history_abs_start
                 };
-                let wlow1 = if $borrowed {
-                    abs_ip1.saturating_sub(advertised_window)
-                } else {
-                    history_abs_start
-                };
+                // The `ip1` counterparts of both are spelled out where they are
+                // read instead of bound here. Every one of their readers is a
+                // match path, and the loop is register-saturated, so holding two
+                // more values across every scanned position for the benefit of
+                // the rare path costs more than recomputing them there — the same
+                // trade the literal lengths below are subject to.
                 // Literal lengths are derived at the emit sites rather than
                 // carried: both inputs are live there anyway, and the loop is
                 // register-saturated, so two values held across every scanned
@@ -2477,6 +2470,14 @@ macro_rules! start_matching_fast_loop_body {
                 // `common_prefix_len` per probe, paying ~3× the work for
                 // rep2/rep3 hits that the dfast fast path never benefits
                 // from (those wins live in the lazy/btopt strategies).
+                //
+                // Read per position rather than hoisted above the loop, even
+                // though nothing writes `offset_hist` while the loop runs.
+                // Hoisting it removed the reload and cost 1.9% in cycles: the
+                // value then has to stay live in a register across a body that
+                // already spills 31 distinct slots, and that is dearer than the
+                // load it saves.
+                let rep1 = $self.offset_hist[0] as usize;
                 // Gate in concat coordinates. `abs_ip1 - rep1 >= history_abs_start`
                 // and `rep1 <= abs_ip1` say exactly one thing about the index:
                 // the back-reference lands at or after the start of live
@@ -2551,7 +2552,7 @@ macro_rules! start_matching_fast_loop_body {
                                     concat,
                                     history_abs_start,
                                     history_abs_start + cand_idx_r,
-                                    abs_ip1,
+                                    $current_abs_start + ip1,
                                     match_len,
                                     ip1 - literals_start,
                                 );
@@ -2830,6 +2831,12 @@ macro_rules! start_matching_fast_loop_body {
                             let mut retry_upgraded = false;
                             let mut live_l1_hit = false;
                             if idxl1 != DFAST_EMPTY_SLOT {
+                                let abs_ip1 = $current_abs_start + ip1;
+                                let wlow1 = if $borrowed {
+                                    abs_ip1.saturating_sub(advertised_window)
+                                } else {
+                                    history_abs_start
+                                };
                                 let cand_pos_l1 = position_base + (idxl1 as usize) - 1;
                                 if cand_pos_l1 >= wlow1 && cand_pos_l1 < abs_ip1 {
                                     let cand_idx_l1 = cand_pos_l1 - history_abs_start;
@@ -2951,7 +2958,7 @@ macro_rules! start_matching_fast_loop_body {
                                                     concat,
                                                     history_abs_start,
                                                     cand_pos,
-                                                    abs_ip1,
+                                                    $current_abs_start + ip1,
                                                     dl1_match_len,
                                                     ip1 - literals_start,
                                                 );
