@@ -151,6 +151,38 @@ fn target_block_size_reaches_the_encoder() {
     );
 }
 
+/// Inputs are processed one after another, so an output derived from an early
+/// one can land on a file still waiting its turn: `-f foo foo.zst` replaces
+/// `foo.zst` before it is ever read, and the original is gone. `-f` says
+/// overwrite the output, not destroy another input.
+#[test]
+fn an_output_may_not_land_on_another_input() {
+    let dir = std::env::temp_dir();
+    let plain = dir.join(format!("szstd-alias-{}", std::process::id()));
+    let archive = PathBuf::from(format!("{}.zst", plain.display()));
+    fs::write(&plain, b"first input").unwrap();
+    fs::write(&archive, b"second input, would be destroyed").unwrap();
+
+    let mut opts = parse(&["-f", "a", "b"]).unwrap();
+    opts.inputs = vec![plain.clone(), archive.clone()];
+    let refused = run(opts);
+
+    let survived = fs::read(&archive).unwrap_or_default();
+    let _ = fs::remove_file(&plain);
+    let _ = fs::remove_file(&archive);
+    let err = refused
+        .expect_err("an output that is also an input must be refused")
+        .to_string();
+    assert!(
+        err.contains("input"),
+        "the refusal must name the collision: {err}"
+    );
+    assert_eq!(
+        survived, b"second input, would be destroyed",
+        "the second input must still be there"
+    );
+}
+
 /// Compressing does not publish anything: an archive of a private file stays
 /// as private as the file was. Creating the output at whatever the umask says
 /// hands a 0600 secret to every user on the machine, which is why upstream
@@ -196,6 +228,56 @@ fn progress_finishes_when_the_reader_does_not_when_the_count_matches() {
         "the reader reached its end, so the monitor has to be finished too"
     );
     assert_eq!(monitor.read, sink.len() as u64, "and count what it read");
+}
+
+/// `Read::read` answers `Ok(0)` for an empty buffer as well as for the end of
+/// the stream — the contract says so. Treating the first as the second finishes
+/// the monitor before any bytes have moved, and the summary for the work that
+/// followed is then never printed.
+#[test]
+fn an_empty_buffer_read_is_not_the_end_of_the_stream() {
+    let mut monitor = ProgressMonitor::new(&b"payload"[..], 7);
+    assert_eq!(monitor.read(&mut []).unwrap(), 0);
+    assert!(
+        !monitor.finished,
+        "an empty buffer says nothing about the reader"
+    );
+
+    let mut buf = [0u8; 7];
+    assert_eq!(monitor.read(&mut buf).unwrap(), 7);
+    assert!(monitor.finished, "reaching the total does finish it");
+}
+
+/// Listing walks frame headers and training builds a dictionary from samples;
+/// neither reads the one `-D` names. Loading it anyway fails a listing over a
+/// missing file that has nothing to do with it, and spends time and memory on a
+/// large one that is never consulted.
+#[test]
+fn a_dictionary_is_loaded_only_where_it_is_used() {
+    let missing = PathBuf::from("/nonexistent/dictionary/for/this/test");
+
+    let mut listing = parse(&["-l", "f"]).unwrap();
+    listing.dict = Some(missing.clone());
+    assert!(
+        load_dictionary(&listing)
+            .expect("listing does not read it")
+            .is_none(),
+        "a listing has no use for a dictionary"
+    );
+
+    let mut training = parse(&["--train", "s1"]).unwrap();
+    training.dict = Some(missing.clone());
+    assert!(
+        load_dictionary(&training)
+            .expect("training does not read it")
+            .is_none(),
+        "training builds a dictionary rather than using one"
+    );
+
+    // The modes that do use it still fail on a missing file.
+    let mut decompressing = parse(&["-d", "f"]).unwrap();
+    decompressing.dict = Some(missing);
+    assert!(load_dictionary(&decompressing).is_err());
 }
 
 /// Both directions stream, so a file only has to fit the window, never memory.
@@ -449,6 +531,21 @@ fn train_flags_parse_and_allow_many_samples_with_output() {
     assert_eq!(opts.inputs.len(), 3);
 }
 
+/// Zero is how the dictionary API spells "pick one for me" (`zdict.h`: "force
+/// dictID value; 0 means auto mode"). Carrying it through as an explicit id
+/// makes the trainer refuse a request that asked for the default.
+#[test]
+fn a_zero_dict_id_means_automatic() {
+    assert_eq!(
+        parse(&["--train", "--dictID=0", "s1"]).unwrap().dict_id,
+        None
+    );
+    assert_eq!(
+        parse(&["--train", "--dictID=42", "s1"]).unwrap().dict_id,
+        Some(42)
+    );
+}
+
 #[test]
 fn list_mode_parses() {
     assert_eq!(parse(&["-l", "a.zst"]).unwrap().mode, Mode::List);
@@ -671,6 +768,20 @@ fn a_benchmark_range_is_validated_at_both_ends() {
     assert!(parse(&["-b-200000", "in.txt"]).is_err());
     assert!(parse(&["-b3", "-e200000", "in.txt"]).is_err());
     assert!(parse(&["-b1", "-e19", "in.txt"]).is_ok());
+}
+
+/// Every other operation flag lets the last one typed win. `-b` set a separate
+/// switch that nothing cleared, so `-b3 --list` benchmarked the file the caller
+/// had just asked to list.
+#[test]
+fn a_later_mode_flag_turns_the_benchmark_off() {
+    let listing = parse(&["-b3", "--list", "a.zst"]).unwrap();
+    assert!(!listing.bench, "--list came last, so it wins");
+    assert_eq!(listing.mode, Mode::List);
+
+    // And the other way: `-b` after a mode flag selects benchmarking.
+    let benching = parse(&["--list", "-b3", "a.zst"]).unwrap();
+    assert!(benching.bench, "-b came last, so it wins");
 }
 
 #[test]

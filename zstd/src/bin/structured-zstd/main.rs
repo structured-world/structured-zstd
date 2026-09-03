@@ -414,13 +414,13 @@ fn parse_args(
         }
         if let Some(long) = arg.strip_prefix("--") {
             match long {
-                "compress" => opts.mode = Mode::Compress,
-                "decompress" | "uncompress" => opts.mode = Mode::Decompress,
-                "test" => opts.mode = Mode::Test,
-                "list" => opts.mode = Mode::List,
+                "compress" => select_mode(&mut opts, Mode::Compress),
+                "decompress" | "uncompress" => select_mode(&mut opts, Mode::Decompress),
+                "test" => select_mode(&mut opts, Mode::Test),
+                "list" => select_mode(&mut opts, Mode::List),
                 // Plain `--train` selects the same default upstream does,
                 // FastCOVER, so the two spellings agree.
-                "train" | "train-fastcover" => opts.mode = Mode::Train,
+                "train" | "train-fastcover" => select_mode(&mut opts, Mode::Train),
                 // The other trainers produce different dictionaries. Accepting
                 // the flag and running FastCOVER anyway would hand back a
                 // dictionary the caller did not ask for, with nothing to say so.
@@ -513,7 +513,11 @@ fn parse_args(
                     } else if let Some(v) = long.strip_prefix("maxdict=") {
                         opts.max_dict = v.parse::<usize>().wrap_err("invalid --maxdict size")?;
                     } else if let Some(v) = long.strip_prefix("dictID=") {
-                        opts.dict_id = Some(v.parse::<u32>().wrap_err("invalid --dictID")?);
+                        // Zero is how the dictionary API spells "choose one for
+                        // me", so it selects the default rather than being
+                        // carried through as an id the trainer would refuse.
+                        let id = v.parse::<u32>().wrap_err("invalid --dictID")?;
+                        opts.dict_id = (id != 0).then_some(id);
                     } else if let Some(v) = long.strip_prefix("stream-size=") {
                         // An exact pledge: it goes into the frame header, so a
                         // stream of a different length is an error.
@@ -593,10 +597,10 @@ fn parse_args(
         while ci < chars.len() {
             let c = chars[ci];
             match c {
-                'd' => opts.mode = Mode::Decompress,
-                'z' => opts.mode = Mode::Compress,
-                't' => opts.mode = Mode::Test,
-                'l' => opts.mode = Mode::List,
+                'd' => select_mode(&mut opts, Mode::Decompress),
+                'z' => select_mode(&mut opts, Mode::Compress),
+                't' => select_mode(&mut opts, Mode::Test),
+                'l' => select_mode(&mut opts, Mode::List),
                 'b' | 'e' | 'i' => {
                     // `-b[N]` benchmark (start level), `-e[N]` end level for a
                     // range, `-i[N]` iteration budget. The number is attached
@@ -805,6 +809,17 @@ fn attached_path(arg: &std::ffi::OsStr, at: usize) -> PathBuf {
     PathBuf::from(rest)
 }
 
+/// Select the operation, replacing whatever was chosen before it.
+///
+/// Benchmarking is a mode like any other from the command line's point of view,
+/// even though it is carried in its own field, so naming an operation after
+/// `-b` has to turn the benchmark off — the last flag typed is the one that
+/// runs, which is how every other operation flag here behaves.
+fn select_mode(opts: &mut Options, mode: Mode) {
+    opts.mode = mode;
+    opts.bench = false;
+}
+
 /// Whether this run will decode anything, and so whether `-M` binds it.
 ///
 /// Not the same question as the mode: benchmarking keeps `Mode::Compress` and
@@ -900,6 +915,13 @@ fn load_dictionary(opts: &Options) -> Result<Option<Vec<u8>>> {
     let Some(path) = &opts.dict else {
         return Ok(None);
     };
+    // Listing walks frame headers and training builds a dictionary from its
+    // samples; neither consults the one `-D` names. Reading it anyway would
+    // fail a listing over a missing file that has nothing to do with it, and
+    // spend time and memory on a large one nothing looks at.
+    if !opts.bench && matches!(opts.mode, Mode::List | Mode::Train) {
+        return Ok(None);
+    }
     let size = fs::metadata(path)
         .wrap_err_with(|| format!("failed to inspect dictionary file {}", path.display()))?
         .len();
@@ -966,11 +988,31 @@ fn run(opts: Options) -> Result<()> {
     if opts.inputs.is_empty() {
         return process_stdin_stdout(&opts, dict);
     }
+    // The inputs are processed one after another, so an output derived from an
+    // early one can land on a file still waiting its turn: `-f foo foo.zst`
+    // would replace `foo.zst` before it is ever read. `-f` permits overwriting
+    // the output, not destroying another input, so the whole list is checked
+    // before the first byte is written.
+    if !opts.to_stdout && opts.inputs.len() > 1 {
+        for input in &opts.inputs {
+            if input == Path::new("-") {
+                continue;
+            }
+            let output = derive_output_path(&opts, input)?;
+            if let Some(clash) = opts.inputs.iter().find(|other| *other == &output) {
+                bail!(
+                    "{} would be written over {}, which is also an input",
+                    input.display(),
+                    clash.display(),
+                );
+            }
+        }
+    }
     for input in &opts.inputs {
-        if input == "-" {
+        if input == Path::new("-") {
             process_stdin_stdout(&opts, dict)?;
         } else {
-            process_file(&opts, Path::new(input), dict)?;
+            process_file(&opts, input, dict)?;
         }
     }
     Ok(())

@@ -133,7 +133,13 @@ impl<R: Read> Read for ProgressMonitor<R> {
         // One read is bounded by the buffer, so only the running total needs
         // the wider type.
         self.read += out as u64;
-        self.update(out);
+        // `Ok(0)` means the end of the stream only when there was room to read
+        // into: the contract gives the same answer for an empty buffer, which
+        // says nothing about the reader. Taking it as the end would finish the
+        // monitor before the work did, and the summary would never come.
+        if !buf.is_empty() {
+            self.update(out);
+        }
         Ok(out)
     }
 }
