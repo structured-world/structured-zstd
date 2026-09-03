@@ -994,27 +994,6 @@ impl FastKernelMatcher {
     /// (`base += correction`) that the flat-`Vec<u8>` history can't
     /// reuse, but pays for it with a one-time eviction every
     /// `max_window_size` worth of input — amortised constant.
-    /// Capacity of the buffer blocks are appended into; see
-    /// [`Self::reserve_for_frame`].
-    #[cfg(test)]
-    pub(crate) fn history_capacity(&self) -> usize {
-        self.history.capacity()
-    }
-
-    /// Size `history` for a whole frame in one allocation, so the per-block
-    /// appends below do not walk a doubling chain. A fresh matcher starts with
-    /// an empty buffer, so without this every frame climbs that chain again and
-    /// hands the pages back at the end of it. Clamped to the eviction ceiling,
-    /// which is the largest the buffer ever grows anyway: `accept_data` drains
-    /// back to a `max_window_size` tail once the append would pass twice that.
-    pub(crate) fn reserve_for_frame(&mut self, bytes: usize) {
-        let ceiling = 2 * self.max_window_size + crate::common::MAX_BLOCK_SIZE as usize;
-        let target = bytes.min(ceiling);
-        if target > self.history.len() && self.history.capacity() < target {
-            self.history.reserve_exact(target - self.history.len());
-        }
-    }
-
     fn extend_history_with_pending(&mut self) -> usize {
         let mut space = self
             .pending
@@ -1058,6 +1037,33 @@ impl FastKernelMatcher {
     /// `take_recycled_space` (or since construction / reset).
     pub(crate) fn take_recycled_space(&mut self) -> Option<Vec<u8>> {
         self.recycled_space.take()
+    }
+
+    /// Capacity of the buffer blocks are appended into; see
+    /// [`Self::reserve_for_frame`].
+    #[cfg(test)]
+    pub(crate) fn history_capacity(&self) -> usize {
+        self.history.capacity()
+    }
+
+    /// Size `history` for a whole frame in one allocation, so the per-block
+    /// appends do not walk a doubling chain. A fresh matcher starts with an
+    /// empty buffer, so without this every frame climbs that chain again and
+    /// hands the pages back at the end of it. Clamped to the eviction ceiling,
+    /// which is the largest the buffer ever grows anyway: `accept_data` drains
+    /// back to a `max_window_size` tail once the append would pass twice that.
+    ///
+    /// `bytes` is what the frame will bring, counted on top of what the buffer
+    /// already holds: a dictionary is primed into it before this runs, so
+    /// sizing to the frame alone would leave the dictionary's bytes to be
+    /// grown into afterwards — the chain this exists to avoid, on exactly the
+    /// path where one dictionary serves many small frames.
+    pub(crate) fn reserve_for_frame(&mut self, bytes: usize) {
+        let ceiling = 2 * self.max_window_size + crate::common::MAX_BLOCK_SIZE as usize;
+        let target = self.history.len().saturating_add(bytes).min(ceiling);
+        if self.history.capacity() < target {
+            self.history.reserve_exact(target - self.history.len());
+        }
     }
 
     /// Process the pending block with the upstream zstd-shape kernel,

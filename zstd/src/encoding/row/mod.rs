@@ -2757,8 +2757,11 @@ impl RowMatchGenerator {
         // `bytes` already carries the caller's block-sized slack, sized off the
         // active block capacity — adding the format maximum here would reserve
         // ~128 KiB for a frame whose window (and therefore block) is 1 KiB.
-        let target = bytes.min(ceiling);
-        if target > self.history.len() && self.history.capacity() < target {
+        // Counted on top of what the buffer already holds: a dictionary is
+        // primed into it before this runs, so sizing to the frame alone would
+        // leave the dictionary's bytes to be grown into afterwards.
+        let target = self.history.len().saturating_add(bytes).min(ceiling);
+        if self.history.capacity() < target {
             self.history.reserve_exact(target - self.history.len());
         }
     }
@@ -2951,6 +2954,12 @@ impl RowMatchGenerator {
         // pair, and only the tree encodes its slots differently.
         if self.hc_split != 0 && self.hc_layout == LazyFinder::Tree {
             self.tables.iter_mut().for_each(rebase_tree);
+        } else if self.rows_len != 0 {
+            // Row mode: only the positions hold absolute cursors. The slot
+            // cursors and hash tags share the buffer, and reading their bytes
+            // as positions writes the empty sentinel over them, leaving every
+            // cursor at 255 — past the end of any row — and every tag at 0xFF.
+            self.row_positions_mut().iter_mut().for_each(rebase_abs);
         } else {
             self.tables.iter_mut().for_each(rebase_abs);
         }
@@ -4530,6 +4539,9 @@ impl RowMatchGenerator {
 // Gated on `feature = "std"` because the runtime feature probe
 // (`std::arch::is_x86_feature_detected!`) used to skip kernels the host CPU
 // lacks is std-only, matching how `RowTagKernel::detect` gates the same probe.
+#[cfg(test)]
+mod rebase_tests;
+
 #[cfg(all(
     test,
     feature = "std",
