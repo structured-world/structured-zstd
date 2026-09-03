@@ -1795,6 +1795,9 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             .huff_table_spare
             .as_ref()
             .map_or(0, |table| table.heap_size());
+        // The weight builder's buffers are kept between blocks and frames, so
+        // a reused compressor holds them for as long as it lives.
+        total += self.state.huff_weights.heap_size();
         total += self
             .dictionary
             .as_ref()

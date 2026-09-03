@@ -527,6 +527,55 @@ fn clear_dictionary_then_nodict_frame_roundtrips() {
     );
 }
 
+/// The weight builder keeps its buffers between blocks and frames — that is
+/// what it is for — so a compressor asked how much it holds has to count them.
+/// Reported through the C API as `ZSTD_sizeof_CCtx`, a caller budgeting memory
+/// around a reused context would otherwise be told less than it keeps.
+#[test]
+fn heap_size_counts_the_retained_weight_scratch() {
+    // Literal-heavy with a skewed alphabet: the matcher finds little to
+    // repeat, so the block goes out as literals and the entropy path actually
+    // builds a Huffman table — which is what leaves the scratch holding its
+    // buffers. A periodic fixture would compress to sequences instead and
+    // never reach the table build.
+    let mut state = 0x2545_F491_4F6C_DD1Du64;
+    let data: Vec<u8> = (0..64 * 1024u32)
+        .map(|_| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((state >> 33) % 64) as u8
+        })
+        .collect();
+    let mut compressor: FrameCompressor<&[u8]> =
+        FrameCompressor::new(super::CompressionLevel::Level(3));
+    let before = compressor.heap_size();
+    compressor.set_source(data.as_slice());
+    compressor.set_drain(Vec::new());
+    compressor.compress();
+
+    let scratch_bytes = compressor.state.huff_weights.heap_size();
+    assert!(
+        scratch_bytes > 0,
+        "a frame that built a table leaves the weight buffers allocated"
+    );
+    assert!(
+        compressor.heap_size() > before,
+        "compressing grows the reported footprint"
+    );
+
+    // Isolate the scratch's contribution: take it away and the reported total
+    // must fall by exactly what it held. Comparing against the pre-frame total
+    // would not — the matcher's tables grew over the same frame and would hide
+    // an unreported scratch behind them.
+    let with_scratch = compressor.heap_size();
+    let taken = core::mem::take(&mut compressor.state.huff_weights);
+    let without_scratch = compressor.heap_size();
+    assert_eq!(
+        with_scratch - without_scratch,
+        taken.heap_size(),
+        "the reported footprint has to move by exactly what the scratch holds"
+    );
+}
+
 // Regression test: `heap_size()` must count the retained Huffman tables
 // (the active `last_huff_table` and the recycled `huff_table_spare`).
 // A reused context that parks a table would otherwise under-report its

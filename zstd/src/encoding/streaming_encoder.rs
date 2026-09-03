@@ -401,6 +401,8 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             .huff_table_spare
             .as_ref()
             .map_or(0, |table| table.heap_size());
+        // Kept between blocks and frames; see `FrameCompressor::heap_size`.
+        total += self.state.huff_weights.heap_size();
         total += self.pending.capacity();
         total += self.encoded_scratch.capacity();
         total += self

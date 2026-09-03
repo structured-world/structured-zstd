@@ -306,9 +306,10 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         }
         #[cfg(not(feature = "std"))]
         {
-            // no_std: no cache field, no shared state — single `weights()`
-            // compute, branch on FSE-vs-raw based on direct encoder call.
-            let weights = self.weights();
+            // no_std: no cache field, no shared state — single weight
+            // computation, branch on FSE-vs-raw based on direct encoder call.
+            let mut buf = [0u8; MAX_HUFFMAN_ALPHABET];
+            let weights = self.weights_into(&mut buf);
             let weights = &weights[..weights.len() - 1];
             if let Some(fse_description) = Self::encode_weight_description(weights) {
                 self.writer.write_bits(fse_description.len() as u8, 8);
@@ -708,7 +709,8 @@ impl HuffmanTable {
         }
         #[cfg(not(feature = "std"))]
         {
-            let weights = self.weights();
+            let mut buf = [0u8; MAX_HUFFMAN_ALPHABET];
+            let weights = self.weights_into(&mut buf);
             let weights = &weights[..weights.len() - 1];
             if let Some(fse_description) =
                 HuffmanEncoder::<Vec<u8>>::encode_weight_description(weights)
@@ -1298,6 +1300,20 @@ pub(crate) struct WeightScratch {
 }
 
 impl WeightScratch {
+    /// Heap bytes this scratch keeps between blocks and frames. It exists to
+    /// hold its buffers rather than take them again, so a compressor asked for
+    /// its footprint — including through the C API's `ZSTD_sizeof_CCtx` — has
+    /// to be told about them.
+    pub(crate) fn heap_size(&self) -> usize {
+        self.leaves.capacity() * core::mem::size_of::<HuffNode>()
+            + self.work.capacity() * core::mem::size_of::<HuffNode>()
+            + self.weights.capacity() * core::mem::size_of::<usize>()
+            + self
+                .spare_table
+                .as_ref()
+                .map_or(0, |table| table.heap_size() + core::mem::size_of_val(table))
+    }
+
     /// Park a table the caller is done with, for the next build to fill.
     pub(crate) fn recycle(&mut self, table: HuffmanTable) {
         self.spare_table = Some(table);

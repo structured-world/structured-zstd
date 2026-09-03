@@ -342,7 +342,11 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
             matcher: EntropyOnlyMatcher,
             last_huff_table: state.last_huff_table.clone(),
             huff_table_spare: None,
-            huff_weights: Default::default(),
+            // Lent, not created: the estimator builds a table per split
+            // candidate, and a fresh scratch here would take its buffers again
+            // on every post-split block and drop them at the end of it. Handed
+            // back below, so the emitter that follows keeps using the same one.
+            huff_weights: core::mem::take(&mut state.huff_weights),
             fse_tables: clone_fse_tables(&state.fse_tables),
             block_scratch: inner_scratch,
             offset_hist: state.offset_hist,
@@ -358,8 +362,15 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
     workspace = estimator.workspace;
     scratch.estimator_workspace = Some(workspace);
     // Stash the inner scratch back for the next frame (its buffers stay
-    // allocated; the estimator clears them per use).
-    scratch.estimator_inner = Some(Box::new(estimator.scratch_state.block_scratch));
+    // allocated; the estimator clears them per use), and take the weight
+    // builder's buffers back so the emitter and the next block reuse them.
+    let CompressState {
+        block_scratch: inner_block_scratch,
+        huff_weights,
+        ..
+    } = estimator.scratch_state;
+    state.huff_weights = huff_weights;
+    scratch.estimator_inner = Some(Box::new(inner_block_scratch));
 
     scratch.compressed.clear();
     let mut seq_start = 0usize;
