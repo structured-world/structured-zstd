@@ -486,13 +486,28 @@ impl HuffmanTable {
     /// (the upstream non-optimalDepth path). The caller gates `use_search` by
     /// strategy and source size (see `CompressState::huf_optimal_search`).
     pub fn build_from_counts_gated(counts: &[usize], use_search: bool) -> Self {
+        let mut scratch = WeightScratch::default();
+        Self::build_from_counts_gated_with(counts, use_search, &mut scratch)
+    }
+
+    /// [`Self::build_from_counts_gated`] reusing caller-owned scratch. The
+    /// cheap path builds a tree and two weight buffers per call, and a
+    /// compressor calls it once per block — and once per split candidate where
+    /// the block splitter probes — so taking them fresh every time was the
+    /// single largest source of per-frame allocations.
+    pub(crate) fn build_from_counts_gated_with(
+        counts: &[usize],
+        use_search: bool,
+        scratch: &mut WeightScratch,
+    ) -> Self {
         if use_search {
             Self::build_from_counts(counts)
         } else {
             // Match upstream's cheap path: tableLog = FSE_optimalTableLog(11,
             // srcSize, maxSV, minus=1) (huf_compress.c:1286), height-limit to it,
             // not the raw natural height (11) which can cost a few bytes vs C.
-            Self::build_from_weights(&build_limited_weights(counts, cheap_huf_table_log(counts)))
+            build_limited_weights_into(counts, cheap_huf_table_log(counts), scratch);
+            Self::build_from_weights(&scratch.weights)
         }
     }
 
@@ -951,13 +966,23 @@ struct HuffNode {
 /// symbol the (0 or 1) leaves are returned with `nb_bits == 0` and the caller
 /// assigns the trivial weight.
 fn build_huffman_leaf_depths(counts: &[usize]) -> Vec<HuffNode> {
+    let mut nodes = Vec::new();
+    build_huffman_leaf_depths_into(counts, &mut nodes);
+    nodes
+}
+
+/// [`build_huffman_leaf_depths`] filling a caller-owned buffer, so a caller
+/// that builds a tree per block reuses one allocation instead of taking a fresh
+/// one every time.
+fn build_huffman_leaf_depths_into(counts: &[usize], nodes: &mut Vec<HuffNode>) {
     let leaf_count = counts.iter().filter(|&&count| count > 0).count();
     // Pre-size to the final node count (`2 * leaf_count - 1`) so the tree
     // build's resize never reallocates.
-    let mut nodes: Vec<HuffNode> = Vec::with_capacity((2 * leaf_count).max(1));
+    nodes.clear();
+    nodes.reserve((2 * leaf_count).max(1));
 
     if leaf_count == 0 {
-        return nodes;
+        return;
     }
     if leaf_count == 1 {
         let (symbol, &count) = counts.iter().enumerate().find(|&(_, &c)| c > 0).unwrap();
@@ -967,7 +992,7 @@ fn build_huffman_leaf_depths(counts: &[usize]) -> Vec<HuffNode> {
             parent: None,
             nb_bits: 0,
         });
-        return nodes;
+        return;
     }
 
     // Bucketed sort (upstream zstd `HUF_sort`, huf_compress.c): an O(n)
@@ -1125,7 +1150,6 @@ fn build_huffman_leaf_depths(counts: &[usize]) -> Vec<HuffNode> {
     // only writes `parent` / `nb_bits` on them and never reorders them or
     // changes their `count` / `symbol`. Return just the leaves (with depths).
     nodes.truncate(leaf_count);
-    nodes
 }
 
 /// Limit the natural Huffman depths in `leaves` (from
@@ -1199,13 +1223,37 @@ fn cheap_huf_table_log(counts: &[usize]) -> usize {
 }
 
 fn build_limited_weights(counts: &[usize], max_nb_bits: usize) -> Vec<usize> {
-    let leaves = build_huffman_leaf_depths(counts);
-    let mut work = Vec::new();
-    let mut out = Vec::new();
-    if limited_weights_into(&leaves, counts.len(), max_nb_bits, &mut work, &mut out) {
-        out
-    } else {
-        legacy_distributed_weights(counts)
+    let mut scratch = WeightScratch::default();
+    build_limited_weights_into(counts, max_nb_bits, &mut scratch);
+    core::mem::take(&mut scratch.weights)
+}
+
+/// The three buffers a weight build needs, owned by the caller so a compressor
+/// that builds a table per block — and, where the block splitter probes, per
+/// split candidate — reuses them instead of taking three fresh allocations
+/// every time. The table-log SEARCH path already reused its scratch; this is
+/// the same for the cheap single-build path.
+#[derive(Default)]
+pub(crate) struct WeightScratch {
+    leaves: Vec<HuffNode>,
+    work: Vec<HuffNode>,
+    weights: Vec<usize>,
+}
+
+/// [`build_limited_weights`] filling caller-owned scratch. The weights land in
+/// `scratch.weights`.
+fn build_limited_weights_into(counts: &[usize], max_nb_bits: usize, scratch: &mut WeightScratch) {
+    build_huffman_leaf_depths_into(counts, &mut scratch.leaves);
+    if !limited_weights_into(
+        &scratch.leaves,
+        counts.len(),
+        max_nb_bits,
+        &mut scratch.work,
+        &mut scratch.weights,
+    ) {
+        // The fallback builds its own; hand its result to the same slot so the
+        // caller reads one place either way.
+        scratch.weights = legacy_distributed_weights(counts);
     }
 }
 

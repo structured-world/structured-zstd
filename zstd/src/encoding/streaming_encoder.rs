@@ -157,6 +157,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                 matcher,
                 last_huff_table: None,
                 huff_table_spare: None,
+                huff_weights: Default::default(),
                 fse_tables: FseTables::new(),
                 block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
                 offset_hist: [1, 4, 8],

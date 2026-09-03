@@ -849,6 +849,14 @@ pub(crate) struct CompressState<M: Matcher> {
     /// allocations. Without this, every dict-seeded frame whose last block
     /// ended raw/RLE paid a fresh two-Vec table clone per frame.
     pub(crate) huff_table_spare: Option<crate::huff0::huff0_encoder::HuffmanTable>,
+    /// The Huffman weight builder's three buffers, kept across blocks and
+    /// frames. The cheap build path takes a tree and two weight buffers per
+    /// call, and it runs once per block plus once per split candidate wherever
+    /// the block splitter probes, so taking them fresh each time was the single
+    /// largest source of per-frame allocations: 1,880 of a frame's 4,000 at
+    /// level 3. Lives here rather than in the per-block scratch, which the
+    /// block emitter takes out of this state while a block is in flight.
+    pub(crate) huff_weights: crate::huff0::huff0_encoder::WeightScratch,
     pub(crate) fse_tables: FseTables,
     pub(crate) block_scratch: crate::encoding::blocks::CompressedBlockScratch,
     /// Offset history for repeat offset encoding: [rep0, rep1, rep2].
@@ -1151,6 +1159,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 matcher: MatchGeneratorDriver::new(1024 * 128, 1),
                 last_huff_table: None,
                 huff_table_spare: None,
+                huff_weights: Default::default(),
                 fse_tables: FseTables::new(),
                 block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
                 offset_hist: [1, 4, 8],
@@ -1560,6 +1569,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 matcher,
                 last_huff_table: None,
                 huff_table_spare: None,
+                huff_weights: Default::default(),
                 fse_tables: FseTables::new(),
                 block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
                 offset_hist: [1, 4, 8],
