@@ -1612,10 +1612,7 @@ impl DfastMatchGenerator {
         let curr_plus_2 = scan_pos + 2;
         let ip_minus_2 = post_match_end - 2;
         let ip_minus_1 = post_match_end - 1;
-        self.insert_long(curr_plus_2);
-        self.insert_long(ip_minus_2);
-        self.insert_short(curr_plus_2);
-        self.insert_short(ip_minus_1);
+        self.insert_complementary(curr_plus_2, ip_minus_2, ip_minus_1);
         // Inline the trailing-block slice rather than calling
         // `get_last_space()` so this matches the gate pattern used by
         // `skip_matching` / `start_matching` (read `window_blocks.back()`
@@ -1843,29 +1840,98 @@ impl DfastMatchGenerator {
         }
     }
 
+    /// The four complementary insertions upstream makes after a match
+    /// (`zstd_double_fast.c:300-304`), with the scan source, the rebase
+    /// check and the slot bias resolved once for all four rather than per
+    /// insertion.
+    ///
+    /// Upstream writes four inline hash-and-store pairs here. Routing each
+    /// through [`Self::insert_masked`] re-derived the scan source, re-ran the
+    /// rebase guard and rebuilt a bounds-checked slice every time, which put
+    /// the two wrappers at 7.6% of a level-3 encode against roughly nothing
+    /// identifiable on the reference profile.
+    #[cfg_attr(not(target_arch = "wasm32"), inline(always))]
+    fn insert_complementary(&mut self, curr_plus_2: usize, ip_minus_2: usize, ip_minus_1: usize) {
+        const PRIME: u64 = 0xCF1BBCDCB7A56463_u64;
+        // `ensure_room_for` is monotone in its argument, so a base with room
+        // for the furthest of the three has room for the nearer two, and all
+        // four slots then pack against that single base. Runs before
+        // `scan_source` / `position_base` are read because a rebase moves the
+        // base out from under both.
+        let borrowed = self.borrowed_block.is_some();
+        if !borrowed {
+            self.ensure_room_for(curr_plus_2.max(ip_minus_2).max(ip_minus_1));
+        }
+        let (base_ptr, start_offset, abs_start, _position_base, concat_len) = self.scan_source();
+        let position_base = self.position_base;
+        let long_shift = 64 - self.long_hash_bits;
+        let short_shift = 64 - self.short_hash_bits;
+        let long_ptr = self.long_mut_ptr();
+        let short_ptr = self.short_mut_ptr();
+        // SAFETY: `base_ptr + start_offset` is the live source start (owned
+        // `history[history_start..]` or the borrowed input slice) and
+        // `concat_len` its readable byte count, taken exactly as
+        // `insert_masked` takes them; every load below is gated on `idx + 8`
+        // (long key) or `idx + 5` (short key) against that length, and a `pos`
+        // below `abs_start` wraps `idx` into a value no gate admits.
+        let src = unsafe { base_ptr.add(start_offset) };
+        let pack = |pos: usize| -> u32 {
+            if borrowed {
+                (pos as u32).wrapping_add(1)
+            } else {
+                debug_assert!(
+                    pos >= position_base,
+                    "complementary insert {pos} below position_base {position_base}",
+                );
+                ((pos - position_base) as u32) + 1
+            }
+        };
+
+        // Order matters when two targets collide in one table: it is the
+        // order `insert_long` / `insert_short` were called in, so a collision
+        // leaves the same occupant as before.
+        for pos in [curr_plus_2, ip_minus_2] {
+            let idx = pos.wrapping_sub(abs_start);
+            if idx + HASH_READ_SIZE <= concat_len {
+                // SAFETY: the gate above puts `idx + 8` inside `concat_len`.
+                let value = unsafe { (src.add(idx) as *const u64).read_unaligned() };
+                let slot = (value.wrapping_mul(PRIME) >> long_shift) as usize;
+                debug_assert!(slot < self.long_len());
+                // SAFETY: `long_shift = 64 - long_hash_bits`, so `slot` is
+                // below `1 << long_hash_bits`, the long table's length.
+                unsafe { *long_ptr.add(slot) = pack(pos) };
+            }
+        }
+        // Short key is the low 5 bytes (upstream `mls = 5`) in the same
+        // `<< 24` form the fast-loop probe builds from its 8-byte load; a
+        // position with fewer than 5 readable bytes is left to the seam
+        // re-seed rather than hashed against a zero-padded key.
+        for pos in [curr_plus_2, ip_minus_1] {
+            let idx = pos.wrapping_sub(abs_start);
+            if idx + 5 <= concat_len {
+                // SAFETY: the gate above puts `idx + 5` inside `concat_len`.
+                let (lo4, b5) = unsafe {
+                    (
+                        u64::from((src.add(idx) as *const u32).read_unaligned()),
+                        u64::from(*src.add(idx + 4)),
+                    )
+                };
+                let slot =
+                    ((((lo4 | (b5 << 32)) << 24).wrapping_mul(PRIME)) >> short_shift) as usize;
+                debug_assert!(slot < self.short_len());
+                // SAFETY: `short_shift = 64 - short_hash_bits`, so `slot` is
+                // below the short table's length, and `short_mut_ptr` already
+                // points at the short region.
+                unsafe { *short_ptr.add(slot) = pack(pos) };
+            }
+        }
+    }
+
+    /// Write `pos` into both hash tables. The asymmetric per-table targets
+    /// upstream writes after a match live in [`Self::insert_complementary`],
+    /// which resolves their shared coordinates once instead of per position.
     #[inline]
     pub(crate) fn insert_position(&mut self, pos: usize) {
-        self.insert_masked::<true, true>(pos);
-    }
-
-    /// Insert `pos` into ONLY the long hash table (upstream zstd asymmetric
-    /// complementary insertion: `hashLong` at `curr+2` and `ip-2`).
-    fn insert_long(&mut self, pos: usize) {
-        self.insert_masked::<false, true>(pos);
-    }
-
-    /// Insert `pos` into ONLY the short hash table (upstream zstd: `hashSmall`
-    /// at `curr+2` and `ip-1`).
-    fn insert_short(&mut self, pos: usize) {
-        self.insert_masked::<true, false>(pos);
-    }
-
-    /// Const-generic insertion core. `SHORT` / `LONG` select which tables to
-    /// write; both `true` is the symmetric `insert_position`. The const flags
-    /// fold at compile time, so `insert_position` stays byte-identical to the
-    /// previous single-function form while the asymmetric variants emit only
-    /// their one write.
-    fn insert_masked<const SHORT: bool, const LONG: bool>(&mut self, pos: usize) {
         // Source the bytes + rebase coordinates through `scan_source()` so a
         // borrowed window's seam / tail re-seeds hash the in-place input
         // exactly as the owned path hashes its `history` concat.
@@ -1906,7 +1972,7 @@ impl DfastMatchGenerator {
         // `start_matching` seam re-seed picks it up once the next block
         // extends the source far enough to form its full 5-byte key.
         let concat = unsafe { core::slice::from_raw_parts(base_ptr.add(start_offset), concat_len) };
-        if SHORT && idx + 5 <= concat_len {
+        if idx + 5 <= concat_len {
             let short = self.short_hash_index(&concat[idx..]);
             debug_assert!(short < self.short_len());
             // Short region starts at `long_len`.
@@ -1914,7 +1980,7 @@ impl DfastMatchGenerator {
             unsafe { *self.tables.get_unchecked_mut(slot) = packed };
         }
 
-        if LONG && idx + 8 <= concat_len {
+        if idx + 8 <= concat_len {
             let long = self.long_hash_index(&concat[idx..]);
             debug_assert!(long < self.long_len());
             unsafe { *self.tables.get_unchecked_mut(long) = packed };
