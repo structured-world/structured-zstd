@@ -507,7 +507,8 @@ impl HuffmanTable {
             // srcSize, maxSV, minus=1) (huf_compress.c:1286), height-limit to it,
             // not the raw natural height (11) which can cost a few bytes vs C.
             build_limited_weights_into(counts, cheap_huf_table_log(counts), scratch);
-            Self::build_from_weights(&scratch.weights)
+            let spare = scratch.spare_table.take();
+            Self::build_from_weights_reusing(&scratch.weights, spare)
         }
     }
 
@@ -748,6 +749,14 @@ impl HuffmanTable {
     }
 
     pub fn build_from_weights(weights: &[usize]) -> Self {
+        Self::build_from_weights_reusing(weights, None)
+    }
+
+    /// [`Self::build_from_weights`] filling a discarded table's buffers instead
+    /// of taking new ones. A table is built per block and, where the splitter
+    /// probes, per split candidate; most are measured and thrown away, so
+    /// handing the last one back turns two allocations per build into none.
+    pub(crate) fn build_from_weights_reusing(weights: &[usize], spare: Option<Self>) -> Self {
         let weight_sum = weights
             .iter()
             .copied()
@@ -758,12 +767,28 @@ impl HuffmanTable {
             panic!("This is an internal error");
         }
         let table_log = highest_bit_set(weight_sum) - 1;
-        let mut table = HuffmanTable {
-            codes: alloc::vec![(0, 0); weights.len()],
-            packed_codes: alloc::vec![0u64; weights.len()],
-            table_log: table_log as u32,
-            #[cfg(feature = "std")]
-            cached_encoded_weight_description: CachedDescription::new(),
+        let mut table = match spare {
+            Some(mut spare) => {
+                // Both buffers are overwritten in full below, so the recycled
+                // contents do not survive; only their allocations do.
+                spare.codes.clear();
+                spare.codes.resize(weights.len(), (0, 0));
+                spare.packed_codes.clear();
+                spare.packed_codes.resize(weights.len(), 0u64);
+                spare.table_log = table_log as u32;
+                #[cfg(feature = "std")]
+                {
+                    spare.cached_encoded_weight_description = CachedDescription::new();
+                }
+                spare
+            }
+            None => HuffmanTable {
+                codes: alloc::vec![(0, 0); weights.len()],
+                packed_codes: alloc::vec![0u64; weights.len()],
+                table_log: table_log as u32,
+                #[cfg(feature = "std")]
+                cached_encoded_weight_description: CachedDescription::new(),
+            },
         };
         let mut nb_per_rank = [0u16; 13];
         for &weight in weights {
@@ -1238,6 +1263,16 @@ pub(crate) struct WeightScratch {
     leaves: Vec<HuffNode>,
     work: Vec<HuffNode>,
     weights: Vec<usize>,
+    /// The last table the caller built and threw away, handed back so the next
+    /// build fills its buffers instead of taking new ones.
+    spare_table: Option<HuffmanTable>,
+}
+
+impl WeightScratch {
+    /// Park a table the caller is done with, for the next build to fill.
+    pub(crate) fn recycle(&mut self, table: HuffmanTable) {
+        self.spare_table = Some(table);
+    }
 }
 
 /// [`build_limited_weights`] filling caller-owned scratch. The weights land in
