@@ -6,6 +6,28 @@ fn no_dict() -> Dictionaries {
     Dictionaries::default()
 }
 
+/// What a benchmark of `input_len` bytes across `levels` actually holds: the
+/// input, the frame it compresses to, the decoded copy, the match finder the
+/// passes build, and the fixed decoder allowance every run pays. The boundary
+/// these tests probe, spelled the way the run spells it so the two cannot
+/// drift apart.
+fn benchmark_budget(input_len: u64, levels: std::ops::RangeInclusive<i32>) -> u64 {
+    let encoder = levels
+        .map(|level| {
+            structured_zstd::encoding::estimated_compression_workspace_bytes_for_source(
+                structured_zstd::encoding::CompressionLevel::Level(level),
+                Some(input_len),
+            ) as u64
+        })
+        .max()
+        .unwrap_or(0);
+    structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE
+        + (1 << 20)
+        + 2 * input_len
+        + structured_zstd::encoding::compress_bound(input_len as usize) as u64
+        + encoder
+}
+
 /// The same blob a `-D` run would hand the codecs, parsed for both directions
 /// so one helper serves a compressing test and a decoding one alike.
 fn prepared_dict(raw: &[u8]) -> Dictionaries {
@@ -1914,16 +1936,10 @@ fn separate_benchmarking_measures_one_file_at_a_time() {
 
     // Measured one at a time, only one file is in memory at once — so a limit
     // that fits a single file is enough, while the concatenation needs both.
-    // Sized the way the run sizes its buffers: the file, its frame, and the
-    // decoded copy.
+    // Sized the way the run sizes what it holds, for one file.
     let mut opts = parse(&["-b3", "-S", "f"]).unwrap();
     opts.inputs = vec![one.clone(), two.clone()];
-    opts.memory_limit = Some(
-        structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE
-            + (1 << 20)
-            + 2 * 32 * 1024
-            + structured_zstd::encoding::compress_bound(32 * 1024) as u64,
-    );
+    opts.memory_limit = Some(benchmark_budget(32 * 1024, 3..=3));
     let separately = run_benchmark(&opts, None);
 
     opts.bench_separately = false;
@@ -2073,6 +2089,78 @@ fn benchmarking_refuses_the_stdin_marker() {
     );
 }
 
+/// The listing walk has the same blind spot benchmarking had: `-` is stdin
+/// everywhere else, and listing cannot read a stream — it seeks between frame
+/// headers. Statting it means the marker names a file whenever one sits in the
+/// working directory under that name, and stdin whenever one does not.
+#[test]
+fn listing_refuses_the_stdin_marker() {
+    let dir = std::env::temp_dir().join(format!("szstd-listdash-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let dash = dir.join("-");
+    // A real archive, so nothing but the marker check can refuse it.
+    fs::write(
+        &dash,
+        structured_zstd::encoding::compress_slice_to_vec(
+            b"listable payload",
+            structured_zstd::encoding::CompressionLevel::Default,
+        ),
+    )
+    .unwrap();
+
+    let mut opts = parse(&["--list", "f"]).unwrap();
+    opts.inputs = vec![PathBuf::from("-")];
+    let previous = std::env::current_dir().unwrap();
+    std::env::set_current_dir(&dir).unwrap();
+    let refused = run(opts);
+    std::env::set_current_dir(previous).unwrap();
+
+    let _ = fs::remove_file(&dash);
+    let _ = fs::remove_dir(&dir);
+    let err = refused
+        .expect_err("the marker means stdin, which listing cannot walk")
+        .to_string();
+    assert!(
+        err.contains("stdin"),
+        "the refusal must say what is wrong with it: {err}"
+    );
+}
+
+/// Every compression pass allocates a match finder, and at the higher levels
+/// its tables dwarf everything else the run holds — hundreds of MiB where the
+/// buffers are tens. A ceiling that counts the buffers and a fixed decoder
+/// allowance but not the encoder is one the run walks straight past.
+#[test]
+fn the_memory_limit_counts_the_encoder_the_benchmark_builds() {
+    let dir = std::env::temp_dir();
+    let input = dir.join(format!("szstd-encws-{}.bin", std::process::id()));
+    fs::write(&input, vec![0u8; 32 * 1024]).unwrap();
+
+    let encoder = structured_zstd::encoding::estimated_compression_workspace_bytes_for_source(
+        structured_zstd::encoding::CompressionLevel::Level(3),
+        Some(32 * 1024),
+    ) as u64;
+    assert!(
+        encoder > 0,
+        "a compression pass allocates something to match with"
+    );
+
+    let mut opts = parse(&["-b3", "f"]).unwrap();
+    opts.inputs = vec![input.clone()];
+
+    // Room for everything but the encoder: it still has to fit beside them.
+    opts.memory_limit = Some(benchmark_budget(32 * 1024, 3..=3) - encoder);
+    let refused = run_benchmark(&opts, None);
+
+    // Room for all of it.
+    opts.memory_limit = Some(benchmark_budget(32 * 1024, 3..=3));
+    let accepted = run_benchmark(&opts, None);
+    let _ = fs::remove_file(&input);
+
+    refused.expect_err("the buffers alone do not cover the encoder beside them");
+    accepted.expect("with room for both it runs");
+}
+
 /// A benchmark holds the dictionary more than once: it measures both
 /// directions, so the blob is parsed into an encoder's tables and a decoder's,
 /// and the blob itself is still there while they are built from it. Counting it
@@ -2084,10 +2172,7 @@ fn the_memory_limit_counts_every_copy_of_the_dictionary() {
     fs::write(&input, vec![0u8; 32 * 1024]).unwrap();
     let dictionary = vec![0u8; 32 * 1024];
 
-    let buffers = structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE
-        + (1 << 20)
-        + 2 * 32 * 1024
-        + structured_zstd::encoding::compress_bound(32 * 1024) as u64;
+    let buffers = benchmark_budget(32 * 1024, 3..=3);
 
     let mut opts = parse(&["-b3", "f"]).unwrap();
     opts.inputs = vec![input.clone()];
@@ -2117,14 +2202,9 @@ fn the_memory_limit_counts_the_dictionary_and_the_benchmark_together() {
 
     let mut opts = parse(&["-b3", "f"]).unwrap();
     opts.inputs = vec![input.clone()];
-    // Room for exactly what the benchmark holds — the input, its frame and the
-    // decoded copy — and so none to spare for a dictionary beside them.
-    opts.memory_limit = Some(
-        structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE
-            + (1 << 20)
-            + 2 * 32 * 1024
-            + structured_zstd::encoding::compress_bound(32 * 1024) as u64,
-    );
+    // Room for exactly what the benchmark holds, and so none to spare for a
+    // dictionary beside it.
+    opts.memory_limit = Some(benchmark_budget(32 * 1024, 3..=3));
     let refused = run_benchmark(&opts, Some(dictionary));
     let alone = run_benchmark(&opts, None);
     let _ = fs::remove_file(&input);

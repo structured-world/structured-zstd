@@ -1045,6 +1045,14 @@ fn run(opts: Options) -> Result<()> {
         if opts.inputs.is_empty() {
             bail!("--list requires regular files (cannot list stdin)");
         }
+        // `-` is stdin, which the walk cannot seek through any more than a
+        // FIFO. Answered before the stat below, or the marker would name a file
+        // whenever one happens to sit in the working directory under that name
+        // — and stdin whenever one does not. A file really called `-` is still
+        // reachable, spelled `./-`.
+        if opts.inputs.iter().any(|input| input == Path::new("-")) {
+            bail!("--list cannot list stdin; name a file (`./-` for one called `-`)");
+        }
         // The walk seeks between frame headers, so it needs a file that can
         // seek. Settled for every input before any is opened: opening a FIFO
         // blocks until a writer appears, and the failure would then arrive
@@ -1210,8 +1218,29 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
             .map(structured_zstd::encoding::compress_bound)
             .map(|bound| bound as u64)
             .ok();
+        // Beside them stands the match finder every compression pass builds,
+        // whose tables are the largest thing at the higher levels — hundreds of
+        // MiB where the buffers are tens. It is sized by the level AND by the
+        // source, since both cap the window and the tables, so it is asked for
+        // the levels this run will measure and the input it will measure them
+        // on. One level runs at a time and its encoder is dropped before the
+        // next, so the largest of them is what stands at the peak.
+        let encoder = (opts.bench_start..=opts.bench_end)
+            .map(|level| {
+                structured_zstd::encoding::estimated_compression_workspace_bytes_for_source(
+                    structured_zstd::encoding::CompressionLevel::Level(level),
+                    Some(inputs),
+                ) as u64
+            })
+            .max()
+            .unwrap_or(0);
         let buffers = frame
-            .and_then(|frame| inputs.checked_mul(2)?.checked_add(frame))
+            .and_then(|frame| {
+                inputs
+                    .checked_mul(2)?
+                    .checked_add(frame)?
+                    .checked_add(encoder)
+            })
             .ok_or_else(|| eyre!("the inputs add up to more than any machine can address"))?;
         check_memory_limit(limit, buffers, 1)?;
         // The dictionary is held alongside them, and more than once: a

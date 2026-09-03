@@ -718,8 +718,22 @@ pub(crate) fn adjust_params_for_source_size(mut params: LevelParams, src_size: u
 /// resolves at frame start, so the estimate tracks the real allocations;
 /// it is an upper-bound style budget figure, not an exact accounting.
 pub fn estimated_compression_workspace_bytes(level: CompressionLevel) -> usize {
+    estimated_compression_workspace_bytes_for_source(level, None)
+}
+
+/// The same estimate for a source whose size is known.
+///
+/// The window and the match-finder tables are capped by the source, so a level
+/// that would reserve hundreds of MiB for an arbitrary stream reserves a
+/// fraction of that for a small one — and a caller budgeting memory for a
+/// compression it is about to run knows which. `None` is the arbitrary-stream
+/// figure that [`estimated_compression_workspace_bytes`] reports.
+pub fn estimated_compression_workspace_bytes_for_source(
+    level: CompressionLevel,
+    src_size_hint: Option<u64>,
+) -> usize {
     use crate::encoding::strategy::StrategyTag;
-    let params = resolve_level_params(level, None);
+    let params = resolve_level_params(level, src_size_hint);
     let window = 1usize << params.window_log;
     // Mirror `configure()`: the HC3 short-match side table exists only on
     // the btultra/btultra2 tags (minMatch 3), capped by the window log; the
