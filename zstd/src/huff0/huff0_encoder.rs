@@ -239,7 +239,7 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         data: &[u8],
     ) {
         for symbol in data.iter().rev() {
-            let (code, num_bits) = table.codes[*symbol as usize];
+            let (code, num_bits) = table.codes.codes[*symbol as usize];
             debug_assert!(num_bits > 0);
             writer.write_bits(code, num_bits as usize);
         }
@@ -306,9 +306,10 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         }
         #[cfg(not(feature = "std"))]
         {
-            // no_std: no cache field, no shared state — single `weights()`
-            // compute, branch on FSE-vs-raw based on direct encoder call.
-            let weights = self.weights();
+            // no_std: no cache field, no shared state — single weight
+            // computation, branch on FSE-vs-raw based on direct encoder call.
+            let mut buf = [0u8; MAX_HUFFMAN_ALPHABET];
+            let weights = self.weights_into(&mut buf);
             let weights = &weights[..weights.len() - 1];
             if let Some(fse_description) = Self::encode_weight_description(weights) {
                 self.writer.write_bits(fse_description.len() as u8, 8);
@@ -415,14 +416,38 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
     }
 }
 
-pub struct HuffmanTable {
+/// The two code tables, sized for the widest alphabet the format admits —
+/// the shape of the reference's `HUF_CElt CTable[HUF_CTABLE_SIZE_ST(255)]`.
+///
+/// Kept behind one pointer in [`HuffmanTable`] rather than inline in it,
+/// because a table is handed between blocks: the reference passes its block
+/// states as `prevCBlock` / `nextCBlock` pointers and swaps those, never
+/// copying the tables. Inline in the struct, the same handoff copied four
+/// kibibytes per block and cost about 3% at level 3 — measured, then fixed
+/// this way.
+#[derive(PartialEq, Eq)]
+struct HuffmanCodes {
     /// Index is the symbol, values are the bitstring in the lower bits of the
-    /// u32 and the amount of bits in the u8. Held inline, like the reference's
-    /// `HUF_CElt CTable[HUF_CTABLE_SIZE_ST(255)]`: a table is built once per
-    /// block and again per split candidate, so owning the codes on the heap
-    /// meant an allocation on every one of those. The live alphabet is
-    /// [`Self::len`] entries.
+    /// u32 and the amount of bits in the u8.
     codes: [(u32, u8); MAX_HUFFMAN_ALPHABET],
+    /// See [`HuffmanTable::packed_codes`].
+    packed: [u64; MAX_HUFFMAN_ALPHABET],
+}
+
+/// Indexing a code container means indexing its per-symbol codes; the packed
+/// mirror is reached by name. Lets a symbol lookup read as `codes[symbol]`.
+impl core::ops::Index<usize> for HuffmanCodes {
+    type Output = (u32, u8);
+
+    fn index(&self, symbol: usize) -> &Self::Output {
+        &self.codes[symbol]
+    }
+}
+
+pub struct HuffmanTable {
+    /// The code tables; see [`HuffmanCodes`]. The live alphabet is
+    /// [`Self::len`] entries of each.
+    codes: alloc::boxed::Box<HuffmanCodes>,
     /// Upstream zstd-format packed Huffman codes (`HUF_CElt`): one `u64` per
     /// symbol where the bottom 8 bits hold `nb_bits` and the top
     /// `(64 - nb_bits)` bits hold `value` left-shifted to the high
@@ -430,10 +455,8 @@ pub struct HuffmanTable {
     /// dual-container [`super::huf_cstream::HufCStream`] can index
     /// symbols with a single u64 load (no per-symbol shift+combine).
     /// See `huf_compress.c:208-221` for the upstream zstd format.
-    packed_codes: [u64; MAX_HUFFMAN_ALPHABET],
-    /// Symbols the table covers — the live prefix of [`Self::codes`] and
-    /// [`Self::packed_codes`]. The arrays are always the format's widest
-    /// alphabet; this says how much of them a given table uses.
+    /// Symbols the table covers — the live prefix of both code arrays, which
+    /// are always the format's widest alphabet.
     len: usize,
     /// Active Huffman table-log (1..=12). Stored explicitly so
     /// `encode4x_reference` can dispatch to the correct `kUnroll`
@@ -456,8 +479,10 @@ pub struct HuffmanTable {
 impl Clone for HuffmanTable {
     fn clone(&self) -> Self {
         Self {
-            codes: self.codes,
-            packed_codes: self.packed_codes,
+            codes: alloc::boxed::Box::new(HuffmanCodes {
+                codes: self.codes.codes,
+                packed: self.codes.packed,
+            }),
             len: self.len,
             table_log: self.table_log,
             #[cfg(feature = "std")]
@@ -468,8 +493,8 @@ impl Clone for HuffmanTable {
     fn clone_from(&mut self, source: &Self) {
         // Only the live prefix carries meaning; the tail beyond `len` is never
         // read, so copying it would be work for nothing.
-        self.codes[..source.len].copy_from_slice(&source.codes[..source.len]);
-        self.packed_codes[..source.len].copy_from_slice(&source.packed_codes[..source.len]);
+        self.codes.codes[..source.len].copy_from_slice(&source.codes.codes[..source.len]);
+        self.codes.packed[..source.len].copy_from_slice(&source.codes.packed[..source.len]);
         self.len = source.len;
         self.table_log = source.table_log;
         #[cfg(feature = "std")]
@@ -701,7 +726,7 @@ impl HuffmanTable {
         for &symbol in data {
             // Bounded by the live alphabet: a symbol the table does not cover
             // has no code, which is what `None` says here.
-            let (_, num_bits) = *self.codes[..self.len].get(symbol as usize)?;
+            let (_, num_bits) = *self.codes.codes[..self.len].get(symbol as usize)?;
             if num_bits == 0 {
                 return None;
             }
@@ -731,7 +756,8 @@ impl HuffmanTable {
         }
         #[cfg(not(feature = "std"))]
         {
-            let weights = self.weights();
+            let mut buf = [0u8; MAX_HUFFMAN_ALPHABET];
+            let weights = self.weights_into(&mut buf);
             let weights = &weights[..weights.len() - 1];
             if let Some(fse_description) =
                 HuffmanEncoder::<Vec<u8>>::encode_weight_description(weights)
@@ -764,7 +790,7 @@ impl HuffmanTable {
     /// once per built table, which is once per block and once per split
     /// candidate, so a `Vec` here was an allocation on that whole path.
     fn weights_into<'b>(&self, buf: &'b mut [u8; MAX_HUFFMAN_ALPHABET]) -> &'b [u8] {
-        let live = &self.codes[..self.len];
+        let live = &self.codes.codes[..self.len];
         let max = *live.iter().map(|(_, nb)| nb).max().unwrap();
         for (slot, &(_, nb)) in buf.iter_mut().zip(live.iter()) {
             *slot = if nb == 0 { 0 } else { max - nb + 1 };
@@ -792,7 +818,7 @@ impl HuffmanTable {
 
     /// Estimates encoded payload size in bytes directly from per-symbol counts.
     pub(crate) fn estimate_compressed_size_from_counts(&self, counts: &[usize]) -> usize {
-        let bits = self.codes[..self.len]
+        let bits = self.codes.codes[..self.len]
             .iter()
             .zip(counts.iter())
             .map(|(&(_, bits), &count)| bits as usize * count)
@@ -812,8 +838,10 @@ impl HuffmanTable {
         }
         let table_log = highest_bit_set(weight_sum) - 1;
         let mut table = HuffmanTable {
-            codes: [(0, 0); MAX_HUFFMAN_ALPHABET],
-            packed_codes: [0u64; MAX_HUFFMAN_ALPHABET],
+            codes: alloc::boxed::Box::new(HuffmanCodes {
+                codes: [(0, 0); MAX_HUFFMAN_ALPHABET],
+                packed: [0u64; MAX_HUFFMAN_ALPHABET],
+            }),
             len: weights.len(),
             table_log: table_log as u32,
             #[cfg(feature = "std")]
@@ -839,8 +867,8 @@ impl HuffmanTable {
             let nb_bits = table_log + 1 - weight;
             let value = val_per_rank[nb_bits];
             val_per_rank[nb_bits] += 1;
-            table.codes[symbol] = (value as u32, nb_bits as u8);
-            table.packed_codes[symbol] =
+            table.codes.codes[symbol] = (value as u32, nb_bits as u8);
+            table.codes.packed[symbol] =
                 super::huf_cstream::pack_huf_celt(value as u32, nb_bits as u8);
         }
 
@@ -852,7 +880,7 @@ impl HuffmanTable {
     /// `huf_compress.c:208-221` for the layout.
     #[inline(always)]
     pub(crate) fn packed_codes(&self) -> &[u64] {
-        &self.packed_codes[..self.len]
+        &self.codes.packed[..self.len]
     }
 
     /// Active Huffman table-log (1..=12) — drives the `kUnroll`
@@ -867,9 +895,9 @@ impl HuffmanTable {
             return None;
         }
         let mut sum = 0;
-        for ((_, other_num_bits), (_, self_num_bits)) in other.codes[..other.len]
+        for ((_, other_num_bits), (_, self_num_bits)) in other.codes.codes[..other.len]
             .iter()
-            .zip(self.codes[..self.len].iter())
+            .zip(self.codes.codes[..self.len].iter())
         {
             if *other_num_bits != 0 && *self_num_bits == 0 {
                 return None;
@@ -879,8 +907,14 @@ impl HuffmanTable {
         Some(sum)
     }
 
+    /// The per-symbol codes the table actually covers.
+    #[cfg(test)]
+    pub(super) fn live_codes(&self) -> &[(u32, u8)] {
+        &self.codes.codes[..self.len]
+    }
+
     pub(crate) fn num_bits_for_symbol(&self, symbol: u8) -> Option<u8> {
-        self.codes
+        self.codes.codes[..self.len]
             .get(symbol as usize)
             .and_then(|&(_, bits)| if bits > 0 { Some(bits) } else { None })
     }
