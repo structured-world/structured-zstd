@@ -1020,7 +1020,7 @@ unsafe fn copy_exact_inline_avx2(src: *const u8, dst: *mut u8, len: usize) {
 /// glibc's IFUNC AVX memcpy beats a 16-byte inline — keeps the AVX2-or-memcpy
 /// arms. Requires `len >= 33`.
 #[cfg(all(
-    target_arch = "x86",
+    any(target_arch = "x86", target_arch = "x86_64"),
     target_feature = "sse2",
     not(target_feature = "avx2"),
     feature = "kernel-sse"
@@ -1137,8 +1137,16 @@ pub(crate) unsafe fn copy_exact_medium(src: *const u8, dst: *mut u8, len: usize)
         copy_exact_inline_avx2(src, dst, len)
     };
 
+    // SSE2 is baseline on x86_64 and this arm is what a stock
+    // `x86_64-unknown-linux-gnu` build takes: AVX2 is not in that target's
+    // baseline, so the arm above compiles out, and before this arm admitted
+    // x86_64 the whole function fell through to `copy_nonoverlapping`, which
+    // lowers to a `memcpy` CALL for a runtime length. That call was reached
+    // 92,628 times in two frames of z000033 at level 3 — once per match — at 73
+    // instructions each, against upstream's inline 16-byte store. It stayed
+    // invisible on aarch64, where NEON is baseline and the arm below fires.
     #[cfg(all(
-        target_arch = "x86",
+        any(target_arch = "x86", target_arch = "x86_64"),
         target_feature = "sse2",
         not(target_feature = "avx2"),
         feature = "kernel-sse"
@@ -1163,7 +1171,7 @@ pub(crate) unsafe fn copy_exact_medium(src: *const u8, dst: *mut u8, len: usize)
             feature = "kernel-avx2"
         ),
         all(
-            target_arch = "x86",
+            any(target_arch = "x86", target_arch = "x86_64"),
             target_feature = "sse2",
             not(target_feature = "avx2"),
             feature = "kernel-sse"
