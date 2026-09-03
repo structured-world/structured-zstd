@@ -1001,19 +1001,26 @@ fn run(opts: Options) -> Result<()> {
                 continue;
             }
             let output = derive_output_path(&opts, input)?;
-            if opts.dict.as_deref() == Some(output.as_path()) {
+            // Compared as files rather than as spellings: `foo.zst`,
+            // `./foo.zst` and `dir/../dir/foo.zst` name one file, and a match
+            // on the string alone would miss two of the three.
+            if let Some(dict) = &opts.dict
+                && names_the_same_file(&output, dict)?
+            {
                 bail!(
                     "{} would be written over the dictionary {}",
                     input.display(),
-                    output.display(),
+                    dict.display(),
                 );
             }
-            if let Some(clash) = opts.inputs.iter().find(|other| *other == &output) {
-                bail!(
-                    "{} would be written over {}, which is also an input",
-                    input.display(),
-                    clash.display(),
-                );
+            for other in &opts.inputs {
+                if other != Path::new("-") && names_the_same_file(&output, other)? {
+                    bail!(
+                        "{} would be written over {}, which is also an input",
+                        input.display(),
+                        other.display(),
+                    );
+                }
             }
         }
     }
@@ -1207,6 +1214,21 @@ fn train_dictionary(opts: &Options) -> Result<()> {
             "{} is a training sample; the dictionary cannot be written over it",
             clash.display()
         );
+    }
+
+    // Training reads every sample whole, so a sample needs an end and a size
+    // that means something: a FIFO would block on a read that never returns
+    // and a character device would grow the corpus until the allocator gave
+    // up. Settled for all of them before the first is opened.
+    for input in &opts.inputs {
+        let metadata = fs::metadata(input)
+            .wrap_err_with(|| format!("failed to inspect {}", input.display()))?;
+        if !metadata.is_file() {
+            bail!(
+                "--train needs regular files: {} is not one",
+                input.display()
+            );
+        }
     }
 
     let mut corpus = Vec::new();
@@ -1877,6 +1899,29 @@ fn ensure_distinct_paths(input: &Path, output: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether two paths name the same file, for a path that may not exist yet.
+///
+/// The preflight compares a derived OUTPUT against files the run reads, and
+/// that output is usually still to be created — `canonicalize` would fail on
+/// it. So each side is resolved as its canonical directory plus its own file
+/// name: the directory exists in both cases, and resolving it collapses `.`,
+/// `..` and symlinked components, which a string comparison cannot. A path
+/// whose directory cannot be resolved names nothing this run could collide
+/// with, so it simply does not match.
+fn names_the_same_file(left: &Path, right: &Path) -> Result<bool> {
+    fn resolved(path: &Path) -> Option<PathBuf> {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty());
+        let directory = fs::canonicalize(parent.unwrap_or_else(|| Path::new("."))).ok()?;
+        Some(directory.join(path.file_name()?))
+    }
+    match (resolved(left), resolved(right)) {
+        (Some(left), Some(right)) => Ok(left == right),
+        _ => Ok(false),
+    }
 }
 
 /// Whether two different paths name one file, as a hard link does.

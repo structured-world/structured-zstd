@@ -239,6 +239,73 @@ fn an_output_may_not_land_on_the_dictionary() {
     assert_eq!(survived.len(), 4096, "the dictionary must still be there");
 }
 
+/// The same file can be named many ways — `foo.zst`, `./foo.zst`,
+/// `dir/../dir/foo.zst` — and a guard that compares the spelling rather than
+/// the file lets every one of those through. The second input is destroyed just
+/// the same.
+#[test]
+fn an_output_may_not_land_on_another_input_spelled_differently() {
+    let dir = std::env::temp_dir();
+    let plain = dir.join(format!("szstd-spelling-{}", std::process::id()));
+    let archive = PathBuf::from(format!("{}.zst", plain.display()));
+    fs::write(&plain, b"first input").unwrap();
+    fs::write(&archive, b"second input, would be destroyed").unwrap();
+
+    // The same archive, reached through the directory rather than named
+    // directly: a different string for one file.
+    let indirect = dir
+        .join("..")
+        .join(dir.file_name().expect("a temp dir has a name"))
+        .join(archive.file_name().expect("the archive has a name"));
+
+    let mut opts = parse(&["-f", "a", "b"]).unwrap();
+    opts.inputs = vec![plain.clone(), indirect];
+    let refused = run(opts);
+
+    let survived = fs::read(&archive).unwrap_or_default();
+    let _ = fs::remove_file(&plain);
+    let _ = fs::remove_file(&archive);
+    refused.expect_err("the collision is the file, not the spelling");
+    assert_eq!(
+        survived, b"second input, would be destroyed",
+        "the second input must still be there"
+    );
+}
+
+/// Training reads every sample whole, so a sample has to be a file with an end:
+/// a FIFO blocks on a read that never returns and a character device grows the
+/// corpus until the allocator gives up — the same reason benchmarking and
+/// listing already refuse them.
+#[cfg(unix)]
+#[test]
+fn training_refuses_samples_that_are_not_regular_files() {
+    let dir = std::env::temp_dir();
+    let fifo = dir.join(format!("szstd-trainfifo-{}", std::process::id()));
+    let _ = fs::remove_file(&fifo);
+    let made = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !made {
+        return;
+    }
+
+    let mut opts = parse(&["--train", "s"]).unwrap();
+    opts.inputs = vec![fifo.clone()];
+    opts.output = Some(dir.join(format!("szstd-trainfifo-out-{}", std::process::id())));
+    let refused = train_dictionary(&opts);
+    let _ = fs::remove_file(&fifo);
+
+    let err = refused
+        .expect_err("a FIFO is not a training sample")
+        .to_string();
+    assert!(
+        err.contains("regular files"),
+        "the refusal must name what is wrong with the sample: {err}"
+    );
+}
+
 /// Compressing does not publish anything: an archive of a private file stays
 /// as private as the file was. Creating the output at whatever the umask says
 /// hands a 0600 secret to every user on the machine, which is why upstream
