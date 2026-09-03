@@ -21,6 +21,11 @@ use crate::{
     histogram,
 };
 
+/// Widest Huffman alphabet the format admits: one code per byte value. Every
+/// per-symbol buffer here is bounded by it, which is what lets them sit on the
+/// stack instead of being allocated per table.
+const MAX_HUFFMAN_ALPHABET: usize = 256;
+
 pub(crate) struct HuffmanEncoder<'output, 'table, V: AsMut<Vec<u8>>> {
     table: &'table HuffmanTable,
     writer: &'output mut BitWriter<V>,
@@ -251,6 +256,12 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         self.table.weights()
     }
 
+    /// [`Self::weights`] into a caller's buffer; see
+    /// [`HuffmanTable::weights_into`].
+    fn weights_into<'b>(&self, buf: &'b mut [u8; MAX_HUFFMAN_ALPHABET]) -> &'b [u8] {
+        self.table.weights_into(buf)
+    }
+
     fn write_table(&mut self) {
         #[cfg(feature = "std")]
         {
@@ -264,7 +275,8 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
                     self.writer.append_bytes(fse_description);
                     return;
                 }
-                let weights = self.weights();
+                let mut buf = [0u8; MAX_HUFFMAN_ALPHABET];
+                let weights = self.weights_into(&mut buf);
                 let weights = &weights[..weights.len() - 1];
                 Self::write_raw_weight_description(self.writer, weights);
                 return;
@@ -275,7 +287,8 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
             // this, the raw fallback would call back into `weights()` and
             // recompute the slice — a measurable hotspot for small /
             // low-cardinality tables (#170 review thread).
-            let weights = self.weights();
+            let mut buf = [0u8; MAX_HUFFMAN_ALPHABET];
+            let weights = self.weights_into(&mut buf);
             let weights = &weights[..weights.len() - 1];
             if let Some(fse_description) = self
                 .table
@@ -712,12 +725,20 @@ impl HuffmanTable {
     }
 
     fn weights(&self) -> Vec<u8> {
-        let max = self.codes.iter().map(|(_, nb)| nb).max().unwrap();
-        self.codes
-            .iter()
-            .copied()
-            .map(|(_, nb)| if nb == 0 { 0 } else { max - nb + 1 })
-            .collect::<Vec<u8>>()
+        let mut buf = [0u8; MAX_HUFFMAN_ALPHABET];
+        self.weights_into(&mut buf).to_vec()
+    }
+
+    /// [`Self::weights`] written into a caller's buffer. The alphabet is at
+    /// most 256 symbols, so a stack buffer covers every table — and this runs
+    /// once per built table, which is once per block and once per split
+    /// candidate, so a `Vec` here was an allocation on that whole path.
+    fn weights_into<'b>(&self, buf: &'b mut [u8; MAX_HUFFMAN_ALPHABET]) -> &'b [u8] {
+        let max = *self.codes.iter().map(|(_, nb)| nb).max().unwrap();
+        for (slot, &(_, nb)) in buf.iter_mut().zip(self.codes.iter()) {
+            *slot = if nb == 0 { 0 } else { max - nb + 1 };
+        }
+        &buf[..self.codes.len()]
     }
 
     #[cfg(feature = "std")]
@@ -725,7 +746,8 @@ impl HuffmanTable {
         if let Some(cached) = self.cached_encoded_weight_description.get() {
             return cached.as_deref();
         }
-        let weights = self.weights();
+        let mut buf = [0u8; MAX_HUFFMAN_ALPHABET];
+        let weights = self.weights_into(&mut buf);
         let weights = &weights[..weights.len() - 1];
         self.cached_encoded_weight_description_with_weights(weights)
     }
