@@ -2293,12 +2293,14 @@ fn the_memory_limit_counts_what_long_distance_matching_adds() {
         Some(8 * 1024 * 1024),
         None,
         false,
+        None,
     );
     let long = structured_zstd::encoding::estimated_compression_workspace_bytes_for_run(
         structured_zstd::encoding::CompressionLevel::Level(16),
         Some(8 * 1024 * 1024),
         Some(27),
         true,
+        None,
     );
     assert!(
         long > plain,
@@ -2635,4 +2637,58 @@ fn skippable_frames_are_stepped_over() {
         out, b"payload and more",
         "skippable content is stepped over, not emitted"
     );
+}
+
+/// A dictionary does not merely sit beside the match finder — it decides how
+/// big the match finder is. Above the size at which the dictionary stops being
+/// searched in place, the frame runs the dictionary's own table geometry, so a
+/// small file compressed against a large dictionary allocates tables sized for
+/// the dictionary: at level 5, 64 KiB of input against a 256 KiB dictionary
+/// asks for 3.4 MiB where the file alone asks for 1.2 MiB, and the gap reaches
+/// hundreds of MiB at the top levels. A ceiling weighed on the file alone is
+/// one such a run walks straight past.
+#[test]
+fn the_memory_limit_counts_the_encoder_the_dictionary_asks_for() {
+    let dir = std::env::temp_dir();
+    let input = dir.join(format!("szstd-dictws-{}.bin", std::process::id()));
+    fs::write(&input, vec![0u8; 64 * 1024]).unwrap();
+    let dictionary = vec![7u8; 256 * 1024];
+
+    let plain = structured_zstd::encoding::estimated_compression_workspace_bytes_for_source(
+        structured_zstd::encoding::CompressionLevel::Level(5),
+        Some(64 * 1024),
+    ) as u64;
+    let with_dict = structured_zstd::encoding::estimated_compression_workspace_bytes_for_run(
+        structured_zstd::encoding::CompressionLevel::Level(5),
+        Some(64 * 1024),
+        None,
+        false,
+        Some(structured_zstd::encoding::DictionarySizes::raw_content(
+            dictionary.len(),
+        )),
+    ) as u64;
+    assert!(
+        with_dict > plain,
+        "tables built to a 256 KiB dictionary are larger than tables built to a \
+         64 KiB file: {with_dict} vs {plain}"
+    );
+
+    let mut opts = parse(&["-b5", "f"]).unwrap();
+    opts.inputs = vec![input.clone()];
+
+    // Everything the run holds, with the encoder weighed on the file alone:
+    // the buffers, three copies of the dictionary, and that too-small figure.
+    let weighed_without_the_dictionary =
+        benchmark_budget(64 * 1024, 5..=5) + 3 * dictionary.len() as u64;
+    opts.memory_limit = Some(weighed_without_the_dictionary);
+    let refused = run_benchmark(&opts, Some(dictionary.clone()));
+
+    // The same, with the encoder weighed on what the dictionary asks for.
+    opts.memory_limit = Some(weighed_without_the_dictionary + (with_dict - plain));
+    let accepted = run_benchmark(&opts, Some(dictionary));
+    let _ = fs::remove_file(&input);
+
+    refused
+        .expect_err("a ceiling weighed on the file alone does not cover the dictionary's tables");
+    accepted.expect("weighed on the dictionary's own parameters, the run fits");
 }

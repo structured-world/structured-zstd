@@ -739,26 +739,41 @@ pub fn estimated_compression_workspace_bytes_for_source(
     level: CompressionLevel,
     src_size_hint: Option<u64>,
 ) -> usize {
-    estimated_compression_workspace_bytes_for_run(level, src_size_hint, None, false)
+    estimated_compression_workspace_bytes_for_run(level, src_size_hint, None, false, None)
 }
 
-/// The same estimate for a run whose window and long-distance matching are what
-/// the caller has actually asked for.
+/// The same estimate for a run whose window, long-distance matching and
+/// dictionary are what the caller has actually asked for.
 ///
 /// A `window_log` override enlarges the history the frame keeps, and
 /// long-distance matching adds a hash table of its own on top — neither of them
-/// visible in the level's own preset, and together they are the difference
-/// between a figure that describes the run and one that describes the default.
-/// `None` and `false` give the preset, which is what
+/// visible in the level's own preset. A dictionary goes further than adding to
+/// the figure: it *decides* it. The frame runs the dictionary's own compression
+/// parameters, so a small source compressed against a large dictionary builds
+/// tables sized for the dictionary, which at the higher levels is the
+/// difference between tens of KiB and hundreds of MiB. `None`, `false` and
+/// `None` give the preset, which is what
 /// [`estimated_compression_workspace_bytes_for_source`] reports.
+///
+/// `dictionary` is what a caller weighing a run before it parses the blob can
+/// answer with [`DictionarySizes::raw_content`] on the blob's own length: the
+/// content of a trained dictionary is smaller than the blob it came in, and
+/// overstating it can only move the estimate toward the copy-mode geometry,
+/// which is the larger of the two.
+///
+/// [`DictionarySizes::raw_content`]: crate::encoding::DictionarySizes::raw_content
 pub fn estimated_compression_workspace_bytes_for_run(
     level: CompressionLevel,
     src_size_hint: Option<u64>,
     window_log: Option<u8>,
     long_distance_matching: bool,
+    dictionary: Option<crate::encoding::DictionarySizes>,
 ) -> usize {
     use crate::encoding::strategy::StrategyTag;
-    let mut params = resolve_level_params(level, src_size_hint);
+    let mut params = match dictionary.filter(|sizes| sizes.content != 0) {
+        Some(sizes) => resolve_level_params_with_dict(level, src_size_hint, sizes).0,
+        None => resolve_level_params(level, src_size_hint),
+    };
     // The override is what the frame will keep, but never below the floor the
     // format sets or above what the source can fill — the same two bounds the
     // encoder applies to it.

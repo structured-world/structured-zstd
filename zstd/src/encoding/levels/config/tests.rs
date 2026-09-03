@@ -17,12 +17,14 @@ fn a_window_log_beyond_the_encoders_own_maximum_is_bounded() {
         None,
         Some(64),
         false,
+        None,
     );
     let largest = super::estimated_compression_workspace_bytes_for_run(
         CompressionLevel::Level(3),
         None,
         Some(30),
         false,
+        None,
     );
     assert_eq!(
         huge, largest,
@@ -54,12 +56,14 @@ fn the_estimate_saturates_rather_than_wrapping() {
         None,
         Some(30),
         true,
+        None,
     );
     let without_ldm = super::estimated_compression_workspace_bytes_for_run(
         CompressionLevel::Level(22),
         None,
         Some(30),
         false,
+        None,
     );
     assert!(
         with_ldm > without_ldm,

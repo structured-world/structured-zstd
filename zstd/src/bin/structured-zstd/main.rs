@@ -1270,6 +1270,19 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
         // measure them on, and the parameters it will measure them with. One
         // level runs at a time and its encoder is dropped before the next, so
         // the largest of them is what stands at the peak.
+        //
+        // The dictionary is one of those parameters, and the one that moves the
+        // figure most: past the size at which it stops being searched in place,
+        // the frame runs the dictionary's own table geometry rather than the
+        // source's, so 64 KiB measured against a 256 KiB dictionary asks for
+        // three times what the file alone does, and a large dictionary at the
+        // top levels asks for hundreds of MiB more. Weighed here from the
+        // blob's own length, which is what the parameters are chosen by; the
+        // content of a trained dictionary is smaller than the blob it arrived
+        // in, and overstating it can only pick the larger of the two geometries.
+        let dictionary = dict
+            .as_ref()
+            .map(|bytes| structured_zstd::encoding::DictionarySizes::raw_content(bytes.len()));
         let encoder = (opts.bench_start..=opts.bench_end)
             .map(|level| {
                 structured_zstd::encoding::estimated_compression_workspace_bytes_for_run(
@@ -1280,6 +1293,7 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
                         .flatten()
                         .and_then(|log| u8::try_from(log).ok()),
                     opts.long && !opts.store,
+                    dictionary,
                 ) as u64
             })
             .max()
