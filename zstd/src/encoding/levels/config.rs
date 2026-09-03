@@ -536,6 +536,13 @@ pub(crate) fn hc_hash_bits_for_window(max_window_size: usize) -> usize {
 /// Smallest window_log the encoder will use regardless of source size.
 pub(crate) const MIN_WINDOW_LOG: u8 = 10;
 
+/// Largest window_log the public parameter API accepts
+/// ([`CParameter::WindowLog`](crate::encoding::CParameter)'s upper bound), and
+/// so the largest a workspace estimate can be asked to describe. The estimate
+/// answers for whatever it is given, and shifting by more than the width of a
+/// `usize` is undefined, so a request beyond this is answered with this.
+pub(crate) const MAX_ESTIMATED_WINDOW_LOG: u8 = 30;
+
 /// Translate a verbatim upstream `ZSTD_defaultCParameters[tier][level]` row
 /// (`cparams::CParams`) into our resolved [`LevelParams`], reproducing
 /// upstream's cParams -> matcher-config derivation so the encoder follows C's
@@ -756,13 +763,18 @@ pub fn estimated_compression_workspace_bytes_for_run(
     // format sets or above what the source can fill — the same two bounds the
     // encoder applies to it.
     if let Some(requested) = window_log {
+        // Bounded to what the encoder itself accepts before anything shifts by
+        // it. This answers for whatever it is asked, and a shift past the width
+        // of the type is undefined rather than merely large: the largest window
+        // there is, is the honest answer to a request beyond it.
+        let requested = requested.min(MAX_ESTIMATED_WINDOW_LOG);
         let capped = match src_size_hint {
             Some(src) => {
                 crate::encoding::cparams::adjusted_window_log(u32::from(requested), src, 0) as u8
             }
             None => requested,
         };
-        params.window_log = capped.max(MIN_WINDOW_LOG);
+        params.window_log = capped.clamp(MIN_WINDOW_LOG, MAX_ESTIMATED_WINDOW_LOG);
     }
     // The long-distance matcher's own table, sized from the window it searches
     // (upstream `ZSTD_ldm_adjustParameters`). Only the `ldm` build has one.
@@ -785,7 +797,12 @@ pub fn estimated_compression_workspace_bytes_for_run(
         let _ = long_distance_matching;
         0
     };
-    let window = 1usize << params.window_log;
+    // A 30-bit window is a gibibyte, which a 32-bit `usize` cannot count: the
+    // widest window is more memory than such a machine has, so the figure is
+    // pinned rather than wrapped.
+    let window = 1usize
+        .checked_shl(u32::from(params.window_log))
+        .unwrap_or(usize::MAX);
     // Mirror `configure()`: the HC3 short-match side table exists only on
     // the btultra/btultra2 tags (minMatch 3), capped by the window log; the
     // BT pointer-pair layout fits inside the `4 << chain_log` chain term
@@ -839,7 +856,14 @@ pub fn estimated_compression_workspace_bytes_for_run(
     // Block staging: literal + sequence buffers plus the compressed-block
     // scratch, each bounded by the 128 KiB block size.
     let staging = 3 * (128 * 1024);
-    window + tables + bt + staging + ldm
+    // Saturating: the parts are each bounded, but their sum at the widest
+    // window is more than a 32-bit `usize` counts, and a total that wrapped
+    // would report a run as fitting a limit it cannot.
+    window
+        .saturating_add(tables)
+        .saturating_add(bt)
+        .saturating_add(staging)
+        .saturating_add(ldm)
 }
 
 /// Extra steady-state workspace the optimal strategies (ordinals 7..=9,

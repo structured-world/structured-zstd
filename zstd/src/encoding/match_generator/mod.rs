@@ -1078,15 +1078,27 @@ impl Matcher for MatchGeneratorDriver {
             // than through the full adjuster, which would reshape the search.
             if let Some(window_log) = ov.window_log {
                 params.window_log = match hint {
-                    // The helper is the source cap on its own; the floor that
-                    // travels with it in `adjust_cparams` has to be applied
-                    // here too. Without it a hint of a few dozen bytes asks for
-                    // a window smaller than the format's smallest, and a stream
-                    // that outgrows the hint is matched through it.
+                    // The source caps the window even here, and even with an
+                    // explicit request: the reference command declares 2 KiB
+                    // for `--ultra -22 --long=27 -D dict` on a 2 KiB file, and
+                    // a window the content cannot fill only makes every decoder
+                    // reserve memory the frame never uses. The floor that
+                    // travels with the cap in `adjust_cparams` applies too, or
+                    // a hint of a few dozen bytes asks for a window smaller
+                    // than the format's smallest.
+                    //
+                    // The dictionary's own size is NOT part of that cap: the
+                    // reference declares the same 2 KiB whether the dictionary
+                    // is 4 KiB or 256 KiB, because a small window does not put
+                    // the dictionary out of reach — sequences may reference it
+                    // at offsets beyond the window while the output so far is
+                    // within it (RFC 8878, Dictionary_Content). Counting it
+                    // made our frames ask decoders for up to 256x what the
+                    // reference asks.
                     Some(src) => (crate::encoding::cparams::adjusted_window_log(
                         u32::from(window_log),
                         src,
-                        dict_hint.map_or(0, |sizes| sizes.content),
+                        0,
                     ) as u8)
                         .max(MIN_WINDOW_LOG),
                     None => window_log,

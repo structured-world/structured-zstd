@@ -87,9 +87,17 @@ impl EncoderDictionary {
     pub fn from_serialized_or_raw_content(
         raw_dictionary: &[u8],
     ) -> Result<Self, crate::decoding::errors::DictionaryDecodeError> {
+        // Parsed for the encoder, which reads the entropy probabilities, the
+        // content and the offsets and never the decode lookup tables: routing a
+        // serialized blob through the full parser builds those tables for
+        // nothing. The emitted frame is identical either way — only the wasted
+        // build is dropped (see `Dictionary::decode_dict_for_encoding`).
+        if raw_dictionary.starts_with(&crate::decoding::DICTIONARY_MAGIC) {
+            return Self::from_bytes(raw_dictionary);
+        }
         Ok(Self {
             inner: crate::decoding::dictionary::SharedDictionary::new(
-                crate::decoding::Dictionary::from_serialized_or_raw_content(raw_dictionary)?,
+                crate::decoding::Dictionary::from_raw_content(0, raw_dictionary.to_vec())?,
             ),
             serialized_len: raw_dictionary.len(),
         })

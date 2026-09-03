@@ -6,6 +6,71 @@ use crate::encoding::CompressionLevel;
 use crate::encoding::cparams::get_cparams;
 use crate::encoding::strategy::{SearchMethod, StrategyTag};
 
+/// The estimate is a budget figure, so it answers for whatever it is asked —
+/// including a window log no encoder would accept. Shifting by one is undefined
+/// past the width of the type, so an unbounded value turns a question about
+/// memory into a panic; the answer is the largest window there is.
+#[test]
+fn a_window_log_beyond_the_encoders_own_maximum_is_bounded() {
+    let huge = super::estimated_compression_workspace_bytes_for_run(
+        CompressionLevel::Level(3),
+        None,
+        Some(64),
+        false,
+    );
+    let largest = super::estimated_compression_workspace_bytes_for_run(
+        CompressionLevel::Level(3),
+        None,
+        Some(30),
+        false,
+    );
+    assert_eq!(
+        huge, largest,
+        "a window past the maximum is the maximum, not a shift off the end of the type"
+    );
+}
+
+/// The same figure has to survive being asked on a 32-bit target, where the
+/// largest long-distance table alone exceeds what a `usize` can count. An
+/// estimate that wraps understates the memory it exists to bound, which is
+/// worse than one that saturates: the caller is told a run fits when it cannot.
+#[cfg(feature = "ldm")]
+#[test]
+fn the_estimate_saturates_rather_than_wrapping() {
+    // The widest table the logs allow: 2^30 entries of 8 bytes plus the bucket
+    // cursors. On a 64-bit host that is the exact figure; on a 32-bit one it
+    // saturates. Either way it is large, where a wrap would make it small.
+    let widest = crate::encoding::ldm::table::LdmHashTable::estimated_workspace_bytes(30, 8);
+    assert!(
+        widest >= (1usize << 30).saturating_mul(2),
+        "the widest table is counted, not wrapped away: {widest}"
+    );
+
+    // And the estimate carries the table the parameters actually produce: the
+    // same run costs more with long-distance matching than without it, and the
+    // difference is that table rather than a wrapped total.
+    let with_ldm = super::estimated_compression_workspace_bytes_for_run(
+        CompressionLevel::Level(22),
+        None,
+        Some(30),
+        true,
+    );
+    let without_ldm = super::estimated_compression_workspace_bytes_for_run(
+        CompressionLevel::Level(22),
+        None,
+        Some(30),
+        false,
+    );
+    assert!(
+        with_ldm > without_ldm,
+        "the matcher's table is part of the figure: {with_ldm} vs {without_ldm}"
+    );
+    assert!(
+        without_ldm >= 1usize << 30,
+        "and the window alone is already a gibibyte at this log: {without_ldm}"
+    );
+}
+
 /// Regression: a dictionary whose content cannot be indexed by the tagged
 /// attach tables (Fast / Dfast position fields hold at most 2^24 bytes) is
 /// primed in COPY mode, so the frame must run the CDict's verbatim table

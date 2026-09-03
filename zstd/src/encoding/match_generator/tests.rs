@@ -5486,6 +5486,39 @@ fn lazy_band_target_len_matches_default_table() {
 /// asserting the full row (not just `search_depth`) keeps the whole budget
 /// aligned and guards every field against silent drift.
 #[test]
+fn a_dictionary_frame_sizes_its_window_by_the_source_alone() {
+    // The window says how far back the frame reaches and so how much memory a
+    // decoder reserves. The dictionary is reachable regardless of it — the
+    // format lets sequences point into the dictionary at offsets beyond the
+    // window while the output so far is within it — so counting the dictionary
+    // into the window only inflates what every decoder must reserve. The
+    // reference command declares the same window for a 4 KiB dictionary and a
+    // 256 KiB one; a window that grew with the dictionary asked for 256x more.
+    let ov = super::super::parameters::ParamOverrides {
+        window_log: Some(27),
+        ..Default::default()
+    };
+    let window_for = |dictionary: usize| {
+        let mut driver = MatchGeneratorDriver::new(32, 2);
+        driver.set_source_size_hint(2048);
+        driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(dictionary));
+        driver.set_param_overrides(Some(ov));
+        driver.reset(CompressionLevel::Level(22));
+        driver.window_size()
+    };
+    assert_eq!(
+        window_for(4 * 1024),
+        window_for(256 * 1024),
+        "the dictionary's size is not part of the window the frame declares"
+    );
+    assert_eq!(
+        window_for(256 * 1024),
+        2048,
+        "which the source alone decides, as the reference command does"
+    );
+}
+
+#[test]
 fn a_dictionary_frame_keeps_the_formats_smallest_window() {
     // A dictionary frame with an explicit window takes the source cap through
     // `adjusted_window_log` alone, because the full adjuster would reshape a
