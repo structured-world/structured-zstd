@@ -3282,3 +3282,46 @@ fn a_prepared_dictionary_is_shared_by_its_clones_not_copied() {
         "and see the whole of it"
     );
 }
+
+/// The buffer blocks are read into is sized from the caller's size hint, once,
+/// rather than grown into a block at a time. A fresh compressor starts with an
+/// empty buffer, so a frame that grows into it climbs the doubling ladder and
+/// hands the pages back at the end of the frame — measured at level 3 over a
+/// 1 MB frame as three growth steps and about 2.4 MB of pages faulted back in
+/// per frame, against none for a compressor that sizes the buffer up front.
+///
+/// The hint reaching this path is advisory (a reader may deliver fewer bytes
+/// than promised), which is why it was not sized on before. Reserving on it is
+/// bounded twice: the same hint has already sized the window and the tables,
+/// and the reservation is clamped to the eviction ceiling the buffer reaches
+/// anyway.
+#[test]
+fn the_ingest_buffer_is_sized_from_the_hint_not_grown_into() {
+    // One level per backend that keeps an ingest buffer: 1 is the Fast
+    // matcher, 3 the double-fast, 5 the row finder, 13 its tree, 16 the
+    // optimal parser. The size is one no doubling step lands on, so a grown
+    // buffer cannot pass by coincidence.
+    for level in [1, 3, 5, 13, 16] {
+        let data = vec![0u8; 700_000];
+        let mut output: Vec<u8> = Vec::new();
+        let mut compressor = FrameCompressor::new(super::CompressionLevel::Level(level));
+        compressor.set_source_size_hint(data.len() as u64);
+        compressor.set_source(data.as_slice());
+        compressor.set_drain(&mut output);
+        compressor.compress();
+
+        let capacity = compressor.state.matcher.ingest_capacity();
+        assert!(
+            capacity >= data.len(),
+            "level {level}: the whole frame has to fit without growing: \
+             {capacity} < {}",
+            data.len()
+        );
+        assert!(
+            !capacity.is_power_of_two(),
+            "level {level}: a capacity that is an exact power of two is what \
+             growth by doubling leaves behind; a reservation lands on the size \
+             asked for: {capacity}"
+        );
+    }
+}

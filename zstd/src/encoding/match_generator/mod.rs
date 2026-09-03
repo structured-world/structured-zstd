@@ -212,6 +212,20 @@ impl MatcherStorage {
         }
     }
 
+    /// Capacity of the buffer blocks are read into, for the backends that
+    /// ingest in place. A frame sized up front reserves this exactly; one that
+    /// grew into it lands on a doubling step instead, which is what makes the
+    /// difference observable to a test.
+    #[cfg(test)]
+    fn ingest_capacity(&self) -> usize {
+        match self {
+            Self::Simple(m) => m.history_capacity(),
+            Self::Dfast(m) => m.history.capacity(),
+            Self::Row(m) => m.history.capacity(),
+            Self::HashChain(m) => m.table.history.capacity(),
+        }
+    }
+
     /// [`super::strategy::BackendTag`] family of the active variant.
     fn backend(&self) -> super::strategy::BackendTag {
         use super::strategy::BackendTag;
@@ -389,6 +403,12 @@ struct PrimedKey {
 }
 
 impl MatchGeneratorDriver {
+    /// See [`MatcherStorage::ingest_capacity`].
+    #[cfg(test)]
+    pub(crate) fn ingest_capacity(&self) -> usize {
+        self.storage.ingest_capacity()
+    }
+
     /// `slice_size` sets the base block allocation size used for matcher input chunks.
     /// `max_slices_in_window` determines the initial window capacity at construction
     /// time. Effective window sizing is recalculated on every [`reset`](Self::reset)
@@ -1178,8 +1198,8 @@ impl Matcher for MatchGeneratorDriver {
                     m.reset();
                 }
                 MatcherStorage::Row(m) => {
-                    m.row_heads = Vec::new();
-                    m.row_tags = Vec::new();
+                    // One buffer holds the positions and, in its byte tail,
+                    // the cursors and tags — releasing it releases all three.
                     m.release_tables();
                     m.reset();
                 }
@@ -1666,7 +1686,7 @@ impl Matcher for MatchGeneratorDriver {
             MatcherStorage::Dfast(m) => m.reserve_for_frame(bytes),
             MatcherStorage::Row(m) => m.reserve_for_frame(bytes),
             MatcherStorage::HashChain(m) => m.table.reserve_for_frame(bytes),
-            MatcherStorage::Simple(_) => {}
+            MatcherStorage::Simple(m) => m.reserve_for_frame(bytes),
         }
     }
 

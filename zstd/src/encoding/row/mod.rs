@@ -451,7 +451,7 @@ macro_rules! row_find_best_match {
         // bits, `row_log == $rl`), the same argument as `insert_at`.
         debug_assert_eq!($rl, $m.row_log);
         debug_assert!(row_base + row_entries <= $m.row_positions().len());
-        let head = unsafe { *$m.row_heads.get_unchecked($row) } as usize;
+        let head = unsafe { *$m.row_heads().get_unchecked($row) } as usize;
         let window_low = $ctx.window_low($abs_pos);
         let budget = $m.search_depth.min(row_entries);
         let mut attempts = budget;
@@ -469,7 +469,7 @@ macro_rules! row_find_best_match {
             let mut pending: u64 = if $use_mask {
                 // SAFETY: see the table-indexing note above.
                 let tags = unsafe {
-                    core::slice::from_raw_parts($m.row_tags.as_ptr().add(row_base), row_entries)
+                    core::slice::from_raw_parts($m.row_tags().as_ptr().add(row_base), row_entries)
                 };
                 let m = $maskmac!(tags, $tag) & entries_bits;
                 if head == 0 {
@@ -496,7 +496,7 @@ macro_rules! row_find_best_match {
                     while scan < row_entries {
                         let s = (head + scan) & row_mask;
                         scan += 1;
-                        if $m.row_tags[row_base + s] == $tag {
+                        if $m.row_tags()[row_base + s] == $tag {
                             found = Some(s);
                             break;
                         }
@@ -1890,7 +1890,7 @@ macro_rules! row_probe_body {
             let row_entries = 1usize << $rl;
             let row_mask = row_entries - 1;
             let row_base = row << $rl;
-            let head = $m.row_heads[row] as usize;
+            let head = $m.row_heads()[row] as usize;
             let max_walk = $m.search_depth.min(row_entries);
 
             // Prefetch the dict row before the live scan (upstream zstd
@@ -1917,7 +1917,7 @@ macro_rules! row_probe_body {
             // scalar tier (`USE_MASK == false`) const-folds this away and does
             // an on-the-fly per-slot byte compare in the loop.
             let tag_match = if $use_mask {
-                $maskmac!(&$m.row_tags[row_base..row_base + row_entries], tag)
+                $maskmac!(&$m.row_tags()[row_base..row_base + row_entries], tag)
             } else {
                 0
             };
@@ -1974,7 +1974,7 @@ macro_rules! row_probe_body {
                     while scan < row_entries {
                         let s = (head + scan) & row_mask;
                         scan += 1;
-                        if $m.row_tags[row_base + s] == tag {
+                        if $m.row_tags()[row_base + s] == tag {
                             found = Some(s);
                             break;
                         }
@@ -2355,10 +2355,28 @@ pub(crate) struct RowMatchGenerator {
     /// whether the tables keep their pages between frames.
     pub(crate) tables: Vec<u32>,
     /// Start of the chain / tree table inside [`Self::tables`]; the hash table
-    /// occupies everything before it. Zero in row mode, where the whole buffer
-    /// is row positions.
+    /// occupies everything before it. Zero in row mode, where the buffer holds
+    /// row positions followed by the two byte tables.
     hc_split: usize,
-    pub(crate) row_heads: Vec<u8>,
+    /// Row positions occupy `tables[..rows_len]`; the slot cursors and hash
+    /// tags share the bytes of `tables[rows_len..]`. Zero in chain / tree mode,
+    /// where the buffer holds no rows. Carrying the seam explicitly keeps the
+    /// three regions in ONE allocation: a fresh compressor that took them
+    /// separately handed the allocator three size classes per frame, and the
+    /// pages of all three went back to the kernel between frames as a result.
+    rows_len: usize,
+    /// Byte length of the slot-cursor region, and of the tag region that
+    /// follows it, inside the tail of [`Self::tables`]. Kept as fields rather
+    /// than recomputed from the logs: the row search reads them per candidate,
+    /// and deriving them there cost more than the allocation churn the shared
+    /// buffer removed. Both are zero whenever the buffer is not laid out for
+    /// rows, which is what makes the accessors branchless.
+    ///
+    /// Invariant, established by [`Self::ensure_tables`] and preserved by every
+    /// path that clears the buffer: `rows_len * 4 + heads_len + tags_len` is at
+    /// most `tables.len() * 4`.
+    heads_len: usize,
+    tags_len: usize,
     // Absolute match positions, one per row slot. Stored as `u32` (not
     // `usize`): this is the largest match-finder array, and `u32` halves its
     // footprint vs the upstream zstd-parity `U32` layout. `ROW_EMPTY_SLOT == u32::MAX`
@@ -2367,8 +2385,8 @@ pub(crate) struct RowMatchGenerator {
     // even while the live window is bounded; `add_data` rebases the coordinate
     // origin down to the oldest live byte before that happens (see
     // [`Self::rebase_positions`]), keeping positions representable without
-    // capping frame length.
-    pub(crate) row_tags: Vec<u8>,
+    // capping frame length. The tags and the slot cursors live in the byte
+    // tail of that same buffer; see [`Self::rows_len`].
     /// Cached tag-match SIMD kernel; CPU features are fixed per process, so
     /// resolve once instead of querying per `row_candidate` call. On
     /// wasm32+simd128 the tier is compile-time (`dispatch_tag_kernel!` selects
@@ -2436,8 +2454,9 @@ impl RowMatchGenerator {
             lazy_reps: None,
             lazy_depth: 1,
             cpl_kernel: crate::encoding::fastpath::select_kernel(),
-            row_heads: Vec::new(),
-            row_tags: Vec::new(),
+            rows_len: 0,
+            heads_len: 0,
+            tags_len: 0,
             tag_kernel: crate::encoding::fastpath::select_kernel(),
             dict: DictAttach::new(),
             borrowed_input: None,
@@ -2452,10 +2471,9 @@ impl RowMatchGenerator {
         let u32_sz = core::mem::size_of::<u32>();
         self.chunk_lens.capacity() * core::mem::size_of::<usize>()
             + self.history.capacity()
-            + self.row_heads.capacity()
-            + self.row_tags.capacity()
-            // One buffer for whichever finder is live: row positions, or the
-            // chain / tree hash and link tables.
+            // One buffer for whichever finder is live: the row positions with
+            // the cursors and tags in its byte tail, or the chain / tree hash
+            // and link tables.
             + self.tables.capacity() * u32_sz
             + self.dict.table().map_or(0, |t| {
                 t.heads.capacity()
@@ -2525,10 +2543,13 @@ impl RowMatchGenerator {
         let row_hash_log = clamped.saturating_sub(self.row_log);
         if self.row_hash_log != row_hash_log {
             self.row_hash_log = row_hash_log;
-            self.row_heads.clear();
+            // One buffer carries the positions and the two byte tables, so
+            // clearing it drops all three; `ensure_tables` re-lays them out.
             self.tables.clear();
             self.hc_split = 0;
-            self.row_tags.clear();
+            self.rows_len = 0;
+            self.heads_len = 0;
+            self.tags_len = 0;
             // NOTE: do NOT invalidate the dict here. `set_hash_bits` is called
             // twice per frame during level setup (once from `configure` with
             // the level's `hash_bits`, once with the hint-resolved table bits),
@@ -2640,8 +2661,6 @@ impl RowMatchGenerator {
             // (mirrors dfast; the u32 packing is separately kept in range
             // by `rebase_positions` in `add_data`).
             self.history_abs_start = 0;
-            self.row_heads.fill(0);
-            self.row_tags.fill(0);
             // The shared buffer holds whichever finder's tables are live, so
             // it takes that finder's empty sentinel.
             let empty = if self.hc_split == 0 {
@@ -2650,6 +2669,14 @@ impl RowMatchGenerator {
                 self.hc_empty_slot()
             };
             self.tables.fill(empty);
+            // In row mode the byte tail is not positions: the sentinel above
+            // wrote `0xFF` over the cursors and tags, whose empty value is
+            // zero, so it is re-zeroed after the buffer-wide fill. In chain /
+            // tree mode there is no tail — `rows_len` is zero and the whole
+            // buffer is the hash and link tables.
+            if self.rows_len != 0 {
+                self.tail_bytes_mut().fill(0);
+            }
         }
         // Nothing of the previous frame is indexed for the new one, and the
         // lazy reps restart from the frame's initial history. The window
@@ -3090,18 +3117,106 @@ impl RowMatchGenerator {
     pub(crate) fn release_tables(&mut self) {
         self.tables = Vec::new();
         self.hc_split = 0;
+        // The cursors and tags lived in the same buffer, so releasing it
+        // releases them; their lengths have to say so.
+        self.rows_len = 0;
+        self.heads_len = 0;
+        self.tags_len = 0;
     }
 
-    /// Row positions: in row mode the whole `u32` buffer is the position table.
+    /// Row positions: the leading region of the shared buffer.
     #[inline(always)]
     pub(crate) fn row_positions(&self) -> &[u32] {
-        &self.tables
+        &self.tables[..self.rows_len]
     }
 
     /// Mutable row positions; see [`Self::row_positions`].
     #[inline(always)]
     pub(crate) fn row_positions_mut(&mut self) -> &mut [u32] {
-        &mut self.tables
+        &mut self.tables[..self.rows_len]
+    }
+
+    /// The byte tail of [`Self::tables`], holding the slot cursors followed by
+    /// the hash tags. Reinterpreting the `u32` tail as bytes is always
+    /// alignment-sound (a 4-byte-aligned pointer is 1-byte-aligned), and the
+    /// region is sized for both tables by [`Self::ensure_tables`].
+    #[inline(always)]
+    fn tail_bytes_mut(&mut self) -> &mut [u8] {
+        let bytes = self.heads_len + self.tags_len;
+        debug_assert!(self.rows_len * 4 + bytes <= self.tables.len() * 4);
+        // SAFETY: the field invariant keeps the region inside the buffer, and
+        // reinterpreting `[u32]` as `[u8]` is always alignment-sound. When the
+        // buffer is not laid out for rows both lengths are zero, so this is an
+        // empty slice at a valid base rather than a branch on the hot path. The
+        // `&mut` borrow of `tables` makes this the only live reference to the
+        // region for the lifetime of the result.
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                self.tables.as_mut_ptr().add(self.rows_len).cast::<u8>(),
+                bytes,
+            )
+        }
+    }
+
+    /// Per-row slot cursor, one byte per row. Empty until the row layout is
+    /// established, as the separate vector this replaced was: callers reach
+    /// for it between a width change and the `ensure_tables` that acts on it.
+    #[inline(always)]
+    pub(crate) fn row_heads(&self) -> &[u8] {
+        // SAFETY: `heads_len` bytes from the tail base, inside the region
+        // the field invariant bounds.
+        unsafe {
+            core::slice::from_raw_parts(
+                self.tables.as_ptr().add(self.rows_len).cast::<u8>(),
+                self.heads_len,
+            )
+        }
+    }
+
+    /// Mutable form of [`Self::row_heads`].
+    #[inline(always)]
+    pub(crate) fn row_heads_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as in `row_heads`, with the exclusive borrow of `tables`.
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                self.tables.as_mut_ptr().add(self.rows_len).cast::<u8>(),
+                self.heads_len,
+            )
+        }
+    }
+
+    /// Hash tag per row slot, laid out like [`Self::row_positions`]. Empty
+    /// under the same condition as [`Self::row_heads`].
+    #[inline(always)]
+    pub(crate) fn row_tags(&self) -> &[u8] {
+        // SAFETY: the tag region follows the cursors inside the same bounded
+        // tail bounded by the field invariant.
+        unsafe {
+            core::slice::from_raw_parts(
+                self.tables
+                    .as_ptr()
+                    .add(self.rows_len)
+                    .cast::<u8>()
+                    .add(self.heads_len),
+                self.tags_len,
+            )
+        }
+    }
+
+    /// Mutable form of [`Self::row_tags`].
+    #[inline(always)]
+    pub(crate) fn row_tags_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as in `row_tags`, with the exclusive borrow of `tables`.
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                self.tables
+                    .as_mut_ptr()
+                    .add(self.rows_len)
+                    .cast::<u8>()
+                    .add(self.heads_len),
+                self.tags_len,
+            )
+        }
     }
 
     /// Chain / tree hash table: the region before [`Self::hc_split`].
@@ -3140,31 +3255,42 @@ impl RowMatchGenerator {
         } else {
             0
         };
+        // The three row tables share one buffer: `total` positions, then the
+        // `row_count` slot cursors and `total` tags packed into its byte tail.
+        // Held separately they were three allocations of three different size
+        // classes per frame, and a fresh compressor takes them anew for every
+        // frame — the pages of all three then went back to the kernel between
+        // frames, which is what the reference avoids by carving one workspace.
+        let tail_u32 = (row_count + total).div_ceil(4);
+        let want = total + tail_u32;
         if total == 0 {
-            self.row_heads = Vec::new();
-            self.row_tags = Vec::new();
-        } else if self.tables.len() != total || self.hc_split != 0 {
-            // Resize in place: `set_hash_bits` width changes `clear()` the
-            // vecs but keep their capacity. The previous `vec![..]` form
-            // re-allocated all three tables on every width change — three
-            // malloc/free pairs (~40 KiB) per hinted frame while the
-            // configure→hint width pair disagreed, which allocator-slow
-            // targets (musl) amplified into the dominant per-frame cost.
-            self.row_heads.clear();
-            self.row_heads.resize(row_count, 0);
-            if super::match_table::storage::capacity_is_oversized(self.tables.capacity(), total) {
+            self.rows_len = 0;
+            self.heads_len = 0;
+            self.tags_len = 0;
+        } else if self.rows_len != total || self.tables.len() != want || self.hc_split != 0 {
+            // Sized to the final width in one step: from an empty buffer
+            // `resize` alone walks a doubling chain whose intermediate steps
+            // the frame allocates and discards. A reused matcher already has
+            // the capacity, so this is a no-op there.
+            if super::match_table::storage::capacity_is_oversized(self.tables.capacity(), want) {
                 // Coming down from the chain / tree finder (or a wider row
                 // layout): `clear` + `resize` would keep that allocation —
                 // tens of MiB at the btlazy2 levels — resident for every later
                 // row frame, which is what the separate vectors released.
-                self.tables = alloc::vec![ROW_EMPTY_SLOT; total];
+                self.tables = alloc::vec![ROW_EMPTY_SLOT; want];
             } else {
                 self.tables.clear();
-                self.tables.resize(total, ROW_EMPTY_SLOT);
+                self.tables.reserve_exact(want);
+                self.tables.resize(want, ROW_EMPTY_SLOT);
             }
             self.hc_split = 0;
-            self.row_tags.clear();
-            self.row_tags.resize(total, 0);
+            self.rows_len = total;
+            self.heads_len = row_count;
+            self.tags_len = total;
+            // The positions want the empty sentinel, the byte tables want
+            // zeroes, and one fill cannot give both: the tail is re-zeroed
+            // after the buffer-wide fill above.
+            self.tail_bytes_mut().fill(0);
         }
         if self.finder != LazyFinder::Rows {
             // Chain / tree mode: `hashTable` is `1 << hashLog` wide (the full
@@ -3189,7 +3315,11 @@ impl RowMatchGenerator {
                     // used.
                     self.tables = alloc::vec![empty; total];
                 } else {
+                    // Reserved to the final width before filling, for the same
+                    // reason as the row branch above: `resize` from an empty
+                    // buffer climbs a doubling chain the frame then discards.
                     self.tables.clear();
+                    self.tables.reserve_exact(total);
                     self.tables.resize(total, empty);
                 }
                 self.hc_split = hash_len;
@@ -3871,8 +4001,8 @@ impl RowMatchGenerator {
             // SAFETY: prefetch is a hint and never faults; the indexes are in
             // bounds by the same `ensure_tables` sizing as `insert_at`.
             unsafe {
-                _mm_prefetch(self.row_heads.as_ptr().add(row).cast(), _MM_HINT_T0);
-                _mm_prefetch(self.row_tags.as_ptr().add(row_base).cast(), _MM_HINT_T0);
+                _mm_prefetch(self.row_heads().as_ptr().add(row).cast(), _MM_HINT_T0);
+                _mm_prefetch(self.row_tags().as_ptr().add(row_base).cast(), _MM_HINT_T0);
                 _mm_prefetch(
                     self.row_positions().as_ptr().add(row_base).cast(),
                     _MM_HINT_T0,
@@ -3913,10 +4043,10 @@ impl RowMatchGenerator {
         // row_entries == row_positions.len() == row_tags.len()`. Both
         // index pairs are provably in bounds; per-byte hot path on
         // fast/dfast/row levels saves ~6 instructions and 3 branches.
-        debug_assert!(row < self.row_heads.len());
+        debug_assert!(row < self.row_heads().len());
         debug_assert!(row_base + row_entries <= self.row_positions().len());
         unsafe {
-            let head = *self.row_heads.get_unchecked(row) as usize;
+            let head = *self.row_heads().get_unchecked(row) as usize;
             // Upstream `ZSTD_row_nextIndex`: slot 0 is never written (it
             // holds the head byte in upstream's tag row), so the cursor
             // cycles over `1..=row_mask`.
@@ -3924,8 +4054,8 @@ impl RowMatchGenerator {
                 0 => row_mask,
                 n => n,
             };
-            *self.row_heads.get_unchecked_mut(row) = next as u8;
-            *self.row_tags.get_unchecked_mut(row_base + next) = tag;
+            *self.row_heads_mut().get_unchecked_mut(row) = next as u8;
+            *self.row_tags_mut().get_unchecked_mut(row_base + next) = tag;
             // `abs_pos < u32::MAX` holds: `add_data` caps a Row frame's
             // absolute cursor below `u32::MAX`, so the cast is lossless and
             // never collides with the `ROW_EMPTY_SLOT == u32::MAX` sentinel.

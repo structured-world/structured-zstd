@@ -2198,7 +2198,7 @@ fn driver_small_source_hint_shrinks_row_hash_tables() {
     space.truncate(12);
     driver.commit_space(space);
     driver.skip_matching_with_hint(None);
-    let full_rows = driver.row_matcher().row_heads.len();
+    let full_rows = driver.row_matcher().row_heads().len();
     // Level 5 uses the upstream row_log (clamp(searchLog=3, 4, 6) = 4) and the
     // upstream L5 hashLog (`ZSTD_getCParams(5,..).hashLog` = 19), so the row
     // count is 1 << (ROW_L5.hash_bits - ROW_L5.row_log).
@@ -2221,7 +2221,7 @@ fn driver_small_source_hint_shrinks_row_hash_tables() {
         super::super::strategy::BackendTag::Row,
         "windowLog > 14 keeps the upstream row matchfinder"
     );
-    let hinted_rows = driver.row_matcher().row_heads.len();
+    let hinted_rows = driver.row_matcher().row_heads().len();
     assert!(
         hinted_rows < full_rows,
         "a window>14 source hint should reduce the row hash table footprint"
