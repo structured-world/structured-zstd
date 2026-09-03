@@ -1208,12 +1208,20 @@ fn train_dictionary(opts: &Options) -> Result<()> {
     // The default destination is a plain `dictionary`, which a sample can
     // easily be named: the run would read that file and then replace it with
     // what it learned from it. `-f` permits replacing the output, not spending
-    // a sample to make one.
-    if let Some(clash) = opts.inputs.iter().find(|sample| *sample == &output) {
-        bail!(
-            "{} is a training sample; the dictionary cannot be written over it",
-            clash.display()
-        );
+    // a sample to make one. Compared as files rather than as paths, because
+    // `dictionary` and `sub/../dictionary` are one file and only the second
+    // spelling has to appear on the command line for a path comparison to miss
+    // it; a sample hard-linked to an existing output is the same collision
+    // reached a third way.
+    for sample in &opts.inputs {
+        let clashes = names_the_same_file(sample, &output)?
+            || (output.exists() && paths_point_to_same_file(sample, &output)?);
+        if clashes {
+            bail!(
+                "{} is a training sample; the dictionary cannot be written over it",
+                sample.display()
+            );
+        }
     }
 
     // Training reads every sample whole, so a sample needs an end and a size

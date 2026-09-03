@@ -210,6 +210,38 @@ fn training_refuses_to_write_over_its_own_sample() {
     assert_eq!(survived.len(), 4096, "the sample must still be there");
 }
 
+/// The same refusal, for a sample that is the output under another spelling.
+/// `dictionary` and `sub/../dictionary` are one file, and the trainer reads its
+/// samples before it writes: comparing the two as paths lets the run consume the
+/// sample and then replace it with what it learned from it.
+#[test]
+fn training_refuses_a_sample_that_is_the_output_spelled_differently() {
+    let dir = fs::canonicalize(std::env::temp_dir()).unwrap();
+    let name = format!("szstd-trainspell-{}", std::process::id());
+    let sample = dir.join(&name);
+    let detour = dir.join(format!("szstd-trainspell-dir-{}", std::process::id()));
+    fs::create_dir_all(&detour).unwrap();
+    fs::write(&sample, vec![7u8; 4096]).unwrap();
+
+    let mut opts = parse(&["--train", "-f", "s"]).unwrap();
+    opts.inputs = vec![sample.clone()];
+    // The same file, reached by walking into a directory and back out of it.
+    opts.output = Some(detour.join("..").join(&name));
+    let refused = train_dictionary(&opts);
+    let _ = fs::remove_dir(&detour);
+
+    let survived = fs::read(&sample).unwrap_or_default();
+    let _ = fs::remove_file(&sample);
+    let err = refused
+        .expect_err("a sample must not be replaced by the dictionary trained from it")
+        .to_string();
+    assert!(
+        err.contains("sample"),
+        "the refusal must name the collision: {err}"
+    );
+    assert_eq!(survived.len(), 4096, "the sample must still be there");
+}
+
 /// The `-D` dictionary is what a frame will need to be read back, so an output
 /// landing on it destroys the key to the file just written. `-f` permits
 /// replacing the output, not the dictionary that gives it meaning.
@@ -368,7 +400,12 @@ fn an_empty_buffer_read_is_not_the_end_of_the_stream() {
 
     let mut buf = [0u8; 7];
     assert_eq!(monitor.read(&mut buf).unwrap(), 7);
-    assert!(monitor.finished, "reaching the total does finish it");
+    assert!(
+        !monitor.finished,
+        "a total taken from a directory entry does not end the stream"
+    );
+    assert_eq!(monitor.read(&mut buf).unwrap(), 0);
+    assert!(monitor.finished, "the reader saying so does");
 }
 
 /// Listing walks frame headers and training builds a dictionary from samples;

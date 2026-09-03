@@ -89,14 +89,15 @@ impl<R: Read> ProgressMonitor<R> {
 
     /// Called after each read, with what that read returned.
     ///
-    /// The end of the work is the reader saying it has no more, not the byte
-    /// count meeting a number from a directory entry: a FIFO reports zero, and
-    /// a file can shrink after it was measured. Waiting for the two to meet
-    /// leaves the bar redrawing and the summary unprinted. A known total that
-    /// is reached still finishes right away, so a regular file's summary
-    /// arrives with its last byte rather than a read later.
+    /// The end of the work is the reader saying it has no more, and nothing
+    /// else: the total is a number from a directory entry, which a FIFO reports
+    /// as zero and which a file that grew after it was measured has already
+    /// passed. Ending on it would print the summary over a stream still being
+    /// read, and the bytes that arrived afterwards would go unreported. Waiting
+    /// for the reader costs one more read, which every caller here performs to
+    /// find the end anyway.
     fn update(&mut self, last_read: usize) {
-        let done = last_read == 0 || (self.total > 0 && self.read >= self.total);
+        let done = last_read == 0;
         if done && !self.finished {
             self.finished = true;
             // Clear the bar's line before the summary, or the leftovers of the
