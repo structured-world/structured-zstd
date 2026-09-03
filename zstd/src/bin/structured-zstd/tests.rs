@@ -2126,6 +2126,46 @@ fn listing_refuses_the_stdin_marker() {
     );
 }
 
+/// `--long` is not a preset: it widens the window the frame keeps and adds a
+/// hash table of its own, neither of which the level's own figures describe. A
+/// ceiling weighed against the preset is one such a run walks straight past.
+#[test]
+fn the_memory_limit_counts_what_long_distance_matching_adds() {
+    let plain = structured_zstd::encoding::estimated_compression_workspace_bytes_for_run(
+        structured_zstd::encoding::CompressionLevel::Level(16),
+        Some(8 * 1024 * 1024),
+        None,
+        false,
+    );
+    let long = structured_zstd::encoding::estimated_compression_workspace_bytes_for_run(
+        structured_zstd::encoding::CompressionLevel::Level(16),
+        Some(8 * 1024 * 1024),
+        Some(27),
+        true,
+    );
+    assert!(
+        long > plain,
+        "the wider window and the matcher's own table are more than the preset: \
+         {long} vs {plain}"
+    );
+
+    let dir = std::env::temp_dir();
+    let input = dir.join(format!("szstd-longmem-{}.bin", std::process::id()));
+    fs::write(&input, vec![0u8; 32 * 1024]).unwrap();
+
+    let mut opts = parse(&["--ultra", "-b16", "--long=27", "f"]).unwrap();
+    opts.inputs = vec![input.clone()];
+    assert!(opts.long, "--long is what the run was asked for");
+    assert_eq!(opts.long_window_log, Some(27));
+
+    // What the run would hold without `--long` — the ceiling has to want more.
+    opts.memory_limit = Some(benchmark_budget(32 * 1024, 16..=16));
+    let refused = run_benchmark(&opts, None);
+    let _ = fs::remove_file(&input);
+
+    refused.expect_err("the preset's figure does not cover the window --long asked for");
+}
+
 /// Every compression pass allocates a match finder, and at the higher levels
 /// its tables dwarf everything else the run holds — hundreds of MiB where the
 /// buffers are tens. A ceiling that counts the buffers and a fixed decoder

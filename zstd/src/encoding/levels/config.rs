@@ -732,8 +732,59 @@ pub fn estimated_compression_workspace_bytes_for_source(
     level: CompressionLevel,
     src_size_hint: Option<u64>,
 ) -> usize {
+    estimated_compression_workspace_bytes_for_run(level, src_size_hint, None, false)
+}
+
+/// The same estimate for a run whose window and long-distance matching are what
+/// the caller has actually asked for.
+///
+/// A `window_log` override enlarges the history the frame keeps, and
+/// long-distance matching adds a hash table of its own on top — neither of them
+/// visible in the level's own preset, and together they are the difference
+/// between a figure that describes the run and one that describes the default.
+/// `None` and `false` give the preset, which is what
+/// [`estimated_compression_workspace_bytes_for_source`] reports.
+pub fn estimated_compression_workspace_bytes_for_run(
+    level: CompressionLevel,
+    src_size_hint: Option<u64>,
+    window_log: Option<u8>,
+    long_distance_matching: bool,
+) -> usize {
     use crate::encoding::strategy::StrategyTag;
-    let params = resolve_level_params(level, src_size_hint);
+    let mut params = resolve_level_params(level, src_size_hint);
+    // The override is what the frame will keep, but never below the floor the
+    // format sets or above what the source can fill — the same two bounds the
+    // encoder applies to it.
+    if let Some(requested) = window_log {
+        let capped = match src_size_hint {
+            Some(src) => {
+                crate::encoding::cparams::adjusted_window_log(u32::from(requested), src, 0) as u8
+            }
+            None => requested,
+        };
+        params.window_log = capped.max(MIN_WINDOW_LOG);
+    }
+    // The long-distance matcher's own table, sized from the window it searches
+    // (upstream `ZSTD_ldm_adjustParameters`). Only the `ldm` build has one.
+    #[cfg(feature = "ldm")]
+    let ldm = if long_distance_matching {
+        let strategy = ldm_strategy_ordinal(params.strategy_tag, params.lazy_depth);
+        let ldm_params = crate::encoding::ldm::params::LdmParams::adjust_for(
+            u32::from(params.window_log),
+            strategy,
+        );
+        crate::encoding::ldm::table::LdmHashTable::estimated_workspace_bytes(
+            ldm_params.hash_log,
+            ldm_params.bucket_size_log,
+        )
+    } else {
+        0
+    };
+    #[cfg(not(feature = "ldm"))]
+    let ldm = {
+        let _ = long_distance_matching;
+        0
+    };
     let window = 1usize << params.window_log;
     // Mirror `configure()`: the HC3 short-match side table exists only on
     // the btultra/btultra2 tags (minMatch 3), capped by the window log; the
@@ -788,7 +839,7 @@ pub fn estimated_compression_workspace_bytes_for_source(
     // Block staging: literal + sequence buffers plus the compressed-block
     // scratch, each bounded by the 128 KiB block size.
     let staging = 3 * (128 * 1024);
-    window + tables + bt + staging
+    window + tables + bt + staging + ldm
 }
 
 /// Extra steady-state workspace the optimal strategies (ordinals 7..=9,

@@ -938,26 +938,63 @@ fn load_dictionary(opts: &Options) -> Result<Option<Vec<u8>>> {
     if !opts.bench && matches!(opts.mode, Mode::List | Mode::Train) {
         return Ok(None);
     }
-    let metadata = fs::metadata(path)
+    // Asked of the path first, because opening a FIFO blocks until a writer
+    // turns up and the point of the check is not to wait for one. Everything
+    // the read depends on is then re-asked of the OPEN FILE below, since a path
+    // is only a name: between this answer and the open it can be made to name
+    // something else, and it is the thing actually read whose type and length
+    // have to hold. (A swap to a FIFO inside that window still blocks in the
+    // open; refusing to wait would need a non-blocking open, which needs a
+    // platform flag this crate has no dependency to name.)
+    let named = fs::metadata(path)
         .wrap_err_with(|| format!("failed to inspect dictionary file {}", path.display()))?;
-    // The size below is what bounds the read, and only a regular file's is the
-    // number of bytes there are to read. A FIFO reports zero, which clears any
-    // memory limit and then blocks in `File::open` until a writer turns up: the
-    // run stops with nothing said about what it is waiting for.
-    if !metadata.is_file() {
+    if !named.is_file() {
         bail!("-D needs a regular file: {} is not one", path.display());
     }
-    let size = metadata.len();
-    if let Some(limit) = opts.memory_limit
-        && decodes(opts)
-    {
-        // As read and again as parsed.
-        check_memory_limit(limit, size, 2)?;
-    }
+    // What the read will cost, answerable from a size alone. Asked of the name
+    // before the file is opened — a dictionary that cannot fit the promise is
+    // refused without spending a descriptor on it — and asked again below of
+    // the file that was actually opened.
+    let weigh = |size: u64| -> Result<usize> {
+        // The size bounds the read, so it has to be a count of bytes this
+        // machine can hold: a 64-bit length cast to a pointer-sized one
+        // truncates on a 32-bit target, where 4 GiB would become a capacity of
+        // zero that the read then grows into an allocation which aborts rather
+        // than refuses.
+        let capacity = usize::try_from(size).map_err(|_| {
+            eyre!(
+                "dictionary file {} is {size} bytes, more than this machine can address",
+                path.display()
+            )
+        })?;
+        if let Some(limit) = opts.memory_limit
+            && decodes(opts)
+        {
+            // As read and again as parsed.
+            check_memory_limit(limit, size, 2)?;
+        }
+        Ok(capacity)
+    };
+    weigh(named.len())?;
 
     let file = File::open(path)
         .wrap_err_with(|| format!("failed to open dictionary file {}", path.display()))?;
-    let mut bytes = Vec::with_capacity(size as usize);
+    // And asked again of the FILE, because a path is only a name: between the
+    // answer above and this open it can be made to name something else, and it
+    // is the thing actually read whose type and length have to hold. (A swap to
+    // a FIFO inside that window still blocks in the open; refusing to wait
+    // would need a non-blocking open, which needs a platform flag this crate
+    // has no dependency to name.)
+    let opened = file
+        .metadata()
+        .wrap_err_with(|| format!("failed to inspect dictionary file {}", path.display()))?;
+    if !opened.is_file() {
+        bail!("-D needs a regular file: {} is not one", path.display());
+    }
+    let size = opened.len();
+    let capacity = weigh(size)?;
+
+    let mut bytes = Vec::with_capacity(capacity);
     // One byte past the size the check cleared: reading it means the file grew.
     file.take(size + 1)
         .read_to_end(&mut bytes)
@@ -1220,16 +1257,24 @@ fn run_benchmark(opts: &Options, dict: Option<Vec<u8>>) -> Result<()> {
             .ok();
         // Beside them stands the match finder every compression pass builds,
         // whose tables are the largest thing at the higher levels — hundreds of
-        // MiB where the buffers are tens. It is sized by the level AND by the
-        // source, since both cap the window and the tables, so it is asked for
-        // the levels this run will measure and the input it will measure them
-        // on. One level runs at a time and its encoder is dropped before the
-        // next, so the largest of them is what stands at the peak.
+        // MiB where the buffers are tens. It is sized by the level, by the
+        // source (both cap the window and the tables) and by what the run has
+        // asked for on top: `--long` widens the window and adds a matcher with
+        // a table of its own, neither of them in the level's own figures. So it
+        // is asked for the levels this run will measure, the input it will
+        // measure them on, and the parameters it will measure them with. One
+        // level runs at a time and its encoder is dropped before the next, so
+        // the largest of them is what stands at the peak.
         let encoder = (opts.bench_start..=opts.bench_end)
             .map(|level| {
-                structured_zstd::encoding::estimated_compression_workspace_bytes_for_source(
+                structured_zstd::encoding::estimated_compression_workspace_bytes_for_run(
                     structured_zstd::encoding::CompressionLevel::Level(level),
                     Some(inputs),
+                    opts.long
+                        .then_some(opts.long_window_log)
+                        .flatten()
+                        .and_then(|log| u8::try_from(log).ok()),
+                    opts.long && !opts.store,
                 ) as u64
             })
             .max()
@@ -1472,11 +1517,29 @@ fn train_dictionary(opts: &Options) -> Result<()> {
         }
     }
 
+    // Each sample is opened once, and what the dictionary may carry is taken
+    // from that same open file rather than from its path afterwards. A path
+    // answers about whatever it names at the moment it is asked, and training
+    // takes long enough for a sample to be replaced while it runs: asking again
+    // at the end could describe a file whose bytes are not the ones now inside
+    // the dictionary, and grant its permissions to theirs.
     let mut corpus = Vec::new();
+    let mut samples = Vec::with_capacity(opts.inputs.len());
     for input in &opts.inputs {
-        let bytes = fs::read(input)
+        let mut file = File::open(input)
+            .wrap_err_with(|| format!("failed to open training sample {}", input.display()))?;
+        let metadata = file
+            .metadata()
+            .wrap_err_with(|| format!("failed to inspect {}", input.display()))?;
+        if !metadata.is_file() {
+            bail!(
+                "--train needs regular files: {} is not one",
+                input.display()
+            );
+        }
+        file.read_to_end(&mut corpus)
             .wrap_err_with(|| format!("failed to read training sample {}", input.display()))?;
-        corpus.extend_from_slice(&bytes);
+        samples.push(metadata);
     }
 
     let mut dict = Vec::new();
@@ -1508,7 +1571,7 @@ fn train_dictionary(opts: &Options) -> Result<()> {
     // not restore it.
     // Asked of the temporary file, which is the one that gets renamed into
     // place: it is where the group the dictionary will belong to is decided.
-    let sample_permissions = strictest_sample_permissions(&opts.inputs, &temp_path)?;
+    let sample_permissions = strictest_sample_permissions(&samples, &temp_path)?;
     if let Some(permissions) = sample_permissions.clone()
         && let Err(err) = fs::set_permissions(&temp_path, permissions)
     {
@@ -1545,20 +1608,18 @@ fn train_dictionary(opts: &Options) -> Result<()> {
 /// stands.
 #[cfg(unix)]
 fn strictest_sample_permissions(
-    samples: &[PathBuf],
+    samples: &[fs::Metadata],
     destination: &Path,
 ) -> Result<Option<fs::Permissions>> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-    let mut samples_by_group = Vec::with_capacity(samples.len());
-    for sample in samples {
-        let metadata = fs::metadata(sample)
-            .wrap_err_with(|| format!("failed to inspect {}", sample.display()))?;
-        samples_by_group.push((metadata.permissions().mode(), metadata.gid()));
-    }
-    if samples_by_group.is_empty() {
+    if samples.is_empty() {
         return Ok(None);
     }
+    let samples_by_group: Vec<(u32, u32)> = samples
+        .iter()
+        .map(|sample| (sample.permissions().mode(), sample.gid()))
+        .collect();
     // The group the file itself is in, which is the one its group bits would
     // admit. It is the process's, or the directory's when that is setgid, so it
     // is read from the file rather than assumed.
@@ -1607,7 +1668,7 @@ fn output_mode_for_sources(sources: &[(u32, u32)], output_gid: u32) -> u32 {
 
 #[cfg(not(unix))]
 fn strictest_sample_permissions(
-    _samples: &[PathBuf],
+    _samples: &[fs::Metadata],
     _destination: &Path,
 ) -> Result<Option<fs::Permissions>> {
     Ok(None)

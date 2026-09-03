@@ -123,6 +123,15 @@ impl LdmHashTable {
     /// Panics if `hash_log == 0` (no buckets) or `hash_log > 30`
     /// (would allocate > 8 GiB of entries — far beyond upstream zstd's
     /// `ZSTD_LDM_HASHLOG_MAX = 30`). Both bounds match upstream zstd.
+    /// Heap the table below will occupy for the same two logs, so a caller
+    /// budgeting memory for a compression can weigh it without building one.
+    /// Budgeted beside the allocation so the two evolve together.
+    pub(crate) fn estimated_workspace_bytes(hash_log: u32, bucket_size_log: u32) -> usize {
+        let effective_bucket_log = bucket_size_log.min(hash_log);
+        let bucket_count = 1usize << (hash_log - effective_bucket_log);
+        (1usize << hash_log) * core::mem::size_of::<LdmEntry>() + bucket_count
+    }
+
     pub(crate) fn new(hash_log: u32, bucket_size_log: u32) -> Self {
         assert!(hash_log > 0, "hash_log must be > 0");
         assert!(
