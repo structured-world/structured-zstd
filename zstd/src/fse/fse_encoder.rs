@@ -155,6 +155,11 @@ pub(crate) struct SymbolTT {
     pub(crate) delta_find_state: isize,
 }
 
+/// Largest next-state table any FSE encoder table can carry: the accuracy log
+/// is capped at 9 (`to_encoder_table` rejects anything wider), so the table
+/// never exceeds `1 << 9` entries.
+pub(super) const MAX_FSE_TABLE_SIZE: usize = 1 << 9;
+
 #[derive(Debug, Clone)]
 pub struct FSETable {
     /// Indexed by symbol
@@ -166,17 +171,24 @@ pub struct FSETable {
     /// transition arithmetic resolves to slot `i`. Length is exactly
     /// `table_size` (= `1 << acc_log`). Mirror of upstream
     /// `nextStateTable` (`fse_compress.c`).
-    pub(super) state_table_flat: alloc::boxed::Box<[u16]>,
+    /// Held inline rather than boxed: it is the table's only heap allocation,
+    /// and the table is rebuilt per block and per Huffman weight description —
+    /// once per built table — so boxing it cost an allocation on a path that
+    /// runs about a hundred times a frame. `MAX_FSE_TABLE_SIZE` entries is a
+    /// kibibyte beside the ~12 KiB of per-symbol arrays already inline, and the
+    /// live region is `state_table_flat[..table_size]`.
+    pub(super) state_table_flat: [u16; MAX_FSE_TABLE_SIZE],
     /// Per-symbol upstream zstd-parity coding transform — see [`SymbolTT`].
     pub(super) symbol_tt: [SymbolTT; 256],
 }
 
 impl FSETable {
-    /// Heap bytes this table holds beyond its inline struct: the flat
-    /// state-transition array (`Box<[u16]>`). The `states` / `symbol_tt`
-    /// arrays are fixed-size and inline (accounted by the owner's `size_of`).
+    /// Heap bytes this table holds beyond its inline struct: none. Every array
+    /// it carries — `states`, `symbol_tt` and the flat state-transition table —
+    /// is fixed-size and inline, so the owner's `size_of` accounts for all of
+    /// it. Kept as a method so callers summing a footprint read one rule.
     pub(crate) fn heap_size(&self) -> usize {
-        self.state_table_flat.len() * core::mem::size_of::<u16>()
+        0
     }
 
     /// O(1) next-state lookup mirroring upstream `FSE_encodeSymbol`
@@ -795,7 +807,6 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
     // (`table_size = 1 << table_log <= 1 << 9 = 512`). Use a stack buffer so the
     // per-build heap alloc + zero is gone. `[..table_size]` keeps the live region
     // exactly as the old `vec![0u8; table_size]`.
-    const MAX_FSE_TABLE_SIZE: usize = 1 << 9;
     // Always-on (not debug_assert): the stack scratch is fixed at 512 bytes
     // (accuracy_log <= 9). `to_encoder_table` already rejects acc_log > 9, but
     // this function is `pub(crate)` — guard the scratch bound here too so a
@@ -879,24 +890,12 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
     // convention so the pre-shift is intentionally skipped here.
     // Every index in `[0, table_size)` is written EXACTLY once by the scatter
     // loop below: the `cumul` cursors partition the table bijectively, which the
-    // two asserts above enforce in every build profile. So a zero-init is dead
-    // -- every slot is overwritten before any read (`into_boxed_slice` +
-    // `FSETable` use happen after the loop). Allocate uninitialized and let the
-    // loop fill it, skipping a per-build `table_size`-element memset (3 FSE
-    // builds per block for the LL/ML/OF streams when custom tables are chosen).
-    // The `uninit_vec` lint cannot see the bijective full-write; soundness is
-    // confirmed under miri (the FSE encoder round-trip exercises this with no
-    // use-of-uninit).
-    #[allow(clippy::uninit_vec)]
-    let mut state_table_flat: alloc::vec::Vec<u16> = {
-        let mut v = alloc::vec::Vec::with_capacity(table_size);
-        // SAFETY: `with_capacity(table_size)` reserved exactly `table_size`
-        // slots; the asserts above guarantee (in every build profile) that the
-        // scatter loop below writes every index in `[0, table_size)` exactly
-        // once before the first read.
-        unsafe { v.set_len(table_size) };
-        v
-    };
+    // two asserts above enforce in every build profile. Slots at or past
+    // `table_size` are never read — `next_state` indexes within the live region
+    // — so the tail keeps whatever the zero-init left and costs nothing to
+    // carry. The table lives inline in [`FSETable`], so this build allocates
+    // nothing at all.
+    let mut state_table_flat = [0u16; MAX_FSE_TABLE_SIZE];
     let mut cursor = cumul;
     for (u, &symbol_at_slot) in table_symbol.iter().enumerate() {
         let s = symbol_at_slot as usize;
@@ -907,7 +906,6 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
         state_table_flat[cursor[s] as usize] = u as u16;
         cursor[s] += 1;
     }
-    let state_table_flat: alloc::boxed::Box<[u16]> = state_table_flat.into_boxed_slice();
 
     // Phase 4 — `symbolTT[]` (delta_nb_bits, delta_find_state) plus
     // precomputed `start_state` and `max_num_bits` per symbol. All via
