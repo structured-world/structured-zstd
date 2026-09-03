@@ -78,11 +78,10 @@ impl EncoderDictionary {
 
     /// The dictionary id.
     ///
-    /// A dictionary attached for encoding always has a non-zero id (the
-    /// `set_dictionary*` / `set_encoder_dictionary` attach path rejects a
-    /// zero id). This getter, however, reflects the wrapped dictionary as-is:
-    /// an `EncoderDictionary` built via [`Self::from_dictionary`] from a raw
-    /// `Dictionary` with `id == 0` reports `0` here until it is attached.
+    /// Zero is a raw-content dictionary, which has no header to carry an id.
+    /// Such a dictionary attaches like any other; what changes is the frame,
+    /// which omits the `Dictionary_ID` field rather than storing a zero, so a
+    /// decoder has to be handed the same bytes explicitly.
     pub fn id(&self) -> u32 {
         self.inner.id
     }

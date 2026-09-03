@@ -16,7 +16,14 @@ use crate::decoding::scratch::HuffmanScratch;
 #[derive(Clone)]
 pub struct Dictionary {
     /// A 4 byte value used by decoders to check if they can use
-    /// the correct dictionary. This value must not be zero.
+    /// the correct dictionary.
+    ///
+    /// Zero means unidentified: a raw-content dictionary has no header to
+    /// carry an ID, and the frames built from it record none, so it can only
+    /// be supplied explicitly and never resolved from a frame header.
+    /// Registration by ID
+    /// ([`FrameDecoder::add_dict`](crate::decoding::FrameDecoder::add_dict))
+    /// therefore still requires a non-zero one.
     pub id: u32,
     /// A dictionary can contain an entropy table, either FSE or
     /// Huffman.

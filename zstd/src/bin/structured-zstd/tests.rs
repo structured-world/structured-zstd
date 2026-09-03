@@ -37,6 +37,76 @@ fn list_file_walks_multi_frame_archive_by_seeking() {
     result.expect("list_file must walk both frames without error");
 }
 
+/// `--target-compressed-block-size` is what a caller reaches for when they need
+/// bounded latency or block-level processing: smaller blocks flush sooner.
+/// Validating the number and then compressing with the default geometry gives
+/// them the blocks they were trying to avoid.
+#[test]
+fn target_block_size_reaches_the_encoder() {
+    /// Count the blocks in a single-frame stream by walking their headers.
+    fn count_blocks(frame: &[u8]) -> usize {
+        use structured_zstd::decoding::read_frame_header_info;
+        let info = read_frame_header_info(frame, false).expect("header must parse");
+        let mut at = info.header_size as usize;
+        let mut blocks = 0;
+        loop {
+            let raw = u32::from(frame[at])
+                | (u32::from(frame[at + 1]) << 8)
+                | (u32::from(frame[at + 2]) << 16);
+            let last = (raw & 1) != 0;
+            let on_disk = if (raw >> 1) & 0b11 == 1 {
+                1
+            } else {
+                (raw >> 3) as usize
+            };
+            at += 3 + on_disk;
+            blocks += 1;
+            if last {
+                break;
+            }
+        }
+        blocks
+    }
+
+    let opts = parse(&["--target-compressed-block-size=4096", "in.txt"]).unwrap();
+    assert_eq!(opts.target_block_size, Some(4096));
+
+    let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    let mut default_geometry = Vec::new();
+    let level_only = FrameSettings {
+        level: 3,
+        ..FrameSettings::default()
+    };
+    compress_stream(payload.as_slice(), &mut default_geometry, &level_only, None).unwrap();
+    let mut small_blocks = Vec::new();
+    compress_stream(
+        payload.as_slice(),
+        &mut small_blocks,
+        &FrameSettings {
+            target_block_size: Some(4096),
+            ..level_only
+        },
+        None,
+    )
+    .unwrap();
+
+    assert!(
+        count_blocks(&small_blocks) > count_blocks(&default_geometry),
+        "a smaller target must actually produce more, smaller blocks: got {} vs {}",
+        count_blocks(&small_blocks),
+        count_blocks(&default_geometry)
+    );
+}
+
+/// An empty file holds no frame, so there is nothing to test and nothing to
+/// decode. Answering `OK` for it says the archive checked out when it was never
+/// an archive; upstream calls it an unexpected end of file.
+#[test]
+fn an_empty_stream_is_not_a_valid_archive() {
+    decompress_stream(&b""[..], io::sink(), None)
+        .expect_err("an empty input carries no frame to decode");
+}
+
 /// Skippable frames sit inside ordinary archives — seekable-zstd puts its index
 /// in one, and callers attach their own metadata the same way. Listing has to
 /// walk past them like any decoder does, or `-l` refuses files the reference
@@ -61,6 +131,39 @@ fn list_file_walks_past_skippable_frames() {
     let result = list_file(&path);
     let _ = fs::remove_file(&path);
     result.expect("a skippable frame between two frames must not fail the listing");
+}
+
+/// Frame_Content_Size is a declaration, not a measurement: a few bytes of
+/// header can claim any size at all. Summing those declarations unchecked lets
+/// a tiny crafted file either crash `-l` or have it report a wrapped-around
+/// total as fact.
+#[test]
+fn list_file_refuses_a_content_size_total_that_overflows() {
+    /// A frame declaring `content_size` bytes but holding one RLE block.
+    fn frame_declaring(content_size: u64) -> Vec<u8> {
+        let mut frame = vec![0x28, 0xB5, 0x2F, 0xFD];
+        // Descriptor: 8-byte Frame_Content_Size, no dictionary, no checksum,
+        // window descriptor present (not single-segment).
+        frame.push(0b11 << 6);
+        // Window descriptor: exponent 10, i.e. a 1 MiB window.
+        frame.push(10 << 3);
+        frame.extend_from_slice(&content_size.to_le_bytes());
+        // One RLE block, last of the frame: size 1, type 1, last-block bit set.
+        let block_header = (1u32 << 3) | (1 << 1) | 1;
+        frame.extend_from_slice(&block_header.to_le_bytes()[..3]);
+        frame.push(b'x');
+        frame
+    }
+
+    let mut archive = frame_declaring(u64::MAX);
+    archive.extend_from_slice(&frame_declaring(u64::MAX));
+
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("szstd-list-overflow-{}.zst", std::process::id()));
+    fs::write(&path, &archive).unwrap();
+    let result = list_file(&path);
+    let _ = fs::remove_file(&path);
+    result.expect_err("a total that cannot be represented must be reported, not wrapped");
 }
 
 #[test]
@@ -174,13 +277,13 @@ fn long_window_log_reaches_the_encoder() {
     compress_stream(
         &b"payload"[..],
         &mut frame,
-        3,
-        false,
+        &FrameSettings {
+            level: 3,
+            long: true,
+            long_window_log: Some(27),
+            ..FrameSettings::default()
+        },
         None,
-        None,
-        None,
-        true,
-        Some(27),
     )
     .expect("compressing with an explicit window log must succeed");
     let info = read_frame_header_info(&frame, false).expect("the frame header must parse");
@@ -235,6 +338,11 @@ fn unimplemented_trainers_are_refused_not_substituted() {
 #[test]
 fn out_of_range_long_window_log_is_refused() {
     assert!(parse(&["--long=99", "in.txt"]).is_err());
+    // The encoder would accept up to 30, but this build's decoder refuses any
+    // frame declaring a window above 128 MiB — so those levels only produce
+    // files it cannot read back. Refuse them at the flag instead.
+    assert!(parse(&["--long=27", "in.txt"]).is_ok());
+    assert!(parse(&["--long=28", "in.txt"]).is_err());
 }
 
 #[test]
@@ -319,6 +427,7 @@ fn decompress_suffix_stripping() {
         bench_secs: 1.0,
         long: false,
         long_window_log: None,
+        target_block_size: None,
         pledged_size: None,
         size_hint: None,
     };
@@ -447,6 +556,15 @@ fn memory_limit_is_honoured_or_refused_never_ignored() {
         err.contains("128"),
         "the refusal should name the ceiling we do enforce, got: {err}"
     );
+    // A bare number is MiB, a suffix means what it says. Applying the implicit
+    // MiB on top of an explicit suffix turns `-M1M` into a terabyte, which sails
+    // past the very check the flag exists for.
+    assert!(parse(&["-d", "-M1M", "f"]).is_err());
+    assert!(parse(&["-d", "-M128MB", "f"]).is_err());
+    assert!(parse(&["-d", "-M256MB", "f"]).is_ok());
+    // The long spelling has the same default unit as the short one.
+    assert!(parse(&["-d", "--memory=256", "f"]).is_ok());
+    assert!(parse(&["-d", "--memory=8", "f"]).is_err());
 }
 
 /// Flags whose whole purpose is to change which files are touched, or what
@@ -538,12 +656,10 @@ fn corrupted_checksum_is_reported_not_passed() {
     compress_stream(
         &payload[..],
         &mut frame,
-        3,
-        false,
-        None,
-        None,
-        None,
-        false,
+        &FrameSettings {
+            level: 3,
+            ..FrameSettings::default()
+        },
         None,
     )
     .expect("compressing the fixture must succeed");
@@ -631,12 +747,10 @@ fn concatenated_frames_are_all_decoded() {
         compress_stream(
             payload,
             &mut stream,
-            3,
-            false,
-            None,
-            None,
-            None,
-            false,
+            &FrameSettings {
+                level: 3,
+                ..FrameSettings::default()
+            },
             None,
         )
         .expect("compressing a fixture frame must succeed");
@@ -656,36 +770,20 @@ fn concatenated_frames_are_all_decoded() {
 #[test]
 fn skippable_frames_are_stepped_over() {
     let mut stream = Vec::new();
-    compress_stream(
-        &b"payload"[..],
-        &mut stream,
-        3,
-        false,
-        None,
-        None,
-        None,
-        false,
-        None,
-    )
-    .expect("compressing the fixture must succeed");
+    let level_only = FrameSettings {
+        level: 3,
+        ..FrameSettings::default()
+    };
+    compress_stream(&b"payload"[..], &mut stream, &level_only, None)
+        .expect("compressing the fixture must succeed");
     // Magic 0x184D2A50 (little-endian) + a 4-byte length + that many bytes.
     stream.extend_from_slice(&0x184D_2A50_u32.to_le_bytes());
     stream.extend_from_slice(&4_u32.to_le_bytes());
     stream.extend_from_slice(b"meta");
     // A frame after it, so the skip has to land on the right byte rather than
     // merely being tolerated at the end of the stream.
-    compress_stream(
-        &b" and more"[..],
-        &mut stream,
-        3,
-        false,
-        None,
-        None,
-        None,
-        false,
-        None,
-    )
-    .expect("compressing the trailing fixture must succeed");
+    compress_stream(&b" and more"[..], &mut stream, &level_only, None)
+        .expect("compressing the trailing fixture must succeed");
 
     let mut out = Vec::new();
     decompress_stream(stream.as_slice(), &mut out, None)

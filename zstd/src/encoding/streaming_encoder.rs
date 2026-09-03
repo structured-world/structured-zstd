@@ -656,7 +656,13 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             single_segment,
             content_checksum: cfg!(feature = "hash") && self.content_checksum,
             dictionary_id: if use_dictionary_state && self.dictionary_id_flag {
-                self.dictionary.as_ref().map(|dict| dict.inner.id as u64)
+                // Id 0 is a raw-content dictionary: RFC 8878 spells "no
+                // dictionary ID" as an absent field, not as a stored zero.
+                self.dictionary
+                    .as_ref()
+                    .map(|dict| dict.inner.id)
+                    .filter(|id| *id != 0)
+                    .map(u64::from)
             } else {
                 None
             },

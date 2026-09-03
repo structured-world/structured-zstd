@@ -112,6 +112,10 @@ struct Options {
     /// Back-reference window from `--long=N`. Bare `--long` leaves it unset, so
     /// the level's own window applies.
     long_window_log: Option<u32>,
+    /// Block-size target from `--target-compressed-block-size`. A soft target,
+    /// as upstream documents it: it bounds what goes into a block, so blocks
+    /// flush sooner and stay near the requested size.
+    target_block_size: Option<u32>,
     /// Exact input length from `--stream-size`. Recorded in the frame header,
     /// so the stream must actually be this long — a wrong value is an error,
     /// not a worse ratio.
@@ -151,6 +155,23 @@ fn parse_size(text: &str) -> Result<u64> {
         .ok_or_else(|| eyre!("size `{text}` does not fit in 64 bits"))
 }
 
+/// Parse a `-M` / `--memory` value into bytes.
+///
+/// The default unit is MiB, as upstream documents, so `-M256` is 256 MiB. A
+/// suffix means what it says and is not multiplied again: `-M1M` is one
+/// mebibyte, a limit far below what decompression needs, and has to be refused
+/// as such rather than read as a terabyte that trivially passes.
+fn parse_memory_limit(text: &str) -> Result<u64> {
+    let value = parse_size(text)?;
+    if text.trim().ends_with(|c: char| c.is_ascii_digit()) {
+        value
+            .checked_mul(1 << 20)
+            .ok_or_else(|| eyre!("memory limit `{text}` MiB does not fit in 64 bits"))
+    } else {
+        Ok(value)
+    }
+}
+
 /// Check a requested decompression memory ceiling against the one this build
 /// actually enforces.
 ///
@@ -182,19 +203,27 @@ fn check_memory_limit(requested: u64) -> Result<()> {
     Ok(())
 }
 
-/// Check a `--long=N` window log against the range the encoder supports.
+/// Check a `--long=N` window log against what this build can both write and
+/// read back.
 ///
-/// Validated at parse time rather than at the first frame, so a wrong value is
-/// reported before any file is opened or any output is written.
+/// The encoder reaches further than the decoder: it accepts window logs up to
+/// 30, while decoding refuses any frame declaring a window above
+/// [`MAXIMUM_ALLOWED_WINDOW_SIZE`](structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE).
+/// The lower of the two is the honest limit, since the values in between only
+/// produce files this tool cannot open. Validated at parse time rather than at
+/// the first frame, so a wrong value is reported before any output is written.
 fn check_window_log(log: u32) -> Result<()> {
     use structured_zstd::encoding::CParameter;
 
     let bounds = CParameter::WindowLog.bounds();
-    if !bounds.contains(i64::from(log)) {
+    let decodable = structured_zstd::decoding::MAXIMUM_ALLOWED_WINDOW_SIZE.ilog2();
+    let upper = bounds.upper_bound.min(i64::from(decodable));
+    if i64::from(log) < bounds.lower_bound || i64::from(log) > upper {
         bail!(
-            "--long window log {log} is outside the supported range {}..={}",
+            "--long window log {log} is outside the supported range {}..={upper} \
+             (above {decodable} the frame would declare a window this build \
+             refuses to decode)",
             bounds.lower_bound,
-            bounds.upper_bound,
         );
     }
     Ok(())
@@ -304,6 +333,7 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
         bench_secs: 1.0,
         long: false,
         long_window_log: None,
+        target_block_size: None,
         pledged_size: None,
         size_hint: None,
     };
@@ -433,7 +463,9 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
                         .or_else(|| long.strip_prefix("memlimit="))
                         .or_else(|| long.strip_prefix("memlimit-decompress="))
                     {
-                        check_memory_limit(parse_size(v).wrap_err("invalid memory limit")?)?;
+                        check_memory_limit(
+                            parse_memory_limit(v).wrap_err("invalid memory limit")?,
+                        )?;
                         memory_limit_given = true;
                     } else if let Some(params) = long.strip_prefix("adapt=") {
                         // Parameterised form (`--adapt=min=1,max=9`). We do not
@@ -449,7 +481,11 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
                             bail!("--auto-threads must be `physical` or `logical`, got `{v}`");
                         }
                     } else if let Some(v) = long.strip_prefix("target-compressed-block-size=") {
-                        let _ = parse_size(v).wrap_err("invalid --target-compressed-block-size")?;
+                        let target =
+                            parse_size(v).wrap_err("invalid --target-compressed-block-size")?;
+                        opts.target_block_size = Some(u32::try_from(target).map_err(|_| {
+                            eyre!("--target-compressed-block-size={v} is too large")
+                        })?);
                     } else if let Some(v) = long.strip_prefix("threads=") {
                         let _ = v.parse::<u32>().wrap_err("invalid --threads")?;
                     } else if let Some(v) = long.strip_prefix("format=") {
@@ -551,15 +587,13 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
                     continue;
                 }
                 'M' => {
-                    // `-M[N]` is a decompression memory ceiling in MiB — a
-                    // safety promise, so it is checked against the one this
-                    // build enforces rather than swallowed.
+                    // `-M[N]` is a decompression memory ceiling — a safety
+                    // promise, so it is checked against the one this build
+                    // enforces rather than swallowed.
                     let rest: String = chars[ci + 1..].iter().collect();
                     if !rest.is_empty() {
-                        let mib = parse_size(&rest).wrap_err("invalid -M memory limit")?;
                         check_memory_limit(
-                            mib.checked_mul(1 << 20)
-                                .ok_or_else(|| eyre!("-M value `{rest}` is out of range"))?,
+                            parse_memory_limit(&rest).wrap_err("invalid -M memory limit")?,
                         )?;
                         memory_limit_given = true;
                     }
@@ -680,6 +714,10 @@ fn print_help() {
          --check, --[no-]sparse, --[no-]asyncio, --[no-]mmap-dict,\n\
          --no-pass-through, --[no-]row-match-finder.\n\
          \n\
+         --target-compressed-block-size=N bounds what goes into each block, so\n\
+         blocks flush sooner and stay near N. --long=N is capped at 27: above\n\
+         that the frame would declare a window this build refuses to decode.\n\
+         \n\
          Rejected rather than ignored, because they would change the result:\n\
          --no-check, --no-content-size, --no-dictID, --format= (other than\n\
          zstd), --patch-from, --rsyncable, --pass-through,\n\
@@ -779,14 +817,15 @@ fn run_benchmark(opts: &Options, dict: Option<&[u8]>) -> Result<()> {
             compress_stream(
                 data.as_slice(),
                 &mut compressed,
-                level,
-                opts.store,
+                &FrameSettings {
+                    level,
+                    // The benchmark holds the whole input, so the length is
+                    // exact and there is no estimate to fall back on.
+                    pledged_size: Some(data.len() as u64),
+                    size_hint: None,
+                    ..FrameSettings::from_options(opts)
+                },
                 dict,
-                // The benchmark holds the whole input, so the length is exact.
-                Some(data.len() as u64),
-                None,
-                opts.long,
-                opts.long_window_log,
             )?;
             best_compress = best_compress.min(t.elapsed().as_secs_f64());
             if start.elapsed().as_secs_f64() >= opts.bench_secs {
@@ -1013,7 +1052,19 @@ fn list_file(path: &Path) -> Result<()> {
         };
 
         match info.content_size {
-            FrameContentSize::Known(n) => decompressed = decompressed.map(|d| d + n),
+            // Declared, not measured: a handful of header bytes can claim any
+            // size, so the running total is checked rather than trusted.
+            FrameContentSize::Known(n) => {
+                decompressed = match decompressed {
+                    Some(total) => Some(total.checked_add(n).ok_or_else(|| {
+                        eyre!(
+                            "{}: declared content sizes total more than 2^64 bytes",
+                            path.display()
+                        )
+                    })?),
+                    None => None,
+                }
+            }
             FrameContentSize::Unknown => decompressed = None,
         }
         check |= info.content_checksum;
@@ -1069,13 +1120,8 @@ fn process_stdin_stdout(opts: &Options, dict: Option<&[u8]>) -> Result<()> {
             compress_stream(
                 reader,
                 stdout.lock(),
-                opts.level,
-                opts.store,
+                &FrameSettings::from_options(opts),
                 dict,
-                opts.pledged_size,
-                opts.size_hint,
-                opts.long,
-                opts.long_window_log,
             )
         }
         Mode::Decompress => {
@@ -1118,13 +1164,11 @@ fn run_stream_core<R: Read, W: Write>(
         Mode::Compress => compress_stream(
             reader,
             writer,
-            opts.level,
-            opts.store,
+            &FrameSettings {
+                pledged_size,
+                ..FrameSettings::from_options(opts)
+            },
             dict,
-            pledged_size,
-            opts.size_hint,
-            opts.long,
-            opts.long_window_log,
         ),
         Mode::Decompress => decompress_stream(reader, writer, dict),
         Mode::Test | Mode::List | Mode::Train => {
@@ -1224,21 +1268,60 @@ fn process_file(opts: &Options, input: &Path, dict: Option<&[u8]>) -> Result<()>
     remove_source_if_requested(opts, input)
 }
 
+/// Everything the command line says about how one frame is to be built.
+///
+/// Grouped rather than passed one by one: these travel together through every
+/// compression entry point, and a positional list this long invites the caller
+/// to line the arguments up wrong.
+#[derive(Clone, Copy, Default)]
+struct FrameSettings {
+    /// Numeric compression level, ignored when `store` is set.
+    level: i32,
+    /// `--format=zstd` with no compression: emit raw blocks.
+    store: bool,
+    /// Exact input length, recorded in the frame header.
+    pledged_size: Option<u64>,
+    /// Estimated input length; steers geometry, never reaches the header.
+    size_hint: Option<u64>,
+    /// Long-distance matching, with the window log if `--long=N` gave one.
+    long: bool,
+    long_window_log: Option<u32>,
+    /// Soft block-size target from `--target-compressed-block-size`.
+    target_block_size: Option<u32>,
+}
+
+impl FrameSettings {
+    /// The settings the command line asked for, less the per-input size, which
+    /// each caller knows and fills in.
+    fn from_options(opts: &Options) -> Self {
+        Self {
+            level: opts.level,
+            store: opts.store,
+            pledged_size: opts.pledged_size,
+            size_hint: opts.size_hint,
+            long: opts.long,
+            long_window_log: opts.long_window_log,
+            target_block_size: opts.target_block_size,
+        }
+    }
+}
+
 /// Streaming compression core (file or stdout), optionally dictionary-primed.
-#[allow(clippy::too_many_arguments)]
 fn compress_stream<R: Read, W: Write>(
     mut reader: R,
     writer: W,
-    level: i32,
-    store: bool,
+    settings: &FrameSettings,
     dict: Option<&[u8]>,
-    // `pledged_size` is the exact length and lands in the frame header;
-    // `size_hint` is only an estimate and steers the encoder's geometry.
-    pledged_size: Option<u64>,
-    size_hint: Option<u64>,
-    long: bool,
-    long_window_log: Option<u32>,
 ) -> Result<()> {
+    let &FrameSettings {
+        level,
+        store,
+        pledged_size,
+        size_hint,
+        long,
+        long_window_log,
+        target_block_size,
+    } = settings;
     let compression_level = if store {
         CompressionLevel::Uncompressed
     } else {
@@ -1251,6 +1334,13 @@ fn compress_stream<R: Read, W: Write>(
     encoder
         .set_content_checksum(true)
         .wrap_err("failed to enable content checksum")?;
+    // A smaller block target is what the caller asked for when they want
+    // bounded latency; the encoder clamps it to the format's own range.
+    if let Some(target) = target_block_size {
+        encoder
+            .set_target_block_size(Some(target))
+            .wrap_err("failed to set the block-size target")?;
+    }
     // Long-distance matching (`--long`) is a per-knob override applied via the
     // compression-parameters API; skip it for `--store` (raw frames don't match).
     if long && !store {
@@ -1330,14 +1420,22 @@ fn decompress_stream<R: Read, W: Write>(
     // Buffered so the end of the stream can be told from the start of another
     // frame without consuming the bytes that answer the question.
     let mut source = BufReader::new(reader);
+    let mut frames = 0u64;
     loop {
         if source
             .fill_buf()
             .wrap_err("failed to read the compressed stream")?
             .is_empty()
         {
+            // End of the last frame is success; end before the first one means
+            // the input never held a frame at all, which is not an archive that
+            // decodes to nothing.
+            if frames == 0 {
+                bail!("unexpected end of input: no zstd frame");
+            }
             return Ok(());
         }
+        frames += 1;
         // Borrowed, not moved: a frame that turns out to be skippable leaves
         // the reader with us to step over it and carry on.
         let built = match &handle {

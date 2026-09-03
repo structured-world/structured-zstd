@@ -58,7 +58,10 @@ command line: levels (`-1`..`-19`, `--ultra` for `-20`..`-22`, `--fast[=N]`),
 
 Flags that only steer how the work is done (`-T`, `-B`, `--adapt`,
 `--[no-]progress`, …) are accepted and ignored — their values are still
-validated, so a typo is an error rather than silence. Flags that would change
+validated, so a typo is an error rather than silence.
+`--target-compressed-block-size` does take effect: it bounds what goes into a
+block, so blocks flush sooner. `--long=N` is capped at 27, since a larger
+window would produce frames this build's decoder refuses. Flags that would change
 the result are refused instead: `--format=` for anything but zstd,
 `--patch-from`, `--rsyncable`, `--no-check`, `--[no-]compress-literals`, and
 the not-yet-implemented `--pass-through` / `--exclude-compressed`. `-M` is
