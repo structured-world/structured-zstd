@@ -601,17 +601,32 @@ pub fn create_fastcover_dict_from_source<R: io::Read, W: io::Write>(
 ) -> io::Result<FastCoverTuned> {
     let mut sample = Vec::new();
     source.read_to_end(&mut sample)?;
+    create_fastcover_dict_from_slice(sample.as_slice(), output, dict_size, fastcover, finalize)
+}
+
+/// Train and finalize a FastCOVER dictionary from a corpus already in memory.
+///
+/// The same work as [`create_fastcover_dict_from_source`] for a caller that
+/// holds the bytes: the corpus is the largest allocation training makes, and
+/// handing it over as a slice keeps it to one copy rather than buffering it a
+/// second time inside.
+pub fn create_fastcover_dict_from_slice<W: io::Write>(
+    sample: &[u8],
+    output: &mut W,
+    dict_size: usize,
+    fastcover: &FastCoverOptions,
+    finalize: FinalizeOptions,
+) -> io::Result<FastCoverTuned> {
     if sample.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "source stream is empty",
         ));
     }
-    let content_budget = finalized_content_budget(sample.as_slice(), sample.as_slice(), dict_size)?;
-    let (raw_dict, tuned) =
-        train_fastcover_raw_from_slice(sample.as_slice(), content_budget, fastcover)?;
+    let content_budget = finalized_content_budget(sample, sample, dict_size)?;
+    let (raw_dict, tuned) = train_fastcover_raw_from_slice(sample, content_budget, fastcover)?;
 
-    let finalized = finalize_raw_dict(raw_dict.as_slice(), sample.as_slice(), dict_size, finalize)?;
+    let finalized = finalize_raw_dict(raw_dict.as_slice(), sample, dict_size, finalize)?;
     output.write_all(finalized.as_slice())?;
     Ok(tuned)
 }

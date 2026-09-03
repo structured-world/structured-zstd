@@ -183,6 +183,62 @@ fn an_output_may_not_land_on_another_input() {
     );
 }
 
+/// Training writes its result over the samples' own directory, and the default
+/// destination is a plain `dictionary`. If a sample carries that name, the run
+/// reads it and then replaces it — the corpus loses a file to the dictionary
+/// built from it, with no `--rm` anywhere in sight.
+#[test]
+fn training_refuses_to_write_over_its_own_sample() {
+    let dir = std::env::temp_dir();
+    let sample = dir.join(format!("szstd-trainalias-{}", std::process::id()));
+    fs::write(&sample, vec![7u8; 4096]).unwrap();
+
+    let mut opts = parse(&["--train", "-f", "s"]).unwrap();
+    opts.inputs = vec![sample.clone()];
+    opts.output = Some(sample.clone());
+    let refused = train_dictionary(&opts);
+
+    let survived = fs::read(&sample).unwrap_or_default();
+    let _ = fs::remove_file(&sample);
+    let err = refused
+        .expect_err("a sample must not be replaced by the dictionary trained from it")
+        .to_string();
+    assert!(
+        err.contains("sample"),
+        "the refusal must name the collision: {err}"
+    );
+    assert_eq!(survived.len(), 4096, "the sample must still be there");
+}
+
+/// The `-D` dictionary is what a frame will need to be read back, so an output
+/// landing on it destroys the key to the file just written. `-f` permits
+/// replacing the output, not the dictionary that gives it meaning.
+#[test]
+fn an_output_may_not_land_on_the_dictionary() {
+    let dir = std::env::temp_dir();
+    let input = dir.join(format!("szstd-dictalias-{}", std::process::id()));
+    let dictionary = PathBuf::from(format!("{}.zst", input.display()));
+    fs::write(&input, b"data to compress").unwrap();
+    fs::write(&dictionary, vec![0u8; 4096]).unwrap();
+
+    let mut opts = parse(&["-f", "a"]).unwrap();
+    opts.inputs = vec![input.clone()];
+    opts.dict = Some(dictionary.clone());
+    let refused = run(opts);
+
+    let survived = fs::read(&dictionary).unwrap_or_default();
+    let _ = fs::remove_file(&input);
+    let _ = fs::remove_file(&dictionary);
+    let err = refused
+        .expect_err("an output that is also the dictionary must be refused")
+        .to_string();
+    assert!(
+        err.contains("dictionary"),
+        "the refusal must name the collision: {err}"
+    );
+    assert_eq!(survived.len(), 4096, "the dictionary must still be there");
+}
+
 /// Compressing does not publish anything: an archive of a private file stays
 /// as private as the file was. Creating the output at whatever the umask says
 /// hands a 0600 secret to every user on the machine, which is why upstream
@@ -374,6 +430,77 @@ fn a_serialized_dictionary_keeps_the_size_its_tier_is_chosen_by() {
         through_cli, expected,
         "`-D` must compress exactly as the same dictionary handed to the library does"
     );
+}
+
+/// Zero is a sentinel in three of these options, and each one says so in the
+/// API this tool mirrors: no block target, no size hint, no dictionary.
+/// Passing the zero through instead turns each into its opposite — the
+/// smallest allowed block, an empty-source hint, a dictionary rejected as
+/// corrupt.
+#[test]
+fn zero_means_unset_where_the_api_says_it_does() {
+    // `ZSTD_c_targetCBlockSize`: "No target when targetCBlockSize == 0."
+    let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+    let mut targeted = Vec::new();
+    compress_stream(
+        payload.as_slice(),
+        &mut targeted,
+        &FrameSettings {
+            level: 3,
+            target_block_size: Some(0),
+            ..FrameSettings::default()
+        },
+        None,
+    )
+    .expect("compressing must succeed");
+    let mut untargeted = Vec::new();
+    compress_stream(
+        payload.as_slice(),
+        &mut untargeted,
+        &FrameSettings {
+            level: 3,
+            ..FrameSettings::default()
+        },
+        None,
+    )
+    .expect("compressing must succeed");
+    assert_eq!(
+        targeted, untargeted,
+        "a zero target must leave the block geometry alone"
+    );
+
+    // `ZSTD_c_srcSizeHint`: "Hint is not valid when srcSizeHint == 0."
+    let mut hinted = Vec::new();
+    compress_stream(
+        payload.as_slice(),
+        &mut hinted,
+        &FrameSettings {
+            level: 3,
+            size_hint: Some(0),
+            ..FrameSettings::default()
+        },
+        None,
+    )
+    .expect("compressing must succeed");
+    assert_eq!(
+        hinted, untargeted,
+        "a zero hint must not size the encoder for an empty source"
+    );
+
+    // `ZSTD_CCtx_loadDictionary`: a zero-size dictionary "returns to
+    // no-dictionary mode".
+    let mut without = Vec::new();
+    compress_stream(
+        payload.as_slice(),
+        &mut without,
+        &FrameSettings {
+            level: 3,
+            ..FrameSettings::default()
+        },
+        Some(&[]),
+    )
+    .expect("an empty dictionary is no dictionary, not a broken one");
+    assert_eq!(without, untargeted, "and produces the same frame");
 }
 
 /// An empty file holds no frame, so there is nothing to test and nothing to

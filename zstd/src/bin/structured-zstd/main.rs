@@ -990,15 +990,24 @@ fn run(opts: Options) -> Result<()> {
     }
     // The inputs are processed one after another, so an output derived from an
     // early one can land on a file still waiting its turn: `-f foo foo.zst`
-    // would replace `foo.zst` before it is ever read. `-f` permits overwriting
-    // the output, not destroying another input, so the whole list is checked
-    // before the first byte is written.
-    if !opts.to_stdout && opts.inputs.len() > 1 {
+    // would replace `foo.zst` before it is ever read. The `-D` dictionary is a
+    // file this run needs too — and the one a frame will need to be read back,
+    // so writing over it destroys the key to what was just produced. `-f`
+    // permits overwriting the output, not destroying either, so everything the
+    // run reads is checked before the first byte is written.
+    if !opts.to_stdout {
         for input in &opts.inputs {
             if input == Path::new("-") {
                 continue;
             }
             let output = derive_output_path(&opts, input)?;
+            if opts.dict.as_deref() == Some(output.as_path()) {
+                bail!(
+                    "{} would be written over the dictionary {}",
+                    input.display(),
+                    output.display(),
+                );
+            }
             if let Some(clash) = opts.inputs.iter().find(|other| *other == &output) {
                 bail!(
                     "{} would be written over {}, which is also an input",
@@ -1172,7 +1181,7 @@ fn benchmark_one(opts: &Options, dict: Option<&[u8]>, label: &str, data: &[u8]) 
 /// `zstd --train FILEs -o dict --maxdict=N [--dictID=N]`.
 fn train_dictionary(opts: &Options) -> Result<()> {
     use structured_zstd::dictionary::{
-        FastCoverOptions, FinalizeOptions, create_fastcover_dict_from_source,
+        FastCoverOptions, FinalizeOptions, create_fastcover_dict_from_slice,
     };
 
     if opts.inputs.is_empty() {
@@ -1189,6 +1198,16 @@ fn train_dictionary(opts: &Options) -> Result<()> {
     if output.exists() && !opts.force {
         bail!("{} already exists; use -f to overwrite", output.display());
     }
+    // The default destination is a plain `dictionary`, which a sample can
+    // easily be named: the run would read that file and then replace it with
+    // what it learned from it. `-f` permits replacing the output, not spending
+    // a sample to make one.
+    if let Some(clash) = opts.inputs.iter().find(|sample| *sample == &output) {
+        bail!(
+            "{} is a training sample; the dictionary cannot be written over it",
+            clash.display()
+        );
+    }
 
     let mut corpus = Vec::new();
     for input in &opts.inputs {
@@ -1198,7 +1217,9 @@ fn train_dictionary(opts: &Options) -> Result<()> {
     }
 
     let mut dict = Vec::new();
-    create_fastcover_dict_from_source(
+    // From the slice, not through a reader: the corpus is the largest thing
+    // this run holds, and the reader path buffers it a second time inside.
+    create_fastcover_dict_from_slice(
         corpus.as_slice(),
         &mut dict,
         opts.max_dict,
@@ -1675,8 +1696,10 @@ fn compress_stream<R: Read, W: Write>(
         .set_content_checksum(true)
         .wrap_err("failed to enable content checksum")?;
     // A smaller block target is what the caller asked for when they want
-    // bounded latency; the encoder clamps it to the format's own range.
-    if let Some(target) = target_block_size {
+    // bounded latency; the encoder clamps it to the format's own range. Zero
+    // is the parameter's own way of saying "no target", so it stays off rather
+    // than being clamped up into the smallest block the format allows.
+    if let Some(target) = target_block_size.filter(|target| *target != 0) {
         encoder
             .set_target_block_size(Some(target))
             .wrap_err("failed to set the block-size target")?;
@@ -1707,15 +1730,20 @@ fn compress_stream<R: Read, W: Write>(
         encoder
             .set_pledged_content_size(size)
             .wrap_err("failed to set pledged content size")?;
-    } else if let Some(size) = size_hint {
+    } else if let Some(size) = size_hint.filter(|size| *size != 0) {
         // Only an estimate (`--size-hint`): it steers the encoder's geometry
         // and must NOT reach the header, or a wrong guess would turn a
-        // successful compression into a failure.
+        // successful compression into a failure. Zero is not a hint — the
+        // parameter says so — and taking it as one would size the encoder for
+        // an empty source and shrink the window a real stream needs.
         encoder
             .set_source_size_hint(size)
             .wrap_err("failed to set source size hint")?;
     }
-    if let Some(raw) = dict {
+    // An empty file is no dictionary rather than a broken one: loading a
+    // zero-size dictionary returns to no-dictionary mode, so `-D` on an empty
+    // file compresses plainly instead of failing before the input is read.
+    if let Some(raw) = dict.filter(|raw| !raw.is_empty()) {
         // Whatever `-D` was pointed at: a trained dictionary, or any file at
         // all, taken as raw content the way upstream does. Loaded through the
         // constructor that keeps the blob's own length, since that is what the
@@ -1749,8 +1777,9 @@ fn decompress_stream<R: Read, W: Write>(
     use structured_zstd::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
 
     // Decoded once rather than per frame: every frame in the stream is primed
-    // with the same dictionary.
-    let handle = match dict {
+    // with the same dictionary. An empty file is no dictionary rather than a
+    // broken one, the same way it is on the compressing side.
+    let handle = match dict.filter(|raw| !raw.is_empty()) {
         Some(raw) => Some(
             structured_zstd::decoding::DictionaryHandle::from_dictionary(
                 structured_zstd::decoding::Dictionary::from_serialized_or_raw_content(raw)
