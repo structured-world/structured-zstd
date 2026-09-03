@@ -291,6 +291,35 @@ fn an_input_that_is_the_dictionary_is_not_removed() {
     assert_eq!(survived.len(), 8192, "the dictionary must still be there");
 }
 
+/// The scan that keeps an output off the dictionary walks the named inputs, and
+/// stdin is not one of them: `-f -D dict -o dict` never reached it, so the
+/// dictionary was loaded and then replaced by a frame that needs it. The result
+/// is an archive whose key it has just overwritten.
+#[test]
+fn a_stdin_output_may_not_land_on_the_dictionary() {
+    let dir = std::env::temp_dir();
+    let dictionary = dir.join(format!("szstd-stdindict-{}", std::process::id()));
+    fs::write(&dictionary, vec![4u8; 8192]).unwrap();
+
+    let mut opts = parse(&["-f", "-c"]).unwrap();
+    opts.to_stdout = false;
+    opts.inputs = Vec::new();
+    opts.dict = Some(dictionary.clone());
+    opts.output = Some(dictionary.clone());
+    let refused = run(opts);
+
+    let survived = fs::read(&dictionary).unwrap_or_default();
+    let _ = fs::remove_file(&dictionary);
+    let err = refused
+        .expect_err("the output must not land on the dictionary it needs")
+        .to_string();
+    assert!(
+        err.contains("dictionary"),
+        "the refusal must name the collision: {err}"
+    );
+    assert_eq!(survived.len(), 8192, "the dictionary must still be there");
+}
+
 /// The same collision reached through a symlink. Resolving only the directory
 /// leaves the last component as written, so `dict-link -> data` and `data` read
 /// as two files; `--rm -D dict-link data` then deletes `data`, the link dangles,
@@ -632,6 +661,46 @@ fn a_new_output_inherits_the_source_permissions() {
         mode.expect("the archive must exist"),
         0o600,
         "the archive must be no more readable than the file it came from"
+    );
+}
+
+/// A dictionary carries stretches of its corpus verbatim — that is what makes
+/// it a dictionary — so training on private samples and leaving the result at
+/// whatever the umask allows publishes fragments of them. It is the same rule
+/// an archive follows, and with several samples the answer is the strictest of
+/// them: no sample's bits may be readable through the dictionary by anyone who
+/// could not read that sample.
+#[cfg(unix)]
+#[test]
+fn a_trained_dictionary_is_no_more_readable_than_its_samples() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir();
+    let open = dir.join(format!("szstd-trainperm-open-{}", std::process::id()));
+    let private = dir.join(format!("szstd-trainperm-private-{}", std::process::id()));
+    let output = dir.join(format!("szstd-trainperm-out-{}", std::process::id()));
+    let corpus: Vec<u8> = (0..40_000u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+        .collect();
+    fs::write(&open, &corpus).unwrap();
+    fs::write(&private, &corpus).unwrap();
+    fs::set_permissions(&open, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let mut opts = parse(&["--train", "-f", "s"]).unwrap();
+    opts.inputs = vec![open.clone(), private.clone()];
+    opts.output = Some(output.clone());
+    let trained = train_dictionary(&opts);
+
+    let mode = fs::metadata(&output).map(|m| m.permissions().mode() & 0o777);
+    let _ = fs::remove_file(&open);
+    let _ = fs::remove_file(&private);
+    let _ = fs::remove_file(&output);
+    trained.expect("training must succeed");
+    assert_eq!(
+        mode.expect("the dictionary must exist"),
+        0o600,
+        "the strictest sample decides: the dictionary holds bytes from it"
     );
 }
 

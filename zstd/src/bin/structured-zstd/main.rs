@@ -1043,6 +1043,22 @@ fn run(opts: Options) -> Result<()> {
         return Ok(());
     }
 
+    // A destination named outright belongs to the whole run, whatever it reads:
+    // stdin, an explicit `-`, or files. The dictionary is what the frame being
+    // written will need to be read back, so an `-o` pointing at it destroys the
+    // key to the archive it is producing. Checked here rather than in the
+    // per-input scan below, which sees neither stdin nor `-`.
+    if let (Some(output), Some(dict)) = (&opts.output, &opts.dict)
+        && !opts.to_stdout
+        && matches!(opts.mode, Mode::Compress | Mode::Decompress)
+        && names_the_same_file(output, dict)?
+    {
+        bail!(
+            "{} would be written over the dictionary {}",
+            output.display(),
+            dict.display(),
+        );
+    }
     if opts.inputs.is_empty() {
         return process_stdin_stdout(&opts, &dicts);
     }
@@ -1370,6 +1386,17 @@ fn train_dictionary(opts: &Options) -> Result<()> {
     // leaves the previous dictionary intact rather than a half-written one.
     // The overwrite gate ran before the corpus was read.
     let (temp_path, mut temp_file) = create_temporary_output_file(&output)?;
+    // And like any other output it is no more readable than what it was made
+    // from. A dictionary carries stretches of its corpus verbatim, so training
+    // on private samples and leaving the result at whatever the umask allows
+    // hands those stretches to everyone; with several samples the strictest
+    // decides, since the bytes of each are in there.
+    if let Some(permissions) = strictest_sample_permissions(&opts.inputs)?
+        && let Err(err) = fs::set_permissions(&temp_path, permissions)
+    {
+        let _ = fs::remove_file(&temp_path);
+        return Err(err).wrap_err("failed to apply the samples' permissions to the dictionary");
+    }
     let written = temp_file
         .write_all(&dict)
         .and_then(|()| temp_file.flush())
@@ -1387,6 +1414,35 @@ fn train_dictionary(opts: &Options) -> Result<()> {
         opts.inputs.len()
     );
     Ok(())
+}
+
+/// The permissions a file made from all of `samples` may carry: every bit that
+/// each of them grants, and no other.
+///
+/// A dictionary holds pieces of every sample, so anyone who could not read one
+/// of them must not be able to read it. On Unix that is the bitwise AND of the
+/// modes. Elsewhere `Permissions` says only whether a file is read-only, which
+/// answers a different question and would make the dictionary unwritable rather
+/// than unreadable, so nothing is applied and the platform's own inheritance
+/// stands.
+#[cfg(unix)]
+fn strictest_sample_permissions(samples: &[PathBuf]) -> Result<Option<fs::Permissions>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut mode: Option<u32> = None;
+    for sample in samples {
+        let sample_mode = fs::metadata(sample)
+            .wrap_err_with(|| format!("failed to inspect {}", sample.display()))?
+            .permissions()
+            .mode();
+        mode = Some(mode.map_or(sample_mode, |so_far| so_far & sample_mode));
+    }
+    Ok(mode.map(fs::Permissions::from_mode))
+}
+
+#[cfg(not(unix))]
+fn strictest_sample_permissions(_samples: &[PathBuf]) -> Result<Option<fs::Permissions>> {
+    Ok(None)
 }
 
 /// Read into `buf` until it is full or EOF, returning the number of bytes read.

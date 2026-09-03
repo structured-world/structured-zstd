@@ -5486,6 +5486,31 @@ fn lazy_band_target_len_matches_default_table() {
 /// asserting the full row (not just `search_depth`) keeps the whole budget
 /// aligned and guards every field against silent drift.
 #[test]
+fn a_dictionary_frame_keeps_the_formats_smallest_window() {
+    // A dictionary frame with an explicit window takes the source cap through
+    // `adjusted_window_log` alone, because the full adjuster would reshape a
+    // search that has to stay keyed the way the dictionary's tables were built.
+    // That helper is only the cap, though: the floor below which no window may
+    // go lives in the adjuster, so applying one without the other lets a small
+    // hint ask for a window the format does not have. A stream larger than the
+    // hint would then be matched through a window of a few hundred bytes.
+    let ov = super::super::parameters::ParamOverrides {
+        window_log: Some(MIN_WINDOW_LOG),
+        ..Default::default()
+    };
+    let mut driver = MatchGeneratorDriver::new(32, 2);
+    driver.set_source_size_hint(64);
+    driver.set_dictionary_size_hint(crate::encoding::DictionarySizes::raw_content(64));
+    driver.set_param_overrides(Some(ov));
+    driver.reset(CompressionLevel::Level(3));
+    assert_eq!(
+        driver.window_size(),
+        1 << MIN_WINDOW_LOG,
+        "the window may be capped by the source but never below the format's own minimum"
+    );
+}
+
+#[test]
 fn upper_lazy_band_params_match_default_table() {
     // table[0] (srcSize > 256 KB), levels 13..=15 (btlazy2 budget):
     // (level, windowLog, hashLog, chainLog, search_depth = 1 << searchLog).

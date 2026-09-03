@@ -1078,11 +1078,17 @@ impl Matcher for MatchGeneratorDriver {
             // than through the full adjuster, which would reshape the search.
             if let Some(window_log) = ov.window_log {
                 params.window_log = match hint {
-                    Some(src) => crate::encoding::cparams::adjusted_window_log(
+                    // The helper is the source cap on its own; the floor that
+                    // travels with it in `adjust_cparams` has to be applied
+                    // here too. Without it a hint of a few dozen bytes asks for
+                    // a window smaller than the format's smallest, and a stream
+                    // that outgrows the hint is matched through it.
+                    Some(src) => (crate::encoding::cparams::adjusted_window_log(
                         u32::from(window_log),
                         src,
                         dict_hint.map_or(0, |sizes| sizes.content),
-                    ) as u8,
+                    ) as u8)
+                        .max(MIN_WINDOW_LOG),
                     None => window_log,
                 };
             }
