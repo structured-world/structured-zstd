@@ -3,6 +3,41 @@ use crate::decoding::Dictionary;
 use std::io::Cursor;
 use std::string::ToString;
 
+/// The Huffman statistics are gathered by striding across the corpus, and the
+/// stride is `i * len` — a product that reaches 2^48 for an addressable corpus
+/// and so cannot be held by a 32-bit `usize`. Past 64 KiB of samples it
+/// overflowed there and the multiply panicked instead of sampling, which no
+/// amount of 64-bit testing shows. The index is computed in 64 bits now: the
+/// last sample of a corpus far larger than the statistics buffer still lands
+/// inside it, and the spread is even.
+#[test]
+fn statistics_are_strided_without_overflowing_the_index() {
+    let len = 4 * MAX_HUFFMAN_STATS_BYTES + 12_345;
+    assert_eq!(
+        strided_index(0, len),
+        0,
+        "the first sample is the first byte"
+    );
+    assert!(
+        strided_index(MAX_HUFFMAN_STATS_BYTES - 1, len) < len,
+        "and the last one is still inside the corpus"
+    );
+    // Evenly spread: each step advances by the corpus over the sample count.
+    assert_eq!(strided_index(1, len), len / MAX_HUFFMAN_STATS_BYTES);
+    assert_eq!(
+        strided_index(MAX_HUFFMAN_STATS_BYTES / 2, len),
+        len / 2,
+        "the middle sample is the middle of the corpus"
+    );
+    // The product that overflows a 32-bit `usize`: 2^16 samples over a corpus
+    // of 2^32 bytes is 2^48, which only 64-bit arithmetic holds.
+    assert_eq!(
+        strided_index(MAX_HUFFMAN_STATS_BYTES - 1, u32::MAX as usize),
+        ((MAX_HUFFMAN_STATS_BYTES as u64 - 1) * u32::MAX as u64 / MAX_HUFFMAN_STATS_BYTES as u64)
+            as usize
+    );
+}
+
 fn training_data() -> Vec<u8> {
     let mut data = Vec::new();
     for i in 0..512u32 {

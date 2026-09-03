@@ -287,6 +287,17 @@ pub fn create_raw_dict_from_source<R: io::Read, W: io::Write>(
     Ok(())
 }
 
+/// The `i`th of [`MAX_HUFFMAN_STATS_BYTES`] samples spread evenly over `len`
+/// bytes.
+///
+/// Computed in 64 bits: `i * len` reaches 2^48 for an addressable corpus, which
+/// a 32-bit `usize` cannot hold — the product overflows for any corpus past
+/// 64 KiB there, and the multiply panics rather than sampling. The quotient is
+/// always below `len`, so the narrowing back is exact.
+fn strided_index(i: usize, len: usize) -> usize {
+    ((i as u64 * len as u64) / MAX_HUFFMAN_STATS_BYTES as u64) as usize
+}
+
 fn serialize_huffman_table(sample_data: &[u8], raw_content: &[u8]) -> io::Result<Vec<u8>> {
     fn bounded_huffman_stats(data: &[u8]) -> Vec<u8> {
         if data.len() <= MAX_HUFFMAN_STATS_BYTES {
@@ -295,8 +306,7 @@ fn serialize_huffman_table(sample_data: &[u8], raw_content: &[u8]) -> io::Result
 
         let mut stats = Vec::with_capacity(MAX_HUFFMAN_STATS_BYTES);
         for i in 0..MAX_HUFFMAN_STATS_BYTES {
-            let idx = i * data.len() / MAX_HUFFMAN_STATS_BYTES;
-            stats.push(data[idx]);
+            stats.push(data[strided_index(i, data.len())]);
         }
         stats
     }
@@ -356,7 +366,7 @@ fn bounded_fse_symbols(data: &[u8], max_symbol: u8) -> Vec<u8> {
 
     let mut out = Vec::with_capacity(MAX_HUFFMAN_STATS_BYTES);
     for i in 0..MAX_HUFFMAN_STATS_BYTES {
-        let idx = i * data.len() / MAX_HUFFMAN_STATS_BYTES;
+        let idx = strided_index(i, data.len());
         out.push((u16::from(data[idx]) % modulo) as u8);
     }
     out

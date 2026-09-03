@@ -659,6 +659,45 @@ fn training_refuses_samples_that_are_not_regular_files() {
     );
 }
 
+/// The dictionary is read whole, so its size has to be a count of bytes this
+/// machine can hold. A 64-bit length cast to a pointer-sized one truncates on a
+/// 32-bit target — 4 GiB becomes a capacity of zero — and the read then grows
+/// into an allocation that aborts the process instead of returning the refusal
+/// the size deserved. Only a 32-bit target can reach it, and the cross-compiled
+/// job runs these tests there.
+#[test]
+fn a_dictionary_bigger_than_the_address_space_is_refused() {
+    let dir = std::env::temp_dir();
+    let sparse = dir.join(format!("szstd-hugedict-{}", std::process::id()));
+    let file = fs::File::create(&sparse).unwrap();
+    // Stated, not occupied: a sparse file claims a length without spending a
+    // byte of disk on it.
+    let stated = u64::from(u32::MAX) + 4096;
+    if file.set_len(stated).is_err() {
+        let _ = fs::remove_file(&sparse);
+        return;
+    }
+    drop(file);
+
+    let mut opts = parse(&["-d", "a"]).unwrap();
+    opts.dict = Some(sparse.clone());
+    let loaded = load_dictionary(&opts);
+    let _ = fs::remove_file(&sparse);
+
+    if usize::try_from(stated).is_ok() {
+        // A machine that can address it may legitimately try to read it; the
+        // refusal under test is the one that cannot.
+        return;
+    }
+    let err = loaded
+        .expect_err("a dictionary larger than the address space cannot be read")
+        .to_string();
+    assert!(
+        err.contains("address"),
+        "the refusal must say the size is the problem: {err}"
+    );
+}
+
 /// The dictionary is read whole, and its size is taken from the directory entry
 /// to bound that read. A FIFO reports zero there, so it clears the memory limit
 /// and then blocks in `File::open` until someone opens the other end — the run
