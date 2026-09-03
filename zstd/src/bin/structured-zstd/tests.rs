@@ -242,7 +242,6 @@ fn performance_only_flags_are_accepted() {
         &["--sparse", "f"][..],
         &["--no-asyncio", "f"][..],
         &["--no-mmap-dict", "f"][..],
-        &["--compress-literals", "f"][..],
         &["--no-row-match-finder", "f"][..],
     ] {
         let parsed = parse(args);
@@ -439,4 +438,64 @@ fn corrupted_checksum_is_reported_not_passed() {
         text.to_ascii_lowercase().contains("checksum"),
         "the failure should name the checksum, got: {text}"
     );
+}
+
+/// `--rm` deletes the input once the output is safely written. With `-c` the
+/// output went to stdout, which may be a pipe that was closed, a terminal, or
+/// anything else we cannot re-read — there is no saved copy to justify the
+/// deletion. Upstream keeps the file in that case; deleting it would be data
+/// loss on the user's behalf.
+#[test]
+fn rm_keeps_the_source_when_output_went_to_stdout() {
+    let dir = std::env::temp_dir();
+    let path = dir.join(format!("szstd-rm-test-{}.txt", std::process::id()));
+    fs::write(&path, b"payload").unwrap();
+
+    let mut opts = parse(&["--rm", "-c", "f"]).unwrap();
+    opts.inputs = vec![path.display().to_string()];
+    let result = remove_source_if_requested(&opts, &path);
+
+    let survived = path.exists();
+    let _ = fs::remove_file(&path);
+    result.expect("the no-op path must not error");
+    assert!(
+        survived,
+        "--rm with -c must keep the input: the output went somewhere we cannot verify"
+    );
+}
+
+/// `-c` and `-o` name competing destinations, so the later one on the command
+/// line wins — verified against upstream, where `-c -o f` writes the file and
+/// `-o f -c` writes stdout. Letting `-c` win regardless would silently drop
+/// the `-o` the caller typed last.
+#[test]
+fn stdout_and_output_follow_last_option_wins() {
+    let file_last = parse(&["-c", "-o", "out.zst", "in.txt"]).unwrap();
+    assert_eq!(file_last.output, Some(PathBuf::from("out.zst")));
+    assert!(!file_last.to_stdout, "-o came last, so it selects the file");
+
+    let stdout_last = parse(&["-o", "out.zst", "-c", "in.txt"]).unwrap();
+    assert!(stdout_last.to_stdout, "-c came last, so it selects stdout");
+    assert_eq!(stdout_last.output, None);
+}
+
+/// `--[no-]compress-literals` forces literals compressed or stored, which
+/// changes the emitted frame. The encoder has no such switch here, so
+/// accepting the flag would hand back a frame laid out the other way.
+#[test]
+fn literal_mode_flags_are_rejected_until_wired() {
+    assert!(parse(&["--compress-literals", "f"]).is_err());
+    assert!(parse(&["--no-compress-literals", "f"]).is_err());
+}
+
+/// `--memory` bounds decompression. Dictionary training loads every sample
+/// into memory instead, so the flag says nothing about what `--train` will
+/// actually use — accepting it there would imply a bound over the one path it
+/// does not cover.
+#[test]
+fn memory_limit_is_refused_for_training() {
+    assert!(parse(&["--train", "-M256", "s1", "s2"]).is_err());
+    assert!(parse(&["--train", "--memory=256MB", "s1", "s2"]).is_err());
+    // Still fine for the modes it does describe.
+    assert!(parse(&["-d", "-M256", "f"]).is_ok());
 }

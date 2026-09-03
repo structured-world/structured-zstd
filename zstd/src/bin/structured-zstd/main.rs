@@ -286,6 +286,9 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
         size_hint: None,
     };
     let mut ultra = false;
+    // `--train` may appear after `-M`, so the conflict is settled once the
+    // whole command line is known rather than at the flag itself.
+    let mut memory_limit_given = false;
     let mut iter = args.iter().enumerate().peekable();
     let mut positional_only = false;
 
@@ -307,7 +310,13 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
                 "train" | "train-fastcover" | "train-cover" | "train-legacy" => {
                     opts.mode = Mode::Train
                 }
-                "stdout" | "to-stdout" => opts.to_stdout = true,
+                // `-c` and `-o` name competing destinations, so each clears the
+                // other and the later one on the command line wins, as upstream
+                // does. Setting only one of them lets `-c -o f` ignore the `-o`.
+                "stdout" | "to-stdout" => {
+                    opts.to_stdout = true;
+                    opts.output = None;
+                }
                 "force" => opts.force = true,
                 "keep" => opts.keep = true,
                 "rm" => opts.remove_source = true,
@@ -348,10 +357,14 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
                 | "mmap-dict"
                 | "no-mmap-dict"
                 | "no-pass-through"
-                | "compress-literals"
-                | "no-compress-literals"
                 | "row-match-finder"
                 | "no-row-match-finder" => {}
+                // Forces literals compressed or stored, which changes the
+                // frame that comes out. The encoder has no such switch here,
+                // so accepting the flag would hand back the other layout.
+                "compress-literals" | "no-compress-literals" => {
+                    bail!("--{long} is not implemented");
+                }
                 // These decide WHICH files are processed, or what happens to
                 // input that is not compressed. Accepting them without doing
                 // the work would compress a file the caller asked to skip, or
@@ -391,6 +404,7 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
                         .or_else(|| long.strip_prefix("memlimit-decompress="))
                     {
                         check_memory_limit(parse_size(v).wrap_err("invalid memory limit")?)?;
+                        memory_limit_given = true;
                     } else if let Some(params) = long.strip_prefix("adapt=") {
                         // Parameterised form (`--adapt=min=1,max=9`). We do not
                         // vary the level, so the bounds change nothing — but a
@@ -479,7 +493,11 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
                     ci = chars.len();
                     continue;
                 }
-                'c' => opts.to_stdout = true,
+                'c' => {
+                    // Clears `-o`; see the `--stdout` arm for why.
+                    opts.to_stdout = true;
+                    opts.output = None;
+                }
                 'f' => opts.force = true,
                 'k' => opts.keep = true,
                 // `-S` (benchmark each file separately) is the default here;
@@ -511,6 +529,7 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
                             mib.checked_mul(1 << 20)
                                 .ok_or_else(|| eyre!("-M value `{rest}` is out of range"))?,
                         )?;
+                        memory_limit_given = true;
                     }
                     ci = chars.len();
                     continue;
@@ -536,7 +555,9 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
                     if c == 'D' {
                         opts.dict = Some(PathBuf::from(value));
                     } else {
+                        // Clears `-c`, so the later of the two wins.
                         opts.output = Some(PathBuf::from(value));
+                        opts.to_stdout = false;
                     }
                     ci = chars.len();
                     continue;
@@ -555,6 +576,12 @@ fn parse_args(args: &[String], default_mode: Mode, argv0_stdout: bool) -> Result
         let _ = idx;
     }
 
+    // `-M` bounds decompression. Training loads every sample into memory
+    // instead, a path the limit says nothing about, so accepting it here would
+    // imply a bound over the one thing it does not cover.
+    if memory_limit_given && opts.mode == Mode::Train {
+        bail!("--memory / -M bounds decompression and does not apply to --train");
+    }
     if !ultra && opts.level > 19 {
         bail!("level {} requires --ultra (levels 20-22)", opts.level);
     }
@@ -619,12 +646,13 @@ fn print_help() {
          Accepted for compatibility, with no effect here: -T/--single-thread/\n\
          --auto-threads (single-threaded), -B, --adapt, --[no-]progress,\n\
          --check, --[no-]sparse, --[no-]asyncio, --[no-]mmap-dict,\n\
-         --no-pass-through, --[no-]compress-literals, --[no-]row-match-finder.\n\
+         --no-pass-through, --[no-]row-match-finder.\n\
          \n\
          Rejected rather than ignored, because they would change the result:\n\
          --no-check, --no-content-size, --no-dictID, --format= (other than\n\
          zstd), --patch-from, --rsyncable, --pass-through,\n\
-         --exclude-compressed, and -M/--memory below the enforced ceiling.\n\
+         --exclude-compressed, --[no-]compress-literals, -M/--memory below\n\
+         the enforced ceiling, and -M with --train.\n\
          \n\
          With no FILE, or when FILE is `-`, read stdin / write stdout."
     );
@@ -992,7 +1020,11 @@ fn process_stdin_stdout(opts: &Options, dict: Option<&[u8]>) -> Result<()> {
 /// Remove the source file after a successful (de)compression when `--rm` is set
 /// (and `-k` was not). A no-op otherwise.
 fn remove_source_if_requested(opts: &Options, input: &Path) -> Result<()> {
-    if opts.remove_source && !opts.keep {
+    // Never when the output went to stdout: that may have been a pipe whose
+    // reader is gone, a terminal, or anything else we cannot read back, so
+    // there is no saved copy to justify deleting the original. Upstream keeps
+    // the file for `-c` too.
+    if opts.remove_source && !opts.keep && !opts.to_stdout {
         fs::remove_file(input).wrap_err("failed to remove source file after success")?;
     }
     Ok(())
@@ -1186,25 +1218,27 @@ fn decompress_stream<R: Read, W: Write>(
     mut writer: W,
     dict: Option<&[u8]>,
 ) -> Result<()> {
-    use structured_zstd::decoding::{ContentChecksum, FrameDecoder, StreamingDecoder};
-
+    // The dictionary constructors FORCE the supplied dictionary, which the
+    // registration path does not: a frame may legitimately omit the optional
+    // dictionary ID, and then nothing would select it. So build through them,
+    // and reach the decoder afterwards for the checksum mode.
+    let mut decoder = match dict {
+        Some(raw) => {
+            structured_zstd::decoding::StreamingDecoder::new_with_dictionary_bytes(reader, raw)
+                .map_err(|err| eyre!("failed to init dictionary decoder: {err:?}"))?
+        }
+        None => structured_zstd::decoding::StreamingDecoder::new(reader)
+            .map_err(|err| eyre!("invalid zstd frame: {err:?}"))?,
+    };
     // The library computes the digest but does not compare it, leaving the
     // decision to the caller. For a command-line tool that decision is made:
     // upstream validates by default, and `-t` exists to answer exactly this
     // question, so a frame whose stored checksum disagrees with its data has
-    // to fail rather than decode quietly. Set before `init`, which is why the
-    // decoder is built here instead of by the plain constructors.
-    let mut frame_decoder = FrameDecoder::new();
-    frame_decoder.set_content_checksum(ContentChecksum::Verify);
-    if let Some(raw) = dict {
-        let handle = structured_zstd::decoding::DictionaryHandle::decode_dict(raw)
-            .map_err(|err| eyre!("failed to load dictionary for decompression: {err:?}"))?;
-        frame_decoder
-            .add_dict_handle(handle)
-            .map_err(|err| eyre!("failed to attach dictionary: {err:?}"))?;
-    }
-    let mut decoder = StreamingDecoder::new_with_decoder(reader, frame_decoder)
-        .map_err(|err| eyre!("invalid zstd frame: {err:?}"))?;
+    // to fail rather than decode quietly. Read at the end of the frame, so
+    // setting it after construction is in time.
+    decoder
+        .decoder_mut()
+        .set_content_checksum(structured_zstd::decoding::ContentChecksum::Verify);
     io::copy(&mut decoder, &mut writer).wrap_err("streaming decompression failed")?;
     Ok(())
 }

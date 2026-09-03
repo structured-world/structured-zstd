@@ -135,6 +135,17 @@ impl<READ: Read, DEC: BorrowMut<FrameDecoder>> StreamingDecoder<READ, DEC> {
         &mut self.source
     }
 
+    /// Gets a mutable reference to the frame decoder driving this stream.
+    ///
+    /// Exposed for settings that are read as decoding proceeds rather than at
+    /// construction — [`FrameDecoder::set_content_checksum`] above all, which a
+    /// caller that wants mismatches to fail (rather than merely be computed)
+    /// has to reach after the constructor has chosen and initialised the
+    /// decoder, including on the dictionary paths.
+    pub fn decoder_mut(&mut self) -> &mut FrameDecoder {
+        self.decoder.borrow_mut()
+    }
+
     /// Destructures this object into the inner reader.
     pub fn into_inner(self) -> READ
     where
