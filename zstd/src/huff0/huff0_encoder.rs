@@ -854,7 +854,6 @@ impl HuffmanTable {
             return;
         }
         let cache = &mut self.cached_encoded_weight_description;
-        cache.reserve_to_bound();
         cache.state =
             if HuffmanEncoder::<Vec<u8>>::encode_weight_description_into(weights, &mut cache.buf) {
                 DescriptionState::Encoded(cache.buf.len())

@@ -357,6 +357,31 @@ pub(crate) struct FseTables {
 }
 
 impl FseTables {
+    /// Heap bytes the retained encoder tables hold.
+    ///
+    /// Both slots of an axis count: the previous table is what the next block
+    /// reads, the next slot is the buffer it builds into, and each lives as
+    /// long as the compressor. A handle shared with the dictionary entropy
+    /// cache is left out, because that cache reports its own tables and the
+    /// caller would otherwise be told about the same allocation twice.
+    pub(crate) fn heap_size(&self) -> usize {
+        let per_table = core::mem::size_of::<FSETable>();
+        let mut total = 0;
+        for previous in [&self.ll_previous, &self.ml_previous, &self.of_previous] {
+            if let Some(PreviousFseTable::Custom(handle)) = previous
+                && SharedFseTable::strong_count(handle) == 1
+            {
+                total += per_table;
+            }
+        }
+        for next in [&self.ll_next, &self.ml_next, &self.of_next] {
+            if next.is_some() {
+                total += per_table;
+            }
+        }
+        total
+    }
+
     pub fn new() -> Self {
         Self {
             ll_next: None,
@@ -965,6 +990,20 @@ impl<M: Matcher> CompressState<M> {
     /// Clears `last_huff_table`, parking the table's buffers in
     /// `huff_table_spare` for reuse instead of dropping them.
     #[inline]
+    /// Heap bytes the entropy state keeps between blocks and frames: the FSE
+    /// tables both slots of each axis hold, and the two rollback slots the emit
+    /// paths copy a Huffman table into before a block that may not be kept.
+    ///
+    /// All of it survives a frame, so a caller sizing a context has to see it.
+    pub(crate) fn retained_entropy_heap_size(&self) -> usize {
+        self.fse_tables.heap_size()
+            + self
+                .huff_rollback
+                .as_ref()
+                .map_or(0, |table| table.heap_size())
+            + self.block_scratch.retained_heap_size()
+    }
+
     pub(crate) fn clear_huff_table(&mut self) {
         if let Some(table) = self.last_huff_table.take() {
             self.park_huff_table(table);
@@ -1838,6 +1877,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // The weight builder's buffers are kept between blocks and frames, so
         // a reused compressor holds them for as long as it lives.
         total += self.state.huff_weights.heap_size();
+        total += self.state.retained_entropy_heap_size();
         total += self
             .dictionary
             .as_ref()

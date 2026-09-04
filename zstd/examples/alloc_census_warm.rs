@@ -10,8 +10,11 @@
 //! warm-up and everything a first frame builds for keeps are excluded; what
 //! remains is what a steady-state frame costs.
 //!
-//! Run: `cargo run --release -p structured-zstd --example alloc_census_warm
+//! Run: `cargo run --release -p ffi-bench --example alloc_census_warm
 //!        -- <level> [corpus path] [fresh]`
+//!
+//! The target is registered by `ffi-bench`, not by the library crate, which
+//! sets `autoexamples = false`.
 //!
 //! When comparing PAGE FAULTS between two builds on the fresh shape, pin the
 //! allocator first:

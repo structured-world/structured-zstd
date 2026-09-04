@@ -525,6 +525,32 @@ fn raw_partition_fallback_restores_repeat_offset_history() {
     );
 }
 
+/// A block that goes predefined or RLE must park the custom table it replaces,
+/// not drop it.
+///
+/// Distributions move between custom and predefined from block to block, and
+/// dropping the handle on the way out means the next custom block builds into a
+/// freshly allocated table. That is the per-block allocation the two-buffer
+/// design removes, coming back through the one transition that does not go
+/// through the swap.
+#[test]
+fn a_predefined_or_rle_block_parks_the_custom_table_it_replaces() {
+    use crate::encoding::frame_compressor::SharedFseTable;
+    use crate::fse::fse_encoder::FSETable;
+
+    for decision in [LastUsedTable::Default, LastUsedTable::Rle(7)] {
+        let mut previous = Some(PreviousFseTable::Custom(SharedFseTable::new(
+            FSETable::blank(),
+        )));
+        let mut next = None;
+        super::commit_last_used_table(&mut previous, &mut next, decision);
+        assert!(
+            next.is_some(),
+            "{decision:?}: the displaced custom table is the next block's buffer",
+        );
+    }
+}
+
 #[test]
 fn remember_last_used_tables_keeps_predefined_and_repeat_modes() {
     let mut fse_tables = FseTables::new();

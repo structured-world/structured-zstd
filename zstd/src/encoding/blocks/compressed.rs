@@ -167,6 +167,20 @@ pub(crate) struct CompressedBlockScratch {
 }
 
 impl CompressedBlockScratch {
+    /// Heap bytes this scratch keeps between blocks, for a caller sizing a
+    /// context. Only the rollback table so far: the count tables are boxed
+    /// arrays the owner's `size_of` already covers, and the nested estimator
+    /// scratch reports through the same path when it exists.
+    pub(crate) fn retained_heap_size(&self) -> usize {
+        self.huff_rollback
+            .as_ref()
+            .map_or(0, |table| table.heap_size())
+            + self
+                .estimator_inner
+                .as_ref()
+                .map_or(0, |inner| inner.retained_heap_size())
+    }
+
     pub(crate) fn new() -> Self {
         Self::default()
     }
@@ -2091,7 +2105,7 @@ fn slot_table(slot: &Option<SharedFseTable>) -> &FSETable {
 
 /// What a block decided for one axis, once its mode is no longer borrowing the
 /// slot the table was built into.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum LastUsedTable {
     /// The axis repeated what was already there, so the slot keeps it.
     Keep,
@@ -2117,6 +2131,18 @@ fn into_last_used_table(mode: FseTableMode<'_>) -> LastUsedTable {
 /// becomes the previous table, and the handle the previous table was using
 /// becomes the slot for the next block. Two handles per axis, alternating, so
 /// after the first block no axis allocates again.
+/// Keep a table handle a commit displaced, if it was one and the slot is free.
+///
+/// The slot already holding a handle wins: that one is the buffer the block
+/// just built into, and it is the fresher of the two.
+fn park_displaced_handle(displaced: Option<PreviousFseTable>, next: &mut Option<SharedFseTable>) {
+    if next.is_none()
+        && let Some(PreviousFseTable::Custom(handle)) = displaced
+    {
+        *next = Some(handle);
+    }
+}
+
 fn commit_last_used_table(
     previous: &mut Option<PreviousFseTable>,
     next: &mut Option<SharedFseTable>,
@@ -2124,8 +2150,17 @@ fn commit_last_used_table(
 ) {
     match decision {
         LastUsedTable::Keep => {}
-        LastUsedTable::Default => *previous = Some(PreviousFseTable::Default),
-        LastUsedTable::Rle(symbol) => *previous = Some(PreviousFseTable::Rle(symbol)),
+        // These two do not swap, so the handle the previous table was using
+        // would go out with the assignment. Park it: a distribution that moves
+        // between custom and predefined from block to block would otherwise
+        // build into a freshly allocated table every time it came back, which
+        // is the per-block allocation the two slots exist to remove.
+        LastUsedTable::Default => {
+            park_displaced_handle(previous.replace(PreviousFseTable::Default), next);
+        }
+        LastUsedTable::Rle(symbol) => {
+            park_displaced_handle(previous.replace(PreviousFseTable::Rle(symbol)), next);
+        }
         LastUsedTable::Encoded => {
             // Take the outgoing handle out first, so the swap needs no third
             // one; the slot is left empty when there was none, and the next

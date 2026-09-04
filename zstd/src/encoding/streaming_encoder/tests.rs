@@ -49,6 +49,35 @@ fn the_reported_footprint_covers_what_compressing_retained() {
     );
     enc.state.huff_weights = scratch;
     assert_eq!(enc.heap_size(), after, "restoring must undo the removal");
+
+    // The entropy state kept between blocks is the other half of the figure:
+    // the FSE tables each axis holds in its two slots, and the Huffman tables
+    // the emit paths copy into before a block that may turn out raw. All of it
+    // survives the frame, so a caller sizing a context has to be told about it.
+    // Checked by removal rather than by comparison: the match-finder's share
+    // alone exceeds it, so any "total is at least the parts" assertion would
+    // pass with the term missing entirely.
+    let entropy = enc.state.retained_entropy_heap_size();
+    assert!(
+        entropy > 0,
+        "compressing should have left entropy state retained",
+    );
+    let with_entropy = enc.heap_size();
+    let saved_tables = core::mem::replace(
+        &mut enc.state.fse_tables,
+        crate::encoding::frame_compressor::FseTables::new(),
+    );
+    let saved_rollback = enc.state.huff_rollback.take();
+    let saved_scratch_rollback = enc.state.block_scratch.huff_rollback.take();
+    assert_eq!(
+        with_entropy - enc.heap_size(),
+        entropy,
+        "the entropy state is retained but not counted in the reported footprint",
+    );
+    enc.state.fse_tables = saved_tables;
+    enc.state.huff_rollback = saved_rollback;
+    enc.state.block_scratch.huff_rollback = saved_scratch_rollback;
+    assert_eq!(enc.heap_size(), with_entropy, "restoring must undo removal");
 }
 use crate::io::{Error, ErrorKind, Read, Write};
 use alloc::vec;
