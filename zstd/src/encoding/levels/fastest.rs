@@ -107,7 +107,6 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
     // physical blocks and records a checksum per partition of its own.
     #[cfg(all(feature = "lsm", feature = "hash"))]
     let post_split_path = rle_byte_opt.is_none()
-        && !raw_fast_path
         && matches!(compression_level, CompressionLevel::Level(16..=22))
         && state.matcher.window_size() >= (1 << 17);
     #[cfg(all(feature = "lsm", feature = "hash"))]
