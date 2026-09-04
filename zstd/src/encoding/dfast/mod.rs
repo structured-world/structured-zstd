@@ -1711,6 +1711,14 @@ impl DfastMatchGenerator {
 
     #[cfg_attr(not(target_arch = "wasm32"), inline(always))]
     pub(crate) fn insert_positions(&mut self, start: usize, end: usize) {
+        self.insert_range(start, end, 1);
+    }
+
+    /// Hash every `step`-th position in `[start, end)` into both tables,
+    /// resolving the scan source, the rebase check and the slot bias once for
+    /// the whole range rather than per position.
+    fn insert_range(&mut self, start: usize, end: usize, step: usize) {
+        debug_assert!(step >= 1, "insert_range needs a positive step");
         // Source the byte buffer + rebase coordinates through `scan_source()`
         // so a borrowed window's batch re-seed hashes the in-place input
         // (owned returns its `history` fields, byte-identical).
@@ -1789,7 +1797,7 @@ impl DfastMatchGenerator {
                 *short_hash_ptr.add(short_idx) = packed;
                 *long_hash_ptr.add(long_idx) = packed;
             }
-            pos += 1;
+            pos += step;
         }
         while pos < short_safe_end {
             unsafe {
@@ -1805,7 +1813,7 @@ impl DfastMatchGenerator {
                 let short_idx = (mixed_short >> short_shift) as usize;
                 *short_hash_ptr.add(short_idx) = packed;
             }
-            pos += 1;
+            pos += step;
         }
     }
 
@@ -1822,22 +1830,11 @@ impl DfastMatchGenerator {
              DFAST_INCOMPRESSIBLE_SKIP_STEP — raw `pos += step` would \
              eat into the STREAM_ABS_HEADROOM reserve"
         );
-        let start = start.max(self.history_abs_start);
-        let end = end.min(self.history_abs_end());
-        if step <= 1 {
-            self.insert_positions(start, end);
-            return;
-        }
-        let mut pos = start;
-        while pos < end {
-            self.insert_position(pos);
-            // `pos + step` is safe: `pos < end <= history_abs_end()` and
-            // `history_abs_end <= usize::MAX - STREAM_ABS_HEADROOM` by
-            // the upstream `check_stream_abs_headroom` gate, while
-            // `step` is bounded above by the assertion at function
-            // entry.
-            pos += step;
-        }
+        self.insert_range(
+            start.max(self.history_abs_start),
+            end.min(self.history_abs_end()),
+            step,
+        );
     }
 
     /// The four complementary insertions upstream makes after a match
