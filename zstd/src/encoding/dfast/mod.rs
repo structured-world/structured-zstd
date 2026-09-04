@@ -2544,10 +2544,22 @@ macro_rules! start_matching_fast_loop_body {
                     // the literal cursor) failed it — collapsing the rep path and
                     // forcing the long-hash to mint creeping offsets.
                     {
-                        let cand_idx_r = idx1 - rep1;
-                        // 4-byte gate; full forward count only if it passes.
+                        // Both reads hang off the block cursor, which is what
+                        // upstream compares (`MEM_read32(ip+1-offset_1)` against
+                        // `MEM_read32(ip+1)`). Routing the candidate through the
+                        // concat index instead — `history_start_offset + idx1 -
+                        // rep1` off the source pointer — spends two more adds per
+                        // scanned position and keeps `history_start_offset` live
+                        // through the whole loop for the sake of this one read.
+                        //
+                        // SAFETY: the gate above puts the candidate at or after
+                        // the start of live history, and `block_ptr` is that
+                        // start plus `block_bias`, so the signed offset lands
+                        // inside the source. `wrapping_offset` because the
+                        // candidate sits BEFORE `ip1` whenever the match reaches
+                        // back past this block.
                         let cand4 = unsafe {
-                            (history_base_ptr.add(history_start_offset + cand_idx_r) as *const u32)
+                            (block_ptr.wrapping_offset(ip1 as isize - rep1 as isize) as *const u32)
                                 .read_unaligned()
                         };
                         let cur4 = unsafe {
@@ -2555,6 +2567,10 @@ macro_rules! start_matching_fast_loop_body {
                                 .read_unaligned()
                         };
                         if cand4 == cur4 {
+                            // Rebuilt only now that the four bytes agreed: the
+                            // concat index is wanted by the extension and the
+                            // emit, neither of which the scan reaches.
+                            let cand_idx_r = idx1 - rep1;
                             let mut match_len = 4usize;
                             let max_fwd = block_len - (ip1 + 4);
                             unsafe {
