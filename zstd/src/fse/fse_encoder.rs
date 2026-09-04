@@ -183,6 +183,19 @@ pub struct FSETable {
 }
 
 impl FSETable {
+    /// A table holding nothing, for a caller that is about to fill it.
+    ///
+    /// Every field is overwritten by a build, so the zeroes are a starting
+    /// point rather than a meaningful state; `table_size == 0` says as much.
+    pub(super) fn blank() -> Self {
+        Self {
+            states: core::array::from_fn(|_| SymbolStates::default()),
+            table_size: 0,
+            state_table_flat: [0u16; MAX_FSE_TABLE_SIZE],
+            symbol_tt: [SymbolTT::default(); 256],
+        }
+    }
+
     /// Heap bytes this table holds beyond its inline struct: none. Every array
     /// it carries — `states`, `symbol_tt` and the flat state-transition table —
     /// is fixed-size and inline, so the owner's `size_of` accounts for all of
@@ -418,6 +431,16 @@ pub(crate) fn build_table_from_symbol_counts(
     build_table_from_counts(counts, max_log, avoid_0_numbit)
 }
 
+/// [`build_table_from_symbol_counts`] writing into a caller-owned table.
+pub(crate) fn build_table_from_symbol_counts_into(
+    counts: &[usize],
+    max_log: u8,
+    avoid_0_numbit: bool,
+    out: &mut FSETable,
+) {
+    build_table_from_counts_into(counts, max_log, avoid_0_numbit, out);
+}
+
 /// Build the FSE CTable for a sequence stream (LL / ML / OF), applying upstream
 /// zstd's last-symbol adjustment (`ZSTD_buildCTable`,
 /// zstd_compress_sequences.c:269-278): the final sequence's symbol is emitted
@@ -431,6 +454,19 @@ pub(crate) fn build_table_from_symbol_counts(
 /// last sequence (an index into `counts`, `<= max_symbol`). `use_low_prob_count`
 /// follows `nbSeq_1` exactly as upstream's `ZSTD_useLowProbCount(nbSeq_1)`.
 pub(crate) fn build_seq_ctable(counts: &mut [usize], max_log: u8, last_code: usize) -> FSETable {
+    let mut out = FSETable::blank();
+    build_seq_ctable_into(counts, max_log, last_code, &mut out);
+    out
+}
+
+/// [`build_seq_ctable`] writing into a caller-owned table, so a block fills the
+/// slot its table will live in rather than building one on the stack.
+pub(crate) fn build_seq_ctable_into(
+    counts: &mut [usize],
+    max_log: u8,
+    last_code: usize,
+    out: &mut FSETable,
+) {
     let total = counts.iter().sum::<usize>();
     let max_symbol = counts
         .iter()
@@ -465,10 +501,22 @@ pub(crate) fn build_seq_ctable(counts: &mut [usize], max_log: u8, last_code: usi
     if adjust {
         counts[last_code] += 1;
     }
-    build_table_from_probabilities(&probs[..=max_symbol], table_log)
+    build_table_from_probabilities_into(&probs[..=max_symbol], table_log, out);
 }
 
 fn build_table_from_counts(counts: &[usize], max_log: u8, avoid_0_numbit: bool) -> FSETable {
+    let mut out = FSETable::blank();
+    build_table_from_counts_into(counts, max_log, avoid_0_numbit, &mut out);
+    out
+}
+
+/// [`build_table_from_counts`] writing into a caller-owned table.
+pub(crate) fn build_table_from_counts_into(
+    counts: &[usize],
+    max_log: u8,
+    avoid_0_numbit: bool,
+    out: &mut FSETable,
+) {
     let total = counts.iter().sum::<usize>();
     // FSE table construction needs at least two samples in the histogram.
     // A single-distinct-symbol histogram (e.g. `[N, 0, ...]`) with `total
@@ -493,7 +541,7 @@ fn build_table_from_counts(counts: &[usize], max_log: u8, avoid_0_numbit: bool) 
         max_symbol,
         avoid_0_numbit,
     );
-    build_table_from_probabilities(&probs[..counts.len()], table_log)
+    build_table_from_probabilities_into(&probs[..counts.len()], table_log, out);
 }
 
 /// Bit size of the serialized FSE NCount table header for the normalized
@@ -781,8 +829,36 @@ fn normalize_m2(
 }
 
 pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSETable {
+    let mut out = FSETable::blank();
+    build_table_from_probabilities_into(probs, acc_log, &mut out);
+    out
+}
+
+/// [`build_table_from_probabilities`] writing into a caller-owned table.
+///
+/// The table is eleven kilobytes of inline arrays, so returning one builds it
+/// on the stack and then moves it wherever it is going. Filling the destination
+/// directly is what upstream does (`FSE_buildCTable_wksp` writes into the
+/// block state's CTable), and it is what lets a compressor keep two of these
+/// and alternate between them instead of producing a new one per block.
+pub(super) fn build_table_from_probabilities_into(probs: &[i32], acc_log: u8, out: &mut FSETable) {
     let table_size: usize = 1 << acc_log;
-    let mut symbol_states: [SymbolStates; 256] = core::array::from_fn(|_| SymbolStates::default());
+    // Disjoint field borrows, so the phases below can write the state table
+    // while reading the per-symbol accounting.
+    let FSETable {
+        table_size: out_table_size,
+        states: symbol_states,
+        state_table_flat,
+        symbol_tt,
+    } = out;
+    *out_table_size = table_size;
+    // The destination may be a table from an earlier block: reset what the
+    // build below does not overwrite in full. `state_table_flat` needs none of
+    // it, the scatter fills every slot under `table_size` and nothing reads
+    // past it; `symbol_tt` and `states` are written only for `probs.len()`
+    // symbols, so the tail above that has to be cleared rather than inherited.
+    symbol_states[probs.len()..].fill_with(SymbolStates::default);
+    symbol_tt[probs.len()..].fill(SymbolTT::default());
 
     // Upstream zstd `FSE_buildCTable_wksp` (lib/compress/fse_compress.c) — build
     // `nextStateTable` (== `state_table_flat`) once via cumul + spread +
@@ -891,7 +967,6 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
     // — so the tail keeps whatever the zero-init left and costs nothing to
     // carry. The table lives inline in [`FSETable`], so this build allocates
     // nothing at all.
-    let mut state_table_flat = [0u16; MAX_FSE_TABLE_SIZE];
     let mut cursor = cumul;
     for (u, &symbol_at_slot) in table_symbol.iter().enumerate() {
         let s = symbol_at_slot as usize;
@@ -906,7 +981,6 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
     // Phase 4 — `symbolTT[]` (delta_nb_bits, delta_find_state) plus
     // precomputed `start_state` and `max_num_bits` per symbol. All via
     // upstream zstd 16.16 fixed-point arithmetic; no per-state enumeration.
-    let mut symbol_tt = [SymbolTT::default(); 256];
     let mut total: usize = 0;
     for (symbol, &prob) in probs.iter().enumerate() {
         symbol_states[symbol].probability = prob;
@@ -971,13 +1045,6 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
 
         symbol_states[symbol].start_state = Some(start_index);
         symbol_states[symbol].max_num_bits = Some(max_num_bits);
-    }
-
-    FSETable {
-        table_size,
-        states: symbol_states,
-        state_table_flat,
-        symbol_tt,
     }
 }
 
