@@ -450,41 +450,20 @@ const LITERAL_INLINE_COPY_MAX: usize = 2048;
 ///   libc call, and never overshoots reads (borrowed-input safe).
 /// - `len ≥ 2048`: `extend_from_slice` — bandwidth-bound, ERMS wins.
 ///
-/// The short case is spelled out at the call site and everything else handed
-/// to [`append_literals_long`], so the sites carry a couple of stores rather
-/// than a call without pulling the whole ladder into each of them. This runs
-/// once per emitted sequence from a dozen-odd sites inside the match loop, and
-/// the runs are short: a level-3 encode of a decodecorpus frame averages about
-/// eight bytes. Upstream calls nothing here at all — `ZSTD_storeSeq` stores
-/// sixteen bytes inline and only reaches for a copy routine past that.
-#[inline(always)]
+/// Called, not inlined, even though upstream inlines the equivalent
+/// (`ZSTD_storeSeq` stores sixteen bytes on the spot) and even though the runs
+/// are short enough for it — a level-3 decodecorpus frame averages about eight
+/// bytes. Splitting the short case out to `#[inline(always)]` and leaving the
+/// ladder behind a tail cost **2.16% in cycles** at level 3 while removing 1.04%
+/// of the program's instructions. The match loop calls this from a dozen-odd
+/// sites, so inlining even a short body there buys decode pressure in the
+/// loop worth more than the calls it saves.
+#[inline]
 fn append_literals(dst: &mut Vec<u8>, lits: &[u8]) {
     let lit_len = lits.len();
     if lit_len == 0 {
         return;
     }
-    let cur_len = dst.len();
-    if lit_len <= 16 && dst.capacity() - cur_len >= lit_len {
-        // SAFETY: `lit_len` bytes are readable from `lits` and writable at
-        // `cur_len` by the capacity test above. For runs under eight bytes the
-        // helper drops to byte moves, so neither side is over-read.
-        unsafe {
-            let dst_ptr = dst.as_mut_ptr().add(cur_len);
-            crate::decoding::simd_copy::copy_bytes_overshooting(
-                (lits.as_ptr(), lit_len),
-                (dst_ptr, lit_len),
-                lit_len,
-            );
-            dst.set_len(cur_len + lit_len);
-        }
-        return;
-    }
-    append_literals_long(dst, lits);
-}
-
-#[inline(never)]
-fn append_literals_long(dst: &mut Vec<u8>, lits: &[u8]) {
-    let lit_len = lits.len();
     if lit_len >= LITERAL_INLINE_COPY_MAX {
         dst.extend_from_slice(lits);
         return;
