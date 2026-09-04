@@ -160,6 +160,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                 huff_table_spare: None,
                 huff_rollback: None,
                 huff_weights: Default::default(),
+                seen_content: Default::default(),
                 fse_tables: FseTables::new(),
                 block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
                 offset_hist: [1, 4, 8],
@@ -406,6 +407,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         // Kept between blocks and frames; see `FrameCompressor::heap_size`.
         total += self.state.huff_weights.heap_size();
         total += self.state.retained_entropy_heap_size();
+        total += self.state.seen_content.heap_size();
         total += self.pending.capacity();
         total += self.encoded_scratch.capacity();
         total += self
@@ -513,6 +515,9 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             return Ok(());
         }
 
+        // Frames are independent, so the raw-skip's memory of emitted content
+        // starts empty; the allocation is kept across frames.
+        self.state.seen_content.reset_for_frame();
         self.ensure_level_supported()?;
         // A dictionary is only active when it can actually be primed: the level
         // compresses (not `Uncompressed`) AND the matcher supports priming AND a
@@ -857,12 +862,15 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                 | CompressionLevel::Level(_) => {
                     let block = raw_block.take().expect("raw block missing");
                     debug_assert!(!block.is_empty(), "empty blocks handled above");
+                    let dict_active = self.dictionary.is_some()
+                        && self.state.matcher.supports_dictionary_priming();
                     compress_block_encoded(
                         &mut self.state,
                         self.compression_level,
                         last_block,
                         crate::encoding::levels::BlockInput::Staged(block),
                         &mut encoded,
+                        dict_active,
                         // No FrameEmitInfo on the streaming encoder path — it
                         // does not surface per-block layout, so no sidecar.
                         #[cfg(feature = "lsm")]

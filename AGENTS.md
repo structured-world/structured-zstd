@@ -240,8 +240,18 @@ both, and for anything under a couple of percent, what the control arm said.
   bounds; a folded base pointer that steps before the buffer needs
   `wrapping_offset` / `wrapping_add`, with the gate placing the final address
   back inside before the read.
-- **A heuristic that skips work belongs after the search it might spoil.** A
-  sample cannot see a repeat that spans more than the sample, so a pre-search
-  check writes off input that would have compressed, and the cost is a factor
-  rather than a percent. Move it behind the search, where being wrong costs
-  microseconds.
+- **A heuristic that skips the search must be paired with what makes being
+  wrong survivable, and confined to where being wrong is cheap.** A sample
+  cannot see a repeat that spans more than the sample, so a check reading only
+  the block's own bytes writes off input that would have compressed, and the
+  cost is a factor rather than a percent. Two things make the trade sound, and
+  both are load-bearing: a probe of what the frame has already emitted, so a
+  block duplicating an earlier one is searched however random it looks; and
+  indexing whatever is skipped, so the later duplicate has something to match
+  against — skipping without indexing loses the repeat on both blocks and no
+  probe can recover it. Then confine it by level: measured over the corpus the
+  skip costs 0.6% of compressed bytes at level 1 and 1.5% by level 9, but 3.7%
+  at 13 and 5.1% at 17, because a false positive costs whatever the search
+  would have found. The upper band pays that on ordinary data while the speed
+  only arrives on data that really is incompressible, so it does not take the
+  skip.

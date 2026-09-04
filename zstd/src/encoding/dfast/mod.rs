@@ -1148,9 +1148,28 @@ impl DfastMatchGenerator {
         incompressible_hint: Option<bool>,
     ) {
         self.stage_borrowed_block(block_start, block_end);
-        if incompressible_hint == Some(false) {
-            self.ensure_hash_tables();
-            self.insert_positions(block_start, block_end);
+        match incompressible_hint {
+            Some(false) => {
+                self.ensure_hash_tables();
+                self.insert_positions(block_start, block_end);
+            }
+            // Written off as noise without being searched — index it sparsely
+            // so a later block duplicating it has something to match against,
+            // which is what the owned path already does.
+            Some(true) => {
+                self.ensure_hash_tables();
+                // Straight to `insert_range`, as the dense arm above does:
+                // `insert_positions_with_step` clamps the range against the
+                // OWNED history bounds, which a borrowed window does not
+                // populate, so routing through it inserts nothing at all.
+                // `insert_range` resolves the borrowed source itself.
+                self.insert_range(
+                    block_start,
+                    block_end,
+                    crate::encoding::match_generator::DFAST_INCOMPRESSIBLE_SKIP_STEP,
+                );
+            }
+            None => {}
         }
     }
 

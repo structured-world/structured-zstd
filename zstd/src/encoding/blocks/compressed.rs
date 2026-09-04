@@ -359,6 +359,9 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
         },
         scratch_state: CompressState {
             matcher: EntropyOnlyMatcher,
+            // The splitter's scratch state never reaches the raw-skip, which
+            // is decided one level up on the whole block.
+            seen_content: Default::default(),
             // Inherited rather than re-resolved: this scratch state stands in
             // for the same compressor on the same CPU.
             copy_tier: state.copy_tier,

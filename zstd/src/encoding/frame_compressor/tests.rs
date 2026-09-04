@@ -2798,6 +2798,26 @@ fn noise_bytes(len: usize, seed: u32) -> Vec<u8> {
         .collect()
 }
 
+/// Noise the incompressibility classifier actually calls incompressible.
+///
+/// A test that needs the raw-skip to fire cannot use [`noise_bytes`]: a
+/// truncated linear congruential sequence leaves enough structure in the low
+/// bits that the classifier's repeat-bucket test rejects it, so the skip never
+/// engages and the test passes whether or not the thing it guards works. This
+/// runs the counter through a 64-bit mixer, which the classifier reads as
+/// random — the same verdict it gives real entropy.
+fn indistinguishable_noise_bytes(len: usize, seed: u64) -> Vec<u8> {
+    (0..len as u64)
+        .map(|i| {
+            let mut x = i.wrapping_add(seed).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            x ^= x >> 30;
+            x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            x ^= x >> 27;
+            (x >> 32) as u8
+        })
+        .collect()
+}
+
 /// The other half of removing the pre-search skip: input that really is
 /// incompressible must still come out at its own size.
 ///
@@ -2839,15 +2859,19 @@ fn genuinely_random_input_still_comes_out_at_its_own_size() {
 /// Regression: high-entropy input that REPEATS must be searched, not written
 /// off by its own appearance.
 ///
-/// The encoder used to sample a block for entropy and, if the sample looked
-/// random, emit it raw without searching at all. Both halves of this payload
-/// look random to any such sample, so the second half was never compared
-/// against the first and a 256 KiB match was thrown away: the frame came out
-/// the size of its input. The reference has no such pre-check — it searches and
-/// halves this — and now so does this encoder.
+/// The encoder samples a block for entropy and, when the sample looks random,
+/// may emit it raw without searching. Both halves of this payload look random
+/// to any such sample, so a check that reads only the block's own bytes never
+/// compares the second half against the first and throws a 256 KiB match away:
+/// the frame comes out the size of its input. What keeps the skip honest is
+/// the probe of the match table that runs beside it, which sees the first half
+/// already indexed.
+///
+/// The payload has to be noise the classifier actually calls random, or the
+/// skip never engages and this passes without exercising anything.
 #[test]
 fn repeated_high_entropy_input_is_searched_not_written_off() {
-    let half = noise_bytes(256 * 1024, 0xBEEF);
+    let half = indistinguishable_noise_bytes(256 * 1024, 0xBEEF);
     let mut payload = half.clone();
     payload.extend_from_slice(&half);
 

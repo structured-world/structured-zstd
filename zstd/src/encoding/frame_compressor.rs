@@ -896,6 +896,10 @@ pub(crate) fn resolve_frame_params(
 
 pub(crate) struct CompressState<M: Matcher> {
     pub(crate) matcher: M,
+    /// Grid fingerprints of the frame's blocks, which is what tells the
+    /// raw-skip that a block duplicating an earlier one is not the noise it
+    /// looks like. See [`SeenContentGrid`](crate::encoding::incompressible::SeenContentGrid).
+    pub(crate) seen_content: crate::encoding::incompressible::SeenContentGrid,
     /// Widest literal-copy kernel this CPU can run, resolved once when the
     /// compressor is built. The emit path reads it; it never re-probes.
     pub(crate) copy_tier: crate::decoding::simd_copy::ExactCopyTier,
@@ -1256,6 +1260,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 huff_table_spare: None,
                 huff_rollback: None,
                 huff_weights: Default::default(),
+                seen_content: Default::default(),
                 fse_tables: FseTables::new(),
                 block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
                 offset_hist: [1, 4, 8],
@@ -1629,13 +1634,17 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             if self.content_checksum {
                 self.hasher.write(block);
             }
+            let dict_active =
+                self.dictionary.is_some() && self.state.matcher.supports_dictionary_priming();
             crate::encoding::levels::compress_block_encoded_borrowed(
                 &mut self.state,
+                self.compression_level,
                 last_block,
                 block,
                 start,
                 end,
                 out,
+                dict_active,
                 #[cfg(feature = "lsm")]
                 Some(&mut self.block_decompressed_sizes),
                 #[cfg(all(feature = "lsm", feature = "hash"))]
@@ -1664,6 +1673,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 huff_table_spare: None,
                 huff_rollback: None,
                 huff_weights: Default::default(),
+                seen_content: Default::default(),
                 fse_tables: FseTables::new(),
                 block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
                 offset_hist: [1, 4, 8],
@@ -1878,6 +1888,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         // a reused compressor holds them for as long as it lives.
         total += self.state.huff_weights.heap_size();
         total += self.state.retained_entropy_heap_size();
+        total += self.state.seen_content.heap_size();
         total += self
             .dictionary
             .as_ref()
@@ -1952,6 +1963,10 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
     }
 
     fn prepare_frame(&mut self) -> FramePrep {
+        // The raw-skip's memory of what this frame has already emitted. Frames
+        // are independent, so carrying it over would let one frame's content
+        // hold the skip off for the next; the allocation is kept.
+        self.state.seen_content.reset_for_frame();
         // Reset per-frame introspection state so a re-used compressor
         // doesn't carry over the previous frame's layout/checksums.
         #[cfg(feature = "lsm")]
@@ -2504,12 +2519,15 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                     } else {
                         crate::encoding::levels::BlockInput::Staged(uncompressed_data)
                     };
+                    let dict_active = self.dictionary.is_some()
+                        && self.state.matcher.supports_dictionary_priming();
                     compress_block_encoded(
                         &mut self.state,
                         self.compression_level,
                         last_block,
                         block_input,
                         out,
+                        dict_active,
                         #[cfg(feature = "lsm")]
                         Some(&mut self.block_decompressed_sizes),
                         #[cfg(all(feature = "lsm", feature = "hash"))]
