@@ -17,7 +17,7 @@
 
 use std::env;
 
-use structured_zstd::encoding::{CompressionLevel, compress_slice_to_vec};
+use structured_zstd::encoding::{CompressionLevel, FrameCompressor, compress_bound};
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -31,9 +31,18 @@ fn main() {
         std::fs::read(path).unwrap_or_else(|e| panic!("oneshot_loop: cannot read {path}: {e}"));
 
     let compressor_level = CompressionLevel::from_level(level);
+    // The destination is allocated once at the worst-case bound and reused,
+    // which is what the C loop does with `ZSTD_compressBound`. Only the
+    // CONTEXT is per-frame, so the comparison isolates the cost of building
+    // one — allocating a fresh output buffer per iteration as well would
+    // charge this side for something the other side never pays.
+    let mut out: Vec<u8> = Vec::with_capacity(compress_bound(src.len()));
     let mut sink: usize = 0;
     for _ in 0..iters {
-        let out = compress_slice_to_vec(&src[..], compressor_level);
+        let mut compressor: FrameCompressor<&[u8], &mut Vec<u8>> =
+            FrameCompressor::new(compressor_level);
+        out.clear();
+        compressor.compress_independent_frame_into(&src[..], &mut out);
         sink = sink.wrapping_add(out.len());
         core::hint::black_box(&out);
     }

@@ -48,12 +48,12 @@ fn main() {
 
     let mut out2 = Vec::new();
     if fresh {
+        // The one-shot contract, not the streaming one: a context per frame
+        // compressing straight from the caller's slice, which is what
+        // `ZSTD_compress` does and what `compress_slice_to_vec` wraps.
         let mut fresh_compressor: FrameCompressor<&[u8], &mut Vec<u8>> =
             FrameCompressor::new(CompressionLevel::Level(level));
-        fresh_compressor.set_source_size_hint(data.len() as u64);
-        fresh_compressor.set_source(&data[..]);
-        fresh_compressor.set_drain(&mut out2);
-        fresh_compressor.compress();
+        fresh_compressor.compress_independent_frame_into(&data[..], &mut out2);
     } else {
         compressor.set_source(&data[..]);
         compressor.set_drain(&mut out2);
