@@ -2420,12 +2420,6 @@ macro_rules! start_matching_fast_loop_body {
 
             let inner_exit: InnerExit = 'inner: loop {
                 let abs_ip0 = $current_abs_start + ip0;
-                // `abs_ip1` and `wlow1` are bound here even though every reader
-                // of either is a match path. Spelling them out at those readers
-                // instead — which removes two values from the loop's live set
-                // and 0.8% of its instructions — measured 2.7% worse in cycles
-                // across three interleaved alternations of the two binaries.
-                let abs_ip1 = $current_abs_start + ip1;
                 // Per-position candidate window-low bound (see `advertised_window`
                 // above). `$borrowed` is const, so owned collapses to
                 // `history_abs_start` (byte-identical) and borrowed-in-window
@@ -2445,11 +2439,6 @@ macro_rules! start_matching_fast_loop_body {
                 } else {
                     min_slot
                 };
-                let wlow1 = if $borrowed {
-                    abs_ip1.saturating_sub(advertised_window)
-                } else {
-                    history_abs_start
-                };
                 // Literal lengths are derived at the emit sites rather than
                 // carried: both inputs are live there anyway, and the loop is
                 // register-saturated, so two values held across every scanned
@@ -2468,10 +2457,12 @@ macro_rules! start_matching_fast_loop_body {
                     (block_ptr.add(ip0) as *const u64)
                         .read_unaligned()
                 };
-                // `v4_0` (low 4 bytes) is the cheap 4-byte equality-gate key
-                // below; the short HASH keys on the upstream zstd 5-byte window
-                // (`v8_0 << 24`, ZSTD_hash5 shape) to match `short_hash_index`.
-                let v4_0 = v8_0 & 0xFFFF_FFFF;
+                // The short probe's 4-byte key is NOT carried from `v8_0`. It is
+                // wanted once, tens of instructions below, so carrying it costs
+                // a register across the whole body in a loop that is already
+                // spilling; the reference reads it fresh at the comparison
+                // (`MEM_read32(ip)`) and so does the probe. The short HASH still
+                // keys on the 5-byte window (`v8_0 << 24`, ZSTD_hash5 shape).
                 let hs0_idx = ((v8_0 << 24).wrapping_mul(PRIME) >> short_shift) as usize;
                 let idxs0 = unsafe { *short_hash_ptr.add(hs0_idx) };
 
@@ -2584,7 +2575,7 @@ macro_rules! start_matching_fast_loop_body {
                                     concat,
                                     history_abs_start,
                                     history_abs_start + cand_idx_r,
-                                    abs_ip1,
+                                    $current_abs_start + ip1,
                                     match_len,
                                     ip1 - literals_start,
                                 );
@@ -2806,7 +2797,9 @@ macro_rules! start_matching_fast_loop_body {
                     let cand4 = unsafe {
                         (slot_base_ptr.add(idxs0 as usize) as *const u32).read_unaligned()
                     };
-                    if cand4 == v4_0 as u32 {
+                    // SAFETY: `ip0 + 8 <= block_len` holds for every iteration of
+                    // this loop, so a 4-byte read at `ip0` is in range.
+                    if cand4 == unsafe { (block_ptr.add(ip0) as *const u32).read_unaligned() } {
                         {
                             let cand_pos_s = position_base + ((idxs0 as usize) - 1);
                             let cand_idx_s = cand_pos_s - history_abs_start;
@@ -2872,6 +2865,12 @@ macro_rules! start_matching_fast_loop_body {
                             let mut retry_upgraded = false;
                             let mut live_l1_hit = false;
                             if idxl1 != DFAST_EMPTY_SLOT {
+                                let abs_ip1 = $current_abs_start + ip1;
+                                let wlow1 = if $borrowed {
+                                    abs_ip1.saturating_sub(advertised_window)
+                                } else {
+                                    history_abs_start
+                                };
                                 let cand_pos_l1 = position_base + (idxl1 as usize) - 1;
                                 if cand_pos_l1 >= wlow1 && cand_pos_l1 < abs_ip1 {
                                     let cand_idx_l1 = cand_pos_l1 - history_abs_start;
@@ -2910,7 +2909,7 @@ macro_rules! start_matching_fast_loop_body {
                                                 concat,
                                                 history_abs_start,
                                                 cand_pos_l1,
-                                                abs_ip1,
+                                                $current_abs_start + ip1,
                                                 l1_match_len,
                                                 ip1 - literals_start,
                                             );
@@ -2993,7 +2992,7 @@ macro_rules! start_matching_fast_loop_body {
                                                     concat,
                                                     history_abs_start,
                                                     cand_pos,
-                                                    abs_ip1,
+                                                    $current_abs_start + ip1,
                                                     dl1_match_len,
                                                     ip1 - literals_start,
                                                 );
@@ -3059,7 +3058,10 @@ macro_rules! start_matching_fast_loop_body {
                                 (history_base_ptr.add(history_start_offset + dp) as *const u32)
                                     .read_unaligned()
                             };
-                            if dcand4 == v4_0 as u32 {
+                            // SAFETY: as above, `ip0` has 8 readable bytes.
+                            if dcand4
+                                == unsafe { (block_ptr.add(ip0) as *const u32).read_unaligned() }
+                            {
                                 let mut s_match_len = 4usize;
                                 let max_fwd = block_len - (ip0 + 4);
                                 unsafe {
