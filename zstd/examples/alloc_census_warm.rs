@@ -79,21 +79,41 @@ fn main() {
     let data = std::fs::read(corpus)
         .unwrap_or_else(|e| panic!("alloc_census_warm: cannot read {corpus}: {e}"));
 
-    // Frame one is the warm-up: it builds whatever the compressor keeps for
-    // the life of the context, which is exactly what this census must not
-    // count. Reusing the compressor is the shape under audit.
+    // `fresh` audits a compressor built inside the recorded region, which is
+    // what a one-shot encode costs; the default reuses one, which is what a
+    // steady-state frame costs. The two shapes allocate very differently and
+    // the same change can help one and hurt the other, so both are askable.
+    let fresh = args.get(3).map(|s| s == "fresh").unwrap_or(false);
+
     let mut out = Vec::new();
-    let mut compressor: FrameCompressor<&[u8], &mut Vec<u8>> =
-        FrameCompressor::new(CompressionLevel::Level(level));
-    compressor.set_source(&data[..]);
-    compressor.set_drain(&mut out);
-    compressor.compress();
+    let mut warm: Option<FrameCompressor<&[u8], &mut Vec<u8>>> = None;
+    if !fresh {
+        // The warm-up frame builds whatever the compressor keeps for the life
+        // of the context, which is exactly what a warm census must not count.
+        let mut compressor: FrameCompressor<&[u8], &mut Vec<u8>> =
+            FrameCompressor::new(CompressionLevel::Level(level));
+        compressor.set_source(&data[..]);
+        compressor.set_drain(&mut out);
+        compressor.compress();
+        warm = Some(compressor);
+    }
 
     let mut out2 = Vec::new();
-    compressor.set_source(&data[..]);
-    compressor.set_drain(&mut out2);
     RECORDING.store(true, Ordering::SeqCst);
-    compressor.compress();
+    match warm.as_mut() {
+        Some(compressor) => {
+            compressor.set_source(&data[..]);
+            compressor.set_drain(&mut out2);
+            compressor.compress();
+        }
+        None => {
+            let mut compressor: FrameCompressor<&[u8], &mut Vec<u8>> =
+                FrameCompressor::new(CompressionLevel::Level(level));
+            compressor.set_source(&data[..]);
+            compressor.set_drain(&mut out2);
+            compressor.compress();
+        }
+    }
     RECORDING.store(false, Ordering::SeqCst);
 
     let mut total_count = 0usize;
