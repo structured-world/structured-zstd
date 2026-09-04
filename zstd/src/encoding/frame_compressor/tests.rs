@@ -2798,6 +2798,44 @@ fn noise_bytes(len: usize, seed: u32) -> Vec<u8> {
         .collect()
 }
 
+/// The other half of removing the pre-search skip: input that really is
+/// incompressible must still come out at its own size.
+///
+/// Dropping the skip means this payload is now searched in full and found to
+/// have nothing, so it reaches a raw block through the ordinary
+/// compressed-is-not-smaller fallback instead of being written off up front.
+/// That fallback is the entire reason the skip was safe to delete, and nothing
+/// pinned it: the repeat test above would still pass if raw emission broke and
+/// random input started expanding. Overhead here is frame and block framing
+/// only, tens of bytes on a megabyte.
+#[test]
+fn genuinely_random_input_still_comes_out_at_its_own_size() {
+    let payload = noise_bytes(1024 * 1024, 0x5EED);
+
+    for level in [
+        super::CompressionLevel::Level(1),
+        super::CompressionLevel::Level(3),
+        super::CompressionLevel::Level(5),
+        super::CompressionLevel::Level(9),
+    ] {
+        let mut compressor: FrameCompressor = FrameCompressor::new(level);
+        let frame = compressor.compress_independent_frame(&payload);
+        assert!(
+            frame.len() <= payload.len() + 256,
+            "{level:?}: incompressible input must not expand beyond framing \
+             ({} of {})",
+            frame.len(),
+            payload.len(),
+        );
+        let mut decoder = FrameDecoder::new();
+        let mut decoded = Vec::with_capacity(payload.len());
+        decoder
+            .decode_all_to_vec(&frame, &mut decoded)
+            .expect("frame decodes");
+        assert_eq!(decoded, payload, "{level:?}: round trip");
+    }
+}
+
 /// Regression: high-entropy input that REPEATS must be searched, not written
 /// off by its own appearance.
 ///
