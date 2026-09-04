@@ -1919,9 +1919,14 @@ fn encode_sequences(
     let ll_table = mode_table(ll_mode, defaults.ll_default_ref());
     let ml_table = mode_table(ml_mode, defaults.ml_default_ref());
     let of_table = mode_table(of_mode, defaults.of_default_ref());
-    let mut ll_state = ll_table.map(|table| table.start_state(ll_code));
-    let mut ml_state = ml_table.map(|table| table.start_state(ml_code));
-    let mut of_state = of_table.map(|table| table.start_state(of_code));
+    // Carried as bare indices, not `Option`s. A component has a state exactly
+    // when it has a table, and the tables are resolved once above the loop, so
+    // wrapping the state too meant re-asking the same question three times per
+    // sequence and re-wrapping the answer. An absent component's index is never
+    // read: every site that touches one is already inside its table's `Some`.
+    let mut ll_state = ll_table.map_or(0, |table| table.start_state(ll_code).index);
+    let mut ml_state = ml_table.map_or(0, |table| table.start_state(ml_code).index);
+    let mut of_state = of_table.map_or(0, |table| table.start_state(of_code).index);
 
     writer.write_bits(ll_add_bits, ll_num_bits);
     writer.write_bits(ml_add_bits, ml_num_bits);
@@ -1977,29 +1982,29 @@ fn encode_sequences(
             // per-sequence flush in this loop (≤ 16 bytes per
             // sequence, plus the 32-byte slack on top of the 64-byte
             // header reserve).
-            if let (Some(table), Some(state)) = (of_table, of_state) {
-                let next = table.next_state(of_code, state.index);
-                let diff = crate::fse::fse_encoder::transition_bits(state.index, next.num_bits);
+            if let Some(table) = of_table {
+                let next = table.next_state(of_code, of_state);
+                let diff = crate::fse::fse_encoder::transition_bits(of_state, next.num_bits);
                 unsafe {
                     writer.write_bits_64_no_check(diff as u64, next.num_bits as usize);
                 }
-                of_state = Some(next);
+                of_state = next.index;
             }
-            if let (Some(table), Some(state)) = (ml_table, ml_state) {
-                let next = table.next_state(ml_code, state.index);
-                let diff = crate::fse::fse_encoder::transition_bits(state.index, next.num_bits);
+            if let Some(table) = ml_table {
+                let next = table.next_state(ml_code, ml_state);
+                let diff = crate::fse::fse_encoder::transition_bits(ml_state, next.num_bits);
                 unsafe {
                     writer.write_bits_64_no_check(diff as u64, next.num_bits as usize);
                 }
-                ml_state = Some(next);
+                ml_state = next.index;
             }
-            if let (Some(table), Some(state)) = (ll_table, ll_state) {
-                let next = table.next_state(ll_code, state.index);
-                let diff = crate::fse::fse_encoder::transition_bits(state.index, next.num_bits);
+            if let Some(table) = ll_table {
+                let next = table.next_state(ll_code, ll_state);
+                let diff = crate::fse::fse_encoder::transition_bits(ll_state, next.num_bits);
                 unsafe {
                     writer.write_bits_64_no_check(diff as u64, next.num_bits as usize);
                 }
-                ll_state = Some(next);
+                ll_state = next.index;
             }
             unsafe {
                 writer.flush_bulk();
@@ -2038,14 +2043,14 @@ fn encode_sequences(
             }
         }
     }
-    if let (Some(state), Some(table)) = (ml_state, ml_table) {
-        writer.write_bits(state.index as u64, table.table_size.ilog2() as usize);
+    if let Some(table) = ml_table {
+        writer.write_bits(ml_state as u64, table.table_size.ilog2() as usize);
     }
-    if let (Some(state), Some(table)) = (of_state, of_table) {
-        writer.write_bits(state.index as u64, table.table_size.ilog2() as usize);
+    if let Some(table) = of_table {
+        writer.write_bits(of_state as u64, table.table_size.ilog2() as usize);
     }
-    if let (Some(state), Some(table)) = (ll_state, ll_table) {
-        writer.write_bits(state.index as u64, table.table_size.ilog2() as usize);
+    if let Some(table) = ll_table {
+        writer.write_bits(ll_state as u64, table.table_size.ilog2() as usize);
     }
 
     let bits_to_fill = writer.misaligned();
