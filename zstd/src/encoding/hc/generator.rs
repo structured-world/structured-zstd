@@ -572,7 +572,19 @@ macro_rules! bt_insert_and_collect_matches_body {
             }
         }
         if $use_hash3 && !skip_further_match_search && *$best_len_for_skip < $min_match_len {
-            $table.update_hash3_until($abs_pos);
+            // The parser advances one position at a time, so this catch-up
+            // almost always has a single position to insert and the call
+            // boundary around it is the whole cost: two frames per position,
+            // each re-deriving the live history and re-reading the fields this
+            // body already holds. Upstream inlines the same work into the
+            // finder (`ZSTD_insertAndFindFirstIndexHash3`), which is what
+            // passing the pointers we already have amounts to. The general
+            // form stays for the cases the fast one declines.
+            // SAFETY: `concat` is the live history and nothing here
+            // reallocates it.
+            if !unsafe { $table.fill_hash3_from(concat.as_ptr(), concat.len(), $abs_pos) } {
+                $table.update_hash3_until($abs_pos);
+            }
             // hash3 short-match probe folded inline (was a separate per-kernel
             // call): table lookup + one common-prefix scan via `$cpl`, reusing
             // the BT collect's `concat` / `idx` / `tail_limit`. Labeled block so

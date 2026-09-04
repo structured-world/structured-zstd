@@ -2441,6 +2441,37 @@ impl MatchTable {
     /// unrepresentable zero relative position, so the stored index is the
     /// cursor itself and needs no `Option`.
     fn fill_hash3_hoisted(&mut self, abs_pos: usize) -> bool {
+        // The slice holds no borrow, so the table write can take `&mut self`
+        // (the same reborrow the collect body uses).
+        let (concat_ptr, concat_len) = {
+            let live = self.live_history();
+            (live.as_ptr(), live.len())
+        };
+        // SAFETY: the pair describes the live history, which this call does
+        // not reallocate.
+        unsafe { self.fill_hash3_from(concat_ptr, concat_len, abs_pos) }
+    }
+
+    /// [`Self::fill_hash3_hoisted`] against a live-history pair the caller
+    /// already holds.
+    ///
+    /// The match finder has both the pointer and the length in registers by
+    /// the time it needs this, and upstream's equivalent is inlined into the
+    /// finder for exactly that reason (`ZSTD_insertAndFindFirstIndexHash3` is
+    /// static, and the parser advances one position at a time, so the loop
+    /// almost always runs once and the call boundary is the whole cost).
+    ///
+    /// # Safety
+    ///
+    /// `concat_ptr` / `concat_len` must describe the current live history, and
+    /// it must not be reallocated for the duration of the call.
+    #[inline]
+    pub(crate) unsafe fn fill_hash3_from(
+        &mut self,
+        concat_ptr: *const u8,
+        concat_len: usize,
+        abs_pos: usize,
+    ) -> bool {
         // `can_skip_rebase_check_at`'s position-independent conjuncts.
         let max_rel_no_rebase = (u32::MAX as usize).saturating_sub(2);
         if self.hash3_log == 0
@@ -2458,12 +2489,6 @@ impl MatchTable {
             return false;
         }
         let hash3_log = self.hash3_log;
-        // The slice holds no borrow, so the table write below can take
-        // `&mut self` (the same reborrow the collect body uses).
-        let (concat_ptr, concat_len) = {
-            let live = self.live_history();
-            (live.as_ptr(), live.len())
-        };
         // `idx + 4 <= concat_len` for every inserted position, so the loop
         // stops where the general path would start early-returning; positions
         // past that insert nothing, which is why the cursor still lands on
