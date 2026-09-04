@@ -1372,6 +1372,20 @@ impl DfastMatchGenerator {
         literals_start: &mut usize,
         handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
     ) -> usize {
+        // Source bytes + rebase coordinate through `scan_source()` so a
+        // borrowed window's rep-extension reads the in-place input.
+        //
+        // Resolved once for the whole chain, not per link. Nothing the loop
+        // does moves them: the only mutation reaching the buffer is
+        // `insert_position`'s rebase, which shifts slot values and
+        // `position_base` — the one field of the five this loop discards —
+        // and never reallocates the history.
+        let (base_ptr, start_offset, abs_start, _position_base, concat_len) = self.scan_source();
+        // SAFETY: `base_ptr + start_offset` is the live source start and
+        // `concat_len` its readable length (owned history or borrowed
+        // input); every read below is gated `< concat.len()`. Raw-ptr
+        // backed, so no borrow is held on `self`.
+        let concat = unsafe { core::slice::from_raw_parts(base_ptr.add(start_offset), concat_len) };
         loop {
             // Need at least DFAST_REP_MIN_MATCH_LEN bytes of room past `pos`.
             if pos + DFAST_REP_MIN_MATCH_LEN > current_len {
@@ -1384,10 +1398,6 @@ impl DfastMatchGenerator {
             if rep == 0 {
                 break;
             }
-            // Source bytes + rebase coordinate through `scan_source()` so a
-            // borrowed window's rep-extension reads the in-place input.
-            let (base_ptr, start_offset, abs_start, _position_base, concat_len) =
-                self.scan_source();
             let abs_pos = current_abs_start + pos;
             let cur_idx = abs_pos - abs_start;
             // `checked_sub` is the authoritative bound here: a valid rep
@@ -1404,12 +1414,6 @@ impl DfastMatchGenerator {
                 Some(idx) => idx,
                 None => break,
             };
-            // SAFETY: `base_ptr + start_offset` is the live source start and
-            // `concat_len` its readable length (owned history or borrowed
-            // input); the `cur_idx` / `cand_idx` reads below are gated `<
-            // concat.len()`. Raw-ptr backed, no borrow on `self`.
-            let concat =
-                unsafe { core::slice::from_raw_parts(base_ptr.add(start_offset), concat_len) };
             if cur_idx + DFAST_REP_MIN_MATCH_LEN > concat.len() {
                 break;
             }
