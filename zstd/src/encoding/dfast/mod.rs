@@ -3144,6 +3144,12 @@ macro_rules! start_matching_fast_loop_body {
                 // `ip1 <= ilimit` with `ilimit = iend - HASH_READ_SIZE`. Adding
                 // the lookahead to the cursor instead spends the add on every
                 // scanned position to reach the same answer.
+                //
+                // Worth 1.11% of the program's instructions. Cycles read 1.36%
+                // higher, of which 0.68% is code layout — the same two binaries
+                // differ by that much at a level where this line cannot run —
+                // leaving a remainder inside the build-to-build drift measured
+                // on this host. Kept for the op-reduction, not on a speed claim.
                 if ip1 > scan_limit {
                     // First position the fast loop did NOT pack into the
                     // hash tables. `seed_remaining_hashable_starts` will
