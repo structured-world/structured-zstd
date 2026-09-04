@@ -32,7 +32,7 @@ impl SeenContentGrid {
     /// One sample per this many bytes: 256 per 128 KiB block, which is noise
     /// against the block's own cost and dense enough that a duplicate collides
     /// hundreds of times over.
-    const STEP: usize = 512;
+    pub(crate) const STEP: usize = 512;
     const SLOTS: usize = 4096;
     /// Bytes read per sample.
     const KEY_LEN: usize = 8;
@@ -95,6 +95,18 @@ pub(crate) const RAW_FAST_PATH_MIN_SAMPLE_LEN: usize = 32;
 /// disabled for `Best` / numeric levels: the largest-window levels (L20-22)
 /// do full match-finding even on apparently-incompressible blocks rather than
 /// risk emitting raw blocks where a far back-reference might still pay off.
+/// How densely a block written off unsearched is still indexed.
+///
+/// It has to be findable at all, or a later block duplicating it has nothing
+/// to match against; it does not have to be findable at every position. The
+/// duplicate is recognised on the [`SeenContentGrid`] grid and then searched,
+/// and the search sweeps positions, so an entry every `STEP` bytes is hit
+/// within `STEP` bytes of scanning — immaterial against a block-sized match.
+/// Indexing more finely is what the skip exists to avoid: at one entry per
+/// eight bytes a megabyte of incompressible input costs 131,000 stores it had
+/// no use for, which measured as a four-fold slowdown on the fast levels.
+pub(crate) const RAW_SKIP_INDEX_STEP: usize = SeenContentGrid::STEP;
+
 /// Highest level that may write a block off unsearched.
 ///
 /// The classifier is not free of false positives, and what a false positive

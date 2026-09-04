@@ -1520,7 +1520,7 @@ impl FastKernelMatcher {
         if incompressible_hint == Some(true) {
             self.prime_hash_table_for_range_stepped(
                 block_start,
-                crate::encoding::match_table::helpers::INCOMPRESSIBLE_SKIP_STEP,
+                crate::encoding::incompressible::RAW_SKIP_INDEX_STEP,
             );
         }
         if incompressible_hint == Some(false) {
@@ -1579,7 +1579,7 @@ impl FastKernelMatcher {
                 self.prime_hash_table_for_range_borrowed(
                     block_start,
                     block_end,
-                    crate::encoding::match_table::helpers::INCOMPRESSIBLE_SKIP_STEP,
+                    crate::encoding::incompressible::RAW_SKIP_INDEX_STEP,
                 );
             }
         }

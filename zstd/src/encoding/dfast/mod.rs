@@ -1166,7 +1166,7 @@ impl DfastMatchGenerator {
                 self.insert_range(
                     block_start,
                     block_end,
-                    crate::encoding::match_generator::DFAST_INCOMPRESSIBLE_SKIP_STEP,
+                    crate::encoding::incompressible::RAW_SKIP_INDEX_STEP,
                 );
             }
             None => {}
