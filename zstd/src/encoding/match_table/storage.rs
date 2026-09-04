@@ -2472,43 +2472,29 @@ impl MatchTable {
         concat_len: usize,
         abs_pos: usize,
     ) -> bool {
-        let hash3_log = self.hash3_log;
-        if hash3_log == 0 {
+        // `can_skip_rebase_check_at`'s position-independent conjuncts.
+        let max_rel_no_rebase = (u32::MAX as usize).saturating_sub(2);
+        if self.hash3_log == 0
+            || self.position_base != 0
+            || self.index_shift != 0
+            || abs_pos > max_rel_no_rebase
+        {
             return false;
         }
         let history_abs_start = self.history_abs_start;
         let start = self.next_to_update3;
+        if start <= history_abs_start {
+            // The boundary position needs the `allow_zero` / btultra2 clause,
+            // and it is one position: let the general loop have it.
+            return false;
+        }
+        let hash3_log = self.hash3_log;
         // `idx + 4 <= concat_len` for every inserted position, so the loop
         // stops where the general path would start early-returning; positions
         // past that insert nothing, which is why the cursor still lands on
         // `abs_pos`.
         let last_insertable = history_abs_start + concat_len.saturating_sub(3);
         let end = abs_pos.min(last_insertable);
-        if start >= end || start < history_abs_start {
-            return false;
-        }
-        // The general loop rebases a position whose relative index is not
-        // representable. That index rises with the position, so proving both
-        // ends of the span representable proves every position between them,
-        // and the whole guard drops out of the loop. Proving it this way
-        // rather than through `can_skip_rebase_check_at`'s untranslated-table
-        // shortcut is what lets a translated table (the seed pass leaves one)
-        // take this path as well; restricted to a zero base, half the
-        // positions in a two-pass level fell back.
-        let stored_start = self.relative_position(start);
-        let stored_last = self.relative_position(end - 1);
-        let (Some(stored_start), Some(stored_last)) = (stored_start, stored_last) else {
-            return false;
-        };
-        if stored_last >= u32::MAX - 1 {
-            return false;
-        }
-        debug_assert!(stored_start <= stored_last, "stored index must rise");
-        // The same translation the general path applies, resolved once: the
-        // stored index is `position + index_shift - position_base`, and both
-        // ends were just proved to land in range.
-        let index_shift = self.index_shift;
-        let position_base = self.position_base;
         let table = self.hash3_table_mut();
         debug_assert_eq!(table.len(), 1usize << hash3_log);
         let table_ptr = table.as_mut_ptr();
@@ -2519,15 +2505,10 @@ impl MatchTable {
             let value = unsafe { Self::read_le_u32_ptr(concat_ptr.add(idx)) };
             let hash = Self::hash_value_with_mls(value, hash3_log, 3);
             debug_assert!(hash < 1usize << hash3_log);
-            let stored = (cursor + index_shift - position_base) as u32;
-            debug_assert!(
-                stored >= stored_start && stored <= stored_last,
-                "the stored index must stay between the ends that were checked",
-            );
             // SAFETY: the hash is masked to `hash3_log` bits and the table
-            // holds `1 << hash3_log` slots (asserted above); `stored` is at
-            // most `stored_last`, which the check above put below `u32::MAX-1`.
-            unsafe { *table_ptr.add(hash) = stored + 1 };
+            // holds `1 << hash3_log` slots (asserted above); `cursor` is below
+            // `abs_pos <= u32::MAX - 2`, so `cursor + 1` fits.
+            unsafe { *table_ptr.add(hash) = cursor as u32 + 1 };
         }
         self.next_to_update3 = abs_pos;
         true
