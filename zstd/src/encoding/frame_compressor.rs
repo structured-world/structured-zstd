@@ -842,6 +842,9 @@ pub(crate) fn resolve_frame_params(
 
 pub(crate) struct CompressState<M: Matcher> {
     pub(crate) matcher: M,
+    /// Widest literal-copy kernel this CPU can run, resolved once when the
+    /// compressor is built. The emit path reads it; it never re-probes.
+    pub(crate) copy_tier: crate::decoding::simd_copy::ExactCopyTier,
     pub(crate) last_huff_table: Option<crate::huff0::huff0_encoder::HuffmanTable>,
     /// Recycled `HuffmanTable` buffers: when a block clears or replaces
     /// `last_huff_table`, the old table parks here instead of dropping, so
@@ -1172,6 +1175,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             source_size_hint: None,
             state: CompressState {
                 matcher: MatchGeneratorDriver::new(1024 * 128, 1),
+                copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
                 last_huff_table: None,
                 huff_table_spare: None,
                 huff_weights: Default::default(),
@@ -1578,6 +1582,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             source_size_hint: None,
             state: CompressState {
                 matcher,
+                copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
                 last_huff_table: None,
                 huff_table_spare: None,
                 huff_weights: Default::default(),

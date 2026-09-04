@@ -336,6 +336,7 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
             };
             let mut est_state = CompressState::<EntropyOnlyMatcher> {
                 matcher: EntropyOnlyMatcher,
+                copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
                 last_huff_table: seed_table.clone(),
                 huff_table_spare: None,
                 huff_weights: Default::default(),
@@ -349,6 +350,7 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
             };
             let mut emit_state = CompressState::<EntropyOnlyMatcher> {
                 matcher: EntropyOnlyMatcher,
+                copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
                 last_huff_table: seed_table,
                 huff_table_spare: None,
                 huff_weights: Default::default(),
@@ -397,6 +399,7 @@ fn encode_match_len_uses_correct_upper_range_base() {
 fn raw_partition_fallback_restores_repeat_offset_history() {
     let mut state = CompressState {
         matcher: super::EntropyOnlyMatcher,
+        copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
         last_huff_table: None,
         huff_table_spare: None,
         huff_weights: Default::default(),

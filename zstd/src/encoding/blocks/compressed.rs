@@ -3,6 +3,7 @@ use alloc::{boxed::Box, vec::Vec};
 use crate::{
     bit_io::BitWriter,
     blocks::block::BlockType,
+    decoding::simd_copy::ExactCopyTier,
     encoding::block_header::BlockHeader,
     encoding::frame_compressor::{CompressState, FseTables, PreviousFseTable, SharedFseTable},
     encoding::{Matcher, Sequence},
@@ -340,6 +341,9 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
         },
         scratch_state: CompressState {
             matcher: EntropyOnlyMatcher,
+            // Inherited rather than re-resolved: this scratch state stands in
+            // for the same compressor on the same CPU.
+            copy_tier: state.copy_tier,
             last_huff_table: state.last_huff_table.clone(),
             huff_table_spare: None,
             // Lent, not created: the estimator builds a table per split
@@ -459,7 +463,7 @@ const LITERAL_INLINE_COPY_MAX: usize = 2048;
 /// sites, so inlining even a short body there buys decode pressure in the
 /// loop worth more than the calls it saves.
 #[inline]
-fn append_literals(dst: &mut Vec<u8>, lits: &[u8]) {
+fn append_literals(dst: &mut Vec<u8>, lits: &[u8], copy_tier: ExactCopyTier) {
     let lit_len = lits.len();
     if lit_len == 0 {
         return;
@@ -491,7 +495,12 @@ fn append_literals(dst: &mut Vec<u8>, lits: &[u8]) {
                 lit_len,
             );
         } else {
-            crate::decoding::simd_copy::copy_exact_medium(lits.as_ptr(), dst_ptr, lit_len);
+            crate::decoding::simd_copy::copy_exact_medium(
+                lits.as_ptr(),
+                dst_ptr,
+                lit_len,
+                copy_tier,
+            );
         }
         dst.set_len(cur_len + lit_len);
     }
@@ -515,15 +524,20 @@ fn collect_block_parts<M: Matcher>(state: &mut CompressState<M>, parts: &mut Enc
             .sequences
             .reserve_exact(sequence_capacity - parts.sequences.len());
     }
+    // Hoisted out of the closure: the tier was settled when the compressor was
+    // built, and the emit loop just carries the value.
+    let copy_tier = state.copy_tier;
     state.matcher.start_matching(|seq| match seq {
-        Sequence::Literals { literals } => append_literals(&mut parts.literals, literals),
+        Sequence::Literals { literals } => {
+            append_literals(&mut parts.literals, literals, copy_tier)
+        }
         Sequence::Triple {
             literals,
             offset,
             match_len,
         } => {
             let ll = literals.len() as u32;
-            append_literals(&mut parts.literals, literals);
+            append_literals(&mut parts.literals, literals, copy_tier);
             parts.sequences.push(RawSequence {
                 ll,
                 ml: match_len as u32,

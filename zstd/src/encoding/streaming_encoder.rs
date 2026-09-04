@@ -155,6 +155,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
             compression_level,
             state: CompressState {
                 matcher,
+                copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
                 last_huff_table: None,
                 huff_table_spare: None,
                 huff_weights: Default::default(),

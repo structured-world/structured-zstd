@@ -118,17 +118,45 @@ settled by measurement, not taste.
 
 ## 5. Dispatch and specialisation
 
-- **Runtime CPU-feature dispatch belongs ABOVE the hot loop, resolved once.**
-  Caching the selected kernel in a field at construction and reading it inside
-  is correct; calling the selector per iteration pays an atomic and a branch
-  every pass. Const-shaped parameters are resolved by one `match` that
-  monomorphises the whole loop, so the body carries no test for them.
-- **SIMD kernels use runtime detection, never `#[cfg(target_feature)]` to
-  choose a path.** A compile-time gate bakes the decision into the artifact:
-  built on a machine with AVX2 it crashes elsewhere, and built on a baseline
-  target it silently falls back, including all the way to a `memcpy` call in a
-  routine written to avoid one. Every SIMD path needs runtime detection, a
-  scalar fallback, and a test proving the two agree bit for bit.
+- **Feature detection happens once, before the operation; dispatch happens
+  once, above the loop.** These are two separate things and both get asked
+  about. The detector is answered at construction and stored in a field, so no
+  encode or decode ever calls it — not per position, and not per block either:
+  a cached selector still costs an atomic load and a branch each time, and its
+  presence in the middle of the work invites callers to add more. What may sit
+  above the loop is the `match` on the already-resolved value, selecting a
+  monomorph that then runs with the tier and the const-shaped parameters baked
+  in and no test for them in the body.
+- **Which kernels EXIST is a compile-time question; which one RUNS is not.**
+  The tiers a build carries follow from the target and the `kernel-*` features.
+  Choosing among them is a property of the CPU executing the binary, so it is
+  answered by runtime detection, resolved once ahead of the work and carried
+  down as a value.
+
+  `#[cfg(target_feature = ...)]` cannot answer it. That flag reflects the
+  build's baseline (the target spec plus `-C target-cpu` / `RUSTFLAGS`), not the
+  host that compiled it and not the host that will run it: a plain `cargo build`
+  on an AVX2 workstation does NOT set `target_feature = "avx2"` for
+  `x86_64-unknown-linux-gnu`. Using it to select a tier therefore fails in both
+  directions. Raise the baseline and the artifact executes an illegal
+  instruction on older CPUs; leave it at stock and the wide tier is compiled out
+  entirely, so the code silently takes a narrower path, possibly all the way
+  down to the `memcpy` call a routine was written to avoid. The second failure
+  is the quiet one, and it is invisible on aarch64.
+
+  A `cfg` gate is legitimate only where the feature is guaranteed by the target
+  itself (NEON on aarch64, SSE2 on x86_64): there is nothing to detect, and the
+  gate states an architectural fact rather than making a choice. It is also the
+  only option under `no_std`, where no detection exists — there the baseline
+  genuinely is all the evidence available, and that limitation belongs in a
+  comment.
+
+  Require of every SIMD path: each tier present in the artifact independently of
+  the baseline (`#[target_feature(enable = ...)]` on the kernel, not a `cfg` on
+  its existence), a scalar fallback, and a test sweeping EVERY tier the running
+  CPU supports against that fallback for bit-identical output — not just the one
+  the detector happens to prefer, or the narrow tiers go untested on the
+  machines that run them.
 - **More monomorphisation is not automatically better.** Duplicating a body into
   many instantiations, or inlining a helper called from a dozen sites inside a
   loop, buys instruction-cache and decode pressure that can exceed the calls it
