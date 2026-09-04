@@ -23,9 +23,13 @@ use alloc::vec::Vec;
 pub(crate) struct SeenContentGrid {
     /// `0` marks an empty slot, so a fingerprint is forced non-zero.
     slots: Vec<u32>,
-    /// Bytes of this frame already recorded, which is where the next block's
-    /// grid positions continue from.
-    frame_offset: usize,
+    /// Where the grid stands relative to the frame, modulo the step. Only the
+    /// phase is needed to continue the frame-wide grid into the next block, and
+    /// keeping only the phase means no counter can run away on a long stream.
+    grid_phase: usize,
+    /// Bytes recorded since the last clear, which is how fingerprints age out
+    /// with the matcher's window.
+    since_clear: usize,
 }
 
 impl SeenContentGrid {
@@ -43,7 +47,8 @@ impl SeenContentGrid {
         } else {
             self.slots.fill(0);
         }
-        self.frame_offset = 0;
+        self.grid_phase = 0;
+        self.since_clear = 0;
     }
 
     pub(crate) fn heap_size(&self) -> usize {
@@ -55,14 +60,28 @@ impl SeenContentGrid {
     /// Recording happens whatever the answer: a block that goes out raw is
     /// still content a later block may duplicate, and one that gets searched
     /// is indexed by the matcher but only for as long as the window holds it.
-    pub(crate) fn record_and_report_repeat(&mut self, block: &[u8]) -> bool {
+    /// `window_size` is that reach; pass `0` when it is unknown, which keeps
+    /// every fingerprint for the frame.
+    pub(crate) fn record_and_report_repeat(&mut self, block: &[u8], window_size: usize) -> bool {
         if self.slots.is_empty() {
             self.reset_for_frame();
         }
+        // Content the matcher can no longer reach is not a repeat worth
+        // reporting: a stream that cycles through blocks at a period just wider
+        // than the window would otherwise collide with every one of them and
+        // hold the skip off for the rest of the frame, for matches that cannot
+        // be encoded. Clearing on window boundaries keeps every consulted
+        // fingerprint inside one window's reach.
+        if window_size > 0 && self.since_clear >= window_size {
+            self.slots.fill(0);
+            self.since_clear = 0;
+        }
         let mut repeat = false;
         // First grid position at or after the block's start, in frame
-        // coordinates, then every STEP from there.
-        let first = self.frame_offset.next_multiple_of(Self::STEP) - self.frame_offset;
+        // coordinates, then every STEP from there. Only the phase matters, and
+        // it is what is carried, so a frame longer than the address space
+        // cannot run the cursor off the end.
+        let first = (Self::STEP - self.grid_phase) % Self::STEP;
         let mut at = first;
         while at + Self::KEY_LEN <= block.len() {
             let key = u64::from_le_bytes(
@@ -83,7 +102,14 @@ impl SeenContentGrid {
             }
             at += Self::STEP;
         }
-        self.frame_offset += block.len();
+        self.grid_phase = (self.grid_phase + block.len() % Self::STEP) % Self::STEP;
+        if window_size > 0 {
+            // Bounded by construction: the clear above fires the moment this
+            // reaches the window, so it never holds more than one window plus
+            // one block. Without a window there is nothing to expire against,
+            // and nothing to accumulate.
+            self.since_clear += block.len();
+        }
         repeat
     }
 }
@@ -91,10 +117,6 @@ impl SeenContentGrid {
 pub(crate) const RAW_FAST_PATH_MIN_BLOCK_LEN: usize = 512;
 pub(crate) const RAW_FAST_PATH_MAX_SAMPLE_LEN: usize = 4096;
 pub(crate) const RAW_FAST_PATH_MIN_SAMPLE_LEN: usize = 32;
-/// Window-size ceiling (8 MiB) above which the incompressible raw-fast-path is
-/// disabled for `Best` / numeric levels: the largest-window levels (L20-22)
-/// do full match-finding even on apparently-incompressible blocks rather than
-/// risk emitting raw blocks where a far back-reference might still pay off.
 /// How densely a block written off unsearched is still indexed.
 ///
 /// It has to be findable at all, or a later block duplicating it has nothing
@@ -107,17 +129,10 @@ pub(crate) const RAW_FAST_PATH_MIN_SAMPLE_LEN: usize = 32;
 /// no use for, which measured as a four-fold slowdown on the fast levels.
 pub(crate) const RAW_SKIP_INDEX_STEP: usize = SeenContentGrid::STEP;
 
-/// Highest level that may write a block off unsearched.
-///
-/// The classifier is not free of false positives, and what a false positive
-/// costs is the ratio the SEARCH would have found — which grows with the
-/// level. Measured over the whole decode corpus, the skip costs 0.6% of total
-/// compressed bytes at level 1 and 1.2-1.5% through level 9, then 3.7% at
-/// level 13 and 5.1% at level 17. That upper cost is paid on ordinary data
-/// while the speed it buys only arrives on data that really is incompressible,
-/// so the levels whose search is strong enough to make the mistake expensive
-/// do not take the skip at all.
-const RAW_FAST_PATH_MAX_LEVEL: i32 = 9;
+/// Window-size ceiling (8 MiB) above which a numeric level does not take the
+/// skip whatever its number: the further back a match may reach, the more a
+/// block written off unsearched can be throwing away. `Best` reads the same
+/// ceiling; the three named levels below it always may.
 const RAW_FAST_PATH_MAX_WINDOW_LOG: u8 = 23;
 const RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES: u64 = 1u64 << RAW_FAST_PATH_MAX_WINDOW_LOG;
 
@@ -195,10 +210,8 @@ pub(crate) fn compression_level_allows_raw_fast_path(
         // The named variants resolve to levels 1 / 3 / 7, all inside the band
         // where a misjudged block is cheap; `Best` is level 13, which is not.
         CompressionLevel::Fastest | CompressionLevel::Default | CompressionLevel::Better => true,
-        CompressionLevel::Best => false,
-        CompressionLevel::Level(n) => {
-            n <= RAW_FAST_PATH_MAX_LEVEL && window_size <= RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES
-        }
+        CompressionLevel::Best => window_size <= RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES,
+        CompressionLevel::Level(_) => window_size <= RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES,
         CompressionLevel::Uncompressed => false,
     }
 }
@@ -219,7 +232,12 @@ pub(crate) fn compression_level_allows_raw_fast_path(
 #[inline]
 fn scan_sample_region(
     sample: &[u8],
-    counts: &mut [u16; 256],
+    // Wide enough for a whole block, not just a sample: the dictionary-aware
+    // classifier scans the full 128 KiB, and a byte can appear more than 65,535
+    // times there without the quad-repeat guard firing first (distinct quads
+    // sharing one byte value do exactly that), which a narrower counter would
+    // wrap or panic on.
+    counts: &mut [u32; 256],
     repeat_table: &mut [u32; INCOMPRESSIBLE_REPEAT_TABLE_LEN],
     repeat_occupied: &mut [u64; INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS],
     repeats: &mut usize,
@@ -376,7 +394,7 @@ fn sample_looks_incompressible_capped(block: &[u8], max_sample_len: usize) -> bo
     let total_quads: usize = regions[..region_count].iter().map(|r| r.len() / 4).sum();
     let repeat_guard = total_quads / INCOMPRESSIBLE_REPEAT_DIVISOR + 1;
 
-    let mut counts = [0u16; 256];
+    let mut counts = [0u32; 256];
     let mut repeat_table = [u32::MAX; INCOMPRESSIBLE_REPEAT_TABLE_LEN];
     // Bitset occupancy keeps this path no_std-friendly while avoiding the
     // larger per-slot bool map (and extra matcher-level scratch state).

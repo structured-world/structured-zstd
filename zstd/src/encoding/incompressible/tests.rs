@@ -10,22 +10,48 @@ use alloc::vec::Vec;
 fn the_content_grid_reports_a_duplicated_block_and_nothing_else() {
     let first = deterministic_bytes(0xBEEF, 128 * 1024);
     let second = deterministic_bytes(0xF00D, 128 * 1024);
+    // A window wide enough to hold the whole fixture, so nothing expires
+    // during the run; expiry has its own test below.
+    const WIDE: usize = 8 * 1024 * 1024;
     let mut grid = SeenContentGrid::default();
     grid.reset_for_frame();
-    assert!(!grid.record_and_report_repeat(&first), "the first block");
     assert!(
-        !grid.record_and_report_repeat(&second),
+        !grid.record_and_report_repeat(&first, WIDE),
+        "the first block"
+    );
+    assert!(
+        !grid.record_and_report_repeat(&second, WIDE),
         "unrelated content must not read as a repeat",
     );
     assert!(
-        grid.record_and_report_repeat(&first),
+        grid.record_and_report_repeat(&first, WIDE),
         "a block repeating the first must be reported",
     );
     // A new frame starts with no memory of the old one.
     grid.reset_for_frame();
     assert!(
-        !grid.record_and_report_repeat(&first),
+        !grid.record_and_report_repeat(&first, WIDE),
         "the grid must not carry content across frames",
+    );
+}
+
+/// Content the matcher can no longer reach must stop reading as a repeat, or a
+/// stream cycling blocks at a period wider than the window holds the raw skip
+/// off for the rest of the frame chasing matches it cannot encode.
+#[test]
+fn the_content_grid_forgets_what_the_window_has_passed() {
+    let block = deterministic_bytes(0xBEEF, 128 * 1024);
+    let other = deterministic_bytes(0xF00D, 128 * 1024);
+    // One block wide: the second block already carries the window past the
+    // first, so the third sees a cleared grid.
+    let window = block.len();
+    let mut grid = SeenContentGrid::default();
+    grid.reset_for_frame();
+    assert!(!grid.record_and_report_repeat(&block, window));
+    assert!(!grid.record_and_report_repeat(&other, window));
+    assert!(
+        !grid.record_and_report_repeat(&block, window),
+        "a repeat of content the window has passed is not reachable, so not a repeat",
     );
 }
 
@@ -44,7 +70,7 @@ fn deterministic_bytes(seed: u64, len: usize) -> Vec<u8> {
 #[test]
 fn sample_metrics_do_not_count_first_u32_max_as_repeat() {
     let sample = [0xFF_u8; 4];
-    let mut counts = [0u16; 256];
+    let mut counts = [0u32; 256];
     let mut repeat_table = [u32::MAX; INCOMPRESSIBLE_REPEAT_TABLE_LEN];
     let mut repeat_occupied = [0_u64; INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS];
     let mut repeats = 0usize;
@@ -71,7 +97,7 @@ fn scan_sample_region_early_exits_on_repetitive_input() {
     // 32 identical 4-byte quads: the repeat count climbs past any small
     // guard, exercising the early-exit `true` path directly.
     let sample = [0xAB_u8; 128];
-    let mut counts = [0u16; 256];
+    let mut counts = [0u32; 256];
     let mut repeat_table = [u32::MAX; INCOMPRESSIBLE_REPEAT_TABLE_LEN];
     let mut repeat_occupied = [0_u64; INCOMPRESSIBLE_REPEAT_OCCUPANCY_WORDS];
     let mut repeats = 0usize;
@@ -92,39 +118,39 @@ fn scan_sample_region_early_exits_on_repetitive_input() {
     assert!(repeats > 1, "repeat count must have exceeded the guard");
 }
 
+/// The window, not the level, is what closes the skip: a match that may reach
+/// further back is worth more than one written off unsearched.
 #[test]
-fn best_never_takes_the_raw_fast_path() {
-    // `Best` resolves to level 13, above the band where writing a block off
-    // unsearched is cheap: measured over the corpus it costs several percent
-    // of compressed size there, paid on ordinary data. No window size makes
-    // that worthwhile.
-    for window in [
-        1u64,
-        RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES,
-        RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES + 1,
+fn the_window_ceiling_is_what_closes_the_raw_fast_path() {
+    for level in [
+        CompressionLevel::Best,
+        CompressionLevel::Level(1),
+        CompressionLevel::Level(9),
+        CompressionLevel::Level(22),
     ] {
-        assert!(!compression_level_allows_raw_fast_path(
-            CompressionLevel::Best,
-            window
-        ));
-    }
-}
-
-/// The numeric band the skip is allowed in, and the first level outside it.
-#[test]
-fn numeric_levels_take_the_raw_fast_path_only_up_to_the_cap() {
-    for level in 1..=RAW_FAST_PATH_MAX_LEVEL {
         assert!(
-            compression_level_allows_raw_fast_path(
-                CompressionLevel::Level(level),
-                RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES
-            ),
-            "level {level} is inside the band"
+            compression_level_allows_raw_fast_path(level, RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES),
+            "{level:?} at the ceiling",
+        );
+        assert!(
+            !compression_level_allows_raw_fast_path(level, RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES + 1),
+            "{level:?} past the ceiling",
         );
     }
+    // The three named levels below the ceiling never consult it.
+    for level in [
+        CompressionLevel::Fastest,
+        CompressionLevel::Default,
+        CompressionLevel::Better,
+    ] {
+        assert!(compression_level_allows_raw_fast_path(
+            level,
+            RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES + 1
+        ));
+    }
     assert!(!compression_level_allows_raw_fast_path(
-        CompressionLevel::Level(RAW_FAST_PATH_MAX_LEVEL + 1),
-        RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES
+        CompressionLevel::Uncompressed,
+        1
     ));
 }
 

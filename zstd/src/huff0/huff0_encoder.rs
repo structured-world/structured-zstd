@@ -424,13 +424,16 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
             return false;
         }
 
-        // Reserve to the weight count: the FSE-encoded description is rejected
-        // above `weights.len() / 2` (the raw nibble fallback wins) and at 128
-        // bytes outright, so `weights.len()` is a generous one-shot capacity
-        // that keeps the BitWriter's backing buffer from reallocating as the
-        // interleaved stream is written. A reused buffer is already at that
-        // size after its first fill, so this reserves nothing on later calls.
-        encoded.reserve(weights.len());
+        // Reserve to the widest description the format admits, not to this
+        // table's weight count. The buffer is reused across rebuilds, so
+        // sizing it to the table in hand means a later table with a larger
+        // alphabet reallocates it; the bound is a couple of hundred bytes and
+        // reserves nothing on every call after the first. It sits after the
+        // early-outs above on purpose: a table whose weights are not encodable
+        // never reaches here, so it never pays for a buffer it will not write.
+        if encoded.capacity() < MAX_HUFFMAN_ALPHABET {
+            encoded.reserve(MAX_HUFFMAN_ALPHABET - encoded.len());
+        }
         {
             let mut writer = BitWriter::from(&mut *encoded);
             let mut encoder = FSEEncoder::new(

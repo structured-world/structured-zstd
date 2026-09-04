@@ -107,10 +107,17 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         .first()
         .copied()
         .filter(|f| bytes.iter().all(|x| x == f));
-    // Recorded for every block, whatever the decision, so a later duplicate of
-    // this one is recognised; a hit means the block repeats content already in
-    // the frame and must be searched however random it looks.
-    let repeats_earlier_content = state.seen_content.record_and_report_repeat(bytes);
+    // Recorded for every block whose level could act on the answer, so a later
+    // duplicate of this one is recognised; a hit means the block repeats
+    // content already in the frame and must be searched however random it
+    // looks. Where the level forbids the skip outright the grid would only
+    // hash blocks to discard the verdict, so it is not consulted at all.
+    let window_size = state.matcher.window_size();
+    let raw_path_possible = compression_level_allows_raw_fast_path(compression_level, window_size);
+    let repeats_earlier_content = raw_path_possible
+        && state
+            .seen_content
+            .record_and_report_repeat(bytes, window_size as usize);
     let dict_rejects_raw = dict_active && state.matcher.block_samples_match_dict(bytes);
     let raw_fast_path = !repeats_earlier_content
         && !dict_rejects_raw
@@ -329,10 +336,15 @@ pub(crate) fn compress_block_encoded_borrowed(
         "borrowed one-shot path reached for an unsupported backend/search config",
     );
     let block_size = block.len() as u32;
-    // As on the owned path: recorded for every block so a later duplicate is
-    // recognised, and a hit sends this one to the search however random its
-    // own bytes look.
-    let repeats_earlier_content = state.seen_content.record_and_report_repeat(block);
+    // As on the owned path: recorded for every block whose level could act on
+    // the answer, and a hit sends this one to the search however random its own
+    // bytes look.
+    let window_size = state.matcher.window_size();
+    let repeats_earlier_content =
+        compression_level_allows_raw_fast_path(compression_level, window_size)
+            && state
+                .seen_content
+                .record_and_report_repeat(block, window_size as usize);
     if !block.is_empty() && block.iter().all(|x| block[0].eq(x)) {
         let rle_byte = block[0];
         #[cfg(feature = "lsm")]

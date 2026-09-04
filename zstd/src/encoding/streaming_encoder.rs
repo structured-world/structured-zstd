@@ -518,6 +518,10 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
         // Frames are independent, so the raw-skip's memory of emitted content
         // starts empty; the allocation is kept across frames.
         self.state.seen_content.reset_for_frame();
+        // Same reason as the frame compressor's start: what the last frame
+        // ended on is about to be replaced, and it is exactly the buffer this
+        // frame wants to build into.
+        self.state.fse_tables.park_previous_before_frame();
         self.ensure_level_supported()?;
         // A dictionary is only active when it can actually be primed: the level
         // compresses (not `Uncompressed`) AND the matcher supports priming AND a

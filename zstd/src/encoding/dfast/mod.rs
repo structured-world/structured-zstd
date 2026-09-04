@@ -1158,15 +1158,15 @@ impl DfastMatchGenerator {
             // which is what the owned path already does.
             Some(true) => {
                 self.ensure_hash_tables();
-                // Straight to `insert_range`, as the dense arm above does:
-                // `insert_positions_with_step` clamps the range against the
-                // OWNED history bounds, which a borrowed window does not
-                // populate, so routing through it inserts nothing at all.
-                // `insert_range` resolves the borrowed source itself.
-                self.insert_range(
+                // The same step the owned skip path uses, and through the same
+                // entry point, so the stream-headroom bound its assert pins
+                // still holds: the insert loop advances with an unchecked
+                // `pos += step` in ABSOLUTE stream coordinates, which the
+                // headroom reserve is sized for at this step and no wider.
+                self.insert_positions_with_step(
                     block_start,
                     block_end,
-                    crate::encoding::incompressible::RAW_SKIP_INDEX_STEP,
+                    DFAST_INCOMPRESSIBLE_SKIP_STEP,
                 );
             }
             None => {}
@@ -1728,10 +1728,6 @@ impl DfastMatchGenerator {
         &self.history[self.history_start..self.history.len() - self.uncommitted_len]
     }
 
-    pub(crate) fn history_abs_end(&self) -> usize {
-        self.history_abs_start + self.live_history().len()
-    }
-
     #[cfg_attr(not(target_arch = "wasm32"), inline(always))]
     pub(crate) fn insert_positions(&mut self, start: usize, end: usize) {
         self.insert_range(start, end, 1);
@@ -1853,11 +1849,12 @@ impl DfastMatchGenerator {
              DFAST_INCOMPRESSIBLE_SKIP_STEP — raw `pos += step` would \
              eat into the STREAM_ABS_HEADROOM reserve"
         );
-        self.insert_range(
-            start.max(self.history_abs_start),
-            end.min(self.history_abs_end()),
-            step,
-        );
+        // Clamping happens inside `insert_range`, against the source it
+        // resolves — which is the borrowed window when one is staged. Clamping
+        // here against the OWNED bounds as well is redundant for an owned
+        // window (the two agree) and empties the range for a borrowed one,
+        // which is a window a borrowed frame never populates.
+        self.insert_range(start, end, step);
     }
 
     /// The four complementary insertions upstream makes after a match

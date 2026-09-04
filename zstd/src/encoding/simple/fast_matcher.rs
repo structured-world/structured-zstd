@@ -386,8 +386,17 @@ impl FastKernelMatcher {
     pub(crate) fn block_samples_match_dict(&self, block: &[u8]) -> bool {
         use super::fast_kernel::kernel::dict_lookup;
         const HASH_READ_SIZE: usize = 8;
-        if !self.dict.is_attached() || block.len() < HASH_READ_SIZE {
+        if block.len() < HASH_READ_SIZE {
             return false;
+        }
+        if !self.dict.is_attached() {
+            // A dictionary above the attach cutoff is COPIED into live history
+            // instead, leaving no dict table to probe. Its content can still
+            // supply a block-sized match, so the honest answer is that it
+            // might: say so, and the block stays on the scan rather than going
+            // out raw unsearched. With no dictionary at all there is nothing
+            // to match against and nothing to report.
+            return self.loaded_dict_end > 0;
         }
         let Some(dict_tab) = self.dict.table() else {
             return false;
@@ -1792,6 +1801,32 @@ impl FastKernelMatcher {
         step: usize,
     ) {
         debug_assert!(step >= 1);
+        if step > 1 {
+            // The two ends densely, whatever the step lands on. The head is the
+            // seam the caller backfilled for — the previous block's trailing
+            // positions read across the boundary, and a stride that skips them
+            // drops every seam-spanning match. The tail is the mirror case for
+            // the next block. Both are a handful of positions.
+            //
+            // The span between them stays sparse on purpose: it exists so a
+            // later block DUPLICATING this one can find it, and a duplicate is
+            // block-sized, so it meets a grid entry long before the stride
+            // matters. Indexing it densely is the cost the skip exists to
+            // avoid.
+            const SEAM: usize = 8;
+            let head_end = last_hashable.min(range_start + SEAM);
+            for pos in range_start..=head_end {
+                let ptr = unsafe { base.add(pos) };
+                let hash = unsafe { self.hash_table.hash_ptr::<MLS>(ptr) };
+                unsafe { self.hash_table.put(hash, (base_offset + pos) as u32) };
+            }
+            let tail_start = last_hashable.saturating_sub(SEAM).max(range_start);
+            for pos in tail_start..=last_hashable {
+                let ptr = unsafe { base.add(pos) };
+                let hash = unsafe { self.hash_table.hash_ptr::<MLS>(ptr) };
+                unsafe { self.hash_table.put(hash, (base_offset + pos) as u32) };
+            }
+        }
         for pos in (range_start..=last_hashable).step_by(step) {
             // SAFETY: pos < history_len (by loop bound), and the load
             // width HASH_READ_SIZE is the kernel's contractually

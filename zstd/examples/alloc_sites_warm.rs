@@ -43,17 +43,26 @@ fn main() {
     // measured against. The default reuses the warmed one.
     let fresh = args.get(3).map(|s| s == "fresh").unwrap_or(false);
 
+    // Sized before the profiler starts, as the C loop sizes its destination
+    // outside its loop: the output buffer's growth is the caller's cost, not
+    // the frame's, and counting it here would attribute it to the encoder.
+    let mut out2 = Vec::with_capacity(structured_zstd::encoding::compress_bound(data.len()));
+
     #[cfg(feature = "dhat-heap")]
     let profiler = dhat::Profiler::new_heap();
 
-    let mut out2 = Vec::new();
+    // Declared outside the branch so it outlives the profiler: dropping a
+    // compressor inside the profiled region reports its teardown as part of
+    // the frame.
+    let mut fresh_compressor: Option<FrameCompressor<&[u8], &mut Vec<u8>>> = None;
     if fresh {
         // The one-shot contract, not the streaming one: a context per frame
         // compressing straight from the caller's slice, which is what
         // `ZSTD_compress` does and what `compress_slice_to_vec` wraps.
-        let mut fresh_compressor: FrameCompressor<&[u8], &mut Vec<u8>> =
+        let mut one_shot: FrameCompressor<&[u8], &mut Vec<u8>> =
             FrameCompressor::new(CompressionLevel::Level(level));
-        fresh_compressor.compress_independent_frame_into(&data[..], &mut out2);
+        one_shot.compress_independent_frame_into(&data[..], &mut out2);
+        fresh_compressor = Some(one_shot);
     } else {
         compressor.set_source(&data[..]);
         compressor.set_drain(&mut out2);
@@ -64,6 +73,7 @@ fn main() {
     // of the buffers above it.
     #[cfg(feature = "dhat-heap")]
     drop(profiler);
+    drop(fresh_compressor);
 
     println!("level {level}: {} bytes in, {} out", data.len(), out2.len());
 }
