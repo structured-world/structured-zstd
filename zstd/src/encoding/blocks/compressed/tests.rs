@@ -1,7 +1,7 @@
 use super::{
-    FseTableMode, RawSequence, choose_table, emit_single_sequence_block, encode_literal_length,
-    encode_match_len, encode_offset_with_history, min_gain, min_literals_to_compress,
-    previous_table, remember_last_used_tables,
+    FseTableMode, LastUsedTable, RawSequence, choose_table, emit_single_sequence_block,
+    encode_literal_length, encode_match_len, encode_offset_with_history, min_gain,
+    min_literals_to_compress, previous_table, remember_last_used_tables,
 };
 use crate::encoding::frame_compressor::{CompressState, FseTables, PreviousFseTable};
 use crate::encoding::strategy::StrategyTag;
@@ -531,9 +531,9 @@ fn remember_last_used_tables_keeps_predefined_and_repeat_modes() {
 
     remember_last_used_tables(
         &mut fse_tables,
-        Some(PreviousFseTable::Default),
-        Some(PreviousFseTable::Default),
-        Some(PreviousFseTable::Default),
+        LastUsedTable::Default,
+        LastUsedTable::Default,
+        LastUsedTable::Default,
     );
 
     assert!(tables_match(
@@ -553,12 +553,18 @@ fn remember_last_used_tables_keeps_predefined_and_repeat_modes() {
     // Lazy is a non-fast-band strategy, so this exercises the cost-based
     // repeat decision (not the fast-band shortcut).
     let strat = crate::encoding::strategy::StrategyTag::Lazy;
+    // Slots for a table these calls are expected NOT to build; the assertions
+    // below are that every axis repeats instead.
+    let mut ll_slot = crate::fse::fse_encoder::FSETable::blank();
+    let mut ml_slot = crate::fse::fse_encoder::FSETable::blank();
+    let mut of_slot = crate::fse::fse_encoder::FSETable::blank();
     let ll_repeat = choose_table(
         fse_tables.ll_previous.as_ref(),
         fse_tables.ll_default_ref(),
         sample_codes.iter().copied(),
         9,
         strat,
+        &mut ll_slot,
     );
     let ml_repeat = choose_table(
         fse_tables.ml_previous.as_ref(),
@@ -566,6 +572,7 @@ fn remember_last_used_tables_keeps_predefined_and_repeat_modes() {
         sample_codes.iter().copied(),
         9,
         strat,
+        &mut ml_slot,
     );
     let of_repeat = choose_table(
         fse_tables.of_previous.as_ref(),
@@ -573,6 +580,7 @@ fn remember_last_used_tables_keeps_predefined_and_repeat_modes() {
         sample_codes.iter().copied(),
         8,
         strat,
+        &mut of_slot,
     );
 
     assert!(matches!(ll_repeat, FseTableMode::RepeatLast(_)));
@@ -602,6 +610,8 @@ fn fast_band_strategies_prefer_repeat_fse_table() {
     // reuse the covering previous table; cover every eligible arm so an
     // enum-arm regression in the implementation branch is caught.
     for strategy in [StrategyTag::Fast, StrategyTag::Dfast, StrategyTag::Greedy] {
+        // A slot the reuse path must leave alone.
+        let mut slot = crate::fse::fse_encoder::FSETable::blank();
         let mode = super::choose_table_from_counts(
             Some(&previous),
             fse_tables.ll_default_ref(),
@@ -611,6 +621,7 @@ fn fast_band_strategies_prefer_repeat_fse_table() {
             9,
             strategy,
             None,
+            &mut slot,
         );
         assert!(
             matches!(mode, FseTableMode::RepeatLast(_)),
@@ -633,9 +644,9 @@ fn remember_last_used_tables_reuses_existing_custom_slot_for_repeat() {
 
     remember_last_used_tables(
         &mut fse_tables,
-        None,
-        Some(PreviousFseTable::Default),
-        Some(PreviousFseTable::Default),
+        LastUsedTable::Keep,
+        LastUsedTable::Default,
+        LastUsedTable::Default,
     );
 
     let after = core::ptr::from_ref(
@@ -652,12 +663,14 @@ fn remember_last_used_tables_reuses_existing_custom_slot_for_repeat() {
 #[test]
 fn choose_table_handles_single_symbol_distribution() {
     let fse_tables = FseTables::new();
+    let mut slot = crate::fse::fse_encoder::FSETable::blank();
     let mode = choose_table(
         None,
         fse_tables.ll_default_ref(),
         core::iter::repeat_n(0u8, 32),
         9,
         crate::encoding::strategy::StrategyTag::Lazy,
+        &mut slot,
     );
     assert!(matches!(mode, FseTableMode::Rle(0)));
 }
@@ -747,12 +760,14 @@ fn match_length_coding_agrees_with_the_ranges_over_every_length() {
 #[test]
 fn choose_table_without_previous_does_not_unwrap_none() {
     let only_zero_one_table = build_table_from_symbol_counts(&[1, 1], 5, false);
+    let mut slot = crate::fse::fse_encoder::FSETable::blank();
     let mode = choose_table(
         None,
         &only_zero_one_table,
         [1u8, 2].into_iter().cycle().take(32),
         5,
         crate::encoding::strategy::StrategyTag::Lazy,
+        &mut slot,
     );
     assert!(matches!(mode, FseTableMode::Encoded(_)));
 }

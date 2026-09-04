@@ -338,11 +338,26 @@ pub(crate) struct FseTables {
     pub(crate) ml_previous: Option<PreviousFseTable>,
     pub(crate) of_default: crate::fse::fse_encoder::FseDefaultTable,
     pub(crate) of_previous: Option<PreviousFseTable>,
+    /// Where a block builds the table it is about to emit, before that table
+    /// becomes the axis's `*_previous`.
+    ///
+    /// Upstream's `ZSTD_blockState_t` keeps `prevCBlock` and `nextCBlock` for
+    /// exactly this: the entropy build reads the previous tables and writes the
+    /// next ones, so the two never alias and committing a block is a pointer
+    /// swap (`ZSTD_blockState_confirmRepcodesAndEntropyTables`). A block that
+    /// ends up raw simply does not swap. Holding the slot here is what lets a
+    /// table be built in place instead of on the stack.
+    pub(crate) ll_next: SharedFseTable,
+    pub(crate) ml_next: SharedFseTable,
+    pub(crate) of_next: SharedFseTable,
 }
 
 impl FseTables {
     pub fn new() -> Self {
         Self {
+            ll_next: SharedFseTable::new(crate::fse::fse_encoder::FSETable::blank()),
+            ml_next: SharedFseTable::new(crate::fse::fse_encoder::FSETable::blank()),
+            of_next: SharedFseTable::new(crate::fse::fse_encoder::FSETable::blank()),
             ll_default: default_ll_table(),
             ll_previous: None,
             ml_default: default_ml_table(),
@@ -352,7 +367,14 @@ impl FseTables {
         }
     }
 
-    /// Borrow the LL default table as `&FSETable`. Abstracts the cfg
+    /// Borrow the LL default table as `&FSETable`.
+    ///
+    /// Test-only now: the encoder and the estimator both destructure
+    /// `FseTables` so they can hold a `*_next` slot mutably, and a method
+    /// borrowing the whole struct cannot coexist with that. Tests keep it
+    /// because they touch one table at a time.
+    ///
+    /// Abstracts the cfg
     /// split in [`crate::fse::fse_encoder::FseDefaultTable`] —
     /// `&'static FSETable` (atomic / `critical-section`) auto-derefs
     /// directly; `Box<FSETable>` (cache-less no-atomic) derefs
@@ -360,6 +382,7 @@ impl FseTables {
     /// downstream consumers can stay cfg-agnostic.
     #[inline]
     #[allow(clippy::borrow_deref_ref)]
+    #[cfg(test)]
     pub(crate) fn ll_default_ref(&self) -> &FSETable {
         &*self.ll_default
     }
@@ -367,6 +390,7 @@ impl FseTables {
     /// Borrow the ML default table as `&FSETable`. See [`Self::ll_default_ref`].
     #[inline]
     #[allow(clippy::borrow_deref_ref)]
+    #[cfg(test)]
     pub(crate) fn ml_default_ref(&self) -> &FSETable {
         &*self.ml_default
     }
@@ -374,6 +398,7 @@ impl FseTables {
     /// Borrow the OF default table as `&FSETable`. See [`Self::ll_default_ref`].
     #[inline]
     #[allow(clippy::borrow_deref_ref)]
+    #[cfg(test)]
     pub(crate) fn of_default_ref(&self) -> &FSETable {
         &*self.of_default
     }

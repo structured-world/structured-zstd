@@ -187,7 +187,7 @@ impl FSETable {
     ///
     /// Every field is overwritten by a build, so the zeroes are a starting
     /// point rather than a meaningful state; `table_size == 0` says as much.
-    pub(super) fn blank() -> Self {
+    pub(crate) fn blank() -> Self {
         Self {
             states: core::array::from_fn(|_| SymbolStates::default()),
             table_size: 0,
@@ -453,14 +453,6 @@ pub(crate) fn build_table_from_symbol_counts_into(
 /// (the `else { total }` branch below). `last_code` is the stream code of the
 /// last sequence (an index into `counts`, `<= max_symbol`). `use_low_prob_count`
 /// follows `nbSeq_1` exactly as upstream's `ZSTD_useLowProbCount(nbSeq_1)`.
-pub(crate) fn build_seq_ctable(counts: &mut [usize], max_log: u8, last_code: usize) -> FSETable {
-    let mut out = FSETable::blank();
-    build_seq_ctable_into(counts, max_log, last_code, &mut out);
-    out
-}
-
-/// [`build_seq_ctable`] writing into a caller-owned table, so a block fills the
-/// slot its table will live in rather than building one on the stack.
 pub(crate) fn build_seq_ctable_into(
     counts: &mut [usize],
     max_log: u8,

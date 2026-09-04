@@ -8,7 +8,8 @@ use crate::{
     encoding::frame_compressor::{CompressState, FseTables, PreviousFseTable, SharedFseTable},
     encoding::{Matcher, Sequence},
     fse::fse_encoder::{
-        FSETable, build_seq_ctable, build_table_from_symbol_counts, fse_header_bits_for_counts,
+        FSETable, build_seq_ctable_into, build_table_from_symbol_counts_into,
+        fse_header_bits_for_counts,
     },
     huff0::huff0_encoder,
 };
@@ -683,35 +684,55 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
             )
         });
 
+        // Destructured because the default-table accessors borrow the whole of
+        // `FseTables`, which would collide with taking a `*_next` slot mutably.
+        let FseTables {
+            ll_previous,
+            ml_previous,
+            of_previous,
+            ll_next,
+            ml_next,
+            of_next,
+            ll_default,
+            ml_default,
+            of_default,
+        } = &mut state.fse_tables;
+        let ll_default: &FSETable = ll_default;
+        let ml_default: &FSETable = ml_default;
+        let of_default: &FSETable = of_default;
+
         let ll_mode = choose_table_from_counts(
-            state.fse_tables.ll_previous.as_ref(),
-            state.fse_tables.ll_default_ref(),
+            ll_previous.as_ref(),
+            ll_default,
             &mut ll_counts,
             total,
             ll_max,
             9,
             state.strategy_tag,
             Some(last_ll),
+            writable_slot(ll_next),
         );
         let ml_mode = choose_table_from_counts(
-            state.fse_tables.ml_previous.as_ref(),
-            state.fse_tables.ml_default_ref(),
+            ml_previous.as_ref(),
+            ml_default,
             &mut ml_counts,
             total,
             ml_max,
             9,
             state.strategy_tag,
             Some(last_ml),
+            writable_slot(ml_next),
         );
         let of_mode = choose_table_from_counts(
-            state.fse_tables.of_previous.as_ref(),
-            state.fse_tables.of_default_ref(),
+            of_previous.as_ref(),
+            of_default,
             &mut of_counts,
             total,
             of_max,
             8,
             state.strategy_tag,
             Some(last_of),
+            writable_slot(of_next),
         );
 
         writer.write_bits(encode_fse_table_modes(&ll_mode, &ml_mode, &of_mode), 8);
@@ -726,13 +747,17 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
             &ll_mode,
             &ml_mode,
             &of_mode,
-            &state.fse_tables,
+            [ll_default, ml_default, of_default],
         );
 
+        // Consuming the modes ends their borrow of the slots, which is what
+        // lets the commit below swap the handles.
         let ll_last = into_last_used_table(ll_mode);
         let ml_last = into_last_used_table(ml_mode);
         let of_last = into_last_used_table(of_mode);
-        remember_last_used_tables(&mut state.fse_tables, ll_last, ml_last, of_last);
+        commit_last_used_table(ll_previous, ll_next, ll_last);
+        commit_last_used_table(ml_previous, ml_next, ml_last);
+        commit_last_used_table(of_previous, of_next, of_last);
     }
     writer.flush();
 }
@@ -1007,36 +1032,53 @@ fn estimate_sequences_section_bytes(
         extra_bits += ll_bits + ml_bits + of as usize;
     }
 
+    // Destructured for the same reason as the emitter: the default accessors
+    // borrow the whole struct, which would collide with the `*_next` slots.
+    let FseTables {
+        ll_previous,
+        ml_previous,
+        of_previous,
+        ll_next,
+        ml_next,
+        of_next,
+        ll_default,
+        ml_default,
+        of_default,
+    } = fse_tables;
+    let ll_default: &FSETable = ll_default;
+    let ml_default: &FSETable = ml_default;
+    let of_default: &FSETable = of_default;
+
     // Same `choose_table` calls as the real encoder — counts the iterator
     // internally, identical decision path.
     let ll_mode = choose_table(
-        fse_tables.ll_previous.as_ref(),
-        fse_tables.ll_default_ref(),
+        ll_previous.as_ref(),
+        ll_default,
         sequences.iter().map(|seq| encode_literal_length(seq.ll).0),
         9,
         strategy,
+        writable_slot(ll_next),
     );
     let ml_mode = choose_table(
-        fse_tables.ml_previous.as_ref(),
-        fse_tables.ml_default_ref(),
+        ml_previous.as_ref(),
+        ml_default,
         sequences.iter().map(|seq| encode_match_len(seq.ml).0),
         9,
         strategy,
+        writable_slot(ml_next),
     );
     let of_mode = choose_table(
-        fse_tables.of_previous.as_ref(),
-        fse_tables.of_default_ref(),
+        of_previous.as_ref(),
+        of_default,
         sequences.iter().map(|seq| encode_offset(seq.of).0),
         8,
         strategy,
+        writable_slot(of_next),
     );
 
-    let ll_bits_chosen =
-        fse_section_bits_for_mode(&ll_mode, ll_counts, fse_tables.ll_default_ref());
-    let ml_bits_chosen =
-        fse_section_bits_for_mode(&ml_mode, ml_counts, fse_tables.ml_default_ref());
-    let of_bits_chosen =
-        fse_section_bits_for_mode(&of_mode, of_counts, fse_tables.of_default_ref());
+    let ll_bits_chosen = fse_section_bits_for_mode(&ll_mode, ll_counts, ll_default);
+    let ml_bits_chosen = fse_section_bits_for_mode(&ml_mode, ml_counts, ml_default);
+    let of_bits_chosen = fse_section_bits_for_mode(&of_mode, of_counts, of_default);
 
     let ll_table_desc_bytes = mode_table_description_bytes(&ll_mode);
     let ml_table_desc_bytes = mode_table_description_bytes(&ml_mode);
@@ -1409,6 +1451,11 @@ fn clone_fse_tables(fse_tables: &FseTables) -> FseTables {
         #[cfg(not(any(target_has_atomic = "ptr", feature = "critical-section")))]
         of_default: fse_tables.of_default.clone(),
         of_previous: fse_tables.of_previous.clone(),
+        // Its own slots: a probe builds tables too, and sharing the emitter's
+        // would let each overwrite what the other is describing.
+        ll_next: SharedFseTable::new(FSETable::blank()),
+        ml_next: SharedFseTable::new(FSETable::blank()),
+        of_next: SharedFseTable::new(FSETable::blank()),
     }
 }
 
@@ -1603,9 +1650,16 @@ impl SplitEstimator<'_> {
 
 #[derive(Clone)]
 #[allow(clippy::large_enum_variant)]
+/// What a block decided to do for one FSE axis, mirroring upstream's
+/// `ZSTD_symbolEncodingType_e`.
+///
+/// `Encoded` borrows the table rather than owning it. The table itself is built
+/// into the axis's `*_next` slot, the way upstream builds its CTable straight
+/// into the block state, so this enum stays two words instead of carrying
+/// eleven kilobytes through every call that passes a mode along.
 enum FseTableMode<'a> {
     Predefined(&'a FSETable),
-    Encoded(FSETable),
+    Encoded(&'a FSETable),
     Rle(u8),
     RepeatLast(&'a PreviousFseTable),
 }
@@ -1706,6 +1760,7 @@ fn choose_table<'a>(
     data: impl Iterator<Item = u8>,
     max_log: u8,
     strategy: crate::encoding::strategy::StrategyTag,
+    next: &'a mut FSETable,
 ) -> FseTableMode<'a> {
     // Collect symbol distribution, tracking the highest code so the selector
     // skips the full-256 reverse scan (see `choose_table_from_counts`).
@@ -1729,6 +1784,7 @@ fn choose_table<'a>(
         // Estimator-only path (no emitted table): price the unadjusted histogram,
         // matching upstream's `ZSTD_NCountCost`.
         None,
+        next,
     )
 }
 
@@ -1776,6 +1832,10 @@ fn choose_table_from_counts<'a>(
     // the cost-estimator call sites, which — like upstream's `ZSTD_NCountCost` —
     // price the unadjusted histogram.
     last_code: Option<usize>,
+    // Where a chosen custom table is built. Borrowed for the returned mode's
+    // lifetime, so the slot stays put while the block writes the table it
+    // describes.
+    next: &'a mut FSETable,
 ) -> FseTableMode<'a> {
     if total == 0 {
         return FseTableMode::Predefined(default_table);
@@ -1883,22 +1943,40 @@ fn choose_table_from_counts<'a>(
         // place the state tables are constructed). `distinct_symbols > 1`
         // held when `new_total_cost` was computed, so the histogram has the
         // two-sample minimum `build_table_from_symbol_counts` requires.
-        Some(Choice::New) => FseTableMode::Encoded(match last_code {
-            Some(lc) => build_seq_ctable(&mut counts[..=max_symbol], max_log, lc),
-            None => {
-                build_table_from_symbol_counts(&counts[..=max_symbol], max_log, use_low_prob_count)
+        // The custom table won the cost comparison, so build it into the slot
+        // it will occupy rather than on the stack.
+        Some(Choice::New) => {
+            match last_code {
+                Some(lc) => build_seq_ctable_into(&mut counts[..=max_symbol], max_log, lc, next),
+                None => build_table_from_symbol_counts_into(
+                    &counts[..=max_symbol],
+                    max_log,
+                    use_low_prob_count,
+                    next,
+                ),
             }
-        }),
+            FseTableMode::Encoded(next)
+        }
         None => {
             let fallback_counts = [counts[0], 0];
-            let fallback = if max_symbol == 0 {
-                // `build_table_from_symbol_counts` needs at least two entries, so
-                // single-symbol streams use a phantom zero-count second slot here.
-                build_table_from_symbol_counts(&fallback_counts, max_log, use_low_prob_count)
+            if max_symbol == 0 {
+                // The builder needs at least two entries, so single-symbol
+                // streams use a phantom zero-count second slot here.
+                build_table_from_symbol_counts_into(
+                    &fallback_counts,
+                    max_log,
+                    use_low_prob_count,
+                    next,
+                );
             } else {
-                build_table_from_symbol_counts(&counts[..=max_symbol], max_log, use_low_prob_count)
-            };
-            FseTableMode::Encoded(fallback)
+                build_table_from_symbol_counts_into(
+                    &counts[..=max_symbol],
+                    max_log,
+                    use_low_prob_count,
+                    next,
+                );
+            }
+            FseTableMode::Encoded(next)
         }
     }
 }
@@ -1930,13 +2008,25 @@ fn encode_fse_table_modes(
 
 fn remember_last_used_tables(
     fse_tables: &mut FseTables,
-    ll_last: Option<PreviousFseTable>,
-    ml_last: Option<PreviousFseTable>,
-    of_last: Option<PreviousFseTable>,
+    ll_last: LastUsedTable,
+    ml_last: LastUsedTable,
+    of_last: LastUsedTable,
 ) {
-    remember_last_used_table(&mut fse_tables.ll_previous, ll_last);
-    remember_last_used_table(&mut fse_tables.ml_previous, ml_last);
-    remember_last_used_table(&mut fse_tables.of_previous, of_last);
+    commit_last_used_table(
+        &mut fse_tables.ll_previous,
+        &mut fse_tables.ll_next,
+        ll_last,
+    );
+    commit_last_used_table(
+        &mut fse_tables.ml_previous,
+        &mut fse_tables.ml_next,
+        ml_last,
+    );
+    commit_last_used_table(
+        &mut fse_tables.of_previous,
+        &mut fse_tables.of_next,
+        of_last,
+    );
 }
 
 #[cfg(test)]
@@ -1947,18 +2037,67 @@ fn previous_table<'a>(
     previous.and_then(|previous| previous.as_table(default))
 }
 
-fn remember_last_used_table(slot: &mut Option<PreviousFseTable>, next: Option<PreviousFseTable>) {
-    if let Some(next) = next {
-        *slot = Some(next);
+/// The slot a block builds its table into, made writable.
+///
+/// Normally nothing else holds the handle parked here, so it is written in
+/// place. A dictionary-seeded frame shares its tables with the entropy cache,
+/// and one of those can end up parked here; a shared handle cannot be written
+/// under its other holder, so the slot takes a fresh one and leaves it alone.
+fn writable_slot(slot: &mut SharedFseTable) -> &mut FSETable {
+    if SharedFseTable::get_mut(slot).is_none() {
+        *slot = SharedFseTable::new(FSETable::blank());
+    }
+    SharedFseTable::get_mut(slot).expect("unique after the replacement above")
+}
+
+/// What a block decided for one axis, once its mode is no longer borrowing the
+/// slot the table was built into.
+#[derive(Clone, Copy)]
+enum LastUsedTable {
+    /// The axis repeated what was already there, so the slot keeps it.
+    Keep,
+    Default,
+    Rle(u8),
+    /// The table is in the axis's `*_next` slot, waiting to be committed.
+    Encoded,
+}
+
+fn into_last_used_table(mode: FseTableMode<'_>) -> LastUsedTable {
+    match mode {
+        FseTableMode::Encoded(_) => LastUsedTable::Encoded,
+        FseTableMode::Predefined(_) => LastUsedTable::Default,
+        FseTableMode::Rle(symbol) => LastUsedTable::Rle(symbol),
+        FseTableMode::RepeatLast(_) => LastUsedTable::Keep,
     }
 }
 
-fn into_last_used_table(mode: FseTableMode<'_>) -> Option<PreviousFseTable> {
-    match mode {
-        FseTableMode::Encoded(table) => Some(PreviousFseTable::Custom(SharedFseTable::new(table))),
-        FseTableMode::Predefined(_) => Some(PreviousFseTable::Default),
-        FseTableMode::Rle(symbol) => Some(PreviousFseTable::Rle(symbol)),
-        FseTableMode::RepeatLast(_) => None,
+/// Make the block's decision for one axis the state the next block reads,
+/// upstream's `ZSTD_blockState_confirmRepcodesAndEntropyTables` for one stream.
+///
+/// For a built table this is a handle swap: what the block wrote into the slot
+/// becomes the previous table, and the handle the previous table was using
+/// becomes the slot for the next block. Two handles per axis, alternating, so
+/// after the first block no axis allocates again.
+fn commit_last_used_table(
+    previous: &mut Option<PreviousFseTable>,
+    next: &mut SharedFseTable,
+    decision: LastUsedTable,
+) {
+    match decision {
+        LastUsedTable::Keep => {}
+        LastUsedTable::Default => *previous = Some(PreviousFseTable::Default),
+        LastUsedTable::Rle(symbol) => *previous = Some(PreviousFseTable::Rle(symbol)),
+        LastUsedTable::Encoded => {
+            // Take the outgoing handle out first, so the swap needs no third
+            // one. Only the first block of an axis finds nothing to swap with
+            // and has to take a handle.
+            let outgoing = match previous.take() {
+                Some(PreviousFseTable::Custom(old)) => old,
+                _ => SharedFseTable::new(FSETable::blank()),
+            };
+            let built = core::mem::replace(next, outgoing);
+            *previous = Some(PreviousFseTable::Custom(built));
+        }
     }
 }
 
@@ -1968,7 +2107,10 @@ fn encode_sequences(
     ll_mode: &FseTableMode<'_>,
     ml_mode: &FseTableMode<'_>,
     of_mode: &FseTableMode<'_>,
-    defaults: &FseTables,
+    // The three predefined tables, in LL / ML / OF order. Passed rather than
+    // read off `FseTables`, whose accessors borrow the whole struct while the
+    // caller is holding its slots.
+    defaults: [&FSETable; 3],
 ) {
     fn mode_table<'a>(mode: &'a FseTableMode<'_>, default: &'a FSETable) -> Option<&'a FSETable> {
         mode.as_table(default)
@@ -1978,9 +2120,10 @@ fn encode_sequences(
     let (ll_code, ll_add_bits, ll_num_bits) = encode_literal_length(sequence.ll);
     let (of_code, of_add_bits, of_num_bits) = encode_offset(sequence.of);
     let (ml_code, ml_add_bits, ml_num_bits) = encode_match_len(sequence.ml);
-    let ll_table = mode_table(ll_mode, defaults.ll_default_ref());
-    let ml_table = mode_table(ml_mode, defaults.ml_default_ref());
-    let of_table = mode_table(of_mode, defaults.of_default_ref());
+    let [ll_default, ml_default, of_default] = defaults;
+    let ll_table = mode_table(ll_mode, ll_default);
+    let ml_table = mode_table(ml_mode, ml_default);
+    let of_table = mode_table(of_mode, of_default);
     // Carried as bare indices, not `Option`s. A component has a state exactly
     // when it has a table, and the tables are resolved once above the loop, so
     // wrapping the state too meant re-asking the same question three times per
