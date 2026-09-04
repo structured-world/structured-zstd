@@ -37,13 +37,28 @@ fn main() {
 
     // Everything above is warm-up. From here the compressor is reused, which is
     // the shape under audit.
+    // `fresh` audits a compressor built inside the profiled region, which is
+    // what a one-shot caller pays and what the upstream one-shot entry point
+    // (`ZSTD_compress`, which creates and frees a context per call) is
+    // measured against. The default reuses the warmed one.
+    let fresh = args.get(3).map(|s| s == "fresh").unwrap_or(false);
+
     #[cfg(feature = "dhat-heap")]
     let profiler = dhat::Profiler::new_heap();
 
     let mut out2 = Vec::new();
-    compressor.set_source(&data[..]);
-    compressor.set_drain(&mut out2);
-    compressor.compress();
+    if fresh {
+        let mut fresh_compressor: FrameCompressor<&[u8], &mut Vec<u8>> =
+            FrameCompressor::new(CompressionLevel::Level(level));
+        fresh_compressor.set_source_size_hint(data.len() as u64);
+        fresh_compressor.set_source(&data[..]);
+        fresh_compressor.set_drain(&mut out2);
+        fresh_compressor.compress();
+    } else {
+        compressor.set_source(&data[..]);
+        compressor.set_drain(&mut out2);
+        compressor.compress();
+    }
 
     // Dropped explicitly so the report covers the frame and not the teardown
     // of the buffers above it.

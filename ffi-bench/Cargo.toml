@@ -227,6 +227,10 @@ name = "encode_loop_z000033"
 path = "../zstd/examples/encode_loop_z000033.rs"
 
 [[example]]
+name = "oneshot_loop"
+path = "../zstd/examples/oneshot_loop.rs"
+
+[[example]]
 name = "ffi_compress_z000033"
 path = "../zstd/examples/ffi_compress_z000033.rs"
 
