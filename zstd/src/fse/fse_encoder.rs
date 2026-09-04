@@ -29,7 +29,7 @@ impl<V: AsMut<Vec<u8>>> FSEEncoder<'_, V> {
         let mut state = self.table.start_state(data[data.len() - 1]);
         for x in data[0..data.len() - 1].iter().rev().copied() {
             let next = self.table.next_state(x, state.index);
-            let diff = state.index - next.baseline;
+            let diff = transition_bits(state.index, next.num_bits);
             self.writer.write_bits(diff as u64, next.num_bits as usize);
             state = next;
         }
@@ -108,7 +108,7 @@ impl<V: AsMut<Vec<u8>>> FSEEncoder<'_, V> {
 
     fn encode_symbol_with_state(&mut self, state_index: usize, symbol: u8) -> usize {
         let next = self.table.next_state(symbol, state_index);
-        let diff = state_index - next.baseline;
+        let diff = transition_bits(state_index, next.num_bits);
         self.writer.write_bits(diff as u64, next.num_bits as usize);
         next.index
     }
@@ -222,15 +222,10 @@ impl FSETable {
         let tt = self.symbol_tt[symbol as usize];
         let value = (self.table_size + idx) as u32;
         let nb_bits = ((value + tt.delta_nb_bits) >> 16) as usize;
-        let mask = (1usize << nb_bits) - 1;
-        let baseline = idx & !mask;
         let slot = ((value >> nb_bits) as isize + tt.delta_find_state) as usize;
-        let next_index = self.state_table_flat[slot] as usize;
         State {
             num_bits: nb_bits as u8,
-            baseline,
-            last_index: baseline + mask,
-            index: next_index,
+            index: self.state_table_flat[slot] as usize,
         }
     }
 
@@ -248,15 +243,9 @@ impl FSETable {
             .expect("symbol must be present in the FSE table");
         // Callers consume only `index` (audited across the encoder + sequence
         // emit paths). Upstream zstd `FSE_initCState2` likewise stores just the
-        // start state value; `num_bits` / `baseline` are properties of
-        // transitions, not of the initial state, so they have no
-        // meaningful values here and are zeroed.
-        State {
-            num_bits: 0,
-            baseline: 0,
-            last_index: 0,
-            index,
-        }
+        // start state value; `num_bits` is a property of a transition, not of
+        // the initial state, so it has no meaningful value here and is zeroed.
+        State { num_bits: 0, index }
     }
 
     pub fn acc_log(&self) -> u8 {
@@ -376,23 +365,30 @@ pub(super) struct SymbolStates {
 // max-nb-bits, probability — is precomputed once per symbol via the
 // upstream zstd arithmetic and held in [`SymbolStates`].
 
+/// A transition's outcome: how many bits the encoder must emit for it, and
+/// where the state lands.
+///
+/// Two fields and no more, so the whole thing comes back in registers on a
+/// 64-bit ABI rather than through the stack — this is returned three times per
+/// sequence. The transition's baseline is deliberately absent: a caller wanting
+/// the bits to emit takes `index & ((1 << num_bits) - 1)` from the state it came
+/// from, since the baseline is that same index with those low bits cleared.
+/// Upstream leans on the same identity, emitting `statePtr->value` directly
+/// under a width rather than subtracting anything (`FSE_encodeSymbol`).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct State {
     /// How many bits the range of this state needs to be encoded as
     pub(crate) num_bits: u8,
-    /// The first index targeted by this state
-    pub(crate) baseline: usize,
-    /// The last index targeted by this state (baseline + the maximum
-    /// number with numbits bits allows). Computed by
-    /// [`FSETable::next_state`] for parity with the old
-    /// `Vec<State>` storage and consumed by the BTreeSet dedup in the
-    /// table builder (`build_table_from_probabilities`); not read on
-    /// the encode hot path (the linear-search consumer was retired in
-    /// #164).
-    #[allow(dead_code)]
-    pub(crate) last_index: usize,
     /// Index of this state in the decoding table
     pub(crate) index: usize,
+}
+
+/// The bits a transition out of `index` emits, given its width.
+///
+/// `index - baseline` where `baseline = index & !mask`, which is `index & mask`.
+#[inline(always)]
+pub(crate) fn transition_bits(index: usize, num_bits: u8) -> usize {
+    index & ((1usize << num_bits) - 1)
 }
 
 #[cfg(any(test, feature = "fuzz-exports"))]

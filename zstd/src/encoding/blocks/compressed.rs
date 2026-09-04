@@ -1979,7 +1979,7 @@ fn encode_sequences(
             // header reserve).
             if let (Some(table), Some(state)) = (of_table, of_state) {
                 let next = table.next_state(of_code, state.index);
-                let diff = state.index - next.baseline;
+                let diff = crate::fse::fse_encoder::transition_bits(state.index, next.num_bits);
                 unsafe {
                     writer.write_bits_64_no_check(diff as u64, next.num_bits as usize);
                 }
@@ -1987,7 +1987,7 @@ fn encode_sequences(
             }
             if let (Some(table), Some(state)) = (ml_table, ml_state) {
                 let next = table.next_state(ml_code, state.index);
-                let diff = state.index - next.baseline;
+                let diff = crate::fse::fse_encoder::transition_bits(state.index, next.num_bits);
                 unsafe {
                     writer.write_bits_64_no_check(diff as u64, next.num_bits as usize);
                 }
@@ -1995,7 +1995,7 @@ fn encode_sequences(
             }
             if let (Some(table), Some(state)) = (ll_table, ll_state) {
                 let next = table.next_state(ll_code, state.index);
-                let diff = state.index - next.baseline;
+                let diff = crate::fse::fse_encoder::transition_bits(state.index, next.num_bits);
                 unsafe {
                     writer.write_bits_64_no_check(diff as u64, next.num_bits as usize);
                 }
