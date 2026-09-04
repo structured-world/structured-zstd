@@ -168,6 +168,15 @@ name = "alloc_audit_fresh"
 path = "../zstd/examples/alloc_audit_fresh.rs"
 
 [[example]]
+name = "alloc_census_warm"
+path = "../zstd/examples/alloc_census_warm.rs"
+
+[[example]]
+name = "alloc_sites_warm"
+path = "../zstd/examples/alloc_sites_warm.rs"
+required-features = ["dhat-heap"]
+
+[[example]]
 name = "huf_matrix"
 path = "../zstd/examples/huf_matrix.rs"
 required-features = ["bench-internals"]
