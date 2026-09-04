@@ -1208,6 +1208,19 @@ impl ExactCopyTier {
 /// routine is a good medium-run implementation — it is a real fallback, not a
 /// degraded one.
 ///
+/// What the tiers cost, so this is not "optimised" back to a compile-time gate:
+/// runtime selection means the SIMD kernels carry `#[target_feature]` and are
+/// therefore CALLED, where a baseline-gated kernel could inline. Measured on the
+/// i9 against the previous compile-time build, which inlined a 16-byte SSE2 body
+/// there, the out-of-line 32-byte AVX2 path came out +0.2% instructions and
+/// +0.7% cycles on decodecorpus z000033 at level 3 — inside the run-to-run band,
+/// so the wider stores and the call boundary roughly cancel on literal runs this
+/// short. The reason to dispatch at runtime is therefore reach, not speed: under
+/// the compile-time gate a stock `x86_64` artifact could not execute the AVX2
+/// kernel at all, on any CPU. Do not read the near-neutral result as licence to
+/// go back — that gate also silently narrowed the path, and once fell all the
+/// way through to a `memcpy` call in a routine written to avoid one.
+///
 /// # Safety
 /// `src` readable and `dst` writable for `len` bytes; regions non-overlapping.
 /// `len` MUST be `>= 33`: every SIMD kernel reads/writes an overlapping tail at
