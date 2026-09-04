@@ -1750,8 +1750,11 @@ pub(crate) fn huf_weight_description_for_test(data: &[u8]) -> (Vec<u8>, Vec<u8>)
     let mut buf = [0u8; MAX_HUFFMAN_ALPHABET];
     let mut weights = table.weights_into(&mut buf).to_vec();
     weights.pop();
-    let encoded = HuffmanEncoder::<Vec<u8>>::encode_weight_description(&weights)
-        .expect("expected FSE weights");
+    let mut encoded = Vec::new();
+    assert!(
+        HuffmanEncoder::<Vec<u8>>::encode_weight_description_into(&weights, &mut encoded),
+        "expected FSE weights",
+    );
     let mut description = Vec::with_capacity(encoded.len() + 1);
     description.push(encoded.len() as u8);
     description.extend_from_slice(&encoded);

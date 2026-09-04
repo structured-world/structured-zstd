@@ -11,7 +11,23 @@
 //! remains is what a steady-state frame costs.
 //!
 //! Run: `cargo run --release -p structured-zstd --example alloc_census_warm
-//!        -- <level> [corpus path]`
+//!        -- <level> [corpus path] [fresh]`
+//!
+//! When comparing PAGE FAULTS between two builds on the fresh shape, pin the
+//! allocator first:
+//!
+//! ```text
+//! MALLOC_MMAP_THRESHOLD_=1000000000 MALLOC_TRIM_THRESHOLD_=1000000000 perf stat -e page-faults ...
+//! ```
+//!
+//! A compressor that does not outlive its frame hands several megabytes back
+//! to the allocator every frame, and whether those pages reach the OS is
+//! decided by glibc's adaptive mmap and trim thresholds, not by the encoder.
+//! Unpinned, two builds of the same source have been measured twenty-fold
+//! apart on this metric while their user-space instruction counts differed by
+//! 0.07%; pinned, both land on the same figure, which is the working set. Note
+//! that setting either variable disables the dynamic adjustment of BOTH, so
+//! pin them together or the measurement swaps one artefact for another.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::env;
