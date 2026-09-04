@@ -1,5 +1,4 @@
 use super::*;
-use crate::encoding::CompressionLevel;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -64,65 +63,6 @@ fn scan_sample_region_early_exits_on_repetitive_input() {
 
     assert!(bailed, "repetitive input must trigger the early exit");
     assert!(repeats > 1, "repeat count must have exceeded the guard");
-}
-
-#[test]
-fn best_raw_fast_path_requires_better_sized_window() {
-    assert!(compression_level_allows_raw_fast_path(
-        CompressionLevel::Best,
-        RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES
-    ));
-    assert!(!compression_level_allows_raw_fast_path(
-        CompressionLevel::Best,
-        RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES + 1
-    ));
-}
-
-#[test]
-fn level4_row_raw_fast_path_allowed_with_better_window_reach() {
-    assert!(compression_level_allows_raw_fast_path(
-        CompressionLevel::Level(4),
-        RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES
-    ));
-    // Over-cap numeric level is rejected, same boundary as `Best`, so the
-    // two branches can't drift apart.
-    assert!(!compression_level_allows_raw_fast_path(
-        CompressionLevel::Level(4),
-        RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES + 1
-    ));
-}
-
-#[test]
-fn strict_incompressible_reuses_full_block_classification_for_min_block() {
-    let block = vec![0xA5; RAW_FAST_PATH_MIN_BLOCK_LEN];
-    let probes = select_strict_probes(block.len());
-    assert_eq!(
-        probes.tail_start, None,
-        "minimum-size strict blocks must reuse the full-block sample"
-    );
-    assert_eq!(
-        block_looks_incompressible_strict(&block),
-        sample_looks_incompressible(&block),
-        "strict path should not re-score identical probes for minimum-size blocks"
-    );
-}
-
-#[test]
-fn strict_probe_selector_avoids_overlap_on_small_non_min_blocks() {
-    let near_min = select_strict_probes(RAW_FAST_PATH_MIN_BLOCK_LEN + 1);
-    assert_eq!(near_min.tail_start, None);
-    assert_eq!(near_min.mid_start, None);
-
-    let two_probe = select_strict_probes(RAW_FAST_PATH_MIN_BLOCK_LEN * 2);
-    assert_eq!(two_probe.tail_start, Some(RAW_FAST_PATH_MIN_BLOCK_LEN));
-    assert_eq!(two_probe.mid_start, None);
-
-    let three_probe = select_strict_probes(RAW_FAST_PATH_MIN_BLOCK_LEN * 3);
-    assert_eq!(
-        three_probe.tail_start,
-        Some(RAW_FAST_PATH_MIN_BLOCK_LEN * 2)
-    );
-    assert_eq!(three_probe.mid_start, Some(RAW_FAST_PATH_MIN_BLOCK_LEN));
 }
 
 #[test]

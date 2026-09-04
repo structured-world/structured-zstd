@@ -2798,6 +2798,45 @@ fn noise_bytes(len: usize, seed: u32) -> Vec<u8> {
         .collect()
 }
 
+/// Regression: high-entropy input that REPEATS must be searched, not written
+/// off by its own appearance.
+///
+/// The encoder used to sample a block for entropy and, if the sample looked
+/// random, emit it raw without searching at all. Both halves of this payload
+/// look random to any such sample, so the second half was never compared
+/// against the first and a 256 KiB match was thrown away: the frame came out
+/// the size of its input. The reference has no such pre-check — it searches and
+/// halves this — and now so does this encoder.
+#[test]
+fn repeated_high_entropy_input_is_searched_not_written_off() {
+    let half = noise_bytes(256 * 1024, 0xBEEF);
+    let mut payload = half.clone();
+    payload.extend_from_slice(&half);
+
+    for level in [
+        super::CompressionLevel::Level(1),
+        super::CompressionLevel::Level(3),
+        super::CompressionLevel::Level(5),
+        super::CompressionLevel::Level(9),
+    ] {
+        let mut compressor: FrameCompressor = FrameCompressor::new(level);
+        let frame = compressor.compress_independent_frame(&payload);
+        assert!(
+            frame.len() * 3 < payload.len() * 2,
+            "{level:?}: the second half repeats the first, so the frame must be far \
+             below two thirds of the input ({} of {})",
+            frame.len(),
+            payload.len(),
+        );
+        let mut decoder = FrameDecoder::new();
+        let mut decoded = Vec::with_capacity(payload.len());
+        decoder
+            .decode_all_to_vec(&frame, &mut decoded)
+            .expect("frame decodes");
+        assert_eq!(decoded, payload, "{level:?}: round trip");
+    }
+}
+
 /// Regression: a COPIED dictionary (source above the 32 KiB attach cutoff)
 /// whose CDict cParams select the hash-chain finder (a 4 KiB dictionary
 /// resolves to a window of 2^14 or less) must be indexed at ABSOLUTE
@@ -2887,10 +2926,20 @@ fn small_dictionary_on_btlazy2_level_contributes_matches() {
     let frame = with_dict.compress_independent_frame(&payload);
     let mut plain: FrameCompressor = FrameCompressor::new(level);
     let no_dict = plain.compress_independent_frame(&payload);
-    // Every 264-byte record carries a 64-byte dictionary slice: the
-    // dictionary must remove well over a tenth of the output.
+    // Every 264-byte record carries a 64-byte dictionary slice, so the
+    // dictionary must take a visible bite out of the output.
+    //
+    // The margin is measured against a baseline that finds what it can on its
+    // own. The records are drawn from a 4 KiB dictionary, so those slices also
+    // recur WITHIN the payload, and the no-dict arm finds them: it went from
+    // 102,444 bytes to 82,581 when the encoder stopped skipping the search on
+    // blocks that merely look high-entropy. The dictionary arm did not move at
+    // all across that change (79,121 either way), so the smaller margin here
+    // reports a stronger baseline, not a weaker dictionary. The regression this
+    // guards is the dictionary contributing NOTHING — primed into tables the
+    // search never reads — which would put the two arms level.
     assert!(
-        frame.len() * 10 < no_dict.len() * 9,
+        frame.len() * 100 < no_dict.len() * 97,
         "the dictionary must supply matches at L13 ({} vs {} without it)",
         frame.len(),
         no_dict.len()

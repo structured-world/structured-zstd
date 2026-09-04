@@ -1,14 +1,6 @@
-use super::CompressionLevel;
-
 pub(crate) const RAW_FAST_PATH_MIN_BLOCK_LEN: usize = 512;
 pub(crate) const RAW_FAST_PATH_MAX_SAMPLE_LEN: usize = 4096;
 pub(crate) const RAW_FAST_PATH_MIN_SAMPLE_LEN: usize = 32;
-/// Window-size ceiling (8 MiB) above which the incompressible raw-fast-path is
-/// disabled for `Best` / numeric levels: the largest-window levels (L20-22)
-/// do full match-finding even on apparently-incompressible blocks rather than
-/// risk emitting raw blocks where a far back-reference might still pay off.
-const RAW_FAST_PATH_MAX_WINDOW_LOG: u8 = 23;
-const RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES: u64 = 1u64 << RAW_FAST_PATH_MAX_WINDOW_LOG;
 
 // Keep classifier scratch modest for no_std/small-stack targets: 1024 slots
 // cuts per-call stack for repeat tracking from ~8 KiB to ~4 KiB.
@@ -22,71 +14,6 @@ const INCOMPRESSIBLE_MIN_DISTINCT_BYTES: usize = 200;
 const INCOMPRESSIBLE_MAX_SYMBOL_DIVISOR: usize = 24;
 // Allow limited 4-byte hash-bucket repeats before treating the sample as structured.
 const INCOMPRESSIBLE_REPEAT_DIVISOR: usize = 64;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct StrictProbeSelection {
-    probe_len: usize,
-    tail_start: Option<usize>,
-    mid_start: Option<usize>,
-}
-
-impl StrictProbeSelection {
-    #[inline]
-    const fn reuses_full_block_classification(self) -> bool {
-        self.tail_start.is_none()
-    }
-}
-
-#[inline]
-fn select_strict_probes(block_len: usize) -> StrictProbeSelection {
-    let probe_len = RAW_FAST_PATH_MIN_BLOCK_LEN.min(block_len);
-    if probe_len == block_len {
-        StrictProbeSelection {
-            probe_len,
-            tail_start: None,
-            mid_start: None,
-        }
-    } else {
-        let tail_start = block_len - probe_len;
-        if tail_start < probe_len {
-            // For [probe_len + 1, 2 * probe_len), head/tail would heavily overlap.
-            // Reuse the full-block classification computed by the caller.
-            StrictProbeSelection {
-                probe_len,
-                tail_start: None,
-                mid_start: None,
-            }
-        } else if tail_start < 2 * probe_len {
-            // For [2 * probe_len, 3 * probe_len), head/tail are separable but a
-            // distinct non-overlapping middle probe is not.
-            StrictProbeSelection {
-                probe_len,
-                tail_start: Some(tail_start),
-                mid_start: None,
-            }
-        } else {
-            // Once we can separate all windows, use head/mid/tail probing.
-            StrictProbeSelection {
-                probe_len,
-                tail_start: Some(tail_start),
-                mid_start: Some(tail_start / 2),
-            }
-        }
-    }
-}
-
-#[inline]
-pub(crate) fn compression_level_allows_raw_fast_path(
-    level: CompressionLevel,
-    window_size: u64,
-) -> bool {
-    match level {
-        CompressionLevel::Fastest | CompressionLevel::Default | CompressionLevel::Better => true,
-        CompressionLevel::Best => window_size <= RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES,
-        CompressionLevel::Level(_) => window_size <= RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES,
-        CompressionLevel::Uncompressed => false,
-    }
-}
 
 /// Accumulate byte counts and 4-byte repeat hits for one sample region in a
 /// single pass.
@@ -158,63 +85,6 @@ pub(crate) fn block_looks_incompressible(block: &[u8]) -> bool {
         return false;
     }
     sample_looks_incompressible(block)
-}
-
-/// Dict-aware incompressibility check: stricter than the plain no-dict
-/// heuristic. With a dictionary attached, a block that LOOKS high-entropy in a
-/// small fixed sample can still compress — either against the dict, or via a
-/// long-range internal repeat the capped sample never spans. So sample the WHOLE
-/// block, which surfaces those repeats; only blocks that stay high-entropy
-/// across their full length are skipped to raw. Truly random data is still
-/// classified incompressible (no repeats anywhere), so the no-dict-quality
-/// rejection of incompressible input is preserved — it is only harder to trip on
-/// the dict path, never weaker.
-///
-/// This covers INTERNAL repeats only. EXTERNAL dict matches (a dict segment
-/// embedded in otherwise-incompressible input — content this content-only sample
-/// can never see) are caught by a SEPARATE layer at the call site: the raw skip
-/// fires only when this returns `true` AND `Matcher::block_samples_match_dict`
-/// finds no extendable dict match. So a block that matches the dictionary is
-/// never emitted raw, even though this function, by design, does not probe the
-/// dict itself.
-#[inline]
-pub(crate) fn block_looks_incompressible_dict(block: &[u8]) -> bool {
-    if block.len() < RAW_FAST_PATH_MIN_BLOCK_LEN {
-        return false;
-    }
-    sample_looks_incompressible_capped(block, block.len())
-}
-
-#[inline]
-pub(crate) fn block_looks_incompressible_strict(block: &[u8]) -> bool {
-    if block.len() < RAW_FAST_PATH_MIN_BLOCK_LEN {
-        return false;
-    }
-    if !sample_looks_incompressible(block) {
-        return false;
-    }
-    // Best level should only early-exit on strongly random data. Probe head,
-    // middle, and tail so mixed-entropy blocks do not get misclassified.
-    let selection = select_strict_probes(block.len());
-    if selection.reuses_full_block_classification() {
-        // The full-block sample above already classified this input. For
-        // minimum and near-min blocks, split probes would overlap too heavily.
-        return true;
-    }
-    let probe_len = selection.probe_len;
-    let tail_start = selection
-        .tail_start
-        .expect("strict probe tail_start should be present for split probes");
-    let head = &block[..probe_len];
-    let tail = &block[tail_start..tail_start + probe_len];
-    if let Some(mid_start) = selection.mid_start {
-        let mid = &block[mid_start..mid_start + probe_len];
-        sample_looks_incompressible(head)
-            && sample_looks_incompressible(mid)
-            && sample_looks_incompressible(tail)
-    } else {
-        sample_looks_incompressible(head) && sample_looks_incompressible(tail)
-    }
 }
 
 #[inline]

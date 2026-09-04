@@ -1548,16 +1548,12 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             if self.content_checksum {
                 self.hasher.write(block);
             }
-            let dict_active =
-                self.dictionary.is_some() && self.state.matcher.supports_dictionary_priming();
             crate::encoding::levels::compress_block_encoded_borrowed(
                 &mut self.state,
-                self.compression_level,
                 last_block,
                 block,
                 start,
                 end,
-                dict_active,
                 out,
                 #[cfg(feature = "lsm")]
                 Some(&mut self.block_decompressed_sizes),
@@ -2419,8 +2415,6 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                     // supports priming — a non-priming matcher ignores an
                     // attached dictionary, so the raw-fast-path must stay
                     // enabled for it. (This arm is already non-Uncompressed.)
-                    let dict_active = self.dictionary.is_some()
-                        && self.state.matcher.supports_dictionary_priming();
                     let block_input = if in_place.is_some() {
                         crate::encoding::levels::BlockInput::InPlace(block_len)
                     } else {
@@ -2432,7 +2426,6 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                         last_block,
                         block_input,
                         out,
-                        dict_active,
                         #[cfg(feature = "lsm")]
                         Some(&mut self.block_decompressed_sizes),
                         #[cfg(all(feature = "lsm", feature = "hash"))]

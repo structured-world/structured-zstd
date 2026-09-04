@@ -598,6 +598,7 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
             strategy,
             state.huf_optimal_search,
             &mut state.huff_weights,
+            literals_suspected_incompressible(literals_vec.len(), raw_sequences.len()),
         ) {
             HuffmanTableUpdate::New(table) => {
                 state.replace_huff_table(table);
@@ -2362,6 +2363,31 @@ fn emit_reuse_literals(
     }
 }
 
+/// Bytes taken from each end when a section is suspected incompressible
+/// (upstream `SUSPECT_INCOMPRESSIBLE_SAMPLE_SIZE`, `huf_compress.c:1251`).
+const SUSPECT_SAMPLE_SIZE: usize = 4096;
+/// How many times the sample must fit in the section before sampling is worth
+/// it at all (upstream `SUSPECT_INCOMPRESSIBLE_SAMPLE_RATIO`).
+const SUSPECT_SAMPLE_RATIO: usize = 10;
+/// Literals per sequence at or above which a section is suspected
+/// incompressible even though the search did find something (upstream
+/// `SUSPECT_UNCOMPRESSIBLE_LITERAL_RATIO`, `zstd_compress.c:2886`).
+pub(crate) const SUSPECT_LITERAL_RATIO: usize = 20;
+
+/// Whether the literals of a block that produced `sequence_count` sequences
+/// should be probed by sample before the full histogram is paid for.
+///
+/// Upstream `zstd_compress.c:2924`. A block whose search found nothing, or
+/// found so little that the literals dwarf it, is the shape that ends up
+/// emitted raw, and the histogram it would otherwise pay for spans the whole
+/// section.
+pub(crate) fn literals_suspected_incompressible(
+    literals_len: usize,
+    sequence_count: usize,
+) -> bool {
+    sequence_count == 0 || literals_len / sequence_count >= SUSPECT_LITERAL_RATIO
+}
+
 fn compress_literals(
     literals: &[u8],
     last_table: Option<&huff0_encoder::HuffmanTable>,
@@ -2369,6 +2395,7 @@ fn compress_literals(
     strategy: crate::encoding::strategy::StrategyTag,
     huf_search: bool,
     weight_scratch: &mut huff0_encoder::WeightScratch,
+    suspected_incompressible: bool,
 ) -> HuffmanTableUpdate {
     let reset_idx = writer.index();
 
@@ -2390,6 +2417,33 @@ fn compress_literals(
     }
 
     let mut counts = [0usize; 256];
+
+    // Sample before committing to the full histogram (upstream
+    // `huf_compress.c:1367`). The histogram spans the whole section, and for a
+    // block the search found nothing in that section is the entire block — a
+    // megabyte of random input costs a megabyte of counting only to be thrown
+    // away by the flatness gate below. Two 4 KiB probes, one from each end,
+    // answer the same question for 8 KiB of counting.
+    //
+    // Both ends, not one: a section that is random at the front and structured
+    // at the back must not be judged on the front alone. The counts are cleared
+    // between the probes so each reports its own most frequent symbol, which is
+    // what the summed threshold is scaled for.
+    if suspected_incompressible && literals.len() >= SUSPECT_SAMPLE_SIZE * SUSPECT_SAMPLE_RATIO {
+        let (_, head_largest) =
+            crate::histogram::count_bytes(&literals[..SUSPECT_SAMPLE_SIZE], &mut counts);
+        counts.fill(0);
+        let (_, tail_largest) = crate::histogram::count_bytes(
+            &literals[literals.len() - SUSPECT_SAMPLE_SIZE..],
+            &mut counts,
+        );
+        if head_largest + tail_largest <= ((2 * SUSPECT_SAMPLE_SIZE) >> 7) + 4 {
+            raw_literals(literals, writer);
+            return HuffmanTableUpdate::Cleared;
+        }
+        counts.fill(0);
+    }
+
     let (max_symbol, largest_count) = crate::histogram::count_bytes(literals, &mut counts);
     // Upstream zstd pre-build incompressibility gate (`huf_compress.c`,
     // `HUF_compress_internal`): a histogram this flat
