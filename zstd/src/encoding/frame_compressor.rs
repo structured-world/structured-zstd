@@ -347,17 +347,21 @@ pub(crate) struct FseTables {
     /// swap (`ZSTD_blockState_confirmRepcodesAndEntropyTables`). A block that
     /// ends up raw simply does not swap. Holding the slot here is what lets a
     /// table be built in place instead of on the stack.
-    pub(crate) ll_next: SharedFseTable,
-    pub(crate) ml_next: SharedFseTable,
-    pub(crate) of_next: SharedFseTable,
+    /// `None` until an axis first builds a table. Lazy because a state that
+    /// never emits a custom table must not pay for a slot: the block splitter
+    /// makes one of these per probe, and eagerly giving each three tables
+    /// faulted in pages for buffers most probes never wrote to.
+    pub(crate) ll_next: Option<SharedFseTable>,
+    pub(crate) ml_next: Option<SharedFseTable>,
+    pub(crate) of_next: Option<SharedFseTable>,
 }
 
 impl FseTables {
     pub fn new() -> Self {
         Self {
-            ll_next: SharedFseTable::new(crate::fse::fse_encoder::FSETable::blank()),
-            ml_next: SharedFseTable::new(crate::fse::fse_encoder::FSETable::blank()),
-            of_next: SharedFseTable::new(crate::fse::fse_encoder::FSETable::blank()),
+            ll_next: None,
+            ml_next: None,
+            of_next: None,
             ll_default: default_ll_table(),
             ll_previous: None,
             ml_default: default_ml_table(),

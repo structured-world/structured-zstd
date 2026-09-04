@@ -1451,11 +1451,12 @@ fn clone_fse_tables(fse_tables: &FseTables) -> FseTables {
         #[cfg(not(any(target_has_atomic = "ptr", feature = "critical-section")))]
         of_default: fse_tables.of_default.clone(),
         of_previous: fse_tables.of_previous.clone(),
-        // Its own slots: a probe builds tables too, and sharing the emitter's
-        // would let each overwrite what the other is describing.
-        ll_next: SharedFseTable::new(FSETable::blank()),
-        ml_next: SharedFseTable::new(FSETable::blank()),
-        of_next: SharedFseTable::new(FSETable::blank()),
+        // Empty, not blank tables: a probe gets its own slots so it cannot
+        // overwrite what the emitter is describing, but most probes never
+        // build a custom table and must not pay for one.
+        ll_next: None,
+        ml_next: None,
+        of_next: None,
     }
 }
 
@@ -2043,11 +2044,16 @@ fn previous_table<'a>(
 /// place. A dictionary-seeded frame shares its tables with the entropy cache,
 /// and one of those can end up parked here; a shared handle cannot be written
 /// under its other holder, so the slot takes a fresh one and leaves it alone.
-fn writable_slot(slot: &mut SharedFseTable) -> &mut FSETable {
-    if SharedFseTable::get_mut(slot).is_none() {
-        *slot = SharedFseTable::new(FSETable::blank());
+fn writable_slot(slot: &mut Option<SharedFseTable>) -> &mut FSETable {
+    let needs_fresh = match slot.as_mut() {
+        Some(handle) => SharedFseTable::get_mut(handle).is_none(),
+        None => true,
+    };
+    if needs_fresh {
+        *slot = Some(SharedFseTable::new(FSETable::blank()));
     }
-    SharedFseTable::get_mut(slot).expect("unique after the replacement above")
+    SharedFseTable::get_mut(slot.as_mut().expect("filled just above"))
+        .expect("unique after the replacement above")
 }
 
 /// What a block decided for one axis, once its mode is no longer borrowing the
@@ -2080,7 +2086,7 @@ fn into_last_used_table(mode: FseTableMode<'_>) -> LastUsedTable {
 /// after the first block no axis allocates again.
 fn commit_last_used_table(
     previous: &mut Option<PreviousFseTable>,
-    next: &mut SharedFseTable,
+    next: &mut Option<SharedFseTable>,
     decision: LastUsedTable,
 ) {
     match decision {
@@ -2089,13 +2095,15 @@ fn commit_last_used_table(
         LastUsedTable::Rle(symbol) => *previous = Some(PreviousFseTable::Rle(symbol)),
         LastUsedTable::Encoded => {
             // Take the outgoing handle out first, so the swap needs no third
-            // one. Only the first block of an axis finds nothing to swap with
-            // and has to take a handle.
+            // one; the slot is left empty when there was none, and the next
+            // build fills it rather than a blank being made here for a block
+            // that may not need one.
             let outgoing = match previous.take() {
-                Some(PreviousFseTable::Custom(old)) => old,
-                _ => SharedFseTable::new(FSETable::blank()),
+                Some(PreviousFseTable::Custom(old)) => Some(old),
+                _ => None,
             };
-            let built = core::mem::replace(next, outgoing);
+            let built = core::mem::replace(next, outgoing)
+                .expect("Encoded means the slot holds the table just built");
             *previous = Some(PreviousFseTable::Custom(built));
         }
     }
