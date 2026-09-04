@@ -865,6 +865,11 @@ impl HuffmanTable {
 
     #[cfg(feature = "std")]
     fn fill_weight_description_from_codes(&mut self) {
+        // Before deriving the weights, not after: they cost a pass over the
+        // whole alphabet, and a warm cache needs none of it.
+        if self.cached_encoded_weight_description.state != DescriptionState::NotComputed {
+            return;
+        }
         let mut buf = [0u8; MAX_HUFFMAN_ALPHABET];
         // The returned slice borrows `buf`, not `self`, so the shared borrow
         // ends here and the fill below can take `&mut self`.
