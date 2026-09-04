@@ -718,7 +718,7 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
             9,
             state.strategy_tag,
             Some(last_ll),
-            writable_slot(ll_next),
+            ll_next,
         );
         let ml_mode = choose_table_from_counts(
             ml_previous.as_ref(),
@@ -729,7 +729,7 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
             9,
             state.strategy_tag,
             Some(last_ml),
-            writable_slot(ml_next),
+            ml_next,
         );
         let of_mode = choose_table_from_counts(
             of_previous.as_ref(),
@@ -740,7 +740,7 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
             8,
             state.strategy_tag,
             Some(last_of),
-            writable_slot(of_next),
+            of_next,
         );
 
         writer.write_bits(encode_fse_table_modes(&ll_mode, &ml_mode, &of_mode), 8);
@@ -1068,7 +1068,7 @@ fn estimate_sequences_section_bytes(
         sequences.iter().map(|seq| encode_literal_length(seq.ll).0),
         9,
         strategy,
-        writable_slot(ll_next),
+        ll_next,
     );
     let ml_mode = choose_table(
         ml_previous.as_ref(),
@@ -1076,7 +1076,7 @@ fn estimate_sequences_section_bytes(
         sequences.iter().map(|seq| encode_match_len(seq.ml).0),
         9,
         strategy,
-        writable_slot(ml_next),
+        ml_next,
     );
     let of_mode = choose_table(
         of_previous.as_ref(),
@@ -1084,7 +1084,7 @@ fn estimate_sequences_section_bytes(
         sequences.iter().map(|seq| encode_offset(seq.of).0),
         8,
         strategy,
-        writable_slot(of_next),
+        of_next,
     );
 
     let ll_bits_chosen = fse_section_bits_for_mode(&ll_mode, ll_counts, ll_default);
@@ -1777,7 +1777,7 @@ fn choose_table<'a>(
     data: impl Iterator<Item = u8>,
     max_log: u8,
     strategy: crate::encoding::strategy::StrategyTag,
-    next: &'a mut FSETable,
+    next: &'a mut Option<SharedFseTable>,
 ) -> FseTableMode<'a> {
     // Collect symbol distribution, tracking the highest code so the selector
     // skips the full-256 reverse scan (see `choose_table_from_counts`).
@@ -1852,7 +1852,7 @@ fn choose_table_from_counts<'a>(
     // Where a chosen custom table is built. Borrowed for the returned mode's
     // lifetime, so the slot stays put while the block writes the table it
     // describes.
-    next: &'a mut FSETable,
+    next: &'a mut Option<SharedFseTable>,
 ) -> FseTableMode<'a> {
     if total == 0 {
         return FseTableMode::Predefined(default_table);
@@ -1963,37 +1963,39 @@ fn choose_table_from_counts<'a>(
         // The custom table won the cost comparison, so build it into the slot
         // it will occupy rather than on the stack.
         Some(Choice::New) => {
-            match last_code {
-                Some(lc) => build_seq_ctable_into(&mut counts[..=max_symbol], max_log, lc, next),
+            build_into_slot(next, |dest| match last_code {
+                Some(lc) => build_seq_ctable_into(&mut counts[..=max_symbol], max_log, lc, dest),
                 None => build_table_from_symbol_counts_into(
                     &counts[..=max_symbol],
                     max_log,
                     use_low_prob_count,
-                    next,
+                    dest,
                 ),
-            }
-            FseTableMode::Encoded(next)
+            });
+            FseTableMode::Encoded(slot_table(next))
         }
         None => {
             let fallback_counts = [counts[0], 0];
-            if max_symbol == 0 {
-                // The builder needs at least two entries, so single-symbol
-                // streams use a phantom zero-count second slot here.
-                build_table_from_symbol_counts_into(
-                    &fallback_counts,
-                    max_log,
-                    use_low_prob_count,
-                    next,
-                );
-            } else {
-                build_table_from_symbol_counts_into(
-                    &counts[..=max_symbol],
-                    max_log,
-                    use_low_prob_count,
-                    next,
-                );
-            }
-            FseTableMode::Encoded(next)
+            build_into_slot(next, |dest| {
+                if max_symbol == 0 {
+                    // The builder needs at least two entries, so single-symbol
+                    // streams use a phantom zero-count second slot here.
+                    build_table_from_symbol_counts_into(
+                        &fallback_counts,
+                        max_log,
+                        use_low_prob_count,
+                        dest,
+                    );
+                } else {
+                    build_table_from_symbol_counts_into(
+                        &counts[..=max_symbol],
+                        max_log,
+                        use_low_prob_count,
+                        dest,
+                    );
+                }
+            });
+            FseTableMode::Encoded(slot_table(next))
         }
     }
 }
@@ -2058,16 +2060,25 @@ fn previous_table<'a>(
 /// place. A dictionary-seeded frame shares its tables with the entropy cache,
 /// and one of those can end up parked here; a shared handle cannot be written
 /// under its other holder, so the slot takes a fresh one and leaves it alone.
-fn writable_slot(slot: &mut Option<SharedFseTable>) -> &mut FSETable {
-    let needs_fresh = match slot.as_mut() {
-        Some(handle) => SharedFseTable::get_mut(handle).is_none(),
-        None => true,
-    };
-    if needs_fresh {
-        *slot = Some(SharedFseTable::new(FSETable::blank()));
+fn build_into_slot(slot: &mut Option<SharedFseTable>, build: impl FnOnce(&mut FSETable)) {
+    // Reuse the handle parked here when nothing else holds it. Otherwise build
+    // the table on the stack and move it into a handle, which is what the
+    // allocate-per-block path did: taking a handle to a zeroed table and then
+    // filling it writes every page twice and, on a compressor that does not
+    // outlive its frame, faults them all in.
+    if let Some(dest) = slot.as_mut().and_then(SharedFseTable::get_mut) {
+        build(dest);
+        return;
     }
-    SharedFseTable::get_mut(slot.as_mut().expect("filled just above"))
-        .expect("unique after the replacement above")
+    let mut built = FSETable::blank();
+    build(&mut built);
+    *slot = Some(SharedFseTable::new(built));
+}
+
+/// The table an axis just built, for the mode to borrow.
+fn slot_table(slot: &Option<SharedFseTable>) -> &FSETable {
+    slot.as_deref()
+        .expect("a build always leaves the slot filled")
 }
 
 /// What a block decided for one axis, once its mode is no longer borrowing the
