@@ -357,6 +357,80 @@ pub(crate) struct FseTables {
 }
 
 impl FseTables {
+    /// Undo a block's table confirmation, keeping the tables it built as the
+    /// next block's buffers.
+    ///
+    /// A block that loses to a raw one has already had its tables confirmed
+    /// into the previous slots, and the caller holds a clone of what they
+    /// were. Restoring only that clone leaves the axis holding the SAME table
+    /// in both slots — the restored one in `previous` and the one confirmation
+    /// displaced into `next` — so the next block finds its buffer shared and
+    /// allocates eleven kilobytes instead of writing into it, on every block
+    /// of a run that keeps falling back.
+    ///
+    /// Handing the discarded table to `next` fixes both halves at once: the
+    /// restored table is unique again, and the buffer the block just filled is
+    /// exactly what the next one wants to build into.
+    pub(crate) fn roll_back_confirmation(&mut self, saved: [Option<PreviousFseTable>; 3]) {
+        let [saved_ll, saved_ml, saved_of] = saved;
+        for (previous, next, restored) in [
+            (&mut self.ll_previous, &mut self.ll_next, saved_ll),
+            (&mut self.ml_previous, &mut self.ml_next, saved_ml),
+            (&mut self.of_previous, &mut self.of_next, saved_of),
+        ] {
+            let discarded = core::mem::replace(previous, restored);
+            match discarded {
+                // The table the block built. Whatever `next` held was the
+                // outgoing previous, which is what was just restored, so it is
+                // a duplicate; this one is free and unique.
+                Some(PreviousFseTable::Custom(built)) => *next = Some(built),
+                // The block settled on a predefined or RLE table, so
+                // confirmation may have parked the outgoing custom one. If
+                // that is the table now back in `previous`, holding it here
+                // too is what keeps the next build from writing into it.
+                _ => {
+                    if let (Some(spare), Some(PreviousFseTable::Custom(back))) =
+                        (next.as_ref(), previous.as_ref())
+                        && SharedFseTable::ptr_eq(spare, back)
+                    {
+                        *next = None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Keep the frame's tables as buffers before the next frame overwrites
+    /// them.
+    ///
+    /// A frame start replaces every previous slot — with the dictionary's
+    /// seed, or with nothing — and dropping the table that was there costs a
+    /// reused compressor an eleven-kilobyte allocation per axis on the next
+    /// frame that builds one. The slot the axis builds into is exactly where
+    /// it belongs. Only an unshared table is worth keeping: one still held by
+    /// the dictionary entropy cache cannot be built into anyway.
+    pub(crate) fn park_previous_before_frame(&mut self) {
+        for (previous, next) in [
+            (&mut self.ll_previous, &mut self.ll_next),
+            (&mut self.ml_previous, &mut self.ml_next),
+            (&mut self.of_previous, &mut self.of_next),
+        ] {
+            // Decided before taking: a handle the cache still holds stays
+            // where it is rather than being pulled out and dropped.
+            let worth_keeping = matches!(
+                previous.as_ref(),
+                Some(PreviousFseTable::Custom(handle))
+                    if SharedFseTable::strong_count(handle) == 1
+            );
+            if next.is_none()
+                && worth_keeping
+                && let Some(PreviousFseTable::Custom(handle)) = previous.take()
+            {
+                *next = Some(handle);
+            }
+        }
+    }
+
     /// Heap bytes the retained encoder tables hold.
     ///
     /// Both slots of an axis count: the previous table is what the next block
@@ -375,7 +449,13 @@ impl FseTables {
             }
         }
         for next in [&self.ll_next, &self.ml_next, &self.of_next] {
-            if next.is_some() {
+            // Same ownership test as the previous slots, and for the same
+            // reason: a dictionary-seeded axis that settles on a predefined
+            // table parks the CACHE's handle here, and that cache reports the
+            // table itself.
+            if let Some(handle) = next
+                && SharedFseTable::strong_count(handle) == 1
+            {
                 total += per_table;
             }
         }
@@ -2141,6 +2221,11 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
         } else {
             self.state.clear_huff_table();
         }
+        // Whatever the last frame ended on is about to be replaced. Keep it as
+        // this frame's build buffer rather than dropping it, or a reused
+        // compressor that emits one custom-table block per frame allocates a
+        // table per axis every frame.
+        self.state.fse_tables.park_previous_before_frame();
         // `clone_from` keeps frame-to-frame seeding cheap for reused compressors by
         // reusing existing allocations where possible instead of reallocating every frame.
         if let Some(cache) = cached_entropy {

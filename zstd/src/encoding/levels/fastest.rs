@@ -259,9 +259,11 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
             // Swap (not move) so the slot keeps owning a reusable table
             // allocation for the next block's snapshot.
             core::mem::swap(&mut state.last_huff_table, &mut saved_huff_table);
-            state.fse_tables.ll_previous = saved_ll_previous;
-            state.fse_tables.ml_previous = saved_ml_previous;
-            state.fse_tables.of_previous = saved_of_previous;
+            state.fse_tables.roll_back_confirmation([
+                saved_ll_previous,
+                saved_ml_previous,
+                saved_of_previous,
+            ]);
             state.block_scratch.huff_rollback = saved_huff_table;
             let header = BlockHeader {
                 last_block,
@@ -432,9 +434,11 @@ pub(crate) fn compress_block_encoded_borrowed(
             // Swap (not move) so the slot keeps owning a reusable table
             // allocation for the next block's snapshot.
             core::mem::swap(&mut state.last_huff_table, &mut saved_huff_table);
-            state.fse_tables.ll_previous = saved_ll_previous;
-            state.fse_tables.ml_previous = saved_ml_previous;
-            state.fse_tables.of_previous = saved_of_previous;
+            state.fse_tables.roll_back_confirmation([
+                saved_ll_previous,
+                saved_ml_previous,
+                saved_of_previous,
+            ]);
             state.block_scratch.huff_rollback = saved_huff_table;
             let header = BlockHeader {
                 last_block,

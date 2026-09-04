@@ -137,7 +137,10 @@ fn main() {
 
     let mut total_count = 0usize;
     let mut total_bytes = 0usize;
-    println!("level {level}, {} bytes in, warm frame:", data.len());
+    // The shape is the whole point of the comparison, so it goes in the
+    // heading rather than being inferred from how the run was invoked.
+    let shape = if fresh { "fresh frame" } else { "warm frame" };
+    println!("level {level}, {} bytes in, {shape}:", data.len());
     println!(
         "{:>12}  {:>7}  {:>12}  {:>9}",
         "size class", "allocs", "bytes", "avg"

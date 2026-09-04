@@ -555,6 +555,81 @@ fn a_predefined_or_rle_block_parks_the_custom_table_it_replaces() {
     }
 }
 
+/// A block that loses to a raw one must leave the axis exactly as it found
+/// it: the restored table unique, and a buffer free to build into.
+///
+/// The caller holds a CLONE of what `previous` was, so restoring only that
+/// leaves the same table in both slots — `previous` restored and `next` where
+/// confirmation displaced it — and the next block finds its buffer shared and
+/// allocates a fresh eleven-kilobyte table. On a run of blocks that keep
+/// falling back to raw that is a per-axis allocation per block, which is the
+/// cost this pair of slots exists to remove.
+#[test]
+fn a_block_that_falls_back_to_raw_leaves_its_axis_reusable() {
+    use crate::encoding::frame_compressor::SharedFseTable;
+    use crate::fse::fse_encoder::FSETable;
+
+    let mut fse_tables = FseTables::new();
+    let before = SharedFseTable::new(FSETable::blank());
+    fse_tables.ll_previous = Some(PreviousFseTable::Custom(before));
+    // What the caller keeps across the attempt.
+    let saved = fse_tables.ll_previous.clone();
+
+    // The attempt builds into the axis's spare slot, then confirms it, which
+    // displaces the old table into that slot.
+    fse_tables.ll_next = Some(SharedFseTable::new(FSETable::blank()));
+    super::commit_last_used_table(
+        &mut fse_tables.ll_previous,
+        &mut fse_tables.ll_next,
+        LastUsedTable::Encoded,
+    );
+
+    fse_tables.roll_back_confirmation([saved, None, None]);
+
+    let Some(PreviousFseTable::Custom(restored)) = fse_tables.ll_previous.as_ref() else {
+        panic!("the restored table must be the custom one the axis started with");
+    };
+    assert_eq!(
+        SharedFseTable::strong_count(restored),
+        1,
+        "the restored table must be unique, or the next block cannot build into its slot",
+    );
+    assert!(
+        fse_tables.ll_next.is_some(),
+        "the discarded table is exactly the buffer the next block wants",
+    );
+}
+
+/// A frame start replaces the previous slots, and the table that was there is
+/// the next frame's buffer — dropping it costs a reused compressor an
+/// allocation per axis on every frame that builds a custom table.
+#[test]
+fn a_frame_start_keeps_the_last_frames_table_as_a_buffer() {
+    use crate::encoding::frame_compressor::SharedFseTable;
+    use crate::fse::fse_encoder::FSETable;
+
+    let mut fse_tables = FseTables::new();
+    fse_tables.ll_previous = Some(PreviousFseTable::Custom(SharedFseTable::new(
+        FSETable::blank(),
+    )));
+    // Shared with the dictionary entropy cache: parking it would hand the axis
+    // a buffer it cannot build into.
+    let shared = SharedFseTable::new(FSETable::blank());
+    let _cache_holds_it = shared.clone();
+    fse_tables.ml_previous = Some(PreviousFseTable::Custom(shared));
+
+    fse_tables.park_previous_before_frame();
+
+    assert!(
+        fse_tables.ll_next.is_some(),
+        "the frame's own table is what the next one builds into",
+    );
+    assert!(
+        fse_tables.ml_next.is_none(),
+        "a table the dictionary cache still holds is not a free buffer",
+    );
+}
+
 #[test]
 fn remember_last_used_tables_keeps_predefined_and_repeat_modes() {
     let mut fse_tables = FseTables::new();

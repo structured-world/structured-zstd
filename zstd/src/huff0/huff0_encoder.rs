@@ -70,7 +70,14 @@ impl Clone for WeightDescription {
     }
 
     fn clone_from(&mut self, source: &Self) {
-        self.reserve_to_bound();
+        // Reserve only for a source that has something to copy. A table whose
+        // weights are not encodable leaves the buffer empty, and reserving the
+        // bound for it hands every rollback and dictionary-seed destination a
+        // 256-byte allocation it may never write into. The destination's own
+        // encode path reserves when it fills the buffer.
+        if !source.buf.is_empty() {
+            self.reserve_to_bound();
+        }
         self.buf.clone_from(&source.buf);
         self.state = source.state;
     }
