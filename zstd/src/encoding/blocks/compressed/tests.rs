@@ -531,9 +531,11 @@ fn remember_last_used_tables_keeps_predefined_and_repeat_modes() {
 
     remember_last_used_tables(
         &mut fse_tables,
-        LastUsedTable::Default,
-        LastUsedTable::Default,
-        LastUsedTable::Default,
+        [
+            LastUsedTable::Default,
+            LastUsedTable::Default,
+            LastUsedTable::Default,
+        ],
     );
 
     assert!(tables_match(
@@ -644,9 +646,11 @@ fn remember_last_used_tables_reuses_existing_custom_slot_for_repeat() {
 
     remember_last_used_tables(
         &mut fse_tables,
-        LastUsedTable::Keep,
-        LastUsedTable::Default,
-        LastUsedTable::Default,
+        [
+            LastUsedTable::Keep,
+            LastUsedTable::Default,
+            LastUsedTable::Default,
+        ],
     );
 
     let after = core::ptr::from_ref(

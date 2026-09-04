@@ -261,13 +261,16 @@ impl Matcher for EntropyOnlyMatcher {
 pub fn compress_block<M: Matcher>(state: &mut CompressState<M>, output: &mut Vec<u8>) {
     let mut scratch = core::mem::take(&mut state.block_scratch);
     collect_block_parts(state, &mut scratch.parts);
-    encode_block_parts_with_sequence_scratch(
+    let decisions = encode_block_parts_with_sequence_scratch(
         state,
         &scratch.parts.literals,
         &scratch.parts.sequences,
         output,
         &mut scratch.estimator_sequences,
     );
+    // This path writes the block it just encoded, so the tables it chose are
+    // what the next block reads.
+    remember_last_used_tables(&mut state.fse_tables, decisions);
     state.block_scratch = scratch;
 }
 
@@ -555,7 +558,12 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
     raw_sequences: &[RawSequence],
     output: &mut Vec<u8>,
     sequences: &mut Vec<crate::blocks::sequence_section::Sequence>,
-) {
+    // What each axis decided, for the caller to apply once it knows the block
+    // is kept. LL, ML, OF.
+) -> [LastUsedTable; 3] {
+    // A block with no sequences writes no tables, so every axis keeps what it
+    // had whatever the caller decides.
+    let mut decisions = [LastUsedTable::Keep; 3];
     encode_raw_sequences_into(
         raw_sequences,
         &mut state.offset_hist,
@@ -750,16 +758,19 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
             [ll_default, ml_default, of_default],
         );
 
-        // Consuming the modes ends their borrow of the slots, which is what
-        // lets the commit below swap the handles.
-        let ll_last = into_last_used_table(ll_mode);
-        let ml_last = into_last_used_table(ml_mode);
-        let of_last = into_last_used_table(of_mode);
-        commit_last_used_table(ll_previous, ll_next, ll_last);
-        commit_last_used_table(ml_previous, ml_next, ml_last);
-        commit_last_used_table(of_previous, of_next, of_last);
+        // Consuming the modes ends their borrow of the slots. The decisions go
+        // back to the caller rather than being applied here: a block that
+        // loses to a raw one must leave the previous tables alone, and
+        // upstream expresses that by not swapping (`out:` in
+        // `ZSTD_compressBlock_internal`) rather than by undoing anything.
+        decisions = [
+            into_last_used_table(ll_mode),
+            into_last_used_table(ml_mode),
+            into_last_used_table(of_mode),
+        ];
     }
     writer.flush();
+    decisions
 }
 
 /// Workspace shared across estimator probes so per-probe cost computation never
@@ -1103,10 +1114,12 @@ fn estimate_sequences_section_bytes(
     let stream_bytes = (bit_content + padding_bits) / 8;
 
     // Mirror state mutation done by `encode_block_parts_with_sequence_scratch`.
-    let ll_last = into_last_used_table(ll_mode);
-    let ml_last = into_last_used_table(ml_mode);
-    let of_last = into_last_used_table(of_mode);
-    remember_last_used_tables(fse_tables, ll_last, ml_last, of_last);
+    let decisions = [
+        into_last_used_table(ll_mode),
+        into_last_used_table(ml_mode),
+        into_last_used_table(of_mode),
+    ];
+    remember_last_used_tables(fse_tables, decisions);
 
     nb_seq_header
         + mode_byte
@@ -1332,11 +1345,12 @@ fn emit_single_sequence_block<M: Matcher>(
             slot => *slot = Some(src.clone()),
         }
     }
-    let saved_ll_previous = state.fse_tables.ll_previous.clone();
-    let saved_ml_previous = state.fse_tables.ml_previous.clone();
-    let saved_of_previous = state.fse_tables.of_previous.clone();
+    // The FSE tables need no copy: the block builds into the `*_next` slots and
+    // the previous ones are only read, so rolling back is simply not applying
+    // the decisions below. Copying them was also what kept the built table's
+    // handle shared, which forced a fresh one per block.
     buffers.compressed.clear();
-    encode_block_parts_with_sequence_scratch(
+    let fse_decisions = encode_block_parts_with_sequence_scratch(
         state,
         literals,
         sequences,
@@ -1355,9 +1369,8 @@ fn emit_single_sequence_block<M: Matcher>(
             // from the state; park it for the next build rather than freeing.
             state.clear_huff_table();
         }
-        state.fse_tables.ll_previous = saved_ll_previous;
-        state.fse_tables.ml_previous = saved_ml_previous;
-        state.fse_tables.of_previous = saved_of_previous;
+        // The FSE decisions are simply not applied, so the previous tables are
+        // whatever the last kept block left.
         let header = BlockHeader {
             last_block,
             block_type: BlockType::Raw,
@@ -1366,6 +1379,9 @@ fn emit_single_sequence_block<M: Matcher>(
         header.serialize(buffers.output);
         true
     } else {
+        // The block is kept, so its tables become what the next one reads.
+        // Upstream's confirm step, at the same point in the decision.
+        remember_last_used_tables(&mut state.fse_tables, fse_decisions);
         let header = BlockHeader {
             last_block,
             block_type: BlockType::Compressed,
@@ -2009,9 +2025,7 @@ fn encode_fse_table_modes(
 
 fn remember_last_used_tables(
     fse_tables: &mut FseTables,
-    ll_last: LastUsedTable,
-    ml_last: LastUsedTable,
-    of_last: LastUsedTable,
+    [ll_last, ml_last, of_last]: [LastUsedTable; 3],
 ) {
     commit_last_used_table(
         &mut fse_tables.ll_previous,
