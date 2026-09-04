@@ -346,6 +346,7 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
             copy_tier: state.copy_tier,
             last_huff_table: state.last_huff_table.clone(),
             huff_table_spare: None,
+            huff_rollback: None,
             // Lent, not created: the estimator builds a table per split
             // candidate, and a fresh scratch here would take its buffers again
             // on every post-split block and drop them at the end of it. Handed
@@ -895,7 +896,9 @@ fn estimate_literals_section_bytes(
         *last_huff = None;
         return uncompressed_literals_header_bytes(literals.len()) + literals.len();
     }
-    let new_table = huff0_encoder::HuffmanTable::build_from_counts_gated_with(
+    // Mutable because the size query is what encodes the weight description
+    // into the table's own buffer, so the emitter that follows reads it.
+    let mut new_table = huff0_encoder::HuffmanTable::build_from_counts_gated_with(
         &counts[..=max_sym],
         huf_search,
         weight_scratch,
@@ -1275,7 +1278,18 @@ fn emit_single_sequence_block<M: Matcher>(
     buffers: &mut SingleSequenceEmitBuffers<'_>,
 ) -> bool {
     let saved_offset_hist = state.offset_hist;
-    let saved_huff_table = state.last_huff_table.clone();
+    // Copy into the rollback slot rather than a fresh `Option`: the slot keeps
+    // its buffers between blocks, so this reuses them instead of taking two
+    // `Vec`s per block. `had_huff_table` carries what an `Option` copy would
+    // have carried, without discarding the buffer when there is nothing to
+    // copy.
+    let had_huff_table = state.last_huff_table.is_some();
+    if let Some(src) = &state.last_huff_table {
+        match &mut state.huff_rollback {
+            Some(dst) => dst.clone_from(src),
+            slot => *slot = Some(src.clone()),
+        }
+    }
     let saved_ll_previous = state.fse_tables.ll_previous.clone();
     let saved_ml_previous = state.fse_tables.ml_previous.clone();
     let saved_of_previous = state.fse_tables.of_previous.clone();
@@ -1290,7 +1304,15 @@ fn emit_single_sequence_block<M: Matcher>(
     let min_gain = (source_len >> 8) + 2;
     if buffers.compressed.len() >= source_len.saturating_sub(min_gain) {
         state.offset_hist = saved_offset_hist;
-        state.last_huff_table = saved_huff_table;
+        if had_huff_table {
+            // Swap, not assign: the table this block built goes back into the
+            // rollback slot and becomes the next block's copy buffer.
+            core::mem::swap(&mut state.last_huff_table, &mut state.huff_rollback);
+        } else {
+            // Nothing was carried in, so whatever this block built is dropped
+            // from the state; park it for the next build rather than freeing.
+            state.clear_huff_table();
+        }
         state.fse_tables.ll_previous = saved_ll_previous;
         state.fse_tables.ml_previous = saved_ml_previous;
         state.fse_tables.of_previous = saved_of_previous;
@@ -2512,7 +2534,10 @@ fn compress_literals(
         return HuffmanTableUpdate::Cleared;
     }
 
-    let new_encoder_table = huff0_encoder::HuffmanTable::build_from_counts_gated_with(
+    // Mutable because the size query encodes the weight description into the
+    // table's buffer; `write_table` below then reads it rather than repeating
+    // the encode.
+    let mut new_encoder_table = huff0_encoder::HuffmanTable::build_from_counts_gated_with(
         &counts[..=max_symbol],
         huf_search,
         weight_scratch,

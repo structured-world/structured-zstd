@@ -196,7 +196,7 @@ fn decide_huff_reuse_prefer_repeat_forces_reuse_for_fast_band() {
     let mut skewed_literals: Vec<u8> = Vec::with_capacity(256);
     skewed_literals.extend(core::iter::repeat_n(0u8, 240));
     skewed_literals.extend((0..16u8).map(|i| 200 + i));
-    let new_tbl = huff0_encoder::HuffmanTable::build_from_data(&skewed_literals);
+    let mut new_tbl = huff0_encoder::HuffmanTable::build_from_data(&skewed_literals);
     let new_desc = new_tbl
         .writeable_table_description_size()
         .expect("non-empty table emits a description");
@@ -339,6 +339,7 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
                 copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
                 last_huff_table: seed_table.clone(),
                 huff_table_spare: None,
+                huff_rollback: None,
                 huff_weights: Default::default(),
                 fse_tables: FseTables::new(),
                 block_scratch: CompressedBlockScratch::new(),
@@ -353,6 +354,7 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
                 copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
                 last_huff_table: seed_table,
                 huff_table_spare: None,
+                huff_rollback: None,
                 huff_weights: Default::default(),
                 fse_tables: FseTables::new(),
                 block_scratch: CompressedBlockScratch::new(),
@@ -415,6 +417,7 @@ fn a_section_with_flat_ends_costs_what_the_emitter_writes_for_it() {
         copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
         last_huff_table: None,
         huff_table_spare: None,
+        huff_rollback: None,
         huff_weights: Default::default(),
         fse_tables: FseTables::new(),
         block_scratch: CompressedBlockScratch::new(),
@@ -473,6 +476,7 @@ fn raw_partition_fallback_restores_repeat_offset_history() {
         copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
         last_huff_table: None,
         huff_table_spare: None,
+        huff_rollback: None,
         huff_weights: Default::default(),
         fse_tables: FseTables::new(),
         block_scratch: super::CompressedBlockScratch::new(),

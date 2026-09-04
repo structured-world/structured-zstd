@@ -852,6 +852,14 @@ pub(crate) struct CompressState<M: Matcher> {
     /// allocations. Without this, every dict-seeded frame whose last block
     /// ended raw/RLE paid a fresh two-Vec table clone per frame.
     pub(crate) huff_table_spare: Option<crate::huff0::huff0_encoder::HuffmanTable>,
+    /// Where a block copies `last_huff_table` before encoding, so it can be put
+    /// back if the compressed form loses to a raw block.
+    ///
+    /// A slot rather than a local because the copy is per block: cloning into a
+    /// fresh `Option` took two `Vec`s every time, while cloning into one that
+    /// already holds a table reuses them. Restoring is a swap, which also hands
+    /// the discarded table back here as the next block's buffer.
+    pub(crate) huff_rollback: Option<crate::huff0::huff0_encoder::HuffmanTable>,
     /// The Huffman weight builder's three buffers, kept across blocks and
     /// frames. The cheap build path takes a tree and two weight buffers per
     /// call, and it runs once per block plus once per split candidate wherever
@@ -1178,6 +1186,7 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
                 copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
                 last_huff_table: None,
                 huff_table_spare: None,
+                huff_rollback: None,
                 huff_weights: Default::default(),
                 fse_tables: FseTables::new(),
                 block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
@@ -1585,6 +1594,7 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                 copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
                 last_huff_table: None,
                 huff_table_spare: None,
+                huff_rollback: None,
                 huff_weights: Default::default(),
                 fse_tables: FseTables::new(),
                 block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),

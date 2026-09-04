@@ -158,6 +158,7 @@ impl<W: Write, M: Matcher> StreamingEncoder<W, M> {
                 copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
                 last_huff_table: None,
                 huff_table_spare: None,
+                huff_rollback: None,
                 huff_weights: Default::default(),
                 fse_tables: FseTables::new(),
                 block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),

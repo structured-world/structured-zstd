@@ -13,7 +13,68 @@ use core::cmp::Ordering;
 /// per-table FSE-encode cache as a trade-off — they get the
 /// recompute-every-time path that existed before the cache landed.
 #[cfg(feature = "std")]
-type CachedDescription = std::sync::OnceLock<Option<Vec<u8>>>;
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+enum DescriptionState {
+    /// Not encoded yet for the table's current contents.
+    #[default]
+    NotComputed,
+    /// The FSE form was rejected, so the raw nibble description is what a
+    /// writer emits. Recorded rather than recomputed: the rejection costs the
+    /// same FSE encode as an acceptance.
+    NotEncodable,
+    /// The first `n` bytes of the buffer hold the encoding.
+    Encoded(usize),
+}
+
+/// Cached FSE-encoded weight description, held with the table it describes.
+///
+/// The buffer outlives the contents: a table that is rebuilt or overwritten
+/// resets the state but keeps the allocation, so a description costs one
+/// allocation for the life of the table rather than one per build. That is the
+/// same reasoning `clone_from` below applies to the code containers, and this
+/// field used to be the exception, replaced wholesale on every rebuild and
+/// every clone.
+///
+/// Plain data, so `HuffmanTable` stays `Sync` for consumers that share encoder
+/// tables across threads.
+#[cfg(feature = "std")]
+#[derive(Default)]
+struct WeightDescription {
+    buf: Vec<u8>,
+    state: DescriptionState,
+}
+
+#[cfg(feature = "std")]
+impl WeightDescription {
+    /// Bring the buffer to the largest size any description can need, once.
+    ///
+    /// Sizing it to each individual description instead makes it grow with
+    /// whichever table it is reused across, and since descriptions vary in
+    /// length that is a reallocation every time a longer one lands in a buffer
+    /// last used by a shorter one. One weight per symbol bounds it, and the
+    /// encoder writes at most that before the length gate rejects the result.
+    fn reserve_to_bound(&mut self) {
+        if self.buf.capacity() < MAX_HUFFMAN_ALPHABET {
+            self.buf.reserve(MAX_HUFFMAN_ALPHABET - self.buf.len());
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl Clone for WeightDescription {
+    fn clone(&self) -> Self {
+        Self {
+            buf: self.buf.clone(),
+            state: self.state,
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.reserve_to_bound();
+        self.buf.clone_from(&source.buf);
+        self.state = source.state;
+    }
+}
 
 use crate::{
     bit_io::BitWriter,
@@ -269,37 +330,39 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
     fn write_table(&mut self) {
         #[cfg(feature = "std")]
         {
-            // Cached path: cache hit → emit FSE bytes directly OR the
-            // cached `None` sentinel → emit raw (one `weights()` recompute,
-            // unavoidable since the cache stores only the FSE encoding,
-            // not the raw nibbles).
-            if let Some(cached) = self.table.cached_encoded_weight_description.get() {
-                if let Some(fse_description) = cached.as_deref() {
+            // Cached path: the size query that precedes every emit has already
+            // encoded the description, so this reads it. A hit emits the FSE
+            // bytes; a recorded rejection emits the raw nibbles, which the
+            // cache does not hold and so are recomputed here.
+            match self.table.weight_description_state() {
+                DescriptionState::Encoded(len) => {
+                    let fse_description = &self.table.cached_encoded_weight_description.buf[..len];
                     self.writer.write_bits(fse_description.len() as u8, 8);
                     self.writer.append_bytes(fse_description);
                     return;
                 }
-                let mut buf = [0u8; MAX_HUFFMAN_ALPHABET];
-                let weights = self.weights_into(&mut buf);
-                let weights = &weights[..weights.len() - 1];
-                Self::write_raw_weight_description(self.writer, weights);
-                return;
+                DescriptionState::NotEncodable => {
+                    let mut buf = [0u8; MAX_HUFFMAN_ALPHABET];
+                    let weights = self.weights_into(&mut buf);
+                    let weights = &weights[..weights.len() - 1];
+                    Self::write_raw_weight_description(self.writer, weights);
+                    return;
+                }
+                DescriptionState::NotComputed => {}
             }
-            // Cold path: compute `weights` once and share it between the
-            // cache initializer (which uses it to FSE-encode) and the raw
-            // fallback (which uses it directly to write nibbles). Without
-            // this, the raw fallback would call back into `weights()` and
-            // recompute the slice — a measurable hotspot for small /
-            // low-cardinality tables (#170 review thread).
+            // Cold path, reached only by a writer whose table was never asked
+            // for its description size. Nothing to fill in place through a
+            // shared borrow, so this one encodes into a local buffer and drops
+            // it; `weights` is computed once and shared between the FSE encode
+            // and the raw fallback, which would otherwise recompute the slice
+            // (a measurable hotspot for small / low-cardinality tables).
             let mut buf = [0u8; MAX_HUFFMAN_ALPHABET];
             let weights = self.weights_into(&mut buf);
             let weights = &weights[..weights.len() - 1];
-            if let Some(fse_description) = self
-                .table
-                .cached_encoded_weight_description_with_weights(weights)
-            {
-                self.writer.write_bits(fse_description.len() as u8, 8);
-                self.writer.append_bytes(fse_description);
+            let mut encoded = Vec::new();
+            if Self::encode_weight_description_into(weights, &mut encoded) {
+                self.writer.write_bits(encoded.len() as u8, 8);
+                self.writer.append_bytes(&encoded);
             } else {
                 Self::write_raw_weight_description(self.writer, weights);
             }
@@ -310,10 +373,12 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
             // computation, branch on FSE-vs-raw based on direct encoder call.
             let mut buf = [0u8; MAX_HUFFMAN_ALPHABET];
             let weights = self.weights_into(&mut buf);
-            let weights = &weights[..weights.len() - 1];
-            if let Some(fse_description) = Self::encode_weight_description(weights) {
-                self.writer.write_bits(fse_description.len() as u8, 8);
-                self.writer.append_bytes(&fse_description);
+            let len = weights.len();
+            let weights = &buf[..len - 1];
+            let mut encoded = Vec::new();
+            if Self::encode_weight_description_into(weights, &mut encoded) {
+                self.writer.write_bits(encoded.len() as u8, 8);
+                self.writer.append_bytes(&encoded);
             } else {
                 Self::write_raw_weight_description(self.writer, weights);
             }
@@ -323,9 +388,15 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
     /// Encodes Huffman weights using FSE when that representation is valid and beneficial.
     ///
     /// Returns `None` when FSE metadata is not suitable, so callers fall back to raw weight encoding.
-    fn encode_weight_description(weights: &[u8]) -> Option<Vec<u8>> {
+    /// Fill `encoded` with the FSE weight description, reporting whether that
+    /// form is the one to emit. `encoded` is the caller's buffer so a table
+    /// rebuilt many times per frame reuses one allocation; on `false` its
+    /// contents are meaningless and the raw nibble description is written
+    /// instead.
+    fn encode_weight_description_into(weights: &[u8], encoded: &mut Vec<u8>) -> bool {
+        encoded.clear();
         if weights.len() <= 2 {
-            return None;
+            return false;
         }
 
         // Upstream zstd `HUF_compressWeights` early-outs
@@ -343,18 +414,18 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         }
         let max_count = counts.iter().copied().max().unwrap_or(0);
         if max_count == weights.len() || max_count <= 1 {
-            return None;
+            return false;
         }
 
-        // Pre-size to the weight count: the FSE-encoded description is rejected
+        // Reserve to the weight count: the FSE-encoded description is rejected
         // above `weights.len() / 2` (the raw nibble fallback wins) and at 128
         // bytes outright, so `weights.len()` is a generous one-shot capacity
         // that keeps the BitWriter's backing buffer from reallocating as the
-        // interleaved stream is written. Transient scratch (discarded or
-        // returned, never the frame output), so no peak-memory trade-off.
-        let mut encoded = Vec::with_capacity(weights.len());
+        // interleaved stream is written. A reused buffer is already at that
+        // size after its first fill, so this reserves nothing on later calls.
+        encoded.reserve(weights.len());
         {
-            let mut writer = BitWriter::from(&mut encoded);
+            let mut writer = BitWriter::from(&mut *encoded);
             let mut encoder = FSEEncoder::new(
                 fse_encoder::build_table_from_symbol_counts(&counts, 6, false),
                 &mut writer,
@@ -378,7 +449,7 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
             && (encoded.len() < raw_description_bytes || !raw_description_is_representable)
         {
             if encoded.len() >= 128 {
-                return None;
+                return false;
             }
             // Trust the FSE encoding and emit it directly, matching upstream
             // zstd's HUF_writeCTable (no decode round-trip). The upstream zstd
@@ -388,9 +459,9 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
             // a wide alphabet sweep. The former per-call decode + re-encode
             // verification was a dominant per-frame heap churn on tiny
             // dict-compress frames, amplified by the musl allocator.
-            Some(encoded)
+            true
         } else {
-            None
+            false
         }
     }
 
@@ -439,7 +510,7 @@ pub struct HuffmanTable {
     /// keep the original recompute-every-time semantics. See the
     /// `CachedDescription` type-alias doc above for full rationale.
     #[cfg(feature = "std")]
-    cached_encoded_weight_description: CachedDescription,
+    cached_encoded_weight_description: WeightDescription,
 }
 
 /// Manual impl so `clone_from` reuses the destination's existing `Vec`
@@ -463,8 +534,12 @@ impl Clone for HuffmanTable {
         self.table_log = source.table_log;
         #[cfg(feature = "std")]
         {
-            self.cached_encoded_weight_description =
-                source.cached_encoded_weight_description.clone();
+            // `clone_from`, not an assignment: assigning drops the
+            // destination's buffer and takes a new one for the source's
+            // contents, which is the allocation this whole type exists to
+            // avoid. Same reasoning as the two code containers above.
+            self.cached_encoded_weight_description
+                .clone_from(&source.cached_encoded_weight_description);
         }
     }
 }
@@ -494,12 +569,11 @@ impl HuffmanTable {
     /// so its bytes are retained and a caller budgeting around a context has to
     /// see them.
     pub fn heap_size(&self) -> usize {
+        // Capacity, not length: the buffer is kept across rebuilds precisely so
+        // it outlives any one description, and a caller budgets against what is
+        // held rather than what is currently in use.
         #[cfg(feature = "std")]
-        let cached = self
-            .cached_encoded_weight_description
-            .get()
-            .and_then(Option::as_ref)
-            .map_or(0, Vec::capacity);
+        let cached = self.cached_encoded_weight_description.buf.capacity();
         #[cfg(not(feature = "std"))]
         let cached = 0;
         self.codes.capacity() * core::mem::size_of::<(u32, u8)>()
@@ -709,9 +783,14 @@ impl HuffmanTable {
     /// weight stream when both planner and emitter call this for the
     /// same table. no_std build path: recomputes via the direct encoder
     /// every call (cache field absent — preserves `Sync`).
-    pub(crate) fn try_table_description_size(&self) -> Option<usize> {
+    pub(crate) fn try_table_description_size(&mut self) -> Option<usize> {
         #[cfg(feature = "std")]
         {
+            // Encodes on the first call for these contents and caches it, so
+            // the writer that follows reads rather than repeats the work. This
+            // is also where the caching happens at all: it is the only step in
+            // the emit path holding the table mutably.
+            self.fill_weight_description_from_codes();
             if let Some(fse_description) = self.cached_encoded_weight_description() {
                 return Some(fse_description.len() + 1);
             }
@@ -726,11 +805,11 @@ impl HuffmanTable {
         {
             let mut buf = [0u8; MAX_HUFFMAN_ALPHABET];
             let weights = self.weights_into(&mut buf);
-            let weights = &weights[..weights.len() - 1];
-            if let Some(fse_description) =
-                HuffmanEncoder::<Vec<u8>>::encode_weight_description(weights)
-            {
-                return Some(fse_description.len() + 1);
+            let len = weights.len();
+            let weights = &buf[..len - 1];
+            let mut encoded = Vec::new();
+            if HuffmanEncoder::<Vec<u8>>::encode_weight_description_into(weights, &mut encoded) {
+                return Some(encoded.len() + 1);
             }
             if weights.len() <= 128 {
                 Some(weights.len().div_ceil(2) + 1)
@@ -741,7 +820,7 @@ impl HuffmanTable {
     }
 
     /// Alias for `try_table_description_size` used by call sites that require explicit writeability.
-    pub(crate) fn writeable_table_description_size(&self) -> Option<usize> {
+    pub(crate) fn writeable_table_description_size(&mut self) -> Option<usize> {
         self.try_table_description_size()
     }
 
@@ -765,22 +844,52 @@ impl HuffmanTable {
         &buf[..self.codes.len()]
     }
 
+    /// Encode the description if it has not been encoded for these contents
+    /// yet. Takes `&mut self` because filling reuses the table's own buffer,
+    /// which is the whole point: the previous lazy form populated through
+    /// `&self` and so had to hand the cache a freshly allocated one.
     #[cfg(feature = "std")]
-    fn cached_encoded_weight_description(&self) -> Option<&[u8]> {
-        if let Some(cached) = self.cached_encoded_weight_description.get() {
-            return cached.as_deref();
+    fn fill_weight_description(&mut self, weights: &[u8]) {
+        if self.cached_encoded_weight_description.state != DescriptionState::NotComputed {
+            return;
         }
-        let mut buf = [0u8; MAX_HUFFMAN_ALPHABET];
-        let weights = self.weights_into(&mut buf);
-        let weights = &weights[..weights.len() - 1];
-        self.cached_encoded_weight_description_with_weights(weights)
+        let cache = &mut self.cached_encoded_weight_description;
+        cache.reserve_to_bound();
+        cache.state =
+            if HuffmanEncoder::<Vec<u8>>::encode_weight_description_into(weights, &mut cache.buf) {
+                DescriptionState::Encoded(cache.buf.len())
+            } else {
+                DescriptionState::NotEncodable
+            };
     }
 
     #[cfg(feature = "std")]
-    fn cached_encoded_weight_description_with_weights(&self, weights: &[u8]) -> Option<&[u8]> {
-        self.cached_encoded_weight_description
-            .get_or_init(|| HuffmanEncoder::<Vec<u8>>::encode_weight_description(weights))
-            .as_deref()
+    fn fill_weight_description_from_codes(&mut self) {
+        let mut buf = [0u8; MAX_HUFFMAN_ALPHABET];
+        // The returned slice borrows `buf`, not `self`, so the shared borrow
+        // ends here and the fill below can take `&mut self`.
+        let weights = self.weights_into(&mut buf);
+        let len = weights.len();
+        let weights = &buf[..len - 1];
+        self.fill_weight_description(weights);
+    }
+
+    /// The cached encoding, or `None` when the FSE form was rejected OR has not
+    /// been encoded yet. Callers that must tell those apart read
+    /// [`Self::weight_description_state`].
+    #[cfg(feature = "std")]
+    fn cached_encoded_weight_description(&self) -> Option<&[u8]> {
+        match self.cached_encoded_weight_description.state {
+            DescriptionState::Encoded(len) => {
+                Some(&self.cached_encoded_weight_description.buf[..len])
+            }
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "std")]
+    fn weight_description_state(&self) -> DescriptionState {
+        self.cached_encoded_weight_description.state
     }
 
     /// Estimates encoded payload size in bytes directly from per-symbol counts.
@@ -824,7 +933,10 @@ impl HuffmanTable {
                 spare.table_log = table_log as u32;
                 #[cfg(feature = "std")]
                 {
-                    spare.cached_encoded_weight_description = CachedDescription::new();
+                    // The contents describe the old codes and are stale, but
+                    // the buffer they sat in is exactly what this path exists
+                    // to keep: reset the state, not the allocation.
+                    spare.cached_encoded_weight_description.state = DescriptionState::NotComputed;
                 }
                 spare
             }
@@ -833,7 +945,7 @@ impl HuffmanTable {
                 packed_codes: alloc::vec![0u64; weights.len()],
                 table_log: table_log as u32,
                 #[cfg(feature = "std")]
-                cached_encoded_weight_description: CachedDescription::new(),
+                cached_encoded_weight_description: WeightDescription::default(),
             },
         };
         let mut nb_per_rank = [0u16; 13];
