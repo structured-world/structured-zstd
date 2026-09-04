@@ -1,5 +1,25 @@
 use super::*;
 
+/// A parked table contributes its HEAP bytes and nothing else. The table
+/// object itself lives inline in the scratch, so counting its size would
+/// report storage that was never allocated — and the figure reaches callers
+/// through the C API's context-size query, which they budget against.
+#[test]
+fn parking_a_table_adds_only_its_heap_bytes() {
+    let mut scratch = WeightScratch::default();
+    let empty = scratch.heap_size();
+
+    let table = HuffmanTable::build_from_weights(&[2, 2, 2, 1, 1]);
+    let table_heap = table.heap_size();
+    scratch.recycle(table);
+
+    assert_eq!(
+        scratch.heap_size() - empty,
+        table_heap,
+        "the parked table's own storage is inline in the scratch, not on the heap",
+    );
+}
+
 #[test]
 fn huffman() {
     let table = HuffmanTable::build_from_weights(&[2, 2, 2, 1, 1]);

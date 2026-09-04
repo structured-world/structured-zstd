@@ -1304,14 +1304,15 @@ impl WeightScratch {
     /// hold its buffers rather than take them again, so a compressor asked for
     /// its footprint — including through the C API's `ZSTD_sizeof_CCtx` — has
     /// to be told about them.
+    ///
+    /// A parked table contributes its own heap bytes only: the table object
+    /// sits inline here, as the three buffers' headers do, and none of them
+    /// are an allocation of this scratch's making.
     pub(crate) fn heap_size(&self) -> usize {
         self.leaves.capacity() * core::mem::size_of::<HuffNode>()
             + self.work.capacity() * core::mem::size_of::<HuffNode>()
             + self.weights.capacity() * core::mem::size_of::<usize>()
-            + self
-                .spare_table
-                .as_ref()
-                .map_or(0, |table| table.heap_size() + core::mem::size_of_val(table))
+            + self.spare_table.as_ref().map_or(0, HuffmanTable::heap_size)
     }
 
     /// Park a table the caller is done with, for the next build to fill.
