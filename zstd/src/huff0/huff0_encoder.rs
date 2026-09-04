@@ -1382,6 +1382,18 @@ fn enforce_max_height(nodes: &mut [HuffNode], target_nb_bits: usize) {
         return;
     }
 
+    // The shift is bounded by the input, not by anything checked here, so pin
+    // the reasoning: a Huffman code of depth d needs at least Fib(d) symbols
+    // counted, and a literals section is at most 128 KiB, which caps natural
+    // depth around 25. `target_nb_bits` is at least 5, leaving a shift under 20
+    // and comfortably inside a 32-bit `usize`. Worth asserting rather than
+    // assuming: on a 32-bit target an over-large shift does not panic in
+    // release, it silently masks to a smaller one and computes a wrong cost.
+    debug_assert!(
+        largest_bits - target_nb_bits < usize::BITS as usize,
+        "code depth {largest_bits} over target {target_nb_bits} exceeds what a \
+         usize shift can express; counts imply an impossibly large section",
+    );
     let base_cost = 1usize << (largest_bits - target_nb_bits);
     let mut total_cost = 0isize;
     let mut n = nodes.len() - 1;

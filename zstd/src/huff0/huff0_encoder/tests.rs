@@ -7,20 +7,37 @@ use super::*;
 /// and the table builder rejects it. Fibonacci counts are the standard
 /// worst case for Huffman depth, so they are what drives the limiter past
 /// what it can repair.
+///
+/// The sequence stops where a real literals section does. Depth costs counts
+/// exponentially, so running Fibonacci out to 40 symbols describes a section of
+/// hundreds of megabytes, which nothing can hand this function; it also pushes
+/// the limiter's cost shift past what a 32-bit `usize` holds, so the test would
+/// be failing on an input the encoder cannot see. Twenty-four terms keep the
+/// total inside one 128 KiB section and still bury the natural code depth well
+/// under the tightest table log.
 #[test]
 fn a_degenerate_distribution_still_yields_usable_weights() {
+    const SYMBOLS: usize = 24;
     let mut counts = [0usize; 256];
     let (mut a, mut b) = (1usize, 1usize);
-    for count in counts.iter_mut().take(40) {
+    for count in counts.iter_mut().take(SYMBOLS) {
         *count = a;
         (a, b) = (b, a + b);
     }
+    debug_assert!(
+        counts.iter().sum::<usize>() <= 128 * 1024,
+        "fixture must stay within one literals section",
+    );
 
     // Across the whole legal table-log range, including the tight end where
     // the natural code is far deeper than the limit allows.
     for max_nb_bits in 5..=11usize {
-        let weights = build_limited_weights(&counts[..40], max_nb_bits);
-        assert_eq!(weights.len(), 40, "weights must cover every symbol slot");
+        let weights = build_limited_weights(&counts[..SYMBOLS], max_nb_bits);
+        assert_eq!(
+            weights.len(),
+            SYMBOLS,
+            "weights must cover every symbol slot"
+        );
         let sum: usize = weights
             .iter()
             .filter(|w| **w > 0)
