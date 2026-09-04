@@ -3,6 +3,7 @@ use alloc::{boxed::Box, vec::Vec};
 use crate::{
     bit_io::BitWriter,
     blocks::block::BlockType,
+    decoding::simd_copy::ExactCopyTier,
     encoding::block_header::BlockHeader,
     encoding::frame_compressor::{CompressState, FseTables, PreviousFseTable, SharedFseTable},
     encoding::{Matcher, Sequence},
@@ -340,8 +341,16 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
         },
         scratch_state: CompressState {
             matcher: EntropyOnlyMatcher,
+            // Inherited rather than re-resolved: this scratch state stands in
+            // for the same compressor on the same CPU.
+            copy_tier: state.copy_tier,
             last_huff_table: state.last_huff_table.clone(),
             huff_table_spare: None,
+            // Lent, not created: the estimator builds a table per split
+            // candidate, and a fresh scratch here would take its buffers again
+            // on every post-split block and drop them at the end of it. Handed
+            // back below, so the emitter that follows keeps using the same one.
+            huff_weights: core::mem::take(&mut state.huff_weights),
             fse_tables: clone_fse_tables(&state.fse_tables),
             block_scratch: inner_scratch,
             offset_hist: state.offset_hist,
@@ -357,8 +366,15 @@ pub(crate) fn compress_block_with_post_split<M: Matcher>(
     workspace = estimator.workspace;
     scratch.estimator_workspace = Some(workspace);
     // Stash the inner scratch back for the next frame (its buffers stay
-    // allocated; the estimator clears them per use).
-    scratch.estimator_inner = Some(Box::new(estimator.scratch_state.block_scratch));
+    // allocated; the estimator clears them per use), and take the weight
+    // builder's buffers back so the emitter and the next block reuse them.
+    let CompressState {
+        block_scratch: inner_block_scratch,
+        huff_weights,
+        ..
+    } = estimator.scratch_state;
+    state.huff_weights = huff_weights;
+    scratch.estimator_inner = Some(Box::new(inner_block_scratch));
 
     scratch.compressed.clear();
     let mut seq_start = 0usize;
@@ -437,8 +453,17 @@ const LITERAL_INLINE_COPY_MAX: usize = 2048;
 ///   upstream zstd-wildcopy analog: matches glibc's store width but drops the
 ///   libc call, and never overshoots reads (borrowed-input safe).
 /// - `len ≥ 2048`: `extend_from_slice` — bandwidth-bound, ERMS wins.
+///
+/// Called, not inlined, even though upstream inlines the equivalent
+/// (`ZSTD_storeSeq` stores sixteen bytes on the spot) and even though the runs
+/// are short enough for it — a level-3 decodecorpus frame averages about eight
+/// bytes. Splitting the short case out to `#[inline(always)]` and leaving the
+/// ladder behind a tail cost **2.16% in cycles** at level 3 while removing 1.04%
+/// of the program's instructions. The match loop calls this from a dozen-odd
+/// sites, so inlining even a short body there buys decode pressure in the
+/// loop worth more than the calls it saves.
 #[inline]
-fn append_literals(dst: &mut Vec<u8>, lits: &[u8]) {
+fn append_literals(dst: &mut Vec<u8>, lits: &[u8], copy_tier: ExactCopyTier) {
     let lit_len = lits.len();
     if lit_len == 0 {
         return;
@@ -470,7 +495,12 @@ fn append_literals(dst: &mut Vec<u8>, lits: &[u8]) {
                 lit_len,
             );
         } else {
-            crate::decoding::simd_copy::copy_exact_medium(lits.as_ptr(), dst_ptr, lit_len);
+            crate::decoding::simd_copy::copy_exact_medium(
+                lits.as_ptr(),
+                dst_ptr,
+                lit_len,
+                copy_tier,
+            );
         }
         dst.set_len(cur_len + lit_len);
     }
@@ -494,15 +524,20 @@ fn collect_block_parts<M: Matcher>(state: &mut CompressState<M>, parts: &mut Enc
             .sequences
             .reserve_exact(sequence_capacity - parts.sequences.len());
     }
+    // Hoisted out of the closure: the tier was settled when the compressor was
+    // built, and the emit loop just carries the value.
+    let copy_tier = state.copy_tier;
     state.matcher.start_matching(|seq| match seq {
-        Sequence::Literals { literals } => append_literals(&mut parts.literals, literals),
+        Sequence::Literals { literals } => {
+            append_literals(&mut parts.literals, literals, copy_tier)
+        }
         Sequence::Triple {
             literals,
             offset,
             match_len,
         } => {
             let ll = literals.len() as u32;
-            append_literals(&mut parts.literals, literals);
+            append_literals(&mut parts.literals, literals, copy_tier);
             parts.sequences.push(RawSequence {
                 ll,
                 ml: match_len as u32,
@@ -585,6 +620,8 @@ fn encode_block_parts_with_sequence_scratch<M: Matcher>(
             &mut writer,
             strategy,
             state.huf_optimal_search,
+            &mut state.huff_weights,
+            literals_suspected_incompressible(literals_vec.len(), raw_sequences.len()),
         ) {
             HuffmanTableUpdate::New(table) => {
                 state.replace_huff_table(table);
@@ -752,6 +789,8 @@ fn estimate_block_parts_size<M: Matcher>(
         state.strategy_tag,
         state.huf_optimal_search,
         state.literal_compression_disabled,
+        &mut state.huff_weights,
+        literals_suspected_incompressible(literals_vec.len(), raw_sequences.len()),
     );
 
     let seq_bytes = if workspace.sequences.is_empty() {
@@ -770,6 +809,11 @@ fn estimate_block_parts_size<M: Matcher>(
     lit_bytes + seq_bytes
 }
 
+// One argument over the lint's threshold. Every one of them is a distinct
+// decision the emitter makes about this section, and this function exists to
+// reproduce those decisions in the same order; bundling them into a struct
+// would hide exactly the correspondence that has to stay visible.
+#[allow(clippy::too_many_arguments)]
 fn estimate_literals_section_bytes(
     literals: &[u8],
     last_huff: &mut Option<huff0_encoder::HuffmanTable>,
@@ -777,6 +821,8 @@ fn estimate_literals_section_bytes(
     strategy: crate::encoding::strategy::StrategyTag,
     huf_search: bool,
     lit_disabled: bool,
+    weight_scratch: &mut huff0_encoder::WeightScratch,
+    suspected_incompressible: bool,
 ) -> usize {
     // Mirror `encode_block_parts_with_sequence_scratch` literal-mode branches
     // **in the same order**. The disabled gate (negative levels: raw literals,
@@ -832,6 +878,15 @@ fn estimate_literals_section_bytes(
         return total;
     }
 
+    // Mirror the emitter's end-sample shortcut, in the same position. Without
+    // it a section with flat ends and a biased interior costs as
+    // Huffman-compressed here and is emitted raw there, and the splitter picks
+    // a partition on a price the emitter cannot produce.
+    if suspected_incompressible && end_samples_look_flat(literals, counts) {
+        *last_huff = None;
+        return uncompressed_literals_header_bytes(literals.len()) + literals.len();
+    }
+
     let (max_sym, largest_count) = crate::histogram::count_bytes(literals, counts);
     // Mirror `compress_literals`' upstream zstd pre-build incompressibility gate
     // byte-for-byte (flat histogram → raw section, no tree build) so
@@ -840,11 +895,17 @@ fn estimate_literals_section_bytes(
         *last_huff = None;
         return uncompressed_literals_header_bytes(literals.len()) + literals.len();
     }
-    let new_table =
-        huff0_encoder::HuffmanTable::build_from_counts_gated(&counts[..=max_sym], huf_search);
+    let new_table = huff0_encoder::HuffmanTable::build_from_counts_gated_with(
+        &counts[..=max_sym],
+        huf_search,
+        weight_scratch,
+    );
 
     let Some(new_desc) = new_table.writeable_table_description_size() else {
         *last_huff = None;
+        // Nothing downstream reads this table; hand its buffers to the next
+        // build rather than dropping them.
+        weight_scratch.recycle(new_table);
         return uncompressed_literals_header_bytes(literals.len()) + literals.len();
     };
     // For lit_size ≥ 256, upstream zstd `compress_literals` calls `encoder.encode4x`
@@ -905,11 +966,17 @@ fn estimate_literals_section_bytes(
     let huf_section_size = total - compressed_header; // tree_desc + payload, no lhSize
     if use_raw_literal_fallback(huf_section_size, literals.len(), strategy) {
         *last_huff = None;
+        weight_scratch.recycle(new_table);
         return raw_section_bytes;
     }
 
     if use_new {
-        *last_huff = Some(new_table);
+        // The table this displaces is the one to recycle; the new one is kept.
+        if let Some(displaced) = last_huff.replace(new_table) {
+            weight_scratch.recycle(displaced);
+        }
+    } else {
+        weight_scratch.recycle(new_table);
     }
     total
 }
@@ -1892,9 +1959,14 @@ fn encode_sequences(
     let ll_table = mode_table(ll_mode, defaults.ll_default_ref());
     let ml_table = mode_table(ml_mode, defaults.ml_default_ref());
     let of_table = mode_table(of_mode, defaults.of_default_ref());
-    let mut ll_state = ll_table.map(|table| table.start_state(ll_code));
-    let mut ml_state = ml_table.map(|table| table.start_state(ml_code));
-    let mut of_state = of_table.map(|table| table.start_state(of_code));
+    // Carried as bare indices, not `Option`s. A component has a state exactly
+    // when it has a table, and the tables are resolved once above the loop, so
+    // wrapping the state too meant re-asking the same question three times per
+    // sequence and re-wrapping the answer. An absent component's index is never
+    // read: every site that touches one is already inside its table's `Some`.
+    let mut ll_state = ll_table.map_or(0, |table| table.start_state(ll_code).index);
+    let mut ml_state = ml_table.map_or(0, |table| table.start_state(ml_code).index);
+    let mut of_state = of_table.map_or(0, |table| table.start_state(of_code).index);
 
     writer.write_bits(ll_add_bits, ll_num_bits);
     writer.write_bits(ml_add_bits, ml_num_bits);
@@ -1950,29 +2022,29 @@ fn encode_sequences(
             // per-sequence flush in this loop (≤ 16 bytes per
             // sequence, plus the 32-byte slack on top of the 64-byte
             // header reserve).
-            if let (Some(table), Some(state)) = (of_table, of_state) {
-                let next = table.next_state(of_code, state.index);
-                let diff = state.index - next.baseline;
+            if let Some(table) = of_table {
+                let next = table.next_state(of_code, of_state);
+                let diff = crate::fse::fse_encoder::transition_bits(of_state, next.num_bits);
                 unsafe {
                     writer.write_bits_64_no_check(diff as u64, next.num_bits as usize);
                 }
-                of_state = Some(next);
+                of_state = next.index;
             }
-            if let (Some(table), Some(state)) = (ml_table, ml_state) {
-                let next = table.next_state(ml_code, state.index);
-                let diff = state.index - next.baseline;
+            if let Some(table) = ml_table {
+                let next = table.next_state(ml_code, ml_state);
+                let diff = crate::fse::fse_encoder::transition_bits(ml_state, next.num_bits);
                 unsafe {
                     writer.write_bits_64_no_check(diff as u64, next.num_bits as usize);
                 }
-                ml_state = Some(next);
+                ml_state = next.index;
             }
-            if let (Some(table), Some(state)) = (ll_table, ll_state) {
-                let next = table.next_state(ll_code, state.index);
-                let diff = state.index - next.baseline;
+            if let Some(table) = ll_table {
+                let next = table.next_state(ll_code, ll_state);
+                let diff = crate::fse::fse_encoder::transition_bits(ll_state, next.num_bits);
                 unsafe {
                     writer.write_bits_64_no_check(diff as u64, next.num_bits as usize);
                 }
-                ll_state = Some(next);
+                ll_state = next.index;
             }
             unsafe {
                 writer.flush_bulk();
@@ -2011,14 +2083,14 @@ fn encode_sequences(
             }
         }
     }
-    if let (Some(state), Some(table)) = (ml_state, ml_table) {
-        writer.write_bits(state.index as u64, table.table_size.ilog2() as usize);
+    if let Some(table) = ml_table {
+        writer.write_bits(ml_state as u64, table.table_size.ilog2() as usize);
     }
-    if let (Some(state), Some(table)) = (of_state, of_table) {
-        writer.write_bits(state.index as u64, table.table_size.ilog2() as usize);
+    if let Some(table) = of_table {
+        writer.write_bits(of_state as u64, table.table_size.ilog2() as usize);
     }
-    if let (Some(state), Some(table)) = (ll_state, ll_table) {
-        writer.write_bits(state.index as u64, table.table_size.ilog2() as usize);
+    if let Some(table) = ll_table {
+        writer.write_bits(ll_state as u64, table.table_size.ilog2() as usize);
     }
 
     let bits_to_fill = writer.misaligned();
@@ -2051,60 +2123,78 @@ fn encode_seqnum(seqnum: usize, writer: &mut BitWriter<impl AsMut<Vec<u8>>>) {
     }
 }
 
+/// Literal-length code per length, for lengths below 64 (upstream `LL_Code`,
+/// `zstd_compress_internal.h:586`). At or above 64 the code is the high bit
+/// plus [`LL_DELTA_CODE`].
+const LL_CODE: [u8; 64] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 16, 17, 17, 18, 18, 19, 19, 20, 20,
+    20, 20, 21, 21, 21, 21, 22, 22, 22, 22, 22, 22, 22, 22, 23, 23, 23, 23, 23, 23, 23, 23, 24, 24,
+    24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+];
+const LL_DELTA_CODE: u32 = 19;
+/// Extra bits carried by each literal-length code (upstream `LL_bits`).
+const LL_EXTRA_BITS: [u8; 36] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11,
+    12, 13, 14, 15, 16,
+];
+
+/// Match-length code per `len - 3`, for values below 128 (upstream `ML_Code`,
+/// `zstd_compress_internal.h:603`). At or above 128 the code is the high bit
+/// plus [`ML_DELTA_CODE`].
+const ML_CODE: [u8; 128] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+    26, 27, 28, 29, 30, 31, 32, 32, 33, 33, 34, 34, 35, 35, 36, 36, 36, 36, 37, 37, 37, 37, 38, 38,
+    38, 38, 38, 38, 38, 38, 39, 39, 39, 39, 39, 39, 39, 39, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40,
+    40, 40, 40, 40, 40, 40, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 42, 42,
+    42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42,
+    42, 42, 42, 42, 42, 42,
+];
+const ML_DELTA_CODE: u32 = 36;
+/// Extra bits carried by each match-length code (upstream `ML_bits`).
+const ML_EXTRA_BITS: [u8; 53] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+];
+
+/// Split a literal-length into its FSE symbol, the extra bits to append, and
+/// how many of them (upstream `ZSTD_LLcode` plus the `LL_bits` lookup its
+/// caller does).
+///
+/// Runs once per sequence inside the encoding loop, where a 22-arm range match
+/// compiled to a chain of comparisons; upstream reaches the same answer with a
+/// table index. Every code's baseline is a multiple of its own extra-bit width,
+/// so masking off those bits is the same subtraction the ranges spelled out.
+#[inline]
 fn encode_literal_length(len: u32) -> (u8, u32, usize) {
-    match len {
-        0..=15 => (len as u8, 0, 0),
-        16..=17 => (16, len - 16, 1),
-        18..=19 => (17, len - 18, 1),
-        20..=21 => (18, len - 20, 1),
-        22..=23 => (19, len - 22, 1),
-        24..=27 => (20, len - 24, 2),
-        28..=31 => (21, len - 28, 2),
-        32..=39 => (22, len - 32, 3),
-        40..=47 => (23, len - 40, 3),
-        48..=63 => (24, len - 48, 4),
-        64..=127 => (25, len - 64, 6),
-        128..=255 => (26, len - 128, 7),
-        256..=511 => (27, len - 256, 8),
-        512..=1023 => (28, len - 512, 9),
-        1024..=2047 => (29, len - 1024, 10),
-        2048..=4095 => (30, len - 2048, 11),
-        4096..=8191 => (31, len - 4096, 12),
-        8192..=16383 => (32, len - 8192, 13),
-        16384..=32767 => (33, len - 16384, 14),
-        32768..=65535 => (34, len - 32768, 15),
-        65536..=131071 => (35, len - 65536, 16),
-        131072.. => unreachable!(),
-    }
+    debug_assert!(len < 131_072, "literal length {len} out of encodable range");
+    let code = if len < 64 {
+        LL_CODE[len as usize]
+    } else {
+        (len.ilog2() + LL_DELTA_CODE) as u8
+    };
+    let bits = LL_EXTRA_BITS[code as usize] as usize;
+    (code, len & ((1u32 << bits) - 1), bits)
 }
 
+/// Split a match length into its FSE symbol, the extra bits to append, and how
+/// many of them (upstream `ZSTD_MLcode` plus the `ML_bits` lookup its caller
+/// does). Codes are keyed on `len - 3`, the form the sequence section stores.
+///
+/// Table-driven for the same reason as [`encode_literal_length`].
+#[inline]
 fn encode_match_len(len: u32) -> (u8, u32, usize) {
-    match len {
-        0..=2 => unreachable!(),
-        3..=34 => (len as u8 - 3, 0, 0),
-        35..=36 => (32, len - 35, 1),
-        37..=38 => (33, len - 37, 1),
-        39..=40 => (34, len - 39, 1),
-        41..=42 => (35, len - 41, 1),
-        43..=46 => (36, len - 43, 2),
-        47..=50 => (37, len - 47, 2),
-        51..=58 => (38, len - 51, 3),
-        59..=66 => (39, len - 59, 3),
-        67..=82 => (40, len - 67, 4),
-        83..=98 => (41, len - 83, 4),
-        99..=130 => (42, len - 99, 5),
-        131..=258 => (43, len - 131, 7),
-        259..=514 => (44, len - 259, 8),
-        515..=1026 => (45, len - 515, 9),
-        1027..=2050 => (46, len - 1027, 10),
-        2051..=4098 => (47, len - 2051, 11),
-        4099..=8194 => (48, len - 4099, 12),
-        8195..=16386 => (49, len - 8195, 13),
-        16387..=32770 => (50, len - 16387, 14),
-        32771..=65538 => (51, len - 32771, 15),
-        65539..=131074 => (52, len - 65539, 16),
-        131075.. => unreachable!(),
-    }
+    debug_assert!(
+        (3..131_075).contains(&len),
+        "match length {len} out of encodable range",
+    );
+    let base = len - 3;
+    let code = if base < 128 {
+        ML_CODE[base as usize]
+    } else {
+        (base.ilog2() + ML_DELTA_CODE) as u8
+    };
+    let bits = ML_EXTRA_BITS[code as usize] as usize;
+    (code, base & ((1u32 << bits) - 1), bits)
 }
 
 /// Convert an actual byte offset into the encoded offset code, using repeat offset
@@ -2312,12 +2402,67 @@ fn emit_reuse_literals(
     }
 }
 
+/// Bytes taken from each end when a section is suspected incompressible
+/// (upstream `SUSPECT_INCOMPRESSIBLE_SAMPLE_SIZE`, `huf_compress.c:1251`).
+const SUSPECT_SAMPLE_SIZE: usize = 4096;
+/// How many times the sample must fit in the section before sampling is worth
+/// it at all (upstream `SUSPECT_INCOMPRESSIBLE_SAMPLE_RATIO`).
+const SUSPECT_SAMPLE_RATIO: usize = 10;
+/// Literals per sequence at or above which a section is suspected
+/// incompressible even though the search did find something (upstream
+/// `SUSPECT_UNCOMPRESSIBLE_LITERAL_RATIO`, `zstd_compress.c:2886`).
+pub(crate) const SUSPECT_LITERAL_RATIO: usize = 20;
+
+/// Whether the literals of a block that produced `sequence_count` sequences
+/// should be probed by sample before the full histogram is paid for.
+///
+/// Upstream `zstd_compress.c:2924`. A block whose search found nothing, or
+/// found so little that the literals dwarf it, is the shape that ends up
+/// emitted raw, and the histogram it would otherwise pay for spans the whole
+/// section.
+pub(crate) fn literals_suspected_incompressible(
+    literals_len: usize,
+    sequence_count: usize,
+) -> bool {
+    sequence_count == 0 || literals_len / sequence_count >= SUSPECT_LITERAL_RATIO
+}
+
+/// Whether two end samples say the section is flat enough to go out raw
+/// without paying for a histogram of the whole thing (upstream
+/// `huf_compress.c:1367`).
+///
+/// Shared by the emitter and by the splitter's cost estimator: the estimator
+/// mirrors the emitter's literal-mode branches in order so a probe cost matches
+/// what the emitter will write, and a section costed as Huffman-compressed here
+/// but emitted raw there would let the splitter choose a partition on a price
+/// nobody can produce.
+///
+/// Both ends, not one: a section that is random at the front and structured at
+/// the back must not be judged on the front alone. `counts` is cleared between
+/// the probes so each reports its own most frequent symbol, which is what the
+/// summed threshold is scaled for, and again on the way out so the caller
+/// receives it zeroed either way.
+fn end_samples_look_flat(literals: &[u8], counts: &mut [usize; 256]) -> bool {
+    if literals.len() < SUSPECT_SAMPLE_SIZE * SUSPECT_SAMPLE_RATIO {
+        return false;
+    }
+    counts.fill(0);
+    let (_, head_largest) = crate::histogram::count_bytes(&literals[..SUSPECT_SAMPLE_SIZE], counts);
+    counts.fill(0);
+    let (_, tail_largest) =
+        crate::histogram::count_bytes(&literals[literals.len() - SUSPECT_SAMPLE_SIZE..], counts);
+    counts.fill(0);
+    head_largest + tail_largest <= ((2 * SUSPECT_SAMPLE_SIZE) >> 7) + 4
+}
+
 fn compress_literals(
     literals: &[u8],
     last_table: Option<&huff0_encoder::HuffmanTable>,
     writer: &mut BitWriter<&mut Vec<u8>>,
     strategy: crate::encoding::strategy::StrategyTag,
     huf_search: bool,
+    weight_scratch: &mut huff0_encoder::WeightScratch,
+    suspected_incompressible: bool,
 ) -> HuffmanTableUpdate {
     let reset_idx = writer.index();
 
@@ -2339,6 +2484,18 @@ fn compress_literals(
     }
 
     let mut counts = [0usize; 256];
+
+    // Sample before committing to the full histogram (upstream
+    // `huf_compress.c:1367`). The histogram spans the whole section, and for a
+    // block the search found nothing in that section is the entire block — a
+    // megabyte of random input costs a megabyte of counting only to be thrown
+    // away by the flatness gate below. Two 4 KiB probes answer the same
+    // question for 8 KiB of counting.
+    if suspected_incompressible && end_samples_look_flat(literals, &mut counts) {
+        raw_literals(literals, writer);
+        return HuffmanTableUpdate::Cleared;
+    }
+
     let (max_symbol, largest_count) = crate::histogram::count_bytes(literals, &mut counts);
     // Upstream zstd pre-build incompressibility gate (`huf_compress.c`,
     // `HUF_compress_internal`): a histogram this flat
@@ -2355,12 +2512,16 @@ fn compress_literals(
         return HuffmanTableUpdate::Cleared;
     }
 
-    let new_encoder_table =
-        huff0_encoder::HuffmanTable::build_from_counts_gated(&counts[..=max_symbol], huf_search);
+    let new_encoder_table = huff0_encoder::HuffmanTable::build_from_counts_gated_with(
+        &counts[..=max_symbol],
+        huf_search,
+        weight_scratch,
+    );
 
     let Some(new_table_description_size) = new_encoder_table.writeable_table_description_size()
     else {
         raw_literals(literals, writer);
+        weight_scratch.recycle(new_encoder_table);
         return HuffmanTableUpdate::Cleared;
     };
     // Shared with the splitter cost estimator
@@ -2441,10 +2602,15 @@ fn compress_literals(
     if use_raw_literal_fallback(huf_section_size, literals.len(), strategy) {
         writer.reset_to(reset_idx);
         raw_literals(literals, writer);
+        // The section goes out raw, so the table just built is dead; hand its
+        // buffers to the next build instead of dropping them.
+        weight_scratch.recycle(new_encoder_table);
         HuffmanTableUpdate::Cleared
     } else if new_table {
         HuffmanTableUpdate::New(new_encoder_table)
     } else {
+        // The previous table was kept, so this one is dead — same as above.
+        weight_scratch.recycle(new_encoder_table);
         HuffmanTableUpdate::Reused
     }
 }

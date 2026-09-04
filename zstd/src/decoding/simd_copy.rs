@@ -939,12 +939,17 @@ unsafe fn copy_simd128(mut src: *const u8, mut dst: *mut u8, len: usize) {
 /// floor-aligned bulk plus one **overlapping** 32-byte store ending exactly
 /// at `len`. Reads and writes strictly `[0, len)` (no read-overshoot), so it
 /// is safe for sources without WILDCOPY slack (encoder literal slices into
-/// possibly-borrowed input). No `#[target_feature]` attribute: this is only
-/// compiled when the whole crate is built with AVX2 enabled
-/// (`cfg(target_feature = "avx2")`, e.g. `-C target-cpu=x86-64-v3`), so the
-/// intrinsics are legal and the body **inlines into the caller** with no ABI
-/// boundary and no runtime detect. Requires `len >= 33` (the `append_literals`
+/// possibly-borrowed input). Requires `len >= 33` (the `append_literals`
 /// `> 32` gate), so the overlapping 32-byte tail never underflows.
+///
+/// Carries `#[target_feature]` rather than a `cfg(target_feature = "avx2")`
+/// gate so the tier exists in a stock `x86_64` artifact, where AVX2 is not in
+/// the baseline: which tier runs is a property of the CPU executing the
+/// binary, not of the machine that built it.
+///
+/// # Safety
+/// Caller must have established AVX2 availability — [`ExactCopyTier::resolve`]
+/// is the only thing that returns the tag selecting this arm.
 ///
 /// **Unrolled 2×32B (64 B/iter)** to match `copy_avx2`'s kernel shape: a
 /// single-store-per-iter loop is throughput-bound by the loop branch on long
@@ -952,10 +957,10 @@ unsafe fn copy_simd128(mut src: *const u8, mut dst: *mut u8, len: usize) {
 /// load/store pairs per iteration expose ILP and amortise the branch.
 #[cfg(all(
     any(target_arch = "x86", target_arch = "x86_64"),
-    target_feature = "avx2",
-    feature = "kernel-avx2"
+    feature = "kernel-avx2",
+    any(feature = "std", target_feature = "avx2"),
 ))]
-#[inline]
+#[target_feature(enable = "avx2")]
 unsafe fn copy_exact_inline_avx2(src: *const u8, dst: *mut u8, len: usize) {
     debug_assert!(len >= 33, "copy_exact_inline_avx2 requires len >= 33");
     unsafe {
@@ -1009,23 +1014,23 @@ unsafe fn copy_exact_inline_avx2(src: *const u8, dst: *mut u8, len: usize) {
     }
 }
 
-/// SSE2 inline exact copy for **i686** (`target_arch = "x86"`, SSE2 baseline)
-/// — 16-byte-width analog of [`copy_exact_inline_avx2`] (branchless size-class
-/// for `len <= 64`, then 2×16B-unrolled loop + exact cleanup + one overlapping
-/// 16B tail). On 32-bit x86 the libc-memcpy call is relatively MORE expensive
-/// (cdecl stack args, few registers), so inlining wins even vs glibc's tuned
-/// SSE2 memcpy; on musl/no_std (scalar memcpy) it wins outright. Compiled only
-/// when SSE2 is in the build (default on `i686-unknown-linux-*`) and NOT AVX2
-/// (the AVX2 arm handles that). Gated to `target_arch = "x86"` so x86_64 — where
-/// glibc's IFUNC AVX memcpy beats a 16-byte inline — keeps the AVX2-or-memcpy
-/// arms. Requires `len >= 33`.
+/// SSE2 inline exact copy — 16-byte-width analog of
+/// [`copy_exact_inline_avx2`] (branchless size-class for `len <= 64`, then
+/// 2×16B-unrolled loop + exact cleanup + one overlapping 16B tail). Selected
+/// on any x86 CPU carrying SSE2 but not AVX2. On 32-bit x86 the libc-memcpy
+/// call is relatively MORE expensive (cdecl stack args, few registers), so
+/// inlining wins even vs glibc's tuned SSE2 memcpy; on musl/no_std (scalar
+/// memcpy) it wins outright. Requires `len >= 33`.
+///
+/// # Safety
+/// Caller must have established SSE2 availability — [`ExactCopyTier::resolve`]
+/// is the only thing that returns the tag selecting this arm.
 #[cfg(all(
-    target_arch = "x86",
-    target_feature = "sse2",
-    not(target_feature = "avx2"),
-    feature = "kernel-sse"
+    any(target_arch = "x86", target_arch = "x86_64"),
+    feature = "kernel-sse",
+    any(feature = "std", target_feature = "sse2"),
 ))]
-#[inline]
+#[target_feature(enable = "sse2")]
 unsafe fn copy_exact_inline_sse2(src: *const u8, dst: *mut u8, len: usize) {
     debug_assert!(len >= 33, "copy_exact_inline_sse2 requires len >= 33");
     unsafe {
@@ -1097,22 +1102,124 @@ unsafe fn copy_exact_inline_neon(src: *const u8, dst: *mut u8, len: usize) {
     }
 }
 
+/// Widest exact-copy kernel the running CPU can execute, out of those the
+/// build baked in.
+///
+/// Which kernels EXIST is a compile-time question, answered by the arch and the
+/// `kernel-*` features. Which one RUNS is a property of the CPU executing the
+/// binary, so it is answered by [`resolve`](ExactCopyTier::resolve) once, ahead
+/// of the work, and carried as a value from there on. A compressor resolves it
+/// at construction and hands it to every copy it performs, so nothing on the
+/// emit path re-asks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ExactCopyTier {
+    /// libc `memcpy`. Also the answer on a CPU that has none of the tiers the
+    /// build carries.
+    Scalar,
+    /// Reachable when a CPU can be asked at runtime (`std`), or when the build
+    /// baseline already guarantees the feature. Without either, no code path
+    /// can ever name this tier — same shape as `CpuKernelTag`'s SVE variant.
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-sse",
+        any(feature = "std", target_feature = "sse2"),
+    ))]
+    Sse2,
+    #[cfg(all(
+        any(target_arch = "x86", target_arch = "x86_64"),
+        feature = "kernel-avx2",
+        any(feature = "std", target_feature = "avx2"),
+    ))]
+    Avx2,
+    #[cfg(all(
+        target_arch = "aarch64",
+        target_feature = "neon",
+        feature = "kernel-neon"
+    ))]
+    Neon,
+}
+
+impl ExactCopyTier {
+    /// Ask the CPU what it supports and pick the widest kernel this build
+    /// carries. Call once, before the work — never per block and never per
+    /// copy.
+    pub(crate) fn resolve() -> Self {
+        // x86 with runtime detection available: ask the CPU. Routing through
+        // `detect_x86_caps` keeps the copy path on the crate's single
+        // capability source of truth, so it can never disagree with the
+        // entropy/sequence path about the machine it is running on.
+        #[cfg(all(
+            feature = "std",
+            feature = "kernel-sse",
+            any(target_arch = "x86", target_arch = "x86_64")
+        ))]
+        {
+            let caps = detect_x86_caps();
+            #[cfg(feature = "kernel-avx2")]
+            if caps.avx2 {
+                return Self::Avx2;
+            }
+            if caps.sse2 {
+                return Self::Sse2;
+            }
+        }
+        // x86 without it (no-std, or the SSE tier trimmed out): there is
+        // nothing to probe, so the build's own baseline is the only evidence
+        // of what the CPU can run — the same convention the bulk-copy
+        // dispatcher uses on no-std.
+        #[cfg(all(
+            not(all(feature = "std", feature = "kernel-sse")),
+            any(target_arch = "x86", target_arch = "x86_64")
+        ))]
+        #[allow(unreachable_code)]
+        {
+            #[cfg(all(target_feature = "avx2", feature = "kernel-avx2"))]
+            return Self::Avx2;
+            #[cfg(all(target_feature = "sse2", feature = "kernel-sse"))]
+            return Self::Sse2;
+        }
+        // NEON is architectural on aarch64, so the build flag alone settles it
+        // — there is nothing to probe.
+        #[cfg(all(
+            target_arch = "aarch64",
+            target_feature = "neon",
+            feature = "kernel-neon"
+        ))]
+        {
+            return Self::Neon;
+        }
+        #[allow(unreachable_code)]
+        Self::Scalar
+    }
+}
+
 /// Exact medium-size copy (`33 <= len < `[`BULK_MEMCPY_THRESHOLD`]) for encoder
-/// literal runs — the safe analog of upstream zstd `ZSTD_wildcopy`. The kernel is
-/// fixed at **compile time** (the build's `target_feature`), so the chosen
-/// SIMD body inlines directly into the caller with NO runtime detect and NO
-/// `#[target_feature]` ABI boundary:
-/// - AVX2 build (`-C target-cpu=x86-64-v3`): inline 32-byte exact copy.
-/// - i686 (SSE2 baseline, no AVX2): inline 16-byte exact copy.
-/// - aarch64 (NEON baseline): inline 16-byte exact copy.
-/// - any other build: libc `memcpy` (`ptr::copy_nonoverlapping`), whose
-///   per-CPU IFUNC routine is already optimal for medium runs — a narrow
-///   inline loop or a runtime-dispatched `#[target_feature]` call both
-///   measured slower than it (i9, 2026-06-06). Default multi-kernel builds
-///   that select AVX2 at runtime fall here: a leaf copy cannot inline AVX2
-///   without the crate-wide feature, and a dispatched call ties glibc, so
-///   glibc is the right choice until the whole emit path is under the
-///   `fastpath` umbrella (then this collapses into the per-tier monolith).
+/// literal runs — the safe analog of upstream zstd `ZSTD_wildcopy`.
+///
+/// `tier` comes from the caller, resolved once before any compression began;
+/// this function never probes the CPU. What is left is the dispatch itself, one
+/// predictable branch selecting a kernel whose own size-class paths are already
+/// laid out straight-line. Widening that to a per-tier monomorph of the whole
+/// emit loop was not taken: it would replicate the match loop per tier for the
+/// sake of this one branch, and monomorphizing that loop has measured as an
+/// instruction-cache regression here before.
+///
+/// Falling through to `Scalar` reaches libc `memcpy`, whose per-CPU IFUNC
+/// routine is a good medium-run implementation — it is a real fallback, not a
+/// degraded one.
+///
+/// What the tiers cost, so this is not "optimised" back to a compile-time gate:
+/// runtime selection means the SIMD kernels carry `#[target_feature]` and are
+/// therefore CALLED, where a baseline-gated kernel could inline. Measured on the
+/// i9 against the previous compile-time build, which inlined a 16-byte SSE2 body
+/// there, the out-of-line 32-byte AVX2 path came out +0.2% instructions and
+/// +0.7% cycles on decodecorpus z000033 at level 3 — inside the run-to-run band,
+/// so the wider stores and the call boundary roughly cancel on literal runs this
+/// short. The reason to dispatch at runtime is therefore reach, not speed: under
+/// the compile-time gate a stock `x86_64` artifact could not execute the AVX2
+/// kernel at all, on any CPU. Do not read the near-neutral result as licence to
+/// go back — that gate also silently narrowed the path, and once fell all the
+/// way through to a `memcpy` call in a routine written to avoid one.
 ///
 /// # Safety
 /// `src` readable and `dst` writable for `len` bytes; regions non-overlapping.
@@ -1121,62 +1228,40 @@ unsafe fn copy_exact_inline_neon(src: *const u8, dst: *mut u8, len: usize) {
 /// `len`. Callers route `<= 32` through a separate exact path, so the dispatcher
 /// only ever sees `>= 33`; the `debug_assert!` below guards future misuse.
 #[inline]
-pub(crate) unsafe fn copy_exact_medium(src: *const u8, dst: *mut u8, len: usize) {
+pub(crate) unsafe fn copy_exact_medium(
+    src: *const u8,
+    dst: *mut u8,
+    len: usize,
+    tier: ExactCopyTier,
+) {
     debug_assert!(
         len >= 33,
         "copy_exact_medium requires len >= 33 (overlapping SIMD tail underflows below that)",
     );
-    // Exactly one of the three cfg arms compiles per build, so each is a
-    // tail statement with no `return` (avoids `clippy::needless_return`).
-    #[cfg(all(
-        any(target_arch = "x86", target_arch = "x86_64"),
-        target_feature = "avx2",
-        feature = "kernel-avx2"
-    ))]
-    unsafe {
-        copy_exact_inline_avx2(src, dst, len)
-    };
-
-    #[cfg(all(
-        target_arch = "x86",
-        target_feature = "sse2",
-        not(target_feature = "avx2"),
-        feature = "kernel-sse"
-    ))]
-    unsafe {
-        copy_exact_inline_sse2(src, dst, len)
-    };
-
-    #[cfg(all(
-        target_arch = "aarch64",
-        target_feature = "neon",
-        feature = "kernel-neon"
-    ))]
-    unsafe {
-        copy_exact_inline_neon(src, dst, len)
-    };
-
-    #[cfg(not(any(
-        all(
+    match tier {
+        // SAFETY: the tier is only ever produced by `ExactCopyTier::resolve`,
+        // which returns each SIMD arm exclusively after confirming that CPU
+        // feature; `len >= 33` is the shared precondition asserted above.
+        #[cfg(all(
             any(target_arch = "x86", target_arch = "x86_64"),
-            target_feature = "avx2",
-            feature = "kernel-avx2"
-        ),
-        all(
-            target_arch = "x86",
-            target_feature = "sse2",
-            not(target_feature = "avx2"),
-            feature = "kernel-sse"
-        ),
-        all(
+            feature = "kernel-avx2",
+            any(feature = "std", target_feature = "avx2"),
+        ))]
+        ExactCopyTier::Avx2 => unsafe { copy_exact_inline_avx2(src, dst, len) },
+        #[cfg(all(
+            any(target_arch = "x86", target_arch = "x86_64"),
+            feature = "kernel-sse",
+            any(feature = "std", target_feature = "sse2"),
+        ))]
+        ExactCopyTier::Sse2 => unsafe { copy_exact_inline_sse2(src, dst, len) },
+        #[cfg(all(
             target_arch = "aarch64",
             target_feature = "neon",
             feature = "kernel-neon"
-        )
-    )))]
-    unsafe {
-        core::ptr::copy_nonoverlapping(src, dst, len)
-    };
+        ))]
+        ExactCopyTier::Neon => unsafe { copy_exact_inline_neon(src, dst, len) },
+        ExactCopyTier::Scalar => unsafe { core::ptr::copy_nonoverlapping(src, dst, len) },
+    }
 }
 
 #[cfg(test)]

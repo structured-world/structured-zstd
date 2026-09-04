@@ -8,18 +8,11 @@ use crate::bit_io::BitReaderReversed;
 use crate::cpu_kernel::Avx2Kernel;
 #[cfg(all(target_arch = "x86_64", feature = "kernel-bmi2"))]
 use crate::cpu_kernel::Bmi2Kernel;
-#[cfg(all(
-    target_arch = "x86_64",
-    any(
-        feature = "kernel-bmi2",
-        feature = "kernel-avx2",
-        feature = "kernel-vbmi2"
-    )
-))]
-use crate::cpu_kernel::CpuKernelTag;
 #[cfg(all(target_arch = "x86_64", feature = "kernel-vbmi2"))]
 use crate::cpu_kernel::Vbmi2Kernel;
-use crate::cpu_kernel::{CpuKernel, ScalarKernel, detect_cpu_kernel};
+#[cfg(test)]
+use crate::cpu_kernel::detect_cpu_kernel;
+use crate::cpu_kernel::{CpuKernel, CpuKernelTag, ScalarKernel};
 use crate::decoding::dictionary::Dictionary;
 use crate::decoding::errors::DecompressLiteralsError;
 use crate::huff0::HuffmanDecoder;
@@ -47,7 +40,11 @@ pub fn decode_literals(
             Ok(1)
         }
         LiteralsSectionType::Compressed | LiteralsSectionType::Treeless => {
-            let bytes_read = decompress_literals(section, scratch, dict, source, target)?;
+            // Standalone entry point: nobody upstream owns a resolved tag, so
+            // this is where detection belongs — once, on the way in, ahead of
+            // the decode rather than inside it.
+            let bytes_read =
+                decompress_literals(section, scratch, dict, source, target, detect_cpu_kernel())?;
             Ok(bytes_read)
         }
     }
@@ -81,6 +78,7 @@ pub fn decode_literals_zerocopy<'a>(
     dict: Option<&Dictionary>,
     source: &'a [u8],
     target: &'a mut Vec<u8>,
+    kernel: CpuKernelTag,
 ) -> Result<LiteralsView<'a>, DecompressLiteralsError> {
     // Snapshot `target.len()` before any decode work — the returned
     // view must point ONLY at the newly-decoded bytes, not at any
@@ -124,7 +122,7 @@ pub fn decode_literals_zerocopy<'a>(
             })
         }
         LiteralsSectionType::Compressed | LiteralsSectionType::Treeless => {
-            let bytes_used = decompress_literals(section, scratch, dict, source, target)?;
+            let bytes_used = decompress_literals(section, scratch, dict, source, target, kernel)?;
             Ok(LiteralsView {
                 data: &target[base..],
                 bytes_used,
@@ -143,13 +141,12 @@ fn decompress_literals(
     dict: Option<&Dictionary>,
     source: &[u8],
     target: &mut Vec<u8>,
+    kernel: CpuKernelTag,
 ) -> Result<u32, DecompressLiteralsError> {
-    // Per-block CpuKernel dispatch. `detect_cpu_kernel()` resolves the
-    // tag at most once per process: under `feature = "std"` via an
-    // `OnceLock` cache around `is_x86_feature_detected!`, and under
-    // `no_std` it is a `cfg(target_feature = ...)` const at compile
-    // time. Either way the match below collapses to a single cmp+jmp
-    // on subsequent calls (or to a single arm at codegen on no-std).
+    // `kernel` was resolved once, before the first block, by whoever owns the
+    // decode; nothing here re-runs feature detection. What remains is the
+    // dispatch itself: one branch per literals section selecting the monomorph
+    // that then runs with no further tier decisions inside it.
     // Each arm dispatches into a target_feature-wrapped outer function
     // so the entire impl::<K> pipeline executes inside the matching
     // target_feature context — without that wrapping, LLVM cannot
@@ -157,7 +154,7 @@ fn decompress_literals(
     // K::mask_lower_bits) through the trait-method call boundary back
     // into the generic caller, and the inlined-intrinsic win
     // evaporates into a function-call trampoline per mask op.
-    match detect_cpu_kernel() {
+    match kernel {
         #[cfg(all(target_arch = "x86_64", feature = "kernel-vbmi2"))]
         CpuKernelTag::Vbmi2 => unsafe {
             decompress_literals_vbmi2(section, scratch, dict, source, target)

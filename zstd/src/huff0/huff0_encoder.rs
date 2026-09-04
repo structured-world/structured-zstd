@@ -21,6 +21,11 @@ use crate::{
     histogram,
 };
 
+/// Widest Huffman alphabet the format admits: one code per byte value. Every
+/// per-symbol buffer here is bounded by it, which is what lets them sit on the
+/// stack instead of being allocated per table.
+const MAX_HUFFMAN_ALPHABET: usize = 256;
+
 pub(crate) struct HuffmanEncoder<'output, 'table, V: AsMut<Vec<u8>>> {
     table: &'table HuffmanTable,
     writer: &'output mut BitWriter<V>,
@@ -247,8 +252,18 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         }
     }
 
+    /// Per-symbol weights into a caller's buffer; see
+    /// [`HuffmanTable::weights_into`].
+    fn weights_into<'b>(&self, buf: &'b mut [u8; MAX_HUFFMAN_ALPHABET]) -> &'b [u8] {
+        self.table.weights_into(buf)
+    }
+
+    /// Owning form of [`Self::weights_into`], for tests that want the weights
+    /// as a value. Production paths use the buffer form: this allocates.
+    #[cfg(test)]
     pub(super) fn weights(&self) -> Vec<u8> {
-        self.table.weights()
+        let mut buf = [0u8; MAX_HUFFMAN_ALPHABET];
+        self.weights_into(&mut buf).to_vec()
     }
 
     fn write_table(&mut self) {
@@ -264,7 +279,8 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
                     self.writer.append_bytes(fse_description);
                     return;
                 }
-                let weights = self.weights();
+                let mut buf = [0u8; MAX_HUFFMAN_ALPHABET];
+                let weights = self.weights_into(&mut buf);
                 let weights = &weights[..weights.len() - 1];
                 Self::write_raw_weight_description(self.writer, weights);
                 return;
@@ -275,7 +291,8 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
             // this, the raw fallback would call back into `weights()` and
             // recompute the slice — a measurable hotspot for small /
             // low-cardinality tables (#170 review thread).
-            let weights = self.weights();
+            let mut buf = [0u8; MAX_HUFFMAN_ALPHABET];
+            let weights = self.weights_into(&mut buf);
             let weights = &weights[..weights.len() - 1];
             if let Some(fse_description) = self
                 .table
@@ -289,9 +306,10 @@ impl<V: AsMut<Vec<u8>>> HuffmanEncoder<'_, '_, V> {
         }
         #[cfg(not(feature = "std"))]
         {
-            // no_std: no cache field, no shared state — single `weights()`
-            // compute, branch on FSE-vs-raw based on direct encoder call.
-            let weights = self.weights();
+            // no_std: no cache field, no shared state — single weight
+            // computation, branch on FSE-vs-raw based on direct encoder call.
+            let mut buf = [0u8; MAX_HUFFMAN_ALPHABET];
+            let weights = self.weights_into(&mut buf);
             let weights = &weights[..weights.len() - 1];
             if let Some(fse_description) = Self::encode_weight_description(weights) {
                 self.writer.write_bits(fse_description.len() as u8, 8);
@@ -466,12 +484,27 @@ pub fn set_force_cheap_huf(on: bool) {
 }
 
 impl HuffmanTable {
-    /// Heap bytes this table holds: the per-symbol code table and the packed
-    /// dual-container codes. The lazily-built weight-description cache is a
-    /// transient and not counted.
+    /// Heap bytes this table holds: the per-symbol code table, the packed
+    /// dual-container codes, and the encoded weight description once it has
+    /// been built.
+    ///
+    /// The description is not a transient. It is built lazily but then lives as
+    /// long as the table does, and tables outlive the block that made them —
+    /// the emitter carries one between blocks and the builder parks a spare —
+    /// so its bytes are retained and a caller budgeting around a context has to
+    /// see them.
     pub fn heap_size(&self) -> usize {
+        #[cfg(feature = "std")]
+        let cached = self
+            .cached_encoded_weight_description
+            .get()
+            .and_then(Option::as_ref)
+            .map_or(0, Vec::capacity);
+        #[cfg(not(feature = "std"))]
+        let cached = 0;
         self.codes.capacity() * core::mem::size_of::<(u32, u8)>()
             + self.packed_codes.capacity() * core::mem::size_of::<u64>()
+            + cached
     }
 
     pub fn build_from_data(data: &[u8]) -> Self {
@@ -486,13 +519,29 @@ impl HuffmanTable {
     /// (the upstream non-optimalDepth path). The caller gates `use_search` by
     /// strategy and source size (see `CompressState::huf_optimal_search`).
     pub fn build_from_counts_gated(counts: &[usize], use_search: bool) -> Self {
+        let mut scratch = WeightScratch::default();
+        Self::build_from_counts_gated_with(counts, use_search, &mut scratch)
+    }
+
+    /// [`Self::build_from_counts_gated`] reusing caller-owned scratch. The
+    /// cheap path builds a tree and two weight buffers per call, and a
+    /// compressor calls it once per block — and once per split candidate where
+    /// the block splitter probes — so taking them fresh every time was the
+    /// single largest source of per-frame allocations.
+    pub(crate) fn build_from_counts_gated_with(
+        counts: &[usize],
+        use_search: bool,
+        scratch: &mut WeightScratch,
+    ) -> Self {
         if use_search {
             Self::build_from_counts(counts)
         } else {
             // Match upstream's cheap path: tableLog = FSE_optimalTableLog(11,
             // srcSize, maxSV, minus=1) (huf_compress.c:1286), height-limit to it,
             // not the raw natural height (11) which can cost a few bytes vs C.
-            Self::build_from_weights(&build_limited_weights(counts, cheap_huf_table_log(counts)))
+            build_limited_weights_into(counts, cheap_huf_table_log(counts), scratch);
+            let spare = scratch.spare_table.take();
+            Self::build_from_weights_reusing(&scratch.weights, spare)
         }
     }
 
@@ -675,7 +724,8 @@ impl HuffmanTable {
         }
         #[cfg(not(feature = "std"))]
         {
-            let weights = self.weights();
+            let mut buf = [0u8; MAX_HUFFMAN_ALPHABET];
+            let weights = self.weights_into(&mut buf);
             let weights = &weights[..weights.len() - 1];
             if let Some(fse_description) =
                 HuffmanEncoder::<Vec<u8>>::encode_weight_description(weights)
@@ -695,13 +745,24 @@ impl HuffmanTable {
         self.try_table_description_size()
     }
 
+    /// Owning form of [`Self::weights_into`], for tests that want the weights
+    /// as a value. Production paths use the buffer form: this allocates.
+    #[cfg(test)]
     fn weights(&self) -> Vec<u8> {
-        let max = self.codes.iter().map(|(_, nb)| nb).max().unwrap();
-        self.codes
-            .iter()
-            .copied()
-            .map(|(_, nb)| if nb == 0 { 0 } else { max - nb + 1 })
-            .collect::<Vec<u8>>()
+        let mut buf = [0u8; MAX_HUFFMAN_ALPHABET];
+        self.weights_into(&mut buf).to_vec()
+    }
+
+    /// Per-symbol weights written into a caller's buffer. The alphabet is at
+    /// most 256 symbols, so a stack buffer covers every table — and this runs
+    /// once per built table, which is once per block and once per split
+    /// candidate, so a `Vec` here was an allocation on that whole path.
+    fn weights_into<'b>(&self, buf: &'b mut [u8; MAX_HUFFMAN_ALPHABET]) -> &'b [u8] {
+        let max = *self.codes.iter().map(|(_, nb)| nb).max().unwrap();
+        for (slot, &(_, nb)) in buf.iter_mut().zip(self.codes.iter()) {
+            *slot = if nb == 0 { 0 } else { max - nb + 1 };
+        }
+        &buf[..self.codes.len()]
     }
 
     #[cfg(feature = "std")]
@@ -709,7 +770,8 @@ impl HuffmanTable {
         if let Some(cached) = self.cached_encoded_weight_description.get() {
             return cached.as_deref();
         }
-        let weights = self.weights();
+        let mut buf = [0u8; MAX_HUFFMAN_ALPHABET];
+        let weights = self.weights_into(&mut buf);
         let weights = &weights[..weights.len() - 1];
         self.cached_encoded_weight_description_with_weights(weights)
     }
@@ -733,6 +795,14 @@ impl HuffmanTable {
     }
 
     pub fn build_from_weights(weights: &[usize]) -> Self {
+        Self::build_from_weights_reusing(weights, None)
+    }
+
+    /// [`Self::build_from_weights`] filling a discarded table's buffers instead
+    /// of taking new ones. A table is built per block and, where the splitter
+    /// probes, per split candidate; most are measured and thrown away, so
+    /// handing the last one back turns two allocations per build into none.
+    pub(crate) fn build_from_weights_reusing(weights: &[usize], spare: Option<Self>) -> Self {
         let weight_sum = weights
             .iter()
             .copied()
@@ -743,12 +813,28 @@ impl HuffmanTable {
             panic!("This is an internal error");
         }
         let table_log = highest_bit_set(weight_sum) - 1;
-        let mut table = HuffmanTable {
-            codes: alloc::vec![(0, 0); weights.len()],
-            packed_codes: alloc::vec![0u64; weights.len()],
-            table_log: table_log as u32,
-            #[cfg(feature = "std")]
-            cached_encoded_weight_description: CachedDescription::new(),
+        let mut table = match spare {
+            Some(mut spare) => {
+                // Both buffers are overwritten in full below, so the recycled
+                // contents do not survive; only their allocations do.
+                spare.codes.clear();
+                spare.codes.resize(weights.len(), (0, 0));
+                spare.packed_codes.clear();
+                spare.packed_codes.resize(weights.len(), 0u64);
+                spare.table_log = table_log as u32;
+                #[cfg(feature = "std")]
+                {
+                    spare.cached_encoded_weight_description = CachedDescription::new();
+                }
+                spare
+            }
+            None => HuffmanTable {
+                codes: alloc::vec![(0, 0); weights.len()],
+                packed_codes: alloc::vec![0u64; weights.len()],
+                table_log: table_log as u32,
+                #[cfg(feature = "std")]
+                cached_encoded_weight_description: CachedDescription::new(),
+            },
         };
         let mut nb_per_rank = [0u16; 13];
         for &weight in weights {
@@ -951,13 +1037,23 @@ struct HuffNode {
 /// symbol the (0 or 1) leaves are returned with `nb_bits == 0` and the caller
 /// assigns the trivial weight.
 fn build_huffman_leaf_depths(counts: &[usize]) -> Vec<HuffNode> {
+    let mut nodes = Vec::new();
+    build_huffman_leaf_depths_into(counts, &mut nodes);
+    nodes
+}
+
+/// [`build_huffman_leaf_depths`] filling a caller-owned buffer, so a caller
+/// that builds a tree per block reuses one allocation instead of taking a fresh
+/// one every time.
+fn build_huffman_leaf_depths_into(counts: &[usize], nodes: &mut Vec<HuffNode>) {
     let leaf_count = counts.iter().filter(|&&count| count > 0).count();
     // Pre-size to the final node count (`2 * leaf_count - 1`) so the tree
     // build's resize never reallocates.
-    let mut nodes: Vec<HuffNode> = Vec::with_capacity((2 * leaf_count).max(1));
+    nodes.clear();
+    nodes.reserve((2 * leaf_count).max(1));
 
     if leaf_count == 0 {
-        return nodes;
+        return;
     }
     if leaf_count == 1 {
         let (symbol, &count) = counts.iter().enumerate().find(|&(_, &c)| c > 0).unwrap();
@@ -967,7 +1063,7 @@ fn build_huffman_leaf_depths(counts: &[usize]) -> Vec<HuffNode> {
             parent: None,
             nb_bits: 0,
         });
-        return nodes;
+        return;
     }
 
     // Bucketed sort (upstream zstd `HUF_sort`, huf_compress.c): an O(n)
@@ -1125,7 +1221,6 @@ fn build_huffman_leaf_depths(counts: &[usize]) -> Vec<HuffNode> {
     // only writes `parent` / `nb_bits` on them and never reorders them or
     // changes their `count` / `symbol`. Return just the leaves (with depths).
     nodes.truncate(leaf_count);
-    nodes
 }
 
 /// Limit the natural Huffman depths in `leaves` (from
@@ -1199,13 +1294,62 @@ fn cheap_huf_table_log(counts: &[usize]) -> usize {
 }
 
 fn build_limited_weights(counts: &[usize], max_nb_bits: usize) -> Vec<usize> {
-    let leaves = build_huffman_leaf_depths(counts);
-    let mut work = Vec::new();
-    let mut out = Vec::new();
-    if limited_weights_into(&leaves, counts.len(), max_nb_bits, &mut work, &mut out) {
-        out
-    } else {
-        legacy_distributed_weights(counts)
+    let mut scratch = WeightScratch::default();
+    build_limited_weights_into(counts, max_nb_bits, &mut scratch);
+    core::mem::take(&mut scratch.weights)
+}
+
+/// The three buffers a weight build needs, owned by the caller so a compressor
+/// that builds a table per block — and, where the block splitter probes, per
+/// split candidate — reuses them instead of taking three fresh allocations
+/// every time. The table-log SEARCH path already reused its scratch; this is
+/// the same for the cheap single-build path.
+#[derive(Default)]
+pub(crate) struct WeightScratch {
+    leaves: Vec<HuffNode>,
+    work: Vec<HuffNode>,
+    weights: Vec<usize>,
+    /// The last table the caller built and threw away, handed back so the next
+    /// build fills its buffers instead of taking new ones.
+    spare_table: Option<HuffmanTable>,
+}
+
+impl WeightScratch {
+    /// Heap bytes this scratch keeps between blocks and frames. It exists to
+    /// hold its buffers rather than take them again, so a compressor asked for
+    /// its footprint — including through the C API's `ZSTD_sizeof_CCtx` — has
+    /// to be told about them.
+    ///
+    /// A parked table contributes its own heap bytes only: the table object
+    /// sits inline here, as the three buffers' headers do, and none of them
+    /// are an allocation of this scratch's making.
+    pub(crate) fn heap_size(&self) -> usize {
+        self.leaves.capacity() * core::mem::size_of::<HuffNode>()
+            + self.work.capacity() * core::mem::size_of::<HuffNode>()
+            + self.weights.capacity() * core::mem::size_of::<usize>()
+            + self.spare_table.as_ref().map_or(0, HuffmanTable::heap_size)
+    }
+
+    /// Park a table the caller is done with, for the next build to fill.
+    pub(crate) fn recycle(&mut self, table: HuffmanTable) {
+        self.spare_table = Some(table);
+    }
+}
+
+/// [`build_limited_weights`] filling caller-owned scratch. The weights land in
+/// `scratch.weights`.
+fn build_limited_weights_into(counts: &[usize], max_nb_bits: usize, scratch: &mut WeightScratch) {
+    build_huffman_leaf_depths_into(counts, &mut scratch.leaves);
+    if !limited_weights_into(
+        &scratch.leaves,
+        counts.len(),
+        max_nb_bits,
+        &mut scratch.work,
+        &mut scratch.weights,
+    ) {
+        // The fallback builds its own; hand its result to the same slot so the
+        // caller reads one place either way.
+        scratch.weights = legacy_distributed_weights(counts);
     }
 }
 
@@ -1238,6 +1382,18 @@ fn enforce_max_height(nodes: &mut [HuffNode], target_nb_bits: usize) {
         return;
     }
 
+    // The shift is bounded by the input, not by anything checked here, so pin
+    // the reasoning: a Huffman code of depth d needs at least Fib(d) symbols
+    // counted, and a literals section is at most 128 KiB, which caps natural
+    // depth around 25. `target_nb_bits` is at least 5, leaving a shift under 20
+    // and comfortably inside a 32-bit `usize`. Worth asserting rather than
+    // assuming: on a 32-bit target an over-large shift does not panic in
+    // release, it silently masks to a smaller one and computes a wrong cost.
+    debug_assert!(
+        largest_bits - target_nb_bits < usize::BITS as usize,
+        "code depth {largest_bits} over target {target_nb_bits} exceeds what a \
+         usize shift can express; counts imply an impossibly large section",
+    );
     let base_cost = 1usize << (largest_bits - target_nb_bits);
     let mut total_cost = 0isize;
     let mut n = nodes.len() - 1;
@@ -1474,12 +1630,8 @@ fn redistribute_weights(weights: &mut [usize], max_num_bits: usize) {
 #[cfg(feature = "bench-internals")]
 pub(crate) fn huf_weight_description_for_test(data: &[u8]) -> (Vec<u8>, Vec<u8>) {
     let table = HuffmanTable::build_from_data(data);
-    let mut weights = {
-        let mut out = Vec::new();
-        let mut writer = BitWriter::from(&mut out);
-        let encoder = HuffmanEncoder::new(&table, &mut writer);
-        encoder.weights()
-    };
+    let mut buf = [0u8; MAX_HUFFMAN_ALPHABET];
+    let mut weights = table.weights_into(&mut buf).to_vec();
     weights.pop();
     let encoded = HuffmanEncoder::<Vec<u8>>::encode_weight_description(&weights)
         .expect("expected FSE weights");

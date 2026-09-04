@@ -7,6 +7,7 @@ use crate::blocks::sequence_section::{
     MAX_LITERAL_LENGTH_CODE, MAX_MATCH_LENGTH_CODE, MAX_OFFSET_CODE,
 };
 use crate::common::MAX_BLOCK_SIZE;
+use crate::cpu_kernel::CpuKernelTag;
 use crate::decoding::errors::{DecodeSequenceError, DecompressBlockError, ExecuteSequencesError};
 use crate::decoding::sequence_execution::do_offset_history;
 use crate::fse::SeqFSEDecoder;
@@ -240,6 +241,11 @@ where
 /// instructions across the `K::mask_lower_bits` call boundary inside
 /// the impl body — otherwise the per-call target_feature boundary
 /// would keep a function-call trampoline at every BitReader op.
+// One argument over the lint's threshold, and the extra one is the resolved
+// kernel tag: bundling it into a struct with the unrelated section/scratch
+// borrows would obscure that it is a plain Copy value carried down from the
+// decoder, not more state to thread.
+#[allow(clippy::too_many_arguments)]
 pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBackend>(
     section: &SequencesHeader,
     source: &[u8],
@@ -248,6 +254,7 @@ pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBacken
     offset_hist: &mut [u32; 3],
     literals_buffer: &[u8],
     dict: Option<&'fse crate::decoding::dictionary::Dictionary>,
+    kernel: CpuKernelTag,
 ) -> Result<(), DecompressBlockError> {
     #[cfg(all(target_arch = "aarch64", feature = "kernel-neon"))]
     use crate::cpu_kernel::NeonKernel;
@@ -257,9 +264,11 @@ pub fn decode_and_execute_sequences<'fse, B: super::buffer_backend::BufferBacken
         any(feature = "std", target_feature = "sve"),
     ))]
     use crate::cpu_kernel::SveKernel;
-    use crate::cpu_kernel::{CpuKernelTag, detect_cpu_kernel};
 
-    match detect_cpu_kernel() {
+    // Feature detection happened once, before the first block. This is the
+    // dispatch: one branch selecting the per-tier monomorph, which then runs
+    // the whole sequence loop with the tier baked in.
+    match kernel {
         CpuKernelTag::Scalar => {
             super::seq_decoder_scalar::decode_and_execute_sequences_scalar::<B>(
                 section,

@@ -1372,6 +1372,20 @@ impl DfastMatchGenerator {
         literals_start: &mut usize,
         handle_sequence: &mut impl for<'a> FnMut(Sequence<'a>),
     ) -> usize {
+        // Source bytes + rebase coordinate through `scan_source()` so a
+        // borrowed window's rep-extension reads the in-place input.
+        //
+        // Resolved once for the whole chain, not per link. Nothing the loop
+        // does moves them: the only mutation reaching the buffer is
+        // `insert_position`'s rebase, which shifts slot values and
+        // `position_base` — the one field of the five this loop discards —
+        // and never reallocates the history.
+        let (base_ptr, start_offset, abs_start, _position_base, concat_len) = self.scan_source();
+        // SAFETY: `base_ptr + start_offset` is the live source start and
+        // `concat_len` its readable length (owned history or borrowed
+        // input); every read below is gated `< concat.len()`. Raw-ptr
+        // backed, so no borrow is held on `self`.
+        let concat = unsafe { core::slice::from_raw_parts(base_ptr.add(start_offset), concat_len) };
         loop {
             // Need at least DFAST_REP_MIN_MATCH_LEN bytes of room past `pos`.
             if pos + DFAST_REP_MIN_MATCH_LEN > current_len {
@@ -1384,10 +1398,6 @@ impl DfastMatchGenerator {
             if rep == 0 {
                 break;
             }
-            // Source bytes + rebase coordinate through `scan_source()` so a
-            // borrowed window's rep-extension reads the in-place input.
-            let (base_ptr, start_offset, abs_start, _position_base, concat_len) =
-                self.scan_source();
             let abs_pos = current_abs_start + pos;
             let cur_idx = abs_pos - abs_start;
             // `checked_sub` is the authoritative bound here: a valid rep
@@ -1404,12 +1414,6 @@ impl DfastMatchGenerator {
                 Some(idx) => idx,
                 None => break,
             };
-            // SAFETY: `base_ptr + start_offset` is the live source start and
-            // `concat_len` its readable length (owned history or borrowed
-            // input); the `cur_idx` / `cand_idx` reads below are gated `<
-            // concat.len()`. Raw-ptr backed, no borrow on `self`.
-            let concat =
-                unsafe { core::slice::from_raw_parts(base_ptr.add(start_offset), concat_len) };
             if cur_idx + DFAST_REP_MIN_MATCH_LEN > concat.len() {
                 break;
             }
@@ -1612,10 +1616,7 @@ impl DfastMatchGenerator {
         let curr_plus_2 = scan_pos + 2;
         let ip_minus_2 = post_match_end - 2;
         let ip_minus_1 = post_match_end - 1;
-        self.insert_long(curr_plus_2);
-        self.insert_long(ip_minus_2);
-        self.insert_short(curr_plus_2);
-        self.insert_short(ip_minus_1);
+        self.insert_complementary(curr_plus_2, ip_minus_2, ip_minus_1);
         // Inline the trailing-block slice rather than calling
         // `get_last_space()` so this matches the gate pattern used by
         // `skip_matching` / `start_matching` (read `window_blocks.back()`
@@ -1714,6 +1715,14 @@ impl DfastMatchGenerator {
 
     #[cfg_attr(not(target_arch = "wasm32"), inline(always))]
     pub(crate) fn insert_positions(&mut self, start: usize, end: usize) {
+        self.insert_range(start, end, 1);
+    }
+
+    /// Hash every `step`-th position in `[start, end)` into both tables,
+    /// resolving the scan source, the rebase check and the slot bias once for
+    /// the whole range rather than per position.
+    fn insert_range(&mut self, start: usize, end: usize, step: usize) {
+        debug_assert!(step >= 1, "insert_range needs a positive step");
         // Source the byte buffer + rebase coordinates through `scan_source()`
         // so a borrowed window's batch re-seed hashes the in-place input
         // (owned returns its `history` fields, byte-identical).
@@ -1792,7 +1801,7 @@ impl DfastMatchGenerator {
                 *short_hash_ptr.add(short_idx) = packed;
                 *long_hash_ptr.add(long_idx) = packed;
             }
-            pos += 1;
+            pos += step;
         }
         while pos < short_safe_end {
             unsafe {
@@ -1808,7 +1817,7 @@ impl DfastMatchGenerator {
                 let short_idx = (mixed_short >> short_shift) as usize;
                 *short_hash_ptr.add(short_idx) = packed;
             }
-            pos += 1;
+            pos += step;
         }
     }
 
@@ -1825,47 +1834,105 @@ impl DfastMatchGenerator {
              DFAST_INCOMPRESSIBLE_SKIP_STEP — raw `pos += step` would \
              eat into the STREAM_ABS_HEADROOM reserve"
         );
-        let start = start.max(self.history_abs_start);
-        let end = end.min(self.history_abs_end());
-        if step <= 1 {
-            self.insert_positions(start, end);
-            return;
+        self.insert_range(
+            start.max(self.history_abs_start),
+            end.min(self.history_abs_end()),
+            step,
+        );
+    }
+
+    /// The four complementary insertions upstream makes after a match
+    /// (`zstd_double_fast.c:300-304`), with the scan source, the rebase
+    /// check and the slot bias resolved once for all four rather than per
+    /// insertion.
+    ///
+    /// Upstream writes four inline hash-and-store pairs here. Routing each
+    /// through [`Self::insert_masked`] re-derived the scan source, re-ran the
+    /// rebase guard and rebuilt a bounds-checked slice every time, which put
+    /// the two wrappers at 7.6% of a level-3 encode against roughly nothing
+    /// identifiable on the reference profile.
+    #[cfg_attr(not(target_arch = "wasm32"), inline(always))]
+    fn insert_complementary(&mut self, curr_plus_2: usize, ip_minus_2: usize, ip_minus_1: usize) {
+        const PRIME: u64 = 0xCF1BBCDCB7A56463_u64;
+        // `ensure_room_for` is monotone in its argument, so a base with room
+        // for the furthest of the three has room for the nearer two, and all
+        // four slots then pack against that single base. Runs before
+        // `scan_source` / `position_base` are read because a rebase moves the
+        // base out from under both.
+        let borrowed = self.borrowed_block.is_some();
+        if !borrowed {
+            self.ensure_room_for(curr_plus_2.max(ip_minus_2).max(ip_minus_1));
         }
-        let mut pos = start;
-        while pos < end {
-            self.insert_position(pos);
-            // `pos + step` is safe: `pos < end <= history_abs_end()` and
-            // `history_abs_end <= usize::MAX - STREAM_ABS_HEADROOM` by
-            // the upstream `check_stream_abs_headroom` gate, while
-            // `step` is bounded above by the assertion at function
-            // entry.
-            pos += step;
+        let (base_ptr, start_offset, abs_start, _position_base, concat_len) = self.scan_source();
+        let position_base = self.position_base;
+        let long_shift = 64 - self.long_hash_bits;
+        let short_shift = 64 - self.short_hash_bits;
+        let long_ptr = self.long_mut_ptr();
+        let short_ptr = self.short_mut_ptr();
+        // SAFETY: `base_ptr + start_offset` is the live source start (owned
+        // `history[history_start..]` or the borrowed input slice) and
+        // `concat_len` its readable byte count, taken exactly as
+        // `insert_masked` takes them; every load below is gated on `idx + 8`
+        // (long key) or `idx + 5` (short key) against that length, and a `pos`
+        // below `abs_start` wraps `idx` into a value no gate admits.
+        let src = unsafe { base_ptr.add(start_offset) };
+        let pack = |pos: usize| -> u32 {
+            if borrowed {
+                (pos as u32).wrapping_add(1)
+            } else {
+                debug_assert!(
+                    pos >= position_base,
+                    "complementary insert {pos} below position_base {position_base}",
+                );
+                ((pos - position_base) as u32) + 1
+            }
+        };
+
+        // Order matters when two targets collide in one table: it is the
+        // order `insert_long` / `insert_short` were called in, so a collision
+        // leaves the same occupant as before.
+        for pos in [curr_plus_2, ip_minus_2] {
+            let idx = pos.wrapping_sub(abs_start);
+            if idx + HASH_READ_SIZE <= concat_len {
+                // SAFETY: the gate above puts `idx + 8` inside `concat_len`.
+                let value = unsafe { (src.add(idx) as *const u64).read_unaligned() };
+                let slot = (value.wrapping_mul(PRIME) >> long_shift) as usize;
+                debug_assert!(slot < self.long_len());
+                // SAFETY: `long_shift = 64 - long_hash_bits`, so `slot` is
+                // below `1 << long_hash_bits`, the long table's length.
+                unsafe { *long_ptr.add(slot) = pack(pos) };
+            }
+        }
+        // Short key is the low 5 bytes (upstream `mls = 5`) in the same
+        // `<< 24` form the fast-loop probe builds from its 8-byte load; a
+        // position with fewer than 5 readable bytes is left to the seam
+        // re-seed rather than hashed against a zero-padded key.
+        for pos in [curr_plus_2, ip_minus_1] {
+            let idx = pos.wrapping_sub(abs_start);
+            if idx + 5 <= concat_len {
+                // SAFETY: the gate above puts `idx + 5` inside `concat_len`.
+                let (lo4, b5) = unsafe {
+                    (
+                        u64::from((src.add(idx) as *const u32).read_unaligned()),
+                        u64::from(*src.add(idx + 4)),
+                    )
+                };
+                let slot =
+                    ((((lo4 | (b5 << 32)) << 24).wrapping_mul(PRIME)) >> short_shift) as usize;
+                debug_assert!(slot < self.short_len());
+                // SAFETY: `short_shift = 64 - short_hash_bits`, so `slot` is
+                // below the short table's length, and `short_mut_ptr` already
+                // points at the short region.
+                unsafe { *short_ptr.add(slot) = pack(pos) };
+            }
         }
     }
 
+    /// Write `pos` into both hash tables. The asymmetric per-table targets
+    /// upstream writes after a match live in [`Self::insert_complementary`],
+    /// which resolves their shared coordinates once instead of per position.
     #[inline]
     pub(crate) fn insert_position(&mut self, pos: usize) {
-        self.insert_masked::<true, true>(pos);
-    }
-
-    /// Insert `pos` into ONLY the long hash table (upstream zstd asymmetric
-    /// complementary insertion: `hashLong` at `curr+2` and `ip-2`).
-    fn insert_long(&mut self, pos: usize) {
-        self.insert_masked::<false, true>(pos);
-    }
-
-    /// Insert `pos` into ONLY the short hash table (upstream zstd: `hashSmall`
-    /// at `curr+2` and `ip-1`).
-    fn insert_short(&mut self, pos: usize) {
-        self.insert_masked::<true, false>(pos);
-    }
-
-    /// Const-generic insertion core. `SHORT` / `LONG` select which tables to
-    /// write; both `true` is the symmetric `insert_position`. The const flags
-    /// fold at compile time, so `insert_position` stays byte-identical to the
-    /// previous single-function form while the asymmetric variants emit only
-    /// their one write.
-    fn insert_masked<const SHORT: bool, const LONG: bool>(&mut self, pos: usize) {
         // Source the bytes + rebase coordinates through `scan_source()` so a
         // borrowed window's seam / tail re-seeds hash the in-place input
         // exactly as the owned path hashes its `history` concat.
@@ -1906,7 +1973,7 @@ impl DfastMatchGenerator {
         // `start_matching` seam re-seed picks it up once the next block
         // extends the source far enough to form its full 5-byte key.
         let concat = unsafe { core::slice::from_raw_parts(base_ptr.add(start_offset), concat_len) };
-        if SHORT && idx + 5 <= concat_len {
+        if idx + 5 <= concat_len {
             let short = self.short_hash_index(&concat[idx..]);
             debug_assert!(short < self.short_len());
             // Short region starts at `long_len`.
@@ -1914,7 +1981,7 @@ impl DfastMatchGenerator {
             unsafe { *self.tables.get_unchecked_mut(slot) = packed };
         }
 
-        if LONG && idx + 8 <= concat_len {
+        if idx + 8 <= concat_len {
             let long = self.long_hash_index(&concat[idx..]);
             debug_assert!(long < self.long_len());
             unsafe { *self.tables.get_unchecked_mut(long) = packed };
@@ -2249,6 +2316,14 @@ macro_rules! start_matching_fast_loop_body {
             // passes it, so `ip1 + 8 <= block_len` holds on every iteration
             // and `ip0 < ip1`. A clamp there would only hide a broken guard.
             let block_len = concat_len - block_bias;
+            // Last cursor position with a full hash key still readable, which is
+            // upstream's `ilimit`. The scan compares against this rather than
+            // adding the lookahead to the cursor every position.
+            //
+            // `$current_len >= HASH_READ_SIZE` whenever this loop runs: the
+            // caller only enters with room for a key, and the outer guard above
+            // re-checks it, so the subtraction cannot wrap.
+            let scan_limit = $current_len - HASH_READ_SIZE;
             // Slot payload for a block-relative cursor: packing a position is
             // `(abs - position_base) + 1`, and `abs = $current_abs_start + ip`,
             // so the whole `position_base` term collapses into a per-block
@@ -2256,6 +2331,41 @@ macro_rules! start_matching_fast_loop_body {
             // at entry guarantees the sum stays inside `u32` for the whole
             // block, which is what makes the narrowing cast safe here.
             let packed_bias = (($current_abs_start - position_base) as u32) + 1;
+            // A slot value indexes its candidate's bytes directly off this
+            // pointer, the way upstream indexes off `base`. Decoding a slot the
+            // long way — `position_base + slot - 1` into position space, minus
+            // `history_abs_start` into concat space, plus the source pointer and
+            // its start offset — spends four constants that then have to stay
+            // LIVE for the whole search loop. They do not fit: the loop already
+            // reloads a dozen invariants from the stack every iteration, and
+            // each one it stops needing frees a register for the ones left.
+            //
+            // Folded here, all four collapse into one pointer, and the loop's
+            // per-candidate work becomes a single add.
+            // Wrapping arithmetic, not `offset`/`add`: the fold is `-1` whenever
+            // the rebase base and the history origin coincide, which is every
+            // borrowed scan and the first owned one, so the intermediate lands
+            // before the allocation. `offset` requires each intermediate to stay
+            // in bounds and is undefined there even though nothing dereferences
+            // it; `wrapping_offset` defers that requirement to the dereference,
+            // which the gates below place inside live history.
+            let slot_base_ptr = history_base_ptr
+                .wrapping_add(history_start_offset)
+                .wrapping_offset(position_base as isize - history_abs_start as isize - 1);
+            // The same fold in slot space, so the window floor is one unsigned
+            // compare against a slot value rather than a decode plus a compare
+            // in position space. The empty sentinel is 0 and this is at least 1,
+            // so it subsumes the emptiness test.
+            let min_slot = ((history_abs_start - position_base) as u32) + 1;
+            // Upstream fuses "slot is populated" and "candidate is in window"
+            // into one unsigned compare against `prefixLowestIndex`
+            // (`zstd_double_fast.c:213`), which needs the window floor carried in
+            // slot space. Measured here it costs more than it saves: the floor
+            // then has to stay live in a register across a loop that already
+            // spills 31 distinct slots, where the emptiness test against the zero
+            // sentinel needed no register at all. It removed 0.75% of the
+            // instructions and added 1.0-1.5% to the cycles, on a flat control
+            // arm. The compare against the sentinel stays.
             debug_assert_eq!(
                 block_len, $current_len,
                 "fast loop expects the scanned block to end live history",
@@ -2327,6 +2437,15 @@ macro_rules! start_matching_fast_loop_body {
 
             let inner_exit: InnerExit = 'inner: loop {
                 let abs_ip0 = $current_abs_start + ip0;
+                // `abs_ip1` and `wlow1` are bound here even though every reader
+                // of either is a match path, and the disassembly shows both
+                // spilled to the stack each iteration for those readers' sake.
+                // Spelling them out at the readers instead measured 2.7% worse
+                // in cycles, and again 2.8% worse after the coordinate constants
+                // were folded away and there was room to hold them. Twice, on
+                // interleaved alternations of prebuilt binaries. Recomputing an
+                // address from a cursor the loop is already advancing is not
+                // cheaper here than keeping it, whatever the live count says.
                 let abs_ip1 = $current_abs_start + ip1;
                 // Per-position candidate window-low bound (see `advertised_window`
                 // above). `$borrowed` is const, so owned collapses to
@@ -2337,6 +2456,15 @@ macro_rules! start_matching_fast_loop_body {
                     abs_ip0.saturating_sub(advertised_window)
                 } else {
                     history_abs_start
+                };
+                // `wlow0` expressed in slot space (see `min_slot`). Owned windows
+                // have a fixed floor for the block, so this is the per-block
+                // constant; only a borrowed window wider than its advertised size
+                // moves it per position, and there `position_base` is zero.
+                let min_slot0 = if $borrowed {
+                    (wlow0 as u32) + 1
+                } else {
+                    min_slot
                 };
                 let wlow1 = if $borrowed {
                     abs_ip1.saturating_sub(advertised_window)
@@ -2364,6 +2492,12 @@ macro_rules! start_matching_fast_loop_body {
                 // `v4_0` (low 4 bytes) is the cheap 4-byte equality-gate key
                 // below; the short HASH keys on the upstream zstd 5-byte window
                 // (`v8_0 << 24`, ZSTD_hash5 shape) to match `short_hash_index`.
+                //
+                // Carried from the load the hash already did, not re-read at the
+                // comparison the way the reference reads `MEM_read32(ip)`. Doing
+                // it the reference's way frees a register and measured 2.8%
+                // worse in cycles: one AND off a value already in hand beats a
+                // second load competing with the probe loads for the same ports.
                 let v4_0 = v8_0 & 0xFFFF_FFFF;
                 let hs0_idx = ((v8_0 << 24).wrapping_mul(PRIME) >> short_shift) as usize;
                 let idxs0 = unsafe { *short_hash_ptr.add(hs0_idx) };
@@ -2395,6 +2529,13 @@ macro_rules! start_matching_fast_loop_body {
                 // `common_prefix_len` per probe, paying ~3× the work for
                 // rep2/rep3 hits that the dfast fast path never benefits
                 // from (those wins live in the lazy/btopt strategies).
+                //
+                // Read per position rather than hoisted above the loop, even
+                // though nothing writes `offset_hist` while the loop runs.
+                // Hoisting it removed the reload and cost 1.9% in cycles: the
+                // value then has to stay live in a register across a body that
+                // already spills 31 distinct slots, and that is dearer than the
+                // load it saves.
                 let rep1 = $self.offset_hist[0] as usize;
                 // Gate in concat coordinates. `abs_ip1 - rep1 >= history_abs_start`
                 // and `rep1 <= abs_ip1` say exactly one thing about the index:
@@ -2420,6 +2561,15 @@ macro_rules! start_matching_fast_loop_body {
                     // the literal cursor) failed it — collapsing the rep path and
                     // forcing the long-hash to mint creeping offsets.
                     {
+                        // The candidate is addressed through the concat index,
+                        // not off the block cursor the way upstream reads
+                        // `MEM_read32(ip+1-offset_1)`. The cursor form removes
+                        // two adds per scanned position and 0.31% of the
+                        // program's instructions, and measured 1.3% WORSE in
+                        // cycles: the offset is signed there, so it costs a
+                        // sign-extend and a worse addressing mode than the
+                        // unsigned add chain it replaces. Fewer instructions,
+                        // dearer ones.
                         let cand_idx_r = idx1 - rep1;
                         // 4-byte gate; full forward count only if it passes.
                         let cand4 = unsafe {
@@ -2487,24 +2637,22 @@ macro_rules! start_matching_fast_loop_body {
                 };
                 let hl1_idx = (v8_1.wrapping_mul(PRIME) >> long_shift) as usize;
 
-                // Prefetch the RANDOM-ACCESS hash-table slots the loop is about
-                // to read, while there is work to hide the latency behind. The
-                // match-find loop is memory-latency bound on these table loads
-                // (perf --call-graph dwarf annotate: ~21% self-time across the
-                // long/short slot reads), and the hardware prefetcher cannot
-                // predict a hash-indexed address. `hl1_idx`'s slot is loaded
-                // ~100 instructions below (the `_search_next_long` retry at
-                // `ip1`); the next inner iteration's short-hash slot is keyed on
-                // these same `v8_1` bytes (this `ip1` becomes the next `ip0`).
-                // Unlike the upstream zstd's input `PREFETCH_L1(ip + 256)` — which only
-                // warms the sequential input the HW prefetcher already covers —
-                // these target the loads that actually stall.
+                // Prefetch the RANDOM-ACCESS long slot the loop is about to
+                // read, while there is work to hide the latency behind. The
+                // hardware prefetcher cannot predict a hash-indexed address, and
+                // this slot is loaded unconditionally a few dozen instructions
+                // below. Upstream instead prefetches the sequential input
+                // (`PREFETCH_L1(ip1 + 64)`), which the hardware already covers,
+                // and only inside its step-growth branch.
+                //
+                // The short slot is NOT prefetched. Its address needs a hash of
+                // the same `v8_1` bytes that the next iteration hashes again as
+                // its own `hs0_idx`, so warming it meant computing that hash
+                // twice per position and throwing the first away.
+                // SAFETY: `hl1_idx < 1 << long_hash_bits`, the long table's
+                // length, so the prefetched address is inside it.
                 unsafe {
-                    let hs1_idx = ((v8_1 << 24).wrapping_mul(PRIME) >> short_shift) as usize;
                     crate::decoding::prefetch::prefetch_l1_at(long_hash_ptr.add(hl1_idx) as *const u8);
-                    crate::decoding::prefetch::prefetch_l1_at(
-                        short_hash_ptr.add(hs1_idx) as *const u8,
-                    );
                 }
 
                 // Long match check at ip0 with idxl0. 8-byte equality
@@ -2518,25 +2666,41 @@ macro_rules! start_matching_fast_loop_body {
                 // mask (`cand_idx &= -(in_long)`), serialising the loop's single
                 // hottest instruction (~13% self-time on z000033) behind the
                 // mask — a stall the predictor cannot hide.
-                if idxl0 != DFAST_EMPTY_SLOT {
-                    // Gate on the absolute position rather than unpacking the
-                    // slot straight into a concat index: the index form was
-                    // measured on the bench host and lost either way it was
-                    // written (`checked_sub` +3.7% cycles, two plain compares
-                    // +0.6%), because the emit paths need the absolute position
-                    // anyway, so it buys no register back and only adds the
-                    // rebase constant.
-                    let cand_pos = position_base + ((idxl0 as usize) - 1);
-                    if cand_pos >= wlow0 && cand_pos < abs_ip0 {
-                        let cand_idx = cand_pos - history_abs_start;
-                        // SAFETY: the bounds above make `cand_idx` a valid
-                        // in-window concat index, so the 8-byte load stays in
-                        // live history (same buffer/length bounds as `v8_0`).
-                        let cand_v8 = unsafe {
-                            (history_base_ptr.add(history_start_offset + cand_idx) as *const u64)
-                                .read_unaligned()
-                        };
-                        if cand_v8 == v8_0 {
+                //
+                // Upstream disagrees and selects the ADDRESS instead
+                // (`ZSTD_selectAddr`, `zstd_double_fast.c:203`): a rejected
+                // candidate reads a stand-in, the compare runs unconditionally,
+                // and its comment calls the gate "(somewhat) unpredictable".
+                // Ported here — cmov between the candidate and `block_ptr`, so
+                // not even a register spent on the stand-in — that shape measured
+                // 2.0% worse in cycles across three interleaved alternations
+                // (962-972 vs 979-994, no overlap). The gate is predictable in
+                // OUR table, so branching skips the load rather than waiting on a
+                // cmov to address it.
+                // Both bounds, in slot space. The upper one is NOT redundant: a
+                // slot can name a position PAST the cursor, because a reused
+                // borrowed frame inherits the previous frame's table while its
+                // scan descriptor reports the origin as zero again, so the
+                // floor-advance that retires those slots on the owned path does
+                // nothing here. A shorter following frame then finds slots
+                // beyond its own input. `packed_curr` is the cursor in the same
+                // space and is already in hand for the stores below.
+                if idxl0 >= min_slot0 && idxl0 < packed_curr {
+                    // SAFETY: the gates admit only slots naming a position at or
+                    // after the window floor and before the cursor, so this
+                    // lands inside live history — the same buffer and length
+                    // bounds `v8_0` is read under.
+                    let cand_v8 = unsafe {
+                        (slot_base_ptr.wrapping_add(idxl0 as usize) as *const u64).read_unaligned()
+                    };
+                    if cand_v8 == v8_0 {
+                        {
+                            let cand_pos = position_base + ((idxl0 as usize) - 1);
+                            let cand_idx = cand_pos - history_abs_start;
+                            debug_assert!(
+                                cand_pos < abs_ip0,
+                                "long candidate {cand_pos} at or past the cursor {abs_ip0}",
+                            );
                             {
                             // 8 bytes match; count forward + extend back.
                             let mut match_len = 8usize;
@@ -2675,16 +2839,21 @@ macro_rules! start_matching_fast_loop_body {
                 // predictable after warmup, so the predictor speculates the
                 // 4-byte candidate load past them. A branchless mask would tie
                 // the load address to the mask, serialising it.
-                if idxs0 != DFAST_EMPTY_SLOT {
-                    // Absolute-position gate, as in the long probe above.
-                    let cand_pos_s = position_base + ((idxs0 as usize) - 1);
-                    if cand_pos_s >= wlow0 && cand_pos_s < abs_ip0 {
-                        let cand_idx_s = cand_pos_s - history_abs_start;
-                        let cand4 = unsafe {
-                            (history_base_ptr.add(history_start_offset + cand_idx_s) as *const u32)
-                                .read_unaligned()
-                        };
-                        if cand4 == v4_0 as u32 {
+                if idxs0 >= min_slot0 && idxs0 < packed_curr {
+                    // SAFETY: as in the long probe, the gates admit only slots
+                    // naming a position at or after the floor and before the
+                    // cursor.
+                    let cand4 = unsafe {
+                        (slot_base_ptr.wrapping_add(idxs0 as usize) as *const u32).read_unaligned()
+                    };
+                    if cand4 == v4_0 as u32 {
+                        {
+                            let cand_pos_s = position_base + ((idxs0 as usize) - 1);
+                            let cand_idx_s = cand_pos_s - history_abs_start;
+                            debug_assert!(
+                                cand_pos_s < abs_ip0,
+                                "short candidate {cand_pos_s} at or past the cursor {abs_ip0}",
+                            );
                             {
                             // Short hit: count forward from byte 4 onwards.
                             let mut s_match_len = 4usize;
@@ -2982,7 +3151,17 @@ macro_rules! start_matching_fast_loop_body {
                 ip1 += step;
                 hl0_idx = hl1_idx;
                 idxl0 = idxl1;
-                if ip1 + HASH_READ_SIZE > $current_len {
+                // Against a precomputed limit, the way upstream compares
+                // `ip1 <= ilimit` with `ilimit = iend - HASH_READ_SIZE`. Adding
+                // the lookahead to the cursor instead spends the add on every
+                // scanned position to reach the same answer.
+                //
+                // Worth 1.11% of the program's instructions. Cycles read 1.36%
+                // higher, of which 0.68% is code layout — the same two binaries
+                // differ by that much at a level where this line cannot run —
+                // leaving a remainder inside the build-to-build drift measured
+                // on this host. Kept for the op-reduction, not on a speed claim.
+                if ip1 > scan_limit {
                     // First position the fast loop did NOT pack into the
                     // hash tables. `seed_remaining_hashable_starts` will
                     // pick up from `ip0` instead of restarting at the

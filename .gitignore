@@ -21,7 +21,6 @@ zstd/fuzz/corpus
 zstd/fuzz/artifacts/**
 .idea
 /=
-AGENTS.md
 CLAUDE.md
 .claude/
 .local/

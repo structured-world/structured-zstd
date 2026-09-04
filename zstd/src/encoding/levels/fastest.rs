@@ -6,10 +6,6 @@ use crate::{
         block_header::BlockHeader,
         blocks::{compress_block, compress_block_with_post_split},
         frame_compressor::CompressState,
-        incompressible::{
-            block_looks_incompressible, block_looks_incompressible_dict,
-            block_looks_incompressible_strict, compression_level_allows_raw_fast_path,
-        },
         match_generator::MatchGeneratorDriver,
     },
 };
@@ -86,12 +82,6 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
     last_block: bool,
     uncompressed_data: BlockInput,
     output: &mut Vec<u8>,
-    // When a dictionary is primed, an "incompressible-looking" block can
-    // still compress well by matching the dictionary content, so the
-    // raw-fast-path (which SKIPS matching) must NOT fire — otherwise the
-    // dictionary is never searched and the block is emitted raw. C always
-    // searches and only falls back to raw post-hoc; we mirror that here.
-    dict_active: bool,
     // Per-physical-block decompressed (regenerated) size sidecar, in
     // block-emit order — 1:1 with `FrameEmitInfo.blocks`, same cardinality
     // discipline as the XXH64 checksum sidecar. Captured under `lsm` alone
@@ -109,20 +99,6 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         .first()
         .copied()
         .filter(|f| bytes.iter().all(|x| x == f));
-    let dict_rejects_raw = dict_active && state.matcher.block_samples_match_dict(bytes);
-    let raw_fast_path = !dict_rejects_raw
-        // Evaluation order matters: the dict-match guard is cheap (a constant
-        // `true` for the conservative backends — HC / Row / BT — and a small
-        // table probe for Fast), whereas `should_emit_raw_fast_path` runs a
-        // WHOLE-BLOCK incompressibility scan on the dict path. When a primed
-        // dictionary forces the raw-skip off anyway, this short-circuit skips
-        // that scan entirely instead of computing it and throwing it away.
-        && should_emit_raw_fast_path(
-            compression_level,
-            state.matcher.window_size(),
-            bytes,
-            dict_active,
-        );
     // Hashed once, from the pre-commit view, and reused by whichever branch
     // wins — the compressed branch covers the same bytes as the RLE and raw
     // ones. This is a whole-block pass, so it is skipped whenever nothing will
@@ -131,7 +107,6 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
     // physical blocks and records a checksum per partition of its own.
     #[cfg(all(feature = "lsm", feature = "hash"))]
     let post_split_path = rle_byte_opt.is_none()
-        && !raw_fast_path
         && matches!(compression_level, CompressionLevel::Level(16..=22))
         && state.matcher.window_size() >= (1 << 17);
     #[cfg(all(feature = "lsm", feature = "hash"))]
@@ -161,25 +136,6 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         header.serialize(output);
         output.push(rle_byte);
         BlockType::RLE
-    } else if raw_fast_path {
-        #[cfg(feature = "lsm")]
-        if let Some(sink) = block_decompressed_sizes {
-            sink.push(block_size);
-        }
-        #[cfg(all(feature = "lsm", feature = "hash"))]
-        if let Some(sink) = block_checksums {
-            sink.push(precomputed_checksum.expect("checksum is hashed whenever a sink exists"));
-        }
-        uncompressed_data.commit(&mut state.matcher);
-        state.matcher.skip_matching_with_hint(Some(true));
-        let header = BlockHeader {
-            last_block,
-            block_type: BlockType::Raw,
-            block_size,
-        };
-        header.serialize(output);
-        output.extend_from_slice(state.matcher.get_last_space());
-        BlockType::Raw
     } else {
         // Compress as a standard compressed block
         uncompressed_data.commit(&mut state.matcher);
@@ -301,12 +257,10 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compress_block_encoded_borrowed(
     state: &mut CompressState<MatchGeneratorDriver>,
-    compression_level: CompressionLevel,
     last_block: bool,
     block: &[u8],
     block_start: usize,
     block_end: usize,
-    dict_active: bool,
     output: &mut Vec<u8>,
     #[cfg(feature = "lsm")] block_decompressed_sizes: Option<&mut Vec<u32>>,
     #[cfg(all(feature = "lsm", feature = "hash"))] block_checksums: Option<&mut Vec<u32>>,
@@ -344,35 +298,6 @@ pub(crate) fn compress_block_encoded_borrowed(
         header.serialize(output);
         output.push(rle_byte);
         BlockType::RLE
-    } else if !(dict_active && state.matcher.block_samples_match_dict(block))
-        // Same cheap-guard-first short-circuit as the owned path: skip the
-        // whole-block dict-incompressibility scan when a primed dict already
-        // forces the raw-skip off. Boolean result unchanged (AND commutes).
-        && should_emit_raw_fast_path(
-            compression_level,
-            state.matcher.window_size(),
-            block,
-            dict_active,
-        )
-    {
-        #[cfg(feature = "lsm")]
-        if let Some(sink) = block_decompressed_sizes {
-            sink.push(block_size);
-        }
-        #[cfg(all(feature = "lsm", feature = "hash"))]
-        if let Some(sink) = block_checksums {
-            sink.push(crate::encoding::frame_compressor::xxh64_block_low32(block));
-        }
-        state.matcher.set_borrowed_block(block_start, block_end);
-        state.matcher.skip_matching_with_hint(Some(true));
-        let header = BlockHeader {
-            last_block,
-            block_type: BlockType::Raw,
-            block_size,
-        };
-        header.serialize(output);
-        output.extend_from_slice(block);
-        BlockType::Raw
     } else {
         // Stage the borrowed range so `compress_block`'s internal
         // `start_matching` scans it in place (no `commit_space` copy).
@@ -449,34 +374,6 @@ pub(crate) fn compress_block_encoded_borrowed(
             BlockType::Compressed
         }
     }
-}
-
-#[inline]
-fn should_emit_raw_fast_path(
-    level: CompressionLevel,
-    window_size: u64,
-    block: &[u8],
-    has_dict: bool,
-) -> bool {
-    if !compression_level_allows_raw_fast_path(level, window_size) {
-        return false;
-    }
-    // With a dictionary attached, a high-entropy-looking block is NOT
-    // necessarily incompressible: the dict can supply matches the block's own
-    // content gives no hint of (e.g. structured records drawn from the trained
-    // dict). So raise the bar to the STRICT head/mid/tail probe before skipping
-    // the scan — the same conservative check `Best` uses. The plain no-dict
-    // heuristic stays for the no-dict path, where it classifies incompressible
-    // blocks very well. Without this, an over-cutoff dict frame whose first
-    // block matches the dict gets emitted raw and ignores the dictionary
-    // entirely.
-    if has_dict {
-        return block_looks_incompressible_dict(block);
-    }
-    if matches!(level, CompressionLevel::Best) {
-        return block_looks_incompressible_strict(block);
-    }
-    block_looks_incompressible(block)
 }
 
 #[cfg(test)]

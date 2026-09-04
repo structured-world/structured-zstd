@@ -29,7 +29,7 @@ impl<V: AsMut<Vec<u8>>> FSEEncoder<'_, V> {
         let mut state = self.table.start_state(data[data.len() - 1]);
         for x in data[0..data.len() - 1].iter().rev().copied() {
             let next = self.table.next_state(x, state.index);
-            let diff = state.index - next.baseline;
+            let diff = transition_bits(state.index, next.num_bits);
             self.writer.write_bits(diff as u64, next.num_bits as usize);
             state = next;
         }
@@ -108,7 +108,7 @@ impl<V: AsMut<Vec<u8>>> FSEEncoder<'_, V> {
 
     fn encode_symbol_with_state(&mut self, state_index: usize, symbol: u8) -> usize {
         let next = self.table.next_state(symbol, state_index);
-        let diff = state_index - next.baseline;
+        let diff = transition_bits(state_index, next.num_bits);
         self.writer.write_bits(diff as u64, next.num_bits as usize);
         next.index
     }
@@ -155,6 +155,11 @@ pub(crate) struct SymbolTT {
     pub(crate) delta_find_state: isize,
 }
 
+/// Largest next-state table any FSE encoder table can carry: the accuracy log
+/// is capped at 9 (`to_encoder_table` rejects anything wider), so the table
+/// never exceeds `1 << 9` entries.
+pub(super) const MAX_FSE_TABLE_SIZE: usize = 1 << 9;
+
 #[derive(Debug, Clone)]
 pub struct FSETable {
     /// Indexed by symbol
@@ -166,17 +171,24 @@ pub struct FSETable {
     /// transition arithmetic resolves to slot `i`. Length is exactly
     /// `table_size` (= `1 << acc_log`). Mirror of upstream
     /// `nextStateTable` (`fse_compress.c`).
-    pub(super) state_table_flat: alloc::boxed::Box<[u16]>,
+    /// Held inline rather than boxed: it is the table's only heap allocation,
+    /// and the table is rebuilt per block and per Huffman weight description —
+    /// once per built table — so boxing it cost an allocation on a path that
+    /// runs about a hundred times a frame. `MAX_FSE_TABLE_SIZE` entries is a
+    /// kibibyte beside the ~12 KiB of per-symbol arrays already inline, and the
+    /// live region is `state_table_flat[..table_size]`.
+    pub(super) state_table_flat: [u16; MAX_FSE_TABLE_SIZE],
     /// Per-symbol upstream zstd-parity coding transform — see [`SymbolTT`].
     pub(super) symbol_tt: [SymbolTT; 256],
 }
 
 impl FSETable {
-    /// Heap bytes this table holds beyond its inline struct: the flat
-    /// state-transition array (`Box<[u16]>`). The `states` / `symbol_tt`
-    /// arrays are fixed-size and inline (accounted by the owner's `size_of`).
+    /// Heap bytes this table holds beyond its inline struct: none. Every array
+    /// it carries — `states`, `symbol_tt` and the flat state-transition table —
+    /// is fixed-size and inline, so the owner's `size_of` accounts for all of
+    /// it. Kept as a method so callers summing a footprint read one rule.
     pub(crate) fn heap_size(&self) -> usize {
-        self.state_table_flat.len() * core::mem::size_of::<u16>()
+        0
     }
 
     /// O(1) next-state lookup mirroring upstream `FSE_encodeSymbol`
@@ -210,15 +222,10 @@ impl FSETable {
         let tt = self.symbol_tt[symbol as usize];
         let value = (self.table_size + idx) as u32;
         let nb_bits = ((value + tt.delta_nb_bits) >> 16) as usize;
-        let mask = (1usize << nb_bits) - 1;
-        let baseline = idx & !mask;
         let slot = ((value >> nb_bits) as isize + tt.delta_find_state) as usize;
-        let next_index = self.state_table_flat[slot] as usize;
         State {
             num_bits: nb_bits as u8,
-            baseline,
-            last_index: baseline + mask,
-            index: next_index,
+            index: self.state_table_flat[slot] as usize,
         }
     }
 
@@ -236,15 +243,9 @@ impl FSETable {
             .expect("symbol must be present in the FSE table");
         // Callers consume only `index` (audited across the encoder + sequence
         // emit paths). Upstream zstd `FSE_initCState2` likewise stores just the
-        // start state value; `num_bits` / `baseline` are properties of
-        // transitions, not of the initial state, so they have no
-        // meaningful values here and are zeroed.
-        State {
-            num_bits: 0,
-            baseline: 0,
-            last_index: 0,
-            index,
-        }
+        // start state value; `num_bits` is a property of a transition, not of
+        // the initial state, so it has no meaningful value here and is zeroed.
+        State { num_bits: 0, index }
     }
 
     pub fn acc_log(&self) -> u8 {
@@ -364,23 +365,30 @@ pub(super) struct SymbolStates {
 // max-nb-bits, probability — is precomputed once per symbol via the
 // upstream zstd arithmetic and held in [`SymbolStates`].
 
+/// A transition's outcome: how many bits the encoder must emit for it, and
+/// where the state lands.
+///
+/// Two fields and no more, so the whole thing comes back in registers on a
+/// 64-bit ABI rather than through the stack — this is returned three times per
+/// sequence. The transition's baseline is deliberately absent: a caller wanting
+/// the bits to emit takes `index & ((1 << num_bits) - 1)` from the state it came
+/// from, since the baseline is that same index with those low bits cleared.
+/// Upstream leans on the same identity, emitting `statePtr->value` directly
+/// under a width rather than subtracting anything (`FSE_encodeSymbol`).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct State {
     /// How many bits the range of this state needs to be encoded as
     pub(crate) num_bits: u8,
-    /// The first index targeted by this state
-    pub(crate) baseline: usize,
-    /// The last index targeted by this state (baseline + the maximum
-    /// number with numbits bits allows). Computed by
-    /// [`FSETable::next_state`] for parity with the old
-    /// `Vec<State>` storage and consumed by the BTreeSet dedup in the
-    /// table builder (`build_table_from_probabilities`); not read on
-    /// the encode hot path (the linear-search consumer was retired in
-    /// #164).
-    #[allow(dead_code)]
-    pub(crate) last_index: usize,
     /// Index of this state in the decoding table
     pub(crate) index: usize,
+}
+
+/// The bits a transition out of `index` emits, given its width.
+///
+/// `index - baseline` where `baseline = index & !mask`, which is `index & mask`.
+#[inline(always)]
+pub(crate) fn transition_bits(index: usize, num_bits: u8) -> usize {
+    index & ((1usize << num_bits) - 1)
 }
 
 #[cfg(any(test, feature = "fuzz-exports"))]
@@ -795,7 +803,6 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
     // (`table_size = 1 << table_log <= 1 << 9 = 512`). Use a stack buffer so the
     // per-build heap alloc + zero is gone. `[..table_size]` keeps the live region
     // exactly as the old `vec![0u8; table_size]`.
-    const MAX_FSE_TABLE_SIZE: usize = 1 << 9;
     // Always-on (not debug_assert): the stack scratch is fixed at 512 bytes
     // (accuracy_log <= 9). `to_encoder_table` already rejects acc_log > 9, but
     // this function is `pub(crate)` — guard the scratch bound here too so a
@@ -879,24 +886,12 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
     // convention so the pre-shift is intentionally skipped here.
     // Every index in `[0, table_size)` is written EXACTLY once by the scatter
     // loop below: the `cumul` cursors partition the table bijectively, which the
-    // two asserts above enforce in every build profile. So a zero-init is dead
-    // -- every slot is overwritten before any read (`into_boxed_slice` +
-    // `FSETable` use happen after the loop). Allocate uninitialized and let the
-    // loop fill it, skipping a per-build `table_size`-element memset (3 FSE
-    // builds per block for the LL/ML/OF streams when custom tables are chosen).
-    // The `uninit_vec` lint cannot see the bijective full-write; soundness is
-    // confirmed under miri (the FSE encoder round-trip exercises this with no
-    // use-of-uninit).
-    #[allow(clippy::uninit_vec)]
-    let mut state_table_flat: alloc::vec::Vec<u16> = {
-        let mut v = alloc::vec::Vec::with_capacity(table_size);
-        // SAFETY: `with_capacity(table_size)` reserved exactly `table_size`
-        // slots; the asserts above guarantee (in every build profile) that the
-        // scatter loop below writes every index in `[0, table_size)` exactly
-        // once before the first read.
-        unsafe { v.set_len(table_size) };
-        v
-    };
+    // two asserts above enforce in every build profile. Slots at or past
+    // `table_size` are never read — `next_state` indexes within the live region
+    // — so the tail keeps whatever the zero-init left and costs nothing to
+    // carry. The table lives inline in [`FSETable`], so this build allocates
+    // nothing at all.
+    let mut state_table_flat = [0u16; MAX_FSE_TABLE_SIZE];
     let mut cursor = cumul;
     for (u, &symbol_at_slot) in table_symbol.iter().enumerate() {
         let s = symbol_at_slot as usize;
@@ -907,7 +902,6 @@ pub(super) fn build_table_from_probabilities(probs: &[i32], acc_log: u8) -> FSET
         state_table_flat[cursor[s] as usize] = u as u16;
         cursor[s] += 1;
     }
-    let state_table_flat: alloc::boxed::Box<[u16]> = state_table_flat.into_boxed_slice();
 
     // Phase 4 — `symbolTT[]` (delta_nb_bits, delta_find_state) plus
     // precomputed `start_state` and `max_num_bits` per symbol. All via

@@ -842,6 +842,9 @@ pub(crate) fn resolve_frame_params(
 
 pub(crate) struct CompressState<M: Matcher> {
     pub(crate) matcher: M,
+    /// Widest literal-copy kernel this CPU can run, resolved once when the
+    /// compressor is built. The emit path reads it; it never re-probes.
+    pub(crate) copy_tier: crate::decoding::simd_copy::ExactCopyTier,
     pub(crate) last_huff_table: Option<crate::huff0::huff0_encoder::HuffmanTable>,
     /// Recycled `HuffmanTable` buffers: when a block clears or replaces
     /// `last_huff_table`, the old table parks here instead of dropping, so
@@ -849,6 +852,14 @@ pub(crate) struct CompressState<M: Matcher> {
     /// allocations. Without this, every dict-seeded frame whose last block
     /// ended raw/RLE paid a fresh two-Vec table clone per frame.
     pub(crate) huff_table_spare: Option<crate::huff0::huff0_encoder::HuffmanTable>,
+    /// The Huffman weight builder's three buffers, kept across blocks and
+    /// frames. The cheap build path takes a tree and two weight buffers per
+    /// call, and it runs once per block plus once per split candidate wherever
+    /// the block splitter probes, so taking them fresh each time was the single
+    /// largest source of per-frame allocations: 1,880 of a frame's 4,000 at
+    /// level 3. Lives here rather than in the per-block scratch, which the
+    /// block emitter takes out of this state while a block is in flight.
+    pub(crate) huff_weights: crate::huff0::huff0_encoder::WeightScratch,
     pub(crate) fse_tables: FseTables,
     pub(crate) block_scratch: crate::encoding::blocks::CompressedBlockScratch,
     /// Offset history for repeat offset encoding: [rep0, rep1, rep2].
@@ -919,7 +930,7 @@ impl<M: Matcher> CompressState<M> {
     #[inline]
     pub(crate) fn clear_huff_table(&mut self) {
         if let Some(table) = self.last_huff_table.take() {
-            self.huff_table_spare = Some(table);
+            self.park_huff_table(table);
         }
     }
 
@@ -928,7 +939,22 @@ impl<M: Matcher> CompressState<M> {
     #[inline]
     pub(crate) fn replace_huff_table(&mut self, table: crate::huff0::huff0_encoder::HuffmanTable) {
         if let Some(old) = self.last_huff_table.replace(table) {
-            self.huff_table_spare = Some(old);
+            self.park_huff_table(old);
+        }
+    }
+
+    /// Keeps a table's buffers rather than dropping them. The dictionary seed
+    /// wants one spare to `clone_from` into, once per frame; every further
+    /// table a block displaces goes to the weight builder instead, which takes
+    /// one per block and per split candidate. Overwriting the single spare
+    /// dropped the previous table on every block, so the builds that followed
+    /// allocated their buffers again.
+    #[inline]
+    fn park_huff_table(&mut self, table: crate::huff0::huff0_encoder::HuffmanTable) {
+        if self.huff_table_spare.is_none() {
+            self.huff_table_spare = Some(table);
+        } else {
+            self.huff_weights.recycle(table);
         }
     }
 }
@@ -1149,8 +1175,10 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             source_size_hint: None,
             state: CompressState {
                 matcher: MatchGeneratorDriver::new(1024 * 128, 1),
+                copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
                 last_huff_table: None,
                 huff_table_spare: None,
+                huff_weights: Default::default(),
                 fse_tables: FseTables::new(),
                 block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
                 offset_hist: [1, 4, 8],
@@ -1524,16 +1552,12 @@ impl<R: Read, W: Write> FrameCompressor<R, W, MatchGeneratorDriver> {
             if self.content_checksum {
                 self.hasher.write(block);
             }
-            let dict_active =
-                self.dictionary.is_some() && self.state.matcher.supports_dictionary_priming();
             crate::encoding::levels::compress_block_encoded_borrowed(
                 &mut self.state,
-                self.compression_level,
                 last_block,
                 block,
                 start,
                 end,
-                dict_active,
                 out,
                 #[cfg(feature = "lsm")]
                 Some(&mut self.block_decompressed_sizes),
@@ -1558,8 +1582,10 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             source_size_hint: None,
             state: CompressState {
                 matcher,
+                copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
                 last_huff_table: None,
                 huff_table_spare: None,
+                huff_weights: Default::default(),
                 fse_tables: FseTables::new(),
                 block_scratch: crate::encoding::blocks::CompressedBlockScratch::new(),
                 offset_hist: [1, 4, 8],
@@ -1770,6 +1796,9 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
             .huff_table_spare
             .as_ref()
             .map_or(0, |table| table.heap_size());
+        // The weight builder's buffers are kept between blocks and frames, so
+        // a reused compressor holds them for as long as it lives.
+        total += self.state.huff_weights.heap_size();
         total += self
             .dictionary
             .as_ref()
@@ -2391,8 +2420,6 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                     // supports priming — a non-priming matcher ignores an
                     // attached dictionary, so the raw-fast-path must stay
                     // enabled for it. (This arm is already non-Uncompressed.)
-                    let dict_active = self.dictionary.is_some()
-                        && self.state.matcher.supports_dictionary_priming();
                     let block_input = if in_place.is_some() {
                         crate::encoding::levels::BlockInput::InPlace(block_len)
                     } else {
@@ -2404,7 +2431,6 @@ impl<R: Read, W: Write, M: Matcher> FrameCompressor<R, W, M> {
                         last_block,
                         block_input,
                         out,
-                        dict_active,
                         #[cfg(feature = "lsm")]
                         Some(&mut self.block_decompressed_sizes),
                         #[cfg(all(feature = "lsm", feature = "hash"))]

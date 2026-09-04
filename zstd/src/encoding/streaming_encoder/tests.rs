@@ -1,5 +1,55 @@
 use crate::decoding::StreamingDecoder;
 use crate::encoding::{CompressionLevel, Matcher, Sequence, StreamingEncoder};
+
+#[test]
+fn the_reported_footprint_covers_what_compressing_retained() {
+    // `heap_size` backs `ZSTD_sizeof_CCtx`, so a caller budgets against it.
+    // Everything the encoder keeps between blocks and frames has to appear
+    // there: the match-finder's tables, the retained Huffman table and its
+    // parked spare, and the Huffman weight builder's buffers, which live on
+    // the compressor state precisely so they are not reallocated per block.
+    // A term omitted from the sum is invisible to every roundtrip test, so
+    // pin it here: compressing must move the number, and the number must
+    // then cover the buffers that are demonstrably still held.
+    let mut enc = StreamingEncoder::new(Vec::new(), CompressionLevel::Level(3));
+    let before = enc.heap_size();
+
+    // Unpredictable enough that the matcher leaves plenty of literals, but
+    // drawn from a narrow alphabet so those literals are worth Huffman-coding:
+    // over the full 256 they would be emitted raw and the weight builder would
+    // never run at all, leaving nothing retained to check. Long enough to span
+    // several blocks.
+    let payload: Vec<u8> = (0..300_000u32)
+        .map(|i| ((i.wrapping_mul(2654435761) >> 24) % 32) as u8)
+        .collect();
+    enc.write_all(&payload).expect("write");
+    enc.flush().expect("flush");
+
+    let after = enc.heap_size();
+    assert!(
+        after > before,
+        "compressing retained buffers the footprint does not report: {before} -> {after}",
+    );
+    // The match-finder alone accounts for most of that growth, so the check
+    // above would pass with the weight scratch missing from the sum entirely.
+    // Prove it is a term: take it out and the reported total must fall by
+    // exactly its own size.
+    let scratch = core::mem::take(&mut enc.state.huff_weights);
+    let scratch_heap = scratch.heap_size();
+    assert!(
+        scratch_heap > 0,
+        "the weight builder's buffers should be populated after compressing",
+    );
+    let without_scratch = enc.heap_size();
+    assert_eq!(
+        after - without_scratch,
+        scratch_heap,
+        "the weight scratch is retained across blocks but is not counted in \
+         the reported footprint",
+    );
+    enc.state.huff_weights = scratch;
+    assert_eq!(enc.heap_size(), after, "restoring must undo the removal");
+}
 use crate::io::{Error, ErrorKind, Read, Write};
 use alloc::vec;
 use alloc::vec::Vec;

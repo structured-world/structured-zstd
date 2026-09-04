@@ -126,8 +126,13 @@ fn check_tables(dec_table: &fse_decoder::FSETable, enc_table: &fse_encoder::FSET
                  (encoder/decoder routing mismatch)",
                 next.index, dec_state.symbol
             );
+            // The encoder no longer carries a baseline: it emits
+            // `index & mask` and leaves `index & !mask` implicit. Rebuild it
+            // here so this parity check still compares the same quantity the
+            // decoder records.
+            let baseline = input_state & !((1usize << next.num_bits) - 1);
             assert_eq!(
-                next.baseline, dec_state.new_state as usize,
+                baseline, dec_state.new_state as usize,
                 "decode/encode baseline mismatch at slot {} (symbol {symbol})",
                 next.index
             );

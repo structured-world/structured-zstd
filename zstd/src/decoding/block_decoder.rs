@@ -6,6 +6,7 @@ use super::super::blocks::sequence_section::SequencesHeader;
 use super::literals_section_decoder::{LiteralsView, decode_literals_zerocopy};
 use super::sequence_section_decoder::decode_and_execute_sequences;
 use crate::common::MAX_BLOCK_SIZE;
+use crate::cpu_kernel::{CpuKernelTag, detect_cpu_kernel};
 use crate::decoding::errors::DecodeSequenceError;
 use crate::decoding::errors::{
     BlockHeaderReadError, BlockSizeError, BlockTypeError, DecodeBlockContentError,
@@ -17,6 +18,12 @@ use crate::io::Read;
 pub struct BlockDecoder {
     header_buffer: [u8; 3],
     internal_state: DecoderState,
+    /// Best kernel available on this CPU, resolved ONCE here rather than
+    /// per block. Feature detection belongs before the first decode, not
+    /// inside it: the two section decoders take this tag and `match` it
+    /// straight to their per-tier monomorph, so the only thing left on the
+    /// hot path is the dispatch branch itself.
+    kernel: CpuKernelTag,
 }
 
 enum DecoderState {
@@ -31,6 +38,7 @@ pub fn new() -> BlockDecoder {
     BlockDecoder {
         internal_state: DecoderState::ReadyToDecodeNextHeader,
         header_buffer: [0u8; 3],
+        kernel: detect_cpu_kernel(),
     }
 }
 
@@ -345,7 +353,14 @@ impl BlockDecoder {
         let LiteralsView {
             data: literals_view,
             bytes_used: bytes_used_in_literals_section,
-        } = decode_literals_zerocopy(&section, huf, dict, raw_literals, literals_buffer)?;
+        } = decode_literals_zerocopy(
+            &section,
+            huf,
+            dict,
+            raw_literals,
+            literals_buffer,
+            self.kernel,
+        )?;
         assert!(
             section.regenerated_size as usize == literals_view.len(),
             "Wrong number of literals: {}, Should have been: {}",
@@ -393,6 +408,7 @@ impl BlockDecoder {
                 offset_hist,
                 literals_view,
                 dict,
+                self.kernel,
             )?;
         } else {
             if !raw.is_empty() {

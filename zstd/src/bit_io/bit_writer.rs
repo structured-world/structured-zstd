@@ -214,7 +214,17 @@ impl<V: AsMut<Vec<u8>>> BitWriter<V> {
         let nb_bytes = self.bits_in_partial >> 3;
         let bytes = self.partial.to_le_bytes();
         let output = self.output.as_mut();
-        let len = output.len();
+        // `bit_idx` counts the bits already committed to `output`, and every
+        // path that appends bytes advances both, so it is the buffer's length
+        // in bits at all times. Taking the length from it keeps this off the
+        // `Vec` header, which is otherwise loaded on every flush, and this runs
+        // two to three times per encoded sequence.
+        let len = self.bit_idx >> 3;
+        debug_assert_eq!(
+            len,
+            output.len(),
+            "bit_idx must track the committed output length",
+        );
         debug_assert!(
             output.capacity() >= len + 8,
             "flush_bulk requires 8 bytes of spare capacity; caller forgot reserve_output",

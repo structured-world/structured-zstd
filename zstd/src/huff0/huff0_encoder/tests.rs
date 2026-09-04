@@ -1,5 +1,107 @@
 use super::*;
 
+/// The height limiter can fail to restore a full canonical code on a
+/// degenerate distribution, and the weight builder then falls back to the
+/// distributed construction. That fallback is a correctness net, not dead
+/// code: without it the caller gets a weight sum that is not a power of two
+/// and the table builder rejects it. Fibonacci counts are the standard
+/// worst case for Huffman depth, so they are what drives the limiter past
+/// what it can repair.
+///
+/// The sequence stops where a real literals section does. Depth costs counts
+/// exponentially, so running Fibonacci out to 40 symbols describes a section of
+/// hundreds of megabytes, which nothing can hand this function; it also pushes
+/// the limiter's cost shift past what a 32-bit `usize` holds, so the test would
+/// be failing on an input the encoder cannot see. Twenty-four terms keep the
+/// total inside one 128 KiB section and still bury the natural code depth well
+/// under the tightest table log.
+#[test]
+fn a_degenerate_distribution_still_yields_usable_weights() {
+    const SYMBOLS: usize = 24;
+    let mut counts = [0usize; 256];
+    let (mut a, mut b) = (1usize, 1usize);
+    for count in counts.iter_mut().take(SYMBOLS) {
+        *count = a;
+        (a, b) = (b, a + b);
+    }
+    debug_assert!(
+        counts.iter().sum::<usize>() <= 128 * 1024,
+        "fixture must stay within one literals section",
+    );
+
+    // Across the whole legal table-log range, including the tight end where
+    // the natural code is far deeper than the limit allows.
+    for max_nb_bits in 5..=11usize {
+        let weights = build_limited_weights(&counts[..SYMBOLS], max_nb_bits);
+        assert_eq!(
+            weights.len(),
+            SYMBOLS,
+            "weights must cover every symbol slot"
+        );
+        let sum: usize = weights
+            .iter()
+            .filter(|w| **w > 0)
+            .map(|w| 1usize << (w - 1))
+            .sum();
+        assert!(
+            sum.is_power_of_two(),
+            "weight sum {sum} is not a power of two at max_nb_bits={max_nb_bits}; \
+             the table builder rejects this",
+        );
+    }
+}
+
+/// A parked table contributes its HEAP bytes and nothing else. The table
+/// object itself lives inline in the scratch, so counting its size would
+/// report storage that was never allocated — and the figure reaches callers
+/// through the C API's context-size query, which they budget against.
+#[test]
+fn parking_a_table_adds_only_its_heap_bytes() {
+    let mut scratch = WeightScratch::default();
+    let empty = scratch.heap_size();
+
+    let table = HuffmanTable::build_from_weights(&[2, 2, 2, 1, 1]);
+    let table_heap = table.heap_size();
+    scratch.recycle(table);
+
+    assert_eq!(
+        scratch.heap_size() - empty,
+        table_heap,
+        "the parked table's own storage is inline in the scratch, not on the heap",
+    );
+}
+
+/// The weight description a table caches is held for as long as the table is,
+/// and a parked table is held across blocks and frames — so it is retained
+/// memory and has to appear in the figure a caller budgets against.
+#[cfg(feature = "std")]
+#[test]
+fn the_cached_weight_description_counts_as_retained() {
+    // The full-alphabet fixture, which is the shape whose description is
+    // actually encodable: a description is only built when the weights are
+    // neither all equal nor all distinct.
+    let mut sample = Vec::new();
+    for symbol in 0u8..=255 {
+        sample.extend(core::iter::repeat_n(symbol, usize::from(symbol) + 1));
+    }
+    let table = HuffmanTable::build_from_data(&sample);
+    let before = table.heap_size();
+
+    let cached_len = table
+        .writeable_table_description_size()
+        .expect("the full-alphabet fixture caches an encoded description")
+        - 1;
+
+    // At least, not exactly: the accounting reports the buffer's capacity,
+    // which the description's length is a lower bound on.
+    assert!(
+        table.heap_size() - before >= cached_len,
+        "the description is a live allocation once built, not a transient: \
+         the reported total grew by {} for a {cached_len}-byte description",
+        table.heap_size() - before,
+    );
+}
+
 #[test]
 fn huffman() {
     let table = HuffmanTable::build_from_weights(&[2, 2, 2, 1, 1]);
