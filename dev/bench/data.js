@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1788470092210,
+  "lastUpdate": 1788533791725,
   "repoUrl": "https://github.com/structured-world/structured-zstd",
   "entries": {
     "structured-zstd vs C FFI (x86_64-gnu)": [
@@ -3875,6 +3875,210 @@ window.BENCHMARK_DATA = {
           {
             "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
             "value": 0.13,
+            "unit": "ms"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "mail@polaz.com",
+            "name": "Dmitry Prudnikov",
+            "username": "polaz"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "45685abca498a46e6d019b9cbddf3aa055a1530c",
+          "message": "fix(encode): search blocks that only look incompressible, and trim the dfast scan (#483)\n\n* perf(encode): reuse the huffman weight builder's buffers across blocks\n\n* perf(encode): recycle the discarded huffman table into the next build\n\n* perf(encode): recycle the emitter's discarded huffman table too\n\n* perf(encode): keep every displaced huffman table, not just the first\n\n* perf(encode): hold the FSE next-state table inline\n\n* perf(encode): build huffman weights on the stack, not a fresh vector\n\n* refactor(huff0): keep the owning weights helper for tests only\n\n* perf(huff0): hold the code tables inline, as the reference does\n\n* perf(huff0): pass the code tables by pointer, not by copy\n\n* perf(huff0): re-fill a finished table instead of zeroing a new one\n\n* revert(huff0): drop the inline-code-table experiment\n\nHolding the Huffman code tables inline — the reference's shape — measured\nas a consistent 3-5% cost at level 3 across three paired runs on the i9,\nfor 16 fewer allocations per frame out of 269. The profile attributes it\nto no single symbol: the delta spreads across matcher functions the change\nnever touched, which reads as code layout rather than new work.\n\nThat shape pays for the reference because its tables live in block states\nwhich persist and are re-initialised only up to the alphabet in hand.\nReproducing both halves here — inline arrays, then a pointer handoff, then\nre-filling a finished table instead of zeroing a new one — still cost on\nevery measurement, so the experiment stops at a recorded result rather\nthan a merged regression. The commits stay reachable on\nexp/481-c-shape-negative.\n\nThis restores the state measured at 962 -> 269 allocations per frame with\nno cycle change.\n\n* fix(encode): count the weight scratch and keep it across split probes\n\nThree defects the scratch introduced, each with the test that fails\nwithout the fix where one can exist:\n\n- The no-std weight paths called a helper that had been narrowed to\n  tests, so a build without `std` did not compile at all. They take the\n  same stack buffer the std paths do.\n- `heap_size` did not count the scratch, on either the frame compressor\n  or the streaming one. It is kept between blocks and frames by design,\n  so a reused context reported less than it holds — including through\n  the C API's `ZSTD_sizeof_CCtx`, where a caller budgeting around a\n  context is told a figure it cannot rely on. The regression test takes\n  the scratch away and asserts the reported total falls by exactly what\n  it held; comparing against a pre-frame total would not catch it, since\n  the matcher's tables grow over the same frame and would hide it.\n- The block splitter's estimator built its own scratch per post-split\n  block and dropped it at the end, so that path went on allocating the\n  buffers this change exists to reuse. It borrows the compressor's and\n  hands it back, which also leaves the emitter that follows using the\n  buffers the probe already warmed.\n\n* perf(encode): resolve the complementary insert coordinates once, not per slot\n\nUpstream writes the four post-match insertions as four inline hash-and-store\npairs against coordinates the block already holds. Ours routed each through\nthe same insertion helper, so every one of the four re-derived the scan\nsource, re-ran the rebase guard, rebuilt a bounds-checked slice and assembled\nits hash key byte-wise through `try_into().unwrap()`.\n\nThat put the two wrappers at 7.6% of a level-3 encode on the bench host,\nagainst nothing separable on the reference profile, which inlines the same\nwork. They are one function now: the source pointer, the rebase check and the\nslot bias are resolved once for all four, and the keys come from unaligned\nloads in the form the fast loop already builds them in.\n\nThe rebase check moves to the furthest of the three positions. It is monotone\nin its argument, so a base with room for that one has room for the nearer two,\nand all four then pack against a single base rather than possibly straddling\none.\n\nOutput is byte-identical across levels 1-19 on z000033, and the const-generic\ntable mask the asymmetric wrappers needed is gone with them.\n\n* perf(encode): gate dfast candidates in slot space, as upstream does\n\nUpstream admits a candidate with one unsigned compare against\n`prefixLowestIndex` (`zstd_double_fast.c:213`), which answers \"populated\"\nand \"in window\" together. Ours asked five questions per candidate: compare\nagainst the empty sentinel, subtract the slot bias, add the rebase base, then\ntwo compares in position space, and it decoded every candidate that way even\nthough the great majority are rejected.\n\nCarrying the window floor in slot space instead collapses that to the single\ncompare. The empty sentinel is zero and the floor is at least one, so\nemptiness comes for free, and the decode into position space now happens only\nfor candidates that survive.\n\nThe upper bound goes with it. Every slot the loop reads names a strictly\nearlier position by construction: the short index is loaded before this\niteration writes its own, and the long one is carried from the previous\niteration. That is a `debug_assert` now, which the suite exercises at every\nlevel without firing.\n\nAn owned window's floor is fixed for the whole block, so it is hoisted out of\nthe loop; only a borrowed window wider than its advertised size still moves\nper position.\n\nOutput is byte-identical across levels 1-19 on two fixtures.\n\n* perf(encode): drop the dfast candidate upper-bound compare, keep the floor\n\nSplits the previous commit's two halves after measuring them apart.\n\nThe upper bound goes. Every slot the loop reads names a strictly earlier\nposition by construction: the short index is loaded before this iteration\nwrites its own, and the long one is carried from the previous iteration. It is\na `debug_assert` now, which the suite exercises at every level without firing.\n\nThe slot-space fusion comes back out. Answering \"populated\" and \"in window\"\nwith one unsigned compare, as upstream does against `prefixLowestIndex`,\nrequires the window floor to stay live in a register across a loop that already\nspills 31 distinct slots; the emptiness test against the zero sentinel needs no\nregister. Measured on a flat control arm it removed 0.75% of the instructions\nand added 1.0-1.5% to the cycles, so the sentinel compare stays and the reason\nis recorded where the fusion would go.\n\nOutput is byte-identical across levels 1-19.\n\n* perf(encode): hoist the dfast rep offset out of the search loop\n\nIt was the only field read left inside the loop, and it cannot change while\nthat loop runs: `offset_hist` is written by `emit_candidate`, which the outer\narm reaches only after a match has broken out. Left in place it was reloaded\nonce per scanned position, because the table stores go through raw pointers\nderived from the same receiver and nothing lets the optimizer prove they miss\nthis field.\n\nOutput is byte-identical across levels 1-19.\n\n* perf(encode): sink the dfast ip1 coordinates into the paths that read them\n\n`abs_ip1` and its window floor were computed on every scanned position, and\nevery one of their readers is a match path. Holding two more values live across\na body that already spills 31 distinct slots costs more than recomputing them\nwhere they are read, which is the trade the literal lengths beside them were\nalready subject to.\n\nThe rep offset goes back to a per-position read for the same reason, with the\nmeasurement recorded beside it: hoisting it above the loop removed the reload\nand cost 1.9% in cycles on a flat control arm.\n\nOutput is byte-identical across levels 1-19.\n\n* perf(encode): restore the dfast ip1 bindings, keep what measuring them taught\n\nBoth attempts to relieve the search loop measured worse, so the code goes back\nto what it was and the numbers go in beside it.\n\nSinking `abs_ip1` and its window floor into the match paths that read them\nremoves two values from the live set and 0.8% of the loop's instructions, and\ncost 2.7% in cycles. Hoisting the rep offset above the loop removes a reload\nper position and cost 1.9%.\n\nBoth were measured by alternating two prebuilt binaries in one session, three\ntimes each, which resolves to 0.1-0.3%. Comparing across rebuilds does not: the\nsame commit read 952M and 965M in two sessions whose control arms differed by\n0.13%, so a 1.4% drift sits in the build, not in the machine, and any single\nbefore-and-after pair spanning a rebuild can invent a result of that size.\n\nThis commit changes comments only. Diffed against the reverted state, not one\nline of code differs.\n\n* perf(encode): drop the dfast short-hash prefetch\n\nIts address needs a hash of the same bytes the next iteration hashes again\nas its own short index, so warming it computed that hash twice per scanned\nposition and discarded the first. Upstream prefetches neither hash slot.\n\nOutput is byte-identical across levels 1-19.\n\n* perf(encode): select the dfast long candidate address, do not branch on it\n\nUpstream's `ZSTD_selectAddr` shape (`zstd_double_fast.c:203`): an out-of-window\ncandidate reads a harmless stand-in, the 8-byte compare runs unconditionally,\nand the only branch left is the one taken when those eight bytes agree, which\nis rare and therefore predictable. Upstream's own comment records the gate it\nreplaces as \"(somewhat) unpredictable\", which is the opposite of what the\ncomment here claimed.\n\nThe stand-in is `block_ptr` rather than a dedicated dummy buffer: eight bytes\nare always readable there while the loop runs, and it is already live, so the\nselect costs no register. If those eight bytes happen to equal the probe,\nvalidity still rejects them.\n\nOutput is byte-identical across levels 1-19.\n\n* revert(encode): keep the branchy dfast long gate, upstream's select loses here\n\nReverts the `ZSTD_selectAddr` port. Selecting the candidate address and\ncomparing unconditionally measured 2.0% worse in cycles across three\ninterleaved alternations of the two binaries (962-972 vs 979-994, no overlap),\nso the branch stays and the number goes in the comment that predicted it.\n\nUpstream's premise does not hold for our table: it calls the gate\n\"(somewhat) unpredictable\", but ours is predictable enough that branching\nskips the candidate load outright, which beats waiting on a conditional move to\naddress it.\n\n* fix(copy): let x86_64 take the SSE2 exact-copy arm\n\nThe arm was gated on `target_arch = \"x86\"`, which is 32-bit only, while SSE2\nis baseline on x86_64 and AVX2 is not. So a stock\n`x86_64-unknown-linux-gnu` build matched neither SIMD arm and fell through to\n`copy_nonoverlapping`, which lowers to a `memcpy` CALL for a runtime length --\nthe opposite of what this function exists to avoid.\n\nCallgrind puts that call at 92,628 invocations in two frames of z000033 at\nlevel 3, reached from the dfast match loop, once per match, 73 instructions\neach. Upstream stores the same literals inline (`ZSTD_copy16` first, wildcopy\nonly past 16 bytes) and has no such call in its profile at all.\n\nIt stayed invisible on aarch64, where NEON is baseline and the arm below fires,\nand on any build with `-C target-cpu` raising the baseline to AVX2.\n\nThe helper carried the same 32-bit-only gate and is widened with it.\n\n* perf(encode): look the length codes up instead of walking their ranges\n\nBoth length coders ran a 22-arm range match, which compiles to a chain of\ncomparisons, once per sequence from inside the sequence-encoding loop, and\nneither was inlined there: callgrind counts 96,004 calls to each over two\nframes of z000033 at level 3, at 31 instructions a call for the match-length\none. Upstream reaches the same answer with a table index (`ZSTD_LLcode` /\n`ZSTD_MLcode`) and precomputes all three codes in one pass before encoding.\n\nTable-driven now, and inlined. Every code's baseline is a multiple of its own\nextra-bit width, so masking those bits off is the same subtraction the ranges\nspelled out, and lengths past the tables take the high bit plus the delta.\n\nThe range form survives as the oracle in a test that walks every encodable\nlength of both -- 131,072 literal lengths and 131,072 match lengths -- and\nasserts the triples agree. It is also the readable statement of the format,\nwhich a pair of numeric tables is not.\n\nOutput is byte-identical across levels 1-19.\n\n* perf(fse): shrink the encoder transition to what the encoder reads\n\n`next_state` returned four fields, three times per sequence, from the\nsequence-encoding loop. Two of them were not worth carrying:\n\n`last_index` was written and read nowhere. Its doc named a consumer in the\ntable builder that had already been retired, and the field was carrying an\n`allow(dead_code)` to say so.\n\n`baseline` is the state index with the transition's low bits cleared, so the\n\"index - baseline\" every call site then computed is just those low bits.\nMasking there instead drops the field, which is what upstream does when it\nemits `statePtr->value` under a width without subtracting anything\n(`FSE_encodeSymbol`).\n\nWhat is left is a width and a landing index, small enough to come back in\nregisters rather than through the stack. The parity check that compared the\nencoder's baseline against the decoder's rebuilds it locally, so it still\ncompares the same quantity.\n\nOutput is byte-identical across levels 1-19.\n\n* perf(encode): carry the FSE states as indices, not options\n\nA component has a state exactly when it has a table, and the three tables are\nresolved once above the sequence loop. Wrapping the states in options as well\nmeant re-asking that settled question three times per sequence -- as a\ntwo-element tuple destructure each time -- and re-wrapping every answer.\n\nThe states are bare indices now, so each component is one option test on its\ntable. An absent component's index is never read: every site that touches one\nalready sits inside its table's arm.\n\nOutput is byte-identical across levels 1-19.\n\n* perf(bitio): take the flush length from the bit counter, not the vec header\n\n`bit_idx` counts the bits already committed to the output, and every path that\nappends bytes advances both it and the buffer, so it is that buffer's length in\nbits at all times -- `reset_to` resizes to match. The bulk flush was\nnonetheless loading the length back out of the `Vec` header on every call, and\nit runs two to three times per encoded sequence.\n\nThe invariant is asserted where it is now relied on, which the suite exercises\nacross every level.\n\nOutput is byte-identical across levels 1-19.\n\n* perf(encode): give the stepped seeder the hoisted insert body\n\nThe dense seeder already resolved the scan source, the rebase check and the\nslot bias once for a whole range. The stepped one, which runs when a block is\njudged incompressible, instead called the per-position helper in a loop, so\neach of its positions re-derived all three and hashed through a bounds-checked\nslice.\n\nOn a megabyte of random bytes at level 3 that put 57.7% of the whole encode in\nthat helper, 65,536 calls per frame at 91 instructions each, against 13.2% for\nthe reference's entire double-fast function, which simply scans the block with\nits growing step and finds nothing. Skipping the search cost us four times what\nsearching costs upstream.\n\nThe two seeders are one routine now, taking the step as a parameter; the dense\none passes 1. Output is byte-identical across levels 1-19 on both a\ndecodecorpus frame and a megabyte of random bytes.\n\n* fix(encode): search every block, sample the literals instead\n\nA block was sampled for entropy and, if the sample looked random, emitted raw\nwithout being searched at all. Input that looks random but repeats was\ntherefore never compared against itself: 256 KiB of noise followed by the same\n256 KiB came out at 524,317 bytes where the reference emits 262,188. Levels 1\nthrough 9, every one of them. The reference has no such pre-check.\n\nIt also bought nothing. Truly random input still reaches a raw block, by the\nordinary route of the compressed form not being smaller, and comes out the same\nsize to the byte. The pre-check only ever removed the chance of finding\nsomething.\n\nWhat made skipping the search look worthwhile was the histogram behind it: a\nblock that finds no matches becomes one long literal run, and counting a\nmegabyte of it only to reject it is expensive. The reference answers that where\nit arises rather than by refusing to look. When a block yields no sequences, or\nso few that the literals dwarf them, it counts 4 KiB from each end and emits\nraw literals if those look flat (`huf_compress.c:1367`,\n`zstd_compress.c:2924`). Eight kilobytes decide what a megabyte of counting\nwould have.\n\nSo the search always runs and the literals are sampled, which is faster than\nwhat it replaces as well as better: a megabyte of random input encodes in 0.73\nms against 0.84 before.\n\nThe whole raw-fast-path apparatus goes with it — the strict and dict-aware\nprobe variants, the probe selector, the window-size gate, and the `dict_active`\nplumbing that existed to hold the skip off when a dictionary might have\nsupplied the matches the block's own content could not.\n\nTwo tests change. The new one is the bug: a repeated noise payload must come\nout far below its input size, which fails on the old code at 524,309 of\n524,288. The dictionary-contribution test keeps its guarantee at a smaller\nmargin, because its no-dict baseline now finds the payload's internal\nrecurrences itself (102,444 -> 82,581) while the dictionary arm is unchanged to\nthe byte; the reasoning is recorded beside the assertion.\n\n* perf(encode): index dfast candidates off one pointer, as upstream does\n\nThe search loop carried three coordinate systems at once, a block-relative\ncursor, an absolute position and an index into the history concat, and every\nconstant that converts between them. Decoding one slot walked all three: the\nrebase base into position space, the history start out of it, then the source\npointer and its offset back into bytes. Four constants, and they had to stay\nlive for the whole loop.\n\nThey did not fit. The loop reloads a dozen invariants from the stack on every\niteration, and its body compiles to 167 instructions against the reference's\n60, with the same proportion of stack traffic in both. The gap is the number of\nvalues wanting registers, not the allocator.\n\nFolded, the four collapse into one pointer a slot indexes straight off, which\nis what upstream's base-plus-index is, and the window floor collapses with them\ninto a single unsigned compare in slot space. That compare also subsumes the\nempty-slot test, since the sentinel is zero and the floor is at least one.\nPosition space is reconstructed only where a match was actually found.\n\nOutput is byte-identical on z000033 across levels 1-19.\n\n* perf(encode): stop carrying two dfast values the scan does not read\n\nBoth were computed on every scanned position and spilled to the stack for the\nbenefit of paths that run once in five.\n\nThe short probe's 4-byte key was carried from the 8 bytes the hash already\nloaded, then wanted once, tens of instructions later. The reference reads it\nfresh at the comparison instead, and a load that leaves no register occupied\nis cheaper here than one that does.\n\n`abs_ip1` and its window floor have no reader at all outside a match; the\ndisassembly showed both of them stored to the stack each iteration and read\nback only in the branches.\n\nBoth were tried before and both lost, by 2.7% and by nothing worth keeping,\nwhen the loop had four coordinate constants pinned in registers. They win now\nthat those are one pointer: what a change costs in this loop is the NET\nmovement in live values, and neither of these had anywhere to go before.\n\nOutput is byte-identical on z000033 across levels 1-19.\n\n* revert(encode): keep the two dfast values, freeing their registers loses\n\nReverts the previous commit. Removing them measured 2.8% worse in cycles across\nthree interleaved alternations, and cost instructions as well.\n\nThe reasoning that sent me back to them was that this loop is judged by the net\nmovement in live values, so a change that lost while four coordinate constants\nwere pinned should win once those became one pointer. It does not. Reading the\nshort probe's key fresh, as the reference does, puts a second load in a loop\nwhose ports are already busy with the probes; recomputing `abs_ip1` from a\ncursor the loop advances anyway is not cheaper than the spill it replaces.\n\nBoth numbers now sit beside the code that keeps them, so the next reader has\nthe measurement rather than the argument for it.\n\n* perf(encode): read the dfast rep candidate off the block cursor\n\nUpstream compares MEM_read32(ip+1-offset_1) against MEM_read32(ip+1), both\nhanging off the cursor it is already advancing. Ours routed the candidate\nthrough the concat index instead, adding the history start offset to a\nblock-relative index built from the block bias, which is two more adds on every\nscanned position and keeps that offset live through the whole loop for the sake\nof one read.\n\nThe concat index is rebuilt where the extension and the emit want it, which is\nonly after the four bytes have agreed.\n\nOutput is byte-identical on z000033 across levels 1-19.\n\n* revert(encode): keep the concat index for the rep candidate\n\nReverts the previous commit. Addressing the candidate off the block cursor, as\nupstream does, removed two adds per scanned position and 0.31% of the program's\ninstructions, and measured 1.3% WORSE in cycles across three interleaved\nalternations.\n\nThe offset is signed there, since the candidate sits before the cursor whenever\nthe match reaches back past this block, so it costs a sign-extend and a worse\naddressing mode than the unsigned add chain it replaced. Fewer instructions,\ndearer ones.\n\nWorth stating plainly because this branch has been leaning on instruction counts\nas a stand-in for time: they are comparable only within a shared boundary, and\neven then only as a diagnostic. This change moved the two in opposite\ndirections.\n\n* perf(encode): compare the dfast cursor against a precomputed limit\n\nUpstream stops the scan with a plain comparison against an ilimit it worked out\nonce, the last cursor position with a full hash key still readable. Ours added\nthe lookahead to the cursor on every scanned position to reach the same answer.\n\nOutput is byte-identical on z000033 across levels 1-19.\n\n* docs(encode): record what the scan-limit measurement did and did not show\n\nThe cycle reading for the previous commit is half code layout: the same two\nbinaries differ by 0.68% at a level where that line cannot execute. The\nremainder sits inside this host's build-to-build drift, so the change rests on\nits instruction count and on matching upstream, not on a speed claim.\n\n* perf(encode): resolve the rep-chain source once, not per link\n\nThe immediate-repcode chain rebuilt its scan source and its slice on every\niteration, and the first of those iterations runs on every emitted match, most\nof them only to fail the four-byte gate and leave. Upstream tests the same four\nbytes inline off the cursor it already holds.\n\nBoth are resolved once for the chain now. Nothing the loop does moves them: the\nonly mutation reaching the buffer is the rebase inside the position insert,\nwhich shifts slot values and the base this loop already discards, and never\nreallocates the history.\n\nOutput is byte-identical on z000033 across levels 1-19.\n\n* perf(encode): inline the short literal append at its call sites\n\nThe literal run is appended once per emitted sequence, from a dozen-odd sites\ninside the match loop, and the runs are short: a level-3 encode of a\ndecodecorpus frame averages about eight bytes. All of them went through one\nout-of-line call carrying the whole size ladder, worth 1.7% of the encode as\nits own symbol before the call overhead.\n\nUpstream calls nothing here. ZSTD_storeSeq stores sixteen bytes inline and only\nreaches for a copy routine past that.\n\nRuns of sixteen bytes or fewer now go inline, everything else to a tail that\nstays out of line, so the sites carry a couple of stores instead of a call\nwithout each of them growing a copy of the ladder.\n\nOutput is byte-identical on z000033 across levels 1-19.\n\n* revert(encode): keep the literal append behind a call\n\nReverts the previous commit. Splitting the short case out to\n`#[inline(always)]` and leaving the size ladder behind an out-of-line tail cost\n2.16% in cycles at level 3, on three non-overlapping readings, while removing\n1.04% of the program's instructions.\n\nThe match loop appends from a dozen-odd sites, so inlining even a short body\nthere buys decode pressure in the loop worth more than the calls it saves. That\nupstream inlines the equivalent does not carry over: its store sits in one\nplace, ours would sit in a dozen.\n\nThe control arm is weaker than usual here because this function is shared by\nevery level, so the level that would normally serve as one is not a path the\nchange cannot reach; it moved 0.20%, which leaves the level-3 signal intact\neither way.\n\nThe number is recorded above the function.\n\n* fix(encode): drop the lsm post-split gate's reference to the removed raw path\n\nThe post-split decision still excluded blocks headed for the raw fast path,\nwhich no longer exists, so the crate did not compile with `lsm` enabled. The\ncondition it guarded is unchanged: the raw path was never a post-split\ncandidate, and now nothing reaches that branch by that route.\n\n* fix(huff0): count only the parked table's heap bytes\n\nThe recycled table's own storage sits inline in the scratch, as the three\nbuffers' headers do, so adding `size_of_val` reported bytes nothing allocated\n— overstating the scratch by the size of a `HuffmanTable` whenever one was\nparked, and every other term in the same function counts capacity alone.\n\nThe figure reaches callers through the C API's context-size query, which they\nbudget against, so it has to be the one they can rely on.\n\nThe regression test parks a table and asserts the scratch grows by exactly that\ntable's heap bytes; it reports 168 against 80 without the fix. The existing\ntest could not catch this, since it compares the scratch against its own\naccounting and is satisfied either way.\n\n* fix(encode): keep the dfast slot gate and pointer sound, and the estimator honest\n\nFour defects from review, three of them mine from the coordinate fold.\n\nThe folded slot base stepped before its allocation. It is `-1` whenever the\nrebase base and the history origin coincide, which is every borrowed scan and\nthe first owned one, and `offset` requires each intermediate to stay in bounds\neven when nothing dereferences it. Wrapping arithmetic now, with the gates\nplacing the dereference inside live history.\n\nThe cursor upper bound comes back, and the argument for removing it was wrong.\nIt held within one frame, but a reused borrowed frame inherits the previous\nframe's table while its scan descriptor reports the origin as zero again, so\nthe floor-advance that retires those slots on the owned path does nothing\nthere. A shorter following frame then finds slots naming positions past its own\ninput, and a lower-bound-only gate admitted them. The regression test compresses\ntwo frames of the same size bucket, longer then shorter, through one borrowed\ncompressor: it reads a candidate at 393,217 with the cursor at 1. The bound\ncosts nothing to restore, since the cursor is already in slot space for the\nstores.\n\nThe cached weight description is retained memory, not a transient. It is built\nlazily but lives as long as its table, and tables now outlive the block that\nmade them, so it belongs in the figure `ZSTD_sizeof_CCtx` reports. Its test\ngrows the table's description and asserts the reported total grows with it: 74\nbytes went uncounted before.\n\nThe splitter's cost estimator did not get the literal-sampling decision the\nemitter makes, so a section with flat ends and a biased interior costs as\nHuffman-compressed there and is emitted raw here, letting the planner pick a\npartition on a price nothing can produce. Both paths call one sampling helper\nnow, and the estimator applies it in the same position in its branch order.\n\n* docs: add AGENTS.md, a performance checklist for this codebase\n\nThe hot paths here run per input byte, per scanned position and per emitted\nsequence, and a change that is correct and readable can still be wrong in ways\nan ordinary read does not look for.\n\nCollects what this codebase has actually been caught by: borrowing versus\ncloning in both directions, allocation per unit of work and what retained\nmemory the context-size query has to report, why saturating arithmetic is not a\nsafety measure and what a hot-path gate should look like instead, where CPU\nfeature dispatch belongs relative to a loop, how a hot loop's coordinate systems\nturn into register pressure, and what a performance claim has to carry before it\ncan be believed.\n\n* perf(kernel): resolve the CPU tier before the work, not during it\n\nWhich kernels exist is a compile-time question; which one runs is a\nproperty of the CPU executing the binary. Two places had that backwards.\n\nThe decoder re-asked `detect_cpu_kernel()` for every literals section and\nevery sequence section, so a cached selector's atomic load and branch were\npaid twice per block for an answer fixed at process start. The tag is now\nresolved once when the block decoder is built and handed to both section\ndecoders, which match it to their per-tier monomorph exactly as before.\n`decode_literals` is its own entry point with no owner above it, so it\nresolves on the way in.\n\n`copy_exact_medium` had no runtime selection at all: its tiers were chosen\nby `cfg(target_feature = ...)`, which reflects the build's baseline rather\nthan the running CPU. On a stock x86_64 build the AVX2 kernel was not\ncompiled at all and SSE2 won permanently, so the widest kernel was\nunreachable on every CPU that had it. The kernels now carry\n`#[target_feature(enable = ...)]` and are present regardless of baseline,\nand the tier is resolved once per compressor into `CompressState`, hoisted\nout of the emit closure and passed down. NEON keeps its `cfg` gate: it is\narchitectural on aarch64, so there is nothing to detect. Builds with no\ndetection available (`no_std`) fall back to the baseline, which is the only\nevidence they have.\n\nWidening this to a per-tier monomorph of the whole emit loop was not taken:\nit would replicate the match loop for the sake of one predictable branch,\nand monomorphising that loop has measured as an instruction-cache\nregression here before.\n\nEvery tier now lives in the artifact, so all of them can finally be tested\non one machine rather than only whichever the build baked in. The sweep\nholds each against the scalar reference across the medium size range, and a\nsecond test pins that the resolver never names a tier the CPU cannot run,\nwhich would be an illegal instruction in production.\n\nAGENTS.md described the compile-time gate as failing because of the build\nmachine's CPU. That is the wrong mechanism, and the wrong mechanism is what\nlet this through: the flag follows the target baseline, so the common\nfailure is not a crash but a silent fall to a narrower path. The rule also\nsaid \"never\", which would flag the legitimate NEON and SSE2 gates, and\nasked for a test of two kernels where there are several.\n\n* test: cover the paths the accounting and estimator fixes added\n\nFour paths this branch introduced ran under no test. All four are places\nwhere being wrong is silent, which is why the gap mattered rather than the\npercentage.\n\nThe estimator's end-sample shortcut had no test at all, despite being the\nfix for a divergence: a section with flat ends and a biased interior is\nemitted raw, and the estimator has to reach that decision at the same point\nin the branch order or the splitter prices a partition nothing can produce.\nWithout the shortcut the estimator costs the new fixture at 14,207 bytes\nagainst the 48,196 the emitter writes, so the test fails by a factor of\nthree on the unfixed code.\n\n`StreamingEncoder::heap_size` was untested as a whole. It backs\n`ZSTD_sizeof_CCtx`, callers budget against it, and a term dropped from the\nsum is invisible to every roundtrip test. The test compresses, then holds\nthe reported total against the parts it is made of.\n\n`FSETable::heap_size` returning zero is what lets the dictionary-entropy\nfootprint report a cached table as its inline size alone. That is only true\nwhile every array it carries is fixed-size, so it is pinned against a table\nbuilt from real counts.\n\nThe weight builder's fallback for a degenerate distribution, taken when the\nheight limiter cannot restore a full canonical code, is a correctness net\nrather than dead code: without it the caller gets a weight sum that is not a\npower of two and the table builder rejects it. Fibonacci counts are the\nstandard worst case for Huffman depth and reach it across the tight end of\nthe table-log range.\n\n* docs(simd-copy): record what runtime tier selection costs\n\nThe dispatch trades an inlinable baseline-gated kernel for a called\ntarget_feature one. Measured near-neutral, so the note says plainly that\nthe reason to dispatch at runtime is reach rather than speed, and what\nthe compile-time gate did instead.\n\n* test(encode): pin that incompressible input stays its own size\n\nRemoving the pre-search skip rests on genuinely random input reaching a\nraw block through the ordinary compressed-is-not-smaller fallback. That\nfallback had no test: the repeated-noise regression would still pass if\nraw emission broke and random input began expanding.\n\nCloses the last open acceptance criterion of #484.\n\n* fix(huff0): pin the height limiter's cost shift against overflow\n\nThe limiter computes `1usize << (largest_bits - target_nb_bits)`. On a\n32-bit target a large enough gap masks the shift instead of panicking in\nrelease, so the cost comes out wrong and the weights follow it, silently.\n\nThe gap is bounded in practice: a code of depth d needs Fib(d) symbols\ncounted, and a literals section is at most 128 KiB, which caps depth near\n25 against a table log of at least 5. That reasoning now sits in a\ndebug_assert rather than in nobody's head.\n\nFound by the degenerate-distribution test failing on i686 only. Its\nFibonacci fixture ran to 40 terms, which describes a section of hundreds\nof megabytes and a depth no input can produce; it is cut to a length that\nfits one section, which also stops it asserting on unreachable inputs.\n\n* test(streaming): prove the weight scratch is in the reported footprint\n\nThe check compared the total against a sum it contains, which the\nmatch-finder's share satisfies on its own, so it would have passed with\nthe weight scratch missing from the accounting entirely. It now removes\nthe scratch and requires the total to fall by exactly its size; without\nthe term it reports 0 against 4608.\n\nThe fixture was also drawn from the full byte range, so its literals went\nout raw and the weight builder never ran. Narrowed to 32 symbols, which\nkeeps the literals worth coding.",
+          "timestamp": "2026-09-04T17:13:28+03:00",
+          "tree_id": "4a827d5d0fe50fcf1d974ec2688e6b5c87d9e709",
+          "url": "https://github.com/structured-world/structured-zstd/commit/45685abca498a46e6d019b9cbddf3aa055a1530c"
+        },
+        "date": 1788533774991,
+        "tool": "customSmallerIsBetter",
+        "benches": [
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.08,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.084,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/pure_rust",
+            "value": 222.151,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/decodecorpus-z000033/matrix/c_ffi",
+            "value": 222.993,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/pure_rust",
+            "value": 0.956,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_22_btultra2/low-entropy-1m/matrix/c_ffi",
+            "value": 1.667,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 2.744,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.951,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 2.773,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.974,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.025,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.126,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.025,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_22_btultra2/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.126,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/pure_rust",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/small-4k-log-lines/matrix/c_ffi",
+            "value": 0.007,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/pure_rust",
+            "value": 10.339,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/decodecorpus-z000033/matrix/c_ffi",
+            "value": 6.443,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/pure_rust",
+            "value": 0.137,
+            "unit": "ms"
+          },
+          {
+            "name": "compress/level_3_dfast/low-entropy-1m/matrix/c_ffi",
+            "value": 0.176,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/rust_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/pure_rust",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/small-4k-log-lines/c_stream/matrix/c_ffi",
+            "value": 0.002,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/pure_rust",
+            "value": 1.552,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/rust_stream/matrix/c_ffi",
+            "value": 1.211,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/pure_rust",
+            "value": 1.711,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/decodecorpus-z000033/c_stream/matrix/c_ffi",
+            "value": 1.303,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/pure_rust",
+            "value": 0.026,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/rust_stream/matrix/c_ffi",
+            "value": 0.156,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/pure_rust",
+            "value": 0.025,
+            "unit": "ms"
+          },
+          {
+            "name": "decompress/level_3_dfast/low-entropy-1m/c_stream/matrix/c_ffi",
+            "value": 0.187,
             "unit": "ms"
           }
         ]
