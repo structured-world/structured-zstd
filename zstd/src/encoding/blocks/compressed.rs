@@ -2078,60 +2078,78 @@ fn encode_seqnum(seqnum: usize, writer: &mut BitWriter<impl AsMut<Vec<u8>>>) {
     }
 }
 
+/// Literal-length code per length, for lengths below 64 (upstream `LL_Code`,
+/// `zstd_compress_internal.h:586`). At or above 64 the code is the high bit
+/// plus [`LL_DELTA_CODE`].
+const LL_CODE: [u8; 64] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 16, 17, 17, 18, 18, 19, 19, 20, 20,
+    20, 20, 21, 21, 21, 21, 22, 22, 22, 22, 22, 22, 22, 22, 23, 23, 23, 23, 23, 23, 23, 23, 24, 24,
+    24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24, 24,
+];
+const LL_DELTA_CODE: u32 = 19;
+/// Extra bits carried by each literal-length code (upstream `LL_bits`).
+const LL_EXTRA_BITS: [u8; 36] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11,
+    12, 13, 14, 15, 16,
+];
+
+/// Match-length code per `len - 3`, for values below 128 (upstream `ML_Code`,
+/// `zstd_compress_internal.h:603`). At or above 128 the code is the high bit
+/// plus [`ML_DELTA_CODE`].
+const ML_CODE: [u8; 128] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+    26, 27, 28, 29, 30, 31, 32, 32, 33, 33, 34, 34, 35, 35, 36, 36, 36, 36, 37, 37, 37, 37, 38, 38,
+    38, 38, 38, 38, 38, 38, 39, 39, 39, 39, 39, 39, 39, 39, 40, 40, 40, 40, 40, 40, 40, 40, 40, 40,
+    40, 40, 40, 40, 40, 40, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 41, 42, 42,
+    42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42, 42,
+    42, 42, 42, 42, 42, 42,
+];
+const ML_DELTA_CODE: u32 = 36;
+/// Extra bits carried by each match-length code (upstream `ML_bits`).
+const ML_EXTRA_BITS: [u8; 53] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    1, 1, 1, 1, 2, 2, 3, 3, 4, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+];
+
+/// Split a literal-length into its FSE symbol, the extra bits to append, and
+/// how many of them (upstream `ZSTD_LLcode` plus the `LL_bits` lookup its
+/// caller does).
+///
+/// Runs once per sequence inside the encoding loop, where a 22-arm range match
+/// compiled to a chain of comparisons; upstream reaches the same answer with a
+/// table index. Every code's baseline is a multiple of its own extra-bit width,
+/// so masking off those bits is the same subtraction the ranges spelled out.
+#[inline]
 fn encode_literal_length(len: u32) -> (u8, u32, usize) {
-    match len {
-        0..=15 => (len as u8, 0, 0),
-        16..=17 => (16, len - 16, 1),
-        18..=19 => (17, len - 18, 1),
-        20..=21 => (18, len - 20, 1),
-        22..=23 => (19, len - 22, 1),
-        24..=27 => (20, len - 24, 2),
-        28..=31 => (21, len - 28, 2),
-        32..=39 => (22, len - 32, 3),
-        40..=47 => (23, len - 40, 3),
-        48..=63 => (24, len - 48, 4),
-        64..=127 => (25, len - 64, 6),
-        128..=255 => (26, len - 128, 7),
-        256..=511 => (27, len - 256, 8),
-        512..=1023 => (28, len - 512, 9),
-        1024..=2047 => (29, len - 1024, 10),
-        2048..=4095 => (30, len - 2048, 11),
-        4096..=8191 => (31, len - 4096, 12),
-        8192..=16383 => (32, len - 8192, 13),
-        16384..=32767 => (33, len - 16384, 14),
-        32768..=65535 => (34, len - 32768, 15),
-        65536..=131071 => (35, len - 65536, 16),
-        131072.. => unreachable!(),
-    }
+    debug_assert!(len < 131_072, "literal length {len} out of encodable range");
+    let code = if len < 64 {
+        LL_CODE[len as usize]
+    } else {
+        (len.ilog2() + LL_DELTA_CODE) as u8
+    };
+    let bits = LL_EXTRA_BITS[code as usize] as usize;
+    (code, len & ((1u32 << bits) - 1), bits)
 }
 
+/// Split a match length into its FSE symbol, the extra bits to append, and how
+/// many of them (upstream `ZSTD_MLcode` plus the `ML_bits` lookup its caller
+/// does). Codes are keyed on `len - 3`, the form the sequence section stores.
+///
+/// Table-driven for the same reason as [`encode_literal_length`].
+#[inline]
 fn encode_match_len(len: u32) -> (u8, u32, usize) {
-    match len {
-        0..=2 => unreachable!(),
-        3..=34 => (len as u8 - 3, 0, 0),
-        35..=36 => (32, len - 35, 1),
-        37..=38 => (33, len - 37, 1),
-        39..=40 => (34, len - 39, 1),
-        41..=42 => (35, len - 41, 1),
-        43..=46 => (36, len - 43, 2),
-        47..=50 => (37, len - 47, 2),
-        51..=58 => (38, len - 51, 3),
-        59..=66 => (39, len - 59, 3),
-        67..=82 => (40, len - 67, 4),
-        83..=98 => (41, len - 83, 4),
-        99..=130 => (42, len - 99, 5),
-        131..=258 => (43, len - 131, 7),
-        259..=514 => (44, len - 259, 8),
-        515..=1026 => (45, len - 515, 9),
-        1027..=2050 => (46, len - 1027, 10),
-        2051..=4098 => (47, len - 2051, 11),
-        4099..=8194 => (48, len - 4099, 12),
-        8195..=16386 => (49, len - 8195, 13),
-        16387..=32770 => (50, len - 16387, 14),
-        32771..=65538 => (51, len - 32771, 15),
-        65539..=131074 => (52, len - 65539, 16),
-        131075.. => unreachable!(),
-    }
+    debug_assert!(
+        (3..131_075).contains(&len),
+        "match length {len} out of encodable range",
+    );
+    let base = len - 3;
+    let code = if base < 128 {
+        ML_CODE[base as usize]
+    } else {
+        (base.ilog2() + ML_DELTA_CODE) as u8
+    };
+    let bits = ML_EXTRA_BITS[code as usize] as usize;
+    (code, base & ((1u32 << bits) - 1), bits)
 }
 
 /// Convert an actual byte offset into the encoded offset code, using repeat offset

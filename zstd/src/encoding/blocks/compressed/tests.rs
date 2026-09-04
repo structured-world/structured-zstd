@@ -1,7 +1,7 @@
 use super::{
-    FseTableMode, RawSequence, choose_table, emit_single_sequence_block, encode_match_len,
-    encode_offset_with_history, min_gain, min_literals_to_compress, previous_table,
-    remember_last_used_tables,
+    FseTableMode, RawSequence, choose_table, emit_single_sequence_block, encode_literal_length,
+    encode_match_len, encode_offset_with_history, min_gain, min_literals_to_compress,
+    previous_table, remember_last_used_tables,
 };
 use crate::encoding::frame_compressor::{CompressState, FseTables, PreviousFseTable};
 use crate::encoding::strategy::StrategyTag;
@@ -582,6 +582,88 @@ fn choose_table_handles_single_symbol_distribution() {
         crate::encoding::strategy::StrategyTag::Lazy,
     );
     assert!(matches!(mode, FseTableMode::Rle(0)));
+}
+
+/// The range-match form both length coders had before they became table
+/// lookups, kept as an oracle. It spells out every code's baseline and width
+/// explicitly, so it is the readable statement of the format and an
+/// independent check that the tables and the extra-bit masking agree with it.
+fn literal_length_ranges(len: u32) -> (u8, u32, usize) {
+    match len {
+        0..=15 => (len as u8, 0, 0),
+        16..=17 => (16, len - 16, 1),
+        18..=19 => (17, len - 18, 1),
+        20..=21 => (18, len - 20, 1),
+        22..=23 => (19, len - 22, 1),
+        24..=27 => (20, len - 24, 2),
+        28..=31 => (21, len - 28, 2),
+        32..=39 => (22, len - 32, 3),
+        40..=47 => (23, len - 40, 3),
+        48..=63 => (24, len - 48, 4),
+        64..=127 => (25, len - 64, 6),
+        128..=255 => (26, len - 128, 7),
+        256..=511 => (27, len - 256, 8),
+        512..=1023 => (28, len - 512, 9),
+        1024..=2047 => (29, len - 1024, 10),
+        2048..=4095 => (30, len - 2048, 11),
+        4096..=8191 => (31, len - 4096, 12),
+        8192..=16383 => (32, len - 8192, 13),
+        16384..=32767 => (33, len - 16384, 14),
+        32768..=65535 => (34, len - 32768, 15),
+        65536..=131071 => (35, len - 65536, 16),
+        131072.. => unreachable!(),
+    }
+}
+
+fn match_len_ranges(len: u32) -> (u8, u32, usize) {
+    match len {
+        0..=2 => unreachable!(),
+        3..=34 => (len as u8 - 3, 0, 0),
+        35..=36 => (32, len - 35, 1),
+        37..=38 => (33, len - 37, 1),
+        39..=40 => (34, len - 39, 1),
+        41..=42 => (35, len - 41, 1),
+        43..=46 => (36, len - 43, 2),
+        47..=50 => (37, len - 47, 2),
+        51..=58 => (38, len - 51, 3),
+        59..=66 => (39, len - 59, 3),
+        67..=82 => (40, len - 67, 4),
+        83..=98 => (41, len - 83, 4),
+        99..=130 => (42, len - 99, 5),
+        131..=258 => (43, len - 131, 7),
+        259..=514 => (44, len - 259, 8),
+        515..=1026 => (45, len - 515, 9),
+        1027..=2050 => (46, len - 1027, 10),
+        2051..=4098 => (47, len - 2051, 11),
+        4099..=8194 => (48, len - 4099, 12),
+        8195..=16386 => (49, len - 8195, 13),
+        16387..=32770 => (50, len - 16387, 14),
+        32771..=65538 => (51, len - 32771, 15),
+        65539..=131074 => (52, len - 65539, 16),
+        131075.. => unreachable!(),
+    }
+}
+
+#[test]
+fn literal_length_coding_agrees_with_the_ranges_over_every_length() {
+    for len in 0..131_072u32 {
+        assert_eq!(
+            encode_literal_length(len),
+            literal_length_ranges(len),
+            "literal length {len}",
+        );
+    }
+}
+
+#[test]
+fn match_length_coding_agrees_with_the_ranges_over_every_length() {
+    for len in 3..131_075u32 {
+        assert_eq!(
+            encode_match_len(len),
+            match_len_ranges(len),
+            "match length {len}"
+        );
+    }
 }
 
 #[test]
