@@ -2312,6 +2312,14 @@ macro_rules! start_matching_fast_loop_body {
             // passes it, so `ip1 + 8 <= block_len` holds on every iteration
             // and `ip0 < ip1`. A clamp there would only hide a broken guard.
             let block_len = concat_len - block_bias;
+            // Last cursor position with a full hash key still readable, which is
+            // upstream's `ilimit`. The scan compares against this rather than
+            // adding the lookahead to the cursor every position.
+            //
+            // `$current_len >= HASH_READ_SIZE` whenever this loop runs: the
+            // caller only enters with room for a key, and the outer guard above
+            // re-checks it, so the subtraction cannot wrap.
+            let scan_limit = $current_len - HASH_READ_SIZE;
             // Slot payload for a block-relative cursor: packing a position is
             // `(abs - position_base) + 1`, and `abs = $current_abs_start + ip`,
             // so the whole `position_base` term collapses into a per-block
@@ -3132,7 +3140,11 @@ macro_rules! start_matching_fast_loop_body {
                 ip1 += step;
                 hl0_idx = hl1_idx;
                 idxl0 = idxl1;
-                if ip1 + HASH_READ_SIZE > $current_len {
+                // Against a precomputed limit, the way upstream compares
+                // `ip1 <= ilimit` with `ilimit = iend - HASH_READ_SIZE`. Adding
+                // the lookahead to the cursor instead spends the add on every
+                // scanned position to reach the same answer.
+                if ip1 > scan_limit {
                     // First position the fast loop did NOT pack into the
                     // hash tables. `seed_remaining_hashable_starts` will
                     // pick up from `ip0` instead of restarting at the
