@@ -162,6 +162,56 @@ fn begin_rebase_clears_index_tables_and_resets_base() {
 /// table along with the main hash / chain replay. `begin_rebase`
 /// zeroes `hash3_table`, so without an explicit refill every HC3
 /// probe before `abs_pos` returns "empty" until the next encode
+/// The hoisted hash3 fill must leave exactly what the per-position loop
+/// leaves: same table contents, same cursor. It resolves the rebase guard,
+/// the live-history slice and the stored-index arithmetic once instead of per
+/// position, so an error there would show up as a differently-populated side
+/// table and, through it, as different short-match selection.
+#[test]
+fn the_hoisted_hash3_fill_matches_the_per_position_loop() {
+    let build = |hoisted: bool| {
+        let mut t = new_table(64);
+        t.history = b"abcdef_abcdef_abcdef_abcdef_abcdef_abcdef".to_vec();
+        t.history_start = 0;
+        t.history_abs_start = 0;
+        t.window_size = t.history.len();
+        t.chunk_lens.push_back(t.history.len());
+        t.hash3_log = 6;
+        t.is_btultra2 = true;
+        t.ensure_tables();
+        // Both paths start past `history_abs_start`, which is where the fast
+        // one is allowed to take over; the general loop is reached by walking
+        // one position at a time, since a single-position span whose start is
+        // the cursor takes the same branch either way.
+        t.next_to_update3 = 1;
+        if hoisted {
+            assert!(t.fill_hash3_hoisted(30), "the fast path must apply here");
+        } else {
+            for target in 2..=30 {
+                t.next_to_update3 = target - 1;
+                let mut cursor = t.next_to_update3;
+                while cursor < target {
+                    t.insert_hash3_only_no_rebase(cursor);
+                    cursor += 1;
+                }
+                t.next_to_update3 = target;
+            }
+        }
+        (t.hash3_table().to_vec(), t.next_to_update3)
+    };
+    let (hoisted_table, hoisted_cursor) = build(true);
+    let (loop_table, loop_cursor) = build(false);
+    assert_eq!(hoisted_cursor, loop_cursor, "the cursor must land alike");
+    assert_eq!(
+        hoisted_table, loop_table,
+        "the hoisted fill wrote a different hash3 table than the loop",
+    );
+    assert!(
+        hoisted_table.iter().any(|&v| v != HC_EMPTY),
+        "fixture precondition: the fill must populate something",
+    );
+}
+
 /// position falls due. On long-running btultra2 streams that
 /// silently changes match selection (the btultra2 cascade leans
 /// heavily on HC3 short matches).
