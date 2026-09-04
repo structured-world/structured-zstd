@@ -1120,6 +1120,14 @@ fn estimate_sequences_section_bytes(
         into_last_used_table(of_mode),
     ];
     remember_last_used_tables(fse_tables, decisions);
+    // The emitter keeps the handle a commit displaces, to build the next
+    // block's table into. A probe must not: the splitter holds many of these
+    // states at once, and a spare per axis per probe doubles the tables alive
+    // at any moment. Dropping it leaves a probe with exactly what it needs,
+    // which is what the allocate-per-table form gave it.
+    fse_tables.ll_next = None;
+    fse_tables.ml_next = None;
+    fse_tables.of_next = None;
 
     nb_seq_header
         + mode_byte
