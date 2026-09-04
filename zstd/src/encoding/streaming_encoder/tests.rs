@@ -14,10 +14,13 @@ fn the_reported_footprint_covers_what_compressing_retained() {
     let mut enc = StreamingEncoder::new(Vec::new(), CompressionLevel::Level(3));
     let before = enc.heap_size();
 
-    // Varied enough to build a real Huffman table rather than going raw or
-    // RLE, and long enough to force several blocks.
+    // Unpredictable enough that the matcher leaves plenty of literals, but
+    // drawn from a narrow alphabet so those literals are worth Huffman-coding:
+    // over the full 256 they would be emitted raw and the weight builder would
+    // never run at all, leaving nothing retained to check. Long enough to span
+    // several blocks.
     let payload: Vec<u8> = (0..300_000u32)
-        .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+        .map(|i| ((i.wrapping_mul(2654435761) >> 24) % 32) as u8)
         .collect();
     enc.write_all(&payload).expect("write");
     enc.flush().expect("flush");
@@ -27,13 +30,25 @@ fn the_reported_footprint_covers_what_compressing_retained() {
         after > before,
         "compressing retained buffers the footprint does not report: {before} -> {after}",
     );
-    // The match-finder alone accounts for a large share; the assertion above
-    // would pass on that term alone, so check the sum also covers the state
-    // the accounting fixes were about.
+    // The match-finder alone accounts for most of that growth, so the check
+    // above would pass with the weight scratch missing from the sum entirely.
+    // Prove it is a term: take it out and the reported total must fall by
+    // exactly its own size.
+    let scratch = core::mem::take(&mut enc.state.huff_weights);
+    let scratch_heap = scratch.heap_size();
     assert!(
-        after >= enc.state.matcher.heap_size() + enc.state.huff_weights.heap_size(),
-        "reported total is smaller than the parts it is made of",
+        scratch_heap > 0,
+        "the weight builder's buffers should be populated after compressing",
     );
+    let without_scratch = enc.heap_size();
+    assert_eq!(
+        after - without_scratch,
+        scratch_heap,
+        "the weight scratch is retained across blocks but is not counted in \
+         the reported footprint",
+    );
+    enc.state.huff_weights = scratch;
+    assert_eq!(enc.heap_size(), after, "restoring must undo the removal");
 }
 use crate::io::{Error, ErrorKind, Read, Write};
 use alloc::vec;
