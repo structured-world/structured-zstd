@@ -1,6 +1,27 @@
 use super::*;
 
 #[test]
+fn an_encoder_table_holds_nothing_on_the_heap() {
+    // The dictionary-entropy footprint reports a cached `Custom` table as
+    // `size_of::<FSETable>() + table.heap_size()`, and this is the half that
+    // says the rest is inline. It is only correct while every array the table
+    // carries is fixed-size; give it a `Vec` and the sum silently under-reports
+    // a per-dictionary allocation through `ZSTD_sizeof_CCtx`, with no roundtrip
+    // test able to notice. Pin it against a table built from real counts, not
+    // a default one, so a lazily-allocated field would show up too.
+    let mut counts = [0usize; 256];
+    for (symbol, count) in counts.iter_mut().enumerate().take(64) {
+        *count = symbol + 1;
+    }
+    let table = fse_encoder::build_table_from_symbol_counts(&counts[..64], 10, false);
+    assert_eq!(
+        table.heap_size(),
+        0,
+        "FSETable grew a heap allocation the dictionary footprint does not count",
+    );
+}
+
+#[test]
 fn decoder_entry_layout_12_bytes_seqsymbol_shape() {
     // Upstream zstd `ZSTD_seqSymbol` shape: 4-byte header (new_state /
     // symbol / num_bits), 4-byte `base_value`, 1-byte

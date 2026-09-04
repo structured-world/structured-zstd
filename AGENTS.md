@@ -127,6 +127,18 @@ settled by measurement, not taste.
   above the loop is the `match` on the already-resolved value, selecting a
   monomorph that then runs with the tier and the const-shaped parameters baked
   in and no test for them in the body.
+
+  **The reason for the monomorph is register pressure, not the branch.** A
+  predictable branch is nearly free; a value is not. A carried "which SIMD do we
+  have" tag is a live value for the whole loop, and these loops already run
+  saturated, holding about as many live values as the machine has registers.
+  One more forces the allocator to spill something hot, and the reload is then
+  paid every iteration by code that has nothing to do with the tier. Baking the
+  tier into the instantiation means no such value exists to be carried. Same
+  argument as the coordinate-system rule below, applied to dispatch. It also
+  says where the line falls: a tag that never enters the saturated loop, read
+  only on a rare path or from a closure's environment, costs nothing worth
+  duplicating a loop body over.
 - **Which kernels EXIST is a compile-time question; which one RUNS is not.**
   The tiers a build carries follow from the target and the `kernel-*` features.
   Choosing among them is a property of the CPU executing the binary, so it is

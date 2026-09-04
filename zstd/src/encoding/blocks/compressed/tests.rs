@@ -389,6 +389,77 @@ fn estimator_literals_section_mirrors_emit_for_short_inputs() {
 }
 
 #[test]
+fn a_section_with_flat_ends_costs_what_the_emitter_writes_for_it() {
+    use super::{
+        CompressedBlockScratch, EntropyOnlyMatcher, EstimatorWorkspace,
+        encode_block_parts_with_sequence_scratch, estimate_block_parts_size,
+    };
+    // The shape the end-sample shortcut exists for, and the one where the
+    // estimator and the emitter can disagree: both ends look random, the
+    // interior is heavily biased. A histogram of the whole section says
+    // "compresses well"; the two 4 KiB end samples say "flat". The emitter
+    // trusts the samples and writes a raw section, so the estimator has to
+    // reach the same decision at the same point in the branch order. If it
+    // prices this as Huffman-compressed instead, the splitter picks a
+    // partition on a price nothing can produce.
+    //
+    // Sized past the shortcut's own floor (it declines to sample sections
+    // smaller than ratio x sample), with each end cycling all 256 values so
+    // the largest per-end count is far under the flatness bound.
+    let mut literals: Vec<u8> = (0..4096u32).map(|i| (i % 256) as u8).collect();
+    literals.extend(core::iter::repeat_n(0u8, 40_000));
+    literals.extend((0..4096u32).map(|i| (i % 256) as u8));
+
+    let make_state = || CompressState::<EntropyOnlyMatcher> {
+        matcher: EntropyOnlyMatcher,
+        copy_tier: crate::decoding::simd_copy::ExactCopyTier::resolve(),
+        last_huff_table: None,
+        huff_table_spare: None,
+        huff_weights: Default::default(),
+        fse_tables: FseTables::new(),
+        block_scratch: CompressedBlockScratch::new(),
+        offset_hist: [1, 4, 8],
+        strategy_tag: StrategyTag::Lazy,
+        pre_split: None,
+        huf_optimal_search: true,
+        literal_compression_disabled: false,
+    };
+    let mut est_state = make_state();
+    let mut emit_state = make_state();
+
+    let mut workspace = EstimatorWorkspace::default();
+    let est = estimate_block_parts_size(&mut est_state, &literals, &[], &mut workspace);
+    let mut emitted: Vec<u8> = Vec::new();
+    let mut scratch: Vec<crate::blocks::sequence_section::Sequence> = Vec::new();
+    encode_block_parts_with_sequence_scratch(
+        &mut emit_state,
+        &literals,
+        &[],
+        &mut emitted,
+        &mut scratch,
+    );
+
+    assert_eq!(
+        est,
+        emitted.len(),
+        "estimator priced a flat-ended section at {est} bytes, emitter wrote {}",
+        emitted.len(),
+    );
+    // Pin that this really is the raw outcome, not parity reached by both
+    // sides compressing: a shortcut that stopped firing on both would keep
+    // the equality above while losing what the test is about.
+    assert!(
+        emitted.len() >= literals.len(),
+        "expected a raw literals section, got {} bytes for {} literals",
+        emitted.len(),
+        literals.len(),
+    );
+    // The shortcut clears any carried table on both sides.
+    assert!(est_state.last_huff_table.is_none());
+    assert!(emit_state.last_huff_table.is_none());
+}
+
+#[test]
 fn encode_match_len_uses_correct_upper_range_base() {
     assert_eq!(encode_match_len(65539), (52, 0, 16));
     assert_eq!(encode_match_len(65540), (52, 1, 16));

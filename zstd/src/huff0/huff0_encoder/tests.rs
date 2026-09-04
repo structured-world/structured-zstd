@@ -1,5 +1,39 @@
 use super::*;
 
+/// The height limiter can fail to restore a full canonical code on a
+/// degenerate distribution, and the weight builder then falls back to the
+/// distributed construction. That fallback is a correctness net, not dead
+/// code: without it the caller gets a weight sum that is not a power of two
+/// and the table builder rejects it. Fibonacci counts are the standard
+/// worst case for Huffman depth, so they are what drives the limiter past
+/// what it can repair.
+#[test]
+fn a_degenerate_distribution_still_yields_usable_weights() {
+    let mut counts = [0usize; 256];
+    let (mut a, mut b) = (1usize, 1usize);
+    for count in counts.iter_mut().take(40) {
+        *count = a;
+        (a, b) = (b, a + b);
+    }
+
+    // Across the whole legal table-log range, including the tight end where
+    // the natural code is far deeper than the limit allows.
+    for max_nb_bits in 5..=11usize {
+        let weights = build_limited_weights(&counts[..40], max_nb_bits);
+        assert_eq!(weights.len(), 40, "weights must cover every symbol slot");
+        let sum: usize = weights
+            .iter()
+            .filter(|w| **w > 0)
+            .map(|w| 1usize << (w - 1))
+            .sum();
+        assert!(
+            sum.is_power_of_two(),
+            "weight sum {sum} is not a power of two at max_nb_bits={max_nb_bits}; \
+             the table builder rejects this",
+        );
+    }
+}
+
 /// A parked table contributes its HEAP bytes and nothing else. The table
 /// object itself lives inline in the scratch, so counting its size would
 /// report storage that was never allocated — and the figure reaches callers

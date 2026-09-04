@@ -1,5 +1,40 @@
 use crate::decoding::StreamingDecoder;
 use crate::encoding::{CompressionLevel, Matcher, Sequence, StreamingEncoder};
+
+#[test]
+fn the_reported_footprint_covers_what_compressing_retained() {
+    // `heap_size` backs `ZSTD_sizeof_CCtx`, so a caller budgets against it.
+    // Everything the encoder keeps between blocks and frames has to appear
+    // there: the match-finder's tables, the retained Huffman table and its
+    // parked spare, and the Huffman weight builder's buffers, which live on
+    // the compressor state precisely so they are not reallocated per block.
+    // A term omitted from the sum is invisible to every roundtrip test, so
+    // pin it here: compressing must move the number, and the number must
+    // then cover the buffers that are demonstrably still held.
+    let mut enc = StreamingEncoder::new(Vec::new(), CompressionLevel::Level(3));
+    let before = enc.heap_size();
+
+    // Varied enough to build a real Huffman table rather than going raw or
+    // RLE, and long enough to force several blocks.
+    let payload: Vec<u8> = (0..300_000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 24) as u8)
+        .collect();
+    enc.write_all(&payload).expect("write");
+    enc.flush().expect("flush");
+
+    let after = enc.heap_size();
+    assert!(
+        after > before,
+        "compressing retained buffers the footprint does not report: {before} -> {after}",
+    );
+    // The match-finder alone accounts for a large share; the assertion above
+    // would pass on that term alone, so check the sum also covers the state
+    // the accounting fixes were about.
+    assert!(
+        after >= enc.state.matcher.heap_size() + enc.state.huff_weights.heap_size(),
+        "reported total is smaller than the parts it is made of",
+    );
+}
 use crate::io::{Error, ErrorKind, Read, Write};
 use alloc::vec;
 use alloc::vec::Vec;
