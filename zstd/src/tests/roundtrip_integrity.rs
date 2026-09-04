@@ -922,6 +922,48 @@ fn all_levels_tiny_input_with_hint() {
     }
 }
 
+/// A reused compressor must not read a slot left by a longer previous frame.
+///
+/// The borrowed path never advances the absolute floor — its scan descriptor
+/// reports zero for both the history origin and the slot base on every frame —
+/// so the floor-advance that retires the previous frame's slots on the owned
+/// path does nothing here. A slot written at a position past the end of a
+/// shorter following frame therefore survives, and a lower-bound-only gate
+/// admits it, which reads outside the input.
+#[test]
+fn a_reused_borrowed_compressor_rejects_slots_from_a_longer_frame() {
+    for level in [
+        CompressionLevel::Level(1),
+        CompressionLevel::Level(2),
+        CompressionLevel::Default,
+        CompressionLevel::Level(4),
+    ] {
+        // Both lengths resolve to the same size bucket, so the second frame
+        // keeps the first one's table widths and therefore its slots; a pair
+        // that straddles a bucket boundary re-widths the tables and clears
+        // them, which hides this entirely. The second frame is still short
+        // enough that a third of the first one's slots name positions past
+        // its end, and both are drawn from the same generator so the hashes
+        // actually reach those slots.
+        let long = generate_compressible(11, 400_000);
+        let short = generate_compressible(11, 300_000);
+
+        let mut compressor: FrameCompressor = FrameCompressor::new(level);
+        let first = compressor.compress_independent_frame(&long);
+        let second = compressor.compress_independent_frame(&short);
+
+        for (frame, source, which) in [(first, &long, "first"), (second, &short, "second")] {
+            let mut decoder = StreamingDecoder::new(frame.as_slice()).unwrap();
+            let mut decoded = Vec::new();
+            decoder.read_to_end(&mut decoded).unwrap();
+            assert_eq!(
+                &decoded, source,
+                "{level:?}: the {which} frame of a reused borrowed compressor did not round trip",
+            );
+        }
+    }
+}
+
 /// The borrowed one-shot path (`compress_slice_to_vec`) must produce a
 /// frame byte-identical to the owned streaming path (`compress_to_vec`)
 /// for Fast-backend levels and round-trip exactly. Covers compressible

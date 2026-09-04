@@ -776,6 +776,7 @@ fn estimate_block_parts_size<M: Matcher>(
         state.huf_optimal_search,
         state.literal_compression_disabled,
         &mut state.huff_weights,
+        literals_suspected_incompressible(literals_vec.len(), raw_sequences.len()),
     );
 
     let seq_bytes = if workspace.sequences.is_empty() {
@@ -794,6 +795,11 @@ fn estimate_block_parts_size<M: Matcher>(
     lit_bytes + seq_bytes
 }
 
+// One argument over the lint's threshold. Every one of them is a distinct
+// decision the emitter makes about this section, and this function exists to
+// reproduce those decisions in the same order; bundling them into a struct
+// would hide exactly the correspondence that has to stay visible.
+#[allow(clippy::too_many_arguments)]
 fn estimate_literals_section_bytes(
     literals: &[u8],
     last_huff: &mut Option<huff0_encoder::HuffmanTable>,
@@ -802,6 +808,7 @@ fn estimate_literals_section_bytes(
     huf_search: bool,
     lit_disabled: bool,
     weight_scratch: &mut huff0_encoder::WeightScratch,
+    suspected_incompressible: bool,
 ) -> usize {
     // Mirror `encode_block_parts_with_sequence_scratch` literal-mode branches
     // **in the same order**. The disabled gate (negative levels: raw literals,
@@ -855,6 +862,15 @@ fn estimate_literals_section_bytes(
             return raw_section_bytes;
         }
         return total;
+    }
+
+    // Mirror the emitter's end-sample shortcut, in the same position. Without
+    // it a section with flat ends and a biased interior costs as
+    // Huffman-compressed here and is emitted raw there, and the splitter picks
+    // a partition on a price the emitter cannot produce.
+    if suspected_incompressible && end_samples_look_flat(literals, counts) {
+        *last_huff = None;
+        return uncompressed_literals_header_bytes(literals.len()) + literals.len();
     }
 
     let (max_sym, largest_count) = crate::histogram::count_bytes(literals, counts);
@@ -2397,6 +2413,34 @@ pub(crate) fn literals_suspected_incompressible(
     sequence_count == 0 || literals_len / sequence_count >= SUSPECT_LITERAL_RATIO
 }
 
+/// Whether two end samples say the section is flat enough to go out raw
+/// without paying for a histogram of the whole thing (upstream
+/// `huf_compress.c:1367`).
+///
+/// Shared by the emitter and by the splitter's cost estimator: the estimator
+/// mirrors the emitter's literal-mode branches in order so a probe cost matches
+/// what the emitter will write, and a section costed as Huffman-compressed here
+/// but emitted raw there would let the splitter choose a partition on a price
+/// nobody can produce.
+///
+/// Both ends, not one: a section that is random at the front and structured at
+/// the back must not be judged on the front alone. `counts` is cleared between
+/// the probes so each reports its own most frequent symbol, which is what the
+/// summed threshold is scaled for, and again on the way out so the caller
+/// receives it zeroed either way.
+fn end_samples_look_flat(literals: &[u8], counts: &mut [usize; 256]) -> bool {
+    if literals.len() < SUSPECT_SAMPLE_SIZE * SUSPECT_SAMPLE_RATIO {
+        return false;
+    }
+    counts.fill(0);
+    let (_, head_largest) = crate::histogram::count_bytes(&literals[..SUSPECT_SAMPLE_SIZE], counts);
+    counts.fill(0);
+    let (_, tail_largest) =
+        crate::histogram::count_bytes(&literals[literals.len() - SUSPECT_SAMPLE_SIZE..], counts);
+    counts.fill(0);
+    head_largest + tail_largest <= ((2 * SUSPECT_SAMPLE_SIZE) >> 7) + 4
+}
+
 fn compress_literals(
     literals: &[u8],
     last_table: Option<&huff0_encoder::HuffmanTable>,
@@ -2431,26 +2475,11 @@ fn compress_literals(
     // `huf_compress.c:1367`). The histogram spans the whole section, and for a
     // block the search found nothing in that section is the entire block — a
     // megabyte of random input costs a megabyte of counting only to be thrown
-    // away by the flatness gate below. Two 4 KiB probes, one from each end,
-    // answer the same question for 8 KiB of counting.
-    //
-    // Both ends, not one: a section that is random at the front and structured
-    // at the back must not be judged on the front alone. The counts are cleared
-    // between the probes so each reports its own most frequent symbol, which is
-    // what the summed threshold is scaled for.
-    if suspected_incompressible && literals.len() >= SUSPECT_SAMPLE_SIZE * SUSPECT_SAMPLE_RATIO {
-        let (_, head_largest) =
-            crate::histogram::count_bytes(&literals[..SUSPECT_SAMPLE_SIZE], &mut counts);
-        counts.fill(0);
-        let (_, tail_largest) = crate::histogram::count_bytes(
-            &literals[literals.len() - SUSPECT_SAMPLE_SIZE..],
-            &mut counts,
-        );
-        if head_largest + tail_largest <= ((2 * SUSPECT_SAMPLE_SIZE) >> 7) + 4 {
-            raw_literals(literals, writer);
-            return HuffmanTableUpdate::Cleared;
-        }
-        counts.fill(0);
+    // away by the flatness gate below. Two 4 KiB probes answer the same
+    // question for 8 KiB of counting.
+    if suspected_incompressible && end_samples_look_flat(literals, &mut counts) {
+        raw_literals(literals, writer);
+        return HuffmanTableUpdate::Cleared;
     }
 
     let (max_symbol, largest_count) = crate::histogram::count_bytes(literals, &mut counts);

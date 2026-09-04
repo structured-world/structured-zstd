@@ -484,12 +484,27 @@ pub fn set_force_cheap_huf(on: bool) {
 }
 
 impl HuffmanTable {
-    /// Heap bytes this table holds: the per-symbol code table and the packed
-    /// dual-container codes. The lazily-built weight-description cache is a
-    /// transient and not counted.
+    /// Heap bytes this table holds: the per-symbol code table, the packed
+    /// dual-container codes, and the encoded weight description once it has
+    /// been built.
+    ///
+    /// The description is not a transient. It is built lazily but then lives as
+    /// long as the table does, and tables outlive the block that made them —
+    /// the emitter carries one between blocks and the builder parks a spare —
+    /// so its bytes are retained and a caller budgeting around a context has to
+    /// see them.
     pub fn heap_size(&self) -> usize {
+        #[cfg(feature = "std")]
+        let cached = self
+            .cached_encoded_weight_description
+            .get()
+            .and_then(Option::as_ref)
+            .map_or(0, Vec::capacity);
+        #[cfg(not(feature = "std"))]
+        let cached = 0;
         self.codes.capacity() * core::mem::size_of::<(u32, u8)>()
             + self.packed_codes.capacity() * core::mem::size_of::<u64>()
+            + cached
     }
 
     pub fn build_from_data(data: &[u8]) -> Self {

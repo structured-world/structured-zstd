@@ -2342,11 +2342,16 @@ macro_rules! start_matching_fast_loop_body {
             //
             // Folded here, all four collapse into one pointer, and the loop's
             // per-candidate work becomes a single add.
-            let slot_base_ptr = unsafe {
-                history_base_ptr
-                    .add(history_start_offset)
-                    .offset(position_base as isize - history_abs_start as isize - 1)
-            };
+            // Wrapping arithmetic, not `offset`/`add`: the fold is `-1` whenever
+            // the rebase base and the history origin coincide, which is every
+            // borrowed scan and the first owned one, so the intermediate lands
+            // before the allocation. `offset` requires each intermediate to stay
+            // in bounds and is undefined there even though nothing dereferences
+            // it; `wrapping_offset` defers that requirement to the dereference,
+            // which the gates below place inside live history.
+            let slot_base_ptr = history_base_ptr
+                .wrapping_add(history_start_offset)
+                .wrapping_offset(position_base as isize - history_abs_start as isize - 1);
             // The same fold in slot space, so the window floor is one unsigned
             // compare against a slot value rather than a decode plus a compare
             // in position space. The empty sentinel is 0 and this is at least 1,
@@ -2672,23 +2677,26 @@ macro_rules! start_matching_fast_loop_body {
                 // (962-972 vs 979-994, no overlap). The gate is predictable in
                 // OUR table, so branching skips the load rather than waiting on a
                 // cmov to address it.
-                if idxl0 >= min_slot0 {
-                    // SAFETY: the gate admits only slots naming an in-window
-                    // position, so this lands inside live history — the same
-                    // buffer and length bounds `v8_0` is read under.
+                // Both bounds, in slot space. The upper one is NOT redundant: a
+                // slot can name a position PAST the cursor, because a reused
+                // borrowed frame inherits the previous frame's table while its
+                // scan descriptor reports the origin as zero again, so the
+                // floor-advance that retires those slots on the owned path does
+                // nothing here. A shorter following frame then finds slots
+                // beyond its own input. `packed_curr` is the cursor in the same
+                // space and is already in hand for the stores below.
+                if idxl0 >= min_slot0 && idxl0 < packed_curr {
+                    // SAFETY: the gates admit only slots naming a position at or
+                    // after the window floor and before the cursor, so this
+                    // lands inside live history — the same buffer and length
+                    // bounds `v8_0` is read under.
                     let cand_v8 = unsafe {
-                        (slot_base_ptr.add(idxl0 as usize) as *const u64).read_unaligned()
+                        (slot_base_ptr.wrapping_add(idxl0 as usize) as *const u64).read_unaligned()
                     };
                     if cand_v8 == v8_0 {
                         {
                             let cand_pos = position_base + ((idxl0 as usize) - 1);
                             let cand_idx = cand_pos - history_abs_start;
-                            // Every slot this loop reads was written at a
-                            // strictly earlier position — `idxs0` is loaded
-                            // before this iteration's store, and `idxl0` is
-                            // carried from the previous one — so the upper bound
-                            // the gate used to spend a compare on holds by
-                            // construction.
                             debug_assert!(
                                 cand_pos < abs_ip0,
                                 "long candidate {cand_pos} at or past the cursor {abs_ip0}",
@@ -2831,18 +2839,17 @@ macro_rules! start_matching_fast_loop_body {
                 // predictable after warmup, so the predictor speculates the
                 // 4-byte candidate load past them. A branchless mask would tie
                 // the load address to the mask, serialising it.
-                if idxs0 >= min_slot0 {
-                    // SAFETY: as in the long probe, the gate admits only slots
-                    // naming an in-window position.
+                if idxs0 >= min_slot0 && idxs0 < packed_curr {
+                    // SAFETY: as in the long probe, the gates admit only slots
+                    // naming a position at or after the floor and before the
+                    // cursor.
                     let cand4 = unsafe {
-                        (slot_base_ptr.add(idxs0 as usize) as *const u32).read_unaligned()
+                        (slot_base_ptr.wrapping_add(idxs0 as usize) as *const u32).read_unaligned()
                     };
                     if cand4 == v4_0 as u32 {
                         {
                             let cand_pos_s = position_base + ((idxs0 as usize) - 1);
                             let cand_idx_s = cand_pos_s - history_abs_start;
-                            // Same construction bound as the long probe: `idxs0`
-                            // is read before this iteration's store.
                             debug_assert!(
                                 cand_pos_s < abs_ip0,
                                 "short candidate {cand_pos_s} at or past the cursor {abs_ip0}",

@@ -20,6 +20,37 @@ fn parking_a_table_adds_only_its_heap_bytes() {
     );
 }
 
+/// The weight description a table caches is held for as long as the table is,
+/// and a parked table is held across blocks and frames — so it is retained
+/// memory and has to appear in the figure a caller budgets against.
+#[cfg(feature = "std")]
+#[test]
+fn the_cached_weight_description_counts_as_retained() {
+    // The full-alphabet fixture, which is the shape whose description is
+    // actually encodable: a description is only built when the weights are
+    // neither all equal nor all distinct.
+    let mut sample = Vec::new();
+    for symbol in 0u8..=255 {
+        sample.extend(core::iter::repeat_n(symbol, usize::from(symbol) + 1));
+    }
+    let table = HuffmanTable::build_from_data(&sample);
+    let before = table.heap_size();
+
+    let cached_len = table
+        .writeable_table_description_size()
+        .expect("the full-alphabet fixture caches an encoded description")
+        - 1;
+
+    // At least, not exactly: the accounting reports the buffer's capacity,
+    // which the description's length is a lower bound on.
+    assert!(
+        table.heap_size() - before >= cached_len,
+        "the description is a live allocation once built, not a transient: \
+         the reported total grew by {} for a {cached_len}-byte description",
+        table.heap_size() - before,
+    );
+}
+
 #[test]
 fn huffman() {
     let table = HuffmanTable::build_from_weights(&[2, 2, 2, 1, 1]);
