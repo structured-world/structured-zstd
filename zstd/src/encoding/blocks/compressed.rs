@@ -449,12 +449,42 @@ const LITERAL_INLINE_COPY_MAX: usize = 2048;
 ///   upstream zstd-wildcopy analog: matches glibc's store width but drops the
 ///   libc call, and never overshoots reads (borrowed-input safe).
 /// - `len ≥ 2048`: `extend_from_slice` — bandwidth-bound, ERMS wins.
-#[inline]
+///
+/// The short case is spelled out at the call site and everything else handed
+/// to [`append_literals_long`], so the sites carry a couple of stores rather
+/// than a call without pulling the whole ladder into each of them. This runs
+/// once per emitted sequence from a dozen-odd sites inside the match loop, and
+/// the runs are short: a level-3 encode of a decodecorpus frame averages about
+/// eight bytes. Upstream calls nothing here at all — `ZSTD_storeSeq` stores
+/// sixteen bytes inline and only reaches for a copy routine past that.
+#[inline(always)]
 fn append_literals(dst: &mut Vec<u8>, lits: &[u8]) {
     let lit_len = lits.len();
     if lit_len == 0 {
         return;
     }
+    let cur_len = dst.len();
+    if lit_len <= 16 && dst.capacity() - cur_len >= lit_len {
+        // SAFETY: `lit_len` bytes are readable from `lits` and writable at
+        // `cur_len` by the capacity test above. For runs under eight bytes the
+        // helper drops to byte moves, so neither side is over-read.
+        unsafe {
+            let dst_ptr = dst.as_mut_ptr().add(cur_len);
+            crate::decoding::simd_copy::copy_bytes_overshooting(
+                (lits.as_ptr(), lit_len),
+                (dst_ptr, lit_len),
+                lit_len,
+            );
+            dst.set_len(cur_len + lit_len);
+        }
+        return;
+    }
+    append_literals_long(dst, lits);
+}
+
+#[inline(never)]
+fn append_literals_long(dst: &mut Vec<u8>, lits: &[u8]) {
+    let lit_len = lits.len();
     if lit_len >= LITERAL_INLINE_COPY_MAX {
         dst.extend_from_slice(lits);
         return;
