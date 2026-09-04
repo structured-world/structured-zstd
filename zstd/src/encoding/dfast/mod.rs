@@ -2319,6 +2319,27 @@ macro_rules! start_matching_fast_loop_body {
             // at entry guarantees the sum stays inside `u32` for the whole
             // block, which is what makes the narrowing cast safe here.
             let packed_bias = (($current_abs_start - position_base) as u32) + 1;
+            // A slot value indexes its candidate's bytes directly off this
+            // pointer, the way upstream indexes off `base`. Decoding a slot the
+            // long way — `position_base + slot - 1` into position space, minus
+            // `history_abs_start` into concat space, plus the source pointer and
+            // its start offset — spends four constants that then have to stay
+            // LIVE for the whole search loop. They do not fit: the loop already
+            // reloads a dozen invariants from the stack every iteration, and
+            // each one it stops needing frees a register for the ones left.
+            //
+            // Folded here, all four collapse into one pointer, and the loop's
+            // per-candidate work becomes a single add.
+            let slot_base_ptr = unsafe {
+                history_base_ptr
+                    .add(history_start_offset)
+                    .offset(position_base as isize - history_abs_start as isize - 1)
+            };
+            // The same fold in slot space, so the window floor is one unsigned
+            // compare against a slot value rather than a decode plus a compare
+            // in position space. The empty sentinel is 0 and this is at least 1,
+            // so it subsumes the emptiness test.
+            let min_slot = ((history_abs_start - position_base) as u32) + 1;
             // Upstream fuses "slot is populated" and "candidate is in window"
             // into one unsigned compare against `prefixLowestIndex`
             // (`zstd_double_fast.c:213`), which needs the window floor carried in
@@ -2414,6 +2435,15 @@ macro_rules! start_matching_fast_loop_body {
                     abs_ip0.saturating_sub(advertised_window)
                 } else {
                     history_abs_start
+                };
+                // `wlow0` expressed in slot space (see `min_slot`). Owned windows
+                // have a fixed floor for the block, so this is the per-block
+                // constant; only a borrowed window wider than its advertised size
+                // moves it per position, and there `position_base` is zero.
+                let min_slot0 = if $borrowed {
+                    (wlow0 as u32) + 1
+                } else {
+                    min_slot
                 };
                 let wlow1 = if $borrowed {
                     abs_ip1.saturating_sub(advertised_window)
@@ -2611,27 +2641,27 @@ macro_rules! start_matching_fast_loop_body {
                 // (962-972 vs 979-994, no overlap). The gate is predictable in
                 // OUR table, so branching skips the load rather than waiting on a
                 // cmov to address it.
-                if idxl0 != DFAST_EMPTY_SLOT {
-                    let cand_pos = position_base + ((idxl0 as usize) - 1);
-                    // Window floor only. Every slot this loop reads was written
-                    // at a strictly earlier position — `idxs0` is loaded before
-                    // this iteration's store, and `idxl0` is carried from the
-                    // previous one — so the upper bound the gate used to spend a
-                    // compare on holds by construction and is asserted instead.
-                    debug_assert!(
-                        cand_pos < abs_ip0,
-                        "long candidate {cand_pos} at or past the cursor {abs_ip0}",
-                    );
-                    if cand_pos >= wlow0 {
-                        let cand_idx = cand_pos - history_abs_start;
-                        // SAFETY: the bounds above make `cand_idx` a valid
-                        // in-window concat index, so the 8-byte load stays in
-                        // live history (same buffer/length bounds as `v8_0`).
-                        let cand_v8 = unsafe {
-                            (history_base_ptr.add(history_start_offset + cand_idx) as *const u64)
-                                .read_unaligned()
-                        };
-                        if cand_v8 == v8_0 {
+                if idxl0 >= min_slot0 {
+                    // SAFETY: the gate admits only slots naming an in-window
+                    // position, so this lands inside live history — the same
+                    // buffer and length bounds `v8_0` is read under.
+                    let cand_v8 = unsafe {
+                        (slot_base_ptr.add(idxl0 as usize) as *const u64).read_unaligned()
+                    };
+                    if cand_v8 == v8_0 {
+                        {
+                            let cand_pos = position_base + ((idxl0 as usize) - 1);
+                            let cand_idx = cand_pos - history_abs_start;
+                            // Every slot this loop reads was written at a
+                            // strictly earlier position — `idxs0` is loaded
+                            // before this iteration's store, and `idxl0` is
+                            // carried from the previous one — so the upper bound
+                            // the gate used to spend a compare on holds by
+                            // construction.
+                            debug_assert!(
+                                cand_pos < abs_ip0,
+                                "long candidate {cand_pos} at or past the cursor {abs_ip0}",
+                            );
                             {
                             // 8 bytes match; count forward + extend back.
                             let mut match_len = 8usize;
@@ -2770,22 +2800,22 @@ macro_rules! start_matching_fast_loop_body {
                 // predictable after warmup, so the predictor speculates the
                 // 4-byte candidate load past them. A branchless mask would tie
                 // the load address to the mask, serialising it.
-                if idxs0 != DFAST_EMPTY_SLOT {
-                    // Window floor only, as in the long probe above; `idxs0` is
-                    // read before this iteration's store, so it too names a
-                    // strictly earlier position.
-                    let cand_pos_s = position_base + ((idxs0 as usize) - 1);
-                    debug_assert!(
-                        cand_pos_s < abs_ip0,
-                        "short candidate {cand_pos_s} at or past the cursor {abs_ip0}",
-                    );
-                    if cand_pos_s >= wlow0 {
-                        let cand_idx_s = cand_pos_s - history_abs_start;
-                        let cand4 = unsafe {
-                            (history_base_ptr.add(history_start_offset + cand_idx_s) as *const u32)
-                                .read_unaligned()
-                        };
-                        if cand4 == v4_0 as u32 {
+                if idxs0 >= min_slot0 {
+                    // SAFETY: as in the long probe, the gate admits only slots
+                    // naming an in-window position.
+                    let cand4 = unsafe {
+                        (slot_base_ptr.add(idxs0 as usize) as *const u32).read_unaligned()
+                    };
+                    if cand4 == v4_0 as u32 {
+                        {
+                            let cand_pos_s = position_base + ((idxs0 as usize) - 1);
+                            let cand_idx_s = cand_pos_s - history_abs_start;
+                            // Same construction bound as the long probe: `idxs0`
+                            // is read before this iteration's store.
+                            debug_assert!(
+                                cand_pos_s < abs_ip0,
+                                "short candidate {cand_pos_s} at or past the cursor {abs_ip0}",
+                            );
                             {
                             // Short hit: count forward from byte 4 onwards.
                             let mut s_match_len = 4usize;
