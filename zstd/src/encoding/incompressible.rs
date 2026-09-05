@@ -75,6 +75,10 @@ impl SeenContentGrid {
     /// isolated miss inside repeating content cannot cost a block, while a frame
     /// that stops repeating returns to skipping within a block or two.
     const STICKY_REACH: u64 = 2 * MAX_BLOCK_SIZE as u64;
+    /// Bytes of a block anchors are taken from, split between its head and its
+    /// tail. Sized like the classifier's own sample: enough content for several
+    /// anchors, small enough that the probe is not the encode.
+    const SCAN_LEN: usize = 8 * 1024;
 
     /// Start a frame. Every frame calls this, most never consult the table, and
     /// clearing it here cost a 64 KiB fill per frame — a fixed few microseconds
@@ -133,54 +137,61 @@ impl SeenContentGrid {
         const ONES: u64 = 0x0101_0101_0101_0101;
         const HIGHS: u64 = 0x8080_8080_8080_8080;
         const SPREAD: u64 = ONES * SeenContentGrid::ANCHOR_BYTE as u64;
-        let mut at = 0usize;
-        while at <= last {
-            let word = u64::from_le_bytes(
-                block[at..at + Self::KEY_LEN]
-                    .try_into()
-                    .expect("the slice is KEY_LEN bytes"),
-            );
-            let marked = word ^ SPREAD;
-            let mut hits = marked.wrapping_sub(ONES) & !marked & HIGHS;
-            while hits != 0 {
-                let byte = (hits.trailing_zeros() / 8) as usize;
-                hits &= hits - 1;
-                let anchor = at + byte;
-                if anchor > last {
-                    break;
-                }
-                let key = u64::from_le_bytes(
-                    block[anchor..anchor + Self::KEY_LEN]
+        // Both ends of the block rather than all of it, on the same reasoning
+        // the classifier samples by: a duplicate is block-sized, so its ends
+        // hold the same bytes as the original's and anchor at the same content.
+        // Reading the whole block was four times the classifier's own cost and,
+        // on the levels where the search is cheap, most of the encode.
+        for (region_start, region_end) in Self::regions(last) {
+            let mut at = region_start;
+            while at <= region_end {
+                let word = u64::from_le_bytes(
+                    block[at..at + Self::KEY_LEN]
                         .try_into()
                         .expect("the slice is KEY_LEN bytes"),
                 );
-                // The byte alone anchors one position in 256, which fills the
-                // table several times over within a window and evicts the older
-                // half of it. A slice of the mixed key thins that to
-                // `ANCHOR_IN`, the density at which a block still carries
-                // several anchors while the window's worth of them fits.
-                let mixed = Self::avalanche(key);
-                if mixed >> Self::THIN_SHIFT != 0 {
-                    continue;
+                let marked = word ^ SPREAD;
+                let mut hits = marked.wrapping_sub(ONES) & !marked & HIGHS;
+                while hits != 0 {
+                    let byte = (hits.trailing_zeros() / 8) as usize;
+                    hits &= hits - 1;
+                    let anchor = at + byte;
+                    if anchor > last {
+                        break;
+                    }
+                    let key = u64::from_le_bytes(
+                        block[anchor..anchor + Self::KEY_LEN]
+                            .try_into()
+                            .expect("the slice is KEY_LEN bytes"),
+                    );
+                    // The byte alone anchors one position in 256, which fills the
+                    // table several times over within a window and evicts the older
+                    // half of it. A slice of the mixed key thins that to
+                    // `ANCHOR_IN`, the density at which a block still carries
+                    // several anchors while the window's worth of them fits.
+                    let mixed = Self::avalanche(key);
+                    if mixed >> Self::THIN_SHIFT != 0 {
+                        continue;
+                    }
+                    let slot = (mixed >> 32) as usize & (Self::SLOTS - 1);
+                    let fingerprint = (mixed as u32) | 1;
+                    let here = self.frame_offset + anchor as u64;
+                    let held = self.slots[slot];
+                    if held.epoch == self.epoch
+                        && held.fingerprint == fingerprint
+                        && here - held.at <= reach
+                    {
+                        repeat = true;
+                    } else {
+                        self.slots[slot] = SeenSample {
+                            fingerprint,
+                            epoch: self.epoch,
+                            at: here,
+                        };
+                    }
                 }
-                let slot = (mixed >> 32) as usize & (Self::SLOTS - 1);
-                let fingerprint = (mixed as u32) | 1;
-                let here = self.frame_offset + anchor as u64;
-                let held = self.slots[slot];
-                if held.epoch == self.epoch
-                    && held.fingerprint == fingerprint
-                    && here - held.at <= reach
-                {
-                    repeat = true;
-                } else {
-                    self.slots[slot] = SeenSample {
-                        fingerprint,
-                        epoch: self.epoch,
-                        at: here,
-                    };
-                }
+                at += Self::KEY_LEN;
             }
-            at += Self::KEY_LEN;
         }
         self.frame_offset += block.len() as u64;
         // Content that repeats does not repeat in every block, and the sampling
@@ -192,6 +203,20 @@ impl SeenContentGrid {
             self.repeat_until = self.frame_offset + Self::STICKY_REACH;
         }
         repeat || self.frame_offset <= self.repeat_until
+    }
+
+    /// The parts of a block anchors are taken from: the whole of a small one,
+    /// otherwise its head and its tail. `last` is the final position a key can
+    /// start at, and both ends are half of [`Self::SCAN_LEN`] so a duplicate
+    /// meets the same content at the same end.
+    fn regions(last: usize) -> [(usize, usize); 2] {
+        let half = Self::SCAN_LEN / 2;
+        if last < Self::SCAN_LEN {
+            // One region covering everything; the second is empty (start past
+            // end), which the loop skips.
+            return [(0, last), (1, 0)];
+        }
+        [(0, half - 1), (last + 1 - half, last)]
     }
 
     /// Full 64-bit avalanche (splitmix64's finalizer): every output bit depends
