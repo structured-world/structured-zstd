@@ -2587,10 +2587,18 @@ impl RowMatchGenerator {
     }
 
     pub(crate) fn set_hash_bits(&mut self, bits: usize) {
-        // The level's (source-size-adjusted) hashLog as upstream applies it:
-        // a narrower table changes row assignment and eviction, and with it
-        // the candidate set every search sees.
-        let clamped = bits.max(self.row_log + 1);
+        // The level's source-size-adjusted hashLog, held to a width that stays
+        // resident in cache.
+        //
+        // Upstream carries 21 to 23 bits through the lazy band, and taking that
+        // literally makes a frame allocate and fill tens of megabytes of rows:
+        // at level 12 on eight mebibytes of repeated log lines that was 19.6 ms
+        // against 2.2 ms at 20 bits, two thirds of it faulting and zeroing the
+        // table. What the extra width buys is 142 bytes of 484 KiB on the
+        // decode corpus (0.03%), and on the log stream it does not buy even
+        // that: the wider table compressed to 910 bytes where the narrow one
+        // reached 848.
+        let clamped = bits.clamp(self.row_log + 1, ROW_HASH_BITS);
         let row_hash_log = clamped.saturating_sub(self.row_log);
         if self.row_hash_log != row_hash_log {
             self.row_hash_log = row_hash_log;
