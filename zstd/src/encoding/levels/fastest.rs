@@ -107,32 +107,28 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         .first()
         .copied()
         .filter(|f| bytes.iter().all(|x| x == f));
-    // Recorded for every block that could still go out raw, so a later
-    // duplicate of this one is recognised; a hit means the block repeats
-    // content already in the frame and must be searched however random it
-    // looks. Everything that settles the block's fate before the skip is
-    // consulted first — an RLE block, a level whose window forbids the skip, a
-    // dictionary the backend cannot probe past — because the grid would then
-    // only hash a block to discard the verdict.
+    // Order is by cost, cheapest question first, because every one of these
+    // runs on every block: an RLE block and a window that forbids the skip are
+    // constants; the dict probe is a constant `true` for the conservative
+    // backends and a small table probe for Fast; the classifier reads a sample;
+    // the repeat grid reads the WHOLE block.
+    //
+    // The grid is therefore asked last, and only about blocks the classifier
+    // already called incompressible — the only blocks a repeat could save from
+    // going out raw. That is also why recording there is enough: a block
+    // duplicating a COMPRESSIBLE one is compressible itself, so it is never at
+    // risk of being skipped and never needs to find its original here.
     let window_size = state.matcher.window_size();
     let dict_rejects_raw = dict_active && state.matcher.block_samples_match_dict(bytes);
-    let raw_path_possible = std::env::var_os("ZSTD_NORAW").is_none()
-        && rle_byte_opt.is_none()
+    let looks_incompressible = rle_byte_opt.is_none()
         && !dict_rejects_raw
-        && compression_level_allows_raw_fast_path(compression_level, window_size);
-    let repeats_earlier_content = raw_path_possible
+        && compression_level_allows_raw_fast_path(compression_level, window_size)
+        && should_emit_raw_fast_path(compression_level, window_size, bytes, dict_active);
+    let repeats_earlier_content = looks_incompressible
         && state
             .seen_content
             .record_and_report_repeat(bytes, window_size as usize);
-    let raw_fast_path = raw_path_possible
-        && !repeats_earlier_content
-        // Evaluation order matters: the dict-match guard folded into
-        // `raw_path_possible` is cheap (a constant `true` for the conservative
-        // backends — HC / Row / BT — and a small table probe for Fast), whereas
-        // `should_emit_raw_fast_path` runs a WHOLE-BLOCK incompressibility scan
-        // on the dict path. Asking it last means a primed dictionary that
-        // forces the raw-skip off never pays for that scan.
-        && should_emit_raw_fast_path(compression_level, window_size, bytes, dict_active);
+    let raw_fast_path = looks_incompressible && !repeats_earlier_content;
     // Hashed once, from the pre-commit view, and reused by whichever branch
     // wins — the compressed branch covers the same bytes as the RLE and raw
     // ones. This is a whole-block pass, so it is skipped whenever nothing will
@@ -336,18 +332,17 @@ pub(crate) fn compress_block_encoded_borrowed(
         "borrowed one-shot path reached for an unsupported backend/search config",
     );
     let block_size = block.len() as u32;
-    // As on the owned path: recorded for every block that could still go out
-    // raw, and a hit sends this one to the search however random its own bytes
-    // look. Everything settling the block's fate ahead of the skip is asked
-    // first, so a block that was never going raw is not hashed to have the
-    // verdict thrown away.
+    // Same order as the owned path, cheapest question first: the whole-block
+    // grid is asked last and only about blocks the classifier already called
+    // incompressible.
     let is_rle = !block.is_empty() && block.iter().all(|x| block[0].eq(x));
     let window_size = state.matcher.window_size();
     let dict_rejects_raw = dict_active && state.matcher.block_samples_match_dict(block);
-    let raw_path_possible = !is_rle
+    let looks_incompressible = !is_rle
         && !dict_rejects_raw
-        && compression_level_allows_raw_fast_path(compression_level, window_size);
-    let repeats_earlier_content = raw_path_possible
+        && compression_level_allows_raw_fast_path(compression_level, window_size)
+        && should_emit_raw_fast_path(compression_level, window_size, block, dict_active);
+    let repeats_earlier_content = looks_incompressible
         && state
             .seen_content
             .record_and_report_repeat(block, window_size as usize);
@@ -371,18 +366,7 @@ pub(crate) fn compress_block_encoded_borrowed(
         header.serialize(output);
         output.push(rle_byte);
         BlockType::RLE
-    } else if raw_path_possible
-        && !repeats_earlier_content
-        // Same cheap-guard-first short-circuit as the owned path: the dict
-        // probe above already forced the raw-skip off where a primed dict
-        // matches, so the whole-block scan below is never reached for it.
-        && should_emit_raw_fast_path(
-            compression_level,
-            state.matcher.window_size(),
-            block,
-            dict_active,
-        )
-    {
+    } else if looks_incompressible && !repeats_earlier_content {
         #[cfg(feature = "lsm")]
         if let Some(sink) = block_decompressed_sizes {
             sink.push(block_size);
