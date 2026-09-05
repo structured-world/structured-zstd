@@ -1,4 +1,5 @@
 use super::CompressionLevel;
+use crate::common::MAX_BLOCK_SIZE;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -38,6 +39,8 @@ pub(crate) struct SeenContentGrid {
     /// be longer than a 16- or 32-bit address space, and only this counter
     /// would notice.
     frame_offset: u64,
+    /// Frame offset up to which the search stays on after a hit.
+    repeat_until: u64,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -50,10 +53,21 @@ impl SeenContentGrid {
     const SLOTS: usize = 4096;
     /// Bytes read per sample.
     const KEY_LEN: usize = 8;
-    /// One position in this many is an anchor, on average: 256 per 128 KiB
-    /// block, dense enough that a duplicate collides hundreds of times over and
-    /// sparse enough that the table holds many blocks' worth.
-    const ANCHOR_IN: u64 = 512;
+    /// The byte whose positions are candidate anchors: one in 256 of random
+    /// bytes, and the scan for it costs a few operations per word.
+    const ANCHOR_BYTE: u8 = 0x9E;
+    /// One position in this many anchors, after the mixed key thins the
+    /// candidates: ~128 per 128 KiB block, so a duplicate collides many times
+    /// over, while a 4 MiB window's worth of anchors still fits the table
+    /// without evicting most of itself.
+    const ANCHOR_IN: u64 = 1024;
+    /// Top bits of the mixed key that must be zero for a candidate to anchor,
+    /// which thins the one-in-256 byte hits to [`Self::ANCHOR_IN`].
+    const THIN_SHIFT: u32 = 64 - (Self::ANCHOR_IN / 256).trailing_zeros();
+    /// How far past a hit the search stays on: two maximum blocks, so an
+    /// isolated miss inside repeating content cannot cost a block, while a frame
+    /// that stops repeating returns to skipping within a block or two.
+    const STICKY_REACH: u64 = 2 * MAX_BLOCK_SIZE as u64;
 
     pub(crate) fn reset_for_frame(&mut self) {
         if self.slots.is_empty() {
@@ -62,6 +76,7 @@ impl SeenContentGrid {
             self.slots.fill(SeenSample::default());
         }
         self.frame_offset = 0;
+        self.repeat_until = 0;
     }
 
     pub(crate) fn heap_size(&self) -> usize {
@@ -91,23 +106,49 @@ impl SeenContentGrid {
             window_size as u64
         };
         let mut repeat = false;
+        let last = block.len() - Self::KEY_LEN;
+        // Candidate anchors are the positions carrying one chosen byte, found
+        // eight at a time by the classic zero-byte word trick. Reading every
+        // position instead costs a load and a multiply per byte, which on the
+        // levels where the search is cheap outweighs the search it saves; this
+        // scan is a handful of register ops per WORD and the key work below runs
+        // at the one position in `ANCHOR_IN` that survives both tests.
+        const ONES: u64 = 0x0101_0101_0101_0101;
+        const HIGHS: u64 = 0x8080_8080_8080_8080;
+        const SPREAD: u64 = ONES * SeenContentGrid::ANCHOR_BYTE as u64;
         let mut at = 0usize;
-        let last = block.len().saturating_sub(Self::KEY_LEN);
         while at <= last {
-            let key = u64::from_le_bytes(
+            let word = u64::from_le_bytes(
                 block[at..at + Self::KEY_LEN]
                     .try_into()
                     .expect("the slice is KEY_LEN bytes"),
             );
-            // One mixing step feeds all three questions from disjoint bits:
-            // whether this position anchors at all, which slot it lands in, and
-            // what is compared there — so a slot collision alone does not read
-            // as a repeat.
-            let mixed = key.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-            if (mixed >> 55) % Self::ANCHOR_IN == 0 {
-                let slot = (mixed >> 43) as usize & (Self::SLOTS - 1);
-                let fingerprint = ((mixed >> 11) as u32) | 1;
-                let here = self.frame_offset + at as u64;
+            let marked = word ^ SPREAD;
+            let mut hits = marked.wrapping_sub(ONES) & !marked & HIGHS;
+            while hits != 0 {
+                let byte = (hits.trailing_zeros() / 8) as usize;
+                hits &= hits - 1;
+                let anchor = at + byte;
+                if anchor > last {
+                    break;
+                }
+                let key = u64::from_le_bytes(
+                    block[anchor..anchor + Self::KEY_LEN]
+                        .try_into()
+                        .expect("the slice is KEY_LEN bytes"),
+                );
+                // The byte alone anchors one position in 256, which fills the
+                // table several times over within a window and evicts the older
+                // half of it. A slice of the mixed key thins that to
+                // `ANCHOR_IN`, the density at which a block still carries
+                // several anchors while the window's worth of them fits.
+                let mixed = Self::avalanche(key);
+                if mixed >> Self::THIN_SHIFT != 0 {
+                    continue;
+                }
+                let slot = (mixed >> 32) as usize & (Self::SLOTS - 1);
+                let fingerprint = (mixed as u32) | 1;
+                let here = self.frame_offset + anchor as u64;
                 let held = self.slots[slot];
                 if held.fingerprint == fingerprint && here - held.at <= reach {
                     repeat = true;
@@ -118,10 +159,28 @@ impl SeenContentGrid {
                     };
                 }
             }
-            at += 1;
+            at += Self::KEY_LEN;
         }
         self.frame_offset += block.len() as u64;
-        repeat
+        // Content that repeats does not repeat in every block, and the sampling
+        // can miss one the matcher would have found — a miss costs a whole block
+        // written out raw, so a hit keeps the search on for a stretch after it.
+        // The case the skip exists for, a frame of noise, never enters this: it
+        // never hits.
+        if repeat {
+            self.repeat_until = self.frame_offset + Self::STICKY_REACH;
+        }
+        repeat || self.frame_offset <= self.repeat_until
+    }
+
+    /// Full 64-bit avalanche (splitmix64's finalizer): every output bit depends
+    /// on every input bit, which a single multiply does not give — its low half
+    /// is barely mixed and its top bits are spoken for by the anchor test.
+    fn avalanche(key: u64) -> u64 {
+        let mut z = key.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
     }
 }
 
