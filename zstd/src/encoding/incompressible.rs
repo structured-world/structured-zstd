@@ -97,6 +97,9 @@ impl SeenContentGrid {
             self.frame_offset += block.len() as u64;
             return false;
         }
+        if std::env::var_os("ZSTD_NOGRID").is_some() {
+            return false;
+        }
         if self.slots.is_empty() {
             self.reset_for_frame();
         }

@@ -1585,6 +1585,20 @@ macro_rules! lazy_parse_body {
                 {
                     let concat = $m.live_history();
                     let literals = &concat[anchor - hist_start..start - hist_start];
+                    // The format allows an offset past the advertised window
+                    // ONLY into a dictionary that is still valid
+                    // (zstd_compression_format.md:918 and 1525-1528); every
+                    // other offset must stay inside it. The buffer now holds a
+                    // full window BEHIND the block, so what keeps an offset
+                    // legal is the per-candidate floor, not the buffer's — this
+                    // asserts the floor is actually being applied on every path
+                    // that reaches here.
+                    debug_assert!(
+                        offset_1 <= $m.max_window_size || $m.loaded_dict_end != 0,
+                        "offset {} exceeds the advertised window {} with no live dictionary",
+                        offset_1,
+                        $m.max_window_size,
+                    );
                     $handle(Sequence::Triple {
                         literals,
                         offset: offset_1,
@@ -2022,13 +2036,17 @@ macro_rules! row_probe_body {
                     continue;
                 }
                 let candidate_pos = raw_pos as usize;
-                // Lower bound = window low. Owned: `history_abs_start` (eviction
-                // floor) is always >= `abs_pos - max_window_size` (window_size <=
-                // max_window_size), so the `max` picks it — byte-identical to the
-                // pre-window_low check. Borrowed (history_abs_start forced to 0 in
-                // set_borrowed_window): the `max` picks `abs_pos - max_window_size`,
-                // capping the offset to the advertised window so an over-window
-                // in-place scan never emits an unresolvable offset.
+                // Lower bound = window low, and BOTH terms are load-bearing.
+                // The buffer keeps a full window behind the block START, so for
+                // a position inside the block its floor lies BELOW `abs_pos -
+                // max_window_size`; the per-candidate term is then what caps the
+                // offset at the advertised window, which the format requires of
+                // every offset that does not reach into a live dictionary
+                // (zstd_compression_format.md:918). Upstream applies the same
+                // per-position cap (`zstd_lazy.c:1203-1207`). The eviction floor
+                // still wins wherever the buffer holds less than a window — the
+                // start of a frame, and the borrowed window, whose
+                // `history_abs_start` is 0.
                 let window_low = $m
                     .history_abs_start
                     .max($abs_pos.saturating_sub($m.max_window_size));

@@ -116,7 +116,8 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
     // only hash a block to discard the verdict.
     let window_size = state.matcher.window_size();
     let dict_rejects_raw = dict_active && state.matcher.block_samples_match_dict(bytes);
-    let raw_path_possible = rle_byte_opt.is_none()
+    let raw_path_possible = std::env::var_os("ZSTD_NORAW").is_none()
+        && rle_byte_opt.is_none()
         && !dict_rejects_raw
         && compression_level_allows_raw_fast_path(compression_level, window_size);
     let repeats_earlier_content = raw_path_possible

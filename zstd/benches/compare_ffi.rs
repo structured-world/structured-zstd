@@ -1006,6 +1006,15 @@ fn configure_group<M: criterion::measurement::Measurement>(
             Duration::from_secs(3)
         }
     };
+    // A whole-matrix sweep across every level and fixture is dominated by the
+    // Large budget above, which is sized for CI's regression signal rather than
+    // for a local A/B of two revisions. `STRUCTURED_ZSTD_BENCH_MAX_SECS` caps
+    // every budget so such a sweep finishes; both sides of an A/B must be run
+    // with the same value, and the dashboard leaves it unset.
+    let measurement = match max_measurement_secs() {
+        Some(cap) if measurement > cap => cap,
+        _ => measurement,
+    };
     let (samples, warm_up) = match scenario.class {
         ScenarioClass::Small => (30, Duration::from_millis(200)),
         _ => (10, Duration::from_millis(500)),
@@ -1014,6 +1023,16 @@ fn configure_group<M: criterion::measurement::Measurement>(
     group.measurement_time(measurement);
     group.warm_up_time(warm_up);
     group.sampling_mode(SamplingMode::Flat);
+}
+
+/// Ceiling on every criterion measurement budget, in seconds, or `None` when
+/// `STRUCTURED_ZSTD_BENCH_MAX_SECS` is unset or unparseable.
+fn max_measurement_secs() -> Option<Duration> {
+    std::env::var("STRUCTURED_ZSTD_BENCH_MAX_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)
 }
 
 fn emit_frame_header_report(
