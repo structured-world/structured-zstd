@@ -1148,28 +1148,39 @@ impl DfastMatchGenerator {
         incompressible_hint: Option<bool>,
     ) {
         self.stage_borrowed_block(block_start, block_end);
-        match incompressible_hint {
-            Some(false) => {
-                self.ensure_hash_tables();
-                self.insert_positions(block_start, block_end);
+        if incompressible_hint.is_none() {
+            return;
+        }
+        self.ensure_hash_tables();
+        // Seam before the block, as on the owned skip path: the preceding
+        // block's last few positions were hashed under a source that ended
+        // there, so without re-seeding them a match starting just before this
+        // block has no entry to find.
+        let seam_start = block_start.saturating_sub(Self::BOUNDARY_DENSE_TAIL_LEN);
+        if seam_start < block_start {
+            self.insert_positions(seam_start, block_start);
+        }
+        // Written off as noise without being searched — index it sparsely so a
+        // later block duplicating it has something to match against, which is
+        // what the owned path already does.
+        if incompressible_hint == Some(true) {
+            // The same step the owned skip path uses, and through the same
+            // entry point, so the stream-headroom bound its assert pins
+            // still holds: the insert loop advances with an unchecked
+            // `pos += step` in ABSOLUTE stream coordinates, which the
+            // headroom reserve is sized for at this step and no wider.
+            self.insert_positions_with_step(block_start, block_end, DFAST_INCOMPRESSIBLE_SKIP_STEP);
+            // And densely at the end, so the next block can match across the
+            // boundary without the sparse step having thinned out exactly the
+            // positions it will look for first.
+            let tail_start = block_end
+                .saturating_sub(Self::BOUNDARY_DENSE_TAIL_LEN)
+                .max(block_start);
+            if tail_start < block_end {
+                self.insert_positions(tail_start, block_end);
             }
-            // Written off as noise without being searched — index it sparsely
-            // so a later block duplicating it has something to match against,
-            // which is what the owned path already does.
-            Some(true) => {
-                self.ensure_hash_tables();
-                // The same step the owned skip path uses, and through the same
-                // entry point, so the stream-headroom bound its assert pins
-                // still holds: the insert loop advances with an unchecked
-                // `pos += step` in ABSOLUTE stream coordinates, which the
-                // headroom reserve is sized for at this step and no wider.
-                self.insert_positions_with_step(
-                    block_start,
-                    block_end,
-                    DFAST_INCOMPRESSIBLE_SKIP_STEP,
-                );
-            }
-            None => {}
+        } else {
+            self.insert_positions(block_start, block_end);
         }
     }
 

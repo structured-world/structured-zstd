@@ -12,50 +12,63 @@ use alloc::vec::Vec;
 /// grid position of every block that reaches the decision, and reports whether
 /// the block in hand collides with one; a collision sends it to the search.
 ///
-/// The grid is frame-absolute rather than block-relative, so a duplicate is
-/// caught wherever the block boundaries happen to fall, for any repeat whose
-/// distance is a multiple of the step — which covers duplication at block or
-/// power-of-two granularity, the shape that arises when a stream carries the
-/// same object twice. A collision that is merely a hash coincidence costs a
-/// search, never correctness, and at a 32-bit fingerprint over a few thousand
-/// live entries that is rarer than one frame in a million.
+/// Which positions are sampled is decided by the CONTENT at them, not by where
+/// they fall: a position is an anchor when its eight bytes hash into a chosen
+/// slice of the hash space. The same content therefore anchors at the same
+/// places wherever it appears, so a duplicate is recognised however it is
+/// shifted — sampling on a position grid instead would see a repeat only at
+/// distances that happen to be a multiple of the step, and miss, say, a block
+/// that repeats the previous one after two inserted bytes.
+///
+/// Each slot carries the frame offset it was recorded at, so a fingerprint is
+/// consulted only while the matcher could still reach that far back and expires
+/// on its own. Clearing the whole table on a window boundary instead would
+/// forget content that is still in reach — a block-sized window would drop the
+/// block a duplicate is about to match against.
+///
+/// A collision that is merely a hash coincidence costs a search, never
+/// correctness, and at a 32-bit fingerprint over a few thousand live entries
+/// that is rarer than one frame in a million.
 #[derive(Debug, Default)]
 pub(crate) struct SeenContentGrid {
-    /// `0` marks an empty slot, so a fingerprint is forced non-zero.
-    slots: Vec<u32>,
-    /// Where the grid stands relative to the frame, modulo the step. Only the
-    /// phase is needed to continue the frame-wide grid into the next block, and
-    /// keeping only the phase means no counter can run away on a long stream.
-    grid_phase: usize,
-    /// Bytes recorded since the last clear, which is how fingerprints age out
-    /// with the matcher's window.
-    since_clear: usize,
+    /// `fingerprint == 0` marks an empty slot, so a fingerprint is forced
+    /// non-zero. `at` is the frame offset the sample was taken at.
+    slots: Vec<SeenSample>,
+    /// Bytes of this frame recorded so far. `u64` on every target: a frame can
+    /// be longer than a 16- or 32-bit address space, and only this counter
+    /// would notice.
+    frame_offset: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct SeenSample {
+    fingerprint: u32,
+    at: u64,
 }
 
 impl SeenContentGrid {
-    /// One sample per this many bytes: 256 per 128 KiB block, which is noise
-    /// against the block's own cost and dense enough that a duplicate collides
-    /// hundreds of times over.
-    pub(crate) const STEP: usize = 512;
     const SLOTS: usize = 4096;
     /// Bytes read per sample.
     const KEY_LEN: usize = 8;
+    /// One position in this many is an anchor, on average: 256 per 128 KiB
+    /// block, dense enough that a duplicate collides hundreds of times over and
+    /// sparse enough that the table holds many blocks' worth.
+    const ANCHOR_IN: u64 = 512;
 
     pub(crate) fn reset_for_frame(&mut self) {
         if self.slots.is_empty() {
-            self.slots = vec![0u32; Self::SLOTS];
+            self.slots = vec![SeenSample::default(); Self::SLOTS];
         } else {
-            self.slots.fill(0);
+            self.slots.fill(SeenSample::default());
         }
-        self.grid_phase = 0;
-        self.since_clear = 0;
+        self.frame_offset = 0;
     }
 
     pub(crate) fn heap_size(&self) -> usize {
-        self.slots.capacity() * core::mem::size_of::<u32>()
+        self.slots.capacity() * core::mem::size_of::<SeenSample>()
     }
 
-    /// Record `block`'s grid samples and report whether any was already there.
+    /// Record `block`'s anchors and report whether any was already there.
     ///
     /// Recording happens whatever the answer: a block that goes out raw is
     /// still content a later block may duplicate, and one that gets searched
@@ -63,53 +76,51 @@ impl SeenContentGrid {
     /// `window_size` is that reach; pass `0` when it is unknown, which keeps
     /// every fingerprint for the frame.
     pub(crate) fn record_and_report_repeat(&mut self, block: &[u8], window_size: usize) -> bool {
+        // Too short to key on. The offset still advances, so the ages of what
+        // follows stay true distances in the stream.
+        if block.len() < Self::KEY_LEN {
+            self.frame_offset += block.len() as u64;
+            return false;
+        }
         if self.slots.is_empty() {
             self.reset_for_frame();
         }
-        // Content the matcher can no longer reach is not a repeat worth
-        // reporting: a stream that cycles through blocks at a period just wider
-        // than the window would otherwise collide with every one of them and
-        // hold the skip off for the rest of the frame, for matches that cannot
-        // be encoded. Clearing on window boundaries keeps every consulted
-        // fingerprint inside one window's reach.
-        if window_size > 0 && self.since_clear >= window_size {
-            self.slots.fill(0);
-            self.since_clear = 0;
-        }
+        let reach = if window_size == 0 {
+            u64::MAX
+        } else {
+            window_size as u64
+        };
         let mut repeat = false;
-        // First grid position at or after the block's start, in frame
-        // coordinates, then every STEP from there. Only the phase matters, and
-        // it is what is carried, so a frame longer than the address space
-        // cannot run the cursor off the end.
-        let first = (Self::STEP - self.grid_phase) % Self::STEP;
-        let mut at = first;
-        while at + Self::KEY_LEN <= block.len() {
+        let mut at = 0usize;
+        let last = block.len().saturating_sub(Self::KEY_LEN);
+        while at <= last {
             let key = u64::from_le_bytes(
                 block[at..at + Self::KEY_LEN]
                     .try_into()
                     .expect("the slice is KEY_LEN bytes"),
             );
-            // Two independent reductions of the same key: one picks the slot,
-            // the other is what is compared, so a slot collision alone does not
-            // read as a repeat.
+            // One mixing step feeds all three questions from disjoint bits:
+            // whether this position anchors at all, which slot it lands in, and
+            // what is compared there — so a slot collision alone does not read
+            // as a repeat.
             let mixed = key.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-            let slot = (mixed >> 52) as usize & (Self::SLOTS - 1);
-            let fingerprint = ((mixed >> 20) as u32) | 1;
-            if self.slots[slot] == fingerprint {
-                repeat = true;
-            } else {
-                self.slots[slot] = fingerprint;
+            if (mixed >> 55) % Self::ANCHOR_IN == 0 {
+                let slot = (mixed >> 43) as usize & (Self::SLOTS - 1);
+                let fingerprint = ((mixed >> 11) as u32) | 1;
+                let here = self.frame_offset + at as u64;
+                let held = self.slots[slot];
+                if held.fingerprint == fingerprint && here - held.at <= reach {
+                    repeat = true;
+                } else {
+                    self.slots[slot] = SeenSample {
+                        fingerprint,
+                        at: here,
+                    };
+                }
             }
-            at += Self::STEP;
+            at += 1;
         }
-        self.grid_phase = (self.grid_phase + block.len() % Self::STEP) % Self::STEP;
-        if window_size > 0 {
-            // Bounded by construction: the clear above fires the moment this
-            // reaches the window, so it never holds more than one window plus
-            // one block. Without a window there is nothing to expire against,
-            // and nothing to accumulate.
-            self.since_clear += block.len();
-        }
+        self.frame_offset += block.len() as u64;
         repeat
     }
 }
@@ -127,7 +138,7 @@ pub(crate) const RAW_FAST_PATH_MIN_SAMPLE_LEN: usize = 32;
 /// Indexing more finely is what the skip exists to avoid: at one entry per
 /// eight bytes a megabyte of incompressible input costs 131,000 stores it had
 /// no use for, which measured as a four-fold slowdown on the fast levels.
-pub(crate) const RAW_SKIP_INDEX_STEP: usize = SeenContentGrid::STEP;
+pub(crate) const RAW_SKIP_INDEX_STEP: usize = 512;
 
 /// Window-size ceiling (8 MiB) above which a numeric level does not take the
 /// skip whatever its number: the further back a match may reach, the more a

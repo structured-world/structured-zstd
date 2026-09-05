@@ -35,24 +35,68 @@ fn the_content_grid_reports_a_duplicated_block_and_nothing_else() {
     );
 }
 
-/// Content the matcher can no longer reach must stop reading as a repeat, or a
-/// stream cycling blocks at a period wider than the window holds the raw skip
-/// off for the rest of the frame chasing matches it cannot encode.
+/// A repeat shifted off any grid must still be recognised.
+///
+/// Sampling positions by their offset sees a duplicate only at distances that
+/// happen to be a multiple of the step; content that repeats after a couple of
+/// inserted bytes then reads as fresh noise and the block goes out unsearched,
+/// throwing away an almost block-sized match. Anchoring on the content itself
+/// is what makes the answer independent of where the bytes landed.
 #[test]
-fn the_content_grid_forgets_what_the_window_has_passed() {
+fn the_content_grid_reports_a_repeat_that_is_shifted() {
+    let base = deterministic_bytes(0xBEEF, 128 * 1024);
+    let mut shifted = alloc::vec![0xAAu8, 0x55];
+    shifted.extend_from_slice(&base[..base.len() - 2]);
+    const WIDE: usize = 8 * 1024 * 1024;
+    let mut grid = SeenContentGrid::default();
+    grid.reset_for_frame();
+    assert!(!grid.record_and_report_repeat(&base, WIDE));
+    assert!(
+        grid.record_and_report_repeat(&shifted, WIDE),
+        "a two-byte shift must not hide a block-sized repeat",
+    );
+}
+
+/// Content still inside the window must keep reading as a repeat, and content
+/// the window has passed must stop.
+///
+/// The window is the matcher's reach: a match against content it can still see
+/// is worth searching for, one against content it cannot is not. With a
+/// block-sized window an immediately repeated block is exactly reachable — the
+/// case a table cleared wholesale on the window boundary would forget.
+#[test]
+fn the_content_grid_expires_a_sample_with_the_window_not_before() {
     let block = deterministic_bytes(0xBEEF, 128 * 1024);
     let other = deterministic_bytes(0xF00D, 128 * 1024);
-    // One block wide: the second block already carries the window past the
-    // first, so the third sees a cleared grid.
     let window = block.len();
     let mut grid = SeenContentGrid::default();
+
+    grid.reset_for_frame();
+    assert!(!grid.record_and_report_repeat(&block, window));
+    assert!(
+        grid.record_and_report_repeat(&block, window),
+        "the block right behind is still within a block-sized window",
+    );
+
     grid.reset_for_frame();
     assert!(!grid.record_and_report_repeat(&block, window));
     assert!(!grid.record_and_report_repeat(&other, window));
     assert!(
         !grid.record_and_report_repeat(&block, window),
-        "a repeat of content the window has passed is not reachable, so not a repeat",
+        "two blocks back is past a block-sized window, so not reachable",
     );
+}
+
+/// A block shorter than one key must be answered, not indexed — the last block
+/// of a frame is routinely a handful of bytes, and reading a key out of it
+/// would run off the end.
+#[test]
+fn the_content_grid_answers_a_block_shorter_than_its_key() {
+    let mut grid = SeenContentGrid::default();
+    grid.reset_for_frame();
+    for len in 0..SeenContentGrid::KEY_LEN {
+        assert!(!grid.record_and_report_repeat(&vec![0xC3; len], 8 * 1024 * 1024));
+    }
 }
 
 fn deterministic_bytes(seed: u64, len: usize) -> Vec<u8> {
