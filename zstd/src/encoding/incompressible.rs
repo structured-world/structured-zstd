@@ -32,9 +32,13 @@ use alloc::vec::Vec;
 /// that is rarer than one frame in a million.
 #[derive(Debug, Default)]
 pub(crate) struct SeenContentGrid {
-    /// `fingerprint == 0` marks an empty slot, so a fingerprint is forced
-    /// non-zero. `at` is the frame offset the sample was taken at.
+    /// A slot belongs to the frame whose `epoch` it carries; one from an
+    /// earlier frame reads as empty, which is what makes starting a frame free.
     slots: Vec<SeenSample>,
+    /// Which frame the live slots belong to. Starts at 0 with a freshly
+    /// allocated (all-zero) table, and every frame increments it first, so no
+    /// frame ever runs under the epoch a zeroed slot carries.
+    epoch: u32,
     /// Bytes of this frame recorded so far. `u64` on every target: a frame can
     /// be longer than a 16- or 32-bit address space, and only this counter
     /// would notice.
@@ -43,9 +47,12 @@ pub(crate) struct SeenContentGrid {
     repeat_until: u64,
 }
 
+/// Sixteen bytes, which is what the three fields pack into with no padding:
+/// widening any of them costs a byte of table for every slot.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct SeenSample {
     fingerprint: u32,
+    epoch: u32,
     at: u64,
 }
 
@@ -69,11 +76,19 @@ impl SeenContentGrid {
     /// that stops repeating returns to skipping within a block or two.
     const STICKY_REACH: u64 = 2 * MAX_BLOCK_SIZE as u64;
 
+    /// Start a frame. Every frame calls this, most never consult the table, and
+    /// clearing it here cost a 64 KiB fill per frame — a fixed few microseconds
+    /// that a small frame pays in full. Stepping the epoch retires the previous
+    /// frame's slots instead, and the table is allocated only once a frame
+    /// actually records into it.
     pub(crate) fn reset_for_frame(&mut self) {
-        if self.slots.is_empty() {
-            self.slots = vec![SeenSample::default(); Self::SLOTS];
-        } else {
+        // The wrap lands on 0, which is the epoch a freshly allocated slot
+        // carries, so the table is cleared on that one frame in four billion
+        // rather than letting a stale slot read as live.
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
             self.slots.fill(SeenSample::default());
+            self.epoch = 1;
         }
         self.frame_offset = 0;
         self.repeat_until = 0;
@@ -98,7 +113,9 @@ impl SeenContentGrid {
             return false;
         }
         if self.slots.is_empty() {
-            self.reset_for_frame();
+            self.slots = vec![SeenSample::default(); Self::SLOTS];
+            // Zeroed slots carry epoch 0, so a frame must never run under it.
+            self.epoch = self.epoch.max(1);
         }
         let reach = if window_size == 0 {
             u64::MAX
@@ -150,11 +167,15 @@ impl SeenContentGrid {
                 let fingerprint = (mixed as u32) | 1;
                 let here = self.frame_offset + anchor as u64;
                 let held = self.slots[slot];
-                if held.fingerprint == fingerprint && here - held.at <= reach {
+                if held.epoch == self.epoch
+                    && held.fingerprint == fingerprint
+                    && here - held.at <= reach
+                {
                     repeat = true;
                 } else {
                     self.slots[slot] = SeenSample {
                         fingerprint,
+                        epoch: self.epoch,
                         at: here,
                     };
                 }
