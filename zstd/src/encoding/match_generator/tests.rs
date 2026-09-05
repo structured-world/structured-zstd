@@ -3311,12 +3311,22 @@ fn prime_with_dictionary_budget_shrinks_after_row_eviction() {
     driver.prime_with_dictionary(b"abcdefghABCDEFGHijklmnop", [1, 4, 8]);
     assert_eq!(driver.row_matcher().max_window_size, base_window + 24);
 
-    for block in [b"AAAAAAAA", b"BBBBBBBB"] {
+    // Three blocks, not two: a full window is retained BEHIND the incoming
+    // block, because the floor a match is measured against is set from the
+    // block's start. The block that fills the window therefore does not yet
+    // displace the dictionary; the one after it does.
+    for block in [b"AAAAAAAA", b"BBBBBBBB", b"CCCCCCCC"] {
         let mut space = driver.get_next_space();
         space.clear();
         space.extend_from_slice(block);
         driver.commit_space(space);
         driver.skip_matching_with_hint(None);
+        if block == b"AAAAAAAA" {
+            assert_eq!(
+                driver.dictionary_retained_budget, 24,
+                "a dictionary the window still reaches is still held",
+            );
+        }
     }
 
     assert_eq!(

@@ -2835,7 +2835,14 @@ impl RowMatchGenerator {
                 self.history.reserve_exact(target - self.history.len());
             }
         }
-        while self.window_size + len > self.max_window_size {
+        // Evict down to a FULL window BEFORE this block, not to a window that
+        // has to include it. The floor a match is measured against is set from
+        // the block's START (upstream zstd `ZSTD_window_enforceMaxDist` takes
+        // `ip`, not `ip + blockSize`), so retaining only `window - block` left
+        // everything between those two distances unreachable however the floor
+        // was computed. The mirror therefore holds up to a block more than the
+        // window, which is the shape upstream's buffer has.
+        while self.window_size > self.max_window_size {
             let removed_len = self.chunk_lens.pop_front().unwrap();
             self.window_size -= removed_len;
             self.history_start += removed_len;
@@ -2895,7 +2902,9 @@ impl RowMatchGenerator {
                 self.history.reserve_exact(target - self.history.len());
             }
         }
-        while self.window_size + data.len() > self.max_window_size {
+        // Same reach as `commit_block`: a full window stays behind the incoming
+        // block, because the floor is measured from the block's start.
+        while self.window_size > self.max_window_size {
             let removed_len = self.chunk_lens.pop_front().unwrap();
             self.window_size -= removed_len;
             self.history_start += removed_len;
