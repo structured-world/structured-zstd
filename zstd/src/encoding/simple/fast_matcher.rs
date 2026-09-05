@@ -1801,7 +1801,31 @@ impl FastKernelMatcher {
         step: usize,
     ) {
         debug_assert!(step >= 1);
-        if step > 1 {
+        // The one position in a row a hash is taken at, shared by both loops
+        // below so the sparse path cannot drift from the dense one.
+        macro_rules! index_at {
+            ($pos:expr) => {{
+                // SAFETY: the position is within the loop bound, and the
+                // kernel's HASH_READ_SIZE load width is readable there by
+                // `last_hashable`'s definition. The MLS const-generic is bound
+                // at the caller's match arm, so both calls constant-fold.
+                let ptr = unsafe { base.add($pos) };
+                let hash = unsafe { self.hash_table.hash_ptr::<MLS>(ptr) };
+                unsafe { self.hash_table.put(hash, (base_offset + $pos) as u32) };
+            }};
+        }
+        // Dense is the ordinary path — every searched block primes through it —
+        // and it has to stay a plain counted loop. Running it as `step_by(1)`
+        // over an inclusive range keeps the iterator's stride and exhausted
+        // flag live, which the optimiser does not reduce back to an induction
+        // variable: that alone cost a factor of two on every fast-level frame.
+        if step == 1 {
+            for pos in range_start..=last_hashable {
+                index_at!(pos);
+            }
+            return;
+        }
+        {
             // The two ends densely, whatever the step lands on. The head is the
             // seam the caller backfilled for — the previous block's trailing
             // positions read across the boundary, and a stride that skips them
@@ -1816,28 +1840,17 @@ impl FastKernelMatcher {
             const SEAM: usize = 8;
             let head_end = last_hashable.min(range_start + SEAM);
             for pos in range_start..=head_end {
-                let ptr = unsafe { base.add(pos) };
-                let hash = unsafe { self.hash_table.hash_ptr::<MLS>(ptr) };
-                unsafe { self.hash_table.put(hash, (base_offset + pos) as u32) };
+                index_at!(pos);
             }
             let tail_start = last_hashable.saturating_sub(SEAM).max(range_start);
             for pos in tail_start..=last_hashable {
-                let ptr = unsafe { base.add(pos) };
-                let hash = unsafe { self.hash_table.hash_ptr::<MLS>(ptr) };
-                unsafe { self.hash_table.put(hash, (base_offset + pos) as u32) };
+                index_at!(pos);
             }
         }
-        for pos in (range_start..=last_hashable).step_by(step) {
-            // SAFETY: pos < history_len (by loop bound), and the load
-            // width HASH_READ_SIZE is the kernel's contractually
-            // required minimum, so `base.add(pos)` covers
-            // HASH_READ_SIZE readable bytes by `last_hashable`'s
-            // definition. The MLS const-generic is bound at the
-            // caller's match arm — `hash_ptr<MLS>` and `put` are
-            // constant-folded per MLS.
-            let ptr = unsafe { base.add(pos) };
-            let hash = unsafe { self.hash_table.hash_ptr::<MLS>(ptr) };
-            unsafe { self.hash_table.put(hash, (base_offset + pos) as u32) };
+        let mut pos = range_start;
+        while pos <= last_hashable {
+            index_at!(pos);
+            pos += step;
         }
     }
 
