@@ -76,6 +76,24 @@ pub(crate) const ROW_HASH_SALT: u64 = zstd_bitmix(0, 8) ^ zstd_bitmix(0, 4);
 const BT_IDX_BASE: usize = 2;
 /// Upstream `ZSTD_DUBT_UNSORTED_MARK`.
 const BT_UNSORTED_MARK: u32 = 1;
+/// How far one node's sort compares before the tree gives up ordering it.
+///
+/// Sorting a node asks only which side of another node it falls on, and every
+/// byte past the first difference is spent on a question already answered. On
+/// ordinary data the answer arrives within tens of bytes and this bound is
+/// never approached. On input that repeats at a short period there IS no first
+/// difference: the comparison runs to the end of the loaded input, and since it
+/// runs per inserted node the parse turns quadratic in the stream. Measured on
+/// 8 MiB of a repeated 48-byte line at level 15, sorting compared 2.29 GB
+/// across 1,487 nodes — an average of 1.5 MB per node, to place nodes whose
+/// order no longer distinguishes anything.
+///
+/// A node that reaches the bound is dropped from the tree, which is what
+/// upstream already does for one that reaches the end of the input ("no way to
+/// know if inf or sup", `zstd_opt.c`). It cannot shorten a match: the lengths
+/// the parse emits come from the search walk, not from this ordering.
+const DUBT_SORT_COMPARE_CAP: usize = 8 * 1024;
+
 /// A tree link "pointer" whose write is discarded (upstream `dummy32`).
 const BT_DISCARD: usize = usize::MAX;
 
@@ -899,6 +917,10 @@ macro_rules! dubt_insert1 {
         // below stops at `iend_rem`.
         let ip = unsafe { $ctx.base.add(cur_idx) };
         let iend_rem = $ctx.len - cur_idx;
+        // Where a compare stops, resolved once: it does not vary with the
+        // candidate, only with how far the carried common prefix already
+        // reached, which the loop handles.
+        let sort_end_cap = iend_rem.min(DUBT_SORT_COMPARE_CAP);
         let window_low = $ctx
             .low_limit
             .max(cur_abs.saturating_sub($ctx.search_window))
@@ -919,8 +941,19 @@ macro_rules! dubt_insert1 {
             // floor); the reads stop at `iend_rem`.
             let (smaller, at_end) = unsafe {
                 let mptr = $ctx.base.add(m_idx);
-                ml += $cpl(mptr.add(ml), ip.add(ml), iend_rem - ml);
-                if ml == iend_rem {
+                let seed = ml;
+                // Bounded by the cap as well as by the input: past it the
+                // ordering question is unanswerable in any useful sense and
+                // the node is dropped, exactly as it is at the input's end.
+                let sort_end = if seed < sort_end_cap {
+                    sort_end_cap
+                } else {
+                    // The carried prefix already reached the cap: one more byte
+                    // is all the ordering can still ask for.
+                    (seed + 1).min(iend_rem)
+                };
+                ml += $cpl(mptr.add(ml), ip.add(ml), sort_end - ml);
+                if ml == sort_end {
                     (false, true)
                 } else {
                     (*mptr.add(ml) < *ip.add(ml), false)
