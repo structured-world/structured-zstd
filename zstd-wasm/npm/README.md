@@ -111,5 +111,5 @@ the browser/Deno they are fetched relative to the module.
 
 ## License
 
-[Apache-2.0](./LICENSE) © Structured World Foundation. Built from
+[Apache-2.0](./LICENSE) © Dmitry Prudnikov. Built from
 [`structured-zstd`](https://github.com/structured-world/structured-zstd).
