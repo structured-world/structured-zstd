@@ -70,7 +70,7 @@ impl SeenContentGrid {
     /// candidates: ~128 per 128 KiB block, so a duplicate collides many times
     /// over, while a 4 MiB window's worth of anchors still fits the table
     /// without evicting most of itself.
-    const ANCHOR_IN: u64 = 1024;
+    const ANCHOR_IN: u64 = 512;
     /// Top bits of the mixed key that must be zero for a candidate to anchor,
     /// which thins the one-in-256 byte hits to [`Self::ANCHOR_IN`].
     const THIN_SHIFT: u32 = 64 - (Self::ANCHOR_IN / 256).trailing_zeros();
@@ -81,7 +81,7 @@ impl SeenContentGrid {
     /// Bytes of a block anchors are taken from, split between its head and its
     /// tail. Sized like the classifier's own sample: enough content for several
     /// anchors, small enough that the probe is not the encode.
-    const SCAN_LEN: usize = 8 * 1024;
+    const SCAN_LEN: usize = 4 * 1024;
 
     /// Start a frame. Every frame calls this, most never consult the table, and
     /// clearing it here cost a 64 KiB fill per frame — a fixed few microseconds
