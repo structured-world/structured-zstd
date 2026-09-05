@@ -168,7 +168,18 @@ impl<B: BufferBackend> DecodeBuffer<B> {
         self.buffer.set_max_capacity(usize::MAX);
         #[cfg(feature = "hash")]
         {
-            self.hash = twox_hash::XxHash64::with_seed(0);
+            // Only a frame that hashed can have dirtied it. Upstream resets
+            // its digest under the same condition (`XXH64_reset` runs from
+            // `ZSTD_decompressBegin` only when the checksum will be
+            // validated), and a frame that carries no content checksum —
+            // every frame at the default settings — then pays nothing for a
+            // digest it never reads. The invariant this keeps is "the digest
+            // is pristine unless a decode wrote to it": writes happen only
+            // under `compute_hash`, so clearing it whenever that flag is set
+            // restores the invariant before the next frame's flag is chosen.
+            if self.compute_hash {
+                self.hash = twox_hash::XxHash64::with_seed(0);
+            }
         }
     }
 
