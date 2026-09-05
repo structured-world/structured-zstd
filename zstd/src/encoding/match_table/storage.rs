@@ -664,19 +664,17 @@ impl MatchTable {
         // re-lays out all three. That costs the same fill the separate vectors
         // paid for the region that changed, and saves two allocations.
         if self.chain_off != hash_size || self.hash3_off != hash_size + chain_size {
-            if capacity_is_oversized(self.tables.capacity(), total) {
-                // Levelling down: `clear` + `resize` would keep the largest
-                // allocation this compressor ever made resident for every
-                // later frame, so hand the buffer back instead.
-                self.tables = alloc::vec![HC_EMPTY; total];
-            } else {
-                // Reserved to the final width first: from an empty buffer
-                // `resize` walks a doubling chain whose steps the frame throws
-                // away, and a fresh matcher starts empty on every frame.
-                self.tables.clear();
-                self.tables.reserve_exact(total);
-                self.tables.resize(total, HC_EMPTY);
-            }
+            // One `vec![HC_EMPTY; total]`, never `clear` + `resize`. The
+            // sentinel is zero, so this asks the allocator for zeroed memory
+            // and a large request comes back as pages the kernel has not had
+            // to write and this frame does not touch until it indexes them.
+            // Resizing writes every element instead, which for a matcher taken
+            // fresh per frame meant faulting and zeroing the whole table on
+            // every frame: at level 22 on eight mebibytes it was 40% of the
+            // encode in `memset` and half of it in the kernel. It also hands
+            // back an oversized buffer, which levelling down from the tree
+            // finder needs anyway.
+            self.tables = alloc::vec![HC_EMPTY; total];
             self.chain_off = hash_size;
             self.hash3_off = hash_size + chain_size;
         } else if self.tables.len() != total {

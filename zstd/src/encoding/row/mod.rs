@@ -3377,20 +3377,14 @@ impl RowMatchGenerator {
             // same fill the separate vectors paid and saves an allocation.
             if self.hc_split != hash_len || self.tables.len() != hash_len + chain_len || relayout {
                 let total = hash_len + chain_len;
-                if super::match_table::storage::capacity_is_oversized(self.tables.capacity(), total)
-                {
-                    // Same release rule as the row branch: a level downgrade
-                    // must not pin the widest tables this compressor ever
-                    // used.
-                    self.tables = alloc::vec![empty; total];
-                } else {
-                    // Reserved to the final width before filling, for the same
-                    // reason as the row branch above: `resize` from an empty
-                    // buffer climbs a doubling chain the frame then discards.
-                    self.tables.clear();
-                    self.tables.reserve_exact(total);
-                    self.tables.resize(total, empty);
-                }
+                // One `vec![empty; total]`, never `clear` + `resize`. The tree
+                // finder's sentinel is zero, so this asks the allocator for
+                // zeroed memory and a large request comes back as pages the
+                // kernel has not had to write; resizing writes every element,
+                // which for a matcher taken fresh per frame meant faulting and
+                // zeroing the whole table every time. It also releases an
+                // oversized buffer, which a level downgrade needs anyway.
+                self.tables = alloc::vec![empty; total];
                 self.hc_split = hash_len;
             }
             self.hc_layout = self.finder;
