@@ -58,6 +58,9 @@ pub(crate) struct SeenSample {
 
 impl SeenContentGrid {
     const SLOTS: usize = 4096;
+    /// Floor on the table, so a tiny window still has room for a few anchors
+    /// without a slot collision reading as a repeat on every one.
+    const MIN_SLOTS: usize = 64;
     /// Bytes read per sample.
     const KEY_LEN: usize = 8;
     /// The byte whose positions are candidate anchors: one in 256 of random
@@ -116,11 +119,13 @@ impl SeenContentGrid {
             self.frame_offset += block.len() as u64;
             return false;
         }
-        if self.slots.is_empty() {
-            self.slots = vec![SeenSample::default(); Self::SLOTS];
+        let wanted = Self::slots_for(window_size);
+        if self.slots.len() < wanted {
+            self.slots = vec![SeenSample::default(); wanted];
             // Zeroed slots carry epoch 0, so a frame must never run under it.
             self.epoch = self.epoch.max(1);
         }
+        let mask = self.slots.len() - 1;
         let reach = if window_size == 0 {
             u64::MAX
         } else {
@@ -173,7 +178,7 @@ impl SeenContentGrid {
                     if mixed >> Self::THIN_SHIFT != 0 {
                         continue;
                     }
-                    let slot = (mixed >> 32) as usize & (Self::SLOTS - 1);
+                    let slot = (mixed >> 32) as usize & mask;
                     let fingerprint = (mixed as u32) | 1;
                     let here = self.frame_offset + anchor as u64;
                     let held = self.slots[slot];
@@ -203,6 +208,24 @@ impl SeenContentGrid {
             self.repeat_until = self.frame_offset + Self::STICKY_REACH;
         }
         repeat || self.frame_offset <= self.repeat_until
+    }
+
+    /// How many slots a window's worth of anchors needs, rounded up to a power
+    /// of two and held to [`Self::SLOTS`].
+    ///
+    /// The window is the reach: a fingerprint older than that is never
+    /// consulted, so a table wider than the anchors the window can hold is
+    /// memory a frame allocates and faults for nothing. A kibibyte frame was
+    /// taking a 64 KiB table for the handful of anchors it could ever record,
+    /// which on the cheapest levels was a third of the encode. Four slots per
+    /// anchor keeps eviction rare.
+    fn slots_for(window_size: usize) -> usize {
+        if window_size == 0 {
+            return Self::SLOTS;
+        }
+        let anchors = (window_size as u64 / Self::ANCHOR_IN).max(1);
+        let wanted = (anchors * 4).next_power_of_two();
+        (wanted as usize).clamp(Self::MIN_SLOTS, Self::SLOTS)
     }
 
     /// The parts of a block anchors are taken from: the whole of a small one,
