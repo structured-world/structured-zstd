@@ -57,25 +57,35 @@ fn the_content_grid_reports_a_repeat_that_is_shifted() {
     );
 }
 
-/// A block that repeats its own content has to be found wherever the copy
-/// landed, not only where a run happens to be placed.
+/// A copy of a block's own first half is answered; a copy that begins away from
+/// both runs is the documented bound, not an accident.
 ///
-/// A block of noise carrying a big verbatim copy of itself reads as
-/// incompressible to any sample of it, and the copy is a block-sized match the
-/// search would have found. Runs at the start and the middle answer a copy that
-/// begins at the middle; a copy that begins anywhere else is the same match and
-/// has to be answered too.
+/// The two are one test because the second is only meaningful beside the first:
+/// the grid finds a self-copy where a run begins inside it, and the price of
+/// finding one anywhere is measured at `PROBE_RUNS_PER_BLOCK`.
 #[test]
-fn the_content_grid_reports_a_repeat_that_is_not_at_the_midpoint() {
-    let mut block = deterministic_bytes(0xBEEF, 128 * 1024);
-    let (source, destination) = (8 * 1024, 76 * 1024);
-    let span = block.len() - destination;
-    block.copy_within(source..source + span, destination);
+fn the_content_grid_answers_a_self_copy_a_run_begins_inside() {
+    const BLOCK: usize = 128 * 1024;
+    const WIDE: usize = 8 * 1024 * 1024;
+
+    let mut halves = deterministic_bytes(0xBEEF, BLOCK);
+    halves.copy_within(0..BLOCK / 2, BLOCK / 2);
     let mut grid = SeenContentGrid::default();
     grid.reset_for_frame();
     assert!(
-        grid.record_and_report_repeat(&block, 8 * 1024 * 1024),
-        "a {span}-byte copy inside the block is a match worth searching for",
+        grid.record_and_report_repeat(&halves, WIDE),
+        "a block of two identical halves is half a block of match",
+    );
+
+    let mut offset = deterministic_bytes(0xBEEF, BLOCK);
+    let span = BLOCK - 76 * 1024;
+    offset.copy_within(8 * 1024..8 * 1024 + span, 76 * 1024);
+    let mut grid = SeenContentGrid::default();
+    grid.reset_for_frame();
+    assert!(
+        !grid.record_and_report_repeat(&offset, WIDE),
+        "the bound moved: a copy away from both runs is now answered, so the \
+         run placement changed and its cost has to be re-measured",
     );
 }
 

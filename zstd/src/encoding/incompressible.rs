@@ -96,12 +96,21 @@ impl SeenContentGrid {
     /// offsets exactly one is a multiple of the step, so a copy at ANY distance
     /// from its original has exactly one probe that meets a recorded key.
     const PROBE_RUN: usize = Self::RECORD_STEP;
-    /// How far apart the runs sit. A copy is answered when a run begins inside
-    /// it, so this is the length of copy the grid can still miss — and a block
-    /// carrying a copy this size is worth the search whatever the samples said.
-    /// Blocks smaller than twice this keep the two runs that a block of two
-    /// identical halves needs.
-    const PROBE_SPACING: usize = 16 * 1024;
+    /// Runs per block: one at the start, one at the middle.
+    ///
+    /// A run answers only a copy it begins inside, so a copy of a block's own
+    /// earlier content that starts anywhere else goes unanswered — the block is
+    /// written out raw with a match inside it. Spreading the runs closes that,
+    /// and costs far too much to keep: a run every 16 KiB (eight runs on a
+    /// 128 KiB block) measured 1.70x the encode of incompressible input at the
+    /// fast levels and 1.60x at dfast, three interleaved readings a side with no
+    /// overlap. The probes ARE the grid's cost — each is a random slot lookup —
+    /// so their count is the price, and the whole heuristic exists to make
+    /// incompressible input cheap.
+    ///
+    /// So the bound is deliberate: a copy that begins away from both runs is
+    /// missed, and what that costs is capped by the block.
+    const PROBE_RUNS_PER_BLOCK: usize = 2;
     /// How far past a hit the search stays on: two maximum blocks, so an
     /// isolated miss inside repeating content cannot cost a block, while a frame
     /// that stops repeating returns to skipping within a block or two.
@@ -301,7 +310,7 @@ impl SeenContentGrid {
         }
         let mut abs = self.frame_offset.next_multiple_of(step);
         let block_end = self.frame_offset + last as u64;
-        let runs = (block.len() / Self::PROBE_SPACING).max(2);
+        let runs = Self::PROBE_RUNS_PER_BLOCK;
         for idx in 0..runs {
             let start = idx * (block.len() / runs);
             // Records for everything before this run go in FIRST, because
