@@ -38,9 +38,6 @@ zrip = "0.8"
 # Only to hand freed memory back to the kernel between benchmark groups, so a
 # group cannot inherit the pages the previous one released. Measurement
 # plumbing; nothing the codec builds against.
-[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
-libc = "0.2"
-
 [features]
 # Forward the structured-zstd features the bench/test/example sources gate on
 # via `#[cfg(feature = ...)]`. None are in `default`: each target that needs

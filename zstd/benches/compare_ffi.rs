@@ -1041,13 +1041,20 @@ fn configure_group<M: criterion::measurement::Measurement>(
 /// see; the per-iteration loop never touches it.
 fn release_freed_memory() {
     // glibc only: `malloc_trim` is a GNU extension, and musl neither provides
-    // it nor keeps the per-arena free lists it exists to return.
+    // it nor keeps the per-arena free lists it exists to return. Declared here
+    // rather than pulled from a binding crate — one symbol with a trivial
+    // signature is not worth a workspace dependency, and it keeps this harness
+    // droppable into an older revision for a paired measurement.
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
-    // SAFETY: `malloc_trim` takes no pointers and only returns free pages to
-    // the kernel; nothing live is touched, and it is a no-op on allocators
-    // that do not implement it.
-    unsafe {
-        libc::malloc_trim(0);
+    {
+        unsafe extern "C" {
+            fn malloc_trim(pad: core::ffi::c_int) -> core::ffi::c_int;
+        }
+        // SAFETY: takes no pointers and only returns free pages to the kernel;
+        // nothing live is touched.
+        unsafe {
+            malloc_trim(0);
+        }
     }
 }
 
