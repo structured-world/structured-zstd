@@ -98,18 +98,20 @@ impl SeenContentGrid {
     const PROBE_RUN: usize = Self::RECORD_STEP;
     /// Runs per block: one at the start, one at the middle.
     ///
-    /// A run answers only a copy it begins inside, so a copy of a block's own
-    /// earlier content that starts anywhere else goes unanswered — the block is
-    /// written out raw with a match inside it. Spreading the runs closes that,
-    /// and costs far too much to keep: a run every 16 KiB (eight runs on a
-    /// 128 KiB block) measured 1.70x the encode of incompressible input at the
-    /// fast levels and 1.60x at dfast, three interleaved readings a side with no
-    /// overlap. The probes ARE the grid's cost — each is a random slot lookup —
-    /// so their count is the price, and the whole heuristic exists to make
-    /// incompressible input cheap.
+    /// A run answers a copy at ANY distance, but only where the run begins. The
+    /// grid points answer a copy ANYWHERE, but only at a distance that is a
+    /// whole number of steps ([`Self::record_key_probing`], which is why they
+    /// probe as they record). Between them the uncovered case is a copy that
+    /// both begins away from the two runs AND sits at a distance that is not a
+    /// multiple of the step.
     ///
-    /// So the bound is deliberate: a copy that begins away from both runs is
-    /// missed, and what that costs is capped by the block.
+    /// Closing that too, by spreading the runs across the block, costs far more
+    /// than it is worth: a run every 16 KiB (eight on a 128 KiB block) measured
+    /// 1.70x the encode of incompressible input at the fast levels and 1.60x at
+    /// dfast, three interleaved readings a side with no overlap. The runs ARE
+    /// the grid's cost — each probe is a random slot lookup — so their number is
+    /// the price, and the whole heuristic exists to make incompressible input
+    /// cheap.
     const PROBE_RUNS_PER_BLOCK: usize = 2;
     /// How far past a hit the search stays on: two maximum blocks, so an
     /// isolated miss inside repeating content cannot cost a block, while a frame
@@ -210,6 +212,42 @@ impl SeenContentGrid {
             epoch: self.epoch,
             at_step: (here / Self::RECORD_STEP as u64) as u32,
         };
+    }
+
+    /// Record the content at `at`, reporting whether the same content was
+    /// already recorded within `reach`.
+    ///
+    /// The probe costs almost nothing here. The key is computed once for both,
+    /// and the record is about to write BOTH tables at this slot, so the lines
+    /// the probe reads are the lines the stores need anyway. What it buys is the
+    /// coverage a run only gives where it begins: a copy sitting a whole number
+    /// of grid steps from its original lands on the grid too, so it is answered
+    /// wherever in the block it starts.
+    #[inline]
+    fn record_key_probing(&mut self, block: &[u8], at: usize, reach: u64, mask: usize) -> bool {
+        let (slot, fingerprint, tag) = self.key_at(block, at, mask);
+        let here = self.frame_offset + at as u64;
+        // The byte first, as in `probe_key`: on content that does not repeat
+        // this is the only comparison that runs.
+        let hit = self.tags[slot] == tag && {
+            let held = self.slots[slot];
+            held.epoch == self.epoch
+                && held.fingerprint == fingerprint
+                && here
+                    .checked_sub(u64::from(held.at_step) * Self::RECORD_STEP as u64)
+                    .is_some_and(|apart| apart != 0 && apart <= reach)
+        };
+        debug_assert!(
+            here.is_multiple_of(Self::RECORD_STEP as u64),
+            "records sit on the grid, which is what lets the offset be stored in steps",
+        );
+        self.tags[slot] = tag;
+        self.slots[slot] = SeenSample {
+            fingerprint,
+            epoch: self.epoch,
+            at_step: (here / Self::RECORD_STEP as u64) as u32,
+        };
+        hit
     }
 
     /// Record this block on the grid and report whether it duplicates content
@@ -322,7 +360,11 @@ impl SeenContentGrid {
             let until = self.frame_offset + start as u64;
             while abs < until && abs <= block_end {
                 let at = (abs - self.frame_offset) as usize;
-                self.record_key(block, at, mask);
+                if probe {
+                    repeat |= self.record_key_probing(block, at, reach, mask);
+                } else {
+                    self.record_key(block, at, mask);
+                }
                 abs += step;
             }
             // The start run on a frame's first block cannot hit anything: the
@@ -338,7 +380,11 @@ impl SeenContentGrid {
             if idx + 1 == runs {
                 while abs <= block_end {
                     let at = (abs - self.frame_offset) as usize;
-                    self.record_key(block, at, mask);
+                    if probe {
+                        repeat |= self.record_key_probing(block, at, reach, mask);
+                    } else {
+                        self.record_key(block, at, mask);
+                    }
                     abs += step;
                 }
             }

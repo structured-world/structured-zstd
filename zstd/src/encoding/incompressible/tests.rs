@@ -57,14 +57,14 @@ fn the_content_grid_reports_a_repeat_that_is_shifted() {
     );
 }
 
-/// A copy of a block's own first half is answered; a copy that begins away from
-/// both runs is the documented bound, not an accident.
+/// A block carrying a copy of its own earlier content has to be answered, both
+/// where a run begins inside the copy and where only the grid points meet it.
 ///
-/// The two are one test because the second is only meaningful beside the first:
-/// the grid finds a self-copy where a run begins inside it, and the price of
-/// finding one anywhere is measured at `PROBE_RUNS_PER_BLOCK`.
+/// Such a block reads as incompressible to every sample of it, and the copy is a
+/// block-sized match the search would have found — the exact case the raw skip
+/// must not throw away.
 #[test]
-fn the_content_grid_answers_a_self_copy_a_run_begins_inside() {
+fn the_content_grid_answers_a_block_that_copies_itself() {
     const BLOCK: usize = 128 * 1024;
     const WIDE: usize = 8 * 1024 * 1024;
 
@@ -77,15 +77,15 @@ fn the_content_grid_answers_a_self_copy_a_run_begins_inside() {
         "a block of two identical halves is half a block of match",
     );
 
+    // Away from both runs, so only the grid points can meet it.
     let mut offset = deterministic_bytes(0xBEEF, BLOCK);
     let span = BLOCK - 76 * 1024;
     offset.copy_within(8 * 1024..8 * 1024 + span, 76 * 1024);
     let mut grid = SeenContentGrid::default();
     grid.reset_for_frame();
     assert!(
-        !grid.record_and_report_repeat(&offset, WIDE),
-        "the bound moved: a copy away from both runs is now answered, so the \
-         run placement changed and its cost has to be re-measured",
+        grid.record_and_report_repeat(&offset, WIDE),
+        "a {span}-byte copy at 76 KiB is a match worth searching for",
     );
 }
 
