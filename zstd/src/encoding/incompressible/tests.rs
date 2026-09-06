@@ -92,6 +92,33 @@ fn the_content_grid_answers_a_block_that_copies_itself() {
     );
 }
 
+/// A frame long enough to exhaust the step index has to keep the records the
+/// window still reaches.
+///
+/// The index is rebased at that point, and retiring the table wholesale there
+/// throws away the last window of records — so the block right after the rebase
+/// finds nothing on the grid and goes out raw although the matcher still holds
+/// and has indexed its original. It is one stretch of a two-tebibyte frame, and
+/// it is a whole window's worth of blocks.
+#[test]
+fn the_content_grid_keeps_what_the_window_reaches_across_a_rebase() {
+    const BLOCK: usize = 128 * 1024;
+    const WIDE: usize = 8 * 1024 * 1024;
+    let limit = (u64::from(u32::MAX) + 1) * SeenContentGrid::RECORD_STEP as u64;
+
+    let block = deterministic_bytes(0x51DE, BLOCK);
+    let mut grid = SeenContentGrid::default();
+    grid.reset_for_frame();
+    // One block short of the limit, so the first call stays under it and the
+    // second crosses.
+    grid.frame_offset = limit - BLOCK as u64;
+    grid.record_searched(&block, WIDE);
+    assert!(
+        grid.record_and_report_repeat(&block, WIDE),
+        "the block right behind this one is exactly what the matcher would find",
+    );
+}
+
 /// Content still inside the window must keep reading as a repeat, and content
 /// the window has passed must stop.
 ///

@@ -448,7 +448,16 @@ impl FseTables {
                 Some(PreviousFseTable::Custom(handle))
                     if SharedFseTable::strong_count(handle) == 1
             );
-            if next.is_none()
+            // An occupied slot is not the same as a usable one. A frame that
+            // settled on a predefined table parks the dictionary cache's handle
+            // here, and a shared handle cannot be built into — so leaving it
+            // there while the uniquely owned table is dropped costs the
+            // allocation this exists to avoid, on the first custom build of
+            // every frame.
+            let next_is_a_buffer = next
+                .as_ref()
+                .is_some_and(|handle| SharedFseTable::strong_count(handle) == 1);
+            if !next_is_a_buffer
                 && worth_keeping
                 && let Some(PreviousFseTable::Custom(handle)) = previous.take()
             {
@@ -488,6 +497,15 @@ impl FseTables {
             {
                 total += per_table;
             }
+        }
+        // Where there is neither a pointer atomic nor `critical-section` to
+        // guard a process-wide cache, each default table is an owned box built
+        // per compressor, so it is this struct's allocation to report. With the
+        // cache it is a `&'static` shared by every compressor and counts as
+        // nothing.
+        #[cfg(not(any(target_has_atomic = "ptr", feature = "critical-section")))]
+        {
+            total += 3 * core::mem::size_of::<FSETable>();
         }
         total
     }

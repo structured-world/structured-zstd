@@ -118,6 +118,9 @@ impl SeenContentGrid {
     /// So the bound is deliberate: a copy that begins away from both runs is
     /// missed, and what that costs is capped by the block.
     const PROBE_RUNS_PER_BLOCK: usize = 2;
+    /// What a rebase keeps: the widest window the format admits, so a record
+    /// dropped there was out of every matcher's reach already.
+    const REBASE_RETAIN_BYTES: u64 = 1 << 31;
     /// How far past a hit the search stays on: two maximum blocks, so an
     /// isolated miss inside repeating content cannot cost a block, while a frame
     /// that stops repeating returns to skipping within a block or two.
@@ -131,10 +134,45 @@ impl SeenContentGrid {
         self.retire_for_rebase();
     }
 
+    /// Move the origin forward, keeping every record the matcher could still
+    /// reach and dropping the rest.
+    ///
+    /// A frame that runs past what the step index holds has to start counting
+    /// again, and retiring the whole table there costs a window's worth of
+    /// blocks: each finds nothing on the grid and goes out raw although the
+    /// matcher still holds and has indexed its original. What is kept is the
+    /// last [`Self::REBASE_RETAIN_BYTES`], which covers the widest window the
+    /// format admits, so nothing droppable was reachable anyway.
+    fn rebase_offsets(&mut self) {
+        let step = Self::RECORD_STEP as u64;
+        let retain_steps = Self::REBASE_RETAIN_BYTES / step;
+        let Some(base_steps) = (self.frame_offset / step).checked_sub(retain_steps) else {
+            // Not far enough along to have anything to drop, which the caller's
+            // guard makes unreachable — the origin only moves at the index
+            // limit, and that is far past the retained span.
+            return;
+        };
+        let base_steps32 = u32::try_from(base_steps).expect("the origin moves at the index limit");
+        for (slot, tag) in self.slots.iter_mut().zip(self.tags.iter_mut()) {
+            if slot.epoch != self.epoch {
+                continue;
+            }
+            match slot.at_step.checked_sub(base_steps32) {
+                Some(rebased) => slot.at_step = rebased,
+                // Older than the widest window: no probe could have used it.
+                None => {
+                    *slot = SeenSample::default();
+                    *tag = 0;
+                }
+            }
+        }
+        self.frame_offset -= base_steps * step;
+        self.repeat_until = self.repeat_until.saturating_sub(base_steps * step);
+    }
+
     /// Retire every record and start the offsets again from zero.
     ///
-    /// Shared by the frame boundary and by the rebase a frame long enough to
-    /// exhaust the step index needs.
+    /// The frame boundary, where nothing recorded is reachable any more.
     fn retire_for_rebase(&mut self) {
         // The wrap lands on 0, which is the epoch a freshly allocated slot
         // carries, so the table is cleared on that one frame in sixty-five
@@ -306,14 +344,13 @@ impl SeenContentGrid {
         // reaches the full width by eight kilobytes and stays whole above it.
         let run = Self::PROBE_RUN.min((block.len() / 16).max(8));
         // A record's offset is stored in grid steps, so a frame that runs past
-        // what that index can hold starts counting again rather than wraps — a
+        // what that index can hold moves its origin rather than wraps — a
         // wrapped offset reads as being near the start of the frame, and a
         // duplicate right behind it is then measured as out of the window and
-        // written off. Retiring the table and rebasing costs one epoch step per
-        // couple of tebibytes of stream, and everything it forgets is far
-        // outside any window the matcher can reach anyway.
+        // written off. The move keeps everything a window could still reach and
+        // costs one pass over the table per couple of tebibytes of stream.
         if (self.frame_offset + last as u64) / step > u64::from(u32::MAX) {
-            self.retire_for_rebase();
+            self.rebase_offsets();
         }
         let mut abs = self.frame_offset.next_multiple_of(step);
         let block_end = self.frame_offset + last as u64;

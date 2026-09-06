@@ -129,9 +129,14 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
     // not — it measures the block against itself, and a repeat is what the grid
     // then catches.
     let dict_rejects_raw = dict_active;
+    // The level and the window decide this for the whole frame, so it also says
+    // whether the grid is worth keeping at all: nothing it records can be acted
+    // on where no block may go out raw, and recording there would take its
+    // tables and hash a run of every block for an answer no one asks for.
+    let raw_skip_reachable = compression_level_allows_raw_fast_path(compression_level, window_size);
     let looks_incompressible = rle_byte_opt.is_none()
         && !dict_rejects_raw
-        && compression_level_allows_raw_fast_path(compression_level, window_size)
+        && raw_skip_reachable
         && should_emit_raw_fast_path(compression_level, bytes);
     let repeats_earlier_content = if looks_incompressible {
         state
@@ -142,9 +147,11 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         // It still has to be RECORDED, or a later block made mostly of this one
         // finds nothing on the grid and goes out raw with the match sitting in
         // history. Recording without probing: the probe is what costs.
-        state
-            .seen_content
-            .record_searched(bytes, window_size as usize);
+        if raw_skip_reachable {
+            state
+                .seen_content
+                .record_searched(bytes, window_size as usize);
+        }
         false
     };
     let raw_fast_path = looks_incompressible && !repeats_earlier_content;
@@ -375,9 +382,12 @@ pub(crate) fn compress_block_encoded_borrowed(
     // As on the owned path: an attached dictionary keeps the block on the
     // search rather than trusting a sample to say the dictionary is irrelevant.
     let dict_rejects_raw = dict_active;
+    // As on the owned path: where no block may go out raw, the grid has nothing
+    // to answer and is left alone.
+    let raw_skip_reachable = compression_level_allows_raw_fast_path(compression_level, window_size);
     let looks_incompressible = !is_rle
         && !dict_rejects_raw
-        && compression_level_allows_raw_fast_path(compression_level, window_size)
+        && raw_skip_reachable
         && should_emit_raw_fast_path(compression_level, block);
     let repeats_earlier_content = if looks_incompressible {
         state
@@ -386,9 +396,11 @@ pub(crate) fn compress_block_encoded_borrowed(
     } else {
         // As on the owned path: a searched block is recorded, not merely
         // stepped over.
-        state
-            .seen_content
-            .record_searched(block, window_size as usize);
+        if raw_skip_reachable {
+            state
+                .seen_content
+                .record_searched(block, window_size as usize);
+        }
         false
     };
     if is_rle {
