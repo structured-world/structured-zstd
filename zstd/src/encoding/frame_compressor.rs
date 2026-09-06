@@ -701,6 +701,23 @@ fn split_block_by_chunks(block: &[u8], level: usize) -> usize {
         sampling_rate,
         hash_log,
     );
+    // A block whose first and last chunk agree by the sampler's OWN test has
+    // no boundary for it to find, and walking the chunks between them is then
+    // pure cost: on eight mebibytes of repeated log lines the walk was half
+    // the encode at level 3 and returned "one block" every time. Two extra
+    // fingerprints answer that for the price of one chunk step, against the
+    // sixty-three the walk would take. The test is the sampler's, not the
+    // cheaper borders heuristic's — that one was measured as a filter and cost
+    // 2.8 to 3.4% of the decode corpus.
+    presplit_record_fingerprint(
+        &mut new_events,
+        &block[block.len() - PRESPLIT_CHUNK_SIZE..],
+        sampling_rate,
+        hash_log,
+    );
+    if !presplit_fingerprints_differ(&past, &new_events, PRESPLIT_THRESHOLD_PENALTY, hash_log) {
+        return block.len();
+    }
     let mut pos = PRESPLIT_CHUNK_SIZE;
     while pos <= block.len() - PRESPLIT_CHUNK_SIZE {
         presplit_record_fingerprint(
