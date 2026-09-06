@@ -68,12 +68,27 @@ fn configure_ffi_bulk_compressor(compressor: &mut zstd::bulk::Compressor<'_>, le
 /// `configure_ffi_bulk_compressor` enable `ZSTD_c_checksumFlag`, all under
 /// the same `hash` feature.
 fn rust_encode_to_vec(input: &[u8], level: &LevelConfig) -> Vec<u8> {
+    let mut output = Vec::new();
+    rust_encode_into(input, level, &mut output);
+    output
+}
+
+/// The same encode, writing into a caller-owned buffer.
+///
+/// The timing loop uses THIS one, because the C arm it is compared against
+/// keeps one `dst` for the whole sample: a fresh context per iteration (both
+/// sides do that) but a reused output. Allocating and freeing a
+/// megabyte-sized output every iteration on our side alone is not a property
+/// of the encoder — on a fresh heap the allocator maps and unmaps it, which
+/// measured as four times the encode on incompressible input and made the
+/// comparison against upstream a comparison of allocator behaviour.
+fn rust_encode_into(input: &[u8], level: &LevelConfig, output: &mut Vec<u8>) {
     let mut enc: FrameCompressor = FrameCompressor::new(level.rust_level);
     if let Some(params) = ldm_parameters(level) {
         enc.set_parameters(&params);
     }
     enc.set_content_checksum(cfg!(feature = "hash"));
-    enc.compress_independent_frame(input)
+    enc.compress_independent_frame_into(input, output);
 }
 
 /// FFI encode helper used by criterion's timing loop: one-shot
@@ -297,7 +312,14 @@ fn bench_compress(c: &mut Criterion) {
             group.throughput(Throughput::Bytes(scenario.throughput_bytes()));
 
             group.bench_function("pure_rust", |b| {
-                b.iter(|| black_box(rust_encode_to_vec(&scenario.bytes[..], &level)))
+                // One output buffer for the whole sample, exactly as the c_ffi
+                // arm below keeps one `dst`. The compressor is still fresh per
+                // iteration on both sides.
+                let mut output = Vec::new();
+                b.iter(|| {
+                    rust_encode_into(&scenario.bytes[..], &level, &mut output);
+                    black_box(&output);
+                })
             });
 
             group.bench_function("c_ffi", |b| {

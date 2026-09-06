@@ -106,6 +106,14 @@ impl SeenContentGrid {
     /// frame's slots instead, and the table is allocated only once a frame
     /// actually records into it.
     pub(crate) fn reset_for_frame(&mut self) {
+        self.retire_for_rebase();
+    }
+
+    /// Retire every record and start the offsets again from zero.
+    ///
+    /// Shared by the frame boundary and by the rebase a frame long enough to
+    /// exhaust the step index needs.
+    fn retire_for_rebase(&mut self) {
         // The wrap lands on 0, which is the epoch a freshly allocated slot
         // carries, so the table is cleared on that one frame in sixty-five
         // thousand rather than letting a stale slot read as live.
@@ -267,6 +275,16 @@ impl SeenContentGrid {
         // the block. So the run is capped at a probe per sixteen bytes, which
         // reaches the full width by eight kilobytes and stays whole above it.
         let run = Self::PROBE_RUN.min((block.len() / 16).max(8));
+        // A record's offset is stored in grid steps, so a frame that runs past
+        // what that index can hold starts counting again rather than wraps — a
+        // wrapped offset reads as being near the start of the frame, and a
+        // duplicate right behind it is then measured as out of the window and
+        // written off. Retiring the table and rebasing costs one epoch step per
+        // couple of tebibytes of stream, and everything it forgets is far
+        // outside any window the matcher can reach anyway.
+        if (self.frame_offset + last as u64) / step > u64::from(u32::MAX) {
+            self.retire_for_rebase();
+        }
         let mut abs = self.frame_offset.next_multiple_of(step);
         let block_end = self.frame_offset + last as u64;
         for (idx, start) in [0usize, block.len() / 2].into_iter().enumerate() {

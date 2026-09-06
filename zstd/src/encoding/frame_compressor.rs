@@ -297,6 +297,16 @@ pub(crate) type SharedFseTable = alloc::sync::Arc<FSETable>;
 #[cfg(not(target_has_atomic = "ptr"))]
 pub(crate) type SharedFseTable = alloc::rc::Rc<FSETable>;
 
+/// Bytes a [`SharedFseTable`] allocation carries in FRONT of the table: the two
+/// reference counts, then whatever padding the table's alignment adds. One
+/// allocation holds both, so a caller sizing a context is told about the whole
+/// of it rather than the payload alone.
+const fn shared_table_overhead() -> usize {
+    let counts = 2 * core::mem::size_of::<usize>();
+    let align = core::mem::align_of::<FSETable>();
+    counts.div_ceil(align) * align
+}
+
 #[derive(Clone)]
 pub(crate) enum PreviousFseTable {
     // Default tables are immutable and already stored alongside the state, so
@@ -455,7 +465,11 @@ impl FseTables {
     /// cache is left out, because that cache reports its own tables and the
     /// caller would otherwise be told about the same allocation twice.
     pub(crate) fn heap_size(&self) -> usize {
-        let per_table = core::mem::size_of::<FSETable>();
+        // The table AND the reference counts in front of it: a shared handle is
+        // one allocation holding both, and reporting only the payload
+        // understates every retained table by the control block and whatever
+        // padding its alignment adds.
+        let per_table = core::mem::size_of::<FSETable>() + shared_table_overhead();
         let mut total = 0;
         for previous in [&self.ll_previous, &self.ml_previous, &self.of_previous] {
             if let Some(PreviousFseTable::Custom(handle)) = previous
