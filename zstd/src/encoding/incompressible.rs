@@ -221,6 +221,13 @@ impl SeenContentGrid {
         // kilobytes of two identical halves reads as incompressible by any
         // sample of it and halves if the search runs.
         let step = Self::RECORD_STEP as u64;
+        // A full run covers every distance a copy could sit at, and on a block
+        // of any size it is a rounding error. On a block of a couple of
+        // kilobytes it is half the block, and the grid then costs more than the
+        // duplicate it could find is worth — a missed one there is bounded by
+        // the block. So the run is capped at a probe per sixteen bytes, which
+        // reaches the full width by eight kilobytes and stays whole above it.
+        let run = Self::PROBE_RUN.min((block.len() / 16).max(8));
         let mut abs = self.frame_offset.next_multiple_of(step);
         let mut halves = [0usize, block.len() / 2].into_iter().peekable();
         while let Some(start) = halves.next() {
@@ -237,7 +244,7 @@ impl SeenContentGrid {
                 self.record_key(block, at, mask);
                 abs += step;
             }
-            let end = (start + Self::PROBE_RUN).min(last + 1);
+            let end = (start + run).min(last + 1);
             for at in start..end {
                 repeat |= self.probe_key(block, at, reach, mask);
             }
