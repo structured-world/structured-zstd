@@ -252,6 +252,13 @@ impl SeenContentGrid {
         // whose own first half is the original — a hundred and twenty-eight
         // kilobytes of two identical halves reads as incompressible by any
         // sample of it and halves if the search runs.
+        //
+        // Dropping the midpoint run on every block after a frame's first was
+        // tried, for half the grid's cost: it loses ratio. Four megabytes
+        // repeated at a shifted distance went from 4,129,240 bytes to 4,194,762
+        // at level 17. The second run is not only about a block's own halves —
+        // it is a second independent chance for the one aligned probe to meet a
+        // record that the first run's slot has since been written over.
         let step = Self::RECORD_STEP as u64;
         // A full run covers every distance a copy could sit at, and on a block
         // of any size it is a rounding error. On a block of a couple of
@@ -261,34 +268,32 @@ impl SeenContentGrid {
         // reaches the full width by eight kilobytes and stays whole above it.
         let run = Self::PROBE_RUN.min((block.len() / 16).max(8));
         let mut abs = self.frame_offset.next_multiple_of(step);
-        let mut halves = [0usize, block.len() / 2].into_iter().peekable();
-        while let Some(start) = halves.next() {
-            // Records for everything before this run go in FIRST, because the
-            // midpoint run's whole job is to meet them: a block whose own first
-            // half is the original is invisible to a run that probes before that
-            // half has been recorded.
-            // Strictly before the run: a grid point recorded at a position the
-            // run then probes answers itself, and every block reads as a repeat
-            // of itself.
+        let block_end = self.frame_offset + last as u64;
+        for (idx, start) in [0usize, block.len() / 2].into_iter().enumerate() {
+            // Records for everything before this run go in FIRST, because
+            // meeting them is the run's whole job — a block whose own first half
+            // is the original is invisible to a run that probes before that half
+            // is recorded. Strictly before: a grid point recorded at a position
+            // the run then probes answers itself, and every block reads as its
+            // own repeat.
             let until = self.frame_offset + start as u64;
-            while abs < until && abs <= self.frame_offset + last as u64 {
+            while abs < until && abs <= block_end {
                 let at = (abs - self.frame_offset) as usize;
                 self.record_key(block, at, mask);
                 abs += step;
             }
-            // Nothing recorded yet, nothing this run could meet: the first
-            // block of a frame opens with an empty table, and a single-block
-            // frame — every frame of a few kilobytes — would otherwise spend
-            // half its probes on a run that cannot hit.
+            // The start run on a frame's first block cannot hit anything: the
+            // table is empty until that block records into it, and a frame of a
+            // few kilobytes is one block.
             if self.frame_offset != 0 || start != 0 {
                 let end = (start + run).min(last + 1);
                 for at in start..end {
                     repeat |= self.probe_key(block, at, reach, mask);
                 }
             }
-            if halves.peek().is_none() {
-                // The rest of the block, once no run is left to probe it.
-                while abs <= self.frame_offset + last as u64 {
+            // The rest of the block, once no run is left to probe it.
+            if idx == 1 {
+                while abs <= block_end {
                     let at = (abs - self.frame_offset) as usize;
                     self.record_key(block, at, mask);
                     abs += step;
@@ -327,7 +332,16 @@ impl SeenContentGrid {
 
     /// Full 64-bit avalanche (splitmix64's finalizer): every output bit depends
     /// on every input bit, which a single multiply does not give — its low half
-    /// is barely mixed and its top bits are spoken for by the anchor test.
+    /// is barely mixed.
+    ///
+    /// Three multiplies is a lot for something a probe run pays five hundred
+    /// times a block, and one multiply with a fold was tried in its place. It
+    /// does not hold: the slot, the tag and the fingerprint are all cut from the
+    /// same word, so a weaker mix correlates them, and a repeat that the grid
+    /// used to report went unrecognised — the chain-finder regression test
+    /// fails on it. The cost of a weaker hash here is not a coincidence, it is
+    /// a miss.
+    #[inline]
     fn avalanche(key: u64) -> u64 {
         let mut z = key.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
