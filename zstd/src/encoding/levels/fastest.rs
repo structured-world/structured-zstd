@@ -138,9 +138,13 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
             .seen_content
             .record_and_report_repeat(bytes, window_size as usize)
     } else {
-        // Not scanned, but the block is still bytes of stream between what came
-        // before it and what comes after.
-        state.seen_content.advance_past(bytes.len());
+        // Searched, so the matcher will hold it for as long as the window does.
+        // It still has to be RECORDED, or a later block made mostly of this one
+        // finds nothing on the grid and goes out raw with the match sitting in
+        // history. Recording without probing: the probe is what costs.
+        state
+            .seen_content
+            .record_searched(bytes, window_size as usize);
         false
     };
     let raw_fast_path = looks_incompressible && !repeats_earlier_content;
@@ -248,7 +252,17 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
         // every block). FSE previous tables are `SharedFseTable` handles —
         // their clone is a refcount bump, no slot needed.
         let mut saved_huff_table = core::mem::take(&mut state.block_scratch.huff_rollback);
-        saved_huff_table.clone_from(&state.last_huff_table);
+        // Only when there IS a table to snapshot. `Option::clone_from` from a
+        // `None` source drops what the slot holds, which is every buffer this
+        // persistent slot exists to keep: a run of blocks that build a table and
+        // then lose the size test would free and rebuild it every time.
+        let had_prior_huff_table = state.last_huff_table.is_some();
+        if let Some(prior) = state.last_huff_table.as_ref() {
+            match saved_huff_table.as_mut() {
+                Some(slot) => slot.clone_from(prior),
+                None => saved_huff_table = Some(prior.clone()),
+            }
+        }
         let saved_ll_previous = state.fse_tables.ll_previous.clone();
         let saved_ml_previous = state.fse_tables.ml_previous.clone();
         let saved_of_previous = state.fse_tables.of_previous.clone();
@@ -275,8 +289,14 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
             output.truncate(hdr_off);
             state.offset_hist = saved_offset_hist;
             // Swap (not move) so the slot keeps owning a reusable table
-            // allocation for the next block's snapshot.
-            core::mem::swap(&mut state.last_huff_table, &mut saved_huff_table);
+            // allocation for the next block's snapshot. With no prior table
+            // there is nothing to restore, and the table this block built goes
+            // into the slot rather than being dropped.
+            if had_prior_huff_table {
+                core::mem::swap(&mut state.last_huff_table, &mut saved_huff_table);
+            } else if let Some(built) = state.last_huff_table.take() {
+                saved_huff_table = Some(built);
+            }
             state.fse_tables.roll_back_confirmation([
                 saved_ll_previous,
                 saved_ml_previous,
@@ -364,7 +384,11 @@ pub(crate) fn compress_block_encoded_borrowed(
             .seen_content
             .record_and_report_repeat(block, window_size as usize)
     } else {
-        state.seen_content.advance_past(block.len());
+        // As on the owned path: a searched block is recorded, not merely
+        // stepped over.
+        state
+            .seen_content
+            .record_searched(block, window_size as usize);
         false
     };
     if is_rle {
@@ -431,7 +455,17 @@ pub(crate) fn compress_block_encoded_borrowed(
         // Persistent rollback slot — same allocation-reuse rationale as the
         // owned `compress_block_encoded` snapshot above.
         let mut saved_huff_table = core::mem::take(&mut state.block_scratch.huff_rollback);
-        saved_huff_table.clone_from(&state.last_huff_table);
+        // Only when there IS a table to snapshot. `Option::clone_from` from a
+        // `None` source drops what the slot holds, which is every buffer this
+        // persistent slot exists to keep: a run of blocks that build a table and
+        // then lose the size test would free and rebuild it every time.
+        let had_prior_huff_table = state.last_huff_table.is_some();
+        if let Some(prior) = state.last_huff_table.as_ref() {
+            match saved_huff_table.as_mut() {
+                Some(slot) => slot.clone_from(prior),
+                None => saved_huff_table = Some(prior.clone()),
+            }
+        }
         let saved_ll_previous = state.fse_tables.ll_previous.clone();
         let saved_ml_previous = state.fse_tables.ml_previous.clone();
         let saved_of_previous = state.fse_tables.of_previous.clone();
@@ -455,8 +489,14 @@ pub(crate) fn compress_block_encoded_borrowed(
             output.truncate(hdr_off);
             state.offset_hist = saved_offset_hist;
             // Swap (not move) so the slot keeps owning a reusable table
-            // allocation for the next block's snapshot.
-            core::mem::swap(&mut state.last_huff_table, &mut saved_huff_table);
+            // allocation for the next block's snapshot. With no prior table
+            // there is nothing to restore, and the table this block built goes
+            // into the slot rather than being dropped.
+            if had_prior_huff_table {
+                core::mem::swap(&mut state.last_huff_table, &mut saved_huff_table);
+            } else if let Some(built) = state.last_huff_table.take() {
+                saved_huff_table = Some(built);
+            }
             state.fse_tables.roll_back_confirmation([
                 saved_ll_previous,
                 saved_ml_previous,

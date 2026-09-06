@@ -131,18 +131,6 @@ impl SeenContentGrid {
         self.slots.capacity() * core::mem::size_of::<SeenSample>() + self.tags.capacity()
     }
 
-    /// Account for a block the grid does not scan. Ages here are distances in
-    /// the stream, and the reach test compares them against the matcher's
-    /// window, so a block that skips the scan — RLE, compressible, or ruled out
-    /// before the grid is asked — must still move the offset. Leaving it behind
-    /// makes an old fingerprint read as in reach long after the matcher has
-    /// dropped it, and every later block then pays for a search that cannot
-    /// find anything.
-    #[inline]
-    pub(crate) fn advance_past(&mut self, block_len: usize) {
-        self.frame_offset += block_len as u64;
-    }
-
     /// The mixed key at `at`, and the slot it belongs in.
     #[inline]
     fn key_at(&self, block: &[u8], at: usize, mask: usize) -> (usize, u16, u8) {
@@ -218,6 +206,24 @@ impl SeenContentGrid {
     /// `window_size` is that reach; pass `0` when it is unknown, which keeps
     /// every record for the frame.
     pub(crate) fn record_and_report_repeat(&mut self, block: &[u8], window_size: usize) -> bool {
+        self.take_block(block, window_size, true)
+    }
+
+    /// Record a block the caller is going to SEARCH, without asking whether it
+    /// repeats.
+    ///
+    /// The matcher indexes what it searches, so that content stays findable for
+    /// as long as the window holds it — but only a block the grid recorded can
+    /// send a later block to the search in the first place. Leaving searched
+    /// blocks unrecorded means a later block made mostly of one of them looks
+    /// like noise, finds nothing, and goes out raw with an almost block-sized
+    /// match sitting in history. The probe is what costs; recording is a key
+    /// every `RECORD_STEP` bytes.
+    pub(crate) fn record_searched(&mut self, block: &[u8], window_size: usize) {
+        self.take_block(block, window_size, false);
+    }
+
+    fn take_block(&mut self, block: &[u8], window_size: usize, probe: bool) -> bool {
         // Too short to key on. The offset still advances, so the ages of what
         // follows stay true distances in the stream.
         if block.len() < Self::KEY_LEN {
@@ -303,7 +309,7 @@ impl SeenContentGrid {
             // The start run on a frame's first block cannot hit anything: the
             // table is empty until that block records into it, and a frame of a
             // few kilobytes is one block.
-            if self.frame_offset != 0 || start != 0 {
+            if probe && (self.frame_offset != 0 || start != 0) {
                 let end = (start + run).min(last + 1);
                 for at in start..end {
                     repeat |= self.probe_key(block, at, reach, mask);
@@ -469,10 +475,17 @@ pub(crate) fn compression_level_allows_raw_fast_path(
         // grid catches those on its own. Four megabytes repeated at nearly the
         // window distance comes out at 4,129,240 bytes against the reference's
         // 4,129,258 with the skip live at level 17.
-        CompressionLevel::Fastest | CompressionLevel::Default | CompressionLevel::Better => true,
-        CompressionLevel::Best | CompressionLevel::Level(_) => {
-            window_size <= RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES
-        }
+        // Every level that compresses reads the same ceiling, the named ones
+        // included: their preset window is well under it, but a public
+        // `window_log` override moves the window without moving the level, and
+        // a named level is then asking for a reach the grid's table cannot hold
+        // records for while a numeric level asking for the same reach is
+        // refused.
+        CompressionLevel::Fastest
+        | CompressionLevel::Default
+        | CompressionLevel::Better
+        | CompressionLevel::Best
+        | CompressionLevel::Level(_) => window_size <= RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES,
         CompressionLevel::Uncompressed => false,
     }
 }

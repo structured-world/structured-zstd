@@ -248,7 +248,10 @@ fn the_window_ceiling_is_what_closes_the_raw_fast_path() {
             "{level:?} past the ceiling",
         );
     }
-    // The three named levels below the ceiling never consult it.
+    // The named levels read the same ceiling. Their preset window is well under
+    // it, but a public `window_log` override moves the window without moving the
+    // level, and a named level must not then be allowed a reach a numeric level
+    // asking for the same thing is refused.
     for level in [
         CompressionLevel::Fastest,
         CompressionLevel::Default,
@@ -256,8 +259,12 @@ fn the_window_ceiling_is_what_closes_the_raw_fast_path() {
     ] {
         assert!(compression_level_allows_raw_fast_path(
             level,
-            RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES + 1
+            RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES
         ));
+        assert!(
+            !compression_level_allows_raw_fast_path(level, RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES + 1),
+            "{level:?} with an overridden window past the ceiling",
+        );
     }
     assert!(!compression_level_allows_raw_fast_path(
         CompressionLevel::Uncompressed,
