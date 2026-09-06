@@ -37,6 +37,13 @@ pub(crate) struct SeenContentGrid {
     /// A slot belongs to the frame whose `epoch` it carries; one from an
     /// earlier frame reads as empty, which is what makes starting a frame free.
     slots: Vec<SeenSample>,
+    /// One byte of each slot's key, in a table of its own. A probe run is 512
+    /// lookups and nearly all of them miss, so the miss has to be cheap: a byte
+    /// per slot keeps a window's worth of them in cache where the same number of
+    /// sixteen-byte samples does not, and only a byte that matches is worth
+    /// reading the sample for. Never zero for a live record, so a slot no frame
+    /// has written cannot match.
+    tags: Vec<u8>,
     /// Which frame the live slots belong to. Starts at 0 with a freshly
     /// allocated (all-zero) table, and every frame increments it first, so no
     /// frame ever runs under the epoch a zeroed slot carries.
@@ -98,6 +105,7 @@ impl SeenContentGrid {
         self.epoch = self.epoch.wrapping_add(1);
         if self.epoch == 0 {
             self.slots.fill(SeenSample::default());
+            self.tags.fill(0);
             self.epoch = 1;
         }
         self.frame_offset = 0;
@@ -105,7 +113,7 @@ impl SeenContentGrid {
     }
 
     pub(crate) fn heap_size(&self) -> usize {
-        self.slots.capacity() * core::mem::size_of::<SeenSample>()
+        self.slots.capacity() * core::mem::size_of::<SeenSample>() + self.tags.capacity()
     }
 
     /// Account for a block the grid does not scan. Ages here are distances in
@@ -122,15 +130,20 @@ impl SeenContentGrid {
 
     /// The mixed key at `at`, and the slot it belongs in.
     #[inline]
-    fn key_at(&self, block: &[u8], at: usize, mask: usize) -> (usize, u32) {
+    fn key_at(&self, block: &[u8], at: usize, mask: usize) -> (usize, u32, u8) {
         let key = u64::from_le_bytes(
             block[at..at + Self::KEY_LEN]
                 .try_into()
                 .expect("the slice is KEY_LEN bytes"),
         );
         let mixed = Self::avalanche(key);
-        // Fingerprint is never zero, so a zeroed slot cannot read as a match.
-        ((mixed >> 32) as usize & mask, (mixed as u32) | 1)
+        // Neither the fingerprint nor the tag is ever zero, so a slot no frame
+        // has written cannot read as a match.
+        (
+            (mixed >> 32) as usize & mask,
+            (mixed as u32) | 1,
+            (mixed >> 24) as u8 | 1,
+        )
     }
 
     /// Whether the content at `at` was recorded within `reach`. Reads only: the
@@ -138,7 +151,11 @@ impl SeenContentGrid {
     /// would fill the table with keys no later probe can align with.
     #[inline]
     fn probe_key(&self, block: &[u8], at: usize, reach: u64, mask: usize) -> bool {
-        let (slot, fingerprint) = self.key_at(block, at, mask);
+        let (slot, fingerprint, tag) = self.key_at(block, at, mask);
+        // The byte first: this is the only line nearly every probe executes.
+        if self.tags[slot] != tag {
+            return false;
+        }
         let held = self.slots[slot];
         let here = self.frame_offset + at as u64;
         if held.epoch != self.epoch || held.fingerprint != fingerprint {
@@ -162,7 +179,8 @@ impl SeenContentGrid {
     /// matcher would find — every other block of the run would go out raw.
     #[inline]
     fn record_key(&mut self, block: &[u8], at: usize, mask: usize) {
-        let (slot, fingerprint) = self.key_at(block, at, mask);
+        let (slot, fingerprint, tag) = self.key_at(block, at, mask);
+        self.tags[slot] = tag;
         self.slots[slot] = SeenSample {
             fingerprint,
             epoch: self.epoch,
@@ -188,6 +206,7 @@ impl SeenContentGrid {
         let wanted = Self::slots_for(window_size);
         if self.slots.len() < wanted {
             self.slots = vec![SeenSample::default(); wanted];
+            self.tags = vec![0u8; wanted];
             // Zeroed slots carry epoch 0, so a frame must never run under it.
             self.epoch = self.epoch.max(1);
         }
@@ -244,9 +263,15 @@ impl SeenContentGrid {
                 self.record_key(block, at, mask);
                 abs += step;
             }
-            let end = (start + run).min(last + 1);
-            for at in start..end {
-                repeat |= self.probe_key(block, at, reach, mask);
+            // Nothing recorded yet, nothing this run could meet: the first
+            // block of a frame opens with an empty table, and a single-block
+            // frame — every frame of a few kilobytes — would otherwise spend
+            // half its probes on a run that cannot hit.
+            if self.frame_offset != 0 || start != 0 {
+                let end = (start + run).min(last + 1);
+                for at in start..end {
+                    repeat |= self.probe_key(block, at, reach, mask);
+                }
             }
             if halves.peek().is_none() {
                 // The rest of the block, once no run is left to probe it.
