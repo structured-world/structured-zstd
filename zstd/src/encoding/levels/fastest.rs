@@ -119,15 +119,30 @@ pub(crate) fn compress_block_encoded<M: Matcher>(
     // duplicating a COMPRESSIBLE one is compressible itself, so it is never at
     // risk of being skipped and never needs to find its original here.
     let window_size = state.matcher.window_size();
-    let dict_rejects_raw = dict_active && state.matcher.block_samples_match_dict(bytes);
+    // An attached dictionary keeps the block on the search, full stop. Asking a
+    // sample of thirty-odd positions whether the dictionary is relevant is the
+    // wrong shape for a gate that DISCARDS the search: dictionary matches are
+    // external to the block, so nothing else in this chain can see them, and a
+    // block whose dictionary runs happen to fall between the sampled offsets
+    // goes out raw although the search would have coded nearly all of it from
+    // the dictionary. The classifier's own sample is safe in a way this one is
+    // not — it measures the block against itself, and a repeat is what the grid
+    // then catches.
+    let dict_rejects_raw = dict_active;
     let looks_incompressible = rle_byte_opt.is_none()
         && !dict_rejects_raw
         && compression_level_allows_raw_fast_path(compression_level, window_size)
         && should_emit_raw_fast_path(compression_level, window_size, bytes, dict_active);
-    let repeats_earlier_content = looks_incompressible
-        && state
+    let repeats_earlier_content = if looks_incompressible {
+        state
             .seen_content
-            .record_and_report_repeat(bytes, window_size as usize);
+            .record_and_report_repeat(bytes, window_size as usize)
+    } else {
+        // Not scanned, but the block is still bytes of stream between what came
+        // before it and what comes after.
+        state.seen_content.advance_past(bytes.len());
+        false
+    };
     let raw_fast_path = looks_incompressible && !repeats_earlier_content;
     // Hashed once, from the pre-commit view, and reused by whichever branch
     // wins — the compressed branch covers the same bytes as the RLE and raw
@@ -337,15 +352,21 @@ pub(crate) fn compress_block_encoded_borrowed(
     // incompressible.
     let is_rle = !block.is_empty() && block.iter().all(|x| block[0].eq(x));
     let window_size = state.matcher.window_size();
-    let dict_rejects_raw = dict_active && state.matcher.block_samples_match_dict(block);
+    // As on the owned path: an attached dictionary keeps the block on the
+    // search rather than trusting a sample to say the dictionary is irrelevant.
+    let dict_rejects_raw = dict_active;
     let looks_incompressible = !is_rle
         && !dict_rejects_raw
         && compression_level_allows_raw_fast_path(compression_level, window_size)
         && should_emit_raw_fast_path(compression_level, window_size, block, dict_active);
-    let repeats_earlier_content = looks_incompressible
-        && state
+    let repeats_earlier_content = if looks_incompressible {
+        state
             .seen_content
-            .record_and_report_repeat(block, window_size as usize);
+            .record_and_report_repeat(block, window_size as usize)
+    } else {
+        state.seen_content.advance_past(block.len());
+        false
+    };
     if is_rle {
         let rle_byte = block[0];
         #[cfg(feature = "lsm")]

@@ -38,7 +38,7 @@ zrip = "0.8"
 # Only to hand freed memory back to the kernel between benchmark groups, so a
 # group cannot inherit the pages the previous one released. Measurement
 # plumbing; nothing the codec builds against.
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
 libc = "0.2"
 
 [features]

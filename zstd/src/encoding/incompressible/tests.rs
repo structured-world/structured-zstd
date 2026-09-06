@@ -87,6 +87,68 @@ fn the_content_grid_expires_a_sample_with_the_window_not_before() {
     );
 }
 
+/// Content the anchor byte never appears in must still record a key.
+///
+/// Anchoring on one byte value leaves a block that happens to contain none of
+/// it with nothing recorded, and its exact copy then goes out raw with a
+/// block-sized match sitting right there. The endpoints cover that: they are
+/// the same content in both copies of a block-aligned duplicate.
+#[test]
+fn the_content_grid_records_a_block_without_the_anchor_byte() {
+    let mut block = deterministic_bytes(0xC0DE, 64 * 1024);
+    for byte in &mut block {
+        if *byte == SeenContentGrid::ANCHOR_BYTE {
+            *byte = SeenContentGrid::ANCHOR_BYTE.wrapping_add(1);
+        }
+    }
+    assert!(!block.contains(&SeenContentGrid::ANCHOR_BYTE));
+    const WIDE: usize = 8 * 1024 * 1024;
+    let mut grid = SeenContentGrid::default();
+    grid.reset_for_frame();
+    assert!(!grid.record_and_report_repeat(&block, WIDE), "the first");
+    assert!(
+        grid.record_and_report_repeat(&block, WIDE),
+        "an exact copy must be recognised whatever bytes the block is made of",
+    );
+}
+
+/// A run of the same block must keep reporting, not every other one.
+///
+/// A hit has to refresh the slot it hit: leaving the recorded offset at the
+/// FIRST occurrence makes the third one measure its distance from there, which
+/// with a window of one block reads as out of reach even though the block right
+/// behind it is exactly what the matcher would find. Every other block of a
+/// repeating run would then go out raw.
+#[test]
+fn the_content_grid_keeps_reporting_a_run_of_the_same_block() {
+    let block = deterministic_bytes(0xBEEF, 128 * 1024);
+    let window = block.len();
+    let mut grid = SeenContentGrid::default();
+    grid.reset_for_frame();
+    assert!(!grid.record_and_report_repeat(&block, window), "the first");
+    assert!(
+        grid.record_and_report_repeat(&block, window),
+        "the second repeats the first",
+    );
+    // The answer above can survive a stale slot by luck — some anchors of the
+    // second block miss and are written fresh — so check the state itself: what
+    // the second block matched must now be dated to the second block, or the
+    // third will measure its distance from the first and read as out of reach.
+    let stale = grid
+        .slots
+        .iter()
+        .filter(|slot| slot.fingerprint != 0 && slot.at < block.len() as u64)
+        .count();
+    assert_eq!(
+        stale, 0,
+        "{stale} slots still carry the first block's offset after the second matched them",
+    );
+    assert!(
+        grid.record_and_report_repeat(&block, window),
+        "the third repeats the second, which is still within a block-sized window",
+    );
+}
+
 /// A block shorter than one key must be answered, not indexed — the last block
 /// of a frame is routinely a handful of bytes, and reading a key out of it
 /// would run off the end.
@@ -166,12 +228,7 @@ fn scan_sample_region_early_exits_on_repetitive_input() {
 /// further back is worth more than one written off unsearched.
 #[test]
 fn the_window_ceiling_is_what_closes_the_raw_fast_path() {
-    for level in [
-        CompressionLevel::Best,
-        CompressionLevel::Level(1),
-        CompressionLevel::Level(9),
-        CompressionLevel::Level(22),
-    ] {
+    for level in [CompressionLevel::Level(1), CompressionLevel::Level(9)] {
         assert!(
             compression_level_allows_raw_fast_path(level, RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES),
             "{level:?} at the ceiling",
@@ -179,6 +236,18 @@ fn the_window_ceiling_is_what_closes_the_raw_fast_path() {
         assert!(
             !compression_level_allows_raw_fast_path(level, RAW_FAST_PATH_MAX_WINDOW_SIZE_BYTES + 1),
             "{level:?} past the ceiling",
+        );
+    }
+    // Above the band the window is beside the point: the block goes to the
+    // search the level was chosen for whatever distance it may reach over.
+    for level in [
+        CompressionLevel::Best,
+        CompressionLevel::Level(10),
+        CompressionLevel::Level(22),
+    ] {
+        assert!(
+            !compression_level_allows_raw_fast_path(level, 1),
+            "{level:?} is outside the band",
         );
     }
     // The three named levels below the ceiling never consult it.

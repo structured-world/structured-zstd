@@ -1040,7 +1040,9 @@ fn configure_group<M: criterion::measurement::Measurement>(
 /// Once per GROUP, so the trim itself is far below anything a measurement can
 /// see; the per-iteration loop never touches it.
 fn release_freed_memory() {
-    #[cfg(target_os = "linux")]
+    // glibc only: `malloc_trim` is a GNU extension, and musl neither provides
+    // it nor keeps the per-arena free lists it exists to return.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
     // SAFETY: `malloc_trim` takes no pointers and only returns free pages to
     // the kernel; nothing live is touched, and it is a no-op on allocators
     // that do not implement it.

@@ -117,7 +117,11 @@ fn main() {
         warm = Some(compressor);
     }
 
-    let mut out2 = Vec::new();
+    // Sized before the recorder is armed. An empty output vector grows by
+    // doubling under the frame it is being written into, and that ladder is
+    // caller-owned output growth: counted here it reads exactly like the
+    // encoder-buffer regressions this census exists to find.
+    let mut out2 = Vec::with_capacity(structured_zstd::encoding::compress_bound(data.len()));
     RECORDING.store(true, Ordering::SeqCst);
     match warm.as_mut() {
         Some(compressor) => {

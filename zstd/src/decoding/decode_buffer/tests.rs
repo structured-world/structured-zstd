@@ -584,3 +584,29 @@ fn prefetch_lookahead_at_wrap_boundary() {
         buf.prefetch_lookahead_match_source(n);
     }
 }
+
+/// The direct decode path assigns a finished digest to `hash` without going
+/// through `compute_hash`, so a reset conditioned on that flag leaves the
+/// previous frame's digest in place and the next checksummed frame verifies
+/// against a hash that already has bytes in it.
+#[cfg(feature = "hash")]
+#[test]
+fn a_reset_clears_a_digest_written_around_the_hashing_flag() {
+    use core::hash::Hasher;
+
+    let mut buf = DecodeBuffer::<RingBuffer>::new(1024);
+    // What the direct path does: hash the output, store the digest, leave the
+    // flag alone (it is false here, as it is after a checksum-free frame).
+    buf.set_compute_hash(false);
+    let mut digest = twox_hash::XxHash64::with_seed(0);
+    digest.write(b"the previous frame");
+    buf.hash = digest;
+
+    buf.reset(1024);
+
+    assert_eq!(
+        buf.hash.finish(),
+        twox_hash::XxHash64::with_seed(0).finish(),
+        "the next frame would append to the previous frame's digest"
+    );
+}

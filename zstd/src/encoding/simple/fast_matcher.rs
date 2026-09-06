@@ -1850,6 +1850,14 @@ impl FastKernelMatcher {
         let mut pos = range_start;
         while pos <= last_hashable {
             index_at!(pos);
+            // The remaining distance, not the sum: `pos + step` is what would
+            // wrap when the last grid position sits within a step of the end of
+            // the address space, and a wrapped `pos` re-enters the loop at a
+            // small value and never leaves. `pos <= last_hashable` holds here,
+            // so the subtraction cannot underflow.
+            if last_hashable - pos < step {
+                break;
+            }
             pos += step;
         }
     }

@@ -90,8 +90,17 @@ const BT_UNSORTED_MARK: u32 = 1;
 ///
 /// A node that reaches the bound is dropped from the tree, which is what
 /// upstream already does for one that reaches the end of the input ("no way to
-/// know if inf or sup", `zstd_opt.c`). It cannot shorten a match: the lengths
-/// the parse emits come from the search walk, not from this ordering.
+/// know if inf or sup", `zstd_opt.c`). Dropping ends the two pending child
+/// links, so whatever hung below the abandoned node leaves this bucket, and a
+/// later string that would have matched one of those branches past the bound
+/// can in principle settle for a shorter match — the bound is not free the way
+/// the input's end is. What it costs was measured rather than assumed: across
+/// the level and fixture matrix no compressed size moved, and on the 8 MiB
+/// repeated line above the frame is within three bytes of the reference's at
+/// every level in the band. The alternative is not "keep the branch" — the
+/// links belong to the node being placed, and leaving them is leaving whatever
+/// the slot held before — but ordering the node by an arbitrary tiebreak, which
+/// keeps the tree connected by misplacing nodes in it.
 const DUBT_SORT_COMPARE_CAP: usize = 8 * 1024;
 
 /// A tree link "pointer" whose write is discarded (upstream `dummy32`).
@@ -2850,7 +2859,27 @@ impl RowMatchGenerator {
         if self.history_abs_start + self.window_size + len >= u32::MAX as usize - 1 - BT_IDX_BASE {
             self.rebase_positions();
         }
-        if self.window_size + len > self.max_window_size {
+        // Evict down to a FULL window BEFORE this block, not to a window that
+        // has to include it. The floor a match is measured against is set from
+        // the block's START (upstream zstd `ZSTD_window_enforceMaxDist` takes
+        // `ip`, not `ip + blockSize`), so retaining only `window - block` left
+        // everything between those two distances unreachable however the floor
+        // was computed. The mirror therefore holds up to a block more than the
+        // window, which is the shape upstream's buffer has.
+        let evicted_from = self.history_start;
+        while self.window_size > self.max_window_size {
+            let removed_len = self.chunk_lens.pop_front().unwrap();
+            self.window_size -= removed_len;
+            self.history_start += removed_len;
+            self.history_abs_start += removed_len;
+        }
+        // Only once history actually left the window. Asking whether it WOULD
+        // leave once this block is added is a wider question than the eviction
+        // asks, and the gap between the two is a whole window's worth of state
+        // where the dictionary index was dropped although nothing had moved —
+        // and a dictionary match starting at the block's first byte is exactly
+        // what is legal there.
+        if self.history_start != evicted_from {
             self.dict.invalidate();
             // Same one-time ceiling as `add_data`: once eviction starts, grow
             // the mirror linearly to (window + window/4 + one block).
@@ -2860,19 +2889,6 @@ impl RowMatchGenerator {
             if target > self.history.len() && self.history.capacity() < target {
                 self.history.reserve_exact(target - self.history.len());
             }
-        }
-        // Evict down to a FULL window BEFORE this block, not to a window that
-        // has to include it. The floor a match is measured against is set from
-        // the block's START (upstream zstd `ZSTD_window_enforceMaxDist` takes
-        // `ip`, not `ip + blockSize`), so retaining only `window - block` left
-        // everything between those two distances unreachable however the floor
-        // was computed. The mirror therefore holds up to a block more than the
-        // window, which is the shape upstream's buffer has.
-        while self.window_size > self.max_window_size {
-            let removed_len = self.chunk_lens.pop_front().unwrap();
-            self.window_size -= removed_len;
-            self.history_start += removed_len;
-            self.history_abs_start += removed_len;
         }
         if self.low_limit < self.history_abs_start {
             self.low_limit = self.history_abs_start;
@@ -2909,9 +2925,21 @@ impl RowMatchGenerator {
         {
             self.rebase_positions();
         }
-        if self.window_size + data.len() > self.max_window_size {
-            // Eviction advances `history_start`, staling the dict row index's
+        // Same reach as `commit_block`: a full window stays behind the incoming
+        // block, because the floor is measured from the block's start.
+        let evicted_from = self.history_start;
+        while self.window_size > self.max_window_size {
+            let removed_len = self.chunk_lens.pop_front().unwrap();
+            self.window_size -= removed_len;
+            self.history_start += removed_len;
+            self.history_abs_start += removed_len;
+        }
+        if self.history_start != evicted_from {
+            // Eviction advanced `history_start`, staling the dict row index's
             // concat positions — drop the attach (dict slid within/out window).
+            // Conditioned on what the eviction DID, not on what adding this
+            // block would need: between the two the dictionary is still whole
+            // and still reachable from the block's first byte.
             self.dict.invalidate();
             // Cap the history buffer near the live window instead of letting
             // the Vec power-of-two double to ~2x window on long streams. Once
@@ -2927,14 +2955,6 @@ impl RowMatchGenerator {
             if target > self.history.len() && self.history.capacity() < target {
                 self.history.reserve_exact(target - self.history.len());
             }
-        }
-        // Same reach as `commit_block`: a full window stays behind the incoming
-        // block, because the floor is measured from the block's start.
-        while self.window_size > self.max_window_size {
-            let removed_len = self.chunk_lens.pop_front().unwrap();
-            self.window_size -= removed_len;
-            self.history_start += removed_len;
-            self.history_abs_start += removed_len;
         }
         // Evicted bytes are gone from `history`, so the valid-data floor
         // rises with them (upstream `window.lowLimit`: the oldest byte the

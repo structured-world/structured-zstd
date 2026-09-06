@@ -70,15 +70,18 @@ impl Clone for WeightDescription {
     }
 
     fn clone_from(&mut self, source: &Self) {
-        // Reserve only for a source that has something to copy. A table whose
-        // weights are not encodable leaves the buffer empty, and reserving the
-        // bound for it hands every rollback and dictionary-seed destination a
-        // 256-byte allocation it may never write into. The destination's own
-        // encode path reserves when it fills the buffer.
-        if !source.buf.is_empty() {
+        // On the state, not on emptiness. A description that lost the size test
+        // after being FSE-encoded keeps the bytes it produced, and they are
+        // bytes no reader ever looks at: the writer's `NotEncodable` arm does
+        // not touch the buffer. Copying them hands every rollback and
+        // dictionary-seed destination a reservation and a memcpy for nothing.
+        // The destination's own encode path reserves when it fills the buffer.
+        if matches!(source.state, DescriptionState::Encoded(_)) {
             self.reserve_to_bound();
+            self.buf.clone_from(&source.buf);
+        } else {
+            self.buf.clear();
         }
-        self.buf.clone_from(&source.buf);
         self.state = source.state;
     }
 }
